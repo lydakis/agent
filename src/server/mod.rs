@@ -1577,6 +1577,9 @@ struct Service {
     wakes: Wakes,
     /// The newest steer each parked turn has been woken for.
     steer_wakes: HashMap<i64, i64>,
+    /// Turns a pool woke for a place on its ramp while they were still
+    /// parking: each resumes as soon as its park lands.
+    pool_woken: std::collections::HashSet<i64>,
     /// Shutting down with a grace period: no turn starts, each running turn
     /// parks at its next boundary, and accepted submissions wait durably
     /// for the next start. Every turn task reads it.
@@ -1659,6 +1662,10 @@ impl Wakes {
             self.due.remove(&(old, turn));
         }
         self.due.insert((at, turn));
+    }
+
+    fn has(&self, turn: i64) -> bool {
+        self.turns.contains_key(&turn)
     }
 
     fn cancel(&mut self, turn: i64) {
@@ -2217,6 +2224,12 @@ pub async fn run(config: Configuration) -> Result<()> {
     let (resume_sender, mut resumes) = mpsc::unbounded_channel();
     let (failure_sender, mut failures) = mpsc::unbounded_channel();
     let handles = Handles::new(resume_sender);
+    // A pool wakes a turn parked on its full ramp when a place frees.
+    let (pool_wake_sender, mut pool_wakes) = mpsc::unbounded_channel();
+    let wake: agent_runtime::provider::pace::Wake = Arc::new(move |bot, turn| {
+        let _ = pool_wake_sender.send((bot, turn));
+    });
+    transport.set_wake(wake);
     let mut publisher = tokio::spawn(publish(publications, hub.clone(), handles.clone()));
     if let Some(gate) = registry.load_gate() {
         tokio::spawn(wake_load_parks(
@@ -2330,6 +2343,7 @@ pub async fn run(config: Configuration) -> Result<()> {
         chores: Commands::default(),
         wakes,
         steer_wakes,
+        pool_woken: Default::default(),
         draining: Arc::default(),
         paused,
         notices: Vec::new(),
@@ -2479,6 +2493,9 @@ pub async fn run(config: Configuration) -> Result<()> {
                     } else {
                         last_activity = std::time::Instant::now();
                     }
+                }
+                Some((bot, turn)) = pool_wakes.recv() => {
+                    service.pool_wake(bot, turn);
                 }
                 Some((bot, turn)) = resumes.recv(), if service.has_capacity() => {
                     let chore = std::time::Instant::now();
@@ -3774,6 +3791,17 @@ impl Service {
             .unwrap_or(Duration::MAX)
     }
 
+    /// A pool has a place for a turn parked on its full ramp: it comes due
+    /// now. One still parking goes as soon as its park lands; one no longer
+    /// parked (ended, or claimed by another wake-up) is left alone.
+    fn pool_wake(&mut self, bot: String, turn: i64) {
+        if self.active.get(&bot).is_some_and(|a| a.turn == turn) {
+            self.pool_woken.insert(turn);
+        } else if self.wakes.has(turn) {
+            self.wakes.set(now_ms(), bot, turn);
+        }
+    }
+
     /// `due` marks a wake-up from the turn's own time rather than an
     /// answer or a resolved handle.
     async fn resume(&mut self, bot: String, turn: i64, due: bool) -> Result<()> {
@@ -4082,6 +4110,7 @@ impl Service {
                     self.ready_hint = true;
                 }
                 self.steer_wakes.remove(&turn);
+                self.pool_woken.remove(&turn);
                 // Before the bot's next turn can start: it starts on what
                 // a `configure` during this one kept. A store refusing it
                 // now leaves it for that start, which waits on it.
@@ -4090,9 +4119,16 @@ impl Service {
             }
             // A wake-up may already have claimed the turn again.
             Reaped::Paced(at) if !self.active.get(&bot).is_some_and(|a| a.turn == turn) => {
+                // A pool already woke it for a place: it goes now.
+                let at = match self.pool_woken.remove(&turn) {
+                    true => now_ms(),
+                    false => at,
+                };
                 self.wakes.set(at, bot.clone(), turn)
             }
-            Reaped::Paced(_) | Reaped::Parked => {}
+            Reaped::Paced(_) | Reaped::Parked => {
+                self.pool_woken.remove(&turn);
+            }
         }
         // A steer committed while the turn was parking on `wait` found it
         // still running, so its wake-up comes from here; a wait with a
@@ -7077,6 +7113,7 @@ mod tests {
             chores: Commands::default(),
             wakes: Wakes::default(),
             steer_wakes: HashMap::new(),
+            pool_woken: Default::default(),
             draining: Arc::default(),
             paused: None,
             notices: Vec::new(),
@@ -7296,6 +7333,7 @@ mod tests {
             chores: Commands::default(),
             wakes: Wakes::default(),
             steer_wakes: HashMap::new(),
+            pool_woken: Default::default(),
             draining: Arc::default(),
             paused: None,
             notices: Vec::new(),
@@ -7611,6 +7649,7 @@ mod tests {
             chores: Commands::default(),
             wakes: Wakes::default(),
             steer_wakes: HashMap::new(),
+            pool_woken: Default::default(),
             draining: Arc::default(),
             paused: None,
             notices: Vec::new(),
@@ -7858,6 +7897,7 @@ mod tests {
             chores: Commands::default(),
             wakes: Wakes::default(),
             steer_wakes: HashMap::new(),
+            pool_woken: Default::default(),
             draining: Arc::default(),
             paused: None,
             notices: Vec::new(),
@@ -8132,6 +8172,46 @@ mod tests {
             .unwrap();
         assert!(service.active.is_empty());
         assert_eq!(service.wakes.next(), Some(later));
+        drop(service);
+        drop(store);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn a_pool_wakes_a_turn_parked_on_its_ramp_now_or_as_its_park_lands() {
+        let dir = std::env::temp_dir().join(format!("agent-pool-wake-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let (store, _publications) = Store::open(&dir.join("state.sqlite")).await.unwrap();
+        let turns = running(&store, &["Bob".into()]).await;
+        let bob = turns[0].1;
+        let mut service = bare_service(&store);
+        let later = now_ms() + 60_000;
+        // Woken while its park is still landing: the park comes due now.
+        service.active.start("Bob".into(), |slot| Active {
+            turn: bob,
+            task: 1,
+            cancel: watch::channel(None).0,
+            steers: Arc::default(),
+            compact: Arc::default(),
+            lift: Arc::default(),
+            slot,
+            given_rules: Default::default(),
+        });
+        service.pool_wake("Bob".into(), bob);
+        service
+            .complete("Bob".into(), bob, 1, Ok(Reaped::Paced(later)))
+            .await
+            .unwrap();
+        assert!(service.wakes.next().is_some_and(|at| at <= now_ms()));
+        assert!(service.pool_woken.is_empty());
+        // Woken once parked: its wake-up moves to now.
+        service.wakes.set(later, "Bob".into(), bob);
+        service.pool_wake("Bob".into(), bob);
+        assert!(service.wakes.next().is_some_and(|at| at <= now_ms()));
+        // A turn no longer parked is left alone.
+        service.wakes.cancel(bob);
+        service.pool_wake("Bob".into(), bob);
+        assert_eq!(service.wakes.next(), None);
         drop(service);
         drop(store);
         let _ = std::fs::remove_dir_all(&dir);

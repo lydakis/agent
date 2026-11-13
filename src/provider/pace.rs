@@ -32,6 +32,18 @@ pub struct Report {
     pub dispatched: bool,
 }
 
+/// Resumes a parked turn now: the daemon's own wake-up for it.
+pub type Wake = Arc<dyn Fn(String, i64) + Send + Sync>;
+
+/// A turn asking for a call, and how to wake it once parked: a caller
+/// that finds a ramp's window full parks, and a settle wakes it.
+#[derive(Clone)]
+pub struct Waiter {
+    pub bot: String,
+    pub turn: i64,
+    pub wake: Wake,
+}
+
 /// Pools keyed by model within one provider.
 #[derive(Default)]
 pub struct Pools(Mutex<HashMap<String, Arc<Pace>>>);
@@ -155,7 +167,52 @@ struct Ramp {
     flying: u32,
     /// Answers counted toward the next call of growth past the threshold.
     credit: u32,
+    /// Turns parked on the full window, in the order they came.
+    queued: std::collections::VecDeque<Waiter>,
+    /// Turns woken for a place, which the window keeps for each until it
+    /// comes back or `PROMISE` passes.
+    promised: Vec<(String, i64, Instant)>,
 }
+impl Ramp {
+    fn new(generation: u64) -> Self {
+        Self {
+            generation,
+            window: 1,
+            threshold: None,
+            flying: 0,
+            credit: 0,
+            queued: Default::default(),
+            promised: Vec::new(),
+        }
+    }
+    fn full(&self) -> bool {
+        self.flying + self.promised.len() as u32 >= self.window
+    }
+    fn promised_to(&self, waiter: Option<&Waiter>) -> bool {
+        waiter.is_some_and(|w| {
+            self.promised
+                .iter()
+                .any(|(bot, turn, _)| *bot == w.bot && *turn == w.turn)
+        })
+    }
+    /// Wake parked turns, oldest first, for the places the window has free.
+    fn wake(&mut self, now: Instant) {
+        self.promised.retain(|(_, _, until)| *until > now);
+        while !self.full() {
+            let Some(waiter) = self.queued.pop_front() else {
+                break;
+            };
+            self.promised
+                .push((waiter.bot.clone(), waiter.turn, now + PROMISE));
+            (waiter.wake)(waiter.bot, waiter.turn);
+        }
+    }
+}
+
+/// How long a woken turn's place is kept for it to come back.
+const PROMISE: Duration = Duration::from_secs(5);
+/// How long a turn parked on a full window waits if no settle wakes it.
+const RAMP_PARK: Duration = Duration::from_secs(30);
 
 /// A window this wide lets the pool's calls go as they come.
 const RAMP_DONE: u32 = 1024;
@@ -489,6 +546,7 @@ impl Drop for Reservation<'_> {
             && ramp.generation == generation
         {
             ramp.flying = ramp.flying.saturating_sub(1);
+            ramp.wake(Instant::now());
         }
         if !self.request_reported {
             state.reserved_requests -= 1;
@@ -588,7 +646,21 @@ impl Pace {
             elapsed_ms: &mut report.paced_ms,
             started: Instant::now(),
         };
-        self.acquire_cost(cost, &mut report.park_for).await
+        self.acquire_cost(cost, &mut report.park_for, None).await
+    }
+    /// As `acquire_reported`, for a turn that can park on a full ramp and
+    /// be woken when a place frees.
+    pub(super) async fn acquire_waking(
+        &self,
+        cost: Cost,
+        report: &mut Report,
+        waiter: Option<&Waiter>,
+    ) -> crate::Result<Reservation<'_>> {
+        let _time = WaitTime {
+            elapsed_ms: &mut report.paced_ms,
+            started: Instant::now(),
+        };
+        self.acquire_cost(cost, &mut report.park_for, waiter).await
     }
     /// Hold the caller until the pool can afford one request of `tokens`,
     /// then reserve it until headers, final usage, or cancellation account
@@ -604,6 +676,7 @@ impl Pace {
                 output: 0,
             },
             park_for,
+            None,
         )
         .await
     }
@@ -611,6 +684,7 @@ impl Pace {
         &'a self,
         cost: Cost,
         park_for: &mut Option<Duration>,
+        waiter: Option<&Waiter>,
     ) -> crate::Result<Reservation<'a>> {
         let started = Instant::now();
         let costs = cost.dims();
@@ -647,13 +721,38 @@ impl Pace {
                         state.refill(now);
                         let due = state.booked.due_by(now + MIN_PARK);
                         let left = due.map(|(at, _)| at.saturating_duration_since(now));
+                        // A place kept for a woken turn that never came
+                        // back goes to the next parked one.
+                        if let Some(ramp) = state.ramp.as_mut() {
+                            ramp.wake(now);
+                        }
                         let wait = match left {
                             Some(left) if !left.is_zero() => left,
                             // A full ramp waits for one of its calls to
-                            // settle, which wakes the gate: like a wait on
-                            // a refund, it is a wait on calls in flight.
-                            _ if state.ramp.as_ref().is_some_and(|r| r.flying >= r.window) => {
-                                Duration::from_secs(60)
+                            // settle. A turn parks, holding nothing live,
+                            // and the settle wakes it with a place kept for
+                            // it; any other caller waits in the gate, which
+                            // a settle wakes too.
+                            _ if let Some(ramp) = state
+                                .ramp
+                                .as_mut()
+                                .filter(|r| r.full() && !r.promised_to(waiter)) =>
+                            {
+                                match waiter {
+                                    None => Duration::from_secs(60),
+                                    Some(waiter) => {
+                                        let queued = ramp
+                                            .queued
+                                            .iter()
+                                            .any(|w| w.bot == waiter.bot && w.turn == waiter.turn);
+                                        if !queued {
+                                            ramp.queued.push_back(waiter.clone());
+                                        }
+                                        *park_for = Some(RAMP_PARK);
+                                        state.counts.parked += 1;
+                                        return Err(crate::Error::new("provider_paced"));
+                                    }
+                                }
                             }
                             _ => state.admit_or_book(costs, due, now, park_for)?,
                         };
@@ -663,6 +762,11 @@ impl Pace {
                             }
                             state.reserved_requests += 1;
                             let ramp = state.ramp.as_mut().map(|r| {
+                                if let Some(w) = waiter {
+                                    r.promised.retain(|(bot, turn, _)| {
+                                        !(*bot == w.bot && *turn == w.turn)
+                                    });
+                                }
                                 r.flying += 1;
                                 r.generation
                             });
@@ -732,13 +836,7 @@ impl Pace {
         match state.ramp.as_mut() {
             None if ramp || (open && blind) => {
                 state.ramps += 1;
-                state.ramp = Some(Ramp {
-                    generation: state.ramps,
-                    window: 1,
-                    threshold: None,
-                    flying: 0,
-                    credit: 0,
-                })
+                state.ramp = Some(Ramp::new(state.ramps))
             }
             Some(running) if open && (ramp || blind) => {
                 let half = (running.window / 2).max(1);
@@ -812,8 +910,14 @@ impl Pace {
                 _ => ramp.window += 1,
             }
             let done = ramp.window >= RAMP_DONE;
-            if done {
-                state.ramp = None;
+            match done {
+                false => ramp.wake(Instant::now()),
+                // Every turn still parked on it goes now.
+                true => {
+                    for waiter in state.ramp.take().into_iter().flat_map(|r| r.queued) {
+                        (waiter.wake)(waiter.bot, waiter.turn);
+                    }
+                }
             }
             // A wider window may let the gate's head go.
             self.changed.notify_one();
@@ -1489,6 +1593,109 @@ mod tests {
         assert_eq!(window(&pace), Some(5));
     }
 
+    /// A call asked for as `waiter`, and how long it was told to park.
+    async fn ask<'a>(
+        pace: &'a Pace,
+        waiter: Option<&Waiter>,
+    ) -> (crate::Result<Reservation<'a>>, Option<Duration>) {
+        let mut park_for = None;
+        let cost = Cost {
+            input: 10,
+            output: 0,
+        };
+        let call = pace.acquire_cost(cost, &mut park_for, waiter).await;
+        (call, park_for)
+    }
+
+    /// A turn that finds the ramp full parks, holding nothing live; a
+    /// settle wakes the oldest, and keeps its place until it comes back.
+    #[tokio::test(start_paused = true)]
+    async fn a_settle_wakes_the_oldest_turn_parked_on_a_full_ramp() {
+        let pace = Pace::default();
+        let woken = Arc::new(Mutex::new(Vec::new()));
+        let waiter = |turn: i64| {
+            let woken = woken.clone();
+            Waiter {
+                bot: format!("bot{turn}"),
+                turn,
+                wake: Arc::new(move |_, turn| woken.lock().unwrap().push(turn)),
+            }
+        };
+        let (one, two) = (waiter(1), waiter(2));
+        pace.limited(None);
+        tokio::time::advance(Duration::from_secs(2)).await;
+        let (first, _) = ask(&pace, None).await;
+        let first = first.unwrap();
+        // Both turns park, in order, for no longer than the fallback.
+        for waiter in [&one, &two] {
+            let (call, park_for) = ask(&pace, Some(waiter)).await;
+            assert_eq!(call.err().unwrap().code, "provider_paced");
+            assert_eq!(park_for, Some(RAMP_PARK));
+        }
+        // A turn coming back before it is woken keeps its place in line.
+        assert!(ask(&pace, Some(&one)).await.0.is_err());
+        pace.accepted();
+        // The window grew to two: the oldest is woken for the place.
+        assert_eq!(*woken.lock().unwrap(), [1]);
+        // The place is kept for it: another caller finds the ramp full.
+        let other = tokio::time::timeout(Duration::from_secs(1), ask(&pace, None)).await;
+        assert!(
+            other.is_err(),
+            "a caller took the place kept for the woken turn"
+        );
+        let (call, _) = ask(&pace, Some(&one)).await;
+        let call = call.unwrap();
+        // A settle wakes the next.
+        drop(first);
+        assert_eq!(*woken.lock().unwrap(), [1, 2]);
+        drop(call);
+    }
+
+    /// A place kept for a woken turn that never comes back is let go, and
+    /// the end of a ramp wakes every turn still parked on it.
+    #[tokio::test(start_paused = true)]
+    async fn kept_places_lapse_and_a_ramp_s_end_wakes_every_parked_turn() {
+        let pace = Pace::default();
+        let woken = Arc::new(Mutex::new(Vec::new()));
+        let waiter = |turn: i64| {
+            let woken = woken.clone();
+            Waiter {
+                bot: format!("bot{turn}"),
+                turn,
+                wake: Arc::new(move |_, turn| woken.lock().unwrap().push(turn)),
+            }
+        };
+        pace.limited(None);
+        tokio::time::advance(Duration::from_secs(2)).await;
+        let first = sent(&pace, 10).await.unwrap();
+        for turn in 1..=3 {
+            let mut park_for = None;
+            let call = pace
+                .acquire_cost(
+                    Cost {
+                        input: 10,
+                        output: 0,
+                    },
+                    &mut park_for,
+                    Some(&waiter(turn)),
+                )
+                .await;
+            assert!(call.is_err());
+        }
+        drop(first);
+        assert_eq!(*woken.lock().unwrap(), [1]);
+        // Turn 1 never comes back: once its place lapses, the next caller
+        // finds it given to turn 2, and parks behind turn 3.
+        tokio::time::advance(PROMISE + Duration::from_secs(1)).await;
+        assert!(ask(&pace, Some(&waiter(4))).await.0.is_err());
+        assert_eq!(*woken.lock().unwrap(), [1, 2]);
+        for _ in 0..RAMP_DONE {
+            pace.accepted();
+        }
+        assert!(pace.state.lock().unwrap().ramp.is_none());
+        assert_eq!(*woken.lock().unwrap(), [1, 2, 3, 4]);
+    }
+
     /// A call admitted under a ramp that has since ended frees nothing in
     /// a later one.
     #[tokio::test(start_paused = true)]
@@ -1590,6 +1797,7 @@ mod tests {
                     output: 500,
                 },
                 &mut None,
+                None,
             )
             .await
             .unwrap();
@@ -1602,6 +1810,7 @@ mod tests {
                     output: 500,
                 },
                 &mut None,
+                None,
             )
             .await
             .unwrap();

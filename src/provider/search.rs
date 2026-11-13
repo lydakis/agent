@@ -312,6 +312,7 @@ mod tests {
                 output_schema: None,
                 web_search,
                 fallback_credit: None,
+                asker: None,
                 cache_key: None,
                 items: Items::empty(),
                 chain: None,

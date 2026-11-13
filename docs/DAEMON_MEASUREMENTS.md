@@ -9166,3 +9166,34 @@ A parked caller cannot be woken by a settle, so it comes back on a guess:
 too soon and it parks again (the store work), too late and the window sits
 idle (the lost turns). Waiting in the gate holds the bot's active slot
 while it waits, as a refund wait does (#940 follows that up).
+
+## A finished call wakes a turn parked on a full ramp (#940)
+
+A turn that finds its pool's ramp full now parks, holding no task and no
+active slot. When one of the ramp's calls settles, or an answer widens the
+window, the pool wakes the oldest parked turn, and the window keeps that
+place for it for up to 5 s. The daemon resumes the turn at once; one
+woken while its park is still landing resumes as soon as the park lands.
+A turn that is never woken comes back after 30 s, and the end of the ramp
+wakes every turn still parked on it. A call that is not a turn's own (a
+summary beside it, a search) still waits in the gate.
+
+`bench.scale_screen` with `bench.streaming_model --tpm 300000
+--no-headers`, 45 s windows, 4-CPU Linux cloud box, waiting in the gate
+(#938) against parked and woken:
+
+| Bots | Measure | In the gate | Parked, woken |
+| ---: | --- | ---: | ---: |
+| 64 | turns a second | 9.31 | 9.31 |
+| 64 | daemon CPU per turn, ms | 1.8 | 2.1 |
+| 64 | store jobs per turn | 9.7 | 11.3 |
+| 256 | turns a second | 7.46 | 7.04 |
+| 256 | daemon CPU per turn, ms | 2.2 | 3.7 |
+| 256 | store jobs per turn | 10.1 | 21.4 |
+| 256 | turns holding a slot at the end | 256 | 12 |
+| 256 | turns parked at the end | 0 | 244 |
+
+Before the ramp, the same 256 bots ran 7.46 turns a second at 11.2 ms of
+CPU and 105 store jobs a turn. A woken turn's place sits idle while it
+resumes (a store round trip and its context read), which costs the 6% at
+256 bots; each park and resume is the added store work.
