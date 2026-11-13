@@ -336,7 +336,7 @@ at its model's own effort (`AGENT_EFFORT` when its model is
 | When a note opens the margin | `[sonny] margin_opens` (`always`, the default, `unless-closed` or `never`) | |
 | The most notes a margin holds | `[sonny] margin_notes` (6 by default, at least 1; past it the agent's new note is refused, and it is told which notes are there) | |
 | The most lines a margin note runs to | `[sonny] margin_note_lines` (12 by default, at least 1, counted in the note's text; a longer one is refused, and the agent told to show a file instead) | |
-| Margin notes of your own, filled as their blanks change | `[sonny.notes.NAME] template`, `title` | |
+| Margin notes of your own, filled as their blanks change | `[sonny.notes.NAME] markdown`, `live`, `title` | |
 | Where a click on an agent's name goes | `[sonny] agent_opens` (`tab`, the default, or `beside`) | |
 | Which tasks open in a tab | `[sonny] task_tabs` (`asked`, the default, or `every`) | |
 | Task windows a lead keeps open | `[sonny] task_windows` (32 by default, 0 for no limit) | |
@@ -1489,7 +1489,7 @@ At each start Sonny writes what every agent leans on: the
 in `~/.agents/skills` (replacing links the Agent app left there), and
 `~/.agent/memory` and `~/.agent/automation`, scripts that run this Sonny as
 `sonny memory ...` (facts saved for later agents, in `~/.agents/memory`;
-a live fact's blanks are filled as it is read, as a template note's are)
+a live fact's blanks are filled as it is read, as a live note's are)
 and `sonny automation ...` (jobs that wake an agent, which Sonny's scheduler
 runs), which other harnesses and scripts run too; Sonny's own agents use the
 `memory` and `automations` tools instead, which the tool host answers outside
@@ -1901,7 +1901,7 @@ with its next call. Posting a note's id again changes it in place, so a
 live note stays one note. A lead can show a task's note as
 `from: "task/id"`, which lookout names when the task puts one up: it
 shows as the task keeps it, follows the task's title until the lead gives
-its own, and stays once the task is gone. A note given as a `template`
+its own, and stays once the task is gone. A note given with `live` true
 is Markdown with blanks, as Jinja writes them (MiniJinja), that Sonny
 fills and fills again whenever what they read changes, with no call from
 the agent and nothing more in its history: `source('ci').latest.text`
@@ -1917,13 +1917,17 @@ that wants something no source covers writes it to a file from its own
 commands. The tool host fills the template once as it is posted and
 answers what it shows; a template that does not read as one, names a
 source you have not set up, or fills to more lines than a note holds is
-refused (`margin_template`, `margin_note_too_long`). The window then
+refused (`live_template`, `margin_note_too_long`). The window then
 watches only what the last fill read, once a second (a source's log, a
 file, the tasks as the footer counts them, the minute for a clock), and a
 fill that fails later keeps what it showed with why under it. Under its
 title a filled note says what it follows (`follows 🛠 ci, tasks,
 state.json`, a source by its icon), and a source that is down says since
-when, so a live note never passes for a written one.
+when, so a live note never passes for a written one. Every live template,
+a note's, a memory fact's or an automation's message, is checked the same
+way as it is written and refused as `live_template`; one shown in a window
+fills again as what it read changes, while one that goes into a prompt
+fills once as it goes, so the prompt never changes under the model.
 
 ![A note of your own in the margin, filled from its blanks: follows 🛠 ci, tasks, release.json; the CI source's latest run, a release file's state, and the lead's task fix-avg with how long its turn took](../docs/sonny/margin-template-note.png)
 
@@ -1934,7 +1938,8 @@ stands now, however long ago it last changed:
 ```toml
 [sonny.notes.prs]
 title = "open pull requests"
-template = """
+live = true
+markdown = """
 {% for pr in source('prs').topics | rejectattr('fields.state', 'eq', 'merged') | sort(attribute='fields.number') %}- **#{{ pr.fields.number }}** {{ pr.fields.title }}
   CI {{ pr.fields.ci }} · {{ pr.fields.review }}
 {% endfor %}"""
@@ -1943,8 +1948,8 @@ template = """
 ![A note of your own listing open pull requests from a source's topics: #41, #42 and #43 with their CI and review state, the merged #40 left out](../docs/sonny/margin-topics-note.png)
 
 Notes of
-your own go in your config as `[sonny.notes.NAME]`, a `template` and a
-`title`, and show over the agent's in every margin, with no buttons:
+your own go in your config as `[sonny.notes.NAME]`, their `markdown`,
+`live = true` for blanks to fill, and a `title`, and show over the agent's in every margin, with no buttons:
 they are yours to change there. A note with `opens: "AGENT"`,
 such as the lead's to-do for a task's question, gets a `↗` that opens that
 agent in the pane, where you answer it. A file, `/status`, `/background` or a side

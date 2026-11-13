@@ -162,7 +162,7 @@ covers, keep a file current from your own commands and read it with
 template as `text` and the fact as it fills now as `filled` (or why it
 does not, as `unfilled`), and an agent starting gets each live
 description filled once, as it stands then. A save is refused
-(`memory_template`) when the text does not read as a template or names
+(`live_template`) when the text does not read as a template or names
 a source the person has not set up. A save that leaves `live` out keeps
 the mark the fact had; `false` makes it plain text again.
 

@@ -241,7 +241,7 @@ impl Query {
 
 /// The smallest id whose row is at or after `ms`, by bisection over ids:
 /// rows' times rise with their ids. One past the newest when none is.
-fn first_at(conn: &Connection, ms: i64) -> Result<i64> {
+pub fn first_at(conn: &Connection, ms: i64) -> Result<i64> {
     let bounds: Option<(i64, i64)> = conn.query_row(
         "SELECT (SELECT MIN(id) FROM audit),(SELECT MAX(id) FROM audit)",
         [],

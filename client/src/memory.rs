@@ -892,7 +892,7 @@ fn save(
     if let Some(fill) = FILL.get().filter(|_| fact.live) {
         for (what, template) in [("description", fact.description.as_str()), ("text", body)] {
             fill.check(template, folder)
-                .map_err(|why| format!("memory_template: the {what} of a live fact: {why}"))?;
+                .map_err(|why| format!("live_template: the {what} of a live fact: {why}"))?;
         }
     }
     let text = fact.render(body);
@@ -2434,7 +2434,7 @@ mod tests {
         // A blank that could never fill is refused, and nothing is saved.
         let refused = save("never", "d", "{{ bad }}").unwrap_err();
         assert!(
-            refused.starts_with("memory_template: the text of a live fact: no source named bad"),
+            refused.starts_with("live_template: the text of a live fact: no source named bad"),
             "{refused}"
         );
         assert!(!root.join("never.md").exists());

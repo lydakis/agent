@@ -3932,7 +3932,7 @@ fn add_as(places: &Places, args: &[String], agents_gate: bool) -> Result<Value, 
         // set up, or the tasks, would never fill.
         let here = std::env::current_dir().map_err(|e| e.to_string())?;
         crate::template::check_message(&asked.message, &here, daemon.store.as_deref())
-            .map_err(|why| format!("invalid_automation: the live message: {why}"))?;
+            .map_err(|why| format!("live_template: the message: {why}"))?;
     }
     if let Some(watch) = &asked.when.watch {
         // A watched file could be the store, which every send writes: one

@@ -804,7 +804,7 @@ async fn called(name: &str, arguments: &Value) -> Answer {
             }
             agent_client::memory::call_in(&home, &project, &here, arguments)
                 .map(|said| said.to_string())
-                .map_err(|e| ("memory_refused", e))
+                .map_err(|e| refused_as("memory_refused", e))
         }
         COMMONS => {
             if !crate::commons::on() {
@@ -893,7 +893,7 @@ async fn called(name: &str, arguments: &Value) -> Answer {
                 tokio::task::spawn_blocking(move || crate::trigger::tool(&arguments, &caller))
                     .await
                     .map_err(|e| ("tool_failed", e.to_string()))?
-                    .map_err(|e| ("automation_refused", e))?;
+                    .map_err(|e| refused_as("automation_refused", e))?;
             // How the turns their last fires sent ended, as the person's
             // `/background` shows them; without the daemon, as the files say.
             // Only a trigger made on this daemon's store: a turn handle names
@@ -2023,6 +2023,16 @@ pub fn stop() {
     crate::mcp::kill_all();
 }
 
+/// A tool's refusal `said`, coded `code`, unless it refuses a live
+/// template, which is coded as one wherever it is written.
+fn refused_as(code: &'static str, said: String) -> (&'static str, String) {
+    let live = format!("{}: ", crate::template::REFUSED);
+    match said.strip_prefix(&live) {
+        Some(why) => (crate::template::REFUSED, why.to_owned()),
+        None => (code, said),
+    }
+}
+
 /// The error codes `sonny tool` answers with, as static names.
 fn code(said: &str) -> &'static str {
     const CODES: [&str; 23] = [
@@ -2042,7 +2052,7 @@ fn code(said: &str) -> &'static str {
         "margin_full",
         "margin_note_too_long",
         "margin_unread",
-        "margin_template",
+        "live_template",
         "not_marked",
         "commons_refused",
         "ask_refused",
@@ -2769,6 +2779,11 @@ mod tests {
         assert_eq!(code("margin_full"), "margin_full");
         assert_eq!(code("ask_refused"), "ask_refused");
         assert_eq!(code("commons_refused"), "commons_refused");
+        assert_eq!(code("live_template"), "live_template");
+        let refused = refused_as("memory_refused", "live_template: the text: line 1".into());
+        assert_eq!(refused, ("live_template", "the text: line 1".to_owned()));
+        let refused = refused_as("memory_refused", "invalid_type: x".into());
+        assert_eq!(refused, ("memory_refused", "invalid_type: x".to_owned()));
         assert_eq!(code("Anything Else"), "tool_failed");
     }
 }
