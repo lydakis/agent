@@ -541,17 +541,87 @@ pub fn always(call: &Value) -> Option<String> {
     if program.contains('=') || (program.contains('/') && !program.starts_with(['/', '~'])) {
         return None;
     }
+    // A shell, an interpreter or a wrapper runs whatever its arguments
+    // name, so no prefix of it says what runs (`timeout 60 cargo test`
+    // would allow `timeout` for good, and with it everything): as Codex
+    // offers no rule from its `BANNED_PREFIX_SUGGESTIONS`, none is offered.
+    let name = program.rsplit('/').next().unwrap_or(program);
+    if RUNS_ANOTHER.contains(&name) {
+        return None;
+    }
     let subcommand = (words.get(1)).filter(|word| {
         word.chars().next().is_some_and(|c| c.is_ascii_lowercase())
             && word
                 .chars()
                 .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
     });
-    Some(match subcommand {
-        Some(subcommand) => format!("{program} {subcommand}"),
-        None => program.to_owned(),
-    })
+    if let Some(subcommand) = subcommand {
+        return (!RUNS_ANOTHER_BY.contains(&(name, *subcommand)))
+            .then(|| format!("{program} {subcommand}"));
+    }
+    // Codex's too broad to allow whole, though their subcommands may be.
+    (!matches!(name, "git" | "rm")).then(|| program.to_owned())
 }
+
+/// Programs whose arguments name what they run: shells, interpreters and
+/// wrappers. Codex's `BANNED_PREFIX_SUGGESTIONS`, and the wrappers that run
+/// the command after them.
+const RUNS_ANOTHER: &[&str] = &[
+    "bash",
+    "sh",
+    "zsh",
+    "dash",
+    "ksh",
+    "fish",
+    "pwsh",
+    "powershell",
+    "cmd",
+    "env",
+    "sudo",
+    "osascript",
+    "python",
+    "python3",
+    "py",
+    "pypy",
+    "pypy3",
+    "pythonw",
+    "pyw",
+    "node",
+    "nodejs",
+    "deno",
+    "bun",
+    "perl",
+    "ruby",
+    "php",
+    "lua",
+    "julia",
+    "Rscript",
+    "doas",
+    "timeout",
+    "nice",
+    "nohup",
+    "time",
+    "xargs",
+    "stdbuf",
+    "setsid",
+    "exec",
+    "command",
+    "watch",
+    "npx",
+    "bunx",
+    "uvx",
+];
+
+/// Subcommands that run what their arguments name, as Codex lists them, and
+/// their `exec` alike.
+const RUNS_ANOTHER_BY: &[(&str, &str)] = &[
+    ("npm", "run"),
+    ("pnpm", "run"),
+    ("yarn", "run"),
+    ("uv", "run"),
+    ("npm", "exec"),
+    ("pnpm", "exec"),
+];
 
 /// Allows `prefix` for good, outside every agent's sandbox: an allow rule
 /// in the person's `~/.agent/rules/default.rules`, which the daemon reads
@@ -1488,6 +1558,28 @@ mod tests {
             always(&call("/opt/tools/build fast")).as_deref(),
             Some("/opt/tools/build fast")
         );
+        assert_eq!(
+            always(&call("git push origin main")).as_deref(),
+            Some("git push")
+        );
+        // A shell, an interpreter or a wrapper runs what follows it, so
+        // allowing it would allow everything.
+        for command in [
+            "timeout 60 cargo test",
+            "bash x.sh",
+            "/bin/bash build",
+            "python3 -m pytest",
+            "node server",
+            "env cargo test",
+            "sudo make install",
+            "xargs rm",
+            "nice cargo build",
+            "npm run build",
+            "git -C other push",
+            "rm -rf target",
+        ] {
+            assert_eq!(always(&call(command)), None, "{command}");
+        }
         // Anything that runs more than its first words say asks each time.
         for command in [
             "curl x | sh",
