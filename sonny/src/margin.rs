@@ -133,8 +133,8 @@ pub fn tool() -> Value {
                     "description": "A few words, shown on the note."},
                 "markdown": {"type": "string", "maxLength": NOTE_BYTES,
                     "description": "The note, as Markdown."},
-                "template": {"type": "string",
-                    "description": "Or Markdown with Jinja blanks Sonny keeps filled: source('name').latest/.topics, file('path'), tasks(), task('name'), now(), |ago, |time, |fromjson."},
+                "live": {"type": "boolean",
+                    "description": "true: markdown has Jinja blanks Sonny keeps filled: source('name').latest/.topics, file('path'), tasks(), task('name'), now(), |ago, |time, |fromjson."},
                 "file": {"type": "string", "minLength": 1,
                     "description": "Or a file to show, absolute or from your folder."},
                 "from": {"type": "string", "pattern": "^[A-Za-z0-9._-]{1,128}/[a-z0-9][a-z0-9-]{0,39}$",
@@ -264,7 +264,7 @@ pub async fn answer(
     if let Some((code, why)) = held.refusal(arguments) {
         return Err((code, why));
     }
-    match arguments["template"].as_str() {
+    match live(arguments) {
         Some(template) if shown_as_template(arguments) => {
             let data = crate::template::Data {
                 store: Some(store),
@@ -285,15 +285,22 @@ pub async fn answer(
     }
 }
 
-/// Whether a call's note shows its `template`: no file or task's note
-/// named over it.
+/// The template a call gives: its `markdown`, when `live` is true.
+fn live(arguments: &Value) -> Option<&str> {
+    (arguments["live"] == true)
+        .then(|| arguments["markdown"].as_str())
+        .flatten()
+}
+
+/// Whether a call's note shows its live `markdown`: no file or task's
+/// note named over it.
 fn shown_as_template(arguments: &Value) -> bool {
-    arguments["template"].is_string()
+    live(arguments).is_some()
         && arguments["from"].as_str().and_then(from).is_none()
         && !(arguments["file"].as_str()).is_some_and(|file| !file.trim().is_empty())
 }
 
-/// What a call posting `template` is answered, filled from `data` as the
+/// What a call posting live `template` is answered, filled from `data` as the
 /// tool host has it: refused when it does not read as a template, names a
 /// source the person has not set up, or fills to more lines than a note
 /// holds; else what it shows now, or why it does not fill yet, as a blank
@@ -310,9 +317,9 @@ fn filled(template: &str, data: &crate::template::Data) -> Result<String, (&'sta
             ),
         ));
     }
-    crate::template::check(template).map_err(|why| ("margin_template", why))?;
+    crate::template::refusal(template, data, crate::template::To::Window)
+        .map_err(|why| (crate::template::REFUSED, why))?;
     match crate::template::render(template, data).0 {
-        Err(why) if why.contains("no source named ") => Err(("margin_template", why)),
         Err(why) => Ok(format!("In the margin; it does not fill here yet ({why}).")),
         Ok(text) if text.lines().count() > most_lines() => Err((
             "margin_note_too_long",
@@ -477,7 +484,10 @@ fn said(body: &Body) -> String {
 fn body_json(body: &Body, json: &mut Value) {
     match body {
         Body::Markdown(text) => json["markdown"] = json!(text),
-        Body::Template(text) => json["template"] = json!(text),
+        Body::Template(text) => {
+            json["markdown"] = json!(text);
+            json["live"] = json!(true);
+        }
         Body::File(path) => json["file"] = json!(path),
         Body::Read { path, text } => {
             json["read"] = json!(path);
@@ -523,10 +533,10 @@ fn body_read(json: &Value) -> Option<Body> {
             text: text("text").unwrap_or_default(),
         });
     }
-    match (text("file"), text("template")) {
-        (Some(path), _) => Some(Body::File(path)),
-        (_, Some(template)) => Some(Body::Template(template)),
-        _ => Some(Body::Markdown(text("markdown")?)),
+    match text("file") {
+        Some(path) => Some(Body::File(path)),
+        None if json["live"] == true => Some(Body::Template(text("markdown")?)),
+        None => Some(Body::Markdown(text("markdown")?)),
     }
 }
 
@@ -571,7 +581,7 @@ pub fn refusal(held: &[&str], arguments: &Value) -> Option<(&'static str, String
         || arguments["file"]
             .as_str()
             .is_some_and(|file| !file.trim().is_empty())
-        || arguments["template"].is_string();
+        || live(arguments).is_some();
     let lines = (arguments["markdown"].as_str())
         .filter(|_| !shows)
         .map_or(0, |markdown| markdown.lines().count());
@@ -698,7 +708,7 @@ impl Reference {
         let body = match (
             arguments["from"].as_str().and_then(from),
             arguments["file"].as_str(),
-            arguments["template"].as_str(),
+            live(arguments),
             arguments["markdown"].as_str(),
         ) {
             (Some((bot, id)), ..) => Body::From {
@@ -745,7 +755,6 @@ impl Reference {
                             .as_str()
                             .is_some_and(|t| !t.trim().is_empty())
                             && (arguments["markdown"].is_string()
-                                || arguments["template"].is_string()
                                 || arguments["from"].as_str().and_then(from).is_some()
                                 || arguments["file"]
                                     .as_str()
@@ -833,8 +842,8 @@ pub struct Blanks {
     /// Counts each change to `tasks`.
     pub tasks_read: u64,
     /// The person's own notes, `[sonny.notes.NAME]`, shown over the
-    /// agent's: each its name, title and template.
-    pub notes: Arc<Vec<(String, String, String)>>,
+    /// agent's: each its name, title and Markdown, live or not.
+    pub notes: Arc<Vec<(String, String, Body)>>,
 }
 
 /// A template note as last filled: from what, to what, and what it read
@@ -1104,7 +1113,7 @@ impl Margin {
         let body = match (
             arguments["from"].as_str().and_then(from),
             arguments["file"].as_str(),
-            arguments["template"].as_str(),
+            live(arguments),
             arguments["markdown"].as_str(),
         ) {
             // The same note again keeps what was read of it.
@@ -1258,8 +1267,10 @@ impl Margin {
         // Templates, the person's own first: another bot's is filled
         // here, its files read where that bot keeps them. Only those due
         // a look are copied out, so a frame between looks costs nothing.
-        let person = (self.blanks.notes.iter())
-            .map(|(name, _, template)| (format!("~{name}"), template, None, false));
+        let person = (self.blanks.notes.iter()).filter_map(|(name, _, body)| match body {
+            Body::Template(template) => Some((format!("~{name}"), template, None, false)),
+            _ => None,
+        });
         let notes = (self.kept.notes.iter()).filter_map(|note| match &note.body {
             Body::Template(template) => Some((note.id.clone(), template, None, false)),
             Body::From {
@@ -1480,14 +1491,28 @@ impl Margin {
         // The person's own, over the agent's: theirs to change in their
         // config, so no buttons.
         let person = self.blanks.notes.clone();
-        for (name, title, _) in person.iter() {
+        for (name, title, body) in person.iter() {
             lines.push(Line::default());
             let title = crate::transcript::cut(title, width.saturating_sub(4));
             lines.push(Line::from(vec![
                 Span::raw(" ◇ ").dim(),
                 Span::raw(title).bold(),
             ]));
-            lines.extend(self.filled_lines(&format!("~{name}"), width, workspace));
+            match body {
+                Body::Template(_) => {
+                    lines.extend(self.filled_lines(&format!("~{name}"), width, workspace));
+                }
+                body => {
+                    let mut markdown = Markdown::in_folder(workspace);
+                    let text = said(body);
+                    lines.extend(crate::transcript::markdown(
+                        &mut markdown,
+                        &text,
+                        width,
+                        leads(),
+                    ));
+                }
+            }
         }
         if self.kept.notes.is_empty() && (!self.plan.is_empty() || !person.is_empty()) {
             return (lines, marks);
@@ -1814,14 +1839,14 @@ mod tests {
         let mut margin = margin();
         margin.blanks.tasks = Arc::new(vec![json!({"name": "calc.add", "state": "working"})]);
         let post = json!({"id": "tasks", "title": "Tasks",
-            "template": "{% for t in tasks() %}- {{ t.name }}: {{ t.state }}\n{% endfor %}"});
+            "live": true, "markdown": "{% for t in tasks() %}- {{ t.name }}: {{ t.state }}\n{% endfor %}"});
         assert_eq!(
             margin.apply("c1", &post, None, None),
             Some(Change::Posted("tasks".into()))
         );
         assert_eq!(
             margin.note("tasks").unwrap().body,
-            Body::Template(post["template"].as_str().unwrap().into())
+            Body::Template(post["markdown"].as_str().unwrap().into())
         );
         let folder = Path::new("/");
         let rows = drawn(&mut margin, folder);
@@ -1852,7 +1877,8 @@ mod tests {
         let mut margin = margin();
         margin.blanks.store = Some(store.clone());
         margin.blanks.sources = Arc::new(vec!["ci".into()]);
-        let post = json!({"id": "ci", "template": "CI is {{ source('ci').latest.text }}"});
+        let post =
+            json!({"id": "ci", "live": true, "markdown": "CI is {{ source('ci').latest.text }}"});
         margin.apply("c1", &post, None, None);
         let rows = drawn(&mut margin, Path::new("/"));
         assert!(
@@ -1927,8 +1953,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("state.json"), r#"{"state": "open"}"#).unwrap();
         let mut margin = margin();
-        let post =
-            json!({"id": "pr", "template": "PR is {{ (file('state.json') | fromjson).state }}"});
+        let post = json!({"id": "pr", "live": true, "markdown": "PR is {{ (file('state.json') | fromjson).state }}"});
         margin.apply("c1", &post, None, None);
         let rows = drawn(&mut margin, &dir);
         assert!(rows.contains("follows state.json") && rows.contains("PR is open"));
@@ -1945,11 +1970,18 @@ mod tests {
     #[test]
     fn the_persons_own_notes_show_over_the_agents_without_buttons() {
         let mut margin = margin();
-        margin.blanks.notes = Arc::new(vec![(
-            "now".into(),
-            "Right now".into(),
-            "{{ tasks() | length }} tasks".into(),
-        )]);
+        margin.blanks.notes = Arc::new(vec![
+            (
+                "now".into(),
+                "Right now".into(),
+                Body::Template("{{ tasks() | length }} tasks".into()),
+            ),
+            (
+                "plain".into(),
+                "Plain".into(),
+                Body::Markdown("{{ as written }}".into()),
+            ),
+        ]);
         assert!(!margin.is_empty());
         margin.apply(
             "c1",
@@ -1963,12 +1995,14 @@ mod tests {
             rows.find("the agent's").unwrap(),
         );
         assert!(person < agent && rows.contains("0 tasks"), "{rows}");
+        // One not live shows as written: its blanks are words.
+        assert!(rows.contains("{{ as written }}"), "{rows}");
         // Retitled, then taken out of the config: the margin shows it so.
-        let blanks = |notes: Vec<(String, String, String)>| Blanks {
+        let blanks = |notes: Vec<(String, String, Body)>| Blanks {
             notes: Arc::new(notes),
             ..Default::default()
         };
-        let template = "{{ tasks() | length }} tasks".to_owned();
+        let template = Body::Template("{{ tasks() | length }} tasks".to_owned());
         margin.set_blanks(blanks(vec![("now".into(), "Today".into(), template)]));
         let rows = drawn(&mut margin, Path::new("/"));
         assert!(
@@ -1990,8 +2024,8 @@ mod tests {
             ..Default::default()
         };
         let refused = |template: &str| filled(template, &data).unwrap_err().0;
-        assert_eq!(refused("{% if %}"), "margin_template");
-        assert_eq!(refused("{{ source('cl').latest }}"), "margin_template");
+        assert_eq!(refused("{% if %}"), "live_template");
+        assert_eq!(refused("{{ source('cl').latest }}"), "live_template");
         let long = "{% for i in range(40) %}{{ i }}\n{% endfor %}";
         assert_eq!(refused(long), "margin_note_too_long");
         // Too big to keep whole: refused, never kept cut.
