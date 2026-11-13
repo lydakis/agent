@@ -74,7 +74,7 @@ const REPLY_WAIT_MS: u64 = 86_400_000;
 /// How long `fire` waits for launchd's run of the job to say what came of
 /// it: its gate's whole time, and then some for the send.
 const FIRE_WAIT: Duration = Duration::from_secs(90);
-pub const USAGE: &str = "usage: automation add [--name NAME] [WHEN] [--bot NAME | --start NAME --model PROVIDER/MODEL [--effort LEVEL] [--fresh]] [--reply-to BOT] [--if CMD] [--runs N] [--until 'YYYY-MM-DD HH:MM'] [--turn-budget-tokens N [--budget-counts work]] [--shadow] [--replace] -- MESSAGE\n         WHEN: --every N{m,h,d} | --in N{m,h} | --at 'YYYY-MM-DD HH:MM' | --cron 'MIN HOUR DAY MONTH WEEKDAY' | --file PATH | --commit REPO; none: only run runs it\n       automation ls [--after NAME]\n       automation show NAME\n       automation run NAME\n       automation rm NAME";
+pub const USAGE: &str = "usage: automation add [--name NAME] [WHEN] [--bot NAME | --start NAME --model PROVIDER/MODEL [--effort LEVEL] [--fresh]] [--reply-to BOT] [--if CMD] [--runs N] [--until 'YYYY-MM-DD HH:MM'] [--turn-budget-tokens N [--budget-counts work]] [--shadow] [--live] [--replace] -- MESSAGE\n         WHEN: --every N{m,h,d} | --in N{m,h} | --at 'YYYY-MM-DD HH:MM' | --cron 'MIN HOUR DAY MONTH WEEKDAY' | --file PATH | --commit REPO; none: only run runs it\n       automation ls [--after NAME]\n       automation show NAME\n       automation run NAME\n       automation rm NAME";
 
 /// The system's own scheduler, which keeps Sonny's one job.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -461,6 +461,9 @@ pub struct Trigger {
     /// Each fire goes to a read-only copy of its agent instead, whose
     /// answer is a report for whoever hears of the trigger: a dry run.
     pub shadow: bool,
+    /// `message` is a template, its blanks filled as each fire sends it
+    /// ([`crate::template`]), files read from `dir`.
+    pub live: bool,
 }
 
 impl Trigger {
@@ -561,6 +564,9 @@ impl Trigger {
         if self.shadow {
             pair("--shadow", "1".into());
         }
+        if self.live {
+            pair("--live", "1".into());
+        }
         args.extend(["--".into(), self.message.clone()]);
         args
     }
@@ -580,7 +586,7 @@ impl Trigger {
             let value = iter
                 .next()
                 .ok_or_else(|| bad(&format!("{flag} needs a value")))?;
-            const FLAGS: [&str; 29] = [
+            const FLAGS: [&str; 30] = [
                 "--name",
                 "--generation",
                 "--bot",
@@ -610,6 +616,7 @@ impl Trigger {
                 "--store",
                 "--socket",
                 "--shadow",
+                "--live",
             ];
             let known = FLAGS
                 .iter()
@@ -676,6 +683,7 @@ impl Trigger {
             store_id: need("--store-id")?,
             message,
             shadow: text("--shadow").is_some(),
+            live: text("--live").is_some(),
         })
     }
 
@@ -708,7 +716,7 @@ impl Trigger {
             "until": self.until.map(until_text),
             "turn_budget_tokens": self.turn_budget_tokens, "budget_counts": self.budget_counts,
             "sent": state["sent"].as_u64().unwrap_or(0), "message": self.message,
-            "once": self.at.is_some(), "shadow": self.shadow, "last": state["last"],
+            "once": self.at.is_some(), "shadow": self.shadow, "live": self.live, "last": state["last"],
             "checked": state["checked"], "run": state["run"]})
     }
 
@@ -742,6 +750,7 @@ impl Trigger {
             ("daemon", self.daemon == other.daemon),
             ("store_id", self.store_id == other.store_id),
             ("shadow", self.shadow == other.shadow),
+            ("live", self.live == other.live),
         ]
         .into_iter()
         .find(|(_, same)| !same)
@@ -1701,7 +1710,7 @@ impl Trigger {
             "runs": self.runs, "until": self.until.map(until_text),
             "turn_budget_tokens": self.turn_budget_tokens,
             "budget_counts": self.budget_counts, "once": self.at.is_some(), "commit": self.commit, "file": self.file,
-            "dir": self.dir, "shadow": self.shadow, "message": self.message})
+            "dir": self.dir, "shadow": self.shadow, "live": self.live, "message": self.message})
     }
 }
 
@@ -2919,6 +2928,8 @@ struct Add {
     turn_budget_tokens: Option<u64>,
     budget_counts: Option<String>,
     shadow: bool,
+    /// Its message is a template filled as each fire sends it.
+    live: bool,
     replace: bool,
     message: String,
 }
@@ -2927,7 +2938,7 @@ fn parse_add(args: &[String], now: i64) -> Result<Add, String> {
     let bad = |what: String| format!("invalid_automation: {what}\n{USAGE}");
     let mut v = std::collections::HashMap::<String, String>::new();
     let (mut when, mut commit, mut replace, mut shadow) = (None, None, false, false);
-    let mut fresh = false;
+    let (mut fresh, mut live) = (false, false);
     let mut iter = args.iter();
     let message = loop {
         let Some(flag) = iter.next() else {
@@ -2946,6 +2957,10 @@ fn parse_add(args: &[String], now: i64) -> Result<Add, String> {
         }
         if flag == "--fresh" {
             fresh = true;
+            continue;
+        }
+        if flag == "--live" {
+            live = true;
             continue;
         }
         let value = iter
@@ -3075,6 +3090,7 @@ fn parse_add(args: &[String], now: i64) -> Result<Add, String> {
         turn_budget_tokens,
         budget_counts,
         shadow,
+        live,
         replace,
         message,
     })
@@ -3772,6 +3788,9 @@ fn add_args(asked: &Value) -> Vec<String> {
     if asked["shadow"] == true {
         args.push("--shadow".to_owned());
     }
+    if asked["live"] == true {
+        args.push("--live".to_owned());
+    }
     let message = asked["message"].as_str().unwrap_or_default();
     args.extend(["--".to_owned(), message.to_owned()]);
     args
@@ -3899,6 +3918,13 @@ fn add_as(places: &Places, args: &[String], agents_gate: bool) -> Result<Value, 
         _ => Writer::Person,
     });
     let daemon = Daemon::current()?;
+    if asked.live {
+        // Refused now, not at its first fire: one that names a source never
+        // set up, or the tasks, would never fill.
+        let here = std::env::current_dir().map_err(|e| e.to_string())?;
+        crate::template::check_message(&asked.message, &here, daemon.store.as_deref())
+            .map_err(|why| format!("invalid_automation: the live message: {why}"))?;
+    }
     if let Some(watch) = &asked.when.watch {
         // A watched file could be the store, which every send writes: one
         // whose store is not known cannot be told apart from it.
@@ -3997,7 +4023,7 @@ fn add_as(places: &Places, args: &[String], agents_gate: bool) -> Result<Value, 
         client.close().await;
         resolved
     })?;
-    let needs_dir = asked.gate.is_some() || asked.start.is_some();
+    let needs_dir = asked.gate.is_some() || asked.start.is_some() || asked.live;
     let trigger = Trigger {
         generation: format!(
             "{}-{}",
@@ -4037,6 +4063,7 @@ fn add_as(places: &Places, args: &[String], agents_gate: bool) -> Result<Value, 
         store_id,
         message: asked.message,
         shadow: asked.shadow,
+        live: asked.live,
     };
     // Where HEAD is now is seen, a repository with no commit yet too: only
     // a commit after it fires. It is read before launchd watches; one made
@@ -4572,12 +4599,12 @@ async fn deliver(
     if trigger.shadow {
         return shadow(client, places, trigger, kept, why, ask).await;
     }
+    let message = sent_message(trigger);
     let prompt = || {
         format!(
-            "[automation {} · {} · {why}]\n{}",
+            "[automation {} · {} · {why}]\n{message}",
             trigger.name,
             stamp(now()),
-            trigger.message
         )
     };
     let (bot, started, asking, sender) = match &trigger.target {
@@ -4640,7 +4667,7 @@ async fn deliver(
                                 before.bot
                             ));
                         }
-                        prompt.push_str(&trigger.message);
+                        prompt.push_str(&message);
                         let id = run.id.unwrap_or_default();
                         let asking = sending(trigger, &run.bot, id, prompt, ask);
                         run.sent = Some(json!({"generation": trigger.generation,
@@ -4672,6 +4699,21 @@ async fn deliver(
     // trigger that replaces this one meanwhile finds the run's turn.
     let outcome = ran(places, trigger, kept, bot, outcome);
     reply(client, &sender, bot, outcome).await
+}
+
+/// What a fire says: its message, a live one's blanks filled as it goes,
+/// at most [`agent_client::memory::cut_filled`]'s bytes. One whose blanks
+/// do not fill goes as written, with why, so the run still comes.
+fn sent_message(trigger: &Trigger) -> String {
+    if !trigger.live {
+        return trigger.message.clone();
+    }
+    let folder = trigger.dir.clone().unwrap_or_default();
+    match crate::template::fill_message(&trigger.message, &folder, trigger.daemon.store.as_deref())
+    {
+        Ok(filled) => agent_client::memory::cut_filled(filled),
+        Err(why) => format!("{}\n\n[its blanks did not fill: {why}]", trigger.message),
+    }
 }
 
 /// The request a fire sends `bot` (`id`) with `prompt`: a turn of its
@@ -4939,7 +4981,7 @@ async fn shadow(
          message or post, with what it would have said.\n\n{}",
         trigger.name,
         stamp(now()),
-        trigger.message
+        sent_message(trigger)
     );
     // The copy is new and at rest, so its turn starts at once; one of its
     // own, as a turn cap needs.
@@ -6196,7 +6238,7 @@ pub(crate) mod tests {
                 "reply_to": null, "if": "test -s inbox", "runs": null, "until": null,
                 "turn_budget_tokens": null, "budget_counts": null, "once": false, "commit": null,
                 "file": null,
-                "dir": "/work/p", "shadow": false, "message": digest.message}),
+                "dir": "/work/p", "shadow": false, "live": false, "message": digest.message}),
             "what it did and its daemon's ids stay out"
         );
 
@@ -6603,7 +6645,48 @@ pub(crate) mod tests {
             store_id: "00ab".into(),
             message: "Check the PR's CI & reviews; <fix> what's \"red\".\nThen say so.".into(),
             shadow: false,
+            live: false,
         }
+    }
+
+    #[test]
+    fn a_live_message_fills_as_each_fire_sends_it_and_goes_as_written_when_it_cannot() {
+        let dir = std::env::temp_dir().join(format!("live-message-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("pr.json"), r#"{"state": "open"}"#).unwrap();
+        let s = Trigger {
+            message: "PR is {% set pr = file('pr.json') | fromjson %}{{ pr.state }}.".into(),
+            dir: Some(dir.clone()),
+            ..trigger()
+        };
+        // Not live, the blanks are words.
+        assert_eq!(sent_message(&s), s.message);
+        let live = Trigger { live: true, ..s };
+        assert_eq!(sent_message(&live), "PR is open.");
+        std::fs::write(dir.join("pr.json"), r#"{"state": "merged"}"#).unwrap();
+        assert_eq!(sent_message(&live), "PR is merged.", "filled as it goes");
+        // A file gone sends the message as written, saying why.
+        std::fs::remove_file(dir.join("pr.json")).unwrap();
+        let sent = sent_message(&live);
+        assert!(
+            sent.starts_with(&format!("{}\n\n[its blanks did not fill: ", live.message)),
+            "{sent}"
+        );
+        // What could never fill is refused when it is added.
+        let refused =
+            |message: &str| crate::template::check_message(message, &dir, None).unwrap_err();
+        assert!(refused("{{ tasks() }}").starts_with("tasks() and task()"));
+        assert!(
+            refused("{{ source('no-such-source').latest }}")
+                .contains("no source named no-such-source")
+        );
+        assert!(refused("{% if %}").contains("line 1"));
+        assert!(
+            crate::template::check_message(&live.message, &dir, None).is_ok(),
+            "a file not written yet fills later"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -6747,6 +6830,12 @@ pub(crate) mod tests {
         };
         assert_eq!(Trigger::parse(&shadowed.args()[1..]).unwrap(), shadowed);
         assert_eq!(shadowed.differs(&s), Some("shadow"));
+        let live = Trigger {
+            live: true,
+            ..s.clone()
+        };
+        assert_eq!(Trigger::parse(&live.args()[1..]).unwrap(), live);
+        assert_eq!(live.differs(&s), Some("live"));
         // One that starts an agent per run says so, and is another start.
         let started = Trigger {
             target: Target::Start {
@@ -8981,6 +9070,9 @@ pub(crate) mod tests {
         assert!(!mine.shadow);
         let shadowed = json!({"every": "30m", "shadow": true, "message": "go"});
         assert!(parse_add(&add_args(&shadowed), now).unwrap().shadow);
+        assert!(!mine.live);
+        let live = json!({"every": "30m", "live": true, "message": "{{ now() | time }}"});
+        assert!(parse_add(&add_args(&live), now).unwrap().live);
         // A cap the tool sets counts tokens: what a cap counts is the
         // person's choice, made on the command line.
         let work = json!({"every": "30m", "turn_budget_tokens": 9000, "budget_counts": "work",

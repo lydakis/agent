@@ -653,6 +653,17 @@ class TriggerFireTests(ModelFixture):
         self.assertEqual(first['last']['outcome'], 'sent', first)
         self.assertFalse(job(self.home, 'p.task').exists())
 
+    def test_a_live_fire_sends_its_message_filled_as_it_fires(self):
+        self.agent('run', *self.common, '--new', '--bot', 'p.task', 'hello')
+        work = Path(self.home) / 'work'
+        work.mkdir()
+        (work / 'pr.json').write_text('{"state": "open", "checks": 3}')
+        message = "{% set pr = file('pr.json') | fromjson %}PR is {{ pr.state }} with {{ pr.checks }} checks."
+        self.fire('p.task', message, extra=['--dir', str(work), '--live', '1'])
+        self.settle('p.task')
+        self.assertRegex(self.turns('p.task')[-1]['prompt_preview'],
+                         '^' + LINE.format('p.task', 'every 30m') + 'PR is open with 3 checks.$')
+
     def test_a_fire_caps_the_turn_it_starts(self):
         self.agent('run', *self.common, '--new', '--bot', 'p.task', 'hello')
         self.fire('p.task', 'check', extra=['--turn-budget-tokens', '500'])

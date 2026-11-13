@@ -391,6 +391,8 @@ fn automations() -> Value {
                                 reading is refused rather than asked about, and its answer comes to you \
                                 (or reply_to) as a report of what it would have done. Replace it without \
                                 shadow once the reports match the job."},
+                        "live": {"type": "boolean",
+                            "description": "The message is a template like a live memory fact's, filled as each run starts."},
                         "replace": {"type": "boolean",
                             "description": "Replace one by this name that differs, keeping its record."},
                         "message": {"type": "string", "minLength": 1}
