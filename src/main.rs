@@ -178,6 +178,12 @@ fn sandboxed(args: &[String]) -> Result<i32> {
     let (mut bot, mut bot_id, mut connection) = (None, None, Vec::new());
     let mut iter = flags.iter();
     while let Some(flag) = iter.next() {
+        // As for any command on the bots: an error, not a daemon started,
+        // when none runs.
+        if flag == "--no-spawn" {
+            connection.push(flag.clone());
+            continue;
+        }
         match (flag.as_str(), iter.next()) {
             // By its real path, which is what the sandbox sees.
             ("--writable", Some(path)) => match std::fs::canonicalize(path)
@@ -200,7 +206,10 @@ fn sandboxed(args: &[String]) -> Result<i32> {
         }
     }
     if bot.is_none() && (bot_id.is_some() || !connection.is_empty()) {
-        return fail_with("usage", "--bot-id, --store and --socket go with --bot");
+        return fail_with(
+            "usage",
+            "--bot-id, --store, --socket and --no-spawn go with --bot",
+        );
     }
     if bot.is_some() && !writable.is_empty() {
         return fail_with(
