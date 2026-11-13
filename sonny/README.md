@@ -1765,14 +1765,13 @@ conversation.
 
 ![/co after /commons was run: /commons ranks first; /cms finds /commons with c, m and s in bold](../docs/sonny/slash-ranked-fuzzy.png)
 
-The pane's place, when nothing else is open there, is the margin. Its
-first row is a glance at the agent: a red `✗` for what failed in the
-background (a click on it opens `/background`), and its context, each
-left out when there is nothing to say; the footer stops saying them while
-it shows. Under the composer, the footer counts the agents that need you
+The pane's place, when nothing else is open there, is the margin, titled
+`margin` as every view there is titled by name. The footer keeps every
+count whatever the pane shows, so nothing moves as the pane changes. Under
+the composer, the footer counts the agents that need you
 and the other agents at work by their marks and numbers alone (`? 1  ● 2`),
 marked as the roster and `/status` mark them, each mark its own shape so
-the counts read without colour, and a click on the count
+the counts read without color, and a click on the count
 opens `/status`. Every surface reads what needs you one way: an agent
 needs you while a call of its waits on your approval (gated for you, or
 handed to you by the reviewer) or a question it asked you is still open,
@@ -1805,7 +1804,7 @@ shortens it and then to `agent`, until at 44 columns a busy lead reads
 what asks something of you: the `?`, the `✗`, the `●` and a context half
 used.
 
-![The footer at 100, 80, 60 and 44 columns: needs you, failed, working and at rest as marks and numbers, at rest giving way first, what needs you stays](../docs/sonny/footer-widths.png) Under the glance are the notes the agent keeps there with its `margin`
+![The footer at 100, 80, 60 and 44 columns: needs you, failed, working and at rest as marks and numbers, at rest giving way first, what needs you stays](../docs/sonny/footer-widths.png) Under its title are the notes the agent keeps there with its `margin`
 tool: a diagram, a table of findings, a file it is discussing (kept fresh
 as the file changes), or a live view it updates while it works. Each
 note is pinned where the agent first put it: a quiet `✎ title · in the
