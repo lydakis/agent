@@ -10,7 +10,9 @@
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Instant, SystemTime};
+
+use crate::live::FRESH;
 
 use ratatui::{
     style::{Color, Stylize},
@@ -87,8 +89,6 @@ const NOTE_ROWS: usize = 600;
 /// How many of the calls and messages applied are remembered, so one
 /// read again as the conversation is drawn again is not applied twice.
 const SEEN: usize = 1024;
-/// How often a file a note shows is looked at for changes.
-const FRESH: Duration = Duration::from_secs(1);
 
 /// What the tool says to the bot: when a note earns its place, and kept
 /// up to date. A bot a lead makes takes the lead's tools as declared, so
@@ -846,24 +846,6 @@ pub struct Blanks {
     pub notes: Arc<Vec<(String, String, Body)>>,
 }
 
-/// A template note as last filled: from what, to what, and what it read
-/// as that stood then.
-struct Filled {
-    template: String,
-    folder: PathBuf,
-    /// What it last filled to; kept while a later fill fails.
-    text: Option<String>,
-    /// Why the last fill failed, when it did.
-    error: Option<String>,
-    reads: crate::template::Reads,
-    /// The sources set up when it filled: one added or taken away since
-    /// may change what it shows.
-    sources: Arc<Vec<String>>,
-    tasks_read: u64,
-    minute: i64,
-    looked: Instant,
-}
-
 /// What a margin's rows were drawn from: its width, the running turn,
 /// the terminal's light, how many times its notes and files changed,
 /// and the folder its files are read from.
@@ -891,7 +873,7 @@ pub struct Margin {
     blanks: Blanks,
     /// Template notes as last filled, by note id; the person's own by
     /// `~NAME`.
-    filled: HashMap<String, Filled>,
+    watch: crate::live::Watch,
 }
 
 /// The number a note's pin goes by on the screen: its call's, the same
@@ -1289,19 +1271,12 @@ impl Margin {
         let mut due = Vec::new();
         for (key, template, folder, kept) in person.chain(notes) {
             let folder = folder.map_or_else(|| workspace.to_owned(), PathBuf::from);
-            let waits = (self.filled.get(&key)).is_some_and(|filled| {
-                filled.looked.elapsed() < FRESH
-                    && filled.template == *template
-                    && filled.folder == folder
-            });
-            if !waits {
+            if self.watch.due(&key, template, &folder) {
                 due.push((key.clone(), template.clone(), folder, kept));
             }
             keys.push(key);
         }
-        let was = self.filled.len();
-        (self.filled).retain(|key, _| keys.contains(key));
-        if self.filled.len() != was {
+        if (self.watch).retain(|key| keys.iter().any(|k| k == key)) {
             self.changes += 1;
         }
         let was = self.kept.filled.len();
@@ -1315,106 +1290,32 @@ impl Margin {
     }
 
     /// The template note `key` filled again from `folder` once what it
-    /// read last changed, looked at no more than once a [`FRESH`]: a
-    /// source's log or a file, the tasks, or the minute, when it read
-    /// the clock. A fill that shows something new counts as a change.
-    /// Another bot's (`kept`) keeps what it filled to, so a later fill
-    /// that fails there, its folder gone, still shows it, in this window
-    /// and the next.
+    /// read last changed ([`crate::live::Watch::fill`]). A fill that
+    /// shows something new counts as a change. Another bot's (`kept`)
+    /// keeps what it filled to, so a later fill that fails there, its
+    /// folder gone, still shows it, in this window and the next.
     fn fill(&mut self, key: &str, template: &str, folder: &Path, kept: bool) {
-        let now = Instant::now();
-        let epoch = SystemTime::now()
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .map_or(0, |d| d.as_secs() as i64);
-        let tasks_read = self.blanks.tasks_read;
-        if let Some(filled) = self.filled.get_mut(key)
-            && filled.template == template
-            && filled.folder == folder
-        {
-            filled.looked = now;
-            let again = (filled.reads.tasks && filled.tasks_read != tasks_read)
-                || !Arc::ptr_eq(&filled.sources, &self.blanks.sources)
-                || (filled.reads.clock && filled.minute != epoch / 60)
-                || crate::template::changed(&filled.reads);
-            if !again {
-                return;
-            }
+        let last = kept.then(|| self.kept.filled.get(key).cloned()).flatten();
+        if !(self.watch).fill(key, (template, folder), &self.blanks, last) {
+            return;
         }
-        let data = crate::template::Data {
-            store: self.blanks.store.clone(),
-            sources: self.blanks.sources.clone(),
-            folder: folder.to_owned(),
-            tasks: self.blanks.tasks.clone(),
-            now: epoch,
-        };
-        let (rendered, reads) = crate::template::render(template, &data);
-        let was = self.filled.remove(key);
-        let (text, error) = match rendered {
-            Ok(text) => (Some(text), None),
-            Err(error) => {
-                let last = (was.as_ref().and_then(|was| was.text.clone()))
-                    .or_else(|| kept.then(|| self.kept.filled.get(key).cloned()).flatten());
-                (last, Some(error))
-            }
-        };
+        self.changes += 1;
         if kept
-            && error.is_none()
-            && let Some(text) = &text
+            && let Some(filled) = self.watch.get(key)
+            && filled.error.is_none()
+            && let Some(text) = &filled.text
             && self.kept.filled.get(key) != Some(text)
         {
             self.kept.filled.insert(key.to_owned(), text.clone());
             self.save();
         }
-        if was
-            .as_ref()
-            .is_none_or(|was| was.text != text || was.error != error || was.reads != reads)
-        {
-            self.changes += 1;
-        }
-        let filled = Filled {
-            template: template.to_owned(),
-            folder: folder.to_owned(),
-            text,
-            error,
-            reads,
-            sources: self.blanks.sources.clone(),
-            tasks_read,
-            minute: epoch / 60,
-            looked: now,
-        };
-        self.filled.insert(key.to_owned(), filled);
     }
 
     /// The template note `key`'s rows as last filled, `width` wide, its
     /// pictures read from `folder`: its text cut at the most lines a note
     /// holds, then why its last fill failed, when it did.
     fn filled_lines(&self, key: &str, width: usize, folder: &Path) -> Vec<Line<'static>> {
-        let Some(filled) = self.filled.get(key) else {
-            return vec![Line::from(format!("{BODY}…")).dim()];
-        };
-        let mut out = follows(&filled.reads, &filled.folder, width);
-        if let Some(text) = &filled.text {
-            let lines: Vec<&str> = text.lines().collect();
-            let shown = lines.len().min(most_lines());
-            let mut markdown = Markdown::in_folder(folder);
-            let text = lines[..shown].join("\n");
-            out.extend(crate::transcript::markdown(
-                &mut markdown,
-                &text,
-                width,
-                leads(),
-            ));
-            if lines.len() > shown {
-                let more = lines.len() - shown;
-                out.push(Line::from(format!("{BODY}… {more} more lines")).dim());
-            }
-        }
-        if let Some(error) = &filled.error {
-            let lead = || Span::raw(BODY);
-            let said = Line::from(format!("⟨{error}⟩")).dim();
-            out.extend(crate::transcript::wrap(said, width, lead(), lead()));
-        }
-        out
+        crate::live::lines(self.watch.get(key), width, folder, most_lines(), BODY)
     }
 
     /// How many times what the margin shows has changed: a note, a file a
@@ -1617,50 +1518,6 @@ fn cut(text: &str, most: usize) -> &str {
     &text[..end]
 }
 
-/// What a template note follows, under its title, so a filled note never
-/// passes for a written one: its sources by their icons, a down one with
-/// since when, the tasks, and its files from `folder`. No rows when it
-/// follows only the clock or nothing.
-fn follows(reads: &crate::template::Reads, folder: &Path, width: usize) -> Vec<Line<'static>> {
-    let icons = match reads.sources.is_empty() {
-        true => Default::default(),
-        false => crate::background::source_icons(),
-    };
-    let mut spans = vec![Span::raw("follows ").dim()];
-    let mut first = true;
-    let mut gap = |spans: &mut Vec<Span<'static>>| {
-        if !std::mem::take(&mut first) {
-            spans.push(Span::raw(", ").dim());
-        }
-    };
-    for name in &reads.sources {
-        gap(&mut spans);
-        let named = match icons.get(name) {
-            Some(icon) => format!("{icon} {name}"),
-            None => name.clone(),
-        };
-        spans.push(Span::raw(named).dim());
-        if let Some(since) = reads.down.get(name) {
-            let down = format!(" down since {}", crate::stamp::when(*since));
-            spans.push(Span::raw(down).fg(Color::Red));
-        }
-    }
-    if reads.tasks {
-        gap(&mut spans);
-        spans.push(Span::raw("tasks").dim());
-    }
-    for path in &reads.files {
-        gap(&mut spans);
-        let name = path.strip_prefix(folder).unwrap_or(path);
-        spans.push(Span::raw(name.display().to_string()).dim());
-    }
-    if first {
-        return Vec::new();
-    }
-    let lead = || Span::raw(BODY);
-    crate::transcript::wrap(Line::from(spans), width, lead(), lead())
-}
-
 /// A note's first row: its title, `live` while the running turn changes
 /// it, and its buttons on the right; and where those buttons are.
 fn head(note: &Note, width: usize, live: bool) -> (Line<'static>, crate::screen::Buttons) {
@@ -1829,9 +1686,7 @@ mod tests {
 
     /// Every template note looked at again as if a [`FRESH`] had passed.
     fn later(margin: &mut Margin) {
-        for filled in margin.filled.values_mut() {
-            filled.looked -= FRESH;
-        }
+        margin.watch.later();
     }
 
     #[test]

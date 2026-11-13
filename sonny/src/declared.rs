@@ -28,6 +28,7 @@ pub fn tools(role: Role) -> Vec<Value> {
         crate::asks::close_tool(),
         crate::plan::tool(),
         crate::margin::tool(),
+        crate::live::tool(),
     ];
     if role.lead {
         tools.push(crate::resolved::tool());

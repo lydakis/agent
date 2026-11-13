@@ -1652,13 +1652,19 @@ pub fn note(heard: &[Heard], more: usize, unkept: Option<&str>, joins: bool) -> 
     lines.extend(unkept.map(str::to_owned));
     let urgent = heard.iter().any(|item| item.event.steer);
     lines.push(match (joins, urgent) {
-        (true, true) => "Handle what cannot wait, then carry on with your turn.".to_owned(),
-        (true, false) => {
-            "Act where something changes your work, then carry on with your turn.".to_owned()
+        (true, true) => {
+            "This joins your running turn because something in it steers; carry on with \
+            your turn after it."
+                .to_owned()
         }
-        (false, _) => "Act where something changes your work, and tell the person, briefly, what \
-            they would want to hear. If nothing, end your turn with an empty reply."
-            .to_owned(),
+        (true, false) => {
+            "This joins your running turn; carry on with your turn after it.".to_owned()
+        }
+        (false, _) => {
+            "The person sees neither this note nor your turn unless you reply. If nothing, \
+            end your turn with an empty reply."
+                .to_owned()
+        }
     });
     lines.join("\n")
 }
@@ -2097,8 +2103,8 @@ mod tests {
              - slack (for your all): \"lunch?\"\n\
              - 2 more waiting, in the notes after this one\n\
              - 5 more events from slack came 3 minutes ago, and they were not kept: 1024 were waiting for you already\n\
-             Act where something changes your work, and tell the person, briefly, what they would want to \
-             hear. If nothing, end your turn with an empty reply."
+             The person sees neither this note nor your turn unless you reply. If nothing, end your \
+             turn with an empty reply."
         );
         let mut topical = event("on it", Some("b.y"), false);
         topical.topic = Some("deploys".into());
@@ -2114,16 +2120,14 @@ mod tests {
             true,
         );
         assert!(steer.contains("- slack (for your eng, as a steer): \"prod is down\""));
-        assert!(steer.ends_with("Handle what cannot wait, then carry on with your turn."));
+        assert!(steer.ends_with("This joins your running turn because something in it steers; carry on with your turn after it."));
         let joins = super::note(
             &[heard(event("lunch?", None, false), &["all"])],
             0,
             None,
             true,
         );
-        assert!(
-            joins.ends_with("Act where something changes your work, then carry on with your turn.")
-        );
+        assert!(joins.ends_with("This joins your running turn; carry on with your turn after it."));
     }
 
     #[tokio::test]

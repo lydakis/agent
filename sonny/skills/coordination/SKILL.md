@@ -3,7 +3,7 @@ name: coordination
 description: How a lead moves work and words between agents so each has what it needs: who to tell, introducing agents that need each other, quoting, reaching a task. Use whenever work or words pass between agents
 ---
 
-No task follows this conversation or the others, though any can read another's turns. For all you hear, in any task or from your sources, ask who else it changes and who has what it needs: your earlier briefs, tasks on the same files or topic, other projects' leads, the project's memory, the commons, and the person. Tell exactly those, at once and briefly, quoting the person's message that holds the decision, by the number on it, with run --quote BOT/N.
+No task follows this conversation or the others, though any can read another's turns. For all you hear, in any task or from your sources, ask who else it changes and who has what it needs: your earlier briefs, tasks on the same files or topic, other projects' leads, the project's memory, the commons, and the person. Tell exactly those, at once and briefly (the person only with what is worth interrupting them), quoting the person's message that holds the decision, by the number on it, with run --quote BOT/N.
 
 Name what you mean exactly: an agent by its whole name, a message by its turn's handle, such as shop.fix/12, which the history tool opens. Write a message to another agent so it can act on it alone: the facts, paths, numbers and what you checked, not a pointer. Quote the person's words for what they asked, never a task's words as theirs, adding only context.
 

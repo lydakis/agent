@@ -47,6 +47,7 @@ mod kept;
 mod link;
 mod links;
 mod list;
+mod live;
 mod login;
 mod look;
 mod lookout;
@@ -4373,6 +4374,13 @@ struct App {
     plans: HashMap<u64, Vec<String>>,
     plan_count: u64,
     plan_full: Option<u64>,
+    /// The `live` calls drawn, by the number each is tagged with: each
+    /// its template, and when it was drawn.
+    blocks: BTreeMap<u64, (String, Instant)>,
+    live_count: u64,
+    /// The live blocks as last filled, and when they were last looked at.
+    live_watch: live::Watch,
+    live_looked: Option<Instant>,
     /// Where a note was put, to show in the conversation once it is drawn
     /// back that far; and how many more older pages may be read for it.
     jump: Option<(screen::Tag, u8)>,
@@ -6118,6 +6126,10 @@ impl App {
             plans: HashMap::new(),
             plan_count: 0,
             plan_full: None,
+            blocks: BTreeMap::new(),
+            live_count: 0,
+            live_watch: live::Watch::default(),
+            live_looked: None,
             jump: None,
             pressed: Vec::new(),
             names: Default::default(),
@@ -7403,7 +7415,7 @@ impl App {
     ) {
         // Words only, the agent's questions are all of its calls drawn,
         // and its plan is the margin's alone.
-        if self.words() && name != asks::TOOL {
+        if self.words() && name != asks::TOOL && name != live::TOOL {
             if name == plan::TOOL
                 && !failed
                 && let Some(steps) = plan::steps(arguments)
@@ -7421,6 +7433,21 @@ impl App {
             // which what comes after it still joins.
             let gathering = (self.clustering).filter(|(_, drawn)| *drawn == self.rows_drawn);
             self.commit_note(id, arguments, failed);
+            if let Some((at, _)) = gathering
+                && !self.verbose
+            {
+                self.clustering = Some((at, self.rows_drawn));
+            }
+            return;
+        }
+        // Something the agent shows live stands out where it put it, as a
+        // note does, and is kept filled there.
+        if name == live::TOOL
+            && !failed
+            && let Some(template) = arguments["markdown"].as_str()
+        {
+            let gathering = (self.clustering).filter(|(_, drawn)| *drawn == self.rows_drawn);
+            self.commit_live(template);
             if let Some((at, _)) = gathering
                 && !self.verbose
             {
@@ -8174,6 +8201,61 @@ impl App {
             self.mark_last(screen::Mark::Tag(screen::Tag::Note(pin)));
             self.mark_last(screen::Mark::Link(link));
             self.marked.insert(pin, note.title);
+        }
+    }
+
+    /// A `live` call's block, filled now, written where the call was made
+    /// and tagged, so [`App::fold_live`] keeps it filled.
+    fn commit_live(&mut self, template: &str) {
+        let at = self.live_count;
+        self.live_count += 1;
+        let folder = std::path::PathBuf::from(&self.workspace);
+        let key = at.to_string();
+        (self.live_watch).fill(&key, (template, &folder), &self.blanks, None);
+        let lines = live::block(self.live_watch.get(&key), self.prose(), &folder);
+        let from = self.pending.len() + usize::from(self.any_history);
+        let rows = lines.len();
+        self.commit(lines);
+        let tag = screen::Mark::Tag(screen::Tag::Live(at));
+        self.marks
+            .extend((from..from + rows).map(|row| (row, tag.clone())));
+        self.blocks
+            .insert(at, (template.to_owned(), Instant::now()));
+    }
+
+    /// The live blocks in view, or a view from it, filled again once what
+    /// they read changed, each looked at no more than once a
+    /// [`live::FRESH`], and drawn again where what they show did. Blocks
+    /// further away cost nothing until they come near.
+    fn fold_live(&mut self) {
+        if self.blocks.is_empty()
+            || (self.live_looked).is_some_and(|at| at.elapsed() < live::FRESH / 4)
+        {
+            return;
+        }
+        self.live_looked = Some(Instant::now());
+        // Those the conversation no longer keeps are forgotten, once
+        // written into it.
+        let kept: std::collections::HashSet<screen::Tag> = self.screen.tags().collect();
+        self.blocks.retain(|at, (_, drawn)| {
+            kept.contains(&screen::Tag::Live(*at)) || drawn.elapsed() < live::FRESH * 5
+        });
+        let blocks = &self.blocks;
+        self.live_watch
+            .retain(|key| key.parse().is_ok_and(|at: u64| blocks.contains_key(&at)));
+        let near = self.screen.tags_near_view();
+        let folder = std::path::PathBuf::from(&self.workspace);
+        let width = self.prose();
+        for (at, (template, _)) in &self.blocks {
+            let tag = screen::Tag::Live(*at);
+            let key = at.to_string();
+            if !near.contains(&tag) || !self.live_watch.due(&key, template, &folder) {
+                continue;
+            }
+            if (self.live_watch).fill(&key, (template, &folder), &self.blanks, None) {
+                let lines = live::block(self.live_watch.get(&key), width, &folder);
+                self.screen.replace_tagged(tag, lines, Vec::new());
+            }
         }
     }
 
@@ -16257,6 +16339,7 @@ impl App {
             && opened
             && pane::margin_width(size.width, kept(size.width)).is_some();
         self.fold_notes(beside);
+        self.fold_live();
         let below = VIEWPORT - 2 + live_rows + composer_rows.len() as u16;
         let workspace = std::path::PathBuf::from(&self.workspace);
         if let Some(at) = shown
@@ -28147,6 +28230,64 @@ mod tests {
         app.refold = true;
         app.fold_notes(false);
         assert!(app.plans.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_live_block_shows_where_it_was_called_and_fills_again_as_its_file_changes() {
+        let dir = std::env::temp_dir().join(format!("sonny-live-block-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("prs.txt"), "#41 open").unwrap();
+        let mut app = app(daemon_with(json!([])).await);
+        app.any_history = true;
+        app.workspace = dir.display().to_string();
+        let texts = |app: &App| -> Vec<String> {
+            (app.screen.texts().iter())
+                .map(|t| t.trim().to_owned())
+                .filter(|t| !t.is_empty())
+                .collect()
+        };
+        let call = json!({"markdown": "Open: {{ file('prs.txt') }}"});
+        let answer = "Shown live in the conversation, kept filled as it changes.";
+        app.commit_call("l1", Some(1), live::TOOL, &call, answer, false);
+        app.commit(vec![Line::from("One PR is open.")]);
+        app.flush();
+        assert_eq!(
+            texts(&app)[..],
+            [
+                "◇ live",
+                "follows prs.txt",
+                "Open: #41 open",
+                "One PR is open."
+            ]
+        );
+        // Looked at again a second on: what it read changed, so it shows
+        // that where it was, the reply under it as it was.
+        std::fs::write(dir.join("prs.txt"), "#41 merged, #42 open").unwrap();
+        app.live_watch.later();
+        app.live_looked = None;
+        app.fold_live();
+        assert_eq!(
+            texts(&app)[..],
+            [
+                "◇ live",
+                "follows prs.txt",
+                "Open: #41 merged, #42 open",
+                "One PR is open."
+            ]
+        );
+        // A refused call draws no block; words only still shows one.
+        app.commit_call("l2", Some(1), live::TOOL, &call, "live_template", true);
+        app.flush();
+        assert_eq!(app.blocks.len(), 1);
+        // Gone from the screen, it is forgotten once it was written there.
+        app.screen.clear();
+        for (_, drawn) in app.blocks.values_mut() {
+            *drawn -= live::FRESH * 5;
+        }
+        app.live_looked = None;
+        app.fold_live();
+        assert!(app.blocks.is_empty());
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[tokio::test]
