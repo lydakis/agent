@@ -3278,8 +3278,10 @@ struct Written {
     arguments: Value,
     /// The agent whose call it is, when not this window's.
     from: Option<String>,
-    /// What came of it, once heard.
+    /// What came of it: the person's answer here, until the call's own
+    /// verdict is `heard`, which is final.
     decided: Option<transcript::Decided>,
+    heard: bool,
     /// Folded to its verdict: it waits no more.
     folded: bool,
     /// Folded, opened whole again by a click or Ctrl+O.
@@ -15570,6 +15572,7 @@ impl App {
                 arguments,
                 from,
                 decided: None,
+                heard: false,
                 folded: false,
                 open: false,
                 at_ms: std::time::SystemTime::now()
@@ -15648,12 +15651,13 @@ impl App {
         let Some(written) = self.written.get_mut(&key) else {
             return;
         };
-        if written.decided.is_some() {
+        if written.heard {
             return;
         }
         let verdicts = data["approvals"].as_array().cloned().unwrap_or_default();
         let you = |verdict: &Value| verdict["by"] != "approver";
         let by = |verdict: &Value| verdict["by"].as_str().is_some_and(|by| !by.is_empty());
+        let answered = written.decided.take();
         written.decided = match verdicts.iter().find(|v| v["allow"] == false) {
             Some(no) if by(no) => Some(transcript::Decided::Denied { you: you(no) }),
             // Refused by no one: its time ran out.
@@ -15665,6 +15669,18 @@ impl App {
                 })
                 .map(|you| transcript::Decided::Allowed { you, kept: None }),
         };
+        // The person's answer here stands until the call's own verdict
+        // says otherwise: another gate may still have denied it. Allowed
+        // after all, what they always allow from now on is theirs.
+        written.decided = match (written.decided.take(), answered) {
+            (
+                Some(transcript::Decided::Allowed { you: true, .. }),
+                Some(transcript::Decided::Allowed { you: true, kept }),
+            ) => Some(transcript::Decided::Allowed { you: true, kept }),
+            (None, answered) => answered,
+            (heard, _) => heard,
+        };
+        written.heard = written.decided.is_some();
         // Folded before its verdict came, as a listing may see the call
         // gone first: drawn again to say it.
         if written.folded && written.decided.is_some() {
@@ -15679,7 +15695,7 @@ impl App {
     async fn verdicts_from_audit(&mut self, gone: Vec<(String, i64, String)>) {
         for key in gone {
             let Some(at_ms) = (self.written.get(&key))
-                .filter(|written| written.decided.is_none())
+                .filter(|written| !written.heard)
                 .map(|written| written.at_ms)
             else {
                 continue;
@@ -15725,7 +15741,15 @@ impl App {
                 _ => continue,
             };
             if let Some(written) = self.written.get_mut(&key) {
-                written.decided = Some(decided);
+                // Kept from the person's answer here: what they always allow.
+                written.decided = match (decided, written.decided.take()) {
+                    (
+                        transcript::Decided::Allowed { you: true, .. },
+                        Some(transcript::Decided::Allowed { you: true, kept }),
+                    ) => Some(transcript::Decided::Allowed { you: true, kept }),
+                    (decided, _) => Some(decided),
+                };
+                written.heard = true;
                 if written.folded {
                     self.draw_written(&key);
                 }
@@ -24823,6 +24847,41 @@ mod tests {
         assert_eq!((asked.len(), &asked[0]["turn"]), (2, &json!(4)));
         assert!(asked[0]["since_ms"].as_i64().unwrap() > 0);
         assert_eq!(asked[1]["before"], 40);
+    }
+
+    #[tokio::test]
+    async fn a_denial_by_another_gate_replaces_the_persons_allow_here() {
+        let client = daemon_answering(|_| json!({})).await;
+        let mut app = app(client);
+        app.width = 80;
+        app.approvals
+            .push(json!({"turn": 3, "call_id": "c1", "name": "shell",
+            "gates": ["manual", "auto"], "arguments": {"command": "git push"}}));
+        app.show_asked();
+        app.flush();
+        let key = |code| Event::Key(event::KeyEvent::new(code, KeyModifiers::NONE));
+        app.key(key(KeyCode::Char('y'))).await;
+        app.fold_written();
+        app.flush();
+        let texts = app.screen.texts();
+        assert!(
+            texts.contains(&"✓ You allowed git push".to_owned()),
+            "{texts:?}"
+        );
+        // The reviewer's gate denied it after all: its end says so.
+        app.heard_verdict(
+            "b",
+            Some(3),
+            &json!({"call_id": "c1", "denied": true,
+            "approvals": [{"tag": "manual", "by": "tui", "allow": true},
+                {"tag": "auto", "by": "approver", "allow": false}]}),
+        );
+        let texts = app.screen.texts();
+        assert!(
+            texts.contains(&"✗ The reviewer denied git push".to_owned()),
+            "{texts:?}"
+        );
+        assert!(!texts.contains(&"✓ You allowed git push".to_owned()));
     }
 
     #[test]
