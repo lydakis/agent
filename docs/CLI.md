@@ -77,7 +77,7 @@ Seatbelt only refuses connections to its sockets and hard links into it,
 so its files stay readable; and the `read` tool, which the daemon answers
 itself outside any sandbox, reads them on both. What a sandbox closes and
 what it leaves open is summed up in
-[Sonny's README](../sonny/README.md#what-the-sandbox-closes).
+[Sonny's sandbox reference](../sonny/REFERENCE.md#what-the-sandbox-closes).
 
 Every daemon lists its store and socket in `~/.agent/run/daemons` as it
 opens its store, and keeps every other listed daemon's as it keeps its own:
@@ -98,7 +98,12 @@ pacer, Sonny's windows and Sky, the lookout, approvals, and upgrades
 shares everything under `~/.agent` and `~/.agents`: settings, prices,
 logins, memory, the commons, automations and task folders. Run one for a
 build under test or an eval, on a store in a temporary folder, and stop it
-when done.
+when done. An `agent` command run from inside a bot's turn never starts a
+daemon on the store that turn runs on, which its shell inherits as
+`AGENT_STORE`, as it never replaces the daemon there: with that daemon
+down, it is `daemon_unavailable`, so a build of the bot's own never takes
+the person's store. On a `--store` of the bot's own it starts one as
+anyone would.
 
 The daemon's [limits](RUST_PROTOTYPE.md#limits) come from `[daemon]` in
 `~/.agent/config.toml` where the command line sets none, each a number or

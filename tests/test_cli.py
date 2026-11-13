@@ -1907,6 +1907,37 @@ class CliTests(ModelFixture):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(json.loads(result.stdout)[0]['name'], 'first')
 
+    def test_inside_a_bot_s_turn_no_daemon_starts_on_the_turn_s_store(self):
+        # A bot's shell inherits its daemon's store. With that daemon down,
+        # an agent there, a build of the bot's own included, starts none in
+        # its place, named or inherited; on a store of the bot's own it
+        # starts one as anyone would.
+        provider = ['--provider', 'openai=responses,http://127.0.0.1:9/v1']
+        live, own = self.path/'live.sqlite', self.path/'own.sqlite'
+        live.touch()
+        turn = {**clean_env(), 'AGENT_BOT': 'Bob', 'AGENT_BOT_ID': '7', 'AGENT_STORE': str(live),
+                'AGENT_SOCKET': str(self.path/'live.sqlite.sock')}
+        for flags in ([], ['--store', str(live)], ['--store', 'live.sqlite']):
+            with self.subTest(flags=flags):
+                refused = subprocess.run([str(self.binary), 'start', *flags, *provider], env=turn,
+                                         capture_output=True, text=True, timeout=10, cwd=self.path)
+                self.assertEqual(refused.returncode, 1, refused.stderr)
+                self.assertEqual(json.loads(refused.stderr)['error'], 'daemon_unavailable')
+                self.assertIn("inside a bot's turn", refused.stderr)
+                self.assertFalse((self.path/'live.sqlite.sock').exists())
+        # As a bot's own command does, `sandbox --bot` with --no-spawn asks
+        # for a running daemon anywhere.
+        lent = subprocess.run([str(self.binary), 'sandbox', '--store', str(own), '--no-spawn', '--bot', 'Bob',
+                               '--', 'true'], env=clean_env(), capture_output=True, text=True,
+                              timeout=10, cwd=self.path)
+        self.assertEqual((lent.returncode, json.loads(lent.stderr)['error']), (125, 'daemon_unavailable'))
+        self.assertFalse(own.exists())
+        started = subprocess.run([str(self.binary), 'start', '--store', str(own), *provider], env=turn,
+                                 capture_output=True, text=True, timeout=30, cwd=self.path)
+        self.addCleanup(subprocess.run, [str(self.binary), 'shutdown', '--store', str(own)],
+                        env=clean_env(), capture_output=True, timeout=35)
+        self.assertEqual(started.returncode, 0, started.stderr)
+
     def test_cli_starts_and_reconnects_with_a_deep_store_path(self):
         store = self.path/('snapshot-'*18)/'state.db'
         env = clean_env()
