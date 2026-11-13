@@ -694,6 +694,9 @@ pub fn name_matches(pattern: &str, name: &str) -> bool {
     pattern[p..].iter().all(|c| *c == '*')
 }
 
+/// The most held back for whole credentials across a stream's cut.
+const CREDENTIAL_HOLD: usize = 64 * 1024;
+
 impl Credentials {
     pub fn set(&self, name: &str, value: &str) {
         if value.is_empty() {
@@ -766,11 +769,18 @@ impl Credentials {
     pub fn unfinished(&self, text: &[u8]) -> usize {
         let set = self.current();
         let open = open_field(text, &set.fields).value;
-        self.unfinished_after(&set, text, open)
+        self.unfinished_after(&set, text, open, false)
     }
     /// How many of `text`'s last bytes could begin a credential that more
-    /// output would finish, the last `open` held besides.
-    fn unfinished_after(&self, set: &CredentialSet, text: &[u8], open: usize) -> usize {
+    /// output would finish, the last `open` held besides. A whole
+    /// credential across the cut is shown at once, or, `exact`, held.
+    fn unfinished_after(
+        &self,
+        set: &CredentialSet,
+        text: &[u8],
+        open: usize,
+        exact: bool,
+    ) -> usize {
         let values = || {
             set.values
                 .iter()
@@ -785,9 +795,34 @@ impl Credentials {
             .max()
             .unwrap_or(0)
             .max(open);
-        // A whole credential across the cut, as one that ends with its own
-        // start, is shown whole.
-        let mut cut = text.len() - started;
+        // Exact, a whole credential across the cut is held with what
+        // follows it: the start held may finish a longer one, which
+        // whole-text redaction replaces first. Past `CREDENTIAL_HOLD` of
+        // such, as in a run of one that ends with its own start, and
+        // otherwise, it is shown whole, as one that ends with its own
+        // start is to a terminal at once.
+        let start = text.len() - started;
+        let mut cut = start;
+        while exact
+            && let Some(first) = values()
+                .filter_map(|value| {
+                    let from = (cut + 1).saturating_sub(value.len());
+                    let to = (cut + value.len() - 1).min(text.len());
+                    let window = text.get(from..to)?;
+                    let at = window.windows(value.len()).position(|w| w == value)?;
+                    Some(from + at)
+                })
+                .min()
+        {
+            cut = first;
+            if start - cut > CREDENTIAL_HOLD {
+                break;
+            }
+        }
+        if exact && start - cut <= CREDENTIAL_HOLD {
+            return text.len() - cut;
+        }
+        let mut cut = start;
         while let Some(end) = values()
             .filter_map(|value| {
                 let from = (cut + 1).saturating_sub(value.len());
@@ -862,7 +897,7 @@ impl Redacting {
         let whole = self.held.len() - unfinished_char(&self.held);
         let kept = self
             .credentials
-            .unfinished_after(&set, &self.held[..whole], 0)
+            .unfinished_after(&set, &self.held[..whole], 0, true)
             .min(whole);
         let rest = self.held.split_off(whole - kept);
         let read = std::mem::replace(&mut self.held, rest);
@@ -1067,12 +1102,47 @@ enum FieldState {
 
 /// A value read so far.
 enum Value {
-    /// Not yet known to be secret: its bytes.
-    Held(Vec<u8>),
+    /// Not yet known to be secret.
+    Held(Held),
     /// Told as redacted: the rest of it is dropped.
     Secret,
     /// Known not to be: told as it comes.
     Shown,
+}
+
+/// A value's bytes held until it is known to be secret or not, and
+/// whether they hold a digit and a letter, kept as they come so each byte
+/// costs the same however long the value runs.
+#[derive(Default)]
+struct Held {
+    bytes: Vec<u8>,
+    digit: bool,
+    letter: bool,
+}
+
+impl Held {
+    fn push(&mut self, b: u8) {
+        self.bytes.push(b);
+        self.digit |= b.is_ascii_digit();
+        self.letter |= b.is_ascii_alphabetic();
+    }
+
+    /// Whether it is secret, as `redact_fields` judges a whole value: long
+    /// enough, mixing letters and digits, and not code.
+    fn secret(&self) -> bool {
+        self.bytes.len() >= SECRET_MIN
+            && self.digit
+            && self.letter
+            && !matches!(self.bytes[0], b'{' | b'[' | b'$')
+    }
+
+    /// Told whole at its end: redacted when it is secret.
+    fn tell(&mut self, out: &mut Vec<u8>) {
+        match self.secret() {
+            true => out.extend_from_slice(REDACTED.as_bytes()),
+            false => out.append(&mut self.bytes),
+        }
+    }
 }
 
 /// The most of a value held before it is known to be secret or not: one
@@ -1176,7 +1246,7 @@ impl FieldStream {
                         self.state = FieldState::Value {
                             quote,
                             escaped: false,
-                            value: Value::Held(Vec::new()),
+                            value: Value::Held(Held::default()),
                         };
                         if quote.is_none() {
                             continue;
@@ -1198,7 +1268,7 @@ impl FieldStream {
                         };
                     if ends {
                         if let Value::Held(held) = value {
-                            tell(&mut out, held);
+                            held.tell(&mut out);
                         }
                         // The byte that ended it is read again.
                         self.state = FieldState::Scan;
@@ -1211,18 +1281,18 @@ impl FieldStream {
                             mark = at + 1;
                         }
                         Value::Held(held) => {
-                            if held.is_empty() {
+                            if held.bytes.is_empty() {
                                 out.extend_from_slice(&bytes[mark..at]);
                             }
                             held.push(b);
                             mark = at + 1;
-                            if secret(held) {
+                            if held.secret() {
                                 out.extend_from_slice(REDACTED.as_bytes());
                                 *value = Value::Secret;
-                            } else if matches!(held[0], b'{' | b'[' | b'$') {
-                                out.append(held);
+                            } else if matches!(held.bytes[0], b'{' | b'[' | b'$') {
+                                out.append(&mut held.bytes);
                                 *value = Value::Shown;
-                            } else if held.len() > VALUE_HOLD {
+                            } else if held.bytes.len() > VALUE_HOLD {
                                 out.extend_from_slice(REDACTED.as_bytes());
                                 *value = Value::Secret;
                             }
@@ -1240,29 +1310,12 @@ impl FieldStream {
                 ..
             } = &mut self.state
             {
-                tell(&mut out, held);
+                held.tell(&mut out);
             }
             self.state = FieldState::Scan;
         }
         String::from_utf8(out)
             .unwrap_or_else(|error| String::from_utf8_lossy(error.as_bytes()).into_owned())
-    }
-}
-
-/// Whether a value read so far is secret, as `redact_fields` judges a
-/// whole one: long enough, mixing letters and digits, and not code.
-fn secret(value: &[u8]) -> bool {
-    value.len() >= SECRET_MIN
-        && !matches!(value[0], b'{' | b'[' | b'$')
-        && value.iter().any(u8::is_ascii_digit)
-        && value.iter().any(u8::is_ascii_alphabetic)
-}
-
-/// A whole value held until its end: redacted when it is secret.
-fn tell(out: &mut Vec<u8>, held: &mut Vec<u8>) {
-    match secret(held) {
-        true => out.extend_from_slice(REDACTED.as_bytes()),
-        false => out.append(held),
     }
 }
 
@@ -4839,11 +4892,13 @@ mod tests {
     fn mixed_texts_redact_in_pieces_as_whole() {
         let credentials = Credentials::default();
         credentials.set("TOKEN", "tok3n-fake-fake-fake9");
+        credentials.set("LONG", "abc123def456");
+        credentials.set("SHORT", "Xabc123");
         credentials.redact_also(
             &["password".to_owned(), "api_key".to_owned()],
             &["PRIVATE KEY".to_owned()],
         );
-        let parts: [&str; 20] = [
+        let parts: [&str; 23] = [
             "password=",
             "\"api_key\": \"",
             "password: '",
@@ -4864,6 +4919,9 @@ mod tests {
             "-----END RSA PRIVATE KEY-----",
             "-----BEGIN ",
             "CERTIFICATE-----\r\n",
+            "Xabc",
+            "123",
+            "def456",
         ];
         let mut seed = 0x2545_f491_4f6c_dd1du64;
         let mut next = || {
@@ -4896,6 +4954,41 @@ mod tests {
                 assert!(out == whole, "in pieces of {size}: {text:?}");
             }
         }
+    }
+    /// A credential that begins a longer one cut across pieces waits for
+    /// it: the longer is redacted first, as in the whole text.
+    #[test]
+    fn a_credential_inside_a_longer_one_cut_across_pieces_waits_for_it() {
+        let credentials = Credentials::default();
+        credentials.set("LONG", "abc123def456");
+        credentials.set("SHORT", "Xabc123");
+        for text in ["Xabc123def456", "Xabc123 then Xabc123def456 end"] {
+            let whole = credentials.redact(text.to_owned());
+            for size in 1..=text.len() {
+                let mut redacting = Redacting::new(credentials.clone());
+                let mut out = String::new();
+                for piece in text.as_bytes().chunks(size) {
+                    out.push_str(&redacting.feed(piece));
+                }
+                out.push_str(&redacting.finish());
+                assert_eq!(out, whole, "in pieces of {size}");
+            }
+        }
+    }
+    /// A long value of letters alone costs each byte the same: it is held
+    /// to its bound, then told as redacted.
+    #[test]
+    fn a_long_value_not_yet_secret_is_read_in_linear_time() {
+        let credentials = Credentials::default();
+        credentials.redact_also(&["password".to_owned()], &[]);
+        let text = format!("password={} after", "k".repeat(2 << 20));
+        let mut redacting = Redacting::new(credentials.clone());
+        let mut out = String::new();
+        for piece in text.as_bytes().chunks(64 << 10) {
+            out.push_str(&redacting.feed(piece));
+        }
+        out.push_str(&redacting.finish());
+        assert_eq!(out, "password=[REDACTED] after");
     }
     /// A piece handed to a stream's writer while it has no room stays
     /// pending when the wait is cut short, and is handed once it has room;
