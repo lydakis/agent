@@ -3272,7 +3272,7 @@ schedule, so a waiting call costs a row and no timer. A later call's gate that
 lapses first ends the wait as `tool_unserved` and the turn as it ends one
 waiting on a verdict. A message that joins the turn lifts the wait as it
 lifts a verdict's (see [tool approval](#tool-approval)) when the tool is
-declared with `lift` (protocol 69, below) or a step of the call waits on a
+declared with `lift` (protocol 70, below) or a step of the call waits on a
 gate: the call becomes a
 `proc:` handle answered `"waits_for":"answer"`, its client still lists,
 takes and answers it, and the answer ends the command, told as
@@ -3280,7 +3280,7 @@ takes and answers it, and the answer ends the command, told as
 running call. A call that does not fit its
 parameters is refused at once and waits for no answer.
 
-Protocol version 69 adds `lift` to a tool a client answers (only with
+Protocol version 70 adds `lift` to a tool a client answers (only with
 `answered_by`; `invalid_declare` otherwise), default `false` and reported
 only when `true`. Protocol 64 let a steer lift every call waiting for its
 client's answer, so a client's quick tools (a note, a memory, a reaction)
@@ -3433,7 +3433,7 @@ keeping the shorter expiry. A bot carries at most 8 gates: a `create` or
 - **A message lifts the wait** (protocol 64, schema 91). A steer that
   joins the turn while a call waits for its verdict, held live or parked,
   wakes the turn and lifts the call (a call its client answers only as
-  protocol 69 says, under [answered tools](#declared-tools)): one commit writes a `processes` row for it, gives
+  protocol 70 says, under [answered tools](#declared-tools)): one commit writes a `processes` row for it, gives
   its request `process` (an indexed column), and answers the call with
   `{"handle":"proc:N","background":true,"steered":true,"waits_for":"approval"}`,
   so the round goes on and the turn reads the message. `call_lifted`
