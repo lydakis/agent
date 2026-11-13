@@ -2,8 +2,9 @@
 //! or stops on them. One Sonny rings for a project: the lead's, which sees
 //! every agent in it; the windows it opens for tasks stay quiet.
 //!
-//! On a Mac the sound is one of the system's (`SONNY_SOUND_DONE=Pop`, a
-//! file's path, or `off` changes one); elsewhere it is the terminal bell.
+//! The sound is off until `[sonny] chime = true` or `/sound` turns it on.
+//! On a Mac it is one of the system's (`SONNY_SOUND_DONE=Pop`, a file's
+//! path, or `off` changes one); elsewhere it is the terminal bell.
 //! The notification is OSC 777, which Rex shows as a desktop notification.
 use std::{
     io::Write,
@@ -34,7 +35,8 @@ impl Alert {
 
 pub struct Sounds {
     on: bool,
-    /// `/sound`: off keeps the notifications and drops the sound.
+    /// `[sonny] chime`, off by default, and `/sound`: off keeps the
+    /// notifications and drops the sound.
     pub chime: bool,
     last: Option<(Instant, Alert)>,
 }
@@ -46,7 +48,7 @@ impl Sounds {
     pub fn new(on: bool) -> Self {
         Self {
             on,
-            chime: true,
+            chime: false,
             last: None,
         }
     }

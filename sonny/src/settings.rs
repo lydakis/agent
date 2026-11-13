@@ -5,7 +5,8 @@
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Settings {
-    /// Whether finished and waiting work rings. Notifications show either way.
+    /// Whether finished and waiting work rings; off by default.
+    /// Notifications show either way.
     pub chime: bool,
     /// Whether the agent's steps between what is said are drawn, or only
     /// the person's words and the agent's (the default).
@@ -99,12 +100,13 @@ mod tests {
     fn the_config_says_what_rings_and_what_is_drawn() {
         let sonny = agent_client::config::Sonny::default;
         assert_eq!(Settings::from(sonny()), Settings::default());
-        let quiet = agent_client::config::Sonny {
-            chime: false,
+        assert!(!Settings::default().chime);
+        let loud = agent_client::config::Sonny {
+            chime: true,
             verbose: true,
             ..sonny()
         };
-        let settings = Settings::from(quiet);
-        assert!(!settings.chime && settings.verbose);
+        let settings = Settings::from(loud);
+        assert!(settings.chime && settings.verbose);
     }
 }
