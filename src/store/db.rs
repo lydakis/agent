@@ -7111,7 +7111,7 @@ impl Database {
     }
     /// An idle bot's line has exactly one ready head, including after recovery.
     /// Only inspect that head; running/parked bots are checked by the caller.
-    fn has_ready_turn(&self, name: &str) -> Result<bool> {
+    pub fn has_ready_turn(&self, name: &str) -> Result<bool> {
         Ok(self
             .conn
             .prepare_cached("SELECT EXISTS(SELECT 1 FROM messages WHERE bot=? AND status='ready')")?

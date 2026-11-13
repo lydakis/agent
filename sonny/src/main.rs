@@ -2683,6 +2683,72 @@ fn first_message(store: &std::path::Path, brief: &str) -> Result<PathBuf, String
     }
 }
 
+/// A task window once its task is done. Its lead closes it, unless the
+/// person used it since the task's newest turn began ([`used::since`]):
+/// then it stays, says `✓ done` under the last reply, and closes itself
+/// once the person looks away. New work reopens the task, as ever.
+#[derive(Default)]
+struct Kept {
+    /// When the person last focused, typed or clicked here.
+    used: Option<Instant>,
+    /// Whether this window has the terminal's focus, once it said.
+    focused: Option<bool>,
+    /// When the newest turn here began, as this window saw it, and its
+    /// number once it ended.
+    began: Option<Instant>,
+    ended: Option<i64>,
+    /// The ended turn the done mark was settled for: shown, left to the
+    /// lead, or closed.
+    settled: Option<i64>,
+    /// `✓ done` is shown: the window closes once it loses the focus.
+    showing: bool,
+    /// When the mark was last read while the task rested.
+    read: Option<Instant>,
+    /// This window asked to be closed.
+    closing: bool,
+    /// A turn heard ending only on reconnecting.
+    reopened: bool,
+}
+
+/// What a task window does once its task is done.
+#[derive(Debug, PartialEq)]
+enum DoneWindow {
+    /// Nothing: the person did not use it, and its lead closes it.
+    Lead,
+    /// It stays, saying it is done, until it loses the focus.
+    Stay,
+    /// It closes now: used, but the person has looked away already.
+    Close,
+}
+
+impl Kept {
+    /// What this window does as its task is done, by the same rule its
+    /// lead keeps it open by, the lead's mark of a use being at most an
+    /// [`used::EVERY`] older than the use: whatever the lead keeps open,
+    /// this window was used.
+    fn done(&self) -> DoneWindow {
+        let used = self
+            .used
+            .is_some_and(|used| (self.began).is_none_or(|began| used + used::EVERY >= began));
+        match (used, self.focused) {
+            (false, _) => DoneWindow::Lead,
+            (true, Some(false)) => DoneWindow::Close,
+            // A terminal that never says where the focus is: the person
+            // used it, so it stays until they type there or close it.
+            (true, _) => DoneWindow::Stay,
+        }
+    }
+}
+
+/// The line under a done task's last reply, with the mark `/status` puts
+/// on a done row.
+fn done_line() -> Line<'static> {
+    Line::from(vec![
+        status::mark(started::DONE),
+        Span::raw(started::DONE).dim(),
+    ])
+}
+
 /// Whether `event` is the person using this window: a key, a click, a
 /// paste, or the window coming to the front.
 fn used(event: &Event) -> bool {
@@ -3919,6 +3985,9 @@ struct App {
     /// When a lead's window last read whether another window marked it
     /// done, which sets its own questions aside here too.
     done_read: Option<Instant>,
+    /// A task's window, kept open by its lead once the task is done
+    /// because the person was using it.
+    kept: Kept,
     /// What the tasks this window started wait on, as their rows last
     /// read it: with no multiplexer, and so no fleet, their questions are
     /// pinned from it.
@@ -4441,6 +4510,10 @@ struct Fleet {
     /// Tasks' turns that resolved them: their window closes once the turn
     /// completes.
     resolving: resolved::Own,
+    /// When each task's newest turn began, as this window heard.
+    began: HashMap<String, std::time::SystemTime>,
+    /// When the person last used a task's window ([`used::when`]).
+    used_when: fn(&str) -> Option<std::time::SystemTime>,
     /// `[sonny] task_windows` and `task_tabs`, read as the file changes.
     windows: Arc<std::sync::Mutex<TaskWindows>>,
 }
@@ -4916,6 +4989,8 @@ impl Fleet {
             waits: Default::default(),
             returned: Vec::new(),
             resolving: Default::default(),
+            began: HashMap::new(),
+            used_when: used::when,
             windows: Default::default(),
         };
         let own = lead.to_owned();
@@ -4965,6 +5040,8 @@ impl Fleet {
             waits: Default::default(),
             returned: Vec::new(),
             resolving: Default::default(),
+            began: HashMap::new(),
+            used_when: used::when,
             windows: Default::default(),
         }
     }
@@ -5021,6 +5098,11 @@ impl Fleet {
             // A turn that ended while away is not known by number, and
             // one that started makes the last ending stale.
             self.ended.remove(name);
+            // Its newest turn began by now at the latest, running or not: a
+            // window the person uses from here on is in use once it is done.
+            if name != self.lead {
+                (self.began.entry(name.to_owned())).or_insert_with(std::time::SystemTime::now);
+            }
             if running && name != self.lead {
                 self.show(name, false);
             } else if !running
@@ -5391,6 +5473,8 @@ impl Fleet {
         match kind {
             "accepted" => {
                 self.ended.remove(bot);
+                self.began
+                    .insert(bot.to_owned(), std::time::SystemTime::now());
             }
             "turn_finished" => match (data["status"].as_str(), event["turn"].as_i64()) {
                 (Some("completed"), Some(turn)) => {
@@ -5466,7 +5550,9 @@ impl Fleet {
     }
 
     /// A task resolved, by the lead or itself: its window closes, unless
-    /// new work has it at work again.
+    /// new work has it at work again, or the person used it since the
+    /// task's newest turn began. That one stays, says it is done, and
+    /// closes itself once the person looks away from it.
     fn resolved(&mut self, task: &str) {
         if self.lineage.contains(task)
             && self.activity.get(task) != Some(&"working")
@@ -5475,7 +5561,12 @@ impl Fleet {
             // Resolved, a question it left open is set aside.
             self.needs.forget(task);
             self.ended.remove(task);
-            self.close(task);
+            // Kept until new work: marked done again, it is still in use.
+            let in_use = (self.began.get(task))
+                .is_some_and(|began| used::since((self.used_when)(task), *began));
+            if !in_use {
+                self.close(task);
+            }
             self.doing.remove(task);
             self.activity.remove(task);
             self.name_windows();
@@ -5764,6 +5855,7 @@ impl App {
             task_answers: Vec::new(),
             task_asks_read: None,
             done_read: None,
+            kept: Kept::default(),
             task_needs: Default::default(),
             reactions_key: record["bot_id"].as_i64().map(|id| {
                 let store =
@@ -5993,11 +6085,17 @@ impl App {
             // opened again on an agent whose turn failed still says so, and
             // keeps its place among the lead's windows.
             // A model that said nothing is no failure, as live.
-            let failed = match self.task_turn(&self.bot).await {
-                Ok(last) => last["status"] == "failed" && last["error"] != EMPTY,
-                Err(_) => false,
+            let (failed, ended) = match self.task_turn(&self.bot).await {
+                Ok(last) => (
+                    last["status"] == "failed" && last["error"] != EMPTY,
+                    (last["status"] == "completed" || last["error"] == EMPTY)
+                        .then(|| last["turn"].as_i64())
+                        .flatten(),
+                ),
+                Err(_) => (false, None),
             };
             self.rest = Some(if failed { "error" } else { "idle" });
+            self.rested(ended);
         }
         self.configure().await;
         self.tell_upgrades().await;
@@ -6231,6 +6329,7 @@ impl App {
             self.count_behind().await;
             self.read_tasks().await;
             self.done_elsewhere();
+            self.done_resting(false);
             if let Some(fleet) = &mut self.fleet {
                 fleet.rescan().await;
                 // What the rescan set off sounds now, not with the next
@@ -7024,6 +7123,9 @@ impl App {
             *events = fresh;
             self.down = false;
             self.notice = None;
+            // What happened while away is not known turn by turn: a kept
+            // done window stays open from here on, as any other.
+            self.kept.showing = false;
             self.context = caught.context.or(self.context);
             self.window = caught.window.or(self.window);
             self.compacted = caught.compacted.clone().or(self.compacted.take());
@@ -7041,7 +7143,11 @@ impl App {
                 let status = row["status"].as_str().unwrap_or("unknown");
                 let ended = json!({"event": "turn_finished", "bot": self.bot,
                     "turn": turn, "data": {"status": status, "error": row["error"]}});
+                // Heard ending only on reconnecting, other turns may have
+                // come and gone since: it leaves the window as it is.
+                self.kept.reopened = true;
                 self.daemon(ended).await;
+                self.kept.reopened = false;
             }
             if self.running.is_none()
                 && let Some(turn) = now
@@ -9814,6 +9920,8 @@ impl App {
                     effort: data["effort"].as_str().map(str::to_owned),
                     acted: false,
                 });
+                // New work reopens a done task: its `✓ done` stays above.
+                self.kept.showing = false;
                 // What this turn runs on and in: the bot may have moved, or
                 // a client chosen another model for it.
                 if let Some(workspace) = data["workspace"].as_str() {
@@ -10356,6 +10464,12 @@ impl App {
                 }
                 let empty = detail == EMPTY;
                 let running = self.running.take();
+                // Only a turn that ended well can leave the task done: one
+                // that failed or stopped stays open to be looked at.
+                if let Some(running) = &running {
+                    self.kept.began = Some(running.started);
+                    self.kept.ended = (status == "completed").then_some(running.turn);
+                }
                 let note = running.as_ref().is_some_and(|r| r.note);
                 let acted = running.as_ref().is_some_and(|r| r.acted);
                 let seconds = running.map(|r| r.started.elapsed().as_secs());
@@ -10424,6 +10538,10 @@ impl App {
                     }
                 }
                 self.draw_bot_reactions();
+                // A task that marked itself done in it, or its lead did.
+                if ended && let Some(turn) = turn {
+                    self.done_at(turn);
+                }
                 // Those a message lifted wait on past it.
                 self.approvals.retain(|call| !call["handle"].is_null());
                 self.notice = None;
@@ -11485,8 +11603,7 @@ impl App {
                 }
                 let action = match &mut self.pane {
                     Some(pane) if in_pane => {
-                        // A button on its first row: the margin's glance, or
-                        // the arrow back to the margin.
+                        // A button on its first row.
                         if down
                             && pane.on_title(mouse.column, mouse.row)
                             && let Some(button) = pane.head_button(mouse.column)
@@ -12086,17 +12203,6 @@ impl App {
         }
     }
 
-    /// What runs for the agent, for the margin's first row: its
-    /// background and its context.
-    fn glance(&self) -> margin::Glance {
-        margin::Glance {
-            name: self.bot.clone(),
-            failed: self.failed,
-            context: self.context,
-            window: self.window,
-        }
-    }
-
     /// A button clicked: what Sonny does for it now, or once the loop
     /// gets to it.
     fn act(&mut self, what: &str) {
@@ -12532,6 +12638,7 @@ impl App {
         if matches!(
             &event,
             Event::FocusGained
+                | Event::Paste(_)
                 | Event::Key(KeyEvent {
                     kind: KeyEventKind::Press,
                     ..
@@ -12542,6 +12649,21 @@ impl App {
                 })
         ) {
             self.window_used.used(&self.bot);
+            self.kept.used = Some(Instant::now());
+        }
+        match &event {
+            Event::FocusGained => self.kept.focused = Some(true),
+            Event::FocusLost => {
+                self.kept.focused = Some(false);
+                match self.kept.showing {
+                    // A message half typed keeps it, until sent or cleared.
+                    true if self.input.is_empty() => self.close_own(),
+                    true => {}
+                    // Marked done by its lead while it rested here.
+                    false => self.done_resting(true),
+                }
+            }
+            _ => {}
         }
         match &event {
             Event::Resize(..) => self.stale = true,
@@ -14360,6 +14482,95 @@ impl App {
         self.settle_asks();
     }
 
+    /// Whether this is a task's own window, which may be the one its lead
+    /// opened, and restored with the terminal since: never a lead's, a side
+    /// chat's or one in another's pane. It closes itself only when it is
+    /// ([`mux::Layout::close_own`]).
+    fn task_window(&self) -> bool {
+        self.fleet.is_none()
+            && self.project.is_none()
+            && self.options.side.is_none()
+            && !self.options.embedded
+            && !project::is_lead(&self.bot)
+    }
+
+    /// The task's turn `turn`, its newest, ended: once marked done up to
+    /// it, by itself or its lead, this window shows so and stays while the
+    /// person uses it ([`Kept`]), or closes, settled once a turn.
+    fn done_at(&mut self, turn: i64) {
+        if !self.task_window() || self.kept.settled == Some(turn) || self.kept.reopened {
+            return;
+        }
+        if !resolved::holds(resolved::read(&self.store(), &self.bot), Some(turn), false) {
+            return;
+        }
+        self.kept.settled = Some(turn);
+        match self.kept.done() {
+            DoneWindow::Lead => {}
+            DoneWindow::Close if self.input.is_empty() => self.close_own(),
+            DoneWindow::Close | DoneWindow::Stay => {
+                self.kept.showing = true;
+                self.commit(vec![done_line()]);
+            }
+        }
+    }
+
+    /// A task window opened on a task at rest since its turn `ended`: a
+    /// done mark its lead makes from now on is heard ([`App::done_resting`]);
+    /// one it already had is how the person found it, and this window stays
+    /// as any other.
+    fn rested(&mut self, ended: Option<i64>) {
+        let Some(turn) = ended.filter(|_| self.task_window()) else {
+            return;
+        };
+        self.kept.ended = Some(turn);
+        if resolved::holds(resolved::read(&self.store(), &self.bot), Some(turn), false) {
+            self.kept.settled = Some(turn);
+        }
+    }
+
+    /// A task at rest marked done by its lead since: read at most every
+    /// two seconds, or `now`, as the person looks away.
+    fn done_resting(&mut self, now: bool) {
+        let Some(turn) = self.kept.ended else {
+            return;
+        };
+        if self.running.is_some()
+            || self.kept.settled == Some(turn)
+            || !self.task_window()
+            || (!now && (self.kept.read).is_some_and(|at| at.elapsed() < Duration::from_secs(2)))
+        {
+            return;
+        }
+        self.kept.read = Some(Instant::now());
+        self.done_at(turn);
+    }
+
+    /// Close this task window as its lead would have, off the screen's
+    /// thread: the block it runs in, when its lead labeled it with the
+    /// task's name.
+    fn close_own(&mut self) {
+        // New work came while away, its start heard only on reconnecting,
+        // or a command of the person's runs here: the task is open again.
+        if self.running.is_some() || self.shell.is_some() {
+            self.kept.showing = false;
+            return;
+        }
+        if self.kept.closing {
+            return;
+        }
+        self.kept.closing = true;
+        let (client, me) = (self.client.clone(), self.bot.clone());
+        let host = self.options.rex_host.clone();
+        tokio::spawn(async move {
+            let project = project_of(&client, &me).await;
+            let _ = tokio::task::spawn_blocking(move || {
+                mux::here(&project, host.as_deref()).map(|mut layout| layout.close_own(&me))
+            })
+            .await;
+        });
+    }
+
     /// A lead marked done from another window, its outer lead's or a
     /// side chat's: its own questions asked up to the mark set aside here
     /// too, as its own call sets them aside. Read at most every two
@@ -15345,9 +15556,8 @@ impl App {
             let live = self.running.as_ref().map(|running| running.turn);
             let width = (pane::margin_room(at.width).saturating_sub(1) as usize).min(measure());
             let (lines, marks) = self.margin.lines(width, &workspace, live);
-            let glance = self.glance().line();
             if let Some(pane) = &mut self.pane {
-                pane.set_margin(lines, marks, glance);
+                pane.set_margin(lines, marks);
                 if let Some(pin) = self.margin_focus.take() {
                     pane.screen.show_tagged(screen::Tag::Note(pin), 1);
                 }
@@ -16486,9 +16696,9 @@ impl App {
             items.push(Item::new(Slot::Place, vec![place]));
             return footer::lay(items, width);
         }
-        // The margin's glance says these while it is in view.
-        let glancing = (self.pane.as_ref()).is_some_and(|p| p.is_margin() && p.area.width > 0);
-        if self.failed > 0 && !glancing {
+        // Every count stays here whatever the pane shows, so nothing moves
+        // as it changes.
+        if self.failed > 0 {
             let forms = footer::count("✗", Color::Red, self.failed, false);
             items.push(Item::new(Slot::Failed, forms).opens("background"));
         }
@@ -16504,16 +16714,14 @@ impl App {
             items.push(Item::new(Slot::Idle, forms).opens("status"));
         }
         let notes = self.margin.notes().len();
-        if notes > 0 && !glancing {
+        if notes > 0 {
             let forms = vec![vec![Span::raw(format!("✎ {notes}")).dim()], Vec::new()];
             items.push(Item::new(Slot::Notes, forms));
         }
         // How full the next round is, as what is left of its window: no
         // hue while there is room, then yellow, then red, and it never
         // goes once half is used.
-        if let Some(size) = self.context
-            && !glancing
-        {
+        if let Some(size) = self.context {
             let (amount, _, color) = transcript::fullness(size, self.window);
             let words = match self.window.is_some_and(|window| window > 0) {
                 true => " left",
@@ -21391,6 +21599,31 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn every_count_stays_in_the_footer_while_the_margin_shows() {
+        let client = daemon_with(json!([])).await;
+        let mut app = app(client);
+        app.failed = 1;
+        app.context = Some(900_000);
+        app.window = Some(1_000_000);
+        let before = app.footer_line(140).to_string();
+        let mut margin = pane::Pane::margin();
+        margin.area = ratatui::layout::Rect::new(104, 0, 40, 30);
+        app.pane = Some(margin);
+        let line = app.footer_line(140);
+        assert_eq!(
+            line.to_string(),
+            before,
+            "nothing moves as the pane changes"
+        );
+        assert!(
+            before.contains("✗ 1") && before.contains("10% left"),
+            "{before}"
+        );
+        let low = line.spans.iter().find(|s| s.content == "10%").unwrap();
+        assert_eq!(low.style.fg, Some(Color::Red), "the warning keeps its hue");
+    }
+
+    #[tokio::test]
     async fn a_reply_quotes_the_message_before_what_is_being_written() {
         let client = daemon_with(json!([])).await;
         let mut app = app(client);
@@ -24788,6 +25021,174 @@ mod tests {
         fleet.go_to("calc.b", true);
         fleet.layout.settle();
         assert!(windowed(&fleet).contains(&"calc.b".to_owned()));
+    }
+
+    #[tokio::test]
+    async fn a_done_task_s_window_the_person_uses_stays_and_others_close() {
+        let (client, events) = daemon_with_events(json!({}), |asked| {
+            match asked["op"].as_str().unwrap_or("") {
+                "bots" => json!({"bots": [
+                    {"name": "calc.lead", "bot_id": 1, "head": 1},
+                    {"name": "calc.c", "bot_id": 4, "created_by": "calc.lead",
+                        "running_turn": 1, "head": 4},
+                    {"name": "calc.d", "bot_id": 5, "created_by": "calc.lead", "head": 5},
+                ], "next_after": null}),
+                "approvals" => json!({"approvals": []}),
+                "turns" => json!({"turns": []}),
+                "history_nodes" => json!({"nodes": []}),
+                "history_items" => json!({"items": []}),
+                _ => json!({}),
+            }
+        })
+        .await;
+        let mut fleet = Fleet::in_memory(client, events, "calc", "calc.lead");
+        // A task running as the lead's window opens, or at rest, began
+        // its newest turn by then.
+        fleet.reconcile().await;
+        assert!(fleet.began.contains_key("calc.c"));
+        assert!(fleet.began.contains_key("calc.d"));
+        let read = (agent_client::config::path().as_ref())
+            .and_then(|path| std::fs::metadata(path).ok())
+            .and_then(|file| file.modified().ok());
+        fleet.windows = Arc::new(std::sync::Mutex::new(TaskWindows {
+            read: Some(read),
+            most: 4,
+            tabs: agent_client::config::TaskTabs::Every,
+        }));
+        // The person typed in `calc.a`'s window, not in `calc.b`'s.
+        fleet.used_when = |bot| (bot == "calc.a").then(std::time::SystemTime::now);
+        let event = |bot: &str, kind: &str, data: Value| json!({"event": kind, "bot": bot, "turn": 1, "data": data});
+        let windowed = |fleet: &Fleet| {
+            let (sent, got) = std::sync::mpsc::channel();
+            fleet.layout.send(move |layout| {
+                let labels: Vec<String> = (layout.windows().into_iter())
+                    .flat_map(|(_, labels)| labels)
+                    .collect();
+                let _ = sent.send(labels);
+            });
+            got.recv().unwrap()
+        };
+        for bot in ["calc.a", "calc.b"] {
+            fleet.lineage.insert(bot.into());
+            fleet.event(&event(bot, "accepted", json!({})));
+        }
+        fleet.layout.settle();
+        assert_eq!(windowed(&fleet), ["calc.a", "calc.b"]);
+        // Each marks itself done as its turn ends.
+        for bot in ["calc.a", "calc.b"] {
+            let call = json!({"call_id": "c1", "name": resolved::TOOL, "arguments": "{}"});
+            fleet.event(&event(bot, "tool_started", call));
+            fleet.event(&event(bot, "tool_completed", json!({"call_id": "c1"})));
+            fleet.event(&event(bot, "turn_finished", json!({"status": "completed"})));
+        }
+        fleet.layout.settle();
+        // The one in use stays, to close itself once the person looks
+        // away; the other closes as it is done.
+        assert_eq!(windowed(&fleet), ["calc.a"]);
+        assert!(!fleet.doing.contains_key("calc.a"));
+        // Its lead marks it done again: still in use, it stays.
+        fleet.resolved("calc.a");
+        fleet.layout.settle();
+        assert_eq!(windowed(&fleet), ["calc.a"]);
+    }
+
+    #[tokio::test]
+    async fn a_done_task_s_window_says_so_and_closes_once_the_person_looks_away() {
+        let client = daemon_answering(|_| json!({})).await;
+        let mut app = app(client);
+        app.options.store = std::env::temp_dir()
+            .join(unique("sonny-kept"))
+            .join("store");
+        let finished = |turn| turn_event("turn_finished", turn, json!({"status": "completed"}));
+        let done = |app: &mut App| {
+            (drawn(app).iter())
+                .filter(|line| line.trim() == "✓ done")
+                .count()
+        };
+        // Not used since its turn began: its lead closes it as ever.
+        app.daemon(turn_event("accepted", 3, json!({}))).await;
+        resolved::keep(&app.store(), "b", 3, "c1").unwrap();
+        app.daemon(finished(3)).await;
+        assert_eq!(app.kept.done(), DoneWindow::Lead);
+        assert!(!app.kept.showing && !app.kept.closing);
+        assert_eq!(done(&mut app), 0);
+        // Used, as the person sends a message there and reads the answer:
+        // it stays, saying so under the reply.
+        app.daemon(turn_event("accepted", 5, json!({}))).await;
+        app.kept.used = Some(Instant::now());
+        app.kept.focused = Some(true);
+        resolved::keep(&app.store(), "b", 5, "c2").unwrap();
+        app.daemon(finished(5)).await;
+        assert!(app.kept.showing && !app.kept.closing);
+        assert_eq!(done(&mut app), 1);
+        // A message half typed keeps it as they look away; cleared, the
+        // next look away closes it.
+        app.input.set("one more");
+        app.key(Event::FocusLost).await;
+        assert!(!app.kept.closing);
+        app.input.clear();
+        app.kept.focused = Some(true);
+        app.key(Event::FocusLost).await;
+        assert!(app.kept.closing);
+        // Typed there instead, the task reopens and the line stays.
+        app.kept.closing = false;
+        app.daemon(turn_event("accepted", 7, json!({}))).await;
+        assert!(!app.kept.showing);
+        app.daemon(finished(7)).await;
+        assert!(!app.kept.closing);
+        assert_eq!(done(&mut app), 1);
+        // Its lead marks it done at rest while the person is away: it
+        // closes as soon as it hears.
+        app.kept.focused = Some(false);
+        resolved::keep(&app.store(), "b", 7, "c3").unwrap();
+        app.done_resting(true);
+        assert!(app.kept.closing);
+        assert_eq!(done(&mut app), 1);
+        // One that marked itself done and then failed stays to be looked
+        // at, as its lead leaves it.
+        app.kept.closing = false;
+        app.daemon(turn_event("accepted", 9, json!({}))).await;
+        resolved::keep(&app.store(), "b", 9, "c4").unwrap();
+        app.daemon(turn_event(
+            "turn_finished",
+            9,
+            json!({"status": "failed", "error": "x"}),
+        ))
+        .await;
+        app.done_resting(true);
+        assert!(!app.kept.closing && !app.kept.showing);
+        // New work heard only on reconnecting: looking away leaves it open.
+        app.kept.showing = true;
+        app.running = Some(Running {
+            turn: 11,
+            started: Instant::now(),
+            phase: "Working".into(),
+            note: false,
+            effort: None,
+        });
+        app.key(Event::FocusLost).await;
+        assert!(!app.kept.closing && !app.kept.showing);
+        app.running = None;
+        // A turn heard ending only on reconnecting: nothing closes.
+        app.kept.reopened = true;
+        app.done_at(9);
+        assert!(!app.kept.closing && app.kept.settled != Some(9));
+        app.kept.reopened = false;
+        // Opened on a task at rest: a mark it already had changes nothing,
+        // one its lead makes after is heard.
+        app.kept = Kept::default();
+        app.rested(Some(9));
+        app.kept.used = Some(Instant::now());
+        app.kept.focused = Some(false);
+        app.done_resting(true);
+        assert!(!app.kept.closing);
+        app.kept = Kept::default();
+        app.rested(Some(13));
+        app.kept.used = Some(Instant::now());
+        app.kept.focused = Some(false);
+        resolved::keep(&app.store(), "b", 13, "c5").unwrap();
+        app.done_resting(true);
+        assert!(app.kept.closing);
     }
 
     #[tokio::test]
