@@ -5895,12 +5895,18 @@ impl Turn {
         // The start and what records it run apart from the turn, so a turn
         // ended meanwhile never leaves a command running that nothing
         // watches or that the store cannot find again.
-        let (registry, store) = (self.registry.clone(), self.store.clone());
+        // The cord as it is now: a pause during the setup ends it too.
+        let (registry, store, cord) = (
+            self.registry.clone(),
+            self.store.clone(),
+            self.registry.cord(),
+        );
         let environment = environment.to_vec();
         let start = tokio::spawn(async move {
             let sandboxed = sandbox.is_some();
             let started = registry
                 .detached(
+                    cord,
                     registry.stopper(id),
                     &command,
                     &folder,
@@ -6188,16 +6194,19 @@ impl Lifts {
                 workdir,
                 ..
             }) => match self.registry.queue() {
-                Ok(queued) => self.registry.background(
-                    stopper,
-                    command,
-                    Prepared::folder(&workspace, workdir.as_deref()),
-                    timeout_ms,
-                    environment,
-                    sandbox,
-                    queued,
-                    sender,
-                ),
+                Ok(queued) => {
+                    self.running_as(process, ProcessKind::Background, &command);
+                    self.registry.background(
+                        stopper,
+                        command,
+                        Prepared::folder(&workspace, workdir.as_deref()),
+                        timeout_ms,
+                        environment,
+                        sandbox,
+                        queued,
+                        sender,
+                    )
+                }
                 Err(error) => {
                     let _ = sender.send(Err(error));
                 }
@@ -6207,6 +6216,7 @@ impl Lifts {
             Ok(Prepared::Terminal {
                 command, workdir, ..
             }) => {
+                self.running_as(process, ProcessKind::Terminal, &command);
                 let registry = self.registry.clone();
                 let folder = Prepared::folder(&workspace, workdir.as_deref());
                 tokio::spawn(async move {
@@ -6263,13 +6273,17 @@ impl Lifts {
                 let (registry, store) = (self.registry.clone(), self.store.clone());
                 let folder = Prepared::folder(&workspace, workdir.as_deref());
                 tokio::spawn(async move {
-                    if let Err(error) = cord.check() {
-                        let _ = sender.send(Err(error));
-                        return;
-                    }
                     let sandboxed = sandbox.is_some();
                     let started = registry
-                        .detached(stopper, &command, &folder, &environment, sandbox, sender)
+                        .detached(
+                            cord,
+                            stopper,
+                            &command,
+                            &folder,
+                            &environment,
+                            sandbox,
+                            sender,
+                        )
                         .await;
                     if let Ok(detached) = started {
                         let _ = store
@@ -6319,6 +6333,19 @@ impl Lifts {
                 let _ = sender.send(Err(error));
             }
         }
+    }
+
+    /// Record that lifted call `process` now runs as a command of `kind`,
+    /// beside its start: its row lists it so from here.
+    fn running_as(&self, process: i64, kind: ProcessKind, command: &str) {
+        let (store, listed) = (self.store.clone(), listed(command));
+        tokio::spawn(async move {
+            let _ = store
+                .op("process_running_as", move |db| {
+                    db.process_running_as(process, kind, &listed)
+                })
+                .await;
+        });
     }
 
     /// Watch again each detached command in `rows`, which an earlier
@@ -6384,8 +6411,18 @@ impl Lifts {
             call_id.to_owned(),
             bot.to_owned(),
         );
+        // A detached command runs on past the daemon: its collector lets
+        // the store go as the daemon stops, recording no end.
+        let stopping = outlives.then(|| self.registry.until_stopping());
         tokio::spawn(async move {
-            let result = match receiver.await {
+            let received = match stopping {
+                Some(stopping) => tokio::select! {
+                    received = receiver => received,
+                    () = stopping => return,
+                },
+                None => receiver.await,
+            };
+            let result = match received {
                 Ok(result) => result,
                 Err(_) if outlives => return,
                 Err(_) => fail("process_lost"),

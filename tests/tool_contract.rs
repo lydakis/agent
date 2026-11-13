@@ -1702,7 +1702,15 @@ async fn a_tracked_detached_command_stops_on_its_handle_and_is_found_again() {
     // Its own end: how its leader exited.
     let (done, ended) = oneshot::channel();
     tools
-        .detached(tools.stopper(1), "exit 3", &dir, &[], None, done)
+        .detached(
+            tools.cord(),
+            tools.stopper(1),
+            "exit 3",
+            &dir,
+            &[],
+            None,
+            done,
+        )
         .await
         .unwrap();
     let outcome = ended.await.unwrap().unwrap();
@@ -1714,7 +1722,15 @@ async fn a_tracked_detached_command_stops_on_its_handle_and_is_found_again() {
     // Stopped on its handle, with what it started.
     let (done, ended) = oneshot::channel();
     let started = tools
-        .detached(tools.stopper(2), "exec sleep 30", &dir, &[], None, done)
+        .detached(
+            tools.cord(),
+            tools.stopper(2),
+            "exec sleep 30",
+            &dir,
+            &[],
+            None,
+            done,
+        )
         .await
         .unwrap();
     let pid = started.pid as i32;
@@ -1730,14 +1746,49 @@ async fn a_tracked_detached_command_stops_on_its_handle_and_is_found_again() {
     let (done, ended) = oneshot::channel();
     let missing = dir.join("missing");
     let error = tools
-        .detached(tools.stopper(3), "true", &missing, &[], None, done)
+        .detached(
+            tools.cord(),
+            tools.stopper(3),
+            "true",
+            &missing,
+            &[],
+            None,
+            done,
+        )
         .await
         .unwrap_err();
+    assert_eq!(ended.await.unwrap().unwrap_err(), error);
+    // A pause after the start was decided, before it ran, refuses it.
+    let (done, ended) = oneshot::channel();
+    let paused = Registry::new("shell").unwrap();
+    let cord_paused = paused.cord();
+    paused.end_running();
+    let error = paused
+        .detached(
+            cord_paused,
+            paused.stopper(3),
+            "true",
+            &dir,
+            &[],
+            None,
+            done,
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(error.code, "daemon_paused");
     assert_eq!(ended.await.unwrap().unwrap_err(), error);
     // Found again by a later registry.
     let (done, first_end) = oneshot::channel();
     let first = tools
-        .detached(tools.stopper(4), "exec sleep 30", &dir, &[], None, done)
+        .detached(
+            tools.cord(),
+            tools.stopper(4),
+            "exec sleep 30",
+            &dir,
+            &[],
+            None,
+            done,
+        )
         .await
         .unwrap();
     let later = Registry::new("shell").unwrap();
@@ -1779,7 +1830,15 @@ async fn a_tracked_detached_command_stops_on_its_handle_and_is_found_again() {
     // may have gone to another group while no daemon watched.
     let (done, _) = oneshot::channel();
     let led = tools
-        .detached(tools.stopper(6), "sleep 30 & exit 0", &dir, &[], None, done)
+        .detached(
+            tools.cord(),
+            tools.stopper(6),
+            "sleep 30 & exit 0",
+            &dir,
+            &[],
+            None,
+            done,
+        )
         .await
         .unwrap();
     assert!(gone(led.pid as i32).await, "the leader still runs");
@@ -1797,7 +1856,15 @@ async fn a_tracked_detached_command_stops_on_its_handle_and_is_found_again() {
     for id in [7, 8] {
         let (done, _) = oneshot::channel();
         let started = tools
-            .detached(tools.stopper(id), "exec sleep 30", &dir, &[], None, done)
+            .detached(
+                tools.cord(),
+                tools.stopper(id),
+                "exec sleep 30",
+                &dir,
+                &[],
+                None,
+                done,
+            )
             .await
             .unwrap();
         let (done, ended) = oneshot::channel();
@@ -1812,7 +1879,15 @@ async fn a_tracked_detached_command_stops_on_its_handle_and_is_found_again() {
     let full = async || {
         let (done, _) = oneshot::channel();
         lower
-            .detached(lower.stopper(9), "true", &dir, &[], None, done)
+            .detached(
+                lower.cord(),
+                lower.stopper(9),
+                "true",
+                &dir,
+                &[],
+                None,
+                done,
+            )
             .await
     };
     let settles = async |running: usize| {

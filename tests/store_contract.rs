@@ -20636,6 +20636,38 @@ fn running_commands_are_listed_and_a_detached_one_outlives_a_restart() {
         assert_eq!(rest, ["shop.lead"], "{page:?}");
         assert!(page.next_after.is_none());
         assert!(db.processes(None, Some(999_999)).is_err());
+        // A call a message lifted is listed as waiting until it runs, and
+        // then as what it runs, from when it started.
+        let raw = Connection::open(&path).unwrap();
+        raw.execute(
+            "INSERT INTO processes(turn,bot,call_id,status,call) VALUES (?1,'other','lift-1','running',?2)",
+            rusqlite::params![
+                other,
+                json!({"call_id":"lift-1","name":"shell","arguments":"{\"command\":\"make\"}"}).to_string()
+            ],
+        )
+        .unwrap();
+        let lifted = raw.last_insert_rowid();
+        drop(raw);
+        let row = |db: &Database| {
+            db.processes(Some("other"), None)
+                .unwrap()
+                .processes
+                .into_iter()
+                .find(|row| row["handle"] == format!("proc:{lifted}"))
+                .unwrap()
+        };
+        assert_eq!(
+            (row(&db)["kind"].clone(), row(&db)["command"].clone()),
+            (json!("call"), json!("make"))
+        );
+        assert_eq!(row(&db)["started_ms"], Value::Null);
+        db.process_running_as(lifted, ProcessKind::Background, "make")
+            .unwrap();
+        assert_eq!(row(&db)["kind"], "background");
+        assert!(row(&db)["started_ms"].as_i64().unwrap() > 0);
+        db.process_finish(lifted, &json!({"exit_code":0}), false, &[], &[])
+            .unwrap();
         // A fleet past a page is listed a page at a time, every row once.
         for call in 0..agent_runtime::store::PROCESSES_PAGE {
             db.process_start(

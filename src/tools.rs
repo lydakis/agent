@@ -120,7 +120,7 @@ impl Tool {
                 "properties":{"text":{"type":"string"}},"required":["text"],"additionalProperties":false}),
             ),
             Tool::Shell => (
-                "Run a noninteractive bash command (sh where bash is not installed) in the workspace, or in workdir when given (relative to the workspace unless absolute). stdout and stderr are returned separately; each is truncated to a head and tail beyond 64 KiB, with up to 1 MiB of it retained: past that, its first and last 512 KiB, and the command keeps running. Default timeout 120 s, maximum 600 s; with background=true there is no timeout unless timeout_ms sets one, of up to a day. A command that times out is killed and returns its output so far with timed_out. Every result reports wall_time_ms. Commands run with no terminal: TERM=dumb, NO_COLOR=1, and cat as the pager; AI_AGENT=agent tells tools an agent runs them. When the command returns or times out, every process it started is killed, so `cmd &` does not outlive it. With background=true the command is started and a proc handle is returned immediately; collect its result later with wait. If no wait collects it, its end comes as a message once no turn of yours runs: {\"finished\":{\"proc:N\":{how it ended}}}; wait on the handle reads the output. A steer that arrives while a command runs moves it to the background: the result is its proc handle with steered=true, and the command keeps running. A background command runs until it exits, its timeout_ms passes, kill=true on its handle stops it, or the daemon stops. With detach=true the command starts in its own session and a proc handle and its pid are returned at once; it outlives the turn and the daemon and runs until it exits, a pause, or kill=true on its handle. Its output is discarded unless the command redirects it to a file; its end comes as a background command's does. \"$AGENT_BIN\" ps --bot \"$AGENT_BOT\" lists your commands still running. With tty=true it runs in a terminal, for a REPL or a program that prompts: the result is what it wrote within yield_time_ms (default 1000) and, while it runs, a proc handle for write_stdin.",
+                "Run a noninteractive bash command (sh where bash is not installed) in the workspace, or in workdir when given (relative to the workspace unless absolute). stdout and stderr are returned separately; each is truncated to a head and tail beyond 64 KiB, with up to 1 MiB of it retained: past that, its first and last 512 KiB, and the command keeps running. Default timeout 120 s, maximum 600 s; with background=true there is no timeout unless timeout_ms sets one, of up to a day. A command that times out is killed and returns its output so far with timed_out. Every result reports wall_time_ms. Commands run with no terminal: TERM=dumb, NO_COLOR=1, and cat as the pager; AI_AGENT=agent tells tools an agent runs them. When the command returns or times out, every process it started is killed, so `cmd &` does not outlive it. With background=true the command is started and a proc handle is returned immediately; collect its result later with wait. If no wait collects it, its end comes as a message once no turn of yours runs: {\"finished\":{\"proc:N\":{how it ended}}}; wait on the handle reads the output. A steer that arrives while a command runs moves it to the background: the result is its proc handle with steered=true, and the command keeps running. A background command runs until it exits, its timeout_ms passes, kill=true on its handle stops it, or the daemon stops. With detach=true the command starts in its own session and a proc handle and its pid are returned at once; it outlives the turn and the daemon and runs until it exits, a pause, or kill=true on its handle. Its output is discarded unless the command redirects it to a file; its end comes as a background command's does. With tty=true it runs in a terminal, for a REPL or a program that prompts: the result is what it wrote within yield_time_ms (default 1000) and, while it runs, a proc handle for write_stdin.",
                 json!({"type":"object","properties":{"command":{"type":"string"},
                 "workdir":{"type":"string"},
                 "timeout_ms":{"type":"integer","minimum":1,"maximum":MAX_BACKGROUND_TIMEOUT_MS},
@@ -2116,8 +2116,16 @@ impl Registry {
             // `detached`.
             Prepared::Detach { command, workdir } => {
                 let folder = Prepared::folder(workspace, workdir.as_deref());
-                let Detached { pid, .. } =
-                    detach(&command, &folder, self, environment, sandbox, None).await?;
+                let Detached { pid, .. } = detach(
+                    self.cord(),
+                    &command,
+                    &folder,
+                    self,
+                    environment,
+                    sandbox,
+                    None,
+                )
+                .await?;
                 Ok(Outcome::text(
                     json!({"detached":true,"pid":pid}).to_string(),
                 ))
@@ -2537,8 +2545,10 @@ impl Registry {
     /// daemon, and its end goes to `done` once nothing it left in its
     /// group runs, if this daemon still does. One that does not start
     /// sends its error there too.
+    #[allow(clippy::too_many_arguments)]
     pub async fn detached(
         &self,
+        cord: Cord,
         stopper: Stopper,
         command: &str,
         workspace: &Path,
@@ -2548,6 +2558,7 @@ impl Registry {
     ) -> Result<Detached> {
         let tracked = Tracked { stopper, done };
         detach(
+            cord,
             command,
             workspace,
             self,
@@ -2631,6 +2642,14 @@ impl Registry {
     pub fn end_running(&self) {
         self.pulls.send_modify(|pulls| *pulls += 1);
         self.end_terminals();
+    }
+
+    /// Resolves once the daemon stops.
+    pub fn until_stopping(&self) -> impl Future<Output = ()> + use<> {
+        let mut stopping = self.stopping.subscribe();
+        async move {
+            let _ = stopping.wait_for(|stopping| *stopping).await;
+        }
     }
 
     /// End every background command still running, as the daemon stops.
@@ -3199,6 +3218,7 @@ pub struct Tracked {
 /// it left in its group runs either.
 #[cfg(unix)]
 async fn detach(
+    cord: Cord,
     command: &str,
     workspace: &Path,
     registry: &Registry,
@@ -3206,7 +3226,13 @@ async fn detach(
     sandbox: Option<Arc<Policy>>,
     tracked: Option<Tracked>,
 ) -> Result<Detached> {
-    let spawned = spawn_detached(command, workspace, registry, environment, sandbox).await;
+    // The cord as it was when the start was decided: a pull since, during
+    // the setup too, ends the command as soon as its watcher has it.
+    let Cord(pulls, _) = cord;
+    let spawned = match Cord(pulls.clone(), registry.stopping.subscribe()).check() {
+        Ok(()) => spawn_detached(command, workspace, registry, environment, sandbox).await,
+        Err(error) => Err(error),
+    };
     let (child, detached, sandboxed, started, held) = match spawned {
         Ok(spawned) => spawned,
         // A command that never started ends here, as its own call says.
@@ -3220,7 +3246,6 @@ async fn detach(
     // The watcher owns the child from here, before anything is awaited:
     // a caller dropped meanwhile leaves no command that nothing watches.
     let (read, since) = tokio::sync::oneshot::channel();
-    let pulls = registry.pulls.subscribe();
     tokio::spawn(async move {
         // Its leader's start, read off the runtime thread as every file is.
         let pid = detached.pid;
@@ -3577,6 +3602,7 @@ async fn end_namespace(_: u32) {}
 
 #[cfg(not(unix))]
 async fn detach(
+    _: Cord,
     _: &str,
     _: &Path,
     _: &Registry,

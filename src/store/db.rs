@@ -11795,6 +11795,23 @@ impl Database {
             ])?;
         Ok(())
     }
+    /// Record that `id`, a call a message lifted, now runs as a command
+    /// of `kind`: what it runs and when it started, which its row lacked
+    /// while it waited.
+    pub fn process_running_as(&mut self, id: i64, kind: ProcessKind, command: &str) -> Result<()> {
+        self.conn
+            .prepare_cached(
+                "UPDATE processes SET kind=?2,command=ifnull(command,?3),
+                 started_ms=ifnull(started_ms,?4) WHERE id=?1 AND status='running'",
+            )?
+            .execute(params![
+                id,
+                kind.name(),
+                listed_command(command),
+                epoch_ms()
+            ])?;
+        Ok(())
+    }
     /// The detached commands an earlier daemon started that were running
     /// when it last knew: each one's handle, bot, turn and call, what finds
     /// it again, whether a sandbox holds it, and when it started.
