@@ -6077,11 +6077,17 @@ impl App {
             // opened again on an agent whose turn failed still says so, and
             // keeps its place among the lead's windows.
             // A model that said nothing is no failure, as live.
-            let failed = match self.task_turn(&self.bot).await {
-                Ok(last) => last["status"] == "failed" && last["error"] != EMPTY,
-                Err(_) => false,
+            let (failed, ended) = match self.task_turn(&self.bot).await {
+                Ok(last) => (
+                    last["status"] == "failed" && last["error"] != EMPTY,
+                    (last["status"] == "completed" || last["error"] == EMPTY)
+                        .then(|| last["turn"].as_i64())
+                        .flatten(),
+                ),
+                Err(_) => (false, None),
             };
             self.rest = Some(if failed { "error" } else { "idle" });
+            self.rested(ended);
         }
         self.configure().await;
         self.tell_upgrades().await;
@@ -14481,6 +14487,20 @@ impl App {
         }
     }
 
+    /// A task window opened on a task at rest since its turn `ended`: a
+    /// done mark its lead makes from now on is heard ([`App::done_resting`]);
+    /// one it already had is how the person found it, and this window stays
+    /// as any other.
+    fn rested(&mut self, ended: Option<i64>) {
+        let Some(turn) = ended.filter(|_| self.task_window()) else {
+            return;
+        };
+        self.kept.ended = Some(turn);
+        if resolved::holds(resolved::read(&self.store(), &self.bot), Some(turn), false) {
+            self.kept.settled = Some(turn);
+        }
+    }
+
     /// A task at rest marked done by its lead since: read at most every
     /// two seconds, or `now`, as the person looks away.
     fn done_resting(&mut self, now: bool) {
@@ -14502,6 +14522,12 @@ impl App {
     /// thread: the block it runs in, when its lead labeled it with the
     /// task's name.
     fn close_own(&mut self) {
+        // New work came while away, its start heard only on reconnecting:
+        // the task is open again.
+        if self.running.is_some() {
+            self.kept.showing = false;
+            return;
+        }
         if self.kept.closing {
             return;
         }
@@ -25011,6 +25037,33 @@ mod tests {
         .await;
         app.done_resting(true);
         assert!(!app.kept.closing && !app.kept.showing);
+        // New work heard only on reconnecting: looking away leaves it open.
+        app.kept.showing = true;
+        app.running = Some(Running {
+            turn: 11,
+            started: Instant::now(),
+            phase: "Working".into(),
+            note: false,
+            effort: None,
+        });
+        app.key(Event::FocusLost).await;
+        assert!(!app.kept.closing && !app.kept.showing);
+        app.running = None;
+        // Opened on a task at rest: a mark it already had changes nothing,
+        // one its lead makes after is heard.
+        app.kept = Kept::default();
+        app.rested(Some(9));
+        app.kept.used = Some(Instant::now());
+        app.kept.focused = Some(false);
+        app.done_resting(true);
+        assert!(!app.kept.closing);
+        app.kept = Kept::default();
+        app.rested(Some(13));
+        app.kept.used = Some(Instant::now());
+        app.kept.focused = Some(false);
+        resolved::keep(&app.store(), "b", 13, "c5").unwrap();
+        app.done_resting(true);
+        assert!(app.kept.closing);
     }
 
     #[tokio::test]
