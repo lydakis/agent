@@ -936,6 +936,31 @@ fn kept_older(options: &Options) -> Option<&'static str> {
     }
 }
 
+/// Whether this agent runs inside a bot's turn on the store that turn's
+/// daemon serves, which its shell inherits as `AGENT_STORE`: there it
+/// never starts a daemon, as it never replaces one ([`kept_older`]). A
+/// daemon on a store of the bot's own it starts as anyone would.
+fn turn_s_store(options: &Options) -> bool {
+    let inherited = (std::env::var_os("AGENT_BOT_ID").is_some())
+        .then(|| std::env::var_os("AGENT_STORE"))
+        .flatten()
+        .filter(|store| !store.is_empty());
+    inherited.is_some_and(|inherited| same_store(Path::new(&inherited), &options.store))
+}
+
+/// Whether `a` and `b` name one store: each by its real path, or, where
+/// it is not there yet, its folder's real path and its name.
+fn same_store(a: &Path, b: &Path) -> bool {
+    let resolved = |path: &Path| {
+        let path = std::path::absolute(path).ok()?;
+        std::fs::canonicalize(&path).ok().or_else(|| {
+            let folder = path.parent()?.canonicalize().ok()?;
+            Some(folder.join(path.file_name()?))
+        })
+    };
+    resolved(a).is_some_and(|a| Some(a) == resolved(b))
+}
+
 /// Why an older daemon is kept when no provider is set to start a new one.
 const NO_PROVIDER_KEPT: &str = "nothing was sent: replacing it starts a new daemon, which needs a \
      provider (--provider, AGENT_PROVIDER, a provider key, or `provider` in config.toml)";
@@ -1049,7 +1074,7 @@ pub struct Lent {
 
 /// Ask the daemon `flags` name (`--store`, `--socket`, else as any command
 /// finds it) to lend bot `bot`'s sandbox, starting it as a command on a
-/// bot does.
+/// bot does, unless `--no-spawn` is among them.
 pub fn lend(flags: &[String], bot: &str, bot_id: Option<i64>) -> Result<Lent> {
     let args: Vec<String> = std::iter::once("sandbox".to_owned())
         .chain(flags.iter().cloned())
@@ -1089,6 +1114,19 @@ fn connect_or_start(options: &Options) -> Result<Connection> {
     startup_remaining(deadline)?;
     if options.no_spawn {
         return fail_with("daemon_unavailable", options.socket.display().to_string());
+    }
+    if turn_s_store(options) {
+        return fail_with(
+            "daemon_unavailable",
+            format!(
+                "{}: no daemon answers for the store this bot's turn runs on, and a command \
+                 from inside a bot's turn does not start one there, since the daemon it \
+                 started would be this agent's build in the person's own one's place. \
+                 `agent start` from outside any bot's turn starts it; a daemon of the \
+                 bot's own takes a --store of its own",
+                options.socket.display()
+            ),
+        );
     }
     let start = Start::read(options)?;
     if start.providers.is_empty() {

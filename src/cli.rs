@@ -236,8 +236,8 @@ const COMMANDS: &[Command] = &[
     Command {
         name: "sandbox",
         about: "Run a command in a sandbox: read-only, writing only the folders named, or as one of a bot's commands",
-        usage: "sandbox [--writable PATH]... [--bot NAME [--bot-id ID]] -- COMMAND [ARGS...]",
-        flags: "--writable --bot --bot-id",
+        usage: "sandbox [--writable PATH]... [--bot NAME [--bot-id ID] [--no-spawn]] -- COMMAND [ARGS...]",
+        flags: "--writable --bot --bot-id --no-spawn",
         settings: "",
         startup: false,
     },
