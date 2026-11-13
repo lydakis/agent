@@ -716,9 +716,10 @@ async fn judge(
                         true => policy::unseen(verdict),
                         false => verdict,
                     };
-                    Some(match call.own_home {
-                        true => policy::own_home(verdict),
-                        false => verdict,
+                    Some(match (call.own_home, call.starts_daemon) {
+                        (true, _) => policy::own_home(verdict),
+                        (_, true) => policy::starts_daemon(verdict),
+                        _ => verdict,
                     })
                 })
                 .collect::<Option<Vec<_>>>()
@@ -875,6 +876,20 @@ fn reaches_home(
         }
         _ => false,
     }
+}
+
+/// Whether a planned call may start a daemon outside its sandbox: a
+/// command that runs unconfined (escalated, or the bot has no sandbox)
+/// whose words run `agent` that way ([`policy::names_daemon_start`]). One
+/// in the sandbox starts at most a daemon that can do nothing its sandbox
+/// doesn't allow.
+fn starts_daemon(tool: &str, arguments: &Value, confined: bool) -> bool {
+    if tool != "shell" || (confined && arguments["sandbox_permissions"] != "require_escalated") {
+        return false;
+    }
+    let mut text = String::new();
+    strings(arguments, &mut text);
+    policy::names_daemon_start(&text)
 }
 
 /// The files a patch names on its file lines. Also read from a cut
@@ -1098,6 +1113,7 @@ async fn intent(
             files: Vec::new(),
             unseen,
             own_home: false,
+            starts_daemon: false,
         });
     }
     let mut allowed = Vec::new();
@@ -1317,6 +1333,7 @@ async fn intent(
         .map_err(|_| Unjudged::Failed)?;
         for (call, flag) in planned.iter_mut().zip(flags) {
             call.own_home = flag;
+            call.starts_daemon = starts_daemon(&call.tool, &call.arguments, confined);
         }
     }
     let instructions = match &workspace {
@@ -1677,6 +1694,19 @@ mod tests {
         assert!(reaches(
             "shell",
             json!({"command": format!("touch {job}")}),
+            false
+        ));
+        // A daemon started outside the sandbox waits for the person too;
+        // one in it is the sandbox's.
+        let side = json!({"command": "agent start --store /tmp/side.sqlite"});
+        assert!(!starts_daemon("shell", &side, true));
+        assert!(starts_daemon("shell", &side, false));
+        let mut escalated_side = side.clone();
+        escalated_side["sandbox_permissions"] = json!("require_escalated");
+        assert!(starts_daemon("shell", &escalated_side, true));
+        assert!(!starts_daemon(
+            "write",
+            &json!({"path": "x", "content": "agent serve"}),
             false
         ));
         // Named from a workdir in the home.
