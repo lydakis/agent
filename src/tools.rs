@@ -2648,6 +2648,11 @@ impl Registry {
                 for path in patch.paths() {
                     writable(sandbox.clone(), &resolve(workspace, path), path).await?;
                 }
+                // A removal happens here, outside the sandbox: the name
+                // removed, a link too, must be one the bot may write.
+                for path in patch.removed() {
+                    removable(sandbox.clone(), &resolve(workspace, path), path).await?;
+                }
                 let staged = patch.stage(workspace).await?;
                 // A process slot only while the sandbox's helper writes.
                 let _held = crate::sandbox::hold_for(sandbox.as_deref()).await;
@@ -3528,11 +3533,25 @@ fn resolve(workspace: &Path, path: &str) -> PathBuf {
 /// command in it would be refused. Resolving the target reads the
 /// filesystem, so it runs off the runtime thread.
 async fn writable(sandbox: Option<Arc<Policy>>, target: &Path, path: &str) -> Result<()> {
+    allowed(sandbox, target, path, Policy::can_write).await
+}
+
+/// [`writable`], for removing `target` itself rather than writing through it.
+async fn removable(sandbox: Option<Arc<Policy>>, target: &Path, path: &str) -> Result<()> {
+    allowed(sandbox, target, path, Policy::can_remove).await
+}
+
+async fn allowed(
+    sandbox: Option<Arc<Policy>>,
+    target: &Path,
+    path: &str,
+    check: fn(&Policy, &Path) -> bool,
+) -> Result<()> {
     let Some(policy) = sandbox else {
         return Ok(());
     };
     let target = target.to_owned();
-    let allowed = tokio::task::spawn_blocking(move || policy.can_write(&target))
+    let allowed = tokio::task::spawn_blocking(move || check(&policy, &target))
         .await
         .unwrap_or(false);
     match allowed {

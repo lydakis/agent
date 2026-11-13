@@ -218,6 +218,20 @@ impl Patch {
         Ok(Patch { changes })
     }
 
+    /// Every path the patch removes, as written in it: each deleted file
+    /// and the source of each move.
+    pub fn removed(&self) -> impl Iterator<Item = &str> {
+        self.changes.iter().filter_map(|change| match change {
+            Change::Delete { path } => Some(path.as_str()),
+            Change::Update {
+                path,
+                move_to: Some(_),
+                ..
+            } => Some(path.as_str()),
+            _ => None,
+        })
+    }
+
     /// Every path the patch writes or removes, as written in it: each
     /// added, updated and deleted file, and both ends of a move. Nothing
     /// is touched before a caller has seen them all.

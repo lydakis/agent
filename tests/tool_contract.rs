@@ -877,6 +877,24 @@ async fn a_sandboxed_command_writes_only_its_roots() {
         std::fs::read_to_string(dir.join("notes/b.md")).unwrap(),
         "x\n"
     );
+    // A link in a kept folder is not removed for pointing at a file the bot
+    // may write.
+    std::fs::create_dir_all(repo.join(".git/hooks")).unwrap();
+    let hook = repo.join(".git/hooks/pre-commit");
+    std::os::unix::fs::symlink(dir.join("notes/b.md"), &hook).unwrap();
+    let delete = format!(
+        "*** Begin Patch\n*** Delete File: {}\n*** End Patch",
+        hook.display()
+    );
+    let delete = tools
+        .prepare("apply_patch", &json!({ "input": delete }).to_string())
+        .unwrap();
+    let error = tools
+        .execute(delete, &dir, &[], Some(policy.clone()))
+        .await
+        .unwrap_err();
+    assert_eq!(error.code, "write_denied");
+    assert!(hook.symlink_metadata().is_ok());
     std::fs::remove_dir_all(base).unwrap();
 }
 
