@@ -67,9 +67,17 @@ keeps PATH, by its absolute path, read-only in every sandbox and from being
 made there; the CLI passes `~/.agent/rules`, where Sonny reads the
 [command rules](RUST_PROTOTYPE.md#command-rules) it gives its bots, so no
 bot writes its own. `serve --wall FOLDER` keeps every sandboxed command,
-the network on or not, from the Unix sockets in FOLDER, which it makes
-private if missing; the CLI passes `~/.agent/run`, where clients such as
-Sonny keep the sockets of programs they run for bots outside the sandbox.
+the network on or not, from connecting to the Unix sockets in FOLDER,
+which it makes private (mode 700) if missing; the CLI passes
+`~/.agent/run`, where clients such as Sonny keep the sockets of programs
+they run for bots outside the sandbox. It is a wall for sockets, not a
+way to hide files. On Linux the folder shows empty to a sandboxed command,
+since bubblewrap mounts an empty read-only folder over it, but on macOS
+Seatbelt only refuses connections to its sockets and hard links into it,
+so its files stay readable; and the `read` tool, which the daemon answers
+itself outside any sandbox, reads them on both. What a sandbox closes and
+what it leaves open is summed up in
+[Sonny's README](../sonny/README.md#what-the-sandbox-closes).
 The daemon's [limits](RUST_PROTOTYPE.md#limits) come from `[daemon]` in
 `~/.agent/config.toml` where the command line sets none, each a number or
 a formula of the machine, as `processes = "cpus * 64"` or

@@ -898,6 +898,26 @@ has something on it, or is off the screen, no time shows.
   agent reaches the daemon's own socket, only its own, through which the
   `agent` and `sonny` commands work as that agent.
 
+  <a id="what-the-sandbox-closes"></a>**What the sandbox closes.** In every
+  row but Full access, a command can't write outside the agent's folder
+  and the folders its row adds (`/tmp`, the zen and state folders, and its
+  `writable` list), can't change the repository's hooks and config,
+  `~/.agents` or `~/.agent/rules`, and can't reach the daemon's socket,
+  other agents' sockets, or those of the programs Sonny runs for agents
+  outside the sandbox (`~/.agent/run`). It leaves open reads of anything
+  you can read, as Codex's `workspace-write` does, your SSH keys, cloud
+  credentials and other projects included; the network, in every row but
+  Read only; and, while the network is on, every other Unix socket that a
+  program signed in as you listens on, such as ssh-agent, MCPX and
+  Docker, each of which acts as you. So the sandbox keeps an agent from
+  doing damage by mistake, not from following instructions it read. For an
+  agent that reads untrusted content from outside, such as web pages,
+  issues or email, use a row of your own with `network = false`, as
+  `strict` above, and `unix_sockets` naming only the sockets it needs (on
+  Linux a row that names any reaches them all): with no network it can't
+  send what it read anywhere, and with no sockets it can't ask a program
+  outside to act for it.
+
   A call that waits on you is written out as Codex's approval shows it:
   `⏸ Allow shell?`, the agent's own reason for it as `Reason:`, the
   command, and what the reviewer doubted, whole. The calls of your lead's
