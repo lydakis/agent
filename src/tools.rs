@@ -1199,19 +1199,33 @@ fn open_field_within(text: &[u8], fields: &[String], window: usize) -> Open {
         if quote.is_some() {
             j += 1;
         }
-        let ended = tail[j..].iter().any(|&b| match quote {
-            Some(q) => b == q || b == b'\n',
-            None => {
-                b.is_ascii_whitespace() || matches!(b, b',' | b';' | b'"' | b'\'' | b'}' | b']')
+        // Where its value ends, read as `redact_fields` reads it: an
+        // escaped quote is part of a quoted value.
+        let value = j;
+        while j < tail.len() {
+            let b = tail[j];
+            let ends = match quote {
+                Some(q) => b == q || b == b'\n',
+                None => {
+                    b.is_ascii_whitespace() || matches!(b, b',' | b';' | b'"' | b'\'' | b'}' | b']')
+                }
+            };
+            if ends {
+                break;
             }
-        });
-        if !ended {
+            j = match (quote, b) {
+                (Some(_), b'\\') => j + 2,
+                _ => j + 1,
+            };
+        }
+        if j >= tail.len() {
             return Open {
                 name,
-                value: tail.len() - j,
+                value: tail.len() - value,
                 quote,
             };
         }
+        i = j;
     }
     Open::default()
 }
@@ -3225,9 +3239,10 @@ pub struct Spill {
     pub usable: Arc<dyn Fn() -> bool + Send + Sync>,
 }
 
-/// A stream's writer: what was read goes to it in pieces, on a blocking
-/// worker, so the runtime's thread never waits on the disk. A full line of
-/// pieces makes the reader wait, and the command with it.
+/// A stream's writer: what was read goes to it in pieces, written in
+/// batches on blocking workers, so the runtime's thread never waits on the
+/// disk. A full line of pieces makes the reader wait, and the command with
+/// it.
 struct Writer {
     /// Closed once the writer stops taking more: at its bound, or failed.
     pieces: Option<tokio::sync::mpsc::Sender<Vec<u8>>>,
@@ -3268,9 +3283,7 @@ impl Captured {
             first.extend_from_slice(&self.head);
             first.extend(self.tail.iter());
             let (pieces, received) = tokio::sync::mpsc::channel(SPILL_PIECES);
-            let done = tokio::task::spawn_blocking(move || {
-                spill_stream(&spill, stream, &credentials, first, received)
-            });
+            let done = tokio::spawn(spill_stream(spill, stream, credentials, first, received));
             self.writer = Some(Writer {
                 pieces: Some(pieces),
                 done,
@@ -3343,57 +3356,125 @@ impl Captured {
 /// Write a stream whole to its file in `spill`'s folder, redacted as it
 /// goes: `first`, then each piece as it comes, up to `SPILL_BYTES`. None
 /// when the folder may not hold it or a write fails, the file removed, and
-/// the stream's bounded copy is kept as before. Run on a blocking worker.
-fn spill_stream(
-    spill: &Spill,
+/// the stream's bounded copy is kept as before. The disk is used only on
+/// blocking workers, a batch of pieces at a time: none is held while the
+/// command writes nothing, so idle streams never fill the blocking pool.
+async fn spill_stream(
+    spill: Spill,
     stream: &'static str,
-    credentials: &Credentials,
+    credentials: Credentials,
     first: Vec<u8>,
     mut pieces: tokio::sync::mpsc::Receiver<Vec<u8>>,
 ) -> Option<Spilled> {
-    use std::io::Write;
-    use std::os::unix::fs::OpenOptionsExt;
-    if !(spill.usable)() {
-        return None;
-    }
-    let path = spill.folder.join(format!("{}-{stream}", spill.name));
-    let file = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .custom_flags(libc::O_NOFOLLOW)
-        .open(&path)
-        .ok()?;
-    let mut out = std::io::BufWriter::with_capacity(256 << 10, file);
-    let mut redacting = Redacting::new(credentials.clone());
-    let mut saved = 0u64;
-    let mut piece = Some(first);
-    let written = (|| {
-        while let Some(bytes) = piece.take() {
-            let fits = (bytes.len() as u64).min(SPILL_BYTES - saved) as usize;
-            out.write_all(redacting.feed(&bytes[..fits]).as_bytes())?;
-            saved += fits as u64;
-            if fits < bytes.len() {
-                break;
-            }
-            piece = pieces.blocking_recv();
+    let folder = spill.folder.clone();
+    let mut file =
+        tokio::task::spawn_blocking(move || SpillFile::open(&spill, stream, credentials))
+            .await
+            .ok()??;
+    let mut batch = vec![first];
+    loop {
+        let (back, full) = tokio::task::spawn_blocking(move || {
+            let full = file.write(&batch)?;
+            Some((file, full))
+        })
+        .await
+        .ok()??;
+        file = back;
+        if full {
+            break;
         }
-        // Past the bound the reader stops sending once this end closes.
-        pieces.close();
-        out.write_all(redacting.finish().as_bytes())?;
-        out.flush()?;
-        // On disk before the store records it, its name with it.
-        out.get_ref().sync_all()?;
-        std::fs::File::open(&spill.folder)?.sync_all()
-    })();
-    if written.is_err() {
-        let _ = std::fs::remove_file(&path);
-        return None;
+        let Some(piece) = pieces.recv().await else {
+            break;
+        };
+        batch = vec![piece];
+        while batch.len() < SPILL_PIECES
+            && let Ok(piece) = pieces.try_recv()
+        {
+            batch.push(piece);
+        }
     }
+    // Past the bound the reader stops sending once this end closes.
+    pieces.close();
+    let (path, saved) = tokio::task::spawn_blocking(move || file.close(&folder))
+        .await
+        .ok()??;
     Some(Spilled {
         files: Files::new(vec![(stream, path.to_str()?.to_owned())]),
         saved,
     })
+}
+
+/// A stream's file while it is written, used on blocking workers only.
+struct SpillFile {
+    path: PathBuf,
+    out: std::io::BufWriter<std::fs::File>,
+    redacting: Redacting,
+    saved: u64,
+}
+
+impl SpillFile {
+    fn open(spill: &Spill, stream: &'static str, credentials: Credentials) -> Option<Self> {
+        use std::os::unix::fs::OpenOptionsExt;
+        if !(spill.usable)() {
+            return None;
+        }
+        let path = spill.folder.join(format!("{}-{stream}", spill.name));
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(&path)
+            .ok()?;
+        Some(SpillFile {
+            path,
+            out: std::io::BufWriter::with_capacity(256 << 10, file),
+            redacting: Redacting::new(credentials),
+            saved: 0,
+        })
+    }
+
+    /// Write `batch`, redacted, up to `SPILL_BYTES`: whether that bound
+    /// was reached, or None, the file removed, when a write failed.
+    fn write(&mut self, batch: &[Vec<u8>]) -> Option<bool> {
+        use std::io::Write;
+        for bytes in batch {
+            let fits = (bytes.len() as u64).min(SPILL_BYTES - self.saved) as usize;
+            let told = self.redacting.feed(&bytes[..fits]);
+            if self.out.write_all(told.as_bytes()).is_err() {
+                let _ = std::fs::remove_file(&self.path);
+                return None;
+            }
+            self.saved += fits as u64;
+            if fits < bytes.len() {
+                return Some(true);
+            }
+        }
+        Some(false)
+    }
+
+    /// Finish the file, on disk with its name in `folder` before the store
+    /// records it: its path and how many bytes of the stream it holds.
+    fn close(self, folder: &Path) -> Option<(PathBuf, u64)> {
+        use std::io::Write;
+        let SpillFile {
+            path,
+            mut out,
+            redacting,
+            saved,
+        } = self;
+        let written = (|| {
+            out.write_all(redacting.finish().as_bytes())?;
+            out.flush()?;
+            out.get_ref().sync_all()?;
+            std::fs::File::open(folder)?.sync_all()
+        })();
+        if written.is_err() {
+            let _ = std::fs::remove_file(&path);
+            return None;
+        }
+        Some((path, saved))
+    }
 }
 
 /// Append a pipe's output to `captured` until it closes. What arrived stays
@@ -4402,14 +4483,16 @@ mod tests {
     fn a_stream_redacted_in_pieces_reads_as_the_whole_redacted() {
         let credentials = Credentials::default();
         credentials.set("TOKEN", "tok3n-fake-fake-fake9");
-        let fields = ["password", "api_key", "SessionToken"].map(String::from);
+        let fields = ["password", "api_key", "SessionToken", "sesame"].map(String::from);
         credentials.redact_also(&fields, &["PRIVATE KEY".to_owned()]);
         let text = "start tok3n-fake-fake-fake9 é\npassword: fake8fake8fake8\n\
             {\"api_key\": \"fake9fake9fake9x\", \"n\": 1}\nexport AWS_SESSION_TOKEN=abc123def456ghi\n\
             -----BEGIN RSA PRIVATE KEY-----\nMIIEsecret\nAAAA\n-----END RSA PRIVATE KEY-----\n\
-            -----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----\nend tok3n-fake-fake-fake9";
+            -----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----\n\
+            sesame=\"abc123def\\\"ghi456hidden789suffix\" shown\nend tok3n-fake-fake-fake9";
         let whole = credentials.redact(text.to_owned());
         assert!(!whole.contains("fake8") && !whole.contains("fake9") && !whole.contains("abc123"));
+        assert!(!whole.contains("hidden789") && whole.contains("shown"));
         assert!(!whole.contains("secret") && whole.contains("MIIB"));
         for size in 1..=text.len() {
             let mut redacting = Redacting::new(credentials.clone());
@@ -4642,11 +4725,7 @@ mod tests {
         let value: serde_json::Value = serde_json::from_str(&outcome.output).unwrap();
         let shown = value["stdout"].as_str().unwrap();
         assert!(shown.len() < PREVIEW_BYTES, "{}", shown.len());
-        assert!(
-            shown.starts_with("sesame=[REDACTED]\n"),
-            "{}",
-            &shown[..60]
-        );
+        assert!(shown.starts_with("sesame=[REDACTED]\n"), "{}", &shown[..60]);
         assert!(shown.contains("bytes not shown here: they are in this stream's file"));
         assert!(shown.ends_with("the full output is retained: see this result's artifacts and read them with the read tool ...]"));
         let [(_, file)] = &outcome.files[..] else {

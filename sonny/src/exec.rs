@@ -1150,8 +1150,10 @@ enum Sink {
     /// not be opened.
     File(PathBuf, Option<Result<Saving, String>>),
     /// Kept to hand back to the machine that called over a link, under the
-    /// name of its file there, up to `LENT_BYTES`.
-    Sent(PathBuf, Option<String>),
+    /// name of its file there, up to `LENT_BYTES`, and whether it reached
+    /// that bound: past it nothing more is kept, so the kept bytes stay the
+    /// output's start.
+    Sent(PathBuf, Option<String>, bool),
 }
 
 /// The most of an output a saved file holds: a sanity bound on a script
@@ -1247,7 +1249,7 @@ impl Output {
         let sink = match whole {
             Whole::Saved(Some(dir)) => Sink::File(dir.join("output"), None),
             Whole::Saved(None) => Sink::Dropped,
-            Whole::Sent(named, _) => Sink::Sent(named.to_path_buf(), None),
+            Whole::Sent(named, _) => Sink::Sent(named.to_path_buf(), None, false),
         };
         Output {
             window: tokens.saturating_mul(4).min(OUTPUT_BYTES),
@@ -1316,7 +1318,7 @@ impl Output {
                 }
                 *saving = Some(opened);
             }
-            Sink::Sent(_, whole) => *whole = Some(head.to_owned()),
+            Sink::Sent(_, whole, _) => *whole = Some(head.to_owned()),
         }
     }
 
@@ -1325,12 +1327,14 @@ impl Output {
             Sink::Dropped => {}
             Sink::File(_, Some(Ok(saving))) => saving.write(text, at),
             Sink::File(..) => {}
-            Sink::Sent(_, whole) => {
-                if let Some(whole) = whole {
-                    let room = LENT_BYTES.saturating_sub(whole.len());
-                    whole.push_str(&text[..floor(text, room.min(text.len()))]);
+            Sink::Sent(_, Some(whole), full @ false) => {
+                let room = LENT_BYTES.saturating_sub(whole.len());
+                if room < text.len() {
+                    *full = true;
                 }
+                whole.push_str(&text[..floor(text, room.min(text.len()))]);
             }
+            Sink::Sent(..) => {}
         }
     }
 
@@ -1360,7 +1364,7 @@ impl Output {
             Sink::File(_, Some(Ok(saving))) => (saving.said(total), None),
             Sink::File(_, Some(Err(error))) => (format!("; it could not be saved: {error}"), None),
             Sink::File(_, None) => (String::new(), None),
-            Sink::Sent(named, whole) => {
+            Sink::Sent(named, whole, _) => {
                 let whole = whole.unwrap_or_default();
                 let named = named.display();
                 let said = match whole.len() as u64 == total {
@@ -3131,6 +3135,16 @@ text(ALL_TOOLS.map(t => t.name).join(","));"#,
             )),
             "{shown}"
         );
+        // A bound inside a character keeps nothing after it: what is sent
+        // stays the output's start.
+        let mut output = Output::new(10, &Whole::Sent(&named, &cut));
+        output.push(&"d".repeat(LENT_BYTES - 2));
+        output.push("é");
+        output.push("Z");
+        let (_, sent) = output.finish();
+        let sent = sent.unwrap();
+        assert!(sent.ends_with("d\n"), "{:?}", &sent[sent.len() - 8..]);
+        assert_eq!(sent.matches('\n').count(), 1);
     }
 
     #[test]
