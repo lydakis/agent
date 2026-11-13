@@ -78,6 +78,11 @@ pub const RECENT_SPAN: Duration = Duration::from_secs(24 * 60 * 60);
 const RECENT_EVENTS: usize = 2_000;
 const RECENT_BYTES: u64 = 4 * 1024 * 1024;
 const RECENT_EVENT_BYTES: usize = 16 * 1024;
+/// Past those, the newest event of each topic is kept however old, so a
+/// pull request quiet for days still has its last word: at most this
+/// many topics and bytes more.
+const RECENT_TOPICS: usize = 200;
+const RECENT_TOPIC_BYTES: u64 = RECENT_BYTES / 8;
 /// The fields every event has, which the note says on its own.
 const OWN: [&str; 6] = ["text", "id", "topic", "from", "url", "steer"];
 /// How the note to the subscriber starts, which Sonny shows folded.
@@ -1358,25 +1363,44 @@ fn add_lines(path: &Path, lines: &str) -> Option<u64> {
 /// Cut a file of what a source printed lately to what it keeps: the
 /// newest events within `RECENT_SPAN` of `now_ms`, at most `RECENT_EVENTS`
 /// of them and three quarters of `RECENT_BYTES`, so it is not cut again
-/// at once.
+/// at once; and past those, each other topic's newest event, at most
+/// `RECENT_TOPICS` of them in `RECENT_TOPIC_BYTES`.
 fn trim(path: &Path, now_ms: u128) {
     let Ok(text) = std::fs::read_to_string(path) else {
         return;
     };
     let since = now_ms.saturating_sub(RECENT_SPAN.as_millis());
-    let fresh = |line: &&str| {
-        serde_json::from_str::<Value>(line)
-            .ok()
-            .and_then(|kept| kept["at_ms"].as_u64())
-            .is_some_and(|at| u128::from(at) >= since)
-    };
     let (mut kept, mut bytes) = (Vec::new(), 0);
-    for line in text.lines().rev().take(RECENT_EVENTS) {
-        bytes += line.len() as u64 + 1;
-        if bytes > RECENT_BYTES * 3 / 4 || !fresh(&line) {
+    let mut topics = std::collections::HashSet::new();
+    let mut lately = true;
+    let (mut older, mut older_bytes) = (0, 0);
+    for line in text.lines().rev() {
+        let size = line.len() as u64 + 1;
+        let read = serde_json::from_str::<Value>(line).ok();
+        let at = read.as_ref().and_then(|kept| kept["at_ms"].as_u64());
+        let topic = read
+            .as_ref()
+            .and_then(|kept| kept["topic"].as_str().map(str::to_owned));
+        lately = lately
+            && kept.len() < RECENT_EVENTS
+            && bytes + size <= RECENT_BYTES * 3 / 4
+            && at.is_some_and(|at| u128::from(at) >= since);
+        if lately {
+            bytes += size;
+            topics.extend(topic);
+            kept.push(line);
+            continue;
+        }
+        let Some(topic) = topic else {
+            continue;
+        };
+        if older >= RECENT_TOPICS || older_bytes + size > RECENT_TOPIC_BYTES {
             break;
         }
-        kept.push(line);
+        if topics.insert(topic) {
+            (older, older_bytes) = (older + 1, older_bytes + size);
+            kept.push(line);
+        }
     }
     kept.reverse();
     let mut body = kept.join("\n");
@@ -1844,6 +1868,43 @@ mod tests {
         assert_eq!(left.lines().count(), RECENT_EVENTS);
         let newest: Value = serde_json::from_str(left.lines().last().unwrap()).unwrap();
         assert_eq!(newest["text"], (RECENT_EVENTS + 9).to_string());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn each_topics_newest_event_is_kept_past_the_day() {
+        let dir = std::env::temp_dir().join(format!("lookout-topics-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let file = recent_file(&dir, "prs");
+        let now = super::super::epoch_ms();
+        let day = RECENT_SPAN.as_millis();
+        let event = |text: &str, topic: Option<&str>, at: u128| {
+            let printed = json!({"text": text, "topic": topic});
+            recent_line(&Event {
+                at_ms: at,
+                ..Event::parse("prs", &printed.to_string(), at).unwrap()
+            })
+        };
+        let lines = [
+            event("#1 opened", Some("1"), now - 3 * day),
+            event("#2 opened", Some("2"), now - 3 * day),
+            event("#1 green", Some("1"), now - 2 * day),
+            event("no topic", None, now - 2 * day),
+            event("#2 merged", Some("2"), now - 1),
+            event("#3 opened", Some("3"), now - 1),
+        ];
+        add_lines(&file, &(lines.join("\n") + "\n"));
+        trim(&file, now);
+        let left: Vec<String> = (std::fs::read_to_string(&file).unwrap().lines())
+            .map(|line| {
+                serde_json::from_str::<Value>(line).unwrap()["text"]
+                    .as_str()
+                    .unwrap()
+                    .to_owned()
+            })
+            .collect();
+        // The day's events, and #1's last word from before it, in order.
+        assert_eq!(left, ["#1 green", "#2 merged", "#3 opened"]);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

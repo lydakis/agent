@@ -1641,6 +1641,33 @@ pub fn main(args: Vec<String>) -> Result<i32> {
         "follow" => follow(&options),
         "fork" => fork(&options),
         "interrupt" => interrupt(&options),
+        "ps" => {
+            let mut connection = connect_running(&options)?;
+            // Every page, as the daemon hands them, into one list.
+            let (mut query, mut rows) = (json!({"bot": options.bot}), Vec::new());
+            loop {
+                let mut page = connection.request("processes", query.clone())?;
+                if let Some(found) = page["processes"].as_array_mut() {
+                    rows.append(found);
+                }
+                match page.get("next_after") {
+                    Some(after) if !after.is_null() => query["after"] = after.clone(),
+                    _ => break,
+                }
+            }
+            print_json(&json!({"processes": rows}), options.pretty)?;
+            Ok(0)
+        }
+        "stop" => {
+            let bot = (options.bot.clone()).ok_or(Error::with("usage", "stop needs --bot"))?;
+            let mut connection = connect_running(&options)?;
+            let stopped = connection.request(
+                "stop_process",
+                json!({"bot": bot, "handle": options.positional[0]}),
+            )?;
+            print_json(&stopped, options.pretty)?;
+            Ok(0)
+        }
         "wait" => wait(&options),
         "inspect" => inspect(&options),
         "turns" => turns(&options),

@@ -123,7 +123,7 @@ impl Tool {
                 "properties":{"text":{"type":"string"}},"required":["text"],"additionalProperties":false}),
             ),
             Tool::Shell => (
-                "Run a noninteractive bash command (sh where bash is not installed) in the workspace, or in workdir when given (relative to the workspace unless absolute). stdout and stderr are returned separately; each is truncated to a head and tail beyond 64 KiB, and retained whole in a file the result names under files, up to 1 GiB, or, where there is no such file, up to 1 MiB: past that, its first and last 512 KiB. The command keeps running. Default timeout 120 s, maximum 600 s; with background=true there is no timeout unless timeout_ms sets one, of up to a day. A command that times out is killed and returns its output so far with timed_out. Every result reports wall_time_ms. Commands run with no terminal: TERM=dumb, NO_COLOR=1, and cat as the pager; AI_AGENT=agent tells tools an agent runs them. When the command returns or times out, every process it started is killed, so `cmd &` does not outlive it. With background=true the command is started and a proc handle is returned immediately; collect its result later with wait. If no wait collects it, its end comes as a message once no turn of yours runs: {\"finished\":{\"proc:N\":{how it ended}}}; wait on the handle reads the output. A steer that arrives while a command runs moves it to the background: the result is its proc handle with steered=true, and the command keeps running. A background command runs until it exits, its timeout_ms passes, kill=true on its handle stops it, or the daemon stops; each agent keeps at most as many as the daemon's process bound, and starting one past them kills the one it started or waited on least recently. With detach=true the command starts in its own session and its pid is returned at once; nothing tracks it and only a daemon pause kills it, so it outlives the turn and the daemon. Its output is discarded unless the command redirects it to a file. With tty=true it runs in a terminal, for a REPL or a program that prompts: the result is what it wrote within yield_time_ms (default 1000) and, while it runs, a proc handle for write_stdin.",
+                "Run a noninteractive bash command (sh where bash is not installed) in the workspace, or in workdir when given (relative to the workspace unless absolute). stdout and stderr are returned separately; each is truncated to a head and tail beyond 64 KiB, and retained whole in a file the result names under files, up to 1 GiB, or, where there is no such file, up to 1 MiB: past that, its first and last 512 KiB. The command keeps running. Default timeout 120 s, maximum 600 s; with background=true there is no timeout unless timeout_ms sets one, of up to a day. A command that times out is killed and returns its output so far with timed_out. Every result reports wall_time_ms. Commands run with no terminal: TERM=dumb, NO_COLOR=1, and cat as the pager; AI_AGENT=agent tells tools an agent runs them. When the command returns or times out, every process it started is killed, so `cmd &` does not outlive it. With background=true the command is started and a proc handle is returned immediately; collect its result later with wait. If no wait collects it, its end comes as a message once no turn of yours runs: {\"finished\":{\"proc:N\":{how it ended}}}; wait on the handle reads the output. A steer that arrives while a command runs moves it to the background: the result is its proc handle with steered=true, and the command keeps running. A background command runs until it exits, its timeout_ms passes, kill=true on its handle stops it, or the daemon stops; each agent keeps at most as many as the daemon's process bound, and starting one past them kills the one it started or waited on least recently. With detach=true it starts in its own session and returns a proc handle and pid at once; it outlives the turn and the daemon until it exits, a pause or kill=true, its output discarded unless redirected, its end told as a background command's. With tty=true it runs in a terminal, for a REPL or a program that prompts: the result is what it wrote within yield_time_ms (default 1000) and, while it runs, a proc handle for write_stdin.",
                 json!({"type":"object","properties":{"command":{"type":"string"},
                 "workdir":{"type":"string"},
                 "timeout_ms":{"type":"integer","minimum":1,"maximum":MAX_BACKGROUND_TIMEOUT_MS},
@@ -177,14 +177,14 @@ impl Tool {
                 "required":["url"],"additionalProperties":false}),
             ),
             Tool::WriteStdin => (
-                "Type into a terminal that shell started with tty=true, and return what it wrote since the last read, stdout and stderr together, which echoes what was typed. A terminal runs until it exits or is killed, across turns; wait on its handle reports how it ended. chars is typed as it is: end a line with \\n, and send a control key as its character, such as \\u0003 for Ctrl-C or \\u0004 for Ctrl-D; empty chars only reads. It waits yield_time_ms for output, 250 by default after typing and 5000 when only reading, at most 30000; a command that ends sooner returns at once with its exit_code. kill=true ends the command and every process it started; on a background command's proc handle, or a call a message moved to the background while it waited for approval or an answer, kill=true stops it (a call still waiting never runs).",
+                "Type into a terminal that shell started with tty=true, and return what it wrote since the last read, stdout and stderr together, which echoes what was typed. A terminal runs until it exits or is killed, across turns; wait on its handle reports how it ended. chars is typed as it is: end a line with \\n, and send a control key as its character, such as \\u0003 for Ctrl-C or \\u0004 for Ctrl-D; empty chars only reads. It waits yield_time_ms for output, 250 by default after typing and 5000 when only reading, at most 30000; a command that ends sooner returns at once with its exit_code. kill=true ends the command and every process it started; on a background or detached command's proc handle, or a call a message moved to the background while it waited for approval or an answer, kill=true stops it (a call still waiting never runs).",
                 json!({"type":"object","properties":{"handle":{"type":"string"},
                 "chars":{"type":"string","maxLength":INPUT_BYTES},
                 "yield_time_ms":{"type":"integer","minimum":0,"maximum":MAX_YIELD_MS},"kill":{"type":"boolean"}},
                 "required":["handle"],"additionalProperties":false}),
             ),
             Tool::Wait => (
-                "Suspend until every handle resolves, without holding any execution capacity. Handles are 'BOT/N' (a message sent to a peer agent, numbered as run gives it) or 'proc:N' (a background shell, or a call a message moved to the background). Each result reports the outcome: for a message that opened a turn, that turn's status and final text, with before_steer, the last text it wrote before it was steered, when it ended on a reply to a steer; for one another turn took in, status taken and that turn's number, to wait on in turn; or a process's output and exit code.
+                "Suspend until every handle resolves, without holding any execution capacity. Handles are 'BOT/N' (a message sent to a peer agent, numbered as run gives it) or 'proc:N' (a background or detached shell, or a call a message moved to the background). Each result reports the outcome: for a message that opened a turn, that turn's status and final text, with before_steer, the last text it wrote before it was steered, when it ended on a reply to a steer; for one another turn took in, status taken and that turn's number, to wait on in turn; or a process's output and exit code.
  With timeout_ms, unresolved handles are reported as pending and stay valid for a later wait; 0 polls without waiting. With any: true, the first resolved handle ends the wait and the rest are reported pending. A steer ends the wait at once with steered=true: unresolved handles are reported pending and stay valid, so wait again to keep waiting.",
                 json!({"type":"object","properties":{"handles":{"type":"array","items":{"type":"string"},"minItems":1,"maxItems":64},
                 "timeout_ms":{"type":"integer","minimum":0,"maximum":MAX_WAIT_TIMEOUT_MS},"any":{"type":"boolean"}},
@@ -529,6 +529,9 @@ pub struct Registry {
     /// gone and with each detached child until its wait completes.
     lasting_slots: Arc<Semaphore>,
     lasting_budget: usize,
+    /// Detached commands found again past a bound lowered since they
+    /// started, each in line for a lasting slot ahead of any new one.
+    lasting_owed: Arc<std::sync::atomic::AtomicUsize>,
     /// Whether the machine's load lets a new command start, as make's
     /// `-l`; see `admits`. None is no gate.
     load: Option<watch::Receiver<bool>>,
@@ -773,24 +776,9 @@ impl Credentials {
         text
     }
     /// How many of `text`'s last bytes could begin a credential that more
-    /// output would finish, or a secret field whose value more output
-    /// would carry: what a stream holds back until it can redact. What it
-    /// shows never ends inside a whole credential.
-    pub fn unfinished(&self, text: &[u8]) -> usize {
-        let set = self.current();
-        let open = open_field(text, &set.fields).value;
-        self.unfinished_after(&set, text, open, false)
-    }
-    /// How many of `text`'s last bytes could begin a credential that more
-    /// output would finish, the last `open` held besides. A whole
-    /// credential across the cut is shown at once, or, `exact`, held.
-    fn unfinished_after(
-        &self,
-        set: &CredentialSet,
-        text: &[u8],
-        open: usize,
-        exact: bool,
-    ) -> usize {
+    /// output would finish: what a stream holds back until it can redact.
+    /// A whole credential across the cut is held with them.
+    fn unfinished(set: &CredentialSet, text: &[u8]) -> usize {
         let values = || {
             set.values
                 .iter()
@@ -803,33 +791,29 @@ impl Credentials {
                     .find(|&n| text.ends_with(&value[..n]))
             })
             .max()
-            .unwrap_or(0)
-            .max(open);
-        // Exact, a whole credential across the cut is held with what
-        // follows it: the start held may finish a longer one, which
-        // whole-text redaction replaces first. Past `CREDENTIAL_HOLD` of
-        // such, as in a run of one that ends with its own start, and
-        // otherwise, it is shown whole, as one that ends with its own
-        // start is to a terminal at once.
+            .unwrap_or(0);
+        // A whole credential across the cut is held with what follows it:
+        // the start held may finish a longer one, which whole-text
+        // redaction replaces first. Past `CREDENTIAL_HOLD` of such, as in a
+        // run of one that ends with its own start, it is shown whole.
         let start = text.len() - started;
         let mut cut = start;
-        while exact
-            && let Some(first) = values()
-                .filter_map(|value| {
-                    let from = (cut + 1).saturating_sub(value.len());
-                    let to = (cut + value.len() - 1).min(text.len());
-                    let window = text.get(from..to)?;
-                    let at = window.windows(value.len()).position(|w| w == value)?;
-                    Some(from + at)
-                })
-                .min()
+        while let Some(first) = values()
+            .filter_map(|value| {
+                let from = (cut + 1).saturating_sub(value.len());
+                let to = (cut + value.len() - 1).min(text.len());
+                let window = text.get(from..to)?;
+                let at = window.windows(value.len()).position(|w| w == value)?;
+                Some(from + at)
+            })
+            .min()
         {
             cut = first;
             if start - cut > CREDENTIAL_HOLD {
                 break;
             }
         }
-        if exact && start - cut <= CREDENTIAL_HOLD {
+        if start - cut <= CREDENTIAL_HOLD {
             return text.len() - cut;
         }
         let mut cut = start;
@@ -846,28 +830,6 @@ impl Credentials {
             cut = end;
         }
         text.len() - cut
-    }
-    /// How many of `text`'s last bytes open a secret field whose value has
-    /// not started: a name, or a name and its separator. They are shown,
-    /// and kept so the next text is redacted as read after them.
-    pub fn opening(&self, text: &[u8]) -> usize {
-        let set = self.current();
-        let open = open_field(text, &set.fields);
-        open.name - open.value
-    }
-    /// `text` redacted as it reads after `before`, already shown: a value
-    /// after a field's name shown earlier is still redacted.
-    pub fn redact_after(&self, before: &str, text: String) -> String {
-        if before.is_empty() {
-            return self.redact(text);
-        }
-        let mut whole = self.redact(format!("{before}{text}"));
-        if whole.starts_with(before) {
-            whole.replace_range(..before.len(), "");
-            whole
-        } else {
-            self.redact(text)
-        }
     }
 }
 
@@ -905,13 +867,16 @@ impl Redacting {
         // A character cut at the piece's end waits for the rest of it,
         // whatever came before.
         let whole = self.held.len() - unfinished_char(&self.held);
-        let kept = self
-            .credentials
-            .unfinished_after(&set, &self.held[..whole], 0, true)
-            .min(whole);
+        let kept = Credentials::unfinished(&set, &self.held[..whole]).min(whole);
         let rest = self.held.split_off(whole - kept);
         let read = std::mem::replace(&mut self.held, rest);
         self.pass(&set, read, false)
+    }
+
+    /// Begin again after a gap in the stream: what was held, and what was
+    /// read before, no longer bear on what comes next.
+    pub fn restart(&mut self) {
+        *self = Redacting::new(self.credentials.clone());
     }
 
     /// What is still held, at the stream's end, redacted.
@@ -1458,117 +1423,6 @@ fn redact_fields(text: String, fields: &[String]) -> String {
     out
 }
 
-/// A secret field still open at a text's end, in bytes from that end.
-#[derive(Clone, Copy, Default)]
-struct Open {
-    /// Where its name starts: a name that may be one's start, a name and
-    /// separator with no value yet, or a name and a value not ended.
-    name: usize,
-    /// Where its value starts, when one has and not ended: held back so it
-    /// is redacted whole, at most `FIELD_HOLD` bytes of it. The name before
-    /// it is not secret, so it is shown: a prompt such as `Password: `
-    /// reaches whoever is to answer it.
-    value: usize,
-}
-
-fn open_field(text: &[u8], fields: &[String]) -> Open {
-    const FIELD_HOLD: usize = 4096;
-    // Four bytes of a field's start, so short words go out as typed.
-    const NAME_START: usize = 4;
-    let word = |b: u8| b.is_ascii_alphanumeric() || b == b'_' || b == b'-';
-    let tail = &text[text.len().saturating_sub(FIELD_HOLD)..];
-    let shortest = fields.iter().map(String::len).min().unwrap_or(0);
-    let mut i = 0;
-    while i < tail.len() {
-        if !word(tail[i]) || (i > 0 && word(tail[i - 1])) {
-            i += 1;
-            continue;
-        }
-        let start = i;
-        while i < tail.len() && word(tail[i]) {
-            i += 1;
-        }
-        // A word shorter than every field cannot end with one; the last
-        // may still begin one.
-        if i - start < shortest && i < tail.len() {
-            continue;
-        }
-        if i == tail.len() {
-            let name = field_key(&String::from_utf8_lossy(&tail[start..i]));
-            // The last word: it may be the start of a field's name.
-            // Bytes, not characters: a field's name may be any text.
-            let begins = fields.iter().any(|field| {
-                (NAME_START.min(field.len())..=field.len())
-                    .any(|n| name.as_bytes().ends_with(&field.as_bytes()[..n]))
-            });
-            let name = if begins { tail.len() - start } else { 0 };
-            return Open {
-                name,
-                ..Open::default()
-            };
-        }
-        if !fields
-            .iter()
-            .any(|field| key_ends_with(&tail[start..i], field))
-        {
-            continue;
-        }
-        // As `redact_fields` reads one: a quote, a separator, a quote.
-        let mut j = i;
-        if j < tail.len() && matches!(tail[j], b'"' | b'\'') {
-            j += 1;
-        }
-        while j < tail.len() && matches!(tail[j], b' ' | b'\t') {
-            j += 1;
-        }
-        let name = tail.len() - start;
-        if j == tail.len() {
-            return Open {
-                name,
-                ..Open::default()
-            };
-        }
-        if !matches!(tail[j], b'=' | b':') {
-            continue;
-        }
-        j += 1;
-        while j < tail.len() && matches!(tail[j], b' ' | b'\t') {
-            j += 1;
-        }
-        let quote = tail.get(j).copied().filter(|b| matches!(b, b'"' | b'\''));
-        if quote.is_some() {
-            j += 1;
-        }
-        // Where its value ends, read as `redact_fields` reads it: an
-        // escaped quote is part of a quoted value.
-        let value = j;
-        while j < tail.len() {
-            let b = tail[j];
-            let ends = match quote {
-                Some(q) => b == q || b == b'\n',
-                None => {
-                    b.is_ascii_whitespace() || matches!(b, b',' | b';' | b'"' | b'\'' | b'}' | b']')
-                }
-            };
-            if ends {
-                break;
-            }
-            j = match (quote, b) {
-                (Some(_), b'\\') => j + 2,
-                _ => j + 1,
-            };
-        }
-        if j >= tail.len() {
-            return Open {
-                name,
-                value: tail.len() - value,
-            };
-        }
-        i = j;
-    }
-    Open::default()
-}
-
 /// Replace the body of each PEM block in `text` whose header names one of
 /// `blocks`.
 fn redact_blocks(mut text: String, blocks: &[String]) -> String {
@@ -1619,7 +1473,9 @@ pub enum Prepared {
         background: bool,
         workdir: Option<String>,
     },
-    /// A command in its own session, neither tracked nor killed.
+    /// A command in its own session that outlives the turn and the
+    /// daemon, on a proc handle. Resolved by the runtime; the registry
+    /// starts one untracked.
     Detach {
         command: String,
         workdir: Option<String>,
@@ -1909,6 +1765,7 @@ impl Registry {
             foreground: Arc::default(),
             lasting_slots: Arc::new(Semaphore::new(default_lasting())),
             lasting_budget: default_lasting(),
+            lasting_owed: Arc::default(),
             #[cfg(unix)]
             terminals: Arc::default(),
             stopping: Arc::new(watch::Sender::new(false)),
@@ -2014,6 +1871,38 @@ impl Registry {
             )
         })
     }
+    /// The lasting slot of a detached command found again: a free one, or
+    /// with none free, its place in line for the next one freed, which it
+    /// takes before any new command can, counted as running meanwhile. A
+    /// bound lowered while it ran so holds new ones back until enough end.
+    #[cfg(unix)]
+    fn lasting_found(&self) -> Box<dyn Send> {
+        if let Ok(permit) = self.lasting_slots.clone().try_acquire_owned() {
+            return Box::new(permit);
+        }
+        struct Owed(Arc<std::sync::atomic::AtomicUsize>);
+        impl Drop for Owed {
+            fn drop(&mut self) {
+                self.0.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+        struct Waiting(tokio::task::JoinHandle<()>);
+        impl Drop for Waiting {
+            fn drop(&mut self) {
+                self.0.abort();
+            }
+        }
+        self.lasting_owed
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let (slots, owed) = (self.lasting_slots.clone(), Owed(self.lasting_owed.clone()));
+        Box::new(Waiting(tokio::spawn(async move {
+            let permit = slots.acquire_owned().await;
+            drop(owed);
+            // Held until the command ends, which aborts this.
+            let _permit = permit;
+            std::future::pending::<()>().await;
+        })))
+    }
     /// Bound on simultaneously running child processes. Waiting never counts.
     /// Zero removes the bound; the operating system is then the only limit.
     pub fn with_process_budget(mut self, budget: usize) -> Self {
@@ -2065,6 +1954,7 @@ impl Registry {
             budget => budget,
         };
         bound.saturating_sub(self.lasting_slots.available_permits())
+            + self.lasting_owed.load(std::sync::atomic::Ordering::Relaxed)
     }
     /// Terminals running now, of the lasting slots in use.
     pub fn terminals_running(&self) -> usize {
@@ -2660,9 +2550,23 @@ impl Registry {
             Prepared::Shell {
                 background: true, ..
             } => fail("background_requires_runtime"),
+            // Untracked: what a runtime starts has a proc handle, from
+            // `detached`.
             Prepared::Detach { command, workdir } => {
                 let folder = Prepared::folder(workspace, workdir.as_deref());
-                detach(&command, &folder, self, environment, sandbox).await
+                let Detached { pid, .. } = detach(
+                    self.cord(),
+                    &command,
+                    &folder,
+                    self,
+                    environment,
+                    sandbox,
+                    None,
+                )
+                .await?;
+                Ok(Outcome::text(
+                    json!({"detached":true,"pid":pid}).to_string(),
+                ))
             }
             Prepared::Wait { .. } => fail("wait_requires_runtime"),
             Prepared::Terminal { .. } | Prepared::WriteStdin { .. } => {
@@ -3146,6 +3050,85 @@ impl Registry {
         }
     }
 
+    /// Start detached command `command` in `workspace` as background
+    /// command `id`, whose `stopper` stops it: it outlives turns and the
+    /// daemon, and its end goes to `done` once nothing it left in its
+    /// group runs, if this daemon still does. One that does not start
+    /// sends its error there too.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn detached(
+        &self,
+        cord: Cord,
+        stopper: Stopper,
+        command: &str,
+        workspace: &Path,
+        environment: &[(String, String)],
+        sandbox: Option<Arc<Policy>>,
+        done: tokio::sync::oneshot::Sender<Result<Outcome>>,
+    ) -> Result<Detached> {
+        let tracked = Tracked { stopper, done };
+        detach(
+            cord,
+            command,
+            workspace,
+            self,
+            environment,
+            sandbox,
+            Some(tracked),
+        )
+        .await
+    }
+
+    /// Watch again detached command `detached`, which an earlier daemon
+    /// started, by its `stopper`, as `detached` watches one it starts: its
+    /// lasting slot is taken again when one is free, as it runs either way.
+    /// False, sending nothing, when it no longer runs.
+    #[cfg(unix)]
+    pub async fn adopt(
+        &self,
+        stopper: Stopper,
+        detached: Detached,
+        sandboxed: bool,
+        elapsed: Duration,
+        done: tokio::sync::oneshot::Sender<Result<Outcome>>,
+    ) -> bool {
+        let runs = tokio::task::spawn_blocking(move || still_runs(detached))
+            .await
+            .unwrap_or(false);
+        if !runs {
+            return false;
+        }
+        let permit = self.lasting_found();
+        let started = std::time::Instant::now()
+            .checked_sub(elapsed)
+            .unwrap_or_else(std::time::Instant::now);
+        // Adopted only with its start known, which identifies its leader.
+        let Some(since) = detached.since else {
+            return false;
+        };
+        tokio::spawn(watch_detached(
+            self.pulls.subscribe(),
+            Leader::Found(since),
+            detached.pid,
+            sandboxed,
+            started,
+            Some(Tracked { stopper, done }),
+            permit,
+        ));
+        true
+    }
+    #[cfg(not(unix))]
+    pub async fn adopt(
+        &self,
+        _: Stopper,
+        _: Detached,
+        _: bool,
+        _: Duration,
+        _: tokio::sync::oneshot::Sender<Result<Outcome>>,
+    ) -> bool {
+        false
+    }
+
     /// `run`, a command a steer moved to the background, ended as the pull
     /// cord is pulled, as one started there is.
     pub fn until_pulled<F>(&self, run: F) -> impl Future<Output = Result<Outcome>> + use<F>
@@ -3173,6 +3156,14 @@ impl Registry {
     pub fn end_running(&self) {
         self.pulls.send_modify(|pulls| *pulls += 1);
         self.end_terminals();
+    }
+
+    /// Resolves once the daemon stops.
+    pub fn until_stopping(&self) -> impl Future<Output = ()> + use<> {
+        let mut stopping = self.stopping.subscribe();
+        async move {
+            let _ = stopping.wait_for(|stopping| *stopping).await;
+        }
     }
 
     /// End every background command still running, as the daemon stops.
@@ -4110,20 +4101,110 @@ fn sh(
     Ok(process)
 }
 
+/// A detached command once started: its pid, which leads its session and
+/// process group, and what tells that leader from a later process given
+/// the same pid, recorded with its handle so a daemon started later can
+/// still find it and stop it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Detached {
+    pub pid: u32,
+    /// When the leader started, as the kernel counts it; none where it
+    /// could not be read.
+    pub since: Option<u64>,
+}
+
+/// What a tracked detached command reports its end to, and what stops it
+/// on its handle.
+pub struct Tracked {
+    pub stopper: Stopper,
+    pub done: tokio::sync::oneshot::Sender<Result<Outcome>>,
+}
+
 /// Start a command in a new session for a service that must outlive the
 /// turn and the daemon. Its output is discarded: a log the daemon wrote would
 /// bypass credential redaction, so a command that wants one redirects itself.
-/// No process slot or handle applies to it, and only the pull cord kills its
-/// session. An async waiter reaps it on exit; its detached slot is released
-/// once nothing it left in its group runs either.
+/// No process slot applies to it; a lasting one does. Tracked, it is a proc
+/// handle its agent or a person stops, and its end goes to `done` once
+/// nothing it left in its group runs; the pull cord kills it either way. An
+/// async waiter reaps it on exit; its lasting slot is released once nothing
+/// it left in its group runs either.
 #[cfg(unix)]
 async fn detach(
+    cord: Cord,
     command: &str,
     workspace: &Path,
     registry: &Registry,
     environment: &[(String, String)],
     sandbox: Option<Arc<Policy>>,
-) -> Result<Outcome> {
+    mut tracked: Option<Tracked>,
+) -> Result<Detached> {
+    // The cord as it was when the start was decided: a pull since, during
+    // the setup too, ends the command as soon as its watcher has it.
+    let Cord(pulls, _) = cord;
+    let stopper = tracked.as_mut().map(|tracked| &mut tracked.stopper);
+    let spawned = match Cord(pulls.clone(), registry.stopping.subscribe()).check() {
+        Ok(()) => spawn_detached(command, workspace, registry, environment, sandbox, stopper).await,
+        Err(error) => Err(error),
+    };
+    let (child, detached, sandboxed, started, held) = match spawned {
+        Ok(spawned) => spawned,
+        // A command that never started ends here, as its own call says.
+        Err(error) => {
+            if let Some(tracked) = tracked {
+                let _ = tracked.done.send(Err(error.clone()));
+            }
+            return Err(error);
+        }
+    };
+    // The watcher owns the child from here, before anything is awaited:
+    // a caller dropped meanwhile leaves no command that nothing watches.
+    let (read, since) = tokio::sync::oneshot::channel();
+    tokio::spawn(async move {
+        // Its leader's start, read off the runtime thread as every file is.
+        let pid = detached.pid;
+        let since = tokio::task::spawn_blocking(move || leader_since(pid))
+            .await
+            .ok()
+            .flatten();
+        let _ = read.send(since);
+        watch_detached(
+            pulls,
+            Leader::Child(child),
+            pid,
+            sandboxed,
+            started,
+            tracked,
+            held,
+        )
+        .await;
+    });
+    Ok(Detached {
+        since: since.await.ok().flatten(),
+        ..detached
+    })
+}
+
+/// A detached command started: its child, its pid (its leader's start is
+/// read once its watcher owns it), whether a sandbox holds it, when it
+/// started, and what it holds while it runs.
+#[cfg(unix)]
+type Spawned = (
+    tokio::process::Child,
+    Detached,
+    bool,
+    std::time::Instant,
+    Box<dyn Send>,
+);
+
+#[cfg(unix)]
+async fn spawn_detached(
+    command: &str,
+    workspace: &Path,
+    registry: &Registry,
+    environment: &[(String, String)],
+    sandbox: Option<Arc<Policy>>,
+    stopper: Option<&mut Stopper>,
+) -> Result<Spawned> {
     use std::process::Stdio;
     let mut process = sh(
         command,
@@ -4155,66 +4236,236 @@ async fn detach(
     // The bot's socket listens while anything the command left in its
     // group runs, not only while the command itself does.
     let listening = sandbox.as_ref().and_then(|policy| policy.listening.clone());
-    let mut child = process.spawn().map_err(|e| not_started(e, workspace))?;
+    // A stop on its handle during the setup: it never runs.
+    if let Some(stopper) = stopper {
+        stopper.check()?;
+    }
+    let started = std::time::Instant::now();
+    let child = process.spawn().map_err(|e| not_started(e, workspace))?;
     let pid = child.id().ok_or(Error::new("shell_spawn_failed"))?;
-    // It outlives turns and the daemon, but not the pull cord: a pull ends
-    // the process group it leads, and a sandbox's namespace, as it ends
-    // every other command an agent runs.
-    let mut pulls = registry.pulls.subscribe();
-    let group = -(pid as i32);
-    // SAFETY: kill with a negative pid signals the process group setsid made
-    // this child lead; it touches no memory.
-    let signal = move |signal| unsafe { libc::kill(group, signal) } == 0;
-    tokio::spawn(async move {
-        let pulled = tokio::select! {
-            _ = child.wait() => false,
-            Ok(()) = pulls.changed() => {
-                if sandboxed {
-                    end_namespace(pid).await;
-                }
-                signal(libc::SIGKILL);
-                let _ = child.wait().await;
-                true
-            }
-        };
-        // What it left running in its group, as `cmd &` leaves, is still
-        // the pull's to end, and still holds the command's place: looked
-        // for each second until the group is empty, so a launcher that
-        // starts a service and exits does not hand its slot to the next
-        // while the service runs. The kernel keeps a group's id from new
-        // processes while any member lives, so only that last second could
-        // see it reused.
-        let members = move || async move {
-            tokio::task::spawn_blocking(move || group_members(-group))
+    let held: Box<dyn Send> = Box::new((permit, held, listening));
+    Ok((
+        child,
+        Detached { pid, since: None },
+        sandboxed,
+        started,
+        held,
+    ))
+}
+
+/// The leader of a detached command's group, as its watcher knows it.
+#[cfg(unix)]
+enum Leader {
+    /// This daemon started it: its child, whose exit it waits on.
+    Child(tokio::process::Child),
+    /// An earlier daemon did: its start time, read once a second while it
+    /// runs, one file, never a walk of every process.
+    Found(u64),
+}
+
+/// Watch detached command `pid` until nothing it left in its group runs:
+/// its `leader`, the child this daemon started or one an earlier daemon
+/// did, found again, then what it left. A pull of the cord or a stop on its handle kills the
+/// group, and with `sandboxed` the pid namespace it runs in; `held` (its
+/// lasting slot, what its sandbox keeps in place) goes with its end, which
+/// goes to `tracked`'s `done`.
+#[cfg(unix)]
+async fn watch_detached(
+    mut pulls: watch::Receiver<u64>,
+    leader: Leader,
+    pid: u32,
+    sandboxed: bool,
+    started: std::time::Instant,
+    tracked: Option<Tracked>,
+    held: Box<dyn Send>,
+) {
+    let group = pid as i32;
+    let (mut stop, listed, done) = match tracked {
+        Some(Tracked { stopper, done }) => {
+            let Stopper { stop, listed } = stopper;
+            (Some(stop), Some(listed), Some(done))
+        }
+        None => (None, None, None),
+    };
+    let end = async || {
+        if sandboxed {
+            end_namespace(pid).await;
+        }
+        // SAFETY: kill with a negative pid signals the process group setsid
+        // made this command lead; it touches no memory.
+        unsafe { libc::kill(-group, libc::SIGKILL) };
+    };
+    // How it ended, once it did: the leader's own status, when this daemon
+    // is its parent, and what ended it otherwise.
+    let mut ended: Option<Result<Option<std::process::ExitStatus>>> = None;
+    if let Leader::Found(since) = leader {
+        let runs = move || async move {
+            tokio::task::spawn_blocking(move || leader_runs(pid, since))
                 .await
-                .unwrap_or(Members::Gone)
+                .unwrap_or(false)
         };
-        // Where only exited members answer, a walk of /proc is no one
-        // moment and can miss a member forked while it read: three walks a
-        // second apart must agree that nothing runs.
-        let mut exited = 0;
-        while !pulled && exited < 3 {
-            match members().await {
-                Members::Gone => break,
-                Members::Running => exited = 0,
-                Members::Exited => exited += 1,
-            }
-            if exited == 3 {
-                break;
-            }
+        while ended.is_none() && runs().await {
             tokio::select! {
                 Ok(()) = pulls.changed() => {
-                    signal(libc::SIGKILL);
-                    break;
+                    end().await;
+                    ended = Some(Err(stopped_by_pause()));
+                }
+                kill = stop_sent(&mut stop) => {
+                    end().await;
+                    ended = Some(Err(stopped(kill)));
                 }
                 () = tokio::time::sleep(std::time::Duration::from_secs(1)) => {}
             }
         }
-        drop((permit, held, listening));
+    } else if let Leader::Child(mut child) = leader {
+        ended = tokio::select! {
+            // Its end is the group's, below; the leader's status is what
+            // it says of how it went.
+            status = child.wait() => Some(Ok(status.ok())),
+            Ok(()) = pulls.changed() => {
+                end().await;
+                let _ = child.wait().await;
+                Some(Err(stopped_by_pause()))
+            }
+            kill = stop_sent(&mut stop) => {
+                end().await;
+                let _ = child.wait().await;
+                Some(Err(stopped(kill)))
+            }
+        };
+    }
+    // What it left running in its group, as `cmd &` leaves, is still the
+    // pull's or its handle's to end, and still holds the command's place:
+    // looked for each second until the group is empty, so a launcher that
+    // starts a service and exits does not hand its slot to the next while
+    // the service runs. The kernel keeps a group's id from new processes
+    // while any member lives, so only that last second could see it reused.
+    let members = move || async move {
+        tokio::task::spawn_blocking(move || group_members(group))
+            .await
+            .unwrap_or(Members::Gone)
+    };
+    // Where only exited members answer, a walk of /proc is no one moment
+    // and can miss a member forked while it read: three walks a second
+    // apart must agree that nothing runs.
+    let mut exited = 0;
+    while !matches!(ended, Some(Err(_))) && exited < 3 {
+        match members().await {
+            Members::Gone => break,
+            Members::Running => exited = 0,
+            Members::Exited => exited += 1,
+        }
+        if exited == 3 {
+            break;
+        }
+        tokio::select! {
+            Ok(()) = pulls.changed() => {
+                end().await;
+                ended = Some(Err(stopped_by_pause()));
+            }
+            kill = stop_sent(&mut stop) => {
+                end().await;
+                ended = Some(Err(stopped(kill)));
+            }
+            () = tokio::time::sleep(std::time::Duration::from_secs(1)) => {}
+        }
+    }
+    drop((held, listed));
+    let Some(done) = done else { return };
+    let wall_time_ms = started.elapsed().as_millis() as u64;
+    let _ = done.send(match ended {
+        Some(Err(error)) => Err(error),
+        Some(Ok(Some(status))) => Ok(Outcome {
+            failed: !status.success(),
+            ..Outcome::text(
+                json!({"exit_code":status.code(),"success":status.success(),
+                    "wall_time_ms":wall_time_ms})
+                .to_string(),
+            )
+        }),
+        // An earlier daemon was its parent: how its leader exited went
+        // with it.
+        _ => Ok(Outcome::text(
+            json!({"exit_code":null,"wall_time_ms":wall_time_ms}).to_string(),
+        )),
     });
-    Ok(Outcome::text(
-        json!({"detached":true,"pid":pid}).to_string(),
-    ))
+}
+
+/// Until a stop comes on a detached command's handle; never without one,
+/// or once what would send it is gone.
+async fn stop_sent(stop: &mut Option<tokio::sync::oneshot::Receiver<Kill>>) -> Kill {
+    if let Some(receiver) = stop {
+        let got = receiver.await;
+        // A finished receiver is never polled again.
+        *stop = None;
+        if let Ok(kill) = got {
+            return kill;
+        }
+    }
+    std::future::pending().await
+}
+
+/// When process `pid` started, as the kernel counts it: what tells a
+/// detached command's leader from a later process given its pid.
+#[cfg(target_os = "linux")]
+fn leader_since(pid: u32) -> Option<u64> {
+    let stat = std::fs::read(format!("/proc/{pid}/stat")).ok()?;
+    let after = &stat[stat.iter().rposition(|&b| b == b')')? + 1..];
+    // `starttime` is the stat file's 22nd field, the 20th after comm.
+    let field = after
+        .split(u8::is_ascii_whitespace)
+        .filter(|field| !field.is_empty())
+        .nth(19)?;
+    std::str::from_utf8(field).ok()?.parse().ok()
+}
+#[cfg(target_os = "macos")]
+fn leader_since(pid: u32) -> Option<u64> {
+    // SAFETY: a zeroed proc_bsdinfo is valid; proc_pidinfo fills it.
+    let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
+    let size = std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int;
+    // SAFETY: the buffer is a proc_bsdinfo of `size` bytes this function owns.
+    let read = unsafe {
+        libc::proc_pidinfo(
+            pid as libc::c_int,
+            libc::PROC_PIDTBSDINFO,
+            0,
+            (&mut info as *mut libc::proc_bsdinfo).cast(),
+            size,
+        )
+    };
+    (read == size).then(|| info.pbi_start_tvsec * 1_000_000 + info.pbi_start_tvusec)
+}
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
+fn leader_since(_: u32) -> Option<u64> {
+    None
+}
+
+/// Whether process `pid`, which started at `since`, still runs: on Linux
+/// not a zombie, which an init that does not reap orphans leaves for good,
+/// unless another of its threads runs. Elsewhere init reaps orphans.
+#[cfg(target_os = "linux")]
+fn leader_runs(pid: u32, since: u64) -> bool {
+    leader_since(pid) == Some(since)
+        && stat(Path::new(&format!("/proc/{pid}/stat")))
+            .is_some_and(|(state, _)| !exited(state) || threads_run(&pid.to_string()))
+}
+#[cfg(all(unix, not(target_os = "linux")))]
+fn leader_runs(pid: u32, since: u64) -> bool {
+    leader_since(pid) == Some(since)
+}
+
+/// Whether detached command `detached`, which an earlier daemon started,
+/// still runs as itself: its leader is the process that started then, by
+/// its start time, not a later one given its pid, has not exited, and its
+/// group has a member. A group whose leader has gone is not taken for it: while no
+/// daemon watched, the group may have ended and its id gone to another,
+/// and a stop on the handle would kill that one.
+#[cfg(unix)]
+fn still_runs(detached: Detached) -> bool {
+    let Some(since) = detached.since else {
+        return false;
+    };
+    leader_runs(detached.pid, since) && !matches!(group_members(detached.pid as i32), Members::Gone)
 }
 
 /// What is left of a detached command's process group.
@@ -4320,12 +4571,14 @@ async fn end_namespace(_: u32) {}
 
 #[cfg(not(unix))]
 async fn detach(
+    _: Cord,
     _: &str,
     _: &Path,
     _: &Registry,
     _: &[(String, String)],
     _: Option<Arc<Policy>>,
-) -> Result<Outcome> {
+    _: Option<Tracked>,
+) -> Result<Detached> {
     fail("shell_platform_unsupported")
 }
 

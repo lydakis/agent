@@ -8981,6 +8981,115 @@ nothing to an idle bot. The index is partial: only a message the person
 wrote enters it, when its turn takes it, beside the message indexes that
 write already updates.
 
+## A terminal's reads redacted as one stream (#937)
+
+A terminal (`write_stdin`) now runs its reads through the same exact
+streaming redactor a retained output's file uses, instead of a hold scan
+plus a re-redaction of what the last read showed. What each path pays:
+
+- **A terminal read**: one linear pass over what was read (line ends,
+  credentials, PEM blocks, secret fields), holding only what may still be
+  redacted. Before, each read scanned for a hold, then redacted the text
+  together with the field opening shown before it.
+- **A terminal's state**: one `Credentials` handle (an `Arc`) and the
+  redactor's hold buffers, which are empty between values.
+- **The store**: nothing new.
+
+The terminal read path itself, 4,000 reads of 1 to 4 KiB of shell output
+(a directory listing and an `export` of a secret field), two credentials
+and four secret fields, release build, best of 7 on one machine:
+
+| Side | Time for 4,000 reads |
+| --- | ---: |
+| main (362029d) | 103.7 ms |
+| head | 44.8 ms |
+
+The Perf workflow's screen on 9e075d2, base against head:
+
+| Bench | Measure | Base | Head | Change |
+| --- | --- | ---: | ---: | ---: |
+| admission | lone submit CPU, ms | 28.258 | 28.406 | +0.5% |
+| admission | burst submit p99, ms | 2.851 | 2.875 | +0.9% |
+| completion | release to terminal p99, ms | 8.039 | 8.564 | +6.5% |
+| footprint | idle RSS, MiB | 16.225 | 16.256 | +0.2% |
+| footprint | per idle bot, KiB | 1.966 | 1.924 | -2.1% |
+| footprint | RSS after a turn each, MiB | 34.078 | 36.199 | +6.2% |
+| footprint | CPU per turn, ms | 0.731 | 0.721 | -1.4% |
+| lifecycle | CPU, s | 0.385 | 0.385 | +0.0% |
+| lifecycle | p95 turn, ms | 662.753 | 615.985 | -7.1% |
+| lifecycle | peak RSS, MiB | 25.406 | 24.727 | -2.7% |
+
+Store work per turn is the same on both sides, and the gate passed. None
+of these benches opens a terminal, so none runs the changed path; the two
+rows past 5% (completion p99 at 0.5 ms, RSS after a turn each) are within
+the runner's spread on earlier screens, and lifecycle moves the other way.
+Sonny's rows are left out: no Sonny source changed.
+
+## Tracked detached commands (protocol 72, schema 97)
+
+A detached command is a `proc:N` handle now, recorded with its pid and its
+leader's start so a later daemon finds it again, and `processes` lists what
+runs. What each path costs:
+
+- **A background command or terminal start**: the same one `process_start`
+  job, which now also writes the kind, the command's first 512 bytes and
+  the start time into the row it already wrote. No new job, no new index.
+- **A foreground command**: a copy of at most 512 bytes of its command,
+  kept for the row a steer would make; nothing else.
+- **A detached command**: two store jobs (its row before it starts, its
+  pid and start after), on a path no screen runs; the one watcher task it
+  had, which now also listens for a stop on its handle.
+- **A call a message lifted that runs**: one store job beside its start,
+  recording its kind and start time.
+- **Daemon start**: one read of the running rows' partial index for
+  detached rows, and per row a `/proc` stat read and a group probe off the
+  runtime thread. A command found again is then watched by its leader's
+  start, one stat file a second, as the one this daemon started waits on
+  its child: the walk of every process for what is left of its group
+  comes only after its leader has gone.
+- **`processes`**: a read through `processes_bot_running`, the partial
+  index of running rows, a page of at most 128 at a time, so it costs
+  what runs, not the history. Sonny's `/ps` reads it every two seconds
+  only while it is open.
+- **An idle bot**: nothing.
+
+Daemon and Sonny screen (`bench.perf_gate`), the Perf workflow's Linux
+runner, base main c5fa712 against head d52771e, alternating rounds:
+
+| Bench | Measure | Base | Head | Change |
+| --- | --- | ---: | ---: | ---: |
+| admission | lone submit CPU, ms | 28.769 | 28.693 | -0.3% |
+| admission | burst submit p99, ms | 3.036 | 2.899 | -4.5% |
+| completion | release to terminal p99, ms | 8.654 | 8.577 | -0.9% |
+| footprint | idle RSS, MiB | 16.008 | 16.037 | +0.2% |
+| footprint | per idle bot, KiB | 1.818 | 1.898 | +4.4% |
+| footprint | RSS after a turn each, MiB | 31.895 | 30.1 | -5.6% |
+| footprint | CPU per turn, ms | 0.763 | 0.755 | -1.0% |
+| sonny | lookout CPU per 1k deltas at 10x1, ms | 12.5 | 12.5 | +0.0% |
+| sonny | lookout CPU per 1k deltas at 10x10, ms | 4.375 | 5.0 | +14.3% |
+| sonny | lookout CPU per 1k deltas at 10x100, ms | 4.06 | 4.12 | +1.5% |
+| sonny | lookout CPU per 1k deltas at 100x10, ms | 4.685 | 4.625 | -1.3% |
+| sonny | lookout seated at 100x10, s | 0.1 | 0.15 | +50.0% |
+| sonny | lookout note p95 at 10x100, ms | 2690.0 | 2812.0 | +4.5% |
+| sonny | lookout note p95 at 100x10, ms | 3122.5 | 3066.5 | -1.8% |
+| sonny | quiet window CPU, ms/s | 1.165 | 0.975 | -16.3% |
+| sonny | quiet window reads, KiB/s | 0.245 | 0.265 | +8.2% |
+| sonny | quiet window requests, /s | 0.695 | 0.74 | +6.5% |
+| sonny | quiet window RSS, MiB | 24.15 | 24.1 | -0.2% |
+| sonny | sky replay CPU per 1k lines, ms | 10.25 | 10.065 | -1.8% |
+| sonny | sky replay RSS, MiB | 77.15 | 82.25 | +6.6% |
+| lifecycle | CPU, s | 0.395 | 0.395 | +0.0% |
+| lifecycle | p95 turn, ms | 596.408 | 775.272 | +30.0% |
+| lifecycle | peak RSS, MiB | 25.062 | 25.043 | -0.1% |
+
+Store work per turn is the same on both sides, and the gate warned on
+nothing: every row past 15% overlaps the base's runs. Lifecycle's p95
+turn is the one wide daemon move, in a bench that runs no command, so no
+path this change touches; its CPU is level, and the same row read 698
+against 654 ms on the screen above with no lifecycle change, so it is the
+runner's spread. The Sonny rows move both ways at the size of earlier
+screens, and `/ps` costs nothing while closed.
+
 ## A pool that knows no allowance ramps back after a refusal
 
 A provider that sends no rate limit headers left the pacer blind: a 429

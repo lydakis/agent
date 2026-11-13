@@ -20,8 +20,9 @@ use agent_runtime::{
     sandbox::Policy,
     store::{
         AfterTurn, Answer, ArtifactLines, Bot, CallAnswer, Charge, ContextPrefix, ContextUsage,
-        Database, ElisionPlan, Gated, Halt, Halted, Lifted, LiftedRun, Limit, Settings, Slot,
-        Spend, Store, Strip, TURN_VIEW_ACCOUNTING, Waiting, Window, unserved,
+        Database, DetachedRow, ElisionPlan, Gated, Halt, Halted, Lifted, LiftedRun, Limit,
+        ProcessKind, Settings, Slot, Spend, Store, Strip, TURN_VIEW_ACCOUNTING, Waiting, Window,
+        listed_command, unserved,
     },
     tools::{
         Cord, Files, Outcome, POLL_YIELD_MS, Place, Prepared, ReadSource, Registry, Spill, Stopper,
@@ -4651,10 +4652,13 @@ impl Turn {
                     yield_ms,
                     workdir,
                 }) => {
-                    let (turn, started) = (self.turn, call.call_id.clone());
+                    let (turn, started, listed) =
+                        (self.turn, call.call_id.clone(), command.clone());
                     let id = self
                         .store
-                        .op("process_start", move |db| db.process_start(turn, &started))
+                        .op("process_start", move |db| {
+                            db.process_start(turn, &started, ProcessKind::Terminal, &listed)
+                        })
                         .await?;
                     let (sender, receiver) = oneshot::channel();
                     self.collect(
@@ -4841,6 +4845,8 @@ impl Turn {
                 }) => {
                     let (started, running) = oneshot::channel();
                     let place = self.registry.place();
+                    // What lists it, should a steer move it to the background.
+                    let listed = listed(&command);
                     let spill = (self.outputs(record, workspace))
                         .map(|outputs| outputs.spill(self.turn, &call.call_id));
                     let run = self.registry.foreground(
@@ -4863,11 +4869,25 @@ impl Turn {
                         Ran::Done(Err(error)) => failure(error),
                         Ran::Lifted(run) => {
                             let outputs = self.outputs(record, workspace);
-                            self.lift_shell(&call.call_id, record.bot_id, run, &place, outputs)
+                            let owner = record.bot_id;
+                            self.lift_shell(&call.call_id, listed, owner, run, &place, outputs)
                                 .await?
                         }
                     }
                 }
+                Ok(Prepared::Detach { command, workdir }) => match self
+                    .detached(
+                        &call.call_id,
+                        command,
+                        Prepared::folder(workspace, workdir.as_deref()),
+                        environment,
+                        sandbox,
+                    )
+                    .await?
+                {
+                    Ok(outcome) => outcome,
+                    Err(error) => failure(error),
+                },
                 Ok(prepared) => match self
                     .run_tool(
                         self.registry
@@ -5078,6 +5098,7 @@ impl Turn {
             } => {
                 let (started, running) = oneshot::channel();
                 let place = self.registry.place();
+                let listed = listed(&command);
                 let spill = (self.outputs(record, workspace))
                     .map(|outputs| outputs.spill(self.turn, &call_id));
                 let mut run = Box::pin(self.registry.foreground(
@@ -5108,7 +5129,7 @@ impl Turn {
                         let outputs = self.outputs(record, workspace);
                         return (
                             call_id.clone(),
-                            self.lift_shell(&call_id, record.bot_id, run, &place, outputs)
+                            self.lift_shell(&call_id, listed, record.bot_id, run, &place, outputs)
                                 .await,
                         );
                     }
@@ -5871,10 +5892,12 @@ impl Turn {
     ) -> Result<Outcome> {
         // The place in line is taken before anything durable is written.
         let queued = self.registry.queue()?;
-        let (turn, started) = (self.turn, call_id.to_owned());
+        let (turn, started, listed) = (self.turn, call_id.to_owned(), command.clone());
         let id = self
             .store
-            .op("process_start", move |db| db.process_start(turn, &started))
+            .op("process_start", move |db| {
+                db.process_start(turn, &started, ProcessKind::Background, &listed)
+            })
             .await?;
         let (sender, receiver) = oneshot::channel();
         let spill = (outputs.clone()).map(|outputs| outputs.spill(self.turn, call_id));
@@ -5896,6 +5919,80 @@ impl Turn {
         ))
     }
 
+    /// Start a detached command on a proc handle the store keeps: it
+    /// outlives the turn and the daemon, its agent or a person stops it by
+    /// its handle, and its end is told as a background command's is. The
+    /// outer error is the store's; the inner one, the call's.
+    async fn detached(
+        &self,
+        call_id: &str,
+        command: String,
+        folder: PathBuf,
+        environment: &[(String, String)],
+        sandbox: Option<Arc<Policy>>,
+    ) -> Result<Result<Outcome>> {
+        let (turn, started, listed) = (self.turn, call_id.to_owned(), listed(&command));
+        let id = self
+            .store
+            .op("process_start", move |db| {
+                db.process_start(turn, &started, ProcessKind::Detached, &listed)
+            })
+            .await?;
+        let (sender, receiver) = oneshot::channel();
+        // Its end, a start that failed too, is recorded as it comes.
+        let lifts = Lifts {
+            store: self.store.clone(),
+            registry: self.registry.clone(),
+            handles: self.handles.clone(),
+            failures: self.background_failures.clone(),
+        };
+        lifts.collect(&self.bot, turn, id, call_id, receiver, None, None, true);
+        // The start and what records it run apart from the turn, so a turn
+        // ended meanwhile never leaves a command running that nothing
+        // watches or that the store cannot find again.
+        // The cord as it is now: a pause during the setup ends it too.
+        let (registry, store, cord) = (
+            self.registry.clone(),
+            self.store.clone(),
+            self.registry.cord(),
+        );
+        let environment = environment.to_vec();
+        let start = tokio::spawn(async move {
+            let sandboxed = sandbox.is_some();
+            let started = registry
+                .detached(
+                    cord,
+                    registry.stopper(id),
+                    &command,
+                    &folder,
+                    &environment,
+                    sandbox,
+                    sender,
+                )
+                .await;
+            let detached = match started {
+                Ok(detached) => detached,
+                Err(error) => {
+                    // This call says it failed: nothing tells it again.
+                    store.op("saw_end", move |db| db.saw_end(id)).await?;
+                    return Ok(Err(error));
+                }
+            };
+            store
+                .op("process_detached", move |db| {
+                    db.process_detached(id, detached, sandboxed, "")
+                })
+                .await?;
+            Ok(Ok(Outcome::text(
+                json!({"handle":format!("proc:{id}"),"detached":true,"pid":detached.pid})
+                    .to_string(),
+            )))
+        });
+        start
+            .await
+            .unwrap_or_else(|_| Err(Error::new("turn_task_failed")))
+    }
+
     /// Move a running foreground command to the background: it keeps its
     /// process slot and timeout, and its result arrives on a proc handle as
     /// a background command's does. A failure to record it drops the
@@ -5903,6 +6000,7 @@ impl Turn {
     async fn lift_shell<F>(
         &self,
         call_id: &str,
+        command: String,
         owner: i64,
         run: std::pin::Pin<Box<F>>,
         place: &Place,
@@ -5914,7 +6012,9 @@ impl Turn {
         let (turn, started) = (self.turn, call_id.to_owned());
         let id = self
             .store
-            .op("process_start", move |db| db.process_start(turn, &started))
+            .op("process_start", move |db| {
+                db.process_start(turn, &started, ProcessKind::Background, &command)
+            })
             .await?;
         let (sender, receiver) = oneshot::channel();
         // It runs on as a background command, and counts as one.
@@ -5951,7 +6051,7 @@ impl Turn {
             failures: self.background_failures.clone(),
         };
         lifts.collect(
-            &self.bot, self.turn, id, call_id, receiver, outputs, terminal,
+            &self.bot, self.turn, id, call_id, receiver, outputs, terminal, false,
         );
     }
 }
@@ -6047,6 +6147,7 @@ impl Lifts {
                 receiver,
                 None,
                 None,
+                false,
             );
             let _ = sender.send(Err(Error::new("workspace_required")));
             return;
@@ -6115,6 +6216,7 @@ impl Lifts {
                             receiver,
                             None,
                             None,
+                            false,
                         );
                         let _ = sender.send(Err(error));
                         return;
@@ -6131,6 +6233,7 @@ impl Lifts {
             Ok(prepared)
         });
         let terminal = matches!(prepared, Ok(Prepared::Terminal { .. }));
+        let detached = matches!(prepared, Ok(Prepared::Detach { .. }));
         let spill = (outputs.clone()).map(|outputs| outputs.spill(turn, &call.call_id));
         self.collect(
             &bot.name,
@@ -6140,6 +6243,7 @@ impl Lifts {
             receiver,
             outputs,
             terminal.then(|| self.registry.clone()),
+            detached,
         );
         match prepared {
             Ok(Prepared::Shell {
@@ -6148,18 +6252,21 @@ impl Lifts {
                 workdir,
                 ..
             }) => match self.registry.queue() {
-                Ok(queued) => self.registry.background(
-                    stopper,
-                    bot.bot_id,
-                    command,
-                    Prepared::folder(&workspace, workdir.as_deref()),
-                    timeout_ms,
-                    environment,
-                    sandbox,
-                    queued,
-                    sender,
-                    spill,
-                ),
+                Ok(queued) => {
+                    self.running_as(process, ProcessKind::Background, &command);
+                    self.registry.background(
+                        stopper,
+                        bot.bot_id,
+                        command,
+                        Prepared::folder(&workspace, workdir.as_deref()),
+                        timeout_ms,
+                        environment,
+                        sandbox,
+                        queued,
+                        sender,
+                        spill,
+                    )
+                }
                 Err(error) => {
                     let _ = sender.send(Err(error));
                 }
@@ -6169,6 +6276,7 @@ impl Lifts {
             Ok(Prepared::Terminal {
                 command, workdir, ..
             }) => {
+                self.running_as(process, ProcessKind::Terminal, &command);
                 let registry = self.registry.clone();
                 let folder = Prepared::folder(&workspace, workdir.as_deref());
                 tokio::spawn(async move {
@@ -6219,6 +6327,33 @@ impl Lifts {
                     let _ = sender.send(typed);
                 });
             }
+            // Its handle is the call's, which runs on past the daemon as any
+            // detached command does, found again by what its start records.
+            Ok(Prepared::Detach { command, workdir }) => {
+                let (registry, store) = (self.registry.clone(), self.store.clone());
+                let folder = Prepared::folder(&workspace, workdir.as_deref());
+                tokio::spawn(async move {
+                    let sandboxed = sandbox.is_some();
+                    let started = registry
+                        .detached(
+                            cord,
+                            stopper,
+                            &command,
+                            &folder,
+                            &environment,
+                            sandbox,
+                            sender,
+                        )
+                        .await;
+                    if let Ok(detached) = started {
+                        let _ = store
+                            .op("process_detached", move |db| {
+                                db.process_detached(process, detached, sandboxed, &command)
+                            })
+                            .await;
+                    }
+                });
+            }
             Ok(Prepared::Declared(result)) => {
                 let _ = sender.send(Ok(Outcome::text(result)));
             }
@@ -6260,10 +6395,63 @@ impl Lifts {
         }
     }
 
+    /// Record that lifted call `process` now runs as a command of `kind`,
+    /// beside its start: its row lists it so from here.
+    fn running_as(&self, process: i64, kind: ProcessKind, command: &str) {
+        let (store, listed) = (self.store.clone(), listed(command));
+        tokio::spawn(async move {
+            let _ = store
+                .op("process_running_as", move |db| {
+                    db.process_running_as(process, kind, &listed)
+                })
+                .await;
+        });
+    }
+
+    /// Watch again each detached command in `rows`, which an earlier
+    /// daemon started: one that still runs is stopped by its handle and its
+    /// end told as it comes; one that ended, or whose leader did, while no
+    /// daemon watched is recorded ended now, with no exit code, and told.
+    pub async fn adopt(&self, rows: Vec<DetachedRow>) {
+        for row in rows {
+            let (sender, receiver) = oneshot::channel();
+            let elapsed = Duration::from_millis(now_ms().saturating_sub(row.started_ms as u64));
+            let stopper = self.registry.stopper(row.id);
+            let runs = (self.registry)
+                .adopt(stopper, row.detached, row.sandboxed, elapsed, sender)
+                .await;
+            let (ended, receiver) = match runs {
+                true => (None, receiver),
+                false => {
+                    let (ended, receiver) = oneshot::channel();
+                    (Some(ended), receiver)
+                }
+            };
+            self.collect(
+                &row.bot,
+                row.turn,
+                row.id,
+                &row.call_id,
+                receiver,
+                None,
+                None,
+                runs,
+            );
+            if let Some(ended) = ended {
+                let _ = ended.send(Ok(Outcome::text(
+                    json!({"exit_code":null,"detail":"it ended, or its first process did, while no daemon watched it; what it left running is no longer tracked"})
+                        .to_string(),
+                )));
+            }
+        }
+    }
+
     /// Record a background command's result when it arrives and wake those
     /// waiting on its handle. A terminal's, `terminal`, stays in the
     /// registry with its end until then, so a poll never finds it gone
-    /// with no result.
+    /// with no result. A detached command, `outlives`, runs on when the
+    /// daemon stops: no result then is no end, and the daemon that opens
+    /// the store next looks for it again.
     #[allow(clippy::too_many_arguments)]
     fn collect(
         &self,
@@ -6274,6 +6462,7 @@ impl Lifts {
         receiver: oneshot::Receiver<Result<Outcome>>,
         outputs: Option<Outputs>,
         terminal: Option<Registry>,
+        outlives: bool,
     ) {
         let (store, handles, failures, call_id_for_refs, bot) = (
             self.store.clone(),
@@ -6282,8 +6471,22 @@ impl Lifts {
             call_id.to_owned(),
             bot.to_owned(),
         );
+        // A detached command runs on past the daemon: its collector lets
+        // the store go as the daemon stops, recording no end.
+        let stopping = outlives.then(|| self.registry.until_stopping());
         tokio::spawn(async move {
-            let result = receiver.await.unwrap_or_else(|_| fail("process_lost"));
+            let received = match stopping {
+                Some(stopping) => tokio::select! {
+                    received = receiver => received,
+                    () = stopping => return,
+                },
+                None => receiver.await,
+            };
+            let result = match received {
+                Ok(result) => result,
+                Err(_) if outlives => return,
+                Err(_) => fail("process_lost"),
+            };
             // Whether it failed, as whoever ran it said.
             let (value, failed, artifacts, files) = match result {
                 Ok(outcome) => {
@@ -6344,11 +6547,16 @@ impl Lifts {
     }
 }
 
+/// The start of `command` its process row lists it by, copied.
+fn listed(command: &str) -> String {
+    listed_command(command).to_owned()
+}
+
 /// Stop `handle`, a command of `bot`'s with no terminal: a call a message
 /// lifted, still waiting for its verdict or answer, is withdrawn, never
 /// run; a background command is killed. Its end is this result, so nothing
 /// tells it later. `None` when it is neither.
-async fn stop_handle(
+pub(super) async fn stop_handle(
     store: &Store,
     registry: &Registry,
     handles: &Handles,
