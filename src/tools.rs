@@ -806,19 +806,17 @@ impl Credentials {
     }
     /// The bytes of a secret field's value open at `text`'s end, and the
     /// quote it opened with, when one is.
-    /// Only a text that ends in a long run a value could be is read whole
-    /// for its field, the name of which may be past `open_field`'s window.
+    /// Only a text whose last line is long is read whole for its field, the
+    /// name of which may be past `open_field`'s window.
     fn open_value(&self, text: &[u8]) -> Option<(usize, Option<u8>)> {
         let set = self.current();
         if set.fields.is_empty() {
             return None;
         }
-        let run = |stop: fn(&u8) -> bool| text.iter().rev().take_while(|b| !stop(b)).count();
-        let bare = run(|b| {
-            b.is_ascii_whitespace() || matches!(b, b',' | b';' | b'"' | b'\'' | b'}' | b']')
-        });
-        let quoted = run(|b| matches!(b, b'"' | b'\'' | b'\n'));
-        if bare.max(quoted) <= VALUE_HOLD {
+        // No value runs past a line's end, bare or quoted: a text whose
+        // last line is short holds none longer than that.
+        let line = text.iter().rev().take_while(|&&b| b != b'\n').count();
+        if line <= VALUE_HOLD {
             return None;
         }
         let open = open_field_within(text, &set.fields, text.len());
@@ -3222,6 +3220,9 @@ struct Captured {
     spill: Option<(Spill, &'static str, Credentials)>,
     /// What writes it there, once it has passed.
     writer: Option<Writer>,
+    /// How many of a command's streams are waiting for their writer to
+    /// take what they read: waiting on the disk, not on the pipe.
+    waiting: Arc<std::sync::atomic::AtomicUsize>,
     /// The file that holds it, once its writer is done.
     spilled: Option<Spilled>,
 }
@@ -3246,7 +3247,40 @@ pub struct Spill {
 struct Writer {
     /// Closed once the writer stops taking more: at its bound, or failed.
     pieces: Option<tokio::sync::mpsc::Sender<Vec<u8>>>,
+    /// Read and not yet taken by the writer: kept here while the reader
+    /// waits, so a wait cut short loses none of it.
+    pending: Option<Vec<u8>>,
     done: tokio::task::JoinHandle<Option<Spilled>>,
+}
+
+impl Writer {
+    /// Hand the pending piece to the writer once it has room, counted in
+    /// `waiting` meanwhile. Cut short, the piece stays pending.
+    async fn hand(&mut self, waiting: &std::sync::atomic::AtomicUsize) {
+        use std::sync::atomic::Ordering;
+        struct Waiting<'a>(&'a std::sync::atomic::AtomicUsize);
+        impl Drop for Waiting<'_> {
+            fn drop(&mut self) {
+                self.0.fetch_sub(1, Ordering::Relaxed);
+            }
+        }
+        let (Some(pieces), Some(_)) = (&self.pieces, &self.pending) else {
+            return;
+        };
+        waiting.fetch_add(1, Ordering::Relaxed);
+        let _waiting = Waiting(waiting);
+        let closed = match pieces.reserve().await {
+            Ok(room) => {
+                room.send(self.pending.take().unwrap_or_default());
+                false
+            }
+            Err(_) => true,
+        };
+        if closed {
+            self.pieces = None;
+            self.pending = None;
+        }
+    }
 }
 
 /// A stream written to its file: `saved` bytes of it, all of it unless
@@ -3260,9 +3294,15 @@ struct Spilled {
 const SPILL_PIECES: usize = 16;
 
 impl Captured {
-    fn spilling(spill: Option<&Spill>, stream: &'static str, registry: &Registry) -> Self {
+    fn spilling(
+        spill: Option<&Spill>,
+        stream: &'static str,
+        registry: &Registry,
+        waiting: &Arc<std::sync::atomic::AtomicUsize>,
+    ) -> Self {
         Captured {
             spill: spill.map(|spill| (spill.clone(), stream, registry.credentials.clone())),
+            waiting: waiting.clone(),
             ..Captured::default()
         }
     }
@@ -3286,24 +3326,26 @@ impl Captured {
             let done = tokio::spawn(spill_stream(spill, stream, credentials, first, received));
             self.writer = Some(Writer {
                 pieces: Some(pieces),
+                pending: None,
                 done,
             });
         }
         let Some(writer) = &mut self.writer else {
             return;
         };
-        if let Some(pieces) = &writer.pieces
-            && pieces.send(bytes.to_vec()).await.is_err()
-        {
-            writer.pieces = None;
+        if writer.pieces.is_some() {
+            writer.pending = Some(bytes.to_vec());
+            writer.hand(&self.waiting).await;
         }
     }
 
-    /// Wait for the writer, when the stream had one, to finish its file.
+    /// Wait for the writer, when the stream had one, to take what it was
+    /// still to be handed and finish its file.
     async fn settle(&mut self) {
-        if let Some(Writer { pieces, done }) = self.writer.take() {
-            drop(pieces);
-            self.spilled = done.await.ok().flatten();
+        if let Some(mut writer) = self.writer.take() {
+            writer.hand(&self.waiting).await;
+            drop(writer.pieces);
+            self.spilled = writer.done.await.ok().flatten();
         }
     }
 
@@ -3900,9 +3942,10 @@ async fn shell(
         .stderr
         .take()
         .ok_or(Error::new("shell_pipe_failed"))?;
+    let waiting = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let (mut out, mut err) = (
-        Captured::spilling(spill, "stdout", registry),
-        Captured::spilling(spill, "stderr", registry),
+        Captured::spilling(spill, "stdout", registry, &waiting),
+        Captured::spilling(spill, "stderr", registry, &waiting),
     );
     let status = {
         let reads = async {
@@ -3945,8 +3988,17 @@ async fn shell(
         // What the group wrote before it ended is still in the pipes, and
         // is read whatever the wait: the bound is on their end alone, which
         // a process that left the group may hold off for as long as it runs.
-        if !read && let Ok(done) = tokio::time::timeout(PIPES_END, &mut reads).await {
-            done?;
+        // A stream waiting for its file to take what it read is waiting on
+        // the disk, not on its pipe, and is waited for.
+        while !read {
+            match tokio::time::timeout(PIPES_END, &mut reads).await {
+                Ok(done) => {
+                    done?;
+                    read = true;
+                }
+                Err(_) if waiting.load(std::sync::atomic::Ordering::Relaxed) > 0 => {}
+                Err(_) => break,
+            }
         }
         status
     };
@@ -4504,6 +4556,37 @@ mod tests {
             assert_eq!(out, whole, "in pieces of {size}");
         }
     }
+    /// A piece handed to a stream's writer while it has no room stays
+    /// pending when the wait is cut short, and is handed once it has room;
+    /// the wait is counted as one on the disk meanwhile.
+    #[tokio::test]
+    async fn a_piece_waiting_for_its_writer_is_kept_when_the_wait_is_cut() {
+        use std::sync::atomic::Ordering;
+        let (pieces, mut received) = tokio::sync::mpsc::channel(1);
+        pieces.send(b"first".to_vec()).await.unwrap();
+        let mut writer = Writer {
+            pieces: Some(pieces),
+            pending: Some(b"second".to_vec()),
+            done: tokio::spawn(async { None }),
+        };
+        let waiting = std::sync::atomic::AtomicUsize::new(0);
+        {
+            let hand = writer.hand(&waiting);
+            tokio::pin!(hand);
+            assert!(
+                tokio::time::timeout(Duration::from_millis(20), &mut hand)
+                    .await
+                    .is_err()
+            );
+            assert_eq!(waiting.load(Ordering::Relaxed), 1);
+        }
+        assert_eq!(waiting.load(Ordering::Relaxed), 0);
+        assert_eq!(writer.pending.as_deref(), Some(&b"second"[..]));
+        assert_eq!(received.recv().await.unwrap(), b"first");
+        writer.hand(&waiting).await;
+        assert_eq!(writer.pending, None);
+        assert_eq!(received.recv().await.unwrap(), b"second");
+    }
     /// A secret field's value longer than the window a field is looked for
     /// in is redacted whole however it is cut, as the whole text's is.
     #[test]
@@ -4516,6 +4599,11 @@ mod tests {
         for text in [
             format!("{}\npassword={value} after\nend", "x".repeat(1 << 20)),
             format!("a \"password\": \"{value}\\\"{value}\", \"n\": 1\nend"),
+            format!(
+                "{}\npassword=\"{}\" after\nend",
+                "x".repeat(1 << 20),
+                "kkkkkkk7'k\\\"".repeat(10_000)
+            ),
         ] {
             let whole = credentials.redact(text.clone());
             assert!(!whole.contains("kkkkkkk7"), "whole");
