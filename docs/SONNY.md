@@ -868,6 +868,8 @@ step; the last is `Successfully updated from OLD to version NEW` (`to the
 newest build of VERSION` for a nightly), or `Sonny is up to date
 (VERSION)`, when the daemon is replaced only if it runs another release.
 
+![sonny update, from a release tarball install of 0.9.4 to 0.9.5](sonny/sonny-update.png)
+
 Each open window notes the program it started from. When it loses the
 daemon and the Sonny installed where it runs from is another program
 (`sonny update`, or `brew upgrade` and install.sh run by hand), it reopens
@@ -877,6 +879,8 @@ pasted pictures and all, as `/new` hands its first message on in a file; the reo
 `Sonny was updated; this window reopened on VERSION`. A window that meets
 a newer daemon with no newer Sonny installed here still says `Sonny was
 upgraded; reopen this window` and starts nothing.
+
+![A window reopened on 0.9.5 by the update above, its unsent message still in the composer](sonny/update-reopened.png)
 
 ## Skills
 
