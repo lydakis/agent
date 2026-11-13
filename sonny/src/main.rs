@@ -12613,6 +12613,7 @@ impl App {
         if matches!(
             &event,
             Event::FocusGained
+                | Event::Paste(_)
                 | Event::Key(KeyEvent {
                     kind: KeyEventKind::Press,
                     ..
@@ -14456,15 +14457,15 @@ impl App {
         self.settle_asks();
     }
 
-    /// Whether this is a task's window its lead opened, which the lead
-    /// closes once the task is done: never a lead's, a side chat's or one
-    /// in another's pane.
+    /// Whether this is a task's own window, which may be the one its lead
+    /// opened, and restored with the terminal since: never a lead's, a side
+    /// chat's or one in another's pane. It closes itself only when it is
+    /// ([`mux::Layout::close_own`]).
     fn task_window(&self) -> bool {
         self.fleet.is_none()
             && self.project.is_none()
             && self.options.side.is_none()
             && !self.options.embedded
-            && self.options.window_place.is_some()
             && !project::is_lead(&self.bot)
     }
 
@@ -24981,8 +24982,6 @@ mod tests {
         app.options.store = std::env::temp_dir()
             .join(unique("sonny-kept"))
             .join("store");
-        // A task window its lead opened.
-        app.options.window_place = Some(String::new());
         let finished = |turn| turn_event("turn_finished", turn, json!({"status": "completed"}));
         let done = |app: &mut App| {
             (drawn(app).iter())
