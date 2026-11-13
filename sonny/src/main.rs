@@ -15684,13 +15684,28 @@ impl App {
             else {
                 continue;
             };
-            let asked = json!({"bot": key.0, "turn": key.1, "limit": 64,
-                "since_ms": at_ms.saturating_sub(AUDIT_SLACK_MS)});
-            let Ok(page) = self.client.request("audit", asked).await else {
-                continue;
+            // A step's row names its call and the step apart.
+            let (call, step) = match key.2.rsplit_once('/') {
+                Some((call, step)) => (call, Some(step)),
+                None => (key.2.as_str(), None),
             };
-            let row = (page["rows"].as_array().into_iter().flatten())
-                .find(|row| row["call_id"] == key.2.as_str());
+            let mut asked = json!({"bot": key.0, "turn": key.1, "limit": 64,
+                "since_ms": at_ms.saturating_sub(AUDIT_SLACK_MS)});
+            // Newest first, page by page, back to when it was written.
+            let row = loop {
+                let Ok(page) = self.client.request("audit", asked.clone()).await else {
+                    break None;
+                };
+                let row = (page["rows"].as_array().into_iter().flatten())
+                    .find(|row| row["call_id"] == call && row["step"].as_str() == step);
+                if let Some(row) = row {
+                    break Some(row.clone());
+                }
+                match page["next_before"].as_i64() {
+                    Some(before) => asked["before"] = json!(before),
+                    None => break None,
+                }
+            };
             let Some(row) = row else {
                 continue;
             };
@@ -24766,13 +24781,22 @@ mod tests {
         let asked = Arc::new(std::sync::Mutex::new(Vec::new()));
         let seen = asked.clone();
         let client = daemon_answering(move |request| match request["op"].as_str() {
+            Some("audit") if request["before"].is_null() => {
+                seen.lock().unwrap().push(request.clone());
+                // A step of c1 denied after it, newest first: not c1's row.
+                json!({"rows": [
+                    {"bot": "shop.fix", "turn": 4, "call_id": "c1", "step": "open",
+                        "approved": "person", "outcome": "denied"},
+                    {"bot": "shop.fix", "turn": 4, "call_id": "c0", "approved": "rule",
+                        "outcome": "completed"}],
+                    "next_before": 40})
+            }
             Some("audit") => {
                 seen.lock().unwrap().push(request.clone());
                 json!({"rows": [
-                    {"bot": "shop.fix", "turn": 4, "call_id": "c0", "approved": "rule",
-                        "outcome": "completed"},
-                    {"bot": "shop.fix", "turn": 4, "call_id": "c1", "approved": "person",
-                        "outcome": "denied"}]})
+                    {"bot": "shop.fix", "turn": 4, "call_id": "c1", "step": null,
+                        "approved": "person", "outcome": "completed"}],
+                    "next_before": null})
             }
             _ => json!({}),
         })
@@ -24791,13 +24815,14 @@ mod tests {
             .await;
         let texts = app.screen.texts();
         assert!(
-            texts.contains(&"✗ You denied cargo publish · shop.fix".to_owned()),
+            texts.contains(&"✓ You allowed cargo publish · shop.fix".to_owned()),
             "{texts:?}"
         );
-        // Only since it was written, so the read stays short.
+        // Only since it was written, so the read stays short, page by page.
         let asked = asked.lock().unwrap();
-        assert_eq!((asked.len(), &asked[0]["turn"]), (1, &json!(4)));
+        assert_eq!((asked.len(), &asked[0]["turn"]), (2, &json!(4)));
         assert!(asked[0]["since_ms"].as_i64().unwrap() > 0);
+        assert_eq!(asked[1]["before"], 40);
     }
 
     #[test]
