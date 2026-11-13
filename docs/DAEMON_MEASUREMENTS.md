@@ -9176,7 +9176,9 @@ place for it for up to 5 s. The daemon resumes the turn at once; one
 woken while its park is still landing resumes as soon as the park lands.
 A turn that is never woken comes back after 30 s, and the end of the ramp
 wakes every turn still parked on it. A call that is not a turn's own (a
-summary beside it, a search) still waits in the gate.
+summary beside it, a search) cannot park: it takes its place in the same
+line and waits outside the gate, so the turns woken ahead of it come back
+through the gate for their places.
 
 `bench.scale_screen` with `bench.streaming_model --tpm 300000
 --no-headers`, 45 s windows, 4-CPU Linux cloud box, waiting in the gate

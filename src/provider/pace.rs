@@ -44,6 +44,33 @@ pub struct Waiter {
     pub wake: Wake,
 }
 
+impl Waiter {
+    fn is(&self, other: &Waiter) -> bool {
+        self.bot == other.bot && self.turn == other.turn
+    }
+}
+
+/// An in-process caller's place in a ramp's queue. A caller dropped while
+/// it waits gives its place up, and any place kept for it goes on.
+struct Queued<'a> {
+    pace: &'a Pace,
+    ticket: Option<(Waiter, Arc<tokio::sync::Notify>)>,
+}
+impl Drop for Queued<'_> {
+    fn drop(&mut self) {
+        let Some((waiter, _)) = self.ticket.take() else {
+            return;
+        };
+        let mut state = self.pace.state.lock().unwrap();
+        if let Some(ramp) = state.ramp.as_mut() {
+            ramp.forget(&waiter.bot, waiter.turn);
+            ramp.wake(Instant::now());
+        }
+        drop(state);
+        self.pace.changed.notify_one();
+    }
+}
+
 /// Pools keyed by model within one provider.
 #[derive(Default)]
 pub struct Pools(Mutex<HashMap<String, Arc<Pace>>>);
@@ -144,6 +171,8 @@ struct State {
     /// Ramps begun, so a call admitted under an ended ramp never settles
     /// into a later one.
     ramps: u64,
+    /// In-process callers queued on a full ramp, for their places in it.
+    tickets: i64,
 }
 
 /// After a refusal from a pool that knows no allowance (a provider that
@@ -194,6 +223,11 @@ impl Ramp {
                 .iter()
                 .any(|(bot, turn, _)| *bot == w.bot && *turn == w.turn)
         })
+    }
+    /// Drop a caller's place in the queue and any place kept for it.
+    fn forget(&mut self, bot: &str, turn: i64) {
+        self.queued.retain(|w| !(w.bot == bot && w.turn == turn));
+        self.promised.retain(|(b, t, _)| !(b == bot && *t == turn));
     }
     /// Wake parked turns, oldest first, for the places the window has free.
     fn wake(&mut self, now: Instant) {
@@ -688,11 +722,24 @@ impl Pace {
     ) -> crate::Result<Reservation<'a>> {
         let started = Instant::now();
         let costs = cost.dims();
-        let _turn = self.gate.lock().await;
+        // A caller that cannot park and finds the ramp full queues in it
+        // as a turn does, and waits outside the gate for its place, so the
+        // turns woken ahead of it can come back through the gate.
+        let mut queued = Queued {
+            pace: self,
+            ticket: None,
+        };
+        let mut gate = None;
         loop {
+            if gate.is_none() {
+                gate = Some(self.gate.lock().await);
+            }
             let changed = self.changed.notified();
+            let mut outside = None;
             let wait = {
                 let mut state = self.state.lock().unwrap();
+                let own = queued.ticket.as_ref().map(|(w, _)| w.clone());
+                let waiter = waiter.or(own.as_ref());
                 let now = Instant::now();
                 for (dim, cost) in state.tokens.iter().zip(costs) {
                     if let Some(limit) = dim.bucket.per_minute
@@ -729,25 +776,40 @@ impl Pace {
                         let wait = match left {
                             Some(left) if !left.is_zero() => left,
                             // A full ramp waits for one of its calls to
-                            // settle. A turn parks, holding nothing live,
-                            // and the settle wakes it with a place kept for
-                            // it; any other caller waits in the gate, which
-                            // a settle wakes too.
-                            _ if let Some(ramp) = state
+                            // settle, in its queue, oldest first; the
+                            // settle wakes the oldest with a place kept for
+                            // it. A turn parks, holding nothing live; any
+                            // other caller waits outside the gate.
+                            _ if state
                                 .ramp
-                                .as_mut()
-                                .filter(|r| r.full() && !r.promised_to(waiter)) =>
+                                .as_ref()
+                                .is_some_and(|r| r.full() && !r.promised_to(waiter)) =>
                             {
-                                match waiter {
-                                    None => Duration::from_secs(60),
-                                    Some(waiter) => {
-                                        let queued = ramp
-                                            .queued
-                                            .iter()
-                                            .any(|w| w.bot == waiter.bot && w.turn == waiter.turn);
-                                        if !queued {
-                                            ramp.queued.push_back(waiter.clone());
-                                        }
+                                let waiter = match waiter {
+                                    Some(waiter) => waiter.clone(),
+                                    None => {
+                                        state.tickets += 1;
+                                        let notify = Arc::new(tokio::sync::Notify::new());
+                                        let woken = notify.clone();
+                                        let waiter = Waiter {
+                                            bot: String::new(),
+                                            turn: -state.tickets,
+                                            wake: Arc::new(move |_, _| woken.notify_one()),
+                                        };
+                                        queued.ticket = Some((waiter.clone(), notify));
+                                        waiter
+                                    }
+                                };
+                                let ramp = state.ramp.as_mut().unwrap();
+                                if !ramp.queued.iter().any(|w| w.is(&waiter)) {
+                                    ramp.queued.push_back(waiter);
+                                }
+                                match &queued.ticket {
+                                    Some((_, notify)) => {
+                                        outside = Some(notify.clone());
+                                        RAMP_PARK
+                                    }
+                                    None => {
                                         *park_for = Some(RAMP_PARK);
                                         state.counts.parked += 1;
                                         return Err(crate::Error::new("provider_paced"));
@@ -763,13 +825,12 @@ impl Pace {
                             state.reserved_requests += 1;
                             let ramp = state.ramp.as_mut().map(|r| {
                                 if let Some(w) = waiter {
-                                    r.promised.retain(|(bot, turn, _)| {
-                                        !(*bot == w.bot && *turn == w.turn)
-                                    });
+                                    r.forget(&w.bot, w.turn);
                                 }
                                 r.flying += 1;
                                 r.generation
                             });
+                            queued.ticket = None;
                             let waited = started.elapsed();
                             state.counts.admitted += 1;
                             if waited >= Duration::from_millis(1) {
@@ -791,6 +852,14 @@ impl Pace {
                     }
                 }
             };
+            if let Some(notify) = outside {
+                gate = None;
+                tokio::select! {
+                    _ = tokio::time::sleep(wait) => {},
+                    _ = notify.notified() => {},
+                }
+                continue;
+            }
             tokio::select! {
                 _ = tokio::time::sleep(wait.min(Duration::from_secs(60))) => {},
                 _ = changed => {},
@@ -1649,6 +1718,68 @@ mod tests {
         drop(first);
         assert_eq!(*woken.lock().unwrap(), [1, 2]);
         drop(call);
+    }
+
+    /// A caller that cannot park (a summary beside a turn, a search) queues
+    /// on a full ramp as a turn does, and waits outside the gate, so a turn
+    /// woken ahead of it can come back for its place.
+    #[tokio::test(start_paused = true)]
+    async fn a_caller_that_cannot_park_waits_its_turn_outside_the_gate() {
+        let pace = Pace::default();
+        let woken = Arc::new(Mutex::new(Vec::new()));
+        let waiter = |turn: i64| {
+            let woken = woken.clone();
+            Waiter {
+                bot: format!("bot{turn}"),
+                turn,
+                wake: Arc::new(move |_, turn| woken.lock().unwrap().push(turn)),
+            }
+        };
+        let one = waiter(1);
+        pace.limited(None);
+        tokio::time::advance(Duration::from_secs(2)).await;
+        let first = ask(&pace, None).await.0.unwrap();
+        assert!(ask(&pace, Some(&one)).await.0.is_err());
+        let background = ask(&pace, None);
+        tokio::pin!(background);
+        let second = Duration::from_secs(1);
+        assert!(tokio::time::timeout(second, &mut background).await.is_err());
+        drop(first);
+        assert_eq!(*woken.lock().unwrap(), [1]);
+        let call = tokio::time::timeout(second, ask(&pace, Some(&one)))
+            .await
+            .expect("the waiting caller held the gate")
+            .0
+            .unwrap();
+        assert!(tokio::time::timeout(second, &mut background).await.is_err());
+        drop(call);
+        let (later, _) = tokio::time::timeout(second, &mut background)
+            .await
+            .expect("a settle wakes the queued caller");
+        later.unwrap();
+    }
+
+    /// A caller that gives up while queued on a ramp gives its place up.
+    #[tokio::test(start_paused = true)]
+    async fn a_caller_that_gives_up_leaves_the_ramp_s_queue() {
+        let pace = Pace::default();
+        let woken = Arc::new(Mutex::new(Vec::new()));
+        let two = Waiter {
+            bot: "bot2".into(),
+            turn: 2,
+            wake: {
+                let woken = woken.clone();
+                Arc::new(move |_, turn| woken.lock().unwrap().push(turn))
+            },
+        };
+        pace.limited(None);
+        tokio::time::advance(Duration::from_secs(2)).await;
+        let first = ask(&pace, None).await.0.unwrap();
+        let gave_up = tokio::time::timeout(Duration::from_secs(1), ask(&pace, None)).await;
+        assert!(gave_up.is_err());
+        assert!(ask(&pace, Some(&two)).await.0.is_err());
+        drop(first);
+        assert_eq!(*woken.lock().unwrap(), [2]);
     }
 
     /// A place kept for a woken turn that never comes back is let go, and
