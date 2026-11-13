@@ -8655,3 +8655,60 @@ not touch: Sonny's only change is one label in the transcript's match on
 tool names. The same lookout note p95 fell 14% at the other size in the
 same run, and quiet window CPU has swung by 16% and 33% on earlier screens
 with no Sonny change (above), so both are the runner's spread.
+
+## Background commands: no default timeout, a bot's share pruned (#896, #901)
+
+#896: a background command given no `timeout_ms` runs until it exits, so it
+arms no timer; one with a `timeout_ms` is unchanged. #901: each bot keeps at
+most the process bound's number of background commands, and starting one
+past them kills the one it started or waited on least recently, as Codex
+prunes a session's processes. What each path costs:
+
+- **A background start**: one lock of the running-command map and one scan
+  of it, which holds at most the process bound plus its line (128 by
+  default): no allocation, no store work, no timer.
+- **A wait on proc handles**: one use counter set per handle under the same
+  lock, after the ownership check it already made; nothing for a wait on
+  messages alone.
+- **Per running background command**: an owner and a use counter, 16 bytes.
+
+None of the screened benches start background commands, so every row below
+measures paths the change leaves alone; store work per turn is the same on
+both sides in both screens.
+
+Daemon and Sonny screen (`bench.perf_gate`), the Perf workflow's Linux
+runner, alternating rounds. #896, base main 4e17d3b against head 9c31bb5:
+
+| Bench | Measure | Base | Head | Change |
+| --- | --- | ---: | ---: | ---: |
+| admission | lone submit CPU, ms | 36.354 | 35.366 | -2.7% |
+| admission | burst submit p99, ms | 4.403 | 4.217 | -4.2% |
+| completion | release to terminal p99, ms | 11.561 | 11.321 | -2.1% |
+| footprint | idle RSS, MiB | 15.92 | 15.852 | -0.4% |
+| footprint | per idle bot, KiB | 1.712 | 1.81 | +5.7% |
+| footprint | RSS after a turn each, MiB | 29.295 | 27.496 | -6.1% |
+| footprint | CPU per turn, ms | 1.036 | 0.999 | -3.6% |
+| lifecycle | CPU, s | 0.54 | 0.535 | -0.9% |
+| lifecycle | p95 turn, ms | 580.476 | 578.868 | -0.3% |
+| lifecycle | peak RSS, MiB | 24.199 | 24.053 | -0.6% |
+
+#901, base main 20de562 (with #896) against head d90db68:
+
+| Bench | Measure | Base | Head | Change |
+| --- | --- | ---: | ---: | ---: |
+| admission | lone submit CPU, ms | 35.123 | 34.547 | -1.6% |
+| admission | burst submit p99, ms | 3.805 | 3.777 | -0.7% |
+| completion | release to terminal p99, ms | 9.753 | 10.226 | +4.8% |
+| footprint | idle RSS, MiB | 16.0 | 16.156 | +1.0% |
+| footprint | per idle bot, KiB | 1.852 | 1.75 | -5.5% |
+| footprint | RSS after a turn each, MiB | 29.312 | 29.797 | +1.7% |
+| footprint | CPU per turn, ms | 0.926 | 0.929 | +0.3% |
+| lifecycle | CPU, s | 0.48 | 0.48 | -0.0% |
+| lifecycle | p95 turn, ms | 706.6 | 578.011 | -18.2% |
+| lifecycle | peak RSS, MiB | 24.594 | 24.496 | -0.4% |
+
+Every row is inside the runner's spread and the gate warned on none. The
+two moves past 5% go opposite ways for the same per-idle-bot figure across
+the two screens (+5.7%, -5.5%), and completion p99 at +4.8% is 0.47 ms on a
+path neither change touches. Sonny's rows are left out: neither PR changes
+Sonny.
