@@ -2637,7 +2637,7 @@ impl Database {
     /// before versioning, stores at versions 1 to 5 and stores from newer
     /// binaries are rejected; an older store from version 6 on is migrated
     /// forward, one version at a time, at open.
-    pub const SCHEMA: i32 = 97;
+    pub const SCHEMA: i32 = 98;
     /// The person's messages a compaction keeps verbatim, newest first:
     /// per-message text, and the total text plus `(ordinal, String)` entry
     /// metadata. Empty entries cost space too, so the retained list cannot
@@ -17333,13 +17333,13 @@ fn migrate_since_73(conn: &Connection, from: i32) -> Result<()> {
         }
     }
 
-    // Schema 97: each turn counts the calls that ran to their end and their
+    // Schema 98: each turn counts the calls that ran to their end and their
     // time, calls that ran together once, and its own model calls' timings,
     // apart from a summary billed to it after it ended. The turns timed
     // since schema 95 take their calls from the audit trail, read from their
     // first start on, and their timings from their models' rows, which
     // count such a summary too.
-    if from < 97 {
+    if from < 98 {
         let has: bool = conn.query_row(
             "SELECT EXISTS(SELECT 1 FROM pragma_table_info('turns') WHERE name='tool_ms')",
             [],
@@ -17366,7 +17366,7 @@ fn migrate_since_73(conn: &Connection, from: i32) -> Result<()> {
 
     Ok(())
 }
-/// 96 -> 97: the tool calls and tool time of every turn with timed model
+/// 97 -> 98: the tool calls and tool time of every turn with timed model
 /// calls, from its rows in the audit trail that ended, as a call ending in
 /// its turn counts them: a call lifted to the background is left out. The
 /// trail is in time order, so it is read from the first of those turns'

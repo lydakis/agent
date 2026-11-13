@@ -17324,7 +17324,7 @@ fn a_trimmed_row_and_a_late_summary_leave_a_turns_time_as_it_ran() {
 }
 
 #[test]
-fn schema_97_clocks_the_timed_turns_from_the_audit_trail() {
+fn schema_98_clocks_the_timed_turns_from_the_audit_trail() {
     let path = std::env::temp_dir().join(format!("agent-clock-97-{}.sqlite", std::process::id()));
     let _ = std::fs::remove_file(&path);
     {

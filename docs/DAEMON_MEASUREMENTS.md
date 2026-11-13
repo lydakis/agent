@@ -9025,7 +9025,7 @@ rows past 5% (completion p99 at 0.5 ms, RSS after a turn each) are within
 the runner's spread on earlier screens, and lifecycle moves the other way.
 Sonny's rows are left out: no Sonny source changed.
 
-## Each turn's tool calls and their time (protocol 72, schema 97)
+## Each turn's tool calls and their time (protocol 73, schema 98)
 
 A turn keeps how many of its calls ran to their end and their time, calls
 that ran together once, so `usage` can say where a finished turn's time went.
