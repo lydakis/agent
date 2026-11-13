@@ -1907,7 +1907,11 @@ file, the tasks as the footer counts them, the minute for a clock), and a
 fill that fails later keeps what it showed with why under it. Under its
 title a filled note says what it follows (`follows 🛠 ci, tasks,
 state.json`, a source by its icon), and a source that is down says since
-when, so a live note never passes for a written one. Notes of
+when, so a live note never passes for a written one.
+
+![A note of your own in the margin, filled from its blanks: follows 🛠 ci, tasks, release.json; the CI source's latest run, a release file's state, and the lead's task fix-avg with how long its turn took](../docs/sonny/margin-template-note.png)
+
+Notes of
 your own go in your config as `[sonny.notes.NAME]`, a `template` and a
 `title`, and show over the agent's in every margin, with no buttons:
 they are yours to change there. A note with `opens: "AGENT"`,
