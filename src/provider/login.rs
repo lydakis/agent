@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{
     path::{Path, PathBuf},
-    sync::Mutex,
+    sync::{Arc, Mutex},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
@@ -182,7 +182,8 @@ pub struct Login {
     redaction: Option<Credentials>,
     state: Mutex<State>,
     /// One refresh at a time within the daemon; a file lock covers others.
-    refreshing: tokio::sync::Mutex<()>,
+    /// Shared with the task an exchange runs in, which holds it to the end.
+    refreshing: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl std::fmt::Debug for Login {
@@ -206,7 +207,7 @@ impl Login {
                 saved: saved.clone(),
                 refreshed: None,
             }),
-            refreshing: tokio::sync::Mutex::new(()),
+            refreshing: Arc::new(tokio::sync::Mutex::new(())),
         };
         login.redact(&saved);
         Ok(login)
@@ -246,22 +247,22 @@ impl Login {
     /// token is now held and the caller may retry. The refused token is
     /// refreshed once, unless this process obtained it moments ago.
     pub async fn reload(&self, client: &reqwest::Client, refused: &Session) -> Result<bool> {
-        {
+        let just_refreshed = {
             let state = self.held();
             if state.saved.access_token != refused.token {
                 return Ok(true);
             }
-            if state.refreshed.is_some_and(|at| at.elapsed() < FRESH) {
-                drop(state);
-                // Not refreshed again, but a sign-in since is taken.
-                return Ok(match read(&self.path) {
-                    Ok(on_disk) if on_disk.access_token != refused.token && !on_disk.due() => {
-                        self.install(on_disk, false);
-                        true
-                    }
-                    _ => false,
-                });
-            }
+            state.refreshed.is_some_and(|at| at.elapsed() < FRESH)
+        };
+        if just_refreshed {
+            // Not refreshed again, but a sign-in since is taken.
+            return Ok(match read_off(&self.path).await {
+                Ok(on_disk) if on_disk.access_token != refused.token && !on_disk.due() => {
+                    self.install(on_disk, false);
+                    true
+                }
+                _ => false,
+            });
         }
         let session = self.refresh(client, &refused.token).await?;
         Ok(session != *refused)
@@ -271,7 +272,7 @@ impl Login {
     /// token set when it differs from the held one, else refresh it and
     /// write the replacement before anyone sends it.
     async fn refresh(&self, client: &reqwest::Client, stale: &str) -> Result<Session> {
-        let _turn = self.refreshing.lock().await;
+        let turn = self.refreshing.clone().lock_owned().await;
         {
             let state = self.held();
             if state.saved.access_token != stale {
@@ -280,87 +281,104 @@ impl Login {
                 });
             }
         }
-        let _lock = lock(&self.path).await?;
-        let on_disk = read(&self.path)?;
+        let file = lock(&self.path).await?;
+        let on_disk = read_off(&self.path).await?;
         if on_disk.access_token != stale && !on_disk.due() {
             return Ok(self.install(on_disk, false));
         }
-        let fresh = tokio::time::timeout(DEADLINE, self.exchange(client, &on_disk))
-            .await
-            .unwrap_or_else(|_| Err(Error::new("provider_connection_timeout")))?;
-        write(&self.path, &fresh)?;
+        // The issuer retires the refresh token as it answers, so the
+        // exchange and the write run in a task of their own that holds both
+        // locks to the end: a turn interrupted meanwhile stops waiting, but
+        // the rotated pair is still saved, and the next use takes it from
+        // the file.
+        let (client, url, path) = (client.clone(), self.token_url.clone(), self.path.clone());
+        let fresh = tokio::spawn(async move {
+            let _locks = (turn, file);
+            let fresh = tokio::time::timeout(DEADLINE, exchange(&client, &url, &path, &on_disk))
+                .await
+                .unwrap_or_else(|_| Err(Error::new("provider_connection_timeout")))?;
+            write_off(&path, &fresh).await?;
+            Ok::<_, Error>(fresh)
+        })
+        .await
+        .map_err(|_| Error::new("provider_login_unavailable"))??;
         Ok(self.install(fresh, true))
     }
+}
 
-    async fn exchange(&self, client: &reqwest::Client, saved: &Saved) -> Result<Saved> {
-        let body = form(&[
-            ("grant_type", "refresh_token"),
-            ("client_id", &saved.client_id),
-            ("refresh_token", &saved.refresh_token),
-            ("resource", RESOURCE),
-        ]);
-        let response = client
-            .post(self.token_url.clone())
-            .header("content-type", "application/x-www-form-urlencoded")
-            .header("accept", "application/json")
-            .body(body)
-            .send()
-            .await
-            .map_err(super::connection_error)?;
-        let status = response.status().as_u16();
-        let body = bounded(response).await?;
-        let value: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
-        if !(200..300).contains(&status) {
-            let code = value["error"].as_str().unwrap_or("refused");
-            // A server's trouble keeps the token set for another try, after
-            // a backoff: a throttled refresh is not the model's pace, so it
-            // is not a 429 the model's pool would retry at once. A refusal
-            // of the grant itself needs a new sign-in.
-            if status >= 500 || status == 429 {
-                return Err(Error {
-                    code: match status {
-                        429 => "provider_login_throttled".to_owned(),
-                        _ => format!("provider_http_{status}"),
-                    },
-                    detail: Some(format!("refreshing {}: {code}", self.path.display())),
-                    facts: None,
-                });
-            }
-            // A client OpenAI no longer knows cannot sign in again either:
-            // only a new registration recovers.
-            let remedy = match code {
-                "invalid_client" => "delete it and run agent login chatgpt to register again",
-                _ => HINT,
-            };
-            return Err(Error::with(
-                "provider_login_expired",
-                format!(
-                    "{} refused its refresh ({code}); {remedy}",
-                    self.path.display()
-                ),
-            ));
+/// Spend `saved`'s refresh token at `url` for a new pair.
+async fn exchange(
+    client: &reqwest::Client,
+    url: &reqwest::Url,
+    path: &Path,
+    saved: &Saved,
+) -> Result<Saved> {
+    let body = form(&[
+        ("grant_type", "refresh_token"),
+        ("client_id", &saved.client_id),
+        ("refresh_token", &saved.refresh_token),
+        ("resource", RESOURCE),
+    ]);
+    let response = client
+        .post(url.clone())
+        .header("content-type", "application/x-www-form-urlencoded")
+        .header("accept", "application/json")
+        .body(body)
+        .send()
+        .await
+        .map_err(super::connection_error)?;
+    let status = response.status().as_u16();
+    let body = bounded(response).await?;
+    let value: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
+    if !(200..300).contains(&status) {
+        let code = value["error"].as_str().unwrap_or("refused");
+        // A server's trouble keeps the token set for another try, after
+        // a backoff: a throttled refresh is not the model's pace, so it
+        // is not a 429 the model's pool would retry at once. A refusal
+        // of the grant itself needs a new sign-in.
+        if status >= 500 || status == 429 {
+            return Err(Error {
+                code: match status {
+                    429 => "provider_login_throttled".to_owned(),
+                    _ => format!("provider_http_{status}"),
+                },
+                detail: Some(format!("refreshing {}: {code}", path.display())),
+                facts: None,
+            });
         }
-        let field = |name: &str| value[name].as_str().filter(|v| !v.is_empty());
-        let (Some(access), Some(refresh)) = (field("access_token"), field("refresh_token")) else {
-            return Err(Error::with(
-                "invalid_provider_response",
-                "a refresh without an access and refresh token",
-            ));
+        // A client OpenAI no longer knows cannot sign in again either:
+        // only a new registration recovers.
+        let remedy = match code {
+            "invalid_client" => "delete it and run agent login chatgpt to register again",
+            _ => HINT,
         };
-        let lifetime = value["expires_in"].as_u64().unwrap_or(3600);
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_or(0, |d| d.as_secs());
-        Ok(Saved {
-            access_token: access.to_owned(),
-            refresh_token: refresh.to_owned(),
-            id_token: field("id_token").unwrap_or(&saved.id_token).to_owned(),
-            expires_at: now + lifetime,
-            scope: field("scope").unwrap_or(&saved.scope).to_owned(),
-            ..saved.clone()
-        })
+        return Err(Error::with(
+            "provider_login_expired",
+            format!("{} refused its refresh ({code}); {remedy}", path.display()),
+        ));
     }
+    let field = |name: &str| value[name].as_str().filter(|v| !v.is_empty());
+    let (Some(access), Some(refresh)) = (field("access_token"), field("refresh_token")) else {
+        return Err(Error::with(
+            "invalid_provider_response",
+            "a refresh without an access and refresh token",
+        ));
+    };
+    let lifetime = value["expires_in"].as_u64().unwrap_or(3600);
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
+    Ok(Saved {
+        access_token: access.to_owned(),
+        refresh_token: refresh.to_owned(),
+        id_token: field("id_token").unwrap_or(&saved.id_token).to_owned(),
+        expires_at: now + lifetime,
+        scope: field("scope").unwrap_or(&saved.scope).to_owned(),
+        ..saved.clone()
+    })
+}
 
+impl Login {
     fn install(&self, saved: Saved, refreshed: bool) -> Session {
         self.redact(&saved);
         let token = saved.access_token.clone();
@@ -403,6 +421,22 @@ pub async fn bounded(response: reqwest::Response) -> Result<Vec<u8>> {
         body.extend_from_slice(&chunk);
     }
     Ok(body)
+}
+
+/// [`read`] on a blocking thread, as [`lock`] takes its lock.
+async fn read_off(path: &Path) -> Result<Saved> {
+    let path = path.to_owned();
+    tokio::task::spawn_blocking(move || read(&path))
+        .await
+        .map_err(|_| Error::new("provider_login_unavailable"))?
+}
+
+/// [`write`], with its fsyncs, on a blocking thread.
+async fn write_off(path: &Path, saved: &Saved) -> Result<()> {
+    let (path, saved) = (path.to_owned(), saved.clone());
+    tokio::task::spawn_blocking(move || write(&path, &saved))
+        .await
+        .map_err(|_| Error::new("provider_login_unavailable"))?
 }
 
 /// An exclusive lock on `PATH.lock`, held while a refresh reads, exchanges
@@ -544,6 +578,62 @@ pub(crate) mod tests {
             assert_eq!(mode & 0o777, 0o600);
         }
         assert_eq!(form(&[("a", "b c"), ("d", "e&f=")]), "a=b+c&d=e%26f%3D");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn an_interrupted_refresh_still_saves_the_rotated_pair() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let dir = temp("login-interrupted");
+        let path = dir.join("chatgpt.json");
+        save(&path, "first");
+        // An issuer that answers only once told to, after the request is in:
+        // by then it has retired the old refresh token.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/token", listener.local_addr().unwrap());
+        let (arrived, mut got) = tokio::sync::mpsc::unbounded_channel();
+        let (release, answer) = tokio::sync::oneshot::channel::<()>();
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            let mut buffer = [0; 4096];
+            while !String::from_utf8_lossy(&request).contains("refresh_token=") {
+                let n = socket.read(&mut buffer).await.unwrap();
+                request.extend_from_slice(&buffer[..n]);
+            }
+            arrived.send(()).unwrap();
+            answer.await.unwrap();
+            let body =
+                r#"{"access_token":"second","refresh_token":"refresh-second","expires_in":3600}"#;
+            let reply = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            socket.write_all(reply.as_bytes()).await.unwrap();
+        });
+        let login = Login::open(&path, None)
+            .unwrap()
+            .with_token_url(&url)
+            .unwrap();
+        let client = reqwest::Client::new();
+        login.expire_now();
+        let mut call = Box::pin(login.current(&client));
+        tokio::select! {
+            _ = &mut call => panic!("answered before the issuer did"),
+            _ = got.recv() => {}
+        }
+        // The turn is interrupted while the issuer answers.
+        drop(call);
+        release.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while read(&path).unwrap().refresh_token != "refresh-second" {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the rotated pair is saved");
+        // The next use takes it from the file, with no second exchange.
+        assert_eq!(login.current(&client).await.unwrap().token, "second");
         std::fs::remove_dir_all(dir).unwrap();
     }
 
