@@ -2279,6 +2279,93 @@ pub fn allowed(
     lines
 }
 
+/// What came of a request written out for the person, once it waits no
+/// more: whose verdict it was, or that none came.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Decided {
+    /// Allowed, by the person (`you`) or the reviewer; with the command
+    /// the person always allows from now on, when they did.
+    Allowed {
+        you: bool,
+        kept: Option<String>,
+    },
+    Denied {
+        you: bool,
+    },
+    /// No one answered before its time ran out.
+    Lapsed,
+    /// It waits no more, and no verdict was heard here: answered where
+    /// this window could not see, or its agent stopped it.
+    Gone,
+}
+
+/// A request for the person folded to one row once it is answered, as
+/// Codex records an approval's decision in place of the request: the
+/// verdict and what it was for, then whose call it was when `from` names
+/// another agent.
+pub fn decided(
+    name: &str,
+    arguments: &Value,
+    from: Option<&str>,
+    decided: &Decided,
+    workspace: &str,
+    width: usize,
+) -> Line<'static> {
+    let what = action(name, arguments, workspace);
+    let who = |you: bool| Span::raw(if you { "You " } else { "The reviewer " });
+    // Its mark and the words before what it was for, then after.
+    let (head, tail): (Vec<Span<'static>>, String) = match decided {
+        Decided::Allowed { you, kept } => (
+            vec![
+                Span::raw("✓ ").fg(Color::Green),
+                who(*you),
+                Span::raw("allowed").bold(),
+                Span::raw(" "),
+            ],
+            kept.as_ref()
+                .map(|kept| format!(", and {kept} from now on"))
+                .unwrap_or_default(),
+        ),
+        Decided::Denied { you } => (
+            vec![
+                Span::raw("✗ ").fg(Color::Red),
+                who(*you),
+                Span::raw("denied").bold(),
+                Span::raw(" "),
+            ],
+            String::new(),
+        ),
+        Decided::Lapsed => (
+            vec![
+                Span::raw("✗ ").fg(Color::Red),
+                Span::raw("Request "),
+                Span::raw("timed out").bold(),
+                Span::raw(" for "),
+            ],
+            String::new(),
+        ),
+        Decided::Gone => (
+            vec![Span::raw("⏸ ").fg(Color::Yellow), Span::raw("Request for ")],
+            " no longer waits".into(),
+        ),
+    };
+    let from = from.map(|bot| format!(" · {bot}")).unwrap_or_default();
+    let used: usize = (head.iter())
+        .map(|span| span.content.chars().count())
+        .sum::<usize>()
+        + tail.chars().count()
+        + from.chars().count();
+    let mut spans = head;
+    spans.push(Span::raw(cut(&what, width.saturating_sub(used + 1).max(8))).dim());
+    if !tail.is_empty() {
+        spans.push(Span::raw(tail));
+    }
+    if !from.is_empty() {
+        spans.push(Span::raw(from).dim());
+    }
+    Line::from(spans)
+}
+
 /// What a tool call did: one header line, then a short look at its result.
 pub fn tool(
     name: &str,
@@ -2696,17 +2783,7 @@ fn drawn(
     }
     let patch = (name == "apply_patch").then(|| as_unified(&field("input"), workspace));
     if let Some(patch) = &patch {
-        let (removed, added) = patch.lines().fold((0, 0), |(removed, added), line| {
-            match (
-                line.starts_with("--- "),
-                line.starts_with("+++ "),
-                line.chars().next(),
-            ) {
-                (false, false, Some('-')) => (removed + 1, added),
-                (false, false, Some('+')) => (removed, added + 1),
-                _ => (removed, added),
-            }
-        });
+        let (removed, added) = crate::diff::changes(patch);
         header.spans.push(Span::raw("  "));
         header.spans.extend(crate::diff::counts(removed, added));
     }

@@ -76,6 +76,8 @@ it keeps these, and says in its PR how:
 - The pacer learns from everything a provider says (rate-limit headers,
   `retry-after-ms` and `retry-after`, named delays, usage) and estimates what
   the provider counts. It invents no caps and refuses only what can never fit.
+  A pool that knows no allowance ramps back after a refusal: one call, then
+  one more for each answered, the window learned from the provider's answers.
 - Every provider error has a class: a rate limit (429, slow down) closes the
   pool and parks; an overload (529, overloaded) backs off its own call and
   closes the pool only when it names a delay or overloads cluster; transient

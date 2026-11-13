@@ -68,6 +68,7 @@ mod place;
 mod plan;
 mod project;
 mod prompt;
+mod ps;
 mod reactions;
 mod recall;
 mod resolved;
@@ -95,6 +96,7 @@ mod switch;
 mod t3;
 mod table;
 mod task;
+mod template;
 mod term;
 #[cfg(test)]
 mod testing;
@@ -103,6 +105,7 @@ mod transcript;
 mod tree;
 mod trigger;
 mod trusted;
+mod update;
 mod upgrade;
 mod usage;
 mod used;
@@ -353,6 +356,11 @@ struct Options {
     /// made, sent once this window is set up: a file, as a message can
     /// be longer than one argument may.
     send: Option<PathBuf>,
+    /// The file holding what was typed in the composer of the window this
+    /// one reopened after an update, put back in its composer unsent.
+    draft: Option<PathBuf>,
+    /// This window reopened on a Sonny installed while it was open.
+    reopened: bool,
 }
 
 fn usage() -> String {
@@ -378,6 +386,8 @@ fn usage() -> String {
      tasks; sonny tool-host answers its agents' calls of Sonny's tools. Sonny starts both.\n\
      sonny agent ARGS... runs Sonny's own `agent` with ARGS, whatever `agent` is on PATH.\n\
      sonny setup asks again for the provider and the default model, as the first run does.\n\
+     sonny update [--download] updates Sonny and its daemon to the latest release, as it was\n\
+     installed, replaces the running daemon with the new one and has open windows reopen on it.\n\
      sonny acp [--store PATH] [--socket PATH] speaks the Agent Client Protocol on stdio\n\
      for T3 Code: a thread is its folder's lead, and each task opens as a thread of its own."
         .into()
@@ -1176,6 +1186,16 @@ pub(crate) async fn answer_once(
             attempt += 1;
             continue;
         }
+        // Answered, it has nothing left to remind of: its deadline goes
+        // now, beside the window, rather than wait in `/background` for a
+        // gate that would say no. Only once the answer opened a turn,
+        // which nothing takes back: one waiting in line, or for the
+        // running turn's next round, may yet be withdrawn or bounce and
+        // leave the question open, so its deadline stays for the gate.
+        if reply.as_ref().is_ok_and(|reply| reply["turn"].is_i64()) {
+            let (bot, ask) = (bot.clone(), ask.to_owned());
+            tokio::task::spawn_blocking(move || asks::let_deadline_go(&bot, &ask));
+        }
         return reply.map_err(|error| match error.code.as_str() {
             "idempotency_conflict" => "that question was answered already".to_owned(),
             _ => error.to_string(),
@@ -1484,15 +1504,16 @@ pub(crate) fn agent_at(places: &[PathBuf]) -> Result<PathBuf, String> {
     })
 }
 
-/// Where Agent's binary is installed with Sonny at `me`: beside it, and,
-/// when Sonny is in Homebrew's Cellar, by the `agent` formula's `opt`
+/// Where Agent's binary is installed with Sonny at `me`: beside it (by
+/// the release tarball's `opt/sonny` link when Sonny was unpacked there),
+/// and, when Sonny is in Homebrew's Cellar, by the `agent` formula's `opt`
 /// path, which outlasts the versions upgrades remove. The daemon hands
 /// that path to its agents, so it must outlast the daemon's version.
 fn installed_agent(me: &std::path::Path) -> Vec<PathBuf> {
     let Some(keg) = me.parent().and_then(std::path::Path::parent) else {
         return Vec::new();
     };
-    let mut found = vec![keg.join("libexec/agent")];
+    let mut found = vec![skills::opt_path(&keg.join("libexec/agent"))];
     if let Some(cellar) = keg
         .parent()
         .filter(|formula| formula.ends_with("Cellar/sonny"))
@@ -1793,6 +1814,25 @@ fn start_daemon(
     socket: &std::path::Path,
     login: bool,
 ) -> Result<(), NotStarted> {
+    start_daemon_with(store, socket, login, false)
+}
+
+/// [`start_daemon`], replacing the daemon running now, whatever its
+/// release, as `sonny update` switches to the new one (`agent start
+/// --replace`).
+fn start_daemon_replacing(
+    store: &std::path::Path,
+    socket: &std::path::Path,
+) -> Result<(), NotStarted> {
+    start_daemon_with(store, socket, false, true)
+}
+
+fn start_daemon_with(
+    store: &std::path::Path,
+    socket: &std::path::Path,
+    login: bool,
+    replace: bool,
+) -> Result<(), NotStarted> {
     let bin = agent_at(&agent_places_here()).map_err(|missing| {
         format!(
             "the daemon is not running and {missing}; install Sonny with Homebrew or its release tarball, or set AGENT_BIN"
@@ -1824,8 +1864,11 @@ fn start_daemon(
     }
     // The CLI gives the daemon the keys in ~/.agent/env itself.
     command.env("AGENT_BIN", &bin).env_remove(named::PROGRAM);
+    command.arg("start");
+    if replace {
+        command.arg("--replace");
+    }
     let out = command
-        .arg("start")
         .arg("--store")
         .arg(store)
         .arg("--socket")
@@ -1886,7 +1929,7 @@ fn parse() -> Result<Options, String> {
         (None, None, None, false, None, None);
     let (mut layout, mut rex_host, mut sound) = (true, None, true);
     let (mut side, mut embedded) = (None, false);
-    let (mut window_place, mut send) = (None, None);
+    let (mut window_place, mut send, mut draft, mut reopened) = (None, None, None, false);
     let mut lead = project::Pick::Last;
     let mut args = args.peekable();
     while let Some(arg) = args.next() {
@@ -1915,6 +1958,10 @@ fn parse() -> Result<Options, String> {
             "--window-place" => window_place = Some(value()?),
             // Unlisted: how `/new` hands the agent it made its first message.
             "--send-file" => send = Some(PathBuf::from(value()?)),
+            // Unlisted: how a window reopens on a Sonny installed while it
+            // was open, with what was typed in its composer.
+            "--draft-file" => draft = Some(PathBuf::from(value()?)),
+            "--reopened" => reopened = true,
             _ => return Err(usage()),
         }
     }
@@ -1934,6 +1981,8 @@ fn parse() -> Result<Options, String> {
         window_place,
         lead,
         send,
+        draft,
+        reopened,
     })
 }
 
@@ -1946,8 +1995,9 @@ fn reopen(bot: &str) -> Vec<String> {
     let mut args = std::env::args().skip(1).peekable();
     while let Some(arg) = args.next() {
         match arg.as_str() {
-            "--new" => {}
-            "--workspace" | "--lead" | "--agent" | "--window-place" | "--send-file" => {
+            "--new" | "--reopened" => {}
+            "--workspace" | "--lead" | "--agent" | "--window-place" | "--send-file"
+            | "--draft-file" => {
                 args.next();
             }
             "--new-lead" => {
@@ -1988,6 +2038,9 @@ fn main() -> std::process::ExitCode {
     lookout::subs::at_start();
     haiku::at_start();
     config::at_start();
+    // Live memory facts are filled wherever Sonny reads memory or composes
+    // a new agent's instructions.
+    agent_client::memory::fill_with(&template::Live);
     let args: Vec<String> = std::env::args().skip(1).collect();
     let result = match args.split_first() {
         // The tool host runs this for each call of a tool Sonny answers.
@@ -2053,6 +2106,8 @@ fn main() -> std::process::ExitCode {
         }
         Some((verb, rest)) if verb == "sky" => sky_cli(rest),
         Some((verb, rest)) if verb == "status" => status_cli(rest),
+        // The person runs this, from a terminal of their own.
+        Some((verb, rest)) if verb == "update" => update::cli(rest),
         // An agent's shell runs this, before it opens anything in a terminal.
         Some((verb, rest)) if verb == "where" => where_cli(rest),
         // An agent's shell runs this, for zen it was asked for in words.
@@ -2323,6 +2378,9 @@ async fn run() -> Result<(), String> {
         }
         return Ok(());
     }
+    // The program this window runs, so one installed over it later is
+    // seen and reopened on.
+    update::note_started();
     let options = parse()?;
     SIDE.store(options.side.is_some(), std::sync::atomic::Ordering::Relaxed);
     // Before any lead is made, so its instructions list the skills.
@@ -2458,6 +2516,8 @@ async fn run() -> Result<(), String> {
     app.pinned = settings.project_color.clone();
     set_measure(settings.text_width);
     margin::set_limits(settings.margin_notes, settings.margin_note_lines);
+    app.blanks.store = Some(app.options.store.clone());
+    app.set_template_settings(&settings);
     app.zen = zen::focus(app.reactions_key.as_deref());
     app.margin_opens = settings.margin_opens;
     app.agent_opens = settings.agent_opens;
@@ -2655,18 +2715,56 @@ async fn run() -> Result<(), String> {
         }
         return Err(format!("could not open {other}: {error}"));
     }
+    // Sonny was updated while this window was open: it goes on as the new
+    // Sonny, in this same terminal, on the same agent, with what was typed.
+    if let (Ok(()), Some(program)) = (&result, app.reopen_on.take()) {
+        use std::os::unix::process::CommandExt;
+        let mut place = None;
+        if let Some(marker) = &app.marker {
+            marker.retire();
+            place = marker.known();
+        }
+        let mut args = reopen(&app.bot).split_off(1);
+        args.push("--reopened".into());
+        if let Some(place) = place {
+            args.extend(["--window-place".into(), mux::Place::encode(&place)]);
+        }
+        // The words, and the pictures behind their placeholders: a picture
+        // pasted from the clipboard has no file to come back from.
+        let draft = (!app.input.trim().is_empty())
+            .then(|| attach::draft(&app.input, &app.pictures))
+            .and_then(|draft| kept_text(&app.options.store, "draft", &draft).ok());
+        if let Some(draft) = &draft {
+            args.extend(["--draft-file".into(), draft.display().to_string()]);
+        }
+        let error = std::process::Command::new(&program).args(&args).exec();
+        if let Some(draft) = &draft {
+            let _ = std::fs::remove_file(draft);
+        }
+        return Err(format!(
+            "could not reopen on the updated Sonny at {}: {error}",
+            program.display()
+        ));
+    }
     result
 }
 
 /// Keeps `brief`, a new lead's first message, in a file of the person's
 /// own beside `store` for its window to send: its path.
 fn first_message(store: &std::path::Path, brief: &str) -> Result<PathBuf, String> {
+    kept_text(store, "first", brief)
+}
+
+/// Keeps `text` in a file of the person's own beside `store`, named for
+/// `what`, for the window this one becomes to read: its path.
+fn kept_text(store: &std::path::Path, what: &str, text: &str) -> Result<PathBuf, String> {
     use std::io::Write;
     use std::os::unix::fs::OpenOptionsExt;
+    let brief = text;
     let nanos = (std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH))
         .map_or(0, |since| since.as_nanos());
     let mut path = store.as_os_str().to_owned();
-    path.push(format!(".first-{}-{nanos}", std::process::id()));
+    path.push(format!(".{what}-{}-{nanos}", std::process::id()));
     let path = PathBuf::from(path);
     let written = std::fs::OpenOptions::new()
         .write(true)
@@ -3265,6 +3363,35 @@ struct Denial {
     reason: String,
 }
 
+/// A call waiting on the person as [`App::show_asked`] wrote it out:
+/// its rows, tagged [`screen::Tag::Request`] with `tag`, and enough to
+/// fold them to one row once it is answered, as Codex keeps only the
+/// decision of an approval it asked.
+struct Written {
+    tag: u64,
+    /// Whether a blank row before it is its own.
+    gap: bool,
+    rows: Vec<Line<'static>>,
+    name: String,
+    arguments: Value,
+    /// The agent whose call it is, when not this window's.
+    from: Option<String>,
+    /// What came of it: the person's answer here, until the call's own
+    /// verdict is `heard`, which is final.
+    decided: Option<transcript::Decided>,
+    heard: bool,
+    /// Folded to its verdict: it waits no more.
+    folded: bool,
+    /// Folded, opened whole again by a click or Ctrl+O.
+    open: bool,
+    /// When it was written out, by the wall clock: its decision came after.
+    at_ms: i64,
+}
+
+/// How far before a request was written out its audit row is looked for:
+/// the clock's own slack, as the daemon stamps rows on the same machine.
+const AUDIT_SLACK_MS: i64 = 5_000;
+
 /// Calls alike, drawn as one: what they did, whom each did it to, and
 /// each one's own rows, shown under it while open.
 struct Fold {
@@ -3567,7 +3694,7 @@ fn hold(unsent: &mut Vec<String>, record: String) {
 /// `/agents` and `/ps` also open `/status`, `/automations` and `/lookout`
 /// open `/background`, `/forum` opens `/commons`, and `/settings` opens
 /// `/config`, unlisted.
-const COMMANDS: [(&str, &str); 30] = [
+const COMMANDS: [(&str, &str); 31] = [
     ("/side", "Start a side chat with a copy of this agent"),
     ("/model", "Pick the model and effort"),
     (
@@ -3602,6 +3729,10 @@ const COMMANDS: [(&str, &str); 30] = [
         "Show or close the agent's notes beside the conversation",
     ),
     ("/background", "Run or remove automations and follows"),
+    (
+        "/ps",
+        "Show the commands the agents left running, and stop one",
+    ),
     ("/commons", "Read what the agents of every project share"),
     ("/sky", "Watch every agent light up as they talk"),
     ("/usage", "Show the tokens the agents spent, over time"),
@@ -3680,6 +3811,8 @@ type Reads = (
 struct Counted {
     mark: Option<u64>,
     read: Option<((status::Counts, std::collections::HashSet<String>), Reads)>,
+    /// The tasks as template notes' `tasks()` gives them, when read.
+    tasks: Option<Vec<Value>>,
 }
 
 /// A mark of where the agents `pattern` names stand, as the daemon lists
@@ -3763,6 +3896,8 @@ struct Watch {
     usage: Option<usage::View>,
     /// `/audit` holds it instead.
     audit: Option<audit::View>,
+    /// `/ps` holds it instead.
+    ps: Option<ps::View>,
     /// `/commons` holds it instead.
     commons: Option<commons::View>,
     /// `/sky` holds it instead.
@@ -3934,6 +4069,13 @@ struct App {
     /// and Enter on an empty composer brings them back. A later turn's
     /// call of the same id is another.
     calls_aside: std::collections::HashSet<(String, i64, String)>,
+    /// The calls waiting on the person written out here, by bot, turn and
+    /// call, folded once they wait no more.
+    written: HashMap<(String, i64, String), Written>,
+    /// How many were written, which numbers the next.
+    written_count: u64,
+    /// How many were kept at the last look for ones trimmed away.
+    written_kept: usize,
     /// The lead's open questions for the person, oldest first: its `ask`
     /// calls not yet answered, nor set aside, and its tasks' open ones,
     /// pinned here as they come ([`App::pin_task_asks`]).
@@ -4010,6 +4152,9 @@ struct App {
     /// Another agent, which this window opens on instead once it quits:
     /// `/switch NAME`, or one `/new` made.
     switch_to: Option<String>,
+    /// The Sonny installed while this window was open, which it reopens on
+    /// once it quits ([`update::installed_since`]).
+    reopen_on: Option<PathBuf>,
     started: Instant,
     fleet: Option<Fleet>,
     /// This window, noted as the one the person uses each time they do,
@@ -4210,6 +4355,9 @@ struct App {
     /// How many of the project's agents each of `/status`'s groups lists,
     /// as its last read found: what the footer shows.
     counts: Option<status::Counts>,
+    /// What template notes are filled from: the tasks that read found,
+    /// the store, the person's sources and notes.
+    blanks: margin::Blanks,
     /// The agents that read gave a row, which its counts count already.
     status_bots: std::collections::HashSet<String>,
     /// The footer's own read of them, under way, and when the last began.
@@ -5839,6 +5987,9 @@ impl App {
             raised: Vec::new(),
             raised_read: Default::default(),
             calls_aside: Default::default(),
+            written: HashMap::new(),
+            written_count: 0,
+            written_kept: 0,
             asks: Vec::new(),
             focus: None,
             aside: Vec::new(),
@@ -5870,6 +6021,7 @@ impl App {
             paused,
             quit: false,
             switch_to: None,
+            reopen_on: None,
             started: Instant::now(),
             fleet: None,
             marker: None,
@@ -5956,6 +6108,7 @@ impl App {
             references: HashMap::new(),
             references_read: None,
             counts: None,
+            blanks: margin::Blanks::default(),
             status_bots: std::collections::HashSet::new(),
             counting: None,
             counted_at: None,
@@ -6100,6 +6253,22 @@ impl App {
         self.configure().await;
         self.tell_upgrades().await;
         self.tell_warnings().await;
+        // What was typed in the window this one reopened from, after an
+        // update: back in the composer, unsent.
+        if let Some(file) = self.options.draft.take() {
+            if let Ok(draft) = std::fs::read_to_string(&file) {
+                let (text, pictures) = attach::undraft(&draft);
+                self.input.set(&text);
+                self.pictures = pictures;
+            }
+            let _ = std::fs::remove_file(&file);
+        }
+        if self.options.reopened {
+            self.notice = Some(format!(
+                "Sonny was updated; this window reopened on {}",
+                env!("CARGO_PKG_VERSION")
+            ));
+        }
         // The first message `/new` was given, sent as the person wrote it:
         // a message as it is, never a command or a shell line typed anew.
         if let Some(file) = self.options.send.take() {
@@ -6252,6 +6421,17 @@ impl App {
                         fleet.zen = zen;
                         fleet.event(&event)
                     });
+                    // A call of an agent below, written out here, decided.
+                    if matches!(
+                        event["event"].as_str(),
+                        Some("tool_started" | "tool_completed" | "step_decided" | "lifted_ended")
+                    )
+                        && let Some(bot) = event["bot"].as_str().filter(|bot| *bot != self.bot)
+                    {
+                        let bot = bot.to_owned();
+                        self.heard_verdict_or_read(&bot, event["turn"].as_i64(), &event["data"])
+                            .await;
+                    }
                     if let Some(fleet) = &mut self.fleet
                         && !fleet.returned.is_empty()
                     {
@@ -6303,6 +6483,7 @@ impl App {
                     w.read.elapsed() > Duration::from_secs(2)
                         || w.usage.as_ref().is_some_and(usage::View::due)
                         || w.audit.as_ref().is_some_and(audit::View::due)
+                        || w.ps.as_ref().is_some_and(ps::View::due)
                 })
             {
                 self.reread().await;
@@ -7084,6 +7265,15 @@ impl App {
     /// what happened meanwhile: the bot's new items, and a turn that ended
     /// or began. Tried again every two seconds until it works.
     async fn reattach(&mut self, events: &mut Events) {
+        // Sonny was updated while this window was open: the daemon it lost
+        // is likely the old one, and what this window would start again is
+        // its own older build. It reopens on the new one, in place.
+        if let Some(program) = update::installed_since() {
+            self.reopen_on = Some(program);
+            self.quit = true;
+            self.retry = None;
+            return;
+        }
         if self.upgraded {
             self.retry = None;
             return;
@@ -7164,6 +7354,19 @@ impl App {
             }
             self.approvals_for(self.running.as_ref().map(|r| r.turn))
                 .await;
+            // Answered while away, its verdict unheard: read from the audit
+            // trail, as a task's is.
+            let unheard: Vec<(String, i64, String)> = (self.written.iter())
+                .filter(|(key, written)| key.0 == self.bot && !written.heard)
+                .map(|(key, _)| key.clone())
+                .filter(|key| {
+                    !(self.approvals.iter()).any(|call| {
+                        call["call_id"].as_str() == Some(key.2.as_str())
+                            && call["turn"].as_i64().unwrap_or(-1) == key.1
+                    })
+                })
+                .collect();
+            self.verdicts_from_audit(unheard).await;
             // A daemon that restarted brings back its companions; one
             // started anew, as by another store's Sonny, gets them now.
             if let Err(error) = start_companions(&self.client).await {
@@ -7736,7 +7939,7 @@ impl App {
         };
         let woken = self.woken.clone();
         let drawn = move || woken.notify_one();
-        let program = embed::Embedded::spawn(program, height, width, term::light(), drawn)?;
+        let program = embed::Embedded::spawn(program, height, width, drawn)?;
         let pane = pane::Pane::program(title, program);
         // Opened from `/status`, it goes back there, as a browser goes back.
         match self.pane.take() {
@@ -7867,6 +8070,17 @@ impl App {
         if let Some(key) = button.strip_prefix("card/") {
             self.card_clicked(key);
         }
+        // A request folded to its verdict, opened whole or folded again.
+        if let Some(tag) = (button.strip_prefix("request/")).and_then(|tag| tag.parse::<u64>().ok())
+            && let Some(key) = (self.written.iter())
+                .find(|(_, written)| written.tag == tag && written.folded)
+                .map(|(key, _)| key.clone())
+        {
+            if let Some(written) = self.written.get_mut(&key) {
+                written.open = !written.open;
+            }
+            self.draw_written(&key);
+        }
         if let Some(command) = (button.strip_prefix("copy/")).and_then(|id| self.commands.get(id)) {
             term::copy(command);
             self.notice = Some("copied".into());
@@ -7968,6 +8182,7 @@ impl App {
     /// done again only once that, or a note, changed.
     fn fold_notes(&mut self, beside: bool) {
         let workspace = std::path::PathBuf::from(&self.workspace);
+        self.margin_blanks();
         if !beside {
             self.margin.freshen(&workspace);
         }
@@ -8485,7 +8700,18 @@ impl App {
         let opens = |fold: &Fold| transcript::unfolds(&fold.whats, &fold.calls);
         let open = self.folds.values().any(|fold| opens(fold) && !fold.open)
             || self.clusters.values().any(|cluster| !cluster.open)
-            || self.relayed.values().any(|relayed| relayed.text.is_none());
+            || self.relayed.values().any(|relayed| relayed.text.is_none())
+            || (self.written.values()).any(|written| written.folded && !written.open);
+        let written: Vec<(String, i64, String)> = (self.written.iter())
+            .filter(|(_, written)| written.folded && written.open != open)
+            .map(|(key, _)| key.clone())
+            .collect();
+        for key in written {
+            if let Some(written) = self.written.get_mut(&key) {
+                written.open = open;
+            }
+            self.draw_written(&key);
+        }
         let folds: Vec<usize> = (self.folds.iter())
             .filter(|(_, fold)| opens(fold))
             .map(|(at, _)| *at)
@@ -8885,6 +9111,34 @@ impl App {
         }));
     }
 
+    /// The tasks as `/status` read them now, for template notes'
+    /// `tasks()`: counted as a change only where they differ.
+    fn tasks_read(&mut self, tasks: Vec<Value>) {
+        if *self.blanks.tasks != tasks {
+            self.blanks.tasks = std::sync::Arc::new(tasks);
+            self.blanks.tasks_read += 1;
+        }
+    }
+
+    /// The person's own notes and sources as the config has them now.
+    fn set_template_settings(&mut self, settings: &settings::Settings) {
+        let notes = std::sync::Arc::new(settings.notes.clone());
+        if *self.blanks.notes != *notes {
+            self.blanks.notes = notes;
+        }
+        // Kept as it was when the same, so notes fill again only once one
+        // is added or taken away.
+        if *self.blanks.sources != settings.sources {
+            self.blanks.sources = std::sync::Arc::new(settings.sources.clone());
+        }
+    }
+
+    /// What template notes are filled from, handed to the margin before
+    /// it is drawn or looked at: it may have been loaded again since.
+    fn margin_blanks(&mut self) {
+        self.margin.set_blanks(self.blanks.clone());
+    }
+
     /// The other bots' notes the margin shows, read again every few
     /// seconds while their bots are there: what each shows is kept once
     /// its bot is gone.
@@ -8921,6 +9175,9 @@ impl App {
             && let Ok(Some(counted)) = job.await
         {
             self.counted_mark = counted.mark;
+            if let Some(tasks) = counted.tasks {
+                self.tasks_read(tasks);
+            }
             if let Some(((counts, bots), (latest, seen))) = counted.read {
                 self.counts = Some(counts);
                 self.status_bots = bots;
@@ -8952,6 +9209,7 @@ impl App {
                 return Some(Counted {
                     mark: Some(mark),
                     read: None,
+                    tasks: None,
                 });
             }
             let view = StatusView {
@@ -8973,6 +9231,7 @@ impl App {
                     (status::counts(&read.rows), status::bots(&read.rows)),
                     (latest, seen),
                 )),
+                tasks: Some(status::tasks(&read.rows)),
             })
         }));
     }
@@ -10266,6 +10525,11 @@ impl App {
                 let name = data["name"].as_str().unwrap_or("tool").to_owned();
                 let id = data["call_id"].as_str().unwrap_or("");
                 self.reviewing.remove(id);
+                // Started, it was allowed, here or anywhere: it waits no more.
+                let bot = self.bot.clone();
+                self.heard_verdict(&bot, turn, data);
+                (self.approvals)
+                    .retain(|call| call["call_id"] != id || call["turn"].as_i64() != turn);
                 // A long call's event carries a preview; the call is kept whole.
                 let arguments = match data["arguments_truncated"] == true {
                     true => self.call(id).await.map(|(_, arguments)| arguments),
@@ -10316,7 +10580,10 @@ impl App {
                 if data["denied"] == true {
                     // It never ran: nothing it would have done follows.
                     shown.1 = true;
-                    if !self.words() {
+                    let bot = self.bot.clone();
+                    self.heard_verdict(&bot, turn, data);
+                    // One written out here says it where it was asked.
+                    if !self.words() && !self.folds_here(&bot, turn, id) {
                         self.commit_denied(&name, &arguments, &reason);
                     }
                     // The approver's, not the person's: `/retry` may
@@ -10375,6 +10642,12 @@ impl App {
                 }
             }
             "approval_requested" | "approval_asked" | "step_decided" => {
+                // A step answered, here or anywhere: its verdict, for its
+                // copy written out here to fold to.
+                if kind == "step_decided" {
+                    let bot = self.bot.clone();
+                    self.heard_verdict(&bot, turn, data);
+                }
                 self.approvals_for(turn).await
             }
             // A message lifted a call out of its turn: it, and the steps
@@ -10389,9 +10662,12 @@ impl App {
                     }
                 }
             }
-            "lifted_ended" => self
-                .approvals
-                .retain(|call| call["handle"] != data["handle"]),
+            "lifted_ended" => {
+                // Allowed after a message lifted it: no start says so.
+                let bot = self.bot.clone();
+                self.heard_verdict_or_read(&bot, turn, data).await;
+                (self.approvals).retain(|call| call["handle"] != data["handle"]);
+            }
             "turn_waiting" => {
                 if let Some(running) = &mut self.running
                     && data["approval"] != true
@@ -10671,6 +10947,7 @@ impl App {
             background: None,
             usage: None,
             audit: None,
+            ps: None,
             commons: None,
             sky: None,
             picked: None,
@@ -10714,6 +10991,7 @@ impl App {
             background: Some(view),
             usage: None,
             audit: None,
+            ps: None,
             commons: None,
             sky: None,
             picked: None,
@@ -10782,6 +11060,7 @@ impl App {
             background: None,
             usage: Some(view),
             audit: None,
+            ps: None,
             commons: None,
             sky: None,
             picked: None,
@@ -10808,6 +11087,7 @@ impl App {
             background: None,
             usage: None,
             audit: Some(view),
+            ps: None,
             commons: None,
             sky: None,
             picked: None,
@@ -10822,6 +11102,76 @@ impl App {
     async fn read_audit(&self, view: &mut audit::View) {
         let read = self.client.request("audit", view.query()).await;
         view.loaded(read.map_err(|error| error.to_string()));
+    }
+
+    /// The commands the project's agents left running, or every agent's,
+    /// oldest first: `/ps` in the pane, as `/status` is, until Esc.
+    async fn ps(&mut self) {
+        let scope = self.scope();
+        let project = scope.project.clone();
+        let mut view = ps::View::new(scope);
+        self.read_ps(&mut view).await;
+        self.watch = Some(Watch {
+            project,
+            rows: Vec::new(),
+            read: Instant::now(),
+            alerts: Vec::new(),
+            open: Vec::new(),
+            background: None,
+            usage: None,
+            audit: None,
+            ps: Some(view),
+            commons: None,
+            sky: None,
+            picked: None,
+            pick: None,
+            helpers: Vec::new(),
+            more: false,
+        });
+        self.open_pane(pane::Pane::card("ps", STATUS_KEYS));
+    }
+
+    /// `view` read from the daemon again.
+    async fn read_ps(&self, view: &mut ps::View) {
+        // Every page, as the daemon hands them, into one list.
+        let (mut query, mut rows) = (view.query(), Vec::new());
+        let read = loop {
+            match self.client.request("processes", query.clone()).await {
+                Ok(mut page) => {
+                    if let Some(found) = page["processes"].as_array_mut() {
+                        rows.append(found);
+                    }
+                    match page.get("next_after") {
+                        Some(after) if !after.is_null() => query["after"] = after.clone(),
+                        _ => break Ok(json!({"processes": rows})),
+                    }
+                }
+                Err(error) => break Err(error.to_string()),
+            }
+        };
+        view.loaded(read);
+    }
+
+    /// Stop `bot`'s command `handle` from `/ps`, beside the window, which
+    /// answers meanwhile: what it came to shows on the card, and the list
+    /// is read again at once.
+    fn stop_process(&mut self, bot: String, handle: String) {
+        let Some(view) = self.watch.as_mut().and_then(|w| w.ps.as_mut()) else {
+            return;
+        };
+        let said = view.stopping(&handle);
+        let (client, woken) = (self.client.clone(), self.woken.clone());
+        tokio::spawn(async move {
+            let stopped = client
+                .request("stop_process", json!({"bot": bot, "handle": handle}))
+                .await;
+            let words = match stopped {
+                Ok(_) => format!("stopped {handle} of {bot}'s"),
+                Err(error) => format!("could not stop {handle}: {error}"),
+            };
+            *said.lock().unwrap_or_else(|e| e.into_inner()) = Some(words);
+            woken.notify_one();
+        });
     }
 
     /// What the agents of every project share: `/commons` in the pane,
@@ -10840,6 +11190,7 @@ impl App {
             background: None,
             usage: None,
             audit: None,
+            ps: None,
             commons: Some(commons::View::open(&home)),
             sky: None,
             picked: None,
@@ -10862,6 +11213,7 @@ impl App {
             background: None,
             usage: None,
             audit: None,
+            ps: None,
             commons: None,
             sky: Some(sky::View::open(self.options.socket.clone(), self.store())),
             picked: None,
@@ -10907,6 +11259,16 @@ impl App {
             watch.read = Instant::now();
             return;
         }
+        if let Some(mut view) = self.watch.as_mut().and_then(|w| w.ps.take()) {
+            if view.due() {
+                self.read_ps(&mut view).await;
+            }
+            if let Some(watch) = &mut self.watch {
+                watch.ps = Some(view);
+                watch.read = Instant::now();
+            }
+            return;
+        }
         if let Some(mut view) = self.watch.as_mut().and_then(|w| w.audit.take()) {
             if view.due() {
                 self.read_audit(&mut view).await;
@@ -10939,8 +11301,9 @@ impl App {
 
     /// What `/status` says is broken around the agents: the daemon's
     /// companions that are down or keep restarting, turns held on a cause
-    /// the person can fix, and a temporary folder every agent shares low
-    /// on space or inodes. Nothing when all is well.
+    /// the person can fix, a temporary folder every agent shares low on
+    /// space or inodes, and failures `/background` lists that the person
+    /// has not seen there. Nothing when all is well.
     async fn status_alerts(&mut self) -> Vec<status::Alert> {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -10970,6 +11333,7 @@ impl App {
         if let Some((_, temp)) = &self.temp_read {
             alerts.extend(temp.iter().cloned());
         }
+        alerts.extend(status::background_alert(self.failed));
         alerts
     }
 
@@ -11073,6 +11437,7 @@ impl App {
         .await?;
         self.counts = Some(status::counts(&read.rows));
         self.status_bots = status::bots(&read.rows);
+        self.tasks_read(status::tasks(&read.rows));
         // The windows' names and the footer say what this read, as it is
         // newer than what they had. A running agent's question is read
         // from its last few items here, so its events keep theirs.
@@ -11324,7 +11689,30 @@ impl App {
                 call["call_id"].as_str().unwrap_or_default().to_owned(),
             )
         };
+        // Answered where no event of theirs reaches this window: what came
+        // of each written out here is read from the audit trail.
+        let mut gone: Vec<(String, i64, String)> = (self.raised.iter())
+            .map(key)
+            .filter(|read| !wanted.contains(read))
+            .collect();
+        // Answered here, its final verdict still unheard: another gate may
+        // have decided it since, which no event of theirs tells this window.
+        if self.fleet.is_none() {
+            gone.extend(
+                (self.written.iter())
+                    .filter(|(read, written)| {
+                        read.0 != me
+                            && written.decided.is_some()
+                            && !written.heard
+                            && !wanted.contains(*read)
+                    })
+                    .map(|(read, _)| read.clone()),
+            );
+            gone.sort();
+            gone.dedup();
+        }
         self.raised.retain(|call| wanted.contains(&key(call)));
+        self.verdicts_from_audit(gone).await;
         self.raised_read.retain(|read| wanted.contains(read));
         let unread: std::collections::BTreeSet<&str> = (wanted.iter())
             .filter(|read| !self.raised_read.contains(*read))
@@ -11440,6 +11828,25 @@ impl App {
                 return;
             }
             Err(error) => self.notice = Some(error.to_string()),
+            // Written out here, its copy folds to the verdict in place.
+            Ok(_)
+                if self.folds_here(
+                    &bot,
+                    call["turn"].as_i64(),
+                    call["call_id"].as_str().unwrap_or_default(),
+                ) =>
+            {
+                let decided = match decision {
+                    "allow" => transcript::Decided::Allowed {
+                        you: true,
+                        kept: kept.map(str::to_owned),
+                    },
+                    _ => transcript::Decided::Denied { you: true },
+                };
+                if let Some(written) = self.written.get_mut(&self.aside_key(&call)) {
+                    written.decided = Some(decided);
+                }
+            }
             Ok(_) if decision == "allow" => {
                 let name = call["name"].as_str().unwrap_or("tool");
                 let lines = transcript::allowed(
@@ -11718,6 +12125,7 @@ impl App {
             && watch.background.is_none()
             && watch.usage.is_none()
             && watch.audit.is_none()
+            && watch.ps.is_none()
             && watch.commons.is_none()
         {
             let bots = card_bots(watch, self.width.max(40));
@@ -11830,6 +12238,33 @@ impl App {
                 }
                 return true;
             }
+            // `/ps` takes its own keys: a pick, its stop, whose.
+            if self.pane_keys
+                && pane.is_card()
+                && let Some(view) = self.watch.as_mut().and_then(|w| w.ps.as_mut())
+            {
+                match key.code {
+                    _ if switches(key) || key.code == KeyCode::Tab => self.pane_keys = false,
+                    _ if copy && let Some(text) = pane.screen.selected() => {
+                        pane.screen.unselect();
+                        self.copied(&text);
+                    }
+                    KeyCode::PageUp => pane.screen.page(true),
+                    KeyCode::PageDown | KeyCode::Char(' ') => pane.screen.page(false),
+                    KeyCode::Home => pane.screen.hold(usize::MAX),
+                    KeyCode::End => pane.screen.latest(),
+                    _ => match view.key(*key) {
+                        ps::Key::Stay => {}
+                        ps::Key::Close => self.close_pane(true),
+                        ps::Key::Open(bot) => {
+                            self.close_pane(true);
+                            self.open_agent(&bot, false);
+                        }
+                        ps::Key::Stop { bot, handle } => self.stop_process(bot, handle),
+                    },
+                }
+                return true;
+            }
             // `/audit` takes its own keys: the filters, whose, a pick.
             if self.pane_keys
                 && pane.is_card()
@@ -11909,6 +12344,7 @@ impl App {
                             && watch.background.is_none()
                             && watch.usage.is_none()
                             && watch.audit.is_none()
+                            && watch.ps.is_none()
                             && watch.commons.is_none()
                             && watch.sky.is_none() =>
                     {
@@ -11921,6 +12357,7 @@ impl App {
                             && watch.background.is_none()
                             && watch.usage.is_none()
                             && watch.audit.is_none()
+                            && watch.ps.is_none()
                             && watch.commons.is_none()
                             && watch.sky.is_none()
                             && let Some(bot) = watch.pick.and_then(|pick| {
@@ -12852,6 +13289,7 @@ impl App {
             self.margin_opens = settings.margin_opens;
             self.agent_opens = settings.agent_opens;
             margin::set_limits(settings.margin_notes, settings.margin_note_lines);
+            self.set_template_settings(&settings);
             if self.verbose != settings.verbose || self.words_only == settings.steps {
                 self.verbose = settings.verbose;
                 self.words_only = !settings.steps;
@@ -13340,7 +13778,16 @@ impl App {
             self.toggle_margin();
             return;
         }
-        if matches!(prompt.as_str(), "/status" | "/agents" | "/ps") {
+        if prompt == "/ps" {
+            self.input.clear();
+            if self.options.side.is_some() {
+                self.notice = Some("/ps is for the agent itself, not a side chat".into());
+            } else {
+                self.ps().await;
+            }
+            return;
+        }
+        if matches!(prompt.as_str(), "/status" | "/agents") {
             self.input.clear();
             // The side chat already holds the screen /status would take.
             if self.options.side.is_some() {
@@ -15315,6 +15762,7 @@ impl App {
         let listing = watch.background.is_none()
             && watch.usage.is_none()
             && watch.audit.is_none()
+            && watch.ps.is_none()
             && watch.commons.is_none()
             && watch.sky.is_none();
         let bots = card_bots(watch, self.width.max(40));
@@ -15370,6 +15818,8 @@ impl App {
         if self.asked.as_ref() == Some(&id) {
             return;
         }
+        let call = call.clone();
+        let call = &call;
         let name = call["name"].as_str().unwrap_or("tool").to_owned();
         let arguments = &call["arguments"];
         let what = arguments["command"]
@@ -15426,7 +15876,265 @@ impl App {
         // What the agent said before the call reads before it, a step as
         // the call's start would make it.
         self.end_live(Words::Step);
-        self.commit(lines);
+        // Written again, brought back after Esc: the copy above goes, so
+        // one call has one copy here, the one by the keys.
+        let key = self.aside_key(call);
+        let from = call["bot"]
+            .as_str()
+            .filter(|bot| *bot != self.bot)
+            .map(str::to_owned);
+        let arguments = arguments.clone();
+        if let Some(old) = self.written.remove(&key) {
+            self.flush();
+            (self.screen).replace_tagged(screen::Tag::Request(old.tag), Vec::new(), Vec::new());
+        }
+        self.forget_written();
+        let tag = self.written_count;
+        self.written_count += 1;
+        let gap = self.any_history;
+        let at = self.pending.len();
+        self.commit(lines.clone());
+        let mark = screen::Mark::Tag(screen::Tag::Request(tag));
+        (self.marks).extend((at..self.pending.len()).map(|row| (row, mark.clone())));
+        self.written.insert(
+            key,
+            Written {
+                tag,
+                gap,
+                rows: lines,
+                name,
+                arguments,
+                from,
+                decided: None,
+                heard: false,
+                folded: false,
+                open: false,
+                at_ms: std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_or(0, |since| since.as_millis() as i64),
+            },
+        );
+    }
+
+    /// The calls written out here that wait on the person no more, folded
+    /// to their verdict in place, as Codex keeps only an approval's
+    /// decision: the hoisted copy in a lead's window and the call's own in
+    /// its agent's alike, whoever answered it and wherever.
+    fn fold_written(&mut self) {
+        if self.written.values().all(|written| written.folded) {
+            return;
+        }
+        let waiting: std::collections::HashSet<(String, i64, String)> =
+            (self.approvals.iter().chain(&self.raised))
+                .map(|call| self.aside_key(call))
+                .collect();
+        let done: Vec<(String, i64, String)> = (self.written.iter())
+            .filter(|(key, written)| !written.folded && !waiting.contains(*key))
+            .map(|(key, _)| key.clone())
+            .collect();
+        for key in done {
+            if let Some(written) = self.written.get_mut(&key) {
+                written.folded = true;
+            }
+            self.draw_written(&key);
+        }
+    }
+
+    /// A folded request drawn again where it is: its verdict, a click on
+    /// which opens the request whole under it, or folds it again.
+    fn draw_written(&mut self, key: &(String, i64, String)) {
+        let Some(written) = self.written.get(key) else {
+            return;
+        };
+        let decided = (written.decided.clone()).unwrap_or(transcript::Decided::Gone);
+        let line = transcript::decided(
+            &written.name,
+            &written.arguments,
+            written.from.as_deref(),
+            &decided,
+            &self.workspace,
+            self.width,
+        );
+        let mut rows = Vec::new();
+        if written.gap {
+            rows.push(Line::default());
+        }
+        let at = rows.len();
+        rows.push(line);
+        if written.open {
+            rows.extend(written.rows.iter().cloned());
+        }
+        let link = screen::Mark::Link(format!("{}request/{}", screen::BUTTON, written.tag));
+        let tag = screen::Tag::Request(written.tag);
+        self.flush();
+        if !self.screen.replace_tagged(tag, rows, vec![(at, link)]) {
+            // Trimmed away: nothing of it is left to fold.
+            self.written.remove(key);
+        }
+    }
+
+    /// What came of a call written out here, as an event of `bot`'s says
+    /// (its start, its end refused, a step decided, or a lifted call's
+    /// wait ended): its verdicts, the person's first.
+    /// A lifted call denied ends without its verdicts: who denied it is
+    /// read from the audit trail instead.
+    async fn heard_verdict_or_read(&mut self, bot: &str, turn: Option<i64>, data: &Value) {
+        if data["outcome"] == "denied" && !data["approvals"].is_array() {
+            let call = data["call_id"].as_str().unwrap_or_default().to_owned();
+            self.verdicts_from_audit(vec![(bot.to_owned(), turn.unwrap_or(-1), call)])
+                .await;
+        } else {
+            self.heard_verdict(bot, turn, data);
+        }
+    }
+
+    fn heard_verdict(&mut self, bot: &str, turn: Option<i64>, data: &Value) {
+        let key = (
+            bot.to_owned(),
+            turn.unwrap_or(-1),
+            data["call_id"].as_str().unwrap_or_default().to_owned(),
+        );
+        let Some(written) = self.written.get_mut(&key) else {
+            return;
+        };
+        if written.heard {
+            return;
+        }
+        let verdicts = data["approvals"].as_array().cloned().unwrap_or_default();
+        let you = |verdict: &Value| verdict["by"] != "approver";
+        let by = |verdict: &Value| verdict["by"].as_str().is_some_and(|by| !by.is_empty());
+        let answered = written.decided.take();
+        written.decided = match verdicts.iter().find(|v| v["allow"] == false) {
+            Some(no) if by(no) => Some(transcript::Decided::Denied { you: you(no) }),
+            // Refused by no one: its time ran out.
+            Some(_) => Some(transcript::Decided::Lapsed),
+            None if data["denied"] == true || data["outcome"] == "expired" => {
+                Some(transcript::Decided::Lapsed)
+            }
+            // A step denied with no gate refusing it: its caller stopped
+            // waiting, and it never ran.
+            None if data["decision"] == "deny" => Some(transcript::Decided::Gone),
+            None => (verdicts.iter().filter(|v| v["allow"] == true))
+                .fold(None, |best: Option<bool>, v| {
+                    Some(best.unwrap_or(false) || you(v))
+                })
+                .map(|you| transcript::Decided::Allowed { you, kept: None }),
+        };
+        // The person's answer here stands until the call's own verdict
+        // says otherwise: another gate may still have denied it. Allowed
+        // after all, what they always allow from now on is theirs.
+        written.decided = match (written.decided.take(), answered) {
+            (
+                Some(transcript::Decided::Allowed { you: true, .. }),
+                Some(transcript::Decided::Allowed { you: true, kept }),
+            ) => Some(transcript::Decided::Allowed { you: true, kept }),
+            (None, answered) => answered,
+            (heard, _) => heard,
+        };
+        written.heard = written.decided.is_some();
+        // Folded before its verdict came, as a listing may see the call
+        // gone first: drawn again to say it.
+        if written.folded && written.decided.is_some() {
+            self.draw_written(&key);
+        }
+    }
+
+    /// What came of calls of agents below written out here that no event
+    /// told this window of, read from the audit trail's rows since each was
+    /// written, which a decision follows: who approved it, and whether it
+    /// was denied.
+    async fn verdicts_from_audit(&mut self, gone: Vec<(String, i64, String)>) {
+        for key in gone {
+            let Some(at_ms) = (self.written.get(&key))
+                .filter(|written| !written.heard)
+                .map(|written| written.at_ms)
+            else {
+                continue;
+            };
+            // A step's row names its call and the step apart.
+            let (call, step) = match key.2.rsplit_once('/') {
+                Some((call, step)) => (call, Some(step)),
+                None => (key.2.as_str(), None),
+            };
+            let mut asked = json!({"bot": key.0, "turn": key.1, "limit": 64,
+                "since_ms": at_ms.saturating_sub(AUDIT_SLACK_MS)});
+            // Newest first, page by page, back to when it was written.
+            let row = loop {
+                let Ok(page) = self.client.request("audit", asked.clone()).await else {
+                    break None;
+                };
+                let row = (page["rows"].as_array().into_iter().flatten())
+                    .find(|row| row["call_id"] == call && row["step"].as_str() == step);
+                if let Some(row) = row {
+                    break Some(row.clone());
+                }
+                match page["next_before"].as_i64() {
+                    Some(before) => asked["before"] = json!(before),
+                    None => break None,
+                }
+            };
+            let Some(row) = row else {
+                continue;
+            };
+            let denied = row["outcome"] == "denied";
+            let decided = match (row["approved"].as_str(), denied) {
+                (Some("person"), true) => transcript::Decided::Denied { you: true },
+                (Some("reviewer"), true) => transcript::Decided::Denied { you: false },
+                // Refused by no one: timed out, or its caller stopped
+                // waiting, which the row does not tell apart.
+                (Some("nobody"), true) => transcript::Decided::Gone,
+                (Some("person"), false) => transcript::Decided::Allowed {
+                    you: true,
+                    kept: None,
+                },
+                (Some("reviewer"), false) => transcript::Decided::Allowed {
+                    you: false,
+                    kept: None,
+                },
+                _ => continue,
+            };
+            if let Some(written) = self.written.get_mut(&key) {
+                // Kept from the person's answer here: what they always allow.
+                written.decided = match (decided, written.decided.take()) {
+                    (
+                        transcript::Decided::Allowed { you: true, .. },
+                        Some(transcript::Decided::Allowed { you: true, kept }),
+                    ) => Some(transcript::Decided::Allowed { you: true, kept }),
+                    (decided, _) => Some(decided),
+                };
+                written.heard = true;
+                if written.folded {
+                    self.draw_written(&key);
+                }
+            }
+        }
+    }
+
+    /// Whether `bot`'s call was written out here and is still there to
+    /// fold: its verdict is drawn in its place, not again under it.
+    fn folds_here(&self, bot: &str, turn: Option<i64>, call: &str) -> bool {
+        let key = (bot.to_owned(), turn.unwrap_or(-1), call.to_owned());
+        (self.written.get(&key))
+            .is_some_and(|written| self.screen.has(screen::Tag::Request(written.tag)))
+    }
+
+    /// Lets go of the requests the screen trimmed away, looked at each
+    /// time they double, so the look costs a row per request.
+    fn forget_written(&mut self) {
+        if self.written.len() < 64.max(2 * self.written_kept) {
+            return;
+        }
+        let screen = &self.screen;
+        let marks = &self.marks;
+        self.written.retain(|_, written| {
+            let tag = screen::Tag::Request(written.tag);
+            !written.folded
+                || screen.has(tag)
+                || marks
+                    .iter()
+                    .any(|(_, mark)| *mark == screen::Mark::Tag(tag))
+        });
+        self.written_kept = self.written.len();
     }
 
     /// What this window's tab says of its agent, from what the window
@@ -15479,6 +16187,7 @@ impl App {
         // multiplexer, as the person still has it to answer.
         used::asking(&self.bot, !self.asks.is_empty());
         self.tell_status();
+        self.fold_written();
         self.show_asked();
         self.margin_back();
         // /status beside the conversation, gone once the pane is.
@@ -15555,6 +16264,7 @@ impl App {
         {
             let live = self.running.as_ref().map(|running| running.turn);
             let width = (pane::margin_room(at.width).saturating_sub(1) as usize).min(measure());
+            self.margin_blanks();
             let (lines, marks) = self.margin.lines(width, &workspace, live);
             if let Some(pane) = &mut self.pane {
                 pane.set_margin(lines, marks);
@@ -15635,6 +16345,28 @@ impl App {
                         pane.screen.show_row(0, 0);
                     }
                 } else if watch.picked != Some(at) {
+                    watch.picked = Some(at);
+                    pane.screen.keep_in_view(at, 2);
+                }
+            } else if let Some(view) = &watch.ps {
+                let now_ms = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis() as i64;
+                let lines: Vec<Line<'static>> = view
+                    .card(width, now_ms)
+                    .into_iter()
+                    .map(|line| {
+                        let mut spans = vec![Span::raw(" ")];
+                        spans.extend(line.spans);
+                        Line::from(spans).style(line.style)
+                    })
+                    .collect();
+                pane.set_card(lines, &view.keys());
+                pane.foot = None;
+                if let Some(at) = view.picked_row()
+                    && watch.picked != Some(at)
+                {
                     watch.picked = Some(at);
                     pane.screen.keep_in_view(at, 2);
                 }
@@ -16703,10 +17435,13 @@ impl App {
             return footer::lay(items, width);
         }
         // Every count stays here whatever the pane shows, so nothing moves
-        // as it changes.
-        if self.failed > 0 {
-            let forms = footer::count("✗", Color::Red, self.failed, false);
-            items.push(Item::new(Slot::Failed, forms).opens("background"));
+        // as it changes. What failed: the agents `/status` lists as failed,
+        // and what of `/background` failed that the person has not seen.
+        // `/status` lists both.
+        let failed = counts.failed + self.failed;
+        if failed > 0 {
+            let forms = footer::count("✗", Color::Red, failed, false);
+            items.push(Item::new(Slot::Failed, forms).opens("status"));
         }
         if working > 0 {
             let forms = footer::count("●", Color::Cyan, working, true);
@@ -16851,7 +17586,13 @@ fn watch_card(
     );
     // What is broken goes under the heading, and the agents under that.
     let mut above: Vec<Line<'static>> = Vec::new();
+    // An alert that opens a view does so on a click on its first line.
+    let mut opening = Vec::new();
     for alert in &watch.alerts {
+        if let Some(opens) = alert.opens {
+            let link = format!("{}{opens}", screen::BUTTON);
+            opening.push((1 + above.len(), screen::Mark::Link(link)));
+        }
         above.extend(status::alert_lines(alert, width.saturating_sub(1)));
     }
     let added = above.len();
@@ -16873,6 +17614,7 @@ fn watch_card(
     if !helpers.is_empty() {
         fold_keys.push("→");
     }
+    marks.extend(opening);
     marks.extend(folds.into_iter().map(|(at, group)| {
         let link = format!("{}group/{}", screen::BUTTON, group_key(group));
         (below(at), screen::Mark::Link(link))
@@ -17847,6 +18589,8 @@ mod tests {
             window_place: None,
             lead: project::Pick::Last,
             send: None,
+            draft: None,
+            reopened: false,
         };
         App::new(client, "b", &json!({"name": "b"}), options)
     }
@@ -18090,7 +18834,7 @@ mod tests {
         // unread once its program's side closes, as a printf's at once.
         let mut command = portable_pty::CommandBuilder::new("sh");
         command.args(["-c", "printf '\\033]7700;open=b\\033\\\\'; exec sleep 30"]);
-        let program = embed::Embedded::spawn(command, 5, 20, false, || {}).unwrap();
+        let program = embed::Embedded::spawn(command, 5, 20, || {}).unwrap();
         let mut pane = pane::Pane::program("fix", program);
         pane.as_agent("shop.fix", false);
         app.open_pane(pane);
@@ -18907,6 +19651,7 @@ mod tests {
             working: 1,
             idle: 1,
             done: 0,
+            ..Default::default()
         };
         assert_eq!(app.counts, Some(counts));
     }
@@ -18962,6 +19707,7 @@ mod tests {
             working,
             idle,
             done: 0,
+            ..Default::default()
         };
         assert_eq!(app.counts, Some(counts(0, 1, 1)));
         // Its mark, then the read itself.
@@ -20264,6 +21010,7 @@ mod tests {
             working: 2,
             idle: 3,
             done: 4,
+            ..Default::default()
         });
         let (footer, counter) = app.footer(60);
         let footer = footer.to_string();
@@ -24310,6 +25057,421 @@ mod tests {
     /// call; set aside with Esc, the keys typing again, and brought back
     /// with Enter.
     #[tokio::test]
+    async fn an_answered_request_folds_to_its_verdict_where_it_was_written() {
+        let client = daemon_answering(|asked| match asked["op"].as_str() {
+            Some("approvals") if asked["bot"] == "shop.fix" => json!({"approvals": [
+                {"bot": "shop.fix", "turn": 4, "call_id": "c1", "request": 1,
+                    "name": "shell", "gates": ["auto"],
+                    "asked": [{"tag": "auto", "reason": "It publishes the crate."}],
+                    "arguments": {"command": "cargo publish",
+                        "justification": "Releasing needs the registry."}}]}),
+            _ => json!({}),
+        })
+        .await;
+        let (_, events) = daemon_with_events(json!({}), |_| json!({})).await;
+        let mut fleet = Fleet::in_memory(client.clone(), events, "home", "home.lead");
+        fleet.raised.insert("shop.fix".into());
+        fleet
+            .needs
+            .held(vec![needs::Held::new("shop.fix", 4, "c1")], |_| true);
+        let mut app = app(client);
+        app.bot = "home.lead".into();
+        app.width = 80;
+        app.fleet = Some(fleet);
+        // This window's own call waits too, written out after the task's.
+        app.approvals
+            .push(json!({"turn": 7, "call_id": "o1", "name": "shell",
+            "gates": ["manual"], "arguments": {"command": "git push"}}));
+        app.raise_approvals().await;
+        app.show_asked();
+        app.flush();
+        assert!(app.screen.texts().contains(&"⏸ Allow shell?".to_owned()));
+        // Its own is answered first, in another window: its start says so.
+        app.daemon(
+            json!({"event": "tool_started", "bot": "home.lead", "turn": 7,
+            "data": {"call_id": "o1", "name": "shell",
+                "arguments": json!({"command": "git push"}).to_string(),
+                "approvals": [{"tag": "manual", "by": "tui", "allow": true}]}}),
+        )
+        .await;
+        app.fold_written();
+        app.show_asked();
+        app.flush();
+        let texts = app.screen.texts();
+        assert!(
+            texts.contains(&"✓ You allowed git push".to_owned()),
+            "{texts:?}"
+        );
+        assert_eq!(
+            texts.iter().filter(|row| *row == "⏸ Allow shell?").count(),
+            1
+        );
+        // The task's, answered here: folded to the verdict, no line under it.
+        let key = |code| Event::Key(event::KeyEvent::new(code, KeyModifiers::NONE));
+        app.key(key(KeyCode::Char('y'))).await;
+        app.fold_written();
+        app.flush();
+        let texts = app.screen.texts();
+        assert_eq!(
+            texts
+                .iter()
+                .filter(|row| !row.is_empty())
+                .collect::<Vec<_>>(),
+            [
+                "✓ You allowed git push",
+                "✓ You allowed cargo publish · shop.fix"
+            ],
+            "{texts:?}"
+        );
+        // A click opens it whole under its verdict, and folds it again.
+        let tag = app.written[&("shop.fix".to_owned(), 4, "c1".to_owned())].tag;
+        app.press(&format!("request/{tag}")).await;
+        let texts = app.screen.texts();
+        let at = texts
+            .iter()
+            .position(|row| row == "✓ You allowed cargo publish · shop.fix");
+        assert_eq!(
+            texts[at.unwrap() + 1..at.unwrap() + 4],
+            [
+                "↳ From shop.fix",
+                "⏸ Allow shell?",
+                "  Reason: Releasing needs the registry."
+            ]
+        );
+        app.press(&format!("request/{tag}")).await;
+        assert_eq!(app.screen.texts().len(), at.unwrap() + 1);
+    }
+
+    #[tokio::test]
+    async fn a_step_or_lifted_call_answered_elsewhere_folds_to_its_verdict() {
+        let client = daemon_answering(|_| json!({})).await;
+        let mut app = app(client);
+        app.width = 80;
+        // A lifted call of turn 3 and a step of turn 5, its call id the same.
+        app.approvals
+            .push(json!({"turn": 3, "call_id": "c1", "handle": "proc:4",
+            "name": "shell", "gates": ["manual"], "arguments": {"command": "git push"}}));
+        app.show_asked();
+        // Turn 5 starting its own c1 leaves turn 3's waiting.
+        app.daemon(json!({"event": "tool_started", "bot": "b", "turn": 5,
+            "data": {"call_id": "c1", "name": "shell", "arguments": "{}"}}))
+            .await;
+        assert_eq!(app.approvals.len(), 1);
+        app.approvals
+            .push(json!({"turn": 5, "call_id": "s1", "step_of": "c9",
+            "name": "browser", "gates": ["manual"], "arguments": {"command": "open"}}));
+        app.calls_aside.insert(("b".into(), 3, "c1".into()));
+        app.show_asked();
+        // The lifted call allowed anywhere: no start, its wait ends.
+        app.daemon(json!({"event": "lifted_ended", "bot": "b", "turn": 3,
+            "data": {"call_id": "c1", "handle": "proc:4", "outcome": "allowed",
+                "approvals": [{"tag": "manual", "by": "tui", "allow": true}]}}))
+            .await;
+        // The step denied anywhere.
+        app.heard_verdict(
+            "b",
+            Some(5),
+            &json!({"call_id": "s1", "decision": "deny",
+            "approvals": [{"tag": "manual", "by": "cli", "allow": false}]}),
+        );
+        app.approvals.clear();
+        app.fold_written();
+        let texts = app.screen.texts();
+        assert!(
+            texts.contains(&"✓ You allowed git push".to_owned()),
+            "{texts:?}"
+        );
+        assert!(texts.contains(&"✗ You denied open".to_owned()), "{texts:?}");
+        // Seen gone before its verdict: folded as no longer waiting, then
+        // drawn again once the verdict comes.
+        app.approvals
+            .push(json!({"turn": 6, "call_id": "c2", "name": "shell",
+            "gates": ["manual"], "arguments": {"command": "make deploy"}}));
+        app.show_asked();
+        app.approvals.clear();
+        app.fold_written();
+        let texts = app.screen.texts();
+        assert!(texts.contains(&"⏸ Request for make deploy no longer waits".to_owned()));
+        app.daemon(json!({"event": "tool_started", "bot": "b", "turn": 6,
+            "data": {"call_id": "c2", "name": "shell", "arguments": "{}",
+                "approvals": [{"tag": "manual", "by": "tui", "allow": true}]}}))
+            .await;
+        let texts = app.screen.texts();
+        assert!(
+            texts.contains(&"✓ You allowed make deploy".to_owned()),
+            "{texts:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_tasks_request_answered_unseen_reads_its_verdict_from_the_audit_trail() {
+        let asked = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = asked.clone();
+        let client = daemon_answering(move |request| match request["op"].as_str() {
+            Some("audit") if request["before"].is_null() => {
+                seen.lock().unwrap().push(request.clone());
+                // A step of c1 denied after it, newest first: not c1's row.
+                json!({"rows": [
+                    {"bot": "shop.fix", "turn": 4, "call_id": "c1", "step": "open",
+                        "approved": "person", "outcome": "denied"},
+                    {"bot": "shop.fix", "turn": 4, "call_id": "c0", "approved": "rule",
+                        "outcome": "completed"}],
+                    "next_before": 40})
+            }
+            Some("audit") => {
+                seen.lock().unwrap().push(request.clone());
+                json!({"rows": [
+                    {"bot": "shop.fix", "turn": 4, "call_id": "c1", "step": null,
+                        "approved": "person", "outcome": "completed"}],
+                    "next_before": null})
+            }
+            _ => json!({}),
+        })
+        .await;
+        let mut app = app(client);
+        app.bot = "home.lead".into();
+        app.width = 80;
+        app.raised
+            .push(json!({"bot": "shop.fix", "turn": 4, "call_id": "c1",
+            "name": "shell", "gates": ["manual"], "arguments": {"command": "cargo publish"}}));
+        app.show_asked();
+        // No fleet: the task's events never reach this window.
+        app.raised.clear();
+        app.fold_written();
+        app.verdicts_from_audit(vec![("shop.fix".into(), 4, "c1".into())])
+            .await;
+        let texts = app.screen.texts();
+        assert!(
+            texts.contains(&"✓ You allowed cargo publish · shop.fix".to_owned()),
+            "{texts:?}"
+        );
+        // Only since it was written, so the read stays short, page by page.
+        let asked = asked.lock().unwrap();
+        assert_eq!((asked.len(), &asked[0]["turn"]), (2, &json!(4)));
+        assert!(asked[0]["since_ms"].as_i64().unwrap() > 0);
+        assert_eq!(asked[1]["before"], 40);
+    }
+
+    #[tokio::test]
+    async fn a_lifted_call_denied_elsewhere_reads_who_denied_it() {
+        let client = daemon_answering(|request| match request["op"].as_str() {
+            Some("audit") => json!({"rows": [
+                {"bot": "b", "turn": 3, "call_id": "c1", "step": null,
+                    "approved": "reviewer", "outcome": "denied"}],
+                "next_before": null}),
+            _ => json!({}),
+        })
+        .await;
+        let mut app = app(client);
+        app.width = 80;
+        app.approvals.push(
+            json!({"turn": 3, "call_id": "c1", "name": "shell", "handle": "proc:9",
+            "gates": ["auto"], "arguments": {"command": "make deploy"}}),
+        );
+        app.show_asked();
+        app.flush();
+        // Its end says only that it was denied, not by whom.
+        app.daemon(json!({"event": "lifted_ended", "bot": "b", "turn": 3,
+            "data": {"call_id": "c1", "handle": "proc:9", "outcome": "denied",
+                "failed": true}}))
+            .await;
+        app.fold_written();
+        app.flush();
+        let texts = app.screen.texts();
+        assert!(
+            texts.contains(&"✗ The reviewer denied make deploy".to_owned()),
+            "{texts:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_step_abandoned_after_one_gate_allowed_it_is_not_allowed() {
+        let client = daemon_answering(|_| json!({})).await;
+        let mut app = app(client);
+        app.width = 80;
+        app.approvals
+            .push(json!({"turn": 5, "call_id": "c2/open", "name": "shell",
+            "gates": ["manual", "auto"], "arguments": {"command": "make deploy"}}));
+        app.show_asked();
+        app.flush();
+        app.heard_verdict(
+            "b",
+            Some(5),
+            &json!({"call_id": "c2/open", "decision": "deny",
+            "reason": "its client stopped waiting",
+            "approvals": [{"tag": "manual", "by": "tui", "allow": true}]}),
+        );
+        app.approvals.clear();
+        app.fold_written();
+        app.flush();
+        let texts = app.screen.texts();
+        assert!(
+            texts.contains(&"⏸ Request for make deploy no longer waits".to_owned()),
+            "{texts:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_request_refused_by_no_one_in_the_audit_trail_no_longer_waits() {
+        let client = daemon_answering(|request| match request["op"].as_str() {
+            // Timed out or its caller stopped waiting: the row is the same.
+            Some("audit") => json!({"rows": [
+                {"bot": "b", "turn": 5, "call_id": "c2", "step": "open",
+                    "approved": "nobody", "outcome": "denied"}],
+                "next_before": null}),
+            _ => json!({}),
+        })
+        .await;
+        let mut app = app(client);
+        app.width = 80;
+        app.approvals
+            .push(json!({"turn": 5, "call_id": "c2/open", "name": "shell",
+            "gates": ["manual"], "arguments": {"command": "make deploy"}}));
+        app.show_asked();
+        app.flush();
+        app.approvals.clear();
+        app.verdicts_from_audit(vec![("b".into(), 5, "c2/open".into())])
+            .await;
+        app.fold_written();
+        app.flush();
+        let texts = app.screen.texts();
+        assert!(
+            texts.contains(&"⏸ Request for make deploy no longer waits".to_owned()),
+            "{texts:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_tasks_request_allowed_here_then_denied_reads_its_final_verdict() {
+        let client = daemon_answering(|request| match request["op"].as_str() {
+            Some("audit") => json!({"rows": [
+                {"bot": "shop.fix", "turn": 4, "call_id": "c1", "step": null,
+                    "approved": "reviewer", "outcome": "denied"}],
+                "next_before": null}),
+            _ => json!({}),
+        })
+        .await;
+        let mut app = app(client);
+        app.bot = "home.lead".into();
+        app.width = 80;
+        app.raised
+            .push(json!({"bot": "shop.fix", "turn": 4, "call_id": "c1",
+            "name": "shell", "gates": ["manual", "auto"], "arguments": {"command": "cargo publish"}}));
+        app.show_asked();
+        app.flush();
+        let key = |code| Event::Key(event::KeyEvent::new(code, KeyModifiers::NONE));
+        app.key(key(KeyCode::Char('y'))).await;
+        app.raised.clear();
+        app.fold_written();
+        // No fleet: the reviewer's gate denying it is read from the trail.
+        app.raise_approvals().await;
+        app.flush();
+        let texts = app.screen.texts();
+        assert!(
+            texts.contains(&"✗ The reviewer denied cargo publish · shop.fix".to_owned()),
+            "{texts:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_lifted_call_allowed_here_that_expired_timed_out() {
+        let client = daemon_answering(|_| json!({})).await;
+        let mut app = app(client);
+        app.width = 80;
+        app.approvals.push(
+            json!({"turn": 3, "call_id": "c1", "name": "shell", "handle": "proc:9",
+            "gates": ["manual", "auto"], "arguments": {"command": "make deploy"}}),
+        );
+        app.show_asked();
+        app.flush();
+        let key = |code| Event::Key(event::KeyEvent::new(code, KeyModifiers::NONE));
+        app.key(key(KeyCode::Char('y'))).await;
+        app.daemon(json!({"event": "lifted_ended", "bot": "b", "turn": 3,
+            "data": {"call_id": "c1", "handle": "proc:9", "outcome": "expired",
+                "failed": true}}))
+            .await;
+        app.fold_written();
+        app.flush();
+        let texts = app.screen.texts();
+        assert!(
+            texts.contains(&"✗ Request timed out for make deploy".to_owned()),
+            "{texts:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_denial_by_another_gate_replaces_the_persons_allow_here() {
+        let client = daemon_answering(|_| json!({})).await;
+        let mut app = app(client);
+        app.width = 80;
+        app.approvals
+            .push(json!({"turn": 3, "call_id": "c1", "name": "shell",
+            "gates": ["manual", "auto"], "arguments": {"command": "git push"}}));
+        app.show_asked();
+        app.flush();
+        let key = |code| Event::Key(event::KeyEvent::new(code, KeyModifiers::NONE));
+        app.key(key(KeyCode::Char('y'))).await;
+        app.fold_written();
+        app.flush();
+        let texts = app.screen.texts();
+        assert!(
+            texts.contains(&"✓ You allowed git push".to_owned()),
+            "{texts:?}"
+        );
+        // The reviewer's gate denied it after all: its end says so.
+        app.heard_verdict(
+            "b",
+            Some(3),
+            &json!({"call_id": "c1", "denied": true,
+            "approvals": [{"tag": "manual", "by": "tui", "allow": true},
+                {"tag": "auto", "by": "approver", "allow": false}]}),
+        );
+        let texts = app.screen.texts();
+        assert!(
+            texts.contains(&"✗ The reviewer denied git push".to_owned()),
+            "{texts:?}"
+        );
+        assert!(!texts.contains(&"✓ You allowed git push".to_owned()));
+    }
+
+    #[test]
+    fn a_decided_request_says_who_decided_and_what() {
+        let shell = json!({"command": "cargo publish --allow-dirty\nmore"});
+        let row = |decided: &transcript::Decided, from| {
+            transcript::seen(&transcript::decided(
+                "shell", &shell, from, decided, "/w", 80,
+            ))
+        };
+        use transcript::Decided::*;
+        assert_eq!(
+            row(
+                &Allowed {
+                    you: true,
+                    kept: Some("cargo".into())
+                },
+                None
+            ),
+            "✓ You allowed cargo publish --allow-dirty, and cargo from now on"
+        );
+        assert_eq!(
+            row(&Denied { you: false }, Some("shop.fix")),
+            "✗ The reviewer denied cargo publish --allow-dirty · shop.fix"
+        );
+        assert_eq!(
+            row(&Lapsed, None),
+            "✗ Request timed out for cargo publish --allow-dirty"
+        );
+        assert_eq!(
+            row(&Gone, None),
+            "⏸ Request for cargo publish --allow-dirty no longer waits"
+        );
+        // A long command is cut to the row.
+        let long = json!({"command": "x".repeat(200)});
+        let line = transcript::decided("shell", &long, None, &Denied { you: true }, "/w", 40);
+        assert!(transcript::seen(&line).chars().count() <= 40);
+    }
+
+    #[tokio::test]
     async fn a_followed_tasks_approval_waits_and_is_answered_in_the_window_youre_in() {
         let sent = Arc::new(std::sync::Mutex::new(Vec::new()));
         let seen = sent.clone();
@@ -24383,13 +25545,21 @@ mod tests {
         assert_eq!(app.input.trim(), "y");
         assert!(sent.lock().unwrap().is_empty());
         assert_eq!(text(&[app.status_line()]), ["⏸ 1 approval set aside"]);
-        // With nothing typed, Enter brings it back, written out again.
+        // With nothing typed, Enter brings it back, written out again by
+        // the keys, the copy above gone: one copy of a call here.
+        let first = text(&app.pending);
         app.input.set("");
         app.key(key(KeyCode::Enter)).await;
         assert!(app.waiting().is_some());
         app.show_asked();
         let again = app.pending.len() - 6;
-        assert_eq!(text(&app.pending[again..]), text(&app.pending[..6]));
+        assert_eq!(text(&app.pending[again..]), first);
+        app.flush();
+        let shown = app.screen.texts();
+        assert_eq!(
+            shown.iter().filter(|row| *row == "⏸ Allow shell?").count(),
+            1
+        );
         // An answer that failed leaves it waiting here, to answer again.
         app.key(key(KeyCode::Char('n'))).await;
         assert!(sent.lock().unwrap().is_empty());
@@ -25423,6 +26593,7 @@ mod tests {
             working: 3,
             idle: 13,
             done: 4,
+            ..Default::default()
         });
         let (line, opens) = app.footer(100);
         let text = line.to_string();
@@ -25484,6 +26655,37 @@ mod tests {
         assert!(app.pane.as_ref().is_some_and(pane::Pane::is_card));
     }
 
+    #[tokio::test]
+    async fn the_footer_counts_failed_agents_and_unseen_background_failures_as_one() {
+        let mut app = app(daemon_answering(|_| json!({})).await);
+        app.model = "opus".into();
+        // As /status counts them: a failed agent is no `?`.
+        app.counts = Some(status::Counts {
+            needs_you: 1,
+            failed: 2,
+            working: 1,
+            ..Default::default()
+        });
+        app.failed = 1;
+        let (line, opens) = app.footer(100);
+        let text = line.to_string();
+        assert!(text.ends_with("  ? 1  ✗ 3  ● 1  "), "{text}");
+        // A click on `✗` opens /status, which lists the agents and says
+        // what failed in the background.
+        assert_eq!(
+            opens.iter().map(|(_, l)| *l).collect::<Vec<_>>(),
+            ["status"; 3]
+        );
+        // Only background failures: still one `✗`, still /status.
+        app.counts = Some(status::Counts::default());
+        let (line, opens) = app.footer(100);
+        assert!(line.to_string().ends_with("  ✗ 1  "), "{line}");
+        assert_eq!(
+            opens.iter().map(|(_, l)| *l).collect::<Vec<_>>(),
+            ["status"]
+        );
+    }
+
     #[test]
     fn a_right_click_on_an_agent_goes_the_other_way_and_on_a_count_nowhere() {
         // The agent a guess came from, as its name anywhere.
@@ -25522,6 +26724,7 @@ mod tests {
             background: None,
             usage: None,
             audit: None,
+            ps: None,
             commons: None,
             sky: None,
             picked: None,
@@ -25819,6 +27022,7 @@ mod tests {
             working: 2,
             idle: 3,
             done: 4,
+            ..Default::default()
         });
         app.failed = 1;
         for id in ["findings", "repro"] {
@@ -25979,6 +27183,7 @@ mod tests {
             background: None,
             usage: None,
             audit: None,
+            ps: None,
             commons: None,
             sky: None,
             picked: None,

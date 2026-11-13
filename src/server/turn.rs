@@ -19,11 +19,14 @@ use agent_runtime::{
     rules::Ruling,
     sandbox::Policy,
     store::{
-        AfterTurn, Answer, Bot, CallAnswer, Charge, ContextPrefix, ContextUsage, Database,
-        ElisionPlan, Gated, Halt, Halted, Lifted, LiftedRun, Limit, Settings, Slot, Spend, Store,
-        Strip, TURN_VIEW_ACCOUNTING, Waiting, Window, unserved,
+        AfterTurn, Answer, ArtifactLines, Bot, CallAnswer, Charge, ContextPrefix, ContextUsage,
+        Database, DetachedRow, ElisionPlan, Gated, Halt, Halted, Lifted, LiftedRun, Limit,
+        ProcessKind, Settings, Slot, Spend, Store, Strip, TURN_VIEW_ACCOUNTING, Waiting, Window,
+        listed_command, unserved,
     },
-    tools::{Cord, Files, Outcome, POLL_YIELD_MS, Place, Prepared, ReadSource, Registry, Stopper},
+    tools::{
+        Cord, Files, Outcome, POLL_YIELD_MS, Place, Prepared, ReadSource, Registry, Spill, Stopper,
+    },
 };
 use bytes::Bytes;
 use futures_util::{StreamExt, stream};
@@ -3060,7 +3063,7 @@ impl Turn {
         let tools = self.registry.encoded(
             provider.family(),
             provider.grammars(),
-            &record.tools,
+            &record.offered(),
             &record.declared,
             record.sandboxed(),
         )?;
@@ -4429,7 +4432,7 @@ impl Turn {
         route: Option<&str>,
         summary_retry_ms: Option<u64>,
     ) -> Result<Option<Stop>> {
-        let (turn, allowed) = (self.turn, record.callable());
+        let turn = self.turn;
         let mut calls = calls.into_iter();
         while let Some(call) = calls.next() {
             // Nor any tool: the calls not yet started are answered as not
@@ -4529,7 +4532,7 @@ impl Turn {
             let prepared = if let Some(tool) = record.declared(&call.name) {
                 agent_runtime::tools::check_declared(tool, &call.arguments)
                     .map(|()| Prepared::Declared(tool.result.clone()))
-            } else if allowed.iter().any(|name| name == &call.name) {
+            } else if record.calls(&call.name) {
                 self.registry.prepare(&call.name, &call.arguments)
             } else {
                 Err(Error::with("tool_not_available", call.name.as_str()))
@@ -4561,16 +4564,16 @@ impl Turn {
                 }),
                 other => other,
             };
-            let answered = record
-                .declared(&call.name)
-                .is_some_and(|tool| tool.answered_by.is_some());
+            let declared = record.declared(&call.name);
+            let answered = declared.is_some_and(|tool| tool.answered_by.is_some());
+            let lifts = declared.is_some_and(|tool| tool.lift);
             // A terminal whose end this result shows its bot.
             let mut seen = None;
             let outcome = match prepared {
                 // A declared tool runs nothing: its meaning is its client's,
                 // and so is its answer, when its client gives one.
                 Ok(Prepared::Declared(_)) if answered => match self
-                    .await_answer(&call.call_id, &mut calls, route, summary_retry_ms)
+                    .await_answer(&call.call_id, lifts, &mut calls, route, summary_retry_ms)
                     .await?
                 {
                     ControlFlow::Continue(Some(outcome)) => outcome,
@@ -4629,6 +4632,7 @@ impl Turn {
                     match self
                         .background(
                             &call.call_id,
+                            record.bot_id,
                             command,
                             Prepared::folder(workspace, workdir.as_deref()),
                             timeout_ms,
@@ -4648,10 +4652,13 @@ impl Turn {
                     yield_ms,
                     workdir,
                 }) => {
-                    let (turn, started) = (self.turn, call.call_id.clone());
+                    let (turn, started, listed) =
+                        (self.turn, call.call_id.clone(), command.clone());
                     let id = self
                         .store
-                        .op("process_start", move |db| db.process_start(turn, &started))
+                        .op("process_start", move |db| {
+                            db.process_start(turn, &started, ProcessKind::Terminal, &listed)
+                        })
                         .await?;
                     let (sender, receiver) = oneshot::channel();
                     self.collect(
@@ -4779,6 +4786,18 @@ impl Turn {
                             db.artifact_lines(&bot, owner, &ref_call, &stream, offset, limit)
                         })
                         .await;
+                    // A file, up to a gigabyte, is paged on a blocking
+                    // worker, read up to the page and counted past it.
+                    let text = match text {
+                        Ok(ArtifactLines::Page(page)) => Ok(page),
+                        Ok(ArtifactLines::File(file)) => tokio::task::spawn_blocking(move || {
+                            agent_runtime::tools::page_file(&file, offset, limit)
+                        })
+                        .await
+                        .unwrap_or_else(|_| fail("storage_error"))
+                        .and_then(|page| page.ok_or(Error::new("artifact_not_found"))),
+                        Err(error) => Err(error),
+                    };
                     match text {
                         Ok(page) => Outcome::text(self.registry.redact_text(page)),
                         Err(error) => failure(error),
@@ -4826,6 +4845,10 @@ impl Turn {
                 }) => {
                     let (started, running) = oneshot::channel();
                     let place = self.registry.place();
+                    // What lists it, should a steer move it to the background.
+                    let listed = listed(&command);
+                    let spill = (self.outputs(record, workspace))
+                        .map(|outputs| outputs.spill(self.turn, &call.call_id));
                     let run = self.registry.foreground(
                         command,
                         Prepared::folder(workspace, workdir.as_deref()),
@@ -4834,6 +4857,7 @@ impl Turn {
                         sandbox,
                         place.clone(),
                         started,
+                        spill,
                     );
                     match self.run_tool(run, Some((&self.lift, running))).await? {
                         Ran::Done(Ok(outcome)) => {
@@ -4845,10 +4869,25 @@ impl Turn {
                         Ran::Done(Err(error)) => failure(error),
                         Ran::Lifted(run) => {
                             let outputs = self.outputs(record, workspace);
-                            self.lift_shell(&call.call_id, run, &place, outputs).await?
+                            let owner = record.bot_id;
+                            self.lift_shell(&call.call_id, listed, owner, run, &place, outputs)
+                                .await?
                         }
                     }
                 }
+                Ok(Prepared::Detach { command, workdir }) => match self
+                    .detached(
+                        &call.call_id,
+                        command,
+                        Prepared::folder(workspace, workdir.as_deref()),
+                        environment,
+                        sandbox,
+                    )
+                    .await?
+                {
+                    Ok(outcome) => outcome,
+                    Err(error) => failure(error),
+                },
                 Ok(prepared) => match self
                     .run_tool(
                         self.registry
@@ -4901,7 +4940,7 @@ impl Turn {
                 Ok(Ruling::None | Ruling::Allow)
             )
             || record.declared(&call.name).is_some()
-            || !record.callable().iter().any(|name| name == &call.name)
+            || !record.calls(&call.name)
             || (call.name == "shell" && record.sandboxed() && !record.confines(call, workspace))
         {
             return None;
@@ -5059,6 +5098,9 @@ impl Turn {
             } => {
                 let (started, running) = oneshot::channel();
                 let place = self.registry.place();
+                let listed = listed(&command);
+                let spill = (self.outputs(record, workspace))
+                    .map(|outputs| outputs.spill(self.turn, &call_id));
                 let mut run = Box::pin(self.registry.foreground(
                     command,
                     Prepared::folder(workspace, workdir.as_deref()),
@@ -5067,6 +5109,7 @@ impl Turn {
                     sandbox,
                     place.clone(),
                     started,
+                    spill,
                 ));
                 let lifted = async {
                     // A run that ends before it starts wins the race below.
@@ -5086,7 +5129,8 @@ impl Turn {
                         let outputs = self.outputs(record, workspace);
                         return (
                             call_id.clone(),
-                            self.lift_shell(&call_id, run, &place, outputs).await,
+                            self.lift_shell(&call_id, listed, record.bot_id, run, &place, outputs)
+                                .await,
                         );
                     }
                 }
@@ -5295,7 +5339,7 @@ impl Turn {
     fn load_holds(&self, record: &Bot, call: &ToolCall, workspace: &std::path::Path) -> bool {
         if self.registry.admits()
             || record.declared(&call.name).is_some()
-            || !record.callable().iter().any(|name| name == &call.name)
+            || !record.calls(&call.name)
         {
             return false;
         }
@@ -5396,10 +5440,15 @@ impl Turn {
     /// Wait for an answered call's answer: live for the hold, then parked
     /// like `wait`, holding no task and no slot, until the answer comes or
     /// the call's time runs out. Answers wake the task through the worker,
-    /// so each check is one job and no commit.
+    /// so each check is one job and no commit. A message for the turn
+    /// lifts the call only when its tool `lifts` (once it has waited the
+    /// grace a command gets) or one of its steps waits on a gate (at
+    /// once, as a gated call is lifted); any other call is answered first,
+    /// and the turn takes the message at its next boundary.
     async fn await_answer(
         &self,
         call_id: &str,
+        lifts: bool,
         calls: &mut std::vec::IntoIter<ToolCall>,
         route: Option<&str>,
         summary_retry_ms: Option<u64>,
@@ -5407,8 +5456,10 @@ impl Turn {
         let turn = self.turn;
         // A client that answers is a program, near at hand: a short hold
         // takes its answer live, and a slower one parks without the slot.
-        let hold = tokio::time::Instant::now()
-            + Duration::from_millis(self.settings().approval_hold_ms().min(ANSWER_HOLD_MS));
+        let started = tokio::time::Instant::now();
+        let hold =
+            started + Duration::from_millis(self.settings().approval_hold_ms().min(ANSWER_HOLD_MS));
+        let graced = started + LIFT_GRACE;
         loop {
             let id = call_id.to_owned();
             let (notify, expires_ms) = match self
@@ -5419,28 +5470,48 @@ impl Turn {
                 CallAnswer::Given(outcome) => return Ok(ControlFlow::Continue(Some(outcome))),
                 CallAnswer::Pending { notify, expires_ms } => (notify, expires_ms),
             };
+            // No deadline while a step of the call waits on a gate: it
+            // waits on a verdict, as a gated call does.
+            let gated = expires_ms.is_none();
+            let liftable = gated || lifts;
             // A message for the turn lifts the call to the background: its
             // answer comes later, as the command's result.
-            if self.lift.is_armed() {
+            if liftable && self.lift.is_armed() && (gated || tokio::time::Instant::now() >= graced)
+            {
                 match self.lift_call(call_id, None).await? {
                     true => return Ok(ControlFlow::Continue(None)),
                     false => continue,
                 }
             }
-            // No deadline while a step of the call waits on a gate.
             let lapse = expires_ms.map(|at| {
                 tokio::time::Instant::now() + Duration::from_millis(at.saturating_sub(now_ms()))
             });
-            let wake = lapse.map_or(hold, |lapse| lapse.min(hold));
+            // A call of a tool that lifts waits out its grace live, never
+            // parked inside it: a steer that resumes a parked call lifts it
+            // at once, so parking first would cut the grace short.
+            let held = match lifts {
+                true => hold.max(graced),
+                false => hold,
+            };
+            let wake = lapse.map_or(held, |lapse| lapse.min(held));
+            let lifted = async {
+                match liftable {
+                    true => self.lift.lifted().await,
+                    false => std::future::pending().await,
+                }
+            };
             if tokio::time::Instant::now() < wake {
                 tokio::select! {
                     () = notify.notified() => continue,
                     () = tokio::time::sleep_until(wake) => {}
-                    () = self.lift.lifted() => continue,
+                    () = lifted => continue,
                 }
             }
-            // A call out of time is answered by the next check.
-            if lapse.is_some_and(|lapse| tokio::time::Instant::now() >= lapse) {
+            // A call out of time is answered by the next check, and one
+            // past its grace is lifted by it.
+            if lapse.is_some_and(|lapse| tokio::time::Instant::now() >= lapse)
+                || (liftable && self.lift.is_armed())
+            {
                 continue;
             }
             let pending: Vec<ToolCall> = calls.as_slice().to_vec();
@@ -5690,16 +5761,16 @@ impl Turn {
         // inherited from a fork's source is not its to collect. An owned
         // command stays owned, so checking before the wait parks is enough.
         if !processes.is_empty() {
-            let bot = self.bot.clone();
+            let (bot, ids) = (self.bot.clone(), processes.clone());
             let refused = self
                 .store
-                .op("unowned_process", move |db| {
-                    db.unowned_process(&bot, &processes)
-                })
+                .op("unowned_process", move |db| db.unowned_process(&bot, &ids))
                 .await?;
             if let Some(error) = refused {
                 return Ok(ControlFlow::Continue(failure(error)));
             }
+            // Waited on, as Codex counts a poll: the last its bot prunes.
+            self.registry.used(&processes);
         }
         // A steer waiting for the next boundary makes the wait a poll: it
         // reports what resolved, and the rest pending.
@@ -5811,6 +5882,7 @@ impl Turn {
     async fn background(
         &self,
         call_id: &str,
+        owner: i64,
         command: String,
         workspace: PathBuf,
         timeout_ms: Option<u64>,
@@ -5820,14 +5892,18 @@ impl Turn {
     ) -> Result<Outcome> {
         // The place in line is taken before anything durable is written.
         let queued = self.registry.queue()?;
-        let (turn, started) = (self.turn, call_id.to_owned());
+        let (turn, started, listed) = (self.turn, call_id.to_owned(), command.clone());
         let id = self
             .store
-            .op("process_start", move |db| db.process_start(turn, &started))
+            .op("process_start", move |db| {
+                db.process_start(turn, &started, ProcessKind::Background, &listed)
+            })
             .await?;
         let (sender, receiver) = oneshot::channel();
+        let spill = (outputs.clone()).map(|outputs| outputs.spill(self.turn, call_id));
         self.registry.background(
             self.registry.stopper(id),
+            owner,
             command,
             workspace,
             timeout_ms,
@@ -5835,11 +5911,86 @@ impl Turn {
             sandbox,
             queued,
             sender,
+            spill,
         );
         self.collect(id, call_id, receiver, outputs, None);
         Ok(Outcome::text(
             json!({"handle":format!("proc:{id}"),"background":true}).to_string(),
         ))
+    }
+
+    /// Start a detached command on a proc handle the store keeps: it
+    /// outlives the turn and the daemon, its agent or a person stops it by
+    /// its handle, and its end is told as a background command's is. The
+    /// outer error is the store's; the inner one, the call's.
+    async fn detached(
+        &self,
+        call_id: &str,
+        command: String,
+        folder: PathBuf,
+        environment: &[(String, String)],
+        sandbox: Option<Arc<Policy>>,
+    ) -> Result<Result<Outcome>> {
+        let (turn, started, listed) = (self.turn, call_id.to_owned(), listed(&command));
+        let id = self
+            .store
+            .op("process_start", move |db| {
+                db.process_start(turn, &started, ProcessKind::Detached, &listed)
+            })
+            .await?;
+        let (sender, receiver) = oneshot::channel();
+        // Its end, a start that failed too, is recorded as it comes.
+        let lifts = Lifts {
+            store: self.store.clone(),
+            registry: self.registry.clone(),
+            handles: self.handles.clone(),
+            failures: self.background_failures.clone(),
+        };
+        lifts.collect(&self.bot, turn, id, call_id, receiver, None, None, true);
+        // The start and what records it run apart from the turn, so a turn
+        // ended meanwhile never leaves a command running that nothing
+        // watches or that the store cannot find again.
+        // The cord as it is now: a pause during the setup ends it too.
+        let (registry, store, cord) = (
+            self.registry.clone(),
+            self.store.clone(),
+            self.registry.cord(),
+        );
+        let environment = environment.to_vec();
+        let start = tokio::spawn(async move {
+            let sandboxed = sandbox.is_some();
+            let started = registry
+                .detached(
+                    cord,
+                    registry.stopper(id),
+                    &command,
+                    &folder,
+                    &environment,
+                    sandbox,
+                    sender,
+                )
+                .await;
+            let detached = match started {
+                Ok(detached) => detached,
+                Err(error) => {
+                    // This call says it failed: nothing tells it again.
+                    store.op("saw_end", move |db| db.saw_end(id)).await?;
+                    return Ok(Err(error));
+                }
+            };
+            store
+                .op("process_detached", move |db| {
+                    db.process_detached(id, detached, sandboxed, "")
+                })
+                .await?;
+            Ok(Ok(Outcome::text(
+                json!({"handle":format!("proc:{id}"),"detached":true,"pid":detached.pid})
+                    .to_string(),
+            )))
+        });
+        start
+            .await
+            .unwrap_or_else(|_| Err(Error::new("turn_task_failed")))
     }
 
     /// Move a running foreground command to the background: it keeps its
@@ -5849,6 +6000,8 @@ impl Turn {
     async fn lift_shell<F>(
         &self,
         call_id: &str,
+        command: String,
+        owner: i64,
         run: std::pin::Pin<Box<F>>,
         place: &Place,
         outputs: Option<Outputs>,
@@ -5859,12 +6012,15 @@ impl Turn {
         let (turn, started) = (self.turn, call_id.to_owned());
         let id = self
             .store
-            .op("process_start", move |db| db.process_start(turn, &started))
+            .op("process_start", move |db| {
+                db.process_start(turn, &started, ProcessKind::Background, &command)
+            })
             .await?;
         let (sender, receiver) = oneshot::channel();
-        let run = self
-            .registry
-            .until_stopped(self.registry.stopper(id), self.registry.until_pulled(run));
+        // It runs on as a background command, and counts as one.
+        let stopper = self.registry.stopper(id);
+        self.registry.own(&stopper, owner);
+        let run = (self.registry).until_stopped(stopper, self.registry.until_pulled(run));
         // Counted as the process it is now, not as a foreground command too.
         place.lift();
         tokio::spawn(async move {
@@ -5895,7 +6051,7 @@ impl Turn {
             failures: self.background_failures.clone(),
         };
         lifts.collect(
-            &self.bot, self.turn, id, call_id, receiver, outputs, terminal,
+            &self.bot, self.turn, id, call_id, receiver, outputs, terminal, false,
         );
     }
 }
@@ -5991,6 +6147,7 @@ impl Lifts {
                 receiver,
                 None,
                 None,
+                false,
             );
             let _ = sender.send(Err(Error::new("workspace_required")));
             return;
@@ -6024,7 +6181,7 @@ impl Lifts {
         let prepared = if let Some(tool) = bot.declared(&call.name) {
             agent_runtime::tools::check_declared(tool, &call.arguments)
                 .map(|()| Prepared::Declared(tool.result.clone()))
-        } else if bot.callable().iter().any(|name| name == &call.name) {
+        } else if bot.calls(&call.name) {
             self.registry.prepare(&call.name, &call.arguments)
         } else {
             Err(Error::with("tool_not_available", call.name.as_str()))
@@ -6059,6 +6216,7 @@ impl Lifts {
                             receiver,
                             None,
                             None,
+                            false,
                         );
                         let _ = sender.send(Err(error));
                         return;
@@ -6075,6 +6233,8 @@ impl Lifts {
             Ok(prepared)
         });
         let terminal = matches!(prepared, Ok(Prepared::Terminal { .. }));
+        let detached = matches!(prepared, Ok(Prepared::Detach { .. }));
+        let spill = (outputs.clone()).map(|outputs| outputs.spill(turn, &call.call_id));
         self.collect(
             &bot.name,
             turn,
@@ -6083,6 +6243,7 @@ impl Lifts {
             receiver,
             outputs,
             terminal.then(|| self.registry.clone()),
+            detached,
         );
         match prepared {
             Ok(Prepared::Shell {
@@ -6091,16 +6252,21 @@ impl Lifts {
                 workdir,
                 ..
             }) => match self.registry.queue() {
-                Ok(queued) => self.registry.background(
-                    stopper,
-                    command,
-                    Prepared::folder(&workspace, workdir.as_deref()),
-                    timeout_ms,
-                    environment,
-                    sandbox,
-                    queued,
-                    sender,
-                ),
+                Ok(queued) => {
+                    self.running_as(process, ProcessKind::Background, &command);
+                    self.registry.background(
+                        stopper,
+                        bot.bot_id,
+                        command,
+                        Prepared::folder(&workspace, workdir.as_deref()),
+                        timeout_ms,
+                        environment,
+                        sandbox,
+                        queued,
+                        sender,
+                        spill,
+                    )
+                }
                 Err(error) => {
                     let _ = sender.send(Err(error));
                 }
@@ -6110,6 +6276,7 @@ impl Lifts {
             Ok(Prepared::Terminal {
                 command, workdir, ..
             }) => {
+                self.running_as(process, ProcessKind::Terminal, &command);
                 let registry = self.registry.clone();
                 let folder = Prepared::folder(&workspace, workdir.as_deref());
                 tokio::spawn(async move {
@@ -6160,6 +6327,33 @@ impl Lifts {
                     let _ = sender.send(typed);
                 });
             }
+            // Its handle is the call's, which runs on past the daemon as any
+            // detached command does, found again by what its start records.
+            Ok(Prepared::Detach { command, workdir }) => {
+                let (registry, store) = (self.registry.clone(), self.store.clone());
+                let folder = Prepared::folder(&workspace, workdir.as_deref());
+                tokio::spawn(async move {
+                    let sandboxed = sandbox.is_some();
+                    let started = registry
+                        .detached(
+                            cord,
+                            stopper,
+                            &command,
+                            &folder,
+                            &environment,
+                            sandbox,
+                            sender,
+                        )
+                        .await;
+                    if let Ok(detached) = started {
+                        let _ = store
+                            .op("process_detached", move |db| {
+                                db.process_detached(process, detached, sandboxed, &command)
+                            })
+                            .await;
+                    }
+                });
+            }
             Ok(Prepared::Declared(result)) => {
                 let _ = sender.send(Ok(Outcome::text(result)));
             }
@@ -6201,10 +6395,63 @@ impl Lifts {
         }
     }
 
+    /// Record that lifted call `process` now runs as a command of `kind`,
+    /// beside its start: its row lists it so from here.
+    fn running_as(&self, process: i64, kind: ProcessKind, command: &str) {
+        let (store, listed) = (self.store.clone(), listed(command));
+        tokio::spawn(async move {
+            let _ = store
+                .op("process_running_as", move |db| {
+                    db.process_running_as(process, kind, &listed)
+                })
+                .await;
+        });
+    }
+
+    /// Watch again each detached command in `rows`, which an earlier
+    /// daemon started: one that still runs is stopped by its handle and its
+    /// end told as it comes; one that ended, or whose leader did, while no
+    /// daemon watched is recorded ended now, with no exit code, and told.
+    pub async fn adopt(&self, rows: Vec<DetachedRow>) {
+        for row in rows {
+            let (sender, receiver) = oneshot::channel();
+            let elapsed = Duration::from_millis(now_ms().saturating_sub(row.started_ms as u64));
+            let stopper = self.registry.stopper(row.id);
+            let runs = (self.registry)
+                .adopt(stopper, row.detached, row.sandboxed, elapsed, sender)
+                .await;
+            let (ended, receiver) = match runs {
+                true => (None, receiver),
+                false => {
+                    let (ended, receiver) = oneshot::channel();
+                    (Some(ended), receiver)
+                }
+            };
+            self.collect(
+                &row.bot,
+                row.turn,
+                row.id,
+                &row.call_id,
+                receiver,
+                None,
+                None,
+                runs,
+            );
+            if let Some(ended) = ended {
+                let _ = ended.send(Ok(Outcome::text(
+                    json!({"exit_code":null,"detail":"it ended, or its first process did, while no daemon watched it; what it left running is no longer tracked"})
+                        .to_string(),
+                )));
+            }
+        }
+    }
+
     /// Record a background command's result when it arrives and wake those
     /// waiting on its handle. A terminal's, `terminal`, stays in the
     /// registry with its end until then, so a poll never finds it gone
-    /// with no result.
+    /// with no result. A detached command, `outlives`, runs on when the
+    /// daemon stops: no result then is no end, and the daemon that opens
+    /// the store next looks for it again.
     #[allow(clippy::too_many_arguments)]
     fn collect(
         &self,
@@ -6215,6 +6462,7 @@ impl Lifts {
         receiver: oneshot::Receiver<Result<Outcome>>,
         outputs: Option<Outputs>,
         terminal: Option<Registry>,
+        outlives: bool,
     ) {
         let (store, handles, failures, call_id_for_refs, bot) = (
             self.store.clone(),
@@ -6223,8 +6471,22 @@ impl Lifts {
             call_id.to_owned(),
             bot.to_owned(),
         );
+        // A detached command runs on past the daemon: its collector lets
+        // the store go as the daemon stops, recording no end.
+        let stopping = outlives.then(|| self.registry.until_stopping());
         tokio::spawn(async move {
-            let result = receiver.await.unwrap_or_else(|_| fail("process_lost"));
+            let received = match stopping {
+                Some(stopping) => tokio::select! {
+                    received = receiver => received,
+                    () = stopping => return,
+                },
+                None => receiver.await,
+            };
+            let result = match received {
+                Ok(result) => result,
+                Err(_) if outlives => return,
+                Err(_) => fail("process_lost"),
+            };
             // Whether it failed, as whoever ran it said.
             let (value, failed, artifacts, files) = match result {
                 Ok(outcome) => {
@@ -6285,11 +6547,16 @@ impl Lifts {
     }
 }
 
+/// The start of `command` its process row lists it by, copied.
+fn listed(command: &str) -> String {
+    listed_command(command).to_owned()
+}
+
 /// Stop `handle`, a command of `bot`'s with no terminal: a call a message
 /// lifted, still waiting for its verdict or answer, is withdrawn, never
 /// run; a background command is killed. Its end is this result, so nothing
 /// tells it later. `None` when it is neither.
-async fn stop_handle(
+pub(super) async fn stop_handle(
     store: &Store,
     registry: &Registry,
     handles: &Handles,
@@ -6415,7 +6682,7 @@ fn withhold_thinking(context: &Context, error: &Error) -> Option<Strip> {
 /// Whether the bot may search the web: its provider declares the search
 /// when it offers one, and a fork's allowed list narrows it as any tool.
 fn searches(record: &agent_runtime::store::Bot) -> bool {
-    record.callable().iter().any(|tool| tool == "web_search")
+    record.calls("web_search")
 }
 
 /// Whether a turn whose budget is spent makes one more call, without tool
@@ -6585,15 +6852,7 @@ impl Outputs {
         if outcome.artifacts.is_empty() {
             return outcome;
         }
-        let name: String = call_id
-            .chars()
-            .map(
-                |c| match c.is_ascii_alphanumeric() || c == '_' || c == '-' {
-                    true => c,
-                    false => '_',
-                },
-            )
-            .collect();
+        let name = file_name(call_id);
         let artifacts = std::mem::take(&mut outcome.artifacts);
         // A turn stopped while this runs drops what it returns, and the
         // files with it: no record will name them.
@@ -6638,9 +6897,20 @@ impl Outputs {
         // A task that failed took the data with it: the cut text stands alone.
         if let Ok(Kept { stored, files }) = kept {
             outcome.artifacts = stored;
-            outcome.files = files;
+            outcome.files = std::mem::take(&mut outcome.files).join(files);
         }
         outcome
+    }
+
+    /// Where a command's streams go whole as it runs, past the bound, as
+    /// `keep` would name their files: only while the bot's sandbox cannot
+    /// write the folder, as `keep` checks, there when one passes it.
+    fn spill(self, turn: i64, call_id: &str) -> Spill {
+        Spill {
+            folder: self.folder.clone(),
+            name: format!("{turn}-{}", file_name(call_id)),
+            usable: Arc::new(move || !self.exposed()),
+        }
     }
 
     /// Whether the bot's commands may write the folder, made first so the
@@ -6687,6 +6957,19 @@ impl Outputs {
             Err(_) => true,
         }
     }
+}
+
+/// A call's id as part of a file's name: letters, digits, `_` and `-`.
+fn file_name(call_id: &str) -> String {
+    call_id
+        .chars()
+        .map(
+            |c| match c.is_ascii_alphanumeric() || c == '_' || c == '-' {
+                true => c,
+                false => '_',
+            },
+        )
+        .collect()
 }
 
 /// A call's cut streams once kept: those the store keeps, and the files
@@ -8125,6 +8408,7 @@ mod tests {
             None,
             registry.place(),
             started,
+            None,
         ));
         running.await.unwrap();
         assert!(!registry.admits());

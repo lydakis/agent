@@ -7,8 +7,9 @@
 //! The calls are the record, in the bot's history; the margin as it
 //! stands is kept beside the person's reactions, by the bot's key, so a
 //! window opened later shows it without reading the whole history.
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
 use ratatui::{
@@ -132,6 +133,8 @@ pub fn tool() -> Value {
                     "description": "A few words, shown on the note."},
                 "markdown": {"type": "string", "maxLength": NOTE_BYTES,
                     "description": "The note, as Markdown."},
+                "template": {"type": "string",
+                    "description": "Or Markdown with Jinja blanks Sonny keeps filled: source('name').latest/.topics, file('path'), tasks(), task('name'), now(), |ago, |time, |fromjson."},
                 "file": {"type": "string", "minLength": 1,
                     "description": "Or a file to show, absolute or from your folder."},
                 "from": {"type": "string", "pattern": "^[A-Za-z0-9._-]{1,128}/[a-z0-9][a-z0-9-]{0,39}$",
@@ -170,10 +173,12 @@ pub async fn answer(
         .request("bots", json!({"name": bot, "limit": 1}))
         .await)
         .map_err(unread)?;
-    let id = (page["bots"].get(0))
-        .filter(|record| record["name"] == bot)
-        .and_then(|record| record["bot_id"].as_i64())
+    let record = (page["bots"].get(0)).filter(|record| record["name"] == bot);
+    let id = (record.and_then(|record| record["bot_id"].as_i64()))
         .ok_or(("margin_unread", format!("{bot} is gone")))?;
+    let workspace = (record.and_then(|record| record["workspace"].as_str()))
+        .map(PathBuf::from)
+        .unwrap_or_default();
     let store = std::fs::canonicalize(store).unwrap_or_else(|_| store.to_owned());
     let key = crate::reactions::key(&store, id);
     // Its own, never a window's: a window reads past calls still waiting
@@ -256,9 +261,71 @@ pub async fn answer(
             held.apply(id, arguments, None, None);
         }
     }
-    match held.refusal(arguments) {
-        Some((code, why)) => Err((code, why)),
-        None => Ok("In the margin.".into()),
+    if let Some((code, why)) = held.refusal(arguments) {
+        return Err((code, why));
+    }
+    match arguments["template"].as_str() {
+        Some(template) if shown_as_template(arguments) => {
+            let data = crate::template::Data {
+                store: Some(store),
+                // The ones the person set up, as the window has them: the
+                // commons keeps nothing a blank reads.
+                sources: crate::template::configured_sources(),
+                folder: workspace,
+                now: SystemTime::now()
+                    .duration_since(SystemTime::UNIX_EPOCH)
+                    .map_or(0, |d| d.as_secs() as i64),
+                // The host does not read where the tasks stand: a blank
+                // that names one is filled in the window.
+                tasks: Default::default(),
+            };
+            filled(template, &data)
+        }
+        _ => Ok("In the margin.".into()),
+    }
+}
+
+/// Whether a call's note shows its `template`: no file or task's note
+/// named over it.
+fn shown_as_template(arguments: &Value) -> bool {
+    arguments["template"].is_string()
+        && arguments["from"].as_str().and_then(from).is_none()
+        && !(arguments["file"].as_str()).is_some_and(|file| !file.trim().is_empty())
+}
+
+/// What a call posting `template` is answered, filled from `data` as the
+/// tool host has it: refused when it does not read as a template, names a
+/// source the person has not set up, or fills to more lines than a note
+/// holds; else what it shows now, or why it does not fill yet, as a blank
+/// that names a task the window fills.
+fn filled(template: &str, data: &crate::template::Data) -> Result<String, (&'static str, String)> {
+    // Whole or not at all: a template cut short would read as another.
+    if template.len() > NOTE_BYTES {
+        return Err((
+            "margin_note_too_long",
+            format!(
+                "the template is {} bytes and a margin note holds at most {NOTE_BYTES}: \
+                 keep what it says short and let its blanks fill the rest",
+                template.len()
+            ),
+        ));
+    }
+    crate::template::check(template).map_err(|why| ("margin_template", why))?;
+    match crate::template::render(template, data).0 {
+        Err(why) if why.contains("no source named ") => Err(("margin_template", why)),
+        Err(why) => Ok(format!("In the margin; it does not fill here yet ({why}).")),
+        Ok(text) if text.lines().count() > most_lines() => Err((
+            "margin_note_too_long",
+            format!(
+                "the template fills to {} lines and a margin note holds at most {}: \
+                 show less of what it reads, such as the newest few events",
+                text.lines().count(),
+                most_lines()
+            ),
+        )),
+        Ok(text) => Ok(format!(
+            "In the margin, filled as it changes. It shows now:\n{text}"
+        )),
     }
 }
 
@@ -286,6 +353,9 @@ fn answered(output: &Value) -> bool {
 #[derive(Clone, Debug, PartialEq)]
 pub enum Body {
     Markdown(String),
+    /// Markdown with blanks, filled as what they read changes
+    /// ([`crate::template`]).
+    Template(String),
     File(String),
     /// A file's text as read where another bot keeps it, shown as the
     /// file is: only what a [`Body::From`] shows.
@@ -342,6 +412,9 @@ struct Kept {
     /// The newest node of the bot's history the notes were brought up to:
     /// a window replays only the `margin` calls and closes after it.
     through: Option<i64>,
+    /// What another bot's template note last filled to here, by note id:
+    /// kept, as a file read there is, once that bot's folder is gone.
+    filled: BTreeMap<String, String>,
 }
 
 impl Kept {
@@ -354,7 +427,8 @@ impl Kept {
                 json
             })
             .collect();
-        json!({"notes": notes, "seen": self.seen, "closed": self.closed, "through": self.through})
+        json!({"notes": notes, "seen": self.seen, "closed": self.closed, "through": self.through,
+            "filled": self.filled})
     }
 
     /// What [`Kept::json`] wrote; a note it cannot read is left out.
@@ -382,6 +456,9 @@ impl Kept {
             seen,
             closed: json["closed"] == true,
             through: json["through"].as_i64(),
+            filled: (json["filled"].as_object().into_iter().flatten())
+                .filter_map(|(id, text)| Some((id.clone(), text.as_str()?.to_owned())))
+                .collect(),
         }
     }
 }
@@ -390,7 +467,7 @@ impl Kept {
 /// what another bot's note showed when last read.
 fn said(body: &Body) -> String {
     match body {
-        Body::Markdown(text) | Body::Read { text, .. } => text.clone(),
+        Body::Markdown(text) | Body::Template(text) | Body::Read { text, .. } => text.clone(),
         Body::File(path) => path.clone(),
         Body::From { shown, .. } => shown.as_deref().map(said).unwrap_or_default(),
     }
@@ -400,6 +477,7 @@ fn said(body: &Body) -> String {
 fn body_json(body: &Body, json: &mut Value) {
     match body {
         Body::Markdown(text) => json["markdown"] = json!(text),
+        Body::Template(text) => json["template"] = json!(text),
         Body::File(path) => json["file"] = json!(path),
         Body::Read { path, text } => {
             json["read"] = json!(path);
@@ -445,9 +523,10 @@ fn body_read(json: &Value) -> Option<Body> {
             text: text("text").unwrap_or_default(),
         });
     }
-    match text("file") {
-        Some(path) => Some(Body::File(path)),
-        None => Some(Body::Markdown(text("markdown")?)),
+    match (text("file"), text("template")) {
+        (Some(path), _) => Some(Body::File(path)),
+        (_, Some(template)) => Some(Body::Template(template)),
+        _ => Some(Body::Markdown(text("markdown")?)),
     }
 }
 
@@ -486,11 +565,13 @@ pub fn refusal(held: &[&str], arguments: &Value) -> Option<(&'static str, String
         return None;
     }
     let id = arguments["id"].as_str().map(str::trim).unwrap_or("");
-    // As the note will show it: a file or a task's note only when named.
+    // As the note will show it: a file or a task's note only when named;
+    // a template's lines are counted as it fills, by the tool host.
     let shows = arguments["from"].as_str().and_then(from).is_some()
         || arguments["file"]
             .as_str()
-            .is_some_and(|file| !file.trim().is_empty());
+            .is_some_and(|file| !file.trim().is_empty())
+        || arguments["template"].is_string();
     let lines = (arguments["markdown"].as_str())
         .filter(|_| !shows)
         .map_or(0, |markdown| markdown.lines().count());
@@ -617,6 +698,7 @@ impl Reference {
         let body = match (
             arguments["from"].as_str().and_then(from),
             arguments["file"].as_str(),
+            arguments["template"].as_str(),
             arguments["markdown"].as_str(),
         ) {
             (Some((bot, id)), ..) => Body::From {
@@ -626,7 +708,8 @@ impl Reference {
                 shown: None,
                 folder: None,
             },
-            (_, Some(file), _) if !file.trim().is_empty() => Body::File(file.trim().to_owned()),
+            (_, Some(file), ..) if !file.trim().is_empty() => Body::File(file.trim().to_owned()),
+            (_, _, Some(template), _) => Body::Template(cut(template, NOTE_BYTES).to_owned()),
             (.., Some(markdown)) => Body::Markdown(cut(markdown, NOTE_BYTES).to_owned()),
             // Put there again with nothing in it, as its own margin does.
             _ if recreated => Body::Markdown(String::new()),
@@ -662,6 +745,7 @@ impl Reference {
                             .as_str()
                             .is_some_and(|t| !t.trim().is_empty())
                             && (arguments["markdown"].is_string()
+                                || arguments["template"].is_string()
                                 || arguments["from"].as_str().and_then(from).is_some()
                                 || arguments["file"]
                                     .as_str()
@@ -736,6 +820,41 @@ struct Read {
     text: Result<String, String>,
 }
 
+/// What a margin's template notes are filled from, as the window has it
+/// ([`crate::template`]), and the person's own notes.
+#[derive(Clone, Default)]
+pub struct Blanks {
+    /// The store whose lookout keeps the sources' events.
+    pub store: Option<PathBuf>,
+    /// The sources the person set up, by name.
+    pub sources: Arc<Vec<String>>,
+    /// The agents as `/status` last read them, as `tasks()` gives them.
+    pub tasks: Arc<Vec<Value>>,
+    /// Counts each change to `tasks`.
+    pub tasks_read: u64,
+    /// The person's own notes, `[sonny.notes.NAME]`, shown over the
+    /// agent's: each its name, title and template.
+    pub notes: Arc<Vec<(String, String, String)>>,
+}
+
+/// A template note as last filled: from what, to what, and what it read
+/// as that stood then.
+struct Filled {
+    template: String,
+    folder: PathBuf,
+    /// What it last filled to; kept while a later fill fails.
+    text: Option<String>,
+    /// Why the last fill failed, when it did.
+    error: Option<String>,
+    reads: crate::template::Reads,
+    /// The sources set up when it filled: one added or taken away since
+    /// may change what it shows.
+    sources: Arc<Vec<String>>,
+    tasks_read: u64,
+    minute: i64,
+    looked: Instant,
+}
+
 /// What a margin's rows were drawn from: its width, the running turn,
 /// the terminal's light, how many times its notes and files changed,
 /// and the folder its files are read from.
@@ -758,6 +877,12 @@ pub struct Margin {
     /// The bot's plan as its newest `plan` call set it, shown over the
     /// notes: one, however often it changes.
     plan: Vec<String>,
+    /// What template notes are filled from, as the window sets it before
+    /// each draw ([`Margin::set_blanks`]).
+    blanks: Blanks,
+    /// Template notes as last filled, by note id; the person's own by
+    /// `~NAME`.
+    filled: HashMap<String, Filled>,
 }
 
 /// The number a note's pin goes by on the screen: its call's, the same
@@ -860,7 +985,7 @@ impl Margin {
 
     /// Whether it holds no note and no plan.
     pub fn is_empty(&self) -> bool {
-        self.kept.notes.is_empty() && self.plan.is_empty()
+        self.kept.notes.is_empty() && self.plan.is_empty() && self.blanks.notes.is_empty()
     }
 
     /// The newest node of the bot's history the notes were brought up to.
@@ -979,6 +1104,7 @@ impl Margin {
         let body = match (
             arguments["from"].as_str().and_then(from),
             arguments["file"].as_str(),
+            arguments["template"].as_str(),
             arguments["markdown"].as_str(),
         ) {
             // The same note again keeps what was read of it.
@@ -1004,9 +1130,10 @@ impl Margin {
                     folder: None,
                 },
             }),
-            (_, Some(file), _) if !file.trim().is_empty() => {
+            (_, Some(file), ..) if !file.trim().is_empty() => {
                 Some(Body::File(file.trim().to_owned()))
             }
+            (_, _, Some(template), _) => Some(Body::Template(cut(template, NOTE_BYTES).to_owned())),
             (.., Some(markdown)) => Some(Body::Markdown(cut(markdown, NOTE_BYTES).to_owned())),
             _ => None,
         };
@@ -1106,17 +1233,177 @@ impl Margin {
 
     /// The files notes show looked at again, so one changed counts as a
     /// change; only those are kept read.
+    /// What template notes are filled from now. The person's own notes
+    /// differing, by one added, taken away or retitled, is a change.
+    pub fn set_blanks(&mut self, blanks: Blanks) {
+        if !Arc::ptr_eq(&self.blanks.notes, &blanks.notes) && self.blanks.notes != blanks.notes {
+            self.changes += 1;
+        }
+        self.blanks = blanks;
+    }
+
     pub fn freshen(&mut self, workspace: &Path) {
         let files: Vec<PathBuf> = (self.kept.notes.iter())
             .filter_map(|note| match &note.body {
                 Body::File(path) => Some(workspace.join(path)),
-                Body::Markdown(_) | Body::Read { .. } | Body::From { .. } => None,
+                Body::Markdown(_) | Body::Template(_) | Body::Read { .. } | Body::From { .. } => {
+                    None
+                }
             })
             .collect();
         self.reads.retain(|path, _| files.contains(path));
         for path in &files {
             self.look(path);
         }
+        // Templates, the person's own first: another bot's is filled
+        // here, its files read where that bot keeps them. Only those due
+        // a look are copied out, so a frame between looks costs nothing.
+        let person = (self.blanks.notes.iter())
+            .map(|(name, _, template)| (format!("~{name}"), template, None, false));
+        let notes = (self.kept.notes.iter()).filter_map(|note| match &note.body {
+            Body::Template(template) => Some((note.id.clone(), template, None, false)),
+            Body::From {
+                shown: Some(shown),
+                folder,
+                ..
+            } => match shown.as_ref() {
+                Body::Template(template) => {
+                    Some((note.id.clone(), template, folder.as_deref(), true))
+                }
+                _ => None,
+            },
+            _ => None,
+        });
+        let mut keys = Vec::new();
+        let mut due = Vec::new();
+        for (key, template, folder, kept) in person.chain(notes) {
+            let folder = folder.map_or_else(|| workspace.to_owned(), PathBuf::from);
+            let waits = (self.filled.get(&key)).is_some_and(|filled| {
+                filled.looked.elapsed() < FRESH
+                    && filled.template == *template
+                    && filled.folder == folder
+            });
+            if !waits {
+                due.push((key.clone(), template.clone(), folder, kept));
+            }
+            keys.push(key);
+        }
+        let was = self.filled.len();
+        (self.filled).retain(|key, _| keys.contains(key));
+        if self.filled.len() != was {
+            self.changes += 1;
+        }
+        let was = self.kept.filled.len();
+        (self.kept.filled).retain(|key, _| keys.contains(key));
+        if self.kept.filled.len() != was {
+            self.save();
+        }
+        for (key, template, folder, kept) in due {
+            self.fill(&key, &template, &folder, kept);
+        }
+    }
+
+    /// The template note `key` filled again from `folder` once what it
+    /// read last changed, looked at no more than once a [`FRESH`]: a
+    /// source's log or a file, the tasks, or the minute, when it read
+    /// the clock. A fill that shows something new counts as a change.
+    /// Another bot's (`kept`) keeps what it filled to, so a later fill
+    /// that fails there, its folder gone, still shows it, in this window
+    /// and the next.
+    fn fill(&mut self, key: &str, template: &str, folder: &Path, kept: bool) {
+        let now = Instant::now();
+        let epoch = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs() as i64);
+        let tasks_read = self.blanks.tasks_read;
+        if let Some(filled) = self.filled.get_mut(key)
+            && filled.template == template
+            && filled.folder == folder
+        {
+            filled.looked = now;
+            let again = (filled.reads.tasks && filled.tasks_read != tasks_read)
+                || !Arc::ptr_eq(&filled.sources, &self.blanks.sources)
+                || (filled.reads.clock && filled.minute != epoch / 60)
+                || crate::template::changed(&filled.reads);
+            if !again {
+                return;
+            }
+        }
+        let data = crate::template::Data {
+            store: self.blanks.store.clone(),
+            sources: self.blanks.sources.clone(),
+            folder: folder.to_owned(),
+            tasks: self.blanks.tasks.clone(),
+            now: epoch,
+        };
+        let (rendered, reads) = crate::template::render(template, &data);
+        let was = self.filled.remove(key);
+        let (text, error) = match rendered {
+            Ok(text) => (Some(text), None),
+            Err(error) => {
+                let last = (was.as_ref().and_then(|was| was.text.clone()))
+                    .or_else(|| kept.then(|| self.kept.filled.get(key).cloned()).flatten());
+                (last, Some(error))
+            }
+        };
+        if kept
+            && error.is_none()
+            && let Some(text) = &text
+            && self.kept.filled.get(key) != Some(text)
+        {
+            self.kept.filled.insert(key.to_owned(), text.clone());
+            self.save();
+        }
+        if was
+            .as_ref()
+            .is_none_or(|was| was.text != text || was.error != error || was.reads != reads)
+        {
+            self.changes += 1;
+        }
+        let filled = Filled {
+            template: template.to_owned(),
+            folder: folder.to_owned(),
+            text,
+            error,
+            reads,
+            sources: self.blanks.sources.clone(),
+            tasks_read,
+            minute: epoch / 60,
+            looked: now,
+        };
+        self.filled.insert(key.to_owned(), filled);
+    }
+
+    /// The template note `key`'s rows as last filled, `width` wide, its
+    /// pictures read from `folder`: its text cut at the most lines a note
+    /// holds, then why its last fill failed, when it did.
+    fn filled_lines(&self, key: &str, width: usize, folder: &Path) -> Vec<Line<'static>> {
+        let Some(filled) = self.filled.get(key) else {
+            return vec![Line::from(format!("{BODY}…")).dim()];
+        };
+        let mut out = follows(&filled.reads, &filled.folder, width);
+        if let Some(text) = &filled.text {
+            let lines: Vec<&str> = text.lines().collect();
+            let shown = lines.len().min(most_lines());
+            let mut markdown = Markdown::in_folder(folder);
+            let text = lines[..shown].join("\n");
+            out.extend(crate::transcript::markdown(
+                &mut markdown,
+                &text,
+                width,
+                leads(),
+            ));
+            if lines.len() > shown {
+                let more = lines.len() - shown;
+                out.push(Line::from(format!("{BODY}… {more} more lines")).dim());
+            }
+        }
+        if let Some(error) = &filled.error {
+            let lead = || Span::raw(BODY);
+            let said = Line::from(format!("⟨{error}⟩")).dim();
+            out.extend(crate::transcript::wrap(said, width, lead(), lead()));
+        }
+        out
     }
 
     /// How many times what the margin shows has changed: a note, a file a
@@ -1149,6 +1436,7 @@ impl Margin {
                 let mut markdown = Markdown::in_folder(folder.unwrap_or(workspace));
                 crate::transcript::markdown(&mut markdown, text, width, leads())
             }
+            Body::Template(_) => self.filled_lines(id, width, folder.unwrap_or(workspace)),
             Body::File(path) => self.file_lines(workspace, path, width),
             Body::Read { path, text } => {
                 text_lines(Path::new(path), text, folder.unwrap_or(workspace), width)
@@ -1189,7 +1477,19 @@ impl Margin {
                 lines.extend(crate::transcript::wrap(step, width, lead(), lead()));
             }
         }
-        if self.kept.notes.is_empty() && !self.plan.is_empty() {
+        // The person's own, over the agent's: theirs to change in their
+        // config, so no buttons.
+        let person = self.blanks.notes.clone();
+        for (name, title, _) in person.iter() {
+            lines.push(Line::default());
+            let title = crate::transcript::cut(title, width.saturating_sub(4));
+            lines.push(Line::from(vec![
+                Span::raw(" ◇ ").dim(),
+                Span::raw(title).bold(),
+            ]));
+            lines.extend(self.filled_lines(&format!("~{name}"), width, workspace));
+        }
+        if self.kept.notes.is_empty() && (!self.plan.is_empty() || !person.is_empty()) {
             return (lines, marks);
         }
         if self.kept.notes.is_empty() {
@@ -1290,6 +1590,50 @@ fn cut(text: &str, most: usize) -> &str {
         end -= 1;
     }
     &text[..end]
+}
+
+/// What a template note follows, under its title, so a filled note never
+/// passes for a written one: its sources by their icons, a down one with
+/// since when, the tasks, and its files from `folder`. No rows when it
+/// follows only the clock or nothing.
+fn follows(reads: &crate::template::Reads, folder: &Path, width: usize) -> Vec<Line<'static>> {
+    let icons = match reads.sources.is_empty() {
+        true => Default::default(),
+        false => crate::background::source_icons(),
+    };
+    let mut spans = vec![Span::raw("follows ").dim()];
+    let mut first = true;
+    let mut gap = |spans: &mut Vec<Span<'static>>| {
+        if !std::mem::take(&mut first) {
+            spans.push(Span::raw(", ").dim());
+        }
+    };
+    for name in &reads.sources {
+        gap(&mut spans);
+        let named = match icons.get(name) {
+            Some(icon) => format!("{icon} {name}"),
+            None => name.clone(),
+        };
+        spans.push(Span::raw(named).dim());
+        if let Some(since) = reads.down.get(name) {
+            let down = format!(" down since {}", crate::stamp::when(*since));
+            spans.push(Span::raw(down).fg(Color::Red));
+        }
+    }
+    if reads.tasks {
+        gap(&mut spans);
+        spans.push(Span::raw("tasks").dim());
+    }
+    for path in &reads.files {
+        gap(&mut spans);
+        let name = path.strip_prefix(folder).unwrap_or(path);
+        spans.push(Span::raw(name.display().to_string()).dim());
+    }
+    if first {
+        return Vec::new();
+    }
+    let lead = || Span::raw(BODY);
+    crate::transcript::wrap(Line::from(spans), width, lead(), lead())
 }
 
 /// A note's first row: its title, `live` while the running turn changes
@@ -1442,6 +1786,227 @@ mod tests {
 
     fn margin() -> Margin {
         Margin::default()
+    }
+
+    /// The rows drawn, as text.
+    fn drawn(margin: &mut Margin, folder: &Path) -> String {
+        let (lines, _) = margin.lines(60, folder, None);
+        (lines.iter())
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|s| s.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// Every template note looked at again as if a [`FRESH`] had passed.
+    fn later(margin: &mut Margin) {
+        for filled in margin.filled.values_mut() {
+            filled.looked -= FRESH;
+        }
+    }
+
+    #[test]
+    fn a_template_note_fills_and_fills_again_only_once_what_it_read_changes() {
+        let mut margin = margin();
+        margin.blanks.tasks = Arc::new(vec![json!({"name": "calc.add", "state": "working"})]);
+        let post = json!({"id": "tasks", "title": "Tasks",
+            "template": "{% for t in tasks() %}- {{ t.name }}: {{ t.state }}\n{% endfor %}"});
+        assert_eq!(
+            margin.apply("c1", &post, None, None),
+            Some(Change::Posted("tasks".into()))
+        );
+        assert_eq!(
+            margin.note("tasks").unwrap().body,
+            Body::Template(post["template"].as_str().unwrap().into())
+        );
+        let folder = Path::new("/");
+        let rows = drawn(&mut margin, folder);
+        assert!(rows.contains("follows tasks\n") && rows.contains("calc.add: working"));
+        // Kept as the template, never what it filled to.
+        let kept = Kept::read(&margin.kept.json());
+        assert!(matches!(&kept.notes[0].body, Body::Template(t) if t.contains("tasks()")));
+        // A new read of the tasks fills it again; the same read does not.
+        let changes = margin.changes();
+        later(&mut margin);
+        drawn(&mut margin, folder);
+        assert_eq!(margin.changes(), changes, "nothing it read changed");
+        margin.blanks.tasks = Arc::new(vec![json!({"name": "calc.add", "state": "failed"})]);
+        margin.blanks.tasks_read += 1;
+        later(&mut margin);
+        assert!(drawn(&mut margin, folder).contains("calc.add: failed"));
+    }
+
+    #[test]
+    fn a_template_note_names_the_source_it_follows_and_says_when_it_is_down() {
+        let store = std::env::temp_dir()
+            .join(format!("sonny-margin-down-{}", std::process::id()))
+            .join("store.sqlite");
+        let dir = crate::lookout::beside(&store, ".sources").join(".recent");
+        std::fs::create_dir_all(&dir).unwrap();
+        let line = json!({"source": "ci", "text": "green", "at_ms": 1000, "seq": 1});
+        std::fs::write(dir.join("ci.jsonl"), format!("{line}\n")).unwrap();
+        let mut margin = margin();
+        margin.blanks.store = Some(store.clone());
+        margin.blanks.sources = Arc::new(vec!["ci".into()]);
+        let post = json!({"id": "ci", "template": "CI is {{ source('ci').latest.text }}"});
+        margin.apply("c1", &post, None, None);
+        let rows = drawn(&mut margin, Path::new("/"));
+        assert!(
+            rows.contains("follows ci\n") && rows.contains("CI is green"),
+            "{rows}"
+        );
+        let down = json!({"source": "ci", "text": "down", "lookout": true, "at_ms": 9000,
+            "since_ms": 5000, "id": "lookout.down.9000", "seq": 2});
+        std::fs::write(dir.join("ci.jsonl"), format!("{line}\n{down}\n")).unwrap();
+        later(&mut margin);
+        let rows = drawn(&mut margin, Path::new("/"));
+        let since = crate::stamp::when(5);
+        assert!(
+            rows.contains(&format!("follows ci down since {since}")),
+            "{rows}"
+        );
+        assert!(rows.contains("CI is green"), "{rows}");
+        // The source taken out of the config: the note fills again and
+        // says so, though its log did not change.
+        margin.set_blanks(Blanks {
+            store: Some(store.clone()),
+            ..Default::default()
+        });
+        later(&mut margin);
+        let rows = drawn(&mut margin, Path::new("/"));
+        assert!(rows.contains("no source named ci"), "{rows}");
+        let _ = std::fs::remove_dir_all(store.parent().unwrap());
+    }
+
+    #[test]
+    fn a_tasks_template_note_keeps_what_it_filled_to_once_its_folder_is_gone() {
+        let dir = std::env::temp_dir().join(format!("sonny-margin-task-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("state.json"), r#"{"state": "open"}"#).unwrap();
+        let mut margin = margin();
+        margin.kept.notes.push(Note {
+            id: "pr".into(),
+            title: "PR".into(),
+            body: Body::From {
+                bot: "calc".into(),
+                id: "pr".into(),
+                title: None,
+                shown: Some(Box::new(Body::Template(
+                    "PR is {{ (file('state.json') | fromjson).state }}".into(),
+                ))),
+                folder: Some(dir.display().to_string()),
+            },
+            call: "c1".into(),
+            after: None,
+            turn: None,
+            opens: None,
+        });
+        assert!(drawn(&mut margin, Path::new("/")).contains("PR is open"));
+        // The task removed, then a new window: what it showed stays.
+        std::fs::remove_dir_all(&dir).unwrap();
+        let mut again = Margin {
+            kept: Kept::read(&margin.kept.json()),
+            ..Margin::default()
+        };
+        let rows = drawn(&mut again, Path::new("/"));
+        assert!(rows.contains("PR is open") && rows.contains("⟨"), "{rows}");
+        // Taken away, it keeps nothing.
+        again.kept.notes.clear();
+        drawn(&mut again, Path::new("/"));
+        assert!(again.kept.filled.is_empty());
+    }
+
+    #[test]
+    fn a_template_that_fails_later_keeps_what_it_showed_and_says_why() {
+        let dir =
+            std::env::temp_dir().join(format!("sonny-margin-template-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("state.json"), r#"{"state": "open"}"#).unwrap();
+        let mut margin = margin();
+        let post =
+            json!({"id": "pr", "template": "PR is {{ (file('state.json') | fromjson).state }}"});
+        margin.apply("c1", &post, None, None);
+        let rows = drawn(&mut margin, &dir);
+        assert!(rows.contains("follows state.json") && rows.contains("PR is open"));
+        std::fs::write(dir.join("state.json"), "not json").unwrap();
+        later(&mut margin);
+        let rows = drawn(&mut margin, &dir);
+        assert!(
+            rows.contains("PR is open") && rows.contains("⟨line 1: not JSON"),
+            "{rows}"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn the_persons_own_notes_show_over_the_agents_without_buttons() {
+        let mut margin = margin();
+        margin.blanks.notes = Arc::new(vec![(
+            "now".into(),
+            "Right now".into(),
+            "{{ tasks() | length }} tasks".into(),
+        )]);
+        assert!(!margin.is_empty());
+        margin.apply(
+            "c1",
+            &json!({"id": "a", "markdown": "the agent's"}),
+            None,
+            None,
+        );
+        let rows = drawn(&mut margin, Path::new("/"));
+        let (person, agent) = (
+            rows.find("◇ Right now").unwrap(),
+            rows.find("the agent's").unwrap(),
+        );
+        assert!(person < agent && rows.contains("0 tasks"), "{rows}");
+        // Retitled, then taken out of the config: the margin shows it so.
+        let blanks = |notes: Vec<(String, String, String)>| Blanks {
+            notes: Arc::new(notes),
+            ..Default::default()
+        };
+        let template = "{{ tasks() | length }} tasks".to_owned();
+        margin.set_blanks(blanks(vec![("now".into(), "Today".into(), template)]));
+        let rows = drawn(&mut margin, Path::new("/"));
+        assert!(
+            rows.contains("◇ Today") && !rows.contains("Right now"),
+            "{rows}"
+        );
+        margin.set_blanks(blanks(Vec::new()));
+        let rows = drawn(&mut margin, Path::new("/"));
+        assert!(
+            !rows.contains("◇") && rows.contains("the agent's"),
+            "{rows}"
+        );
+    }
+
+    #[test]
+    fn the_tool_host_refuses_a_template_that_cannot_fill_and_says_what_one_shows() {
+        let data = crate::template::Data {
+            sources: Arc::new(vec!["ci".into()]),
+            ..Default::default()
+        };
+        let refused = |template: &str| filled(template, &data).unwrap_err().0;
+        assert_eq!(refused("{% if %}"), "margin_template");
+        assert_eq!(refused("{{ source('cl').latest }}"), "margin_template");
+        let long = "{% for i in range(40) %}{{ i }}\n{% endfor %}";
+        assert_eq!(refused(long), "margin_note_too_long");
+        // Too big to keep whole: refused, never kept cut.
+        let big = format!("{{# {} #}}ok", "x".repeat(NOTE_BYTES));
+        assert_eq!(refused(&big), "margin_note_too_long");
+        assert_eq!(
+            filled("{{ 1 + 1 }} done", &data).unwrap(),
+            "In the margin, filled as it changes. It shows now:\n2 done"
+        );
+        // A task the host cannot see is filled in the window.
+        let later = filled("{{ task('calc.add').state }}", &data).unwrap();
+        assert!(
+            later.starts_with("In the margin; it does not fill here yet"),
+            "{later}"
+        );
     }
 
     #[test]

@@ -1,2 +1,8 @@
 [build]
 target-dir = ".local/target"
+
+# Resolve only crate versions published at least three days ago, so a
+# hijacked release is usually yanked before an update can pick it up.
+# `cargo install` and locked builds are unaffected.
+[registry]
+global-min-publish-age = "3 days"

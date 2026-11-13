@@ -240,13 +240,11 @@ impl Edit {
     }
 }
 
-/// A unified diff (`git diff`, `diff -u`) as files with their hunks, or
-/// none when the text is not one. At most `most` rows, then a count.
-pub fn unified(text: &str, width: usize, most: usize) -> Option<Vec<Line<'static>>> {
-    if !text.lines().any(|l| l.starts_with("@@ ")) || !text.lines().any(|l| l.starts_with("--- ")) {
-        return None;
-    }
-    let mut out: Vec<Line<'static>> = Vec::new();
+/// A unified diff's files, each with its hunks, and which of them it
+/// deletes. A hunk's lines are as many as its `@@` header counts, as git
+/// reads them: a removed line that reads `-- x` is `--- x` in the diff,
+/// and is the hunk's, not another file's header.
+fn parse(text: &str) -> (Vec<(String, Vec<Hunk>)>, Vec<usize>) {
     let mut files: Vec<(String, Vec<Hunk>)> = Vec::new();
     // Files a diff deletes: named by their old path, with no lines shown.
     let mut deleted: Vec<usize> = Vec::new();
@@ -268,27 +266,69 @@ pub fn unified(text: &str, width: usize, most: usize) -> Option<Vec<Line<'static
             && let Some((_, hunks)) = files.last_mut()
         {
             let mut ranges = header.split_whitespace();
-            let start = |range: Option<&str>| -> usize {
-                range
-                    .and_then(|r| r.strip_prefix(['-', '+'])?.split(',').next()?.parse().ok())
-                    .unwrap_or(1)
+            // `-START,COUNT`; a count left out is 1.
+            let range = |range: Option<&str>| -> (usize, usize) {
+                let mut parts = range
+                    .and_then(|r| r.strip_prefix(['-', '+']))
+                    .unwrap_or("1")
+                    .split(',');
+                let start = parts.next().and_then(|n| n.parse().ok()).unwrap_or(1);
+                let count = parts.next().map_or(Some(1), |n| n.parse().ok());
+                (start, count.unwrap_or(1))
             };
-            let (old_start, new_start) = (start(ranges.next()), start(ranges.next()));
+            let ((old_start, mut old_left), (new_start, mut new_left)) =
+                (range(ranges.next()), range(ranges.next()));
             let mut hunk = Hunk {
                 old_start,
                 new_start,
                 lines: Vec::new(),
             };
-            while let Some(next) = lines.peek() {
-                if next.starts_with("@@ ") || next.starts_with("diff ") || next.starts_with("--- ")
-                {
+            while old_left > 0 || new_left > 0 {
+                // A header where a line was due: the counts were wrong.
+                let Some(next) =
+                    lines.next_if(|next| !next.starts_with("@@ ") && !next.starts_with("diff "))
+                else {
                     break;
+                };
+                match next.chars().next() {
+                    Some('-') => old_left = old_left.saturating_sub(1),
+                    Some('+') => new_left = new_left.saturating_sub(1),
+                    Some('\\') => {}
+                    // Context, or an empty line where a tool cut its space.
+                    _ => {
+                        old_left = old_left.saturating_sub(1);
+                        new_left = new_left.saturating_sub(1);
+                    }
                 }
-                hunk.lines.push(lines.next().unwrap_or_default().to_owned());
+                hunk.lines.push(next.to_owned());
+            }
+            // "\\ No newline at end of file" after the last line.
+            while let Some(next) = lines.next_if(|next| next.starts_with('\\')) {
+                hunk.lines.push(next.to_owned());
             }
             hunks.push(hunk);
         }
     }
+    (files, deleted)
+}
+
+/// The lines a unified diff removes and adds.
+pub fn changes(text: &str) -> (usize, usize) {
+    let (files, _) = parse(text);
+    let hunks = files.iter().flat_map(|(_, hunks)| hunks);
+    hunks.fold((0, 0), |(removed, added), hunk| {
+        (removed + hunk.count('-'), added + hunk.count('+'))
+    })
+}
+
+/// A unified diff (`git diff`, `diff -u`) as files with their hunks, or
+/// none when the text is not one. At most `most` rows, then a count.
+pub fn unified(text: &str, width: usize, most: usize) -> Option<Vec<Line<'static>>> {
+    if !text.lines().any(|l| l.starts_with("@@ ")) || !text.lines().any(|l| l.starts_with("--- ")) {
+        return None;
+    }
+    let mut out: Vec<Line<'static>> = Vec::new();
+    let (files, deleted) = parse(text);
     if files.is_empty() {
         return None;
     }
@@ -480,5 +520,17 @@ mod tests {
             "{text:?}"
         );
         assert!(unified("just text\n", 80, 100).is_none());
+    }
+
+    #[test]
+    fn a_removed_line_that_reads_as_a_header_stays_in_its_hunk() {
+        // A SQL comment removed and a `++` line added read `--- ` and `+++ `.
+        let git = "--- a/q.sql\n+++ b/q.sql\n@@ -1,3 +1,3 @@\n select 1;\n--- old note\n+++ new note\n select 2;\n--- a/r.sql\n+++ b/r.sql\n@@ -4 +4 @@\n-a\n+b\n\\ No newline at end of file\n";
+        assert_eq!(changes(git), (2, 2));
+        let text = text(&unified(git, 80, 100).unwrap());
+        assert_eq!(text[0], "  └ q.sql  -1 +1");
+        assert!(text.iter().any(|l| l.contains("- -- old note")), "{text:?}");
+        assert!(text.iter().any(|l| l.contains("+ ++ new note")), "{text:?}");
+        assert!(text.iter().any(|l| l.contains("r.sql  -1 +1")), "{text:?}");
     }
 }

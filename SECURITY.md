@@ -121,7 +121,9 @@ vulnerability, whether or not the code's own documentation agrees.
 - A write or edit is checked by the target's real path and then carried
   out inside the sandbox, so a symlink swapped in after the check cannot
   carry it outside. A protected folder that is a symlink refuses the call.
-- Network is off unless the bot's `network` is set. Off, a bot reaches
+- Network is off unless the bot's `network` is set. Off, a bot is
+  neither offered nor runs `web_fetch` or `web_search`, which the daemon
+  and the provider answer outside the sandbox, and it reaches
   only the Unix sockets its `unix_sockets` names, since a program on a
   socket runs what it is asked outside any sandbox: Seatbelt holds
   commands to those paths on macOS, and on Linux a seccomp filter refuses
@@ -328,6 +330,9 @@ approval gate as a call that leaves the sandbox would; `memory` and
 - `Cargo.lock` is committed and every release builds `--locked`.
   `rust-toolchain.toml` pins the toolchain. Workflow actions are pinned by
   commit SHA, and Dependabot keeps crates and actions current.
+- Cargo and Dependabot take a crate version only once it has been
+  published for three days (`.cargo/config.toml`, `.github/dependabot.yml`),
+  so a hijacked release is usually yanked before an update can pick it up.
 - A tag push runs a workflow that holds no secrets and does nothing;
   the release and Homebrew workflows run from `main`'s own definitions on
   its completion, verify the tag points to a commit on `main` and that
