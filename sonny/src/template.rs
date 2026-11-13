@@ -122,11 +122,79 @@ impl Live {
     }
 }
 
+const TASKS: &str = "tasks() and task() fill margin notes only: a fact outlives its tasks";
+
+/// The sources `template` names by a literal, `source('NAME')`, and
+/// whether it calls `tasks()` or `task()`, in its blanks and tags alone:
+/// text outside them, `{% raw %}` blocks and comments are words.
+fn named(template: &str) -> (Vec<String>, bool) {
+    let (mut sources, mut tasks) = (Vec::new(), false);
+    let mut rest = template;
+    let mut raw = false;
+    while let Some(at) = rest.find(['{']) {
+        let after = &rest[at..];
+        let close = match after.get(..2) {
+            Some("{{") => "}}",
+            Some("{%") => "%}",
+            _ => {
+                rest = &after[1..];
+                continue;
+            }
+        };
+        let Some(end) = after[2..].find(close) else {
+            break;
+        };
+        let code = &after[2..2 + end];
+        rest = &after[2 + end + 2..];
+        let tag = code.trim_matches(|c: char| c == '-' || c == '+' || c.is_whitespace());
+        if close == "%}" && (tag == "raw" || tag == "endraw") {
+            raw = tag == "raw";
+            continue;
+        }
+        if raw {
+            continue;
+        }
+        for (i, _) in code.match_indices('(') {
+            let before = &code[..i];
+            let word_at = before
+                .rfind(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+                .map_or(0, |at| at + 1);
+            let word = &before[word_at..];
+            // A global's call, not an attribute's.
+            if before[..word_at].trim_end().ends_with('.') {
+                continue;
+            }
+            match word {
+                "tasks" | "task" => tasks = true,
+                "source" => {
+                    let arg = code[i + 1..].trim_start();
+                    if let Some(quote) = arg.chars().next().filter(|c| *c == '\'' || *c == '"')
+                        && let Some(end) = arg[1..].find(quote)
+                    {
+                        sources.push(arg[1..1 + end].to_owned());
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    (sources, tasks)
+}
+
+/// Why a blank cannot read `name`: no source of that name is set up.
+fn no_source(name: &str, sources: &[String]) -> String {
+    let yours = match sources.is_empty() {
+        true => "you have none set up".to_owned(),
+        false => format!("yours are {}", sources.join(", ")),
+    };
+    format!("no source named {name}: {yours}")
+}
+
 /// A live fact's `template` filled from `data`, or why not.
 fn live(template: &str, data: &Data) -> Result<String, String> {
     let (filled, reads) = render(template, data);
     if reads.tasks {
-        return Err("tasks() and task() fill margin notes only: a fact outlives its tasks".into());
+        return Err(TASKS.into());
     }
     filled
 }
@@ -136,6 +204,15 @@ fn live(template: &str, data: &Data) -> Result<String, String> {
 /// such as a file not written yet, does not refuse it.
 fn live_check(template: &str, data: &Data) -> Result<(), String> {
     check(template)?;
+    // Named in the text, each is checked whether or not a render gets to
+    // it now: a blank before it may wait on a file not written yet.
+    let (sources, tasks) = named(template);
+    if tasks {
+        return Err(TASKS.into());
+    }
+    if let Some(name) = sources.iter().find(|name| !data.sources.contains(name)) {
+        return Err(no_source(name, &data.sources));
+    }
     match live(template, data) {
         Err(why) if why.contains("no source named ") || why.contains("tasks()") => Err(why),
         _ => Ok(()),
@@ -210,11 +287,7 @@ fn blanks(env: &mut Environment<'static>, data: &Data, reads: &Arc<Mutex<Reads>>
             reads.sources.insert(name.clone());
         });
         if !d.sources.contains(&name) {
-            let yours = match d.sources.is_empty() {
-                true => "you have none set up".to_owned(),
-                false => format!("yours are {}", d.sources.join(", ")),
-            };
-            return Err(failed(format!("no source named {name}: {yours}")));
+            return Err(failed(no_source(&name, &d.sources)));
         }
         let log = (d.store.as_deref()).map_or_else(Default::default, |store| {
             let file = recent_file(store, &name);
@@ -469,6 +542,28 @@ mod tests {
             );
         }
         assert!(live_check("{{ open", &data).is_err());
+        // A file not written yet before them hides neither.
+        std::fs::remove_file(dir.join("prs.txt")).unwrap();
+        let late = "{{ file('prs.txt') }} {{ source(\"typo\").latest.text }}";
+        assert!(
+            live_check(late, &data)
+                .unwrap_err()
+                .contains("no source named typo")
+        );
+        let late = "{{ file('prs.txt') }}{% for t in tasks() %}{{ t.name }}{% endfor %}";
+        assert!(
+            live_check(late, &data)
+                .unwrap_err()
+                .starts_with("tasks() and task()")
+        );
+        // Words outside the blanks, raw blocks and attributes are not calls.
+        let words = "source('typo') and tasks() {% raw %}{{ source('typo') }}{% endraw %} \
+            {{ file('prs.txt') | length }}";
+        assert_eq!(named(words), (vec![], false));
+        assert_eq!(
+            named("{{ x.task(1) }} {{- source( 'ci' ).latest -}}"),
+            (vec!["ci".to_owned()], false)
+        );
     }
 
     #[test]
