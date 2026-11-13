@@ -525,12 +525,16 @@ stream there whole instead, as `TURN-CALL_ID-STREAM`, and its result lists
 those paths as `files` beside `artifacts`, so any command or tool reads them.
 A shell stream that passes 1 MiB is written there as it is read, every byte of
 it, never its first and last 512 KiB alone: memory keeps only what the model is
-shown. Its pieces go to a writer on a blocking worker through a short line, so
-the runtime's thread never waits on the disk, and a full line makes the command
-wait. The writer redacts as it goes, as the whole would be redacted: what may
-begin a credential, a secret field's value or a secret PEM block (up to 64 KiB)
-that more output would finish is held until it can be told, and each piece is
-redacted as read after the end of the last. A stream stops being written at
+shown. Its pieces go through a short line to a writer that writes them in
+batches on blocking workers, so the runtime's thread never waits on the disk
+and a quiet stream holds no worker; a full line makes the command wait, and a
+command that has ended is waited for while its streams wait on the disk. The
+writer redacts as it goes, exactly as the whole would be redacted however the
+stream is cut: each pass (credentials, then secret PEM blocks, then secret
+fields' values) reads the stream byte by byte as it reads a whole text, holding
+only what may still be redacted: the end that may begin a credential, a value
+not yet known to be secret (past 1 MiB it is told as redacted). A secret
+block's body and a secret value are dropped as they come. A stream stops being written at
 1 GiB, and its result says how many bytes the file holds and how many it does
 not. A stream within 1 MiB never reaches the writer: its file is written once,
 after the command, as below.

@@ -765,6 +765,12 @@ impl Credentials {
     /// shows never ends inside a whole credential.
     pub fn unfinished(&self, text: &[u8]) -> usize {
         let set = self.current();
+        let open = open_field(text, &set.fields).value;
+        self.unfinished_after(&set, text, open)
+    }
+    /// How many of `text`'s last bytes could begin a credential that more
+    /// output would finish, the last `open` held besides.
+    fn unfinished_after(&self, set: &CredentialSet, text: &[u8], open: usize) -> usize {
         let values = || {
             set.values
                 .iter()
@@ -778,7 +784,7 @@ impl Credentials {
             })
             .max()
             .unwrap_or(0)
-            .max(open_field(text, &set.fields).value);
+            .max(open);
         // A whole credential across the cut, as one that ends with its own
         // start, is shown whole.
         let mut cut = text.len() - started;
@@ -804,24 +810,6 @@ impl Credentials {
         let open = open_field(text, &set.fields);
         open.name - open.value
     }
-    /// The bytes of a secret field's value open at `text`'s end, and the
-    /// quote it opened with, when one is.
-    /// Only a text whose last line is long is read whole for its field, the
-    /// name of which may be past `open_field`'s window.
-    fn open_value(&self, text: &[u8]) -> Option<(usize, Option<u8>)> {
-        let set = self.current();
-        if set.fields.is_empty() {
-            return None;
-        }
-        // No value runs past a line's end, bare or quoted: a text whose
-        // last line is short holds none longer than that.
-        let line = text.iter().rev().take_while(|&&b| b != b'\n').count();
-        if line <= VALUE_HOLD {
-            return None;
-        }
-        let open = open_field_within(text, &set.fields, text.len());
-        (open.value > 0).then_some((open.value, open.quote))
-    }
     /// `text` redacted as it reads after `before`, already shown: a value
     /// after a field's name shown earlier is still redacted.
     pub fn redact_after(&self, before: &str, text: String) -> String {
@@ -838,43 +826,29 @@ impl Credentials {
     }
 }
 
-/// A stream redacted piece by piece as [`Credentials::redact`] would
-/// redact it whole: what may begin a credential, a secret field's value or
-/// a secret PEM block that more output would finish is held until it can
-/// be told, and each piece is redacted as read after the end of the last,
-/// so a field's name in one piece still marks its value in the next.
+/// A stream redacted piece by piece exactly as [`Credentials::redact`]
+/// would redact it whole. Each of its passes runs as a stream in the same
+/// order: credentials, held back only while the end of what was read may
+/// begin one; then secret PEM blocks; then secret fields' values, each
+/// read byte by byte as `redact_blocks` and `redact_fields` read a whole
+/// text, so how the stream is cut never changes what they find. Only what
+/// may still be redacted is held, and a block or value too long to hold
+/// is dropped as it comes.
 pub struct Redacting {
     credentials: Credentials,
-    /// Read and not yet redacted.
+    /// Read and not yet past the credentials' pass.
     held: Vec<u8>,
-    /// The end of what was told, redacted: what the next piece reads after.
-    told: String,
-    /// Inside a secret field's value too long to hold, told as redacted:
-    /// the rest of it is dropped as it comes, up to its end, as the whole
-    /// text's redaction drops it. Its quote, and whether the last byte read
-    /// escaped the next.
-    skipping: Option<(Option<u8>, bool)>,
+    blocks: BlockStream,
+    fields: FieldStream,
 }
-
-/// The most of a secret field's value held back before it is told as
-/// redacted, well within the window a field is looked for in.
-const VALUE_HOLD: usize = 2048;
-
-/// The end of a stream's told text the next piece is redacted after: room
-/// for any field's name and its separator.
-const TOLD_CONTEXT: usize = 256;
-
-/// The most of an unfinished PEM block held back: far past any key's, so
-/// a block still open past it is no key and goes on as read.
-const BLOCK_HOLD: usize = 64 * 1024;
 
 impl Redacting {
     pub fn new(credentials: Credentials) -> Self {
         Redacting {
             credentials,
             held: Vec::new(),
-            told: String::new(),
-            skipping: None,
+            blocks: BlockStream::default(),
+            fields: FieldStream::default(),
         }
     }
 
@@ -882,139 +856,413 @@ impl Redacting {
     /// as can be told now, redacted.
     pub fn feed(&mut self, bytes: &[u8]) -> String {
         self.held.extend_from_slice(bytes);
-        if let Some((quote, escaped)) = &mut self.skipping {
-            // As `redact_fields` ends a value.
-            let mut end = None;
-            for (at, &b) in self.held.iter().enumerate() {
-                if std::mem::take(escaped) {
-                    continue;
-                }
-                let ends = match quote {
-                    Some(q) => b == *q || b == b'\n',
-                    None => {
-                        b.is_ascii_whitespace()
-                            || matches!(b, b',' | b';' | b'"' | b'\'' | b'}' | b']')
-                    }
-                };
-                if ends {
-                    end = Some(at);
-                    break;
-                }
-                *escaped = quote.is_some() && b == b'\\';
-            }
-            match end {
-                Some(at) => {
-                    self.held.drain(..at);
-                    self.skipping = None;
-                }
-                None => {
-                    self.held.clear();
-                    return String::new();
-                }
-            }
-        }
-        let mut whole = match std::str::from_utf8(&self.held) {
-            Err(error) if error.error_len().is_none() => error.valid_up_to(),
-            _ => self.held.len(),
-        };
-        let mut joined = Vec::with_capacity(self.told.len() + whole);
-        joined.extend_from_slice(self.told.as_bytes());
-        joined.extend_from_slice(&self.held[..whole]);
-        // A value held past its bound is told as redacted now, its rest
-        // dropped as it comes: one longer than the window a field is looked
-        // for in would otherwise go out unredacted.
-        if let Some((value, quote)) = self.credentials.open_value(&joined)
-            && value > VALUE_HOLD
-            && value <= whole
-            && !matches!(self.held[whole - value], b'{' | b'[' | b'$')
-        {
-            let start = whole - value;
-            let escaped = quote.is_some()
-                && (self.held[start..whole].iter().rev())
-                    .take_while(|&&b| b == b'\\')
-                    .count()
-                    % 2
-                    == 1;
-            let read = String::from_utf8_lossy(&self.held[..start]).into_owned();
-            let mut told = self.credentials.redact_after(&self.told, read);
-            told.push_str(REDACTED);
-            self.held.clear();
-            self.skipping = Some((quote, escaped));
-            self.remember(&told);
-            return told;
-        }
-        let held = (self.credentials.unfinished(&joined))
-            .max(open_block(&joined, &self.credentials.current().blocks))
+        let set = self.credentials.current();
+        // A character cut at the piece's end waits for the rest of it,
+        // whatever came before.
+        let whole = self.held.len() - unfinished_char(&self.held);
+        let kept = self
+            .credentials
+            .unfinished_after(&set, &self.held[..whole], 0)
             .min(whole);
-        whole -= held;
-        let rest = self.held.split_off(whole);
+        let rest = self.held.split_off(whole - kept);
         let read = std::mem::replace(&mut self.held, rest);
-        let read = String::from_utf8(read)
-            .unwrap_or_else(|error| String::from_utf8_lossy(error.as_bytes()).into_owned());
-        let told = self.credentials.redact_after(&self.told, read);
-        self.remember(&told);
-        told
-    }
-
-    /// Keep the end of what was `told` for the next piece to read after.
-    fn remember(&mut self, told: &str) {
-        self.told.push_str(told);
-        let cut = self.told.len().saturating_sub(TOLD_CONTEXT);
-        let cut = (cut..=self.told.len())
-            .find(|&at| self.told.is_char_boundary(at))
-            .unwrap_or(self.told.len());
-        self.told.drain(..cut);
+        self.pass(&set, read, false)
     }
 
     /// What is still held, at the stream's end, redacted.
-    pub fn finish(self) -> String {
-        if self.skipping.is_some() {
-            return String::new();
+    pub fn finish(mut self) -> String {
+        let set = self.credentials.current();
+        let read = std::mem::take(&mut self.held);
+        self.pass(&set, read, true)
+    }
+
+    fn pass(&mut self, set: &CredentialSet, read: Vec<u8>, last: bool) -> String {
+        let mut text = String::from_utf8(read)
+            .unwrap_or_else(|error| String::from_utf8_lossy(error.as_bytes()).into_owned());
+        for credential in &set.values {
+            if text.contains(&credential.value) {
+                text = text.replace(&credential.value, REDACTED);
+            }
         }
-        let rest = String::from_utf8_lossy(&self.held).into_owned();
-        self.credentials.redact_after(&self.told, rest)
+        if !set.blocks.is_empty() || self.blocks.busy() {
+            text = self.blocks.feed(&text, &set.blocks, last);
+        }
+        if !set.fields.is_empty() || self.fields.busy() {
+            text = self.fields.feed(&text, &set.fields, last);
+        }
+        text
     }
 }
 
-/// How many of `text`'s last bytes may be a PEM block named by `blocks`
-/// that more output would close, or the start of one's marker: held so
-/// the block is redacted whole, up to `BLOCK_HOLD`.
-fn open_block(text: &[u8], blocks: &[String]) -> usize {
-    const BEGIN: &[u8] = b"-----BEGIN ";
-    if blocks.is_empty() {
-        return 0;
-    }
-    let find =
-        |haystack: &[u8], needle: &[u8]| haystack.windows(needle.len()).position(|w| w == needle);
-    let marker = (1..BEGIN.len())
-        .rev()
-        .find(|&n| text.ends_with(&BEGIN[..n]))
-        .unwrap_or(0);
-    let from = text.len().saturating_sub(BLOCK_HOLD);
-    let Some(begin) = (text[from..].windows(BEGIN.len()))
-        .rposition(|w| w == BEGIN)
-        .map(|at| from + at)
-    else {
-        return marker;
-    };
-    let block = &text[begin..];
-    if find(block, b"-----END ").is_some() {
-        return marker;
-    }
-    // A header that is whole names a block or not; one still being read
-    // may.
-    let named = match find(&block[BEGIN.len()..], b"-----") {
-        Some(end) => {
-            let header = &block[..BEGIN.len() + end];
-            blocks
-                .iter()
-                .any(|name| find(header, name.as_bytes()).is_some())
+/// How many of `bytes`' last bytes begin a UTF-8 character that more
+/// bytes would finish.
+fn unfinished_char(bytes: &[u8]) -> usize {
+    for back in 1..=bytes.len().min(3) {
+        let lead = bytes[bytes.len() - back];
+        if lead & 0xC0 == 0x80 {
+            continue;
         }
-        None => true,
-    };
-    match named {
-        true => block.len(),
-        false => marker,
+        let needs = match lead {
+            0xC2..=0xDF => 2,
+            0xE0..=0xEF => 3,
+            0xF0..=0xF4 => 4,
+            _ => return 0,
+        };
+        let begun = std::str::from_utf8(&bytes[bytes.len() - back..])
+            .err()
+            .is_some_and(|error| error.error_len().is_none());
+        return if needs > back && begun { back } else { 0 };
+    }
+    0
+}
+
+/// `redact_blocks` as a stream: what it may still replace is held, and a
+/// secret block's body is dropped as it comes, up to its end.
+#[derive(Default)]
+struct BlockStream {
+    /// Read and not yet told: from a block's start, or the end of the
+    /// text that may begin one.
+    held: String,
+    /// Inside a secret block's body, dropped: its last bytes, which may
+    /// begin its end's marker.
+    body: Option<String>,
+}
+
+/// The most of a block's header held back for its end: far past any
+/// key's, so a header still open past it names nothing.
+const HEADER_HOLD: usize = 64 * 1024;
+
+impl BlockStream {
+    fn busy(&self) -> bool {
+        !self.held.is_empty() || self.body.is_some()
+    }
+
+    fn feed(&mut self, text: &str, blocks: &[String], last: bool) -> String {
+        const BEGIN: &str = "-----BEGIN ";
+        const END: &str = "-----END ";
+        let mut out = String::new();
+        let mut text = std::mem::take(&mut self.held) + text;
+        loop {
+            if let Some(body) = &mut self.body {
+                body.push_str(&text);
+                match body.find(END) {
+                    Some(end) => {
+                        // As `redact_blocks` goes on: past the end's marker.
+                        out.push_str(REDACTED);
+                        out.push('\n');
+                        out.push_str(END);
+                        text = body.split_off(end + END.len());
+                        self.body = None;
+                    }
+                    None => {
+                        if last {
+                            // A key cut off by its stream's end is still a key.
+                            out.push_str(REDACTED);
+                            self.body = None;
+                        } else {
+                            let keep = floor_char(body, body.len().saturating_sub(END.len() - 1));
+                            body.drain(..keep);
+                        }
+                        return out;
+                    }
+                }
+                continue;
+            }
+            let Some(begin) = text.find(BEGIN) else {
+                // The end may begin a block's marker.
+                let keep = match last {
+                    true => 0,
+                    false => (1..BEGIN.len())
+                        .rev()
+                        .find(|&n| text.ends_with(&BEGIN[..n]))
+                        .unwrap_or(0),
+                };
+                self.held = text.split_off(text.len() - keep);
+                out.push_str(&text);
+                return out;
+            };
+            out.push_str(&text[..begin]);
+            text.drain(..begin);
+            let Some(dashes) = text[BEGIN.len()..]
+                .find("-----")
+                .map(|n| BEGIN.len() + n + 5)
+            else {
+                if last {
+                    // No header ends: `redact_blocks` stops here.
+                    out.push_str(&text);
+                    return out;
+                }
+                if text.len() > HEADER_HOLD {
+                    // No key's header: told as it is, and read on past it.
+                    out.push_str(&text[..BEGIN.len()]);
+                    text.drain(..BEGIN.len());
+                    continue;
+                }
+                self.held = text;
+                return out;
+            };
+            let header = match &text.as_bytes()[dashes..] {
+                [b'\r', b'\n', ..] => dashes + 2,
+                [b'\n', ..] => dashes + 1,
+                [b'\r'] | [] if !last => {
+                    // The line's end may follow.
+                    self.held = text;
+                    return out;
+                }
+                _ => dashes,
+            };
+            out.push_str(&text[..header]);
+            let named = blocks
+                .iter()
+                .any(|block| text[..header].contains(block.as_str()));
+            text.drain(..header);
+            if named {
+                self.body = Some(String::new());
+            }
+        }
+    }
+}
+
+/// The last char boundary of `text` at or before `at`.
+fn floor_char(text: &str, mut at: usize) -> usize {
+    while !text.is_char_boundary(at) {
+        at -= 1;
+    }
+    at
+}
+
+/// `redact_fields` as a stream, read byte by byte as it reads a whole
+/// text: all but a value that may be secret is told as it comes.
+#[derive(Default)]
+struct FieldStream {
+    state: FieldState,
+    /// Whether the last byte read was part of a word.
+    after_word: bool,
+}
+
+#[derive(Default)]
+enum FieldState {
+    /// Between words, or in a word that cannot be a field's name.
+    #[default]
+    Scan,
+    /// In a word: its length, the end of its key, as `field_key` makes
+    /// it, from the texts before this one, up to the longest field's, and
+    /// where it starts in this text.
+    Word {
+        length: usize,
+        key: Vec<u8>,
+        from: usize,
+    },
+    /// After a field's name: past its closing quote, if it had one, and
+    /// then past its separator.
+    Name { quoted: bool, separated: bool },
+    /// In a value: its quote, whether the last byte escaped the next, and
+    /// what of it is held until it is known to be secret or not.
+    Value {
+        quote: Option<u8>,
+        escaped: bool,
+        value: Value,
+    },
+}
+
+/// A value read so far.
+enum Value {
+    /// Not yet known to be secret: its bytes.
+    Held(Vec<u8>),
+    /// Told as redacted: the rest of it is dropped.
+    Secret,
+    /// Known not to be: told as it comes.
+    Shown,
+}
+
+/// The most of a value held before it is known to be secret or not: one
+/// longer is told as redacted.
+const VALUE_HOLD: usize = 1 << 20;
+
+impl FieldStream {
+    fn busy(&self) -> bool {
+        !matches!(self.state, FieldState::Scan)
+    }
+
+    fn feed(&mut self, text: &str, fields: &[String], last: bool) -> String {
+        let shortest = fields.iter().map(String::len).min().unwrap_or(0);
+        let longest = fields.iter().map(String::len).max().unwrap_or(0);
+        let word = |b: u8| b.is_ascii_alphanumeric() || b == b'_' || b == b'-';
+        let bytes = text.as_bytes();
+        let mut out = Vec::with_capacity(text.len());
+        // What is told as read runs from `mark`, copied out whole when a
+        // value is held or dropped, and at the end.
+        let mut mark = 0;
+        let mut at = 0;
+        while at < bytes.len() {
+            let b = bytes[at];
+            match &mut self.state {
+                FieldState::Scan => {
+                    if word(b) && !self.after_word {
+                        self.state = FieldState::Word {
+                            length: 0,
+                            key: Vec::new(),
+                            from: at,
+                        };
+                        continue;
+                    }
+                    // Runs of bytes that start no word pass at once.
+                    let mut end = at + 1;
+                    while end < bytes.len() && !word(bytes[end]) {
+                        end += 1;
+                    }
+                    if end > at + 1 || !word(b) {
+                        self.after_word = false;
+                        at = end;
+                        continue;
+                    }
+                    // A word byte after a word: the rest of that word.
+                }
+                FieldState::Word { length, key, from } => {
+                    let mut end = at;
+                    while end < bytes.len() && word(bytes[end]) {
+                        end += 1;
+                    }
+                    *length += end - at;
+                    if end == bytes.len() {
+                        // The word goes on into the next text: keep its
+                        // key's end.
+                        key.extend(
+                            (bytes[*from..end].iter())
+                                .filter(|&&b| b != b'_' && b != b'-')
+                                .map(u8::to_ascii_lowercase),
+                        );
+                        let cut = key.len().saturating_sub(longest);
+                        key.drain(..cut);
+                        *from = 0;
+                        self.after_word = true;
+                        at = end;
+                        continue;
+                    }
+                    let part = &bytes[*from..end];
+                    let named = *length >= shortest
+                        && fields.iter().any(|field| {
+                            let mut name = (part.iter().rev())
+                                .filter(|&&b| b != b'_' && b != b'-')
+                                .map(u8::to_ascii_lowercase)
+                                .chain(key.iter().rev().copied());
+                            field.bytes().rev().all(|b| name.next() == Some(b))
+                        });
+                    self.state = match named {
+                        true => FieldState::Name {
+                            quoted: false,
+                            separated: false,
+                        },
+                        false => FieldState::Scan,
+                    };
+                    self.after_word = true;
+                    at = end;
+                    continue;
+                }
+                FieldState::Name { quoted, separated } => {
+                    if !*separated {
+                        if !*quoted && matches!(b, b'"' | b'\'') || matches!(b, b' ' | b'\t') {
+                            *quoted = true;
+                        } else if matches!(b, b'=' | b':') {
+                            *separated = true;
+                        } else {
+                            // No separator: no field. The byte is read
+                            // again, after what came before it.
+                            self.state = FieldState::Scan;
+                            continue;
+                        }
+                    } else if !matches!(b, b' ' | b'\t') {
+                        let quote = matches!(b, b'"' | b'\'').then_some(b);
+                        self.state = FieldState::Value {
+                            quote,
+                            escaped: false,
+                            value: Value::Held(Vec::new()),
+                        };
+                        if quote.is_none() {
+                            continue;
+                        }
+                    }
+                }
+                FieldState::Value {
+                    quote,
+                    escaped,
+                    value,
+                } => {
+                    let ends = !*escaped
+                        && match quote {
+                            Some(q) => b == *q || b == b'\n',
+                            None => {
+                                b.is_ascii_whitespace()
+                                    || matches!(b, b',' | b';' | b'"' | b'\'' | b'}' | b']')
+                            }
+                        };
+                    if ends {
+                        if let Value::Held(held) = value {
+                            tell(&mut out, held);
+                        }
+                        // The byte that ended it is read again.
+                        self.state = FieldState::Scan;
+                        continue;
+                    }
+                    *escaped = !*escaped && quote.is_some() && b == b'\\';
+                    match value {
+                        Value::Shown => {}
+                        Value::Secret => {
+                            mark = at + 1;
+                        }
+                        Value::Held(held) => {
+                            if held.is_empty() {
+                                out.extend_from_slice(&bytes[mark..at]);
+                            }
+                            held.push(b);
+                            mark = at + 1;
+                            if secret(held) {
+                                out.extend_from_slice(REDACTED.as_bytes());
+                                *value = Value::Secret;
+                            } else if matches!(held[0], b'{' | b'[' | b'$') {
+                                out.append(held);
+                                *value = Value::Shown;
+                            } else if held.len() > VALUE_HOLD {
+                                out.extend_from_slice(REDACTED.as_bytes());
+                                *value = Value::Secret;
+                            }
+                        }
+                    }
+                }
+            }
+            self.after_word = word(b);
+            at += 1;
+        }
+        out.extend_from_slice(&bytes[mark..]);
+        if last {
+            if let FieldState::Value {
+                value: Value::Held(held),
+                ..
+            } = &mut self.state
+            {
+                tell(&mut out, held);
+            }
+            self.state = FieldState::Scan;
+        }
+        String::from_utf8(out)
+            .unwrap_or_else(|error| String::from_utf8_lossy(error.as_bytes()).into_owned())
+    }
+}
+
+/// Whether a value read so far is secret, as `redact_fields` judges a
+/// whole one: long enough, mixing letters and digits, and not code.
+fn secret(value: &[u8]) -> bool {
+    value.len() >= SECRET_MIN
+        && !matches!(value[0], b'{' | b'[' | b'$')
+        && value.iter().any(u8::is_ascii_digit)
+        && value.iter().any(u8::is_ascii_alphabetic)
+}
+
+/// A whole value held until its end: redacted when it is secret.
+fn tell(out: &mut Vec<u8>, held: &mut Vec<u8>) {
+    match secret(held) {
+        true => out.extend_from_slice(REDACTED.as_bytes()),
+        false => out.append(held),
     }
 }
 
@@ -1029,6 +1277,15 @@ fn field_key(name: &str) -> String {
         .filter(|c| *c != '_' && *c != '-')
         .map(|c| c.to_ascii_lowercase())
         .collect()
+}
+
+/// Whether `name`'s key, as `field_key` makes it, ends with `field`,
+/// without making it: `name` is a word, all ASCII.
+fn key_ends_with(name: &[u8], field: &str) -> bool {
+    let mut key = (name.iter().rev())
+        .filter(|&&b| b != b'_' && b != b'-')
+        .map(u8::to_ascii_lowercase);
+    field.bytes().rev().all(|b| key.next() == Some(b))
 }
 
 /// Replace the value after each of `fields` in `text`, printed as
@@ -1053,8 +1310,10 @@ fn redact_fields(text: String, fields: &[String]) -> String {
         if i - start < shortest {
             continue;
         }
-        let name = field_key(&text[start..i]);
-        if !fields.iter().any(|field| name.ends_with(field.as_str())) {
+        if !fields
+            .iter()
+            .any(|field| key_ends_with(&bytes[start..i], field))
+        {
             continue;
         }
         // The name's closing quote, the separator, and the value's quote.
@@ -1128,22 +1387,15 @@ struct Open {
     /// it is not secret, so it is shown: a prompt such as `Password: `
     /// reaches whoever is to answer it.
     value: usize,
-    /// The quote its value opened with, when it has one.
-    quote: Option<u8>,
 }
 
 fn open_field(text: &[u8], fields: &[String]) -> Open {
     const FIELD_HOLD: usize = 4096;
-    open_field_within(text, fields, FIELD_HOLD)
-}
-
-/// `open_field`, looking in the last `window` bytes of `text`.
-fn open_field_within(text: &[u8], fields: &[String], window: usize) -> Open {
     // Four bytes of a field's start, so short words go out as typed.
     const NAME_START: usize = 4;
     let word = |b: u8| b.is_ascii_alphanumeric() || b == b'_' || b == b'-';
-    let tail = &text[text.len().saturating_sub(window)..];
-    let key = |name: &[u8]| field_key(&String::from_utf8_lossy(name));
+    let tail = &text[text.len().saturating_sub(FIELD_HOLD)..];
+    let shortest = fields.iter().map(String::len).min().unwrap_or(0);
     let mut i = 0;
     while i < tail.len() {
         if !word(tail[i]) || (i > 0 && word(tail[i - 1])) {
@@ -1154,8 +1406,13 @@ fn open_field_within(text: &[u8], fields: &[String], window: usize) -> Open {
         while i < tail.len() && word(tail[i]) {
             i += 1;
         }
-        let name = key(&tail[start..i]);
+        // A word shorter than every field cannot end with one; the last
+        // may still begin one.
+        if i - start < shortest && i < tail.len() {
+            continue;
+        }
         if i == tail.len() {
+            let name = field_key(&String::from_utf8_lossy(&tail[start..i]));
             // The last word: it may be the start of a field's name.
             // Bytes, not characters: a field's name may be any text.
             let begins = fields.iter().any(|field| {
@@ -1168,7 +1425,10 @@ fn open_field_within(text: &[u8], fields: &[String], window: usize) -> Open {
                 ..Open::default()
             };
         }
-        if !fields.iter().any(|field| name.ends_with(field.as_str())) {
+        if !fields
+            .iter()
+            .any(|field| key_ends_with(&tail[start..i], field))
+        {
             continue;
         }
         // As `redact_fields` reads one: a quote, a separator, a quote.
@@ -1220,7 +1480,6 @@ fn open_field_within(text: &[u8], fields: &[String], window: usize) -> Open {
             return Open {
                 name,
                 value: tail.len() - value,
-                quote,
             };
         }
         i = j;
@@ -4556,6 +4815,88 @@ mod tests {
             assert_eq!(out, whole, "in pieces of {size}");
         }
     }
+    /// Text cut anywhere reads as the whole: a character cut at a piece's
+    /// end is finished by the next, whatever invalid bytes came before.
+    #[test]
+    fn a_stream_cut_inside_a_character_reads_as_the_whole() {
+        let credentials = Credentials::default();
+        let text = b"before\xff after\xc3\xa9 end \xf0\x9f\x98\x80 \xe2\x82";
+        let whole = String::from_utf8_lossy(text).into_owned();
+        for size in 1..=text.len() {
+            let mut redacting = Redacting::new(credentials.clone());
+            let mut out = String::new();
+            for piece in text.chunks(size) {
+                out.push_str(&redacting.feed(piece));
+            }
+            out.push_str(&redacting.finish());
+            assert_eq!(out, whole, "in pieces of {size}");
+        }
+    }
+    /// Texts built from the pieces of secret fields, quotes, escapes, line
+    /// ends and long runs read the same redacted piece by piece as whole,
+    /// however they are cut.
+    #[test]
+    fn mixed_texts_redact_in_pieces_as_whole() {
+        let credentials = Credentials::default();
+        credentials.set("TOKEN", "tok3n-fake-fake-fake9");
+        credentials.redact_also(
+            &["password".to_owned(), "api_key".to_owned()],
+            &["PRIVATE KEY".to_owned()],
+        );
+        let parts: [&str; 20] = [
+            "password=",
+            "\"api_key\": \"",
+            "password: '",
+            "\"",
+            "'",
+            "\\",
+            "\n",
+            " ",
+            ",",
+            "k7k7k7k7",
+            "é",
+            "word ",
+            "=",
+            "x",
+            "tok3n-fake-",
+            "fake-fake9",
+            "-----BEGIN RSA PRIVATE KEY-----\n",
+            "-----END RSA PRIVATE KEY-----",
+            "-----BEGIN ",
+            "CERTIFICATE-----\r\n",
+        ];
+        let mut seed = 0x2545_f491_4f6c_dd1du64;
+        let mut next = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        for _ in 0..100 {
+            let mut text = String::new();
+            for _ in 0..(next() % 40) {
+                match next() % 10 {
+                    0 => text.push_str(&"k7".repeat(1 + (next() % 4000) as usize)),
+                    1 => text.push_str(&"y".repeat((next() % 6000) as usize)),
+                    _ => text.push_str(parts[(next() % parts.len() as u64) as usize]),
+                }
+            }
+            let whole = credentials.redact(text.clone());
+            for size in [
+                1 + (next() % 7) as usize,
+                64 + (next() % 4096) as usize,
+                9000,
+            ] {
+                let mut redacting = Redacting::new(credentials.clone());
+                let mut out = String::new();
+                for piece in text.as_bytes().chunks(size) {
+                    out.push_str(&redacting.feed(piece));
+                }
+                out.push_str(&redacting.finish());
+                assert!(out == whole, "in pieces of {size}: {text:?}");
+            }
+        }
+    }
     /// A piece handed to a stream's writer while it has no room stays
     /// pending when the wait is cut short, and is handed once it has room;
     /// the wait is counted as one on the disk meanwhile.
@@ -4603,6 +4944,12 @@ mod tests {
                 "{}\npassword=\"{}\" after\nend",
                 "x".repeat(1 << 20),
                 "kkkkkkk7'k\\\"".repeat(10_000)
+            ),
+            format!(
+                "{}\npassword=\"{}\\\n{}kkkkkkk7suffix\" after\nend",
+                "x".repeat((1 << 20) - 6_000),
+                "kkkkkkk7".repeat(675),
+                "k".repeat(600)
             ),
         ] {
             let whole = credentials.redact(text.clone());
