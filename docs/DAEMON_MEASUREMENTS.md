@@ -8874,3 +8874,62 @@ rows that moved belong to code this change doesn't touch: no Sonny source
 changed. The lookout's 10x1 row counts a handful of 6 ms ticks, so one
 tick is the 50%, and quiet window CPU has swung by 16% to 33% on earlier
 screens with no Sonny change. Both are the runner's spread.
+
+## Stats: waits for the loop, the loop's own work, runtime, hub and pacer counts
+
+`stats` now says where a busy daemon's time goes without a profiler: how
+long each request waited for the service loop before dispatch, how long
+each of the loop's own chores held it, how busy the async runtime was, what
+the event hub carried and dropped, and what each provider pool did to its
+calls (admitted, waited, parked, closed, overloads). What each path pays:
+
+- **A request**: the line's read time travels with it (one `Instant`
+  read); at dispatch, one subtraction and two adds into the op's entry.
+- **A loop chore**: one `Instant` read either side and an update of its
+  entry in a map the loop alone touches.
+- **An event**: two relaxed atomic adds (published, delivered) per
+  follower queue.
+- **A paced call**: three integer adds under the pool lock it already holds.
+- **`stats`**: tokio's own runtime counters, read with a few loads.
+
+`bench.scale_screen`, 2,048 bots streaming back to back, 2.3 s calls spread
+by half, 20 s windows, 4-CPU Linux cloud box, base (the next_ready fix)
+against head, alternating rounds:
+
+| Measure | Base | Head |
+| --- | ---: | ---: |
+| turns a second (ideal 890) | 886, 890 | 884, 888 |
+| `submit` answer p50, ms | 3.4, 3.0 | 3.3, 2.8 |
+| daemon CPU per turn, ms | 1.35, 1.33 | 1.35, 1.33 |
+| runtime thread CPU, % | 48.6, 47.6 | 48.4, 47.8 |
+
+No store job, statement or allocation per call is added.
+
+Daemon screen (`bench.perf_gate`'s benches), same 4-CPU box, base main
+a4febaf against head, two alternating rounds:
+
+| Bench | Measure | Base | Head | Change |
+| --- | --- | ---: | ---: | ---: |
+| admission | lone submit CPU, ms | 26.513 | 30.798 | +16.2% |
+| admission | burst submit p99, ms | 4.022 | 4.232 | +5.2% |
+| completion | release to terminal p99, ms | 9.571 | 9.432 | -1.5% |
+| footprint | idle RSS, MiB | 16.207 | 15.947 | -1.6% |
+| footprint | per idle bot, KiB | 1.788 | 1.788 | +0.0% |
+| footprint | RSS after a turn each, MiB | 31.719 | 30.82 | -2.8% |
+| footprint | CPU per turn, ms | 0.811 | 0.755 | -6.9% |
+| lifecycle | CPU, s | 0.455 | 0.42 | -7.7% |
+| lifecycle | p95 turn, ms | 582.53 | 578.291 | -0.7% |
+| lifecycle | peak RSS, MiB | 24.92 | 24.482 | -1.8% |
+
+Store work per turn is the same (`bench.footprint` 7.001 jobs a turn on
+both). The gate warned on no row: each side's runs overlap the other's.
+The lone submit row moved most, so three more alternating admission
+rounds ran: over all 25 runs a side, the 32 lone submits took a median of
+26.4 ms of daemon CPU on base (23.9 to 33.2) and 29.9 on head (24.1 to
+34.6), burst submits 12.0 against 13.0, and burst creates 5.3 against 5.7.
+Nothing the change adds runs long enough for that: a request pays one
+clock read on this box's vDSO `tsc` clock and three adds, and the measures
+of whole turns, which pay the same per request, fall on head (footprint
+CPU per turn, lifecycle CPU, and `bench.scale_screen` above). The
+difference most likely comes from the two builds' code layout, not the
+counting; this was not proven further.
