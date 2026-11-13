@@ -95,6 +95,7 @@ mod switch;
 mod t3;
 mod table;
 mod task;
+mod template;
 mod term;
 #[cfg(test)]
 mod testing;
@@ -103,6 +104,7 @@ mod transcript;
 mod tree;
 mod trigger;
 mod trusted;
+mod update;
 mod upgrade;
 mod usage;
 mod used;
@@ -353,6 +355,11 @@ struct Options {
     /// made, sent once this window is set up: a file, as a message can
     /// be longer than one argument may.
     send: Option<PathBuf>,
+    /// The file holding what was typed in the composer of the window this
+    /// one reopened after an update, put back in its composer unsent.
+    draft: Option<PathBuf>,
+    /// This window reopened on a Sonny installed while it was open.
+    reopened: bool,
 }
 
 fn usage() -> String {
@@ -378,6 +385,8 @@ fn usage() -> String {
      tasks; sonny tool-host answers its agents' calls of Sonny's tools. Sonny starts both.\n\
      sonny agent ARGS... runs Sonny's own `agent` with ARGS, whatever `agent` is on PATH.\n\
      sonny setup asks again for the provider and the default model, as the first run does.\n\
+     sonny update [--download] updates Sonny and its daemon to the latest release, as it was\n\
+     installed, replaces the running daemon with the new one and has open windows reopen on it.\n\
      sonny acp [--store PATH] [--socket PATH] speaks the Agent Client Protocol on stdio\n\
      for T3 Code: a thread is its folder's lead, and each task opens as a thread of its own."
         .into()
@@ -1494,15 +1503,16 @@ pub(crate) fn agent_at(places: &[PathBuf]) -> Result<PathBuf, String> {
     })
 }
 
-/// Where Agent's binary is installed with Sonny at `me`: beside it, and,
-/// when Sonny is in Homebrew's Cellar, by the `agent` formula's `opt`
+/// Where Agent's binary is installed with Sonny at `me`: beside it (by
+/// the release tarball's `opt/sonny` link when Sonny was unpacked there),
+/// and, when Sonny is in Homebrew's Cellar, by the `agent` formula's `opt`
 /// path, which outlasts the versions upgrades remove. The daemon hands
 /// that path to its agents, so it must outlast the daemon's version.
 fn installed_agent(me: &std::path::Path) -> Vec<PathBuf> {
     let Some(keg) = me.parent().and_then(std::path::Path::parent) else {
         return Vec::new();
     };
-    let mut found = vec![keg.join("libexec/agent")];
+    let mut found = vec![skills::opt_path(&keg.join("libexec/agent"))];
     if let Some(cellar) = keg
         .parent()
         .filter(|formula| formula.ends_with("Cellar/sonny"))
@@ -1803,6 +1813,25 @@ fn start_daemon(
     socket: &std::path::Path,
     login: bool,
 ) -> Result<(), NotStarted> {
+    start_daemon_with(store, socket, login, false)
+}
+
+/// [`start_daemon`], replacing the daemon running now, whatever its
+/// release, as `sonny update` switches to the new one (`agent start
+/// --replace`).
+fn start_daemon_replacing(
+    store: &std::path::Path,
+    socket: &std::path::Path,
+) -> Result<(), NotStarted> {
+    start_daemon_with(store, socket, false, true)
+}
+
+fn start_daemon_with(
+    store: &std::path::Path,
+    socket: &std::path::Path,
+    login: bool,
+    replace: bool,
+) -> Result<(), NotStarted> {
     let bin = agent_at(&agent_places_here()).map_err(|missing| {
         format!(
             "the daemon is not running and {missing}; install Sonny with Homebrew or its release tarball, or set AGENT_BIN"
@@ -1834,8 +1863,11 @@ fn start_daemon(
     }
     // The CLI gives the daemon the keys in ~/.agent/env itself.
     command.env("AGENT_BIN", &bin).env_remove(named::PROGRAM);
+    command.arg("start");
+    if replace {
+        command.arg("--replace");
+    }
     let out = command
-        .arg("start")
         .arg("--store")
         .arg(store)
         .arg("--socket")
@@ -1896,7 +1928,7 @@ fn parse() -> Result<Options, String> {
         (None, None, None, false, None, None);
     let (mut layout, mut rex_host, mut sound) = (true, None, true);
     let (mut side, mut embedded) = (None, false);
-    let (mut window_place, mut send) = (None, None);
+    let (mut window_place, mut send, mut draft, mut reopened) = (None, None, None, false);
     let mut lead = project::Pick::Last;
     let mut args = args.peekable();
     while let Some(arg) = args.next() {
@@ -1925,6 +1957,10 @@ fn parse() -> Result<Options, String> {
             "--window-place" => window_place = Some(value()?),
             // Unlisted: how `/new` hands the agent it made its first message.
             "--send-file" => send = Some(PathBuf::from(value()?)),
+            // Unlisted: how a window reopens on a Sonny installed while it
+            // was open, with what was typed in its composer.
+            "--draft-file" => draft = Some(PathBuf::from(value()?)),
+            "--reopened" => reopened = true,
             _ => return Err(usage()),
         }
     }
@@ -1944,6 +1980,8 @@ fn parse() -> Result<Options, String> {
         window_place,
         lead,
         send,
+        draft,
+        reopened,
     })
 }
 
@@ -1956,8 +1994,9 @@ fn reopen(bot: &str) -> Vec<String> {
     let mut args = std::env::args().skip(1).peekable();
     while let Some(arg) = args.next() {
         match arg.as_str() {
-            "--new" => {}
-            "--workspace" | "--lead" | "--agent" | "--window-place" | "--send-file" => {
+            "--new" | "--reopened" => {}
+            "--workspace" | "--lead" | "--agent" | "--window-place" | "--send-file"
+            | "--draft-file" => {
                 args.next();
             }
             "--new-lead" => {
@@ -2063,6 +2102,8 @@ fn main() -> std::process::ExitCode {
         }
         Some((verb, rest)) if verb == "sky" => sky_cli(rest),
         Some((verb, rest)) if verb == "status" => status_cli(rest),
+        // The person runs this, from a terminal of their own.
+        Some((verb, rest)) if verb == "update" => update::cli(rest),
         // An agent's shell runs this, before it opens anything in a terminal.
         Some((verb, rest)) if verb == "where" => where_cli(rest),
         // An agent's shell runs this, for zen it was asked for in words.
@@ -2333,6 +2374,9 @@ async fn run() -> Result<(), String> {
         }
         return Ok(());
     }
+    // The program this window runs, so one installed over it later is
+    // seen and reopened on.
+    update::note_started();
     let options = parse()?;
     SIDE.store(options.side.is_some(), std::sync::atomic::Ordering::Relaxed);
     // Before any lead is made, so its instructions list the skills.
@@ -2468,6 +2512,8 @@ async fn run() -> Result<(), String> {
     app.pinned = settings.project_color.clone();
     set_measure(settings.text_width);
     margin::set_limits(settings.margin_notes, settings.margin_note_lines);
+    app.blanks.store = Some(app.options.store.clone());
+    app.set_template_settings(&settings);
     app.zen = zen::focus(app.reactions_key.as_deref());
     app.margin_opens = settings.margin_opens;
     app.agent_opens = settings.agent_opens;
@@ -2665,18 +2711,56 @@ async fn run() -> Result<(), String> {
         }
         return Err(format!("could not open {other}: {error}"));
     }
+    // Sonny was updated while this window was open: it goes on as the new
+    // Sonny, in this same terminal, on the same agent, with what was typed.
+    if let (Ok(()), Some(program)) = (&result, app.reopen_on.take()) {
+        use std::os::unix::process::CommandExt;
+        let mut place = None;
+        if let Some(marker) = &app.marker {
+            marker.retire();
+            place = marker.known();
+        }
+        let mut args = reopen(&app.bot).split_off(1);
+        args.push("--reopened".into());
+        if let Some(place) = place {
+            args.extend(["--window-place".into(), mux::Place::encode(&place)]);
+        }
+        // The words, and the pictures behind their placeholders: a picture
+        // pasted from the clipboard has no file to come back from.
+        let draft = (!app.input.trim().is_empty())
+            .then(|| attach::draft(&app.input, &app.pictures))
+            .and_then(|draft| kept_text(&app.options.store, "draft", &draft).ok());
+        if let Some(draft) = &draft {
+            args.extend(["--draft-file".into(), draft.display().to_string()]);
+        }
+        let error = std::process::Command::new(&program).args(&args).exec();
+        if let Some(draft) = &draft {
+            let _ = std::fs::remove_file(draft);
+        }
+        return Err(format!(
+            "could not reopen on the updated Sonny at {}: {error}",
+            program.display()
+        ));
+    }
     result
 }
 
 /// Keeps `brief`, a new lead's first message, in a file of the person's
 /// own beside `store` for its window to send: its path.
 fn first_message(store: &std::path::Path, brief: &str) -> Result<PathBuf, String> {
+    kept_text(store, "first", brief)
+}
+
+/// Keeps `text` in a file of the person's own beside `store`, named for
+/// `what`, for the window this one becomes to read: its path.
+fn kept_text(store: &std::path::Path, what: &str, text: &str) -> Result<PathBuf, String> {
     use std::io::Write;
     use std::os::unix::fs::OpenOptionsExt;
+    let brief = text;
     let nanos = (std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH))
         .map_or(0, |since| since.as_nanos());
     let mut path = store.as_os_str().to_owned();
-    path.push(format!(".first-{}-{nanos}", std::process::id()));
+    path.push(format!(".{what}-{}-{nanos}", std::process::id()));
     let path = PathBuf::from(path);
     let written = std::fs::OpenOptions::new()
         .write(true)
@@ -3690,6 +3774,8 @@ type Reads = (
 struct Counted {
     mark: Option<u64>,
     read: Option<((status::Counts, std::collections::HashSet<String>), Reads)>,
+    /// The tasks as template notes' `tasks()` gives them, when read.
+    tasks: Option<Vec<Value>>,
 }
 
 /// A mark of where the agents `pattern` names stand, as the daemon lists
@@ -4020,6 +4106,9 @@ struct App {
     /// Another agent, which this window opens on instead once it quits:
     /// `/switch NAME`, or one `/new` made.
     switch_to: Option<String>,
+    /// The Sonny installed while this window was open, which it reopens on
+    /// once it quits ([`update::installed_since`]).
+    reopen_on: Option<PathBuf>,
     started: Instant,
     fleet: Option<Fleet>,
     /// This window, noted as the one the person uses each time they do,
@@ -4220,6 +4309,9 @@ struct App {
     /// How many of the project's agents each of `/status`'s groups lists,
     /// as its last read found: what the footer shows.
     counts: Option<status::Counts>,
+    /// What template notes are filled from: the tasks that read found,
+    /// the store, the person's sources and notes.
+    blanks: margin::Blanks,
     /// The agents that read gave a row, which its counts count already.
     status_bots: std::collections::HashSet<String>,
     /// The footer's own read of them, under way, and when the last began.
@@ -5880,6 +5972,7 @@ impl App {
             paused,
             quit: false,
             switch_to: None,
+            reopen_on: None,
             started: Instant::now(),
             fleet: None,
             marker: None,
@@ -5966,6 +6059,7 @@ impl App {
             references: HashMap::new(),
             references_read: None,
             counts: None,
+            blanks: margin::Blanks::default(),
             status_bots: std::collections::HashSet::new(),
             counting: None,
             counted_at: None,
@@ -6110,6 +6204,22 @@ impl App {
         self.configure().await;
         self.tell_upgrades().await;
         self.tell_warnings().await;
+        // What was typed in the window this one reopened from, after an
+        // update: back in the composer, unsent.
+        if let Some(file) = self.options.draft.take() {
+            if let Ok(draft) = std::fs::read_to_string(&file) {
+                let (text, pictures) = attach::undraft(&draft);
+                self.input.set(&text);
+                self.pictures = pictures;
+            }
+            let _ = std::fs::remove_file(&file);
+        }
+        if self.options.reopened {
+            self.notice = Some(format!(
+                "Sonny was updated; this window reopened on {}",
+                env!("CARGO_PKG_VERSION")
+            ));
+        }
         // The first message `/new` was given, sent as the person wrote it:
         // a message as it is, never a command or a shell line typed anew.
         if let Some(file) = self.options.send.take() {
@@ -7094,6 +7204,15 @@ impl App {
     /// what happened meanwhile: the bot's new items, and a turn that ended
     /// or began. Tried again every two seconds until it works.
     async fn reattach(&mut self, events: &mut Events) {
+        // Sonny was updated while this window was open: the daemon it lost
+        // is likely the old one, and what this window would start again is
+        // its own older build. It reopens on the new one, in place.
+        if let Some(program) = update::installed_since() {
+            self.reopen_on = Some(program);
+            self.quit = true;
+            self.retry = None;
+            return;
+        }
         if self.upgraded {
             self.retry = None;
             return;
@@ -7746,7 +7865,7 @@ impl App {
         };
         let woken = self.woken.clone();
         let drawn = move || woken.notify_one();
-        let program = embed::Embedded::spawn(program, height, width, term::light(), drawn)?;
+        let program = embed::Embedded::spawn(program, height, width, drawn)?;
         let pane = pane::Pane::program(title, program);
         // Opened from `/status`, it goes back there, as a browser goes back.
         match self.pane.take() {
@@ -7978,6 +8097,7 @@ impl App {
     /// done again only once that, or a note, changed.
     fn fold_notes(&mut self, beside: bool) {
         let workspace = std::path::PathBuf::from(&self.workspace);
+        self.margin_blanks();
         if !beside {
             self.margin.freshen(&workspace);
         }
@@ -8895,6 +9015,34 @@ impl App {
         }));
     }
 
+    /// The tasks as `/status` read them now, for template notes'
+    /// `tasks()`: counted as a change only where they differ.
+    fn tasks_read(&mut self, tasks: Vec<Value>) {
+        if *self.blanks.tasks != tasks {
+            self.blanks.tasks = std::sync::Arc::new(tasks);
+            self.blanks.tasks_read += 1;
+        }
+    }
+
+    /// The person's own notes and sources as the config has them now.
+    fn set_template_settings(&mut self, settings: &settings::Settings) {
+        let notes = std::sync::Arc::new(settings.notes.clone());
+        if *self.blanks.notes != *notes {
+            self.blanks.notes = notes;
+        }
+        // Kept as it was when the same, so notes fill again only once one
+        // is added or taken away.
+        if *self.blanks.sources != settings.sources {
+            self.blanks.sources = std::sync::Arc::new(settings.sources.clone());
+        }
+    }
+
+    /// What template notes are filled from, handed to the margin before
+    /// it is drawn or looked at: it may have been loaded again since.
+    fn margin_blanks(&mut self) {
+        self.margin.set_blanks(self.blanks.clone());
+    }
+
     /// The other bots' notes the margin shows, read again every few
     /// seconds while their bots are there: what each shows is kept once
     /// its bot is gone.
@@ -8931,6 +9079,9 @@ impl App {
             && let Ok(Some(counted)) = job.await
         {
             self.counted_mark = counted.mark;
+            if let Some(tasks) = counted.tasks {
+                self.tasks_read(tasks);
+            }
             if let Some(((counts, bots), (latest, seen))) = counted.read {
                 self.counts = Some(counts);
                 self.status_bots = bots;
@@ -8962,6 +9113,7 @@ impl App {
                 return Some(Counted {
                     mark: Some(mark),
                     read: None,
+                    tasks: None,
                 });
             }
             let view = StatusView {
@@ -8983,6 +9135,7 @@ impl App {
                     (status::counts(&read.rows), status::bots(&read.rows)),
                     (latest, seen),
                 )),
+                tasks: Some(status::tasks(&read.rows)),
             })
         }));
     }
@@ -11085,6 +11238,7 @@ impl App {
         .await?;
         self.counts = Some(status::counts(&read.rows));
         self.status_bots = status::bots(&read.rows);
+        self.tasks_read(status::tasks(&read.rows));
         // The windows' names and the footer say what this read, as it is
         // newer than what they had. A running agent's question is read
         // from its last few items here, so its events keep theirs.
@@ -12864,6 +13018,7 @@ impl App {
             self.margin_opens = settings.margin_opens;
             self.agent_opens = settings.agent_opens;
             margin::set_limits(settings.margin_notes, settings.margin_note_lines);
+            self.set_template_settings(&settings);
             if self.verbose != settings.verbose || self.words_only == settings.steps {
                 self.verbose = settings.verbose;
                 self.words_only = !settings.steps;
@@ -15567,6 +15722,7 @@ impl App {
         {
             let live = self.running.as_ref().map(|running| running.turn);
             let width = (pane::margin_room(at.width).saturating_sub(1) as usize).min(measure());
+            self.margin_blanks();
             let (lines, marks) = self.margin.lines(width, &workspace, live);
             if let Some(pane) = &mut self.pane {
                 pane.set_margin(lines, marks);
@@ -17863,6 +18019,8 @@ mod tests {
             window_place: None,
             lead: project::Pick::Last,
             send: None,
+            draft: None,
+            reopened: false,
         };
         App::new(client, "b", &json!({"name": "b"}), options)
     }
@@ -18106,7 +18264,7 @@ mod tests {
         // unread once its program's side closes, as a printf's at once.
         let mut command = portable_pty::CommandBuilder::new("sh");
         command.args(["-c", "printf '\\033]7700;open=b\\033\\\\'; exec sleep 30"]);
-        let program = embed::Embedded::spawn(command, 5, 20, false, || {}).unwrap();
+        let program = embed::Embedded::spawn(command, 5, 20, || {}).unwrap();
         let mut pane = pane::Pane::program("fix", program);
         pane.as_agent("shop.fix", false);
         app.open_pane(pane);

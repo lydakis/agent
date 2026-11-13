@@ -31,6 +31,10 @@ latest one into `~/.local`:
 
     curl -fsSL https://raw.githubusercontent.com/lydakis/agent/main/install.sh | sh
 
+`sonny update` updates either install to the latest release, replaces the
+running daemon with the new one (its running turns continue on it) and has
+open windows reopen on it ([docs/SONNY.md](../docs/SONNY.md#updating)).
+
 For main without a version tag, `brew install lydakis/agent/sonny-nightly`
 fetches current main and builds Sonny and its matching daemon together. If
 stable Sonny is installed, run `brew unlink sonny` first. Update with
@@ -332,6 +336,7 @@ at its model's own effort (`AGENT_EFFORT` when its model is
 | When a note opens the margin | `[sonny] margin_opens` (`always`, the default, `unless-closed` or `never`) | |
 | The most notes a margin holds | `[sonny] margin_notes` (6 by default, at least 1; past it the agent's new note is refused, and it is told which notes are there) | |
 | The most lines a margin note runs to | `[sonny] margin_note_lines` (12 by default, at least 1, counted in the note's text; a longer one is refused, and the agent told to show a file instead) | |
+| Margin notes of your own, filled as their blanks change | `[sonny.notes.NAME] template`, `title` | |
 | Where a click on an agent's name goes | `[sonny] agent_opens` (`tab`, the default, or `beside`) | |
 | Which tasks open in a tab | `[sonny] task_tabs` (`asked`, the default, or `every`) | |
 | Task windows a lead keeps open | `[sonny] task_windows` (32 by default, 0 for no limit) | |
@@ -960,14 +965,12 @@ has something on it, or is off the screen, no time shows.
   agent that reads untrusted content from outside, such as web pages,
   issues or email, use a row of your own with `network = false`, as
   `strict` above, and `unix_sockets` naming only the sockets it needs (on
-  Linux a row that names any reaches them all): its commands then can't
-  send what it read anywhere, nor ask a program outside to act for it. A
-  row holds only the agent's commands, though. `web_fetch` and
-  `web_search`, which the daemon and the provider answer, reach the web in
-  every row, so set `web_search = "disabled"` in `~/.agent/config.toml`
-  too, which leaves both out of every agent made from then on (one made
-  before keeps its tools); and a call approved to run outside the sandbox
-  reaches whatever you can.
+  Linux a row that names any reaches them all): it then can't send what
+  it read anywhere, nor ask a program outside to act for it, since a row
+  off the network (Read only too) also takes away `web_fetch` and
+  `web_search`, which the daemon and the provider would answer past the
+  sandbox, from the agent's next call. A call approved to run outside the
+  sandbox still reaches whatever you can.
 
   A call that waits on you is written out as Codex's approval shows it:
   `⏸ Allow shell?`, the agent's own reason for it as `Reason:`, the
@@ -1895,7 +1898,34 @@ with its next call. Posting a note's id again changes it in place, so a
 live note stays one note. A lead can show a task's note as
 `from: "task/id"`, which lookout names when the task puts one up: it
 shows as the task keeps it, follows the task's title until the lead gives
-its own, and stays once the task is gone. A note with `opens: "AGENT"`,
+its own, and stays once the task is gone. A note given as a `template`
+is Markdown with blanks, as Jinja writes them (MiniJinja), that Sonny
+fills and fills again whenever what they read changes, with no call from
+the agent and nothing more in its history: `source('ci').latest.text`
+and `.events` (what one of your sources printed lately, newest first;
+`.up` and `.down_since` while the lookout says it is down),
+`file('state.json')` (a file in its folder, `| fromjson` making JSON
+fields of it), `tasks()` and `task('NAME')` (where its tasks stand, as
+`/status` reads them), `now()`, and `| ago` and `| time` for a time in
+seconds. A blank never runs a command or reaches the network, so an agent
+that wants something no source covers writes it to a file from its own
+commands. The tool host fills the template once as it is posted and
+answers what it shows; a template that does not read as one, names a
+source you have not set up, or fills to more lines than a note holds is
+refused (`margin_template`, `margin_note_too_long`). The window then
+watches only what the last fill read, once a second (a source's log, a
+file, the tasks as the footer counts them, the minute for a clock), and a
+fill that fails later keeps what it showed with why under it. Under its
+title a filled note says what it follows (`follows 🛠 ci, tasks,
+state.json`, a source by its icon), and a source that is down says since
+when, so a live note never passes for a written one.
+
+![A note of your own in the margin, filled from its blanks: follows 🛠 ci, tasks, release.json; the CI source's latest run, a release file's state, and the lead's task fix-avg with how long its turn took](../docs/sonny/margin-template-note.png)
+
+Notes of
+your own go in your config as `[sonny.notes.NAME]`, a `template` and a
+`title`, and show over the agent's in every margin, with no buttons:
+they are yours to change there. A note with `opens: "AGENT"`,
 such as the lead's to-do for a task's question, gets a `↗` that opens that
 agent in the pane, where you answer it. A file, `/status`, `/background` or a side
 chat opens over the margin, its title's `←`, Esc and Ctrl+[ going back to it;

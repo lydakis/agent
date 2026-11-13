@@ -388,6 +388,36 @@ struct Lasting {
     seen: Arc<tokio::sync::Mutex<Seen>>,
 }
 
+impl Lasting {
+    /// As a source starts in a new lookout: down, as its log `keeps`
+    /// says the last one told, so its first run that works says it is
+    /// back, to its subscribers and to the notes that show it.
+    fn after(keeps: &Path) -> Lasting {
+        let lasting = Lasting::default();
+        if let Some(since) = still_down(keeps)
+            && let Ok(mut health) = lasting.health.lock()
+        {
+            health.failed = DOWN_AFTER;
+            health.since_ms = Some(since);
+            health.told = Some(std::time::Instant::now());
+        }
+        lasting
+    }
+}
+
+/// When the source whose log is `keeps` started failing, while the
+/// lookout's newest word on it there is that it is down.
+fn still_down(keeps: &Path) -> Option<u128> {
+    let text = std::fs::read_to_string(keeps).ok()?;
+    let word = (text.lines().rev())
+        .filter(|line| line.contains("\"lookout\""))
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .find(|kept| kept["lookout"] == true)?;
+    let down = word["id"].as_str()?.starts_with("lookout.down.");
+    let since = word["since_ms"].as_u64().or(word["at_ms"].as_u64())?;
+    down.then_some(u128::from(since))
+}
+
 impl Runner {
     pub fn new(dir: PathBuf, sent: Sender<Said>) -> Runner {
         Runner {
@@ -507,7 +537,9 @@ impl Runner {
                     self.poked.clone(),
                 )),
                 false => {
-                    let lasting = self.lasting.entry(source.name.clone()).or_default().clone();
+                    let lasting = (self.lasting.entry(source.name.clone()))
+                        .or_insert_with(|| Lasting::after(&keeps))
+                        .clone();
                     tokio::spawn(run(
                         source.clone(),
                         every,
@@ -744,10 +776,18 @@ async fn run(
             return;
         };
         let told = (health.lock().ok()).and_then(|mut health| {
-            health.after(&source, failed, stderr, std::time::Instant::now())
+            let told = health.after(&source, failed, stderr, std::time::Instant::now())?;
+            Some((told, health.since_ms))
         });
         match told {
-            Some(told) => place.send(Said::Event(Box::new(told))),
+            Some((told, since_ms)) => {
+                // Kept beside what it printed, so a note that shows the
+                // source says it is down, and since when.
+                if let Some(file) = shape.keeps.clone() {
+                    shapes::append(file, lookout_line(&told, since_ms));
+                }
+                place.send(Said::Event(Box::new(told)))
+            }
             // Given back before it sleeps, so it holds no place meanwhile.
             None => drop(place),
         }
@@ -1061,6 +1101,17 @@ pub fn shape_file(dir: &Path, source: &str) -> PathBuf {
 /// a filter on.
 pub fn recent_file(dir: &Path, source: &str) -> PathBuf {
     dir.join(".recent").join(format!("{source}.jsonl"))
+}
+
+/// The lookout's word on a source as kept beside what it printed: only
+/// what says it is down or back, and since when it fails.
+fn lookout_line(told: &Event, since_ms: Option<u128>) -> String {
+    let mut kept = json!({"source": told.source, "id": told.id, "text": told.text,
+        "lookout": true, "at_ms": told.at_ms as u64, "seq": told.seq});
+    if let Some(since) = since_ms {
+        kept["since_ms"] = json!(since as u64);
+    }
+    kept.to_string()
 }
 
 /// An event as kept to test filters on: whole, or with its fields cut as
@@ -2155,6 +2206,16 @@ mod tests {
         let down = next_event(&mut got).await;
         assert!(down.text.contains("is down"), "{}", down.text);
         assert_eq!(down.fields["stderr"], json!(["boom"]));
+        // Kept beside what it printed, with since when, for a note to show.
+        shapes::written();
+        let kept = std::fs::read_to_string(recent_file(&dir.join("state"), "poll")).unwrap();
+        let word: Value = serde_json::from_str(kept.lines().last().unwrap()).unwrap();
+        let since = word["since_ms"].as_u64().unwrap();
+        assert!(word["lookout"] == true && since <= word["at_ms"].as_u64().unwrap());
+        assert!(
+            word["id"].as_str().unwrap().starts_with("lookout.down."),
+            "{word}"
+        );
         // Fixed, it starts again and is heard to work.
         edit("echo fine\n", 3);
         runner.set(vec![source]);
@@ -2163,6 +2224,39 @@ mod tests {
             texts.push(next_event(&mut got).await.text);
         }
         assert!(texts.iter().any(|t| t.contains("works again")), "{texts:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn a_source_down_before_the_lookout_started_is_heard_to_work_again() {
+        let dir = std::env::temp_dir().join(format!("lookout-down-before-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let keeps = recent_file(&dir.join("state"), "poll");
+        std::fs::create_dir_all(keeps.parent().unwrap()).unwrap();
+        let down = json!({"source": "poll", "id": "lookout.down.9", "text": "down",
+            "lookout": true, "at_ms": 9000, "since_ms": 5000, "seq": 1});
+        std::fs::write(&keeps, format!("{down}\n")).unwrap();
+        assert_eq!(still_down(&keeps), Some(5000));
+        let (sent, mut got) = tokio::sync::mpsc::channel(16);
+        let mut runner = Runner::new(dir.join("state"), sent);
+        let source = Source {
+            name: "poll".into(),
+            command: "echo fine".into(),
+            every: Some("1h".into()),
+            digest: None,
+            steer: None,
+            watch: Vec::new(),
+            icon: None,
+            wants: None,
+        };
+        runner.set(vec![source]);
+        let mut texts = Vec::new();
+        for _ in 0..2 {
+            texts.push(next_event(&mut got).await.text);
+        }
+        assert!(texts.iter().any(|t| t.contains("works again")), "{texts:?}");
+        shapes::written();
+        assert_eq!(still_down(&keeps), None);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
