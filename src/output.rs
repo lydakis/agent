@@ -203,27 +203,31 @@ impl Output {
             .map_err(|_| Error::new("output_closed"))
     }
 
-    /// Room for one later event no larger than `upto`, waiting for it as
-    /// `send` does. `send_in` then sends into it without waiting, so an
-    /// event whose content is settled under a lock still never fails for
-    /// want of room. Dropped unused, the room goes back to the budget.
-    pub async fn reserve(&self, upto: &Value) -> Result<Room> {
-        let bytes = Self::encode(upto)?;
+    /// Room for later events, one no larger than each of `upto`, waiting
+    /// for it as `send` does, in one acquisition: a caller never holds part
+    /// of the budget while it waits for more. `send_in` then sends into it
+    /// without waiting, so an event whose content is settled under a lock
+    /// still never fails for want of room. What is left unused goes back to
+    /// the budget when the room is dropped.
+    pub async fn reserve(&self, upto: &[Value]) -> Result<Room> {
+        let mut total = 0u32;
+        for event in upto {
+            total += cost(&Self::encode(event)?);
+        }
         let permit = self
             .budget
             .clone()
-            .acquire_many_owned(cost(&bytes))
+            .acquire_many_owned(total)
             .await
             .map_err(|_| Error::new("output_closed"))?;
         Ok(Room(permit))
     }
 
-    /// Send `event` into `room`, never waiting. The part of the room the
-    /// event does not take goes back to the budget.
-    pub fn send_in(&self, room: Room, event: &Value) -> Result<()> {
+    /// Send `event` into `room`, never waiting, taking only what it costs.
+    pub fn send_in(&self, room: &mut Room, event: &Value) -> Result<()> {
         let bytes = Self::encode(event)?;
-        let mut permit = room.0;
-        let permit = permit
+        let permit = room
+            .0
             .split(cost(&bytes) as usize)
             .ok_or_else(|| Error::new("output_room"))?;
         self.sender
@@ -251,7 +255,7 @@ impl Output {
     }
 }
 
-/// Budget set aside by [`Output::reserve`] for one event.
+/// Budget set aside by [`Output::reserve`] for a few events.
 pub struct Room(OwnedSemaphorePermit);
 
 /// What a packet of `bytes` takes from the budget.

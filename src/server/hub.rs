@@ -782,17 +782,17 @@ pub async fn replay(store: Store, hub: Hub, bot: String, sub: Sub) -> Result<()>
         if events.is_empty() {
             // The boundary marker, and a pruned notice ahead of it, go out
             // under the subscription's lock as it goes live, before any live
-            // event can: their room is set aside first, so neither waits
-            // there nor fails for want of it.
+            // event can. Their room is set aside first, in one acquisition,
+            // so neither waits there nor fails for want of it, and no replay
+            // holds part of a session's budget while it waits for the rest.
             let widest = i64::MIN;
-            let (Ok(marker), Ok(notice)) = (
-                output
-                    .reserve(&json!({"event":"follow_live","bot":bot,"cursor":widest}))
-                    .await,
-                output
-                    .reserve(&json!({"event":"pruned","bot":bot,"before":widest,"durable":false}))
-                    .await,
-            ) else {
+            let reserved = output
+                .reserve(&[
+                    json!({"event":"pruned","bot":bot,"before":widest,"durable":false}),
+                    json!({"event":"follow_live","bot":bot,"cursor":widest}),
+                ])
+                .await;
+            let Ok(mut room) = reserved else {
                 hub.unsubscribe(&bot, session);
                 return Ok(());
             };
@@ -814,7 +814,7 @@ pub async fn replay(store: Store, hub: Hub, bot: String, sub: Sub) -> Result<()>
                     // the switch's own check is the one to report.
                     if let Some(before) = behind["pruned_before"].as_i64().or(page_pruned) {
                         let notice_event = json!({"event":"pruned","bot":switch_bot,"before":before,"durable":false});
-                        if switch_output.send_in(notice, &notice_event).is_err() {
+                        if switch_output.send_in(&mut room, &notice_event).is_err() {
                             return Ok(Switch::Closed);
                         }
                     }
@@ -826,7 +826,7 @@ pub async fn replay(store: Store, hub: Hub, bot: String, sub: Sub) -> Result<()>
                     s.last_cursor = s.last_cursor.max(switch_hub.published());
                     let marker_event =
                         json!({"event":"follow_live","bot":switch_bot,"cursor":s.last_cursor});
-                    if switch_output.send_in(marker, &marker_event).is_err() {
+                    if switch_output.send_in(&mut room, &marker_event).is_err() {
                         return Ok(Switch::Closed);
                     }
                     s.live = true;
