@@ -30,8 +30,8 @@ pub struct Settings {
     pub project_colors: bool,
     /// The color each project pins, by project.
     pub project_color: std::collections::BTreeMap<String, String>,
-    /// The person's own margin notes: name, title and template.
-    pub notes: Vec<(String, String, String)>,
+    /// The person's own margin notes: name, title and what each shows.
+    pub notes: Vec<(String, String, crate::margin::Body)>,
     /// The sources the person set up, by name, for template notes.
     pub sources: Vec<String>,
 }
@@ -72,7 +72,13 @@ impl Settings {
             project_colors: sonny.project_colors,
             project_color: sonny.project_color,
             notes: (sonny.notes.into_iter())
-                .map(|note| (note.name, note.title, note.template))
+                .map(|note| {
+                    let body = match note.live {
+                        true => crate::margin::Body::Template(note.markdown),
+                        false => crate::margin::Body::Markdown(note.markdown),
+                    };
+                    (note.name, note.title, body)
+                })
                 .collect(),
             // Only those the person set up keep what they printed for a
             // blank to read: the commons keeps none.

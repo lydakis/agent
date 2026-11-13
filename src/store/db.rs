@@ -2392,6 +2392,39 @@ impl Spent {
             "daemon_ms":self.daemon_ms})
     }
 }
+/// What finished turns with timed calls took, as `usage` reports it under
+/// `time`: how many, their time from start to end, the calls that ran to
+/// their end and those calls' time (calls that ran together once), the time
+/// paced, held by summaries and the daemon's own, and their own timed model
+/// calls: how many, their output and their time to answer and to first
+/// output. A turn counts wholly, so its parts account for its time but for
+/// what none records: waits on gates and failed attempts.
+#[derive(Default)]
+struct Clock([i64; 11]);
+impl Clock {
+    const FIELDS: [&str; 11] = [
+        "turns",
+        "turn_ms",
+        "tool_calls",
+        "tool_ms",
+        "paced_ms",
+        "summary_ms",
+        "daemon_ms",
+        "timed_rounds",
+        "timed_output_tokens",
+        "model_ms",
+        "first_token_ms",
+    ];
+    fn add(&mut self, other: &Clock) {
+        (self.0.iter_mut().zip(other.0)).for_each(|(sum, part)| *sum += part);
+    }
+    fn json(&self) -> Value {
+        let row: serde_json::Map<String, Value> = (Self::FIELDS.iter().zip(self.0))
+            .map(|(field, part)| ((*field).to_owned(), json!(part)))
+            .collect();
+        Value::Object(row)
+    }
+}
 /// What timed calls took, as `usage` reports it: how many, their output,
 /// and their time from send to answer and to the start of output.
 fn timing(row: &mut Value, [rounds, output, model_ms, first_token_ms]: [i64; 4]) {
@@ -2661,7 +2694,7 @@ impl Database {
     /// before versioning, stores at versions 1 to 5 and stores from newer
     /// binaries are rejected; an older store from version 6 on is migrated
     /// forward, one version at a time, at open.
-    pub const SCHEMA: i32 = 97;
+    pub const SCHEMA: i32 = 98;
     /// The person's messages a compaction keeps verbatim, newest first:
     /// per-message text, and the total text plus `(ordinal, String)` entry
     /// metadata. Empty entries cost space too, so the retained list cannot
@@ -2893,7 +2926,11 @@ impl Database {
                 retries INTEGER NOT NULL DEFAULT 0, paced_ms INTEGER NOT NULL DEFAULT 0,
                 summary_ms INTEGER NOT NULL DEFAULT 0, reply_node INTEGER,
                 work INTEGER NOT NULL DEFAULT 0, limited TEXT, drops INTEGER NOT NULL DEFAULT 0,
-                error TEXT, daemon_ms INTEGER NOT NULL DEFAULT 0);
+                error TEXT, daemon_ms INTEGER NOT NULL DEFAULT 0,
+                tool_calls INTEGER NOT NULL DEFAULT 0, tool_ms INTEGER NOT NULL DEFAULT 0,
+                tools_until_ms INTEGER, timed_rounds INTEGER NOT NULL DEFAULT 0,
+                timed_output_tokens INTEGER NOT NULL DEFAULT 0, model_ms INTEGER NOT NULL DEFAULT 0,
+                first_token_ms INTEGER NOT NULL DEFAULT 0);
             CREATE INDEX IF NOT EXISTS turns_bot_id ON turns(bot,id);
             CREATE INDEX IF NOT EXISTS turns_started_ms ON turns(started_ms);
             CREATE TABLE IF NOT EXISTS turn_models(turn INTEGER NOT NULL REFERENCES turns(id) ON DELETE CASCADE,
@@ -8234,7 +8271,9 @@ impl Database {
             return fail("invalid_tool_state");
         };
         if let Some(row) = row {
-            audit::finish(&tx, row, epoch_ms(), outcome.failed)?;
+            let now = epoch_ms();
+            audit::finish(&tx, row, now, outcome.failed)?;
+            clock_tool(&tx, turn, row, now)?;
         }
         for (stream, data) in &outcome.artifacts {
             artifact::put(&tx, turn, call_id, stream, data)?;
@@ -14332,15 +14371,52 @@ impl Database {
             (timed.iter_mut().zip(times)).for_each(|(sum, time)| *sum += time);
             models.push((r.get(0)?, spent, r.get(5)?, r.get(6)?, r.get(7)?, times));
         }
-        let mut bots: Vec<(String, i64, Spent)> = bots
+        drop(rows);
+        // What the finished turns with timed calls took, by bot, from the
+        // turns' own rows.
+        let mut statement = snapshot.prepare_cached(&format!(
+            "SELECT t.bot,COUNT(*),SUM(t.finished_ms-t.started_ms),SUM(t.tool_calls),
+                    SUM(t.tool_ms),SUM(t.paced_ms),SUM(t.summary_ms),SUM(t.daemon_ms),
+                    SUM(t.timed_rounds),SUM(t.timed_output_tokens),SUM(t.model_ms),
+                    SUM(t.first_token_ms)
+             FROM turns t
+             WHERE t.started_ms>=?1 AND t.finished_ms IS NOT NULL AND t.timed_rounds>0{glob}
+             GROUP BY t.bot"
+        ))?;
+        let mut rows = match name {
+            Some(pattern) => statement.query(params![
+                since_ms,
+                None::<i64>,
+                pattern,
+                glob_prefix(pattern)
+            ])?,
+            None => statement.query(params![since_ms])?,
+        };
+        let mut clocks: HashMap<String, Clock> = HashMap::new();
+        let mut clocked = Clock::default();
+        while let Some(r) = rows.next()? {
+            let mut clock = Clock::default();
+            for (i, part) in clock.0.iter_mut().enumerate() {
+                *part = r.get::<_, Option<i64>>(i + 1)?.unwrap_or(0);
+            }
+            clocked.add(&clock);
+            clocks.insert(r.get(0)?, clock);
+        }
+        drop(rows);
+        let mut bots: Vec<(String, i64, Spent, Clock)> = bots
             .into_iter()
-            .map(|(bot, (id, spent))| (bot, id, spent))
+            .map(|(bot, (id, spent))| {
+                let clock = clocks.remove(&bot).unwrap_or_default();
+                (bot, id, spent, clock)
+            })
             .collect();
         bots.sort_by(|a, b| b.2.tokens().cmp(&a.2.tokens()).then_with(|| a.0.cmp(&b.0)));
         let mut others = Spent::default();
+        let mut others_clock = Clock::default();
         let rest = bots.len().saturating_sub(limit);
-        for (_, _, spent) in bots.drain(limit.min(bots.len())..) {
+        for (_, _, spent, clock) in bots.drain(limit.min(bots.len())..) {
             others.add(&spent);
+            others_clock.add(&clock);
         }
         models.sort_by(|a, b| {
             (b.1.tokens().cmp(&a.1.tokens()))
@@ -14351,14 +14427,16 @@ impl Database {
         origins.sort_by(|a, b| b.1.tokens().cmp(&a.1.tokens()).then_with(|| a.0.cmp(&b.0)));
         let mut out = total.json();
         timing(&mut out, timed);
+        out["time"] = clocked.json();
         out["since_ms"] = json!(since_ms);
         out["bucket_ms"] = json!(bucket_ms);
         out["bots"] = bots
             .iter()
-            .map(|(bot, id, spent)| {
+            .map(|(bot, id, spent, clock)| {
                 let mut row = spent.json();
                 row["bot"] = json!(bot);
                 row["bot_id"] = json!(id);
+                row["time"] = clock.json();
                 row
             })
             .collect();
@@ -14367,6 +14445,7 @@ impl Database {
             n => {
                 let mut row = others.json();
                 row["bots"] = json!(n);
+                row["time"] = others_clock.json();
                 row
             }
         };
@@ -14639,6 +14718,7 @@ fn record_usage(
     record_usage_for(conn, bot, turn, usage, None, Charge::Round { added }, head)
 }
 /// Record a call's usage, and its work, from the measure as `bot` holds it.
+#[allow(clippy::too_many_arguments)]
 fn record_usage_for(
     conn: &Connection,
     bot: &Bot,
@@ -14656,9 +14736,15 @@ fn record_usage_for(
     }
     let cursor = event(conn, &bot.name, Some(turn), "usage", data.clone())?;
     spent_by_model(conn, turn, usage)?;
+    // The turn's own timed rounds are its model time. A summary is not: one
+    // the turn waited on is its `summary_ms`, one that ran beside a round
+    // overlaps it, and one billed after the turn ended was not in it.
+    let timed = purpose.is_none() && usage.model_ms > 0;
     conn.prepare_cached(
-        "UPDATE turns SET input_tokens=input_tokens+?,output_tokens=output_tokens+?,
-             cached_input_tokens=cached_input_tokens+?,work=work+?,daemon_ms=daemon_ms+? WHERE id=?",
+        "UPDATE turns SET input_tokens=input_tokens+?1,output_tokens=output_tokens+?2,
+             cached_input_tokens=cached_input_tokens+?3,work=work+?4,daemon_ms=daemon_ms+?5,
+             timed_rounds=timed_rounds+?7,timed_output_tokens=timed_output_tokens+?7*?10,
+             model_ms=model_ms+?7*?8,first_token_ms=first_token_ms+?7*?9 WHERE id=?6",
     )?
     .execute(params![
         usage.input_tokens as i64,
@@ -14666,7 +14752,11 @@ fn record_usage_for(
         usage.cached_input_tokens as i64,
         work as i64,
         usage.daemon_ms as i64,
-        turn
+        turn,
+        timed as i64,
+        usage.model_ms as i64,
+        usage.first_token_ms as i64,
+        usage.timed_output_tokens() as i64,
     ])?;
     conn.prepare_cached(
         "UPDATE bots SET tokens_used=tokens_used+?,input_tokens=input_tokens+?,
@@ -14792,6 +14882,31 @@ fn audit_call(
         outcome,
         &call.arguments,
     )
+}
+/// Count a call that ran to its end in its turn's tools, and its time in
+/// the turn's tool time: from its row's start in the audit trail to `now`,
+/// less what calls of the turn already counted, so calls that ran together
+/// count their time once. A call whose row a trim took while it ran counts
+/// with no time, and leaves what was counted where it was.
+fn clock_tool(tx: &Connection, turn: i64, row: i64, now: i64) -> Result<()> {
+    let started: Option<i64> = tx
+        .prepare_cached("SELECT at_ms FROM audit WHERE id=?")?
+        .query_row([row], |r| r.get(0))
+        .optional()?;
+    match started {
+        Some(started) => tx
+            .prepare_cached(
+                "UPDATE turns SET tool_calls=tool_calls+1,
+                    tool_ms=tool_ms+MAX(0,?3-MAX(?2,COALESCE(tools_until_ms,0))),
+                    tools_until_ms=MAX(COALESCE(tools_until_ms,0),?3)
+                 WHERE id=?1",
+            )?
+            .execute(params![turn, started, now])?,
+        None => tx
+            .prepare_cached("UPDATE turns SET tool_calls=tool_calls+1 WHERE id=?")?
+            .execute([turn])?,
+    };
+    Ok(())
 }
 /// A `tool_started` event's data: the call with its arguments previewed.
 fn started(call: &ToolCall) -> Value {
@@ -17435,6 +17550,76 @@ fn migrate_since_73(conn: &Connection, from: i32) -> Result<()> {
         }
     }
 
+    // Schema 98: each turn counts the calls that ran to their end and their
+    // time, calls that ran together once, and its own model calls' timings,
+    // apart from summaries. The turns timed since schema 95 take their calls
+    // from the audit trail, read from their first start on, and their
+    // timings from their models' rows, which count summaries too.
+    if from < 98 {
+        let has: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('turns') WHERE name='tool_ms')",
+            [],
+            |r| r.get(0),
+        )?;
+        if !has {
+            conn.execute_batch(
+                "ALTER TABLE turns ADD COLUMN tool_calls INTEGER NOT NULL DEFAULT 0;
+                 ALTER TABLE turns ADD COLUMN tool_ms INTEGER NOT NULL DEFAULT 0;
+                 ALTER TABLE turns ADD COLUMN tools_until_ms INTEGER;
+                 ALTER TABLE turns ADD COLUMN timed_rounds INTEGER NOT NULL DEFAULT 0;
+                 ALTER TABLE turns ADD COLUMN timed_output_tokens INTEGER NOT NULL DEFAULT 0;
+                 ALTER TABLE turns ADD COLUMN model_ms INTEGER NOT NULL DEFAULT 0;
+                 ALTER TABLE turns ADD COLUMN first_token_ms INTEGER NOT NULL DEFAULT 0;
+                 UPDATE turns SET (timed_rounds,timed_output_tokens,model_ms,first_token_ms)=
+                     (SELECT SUM(m.timed_rounds),SUM(m.timed_output_tokens),SUM(m.model_ms),
+                             SUM(m.first_token_ms)
+                      FROM turn_models m WHERE m.turn=turns.id)
+                 WHERE EXISTS(SELECT 1 FROM turn_models m WHERE m.turn=turns.id AND m.timed_rounds>0);",
+            )?;
+            clock_timed_turns(conn)?;
+        }
+    }
+
+    Ok(())
+}
+/// 97 -> 98: the tool calls and tool time of every turn with timed model
+/// calls, from its rows in the audit trail that ended, as a call ending in
+/// its turn counts them: a call lifted to the background (its `call_lifted`
+/// event) is left out, a terminal's call with a process of its own is not.
+/// The trail is in time order, so it is read from the first of those
+/// turns' starts on.
+fn clock_timed_turns(conn: &Connection) -> Result<()> {
+    let first: Option<i64> = conn.query_row(
+        "SELECT MIN(started_ms) FROM turns WHERE timed_rounds>0",
+        [],
+        |r| r.get(0),
+    )?;
+    let Some(first) = first else {
+        return Ok(());
+    };
+    let from = audit::first_at(conn, first)?;
+    let mut clocks: HashMap<i64, (i64, i64, i64)> = HashMap::new();
+    let mut rows = conn.prepare(
+        "SELECT a.turn,a.at_ms,a.at_ms+a.ms FROM audit a
+         WHERE a.id>=? AND a.step IS NULL AND a.ms IS NOT NULL
+             AND NOT EXISTS(SELECT 1 FROM events e WHERE e.turn=a.turn AND e.kind='call_lifted'
+                 AND e.data->>'$.call_id'=a.call_id)
+         ORDER BY a.turn,a.at_ms",
+    )?;
+    let mut rows = rows.query([from])?;
+    while let Some(r) = rows.next()? {
+        let (turn, start, end): (i64, i64, i64) = (r.get(0)?, r.get(1)?, r.get(2)?);
+        let (calls, ms, until) = clocks.entry(turn).or_insert((0, 0, 0));
+        *calls += 1;
+        *ms += (end - start.max(*until)).max(0);
+        *until = (*until).max(end);
+    }
+    let mut update = conn.prepare(
+        "UPDATE turns SET tool_calls=?2,tool_ms=?3,tools_until_ms=?4 WHERE id=?1 AND timed_rounds>0",
+    )?;
+    for (turn, (calls, ms, until)) in clocks {
+        update.execute(params![turn, calls, ms, until])?;
+    }
     Ok(())
 }
 /// 91 -> 92: every turns row becomes a message with its number; the rows

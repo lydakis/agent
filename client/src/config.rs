@@ -112,7 +112,8 @@
 //! digest = "15m"                # the default; 0 at once. Takes digest and steer alone
 //! [sonny.notes.prs]             # a margin note of your own, over the agent's in every lead's margin
 //! title = "My PRs"              # its name by default
-//! template = "{{ source('prs').latest.text }}"  # Markdown with blanks Sonny keeps filled, as an agent's template note
+//! markdown = "{{ source('prs').latest.text }}"  # the note, as Markdown
+//! live = true                   # its blanks filled and kept filled, as an agent's live note
 //! ```
 //!
 //! Each unset value is the model's own, or, for a task, its lead's.
@@ -979,17 +980,19 @@ pub enum TaskTabs {
     Every,
 }
 
-/// A margin note of the person's own: Markdown with blanks Sonny fills
-/// and keeps current, as an agent's template note is.
+/// A margin note of the person's own: Markdown, its blanks filled and
+/// kept current when live, as an agent's live note is.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Note {
     pub name: String,
     /// Shown over it; unset, its name.
     pub title: String,
-    pub template: String,
+    pub markdown: String,
+    pub live: bool,
 }
 
-/// `[sonny.notes.NAME]` tables: each a `template`, and a `title`.
+/// `[sonny.notes.NAME]` tables: each its `markdown`, whether it is
+/// `live`, and a `title`.
 fn notes(value: &toml::Value) -> Result<Vec<Note>, String> {
     let table = (value.as_table()).ok_or("sonny.notes must be a table of notes")?;
     let mut notes = Vec::new();
@@ -1005,18 +1008,23 @@ fn notes(value: &toml::Value) -> Result<Vec<Note>, String> {
         }
         let fields =
             (note.as_table()).ok_or_else(|| format!("sonny.notes.{name} must be a table"))?;
-        let (mut title, mut template) = (None, None);
+        let (mut title, mut markdown, mut live) = (None, None, false);
         for (field, value) in fields {
             match field.as_str() {
                 "title" => title = Some(string(&key(field), value)?),
-                "template" => template = Some(string(&key(field), value)?),
+                "markdown" => markdown = Some(string(&key(field), value)?),
+                "live" => {
+                    live = (value.as_bool())
+                        .ok_or_else(|| format!("{} must be true or false", key(field)))?;
+                }
                 _ => return Err(format!("unknown key {}", key(field))),
             }
         }
         notes.push(Note {
             name: name.clone(),
             title: title.unwrap_or_else(|| name.clone()),
-            template: template.ok_or_else(|| format!("{} is missing", key("template")))?,
+            markdown: markdown.ok_or_else(|| format!("{} is missing", key("markdown")))?,
+            live,
         });
     }
     Ok(notes)
@@ -3179,18 +3187,19 @@ mod tests {
     }
 
     #[test]
-    fn notes_are_named_templates() {
+    fn notes_are_named_and_live_only_when_said() {
         let config = parse(
-            "[sonny.notes.prs]\ntitle = \"My PRs\"\ntemplate = \"{{ source('prs').latest.text }}\"\n\n[sonny.notes.now]\ntemplate = \"x\"\n",
+            "[sonny.notes.prs]\ntitle = \"My PRs\"\nmarkdown = \"{{ source('prs').latest.text }}\"\nlive = true\n\n[sonny.notes.now]\nmarkdown = \"x\"\n",
         )
         .unwrap();
-        let notes: Vec<(&str, &str)> = (config.sonny.notes.iter())
-            .map(|note| (note.name.as_str(), note.title.as_str()))
+        let notes: Vec<(&str, &str, bool)> = (config.sonny.notes.iter())
+            .map(|note| (note.name.as_str(), note.title.as_str(), note.live))
             .collect();
-        assert_eq!(notes, [("now", "now"), ("prs", "My PRs")]);
+        assert_eq!(notes, [("now", "now", false), ("prs", "My PRs", true)]);
         assert!(parse("[sonny.notes.a]\ntitle = \"t\"\n").is_err());
-        assert!(parse("[sonny.notes.a]\ntemplate = \"t\"\nfile = \"x\"\n").is_err());
-        assert!(parse("[sonny.notes.\"a b\"]\ntemplate = \"t\"\n").is_err());
+        assert!(parse("[sonny.notes.a]\nmarkdown = \"t\"\nfile = \"x\"\n").is_err());
+        assert!(parse("[sonny.notes.a]\nmarkdown = \"t\"\nlive = \"yes\"\n").is_err());
+        assert!(parse("[sonny.notes.\"a b\"]\nmarkdown = \"t\"\n").is_err());
     }
 
     #[test]

@@ -733,6 +733,16 @@ fn event_page(
     }
 }
 
+/// How a replay's switch to live went.
+enum Switch {
+    /// Something wanted was committed past the cursor: page on.
+    Paging,
+    /// The follower is gone.
+    Closed,
+    /// The marker is queued and live delivery has begun.
+    Live,
+}
+
 /// Page durable history to a follower, then hand it to live delivery, as a
 /// catch-up subscription does. Pages are read on the reader pool without
 /// the subscription's lock, so they hold up neither commits nor the
@@ -769,17 +779,44 @@ pub async fn replay(store: Store, hub: Hub, bot: String, sub: Sub) -> Result<()>
         let Value::Array(events) = page["events"].take() else {
             return fail("invalid_event_page");
         };
-        let mut cursor = after;
         if events.is_empty() {
+            // The boundary marker, and a pruned notice ahead of it, go out
+            // under the subscription's lock as it goes live, before any live
+            // event can. Their room is set aside first, in one acquisition,
+            // so neither waits there nor fails for want of it, and no replay
+            // holds part of a session's budget while it waits for the rest.
+            let widest = i64::MIN;
+            let reserved = output
+                .reserve(&[
+                    json!({"event":"pruned","bot":bot,"before":widest,"durable":false}),
+                    json!({"event":"follow_live","bot":bot,"cursor":widest}),
+                ])
+                .await;
+            let Ok(mut room) = reserved else {
+                hub.unsubscribe(&bot, session);
+                return Ok(());
+            };
+            let page_pruned = page.get("pruned_before").and_then(Value::as_i64);
             let (switch_sub, switch_bot, switch_hub) = (sub.clone(), bot.clone(), hub.clone());
-            let (live, pruned, boundary) = store
+            let switch_output = output.clone();
+            let switched = store
                 .op("follow_live", move |db| {
                     let mut s = switch_sub.lock().unwrap();
                     // Only a wanted event behind it keeps the follow paging:
                     // for every bot's, one index probe a kind.
                     let behind = event_page(db, &switch_bot, s.kinds.as_ref(), s.last_cursor, 1)?;
                     if s.cancelled || behind["events"].as_array().is_some_and(|e| !e.is_empty()) {
-                        return Ok((false, None, s.last_cursor));
+                        return Ok(Switch::Paging);
+                    }
+                    // Retention removed events the follower asked for: say
+                    // so once, ahead of what is live. A deletion since the
+                    // empty page may have removed events past the cursor:
+                    // the switch's own check is the one to report.
+                    if let Some(before) = behind["pruned_before"].as_i64().or(page_pruned) {
+                        let notice_event = json!({"event":"pruned","bot":switch_bot,"before":before,"durable":false});
+                        if switch_output.send_in(&mut room, &notice_event).is_err() {
+                            return Ok(Switch::Closed);
+                        }
                     }
                     // A page of some kinds ends at the last one it found,
                     // which can sit far behind what was committed. Nothing
@@ -787,26 +824,28 @@ pub async fn replay(store: Store, hub: Hub, bot: String, sub: Sub) -> Result<()>
                     // published: its boundary is the newer of the two, and a
                     // follow resumed from it replays nothing from before.
                     s.last_cursor = s.last_cursor.max(switch_hub.published());
+                    let marker_event =
+                        json!({"event":"follow_live","bot":switch_bot,"cursor":s.last_cursor});
+                    if switch_output.send_in(&mut room, &marker_event).is_err() {
+                        return Ok(Switch::Closed);
+                    }
                     s.live = true;
-                    Ok((true, behind["pruned_before"].as_i64(), s.last_cursor))
+                    Ok(Switch::Live)
                 })
                 .await?;
-            if !live {
-                continue;
+            match switched {
+                Switch::Paging => continue,
+                Switch::Closed => hub.unsubscribe(&bot, session),
+                Switch::Live => {}
             }
-            cursor = boundary;
-            // A deletion since the empty page may have removed events past
-            // the cursor: the switch's own check is the one to report.
-            if let Some(before) = pruned {
-                page["pruned_before"] = before.into();
-            }
-        } else if let Some(next) = page["next_cursor"].as_i64() {
+            return Ok(());
+        }
+        if let Some(next) = page["next_cursor"].as_i64() {
             let mut s = sub.lock().unwrap();
             if s.cancelled {
                 return Ok(());
             }
             s.last_cursor = next;
-            cursor = next;
         }
         if let Some(before) = page.get("pruned_before").and_then(Value::as_i64) {
             // Retention removed events the follower asked for: say so once,
@@ -816,18 +855,6 @@ pub async fn replay(store: Store, hub: Hub, bot: String, sub: Sub) -> Result<()>
                 hub.unsubscribe(&bot, session);
                 return Ok(());
             }
-        }
-        if events.is_empty() {
-            // Marks the replay/live boundary for the follower.
-            if output
-                .try_send(json!({"event":"follow_live","bot":bot,"cursor":cursor}))
-                .is_err()
-            {
-                hub.counts.dropped.fetch_add(1, Ordering::Relaxed);
-                hub.close_session(session);
-                output.close();
-            }
-            return Ok(());
         }
         for event in (events.into_iter()).filter(|event| wanted(kinds.as_ref(), event)) {
             if output.send(event).await.is_err() {

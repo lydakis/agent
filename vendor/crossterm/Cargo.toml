@@ -70,7 +70,7 @@ name = "crossterm"
 path = "src/lib.rs"
 
 [dependencies.base64]
-version = "0.22"
+version = "0.23"
 optional = true
 
 [dependencies.bitflags]
@@ -121,7 +121,7 @@ features = [
 default-features = false
 
 [target."cfg(unix)".dependencies.signal-hook]
-version = "0.3.17"
+version = "0.4.6"
 optional = true
 
 [target."cfg(unix)".dependencies.signal-hook-mio]

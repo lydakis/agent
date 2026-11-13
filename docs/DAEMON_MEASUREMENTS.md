@@ -9220,3 +9220,38 @@ in `bench.footprint` are 7.001 on both:
 | lifecycle | CPU, s | 0.475 | 0.485 | +2.1% |
 | lifecycle | p95 turn, ms | 576.866 | 578.123 | +0.2% |
 | lifecycle | peak RSS, MiB | 24.811 | 25.33 | +2.1% |
+
+## Each turn's tool calls and their time (protocol 73, schema 98)
+
+A turn keeps how many of its calls ran to their end and their time, calls
+that ran together once, so `usage` can say where a finished turn's time went.
+What each path does now:
+
+- **A call that ends**: one more update of its turn's row by key, reading its
+  audit row's start by key, in the commit that already ends the call. No new
+  store job.
+- **`usage`**: one more grouped statement over the window's finished turns,
+  in the same snapshot, on a reader connection.
+- **A model call billed**: the update of its turn's row that already adds its
+  tokens adds its timings too, for the turn's own rounds.
+- **Opening a schema 97 store**: one pass over the audit trail from the first
+  timed turn's start (found by a binary search on ids), and one update per
+  turn that ran calls.
+
+The Perf workflow's matched screen, main (65c288c) against this change with
+the clock on every call's end (6bc7491), on the same runner. Every daemon
+measure is within its run-to-run spread; the call-end path is
+`completion`'s release to terminal, +0.5%.
+
+| Bench | Measure | Base | Head | Change |
+| --- | --- | ---: | ---: | ---: |
+| admission | lone submit CPU, ms | 34.677 | 35.174 | +1.4% |
+| admission | burst submit p99, ms | 4.049 | 4.005 | -1.1% |
+| completion | release to terminal p99, ms | 10.633 | 10.683 | +0.5% |
+| footprint | idle RSS, MiB | 16.162 | 16.445 | +1.8% |
+| footprint | per idle bot, KiB | 1.842 | 1.774 | -3.7% |
+| footprint | RSS after a turn each, MiB | 34.654 | 32.951 | -4.9% |
+| footprint | CPU per turn, ms | 0.898 | 0.893 | -0.6% |
+| lifecycle | CPU, s | 0.485 | 0.49 | +1.0% |
+| lifecycle | p95 turn, ms | 573.529 | 577.316 | +0.7% |
+| lifecycle | peak RSS, MiB | 24.502 | 24.596 | +0.4% |
