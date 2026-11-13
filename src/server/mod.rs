@@ -734,6 +734,33 @@ enum Command {
         #[serde(default)]
         bot: Option<String>,
     },
+    /// What runs for the bots `bot` names, a name or a GLOB pattern, or
+    /// for every bot: each background, terminal and detached command still
+    /// running and each call a message lifted that waits on, by bot and
+    /// oldest first, a page at a time after `after`, the last page's
+    /// `next_after`. A read.
+    Processes {
+        #[serde(default)]
+        bot: Option<String>,
+        #[serde(default)]
+        after: Option<ProcessesAfter>,
+    },
+    /// Stop `bot`'s command `handle` (`proc:N`), as its agent's
+    /// `write_stdin` with kill does: a command is killed with all it
+    /// started, a lifted call that waits is withdrawn.
+    StopProcess {
+        bot: String,
+        handle: String,
+    },
+}
+/// Where a `processes` page ends: the last row's bot and handle, which
+/// place the next page in the listing's order whether or not that row is
+/// still there.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProcessesAfter {
+    bot: String,
+    handle: String,
 }
 /// How long the service loop held each kind of request: from its
 /// dispatch to its answer or its handoff to a reader, so a request that
@@ -837,6 +864,8 @@ impl Command {
             Command::Resume { .. } => "resume",
             Command::Held { .. } => "held",
             Command::RetryHeld { .. } => "retry_held",
+            Command::Processes { .. } => "processes",
+            Command::StopProcess { .. } => "stop_process",
         }
     }
 }
@@ -2336,6 +2365,20 @@ pub async fn run(config: Configuration) -> Result<()> {
         .read("lifted_waiting", |db| db.lifted_waiting())
         .await?;
     service.check_lifted(lifted);
+    // Detached commands an earlier daemon started run on: each is watched
+    // again, and stopped by its handle, or its end is recorded now.
+    let detached = service
+        .store
+        .read("detached_running", |db| db.detached_running())
+        .await?;
+    turn::Lifts {
+        store: service.store.clone(),
+        registry: service.registry.clone(),
+        handles: service.handles.clone(),
+        failures: service.background_failures.clone(),
+    }
+    .adopt(detached)
+    .await;
     // A start may follow the fix of what held turns (a key, a provider,
     // the config): every held turn is tried again at once.
     service.retry_held(None).await?;
@@ -3090,7 +3133,8 @@ impl Service {
             Command::Delete { bot, .. }
             | Command::Prune { bot, .. }
             | Command::Compact { bot, .. }
-            | Command::Interrupt { bot, .. } => {
+            | Command::Interrupt { bot, .. }
+            | Command::StopProcess { bot, .. } => {
                 let bot = bot.clone();
                 match self.store.op("inspect", move |db| db.inspect(&bot)).await {
                     Ok(target)
@@ -4962,6 +5006,49 @@ impl Service {
                         db.held(after, limit.unwrap_or(64), bot.as_deref())
                     })
                     .await
+            }
+            Command::Processes { bot, after } => {
+                if bot.as_ref().is_some_and(|b| b.is_empty() || b.len() > 128) {
+                    return fail_with("invalid_bot", "bot must be 1 to 128 bytes");
+                }
+                let after = match after {
+                    None => None,
+                    Some(ProcessesAfter { bot, handle }) => match handles::Handle::parse(&handle) {
+                        Ok(handles::Handle::Process(id)) => Some((bot, id)),
+                        _ => {
+                            return fail_with(
+                                "invalid_handle",
+                                "after must be a page's next_after, {bot, handle: proc:N}",
+                            );
+                        }
+                    },
+                };
+                store
+                    .read("processes", move |db| {
+                        let after = after.as_ref().map(|(bot, id)| (bot.as_str(), *id));
+                        Ok(serde_json::to_value(db.processes(bot.as_deref(), after)?)?)
+                    })
+                    .await
+            }
+            Command::StopProcess { bot, handle } => {
+                let id = match handles::Handle::parse(&handle) {
+                    Ok(handles::Handle::Process(id)) => id,
+                    _ => {
+                        return fail_with(
+                            "invalid_handle",
+                            format!("{handle} is not a command's handle, proc:N"),
+                        );
+                    }
+                };
+                match turn::stop_handle(&self.store, &self.registry, &self.handles, &bot, id)
+                    .await?
+                {
+                    Some(outcome) => Ok(serde_json::from_str(&outcome.output)?),
+                    None => fail_with(
+                        "process_not_running",
+                        format!("{handle} is not a command of {bot}'s that runs"),
+                    ),
+                }
             }
             Command::RetryHeld { bot } => {
                 let retried = self.retry_held(bot).await?;
@@ -9717,9 +9804,22 @@ mod tests {
         // had not run yet when the turn resumed; the second still runs.
         let (done, running) = store
             .call(move |db| {
-                let done = db.process_start(turn, "shell-1")?;
+                let done = db.process_start(
+                    turn,
+                    "shell-1",
+                    agent_runtime::store::ProcessKind::Background,
+                    "",
+                )?;
                 db.process_finish(done, &json!({"exit_code":0}), false, &[], &[])?;
-                Ok((done, db.process_start(turn, "shell-2")?))
+                Ok((
+                    done,
+                    db.process_start(
+                        turn,
+                        "shell-2",
+                        agent_runtime::store::ProcessKind::Background,
+                        "",
+                    )?,
+                ))
             })
             .await
             .unwrap();

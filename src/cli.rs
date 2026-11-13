@@ -50,6 +50,22 @@ const COMMANDS: &[Command] = &[
         startup: false,
     },
     Command {
+        name: "ps",
+        about: "Commands still running, a bot's or every bot's: background, terminal and detached, each by its proc handle",
+        usage: "ps [--bot NAME]",
+        flags: "--bot --pretty --no-spawn",
+        settings: "",
+        startup: false,
+    },
+    Command {
+        name: "stop",
+        about: "Stop a bot's running command by its proc handle, with all it started",
+        usage: "stop --bot NAME HANDLE",
+        flags: "--bot --pretty --no-spawn",
+        settings: "",
+        startup: false,
+    },
+    Command {
         name: "ls",
         about: "List the bots",
         usage: "ls [--name GLOB] [--active] [--created-by BOT] [--limit N]",
@@ -906,6 +922,10 @@ pub fn prepare(args: Vec<String>) -> Result<Option<Vec<String>>> {
     } else if c.name == "login" {
         if positional != 1 {
             return fail_with("usage", "login needs a provider: chatgpt");
+        }
+    } else if c.name == "stop" {
+        if positional != 1 {
+            return fail_with("usage", "stop needs one handle, proc:N, as ps lists it");
         }
     } else if c.name == "sandbox" {
         if positional == 0 {
