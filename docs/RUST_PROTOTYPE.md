@@ -8,7 +8,7 @@ fastest harness. The [first measurements](RUST_MEASUREMENTS.md) passed it.
 
 ## Build and validate
 
-Development builds use Rust 1.99.1, pinned in `rust-toolchain.toml` with Clippy
+Development builds use Rust 1.100.0, pinned in `rust-toolchain.toml` with Clippy
 and rustfmt. The declared minimum supported Rust version is 1.95, which the
 atomics' `try_update` needs.
 Dependencies are locked; build outputs and the optional repository-local Cargo
@@ -1306,8 +1306,9 @@ every background command (whose handle then answers `daemon_paused`, saying
 the same), terminal, and detached command this
 daemon started (the process group each leads, with what it left running
 there after it exited, and on Linux a sandboxed one's whole pid namespace;
-one started before a restart, or an unsandboxed process that left that
-group, is no longer the daemon's to find), and from
+a detached command an earlier daemon started too, found again by its row;
+an unsandboxed process that left that group is no longer the daemon's to
+find), and from
 then no turn starts: a `reject`
 submission answers `daemon_paused`, `queue` and `steer` submissions are
 recorded and wait, automations' runs and notes with them, and parked and paced turns
@@ -1849,7 +1850,7 @@ none for a person's) and, in `prompts`, its `text` within the read's
 and their prompt says `quotes_more` and `truncated`; Sonny's approver reads a quote of the person's own words as
 consent only in a prompt the person sent, and any other as asking for
 nothing.
-`{"op":"prompts","bot","turn","bytes"?}` reads a turn's words and calls
+`{"op":"prompts","bot","turn","bytes"?,"persons"?,"persons_each"?}` reads a turn's words and calls
 as an approver judges them, within `bytes` of text (default 64 KiB, at most
 256 KiB): the turn's prompt and each steer it absorbed, in order, with
 `from` or `origin`, and `prompts_more` when steers were left out; the calls it started, each with its argument preview,
@@ -1877,7 +1878,19 @@ answers. Refused calls and
 their own, so a long prompt still leaves the calls (and the files they
 wrote) to read. Text that does not fit is cut and marked
 `truncated`, and each steer, call, and earlier prompt also counts 64
-bytes, so many short entries stay within `bytes` too. A fork keeps the source's binding, instructions,
+bytes, so many short entries stay within `bytes` too. With `persons`
+(bytes, at most 256 KiB), the read also lists the person's own earlier
+words to the bot under `persons`, as Codex's reviewer keeps every message
+its person wrote apart from the transcript: the messages it took in
+before the turn that no bot, client or other person wrote, newest first,
+each `{message, text, steer?}` whole within `persons_each` bytes (all of
+`persons` when absent; Sonny's reviewer asks 3,600, Codex's 900 tokens)
+or left out whole, with `persons_more` when some were left out
+(protocol 71). They have their own budget, so notes a client sent never
+crowd the person's words out of `earlier`; a partial index
+(`messages_persons`) keeps the read to the person's messages alone, at
+most 256 of them are looked at, and one whose length alone is past
+`persons_each` is passed over unread. A fork keeps the source's binding, instructions,
 and tools, and takes no text of its own; the source is never changed. Workspaces, wherever given, must already exist and be absolute. Use the actual returned checkpoint
 and turn IDs, not the illustrative numbers. Names are immutable bot identities
 within one store; rename/alias operations are not implemented. A fork starts
@@ -2436,6 +2449,28 @@ detail, so a reader that only says how many are held, as Sonny's alerts
 do, reads one page whatever the fleet's size (protocol 48; before, one
 answer held every turn and went past the frame limit near 6,000 agents).
 A page is bounded by bytes too, as `pauses` pages are.
+`{"op":"processes","bot":NAME?,"after":CURSOR?}` lists what runs for `bot`, a name or a
+GLOB pattern of names, or for every bot (protocol 72): each background
+command, terminal and detached command still running, and each call a
+message lifted that waits on, by bot and oldest first, as `{processes:
+[{handle, bot, turn, call_id, kind, command, started_ms, pid}]}`. `kind` is `background`,
+`terminal`, `detached` or `call`; `command` is the command's first 512
+bytes (a lifted call's, or its tool's name); `pid` is a detached
+command's, which leads its session and process group, so it is the one
+pid outside a sandbox's namespace that names it. The rows come from the
+running rows' partial index, so the read costs what runs, not the
+history. A page holds at most 128; when more follow, `next_after` is the
+last row's `{bot, handle}`, passed back as `after` for the next page. It
+places the next page whether or not that row is still there, so a command
+that ends between pages, its row pruned with its turn, does not break the
+listing. `{"op":"stop_process","bot":NAME,"handle":"proc:N"}` stops it as
+its agent's `write_stdin` with `kill: true` does and answers as that does,
+`{handle, stopped: true, ran}`; a handle that is not a command of that
+bot's still running answers `process_not_running`. `agent ps [--bot NAME]`
+and `agent stop --bot NAME proc:N` send them, and Sonny's `/ps` lists the
+project's and stops one. A bot whose command still runs is not deleted
+(`bot_busy`, naming the two requests): nothing an agent started runs
+untracked.
 `{"op":"retry_held","bot":NAME?}` tries every held turn again now,
 or only `bot`'s, and answers `{retried: N}`; a sandboxed bot's own socket
 refuses it with `not_permitted`, since what held the turn is the person's to
@@ -2812,11 +2847,27 @@ timeout is a result, not an error: the output written before the kill, with
 often what the model needs next. Background commands are killed when the
 daemon stops. `detach: true` is the way to leave a service running: the
 command starts in a new session with stdin, stdout and stderr on
-`/dev/null`, and the call returns its pid at once. The daemon writes no log
+`/dev/null`, and the call returns `{handle, detached: true, pid}` at once,
+a `proc:N` handle like a background command's. The daemon writes no log
 for it, since such a file would hold output that never passed credential
-redaction; a command that wants its output redirects it to a file itself. No process slot, timeout, group kill, or
-handle applies to it, so it outlives the turn and the daemon and is outside
-`--max-processes`; stopping it is the bot's job. What does bound it is
+redaction; a command that wants its output redirects it to a file itself. No process slot, timeout, or
+group kill at the call's end applies to it, so it outlives the turn and the daemon and is outside
+`--max-processes`. Its handle is tracked as a background command's is
+(protocol 72, schema 97), as Codex tracks every command it leaves
+running: `write_stdin` with `kill: true` on it, or `stop_process`, ends
+its process group (and on Linux a sandboxed one's pid namespace), `wait`
+on it reports how it ended, and its end is told as a background command's
+once nothing it left in its group runs, `{exit_code, success,
+wall_time_ms}` by its leader's exit. Its row records its pid and when
+that leader started (`/proc` `starttime` on Linux, `proc_pidinfo` on
+macOS), so a daemon started later watches it again and stops it by its
+handle when its leader still runs and started then. A group whose leader
+has gone is not taken for it, since while no daemon watched the group may
+have ended and its id gone to another: such a command, like one that
+ended, is recorded ended then, with `exit_code: null`, and told, and what
+it left running is no longer tracked. A command found again keeps its
+place under `--max-lasting` even past a bound lowered meanwhile: no new
+one starts until enough end. What does bound it is
 `--max-lasting`, shared with terminals as a systemd slice holds a
 service's processes: each detached command retains a slot until its async
 waiter has reaped it and nothing it left in its process group runs (a
@@ -2844,10 +2895,12 @@ until the command ends or the read's time runs out, and the read's result is
 what the command wrote meanwhile. A steer waiting for the boundary keeps the
 read live. Output merges stdout and stderr, as a terminal
 does, keeps its last 64 KiB unread, counting what it drops, and is redacted
-like any other; a secret field's value, cut off at the end of a read, waits
-for the next one so it is redacted whole, while its name and separator are
-shown at once, so a prompt such as `Password: ` reaches the bot, and the
-next read is redacted as read after them. A
+as one stream across its reads, exactly as the whole would be however the
+reads cut it, as a [retained output's](#retained-outputs) file is: what may
+still be redacted (the end that may begin a credential, a value not yet
+known to be secret) waits for the next read, while a field's name and
+separator are shown at once, so a prompt such as `Password: ` reaches the
+bot. A
 terminal takes no process slot and no timeout: it runs until
 it exits or is killed, across turns, and `wait` on its handle reports how it
 ended, with what no write read. It takes a `--max-lasting` slot before it
@@ -2959,7 +3012,7 @@ command reaches another bot's. A request on it:
 | `audit_trim` | `not_permitted`: the audit trail is the person's record of what agents did |
 | `create`, `fork` | Made by the caller, whatever `created_by` names (another is `not_permitted`), so the bot inherits its sandbox; its workspace and `writable` folders, and a fork's source's, must be ones the caller may write. A fork with `allow: []`, which only answers, may be of any bot |
 | `submit` | Reads as the caller's: `from` its turn when the request names it (the CLI does, from `AGENT_TURN`), else with its name as `origin`; `from` naming another bot is `not_permitted`. A workspace for a sandboxed bot must be one the caller may write |
-| `delete`, `prune`, `compact`, `interrupt` | The caller itself, or a bot it made; another is `not_permitted` |
+| `delete`, `prune`, `compact`, `interrupt`, `stop_process` | The caller itself, or a bot it made; another is `not_permitted` |
 | Everything else | As on the daemon's socket |
 
 The folder of these sockets stays read-only in every root, so no bot can

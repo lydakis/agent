@@ -391,6 +391,8 @@ fn automations() -> Value {
                                 reading is refused rather than asked about, and its answer comes to you \
                                 (or reply_to) as a report of what it would have done. Replace it without \
                                 shadow once the reports match the job."},
+                        "live": {"type": "boolean",
+                            "description": "The message is a template like a live memory fact's, filled as each run starts."},
                         "replace": {"type": "boolean",
                             "description": "Replace one by this name that differs, keeping its record."},
                         "message": {"type": "string", "minLength": 1}
@@ -435,7 +437,8 @@ fn memory() -> Value {
                 "confirmed": {"type": "integer", "minimum": 0,
                     "description": "How many times the person confirmed what a feedback fact says; left out, the fact keeps the count it had."},
                 "pushed_back": {"type": "integer", "minimum": 0,
-                    "description": "How many times the person pushed back on it; left out, the fact keeps the count it had."}
+                    "description": "How many times the person pushed back on it; left out, the fact keeps the count it had."},
+                "live": {"type": "boolean"}
             },
             "required": ["name", "type", "description", "source", "text"],
             "additionalProperties": false
@@ -790,15 +793,16 @@ async fn called(name: &str, arguments: &Value) -> Answer {
             let home = std::env::var_os("HOME")
                 .map(PathBuf::from)
                 .ok_or(("memory_refused", "no HOME".to_owned()))?;
-            // A task in a folder of its own works for its lead's project.
-            let here = crate::task::source_folder(&here).unwrap_or(here);
+            // A task in a folder of its own works for its lead's project,
+            // and a live fact's file blanks read its own folder.
+            let project = crate::task::source_folder(&here).unwrap_or_else(|| here.clone());
             if arguments["changed"] == true {
-                return crate::said::changed(&home, &here)
+                return crate::said::changed(&home, &project)
                     .await
                     .map(|said| said.to_string())
                     .map_err(|e| ("memory_refused", e));
             }
-            agent_client::memory::call(&home, &here, arguments)
+            agent_client::memory::call_in(&home, &project, &here, arguments)
                 .map(|said| said.to_string())
                 .map_err(|e| ("memory_refused", e))
         }

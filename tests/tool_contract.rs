@@ -877,6 +877,24 @@ async fn a_sandboxed_command_writes_only_its_roots() {
         std::fs::read_to_string(dir.join("notes/b.md")).unwrap(),
         "x\n"
     );
+    // A link in a kept folder is not removed for pointing at a file the bot
+    // may write.
+    std::fs::create_dir_all(repo.join(".git/hooks")).unwrap();
+    let hook = repo.join(".git/hooks/pre-commit");
+    std::os::unix::fs::symlink(dir.join("notes/b.md"), &hook).unwrap();
+    let delete = format!(
+        "*** Begin Patch\n*** Delete File: {}\n*** End Patch",
+        hook.display()
+    );
+    let delete = tools
+        .prepare("apply_patch", &json!({ "input": delete }).to_string())
+        .unwrap();
+    let error = tools
+        .execute(delete, &dir, &[], Some(policy.clone()))
+        .await
+        .unwrap_err();
+    assert_eq!(error.code, "write_denied");
+    assert!(hook.symlink_metadata().is_ok());
     std::fs::remove_dir_all(base).unwrap();
 }
 
@@ -1677,4 +1695,254 @@ async fn terminals_hold_a_lasting_permit_and_end_their_whole_session() {
         .unwrap();
     assert_eq!(error.code, "terminal_not_running");
     tools.end_terminals();
+}
+
+/// A detached command started on a handle ends by it, says how it ended
+/// when it ends on its own, and a later registry, as a daemon started
+/// again is, finds it by its pid and start and stops it too.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[tokio::test]
+async fn a_tracked_detached_command_stops_on_its_handle_and_is_found_again() {
+    use agent_runtime::tools::Detached;
+    use std::time::Duration;
+    use tokio::sync::oneshot;
+    let tools = Registry::new("shell").unwrap().with_lasting_budget(4);
+    let dir = std::env::temp_dir().join(format!("agent-detach-tracked-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let gone = async |pid: i32| {
+        for _ in 0..500 {
+            if unsafe { libc::kill(pid, 0) } != 0 {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        false
+    };
+    // Its own end: how its leader exited.
+    let (done, ended) = oneshot::channel();
+    tools
+        .detached(
+            tools.cord(),
+            tools.stopper(1),
+            "exit 3",
+            &dir,
+            &[],
+            None,
+            done,
+        )
+        .await
+        .unwrap();
+    let outcome = ended.await.unwrap().unwrap();
+    let output: Value = serde_json::from_str(&outcome.output).unwrap();
+    assert_eq!(
+        (output["exit_code"].as_i64(), outcome.failed),
+        (Some(3), true)
+    );
+    // Stopped on its handle, with what it started.
+    let (done, ended) = oneshot::channel();
+    let started = tools
+        .detached(
+            tools.cord(),
+            tools.stopper(2),
+            "exec sleep 30",
+            &dir,
+            &[],
+            None,
+            done,
+        )
+        .await
+        .unwrap();
+    let pid = started.pid as i32;
+    assert_eq!(unsafe { libc::getsid(pid) }, pid);
+    if cfg!(any(target_os = "linux", target_os = "macos")) {
+        assert!(started.since.is_some());
+    }
+    assert!(tools.stop(2));
+    assert_eq!(ended.await.unwrap().unwrap_err().code, "stopped");
+    assert!(gone(pid).await, "the stopped command still runs");
+    assert!(!tools.stop(2), "a stopped handle stops nothing again");
+    // A command that does not start says so on its handle too.
+    let (done, ended) = oneshot::channel();
+    let missing = dir.join("missing");
+    let error = tools
+        .detached(
+            tools.cord(),
+            tools.stopper(3),
+            "true",
+            &missing,
+            &[],
+            None,
+            done,
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(ended.await.unwrap().unwrap_err(), error);
+    // A pause after the start was decided, before it ran, refuses it.
+    let (done, ended) = oneshot::channel();
+    let paused = Registry::new("shell").unwrap();
+    let cord_paused = paused.cord();
+    paused.end_running();
+    let error = paused
+        .detached(
+            cord_paused,
+            paused.stopper(3),
+            "true",
+            &dir,
+            &[],
+            None,
+            done,
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(error.code, "daemon_paused");
+    assert_eq!(ended.await.unwrap().unwrap_err(), error);
+    // A stop on its handle before it started: it never runs.
+    let (done, ended) = oneshot::channel();
+    let marker = dir.join("ran");
+    let stopper = tools.stopper(10);
+    assert!(tools.stop(10));
+    let error = tools
+        .detached(tools.cord(), stopper, "touch ran", &dir, &[], None, done)
+        .await
+        .unwrap_err();
+    assert_eq!(error.code, "stopped");
+    assert_eq!(ended.await.unwrap().unwrap_err(), error);
+    assert!(!marker.exists());
+    // Found again by a later registry.
+    let (done, first_end) = oneshot::channel();
+    let first = tools
+        .detached(
+            tools.cord(),
+            tools.stopper(4),
+            "exec sleep 30",
+            &dir,
+            &[],
+            None,
+            done,
+        )
+        .await
+        .unwrap();
+    let later = Registry::new("shell").unwrap();
+    // A process given its pid that started at another time is not it.
+    let (done, _) = oneshot::channel();
+    let other = Detached {
+        pid: first.pid,
+        since: first.since.map(|since| since + 1),
+    };
+    if first.since.is_some() {
+        assert!(
+            !later
+                .adopt(later.stopper(4), other, false, Duration::ZERO, done)
+                .await
+        );
+    }
+    let (done, ended) = oneshot::channel();
+    assert!(
+        later
+            .adopt(later.stopper(4), first, false, Duration::from_secs(5), done)
+            .await
+    );
+    assert_eq!(later.lasting_running(), 1);
+    assert!(later.stop(4));
+    assert_eq!(ended.await.unwrap().unwrap_err().code, "stopped");
+    assert!(gone(first.pid as i32).await);
+    // The registry that started it sees its end as an end by a signal.
+    let output: Value = serde_json::from_str(&first_end.await.unwrap().unwrap().output).unwrap();
+    assert_eq!(output["exit_code"], Value::Null);
+    // One that has ended is not found again.
+    let (done, _) = oneshot::channel();
+    assert!(
+        !later
+            .adopt(later.stopper(5), first, false, Duration::ZERO, done)
+            .await
+    );
+    assert_eq!(later.lasting_running(), 0);
+    // A group whose leader has gone is not taken for the command: its id
+    // may have gone to another group while no daemon watched.
+    let (done, _) = oneshot::channel();
+    let led = tools
+        .detached(
+            tools.cord(),
+            tools.stopper(6),
+            "sleep 30 & exit 0",
+            &dir,
+            &[],
+            None,
+            done,
+        )
+        .await
+        .unwrap();
+    assert!(gone(led.pid as i32).await, "the leader still runs");
+    let (done, _) = oneshot::channel();
+    assert!(
+        !later
+            .adopt(later.stopper(6), led, false, Duration::ZERO, done)
+            .await
+    );
+    assert!(tools.stop(6));
+    // Commands found again past a bound lowered meanwhile keep their
+    // places: no new one starts until enough of them end.
+    let lower = Registry::new("shell").unwrap().with_lasting_budget(1);
+    let mut found = Vec::new();
+    for id in [7, 8] {
+        let (done, _) = oneshot::channel();
+        let started = tools
+            .detached(
+                tools.cord(),
+                tools.stopper(id),
+                "exec sleep 30",
+                &dir,
+                &[],
+                None,
+                done,
+            )
+            .await
+            .unwrap();
+        let (done, ended) = oneshot::channel();
+        assert!(
+            lower
+                .adopt(lower.stopper(id), started, false, Duration::ZERO, done)
+                .await
+        );
+        found.push((id, started, ended));
+    }
+    assert_eq!(lower.lasting_running(), 2);
+    let full = async || {
+        let (done, _) = oneshot::channel();
+        lower
+            .detached(
+                lower.cord(),
+                lower.stopper(9),
+                "true",
+                &dir,
+                &[],
+                None,
+                done,
+            )
+            .await
+    };
+    let settles = async |running: usize| {
+        for _ in 0..500 {
+            if lower.lasting_running() == running {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        false
+    };
+    assert_eq!(full().await.unwrap_err().code, "lasting_limit");
+    for (id, started, ended) in found {
+        assert!(lower.stop(id));
+        assert_eq!(ended.await.unwrap().unwrap_err().code, "stopped");
+        assert!(gone(started.pid as i32).await);
+        tools.stop(id);
+        if id == 7 {
+            // The other one takes the slot this one freed, not a new one.
+            assert!(settles(1).await);
+            assert_eq!(full().await.unwrap_err().code, "lasting_limit");
+        }
+    }
+    assert!(settles(0).await);
+    assert!(full().await.is_ok());
+    std::fs::remove_dir_all(dir).unwrap();
 }
