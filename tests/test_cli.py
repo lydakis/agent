@@ -71,6 +71,21 @@ class SocketAndCliTests(ModelFixture):
             self.assertEqual(files['limit'], hard)
         self.assertGreater(files['open'], 3)
 
+    def test_stats_report_the_room_left_in_each_temporary_folder(self):
+        temp = self.path / 'temp'
+        temp.mkdir()
+        result = subprocess.run([*self.base, 'run', *self.common, '--new', '--bot', 'Bob', 'hello'],
+                                env=dict(clean_env(), TMPDIR=str(temp)), capture_output=True,
+                                text=True, timeout=30, cwd=self.path)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        rooms = json.loads(self.agent('stats', '--store', str(self.store)).stdout)['temp']
+        # The daemon's TMPDIR first, then /tmp, each as named.
+        self.assertEqual([room['path'] for room in rooms], [str(temp), '/tmp'])
+        for room in rooms:
+            self.assertGreater(room['bytes_total'], 0)
+            self.assertLessEqual(room['bytes_free'], room['bytes_total'])
+            self.assertEqual(set(room), {'path', 'bytes_free', 'bytes_total', 'inodes_free', 'inodes_total'})
+
     def test_listings_filter_and_stop_at_their_limit(self):
         for bot in ('p.lead', 'p.worker', 'q.lead'):
             self.agent('run', *self.common, '--new', '--bot', bot, 'hello')
@@ -1891,6 +1906,37 @@ class CliTests(ModelFixture):
         result = subprocess.run([*base, '--socket', str(client.socket_path)], env=env, capture_output=True, text=True, timeout=3)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(json.loads(result.stdout)[0]['name'], 'first')
+
+    def test_inside_a_bot_s_turn_no_daemon_starts_on_the_turn_s_store(self):
+        # A bot's shell inherits its daemon's store. With that daemon down,
+        # an agent there, a build of the bot's own included, starts none in
+        # its place, named or inherited; on a store of the bot's own it
+        # starts one as anyone would.
+        provider = ['--provider', 'openai=responses,http://127.0.0.1:9/v1']
+        live, own = self.path/'live.sqlite', self.path/'own.sqlite'
+        live.touch()
+        turn = {**clean_env(), 'AGENT_BOT': 'Bob', 'AGENT_BOT_ID': '7', 'AGENT_STORE': str(live),
+                'AGENT_SOCKET': str(self.path/'live.sqlite.sock')}
+        for flags in ([], ['--store', str(live)], ['--store', 'live.sqlite']):
+            with self.subTest(flags=flags):
+                refused = subprocess.run([str(self.binary), 'start', *flags, *provider], env=turn,
+                                         capture_output=True, text=True, timeout=10, cwd=self.path)
+                self.assertEqual(refused.returncode, 1, refused.stderr)
+                self.assertEqual(json.loads(refused.stderr)['error'], 'daemon_unavailable')
+                self.assertIn("inside a bot's turn", refused.stderr)
+                self.assertFalse((self.path/'live.sqlite.sock').exists())
+        # As a bot's own command does, `sandbox --bot` with --no-spawn asks
+        # for a running daemon anywhere.
+        lent = subprocess.run([str(self.binary), 'sandbox', '--store', str(own), '--no-spawn', '--bot', 'Bob',
+                               '--', 'true'], env=clean_env(), capture_output=True, text=True,
+                              timeout=10, cwd=self.path)
+        self.assertEqual((lent.returncode, json.loads(lent.stderr)['error']), (125, 'daemon_unavailable'))
+        self.assertFalse(own.exists())
+        started = subprocess.run([str(self.binary), 'start', '--store', str(own), *provider], env=turn,
+                                 capture_output=True, text=True, timeout=30, cwd=self.path)
+        self.addCleanup(subprocess.run, [str(self.binary), 'shutdown', '--store', str(own)],
+                        env=clean_env(), capture_output=True, timeout=35)
+        self.assertEqual(started.returncode, 0, started.stderr)
 
     def test_cli_starts_and_reconnects_with_a_deep_store_path(self):
         store = self.path/('snapshot-'*18)/'state.db'

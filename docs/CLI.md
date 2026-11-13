@@ -67,9 +67,44 @@ keeps PATH, by its absolute path, read-only in every sandbox and from being
 made there; the CLI passes `~/.agent/rules`, where Sonny reads the
 [command rules](RUST_PROTOTYPE.md#command-rules) it gives its bots, so no
 bot writes its own. `serve --wall FOLDER` keeps every sandboxed command,
-the network on or not, from the Unix sockets in FOLDER, which it makes
-private if missing; the CLI passes `~/.agent/run`, where clients such as
-Sonny keep the sockets of programs they run for bots outside the sandbox.
+the network on or not, from connecting to the Unix sockets in FOLDER,
+which it makes private (mode 700) if missing; the CLI passes
+`~/.agent/run`, where clients such as Sonny keep the sockets of programs
+they run for bots outside the sandbox. It is a wall for sockets, not a
+way to hide files. On Linux the folder shows empty to a sandboxed command,
+since bubblewrap mounts an empty read-only folder over it, but on macOS
+Seatbelt only refuses connections to its sockets and hard links into it,
+so its files stay readable; and the `read` tool, which the daemon answers
+itself outside any sandbox, reads them on both. What a sandbox closes and
+what it leaves open is summed up in
+[Sonny's sandbox reference](../sonny/REFERENCE.md#what-the-sandbox-closes).
+
+Every daemon lists its store and socket in `~/.agent/run/daemons` as it
+opens its store, and keeps every other listed daemon's as it keeps its own:
+the store and the files SQLite keeps beside it read-only in every sandbox,
+and the socket and its bots' own sockets (`SOCKET.d`) out of every
+sandboxed command's reach, the network on or not. So a second daemon on
+the machine is no way out of the first one's sandbox, nor the first out of
+the second's. An entry stays while its store does, so an idle store is kept
+too. A daemon that cannot write the list, as one started inside a sandbox
+cannot, runs all the same and says so in its log; it can do nothing its
+sandbox does not allow. A command that was already running when a new
+daemon listed itself keeps the sandbox it started with.
+
+One daemon per person is the shape everything else assumes. A second one,
+on its own `--store`, is a separate world for chats, usage, stats, the
+pacer, Sonny's windows and Sky, the lookout, approvals, and upgrades
+(each client replaces only the daemon on the socket it reaches), while it
+shares everything under `~/.agent` and `~/.agents`: settings, prices,
+logins, memory, the commons, automations and task folders. Run one for a
+build under test or an eval, on a store in a temporary folder, and stop it
+when done. An `agent` command run from inside a bot's turn never starts a
+daemon on the store that turn runs on, which its shell inherits as
+`AGENT_STORE`, as it never replaces the daemon there: with that daemon
+down, it is `daemon_unavailable`, so a build of the bot's own never takes
+the person's store. On a `--store` of the bot's own it starts one as
+anyone would.
+
 The daemon's [limits](RUST_PROTOTYPE.md#limits) come from `[daemon]` in
 `~/.agent/config.toml` where the command line sets none, each a number or
 a formula of the machine, as `processes = "cpus * 64"` or
@@ -444,7 +479,13 @@ to start a new one, or on a socket that is not the store's own. Sonny
 starts the daemon this way, so opening it after an upgrade replaces the old
 daemon, and it says so first. `stats` starts it as `start` does, so it answers on a fresh install;
 its `files` says how many files the daemon holds open against its limit,
-so a leak (a count that grows while idle) is told from a busy peak. The
+so a leak (a count that grows while idle) is told from a busy peak, and
+its `temp` the room left in each temporary folder every agent's commands
+share (the daemon's `TMPDIR`, then `/tmp`, each folder once):
+`bytes_free` and `bytes_total`, `inodes_free` and `inodes_total`, one
+`statvfs` each off the run loop as `stats` answers. A file system can run
+out of inodes with space to spare; one that keeps no inode count reports
+none, or as many free as in all. The
 daemon raises its soft limit on open files to the hard one as it starts
 (on macOS, to the most a process may open), as Go's runtime does, and
 the commands it runs inherit the raised limit;

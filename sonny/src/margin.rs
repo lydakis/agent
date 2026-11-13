@@ -1,8 +1,8 @@
 //! The margin beside the conversation: notes a bot keeps there with the
 //! `margin` tool Sonny declares on it, each pinned to the point in the
-//! conversation where it was first put, under a glance line of what runs
-//! for the agent. A marker where a note was put scrolls the margin to it,
-//! and the note's ↑ scrolls the conversation back there.
+//! conversation where it was first put. A marker where a note was put
+//! scrolls the margin to it, and the note's ↑ scrolls the conversation
+//! back there.
 //!
 //! The calls are the record, in the bot's history; the margin as it
 //! stands is kept beside the person's reactions, by the bot's key, so a
@@ -1436,58 +1436,6 @@ fn is_id(id: &str) -> bool {
         && chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
 }
 
-/// The agent, what of its background failed and its context, as the
-/// margin's first row says them.
-#[derive(Clone, Default)]
-pub struct Glance {
-    pub name: String,
-    /// What of `/background` failed.
-    pub failed: usize,
-    pub context: Option<u64>,
-    /// The model's context window, when the daemon said it.
-    pub window: Option<u64>,
-}
-
-impl Glance {
-    /// The row, and where its buttons are: each fact opens its view.
-    pub fn line(&self) -> (Line<'static>, crate::screen::Buttons) {
-        let mut spans = vec![Span::raw(" "), Span::raw(self.name.clone()).bold()];
-        let mut buttons = Vec::new();
-        let mut at = 1 + self.name.width();
-        let mut fact = |spans: &mut Vec<Span<'static>>,
-                        text: String,
-                        span: Span<'static>,
-                        url: Option<&str>| {
-            spans.push(Span::raw(" · ").dim());
-            at += 3;
-            let width = text.width();
-            if let Some(url) = url {
-                buttons.push((at as u16, (at + width) as u16, format!("{BUTTON}{url}")));
-            }
-            spans.push(span);
-            at += width;
-        };
-        if self.failed > 0 {
-            let text = format!("✗ {}", self.failed);
-            fact(
-                &mut spans,
-                text.clone(),
-                Span::raw(text).fg(Color::Red),
-                Some("background"),
-            );
-        }
-        if let Some(context) = self.context {
-            let (amount, _, _) = crate::transcript::fullness(context, self.window);
-            let text = match self.window {
-                Some(_) => format!("{amount} left"),
-                None => amount,
-            };
-            fact(&mut spans, text.clone(), Span::raw(text).dim(), None);
-        }
-        (Line::from(spans), buttons)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2209,49 +2157,5 @@ mod tests {
         assert!(lines.iter().any(|line| line.to_string().contains('y')));
         let (wider, _) = margin.lines(60, workspace, None);
         assert_eq!(wider[1].width(), 60);
-    }
-
-    #[test]
-    fn the_glance_line_says_only_what_failed_and_the_context_and_failures_open_their_view() {
-        let quiet = Glance {
-            name: "calc".into(),
-            ..Glance::default()
-        };
-        assert_eq!(quiet.line().0.to_string(), " calc");
-        let busy = Glance {
-            name: "calc".into(),
-            failed: 0,
-            context: Some(41_000),
-            window: None,
-        };
-        let (line, buttons) = busy.line();
-        assert!(line.to_string().starts_with(" calc · "), "{line}");
-        assert!(buttons.is_empty(), "the context opens nothing");
-        let windowed = Glance {
-            window: Some(1_000_000),
-            ..busy.clone()
-        };
-        assert!(windowed.line().0.to_string().ends_with(" · 96% left"));
-        let (failing, failed_buttons) = Glance {
-            failed: 2,
-            ..busy.clone()
-        }
-        .line();
-        let text = failing.to_string();
-        assert!(text.starts_with(" calc · ✗ 2 · "), "{text}");
-        assert!(
-            !text.contains('↻'),
-            "what runs in the background goes unsaid"
-        );
-        assert_eq!(failing.spans[3].style.fg, Some(Color::Red));
-        let urls: Vec<&str> = failed_buttons.iter().map(|b| b.2.as_str()).collect();
-        assert_eq!(urls, ["sonny:background"]);
-        let slice = |(from, to): (u16, u16)| -> String {
-            text.chars()
-                .skip(from as usize)
-                .take((to - from) as usize)
-                .collect()
-        };
-        assert_eq!(slice((failed_buttons[0].0, failed_buttons[0].1)), "✗ 2");
     }
 }
