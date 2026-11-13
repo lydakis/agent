@@ -1175,8 +1175,11 @@ pub(crate) async fn answer_once(
         }
         // Answered, it has nothing left to remind of: its deadline goes
         // now, beside the window, rather than wait in `/background` for a
-        // gate that would say no.
-        if reply.is_ok() {
+        // gate that would say no. Only once the answer opened a turn,
+        // which nothing takes back: one waiting in line, or for the
+        // running turn's next round, may yet be withdrawn or bounce and
+        // leave the question open, so its deadline stays for the gate.
+        if reply.as_ref().is_ok_and(|reply| reply["turn"].is_i64()) {
             let (bot, ask) = (bot.clone(), ask.to_owned());
             tokio::task::spawn_blocking(move || asks::let_deadline_go(&bot, &ask));
         }

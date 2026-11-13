@@ -1291,8 +1291,8 @@ has something on it, or is off the screen, no time shows.
   deadline is a one-off automation (`/background`) the tool host sets,
   `[sonny] ask_wait_minutes` from the ask (60 by default, 0 for none,
   which makes every ask wait) unless the agent sets its own for work on a
-  clock. Your answer, picked or typed, removes it at once, as the agent's
-  close does; it runs nothing once you answer or write to that agent, since the
+  clock. Your answer, picked or typed, removes it once the agent
+  takes it up, as the agent's close does; it runs nothing once you answer or write to that agent, since the
   conversation moved on, nor for an ask whose call failed and showed no card; when it runs, it is Sonny's words, never yours,
   so it allows nothing that needs your own. Pick another option later and
   the agent undoes what it did. Open

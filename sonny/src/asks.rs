@@ -19,8 +19,8 @@
 //! answers the call ([`served`]) sets a one-off trigger at the deadline.
 //! Its `--if` is `sonny ask open` ([`still_open`]): once the person
 //! answered, or wrote words of their own to that agent, the conversation
-//! moved on and nothing fires; an answer, or the agent's close, removes it
-//! at once ([`let_deadline_go`]). A fire is Sonny's words in a trigger's turn,
+//! moved on and nothing fires; an answer that opened a turn, or the
+//! agent's close, removes it at once ([`let_deadline_go`]). A fire is Sonny's words in a trigger's turn,
 //! never the person's, so it allows nothing that needs their own; a pick
 //! of another option later still answers the card, and the agent undoes
 //! what it did.
