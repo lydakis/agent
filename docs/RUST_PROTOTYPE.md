@@ -1249,7 +1249,9 @@ answered as its deadline would answer it, the parked turn reported pending
 as it stands. Background commands and terminals end with the daemon as
 before. Only a planned stop parks: a daemon that exits on a fatal error ends
 its running turns `interrupted` with `process_interrupted`, as a crash would,
-and leaves its waits unanswered. A park says which halt held it in the
+and leaves its waits unanswered. A panic inside one turn is not fatal: that
+turn alone fails with `turn_panicked` and the panic's words, and the daemon
+and its other turns go on. A park says which halt held it in the
 turn's `waiting` record (`halt`: `pause` or `shutdown`); schema 74 moves a
 pull's park from its own flag to that. Protocol 36 parks turns on a stop; before it, they ended
 `interrupted` with `daemon_shutdown`. A daemon older than 36 still ends them
