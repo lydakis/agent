@@ -329,7 +329,9 @@ fn large_artifacts_remain_exact_after_reopen_and_background_completion() {
         assert_eq!(
             db.artifact_lines("bot", turn, "call", "stdout", 4, 2)
                 .unwrap(),
-            "     4\té\0🙂 record\n     5\té\0🙂 record\n[showing lines 4-5 of 60000]\n"
+            agent_runtime::store::ArtifactLines::Page(
+                "     4\té\0🙂 record\n     5\té\0🙂 record\n[showing lines 4-5 of 60000]\n".into()
+            )
         );
         // The background command no wait collected was told in a turn of
         // its own once the bot rested.
