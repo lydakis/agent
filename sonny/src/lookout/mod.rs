@@ -277,10 +277,11 @@ fn note(told: &updates::Told, steer: Option<&Steer>) -> String {
         None => "Each ended turn comes with what the task replied; read a turn with one \
             wait call (timeout_ms 0) only when you need more of it, and act where something \
             changes the work. Tell the person only what is worth interrupting them for: \
-            the outcome of work you started for them, once, when it is done or has failed, \
-            not again when they write in that task; what only they can decide; and where \
-            their latest words contradict what they asked before. Keep the rest for when \
-            they ask. If nothing, end your turn with an empty reply."
+            what only they can decide; a failure they would act on; where their latest words \
+            contradict what they asked before; and the outcome of work they asked for, once, \
+            when it is done, not again when they write in that task. Keep the rest, and what \
+            waits on their word, for when they ask. If nothing, end your turn with an empty \
+            reply."
             .to_owned(),
     });
     let mut text = lines.join("\n");
@@ -4050,7 +4051,7 @@ mod tests {
             "Task updates: what happened in your tasks since you last heard; the wait tool reads each turn by its handle.\n\
              - calc.docs: calc.docs/3 completed\n\
              Each ended turn comes with what the task replied; read a turn with one wait call (timeout_ms 0) only when you need more of it, and act where something changes the work. \
-             Tell the person only what is worth interrupting them for: the outcome of work you started for them, once, when it is done or has failed, not again when they write in that task; what only they can decide; and where their latest words contradict what they asked before. Keep the rest for when they ask. If nothing, end your turn with an empty reply."
+             Tell the person only what is worth interrupting them for: what only they can decide; a failure they would act on; where their latest words contradict what they asked before; and the outcome of work they asked for, once, when it is done, not again when they write in that task. Keep the rest, and what waits on their word, for when they ask. If nothing, end your turn with an empty reply."
         );
         // News joining a busy subscriber's turn, with nothing urgent in it.
         assert!(note(&told, Some(&Steer::News)).ends_with(
