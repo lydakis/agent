@@ -6,6 +6,23 @@
 //!
 //! A render says what it read ([`Reads`]), so a window watches only that
 //! and fills the blanks again only once one of those changed ([`stamp`]).
+//!
+//! Every live template is one thing, wherever it is written: Markdown or
+//! a message given with `live` true, checked once as it is written by
+//! [`refusal`], which refuses it as `live_template` ([`REFUSED`]). Where
+//! its fill goes ([`To`]) sets the one rule that differs: one the person
+//! sees in a window (a margin note) is filled again whenever what it
+//! read changes, and may read the tasks; one that goes into a prompt (a
+//! memory fact, an automation's message) is filled once as it goes and
+//! never again, so a prompt never changes under the model, and reads no
+//! tasks, which it outlives. How much of a fill is kept:
+//!
+//! | where it goes | most kept |
+//! |---|---|
+//! | any render | [`OUTPUT`], 64 KiB, the render stopped there |
+//! | a margin note | its template [`crate::margin`]'s `NOTE_BYTES`; its fill the note's lines |
+//! | a prompt | `agent_client::memory::cut_filled`, 32 KiB, and what it cut |
+//! | a memory fact's index line | 300 bytes, one line |
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -124,7 +141,20 @@ impl Live {
     }
 }
 
-const TASKS: &str = "tasks() and task() fill margin notes only: a fact outlives its tasks";
+/// The code every live template is refused with, wherever it is written.
+pub const REFUSED: &str = "live_template";
+
+/// Where a live template's fill goes, which sets whether it may read the
+/// tasks: a prompt outlives them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum To {
+    /// Shown in a window, and filled again there as what it read changes.
+    Window,
+    /// Into a prompt, filled once as it goes.
+    Prompt,
+}
+
+const TASKS: &str = "tasks() and task() fill only what a window shows: a prompt outlives its tasks";
 
 /// The sources `template` names by a literal, `source('NAME')`, and
 /// whether it calls `tasks()` or `task()`, in its blanks and tags alone:
@@ -249,7 +279,7 @@ fn no_source(name: &str, sources: &[String]) -> String {
     format!("no source named {name}: {yours}")
 }
 
-/// A live fact's `template` filled from `data`, or why not.
+/// A live template going into a prompt filled from `data`, or why not.
 fn live(template: &str, data: &Data) -> Result<String, String> {
     let (filled, reads) = render(template, data);
     if reads.tasks {
@@ -258,22 +288,26 @@ fn live(template: &str, data: &Data) -> Result<String, String> {
     filled
 }
 
-/// Why `template` cannot be a live fact's: it does not read as one, or
-/// names a source never set up or the tasks. What a later read may fill,
-/// such as a file not written yet, does not refuse it.
-fn live_check(template: &str, data: &Data) -> Result<(), String> {
+/// Why `template` cannot be a live one whose fill goes `to`: it does not
+/// read as one, names a source never set up, or, going into a prompt,
+/// the tasks. What a later fill may find, such as a file not written
+/// yet, does not refuse it. The one check every live template is written
+/// past, refused as [`REFUSED`].
+pub fn refusal(template: &str, data: &Data, to: To) -> Result<(), String> {
     check(template)?;
     // Named in the text, each is checked whether or not a render gets to
     // it now: a blank before it may wait on a file not written yet.
     let (sources, tasks) = named(template);
-    if tasks {
+    if tasks && to == To::Prompt {
         return Err(TASKS.into());
     }
     if let Some(name) = sources.iter().find(|name| !data.sources.contains(name)) {
         return Err(no_source(name, &data.sources));
     }
-    match live(template, data) {
-        Err(why) if why.contains("no source named ") || why.contains("tasks()") => Err(why),
+    let (filled, reads) = render(template, data);
+    match filled {
+        Err(why) if why.contains("no source named ") => Err(why),
+        _ if reads.tasks && to == To::Prompt => Err(TASKS.into()),
         _ => Ok(()),
     }
 }
@@ -286,9 +320,9 @@ pub fn fill_message(message: &str, folder: &Path, store: Option<&Path>) -> Resul
 }
 
 /// Why an automation's `message` could never fill as a live one, or
-/// nothing: [`live_check`]'s refusals.
+/// nothing: [`refusal`]'s, as a prompt's.
 pub fn check_message(message: &str, folder: &Path, store: Option<&Path>) -> Result<(), String> {
-    live_check(message, &message_data(folder, store))
+    refusal(message, &message_data(folder, store), To::Prompt)
 }
 
 fn message_data(folder: &Path, store: Option<&Path>) -> Data {
@@ -301,7 +335,7 @@ fn message_data(folder: &Path, store: Option<&Path>) -> Data {
 
 impl agent_client::memory::Fill for Live {
     fn check(&self, template: &str, folder: &Path) -> Result<(), String> {
-        live_check(template, &Self::data(folder))
+        refusal(template, &Self::data(folder), To::Prompt)
     }
 
     fn fill(&self, template: &str, folder: &Path) -> Result<String, String> {
@@ -606,6 +640,28 @@ mod tests {
         assert!(reads.sources.is_empty() && reads.files.is_empty());
     }
 
+    fn refusal_prompt(template: &str, data: &Data) -> Result<(), String> {
+        refusal(template, data, To::Prompt)
+    }
+
+    #[test]
+    fn a_window_may_read_the_tasks_and_is_refused_as_a_prompt_is_otherwise() {
+        let dir = tempfile_dir("window");
+        let data = data(&dir);
+        assert_eq!(refusal("{{ tasks() | length }}", &data, To::Window), Ok(()));
+        assert!(
+            refusal("{{ source('ci').latest }}", &data, To::Window)
+                .unwrap_err()
+                .contains("no source named ci")
+        );
+        assert!(refusal("{% if %}", &data, To::Window).is_err());
+        // A file not written yet fills later, in a window as in a prompt.
+        assert_eq!(
+            refusal("{{ file('later.txt') }}", &data, To::Window),
+            Ok(())
+        );
+    }
+
     #[test]
     fn a_live_fact_fills_from_sources_files_and_the_clock_but_never_from_tasks() {
         let dir = tempfile_dir("live-fact");
@@ -616,35 +672,35 @@ mod tests {
         // A file not written yet fills later: the fact is kept, and a read
         // says why it does not fill now.
         let fact = "PRs open: {{ file('prs.txt') }}, as of {{ 999_940 | ago }}";
-        assert_eq!(live_check(fact, &data), Ok(()));
+        assert_eq!(refusal_prompt(fact, &data), Ok(()));
         assert!(live(fact, &data).unwrap_err().contains("prs.txt"));
         std::fs::write(dir.join("prs.txt"), "#886").unwrap();
         assert_eq!(live(fact, &data).unwrap(), "PRs open: #886, as of 1m ago");
         // A source with no events yet fills too.
-        assert_eq!(live_check("{{ source('ci').latest }}", &data), Ok(()));
+        assert_eq!(refusal_prompt("{{ source('ci').latest }}", &data), Ok(()));
         // Refused: a source never set up, the tasks, and what is no
         // template at all.
-        let refused = live_check("{{ source('deploys').latest }}", &data).unwrap_err();
+        let refused = refusal_prompt("{{ source('deploys').latest }}", &data).unwrap_err();
         assert!(refused.contains("no source named deploys"), "{refused}");
         for tasks in ["{{ tasks() | length }}", "{{ task('calc.add').state }}"] {
-            let refused = live_check(tasks, &data).unwrap_err();
+            let refused = refusal_prompt(tasks, &data).unwrap_err();
             assert!(
-                refused.starts_with("tasks() and task() fill margin notes only"),
+                refused.starts_with("tasks() and task() fill only what a window shows"),
                 "{refused}"
             );
         }
-        assert!(live_check("{{ open", &data).is_err());
+        assert!(refusal_prompt("{{ open", &data).is_err());
         // A file not written yet before them hides neither.
         std::fs::remove_file(dir.join("prs.txt")).unwrap();
         let late = "{{ file('prs.txt') }} {{ source(\"typo\").latest.text }}";
         assert!(
-            live_check(late, &data)
+            refusal_prompt(late, &data)
                 .unwrap_err()
                 .contains("no source named typo")
         );
         let late = "{{ file('prs.txt') }}{% for t in tasks() %}{{ t.name }}{% endfor %}";
         assert!(
-            live_check(late, &data)
+            refusal_prompt(late, &data)
                 .unwrap_err()
                 .starts_with("tasks() and task()")
         );

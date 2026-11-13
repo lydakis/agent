@@ -89,7 +89,7 @@ one of your sources printed, its `.latest`, `.events` and each topic's
 newest in `.topics`), `file('PATH')` from the folder the automation was
 added in, `now()`, and `| ago` and `| time`. So a run starts with the data
 in its prompt instead of spending its first calls fetching it. `add` refuses
-(`invalid_automation`) a message that does not read as a template, names a
+(`live_template`, as every live template is) a message that does not read as a template, names a
 source you have not set up, or calls `tasks()`, which a run outlives; a file
 not written yet fills on a later run. A run whose blanks do not fill gets
 the message as written and a line saying why, so the run still comes. What
@@ -510,7 +510,7 @@ fills now as `filled`, or why it does not as `unfilled`; a new agent's
 instructions take each live description filled once, as it is when the
 agent is made, one line of at most 300 bytes, and never filled again, so
 its prompt stays cached. A description that does not fill shows as
-written. A save is refused (`memory_template`) when its text or
+written. A save is refused (`live_template`) when its text or
 description does not read as a template, names a source the person has
 not set up, or reads the tasks; one that leaves `live` out keeps the mark
 the fact had, so the cleanup's rewording keeps it, and the cleanup keeps
