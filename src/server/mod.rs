@@ -2031,7 +2031,24 @@ pub async fn run(config: Configuration) -> Result<()> {
         protected_paths,
         walled,
         owned: config.own_copies.clone(),
+        known: agent_client::config::daemons(),
     };
+    // Listed with the person's other daemons, so each keeps this one's
+    // store and socket out of its sandboxes as this one keeps theirs. One
+    // that cannot list itself, as one inside a sandbox cannot write
+    // `~/.agent`, runs all the same: it can do nothing its sandbox doesn't.
+    if let (Some(folder), Some(store)) = (&daemon.known, &daemon.store) {
+        let known = agent_runtime::sandbox::known::Known {
+            store: store.clone(),
+            socket: daemon.socket.clone(),
+        };
+        if let Err(error) = agent_runtime::sandbox::known::record(folder, &known) {
+            eprintln!(
+                "agent: not listed in {}, so other daemons' sandboxes don't keep this one's store and socket: {error}",
+                folder.display()
+            );
+        }
+    }
     daemon.capabilities = daemon
         .socket
         .as_deref()
@@ -4931,11 +4948,13 @@ impl Service {
                     })
                     .await?;
                 let (waiters, retained) = self.handles.stats();
-                // A folder read and the process's own record, off the run loop.
-                let ((open_files, file_limit), process) = tokio::task::spawn_blocking(|| {
+                // A folder read, the process's own record and a statvfs on
+                // each temporary folder, off the run loop.
+                let ((open_files, file_limit), process, temp) = tokio::task::spawn_blocking(|| {
                     (
                         agent_runtime::open_files::count(),
                         agent_runtime::footprint::read(),
+                        agent_runtime::sandbox::temporary_room(),
                     )
                 })
                 .await
@@ -4984,6 +5003,9 @@ impl Service {
                     "files": {"open": open_files, "limit": file_limit},
                     // Its memory, threads and processor time.
                     "process": process,
+                    // The room left in the temporary folders every agent's
+                    // commands share; inodes can run out with space to spare.
+                    "temp": temp,
                     "commands": self.commands.snapshot(),
                     "draining": self.draining(),
                     "paused": self.paused,

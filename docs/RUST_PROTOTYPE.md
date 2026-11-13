@@ -2735,9 +2735,14 @@ bash is not installed) in the bot workspace, or in `workdir` when the call
 names one, read against the workspace unless absolute, as Codex's
 `workdir` is (a `workdir` that is not there fails the call with
 `path_not_found`), with
-`timeout_ms` (default 120 s, maximum 600 s, or a day for a background command,
-which holds no turn while it runs), which bounds the command's
-running time, not any time spent in line for a process slot. Commands are at
+`timeout_ms` (default 120 s, maximum 600 s), which bounds the command's
+running time, not any time spent in line for a process slot. A background
+command holds no turn while it runs, so it has no timeout unless its call
+names one, of up to a day: as Codex's unified exec runs a command, it runs
+until it exits, `write_stdin` with `kill: true` on its handle stops it, or
+the daemon stops, and only a `timeout_ms` it was given ends it with
+`timed_out`. A command a steer moves to the background keeps the timeout it
+started with. Commands are at
 most 16 KiB. At most `--max-processes` child processes run at once across the
 service, foreground or background; waiting never counts. Background commands
 the service has accepted but not started are bounded by the same number: when

@@ -365,7 +365,7 @@ Each of a
 project's Sonny windows notes where it is in `~/.agent/sonny/places`, the
 agent it shows, and when the person last used it (a key, a click, a paste,
 or the window coming to the front). An agent acts in the terminal it is
-spoken to in: its `run_in_pane` and `show_agent` calls go where the open
+spoken to in: its `show_agent` calls go where the open
 window used last of those showing it is, that Herdr or cmux workspace or
 Rex session; a task no window shows goes where the agent that made it is
 spoken to; and only a lead's own window, or one in the same home, opens
@@ -389,8 +389,8 @@ recently, as each window's own Sonny saw you focus, type or click there
 (marked in `~/.agent/sonny/used/`). Only the lead's own tasks' windows
 count and close, as another lead of the folder keeps its own; tasks shown
 together in one window count once and close together. One that
-needs you (an approval, or a question open in it), failed, or holds a
-block its task asked for (a dev server) is never closed for room, as the
+needs you (an approval, or a question open in it) or failed is never
+closed for room, as the
 lead heard or as that window's own Sonny last said (kept in
 `~/.agent/sonny/held/`, so it holds across either one starting again);
 with no other, the limit is passed. A window you have not looked at yet is
@@ -408,15 +408,11 @@ multiplexer the machine has to `~/.agents/skills` (`rex-windows`,
 session its calls act in now, by the rule the tools follow: where the person
 last used a window of the agent's (or of the agent that made it), so a
 project open in Herdr and in cmux at once has its agents act in the one the
-person is typing in. With that, any agent can run a long command where
-the person can watch it, and read it back: the `run_in_pane` tool
-(`name`, `command`, `split` right, left, above, below or float) opens a block
-labelled `AGENT/NAME` in a tab of its own (or on that side of the agent's
-own block; `float`, in Rex, over the agent's window, for something
-looked at once and closed) and gives its ID. The `show_agent` tool (`agent`, `split`,
-`beside`) moves a task's window. Tabs are the default; the skills tell agents to split only
-to show the person something now, such as a server's or a tool's output, or
-an agent to watch beside them. Sessions are for leads, tabs and splits for
+person is typing in. The `show_agent` tool (`agent`, `split` right, left,
+above, below or float, `beside`) moves a task's window. Tabs are the
+default; the skills tell agents to split only to show the person an agent
+to watch beside them. Agents run their commands, long ones included, in
+the shell tool, never in a block of their own. Sessions are for leads, tabs and splits for
 their tasks: `show_agent` on `PROJECT.lead`, from another project's lead (one
 that leads the projects in its folder), opens that lead's Sonny in its own
 project's session or workspace (the one named for that project, made when
@@ -898,6 +894,34 @@ has something on it, or is off the screen, no time shows.
   agent reaches the daemon's own socket, only its own, through which the
   `agent` and `sonny` commands work as that agent.
 
+  <a id="what-the-sandbox-closes"></a>**What the sandbox closes.** In every
+  row but Full access, a command can't write outside the agent's folder
+  and the folders its row adds (`/tmp`, the zen and state folders, and its
+  `writable` list), can't change the repository's hooks and config,
+  `~/.agents` or `~/.agent/rules`, can't write any other daemon's store
+  you run, and can't reach the daemon's socket, other agents' sockets,
+  any other daemon's socket or its agents' sockets, or those of the
+  programs Sonny runs for agents outside the sandbox (`~/.agent/run`).
+  A call to run outside the sandbox that may start a daemon waits for
+  you, never the reviewer alone. It leaves open reads of anything
+  you can read, as Codex's `workspace-write` does, your SSH keys, cloud
+  credentials and other projects included; the network, in every row but
+  Read only; and, while the network is on, every other Unix socket that a
+  program signed in as you listens on, such as ssh-agent, MCPX and
+  Docker, each of which acts as you. So the sandbox keeps an agent from
+  doing damage by mistake, not from following instructions it read. For an
+  agent that reads untrusted content from outside, such as web pages,
+  issues or email, use a row of your own with `network = false`, as
+  `strict` above, and `unix_sockets` naming only the sockets it needs (on
+  Linux a row that names any reaches them all): its commands then can't
+  send what it read anywhere, nor ask a program outside to act for it. A
+  row holds only the agent's commands, though. `web_fetch` and
+  `web_search`, which the daemon and the provider answer, reach the web in
+  every row, so set `web_search = "disabled"` in `~/.agent/config.toml`
+  too, which leaves both out of every agent made from then on (one made
+  before keeps its tools); and a call approved to run outside the sandbox
+  reaches whatever you can.
+
   A call that waits on you is written out as Codex's approval shows it:
   `⏸ Allow shell?`, the agent's own reason for it as `Reason:`, the
   command, and what the reviewer doubted, whole. The calls of your lead's
@@ -948,7 +972,10 @@ has something on it, or is off the screen, no time shows.
   nothing is left to do in it, such as when its pull request merged or
   you dropped the work, and the lead can mark any of its tasks done the
   same way; the lead hears when a task marked itself done, and the task's
-  window closes once its turn ends. New work sent to the task reopens it.
+  window closes once its turn ends. One you used since its newest turn
+  began stays, says `✓ done` under its last reply, and closes once you
+  look away from it, unless a message is half typed there. New work sent
+  to the task, or a message you type there, reopens it.
   A lead is marked done the same way once you say its project is done: it
   calls `mark_done` naming no task, or an outer lead names it. Its row
   reads done, its old questions are set aside, and its automations skip
@@ -982,8 +1009,11 @@ has something on it, or is off the screen, no time shows.
   Under its heading, `/status` says only what is broken around the
   agents, each with a red `✗`: a companion of the daemon that keeps
   restarting (down and waiting for its next start, or up for less than a
-  minute after a restart), with how it exits and its log, and turns held
-  on something only you can fix, with how to fix it. When all is well it
+  minute after a restart), with how it exits and its log, turns held
+  on something only you can fix, with how to fix it, and a temporary
+  folder every agent's commands share with under a tenth of its space or
+  inodes left (`temp folder /tmp: 3% inodes left`, from the daemon's
+  `stats`, read every 30 seconds). When all is well it
   says nothing; the lookout's own line is in `/background`. Each Sonny start keeps the reviewer again on its own binary
   and build, with the model it has, so an upgrade restarts it with the
   lookout and the tool host.
@@ -1351,8 +1381,8 @@ has something on it, or is off the screen, no time shows.
 Sonny declares its tools on the agents it opens and the leads it makes,
 which agents they make inherit: `react`, `ask`, `plan` (the plan the
 person sees, as a checklist), `margin` (notes beside the conversation),
-`mark_done`, `follows`, `show_agent` and
-`run_in_pane`, `start_task` and `remove_task`; a lead's own, which its
+`mark_done`, `follows`, `show_agent`, `start_task` and
+`remove_task`; a lead's own, which its
 tasks never take, is `new_project`. The daemon shows them to
 the model and records each call: `plan` and `mark_done` run nothing,
 and the rest wait for Sonny's answer, a `react` naming another agent kept
@@ -1741,14 +1771,13 @@ conversation.
 
 ![/co after /commons was run: /commons ranks first; /cms finds /commons with c, m and s in bold](../docs/sonny/slash-ranked-fuzzy.png)
 
-The pane's place, when nothing else is open there, is the margin. Its
-first row is a glance at the agent: a red `✗` for what failed in the
-background (a click on it opens `/background`), and its context, each
-left out when there is nothing to say; the footer stops saying them while
-it shows. Under the composer, the footer counts the agents that need you
+The pane's place, when nothing else is open there, is the margin, titled
+`margin` as every view there is titled by name. The footer keeps every
+count whatever the pane shows, so nothing moves as the pane changes. Under
+the composer, the footer counts the agents that need you
 and the other agents at work by their marks and numbers alone (`? 1  ● 2`),
 marked as the roster and `/status` mark them, each mark its own shape so
-the counts read without colour, and a click on the count
+the counts read without color, and a click on the count
 opens `/status`. Every surface reads what needs you one way: an agent
 needs you while a call of its waits on your approval (gated for you, or
 handed to you by the reviewer) or a question it asked you is still open,
@@ -1781,7 +1810,7 @@ shortens it and then to `agent`, until at 44 columns a busy lead reads
 what asks something of you: the `?`, the `✗`, the `●` and a context half
 used.
 
-![The footer at 100, 80, 60 and 44 columns: needs you, failed, working and at rest as marks and numbers, at rest giving way first, what needs you stays](../docs/sonny/footer-widths.png) Under the glance are the notes the agent keeps there with its `margin`
+![The footer at 100, 80, 60 and 44 columns: needs you, failed, working and at rest as marks and numbers, at rest giving way first, what needs you stays](../docs/sonny/footer-widths.png) Under its title are the notes the agent keeps there with its `margin`
 tool: a diagram, a table of findings, a file it is discussing (kept fresh
 as the file changes), or a live view it updates while it works. Each
 note is pinned where the agent first put it: a quiet `✎ title · in the

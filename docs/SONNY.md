@@ -836,8 +836,8 @@ flags and `--json` ([SKILL.md](../sonny/skills/sonny-setup/SKILL.md));
 ([SKILL.md](../sonny/skills/sonny-config/SKILL.md)); `pictures`; and one
 for each multiplexer the machine has, `rex-windows`, `herdr-panes` and
 `cmux-tabs`, each telling the agent to run `sonny where` first, which
-prints the multiplexer and workspace its `run_in_pane` and `show_agent`
-calls act in now. They are normal skills, real files
+prints the multiplexer and workspace its `show_agent` calls act in
+now. They are normal skills, real files
 ([skills.rs](../sonny/src/skills.rs)). Sonny notes a fingerprint of each file
 it writes in `~/.agent/sonny/skills` and rewrites or removes a skill only
 while it is as Sonny last wrote it: one the person edited, or one of that
@@ -1101,7 +1101,7 @@ runs) and, where the server marks the tool, whether it reads
 Browser commands (read for a snapshot, screenshot, get, is, console or
 errors), desktop calls (read for a look, write once any command acts) and
 automation changes are recorded the same way. Each tool Sonny declares
-names its kind (`run_in_pane` shell, `memory` file, `exec` mcp, `browser`,
+names its kind (`memory` file, `exec` mcp, `browser`,
 `desktop`, the rest agents). `/audit` shows the trail: this agent's rows,
 newest first, `a` for every agent's, `t`, `p` and `w` to filter by kind,
 place and who approved, Enter to open a row's agent.

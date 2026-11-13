@@ -322,13 +322,11 @@ impl Cmux {
     }
 
     /// The line typed into a new tab's shell: `command` in its place
-    /// (`exec`), so the tab goes with it, unless it is to be read once it
-    /// exits.
-    fn input(command: &[String], keep: bool) -> String {
-        let mut line: Vec<String> = command.iter().map(|w| crate::herdr::quote(w)).collect();
-        if !keep {
-            line.insert(0, "exec".into());
-        }
+    /// (`exec`), so the tab goes with it.
+    fn input(command: &[String]) -> String {
+        let line: Vec<String> = std::iter::once("exec".to_owned())
+            .chain(command.iter().map(|w| crate::herdr::quote(w)))
+            .collect();
         format!("{}\r", line.join(" "))
     }
 }
@@ -384,24 +382,14 @@ impl Backend for Cmux {
     /// labels, and what each is doing is the workspace's status row.
     fn rename_window(&self, _: &str, _: &str) {}
 
-    fn window(
-        &self,
-        label: &str,
-        _: &str,
-        cwd: &Path,
-        command: &[String],
-        keep: bool,
-    ) -> Result<String, String> {
+    fn window(&self, label: &str, _: &str, command: &[String]) -> Result<String, String> {
         let mut params = json!({
             "workspace_id": self.workspace,
-            "initial_input": Self::input(command, keep),
+            "initial_input": Self::input(command),
             "focus": false,
         });
         if let Some(pane) = self.home_pane(&self.blocks().unwrap_or_default()) {
             params["pane_id"] = pane.into();
-        }
-        if keep {
-            params["working_directory"] = cwd.to_string_lossy().into();
         }
         let made = self.call("surface.create", params)?;
         let surface = made["surface_id"]
@@ -416,34 +404,23 @@ impl Backend for Cmux {
         &self,
         anchor: &str,
         side: &str,
-        small: bool,
         label: &str,
-        cwd: &Path,
         command: &[String],
-        keep: bool,
     ) -> Result<String, String> {
-        // The divider's place from the left or top: a small split keeps
-        // most of the room for the tab it is beside.
-        let (direction, divider) = match side {
-            "right" => ("right", 0.65),
-            "left" => ("left", 0.35),
-            "below" => ("down", 0.65),
-            "above" => ("up", 0.35),
+        let direction = match side {
+            "right" => "right",
+            "left" => "left",
+            "below" => "down",
+            "above" => "up",
             _ => return Err(format!("no side {side}: right, left, above or below")),
         };
-        let mut params = json!({
+        let params = json!({
             "workspace_id": self.workspace,
             "surface_id": anchor,
             "direction": direction,
-            "initial_input": Self::input(command, keep),
+            "initial_input": Self::input(command),
             "focus": false,
         });
-        if small {
-            params["initial_divider_position"] = divider.into();
-        }
-        if keep {
-            params["working_directory"] = cwd.to_string_lossy().into();
-        }
         let made = self.call("surface.split", params)?;
         let surface = made["surface_id"]
             .as_str()
@@ -678,7 +655,7 @@ print(json.dumps(out))
     }
 
     #[test]
-    fn an_agent_finds_its_leads_workspace_and_its_commands_close_with_it() {
+    fn an_agent_finds_its_leads_workspace_and_closes_there() {
         let (bin, dir) = fake(
             "home",
             json!({
@@ -696,20 +673,18 @@ print(json.dumps(out))
             ("ws-1", "cmux workspace home")
         );
         let mut layout = Layout::new(Box::new(cmux));
+        let below = crate::mux::Placement::Split {
+            side: "below".into(),
+            beside: "graft.fix".into(),
+        };
+        let tests = ["/bin/sonny".into(), "--agent".into(), "graft.it's".into()];
         layout
-            .split(
-                "graft.fix",
-                "tests",
-                Path::new("/work"),
-                &["cargo".into(), "test it's".into()],
-                Some("below"),
-            )
+            .place("graft.tests", "tests", &tests, &below)
             .unwrap();
         assert_eq!(
             last(&dir, "surface.split"),
             json!({"workspace_id": "ws-1", "surface_id": "sf-2", "direction": "down",
-                "initial_input": "cargo 'test it'\\''s'\r", "focus": false,
-                "initial_divider_position": 0.65, "working_directory": "/work"})
+                "initial_input": "exec /bin/sonny --agent 'graft.it'\\''s'\r", "focus": false})
         );
         // A task's own Sonny runs in its tab's place, in the lead's pane.
         let sonny = ["/bin/sonny".into(), "--agent".into(), "graft.docs".into()];
@@ -722,12 +697,11 @@ print(json.dumps(out))
                 &json!("exec /bin/sonny --agent graft.docs\r")
             )
         );
-        assert_eq!(made.get("working_directory"), None);
         assert_eq!(
             titles(&dir)[0],
             [
                 vec!["graft.lead", "graft.fix", "graft.docs"],
-                vec!["graft.fix/tests"]
+                vec!["graft.tests"]
             ]
         );
         assert!(
@@ -735,8 +709,11 @@ print(json.dumps(out))
                 .iter()
                 .all(|c| !c.iter().any(|a| a.contains("ws-2")))
         );
-        layout.close("graft.fix");
-        assert_eq!(titles(&dir)[0], [vec!["graft.lead", "graft.docs"]]);
+        layout.close("graft.tests");
+        assert_eq!(
+            titles(&dir)[0],
+            [vec!["graft.lead", "graft.fix", "graft.docs"]]
+        );
         assert_eq!(last(&dir, "surface.close")["force"], true);
     }
 
@@ -839,7 +816,7 @@ print(json.dumps(out))
     fn places_count_tabs_in_their_pane_and_say_which_side_a_split_is() {
         let mut lead = pane("pn-1", &[("sf-1", "shop.lead"), ("sf-2", "shop.fix")]);
         lead["frame"] = json!({"x": 0, "y": 0, "width": 800, "height": 900});
-        let mut right = pane("pn-2", &[("sf-3", "shop.lead/server")]);
+        let mut right = pane("pn-2", &[("sf-3", "shop.docs")]);
         right["frame"] = json!({"x": 800, "y": 0, "width": 400, "height": 900});
         let (bin, _) = fake(
             "places",
@@ -850,15 +827,9 @@ print(json.dumps(out))
             .places()
             .unwrap();
         let side = |s: &str, of: &str| Some((s.to_owned(), of.to_owned()));
-        assert_eq!(
-            places["shop.lead"],
-            (1, side("left of", "shop.lead/server"))
-        );
-        assert_eq!(places["shop.fix"], (2, side("left of", "shop.lead/server")));
-        assert_eq!(
-            places["shop.lead/server"],
-            (1, side("right of", "shop.lead"))
-        );
+        assert_eq!(places["shop.lead"], (1, side("left of", "shop.docs")));
+        assert_eq!(places["shop.fix"], (2, side("left of", "shop.docs")));
+        assert_eq!(places["shop.docs"], (1, side("right of", "shop.lead")));
     }
 
     #[test]

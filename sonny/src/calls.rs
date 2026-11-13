@@ -799,17 +799,6 @@ pub fn declared(name: &str, arguments: &Value, failed: bool) -> Option<Said> {
                 None => said("Moved", &format!("{agent} to a tab of its own")),
             })
         }
-        crate::served::RUN => {
-            let verb = match field("split") {
-                Some(_) => "Opened a split",
-                None => "Opened a tab",
-            };
-            let mut said = said(verb, field("name")?);
-            if let Some(command) = field("command") {
-                said.under.push(dim(format!("$ {}", first_line(command))));
-            }
-            Some(said)
-        }
         crate::served::PROJECT => Some(said("Added the project", field("folder")?)),
         // `subscriptions`, as before 0.9.1, in history.
         crate::served::FOLLOWS | "subscriptions" => {
@@ -1171,27 +1160,6 @@ Keep the rest.'"#,
         );
         assert_eq!(said.what, "…abcdef");
         assert_eq!(said.under.len(), 4);
-        let said = declared(
-            "run_in_pane",
-            &serde_json::json!({"name": "tests", "command": "cargo test --workspace"}),
-            false,
-        )
-        .unwrap();
-        assert_eq!(
-            (said.verb.as_str(), said.what.as_str()),
-            ("Opened a tab", "tests")
-        );
-        assert_eq!(text(&said.under[0]), "$ cargo test --workspace");
-        let said = declared(
-            "run_in_pane",
-            &serde_json::json!({"name": "server", "split": "right", "command": "npm run dev"}),
-            false,
-        )
-        .unwrap();
-        assert_eq!(
-            (said.verb.as_str(), said.what.as_str()),
-            ("Opened a split", "server")
-        );
     }
 
     #[test]
