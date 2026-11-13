@@ -54,6 +54,14 @@ const BOT_APPROVALS: &str = "SELECT a.id,b.name,a.turn,a.call_id,a.name,a.node,a
        AND a.turn IS NOT b.running_turn
      ORDER BY 1 LIMIT ?3";
 
+/// A retained stream for the model's `read`: a page of the store's copy,
+/// or the path of the file that holds it, for the caller to page.
+#[derive(Debug, PartialEq, Eq)]
+pub enum ArtifactLines {
+    Page(String),
+    File(String),
+}
+
 /// How a bot's newest turn that counts ended: one that ran, or one that
 /// failed before it started. A message steered into a running turn, one
 /// riding the next call, and one cancelled while it waited in line never
@@ -595,6 +603,13 @@ impl Settings {
 const INHERITED: [&str; 2] = ["rules", "env"];
 /// The settings that make a bot's sandbox, which change together.
 pub const SANDBOX: [&str; 4] = ["sandbox", "writable", "network", "unix_sockets"];
+
+/// Whether the daemon's tool `name` reaches the web past a bot's sandbox:
+/// `web_fetch`, which the daemon answers, and `web_search`, which the
+/// provider does.
+pub fn web(name: &str) -> bool {
+    matches!(name, "web_fetch" | "web_search")
+}
 /// Every setting's name, as `create` and `configure` take it.
 pub const SETTINGS: [&str; 23] = [
     "context_bytes",
@@ -1001,7 +1016,37 @@ impl Bot {
     }
     /// Whether the bot may call `name`, the daemon's tool or a declared one.
     pub fn may_call(&self, name: &str) -> bool {
+        self.calls(name) || self.declared(name).is_some()
+    }
+    /// Whether `name` is among what the bot may call, whatever its sandbox
+    /// allows now: a web tool an offline bot keeps counts, so a fork's
+    /// allowed list may name it and gets it when the network is set.
+    pub fn entitled(&self, name: &str) -> bool {
         self.callable().iter().any(|tool| tool == name) || self.declared(name).is_some()
+    }
+    /// Whether the bot may call the daemon's tool `name` now: one it may
+    /// call, unless its sandbox keeps it off the network and the tool
+    /// reaches the web, which the daemon and the provider would reach for
+    /// it past the sandbox.
+    pub fn calls(&self, name: &str) -> bool {
+        self.callable().iter().any(|tool| tool == name) && !(self.offline() && web(name))
+    }
+    /// Whether its sandbox keeps it off the network: a read-only one, or a
+    /// workspace-write one without the network.
+    pub fn offline(&self) -> bool {
+        self.sandboxed() && !self.settings.network
+    }
+    /// Its tools as offered to the model now: [`Bot::calls`]'s, so an
+    /// offline bot is offered no web tool, from its next call on.
+    pub fn offered(&self) -> std::borrow::Cow<'_, [String]> {
+        match self.offline() && self.tools.iter().any(|tool| web(tool)) {
+            true => (self.tools.iter())
+                .filter(|tool| !web(tool))
+                .cloned()
+                .collect::<Vec<_>>()
+                .into(),
+            false => self.tools.as_slice().into(),
+        }
     }
     /// The bot id that keys this bot's provider prompt cache.
     pub fn cache_bot(&self) -> i64 {
@@ -3206,8 +3251,9 @@ impl Database {
 
     /// The bot's turn parked on a wait of its own while a steer waits for
     /// it, with the newest queued steer: the steer wakes it. A `wait`'s
-    /// handles are reported pending; a call waiting on its verdict or its
-    /// client's answer is lifted to the background. The daemon's load gate
+    /// handles are reported pending; a call waiting on its verdict, or on
+    /// its client's answer when that lifts (see `wake`), is lifted to the
+    /// background. The daemon's load gate
     /// or a closed pool is not the bot's own wait, so neither is woken.
     pub fn steered_park(&self, name: &str) -> Result<Option<(i64, i64)>> {
         let parked: Option<i64> = self
@@ -8961,11 +9007,13 @@ impl Database {
         ])?;
         let approval = tx.last_insert_rowid();
         tag_approval(&tx, approval, turn, &gates)?;
-        tx.prepare_cached(
-            "UPDATE answers SET paused_ms=MAX(expires_ms-?,0)
-             WHERE turn=? AND call_id=? AND paused_ms IS NULL",
-        )?
-        .execute(params![now_ms as i64, turn, call_id])?;
+        let paused = tx
+            .prepare_cached(
+                "UPDATE answers SET paused_ms=MAX(expires_ms-?,0)
+                 WHERE turn=? AND call_id=? AND paused_ms IS NULL",
+            )?
+            .execute(params![now_ms as i64, turn, call_id])?
+            == 1;
         let tags: Vec<&str> = gates.iter().map(|g| g.tag.as_str()).collect();
         let data = json!({"calls":[{"call_id":id,"step_of":call_id,"request":1,
             "announced_ms":now_ms,"gates":tags,"name":tool,"node":0}]});
@@ -8996,13 +9044,18 @@ impl Database {
             .push(Served::new(&bot.name, turn, cursor, vec![judged], None));
         self.approvals += 1;
         self.steps.insert(approval, turn);
+        // The call now waits on a verdict, which a message for its turn
+        // lifts: the turn hears so, live or parked, if one waits.
+        let steered =
+            paused && !lifted && bot.running_turn == Some(turn) && self.joining_steer(&bot.name)?;
         Ok(Stepped {
             step: Step::Pending {
                 approval,
                 expires_ms,
             },
-            notify: None,
-            wake: false,
+            notify: (steered && bot.status == "running")
+                .then(|| self.live.entry(turn).or_default().notify.clone()),
+            wake: steered && bot.status == "waiting",
             lifted: None,
         })
     }
@@ -11374,31 +11427,36 @@ impl Database {
             .query_row(params![name, turn], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
             .optional()?;
         let now = epoch_ms().max(0) as u64;
-        // A message that joins the turn lifts the call it waits on, as it
-        // lifts a `wait`: the turn resumes to take it.
-        if parked
-            .as_ref()
-            .is_some_and(|(_, status, _)| status == "waiting")
-            && self.joining_steer(name)?
-        {
-            return Ok(Wake::Resume);
-        }
         // Parked on an answer: the answer, its deadline, or a later gated
         // call's lapse resumes it.
-        if let Some((_, _, Some(call_id))) = parked {
-            let answer: Option<(bool, i64, bool)> = self
+        if let Some((_, status, Some(call_id))) = parked {
+            let answer: Option<(String, bool, i64, bool)> = self
                 .conn
                 .prepare_cached(
-                    "SELECT output IS NOT NULL,expires_ms,paused_ms IS NOT NULL FROM answers
+                    "SELECT name,output IS NOT NULL,expires_ms,paused_ms IS NOT NULL FROM answers
                      WHERE turn=? AND call_id=?",
                 )?
                 .query_row(params![turn, call_id], |r| {
-                    Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+                    Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
                 })
                 .optional()?;
-            let Some((answered, expires_ms, paused)) = answer else {
+            let Some((tool, answered, expires_ms, paused)) = answer else {
                 return Ok(Wake::Resume);
             };
+            // A message that joins the turn lifts the call it waits on, as
+            // it lifts a `wait`, when a step of the call waits on a gate or
+            // its tool lifts: the turn resumes to take it. Any other call
+            // is answered first.
+            if status == "waiting"
+                && !answered
+                && self.joining_steer(name)?
+                && (paused
+                    || (self.inspect(name)?)
+                        .declared(&tool)
+                        .is_some_and(|tool| tool.lift))
+            {
+                return Ok(Wake::Resume);
+            }
             // A step waiting on a gate stops the call's time.
             let deadline = (!paused).then_some(expires_ms.max(0) as u64);
             let at = match (self.next_lapse(turn)?, deadline) {
@@ -12506,7 +12564,7 @@ impl Database {
             Some(allow) => {
                 let mut allowed: Vec<String> = Vec::with_capacity(allow.len());
                 for tool in allow {
-                    if !parent.may_call(tool) {
+                    if !parent.entitled(tool) {
                         return fail_with(
                             "allow_not_in_source",
                             format!("{source} may not call {tool}"),
@@ -14141,7 +14199,9 @@ impl Database {
             fail("artifact_not_found")
         }
     }
-    /// A retained stream as text, for the model's own `read`.
+    /// A retained stream as text, for the model's own `read`: a page of
+    /// the store's copy, or the file that holds it, which may run to a
+    /// gigabyte and so is paged by the caller off the storage worker.
     pub fn artifact_lines(
         &self,
         name: &str,
@@ -14150,16 +14210,20 @@ impl Database {
         stream: &str,
         offset: usize,
         limit: usize,
-    ) -> Result<String> {
+    ) -> Result<ArtifactLines> {
         if offset == 0 || !(1..=5000).contains(&limit) {
             return fail("invalid_tool_arguments");
         }
         self.authorize_artifact(name, turn, call_id)?;
+        if let Some(file) = artifact::file(&self.conn, turn, call_id, stream)? {
+            return Ok(ArtifactLines::File(file));
+        }
         let Some((_, data)) = artifact::read(&self.conn, turn, call_id, stream, 0, usize::MAX)?
         else {
             return self.missing_artifact(turn);
         };
         crate::tools::page_lines(&String::from_utf8_lossy(&data), offset, limit)
+            .map(ArtifactLines::Page)
     }
     /// A recorded tool result on the bot's own lineage, as text, for the
     /// model's own `read` of what an elided result's stub names. `checked`

@@ -124,6 +124,21 @@ struct State {
     counted: std::collections::VecDeque<u32>,
     /// Allowance set aside for calls parked until it refills.
     booked: Booked,
+    /// What the pool did to the calls it saw, since the daemon started.
+    counts: Counts,
+}
+
+/// What a pool did to its calls, for `stats`: how many it admitted, how
+/// many of those waited in the gate and for how long in all, how many it
+/// parked, how often a refusal closed it, and the overloads refused.
+#[derive(Default)]
+struct Counts {
+    admitted: u64,
+    waited: u64,
+    waited_ms: u64,
+    parked: u64,
+    closed: u64,
+    overloads: u64,
 }
 
 /// The scale of a counted-input share: parts per million.
@@ -344,6 +359,7 @@ impl State {
         }
         if park {
             *park_for = Some(refill);
+            self.counts.parked += 1;
             return Err(crate::Error::new("provider_paced"));
         }
         Ok(Duration::ZERO)
@@ -580,6 +596,7 @@ impl Pace {
                         let left = until - now;
                         if left >= MIN_PARK {
                             *park_for = Some(left);
+                            state.counts.parked += 1;
                             return Err(crate::Error::new("provider_paced"));
                         }
                         left
@@ -598,6 +615,12 @@ impl Pace {
                                 dim.reserved += cost;
                             }
                             state.reserved_requests += 1;
+                            let waited = started.elapsed();
+                            state.counts.admitted += 1;
+                            if waited >= Duration::from_millis(1) {
+                                state.counts.waited += 1;
+                                state.counts.waited_ms += waited.as_millis() as u64;
+                            }
                             return Ok(Reservation {
                                 pace: self,
                                 estimated: costs,
@@ -605,7 +628,7 @@ impl Pace {
                                 reported: [false; DIMS],
                                 dispatched: false,
                                 request_reported: false,
-                                waited: started.elapsed(),
+                                waited,
                             });
                         }
                         wait
@@ -644,6 +667,7 @@ impl Pace {
         });
         let until = now + delay;
         state.blocked_until = Some(state.blocked_until.map_or(until, |u| u.max(until)));
+        state.counts.closed += 1;
         drop(state);
         // Wake the FIFO head even when it was waiting for allowance refill.
         // It parks and releases the gate; queued callers then observe the block.
@@ -697,11 +721,14 @@ impl Pace {
     /// overloads cluster: then the pool closes as for an unnamed rate limit.
     /// Whether it closed.
     pub fn overloaded(&self, after: Option<Duration>) -> bool {
-        let clustered = after.is_some() || {
+        let clustered = {
             let mut state = self.state.lock().unwrap();
-            let window = state.overloads.at(Instant::now());
-            window.refused += 1;
-            window.refused >= OVERLOAD_CLUSTER && window.refused * 3 >= window.answered
+            state.counts.overloads += 1;
+            after.is_some() || {
+                let window = state.overloads.at(Instant::now());
+                window.refused += 1;
+                window.refused >= OVERLOAD_CLUSTER && window.refused * 3 >= window.answered
+            }
         };
         if clustered {
             self.limited(after);
@@ -841,6 +868,12 @@ impl Pace {
             "reserved_tokens": state.tokens[TOTAL].reserved,
             "reserved_requests": state.reserved_requests,
             "blocked_ms": blocked_ms,
+            "admitted": state.counts.admitted,
+            "waited": state.counts.waited,
+            "waited_ms": state.counts.waited_ms,
+            "parked": state.counts.parked,
+            "closed": state.counts.closed,
+            "overloads": state.counts.overloads,
         })
     }
     #[cfg(test)]

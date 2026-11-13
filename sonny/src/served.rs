@@ -1573,8 +1573,12 @@ async fn script(
         let lent = json!({"input": input, "bot": bot, "timeout_ms": running(call).as_millis() as u64,
             "whole": whole, "store": client.store().unwrap_or_default()});
         let answer = crate::link::call(&machine, EXEC, lent, Some(&steps)).await?;
-        if let (Some(file), Some(text)) = (&whole, answer["whole"].as_str()) {
-            let _ = std::fs::write(file, text);
+        // Up to megabytes, so off the runtime; its owner's alone, as a
+        // file saved here is.
+        if let (Some(file), Some(text)) = (whole, answer["whole"].as_str()) {
+            let text = text.to_owned();
+            let _ =
+                tokio::task::spawn_blocking(move || crate::exec::save_whole(&file, &text)).await;
         }
         return Ok(answer["answer"].clone());
     }
@@ -2017,7 +2021,7 @@ pub fn stop() {
 
 /// The error codes `sonny tool` answers with, as static names.
 fn code(said: &str) -> &'static str {
-    const CODES: [&str; 22] = [
+    const CODES: [&str; 23] = [
         "not_in_folder",
         "no_caller",
         "invalid_arguments",
@@ -2034,6 +2038,7 @@ fn code(said: &str) -> &'static str {
         "margin_full",
         "margin_note_too_long",
         "margin_unread",
+        "margin_template",
         "not_marked",
         "commons_refused",
         "ask_refused",

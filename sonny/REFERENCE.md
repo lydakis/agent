@@ -31,6 +31,10 @@ latest one into `~/.local`:
 
     curl -fsSL https://raw.githubusercontent.com/lydakis/agent/main/install.sh | sh
 
+`sonny update` updates either install to the latest release, replaces the
+running daemon with the new one (its running turns continue on it) and has
+open windows reopen on it ([docs/SONNY.md](../docs/SONNY.md#updating)).
+
 For main without a version tag, `brew install lydakis/agent/sonny-nightly`
 fetches current main and builds Sonny and its matching daemon together. If
 stable Sonny is installed, run `brew unlink sonny` first. Update with
@@ -332,6 +336,7 @@ at its model's own effort (`AGENT_EFFORT` when its model is
 | When a note opens the margin | `[sonny] margin_opens` (`always`, the default, `unless-closed` or `never`) | |
 | The most notes a margin holds | `[sonny] margin_notes` (6 by default, at least 1; past it the agent's new note is refused, and it is told which notes are there) | |
 | The most lines a margin note runs to | `[sonny] margin_note_lines` (12 by default, at least 1, counted in the note's text; a longer one is refused, and the agent told to show a file instead) | |
+| Margin notes of your own, filled as their blanks change | `[sonny.notes.NAME] template`, `title` | |
 | Where a click on an agent's name goes | `[sonny] agent_opens` (`tab`, the default, or `beside`) | |
 | Which tasks open in a tab | `[sonny] task_tabs` (`asked`, the default, or `every`) | |
 | Task windows a lead keeps open | `[sonny] task_windows` (32 by default, 0 for no limit) | |
@@ -960,14 +965,12 @@ has something on it, or is off the screen, no time shows.
   agent that reads untrusted content from outside, such as web pages,
   issues or email, use a row of your own with `network = false`, as
   `strict` above, and `unix_sockets` naming only the sockets it needs (on
-  Linux a row that names any reaches them all): its commands then can't
-  send what it read anywhere, nor ask a program outside to act for it. A
-  row holds only the agent's commands, though. `web_fetch` and
-  `web_search`, which the daemon and the provider answer, reach the web in
-  every row, so set `web_search = "disabled"` in `~/.agent/config.toml`
-  too, which leaves both out of every agent made from then on (one made
-  before keeps its tools); and a call approved to run outside the sandbox
-  reaches whatever you can.
+  Linux a row that names any reaches them all): it then can't send what
+  it read anywhere, nor ask a program outside to act for it, since a row
+  off the network (Read only too) also takes away `web_fetch` and
+  `web_search`, which the daemon and the provider would answer past the
+  sandbox, from the agent's next call. A call approved to run outside the
+  sandbox still reaches whatever you can.
 
   A call that waits on you is written out as Codex's approval shows it:
   `⏸ Allow shell?`, the agent's own reason for it as `Reason:`, the
@@ -995,15 +998,16 @@ has something on it, or is off the screen, no time shows.
 - `/status` shows the project's agents in the pane beside the
   conversation, grouped by where they stand, the lead first in its group,
   under a head that counts each group that has any
-  (`calc · 1 needs you · 2 working · 1 idle · 3 done`, no total): **Needs you** (waiting on your
-  approval, asking you a question, held on something only you can fix,
-  such as a ChatGPT sign-in, or failed),
+  (`calc · 1 needs you · 1 failed · 2 working · 1 idle · 3 done`, no total): **Needs you** (waiting on your
+  approval, asking you a question, or held on something only you can fix,
+  such as a ChatGPT sign-in), **Failed** (its last turn failed; it asks
+  nothing, and says what went wrong under it),
   **Working** (a turn running, queued, rate limited, waiting on other
   tasks, or `waiting on its reviewer` while the reviewer weighs a call), **Idle**
   (its turn ended, stopped, or never started, with nothing open; a pull
   request its last reply linked shows on its row), and **Done** (marked
   done). Each agent is one line: its mark, name, state and time; one
-  that needs you says what for under it. That is all it shows as it opens; `m` shows more and hides it
+  that needs you says what for under it, one that failed why. That is all it shows as it opens; `m` shows more and hides it
   again: at each row's right edge, dim, the rest of what it tracks: what it follows (a source with an
   `icon` in `[sonny.sources.NAME]` shows as that icon, as it does wherever
   Sonny names that source: `/background` and the "From your sources" row), a pull or merge
@@ -1013,7 +1017,7 @@ has something on it, or is off the screen, no time shows.
   `Done · 3 ▸`). A click on either, or `i` and `d`
   with the keys in the pane, opens them, and the same folds them again.
   The helpers a task started fold under it (`▸ 2 helpers, 1 working`),
-  a helper that needs you listed under Needs you too; a click on that
+  a helper that needs you or failed listed in its group too; a click on that
   line, or → on the picked task, opens them, and ← folds them. As threads in a claude.ai project are
   resolved, a task marks itself done with the `mark_done` tool once
   nothing is left to do in it, such as when its pull request merged or
@@ -1060,7 +1064,8 @@ has something on it, or is off the screen, no time shows.
   on something only you can fix, with how to fix it, and a temporary
   folder every agent's commands share with under a tenth of its space or
   inodes left (`temp folder /tmp: 3% inodes left`, from the daemon's
-  `stats`, read every 30 seconds). When all is well it
+  `stats`, read every 30 seconds), and how many of `/background`'s
+  failures you have not seen yet. When all is well it
   says nothing; the lookout's own line is in `/background`. Each Sonny start keeps the reviewer again on its own binary
   and build, with the model it has, so an upgrade restarts it with the
   lookout and the tool host.
@@ -1078,8 +1083,10 @@ has something on it, or is off the screen, no time shows.
   it), or whose run went out and whose turn then failed (as
   when the machine was offline or a login expired), and a server the
   nightly memory cleanup could not read. Your own agents' failures, such as
-  the memory cleanup's, show in every window. The footer then says
-  `✗ 1` with a red `✗`, and a click on it opens `/background`. An agent sees the same in its `automations` tool, whose rows
+  the memory cleanup's, show in every window. The footer's red `✗`
+  counts them with the failed agents until you look here, and
+  `/status` says how many under its heading, a click there opening
+  `/background`. An agent sees the same in its `automations` tool, whose rows
   say how the turn their last run sent ended. Automations and follows are
   what the agents' `automations` and `follows` tools make.
 
@@ -1368,8 +1375,9 @@ has something on it, or is off the screen, no time shows.
   deadline is a one-off automation (`/background`) the tool host sets,
   `[sonny] ask_wait_minutes` from the ask (60 by default, 0 for none,
   which makes every ask wait) unless the agent sets its own for work on a
-  clock. It runs nothing once you answer or write to that agent, since the
-  conversation moved on; when it runs, it is Sonny's words, never yours,
+  clock. Your answer, picked or typed, removes it once the agent
+  takes it up, as the agent's close does; it runs nothing once you answer or write to that agent, since the
+  conversation moved on, nor for an ask whose call failed and showed no card; when it runs, it is Sonny's words, never yours,
   so it allows nothing that needs your own. Pick another option later and
   the agent undoes what it did. Open
   questions are read from the history Sonny replays (its `ask` calls not
@@ -1464,7 +1472,8 @@ turn of the task numbered after that one reopens it.
 ## Shared settings
 
 Settings Sonny keeps for every folder are in `~/.agent/config.toml`'s
-`[sonny]`, which `/config` shows: the chime (`chime`, on by default) and
+`[sonny]`, which `/config` shows: the chime (`chime`, off by default; `/sound` or
+`chime = true` turns it on) and
 the view (`steps` and `verbose`, both off by default), besides the efforts and the side chat
 above. `/config` lists the keys under their table's name, a value set in
 the file plain and a default muted, so what you changed stands out.
@@ -1863,9 +1872,12 @@ of the footer says what you talk to and where (the permissions mark, the
 model as pickers name it, its effort, the folder and its branch), and the
 right what wants you (needs you, failed, working, at rest, `✎`, the
 context). Its counts of the agents are the ones `/status` heads its
-groups with, marks and numbers only: `? 2  ● 3  ○ 13` needs you,
-working, and at rest; what is done asks nothing of you, and `/status`
-counts it. The agent's name is left to the
+groups with, marks and numbers only: `? 2  ✗ 1  ● 3  ○ 13` needs you,
+failed, working, and at rest; what is done asks nothing of you, and `/status`
+counts it. The `✗` also counts what failed in `/background` that you
+have not seen there; a click on it opens `/status`, which lists the
+failed agents and says how many failed in the background, a click there
+opening `/background`. The agent's name is left to the
 composer, which says it. When the window is too narrow for all of it,
 items give way in one order, as Powerline drops its lowest segments
 first: at rest first, words before marks, marks before whole
@@ -1886,7 +1898,34 @@ with its next call. Posting a note's id again changes it in place, so a
 live note stays one note. A lead can show a task's note as
 `from: "task/id"`, which lookout names when the task puts one up: it
 shows as the task keeps it, follows the task's title until the lead gives
-its own, and stays once the task is gone. A note with `opens: "AGENT"`,
+its own, and stays once the task is gone. A note given as a `template`
+is Markdown with blanks, as Jinja writes them (MiniJinja), that Sonny
+fills and fills again whenever what they read changes, with no call from
+the agent and nothing more in its history: `source('ci').latest.text`
+and `.events` (what one of your sources printed lately, newest first;
+`.up` and `.down_since` while the lookout says it is down),
+`file('state.json')` (a file in its folder, `| fromjson` making JSON
+fields of it), `tasks()` and `task('NAME')` (where its tasks stand, as
+`/status` reads them), `now()`, and `| ago` and `| time` for a time in
+seconds. A blank never runs a command or reaches the network, so an agent
+that wants something no source covers writes it to a file from its own
+commands. The tool host fills the template once as it is posted and
+answers what it shows; a template that does not read as one, names a
+source you have not set up, or fills to more lines than a note holds is
+refused (`margin_template`, `margin_note_too_long`). The window then
+watches only what the last fill read, once a second (a source's log, a
+file, the tasks as the footer counts them, the minute for a clock), and a
+fill that fails later keeps what it showed with why under it. Under its
+title a filled note says what it follows (`follows 🛠 ci, tasks,
+state.json`, a source by its icon), and a source that is down says since
+when, so a live note never passes for a written one.
+
+![A note of your own in the margin, filled from its blanks: follows 🛠 ci, tasks, release.json; the CI source's latest run, a release file's state, and the lead's task fix-avg with how long its turn took](../docs/sonny/margin-template-note.png)
+
+Notes of
+your own go in your config as `[sonny.notes.NAME]`, a `template` and a
+`title`, and show over the agent's in every margin, with no buttons:
+they are yours to change there. A note with `opens: "AGENT"`,
 such as the lead's to-do for a task's question, gets a `↗` that opens that
 agent in the pane, where you answer it. A file, `/status`, `/background` or a side
 chat opens over the margin, its title's `←`, Esc and Ctrl+[ going back to it;
