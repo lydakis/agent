@@ -6299,7 +6299,8 @@ impl App {
                         && let Some(bot) = event["bot"].as_str().filter(|bot| *bot != self.bot)
                     {
                         let bot = bot.to_owned();
-                        self.heard_verdict(&bot, event["turn"].as_i64(), &event["data"]);
+                        self.heard_verdict_or_read(&bot, event["turn"].as_i64(), &event["data"])
+                            .await;
                     }
                     if let Some(fleet) = &mut self.fleet
                         && !fleet.returned.is_empty()
@@ -10477,7 +10478,7 @@ impl App {
             "lifted_ended" => {
                 // Allowed after a message lifted it: no start says so.
                 let bot = self.bot.clone();
-                self.heard_verdict(&bot, turn, data);
+                self.heard_verdict_or_read(&bot, turn, data).await;
                 (self.approvals).retain(|call| call["handle"] != data["handle"]);
             }
             "turn_waiting" => {
@@ -15642,6 +15643,18 @@ impl App {
     /// What came of a call written out here, as an event of `bot`'s says
     /// (its start, its end refused, a step decided, or a lifted call's
     /// wait ended): its verdicts, the person's first.
+    /// A lifted call denied ends without its verdicts: who denied it is
+    /// read from the audit trail instead.
+    async fn heard_verdict_or_read(&mut self, bot: &str, turn: Option<i64>, data: &Value) {
+        if data["outcome"] == "denied" && !data["approvals"].is_array() {
+            let call = data["call_id"].as_str().unwrap_or_default().to_owned();
+            self.verdicts_from_audit(vec![(bot.to_owned(), turn.unwrap_or(-1), call)])
+                .await;
+        } else {
+            self.heard_verdict(bot, turn, data);
+        }
+    }
+
     fn heard_verdict(&mut self, bot: &str, turn: Option<i64>, data: &Value) {
         let key = (
             bot.to_owned(),
@@ -24847,6 +24860,38 @@ mod tests {
         assert_eq!((asked.len(), &asked[0]["turn"]), (2, &json!(4)));
         assert!(asked[0]["since_ms"].as_i64().unwrap() > 0);
         assert_eq!(asked[1]["before"], 40);
+    }
+
+    #[tokio::test]
+    async fn a_lifted_call_denied_elsewhere_reads_who_denied_it() {
+        let client = daemon_answering(|request| match request["op"].as_str() {
+            Some("audit") => json!({"rows": [
+                {"bot": "b", "turn": 3, "call_id": "c1", "step": null,
+                    "approved": "reviewer", "outcome": "denied"}],
+                "next_before": null}),
+            _ => json!({}),
+        })
+        .await;
+        let mut app = app(client);
+        app.width = 80;
+        app.approvals.push(
+            json!({"turn": 3, "call_id": "c1", "name": "shell", "handle": "proc:9",
+            "gates": ["auto"], "arguments": {"command": "make deploy"}}),
+        );
+        app.show_asked();
+        app.flush();
+        // Its end says only that it was denied, not by whom.
+        app.daemon(json!({"event": "lifted_ended", "bot": "b", "turn": 3,
+            "data": {"call_id": "c1", "handle": "proc:9", "outcome": "denied",
+                "failed": true}}))
+            .await;
+        app.fold_written();
+        app.flush();
+        let texts = app.screen.texts();
+        assert!(
+            texts.contains(&"✗ The reviewer denied make deploy".to_owned()),
+            "{texts:?}"
+        );
     }
 
     #[tokio::test]
