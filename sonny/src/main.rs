@@ -3284,7 +3284,13 @@ struct Written {
     folded: bool,
     /// Folded, opened whole again by a click or Ctrl+O.
     open: bool,
+    /// When it was written out, by the wall clock: its decision came after.
+    at_ms: i64,
 }
+
+/// How far before a request was written out its audit row is looked for:
+/// the clock's own slack, as the daemon stamps rows on the same machine.
+const AUDIT_SLACK_MS: i64 = 5_000;
 
 /// Calls alike, drawn as one: what they did, whom each did it to, and
 /// each one's own rows, shown under it while open.
@@ -11404,7 +11410,14 @@ impl App {
                 call["call_id"].as_str().unwrap_or_default().to_owned(),
             )
         };
+        // Answered where no event of theirs reaches this window: what came
+        // of each written out here is read from the audit trail.
+        let gone: Vec<(String, i64, String)> = (self.raised.iter())
+            .map(key)
+            .filter(|read| !wanted.contains(read))
+            .collect();
         self.raised.retain(|call| wanted.contains(&key(call)));
+        self.verdicts_from_audit(gone).await;
         self.raised_read.retain(|read| wanted.contains(read));
         let unread: std::collections::BTreeSet<&str> = (wanted.iter())
             .filter(|read| !self.raised_read.contains(*read))
@@ -15559,6 +15572,9 @@ impl App {
                 decided: None,
                 folded: false,
                 open: false,
+                at_ms: std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_or(0, |since| since.as_millis() as i64),
             },
         );
     }
@@ -15653,6 +15669,52 @@ impl App {
         // gone first: drawn again to say it.
         if written.folded && written.decided.is_some() {
             self.draw_written(&key);
+        }
+    }
+
+    /// What came of calls of agents below written out here that no event
+    /// told this window of, read from the audit trail's rows since each was
+    /// written, which a decision follows: who approved it, and whether it
+    /// was denied.
+    async fn verdicts_from_audit(&mut self, gone: Vec<(String, i64, String)>) {
+        for key in gone {
+            let Some(at_ms) = (self.written.get(&key))
+                .filter(|written| written.decided.is_none())
+                .map(|written| written.at_ms)
+            else {
+                continue;
+            };
+            let asked = json!({"bot": key.0, "turn": key.1, "limit": 64,
+                "since_ms": at_ms.saturating_sub(AUDIT_SLACK_MS)});
+            let Ok(page) = self.client.request("audit", asked).await else {
+                continue;
+            };
+            let row = (page["rows"].as_array().into_iter().flatten())
+                .find(|row| row["call_id"] == key.2.as_str());
+            let Some(row) = row else {
+                continue;
+            };
+            let denied = row["outcome"] == "denied";
+            let decided = match (row["approved"].as_str(), denied) {
+                (Some("person"), true) => transcript::Decided::Denied { you: true },
+                (Some("reviewer"), true) => transcript::Decided::Denied { you: false },
+                (Some("nobody"), true) => transcript::Decided::Lapsed,
+                (Some("person"), false) => transcript::Decided::Allowed {
+                    you: true,
+                    kept: None,
+                },
+                (Some("reviewer"), false) => transcript::Decided::Allowed {
+                    you: false,
+                    kept: None,
+                },
+                _ => continue,
+            };
+            if let Some(written) = self.written.get_mut(&key) {
+                written.decided = Some(decided);
+                if written.folded {
+                    self.draw_written(&key);
+                }
+            }
         }
     }
 
@@ -24697,6 +24759,45 @@ mod tests {
             texts.contains(&"✓ You allowed make deploy".to_owned()),
             "{texts:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn a_tasks_request_answered_unseen_reads_its_verdict_from_the_audit_trail() {
+        let asked = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = asked.clone();
+        let client = daemon_answering(move |request| match request["op"].as_str() {
+            Some("audit") => {
+                seen.lock().unwrap().push(request.clone());
+                json!({"rows": [
+                    {"bot": "shop.fix", "turn": 4, "call_id": "c0", "approved": "rule",
+                        "outcome": "completed"},
+                    {"bot": "shop.fix", "turn": 4, "call_id": "c1", "approved": "person",
+                        "outcome": "denied"}]})
+            }
+            _ => json!({}),
+        })
+        .await;
+        let mut app = app(client);
+        app.bot = "home.lead".into();
+        app.width = 80;
+        app.raised
+            .push(json!({"bot": "shop.fix", "turn": 4, "call_id": "c1",
+            "name": "shell", "gates": ["manual"], "arguments": {"command": "cargo publish"}}));
+        app.show_asked();
+        // No fleet: the task's events never reach this window.
+        app.raised.clear();
+        app.fold_written();
+        app.verdicts_from_audit(vec![("shop.fix".into(), 4, "c1".into())])
+            .await;
+        let texts = app.screen.texts();
+        assert!(
+            texts.contains(&"✗ You denied cargo publish · shop.fix".to_owned()),
+            "{texts:?}"
+        );
+        // Only since it was written, so the read stays short.
+        let asked = asked.lock().unwrap();
+        assert_eq!((asked.len(), &asked[0]["turn"]), (1, &json!(4)));
+        assert!(asked[0]["since_ms"].as_i64().unwrap() > 0);
     }
 
     #[test]
