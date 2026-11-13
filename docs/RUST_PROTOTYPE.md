@@ -1850,7 +1850,7 @@ none for a person's) and, in `prompts`, its `text` within the read's
 and their prompt says `quotes_more` and `truncated`; Sonny's approver reads a quote of the person's own words as
 consent only in a prompt the person sent, and any other as asking for
 nothing.
-`{"op":"prompts","bot","turn","bytes"?}` reads a turn's words and calls
+`{"op":"prompts","bot","turn","bytes"?,"persons"?,"persons_each"?}` reads a turn's words and calls
 as an approver judges them, within `bytes` of text (default 64 KiB, at most
 256 KiB): the turn's prompt and each steer it absorbed, in order, with
 `from` or `origin`, and `prompts_more` when steers were left out; the calls it started, each with its argument preview,
@@ -1878,7 +1878,19 @@ answers. Refused calls and
 their own, so a long prompt still leaves the calls (and the files they
 wrote) to read. Text that does not fit is cut and marked
 `truncated`, and each steer, call, and earlier prompt also counts 64
-bytes, so many short entries stay within `bytes` too. A fork keeps the source's binding, instructions,
+bytes, so many short entries stay within `bytes` too. With `persons`
+(bytes, at most 256 KiB), the read also lists the person's own earlier
+words to the bot under `persons`, as Codex's reviewer keeps every message
+its person wrote apart from the transcript: the messages it took in
+before the turn that no bot, client or other person wrote, newest first,
+each `{message, text, steer?}` whole within `persons_each` bytes (all of
+`persons` when absent; Sonny's reviewer asks 3,600, Codex's 900 tokens)
+or left out whole, with `persons_more` when some were left out
+(protocol 71). They have their own budget, so notes a client sent never
+crowd the person's words out of `earlier`; a partial index
+(`messages_persons`) keeps the read to the person's messages alone, at
+most 256 of them are looked at, and one whose length alone is past
+`persons_each` is passed over unread. A fork keeps the source's binding, instructions,
 and tools, and takes no text of its own; the source is never changed. Workspaces, wherever given, must already exist and be absolute. Use the actual returned checkpoint
 and turn IDs, not the illustrative numbers. Names are immutable bot identities
 within one store; rename/alias operations are not implemented. A fork starts
@@ -2438,7 +2450,7 @@ do, reads one page whatever the fleet's size (protocol 48; before, one
 answer held every turn and went past the frame limit near 6,000 agents).
 A page is bounded by bytes too, as `pauses` pages are.
 `{"op":"processes","bot":NAME?}` lists what runs for `bot`, a name or a
-GLOB pattern of names, or for every bot (protocol 71): each background
+GLOB pattern of names, or for every bot (protocol 72): each background
 command, terminal and detached command still running, and each call a
 message lifted that waits on, by bot and oldest first, as `{processes:
 [{handle, bot, turn, call_id, kind, command, started_ms, pid}]}`. `kind` is `background`,
@@ -2837,7 +2849,7 @@ for it, since such a file would hold output that never passed credential
 redaction; a command that wants its output redirects it to a file itself. No process slot, timeout, or
 group kill at the call's end applies to it, so it outlives the turn and the daemon and is outside
 `--max-processes`. Its handle is tracked as a background command's is
-(protocol 71, schema 97), as Codex tracks every command it leaves
+(protocol 72, schema 97), as Codex tracks every command it leaves
 running: `write_stdin` with `kill: true` on it, or `stop_process`, ends
 its process group (and on Linux a sandboxed one's pid namespace), `wait`
 on it reports how it ended, and its end is told as a background command's

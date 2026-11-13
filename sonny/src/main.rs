@@ -3360,6 +3360,35 @@ struct Denial {
     reason: String,
 }
 
+/// A call waiting on the person as [`App::show_asked`] wrote it out:
+/// its rows, tagged [`screen::Tag::Request`] with `tag`, and enough to
+/// fold them to one row once it is answered, as Codex keeps only the
+/// decision of an approval it asked.
+struct Written {
+    tag: u64,
+    /// Whether a blank row before it is its own.
+    gap: bool,
+    rows: Vec<Line<'static>>,
+    name: String,
+    arguments: Value,
+    /// The agent whose call it is, when not this window's.
+    from: Option<String>,
+    /// What came of it: the person's answer here, until the call's own
+    /// verdict is `heard`, which is final.
+    decided: Option<transcript::Decided>,
+    heard: bool,
+    /// Folded to its verdict: it waits no more.
+    folded: bool,
+    /// Folded, opened whole again by a click or Ctrl+O.
+    open: bool,
+    /// When it was written out, by the wall clock: its decision came after.
+    at_ms: i64,
+}
+
+/// How far before a request was written out its audit row is looked for:
+/// the clock's own slack, as the daemon stamps rows on the same machine.
+const AUDIT_SLACK_MS: i64 = 5_000;
+
 /// Calls alike, drawn as one: what they did, whom each did it to, and
 /// each one's own rows, shown under it while open.
 struct Fold {
@@ -4037,6 +4066,13 @@ struct App {
     /// and Enter on an empty composer brings them back. A later turn's
     /// call of the same id is another.
     calls_aside: std::collections::HashSet<(String, i64, String)>,
+    /// The calls waiting on the person written out here, by bot, turn and
+    /// call, folded once they wait no more.
+    written: HashMap<(String, i64, String), Written>,
+    /// How many were written, which numbers the next.
+    written_count: u64,
+    /// How many were kept at the last look for ones trimmed away.
+    written_kept: usize,
     /// The lead's open questions for the person, oldest first: its `ask`
     /// calls not yet answered, nor set aside, and its tasks' open ones,
     /// pinned here as they come ([`App::pin_task_asks`]).
@@ -5948,6 +5984,9 @@ impl App {
             raised: Vec::new(),
             raised_read: Default::default(),
             calls_aside: Default::default(),
+            written: HashMap::new(),
+            written_count: 0,
+            written_kept: 0,
             asks: Vec::new(),
             focus: None,
             aside: Vec::new(),
@@ -6379,6 +6418,17 @@ impl App {
                         fleet.zen = zen;
                         fleet.event(&event)
                     });
+                    // A call of an agent below, written out here, decided.
+                    if matches!(
+                        event["event"].as_str(),
+                        Some("tool_started" | "tool_completed" | "step_decided" | "lifted_ended")
+                    )
+                        && let Some(bot) = event["bot"].as_str().filter(|bot| *bot != self.bot)
+                    {
+                        let bot = bot.to_owned();
+                        self.heard_verdict_or_read(&bot, event["turn"].as_i64(), &event["data"])
+                            .await;
+                    }
                     if let Some(fleet) = &mut self.fleet
                         && !fleet.returned.is_empty()
                     {
@@ -7301,6 +7351,19 @@ impl App {
             }
             self.approvals_for(self.running.as_ref().map(|r| r.turn))
                 .await;
+            // Answered while away, its verdict unheard: read from the audit
+            // trail, as a task's is.
+            let unheard: Vec<(String, i64, String)> = (self.written.iter())
+                .filter(|(key, written)| key.0 == self.bot && !written.heard)
+                .map(|(key, _)| key.clone())
+                .filter(|key| {
+                    !(self.approvals.iter()).any(|call| {
+                        call["call_id"].as_str() == Some(key.2.as_str())
+                            && call["turn"].as_i64().unwrap_or(-1) == key.1
+                    })
+                })
+                .collect();
+            self.verdicts_from_audit(unheard).await;
             // A daemon that restarted brings back its companions; one
             // started anew, as by another store's Sonny, gets them now.
             if let Err(error) = start_companions(&self.client).await {
@@ -8004,6 +8067,17 @@ impl App {
         if let Some(key) = button.strip_prefix("card/") {
             self.card_clicked(key);
         }
+        // A request folded to its verdict, opened whole or folded again.
+        if let Some(tag) = (button.strip_prefix("request/")).and_then(|tag| tag.parse::<u64>().ok())
+            && let Some(key) = (self.written.iter())
+                .find(|(_, written)| written.tag == tag && written.folded)
+                .map(|(key, _)| key.clone())
+        {
+            if let Some(written) = self.written.get_mut(&key) {
+                written.open = !written.open;
+            }
+            self.draw_written(&key);
+        }
         if let Some(command) = (button.strip_prefix("copy/")).and_then(|id| self.commands.get(id)) {
             term::copy(command);
             self.notice = Some("copied".into());
@@ -8623,7 +8697,18 @@ impl App {
         let opens = |fold: &Fold| transcript::unfolds(&fold.whats, &fold.calls);
         let open = self.folds.values().any(|fold| opens(fold) && !fold.open)
             || self.clusters.values().any(|cluster| !cluster.open)
-            || self.relayed.values().any(|relayed| relayed.text.is_none());
+            || self.relayed.values().any(|relayed| relayed.text.is_none())
+            || (self.written.values()).any(|written| written.folded && !written.open);
+        let written: Vec<(String, i64, String)> = (self.written.iter())
+            .filter(|(_, written)| written.folded && written.open != open)
+            .map(|(key, _)| key.clone())
+            .collect();
+        for key in written {
+            if let Some(written) = self.written.get_mut(&key) {
+                written.open = open;
+            }
+            self.draw_written(&key);
+        }
         let folds: Vec<usize> = (self.folds.iter())
             .filter(|(_, fold)| opens(fold))
             .map(|(at, _)| *at)
@@ -10437,6 +10522,11 @@ impl App {
                 let name = data["name"].as_str().unwrap_or("tool").to_owned();
                 let id = data["call_id"].as_str().unwrap_or("");
                 self.reviewing.remove(id);
+                // Started, it was allowed, here or anywhere: it waits no more.
+                let bot = self.bot.clone();
+                self.heard_verdict(&bot, turn, data);
+                (self.approvals)
+                    .retain(|call| call["call_id"] != id || call["turn"].as_i64() != turn);
                 // A long call's event carries a preview; the call is kept whole.
                 let arguments = match data["arguments_truncated"] == true {
                     true => self.call(id).await.map(|(_, arguments)| arguments),
@@ -10487,7 +10577,10 @@ impl App {
                 if data["denied"] == true {
                     // It never ran: nothing it would have done follows.
                     shown.1 = true;
-                    if !self.words() {
+                    let bot = self.bot.clone();
+                    self.heard_verdict(&bot, turn, data);
+                    // One written out here says it where it was asked.
+                    if !self.words() && !self.folds_here(&bot, turn, id) {
                         self.commit_denied(&name, &arguments, &reason);
                     }
                     // The approver's, not the person's: `/retry` may
@@ -10546,6 +10639,12 @@ impl App {
                 }
             }
             "approval_requested" | "approval_asked" | "step_decided" => {
+                // A step answered, here or anywhere: its verdict, for its
+                // copy written out here to fold to.
+                if kind == "step_decided" {
+                    let bot = self.bot.clone();
+                    self.heard_verdict(&bot, turn, data);
+                }
                 self.approvals_for(turn).await
             }
             // A message lifted a call out of its turn: it, and the steps
@@ -10560,9 +10659,12 @@ impl App {
                     }
                 }
             }
-            "lifted_ended" => self
-                .approvals
-                .retain(|call| call["handle"] != data["handle"]),
+            "lifted_ended" => {
+                // Allowed after a message lifted it: no start says so.
+                let bot = self.bot.clone();
+                self.heard_verdict_or_read(&bot, turn, data).await;
+                (self.approvals).retain(|call| call["handle"] != data["handle"]);
+            }
             "turn_waiting" => {
                 if let Some(running) = &mut self.running
                     && data["approval"] != true
@@ -11584,7 +11686,30 @@ impl App {
                 call["call_id"].as_str().unwrap_or_default().to_owned(),
             )
         };
+        // Answered where no event of theirs reaches this window: what came
+        // of each written out here is read from the audit trail.
+        let mut gone: Vec<(String, i64, String)> = (self.raised.iter())
+            .map(key)
+            .filter(|read| !wanted.contains(read))
+            .collect();
+        // Answered here, its final verdict still unheard: another gate may
+        // have decided it since, which no event of theirs tells this window.
+        if self.fleet.is_none() {
+            gone.extend(
+                (self.written.iter())
+                    .filter(|(read, written)| {
+                        read.0 != me
+                            && written.decided.is_some()
+                            && !written.heard
+                            && !wanted.contains(*read)
+                    })
+                    .map(|(read, _)| read.clone()),
+            );
+            gone.sort();
+            gone.dedup();
+        }
         self.raised.retain(|call| wanted.contains(&key(call)));
+        self.verdicts_from_audit(gone).await;
         self.raised_read.retain(|read| wanted.contains(read));
         let unread: std::collections::BTreeSet<&str> = (wanted.iter())
             .filter(|read| !self.raised_read.contains(*read))
@@ -11700,6 +11825,25 @@ impl App {
                 return;
             }
             Err(error) => self.notice = Some(error.to_string()),
+            // Written out here, its copy folds to the verdict in place.
+            Ok(_)
+                if self.folds_here(
+                    &bot,
+                    call["turn"].as_i64(),
+                    call["call_id"].as_str().unwrap_or_default(),
+                ) =>
+            {
+                let decided = match decision {
+                    "allow" => transcript::Decided::Allowed {
+                        you: true,
+                        kept: kept.map(str::to_owned),
+                    },
+                    _ => transcript::Decided::Denied { you: true },
+                };
+                if let Some(written) = self.written.get_mut(&self.aside_key(&call)) {
+                    written.decided = Some(decided);
+                }
+            }
             Ok(_) if decision == "allow" => {
                 let name = call["name"].as_str().unwrap_or("tool");
                 let lines = transcript::allowed(
@@ -15671,6 +15815,8 @@ impl App {
         if self.asked.as_ref() == Some(&id) {
             return;
         }
+        let call = call.clone();
+        let call = &call;
         let name = call["name"].as_str().unwrap_or("tool").to_owned();
         let arguments = &call["arguments"];
         let what = arguments["command"]
@@ -15727,7 +15873,265 @@ impl App {
         // What the agent said before the call reads before it, a step as
         // the call's start would make it.
         self.end_live(Words::Step);
-        self.commit(lines);
+        // Written again, brought back after Esc: the copy above goes, so
+        // one call has one copy here, the one by the keys.
+        let key = self.aside_key(call);
+        let from = call["bot"]
+            .as_str()
+            .filter(|bot| *bot != self.bot)
+            .map(str::to_owned);
+        let arguments = arguments.clone();
+        if let Some(old) = self.written.remove(&key) {
+            self.flush();
+            (self.screen).replace_tagged(screen::Tag::Request(old.tag), Vec::new(), Vec::new());
+        }
+        self.forget_written();
+        let tag = self.written_count;
+        self.written_count += 1;
+        let gap = self.any_history;
+        let at = self.pending.len();
+        self.commit(lines.clone());
+        let mark = screen::Mark::Tag(screen::Tag::Request(tag));
+        (self.marks).extend((at..self.pending.len()).map(|row| (row, mark.clone())));
+        self.written.insert(
+            key,
+            Written {
+                tag,
+                gap,
+                rows: lines,
+                name,
+                arguments,
+                from,
+                decided: None,
+                heard: false,
+                folded: false,
+                open: false,
+                at_ms: std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_or(0, |since| since.as_millis() as i64),
+            },
+        );
+    }
+
+    /// The calls written out here that wait on the person no more, folded
+    /// to their verdict in place, as Codex keeps only an approval's
+    /// decision: the hoisted copy in a lead's window and the call's own in
+    /// its agent's alike, whoever answered it and wherever.
+    fn fold_written(&mut self) {
+        if self.written.values().all(|written| written.folded) {
+            return;
+        }
+        let waiting: std::collections::HashSet<(String, i64, String)> =
+            (self.approvals.iter().chain(&self.raised))
+                .map(|call| self.aside_key(call))
+                .collect();
+        let done: Vec<(String, i64, String)> = (self.written.iter())
+            .filter(|(key, written)| !written.folded && !waiting.contains(*key))
+            .map(|(key, _)| key.clone())
+            .collect();
+        for key in done {
+            if let Some(written) = self.written.get_mut(&key) {
+                written.folded = true;
+            }
+            self.draw_written(&key);
+        }
+    }
+
+    /// A folded request drawn again where it is: its verdict, a click on
+    /// which opens the request whole under it, or folds it again.
+    fn draw_written(&mut self, key: &(String, i64, String)) {
+        let Some(written) = self.written.get(key) else {
+            return;
+        };
+        let decided = (written.decided.clone()).unwrap_or(transcript::Decided::Gone);
+        let line = transcript::decided(
+            &written.name,
+            &written.arguments,
+            written.from.as_deref(),
+            &decided,
+            &self.workspace,
+            self.width,
+        );
+        let mut rows = Vec::new();
+        if written.gap {
+            rows.push(Line::default());
+        }
+        let at = rows.len();
+        rows.push(line);
+        if written.open {
+            rows.extend(written.rows.iter().cloned());
+        }
+        let link = screen::Mark::Link(format!("{}request/{}", screen::BUTTON, written.tag));
+        let tag = screen::Tag::Request(written.tag);
+        self.flush();
+        if !self.screen.replace_tagged(tag, rows, vec![(at, link)]) {
+            // Trimmed away: nothing of it is left to fold.
+            self.written.remove(key);
+        }
+    }
+
+    /// What came of a call written out here, as an event of `bot`'s says
+    /// (its start, its end refused, a step decided, or a lifted call's
+    /// wait ended): its verdicts, the person's first.
+    /// A lifted call denied ends without its verdicts: who denied it is
+    /// read from the audit trail instead.
+    async fn heard_verdict_or_read(&mut self, bot: &str, turn: Option<i64>, data: &Value) {
+        if data["outcome"] == "denied" && !data["approvals"].is_array() {
+            let call = data["call_id"].as_str().unwrap_or_default().to_owned();
+            self.verdicts_from_audit(vec![(bot.to_owned(), turn.unwrap_or(-1), call)])
+                .await;
+        } else {
+            self.heard_verdict(bot, turn, data);
+        }
+    }
+
+    fn heard_verdict(&mut self, bot: &str, turn: Option<i64>, data: &Value) {
+        let key = (
+            bot.to_owned(),
+            turn.unwrap_or(-1),
+            data["call_id"].as_str().unwrap_or_default().to_owned(),
+        );
+        let Some(written) = self.written.get_mut(&key) else {
+            return;
+        };
+        if written.heard {
+            return;
+        }
+        let verdicts = data["approvals"].as_array().cloned().unwrap_or_default();
+        let you = |verdict: &Value| verdict["by"] != "approver";
+        let by = |verdict: &Value| verdict["by"].as_str().is_some_and(|by| !by.is_empty());
+        let answered = written.decided.take();
+        written.decided = match verdicts.iter().find(|v| v["allow"] == false) {
+            Some(no) if by(no) => Some(transcript::Decided::Denied { you: you(no) }),
+            // Refused by no one: its time ran out.
+            Some(_) => Some(transcript::Decided::Lapsed),
+            None if data["denied"] == true || data["outcome"] == "expired" => {
+                Some(transcript::Decided::Lapsed)
+            }
+            // A step denied with no gate refusing it: its caller stopped
+            // waiting, and it never ran.
+            None if data["decision"] == "deny" => Some(transcript::Decided::Gone),
+            None => (verdicts.iter().filter(|v| v["allow"] == true))
+                .fold(None, |best: Option<bool>, v| {
+                    Some(best.unwrap_or(false) || you(v))
+                })
+                .map(|you| transcript::Decided::Allowed { you, kept: None }),
+        };
+        // The person's answer here stands until the call's own verdict
+        // says otherwise: another gate may still have denied it. Allowed
+        // after all, what they always allow from now on is theirs.
+        written.decided = match (written.decided.take(), answered) {
+            (
+                Some(transcript::Decided::Allowed { you: true, .. }),
+                Some(transcript::Decided::Allowed { you: true, kept }),
+            ) => Some(transcript::Decided::Allowed { you: true, kept }),
+            (None, answered) => answered,
+            (heard, _) => heard,
+        };
+        written.heard = written.decided.is_some();
+        // Folded before its verdict came, as a listing may see the call
+        // gone first: drawn again to say it.
+        if written.folded && written.decided.is_some() {
+            self.draw_written(&key);
+        }
+    }
+
+    /// What came of calls of agents below written out here that no event
+    /// told this window of, read from the audit trail's rows since each was
+    /// written, which a decision follows: who approved it, and whether it
+    /// was denied.
+    async fn verdicts_from_audit(&mut self, gone: Vec<(String, i64, String)>) {
+        for key in gone {
+            let Some(at_ms) = (self.written.get(&key))
+                .filter(|written| !written.heard)
+                .map(|written| written.at_ms)
+            else {
+                continue;
+            };
+            // A step's row names its call and the step apart.
+            let (call, step) = match key.2.rsplit_once('/') {
+                Some((call, step)) => (call, Some(step)),
+                None => (key.2.as_str(), None),
+            };
+            let mut asked = json!({"bot": key.0, "turn": key.1, "limit": 64,
+                "since_ms": at_ms.saturating_sub(AUDIT_SLACK_MS)});
+            // Newest first, page by page, back to when it was written.
+            let row = loop {
+                let Ok(page) = self.client.request("audit", asked.clone()).await else {
+                    break None;
+                };
+                let row = (page["rows"].as_array().into_iter().flatten())
+                    .find(|row| row["call_id"] == call && row["step"].as_str() == step);
+                if let Some(row) = row {
+                    break Some(row.clone());
+                }
+                match page["next_before"].as_i64() {
+                    Some(before) => asked["before"] = json!(before),
+                    None => break None,
+                }
+            };
+            let Some(row) = row else {
+                continue;
+            };
+            let denied = row["outcome"] == "denied";
+            let decided = match (row["approved"].as_str(), denied) {
+                (Some("person"), true) => transcript::Decided::Denied { you: true },
+                (Some("reviewer"), true) => transcript::Decided::Denied { you: false },
+                // Refused by no one: timed out, or its caller stopped
+                // waiting, which the row does not tell apart.
+                (Some("nobody"), true) => transcript::Decided::Gone,
+                (Some("person"), false) => transcript::Decided::Allowed {
+                    you: true,
+                    kept: None,
+                },
+                (Some("reviewer"), false) => transcript::Decided::Allowed {
+                    you: false,
+                    kept: None,
+                },
+                _ => continue,
+            };
+            if let Some(written) = self.written.get_mut(&key) {
+                // Kept from the person's answer here: what they always allow.
+                written.decided = match (decided, written.decided.take()) {
+                    (
+                        transcript::Decided::Allowed { you: true, .. },
+                        Some(transcript::Decided::Allowed { you: true, kept }),
+                    ) => Some(transcript::Decided::Allowed { you: true, kept }),
+                    (decided, _) => Some(decided),
+                };
+                written.heard = true;
+                if written.folded {
+                    self.draw_written(&key);
+                }
+            }
+        }
+    }
+
+    /// Whether `bot`'s call was written out here and is still there to
+    /// fold: its verdict is drawn in its place, not again under it.
+    fn folds_here(&self, bot: &str, turn: Option<i64>, call: &str) -> bool {
+        let key = (bot.to_owned(), turn.unwrap_or(-1), call.to_owned());
+        (self.written.get(&key))
+            .is_some_and(|written| self.screen.has(screen::Tag::Request(written.tag)))
+    }
+
+    /// Lets go of the requests the screen trimmed away, looked at each
+    /// time they double, so the look costs a row per request.
+    fn forget_written(&mut self) {
+        if self.written.len() < 64.max(2 * self.written_kept) {
+            return;
+        }
+        let screen = &self.screen;
+        let marks = &self.marks;
+        self.written.retain(|_, written| {
+            let tag = screen::Tag::Request(written.tag);
+            !written.folded
+                || screen.has(tag)
+                || marks
+                    .iter()
+                    .any(|(_, mark)| *mark == screen::Mark::Tag(tag))
+        });
+        self.written_kept = self.written.len();
     }
 
     /// What this window's tab says of its agent, from what the window
@@ -15780,6 +16184,7 @@ impl App {
         // multiplexer, as the person still has it to answer.
         used::asking(&self.bot, !self.asks.is_empty());
         self.tell_status();
+        self.fold_written();
         self.show_asked();
         self.margin_back();
         // /status beside the conversation, gone once the pane is.
@@ -24637,6 +25042,421 @@ mod tests {
     /// call; set aside with Esc, the keys typing again, and brought back
     /// with Enter.
     #[tokio::test]
+    async fn an_answered_request_folds_to_its_verdict_where_it_was_written() {
+        let client = daemon_answering(|asked| match asked["op"].as_str() {
+            Some("approvals") if asked["bot"] == "shop.fix" => json!({"approvals": [
+                {"bot": "shop.fix", "turn": 4, "call_id": "c1", "request": 1,
+                    "name": "shell", "gates": ["auto"],
+                    "asked": [{"tag": "auto", "reason": "It publishes the crate."}],
+                    "arguments": {"command": "cargo publish",
+                        "justification": "Releasing needs the registry."}}]}),
+            _ => json!({}),
+        })
+        .await;
+        let (_, events) = daemon_with_events(json!({}), |_| json!({})).await;
+        let mut fleet = Fleet::in_memory(client.clone(), events, "home", "home.lead");
+        fleet.raised.insert("shop.fix".into());
+        fleet
+            .needs
+            .held(vec![needs::Held::new("shop.fix", 4, "c1")], |_| true);
+        let mut app = app(client);
+        app.bot = "home.lead".into();
+        app.width = 80;
+        app.fleet = Some(fleet);
+        // This window's own call waits too, written out after the task's.
+        app.approvals
+            .push(json!({"turn": 7, "call_id": "o1", "name": "shell",
+            "gates": ["manual"], "arguments": {"command": "git push"}}));
+        app.raise_approvals().await;
+        app.show_asked();
+        app.flush();
+        assert!(app.screen.texts().contains(&"⏸ Allow shell?".to_owned()));
+        // Its own is answered first, in another window: its start says so.
+        app.daemon(
+            json!({"event": "tool_started", "bot": "home.lead", "turn": 7,
+            "data": {"call_id": "o1", "name": "shell",
+                "arguments": json!({"command": "git push"}).to_string(),
+                "approvals": [{"tag": "manual", "by": "tui", "allow": true}]}}),
+        )
+        .await;
+        app.fold_written();
+        app.show_asked();
+        app.flush();
+        let texts = app.screen.texts();
+        assert!(
+            texts.contains(&"✓ You allowed git push".to_owned()),
+            "{texts:?}"
+        );
+        assert_eq!(
+            texts.iter().filter(|row| *row == "⏸ Allow shell?").count(),
+            1
+        );
+        // The task's, answered here: folded to the verdict, no line under it.
+        let key = |code| Event::Key(event::KeyEvent::new(code, KeyModifiers::NONE));
+        app.key(key(KeyCode::Char('y'))).await;
+        app.fold_written();
+        app.flush();
+        let texts = app.screen.texts();
+        assert_eq!(
+            texts
+                .iter()
+                .filter(|row| !row.is_empty())
+                .collect::<Vec<_>>(),
+            [
+                "✓ You allowed git push",
+                "✓ You allowed cargo publish · shop.fix"
+            ],
+            "{texts:?}"
+        );
+        // A click opens it whole under its verdict, and folds it again.
+        let tag = app.written[&("shop.fix".to_owned(), 4, "c1".to_owned())].tag;
+        app.press(&format!("request/{tag}")).await;
+        let texts = app.screen.texts();
+        let at = texts
+            .iter()
+            .position(|row| row == "✓ You allowed cargo publish · shop.fix");
+        assert_eq!(
+            texts[at.unwrap() + 1..at.unwrap() + 4],
+            [
+                "↳ From shop.fix",
+                "⏸ Allow shell?",
+                "  Reason: Releasing needs the registry."
+            ]
+        );
+        app.press(&format!("request/{tag}")).await;
+        assert_eq!(app.screen.texts().len(), at.unwrap() + 1);
+    }
+
+    #[tokio::test]
+    async fn a_step_or_lifted_call_answered_elsewhere_folds_to_its_verdict() {
+        let client = daemon_answering(|_| json!({})).await;
+        let mut app = app(client);
+        app.width = 80;
+        // A lifted call of turn 3 and a step of turn 5, its call id the same.
+        app.approvals
+            .push(json!({"turn": 3, "call_id": "c1", "handle": "proc:4",
+            "name": "shell", "gates": ["manual"], "arguments": {"command": "git push"}}));
+        app.show_asked();
+        // Turn 5 starting its own c1 leaves turn 3's waiting.
+        app.daemon(json!({"event": "tool_started", "bot": "b", "turn": 5,
+            "data": {"call_id": "c1", "name": "shell", "arguments": "{}"}}))
+            .await;
+        assert_eq!(app.approvals.len(), 1);
+        app.approvals
+            .push(json!({"turn": 5, "call_id": "s1", "step_of": "c9",
+            "name": "browser", "gates": ["manual"], "arguments": {"command": "open"}}));
+        app.calls_aside.insert(("b".into(), 3, "c1".into()));
+        app.show_asked();
+        // The lifted call allowed anywhere: no start, its wait ends.
+        app.daemon(json!({"event": "lifted_ended", "bot": "b", "turn": 3,
+            "data": {"call_id": "c1", "handle": "proc:4", "outcome": "allowed",
+                "approvals": [{"tag": "manual", "by": "tui", "allow": true}]}}))
+            .await;
+        // The step denied anywhere.
+        app.heard_verdict(
+            "b",
+            Some(5),
+            &json!({"call_id": "s1", "decision": "deny",
+            "approvals": [{"tag": "manual", "by": "cli", "allow": false}]}),
+        );
+        app.approvals.clear();
+        app.fold_written();
+        let texts = app.screen.texts();
+        assert!(
+            texts.contains(&"✓ You allowed git push".to_owned()),
+            "{texts:?}"
+        );
+        assert!(texts.contains(&"✗ You denied open".to_owned()), "{texts:?}");
+        // Seen gone before its verdict: folded as no longer waiting, then
+        // drawn again once the verdict comes.
+        app.approvals
+            .push(json!({"turn": 6, "call_id": "c2", "name": "shell",
+            "gates": ["manual"], "arguments": {"command": "make deploy"}}));
+        app.show_asked();
+        app.approvals.clear();
+        app.fold_written();
+        let texts = app.screen.texts();
+        assert!(texts.contains(&"⏸ Request for make deploy no longer waits".to_owned()));
+        app.daemon(json!({"event": "tool_started", "bot": "b", "turn": 6,
+            "data": {"call_id": "c2", "name": "shell", "arguments": "{}",
+                "approvals": [{"tag": "manual", "by": "tui", "allow": true}]}}))
+            .await;
+        let texts = app.screen.texts();
+        assert!(
+            texts.contains(&"✓ You allowed make deploy".to_owned()),
+            "{texts:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_tasks_request_answered_unseen_reads_its_verdict_from_the_audit_trail() {
+        let asked = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = asked.clone();
+        let client = daemon_answering(move |request| match request["op"].as_str() {
+            Some("audit") if request["before"].is_null() => {
+                seen.lock().unwrap().push(request.clone());
+                // A step of c1 denied after it, newest first: not c1's row.
+                json!({"rows": [
+                    {"bot": "shop.fix", "turn": 4, "call_id": "c1", "step": "open",
+                        "approved": "person", "outcome": "denied"},
+                    {"bot": "shop.fix", "turn": 4, "call_id": "c0", "approved": "rule",
+                        "outcome": "completed"}],
+                    "next_before": 40})
+            }
+            Some("audit") => {
+                seen.lock().unwrap().push(request.clone());
+                json!({"rows": [
+                    {"bot": "shop.fix", "turn": 4, "call_id": "c1", "step": null,
+                        "approved": "person", "outcome": "completed"}],
+                    "next_before": null})
+            }
+            _ => json!({}),
+        })
+        .await;
+        let mut app = app(client);
+        app.bot = "home.lead".into();
+        app.width = 80;
+        app.raised
+            .push(json!({"bot": "shop.fix", "turn": 4, "call_id": "c1",
+            "name": "shell", "gates": ["manual"], "arguments": {"command": "cargo publish"}}));
+        app.show_asked();
+        // No fleet: the task's events never reach this window.
+        app.raised.clear();
+        app.fold_written();
+        app.verdicts_from_audit(vec![("shop.fix".into(), 4, "c1".into())])
+            .await;
+        let texts = app.screen.texts();
+        assert!(
+            texts.contains(&"✓ You allowed cargo publish · shop.fix".to_owned()),
+            "{texts:?}"
+        );
+        // Only since it was written, so the read stays short, page by page.
+        let asked = asked.lock().unwrap();
+        assert_eq!((asked.len(), &asked[0]["turn"]), (2, &json!(4)));
+        assert!(asked[0]["since_ms"].as_i64().unwrap() > 0);
+        assert_eq!(asked[1]["before"], 40);
+    }
+
+    #[tokio::test]
+    async fn a_lifted_call_denied_elsewhere_reads_who_denied_it() {
+        let client = daemon_answering(|request| match request["op"].as_str() {
+            Some("audit") => json!({"rows": [
+                {"bot": "b", "turn": 3, "call_id": "c1", "step": null,
+                    "approved": "reviewer", "outcome": "denied"}],
+                "next_before": null}),
+            _ => json!({}),
+        })
+        .await;
+        let mut app = app(client);
+        app.width = 80;
+        app.approvals.push(
+            json!({"turn": 3, "call_id": "c1", "name": "shell", "handle": "proc:9",
+            "gates": ["auto"], "arguments": {"command": "make deploy"}}),
+        );
+        app.show_asked();
+        app.flush();
+        // Its end says only that it was denied, not by whom.
+        app.daemon(json!({"event": "lifted_ended", "bot": "b", "turn": 3,
+            "data": {"call_id": "c1", "handle": "proc:9", "outcome": "denied",
+                "failed": true}}))
+            .await;
+        app.fold_written();
+        app.flush();
+        let texts = app.screen.texts();
+        assert!(
+            texts.contains(&"✗ The reviewer denied make deploy".to_owned()),
+            "{texts:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_step_abandoned_after_one_gate_allowed_it_is_not_allowed() {
+        let client = daemon_answering(|_| json!({})).await;
+        let mut app = app(client);
+        app.width = 80;
+        app.approvals
+            .push(json!({"turn": 5, "call_id": "c2/open", "name": "shell",
+            "gates": ["manual", "auto"], "arguments": {"command": "make deploy"}}));
+        app.show_asked();
+        app.flush();
+        app.heard_verdict(
+            "b",
+            Some(5),
+            &json!({"call_id": "c2/open", "decision": "deny",
+            "reason": "its client stopped waiting",
+            "approvals": [{"tag": "manual", "by": "tui", "allow": true}]}),
+        );
+        app.approvals.clear();
+        app.fold_written();
+        app.flush();
+        let texts = app.screen.texts();
+        assert!(
+            texts.contains(&"⏸ Request for make deploy no longer waits".to_owned()),
+            "{texts:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_request_refused_by_no_one_in_the_audit_trail_no_longer_waits() {
+        let client = daemon_answering(|request| match request["op"].as_str() {
+            // Timed out or its caller stopped waiting: the row is the same.
+            Some("audit") => json!({"rows": [
+                {"bot": "b", "turn": 5, "call_id": "c2", "step": "open",
+                    "approved": "nobody", "outcome": "denied"}],
+                "next_before": null}),
+            _ => json!({}),
+        })
+        .await;
+        let mut app = app(client);
+        app.width = 80;
+        app.approvals
+            .push(json!({"turn": 5, "call_id": "c2/open", "name": "shell",
+            "gates": ["manual"], "arguments": {"command": "make deploy"}}));
+        app.show_asked();
+        app.flush();
+        app.approvals.clear();
+        app.verdicts_from_audit(vec![("b".into(), 5, "c2/open".into())])
+            .await;
+        app.fold_written();
+        app.flush();
+        let texts = app.screen.texts();
+        assert!(
+            texts.contains(&"⏸ Request for make deploy no longer waits".to_owned()),
+            "{texts:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_tasks_request_allowed_here_then_denied_reads_its_final_verdict() {
+        let client = daemon_answering(|request| match request["op"].as_str() {
+            Some("audit") => json!({"rows": [
+                {"bot": "shop.fix", "turn": 4, "call_id": "c1", "step": null,
+                    "approved": "reviewer", "outcome": "denied"}],
+                "next_before": null}),
+            _ => json!({}),
+        })
+        .await;
+        let mut app = app(client);
+        app.bot = "home.lead".into();
+        app.width = 80;
+        app.raised
+            .push(json!({"bot": "shop.fix", "turn": 4, "call_id": "c1",
+            "name": "shell", "gates": ["manual", "auto"], "arguments": {"command": "cargo publish"}}));
+        app.show_asked();
+        app.flush();
+        let key = |code| Event::Key(event::KeyEvent::new(code, KeyModifiers::NONE));
+        app.key(key(KeyCode::Char('y'))).await;
+        app.raised.clear();
+        app.fold_written();
+        // No fleet: the reviewer's gate denying it is read from the trail.
+        app.raise_approvals().await;
+        app.flush();
+        let texts = app.screen.texts();
+        assert!(
+            texts.contains(&"✗ The reviewer denied cargo publish · shop.fix".to_owned()),
+            "{texts:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_lifted_call_allowed_here_that_expired_timed_out() {
+        let client = daemon_answering(|_| json!({})).await;
+        let mut app = app(client);
+        app.width = 80;
+        app.approvals.push(
+            json!({"turn": 3, "call_id": "c1", "name": "shell", "handle": "proc:9",
+            "gates": ["manual", "auto"], "arguments": {"command": "make deploy"}}),
+        );
+        app.show_asked();
+        app.flush();
+        let key = |code| Event::Key(event::KeyEvent::new(code, KeyModifiers::NONE));
+        app.key(key(KeyCode::Char('y'))).await;
+        app.daemon(json!({"event": "lifted_ended", "bot": "b", "turn": 3,
+            "data": {"call_id": "c1", "handle": "proc:9", "outcome": "expired",
+                "failed": true}}))
+            .await;
+        app.fold_written();
+        app.flush();
+        let texts = app.screen.texts();
+        assert!(
+            texts.contains(&"✗ Request timed out for make deploy".to_owned()),
+            "{texts:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_denial_by_another_gate_replaces_the_persons_allow_here() {
+        let client = daemon_answering(|_| json!({})).await;
+        let mut app = app(client);
+        app.width = 80;
+        app.approvals
+            .push(json!({"turn": 3, "call_id": "c1", "name": "shell",
+            "gates": ["manual", "auto"], "arguments": {"command": "git push"}}));
+        app.show_asked();
+        app.flush();
+        let key = |code| Event::Key(event::KeyEvent::new(code, KeyModifiers::NONE));
+        app.key(key(KeyCode::Char('y'))).await;
+        app.fold_written();
+        app.flush();
+        let texts = app.screen.texts();
+        assert!(
+            texts.contains(&"✓ You allowed git push".to_owned()),
+            "{texts:?}"
+        );
+        // The reviewer's gate denied it after all: its end says so.
+        app.heard_verdict(
+            "b",
+            Some(3),
+            &json!({"call_id": "c1", "denied": true,
+            "approvals": [{"tag": "manual", "by": "tui", "allow": true},
+                {"tag": "auto", "by": "approver", "allow": false}]}),
+        );
+        let texts = app.screen.texts();
+        assert!(
+            texts.contains(&"✗ The reviewer denied git push".to_owned()),
+            "{texts:?}"
+        );
+        assert!(!texts.contains(&"✓ You allowed git push".to_owned()));
+    }
+
+    #[test]
+    fn a_decided_request_says_who_decided_and_what() {
+        let shell = json!({"command": "cargo publish --allow-dirty\nmore"});
+        let row = |decided: &transcript::Decided, from| {
+            transcript::seen(&transcript::decided(
+                "shell", &shell, from, decided, "/w", 80,
+            ))
+        };
+        use transcript::Decided::*;
+        assert_eq!(
+            row(
+                &Allowed {
+                    you: true,
+                    kept: Some("cargo".into())
+                },
+                None
+            ),
+            "✓ You allowed cargo publish --allow-dirty, and cargo from now on"
+        );
+        assert_eq!(
+            row(&Denied { you: false }, Some("shop.fix")),
+            "✗ The reviewer denied cargo publish --allow-dirty · shop.fix"
+        );
+        assert_eq!(
+            row(&Lapsed, None),
+            "✗ Request timed out for cargo publish --allow-dirty"
+        );
+        assert_eq!(
+            row(&Gone, None),
+            "⏸ Request for cargo publish --allow-dirty no longer waits"
+        );
+        // A long command is cut to the row.
+        let long = json!({"command": "x".repeat(200)});
+        let line = transcript::decided("shell", &long, None, &Denied { you: true }, "/w", 40);
+        assert!(transcript::seen(&line).chars().count() <= 40);
+    }
+
+    #[tokio::test]
     async fn a_followed_tasks_approval_waits_and_is_answered_in_the_window_youre_in() {
         let sent = Arc::new(std::sync::Mutex::new(Vec::new()));
         let seen = sent.clone();
@@ -24710,13 +25530,21 @@ mod tests {
         assert_eq!(app.input.trim(), "y");
         assert!(sent.lock().unwrap().is_empty());
         assert_eq!(text(&[app.status_line()]), ["⏸ 1 approval set aside"]);
-        // With nothing typed, Enter brings it back, written out again.
+        // With nothing typed, Enter brings it back, written out again by
+        // the keys, the copy above gone: one copy of a call here.
+        let first = text(&app.pending);
         app.input.set("");
         app.key(key(KeyCode::Enter)).await;
         assert!(app.waiting().is_some());
         app.show_asked();
         let again = app.pending.len() - 6;
-        assert_eq!(text(&app.pending[again..]), text(&app.pending[..6]));
+        assert_eq!(text(&app.pending[again..]), first);
+        app.flush();
+        let shown = app.screen.texts();
+        assert_eq!(
+            shown.iter().filter(|row| *row == "⏸ Allow shell?").count(),
+            1
+        );
         // An answer that failed leaves it waiting here, to answer again.
         app.key(key(KeyCode::Char('n'))).await;
         assert!(sent.lock().unwrap().is_empty());

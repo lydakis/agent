@@ -80,6 +80,9 @@ pub enum Tag {
     Plan(u64),
     /// A question's card, by the client's number for it.
     Ask(u64),
+    /// A call waiting on the person, written out, then folded to its
+    /// verdict once answered, by the client's number for it.
+    Request(u64),
     /// The last row of the words streamed as this item of the running
     /// turn, until their message names its node.
     Streamed(u64),

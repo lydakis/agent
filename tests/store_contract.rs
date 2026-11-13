@@ -4194,6 +4194,103 @@ fn prompts_name_who_wrote_each_and_what_the_turn_ran() {
 }
 
 #[test]
+fn a_prompts_read_lists_the_persons_own_earlier_words_apart_from_notes() {
+    let mut db = db();
+    db.create("Ann", Some("/synthetic"), binding()).unwrap();
+    let note = TurnOptions {
+        origin: Some("lookout".into()),
+        ..TurnOptions::default()
+    };
+    let run = |db: &mut Database, request: &str, text: &str, options: &TurnOptions| {
+        let turn = db
+            .begin("Ann", request, text, true, options, allow_provider)
+            .unwrap()
+            .turn;
+        db.finish(turn, None).unwrap();
+        turn
+    };
+    let plain = TurnOptions::default();
+    let rule = run(
+        &mut db,
+        "a1",
+        "answer coworkers' factual questions yourself",
+        &plain,
+    );
+    run(&mut db, "a2", "a task finished", &note);
+    let each = 3600;
+    let long = "x".repeat(each + 1);
+    let long_turn = run(&mut db, "a3", &long, &plain);
+    let ok = run(&mut db, "a4", "ok", &plain);
+    run(&mut db, "a5", &"n".repeat(4096), &note);
+    let now = db
+        .begin("Ann", "a6", "now", true, &plain, allow_provider)
+        .unwrap()
+        .turn;
+    // Without `persons`, nothing is listed apart.
+    let read = db.prompts("Ann", now, 1024).unwrap();
+    assert!(read.get("persons").is_none(), "{read}");
+    // The notes fill `earlier`; the person's words have their own budget,
+    // newest first, each whole or left out whole.
+    let read = db
+        .prompts_and_persons("Ann", now, 1024, 64 * 1024, each)
+        .unwrap();
+    assert_eq!(read["more"], true);
+    assert_eq!(
+        read["persons"],
+        json!([{"message":ok,"text":"ok"},
+            {"message":rule,"text":"answer coworkers' factual questions yourself"}])
+    );
+    assert_eq!(read["persons_more"], true, "the long one is left out");
+    // How long one may be is the caller's: with no limit of its own, the
+    // budget alone decides, and the long one is listed whole.
+    let read = db
+        .prompts_and_persons("Ann", now, 1024, 64 * 1024, 0)
+        .unwrap();
+    assert_eq!(read["persons"][1]["message"], long_turn);
+    assert_eq!(read["persons"][1]["text"].as_str().unwrap().len(), each + 1);
+    assert_eq!(read["persons_more"], false);
+    // Past the budget the older ones are left out, never cut.
+    let entry = Database::PROMPTS_ENTRY;
+    let read = db
+        .prompts_and_persons("Ann", now, 1024, entry + 2, each)
+        .unwrap();
+    assert_eq!(read["persons"], json!([{"message":ok,"text":"ok"}]));
+    assert_eq!(read["persons_more"], true);
+    // Only words from before the turn are listed.
+    let read = db
+        .prompts_and_persons("Ann", rule, 1024, 1024, each)
+        .unwrap();
+    assert_eq!(
+        (&read["persons"], &read["persons_more"]),
+        (&json!([]), &json!(false))
+    );
+    // At most so many of the person's messages are looked at, however
+    // many the budget would hold.
+    db.finish(now, None).unwrap();
+    for n in 0..Database::PROMPTS_SCANNED {
+        run(&mut db, &format!("b{n}"), "y", &plain);
+    }
+    let last = db
+        .begin("Ann", "b-last", "last", true, &plain, allow_provider)
+        .unwrap()
+        .turn;
+    let read = db
+        .prompts_and_persons("Ann", last, 1024, Database::PROMPTS_BYTES, 0)
+        .unwrap();
+    assert_eq!(
+        read["persons"].as_array().unwrap().len(),
+        Database::PROMPTS_SCANNED
+    );
+    assert_eq!(read["persons_more"], true);
+    assert_eq!(
+        db.prompts_and_persons("Ann", now, 1024, Database::PROMPTS_BYTES + 1, 0)
+            .unwrap_err()
+            .code,
+        "invalid_limit"
+    );
+}
+
+#[test]
 fn a_prompts_read_keeps_the_prompt_and_the_newest_steers() {
     let mut db = db();
     db.create("Carol", Some("/synthetic"), binding()).unwrap();
