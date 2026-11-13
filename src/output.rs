@@ -203,6 +203,34 @@ impl Output {
             .map_err(|_| Error::new("output_closed"))
     }
 
+    /// Room for one later event no larger than `upto`, waiting for it as
+    /// `send` does. `send_in` then sends into it without waiting, so an
+    /// event whose content is settled under a lock still never fails for
+    /// want of room. Dropped unused, the room goes back to the budget.
+    pub async fn reserve(&self, upto: &Value) -> Result<Room> {
+        let bytes = Self::encode(upto)?;
+        let permit = self
+            .budget
+            .clone()
+            .acquire_many_owned(cost(&bytes))
+            .await
+            .map_err(|_| Error::new("output_closed"))?;
+        Ok(Room(permit))
+    }
+
+    /// Send `event` into `room`, never waiting. The part of the room the
+    /// event does not take goes back to the budget.
+    pub fn send_in(&self, room: Room, event: &Value) -> Result<()> {
+        let bytes = Self::encode(event)?;
+        let mut permit = room.0;
+        let permit = permit
+            .split(cost(&bytes) as usize)
+            .ok_or_else(|| Error::new("output_room"))?;
+        self.sender
+            .send((bytes, permit, None))
+            .map_err(|_| Error::new("output_closed"))
+    }
+
     /// The budget `try_send` would accept right now, in bytes, each packet
     /// counting `PACKET_BYTES` besides its own.
     pub fn room(&self) -> usize {
@@ -222,6 +250,9 @@ impl Output {
             .map_err(|_| Error::new("output_closed"))
     }
 }
+
+/// Budget set aside by [`Output::reserve`] for one event.
+pub struct Room(OwnedSemaphorePermit);
 
 /// What a packet of `bytes` takes from the budget.
 fn cost(bytes: &[u8]) -> u32 {

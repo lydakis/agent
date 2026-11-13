@@ -9143,6 +9143,50 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_follower_full_at_the_boundary_gets_its_marker_once_it_reads() {
+        use tokio::io::AsyncBufReadExt;
+        let dir = scratch("replay-full-boundary");
+        let (store, _publications) = Store::open(&dir.join("state.sqlite")).await.unwrap();
+        let hub = Hub::default();
+        // The follower reads nothing yet, and what is queued for it already
+        // fills its output: a marker that could not wait would close it.
+        let (near, far) = tokio::io::duplex(4096);
+        let output = Output::writer(near);
+        let pad = json!({"event": "pad", "text": "x".repeat(60_000)});
+        let mut queued = 0;
+        while output.try_send(pad.clone()).is_ok() {
+            queued += 1;
+        }
+        // Then down to the last few bytes, too few for a marker.
+        while output.try_send(json!({"e": 1})).is_ok() {
+            queued += 1;
+        }
+        let closed = output.subscribe_closed();
+        let sub = hub.subscribe(hub::ALL, 1, output.clone(), 0, None);
+        let paging = tokio::spawn(replay(store.clone(), hub.clone(), hub::ALL.to_owned(), sub));
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(
+            !*closed.borrow(),
+            "a full follower waits for room at the boundary"
+        );
+        let mut lines = tokio::io::BufReader::new(far).lines();
+        for _ in 0..queued {
+            lines.next_line().await.unwrap().unwrap();
+        }
+        let line = tokio::time::timeout(Duration::from_secs(5), lines.next_line())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        let marker: Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(marker["event"], "follow_live");
+        paging.await.unwrap().unwrap();
+        assert!(!*closed.borrow());
+        drop(store);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
     async fn a_replay_racing_new_events_delivers_each_once_in_order() {
         use tokio::io::AsyncBufReadExt;
         let dir = scratch("replay-race");
@@ -9194,12 +9238,17 @@ mod tests {
         let mut lines = tokio::io::BufReader::new(far).lines();
         let mut cursors = Vec::new();
         let mut live = 0;
+        let (mut boundary, mut replayed) = (None, 0);
         while let Ok(Ok(Some(line))) =
             tokio::time::timeout(Duration::from_secs(5), lines.next_line()).await
         {
             let event: Value = serde_json::from_str(&line).unwrap();
             match event["cursor"].as_i64() {
-                _ if event["event"] == "follow_live" => live += 1,
+                _ if event["event"] == "follow_live" => {
+                    live += 1;
+                    boundary = event["cursor"].as_i64();
+                    replayed = cursors.len();
+                }
                 Some(cursor) => cursors.push(cursor),
                 None => {}
             }
@@ -9211,6 +9260,16 @@ mod tests {
         assert!(last >= 1000, "{last}");
         let expected: Vec<i64> = (1..=last).collect();
         assert_eq!(cursors, expected, "every event once, in order");
+        // The marker parts replay from live: no live event comes before it.
+        let boundary = boundary.unwrap();
+        assert!(
+            cursors[..replayed].iter().all(|&c| c <= boundary),
+            "{boundary}"
+        );
+        assert!(
+            cursors[replayed..].iter().all(|&c| c > boundary),
+            "{boundary}"
+        );
         publisher.abort();
         drop(service);
         drop(store);
