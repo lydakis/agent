@@ -1287,6 +1287,14 @@ pub fn run() -> Option<PathBuf> {
     std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".agent/run"))
 }
 
+/// Where every daemon of the person's lists its store and socket,
+/// `~/.agent/run/daemons`, so each keeps the others' out of its sandboxes
+/// as it keeps its own: a sandboxed command reaches no daemon but through
+/// its own bot's socket, and writes no daemon's store.
+pub fn daemons() -> Option<PathBuf> {
+    run().map(|run| run.join("daemons"))
+}
+
 /// The person's command rules, `~/.agent/rules`: each `*.rules` file in it
 /// holds Codex's `prefix_rule` calls, which every agent's commands follow.
 pub fn rules() -> Option<PathBuf> {

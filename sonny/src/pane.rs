@@ -92,8 +92,6 @@ pub struct Pane {
     /// A folder, drawn as a tree its folders open and close in.
     tree: Option<crate::tree::Tree>,
     width: usize,
-    /// The margin's first row in place of a title, and its buttons.
-    head: Option<(Line<'static>, crate::screen::Buttons)>,
     /// The marks the margin's lines were last set with.
     marks: Vec<(usize, crate::screen::Mark)>,
     /// It is the margin, not something opened over it.
@@ -217,7 +215,6 @@ impl Pane {
             forward: Vec::new(),
             tree,
             width,
-            head: None,
             marks: Vec::new(),
             margin: false,
             over: false,
@@ -350,7 +347,6 @@ impl Pane {
             forward: Vec::new(),
             tree: None,
             width: 0,
-            head: None,
             marks: Vec::new(),
             margin: false,
             over: false,
@@ -385,7 +381,6 @@ impl Pane {
             forward: Vec::new(),
             tree: None,
             width: 0,
-            head: None,
             marks: Vec::new(),
             margin: false,
             over: false,
@@ -426,7 +421,7 @@ impl Pane {
         (self.area.x + 1, self.area.y + 2)
     }
 
-    /// The margin: the agent's notes, under a glance line.
+    /// The margin: the agent's notes.
     pub fn margin() -> Self {
         Self {
             margin: true,
@@ -460,14 +455,12 @@ impl Pane {
     }
 
     /// The margin's lines, with their tags and buttons, put in only when
-    /// they changed, as [`Pane::set_card`] puts a card's; and its first row.
+    /// they changed, as [`Pane::set_card`] puts a card's.
     pub fn set_margin(
         &mut self,
         lines: Vec<Line<'static>>,
         marks: Vec<(usize, crate::screen::Mark)>,
-        head: (Line<'static>, crate::screen::Buttons),
     ) {
-        self.head = Some(head);
         // The same rows for another note still point at the other note.
         if self.card.as_ref() != Some(&lines) || self.marks != marks {
             self.screen.replace_marked(lines.clone(), marks.clone());
@@ -476,10 +469,8 @@ impl Pane {
         }
     }
 
-    /// The button under `column` on the title row, if any: the margin's
-    /// glance, or the arrow back to the margin.
+    /// The button under `column` on the title row, if any.
     pub fn head_button(&self, column: u16) -> Option<String> {
-        let at = column.checked_sub(self.area.x)?;
         if let (Some(agent), Some((from, to))) = (&self.agent, self.main_at)
             && (from..to).contains(&column)
         {
@@ -506,10 +497,7 @@ impl Pane {
         {
             return Some(format!("{}bigger", crate::screen::BUTTON));
         }
-        let (_, buttons) = self.head.as_ref()?;
-        (buttons.iter())
-            .find(|(from, to, _)| (*from..*to).contains(&at))
-            .map(|(.., url)| url.clone())
+        None
     }
 
     /// The card's rows as text.
@@ -634,16 +622,14 @@ impl Pane {
         }
         // A name keeps its room: the keys before esc go first, from the
         // last, as the footer's least urgent do; esc, named last, stays.
-        if self.head.is_none() {
-            let button = if self.agent.is_some() {
-                MAIN.width()
-            } else {
-                0
-            };
-            let name =
-                head.iter().map(|s| s.content.width()).sum::<usize>() + self.title.width() + button;
-            keys = fit_keys(&keys, (area.width as usize).saturating_sub(name));
-        }
+        let button = if self.agent.is_some() {
+            MAIN.width()
+        } else {
+            0
+        };
+        let name =
+            head.iter().map(|s| s.content.width()).sum::<usize>() + self.title.width() + button;
+        keys = fit_keys(&keys, (area.width as usize).saturating_sub(name));
         // The switch key's hint is a button too: where it sits, as the
         // keys end at the title's right edge.
         let from = area.x + (area.width as usize).saturating_sub(keys.width()) as u16;
@@ -662,51 +648,33 @@ impl Pane {
             true => crate::hint::spans(&keys),
             false => vec![Span::raw(keys.clone()).dim()],
         };
-        let head = match &self.head {
-            // The margin's glance in place of a title, its keys after.
-            Some((glance, _)) => {
-                let room = (area.width as usize).saturating_sub(keys.width() + 1);
-                let cut = crate::transcript::cut(&glance.to_string(), room);
-                let mut spans = match cut.width() < glance.width() {
-                    true => vec![Span::raw(cut)],
-                    false => glance.spans.clone(),
-                };
-                let gap =
-                    (area.width as usize).saturating_sub(glance.width().min(room) + keys.width());
-                spans.push(Span::raw(" ".repeat(gap)));
-                spans.extend(key_spans);
-                Line::from(spans)
-            }
-            None => {
-                // An agent's Sonny opens in the main view from its title,
-                // where there is room for the button beside the name.
-                let button = match &self.agent {
-                    Some(_) => MAIN,
-                    None => "",
-                };
-                let used: usize = head.iter().map(|s| s.content.width()).sum();
-                let room = (area.width as usize).saturating_sub(used + keys.width());
-                let button = match self.title.width() + button.width() <= room {
-                    true => button,
-                    false => "",
-                };
-                let title = crate::transcript::cut(&self.title, room - button.width());
-                let gap = (area.width as usize)
-                    .saturating_sub(used + title.width() + button.width() + keys.width());
-                let at = area.x + (used + title.width() + 1) as u16;
-                let name = area.x + used as u16;
-                self.name_at = self.tab.then_some((name, name + title.width() as u16));
-                head.push(Span::styled(title, style));
-                self.main_at = None;
-                if !button.is_empty() {
-                    self.main_at = Some((at, at + 1));
-                    head.push(Span::raw(button).fg(ratatui::style::Color::Cyan));
-                }
-                head.push(Span::raw(" ".repeat(gap)));
-                head.extend(key_spans);
-                Line::from(head)
-            }
+        // An agent's Sonny opens in the main view from its title,
+        // where there is room for the button beside the name.
+        let button = match &self.agent {
+            Some(_) => MAIN,
+            None => "",
         };
+        let used: usize = head.iter().map(|s| s.content.width()).sum();
+        let room = (area.width as usize).saturating_sub(used + keys.width());
+        let button = match self.title.width() + button.width() <= room {
+            true => button,
+            false => "",
+        };
+        let title = crate::transcript::cut(&self.title, room - button.width());
+        let gap = (area.width as usize)
+            .saturating_sub(used + title.width() + button.width() + keys.width());
+        let at = area.x + (used + title.width() + 1) as u16;
+        let name = area.x + used as u16;
+        self.name_at = self.tab.then_some((name, name + title.width() as u16));
+        head.push(Span::styled(title, style));
+        self.main_at = None;
+        if !button.is_empty() {
+            self.main_at = Some((at, at + 1));
+            head.push(Span::raw(button).fg(ratatui::style::Color::Cyan));
+        }
+        head.push(Span::raw(" ".repeat(gap)));
+        head.extend(key_spans);
+        let head = Line::from(head);
         buf.set_line(area.x, area.y, &head, area.width);
         // A row between the name and what it holds, and above the foot.
         let mut rows = Rect {
@@ -1520,14 +1488,11 @@ mod tests {
         use crate::screen::{Mark, Tag};
         let mut pane = Pane::margin();
         let lines = vec![Line::from(" ✎ Repro")];
-        let head = (Line::from("calc"), Vec::new());
-        pane.set_margin(
-            lines.clone(),
-            vec![(0, Mark::Tag(Tag::Note(1)))],
-            head.clone(),
-        );
-        pane.set_margin(lines, vec![(0, Mark::Tag(Tag::Note(2)))], head);
+        pane.set_margin(lines.clone(), vec![(0, Mark::Tag(Tag::Note(1)))]);
+        pane.set_margin(lines, vec![(0, Mark::Tag(Tag::Note(2)))]);
         assert!(pane.screen.show_tagged(Tag::Note(2), 0));
         assert!(!pane.screen.show_tagged(Tag::Note(1), 0));
+        // Titled as every view here is.
+        assert!(rows(&mut pane, 40, 4)[0].starts_with(" margin "));
     }
 }

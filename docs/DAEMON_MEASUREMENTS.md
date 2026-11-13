@@ -8655,3 +8655,58 @@ not touch: Sonny's only change is one label in the transcript's match on
 tool names. The same lookout note p95 fell 14% at the other size in the
 same run, and quiet window CPU has swung by 16% and 33% on earlier screens
 with no Sonny change (above), so both are the runner's spread.
+
+## No look for ready work after every end
+
+The service loop looked for a ready message (`next_ready`, a query on the
+store's writer) after every turn that ended and every slot that opened,
+and waited for the answer, though almost every end leaves nothing ready.
+At a thousand bots or more that wait was most of the loop's time, and
+every request queued behind it. Now the end's own store job says whether
+it promoted the bot's next message (one indexed lookup in a job it already
+runs), and the loop looks only then. A slot opening needs no look: the
+hint is cleared only when a look finds nothing, and stays set while a full
+daemon keeps ready work waiting.
+
+`bench.scale_screen` (new), 2,048 bots streaming back to back, 2.3 s calls
+with lengths spread by half either way, one firehose follower, 20 s
+windows, 4-CPU Linux cloud box, base main afe098f against head, three
+alternating rounds each:
+
+| Measure | Base | Head |
+| --- | ---: | ---: |
+| turns a second (ideal 890) | 826, 863, 870 | 881, 883, 886 |
+| `submit` answer p50, ms | 176.9, 24.0, 32.2 | 3.3, 3.5, 3.5 |
+| `submit` answer p95, ms | 396.8, 294.9, 299.6 | 26.2, 16.4, 11.8 |
+| turn p50, ms (ideal 2,300) | 2,475, 2,359, 2,345 | 2,319, 2,319, 2,308 |
+| daemon CPU per turn, ms | 1.48, 1.37, 1.38 | 1.35, 1.36, 1.36 |
+| store jobs per turn | 7.99, 8.11, 8.06 | 7.63, 7.55, 7.56 |
+| `next_ready` looks in the window | 7,104, 8,081, 7,856 | 0, 0, 0 |
+| loop time waiting on `next_ready` | 80%, 74%, 76% | 0% |
+
+Daemon and Sonny screen (`bench.perf_gate`), the Perf workflow's Linux
+runner, base main afe098f against head 109e113, alternating rounds:
+
+| Bench | Measure | Base | Head | Change |
+| --- | --- | ---: | ---: | ---: |
+| admission | lone submit CPU, ms | 27.708 | 28.121 | +1.5% |
+| admission | burst submit p99, ms | 2.844 | 2.971 | +4.5% |
+| completion | release to terminal p99, ms | 7.919 | 8.522 | +7.6% |
+| footprint | idle RSS, MiB | 16.002 | 16.07 | +0.4% |
+| footprint | per idle bot, KiB | 1.874 | 1.802 | -3.8% |
+| footprint | RSS after a turn each, MiB | 30.041 | 39.121 | +30.2% |
+| footprint | CPU per turn, ms | 0.726 | 0.722 | -0.5% |
+| lifecycle | CPU, s | 0.395 | 0.385 | -2.5% |
+| lifecycle | p95 turn, ms | 577.713 | 612.176 | +6.0% |
+| lifecycle | peak RSS, MiB | 24.385 | 24.736 | +1.4% |
+
+Store work per turn falls on head: `bench.footprint` counts 7.00 jobs a
+turn against 7.36 to 7.39, and half the commits (0.26 to 0.35 a turn
+against 0.51 to 0.60), since an end no longer queues a look behind it. The
+gate warned on no row. The RSS after a turn each is the allocator's
+high-water mark from 1,000 turns at once, and moves by whole MiB between
+runs: three alternating `bench.footprint --repeat 2` rounds on a 4-CPU
+Linux cloud box gave 29.3 to 32.9 MiB on base and 28.9 to 36.0 on head,
+both with a median of 31.3. The Sonny rows are untouched by the change.
+
+The next ceiling is the store's single writer (#900).
