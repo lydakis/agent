@@ -77,7 +77,7 @@ Seatbelt only refuses connections to its sockets and hard links into it,
 so its files stay readable; and the `read` tool, which the daemon answers
 itself outside any sandbox, reads them on both. What a sandbox closes and
 what it leaves open is summed up in
-[Sonny's README](../sonny/README.md#what-the-sandbox-closes).
+[Sonny's sandbox reference](../sonny/REFERENCE.md#what-the-sandbox-closes).
 
 Every daemon lists its store and socket in `~/.agent/run/daemons` as it
 opens its store, and keeps every other listed daemon's as it keeps its own:
