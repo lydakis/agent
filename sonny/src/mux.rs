@@ -1099,6 +1099,23 @@ impl Layout {
         self.blocks.insert(bot.to_owned(), own);
     }
 
+    /// Close the block this Sonny runs in, when it is `bot`'s, as its lead
+    /// labeled it: the task window the lead would close. One the person
+    /// switched to `bot`, or opened on it by hand, is left as it is.
+    /// Whether it closed.
+    pub fn close_own(&mut self, bot: &str) -> bool {
+        let Some(mine) = self.backend.own_block() else {
+            return false;
+        };
+        if !(self.listed().iter()).any(|b| b.id == mine && b.label == bot) {
+            return false;
+        }
+        self.blocks.remove(bot);
+        self.used.remove(bot);
+        self.close_block(&mine);
+        true
+    }
+
     /// Close every other block labelled with the bot's name, as one Sonny
     /// opened for the task while this one placed it.
     pub fn close_others(&mut self, bot: &str) {
@@ -2566,6 +2583,35 @@ mod tests {
 
     fn labels(layout: &mut Layout) -> Vec<(String, Vec<String>)> {
         layout.windows()
+    }
+
+    #[test]
+    fn a_task_window_closes_itself_only_as_its_lead_labeled_it() {
+        // Sonny runs in the task's block, as its lead opened it.
+        let fake = Fake::default();
+        fake.add("shop.lead", "home");
+        let own = fake.add("shop.fix", "fix");
+        let fake = Fake {
+            own: Some(own),
+            ..fake
+        };
+        let mut layout = Layout::new(Box::new(fake));
+        assert!(!layout.close_own("shop.other"));
+        assert!(layout.close_own("shop.fix"));
+        assert_eq!(
+            labels(&mut layout),
+            [("home".into(), vec!["shop.lead".into()])]
+        );
+        // One the person switched to the task, still the lead's block, or
+        // in no multiplexer it knows, stays.
+        let fake = Fake::default();
+        let own = fake.add("shop.lead", "home");
+        let mut layout = Layout::new(Box::new(Fake {
+            own: Some(own),
+            ..fake
+        }));
+        assert!(!layout.close_own("shop.fix"));
+        assert!(!Layout::new(Box::new(Fake::default())).close_own("shop.fix"));
     }
 
     #[test]
