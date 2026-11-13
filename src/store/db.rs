@@ -5576,7 +5576,6 @@ impl Database {
                     Some("compaction"),
                     Charge::Aside,
                     None,
-                    ended.is_none(),
                 )?;
             }
             tx.execute(
@@ -8096,7 +8095,7 @@ impl Database {
         let bot = self.active(turn)?;
         let tx = self.conn.savepoint()?;
         let charge = Charge::Failed { added, read };
-        let entry = record_usage_for(&tx, &bot, turn, usage, None, charge, None, true)?;
+        let entry = record_usage_for(&tx, &bot, turn, usage, None, charge, None)?;
         tx.execute(
             "UPDATE turns SET model_rounds=model_rounds+1 WHERE id=?",
             [turn],
@@ -8134,7 +8133,6 @@ impl Database {
                 Some("compaction"),
                 Charge::Aside,
                 None,
-                !late,
             )?;
         }
         tx.execute(
@@ -14514,16 +14512,7 @@ fn record_usage(
     added: u64,
     head: Option<i64>,
 ) -> Result<Value> {
-    record_usage_for(
-        conn,
-        bot,
-        turn,
-        usage,
-        None,
-        Charge::Round { added },
-        head,
-        true,
-    )
+    record_usage_for(conn, bot, turn, usage, None, Charge::Round { added }, head)
 }
 /// Record a call's usage, and its work, from the measure as `bot` holds it.
 #[allow(clippy::too_many_arguments)]
@@ -14535,7 +14524,6 @@ fn record_usage_for(
     purpose: Option<&str>,
     charge: Charge,
     head: Option<i64>,
-    within: bool,
 ) -> Result<Value> {
     let (work, read) = bot.work.charged(usage, charge, head);
     let mut data = serde_json::to_value(usage)?;
@@ -14545,13 +14533,14 @@ fn record_usage_for(
     }
     let cursor = event(conn, &bot.name, Some(turn), "usage", data.clone())?;
     spent_by_model(conn, turn, usage)?;
-    // A timed call made while its turn ran is the turn's own time too; a
-    // summary billed to it after it ended is not.
-    let timed = within && usage.model_ms > 0;
+    // The turn's own timed rounds are its model time. A summary is not: one
+    // the turn waited on is its `summary_ms`, one that ran beside a round
+    // overlaps it, and one billed after the turn ended was not in it.
+    let timed = purpose.is_none() && usage.model_ms > 0;
     conn.prepare_cached(
         "UPDATE turns SET input_tokens=input_tokens+?1,output_tokens=output_tokens+?2,
              cached_input_tokens=cached_input_tokens+?3,work=work+?4,daemon_ms=daemon_ms+?5,
-             timed_rounds=timed_rounds+?7,timed_output_tokens=timed_output_tokens+?7*?2,
+             timed_rounds=timed_rounds+?7,timed_output_tokens=timed_output_tokens+?7*?10,
              model_ms=model_ms+?7*?8,first_token_ms=first_token_ms+?7*?9 WHERE id=?6",
     )?
     .execute(params![
@@ -14564,6 +14553,7 @@ fn record_usage_for(
         timed as i64,
         usage.model_ms as i64,
         usage.first_token_ms as i64,
+        usage.timed_output_tokens() as i64,
     ])?;
     conn.prepare_cached(
         "UPDATE bots SET tokens_used=tokens_used+?,input_tokens=input_tokens+?,
@@ -17335,10 +17325,9 @@ fn migrate_since_73(conn: &Connection, from: i32) -> Result<()> {
 
     // Schema 98: each turn counts the calls that ran to their end and their
     // time, calls that ran together once, and its own model calls' timings,
-    // apart from a summary billed to it after it ended. The turns timed
-    // since schema 95 take their calls from the audit trail, read from their
-    // first start on, and their timings from their models' rows, which
-    // count such a summary too.
+    // apart from summaries. The turns timed since schema 95 take their calls
+    // from the audit trail, read from their first start on, and their
+    // timings from their models' rows, which count summaries too.
     if from < 98 {
         let has: bool = conn.query_row(
             "SELECT EXISTS(SELECT 1 FROM pragma_table_info('turns') WHERE name='tool_ms')",

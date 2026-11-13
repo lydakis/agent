@@ -17263,7 +17263,7 @@ fn each_turn_counts_its_calls_and_their_time_once() {
 }
 
 #[test]
-fn a_trimmed_row_and_a_late_summary_leave_a_turns_time_as_it_ran() {
+fn a_trimmed_row_a_fallback_and_summaries_leave_a_turns_time_as_it_ran() {
     let path = std::env::temp_dir().join(format!("agent-clock-late-{}.sqlite", std::process::id()));
     let _ = std::fs::remove_file(&path);
     let mut db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
@@ -17284,17 +17284,39 @@ fn a_trimmed_row_and_a_late_summary_leave_a_turns_time_as_it_ran() {
     .unwrap();
     db.tool_finish(turn, "s1", &result("ok")).unwrap();
     db.tool_finish(turn, "r1", &result("ok")).unwrap();
+    // A fallback's round: 3 tokens from the attempt that failed, 40 from
+    // the one that answered, which its time is.
+    let attempt = |model: &str, output| ModelTokens {
+        model: model.to_owned(),
+        provider: None,
+        input_tokens: 50,
+        output_tokens: output,
+        cached_input_tokens: 0,
+        cache_write_tokens: 0,
+        cache_write_1h_tokens: 0,
+    };
     let usage = Usage {
         input_tokens: 100,
-        output_tokens: 40,
+        output_tokens: 43,
         model_ms: 1_000,
         first_token_ms: 300,
+        models: vec![attempt("first", 3), attempt("second", 40)],
         ..Usage::default()
     };
     db.append(turn, vec![assistant("done")], &[], Some(&usage))
         .unwrap();
+    // A summary made while the turn ran is its spend, and its wait is its
+    // `summary_ms`, not model time: it may have run beside a round.
+    let beside = Usage {
+        input_tokens: 2_000,
+        output_tokens: 200,
+        model_ms: 5_000,
+        first_token_ms: 400,
+        ..Usage::default()
+    };
+    db.compaction_usage(turn, Some(&beside)).unwrap();
     db.finish(turn, None).unwrap();
-    // A summary billed after the turn ended is its spend, not its time.
+    // Nor is one billed after the turn ended.
     let summary = Usage {
         input_tokens: 5_000,
         output_tokens: 500,
@@ -17318,7 +17340,7 @@ fn a_trimmed_row_and_a_late_summary_leave_a_turns_time_as_it_ran() {
         ],
         [&json!(2), &json!(1), &json!(1_000), &json!(300), &json!(40)]
     );
-    assert_eq!(usage["model_ms"], 11_000, "the spend counts the summary");
+    assert_eq!(usage["model_ms"], 16_000, "the spend counts the summaries");
     drop(db);
     let _ = std::fs::remove_file(&path);
 }

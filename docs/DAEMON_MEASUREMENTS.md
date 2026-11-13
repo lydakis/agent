@@ -9034,8 +9034,10 @@ What each path does now:
 - **A call that ends**: one more update of its turn's row by key, reading its
   audit row's start by key, in the commit that already ends the call. No new
   store job.
-- **`usage`**: one more grouped statement over the window's finished turns
-  and their models' rows, in the same snapshot, on a reader connection.
+- **`usage`**: one more grouped statement over the window's finished turns,
+  in the same snapshot, on a reader connection.
+- **A model call billed**: the update of its turn's row that already adds its
+  tokens adds its timings too, for the turn's own rounds.
 - **Opening a schema 96 store**: one pass over the audit trail from the first
   timed turn's start (found by a binary search on ids), and one update per
   turn that ran calls.
