@@ -6284,7 +6284,10 @@ impl App {
                         fleet.event(&event)
                     });
                     // A call of an agent below, written out here, decided.
-                    if matches!(event["event"].as_str(), Some("tool_started" | "tool_completed"))
+                    if matches!(
+                        event["event"].as_str(),
+                        Some("tool_started" | "tool_completed" | "step_decided" | "lifted_ended")
+                    )
                         && let Some(bot) = event["bot"].as_str().filter(|bot| *bot != self.bot)
                     {
                         let bot = bot.to_owned();
@@ -10329,7 +10332,8 @@ impl App {
                 // Started, it was allowed, here or anywhere: it waits no more.
                 let bot = self.bot.clone();
                 self.heard_verdict(&bot, turn, data);
-                self.approvals.retain(|call| call["call_id"] != id);
+                (self.approvals)
+                    .retain(|call| call["call_id"] != id || call["turn"].as_i64() != turn);
                 // A long call's event carries a preview; the call is kept whole.
                 let arguments = match data["arguments_truncated"] == true {
                     true => self.call(id).await.map(|(_, arguments)| arguments),
@@ -10442,6 +10446,12 @@ impl App {
                 }
             }
             "approval_requested" | "approval_asked" | "step_decided" => {
+                // A step answered, here or anywhere: its verdict, for its
+                // copy written out here to fold to.
+                if kind == "step_decided" {
+                    let bot = self.bot.clone();
+                    self.heard_verdict(&bot, turn, data);
+                }
                 self.approvals_for(turn).await
             }
             // A message lifted a call out of its turn: it, and the steps
@@ -10456,9 +10466,12 @@ impl App {
                     }
                 }
             }
-            "lifted_ended" => self
-                .approvals
-                .retain(|call| call["handle"] != data["handle"]),
+            "lifted_ended" => {
+                // Allowed after a message lifted it: no start says so.
+                let bot = self.bot.clone();
+                self.heard_verdict(&bot, turn, data);
+                (self.approvals).retain(|call| call["handle"] != data["handle"]);
+            }
             "turn_waiting" => {
                 if let Some(running) = &mut self.running
                     && data["approval"] != true
@@ -15608,7 +15621,8 @@ impl App {
     }
 
     /// What came of a call written out here, as an event of `bot`'s says
-    /// (its start, or its end refused): its verdicts, the person's first.
+    /// (its start, its end refused, a step decided, or a lifted call's
+    /// wait ended): its verdicts, the person's first.
     fn heard_verdict(&mut self, bot: &str, turn: Option<i64>, data: &Value) {
         let key = (
             bot.to_owned(),
@@ -24617,6 +24631,48 @@ mod tests {
         );
         app.press(&format!("request/{tag}")).await;
         assert_eq!(app.screen.texts().len(), at.unwrap() + 1);
+    }
+
+    #[tokio::test]
+    async fn a_step_or_lifted_call_answered_elsewhere_folds_to_its_verdict() {
+        let client = daemon_answering(|_| json!({})).await;
+        let mut app = app(client);
+        app.width = 80;
+        // A lifted call of turn 3 and a step of turn 5, its call id the same.
+        app.approvals
+            .push(json!({"turn": 3, "call_id": "c1", "handle": "proc:4",
+            "name": "shell", "gates": ["manual"], "arguments": {"command": "git push"}}));
+        app.show_asked();
+        // Turn 5 starting its own c1 leaves turn 3's waiting.
+        app.daemon(json!({"event": "tool_started", "bot": "b", "turn": 5,
+            "data": {"call_id": "c1", "name": "shell", "arguments": "{}"}}))
+            .await;
+        assert_eq!(app.approvals.len(), 1);
+        app.approvals
+            .push(json!({"turn": 5, "call_id": "s1", "step_of": "c9",
+            "name": "browser", "gates": ["manual"], "arguments": {"command": "open"}}));
+        app.calls_aside.insert(("b".into(), 3, "c1".into()));
+        app.show_asked();
+        // The lifted call allowed anywhere: no start, its wait ends.
+        app.daemon(json!({"event": "lifted_ended", "bot": "b", "turn": 3,
+            "data": {"call_id": "c1", "handle": "proc:4", "outcome": "allowed",
+                "approvals": [{"tag": "manual", "by": "tui", "allow": true}]}}))
+            .await;
+        // The step denied anywhere.
+        app.heard_verdict(
+            "b",
+            Some(5),
+            &json!({"call_id": "s1", "decision": "deny",
+            "approvals": [{"tag": "manual", "by": "cli", "allow": false}]}),
+        );
+        app.approvals.clear();
+        app.fold_written();
+        let texts = app.screen.texts();
+        assert!(
+            texts.contains(&"✓ You allowed git push".to_owned()),
+            "{texts:?}"
+        );
+        assert!(texts.contains(&"✗ You denied open".to_owned()), "{texts:?}");
     }
 
     #[test]
