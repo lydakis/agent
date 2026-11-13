@@ -1408,7 +1408,7 @@ impl Persons {
     /// one count for every bot. A delegating turn read twice lists its
     /// words once.
     fn finish(mut self) -> Vec<policy::PersonsWords> {
-        self.words.sort_by(|a, b| b.message.cmp(&a.message));
+        self.words.sort_by_key(|a| std::cmp::Reverse(a.message));
         self.words.dedup_by(|a, b| a.message == b.message);
         self.words
     }
