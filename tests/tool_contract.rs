@@ -1777,6 +1777,18 @@ async fn a_tracked_detached_command_stops_on_its_handle_and_is_found_again() {
         .unwrap_err();
     assert_eq!(error.code, "daemon_paused");
     assert_eq!(ended.await.unwrap().unwrap_err(), error);
+    // A stop on its handle before it started: it never runs.
+    let (done, ended) = oneshot::channel();
+    let marker = dir.join("ran");
+    let stopper = tools.stopper(10);
+    assert!(tools.stop(10));
+    let error = tools
+        .detached(tools.cord(), stopper, "touch ran", &dir, &[], None, done)
+        .await
+        .unwrap_err();
+    assert_eq!(error.code, "stopped");
+    assert_eq!(ended.await.unwrap().unwrap_err(), error);
+    assert!(!marker.exists());
     // Found again by a later registry.
     let (done, first_end) = oneshot::channel();
     let first = tools

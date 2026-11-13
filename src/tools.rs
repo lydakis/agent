@@ -3228,13 +3228,14 @@ async fn detach(
     registry: &Registry,
     environment: &[(String, String)],
     sandbox: Option<Arc<Policy>>,
-    tracked: Option<Tracked>,
+    mut tracked: Option<Tracked>,
 ) -> Result<Detached> {
     // The cord as it was when the start was decided: a pull since, during
     // the setup too, ends the command as soon as its watcher has it.
     let Cord(pulls, _) = cord;
+    let stopper = tracked.as_mut().map(|tracked| &mut tracked.stopper);
     let spawned = match Cord(pulls.clone(), registry.stopping.subscribe()).check() {
-        Ok(()) => spawn_detached(command, workspace, registry, environment, sandbox).await,
+        Ok(()) => spawn_detached(command, workspace, registry, environment, sandbox, stopper).await,
         Err(error) => Err(error),
     };
     let (child, detached, sandboxed, started, held) = match spawned {
@@ -3294,6 +3295,7 @@ async fn spawn_detached(
     registry: &Registry,
     environment: &[(String, String)],
     sandbox: Option<Arc<Policy>>,
+    stopper: Option<&mut Stopper>,
 ) -> Result<Spawned> {
     use std::process::Stdio;
     let mut process = sh(
@@ -3326,6 +3328,10 @@ async fn spawn_detached(
     // The bot's socket listens while anything the command left in its
     // group runs, not only while the command itself does.
     let listening = sandbox.as_ref().and_then(|policy| policy.listening.clone());
+    // A stop on its handle during the setup: it never runs.
+    if let Some(stopper) = stopper {
+        stopper.check()?;
+    }
     let started = std::time::Instant::now();
     let child = process.spawn().map_err(|e| not_started(e, workspace))?;
     let pid = child.id().ok_or(Error::new("shell_spawn_failed"))?;
@@ -3386,7 +3392,7 @@ async fn watch_detached(
     let mut ended: Option<Result<Option<std::process::ExitStatus>>> = None;
     if let Leader::Found(since) = leader {
         let runs = move || async move {
-            tokio::task::spawn_blocking(move || leader_since(pid) == Some(since))
+            tokio::task::spawn_blocking(move || leader_runs(pid, since))
                 .await
                 .unwrap_or(false)
         };
@@ -3526,10 +3532,24 @@ fn leader_since(_: u32) -> Option<u64> {
     None
 }
 
+/// Whether process `pid`, which started at `since`, still runs: on Linux
+/// not a zombie, which an init that does not reap orphans leaves for good,
+/// unless another of its threads runs. Elsewhere init reaps orphans.
+#[cfg(target_os = "linux")]
+fn leader_runs(pid: u32, since: u64) -> bool {
+    leader_since(pid) == Some(since)
+        && stat(Path::new(&format!("/proc/{pid}/stat")))
+            .is_some_and(|(state, _)| !exited(state) || threads_run(&pid.to_string()))
+}
+#[cfg(all(unix, not(target_os = "linux")))]
+fn leader_runs(pid: u32, since: u64) -> bool {
+    leader_since(pid) == Some(since)
+}
+
 /// Whether detached command `detached`, which an earlier daemon started,
 /// still runs as itself: its leader is the process that started then, by
-/// its start time, not a later one given its pid, and its group has a
-/// member. A group whose leader has gone is not taken for it: while no
+/// its start time, not a later one given its pid, has not exited, and its
+/// group has a member. A group whose leader has gone is not taken for it: while no
 /// daemon watched, the group may have ended and its id gone to another,
 /// and a stop on the handle would kill that one.
 #[cfg(unix)]
@@ -3537,8 +3557,7 @@ fn still_runs(detached: Detached) -> bool {
     let Some(since) = detached.since else {
         return false;
     };
-    leader_since(detached.pid) == Some(since)
-        && !matches!(group_members(detached.pid as i32), Members::Gone)
+    leader_runs(detached.pid, since) && !matches!(group_members(detached.pid as i32), Members::Gone)
 }
 
 /// What is left of a detached command's process group.
