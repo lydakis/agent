@@ -914,9 +914,14 @@ has something on it, or is off the screen, no time shows.
   agent that reads untrusted content from outside, such as web pages,
   issues or email, use a row of your own with `network = false`, as
   `strict` above, and `unix_sockets` naming only the sockets it needs (on
-  Linux a row that names any reaches them all): with no network it can't
-  send what it read anywhere, and with no sockets it can't ask a program
-  outside to act for it.
+  Linux a row that names any reaches them all): its commands then can't
+  send what it read anywhere, nor ask a program outside to act for it. A
+  row holds only the agent's commands, though. `web_fetch` and
+  `web_search`, which the daemon and the provider answer, reach the web in
+  every row, so set `web_search = "disabled"` in `~/.agent/config.toml`
+  too, which leaves both out of every agent made from then on (one made
+  before keeps its tools); and a call approved to run outside the sandbox
+  reaches whatever you can.
 
   A call that waits on you is written out as Codex's approval shows it:
   `⏸ Allow shell?`, the agent's own reason for it as `Reason:`, the
