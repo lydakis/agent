@@ -1548,6 +1548,10 @@ class RuntimeTests(ModelFixture):
         done = [e for e in events if e['event'] == 'tool_completed'][0]
         output = node_item(client, 'Bob', done['data']['node'])['result']['output']
         self.assertEqual(json.loads(output)['error'], 'tool_not_available')
+        # The tool is still its own: a fork may be allowed it, as a shadow
+        # copies its source's tools, and inherits the sandbox that holds it.
+        fork = client.request('fork', source='Bob', bot='Shadow', allow=['echo', 'web_fetch'])
+        self.assertEqual(fork['result']['allowed'], ['echo', 'web_fetch'])
         # Given the network, it is offered the tool again.
         client.request('configure', bot='Bob', settings={'network': True})
         while not self.model.requests.empty():

@@ -1010,6 +1010,12 @@ impl Bot {
     pub fn may_call(&self, name: &str) -> bool {
         self.calls(name) || self.declared(name).is_some()
     }
+    /// Whether `name` is among what the bot may call, whatever its sandbox
+    /// allows now: a web tool an offline bot keeps counts, so a fork's
+    /// allowed list may name it and gets it when the network is set.
+    pub fn entitled(&self, name: &str) -> bool {
+        self.callable().iter().any(|tool| tool == name) || self.declared(name).is_some()
+    }
     /// Whether the bot may call the daemon's tool `name` now: one it may
     /// call, unless its sandbox keeps it off the network and the tool
     /// reaches the web, which the daemon and the provider would reach for
@@ -12537,7 +12543,7 @@ impl Database {
             Some(allow) => {
                 let mut allowed: Vec<String> = Vec::with_capacity(allow.len());
                 for tool in allow {
-                    if !parent.may_call(tool) {
+                    if !parent.entitled(tool) {
                         return fail_with(
                             "allow_not_in_source",
                             format!("{source} may not call {tool}"),
