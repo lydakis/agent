@@ -8670,9 +8670,14 @@ runs. What each path costs:
 - **A detached command**: two store jobs (its row before it starts, its
   pid and start after), on a path no screen runs; the one watcher task it
   had, which now also listens for a stop on its handle.
+- **A call a message lifted that runs**: one store job beside its start,
+  recording its kind and start time.
 - **Daemon start**: one read of the running rows' partial index for
   detached rows, and per row a `/proc` stat read and a group probe off the
-  runtime thread.
+  runtime thread. A command found again is then watched by its leader's
+  start, one stat file a second, as the one this daemon started waits on
+  its child: the walk of every process for what is left of its group
+  comes only after its leader has gone.
 - **`processes`**: a read through `processes_bot_running`, the partial
   index of running rows, a page of at most 128 at a time, so it costs
   what runs, not the history. Sonny's `/ps` reads it every two seconds

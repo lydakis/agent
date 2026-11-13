@@ -2592,9 +2592,13 @@ impl Registry {
         let started = std::time::Instant::now()
             .checked_sub(elapsed)
             .unwrap_or_else(std::time::Instant::now);
+        // Adopted only with its start known, which identifies its leader.
+        let Some(since) = detached.since else {
+            return false;
+        };
         tokio::spawn(watch_detached(
             self.pulls.subscribe(),
-            None,
+            Leader::Found(since),
             detached.pid,
             sandboxed,
             started,
@@ -3254,7 +3258,16 @@ async fn detach(
             .ok()
             .flatten();
         let _ = read.send(since);
-        watch_detached(pulls, Some(child), pid, sandboxed, started, tracked, held).await;
+        watch_detached(
+            pulls,
+            Leader::Child(child),
+            pid,
+            sandboxed,
+            started,
+            tracked,
+            held,
+        )
+        .await;
     });
     Ok(Detached {
         since: since.await.ok().flatten(),
@@ -3326,16 +3339,26 @@ async fn spawn_detached(
     ))
 }
 
+/// The leader of a detached command's group, as its watcher knows it.
+#[cfg(unix)]
+enum Leader {
+    /// This daemon started it: its child, whose exit it waits on.
+    Child(tokio::process::Child),
+    /// An earlier daemon did: its start time, read once a second while it
+    /// runs, one file, never a walk of every process.
+    Found(u64),
+}
+
 /// Watch detached command `pid` until nothing it left in its group runs:
-/// its own `child` when this daemon started it, or one an earlier daemon
-/// did, found again. A pull of the cord or a stop on its handle kills the
+/// its `leader`, the child this daemon started or one an earlier daemon
+/// did, found again, then what it left. A pull of the cord or a stop on its handle kills the
 /// group, and with `sandboxed` the pid namespace it runs in; `held` (its
 /// lasting slot, what its sandbox keeps in place) goes with its end, which
 /// goes to `tracked`'s `done`.
 #[cfg(unix)]
 async fn watch_detached(
     mut pulls: watch::Receiver<u64>,
-    child: Option<tokio::process::Child>,
+    leader: Leader,
     pid: u32,
     sandboxed: bool,
     started: std::time::Instant,
@@ -3361,7 +3384,26 @@ async fn watch_detached(
     // How it ended, once it did: the leader's own status, when this daemon
     // is its parent, and what ended it otherwise.
     let mut ended: Option<Result<Option<std::process::ExitStatus>>> = None;
-    if let Some(mut child) = child {
+    if let Leader::Found(since) = leader {
+        let runs = move || async move {
+            tokio::task::spawn_blocking(move || leader_since(pid) == Some(since))
+                .await
+                .unwrap_or(false)
+        };
+        while ended.is_none() && runs().await {
+            tokio::select! {
+                Ok(()) = pulls.changed() => {
+                    end().await;
+                    ended = Some(Err(stopped_by_pause()));
+                }
+                () = stopped(&mut stop) => {
+                    end().await;
+                    ended = Some(Err(stopped_by_agent()));
+                }
+                () = tokio::time::sleep(std::time::Duration::from_secs(1)) => {}
+            }
+        }
+    } else if let Leader::Child(mut child) = leader {
         ended = tokio::select! {
             // Its end is the group's, below; the leader's status is what
             // it says of how it went.
