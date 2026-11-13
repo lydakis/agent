@@ -945,9 +945,12 @@ has something on it, or is off the screen, no time shows.
   row but Full access, a command can't write outside the agent's folder
   and the folders its row adds (`/tmp`, the zen and state folders, and its
   `writable` list), can't change the repository's hooks and config,
-  `~/.agents` or `~/.agent/rules`, and can't reach the daemon's socket,
-  other agents' sockets, or those of the programs Sonny runs for agents
-  outside the sandbox (`~/.agent/run`). It leaves open reads of anything
+  `~/.agents` or `~/.agent/rules`, can't write any other daemon's store
+  you run, and can't reach the daemon's socket, other agents' sockets,
+  any other daemon's socket or its agents' sockets, or those of the
+  programs Sonny runs for agents outside the sandbox (`~/.agent/run`).
+  A call to run outside the sandbox that may start a daemon waits for
+  you, never the reviewer alone. It leaves open reads of anything
   you can read, as Codex's `workspace-write` does, your SSH keys, cloud
   credentials and other projects included; the network, in every row but
   Read only; and, while the network is on, every other Unix socket that a
