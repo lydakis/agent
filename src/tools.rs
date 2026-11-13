@@ -517,6 +517,9 @@ pub struct Registry {
     /// gone and with each detached child until its wait completes.
     lasting_slots: Arc<Semaphore>,
     lasting_budget: usize,
+    /// Detached commands found again past a bound lowered since they
+    /// started, each in line for a lasting slot ahead of any new one.
+    lasting_owed: Arc<std::sync::atomic::AtomicUsize>,
     /// Whether the machine's load lets a new command start, as make's
     /// `-l`; see `admits`. None is no gate.
     load: Option<watch::Receiver<bool>>,
@@ -1324,6 +1327,7 @@ impl Registry {
             foreground: Arc::default(),
             lasting_slots: Arc::new(Semaphore::new(default_lasting())),
             lasting_budget: default_lasting(),
+            lasting_owed: Arc::default(),
             #[cfg(unix)]
             terminals: Arc::default(),
             stopping: Arc::new(watch::Sender::new(false)),
@@ -1429,6 +1433,38 @@ impl Registry {
             )
         })
     }
+    /// The lasting slot of a detached command found again: a free one, or
+    /// with none free, its place in line for the next one freed, which it
+    /// takes before any new command can, counted as running meanwhile. A
+    /// bound lowered while it ran so holds new ones back until enough end.
+    #[cfg(unix)]
+    fn lasting_found(&self) -> Box<dyn Send> {
+        if let Ok(permit) = self.lasting_slots.clone().try_acquire_owned() {
+            return Box::new(permit);
+        }
+        struct Owed(Arc<std::sync::atomic::AtomicUsize>);
+        impl Drop for Owed {
+            fn drop(&mut self) {
+                self.0.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+        struct Waiting(tokio::task::JoinHandle<()>);
+        impl Drop for Waiting {
+            fn drop(&mut self) {
+                self.0.abort();
+            }
+        }
+        self.lasting_owed
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let (slots, owed) = (self.lasting_slots.clone(), Owed(self.lasting_owed.clone()));
+        Box::new(Waiting(tokio::spawn(async move {
+            let permit = slots.acquire_owned().await;
+            drop(owed);
+            // Held until the command ends, which aborts this.
+            let _permit = permit;
+            std::future::pending::<()>().await;
+        })))
+    }
     /// Bound on simultaneously running child processes. Waiting never counts.
     /// Zero removes the bound; the operating system is then the only limit.
     pub fn with_process_budget(mut self, budget: usize) -> Self {
@@ -1480,6 +1516,7 @@ impl Registry {
             budget => budget,
         };
         bound.saturating_sub(self.lasting_slots.available_permits())
+            + self.lasting_owed.load(std::sync::atomic::Ordering::Relaxed)
     }
     /// Terminals running now, of the lasting slots in use.
     pub fn terminals_running(&self) -> usize {
@@ -2540,7 +2577,7 @@ impl Registry {
         if !runs {
             return false;
         }
-        let permit = self.lasting().ok().flatten();
+        let permit = self.lasting_found();
         let started = std::time::Instant::now()
             .checked_sub(elapsed)
             .unwrap_or_else(std::time::Instant::now);
@@ -2551,7 +2588,7 @@ impl Registry {
             sandboxed,
             started,
             Some(Tracked { stopper, done }),
-            Box::new(permit),
+            permit,
         ));
         true
     }
@@ -3413,21 +3450,18 @@ fn leader_since(_: u32) -> Option<u64> {
 }
 
 /// Whether detached command `detached`, which an earlier daemon started,
-/// still runs: its group has a member, and its leader, when there, is the
-/// process that started then and not a later one given its pid. A leader
-/// gone with its group still running is the group it led: the kernel
-/// gives no new process a group id while a member holds it.
+/// still runs as itself: its leader is the process that started then, by
+/// its start time, not a later one given its pid, and its group has a
+/// member. A group whose leader has gone is not taken for it: while no
+/// daemon watched, the group may have ended and its id gone to another,
+/// and a stop on the handle would kill that one.
 #[cfg(unix)]
 fn still_runs(detached: Detached) -> bool {
-    let group = detached.pid as i32;
-    if matches!(group_members(group), Members::Gone) {
+    let Some(since) = detached.since else {
         return false;
-    }
-    // SAFETY: kill with signal 0 only checks the process.
-    let leader = unsafe { libc::kill(group, 0) } == 0;
-    !leader
-        || detached.since.is_none()
-        || leader_since(detached.pid).is_none_or(|since| Some(since) == detached.since)
+    };
+    leader_since(detached.pid) == Some(since)
+        && !matches!(group_members(detached.pid as i32), Members::Gone)
 }
 
 /// What is left of a detached command's process group.

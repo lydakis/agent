@@ -728,11 +728,13 @@ enum Command {
     },
     /// What runs for the bots `bot` names, a name or a GLOB pattern, or
     /// for every bot: each background, terminal and detached command still
-    /// running and each call a message lifted that waits on, oldest first,
-    /// by its proc handle. A read.
+    /// running and each call a message lifted that waits on, by bot and
+    /// oldest first, a page at a time after the handle `after`. A read.
     Processes {
         #[serde(default)]
         bot: Option<String>,
+        #[serde(default)]
+        after: Option<String>,
     },
     /// Stop `bot`'s command `handle` (`proc:N`), as its agent's
     /// `write_stdin` with kill does: a command is killed with all it
@@ -4888,13 +4890,20 @@ impl Service {
                     })
                     .await
             }
-            Command::Processes { bot } => {
+            Command::Processes { bot, after } => {
                 if bot.as_ref().is_some_and(|b| b.is_empty() || b.len() > 128) {
                     return fail_with("invalid_bot", "bot must be 1 to 128 bytes");
                 }
+                let after = match after.as_deref().map(handles::Handle::parse) {
+                    None => None,
+                    Some(Ok(handles::Handle::Process(id))) => Some(id),
+                    Some(_) => {
+                        return fail_with("invalid_handle", "after must be a proc:N handle");
+                    }
+                };
                 store
                     .read("processes", move |db| {
-                        Ok(json!({"processes": db.processes(bot.as_deref())?}))
+                        Ok(serde_json::to_value(db.processes(bot.as_deref(), after)?)?)
                     })
                     .await
             }

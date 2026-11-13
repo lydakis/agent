@@ -2588,6 +2588,20 @@ pub struct DetachedRow {
 /// The most of a command a process row keeps, to list it by: its start.
 const LISTED_COMMAND_BYTES: usize = 512;
 
+/// Running commands a `processes` page lists at most: each row's command
+/// is cut to `LISTED_COMMAND_BYTES`, so a page stays well inside the
+/// largest response the socket sends however its text is escaped.
+pub const PROCESSES_PAGE: i64 = 128;
+
+/// One page of `processes`: the rows, and the handle the next page
+/// follows, when there is one.
+#[derive(Debug, serde::Serialize)]
+pub struct ProcessesPage {
+    pub processes: Vec<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_after: Option<Value>,
+}
+
 /// The start of `command` a process row keeps, cut at a character.
 pub fn listed_command(command: &str) -> &str {
     let mut end = command.len().min(LISTED_COMMAND_BYTES);
@@ -11813,13 +11827,31 @@ impl Database {
     /// by bot and oldest first, read through the running rows' index
     /// alone: its handle, bot, turn and call, kind, the start of its
     /// command, when it started, and a detached command's pid.
-    pub fn processes(&self, bot: Option<&str>) -> Result<Vec<Value>> {
+    /// A page holds at most `PROCESSES_PAGE` of them, after the one whose
+    /// handle is `after`; `next_after` is set when more follow.
+    pub fn processes(&self, bot: Option<&str>, after: Option<i64>) -> Result<ProcessesPage> {
+        // Pages follow the index's order, which a handle alone does not
+        // place: its bot does, read by its key.
+        let from = match after {
+            Some(id) => {
+                let bot: Option<String> = self
+                    .conn
+                    .prepare_cached("SELECT bot FROM processes WHERE id=?")?
+                    .query_row([id], |r| r.get(0))
+                    .optional()?;
+                match bot {
+                    Some(bot) => (bot, id),
+                    None => return fail("invalid_handle"),
+                }
+            }
+            None => (String::new(), 0),
+        };
         let mut rows = self.conn.prepare_cached(
             "SELECT id,bot,turn,call_id,kind,command,started_ms,detached,call FROM processes
-             WHERE status='running' AND (?1 IS NULL OR bot GLOB ?1)
-             ORDER BY bot,id",
+             WHERE status='running' AND (?1 IS NULL OR bot GLOB ?1) AND (bot,id)>(?2,?3)
+             ORDER BY bot,id LIMIT ?4",
         )?;
-        let found = rows.query_map([bot], |r| {
+        let found = rows.query_map(params![bot, from.0, from.1, PROCESSES_PAGE + 1], |r| {
             let detached: Option<String> = r.get(7)?;
             let pid = detached
                 .and_then(|detached| serde_json::from_str::<Value>(&detached).ok())
@@ -11845,7 +11877,15 @@ impl Database {
                 "pid": pid,
             }))
         })?;
-        Ok(found.collect::<rusqlite::Result<_>>()?)
+        let mut processes: Vec<Value> = found.collect::<rusqlite::Result<_>>()?;
+        let next_after = (processes.len() > PROCESSES_PAGE as usize).then(|| {
+            processes.truncate(PROCESSES_PAGE as usize);
+            processes[PROCESSES_PAGE as usize - 1]["handle"].clone()
+        });
+        Ok(ProcessesPage {
+            processes,
+            next_after,
+        })
     }
     /// The outcome and its overflow become visible in one transaction.
     /// `failed` is whoever ran it saying the call failed, never read back

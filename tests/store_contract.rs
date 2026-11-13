@@ -20601,7 +20601,7 @@ fn running_commands_are_listed_and_a_detached_one_outlives_a_restart() {
         let other = begin(&mut db, "other");
         db.process_start(other, "detach-2", ProcessKind::Detached, "sleep 9")
             .unwrap();
-        let listed = db.processes(Some("shop.*")).unwrap();
+        let listed = db.processes(Some("shop.*"), None).unwrap().processes;
         let handles: Vec<&str> = listed
             .iter()
             .map(|row| row["handle"].as_str().unwrap())
@@ -20623,14 +20623,48 @@ fn running_commands_are_listed_and_a_detached_one_outlives_a_restart() {
         assert_eq!(listed[2]["kind"], "detached");
         assert_eq!(listed[2]["pid"], 4242);
         assert_eq!(listed[2]["command"].as_str().unwrap().len(), 512);
-        assert_eq!(db.processes(None).unwrap().len(), 4);
-        assert_eq!(db.processes(Some("nobody")).unwrap().len(), 0);
+        assert_eq!(db.processes(None, None).unwrap().processes.len(), 4);
+        assert_eq!(
+            db.processes(Some("nobody"), None).unwrap().processes.len(),
+            0
+        );
+        // Pages follow on from a handle, by bot, oldest first.
+        let page = db.processes(None, Some(terminal)).unwrap();
+        let rest: Vec<&str> = (page.processes.iter())
+            .map(|row| row["bot"].as_str().unwrap())
+            .collect();
+        assert_eq!(rest, ["shop.lead"], "{page:?}");
+        assert!(page.next_after.is_none());
+        assert!(db.processes(None, Some(999_999)).is_err());
+        // A fleet past a page is listed a page at a time, every row once.
+        for call in 0..agent_runtime::store::PROCESSES_PAGE {
+            db.process_start(
+                other,
+                &format!("many-{call}"),
+                ProcessKind::Background,
+                "sleep 9",
+            )
+            .unwrap();
+        }
+        let first = db.processes(None, None).unwrap();
+        assert_eq!(
+            first.processes.len() as i64,
+            agent_runtime::store::PROCESSES_PAGE
+        );
+        let after = first.next_after.clone().unwrap();
+        let after: i64 = after.as_str().unwrap()["proc:".len()..].parse().unwrap();
+        let second = db.processes(None, Some(after)).unwrap();
+        assert!(second.next_after.is_none());
+        assert_eq!(
+            first.processes.len() + second.processes.len(),
+            4 + agent_runtime::store::PROCESSES_PAGE as usize
+        );
         (background, terminal, service, ended)
     };
     // The daemon stopped: its background command and terminal went with
     // it, the detached command did not, and the next daemon finds it.
     let db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
-    let listed = db.processes(None).unwrap();
+    let listed = db.processes(None, None).unwrap().processes;
     assert_eq!(listed.len(), 1, "{listed:?}");
     assert_eq!(listed[0]["handle"], format!("proc:{service}"));
     let rows = db.detached_running().unwrap();

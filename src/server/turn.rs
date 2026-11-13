@@ -5884,18 +5884,6 @@ impl Turn {
             })
             .await?;
         let (sender, receiver) = oneshot::channel();
-        let sandboxed = sandbox.is_some();
-        let started = self
-            .registry
-            .detached(
-                self.registry.stopper(id),
-                &command,
-                &folder,
-                environment,
-                sandbox,
-                sender,
-            )
-            .await;
         // Its end, a start that failed too, is recorded as it comes.
         let lifts = Lifts {
             store: self.store.clone(),
@@ -5904,22 +5892,44 @@ impl Turn {
             failures: self.background_failures.clone(),
         };
         lifts.collect(&self.bot, turn, id, call_id, receiver, None, None, true);
-        let detached = match started {
-            Ok(detached) => detached,
-            Err(error) => {
-                // This call says it failed: nothing tells it again.
-                self.store.op("saw_end", move |db| db.saw_end(id)).await?;
-                return Ok(Err(error));
-            }
-        };
-        self.store
-            .op("process_detached", move |db| {
-                db.process_detached(id, detached, sandboxed, "")
-            })
-            .await?;
-        Ok(Ok(Outcome::text(
-            json!({"handle":format!("proc:{id}"),"detached":true,"pid":detached.pid}).to_string(),
-        )))
+        // The start and what records it run apart from the turn, so a turn
+        // ended meanwhile never leaves a command running that nothing
+        // watches or that the store cannot find again.
+        let (registry, store) = (self.registry.clone(), self.store.clone());
+        let environment = environment.to_vec();
+        let start = tokio::spawn(async move {
+            let sandboxed = sandbox.is_some();
+            let started = registry
+                .detached(
+                    registry.stopper(id),
+                    &command,
+                    &folder,
+                    &environment,
+                    sandbox,
+                    sender,
+                )
+                .await;
+            let detached = match started {
+                Ok(detached) => detached,
+                Err(error) => {
+                    // This call says it failed: nothing tells it again.
+                    store.op("saw_end", move |db| db.saw_end(id)).await?;
+                    return Ok(Err(error));
+                }
+            };
+            store
+                .op("process_detached", move |db| {
+                    db.process_detached(id, detached, sandboxed, "")
+                })
+                .await?;
+            Ok(Ok(Outcome::text(
+                json!({"handle":format!("proc:{id}"),"detached":true,"pid":detached.pid})
+                    .to_string(),
+            )))
+        });
+        start
+            .await
+            .unwrap_or_else(|_| Err(Error::new("turn_task_failed")))
     }
 
     /// Move a running foreground command to the background: it keeps its
@@ -6313,8 +6323,8 @@ impl Lifts {
 
     /// Watch again each detached command in `rows`, which an earlier
     /// daemon started: one that still runs is stopped by its handle and its
-    /// end told as it comes; one that ended while no daemon watched is
-    /// recorded ended now, with no exit code, and told.
+    /// end told as it comes; one that ended, or whose leader did, while no
+    /// daemon watched is recorded ended now, with no exit code, and told.
     pub async fn adopt(&self, rows: Vec<DetachedRow>) {
         for row in rows {
             let (sender, receiver) = oneshot::channel();
@@ -6342,7 +6352,7 @@ impl Lifts {
             );
             if let Some(ended) = ended {
                 let _ = ended.send(Ok(Outcome::text(
-                    json!({"exit_code":null,"detail":"it ended while no daemon watched it"})
+                    json!({"exit_code":null,"detail":"it ended, or its first process did, while no daemon watched it; what it left running is no longer tracked"})
                         .to_string(),
                 )));
             }

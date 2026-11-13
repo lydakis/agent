@@ -2809,10 +2809,13 @@ once nothing it left in its group runs, `{exit_code, success,
 wall_time_ms}` by its leader's exit. Its row records its pid and when
 that leader started (`/proc` `starttime` on Linux, `proc_pidinfo` on
 macOS), so a daemon started later watches it again and stops it by its
-handle: a group still running whose leader, if there, started then is the
-same command, since the kernel gives no new process a group id a member
-holds; one that ended while no daemon watched is recorded ended then,
-with `exit_code: null`, and told. What does bound it is
+handle when its leader still runs and started then. A group whose leader
+has gone is not taken for it, since while no daemon watched the group may
+have ended and its id gone to another: such a command, like one that
+ended, is recorded ended then, with `exit_code: null`, and told, and what
+it left running is no longer tracked. A command found again keeps its
+place under `--max-lasting` even past a bound lowered meanwhile: no new
+one starts until enough end. What does bound it is
 `--max-lasting`, shared with terminals as a systemd slice holds a
 service's processes: each detached command retains a slot until its async
 waiter has reaped it and nothing it left in its process group runs (a

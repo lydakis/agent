@@ -10719,8 +10719,23 @@ impl App {
 
     /// `view` read from the daemon again.
     async fn read_ps(&self, view: &mut ps::View) {
-        let read = self.client.request("processes", view.query()).await;
-        view.loaded(read.map_err(|error| error.to_string()));
+        // Every page, as the daemon hands them, into one list.
+        let (mut query, mut rows) = (view.query(), Vec::new());
+        let read = loop {
+            match self.client.request("processes", query.clone()).await {
+                Ok(mut page) => {
+                    if let Some(found) = page["processes"].as_array_mut() {
+                        rows.append(found);
+                    }
+                    match page.get("next_after") {
+                        Some(after) if !after.is_null() => query["after"] = after.clone(),
+                        _ => break Ok(json!({"processes": rows})),
+                    }
+                }
+                Err(error) => break Err(error.to_string()),
+            }
+        };
+        view.loaded(read);
     }
 
     /// Stop `bot`'s command `handle` from `/ps`, beside the window, which

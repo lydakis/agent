@@ -1681,7 +1681,7 @@ async fn terminals_hold_a_lasting_permit_and_end_their_whole_session() {
 /// A detached command started on a handle ends by it, says how it ended
 /// when it ends on its own, and a later registry, as a daemon started
 /// again is, finds it by its pid and start and stops it too.
-#[cfg(unix)]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 #[tokio::test]
 async fn a_tracked_detached_command_stops_on_its_handle_and_is_found_again() {
     use agent_runtime::tools::Detached;
@@ -1775,5 +1775,68 @@ async fn a_tracked_detached_command_stops_on_its_handle_and_is_found_again() {
             .await
     );
     assert_eq!(later.lasting_running(), 0);
+    // A group whose leader has gone is not taken for the command: its id
+    // may have gone to another group while no daemon watched.
+    let (done, _) = oneshot::channel();
+    let led = tools
+        .detached(tools.stopper(6), "sleep 30 & exit 0", &dir, &[], None, done)
+        .await
+        .unwrap();
+    assert!(gone(led.pid as i32).await, "the leader still runs");
+    let (done, _) = oneshot::channel();
+    assert!(
+        !later
+            .adopt(later.stopper(6), led, false, Duration::ZERO, done)
+            .await
+    );
+    assert!(tools.stop(6));
+    // Commands found again past a bound lowered meanwhile keep their
+    // places: no new one starts until enough of them end.
+    let lower = Registry::new("shell").unwrap().with_lasting_budget(1);
+    let mut found = Vec::new();
+    for id in [7, 8] {
+        let (done, _) = oneshot::channel();
+        let started = tools
+            .detached(tools.stopper(id), "exec sleep 30", &dir, &[], None, done)
+            .await
+            .unwrap();
+        let (done, ended) = oneshot::channel();
+        assert!(
+            lower
+                .adopt(lower.stopper(id), started, false, Duration::ZERO, done)
+                .await
+        );
+        found.push((id, started, ended));
+    }
+    assert_eq!(lower.lasting_running(), 2);
+    let full = async || {
+        let (done, _) = oneshot::channel();
+        lower
+            .detached(lower.stopper(9), "true", &dir, &[], None, done)
+            .await
+    };
+    let settles = async |running: usize| {
+        for _ in 0..500 {
+            if lower.lasting_running() == running {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        false
+    };
+    assert_eq!(full().await.unwrap_err().code, "lasting_limit");
+    for (id, started, ended) in found {
+        assert!(lower.stop(id));
+        assert_eq!(ended.await.unwrap().unwrap_err().code, "stopped");
+        assert!(gone(started.pid as i32).await);
+        tools.stop(id);
+        if id == 7 {
+            // The other one takes the slot this one freed, not a new one.
+            assert!(settles(1).await);
+            assert_eq!(full().await.unwrap_err().code, "lasting_limit");
+        }
+    }
+    assert!(settles(0).await);
+    assert!(full().await.is_ok());
     std::fs::remove_dir_all(dir).unwrap();
 }
