@@ -49,8 +49,9 @@ const RUNNING_GAP: Duration = Duration::from_millis(50);
 /// The output a script returns, in tokens of about four bytes, unless its
 /// options line says otherwise.
 const OUTPUT_TOKENS: usize = 10_000;
-/// The bytes of output a script keeps while it runs, outside its memory
-/// cap: past them, its first and last halves, as Codex keeps a command's.
+/// The most bytes of output a script keeps in memory while it runs,
+/// outside its memory cap, whatever its budget: past them, its first and
+/// last halves, as Codex keeps a command's. The whole goes to a file.
 const OUTPUT_BYTES: usize = 1 << 20;
 /// A script's tool calls in flight at once; the rest wait their turn, so
 /// the results held outside its memory cap are at most these many of
@@ -74,7 +75,7 @@ const DESCRIPTION: &str = r#"Run JavaScript code to orchestrate/compose MCP tool
 - Accepts raw JavaScript source text, not JSON, quoted strings, or markdown code fences.
 - Only what the script passes to `text()` and `image()` is returned to you.
 - You may optionally start the tool input with a first-line pragma like `// @exec: {"max_output_tokens": 1000, "timeout_ms": 60000}`.
-- `max_output_tokens` sets the token budget for `exec` results. Defaults to 10000 tokens; longer output keeps its start and end, and the whole of it, up to 1 MB, is saved to a file the result names.
+- `max_output_tokens` sets the token budget for `exec` results. Defaults to 10000 tokens; longer output keeps its start and end, and is saved whole to a file the result names. Print data you want on disk, then decode or move that file with the shell.
 - `timeout_ms` ends the script after that many milliseconds. Defaults to 600000, the most it may run.
 - When the JS code is fully evaluated, its context ends and unawaited promises are silently discarded.
 
@@ -848,6 +849,19 @@ pub fn whole_file() -> Option<PathBuf> {
     Some(fresh(&dir).ok()?.join(format!("{}.txt", stamp())))
 }
 
+/// Save `text`, the whole of an output a machine linked here handed back,
+/// to `file`, as `whole_file` named it.
+pub fn save_whole(file: &Path, text: &str) -> std::io::Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(file)?
+        .write_all(text.as_bytes())
+}
+
 /// Run a script against the servers `hub` serves, keeping what it saves
 /// under `dir`.
 pub(crate) async fn run(
@@ -892,14 +906,10 @@ async fn run_keeping(
         Ok(readied) => readied?,
         Err(_) => {
             let ended = Ended::Terminated("it ran out of time before it started".into());
-            return Ok(Value::String(said(
-                &ended,
-                started,
-                &BTreeMap::new(),
-                String::new(),
-                budget,
-                whole,
-            )));
+            let output = Output::new(budget, whole);
+            return Ok(Value::String(
+                said(&ended, started, &BTreeMap::new(), output).0,
+            ));
         }
     };
     // A trigger's shadow run reads and does nothing else: a call of a tool
@@ -917,7 +927,7 @@ async fn run_keeping(
         failed: Arc::new(failed),
         listed: Value::Array(listed).to_string(),
         store: dir.map(|dir| dir.join("store").join(format!("{bot}.json"))),
-        said: Arc::default(),
+        said: Arc::new(Mutex::new(Output::new(budget, whole))),
         pictures: Arc::default(),
         calls: Arc::default(),
         halt: Arc::default(),
@@ -931,25 +941,31 @@ async fn run_keeping(
         Arc::clone(&run.pictures),
     );
     let clock = Arc::clone(&run.clock);
-    let ended = tokio::task::spawn_blocking(move || {
+    let (text, sent) = tokio::task::spawn_blocking(move || {
         // Its places are held until the script's runtime is gone, so an
         // interrupted turn frees them only once its script has stopped.
         let _running = (clock, alive);
-        tokio::runtime::Builder::new_current_thread()
+        let ended = tokio::runtime::Builder::new_current_thread()
             .enable_time()
             .build()
             .map_err(|e| e.to_string())?
-            .block_on(run.script(script.code))
+            .block_on(run.script(script.code))?;
+        // Here, off the runtime: the end of a saved output is written and
+        // its file closed.
+        let calls = calls.lock().unwrap().clone();
+        let output = std::mem::replace(
+            &mut *output.lock().unwrap(),
+            Output::new(0, &Whole::Saved(None)),
+        );
+        Ok::<_, String>(said(&ended, started, &calls, output))
     })
     .await
     .map_err(|e| e.to_string())??;
-    let calls = calls.lock().unwrap().clone();
-    let body = std::mem::take(&mut *output.lock().unwrap()).body();
+    if let (Whole::Sent(_, cut), Some(sent)) = (whole, sent) {
+        *cut.lock().unwrap() = Some(sent);
+    }
     let pictures = std::mem::take(&mut *pictures.lock().unwrap());
-    Ok(parts(
-        said(&ended, started, &calls, body, budget, whole),
-        pictures,
-    ))
+    Ok(parts(text, pictures))
 }
 
 /// Mark where an `image()` call's picture goes in the output, opening and
@@ -1081,10 +1097,8 @@ fn said(
     ended: &Ended,
     started: Instant,
     calls: &BTreeMap<String, usize>,
-    mut body: String,
-    budget: usize,
-    whole: &Whole<'_>,
-) -> String {
+    mut output: Output,
+) -> (String, Option<String>) {
     let status = match ended {
         Ended::Completed => "Script completed".to_owned(),
         Ended::Failed(_) => "Script failed".to_owned(),
@@ -1103,28 +1117,152 @@ fn said(
     }
     head.push_str("Output:\n");
     if let Ended::Failed(error) = ended {
-        if !body.is_empty() {
-            body.push('\n');
+        if output.total > 0 {
+            output.add("\n");
         }
-        body.push_str(&format!("Script error:\n{error}"));
+        output.add(&format!("Script error:\n{error}"));
     }
-    head + &budgeted(body, budget, whole)
+    let (shown, sent) = output.finish();
+    (head + &shown, sent)
 }
 
-/// What a script printed, a line for each `text()`, kept within
-/// `OUTPUT_BYTES` as it runs: past them, its first half and its latest.
-#[derive(Default)]
+/// What a script printed, a line for each `text()`. It keeps in memory
+/// the bytes the model is shown, its budget at most `OUTPUT_BYTES`: past
+/// them, its first half and its latest. The whole of it goes to its
+/// [`Sink`] as it is printed, once it passes them, so the file the result
+/// names holds every byte, never a cut copy.
 struct Output {
+    /// The bytes shown: the budget, at most `OUTPUT_BYTES`.
+    window: usize,
     head: String,
-    /// The latest output once the head is full, up to twice the half
-    /// kept, so that it is cut once per half rather than on every line.
+    /// The latest output once the head is full, up to the window, so that
+    /// it is cut once per half rather than on every line.
     tail: String,
-    dropped: usize,
     lines: usize,
+    /// Every byte printed.
+    total: u64,
+    sink: Sink,
+}
+
+/// Where the whole of an output past its window goes.
+enum Sink {
+    /// Nowhere: there is no home to save it in.
+    Dropped,
+    /// To a file of its own in this folder, opened when the output first
+    /// passes its window and written as the script prints, or why it could
+    /// not be opened.
+    File(PathBuf, Option<Result<Saving, String>>),
+    /// Kept to hand back to the machine that called over a link, under the
+    /// name of its file there, up to `LENT_BYTES`, and whether it reached
+    /// that bound: past it nothing more is kept, so the kept bytes stay the
+    /// output's start.
+    Sent(PathBuf, Option<String>, bool),
+}
+
+/// The most of an output a saved file holds: a sanity bound on a script
+/// that prints without end, far past anything a model reads.
+const SAVED_BYTES: u64 = 1 << 30;
+
+/// The most of an output a machine that lends `exec` hands back over the
+/// link, within what one line of it carries, escaped, beside the answer.
+const LENT_BYTES: usize = 4 << 20;
+
+/// A file an output is being saved to.
+struct Saving {
+    path: PathBuf,
+    /// Closed once it is full or a write failed.
+    file: Option<std::io::BufWriter<std::fs::File>>,
+    /// Why it holds less than the whole: its bound, or the failure.
+    short: Option<String>,
+}
+
+impl Saving {
+    fn open(dir: &Path) -> Result<Saving, String> {
+        use std::os::unix::fs::OpenOptionsExt;
+        let dir = fresh(dir)?;
+        let path = dir.join(format!("{}.txt", stamp()));
+        // Its owner's alone: what a script prints may be private.
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&path)
+            .map_err(|e| e.to_string())?;
+        Ok(Saving {
+            path,
+            file: Some(std::io::BufWriter::with_capacity(64 << 10, file)),
+            short: None,
+        })
+    }
+
+    /// Append `text`, at `at` bytes into the output.
+    fn write(&mut self, text: &str, at: u64) {
+        use std::io::Write;
+        let Some(file) = &mut self.file else {
+            return;
+        };
+        let room = SAVED_BYTES.saturating_sub(at) as usize;
+        let fits = match text.len() <= room {
+            true => text.len(),
+            false => floor(text, room),
+        };
+        if let Err(error) = file.write_all(&text.as_bytes()[..fits]) {
+            self.close(Some(error.to_string()));
+        } else if fits < text.len() {
+            self.close(Some(format!(
+                "past the {} GB a saved output holds",
+                SAVED_BYTES >> 30
+            )));
+        }
+    }
+
+    /// Flush and close it, saying why it holds no more when it is cut short.
+    fn close(&mut self, short: Option<String>) {
+        use std::io::Write;
+        if let Some(mut file) = self.file.take()
+            && let Err(error) = file.flush()
+        {
+            self.short.get_or_insert(error.to_string());
+        }
+        if let Some(short) = short {
+            self.short.get_or_insert(short);
+        }
+    }
+
+    /// What the cut says of it: where the whole is, or how much of it.
+    fn said(mut self, total: u64) -> String {
+        self.close(None);
+        let path = self.path.display();
+        match self.short {
+            None => format!("; the whole output is in {path}"),
+            Some(why) => {
+                let saved = std::fs::metadata(&self.path).map_or(0, |m| m.len());
+                format!(
+                    "; its first {saved} of {total} bytes are in {path}, the rest not saved: {why}"
+                )
+            }
+        }
+    }
 }
 
 impl Output {
-    const HALF: usize = OUTPUT_BYTES / 2;
+    /// An output shown within `tokens`, of about four bytes each, its
+    /// whole going to `whole`.
+    fn new(tokens: usize, whole: &Whole<'_>) -> Self {
+        let sink = match whole {
+            Whole::Saved(Some(dir)) => Sink::File(dir.join("output"), None),
+            Whole::Saved(None) => Sink::Dropped,
+            Whole::Sent(named, _) => Sink::Sent(named.to_path_buf(), None, false),
+        };
+        Output {
+            window: tokens.saturating_mul(4).min(OUTPUT_BYTES),
+            head: String::new(),
+            tail: String::new(),
+            lines: 0,
+            total: 0,
+            sink,
+        }
+    }
 
     fn push(&mut self, text: &str) {
         if self.lines > 0 {
@@ -1135,46 +1273,118 @@ impl Output {
     }
 
     fn add(&mut self, mut text: &str) {
-        if self.tail.is_empty() && self.dropped == 0 {
-            if self.head.len() + text.len() <= OUTPUT_BYTES {
+        let at = self.total;
+        self.total += text.len() as u64;
+        let half = self.window / 2;
+        if at as usize == self.head.len() {
+            // Nothing past the window yet: all of it is in the head.
+            if self.head.len() + text.len() <= self.window {
                 self.head.push_str(text);
                 return;
             }
-            // Past the cap: the head is the first half of all the output,
+            self.spill();
+            self.save(text, at);
+            // Past the window: the head is the first half of the output,
             // whether the output so far fills it or this text does.
-            if self.head.len() > Self::HALF {
-                let cut = floor(&self.head, Self::HALF);
+            if self.head.len() > half {
+                let cut = floor(&self.head, half);
                 self.tail = self.head.split_off(cut);
             } else {
-                let fill = floor(text, Self::HALF - self.head.len());
+                let fill = floor(text, half - self.head.len());
                 self.head.push_str(&text[..fill]);
                 text = &text[fill..];
             }
+        } else {
+            self.save(text, at);
         }
-        let keep = text.len().min(2 * Self::HALF);
+        let keep = text.len().min(2 * half);
         let start = ceil(text, text.len() - keep);
-        self.dropped += start;
         self.tail.push_str(&text[start..]);
-        if self.tail.len() > 2 * Self::HALF {
-            let cut = ceil(&self.tail, self.tail.len() - Self::HALF);
-            self.dropped += cut;
+        if self.tail.len() > 2 * half {
+            let cut = ceil(&self.tail, self.tail.len() - half);
             self.tail.drain(..cut);
         }
     }
 
-    /// All that was kept, the bytes dropped between its halves named.
-    fn body(self) -> String {
-        let mut tail = self.tail;
-        let mut dropped = self.dropped;
-        if tail.len() > Self::HALF {
-            let cut = ceil(&tail, tail.len() - Self::HALF);
-            dropped += cut;
+    /// Start the whole with what is in the head, all of the output so far,
+    /// as the output first passes the window.
+    fn spill(&mut self) {
+        let head = self.head.as_str();
+        match &mut self.sink {
+            Sink::Dropped => {}
+            Sink::File(dir, saving) => {
+                // A folder or a file that cannot be made leaves the output
+                // unsaved, as no home does, and says so.
+                let mut opened = Saving::open(dir);
+                if let Ok(saving) = &mut opened {
+                    saving.write(head, 0);
+                }
+                *saving = Some(opened);
+            }
+            Sink::Sent(_, whole, _) => *whole = Some(head.to_owned()),
+        }
+    }
+
+    fn save(&mut self, text: &str, at: u64) {
+        match &mut self.sink {
+            Sink::Dropped => {}
+            Sink::File(_, Some(Ok(saving))) => saving.write(text, at),
+            Sink::File(..) => {}
+            Sink::Sent(_, Some(whole), full @ false) => {
+                let room = LENT_BYTES.saturating_sub(whole.len());
+                if room < text.len() {
+                    *full = true;
+                }
+                whole.push_str(&text[..floor(text, room.min(text.len()))]);
+            }
+            Sink::Sent(..) => {}
+        }
+    }
+
+    /// What the model is shown, the bytes cut from between its halves
+    /// counted and where the whole of it is named, and the whole to hand
+    /// back over a link, once it passed the window.
+    fn finish(self) -> (String, Option<String>) {
+        let Output {
+            window,
+            head,
+            mut tail,
+            total,
+            sink,
+            ..
+        } = self;
+        if total as usize == head.len() {
+            return (head, None);
+        }
+        let half = window / 2;
+        if tail.len() > half {
+            let cut = ceil(&tail, tail.len() - half);
             tail.drain(..cut);
         }
-        match dropped {
-            0 => self.head + &tail,
-            dropped => format!("{}\n…{dropped} bytes dropped…\n{tail}", self.head),
-        }
+        let cut = (total - (head.len() + tail.len()) as u64).div_ceil(4);
+        let (whole, sent) = match sink {
+            Sink::Dropped => (String::new(), None),
+            Sink::File(_, Some(Ok(saving))) => (saving.said(total), None),
+            Sink::File(_, Some(Err(error))) => (format!("; it could not be saved: {error}"), None),
+            Sink::File(_, None) => (String::new(), None),
+            Sink::Sent(named, whole, _) => {
+                let whole = whole.unwrap_or_default();
+                let named = named.display();
+                let said = match whole.len() as u64 == total {
+                    true => format!("; the whole output is in {named}"),
+                    false => format!(
+                        "; its first {} of {total} bytes are in {named}, the rest not sent: past the {} MB a linked machine sends back",
+                        whole.len(),
+                        LENT_BYTES >> 20
+                    ),
+                };
+                (said, Some(whole))
+            }
+        };
+        (
+            format!("{head}\n…{cut} tokens truncated{whole}…\n{tail}"),
+            sent,
+        )
     }
 }
 
@@ -1241,47 +1451,6 @@ impl Halt {
             false => Ok(()),
         }
     }
-}
-
-/// `body` within `tokens`, of about four bytes each: its start and end,
-/// with the whole saved to a file the cut names.
-fn budgeted(body: String, tokens: usize, whole: &Whole<'_>) -> String {
-    let bytes = tokens.saturating_mul(4);
-    if body.len() <= bytes {
-        return body;
-    }
-    let saved = match whole {
-        Whole::Saved(dir) => dir.and_then(|dir| {
-            let file = fresh(&dir.join("output"))
-                .ok()?
-                .join(format!("{}.txt", stamp()));
-            std::fs::write(&file, &body).ok()?;
-            Some(file)
-        }),
-        Whole::Sent(named, cut) => {
-            *cut.lock().unwrap() = Some(body.clone());
-            Some(named.to_path_buf())
-        }
-    };
-    let half = bytes / 2;
-    let mut start = half;
-    while !body.is_char_boundary(start) {
-        start -= 1;
-    }
-    let mut end = body.len() - half;
-    while !body.is_char_boundary(end) {
-        end += 1;
-    }
-    let cut = (body.len() - start - (body.len() - end)).div_ceil(4);
-    let whole = match saved {
-        Some(file) => format!("; the whole output is in {}", file.display()),
-        None => String::new(),
-    };
-    format!(
-        "{}\n…{cut} tokens truncated{whole}…\n{}",
-        &body[..start],
-        &body[end..]
-    )
 }
 
 /// How long the outputs scripts save are kept.
@@ -2844,53 +3013,166 @@ text(ALL_TOOLS.map(t => t.name).join(","));"#,
         .await;
         assert!(fanned.ends_with("all"), "{fanned}");
         assert!(started.elapsed() >= Duration::from_millis(600), "{fanned}");
-        // Megabytes printed keep their start and end, whatever the budget.
+        // Megabytes printed keep their start and end, whatever the budget,
+        // and every byte of them is in the file named.
         let printed = ran(
             &hub,
             &dir,
             "// @exec: {\"max_output_tokens\": 100000000}\nfor (let i = 0; i < 4000; i++) text(String(i).padEnd(1000, '.'));",
         )
         .await;
-        assert!(printed.len() < OUTPUT_BYTES + 200, "{}", printed.len());
+        assert!(printed.len() < OUTPUT_BYTES + 300, "{}", printed.len());
         assert!(printed.contains("Output:\n0...."));
-        assert!(printed.contains("bytes dropped"));
         assert!(printed.ends_with(&format!("3999{}", ".".repeat(996))));
+        let file = printed
+            .split("; the whole output is in ")
+            .nth(1)
+            .and_then(|rest| rest.split('…').next())
+            .unwrap();
+        let whole = std::fs::read_to_string(file).unwrap();
+        let lines: Vec<&str> = whole.split('\n').collect();
+        assert_eq!(lines.len(), 4000);
+        assert!(
+            lines
+                .iter()
+                .enumerate()
+                .all(|(i, line)| line.len() == 1000 && line.starts_with(&i.to_string()))
+        );
         hub.stop().await;
     }
 
+    /// The whole of an output a saved file holds, read back from the
+    /// name its cut gives.
+    fn saved(shown: &str) -> String {
+        let file = shown
+            .split("; the whole output is in ")
+            .nth(1)
+            .and_then(|rest| rest.split('…').next())
+            .unwrap_or_else(|| panic!("no file named: {}", &shown[..shown.len().min(200)]));
+        std::fs::read_to_string(file).unwrap()
+    }
+
     #[test]
-    fn output_keeps_its_first_and_latest_halves() {
-        let mut output = Output::default();
+    fn output_keeps_its_first_and_latest_halves_and_saves_the_whole() {
+        let dir = scratch("halves");
+        let whole = Whole::Saved(Some(&dir));
+        let tokens = OUTPUT_BYTES / 4;
+        let mut output = Output::new(tokens, &whole);
         output.push("first");
-        assert_eq!(std::mem::take(&mut output).body(), "first");
+        assert_eq!(output.finish(), ("first".to_owned(), None));
+        // Nothing within the window touches the folder.
+        assert!(!dir.join("output").exists());
+        let mut output = Output::new(tokens, &whole);
         let line = "é".repeat(1000);
-        for _ in 0..3000 {
+        let mut printed = String::new();
+        for n in 0..3000 {
+            if n > 0 {
+                printed.push('\n');
+            }
+            printed.push_str(&line);
             output.push(&line);
         }
+        printed.push_str("\nlast");
         output.push("last");
-        let body = output.body();
-        assert!(body.len() <= OUTPUT_BYTES + 64, "{}", body.len());
-        assert!(body.starts_with('é') && body.ends_with("\nlast"));
-        let dropped: usize = body
-            .split('…')
-            .nth(1)
-            .and_then(|said| said.split(' ').next())
-            .and_then(|n| n.parse().ok())
-            .unwrap();
-        // What was kept and what was dropped add up to what was printed.
-        let kept = body.len() - format!("\n…{dropped} bytes dropped…\n").len();
-        assert_eq!(kept + dropped, 3000 * line.len() + 2999 + "\nlast".len());
-        // One text past the cap keeps its own start and end.
-        let mut output = Output::default();
+        let (shown, sent) = output.finish();
+        assert_eq!(sent, None);
+        assert!(shown.len() <= OUTPUT_BYTES + 200, "{}", shown.len());
+        assert!(shown.starts_with('é') && shown.ends_with("\nlast"));
+        // The middle the model is not shown is in the file, every byte.
+        assert_eq!(saved(&shown), printed);
+        // One text past the window keeps its own start and end.
+        let mut output = Output::new(tokens, &whole);
         output.push("before");
-        output.push(&format!("START{}END", "x".repeat(2 * OUTPUT_BYTES)));
-        let body = output.body();
+        let long = format!("START{}END", "x".repeat(2 * OUTPUT_BYTES));
+        output.push(&long);
+        let (shown, _) = output.finish();
         assert!(
-            body.starts_with("before\nSTARTxx") && body.ends_with("xxEND"),
+            shown.starts_with("before\nSTARTxx") && shown.ends_with("xxEND"),
             "{}",
-            &body[..20]
+            &shown[..20]
         );
-        assert!(body.len() <= OUTPUT_BYTES + 64, "{}", body.len());
+        assert!(shown.len() <= OUTPUT_BYTES + 200, "{}", shown.len());
+        assert_eq!(saved(&shown), format!("before\n{long}"));
+        // A small budget shows its start and end and saves the rest.
+        let mut output = Output::new(10, &whole);
+        output.push(&"a".repeat(100));
+        output.push("end");
+        let (shown, _) = output.finish();
+        assert!(
+            shown.starts_with("aaaaaaaaaaaaaaaaaaaa\n…")
+                && shown.ends_with("aaaaaaaaaaaaaaaa\nend"),
+            "{shown}"
+        );
+        assert!(
+            shown.contains("…16 tokens truncated; the whole output is in "),
+            "{shown}"
+        );
+        assert_eq!(saved(&shown), format!("{}\nend", "a".repeat(100)));
+    }
+
+    #[test]
+    fn an_output_without_a_home_or_past_a_link_says_what_was_kept() {
+        let mut output = Output::new(10, &Whole::Saved(None));
+        output.push(&"a".repeat(100));
+        let (shown, _) = output.finish();
+        assert!(shown.contains("…15 tokens truncated…"), "{shown}");
+        // Handed back over a link: the whole, up to what a link sends.
+        let cut = Mutex::new(None);
+        let named = PathBuf::from("/there/out.txt");
+        let mut output = Output::new(10, &Whole::Sent(&named, &cut));
+        output.push(&"b".repeat(100));
+        let (shown, sent) = output.finish();
+        assert!(
+            shown.contains("; the whole output is in /there/out.txt…"),
+            "{shown}"
+        );
+        assert_eq!(sent, Some("b".repeat(100)));
+        let mut output = Output::new(10, &Whole::Sent(&named, &cut));
+        output.push(&"c".repeat(LENT_BYTES + 10));
+        let (shown, sent) = output.finish();
+        assert_eq!(sent.map(|sent| sent.len()), Some(LENT_BYTES));
+        assert!(
+            shown.contains(&format!(
+                "; its first {LENT_BYTES} of {} bytes are in /there/out.txt, the rest not sent",
+                LENT_BYTES + 10
+            )),
+            "{shown}"
+        );
+        // A bound inside a character keeps nothing after it: what is sent
+        // stays the output's start.
+        let mut output = Output::new(10, &Whole::Sent(&named, &cut));
+        output.push(&"d".repeat(LENT_BYTES - 2));
+        output.push("é");
+        output.push("Z");
+        let (_, sent) = output.finish();
+        let sent = sent.unwrap();
+        assert!(sent.ends_with("d\n"), "{:?}", &sent[sent.len() - 8..]);
+        assert_eq!(sent.matches('\n').count(), 1);
+    }
+
+    #[test]
+    fn a_saved_output_stops_at_its_bound_and_says_so() {
+        let dir = scratch("bound");
+        let mut saving = Saving::open(&dir).unwrap();
+        let path = saving.path.clone();
+        // As though a gigabyte were written already: the next bytes fill
+        // what is left of the bound and no more.
+        saving.write("abcdef", SAVED_BYTES - 4);
+        saving.write("more", SAVED_BYTES + 2);
+        let said = saving.said(SAVED_BYTES + 6);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "abcd");
+        assert!(
+            said.contains(&format!("its first 4 of {} bytes are in", SAVED_BYTES + 6))
+                && said.ends_with("the rest not saved: past the 1 GB a saved output holds"),
+            "{said}"
+        );
+        // A folder that cannot be made says so.
+        let blocked = dir.join("file");
+        std::fs::write(&blocked, "x").unwrap();
+        let mut output = Output::new(1, &Whole::Saved(Some(&blocked)));
+        output.push("too long");
+        let (shown, _) = output.finish();
+        assert!(shown.contains("; it could not be saved: "), "{shown}");
     }
 
     #[tokio::test]
@@ -3097,7 +3379,9 @@ text(ALL_TOOLS.map(t => t.name).join(","));"#,
         (std::fs::File::options().write(true).open(&old).unwrap())
             .set_modified(week_ago)
             .unwrap();
-        budgeted("y".repeat(100), 1, &Whole::Saved(dir.parent()));
+        let mut output = Output::new(1, &Whole::Saved(dir.parent()));
+        output.push(&"y".repeat(100));
+        output.finish();
         let left: Vec<String> = (std::fs::read_dir(&dir).unwrap().flatten())
             .map(|entry| entry.file_name().to_string_lossy().into_owned())
             .collect();

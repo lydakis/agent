@@ -4828,8 +4828,10 @@ pub fn watch(
     }
     terminal::enable_raw_mode().map_err(|e| e.to_string())?;
     // The theme's colours, so muted reads as the measured gray it is in
-    // the conversation, and `NO_COLOR` is honoured here too.
+    // the conversation, and `NO_COLOR` is honoured here too; followed as
+    // the terminal switches between light and dark, as in the conversation.
     crate::term::detect();
+    crate::term::follow(true);
     let _ = execute!(
         std::io::stdout(),
         EnterAlternateScreen,
@@ -4863,6 +4865,9 @@ pub fn watch(
                     continue;
                 }
                 match event::read().map_err(|e| e.to_string())? {
+                    // The terminal answering: its colors, or its light and
+                    // dark, drawn with on the next frame.
+                    event::Event::Reply(reply) => crate::term::heard(&reply),
                     event::Event::Key(key) if key.kind != event::KeyEventKind::Release => {
                         // Esc lets go of the pick and the centre before it leaves.
                         if !view.press(key.code) && quits(&key) {
@@ -4882,6 +4887,7 @@ pub fn watch(
                 }
             }
         });
+    crate::term::follow(false);
     let _ = execute!(
         std::io::stdout(),
         event::DisableMouseCapture,
