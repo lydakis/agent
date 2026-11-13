@@ -10939,8 +10939,9 @@ impl App {
 
     /// What `/status` says is broken around the agents: the daemon's
     /// companions that are down or keep restarting, turns held on a cause
-    /// the person can fix, and a temporary folder every agent shares low
-    /// on space or inodes. Nothing when all is well.
+    /// the person can fix, a temporary folder every agent shares low on
+    /// space or inodes, and failures `/background` lists that the person
+    /// has not seen there. Nothing when all is well.
     async fn status_alerts(&mut self) -> Vec<status::Alert> {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -10970,6 +10971,7 @@ impl App {
         if let Some((_, temp)) = &self.temp_read {
             alerts.extend(temp.iter().cloned());
         }
+        alerts.extend(status::background_alert(self.failed));
         alerts
     }
 
@@ -16697,10 +16699,13 @@ impl App {
             return footer::lay(items, width);
         }
         // Every count stays here whatever the pane shows, so nothing moves
-        // as it changes.
-        if self.failed > 0 {
-            let forms = footer::count("✗", Color::Red, self.failed, false);
-            items.push(Item::new(Slot::Failed, forms).opens("background"));
+        // as it changes. What failed: the agents `/status` lists as failed,
+        // and what of `/background` failed that the person has not seen.
+        // `/status` lists both.
+        let failed = counts.failed + self.failed;
+        if failed > 0 {
+            let forms = footer::count("✗", Color::Red, failed, false);
+            items.push(Item::new(Slot::Failed, forms).opens("status"));
         }
         if working > 0 {
             let forms = footer::count("●", Color::Cyan, working, true);
@@ -16845,7 +16850,13 @@ fn watch_card(
     );
     // What is broken goes under the heading, and the agents under that.
     let mut above: Vec<Line<'static>> = Vec::new();
+    // An alert that opens a view does so on a click on its first line.
+    let mut opening = Vec::new();
     for alert in &watch.alerts {
+        if let Some(opens) = alert.opens {
+            let link = format!("{}{opens}", screen::BUTTON);
+            opening.push((1 + above.len(), screen::Mark::Link(link)));
+        }
         above.extend(status::alert_lines(alert, width.saturating_sub(1)));
     }
     let added = above.len();
@@ -16867,6 +16878,7 @@ fn watch_card(
     if !helpers.is_empty() {
         fold_keys.push("→");
     }
+    marks.extend(opening);
     marks.extend(folds.into_iter().map(|(at, group)| {
         let link = format!("{}group/{}", screen::BUTTON, group_key(group));
         (below(at), screen::Mark::Link(link))
@@ -18901,6 +18913,7 @@ mod tests {
             working: 1,
             idle: 1,
             done: 0,
+            ..Default::default()
         };
         assert_eq!(app.counts, Some(counts));
     }
@@ -18956,6 +18969,7 @@ mod tests {
             working,
             idle,
             done: 0,
+            ..Default::default()
         };
         assert_eq!(app.counts, Some(counts(0, 1, 1)));
         // Its mark, then the read itself.
@@ -20258,6 +20272,7 @@ mod tests {
             working: 2,
             idle: 3,
             done: 4,
+            ..Default::default()
         });
         let (footer, counter) = app.footer(60);
         let footer = footer.to_string();
@@ -25411,6 +25426,7 @@ mod tests {
             working: 3,
             idle: 13,
             done: 4,
+            ..Default::default()
         });
         let (line, opens) = app.footer(100);
         let text = line.to_string();
@@ -25470,6 +25486,37 @@ mod tests {
         assert!(app.pane.is_none());
         app.key(click(10 + counter.start)).await;
         assert!(app.pane.as_ref().is_some_and(pane::Pane::is_card));
+    }
+
+    #[tokio::test]
+    async fn the_footer_counts_failed_agents_and_unseen_background_failures_as_one() {
+        let mut app = app(daemon_answering(|_| json!({})).await);
+        app.model = "opus".into();
+        // As /status counts them: a failed agent is no `?`.
+        app.counts = Some(status::Counts {
+            needs_you: 1,
+            failed: 2,
+            working: 1,
+            ..Default::default()
+        });
+        app.failed = 1;
+        let (line, opens) = app.footer(100);
+        let text = line.to_string();
+        assert!(text.ends_with("  ? 1  ✗ 3  ● 1  "), "{text}");
+        // A click on `✗` opens /status, which lists the agents and says
+        // what failed in the background.
+        assert_eq!(
+            opens.iter().map(|(_, l)| *l).collect::<Vec<_>>(),
+            ["status"; 3]
+        );
+        // Only background failures: still one `✗`, still /status.
+        app.counts = Some(status::Counts::default());
+        let (line, opens) = app.footer(100);
+        assert!(line.to_string().ends_with("  ✗ 1  "), "{line}");
+        assert_eq!(
+            opens.iter().map(|(_, l)| *l).collect::<Vec<_>>(),
+            ["status"]
+        );
     }
 
     #[test]
@@ -25807,6 +25854,7 @@ mod tests {
             working: 2,
             idle: 3,
             done: 4,
+            ..Default::default()
         });
         app.failed = 1;
         for id in ["findings", "repro"] {
