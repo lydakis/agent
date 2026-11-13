@@ -823,6 +823,7 @@ pub async fn replay(store: Store, hub: Hub, bot: String, sub: Sub) -> Result<()>
                 .try_send(json!({"event":"follow_live","bot":bot,"cursor":cursor}))
                 .is_err()
             {
+                hub.counts.dropped.fetch_add(1, Ordering::Relaxed);
                 hub.close_session(session);
                 output.close();
             }
@@ -833,6 +834,7 @@ pub async fn replay(store: Store, hub: Hub, bot: String, sub: Sub) -> Result<()>
                 hub.unsubscribe(&bot, session);
                 return Ok(());
             }
+            hub.counts.delivered.fetch_add(1, Ordering::Relaxed);
         }
     }
 }

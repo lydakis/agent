@@ -361,8 +361,8 @@ requests: `reap` (a turn's task ended), `start_ready`, `resume`, `wake`,
 `reload`. `runtime` reports the async runtime's `workers`, `busy_ms` (time
 they ran rather than parked), `parks`, `alive_tasks` and `queued_tasks`,
 kept by tokio as it runs. `hub` counts the events published (`durable`,
-`live`), the copies `delivered` to followers' queues, and the followers
-`dropped` for falling behind. Each provider pool adds what it did to its
+`live`), the copies `delivered` to followers' queues (replayed ones too),
+and the followers `dropped` for falling behind. Each provider pool adds what it did to its
 calls: `admitted`, `waited` (admitted after waiting in the gate) with
 `waited_ms`, `parked`, `closed` (a refusal closed the pool) and `overloads`.
 

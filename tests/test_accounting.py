@@ -252,6 +252,11 @@ class AccountingTests(ModelFixture):
         self.assertTrue(hub['durable'] > 0 and hub['dropped'] == 0, hub)
         (pool,) = stats['providers']['openai']['pools'].values()
         self.assertEqual((pool['admitted'], pool['parked'], pool['closed']), (1, 0, 0), pool)
+        # A follow that replays the turn counts what it was sent.
+        client.request('follow', bot='Bob', after=0)
+        client.receive(lambda e: e.get('event') == 'follow_live')
+        replayed = client.request('stats')['result']['hub']
+        self.assertGreaterEqual(replayed['delivered'] - hub['delivered'], len(events), replayed)
 
     def test_a_cut_reply_s_usage_is_durable_and_the_spent_budget_wraps_its_turn_up(self):
         client = self.client('echo')
