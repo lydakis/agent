@@ -972,7 +972,10 @@ has something on it, or is off the screen, no time shows.
   nothing is left to do in it, such as when its pull request merged or
   you dropped the work, and the lead can mark any of its tasks done the
   same way; the lead hears when a task marked itself done, and the task's
-  window closes once its turn ends. New work sent to the task reopens it.
+  window closes once its turn ends. One you used since its newest turn
+  began stays, says `✓ done` under its last reply, and closes once you
+  look away from it, unless a message is half typed there. New work sent
+  to the task, or a message you type there, reopens it.
   A lead is marked done the same way once you say its project is done: it
   calls `mark_done` naming no task, or an outer lead names it. Its row
   reads done, its old questions are set aside, and its automations skip
