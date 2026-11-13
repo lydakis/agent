@@ -53,6 +53,11 @@ of it ends `tool_unserved`, run the same command with
      with `external` true in `save` (`--external` for the script), and do
      the same for a merge that takes in one; only the person's own words
      in step 4 clear it.
+   - **Live facts.** A fact whose index line says `live` has blanks
+     (`{{ ... }}`) that Sonny fills when it is read. Merge and reword the
+     words around them, but keep each blank as written: never put what one
+     filled to in its place, which would make it a stale copy. Its mark
+     stays when a save leaves `live` out.
    - **Stale work.** A `stale_work` fact is work no agent has moved in
      three days. When it holds something a later agent needs once the
      work is over, such as a decision and why, a trap, or how the person

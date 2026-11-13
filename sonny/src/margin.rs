@@ -134,7 +134,7 @@ pub fn tool() -> Value {
                 "markdown": {"type": "string", "maxLength": NOTE_BYTES,
                     "description": "The note, as Markdown."},
                 "template": {"type": "string",
-                    "description": "Or Markdown with Jinja blanks Sonny keeps filled: source('name').latest, file('path'), tasks(), task('name'), now(), |ago, |time, |fromjson."},
+                    "description": "Or Markdown with Jinja blanks Sonny keeps filled: source('name').latest/.topics, file('path'), tasks(), task('name'), now(), |ago, |time, |fromjson."},
                 "file": {"type": "string", "minLength": 1,
                     "description": "Or a file to show, absolute or from your folder."},
                 "from": {"type": "string", "pattern": "^[A-Za-z0-9._-]{1,128}/[a-z0-9][a-z0-9-]{0,39}$",
@@ -270,14 +270,7 @@ pub async fn answer(
                 store: Some(store),
                 // The ones the person set up, as the window has them: the
                 // commons keeps nothing a blank reads.
-                sources: std::sync::Arc::new(
-                    (crate::lookout::sources::configured()
-                        .unwrap_or_default()
-                        .into_iter())
-                    .filter(|source| !source.command.is_empty())
-                    .map(|source| source.name)
-                    .collect(),
-                ),
+                sources: crate::template::configured_sources(),
                 folder: workspace,
                 now: SystemTime::now()
                     .duration_since(SystemTime::UNIX_EPOCH)
