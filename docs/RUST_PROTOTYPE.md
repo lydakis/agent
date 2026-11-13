@@ -3063,7 +3063,7 @@ programs its config names (an fsmonitor, a filter) even to list its files,
 so a repository an agent made would run what it left there as the person.
 Sonny runs its own git in such places this way (#597).
 
-`agent sandbox --bot NAME [--bot-id ID] -- COMMAND [ARGS...]` runs one
+`agent sandbox --bot NAME [--bot-id ID] [--no-spawn] -- COMMAND [ARGS...]` runs one
 command as one of that bot's own commands runs, for a client running a
 command a bot wrote outside its turns, as Codex runs whatever an agent wrote
 in its sandbox: Sonny's automation gates (`--if`) that an agent added.
@@ -3084,7 +3084,9 @@ store) and nothing of the caller's environment reaches it. Only a session
 outside every sandbox may lend (`not_permitted`), so a confined command
 cannot reach another bot's socket; `bot_id` that is not the bot's is
 `bot_not_found`. The lend costs one round trip and, for a bot whose socket
-was not listening, one bind.
+was not listening, one bind. It starts the daemon when none runs, as a
+command on the bots does; with `--no-spawn` it is `daemon_unavailable`
+instead.
 `agent sandbox` exits as its command does, or 125 when it
 could not run it (a usage error, no sandbox here, the bot not found), as
 `env` and `timeout` do, with the error on stderr.
