@@ -19,7 +19,8 @@
 //! answers the call ([`served`]) sets a one-off trigger at the deadline.
 //! Its `--if` is `sonny ask open` ([`still_open`]): once the person
 //! answered, or wrote words of their own to that agent, the conversation
-//! moved on and nothing fires. A fire is Sonny's words in a trigger's turn,
+//! moved on and nothing fires; an answer, or the agent's close, removes it
+//! at once ([`let_deadline_go`]). A fire is Sonny's words in a trigger's turn,
 //! never the person's, so it allows nothing that needs their own; a pick
 //! of another option later still answers the card, and the agent undoes
 //! what it did.
@@ -1193,6 +1194,24 @@ fn deadline(minutes: u64, now: i64) -> i64 {
     at + (60 - at.rem_euclid(60)) % 60
 }
 
+/// Lets the deadline of `bot`'s ask `asked` go once nothing is left for
+/// it to remind of: the person answered it, or it was closed. Its one-off
+/// trigger leaves `/background` then, not at its time; none there (no
+/// deadline, or gone already) is fine. Should this miss, its gate still
+/// says no at the deadline.
+pub fn let_deadline_go(bot: &str, asked: &str) {
+    if let Some((turn, call)) = named(asked) {
+        let name = trigger_name(bot, turn, call);
+        let _ = crate::trigger::tool(&json!({"remove": name}), &crate::trigger::Caller::default());
+    }
+}
+
+/// The turn and call ask `asked` names, as [`id`] wrote it.
+fn named(asked: &str) -> Option<(i64, &str)> {
+    let (turn, call) = asked.strip_prefix("ask:")?.split_once('/')?;
+    (!call.is_empty()).then_some((turn.parse().ok()?, call))
+}
+
 /// The trigger an ask's deadline is, by its agent, turn and call (call IDs
 /// repeat across turns): a name the person reads in `/background` beside
 /// the agent's own.
@@ -1258,6 +1277,9 @@ struct Standing {
     /// running may yet fail. A result comes after its call, so each is
     /// let go once its call is read.
     taken: Vec<(i64, Value)>,
+    /// The calls that failed or were refused whose call is not read yet,
+    /// by turn and call, let go the same way.
+    refused: Vec<(i64, Value)>,
     /// The one ask read for, when only its answers and closes are kept,
     /// so a long history costs no more than that ask's.
     wanted: Option<String>,
@@ -1284,10 +1306,14 @@ impl Standing {
         if at != turn {
             return None;
         }
-        let (made, _) = (items.iter())
+        let (made, came) = (items.iter())
             .find(|(item, _)| item["type"] == "function_call" && item["call_id"] == call)?;
         let asked = id(turn, call);
+        // A call that failed or was refused put no question, as no card
+        // shows one: its deadline, set as it was answered, has nothing
+        // to remind of, while the agent may well ask it again.
         let ask = (made["arguments"].as_str())
+            .filter(|_| *came != Came::Refused)
             .and_then(|a| serde_json::from_str::<Value>(a).ok())
             .and_then(|arguments| self::call(&asked, &arguments));
         Some(ask.map(|ask| {
@@ -1298,31 +1324,39 @@ impl Standing {
 
     /// Takes in what `entry`, of turn `at`, says of the asks before it:
     /// answers, closes, results and the person's own words. Its calls,
-    /// each with whether it was taken.
-    fn read(&mut self, at: i64, entry: &Value) -> Vec<(Value, bool)> {
+    /// each with what came of it.
+    fn read(&mut self, at: i64, entry: &Value) -> Vec<(Value, Came)> {
         let items = crate::responses(&entry["item"]);
         let mut read = Vec::with_capacity(items.len());
         let wanted = |of: &str| self.wanted.as_deref().is_none_or(|wanted| wanted == of);
         // An entry's results first, as they come after its calls.
-        self.taken.extend(
-            (items.iter())
-                .filter(|item| {
-                    item["type"] == "function_call_output"
-                        && item["failed"] != true
-                        && !crate::reactions::refused(item)
-                })
-                .map(|item| (at, item["call_id"].clone())),
-        );
+        for item in items
+            .iter()
+            .filter(|item| item["type"] == "function_call_output")
+        {
+            let made = (at, item["call_id"].clone());
+            match item["failed"] == true || crate::reactions::refused(item) {
+                true => self.refused.push(made),
+                false => self.taken.push(made),
+            }
+        }
         let mut closes = Vec::new();
         for item in items.iter().filter(|item| item["type"] == "function_call") {
             let made = (at, item["call_id"].clone());
-            let was_taken = (self.taken.iter().position(|taken| *taken == made))
-                .map(|at| self.taken.swap_remove(at))
-                .is_some();
-            read.push((item.clone(), was_taken));
+            let mut came = Came::Running;
+            for (list, so) in [
+                (&mut self.taken, Came::Taken),
+                (&mut self.refused, Came::Refused),
+            ] {
+                if let Some(at) = list.iter().position(|result| *result == made) {
+                    list.swap_remove(at);
+                    came = so;
+                }
+            }
+            read.push((item.clone(), came));
             if let Some((closed, state)) = closed_by(item)
                 && self.skip.as_ref() != Some(&made)
-                && was_taken
+                && came == Came::Taken
                 && wanted(&closed)
             {
                 closes.push((closed, state));
@@ -1365,6 +1399,17 @@ impl Standing {
     }
 }
 
+/// What came of a call, as [`Standing`] reads its result.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Came {
+    /// Its result says it was taken.
+    Taken,
+    /// It failed, or the daemon refused it.
+    Refused,
+    /// No result yet: still running, or cut before it had one.
+    Running,
+}
+
 /// Every question one agent's history put, read newest first as
 /// [`Standing`] reads one: each where it stands by what came after it.
 #[derive(Default)]
@@ -1376,7 +1421,7 @@ impl Asked {
     pub fn entry(&mut self, at: i64, entry: &Value) -> Vec<(Ask, State)> {
         let items = self.0.read(at, entry);
         (items.iter())
-            .filter(|(item, taken)| *taken && item["name"] == TOOL)
+            .filter(|(item, came)| *came == Came::Taken && item["name"] == TOOL)
             .filter_map(|(item, _)| {
                 let asked = id(at, item["call_id"].as_str()?);
                 let arguments = serde_json::from_str::<Value>(item["arguments"].as_str()?).ok()?;
@@ -1447,9 +1492,8 @@ pub async fn served_close(
     if matches!(&state, State::Recorded { note, .. } | State::Withdrawn(note) if note.is_empty()) {
         return Err("invalid_arguments: a line in note for the card".into());
     }
-    let (turn, call) = (asked.strip_prefix("ask:"))
-        .and_then(|rest| rest.split_once('/'))
-        .and_then(|(turn, call)| Some((turn.parse::<i64>().ok()?, call.to_owned())))
+    let (turn, call) = (named(&asked))
+        .map(|(turn, call)| (turn, call.to_owned()))
         .ok_or("invalid_arguments: the ask's ID as ask gave it (ask:TURN/CALL)")?;
     let daemon = crate::trigger::Daemon::current()?;
     let socket = daemon.socket()?;
@@ -1460,17 +1504,22 @@ pub async fn served_close(
     let Some((ask, now)) = found else {
         return Err(format!("ask_not_found: {asked} is no question of yours"));
     };
-    match now {
-        State::Answered(answer) => {
-            return Err(format!(
-                "answered: the person answered it themselves (\"{}\"), and their answer stands",
-                crate::transcript::cut(answer.lines().next().unwrap_or(""), QUOTED)
-            ));
-        }
+    // Settled before this close, it has nothing left to remind of either:
+    // its deadline goes as it would with the close.
+    let settled = match now {
+        State::Answered(answer) => Some(format!(
+            "answered: the person answered it themselves (\"{}\"), and their answer stands",
+            crate::transcript::cut(answer.lines().next().unwrap_or(""), QUOTED)
+        )),
         State::Recorded { .. } | State::Withdrawn(_) => {
-            return Err(format!("closed: {asked} is closed already"));
+            Some(format!("closed: {asked} is closed already"))
         }
-        State::Open | State::Aside => {}
+        State::Open | State::Aside => None,
+    };
+    if let Some(refusal) = settled {
+        let (bot, gone) = (bot.to_owned(), asked.clone());
+        let _ = tokio::task::spawn_blocking(move || let_deadline_go(&bot, &gone)).await;
+        return Err(refusal);
     }
     if let State::Recorded {
         option: Some(at), ..
@@ -1483,11 +1532,8 @@ pub async fn served_close(
         ));
     }
     // Its deadline goes with it: nothing to fire, nothing left on disk.
-    let name = trigger_name(bot, turn, &call);
-    let _ = tokio::task::spawn_blocking(move || {
-        crate::trigger::tool(&json!({"remove": name}), &crate::trigger::Caller::default())
-    })
-    .await;
+    let (bot, gone) = (bot.to_owned(), asked.clone());
+    let _ = tokio::task::spawn_blocking(move || let_deadline_go(&bot, &gone)).await;
     let outcome = match state {
         State::Withdrawn(_) => "withdrawn",
         _ => "answered",
@@ -2645,6 +2691,68 @@ mod tests {
         let wait = fire("Tag it?", Unanswered::Wait, "");
         assert!(wait.contains("do not go ahead with it"));
         assert!(wait.contains("This is Sonny, not the person"));
+    }
+
+    #[test]
+    fn an_ask_whose_call_failed_reminds_of_nothing() {
+        let asking = json!({"node": 1, "item": {"type": "function_call", "name": TOOL,
+            "call_id": "a1", "arguments": asked("wait").to_string()}});
+        let result = |failed: bool, output: &str| {
+            json!({"node": 2, "item": {"type": "function_call_output", "call_id": "a1",
+                "failed": failed, "output": output}})
+        };
+        let read = |entries: &[Value]| {
+            let mut reading = Reading::default();
+            (entries.iter()).find_map(|entry| reading.entry(2, entry, 2, "a1"))
+        };
+        // Taken, or still running, it waits on the person.
+        let taken = result(false, r#"{"id":"ask:2/a1"}"#);
+        assert_eq!(read(&[taken, asking.clone()]), Some(true));
+        assert_eq!(read(std::slice::from_ref(&asking)), Some(true));
+        // Failed or refused, no card shows it: its deadline has nothing to
+        // remind of, and a close finds no question there.
+        let failed = result(true, "expired");
+        assert_eq!(read(&[failed.clone(), asking.clone()]), Some(false));
+        let refused = result(false, r#"{"error":"denied"}"#);
+        assert_eq!(read(&[refused, asking.clone()]), Some(false));
+        let mut standing = Standing::default();
+        assert_eq!(
+            [failed, asking.clone()]
+                .iter()
+                .find_map(|entry| standing.entry(2, entry, 2, "a1")),
+            Some(None)
+        );
+        // Another turn's failed call of the same ID is not this one.
+        let mut reading = Reading::default();
+        let elsewhere = result(true, "expired");
+        assert_eq!(
+            [(3, elsewhere), (2, asking)]
+                .iter()
+                .find_map(|(at, entry)| reading.entry(*at, entry, 2, "a1")),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn an_answered_or_closed_ask_lets_its_deadline_go() {
+        assert_eq!(named("ask:12/toolu_1"), Some((12, "toolu_1")));
+        assert_eq!(named("ask:12/"), None);
+        assert_eq!(named("ask:x/toolu_1"), None);
+        assert_eq!(named("toolu_1"), None);
+        let places = crate::trigger::Places::home().unwrap();
+        std::fs::create_dir_all(&places.jobs).unwrap();
+        std::fs::create_dir_all(&places.state).unwrap();
+        let job = places.job(&trigger_name("let.go", 12, "toolu_01AbCdEf"));
+        std::fs::write(&job, "{}").unwrap();
+        // Another ask's deadline stays.
+        let other = places.job(&trigger_name("let.go", 13, "toolu_01AbCdEf"));
+        std::fs::write(&other, "{}").unwrap();
+        let_deadline_go("let.go", "ask:12/toolu_01AbCdEf");
+        assert!(!job.exists());
+        assert!(other.exists());
+        // Gone already, or never set, is fine.
+        let_deadline_go("let.go", "ask:12/toolu_01AbCdEf");
+        let_deadline_go("let.go", "not an ask");
     }
 
     #[test]
