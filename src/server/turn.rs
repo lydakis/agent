@@ -3062,7 +3062,7 @@ impl Turn {
         let tools = self.registry.encoded(
             provider.family(),
             provider.grammars(),
-            &record.tools,
+            &record.offered(),
             &record.declared,
             record.sandboxed(),
         )?;
@@ -4431,7 +4431,7 @@ impl Turn {
         route: Option<&str>,
         summary_retry_ms: Option<u64>,
     ) -> Result<Option<Stop>> {
-        let (turn, allowed) = (self.turn, record.callable());
+        let turn = self.turn;
         let mut calls = calls.into_iter();
         while let Some(call) = calls.next() {
             // Nor any tool: the calls not yet started are answered as not
@@ -4531,7 +4531,7 @@ impl Turn {
             let prepared = if let Some(tool) = record.declared(&call.name) {
                 agent_runtime::tools::check_declared(tool, &call.arguments)
                     .map(|()| Prepared::Declared(tool.result.clone()))
-            } else if allowed.iter().any(|name| name == &call.name) {
+            } else if record.calls(&call.name) {
                 self.registry.prepare(&call.name, &call.arguments)
             } else {
                 Err(Error::with("tool_not_available", call.name.as_str()))
@@ -4631,6 +4631,7 @@ impl Turn {
                     match self
                         .background(
                             &call.call_id,
+                            record.bot_id,
                             command,
                             Prepared::folder(workspace, workdir.as_deref()),
                             timeout_ms,
@@ -4862,7 +4863,8 @@ impl Turn {
                         Ran::Done(Err(error)) => failure(error),
                         Ran::Lifted(run) => {
                             let outputs = self.outputs(record, workspace);
-                            self.lift_shell(&call.call_id, run, &place, outputs).await?
+                            self.lift_shell(&call.call_id, record.bot_id, run, &place, outputs)
+                                .await?
                         }
                     }
                 }
@@ -4918,7 +4920,7 @@ impl Turn {
                 Ok(Ruling::None | Ruling::Allow)
             )
             || record.declared(&call.name).is_some()
-            || !record.callable().iter().any(|name| name == &call.name)
+            || !record.calls(&call.name)
             || (call.name == "shell" && record.sandboxed() && !record.confines(call, workspace))
         {
             return None;
@@ -5106,7 +5108,8 @@ impl Turn {
                         let outputs = self.outputs(record, workspace);
                         return (
                             call_id.clone(),
-                            self.lift_shell(&call_id, run, &place, outputs).await,
+                            self.lift_shell(&call_id, record.bot_id, run, &place, outputs)
+                                .await,
                         );
                     }
                 }
@@ -5315,7 +5318,7 @@ impl Turn {
     fn load_holds(&self, record: &Bot, call: &ToolCall, workspace: &std::path::Path) -> bool {
         if self.registry.admits()
             || record.declared(&call.name).is_some()
-            || !record.callable().iter().any(|name| name == &call.name)
+            || !record.calls(&call.name)
         {
             return false;
         }
@@ -5737,16 +5740,16 @@ impl Turn {
         // inherited from a fork's source is not its to collect. An owned
         // command stays owned, so checking before the wait parks is enough.
         if !processes.is_empty() {
-            let bot = self.bot.clone();
+            let (bot, ids) = (self.bot.clone(), processes.clone());
             let refused = self
                 .store
-                .op("unowned_process", move |db| {
-                    db.unowned_process(&bot, &processes)
-                })
+                .op("unowned_process", move |db| db.unowned_process(&bot, &ids))
                 .await?;
             if let Some(error) = refused {
                 return Ok(ControlFlow::Continue(failure(error)));
             }
+            // Waited on, as Codex counts a poll: the last its bot prunes.
+            self.registry.used(&processes);
         }
         // A steer waiting for the next boundary makes the wait a poll: it
         // reports what resolved, and the rest pending.
@@ -5858,6 +5861,7 @@ impl Turn {
     async fn background(
         &self,
         call_id: &str,
+        owner: i64,
         command: String,
         workspace: PathBuf,
         timeout_ms: Option<u64>,
@@ -5876,6 +5880,7 @@ impl Turn {
         let spill = (outputs.clone()).map(|outputs| outputs.spill(self.turn, call_id));
         self.registry.background(
             self.registry.stopper(id),
+            owner,
             command,
             workspace,
             timeout_ms,
@@ -5898,6 +5903,7 @@ impl Turn {
     async fn lift_shell<F>(
         &self,
         call_id: &str,
+        owner: i64,
         run: std::pin::Pin<Box<F>>,
         place: &Place,
         outputs: Option<Outputs>,
@@ -5911,9 +5917,10 @@ impl Turn {
             .op("process_start", move |db| db.process_start(turn, &started))
             .await?;
         let (sender, receiver) = oneshot::channel();
-        let run = self
-            .registry
-            .until_stopped(self.registry.stopper(id), self.registry.until_pulled(run));
+        // It runs on as a background command, and counts as one.
+        let stopper = self.registry.stopper(id);
+        self.registry.own(&stopper, owner);
+        let run = (self.registry).until_stopped(stopper, self.registry.until_pulled(run));
         // Counted as the process it is now, not as a foreground command too.
         place.lift();
         tokio::spawn(async move {
@@ -6073,7 +6080,7 @@ impl Lifts {
         let prepared = if let Some(tool) = bot.declared(&call.name) {
             agent_runtime::tools::check_declared(tool, &call.arguments)
                 .map(|()| Prepared::Declared(tool.result.clone()))
-        } else if bot.callable().iter().any(|name| name == &call.name) {
+        } else if bot.calls(&call.name) {
             self.registry.prepare(&call.name, &call.arguments)
         } else {
             Err(Error::with("tool_not_available", call.name.as_str()))
@@ -6143,6 +6150,7 @@ impl Lifts {
             }) => match self.registry.queue() {
                 Ok(queued) => self.registry.background(
                     stopper,
+                    bot.bot_id,
                     command,
                     Prepared::folder(&workspace, workdir.as_deref()),
                     timeout_ms,
@@ -6466,7 +6474,7 @@ fn withhold_thinking(context: &Context, error: &Error) -> Option<Strip> {
 /// Whether the bot may search the web: its provider declares the search
 /// when it offers one, and a fork's allowed list narrows it as any tool.
 fn searches(record: &agent_runtime::store::Bot) -> bool {
-    record.callable().iter().any(|tool| tool == "web_search")
+    record.calls("web_search")
 }
 
 /// Whether a turn whose budget is spent makes one more call, without tool

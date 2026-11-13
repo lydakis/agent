@@ -568,7 +568,10 @@ family is trained on: `apply_patch` for a Responses model, else `edit`, and
 `web_search` where the provider offers it and `web_fetch` for any, unless
 `~/.agent/config.toml` sets `web_search = "disabled"` (or names the model in
 `web_search_off`, `PROVIDER/MODEL` patterns with `*` and `?`, which leaves
-search out and keeps `web_fetch`). An
+search out and keeps `web_fetch`). A bot whose sandbox keeps it off the
+network (`read-only`, or `workspace-write` without `network`) is offered
+neither web tool and runs neither, from its next call, while they stay
+among its tools for when its network is set. An
 existing bot keeps its own,
 so `--tools` while continuing one is a usage error.
 `run --fallback PROVIDER/MODEL` gives a new bot a model, in its family, that

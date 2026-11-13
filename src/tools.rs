@@ -123,7 +123,7 @@ impl Tool {
                 "properties":{"text":{"type":"string"}},"required":["text"],"additionalProperties":false}),
             ),
             Tool::Shell => (
-                "Run a noninteractive bash command (sh where bash is not installed) in the workspace, or in workdir when given (relative to the workspace unless absolute). stdout and stderr are returned separately; each is truncated to a head and tail beyond 64 KiB, and retained whole in a file the result names under files, up to 1 GiB, or, where there is no such file, up to 1 MiB: past that, its first and last 512 KiB. The command keeps running. Default timeout 120 s, maximum 600 s; with background=true there is no timeout unless timeout_ms sets one, of up to a day. A command that times out is killed and returns its output so far with timed_out. Every result reports wall_time_ms. Commands run with no terminal: TERM=dumb, NO_COLOR=1, and cat as the pager; AI_AGENT=agent tells tools an agent runs them. When the command returns or times out, every process it started is killed, so `cmd &` does not outlive it. With background=true the command is started and a proc handle is returned immediately; collect its result later with wait. If no wait collects it, its end comes as a message once no turn of yours runs: {\"finished\":{\"proc:N\":{how it ended}}}; wait on the handle reads the output. A steer that arrives while a command runs moves it to the background: the result is its proc handle with steered=true, and the command keeps running. A background command runs until it exits, its timeout_ms passes, kill=true on its handle stops it, or the daemon stops. With detach=true the command starts in its own session and its pid is returned at once; nothing tracks it and only a daemon pause kills it, so it outlives the turn and the daemon. Its output is discarded unless the command redirects it to a file. With tty=true it runs in a terminal, for a REPL or a program that prompts: the result is what it wrote within yield_time_ms (default 1000) and, while it runs, a proc handle for write_stdin.",
+                "Run a noninteractive bash command (sh where bash is not installed) in the workspace, or in workdir when given (relative to the workspace unless absolute). stdout and stderr are returned separately; each is truncated to a head and tail beyond 64 KiB, and retained whole in a file the result names under files, up to 1 GiB, or, where there is no such file, up to 1 MiB: past that, its first and last 512 KiB. The command keeps running. Default timeout 120 s, maximum 600 s; with background=true there is no timeout unless timeout_ms sets one, of up to a day. A command that times out is killed and returns its output so far with timed_out. Every result reports wall_time_ms. Commands run with no terminal: TERM=dumb, NO_COLOR=1, and cat as the pager; AI_AGENT=agent tells tools an agent runs them. When the command returns or times out, every process it started is killed, so `cmd &` does not outlive it. With background=true the command is started and a proc handle is returned immediately; collect its result later with wait. If no wait collects it, its end comes as a message once no turn of yours runs: {\"finished\":{\"proc:N\":{how it ended}}}; wait on the handle reads the output. A steer that arrives while a command runs moves it to the background: the result is its proc handle with steered=true, and the command keeps running. A background command runs until it exits, its timeout_ms passes, kill=true on its handle stops it, or the daemon stops; each agent keeps at most as many as the daemon's process bound, and starting one past them kills the one it started or waited on least recently. With detach=true the command starts in its own session and its pid is returned at once; nothing tracks it and only a daemon pause kills it, so it outlives the turn and the daemon. Its output is discarded unless the command redirects it to a file. With tty=true it runs in a terminal, for a REPL or a program that prompts: the result is what it wrote within yield_time_ms (default 1000) and, while it runs, a proc handle for write_stdin.",
                 json!({"type":"object","properties":{"command":{"type":"string"},
                 "workdir":{"type":"string"},
                 "timeout_ms":{"type":"integer","minimum":1,"maximum":MAX_BACKGROUND_TIMEOUT_MS},
@@ -546,8 +546,9 @@ pub struct Registry {
     /// end then rather than outlive it.
     stopping: Arc<watch::Sender<bool>>,
     /// Background commands running, by proc handle, each with what stops
-    /// it when its agent kills it.
-    stops: Arc<std::sync::Mutex<HashMap<i64, tokio::sync::oneshot::Sender<()>>>>,
+    /// it when its agent kills it, and whose it is once it counts toward
+    /// its bot's share.
+    stops: Arc<std::sync::Mutex<Stops>>,
     /// Counts pulls of the cord: background commands running or waiting
     /// for a slot at one end then.
     pulls: Arc<watch::Sender<u64>>,
@@ -2987,6 +2988,7 @@ impl Registry {
     pub fn background(
         &self,
         stopper: Stopper,
+        owner: i64,
         command: String,
         workspace: PathBuf,
         timeout_ms: Option<u64>,
@@ -3000,6 +3002,7 @@ impl Registry {
         let mut queued = queued;
         let mut stopping = self.stopping.subscribe();
         let mut pulls = self.pulls.subscribe();
+        self.own(&stopper, owner);
         let Stopper { stop, listed } = stopper;
         tokio::spawn(async move {
             let _listed = listed;
@@ -3038,8 +3041,8 @@ impl Registry {
             // that came before it began wins, so it never starts.
             tokio::select! {
                 biased;
-                Ok(()) = stop => {
-                    let _ = done.send(Err(stopped_by_agent()));
+                Ok(kill) = stop => {
+                    let _ = done.send(Err(stopped(kill)));
                 }
                 // The cord pulled: dropped the same way, its handle saying
                 // why.
@@ -3062,7 +3065,12 @@ impl Registry {
     /// command is readied, so a kill while it is finds it.
     pub fn stopper(&self, id: i64) -> Stopper {
         let (sender, stop) = tokio::sync::oneshot::channel();
-        self.stops.lock().unwrap().insert(id, sender);
+        let entry = Stop {
+            sender,
+            owner: None,
+            used: 0,
+        };
+        self.stops.lock().unwrap().running.insert(id, entry);
         let listed = Stoppable {
             stops: self.stops.clone(),
             id,
@@ -3086,7 +3094,7 @@ impl Registry {
             // A kill that came before it began wins, so it never starts.
             tokio::select! {
                 biased;
-                Ok(()) = stop => Err(stopped_by_agent()),
+                Ok(kill) = stop => Err(stopped(kill)),
                 result = run => result,
             }
         }
@@ -3095,8 +3103,47 @@ impl Registry {
     /// Kill background command `id`, dropping it, which kills its group:
     /// false when none of that handle runs. Whose it is, the caller checks.
     pub fn stop(&self, id: i64) -> bool {
-        let stop = self.stops.lock().unwrap().remove(&id);
-        stop.is_some_and(|stop| stop.send(()).is_ok())
+        let stop = self.stops.lock().unwrap().running.remove(&id);
+        stop.is_some_and(|stop| stop.sender.send(Kill::Agent).is_ok())
+    }
+
+    /// Count `stopper`'s command toward bot `owner`'s share, as just used.
+    /// The share is the process bound (64 by default, Codex's number for a
+    /// session's processes): one past it kills the bot's command it used
+    /// least recently, as Codex prunes, so an agent that loses track of
+    /// what it started cannot hold the whole bound forever. With no bound,
+    /// nothing is pruned.
+    pub fn own(&self, stopper: &Stopper, owner: i64) {
+        let pruned = {
+            let mut stops = self.stops.lock().unwrap();
+            let used = stops.tick();
+            let Some(entry) = stops.running.get_mut(&stopper.listed.id) else {
+                return;
+            };
+            (entry.owner, entry.used) = (Some(owner), used);
+            let own = (stops.running.iter())
+                .filter(|(_, stop)| stop.owner == Some(owner))
+                .map(|(id, stop)| (*id, stop.used));
+            let least = match self.budget > 0 && own.clone().count() > self.budget {
+                true => own.min_by_key(|(_, used)| *used).map(|(id, _)| id),
+                false => None,
+            };
+            least.and_then(|id| stops.running.remove(&id))
+        };
+        if let Some(pruned) = pruned {
+            let _ = pruned.sender.send(Kill::Pruned);
+        }
+    }
+
+    /// Background commands `ids` were just used: a wait named them.
+    pub fn used(&self, ids: &[i64]) {
+        let mut stops = self.stops.lock().unwrap();
+        for id in ids {
+            let used = stops.tick();
+            if let Some(entry) = stops.running.get_mut(id) {
+                entry.used = used;
+            }
+        }
     }
 
     /// `run`, a command a steer moved to the background, ended as the pull
@@ -3134,12 +3181,53 @@ impl Registry {
     }
 }
 
-/// How a background command its agent killed answers.
-fn stopped_by_agent() -> Error {
+/// How a background command that was killed answers: by its agent, or
+/// pruned as its agent started one past its share.
+fn stopped(kill: Kill) -> Error {
     Error::with(
         "stopped",
-        "its agent killed this command before it finished, so it may have had effects",
+        match kill {
+            Kill::Agent => {
+                "its agent killed this command before it finished, so it may have had effects"
+            }
+            Kill::Pruned => {
+                "its agent started more background commands than the daemon's process bound, so this one, the one it used least recently, was killed before it finished; it may have had effects"
+            }
+        },
     )
+}
+
+/// Why a background command was killed.
+#[derive(Clone, Copy, Debug)]
+enum Kill {
+    /// Its agent killed it by its handle.
+    Agent,
+    /// Its agent started one past its share, and it was the one used least
+    /// recently.
+    Pruned,
+}
+
+/// The background commands running, by proc handle.
+#[derive(Default)]
+struct Stops {
+    running: HashMap<i64, Stop>,
+    /// Orders uses: each start and each wait takes the next.
+    ticks: u64,
+}
+
+impl Stops {
+    fn tick(&mut self) -> u64 {
+        self.ticks += 1;
+        self.ticks
+    }
+}
+
+/// What kills one background command, whose bot it counts for once its
+/// command runs, and when that bot last used it.
+struct Stop {
+    sender: tokio::sync::oneshot::Sender<Kill>,
+    owner: Option<i64>,
+    used: u64,
 }
 
 /// How a command its agent killed before it started answers.
@@ -3152,7 +3240,7 @@ fn stopped_before_start() -> Error {
 
 /// What lets its agent kill a background command by its handle.
 pub struct Stopper {
-    stop: tokio::sync::oneshot::Receiver<()>,
+    stop: tokio::sync::oneshot::Receiver<Kill>,
     listed: Stoppable,
 }
 
@@ -3160,7 +3248,7 @@ impl Stopper {
     /// Refuse a start its agent killed before.
     pub fn check(&mut self) -> Result<()> {
         match self.stop.try_recv() {
-            Ok(()) => Err(stopped_before_start()),
+            Ok(_) => Err(stopped_before_start()),
             Err(_) => Ok(()),
         }
     }
@@ -3180,13 +3268,13 @@ impl Stopper {
 /// up when dropped: a run a pause or the daemon's stop drops leaves none
 /// behind.
 struct Stoppable {
-    stops: Arc<std::sync::Mutex<HashMap<i64, tokio::sync::oneshot::Sender<()>>>>,
+    stops: Arc<std::sync::Mutex<Stops>>,
     id: i64,
 }
 
 impl Drop for Stoppable {
     fn drop(&mut self) {
-        self.stops.lock().unwrap().remove(&self.id);
+        self.stops.lock().unwrap().running.remove(&self.id);
     }
 }
 
@@ -4455,11 +4543,11 @@ mod tests {
                 .until_pulled(registry.until_stopped(registry.stopper(7), std::future::pending())),
         );
         tokio::task::yield_now().await;
-        assert!(registry.stops.lock().unwrap().contains_key(&7));
+        assert!(registry.stops.lock().unwrap().running.contains_key(&7));
         registry.end_running();
         let ended = running.await.unwrap().unwrap_err();
         assert_eq!(ended.code, "daemon_paused");
-        assert!(registry.stops.lock().unwrap().is_empty());
+        assert!(registry.stops.lock().unwrap().running.is_empty());
         assert!(!registry.stop(7));
     }
     #[test]
@@ -4763,6 +4851,89 @@ mod tests {
             "-----BEGIN PRIVATE KEY-----\r\n[REDACTED]\n-----END PRIVATE KEY-----\r\n"
         );
     }
+    /// A bot keeps at most the process bound's number of background
+    /// commands, as Codex keeps a session's processes: starting one past
+    /// them kills the one its bot used least recently, a wait counting as
+    /// a use. Another bot's and a command no bot owns, such as a detached
+    /// one, never count, and with no bound nothing is pruned.
+    #[test]
+    fn a_bot_past_its_share_loses_the_command_it_used_least_recently() {
+        let registry = Registry::new("shell").unwrap().with_process_budget(4);
+        let pruned = |stopper: &mut Stopper| matches!(stopper.stop.try_recv(), Ok(Kill::Pruned));
+        let mut own: Vec<Stopper> = (1..=4)
+            .map(|id| {
+                let stopper = registry.stopper(id);
+                registry.own(&stopper, 7);
+                stopper
+            })
+            .collect();
+        let mut other = registry.stopper(1000);
+        registry.own(&other, 8);
+        let mut unowned = registry.stopper(2000);
+        assert!(own.iter_mut().all(|stopper| !pruned(stopper)));
+        // The oldest was waited on since, so the next oldest goes.
+        registry.used(&[1]);
+        let mut next = registry.stopper(5);
+        registry.own(&next, 7);
+        assert!(!pruned(&mut own[0]));
+        assert!(pruned(&mut own[1]));
+        assert!(own[2..].iter_mut().all(|stopper| !pruned(stopper)));
+        assert!(!pruned(&mut other) && !pruned(&mut unowned) && !pruned(&mut next));
+        // Gone from those its agent can kill: a kill by its handle finds none.
+        assert!(!registry.stop(2));
+        assert!(registry.stop(3));
+        let unbounded = Registry::new("shell").unwrap().with_process_budget(0);
+        let mut first = unbounded.stopper(1);
+        unbounded.own(&first, 7);
+        let _rest: Vec<Stopper> = (2..=200)
+            .map(|id| {
+                let stopper = unbounded.stopper(id);
+                unbounded.own(&stopper, 7);
+                stopper
+            })
+            .collect();
+        assert!(!pruned(&mut first));
+    }
+    /// A running background command its bot pruned is killed, and says why.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_pruned_background_command_is_killed_and_says_so() {
+        let registry = Registry::new("shell").unwrap().with_process_budget(4);
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+        registry.background(
+            registry.stopper(1),
+            7,
+            "sleep 100".to_owned(),
+            std::env::temp_dir(),
+            None,
+            Vec::new(),
+            None,
+            registry.queue().unwrap(),
+            sender,
+            None,
+        );
+        let _later: Vec<Stopper> = (2..=5)
+            .map(|id| {
+                let stopper = registry.stopper(id);
+                registry.own(&stopper, 7);
+                stopper
+            })
+            .collect();
+        let ended = tokio::time::timeout(Duration::from_secs(10), receiver)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(ended.code, "stopped");
+        assert!(
+            ended
+                .detail
+                .as_deref()
+                .unwrap_or("")
+                .contains("used least recently"),
+            "{ended:?}"
+        );
+    }
     /// A background command given no timeout_ms runs until it exits, as
     /// Codex's unified exec runs one: no deadline is armed for it, so a
     /// paused clock, which skips straight to the next deadline whenever the
@@ -4786,6 +4957,7 @@ mod tests {
             let (sender, receiver) = tokio::sync::oneshot::channel();
             registry.background(
                 registry.stopper(id),
+                1,
                 command,
                 std::env::temp_dir(),
                 timeout_ms,
