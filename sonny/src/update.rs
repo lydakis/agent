@@ -161,6 +161,10 @@ pub fn cli(args: &[String]) -> Result<(), String> {
     // Read before anything is installed: an upgrade may remove the program
     // this one runs from, and the link is how the new one is reached.
     let stable = crate::skills::sonny_path().unwrap_or_else(|| real.clone());
+    // The program this is, by its file, before anything is installed: a
+    // reinstall in place (a nightly of the same version) puts another file
+    // at this same path.
+    let running = identity(&real);
     println!("Current version: {VERSION}");
     let install = install_of(&real);
     if download && !matches!(install, Install::Tarball { .. }) {
@@ -193,7 +197,7 @@ pub fn cli(args: &[String]) -> Result<(), String> {
         Install::Tarball { .. } => new,
         _ => stable,
     };
-    if same_file(&new, &real) {
+    if running.is_some() && identity(&new) == running {
         return finish(Last::Current, &store, &socket);
     }
     use std::os::unix::process::CommandExt;
@@ -203,13 +207,6 @@ pub fn cli(args: &[String]) -> Result<(), String> {
         .args(&passed)
         .exec();
     Err(format!("{}: {error}", new.display()))
-}
-
-/// Whether `a` and `b` are one file.
-fn same_file(a: &Path, b: &Path) -> bool {
-    use std::os::unix::fs::MetadataExt;
-    let identity = |path: &Path| std::fs::metadata(path).ok().map(|m| (m.dev(), m.ino()));
-    identity(a).is_some_and(|a| Some(a) == identity(b))
 }
 
 /// Homebrew's `brew`: the one beside the Cellar Sonny is in, else PATH's.
@@ -781,7 +778,15 @@ mod tests {
         std::fs::remove_file(&link).unwrap();
         std::os::unix::fs::symlink(&new, &link).unwrap();
         assert_ne!(identity(&link), started);
-        assert!(same_file(&link, &new) && !same_file(&link, &old));
+        assert_eq!(identity(&link), identity(&new));
+        // A file put in place of the old one, as a reinstall does, is
+        // another program at the same path.
+        // Held open, as a running program is, so its inode is not reused.
+        let before = identity(&old);
+        let _running = std::fs::File::open(&old).unwrap();
+        std::fs::remove_file(&old).unwrap();
+        std::fs::write(&old, "reinstalled").unwrap();
+        assert!(identity(&old).is_some() && identity(&old) != before);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
