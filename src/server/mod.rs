@@ -5378,6 +5378,14 @@ impl Service {
                 } = stepped.step
                 {
                     self.handles.step_lapses(approval, expires_ms);
+                    // The call now waits on a verdict: a steer waiting for
+                    // its turn lifts it.
+                    if let Some(notify) = stepped.notify {
+                        notify.notify_one();
+                    }
+                    if stepped.wake {
+                        self.handles.wake(stepping.bot.clone(), turn);
+                    }
                     self.stepping.insert(approval, stepping);
                     // The response is sent from the run loop once the step
                     // is decided, not by this dispatch.

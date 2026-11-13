@@ -8711,7 +8711,63 @@ both with a median of 31.3. The Sonny rows are untouched by the change.
 
 The next ceiling is the store's single writer (#900).
 
-## Tracked detached commands (protocol 69, schema 97)
+## A steer lets a quick answered call finish (protocol 70)
+
+A steer lifts a call its client answers only when the tool is declared
+with `lift` or a step of the call waits on a gate. What each path does now:
+
+- **A quick answered call under a steer** (Sonny's margin, memory, react):
+  no lift commit, no `processes` row, no handle and no later `wait` round;
+  the answer is taken in the same hold, and the steer joins at the next
+  boundary.
+- **A call that will lift**: held live until its 250 ms grace ends rather
+  than parked at the 250 ms answer hold and resumed by the steer, which
+  saves a park commit and a resume.
+- **A parked answer wait woken by a steer**: `wake` reads one more column
+  of the call's `answers` row, and the bot's record only when the call's
+  step is not waiting on a gate.
+- **A step that starts waiting on a gate**: one `joining_steer` read, only
+  when it is the first step to pause its call.
+
+Daemon and Sonny screen (`bench.perf_gate`), the Perf workflow's Linux
+runner, base main c5fa712 against head 0cd7d50, alternating rounds:
+
+| Bench | Measure | Base | Head | Change |
+| --- | --- | ---: | ---: | ---: |
+| admission | lone submit CPU, ms | 37.791 | 38.332 | +1.4% |
+| admission | burst submit p99, ms | 4.269 | 4.285 | +0.4% |
+| completion | release to terminal p99, ms | 12.032 | 11.556 | -4.0% |
+| footprint | idle RSS, MiB | 15.893 | 16.066 | +1.1% |
+| footprint | per idle bot, KiB | 1.838 | 1.704 | -7.3% |
+| footprint | RSS after a turn each, MiB | 29.014 | 30.045 | +3.6% |
+| footprint | CPU per turn, ms | 1.029 | 1.065 | +3.5% |
+| sonny | lookout CPU per 1k deltas at 10x1, ms | 12.5 | 18.75 | +50.0% |
+| sonny | lookout CPU per 1k deltas at 10x10, ms | 6.25 | 5.625 | -10.0% |
+| sonny | lookout CPU per 1k deltas at 10x100, ms | 5.435 | 5.56 | +2.3% |
+| sonny | lookout CPU per 1k deltas at 100x10, ms | 6.12 | 6.44 | +5.2% |
+| sonny | lookout seated at 100x10, s | 0.1 | 0.1 | +0.0% |
+| sonny | lookout note p95 at 10x100, ms | 2340.0 | 2408.5 | +2.9% |
+| sonny | lookout note p95 at 100x10, ms | 2396.0 | 2513.5 | +4.9% |
+| sonny | quiet window CPU, ms/s | 0.96 | 1.17 | +21.9% |
+| sonny | quiet window reads, KiB/s | 0.25 | 0.26 | +4.0% |
+| sonny | quiet window requests, /s | 0.695 | 0.74 | +6.5% |
+| sonny | quiet window RSS, MiB | 24.05 | 24.15 | +0.4% |
+| sonny | sky replay CPU per 1k lines, ms | 14.48 | 13.765 | -4.9% |
+| sonny | sky replay RSS, MiB | 72.85 | 69.1 | -5.1% |
+| lifecycle | CPU, s | 0.575 | 0.565 | -1.7% |
+| lifecycle | p95 turn, ms | 590.401 | 580.248 | -1.7% |
+| lifecycle | peak RSS, MiB | 24.396 | 24.34 | -0.2% |
+
+Store work per turn is the same on both sides; the screen's turns run no
+answered call, so the paths above do not show in it. Every daemon row is
+inside the run-to-run spread of earlier screens, and lifecycle is lower on
+head for CPU and latency. The gate warned on quiet window CPU, which has
+swung by 16% to 33% on earlier screens with no Sonny change; Sonny's only
+change is three fields in the tools it declares. The 10x1 lookout row is
+one timer tick of 6.25 ms over a thousand deltas, and the same measure fell
+10% at 10x10 in the same run.
+
+## Tracked detached commands (protocol 71, schema 97)
 
 A detached command is a `proc:N` handle now, recorded with its pid and its
 leader's start so a later daemon finds it again, and `processes` lists what
