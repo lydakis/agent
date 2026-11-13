@@ -3168,6 +3168,73 @@ pub fn finished(status: &str, detail: &str, seconds: Option<u64>) -> Line<'stati
     Line::from(Span::styled(label, style))
 }
 
+/// The most rows of a provider's explanation drawn under its refusal.
+const REFUSAL_ROWS: usize = 4;
+
+/// A turn the provider refused, from its `turn_finished` facts, in plain
+/// words in place of its `provider_refusal` code: what was declined and
+/// its category, then the provider's explanation and what became of the
+/// fallback, dimmed. `reached` is false when the declined request carried
+/// the person's message and nothing since: it never reached the agent.
+pub fn refused(data: &Value, reached: bool, width: usize) -> Vec<Line<'static>> {
+    let category = (data["category"].as_str())
+        .filter(|category| !category.is_empty())
+        .map(|category| format!(" ({})", category.replace('_', " ")))
+        .unwrap_or_default();
+    // Declined partway through its answer, the model had read the request.
+    let said = match data["mid_stream"] == true {
+        true => format!("The provider cut off the agent's answer{category}."),
+        false if !reached => {
+            format!(
+                "The provider declined this request{category}; your message did not reach the agent."
+            )
+        }
+        false => format!("The provider declined this request{category}."),
+    };
+    let mut lines = wrap(
+        Line::from(said),
+        width,
+        Span::raw("✗ ").fg(Color::Red),
+        Span::raw("  "),
+    );
+    let mut under = Vec::new();
+    let explanation = data["explanation"].as_str().unwrap_or("");
+    for paragraph in explanation.lines().filter(|line| !line.trim().is_empty()) {
+        under.extend(wrap(
+            Line::from(paragraph.trim().to_owned()),
+            width,
+            Span::raw("  "),
+            Span::raw("  "),
+        ));
+    }
+    if under.len() > REFUSAL_ROWS {
+        under.truncate(REFUSAL_ROWS);
+        if let Some(span) = under.last_mut().and_then(|last| last.spans.last_mut()) {
+            span.content = format!("{} …", span.content.trim_end()).into();
+        }
+    }
+    // The fallback it went to, or one it could not; none only when the
+    // daemon says so, as one from before it kept the fact does not.
+    let fallback = match (&data["fallback"], data["unused_fallback"]["model"].as_str()) {
+        (Value::String(model), _) => Some(format!("The fallback, {model}, declined it too.")),
+        (_, Some(model)) => Some(format!("The fallback, {model}, could not be used.")),
+        (Value::Null, None) if data.get("fallback").is_some() => {
+            Some("No fallback is set for this model.".to_owned())
+        }
+        _ => None,
+    };
+    if let Some(fallback) = fallback {
+        under.extend(wrap(
+            Line::from(fallback),
+            width,
+            Span::raw("  "),
+            Span::raw("  "),
+        ));
+    }
+    lines.extend(under.into_iter().map(|line| line.dim()));
+    lines
+}
+
 /// How full a conversation of `size` tokens is, as the footer says it:
 /// with the model's `window` known, what is left of it (`62%`, ` context
 /// left`) and its colour, yellow from half used and red from four fifths;
@@ -3222,6 +3289,70 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn a_refusal_says_what_was_declined_and_what_became_of_the_fallback() {
+        use serde_json::json;
+        let rows = |data: Value, reached: bool| -> Vec<String> {
+            (refused(&data, reached, 200).iter())
+                .map(|line| line.to_string())
+                .collect()
+        };
+        // Declined with the person's words, no fallback for the model.
+        let data = json!({"error": "provider_refusal", "category": "cyber",
+            "explanation": "This request was flagged.", "fallback": null});
+        assert_eq!(
+            rows(data.clone(), false),
+            [
+                "✗ The provider declined this request (cyber); your message did not reach the agent.",
+                "  This request was flagged.",
+                "  No fallback is set for this model.",
+            ]
+        );
+        // The mark is the failed one; what is under it is dimmed.
+        let lines = refused(&data, false, 200);
+        let mark = lines[0]
+            .spans
+            .iter()
+            .find(|span| span.content == "✗ ")
+            .unwrap();
+        assert_eq!(mark.style.fg, Some(Color::Red));
+        assert!(
+            lines[1..]
+                .iter()
+                .all(|line| line.style.add_modifier.contains(Modifier::DIM))
+        );
+        // Partway into its work, its fallback declined it too.
+        let data = json!({"category": "reasoning_extraction",
+            "fallback": "anthropic/claude-opus-4-8"});
+        assert_eq!(
+            rows(data, true),
+            [
+                "✗ The provider declined this request (reasoning extraction).",
+                "  The fallback, anthropic/claude-opus-4-8, declined it too.",
+            ]
+        );
+        // Cut off as it answered, with one it could not go to.
+        let data = json!({"mid_stream": true, "fallback": null,
+            "unused_fallback": {"model": "other/model", "error": "provider_unavailable"}});
+        assert_eq!(
+            rows(data, false),
+            [
+                "✗ The provider cut off the agent's answer.",
+                "  The fallback, other/model, could not be used.",
+            ]
+        );
+        // A daemon that did not say claims nothing about a fallback.
+        assert_eq!(
+            rows(json!({"category": null}), true),
+            ["✗ The provider declined this request."]
+        );
+        // A long explanation stops at its rows.
+        let long = "word ".repeat(400);
+        let lines = refused(&json!({"explanation": long}), true, 40);
+        assert_eq!(lines.len(), 1 + REFUSAL_ROWS);
+        assert!(lines.last().unwrap().to_string().ends_with(" …"));
+    }
 
     #[test]
     fn the_row_between_things_said_says_what_came_and_what_was_done() {

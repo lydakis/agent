@@ -77,7 +77,34 @@ Seatbelt only refuses connections to its sockets and hard links into it,
 so its files stay readable; and the `read` tool, which the daemon answers
 itself outside any sandbox, reads them on both. What a sandbox closes and
 what it leaves open is summed up in
-[Sonny's README](../sonny/README.md#what-the-sandbox-closes).
+[Sonny's sandbox reference](../sonny/REFERENCE.md#what-the-sandbox-closes).
+
+Every daemon lists its store and socket in `~/.agent/run/daemons` as it
+opens its store, and keeps every other listed daemon's as it keeps its own:
+the store and the files SQLite keeps beside it read-only in every sandbox,
+and the socket and its bots' own sockets (`SOCKET.d`) out of every
+sandboxed command's reach, the network on or not. So a second daemon on
+the machine is no way out of the first one's sandbox, nor the first out of
+the second's. An entry stays while its store does, so an idle store is kept
+too. A daemon that cannot write the list, as one started inside a sandbox
+cannot, runs all the same and says so in its log; it can do nothing its
+sandbox does not allow. A command that was already running when a new
+daemon listed itself keeps the sandbox it started with.
+
+One daemon per person is the shape everything else assumes. A second one,
+on its own `--store`, is a separate world for chats, usage, stats, the
+pacer, Sonny's windows and Sky, the lookout, approvals, and upgrades
+(each client replaces only the daemon on the socket it reaches), while it
+shares everything under `~/.agent` and `~/.agents`: settings, prices,
+logins, memory, the commons, automations and task folders. Run one for a
+build under test or an eval, on a store in a temporary folder, and stop it
+when done. An `agent` command run from inside a bot's turn never starts a
+daemon on the store that turn runs on, which its shell inherits as
+`AGENT_STORE`, as it never replaces the daemon there: with that daemon
+down, it is `daemon_unavailable`, so a build of the bot's own never takes
+the person's store. On a `--store` of the bot's own it starts one as
+anyone would.
+
 The daemon's [limits](RUST_PROTOTYPE.md#limits) come from `[daemon]` in
 `~/.agent/config.toml` where the command line sets none, each a number or
 a formula of the machine, as `processes = "cpus * 64"` or

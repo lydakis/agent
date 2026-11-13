@@ -1495,7 +1495,7 @@ struct Service {
     /// task may already own the slot.
     active: Actives,
     next_task: u64,
-    jobs: JoinSet<(String, i64, u64, Result<turn::Exit>)>,
+    jobs: JoinSet<(String, i64, u64, Result<Reaped>)>,
     /// Per bot, the summary its last turn started as it ended, until it
     /// is installed; each turn task of the bot takes it from here.
     aheads: turn::Aheads,
@@ -2031,7 +2031,24 @@ pub async fn run(config: Configuration) -> Result<()> {
         protected_paths,
         walled,
         owned: config.own_copies.clone(),
+        known: agent_client::config::daemons(),
     };
+    // Listed with the person's other daemons, so each keeps this one's
+    // store and socket out of its sandboxes as this one keeps theirs. One
+    // that cannot list itself, as one inside a sandbox cannot write
+    // `~/.agent`, runs all the same: it can do nothing its sandbox doesn't.
+    if let (Some(folder), Some(store)) = (&daemon.known, &daemon.store) {
+        let known = agent_runtime::sandbox::known::Known {
+            store: store.clone(),
+            socket: daemon.socket.clone(),
+        };
+        if let Err(error) = agent_runtime::sandbox::known::record(folder, &known) {
+            eprintln!(
+                "agent: not listed in {}, so other daemons' sandboxes don't keep this one's store and socket: {error}",
+                folder.display()
+            );
+        }
+    }
     daemon.capabilities = daemon
         .socket
         .as_deref()
@@ -2772,6 +2789,17 @@ fn validate_provider(
         );
     }
     Ok(())
+}
+
+/// What a turn's task came to once its end, if it ended, committed.
+enum Reaped {
+    /// It ended; `next_ready` says the end left the bot's next message
+    /// ready to start.
+    Finished {
+        next_ready: bool,
+    },
+    Parked,
+    Paced(u64),
 }
 
 /// A turn's run, with a panic in it ending that turn alone, failed with
@@ -3895,11 +3923,15 @@ impl Service {
                         }
                         None => {}
                     }
-                    committed.map(|()| exit)
+                    committed.map(|next_ready| Reaped::Finished { next_ready })
                 }
-                _ => {
+                turn::Exit::Parked => {
                     task.drop_after();
-                    Ok(exit)
+                    Ok(Reaped::Parked)
+                }
+                turn::Exit::Paced(at) => {
+                    task.drop_after();
+                    Ok(Reaped::Paced(*at))
                 }
             };
             drop(cancelled);
@@ -3916,20 +3948,26 @@ impl Service {
         bot: String,
         turn: i64,
         task: u64,
-        exit: Result<turn::Exit>,
+        exit: Result<Reaped>,
     ) -> Result<()> {
         let exit = exit?;
+        // A slot opening needs no look for ready work: the hint is cleared
+        // only when a look finds none, and stays set while a full daemon
+        // keeps ready work waiting.
         if self.active.get(&bot).is_some_and(|a| a.task == task) {
             self.active.remove(&bot);
-            // A slot opened, and a finish may promote the bot's next turn.
-            self.ready_hint = true;
         }
         self.storage_backoff = Duration::ZERO;
         match exit {
-            turn::Exit::Finished(_) => {
-                // Interrupt may already have released the task's active slot.
-                // Finishing still promotes queued work in that case.
-                self.ready_hint = true;
+            Reaped::Finished { next_ready } => {
+                // The end promoted the bot's next message, also when an
+                // interrupt released the task's slot first. An end that
+                // left nothing ready costs the service no look: at a
+                // thousand bots, that look on the writer after every end
+                // was most of the service loop's time.
+                if next_ready {
+                    self.ready_hint = true;
+                }
                 self.steer_wakes.remove(&turn);
                 // Before the bot's next turn can start: it starts on what
                 // a `configure` during this one kept. A store refusing it
@@ -3938,10 +3976,10 @@ impl Service {
                 return Ok(());
             }
             // A wake-up may already have claimed the turn again.
-            turn::Exit::Paced(at) if !self.active.get(&bot).is_some_and(|a| a.turn == turn) => {
+            Reaped::Paced(at) if !self.active.get(&bot).is_some_and(|a| a.turn == turn) => {
                 self.wakes.set(at, bot.clone(), turn)
             }
-            turn::Exit::Paced(_) | turn::Exit::Parked => {}
+            Reaped::Paced(_) | Reaped::Parked => {}
         }
         // A steer committed while the turn was parking on `wait` found it
         // still running, so its wake-up comes from here; a wait with a
@@ -6004,7 +6042,7 @@ impl Service {
                     return Err(stale(state.running_turn));
                 }
                 let name = bot.clone();
-                store
+                let next_ready = store
                     .op_pruning("finish", name.clone(), move |db| {
                         turn::Finished::record(
                             db,
@@ -6019,7 +6057,9 @@ impl Service {
                 self.handles.forget(Waiter::Turn(turn));
                 self.wakes.cancel(turn);
                 self.steer_wakes.remove(&turn);
-                self.ready_hint = true;
+                if next_ready {
+                    self.ready_hint = true;
+                }
                 // It ended here, with no task to finish: what a `configure`
                 // kept for its end is taken now.
                 kept_for_start(self.take_configure(&bot).await)?;
@@ -6069,7 +6109,7 @@ async fn commit_finish(
     turn: i64,
     error: Option<&Error>,
     cancelled: &mut watch::Receiver<Option<&'static str>>,
-) -> Result<()> {
+) -> Result<bool> {
     let mut error = error.cloned();
     let mut backoff = Duration::from_millis(10);
     loop {
@@ -7085,7 +7125,7 @@ mod tests {
         };
         service.jobs.spawn(async move {
             drop(cancelled);
-            ("Bob".into(), turn, 1, Ok(turn::Exit::Parked))
+            ("Bob".into(), turn, 1, Ok(Reaped::Parked))
         });
         service.active["Bob"].cancel.closed().await;
         let output = Output::writer(tokio::io::sink());
@@ -7188,14 +7228,15 @@ mod tests {
         // A finished task can likewise be reaped after interrupt released
         // its active slot. Its successor must still wake the dispatcher.
         service.ready_hint = false;
-        store
+        let next_ready = store
             .op("finish", move |db| {
                 turn::Finished::record(db, "Bob", next, None)
             })
             .await
             .unwrap();
+        assert!(next_ready, "the end promoted the queued message");
         service
-            .complete("Bob".into(), next, 2, Ok(turn::Exit::Finished(None)))
+            .complete("Bob".into(), next, 2, Ok(Reaped::Finished { next_ready }))
             .await
             .unwrap();
         assert!(service.ready_hint);
@@ -7885,7 +7926,7 @@ mod tests {
             given_rules: Default::default(),
         });
         let later = now_ms() + 60_000;
-        for exit in [turn::Exit::Paced(later), turn::Exit::Parked] {
+        for exit in [Reaped::Paced(later), Reaped::Parked] {
             service
                 .complete("Bob".into(), bob, 1, Ok(exit))
                 .await
@@ -7898,7 +7939,7 @@ mod tests {
         }
         // Task 2's own completion is the one that lets the bot go.
         service
-            .complete("Bob".into(), bob, 2, Ok(turn::Exit::Paced(later)))
+            .complete("Bob".into(), bob, 2, Ok(Reaped::Paced(later)))
             .await
             .unwrap();
         assert!(service.active.is_empty());
@@ -7925,6 +7966,8 @@ mod tests {
         let (bot, turn, task, exit) = service.jobs.join_next().await.unwrap().unwrap();
         assert_eq!(bot, "Alice");
         service.complete(bot, turn, task, exit).await.unwrap();
+        // Her end left nothing ready, so the loop is not sent to look.
+        assert!(!service.ready_hint);
         finish_errors(&store, 3).await;
         assert!(
             service.jobs.try_join_next().is_none(),
@@ -9602,7 +9645,7 @@ mod tests {
                 "Bob".into(),
                 turn,
                 0,
-                Ok(turn::Exit::Paced(now_ms() + 86_400_000)),
+                Ok(Reaped::Paced(now_ms() + 86_400_000)),
             )
             .await
             .unwrap();
