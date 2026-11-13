@@ -7736,7 +7736,7 @@ impl App {
         };
         let woken = self.woken.clone();
         let drawn = move || woken.notify_one();
-        let program = embed::Embedded::spawn(program, height, width, term::light(), drawn)?;
+        let program = embed::Embedded::spawn(program, height, width, drawn)?;
         let pane = pane::Pane::program(title, program);
         // Opened from `/status`, it goes back there, as a browser goes back.
         match self.pane.take() {
@@ -18084,7 +18084,7 @@ mod tests {
         // unread once its program's side closes, as a printf's at once.
         let mut command = portable_pty::CommandBuilder::new("sh");
         command.args(["-c", "printf '\\033]7700;open=b\\033\\\\'; exec sleep 30"]);
-        let program = embed::Embedded::spawn(command, 5, 20, false, || {}).unwrap();
+        let program = embed::Embedded::spawn(command, 5, 20, || {}).unwrap();
         let mut pane = pane::Pane::program("fix", program);
         pane.as_agent("shop.fix", false);
         app.open_pane(pane);
