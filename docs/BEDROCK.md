@@ -26,8 +26,11 @@ features that depend on the first-party APIs.
   `x-api-key`, are for exploration; short-term ones last at most twelve hours.
 - **Quotas.** **Documented**: Mantle has separate input and output
   tokens-per-minute quotas per model and region, and no requests-per-minute
-  quota. Runtime counts input plus output against one tokens-per-minute quota,
-  deducts `input + max_tokens` when a call starts, and burns output down at 10x
+  quota. A call's admission checks its input plus its `max_tokens` against
+  the input quota, the model's own maximum when the call names none, and the
+  unused part comes back once the response completes. Runtime counts input
+  plus output against one tokens-per-minute quota, deducts
+  `input + max_tokens` when a call starts, and burns output down at 10x
   for current Claude and GPT-5.6 models (15x for Claude 4.8). The two
   endpoints' quotas are independent even for the same model.
 - **Price.** **Documented** by Anthropic: regional endpoints carry a 10%
@@ -101,6 +104,12 @@ region's geography ids. What the move costs, against Claude on Mantle:
   burns output down at 10x, so a fleet with a tight quota sets
   `--max-output-tokens` near real output.
 - In exchange, `global.` routing carries no regional premium.
+
+Mantle holds a call's `max_tokens` against its input quota until the
+response completes, too. A `--provider bedrock-openai` call names no output
+cap unless the bot sets `--max-output-tokens`, so Mantle holds the model's
+full maximum for it and fewer calls fit under the quota at once: a fleet
+with a tight quota sets the cap near real output on either endpoint.
 
 **Unverified**: a Bedrock API key reaches runtime's Anthropic route as a
 bearer token, as AWS documents for runtime calls, and Mantle's as
