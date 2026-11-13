@@ -517,6 +517,8 @@ pub enum Exit {
 /// Completion as one storage job: the terminal event, the outcome its
 /// waiters get, and retention, all or nothing, so a failed completion can
 /// be submitted again. The worker publishes all of it after the job commits.
+/// It says whether the bot's next message is ready to start, which only an
+/// end can make so: the service looks for ready work only then.
 pub struct Finished;
 
 impl Finished {
@@ -525,8 +527,8 @@ impl Finished {
         bot: &str,
         turn: i64,
         error: Option<&Error>,
-    ) -> Result<()> {
-        let outcome = db.atomic(|db| {
+    ) -> Result<bool> {
+        let (outcome, next) = db.atomic(|db| {
             db.finish(turn, error)?;
             let outcome = db
                 .turn_outcome(bot, turn)?
@@ -535,10 +537,10 @@ impl Finished {
             // outside retention: the outcome is captured above, and the
             // turn's own records are kept so its terminal event is published.
             db.retain(bot, Some(turn))?;
-            Ok(outcome)
+            Ok((outcome, db.has_ready_turn(bot)?))
         })?;
         db.announce(bot, turn, outcome);
-        Ok(())
+        Ok(next)
     }
 }
 
