@@ -144,6 +144,9 @@ pub fn tool() -> Option<Value> {
         "expire_ms": TIMEOUT.as_millis() as u64,
         // The agent's gate judges the script's calls, not the script.
         "steps": true,
+        // A script may run for minutes, so a message for the agent lifts
+        // a call still running past the grace, as it lifts a command.
+        "lift": true,
     }))
 }
 
