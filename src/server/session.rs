@@ -18,8 +18,9 @@ pub enum Inbound {
     /// the process at its other end, where the system says.
     Open(u64, Output, Option<i64>, Option<u32>),
     /// A request, with the input credit its line took, which goes back
-    /// once the service has taken the request up.
-    Request(u64, Result<Request>, Credit),
+    /// once the service has taken the request up, and when its line was
+    /// read, so `stats` shows how long requests wait for the service.
+    Request(u64, Result<Request>, Credit, std::time::Instant),
     Closed(u64),
 }
 impl Inbound {
@@ -450,7 +451,10 @@ pub fn stdio_reader(sender: Sender) {
                     let request = parse(&line);
                     drop(line);
                     if sender
-                        .blocking_send(&runtime, Inbound::Request(0, request, credit))
+                        .blocking_send(
+                            &runtime,
+                            Inbound::Request(0, request, credit, std::time::Instant::now()),
+                        )
                         .is_err()
                     {
                         break;
@@ -459,7 +463,12 @@ pub fn stdio_reader(sender: Sender) {
                 _ => {
                     let _ = sender.blocking_send(
                         &runtime,
-                        Inbound::Request(0, fail("input_line_limit_or_truncation"), credit),
+                        Inbound::Request(
+                            0,
+                            fail("input_line_limit_or_truncation"),
+                            credit,
+                            std::time::Instant::now(),
+                        ),
                     );
                     break;
                 }
@@ -636,7 +645,12 @@ pub async fn socket_reader(
                     continue;
                 }
                 if sender
-                    .send(Inbound::Request(id, request, credit))
+                    .send(Inbound::Request(
+                        id,
+                        request,
+                        credit,
+                        std::time::Instant::now(),
+                    ))
                     .await
                     .is_err()
                 {
@@ -649,6 +663,7 @@ pub async fn socket_reader(
                         id,
                         fail("input_line_limit_or_truncation"),
                         credit,
+                        std::time::Instant::now(),
                     ))
                     .await;
                 break;

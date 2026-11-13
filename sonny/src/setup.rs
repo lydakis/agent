@@ -1187,7 +1187,7 @@ const TEMPLATE: &str = "\
 # [sonny]
 # lead_effort, task_effort   a new lead's and each new task's effort: low, medium,
 #                            high, xhigh, or max on Claude; unset, the model's own
-# chime = true               rings when work ends or waits
+# chime = true               rings when work ends or waits; quiet by default
 #
 # [reviewer]
 # model = \"PROVIDER/MODEL\"  who reviews calls in auto mode; unset, the agent's model

@@ -133,7 +133,7 @@ pub const SETTINGS: &[Setting] = &[
         key: "sonny.chime",
         about: "whether finished and waiting work rings; notifications show either way",
         values: SWITCH,
-        default: "true",
+        default: "false",
     },
     Setting {
         key: "sonny.steps",
@@ -1056,12 +1056,12 @@ mod tests {
         // A switch is written as TOML's own.
         view.pick = 12;
         press(&mut view, KeyCode::Right);
-        assert_eq!(view.values[12].as_deref(), Some("false"));
-        assert!(!agent_client::config::read(&path).unwrap().sonny.chime);
+        assert_eq!(view.values[12].as_deref(), Some("true"));
+        assert!(agent_client::config::read(&path).unwrap().sonny.chime);
         assert!(
             std::fs::read_to_string(&path)
                 .unwrap()
-                .ends_with("chime = false\n")
+                .ends_with("chime = true\n")
         );
         press(&mut view, KeyCode::Right);
         assert_eq!(view.values[12], None);

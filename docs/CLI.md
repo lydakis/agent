@@ -183,9 +183,12 @@ tries its held turns at once.
   once with its unresolved handles pending (still valid) and `steered: true`,
   and a foreground `shell` command still running 250 ms after the steer
   moves to the background and returns its `proc:` handle, as does a call
-  waiting for its approval or its client's answer, which waits on past the
-  turn and reports back as a background command does. `queue`
-  deliveries leave both alone.
+  waiting for its approval, which waits on past the turn and reports back
+  as a background command does. A call its client answers is lifted the
+  same way only when its tool is declared with `lift` (and has waited
+  250 ms) or a step of it waits for approval; any other is answered first,
+  as Codex lets a running tool return, and the steer joins the turn
+  right after. `queue` deliveries leave all of these alone.
   A steer with an explicit workspace or model that differs from the running
   turn stays queued and runs separately with those choices.
   `attach` adds a message that needs no reply to the bot's next model call,
@@ -477,7 +480,13 @@ the older daemon says why in its `daemon_protocol_mismatch` detail, and that
 nothing was sent: from inside a bot's turn, with `--no-spawn`, with no provider
 to start a new one, or on a socket that is not the store's own. Sonny
 starts the daemon this way, so opening it after an upgrade replaces the old
-daemon, and it says so first. `stats` starts it as `start` does, so it answers on a fresh install;
+daemon, and it says so first. `start --replace` replaces the daemon running
+now the same way whatever its version, so an upgrade that kept the protocol
+still runs the new build (`sonny update` runs it): it fails with
+`daemon_kept`, saying why, from inside a bot's turn, with `--no-spawn`, or with
+no provider to start a new one; a newer daemon is left running and refused
+with `daemon_protocol_mismatch`; with none running, it starts one as `start`
+does. `stats` starts it as `start` does, so it answers on a fresh install;
 its `files` says how many files the daemon holds open against its limit,
 so a leak (a count that grows while idle) is told from a busy peak, and
 its `temp` the room left in each temporary folder every agent's commands
@@ -565,7 +574,10 @@ family is trained on: `apply_patch` for a Responses model, else `edit`, and
 `web_search` where the provider offers it and `web_fetch` for any, unless
 `~/.agent/config.toml` sets `web_search = "disabled"` (or names the model in
 `web_search_off`, `PROVIDER/MODEL` patterns with `*` and `?`, which leaves
-search out and keeps `web_fetch`). An
+search out and keeps `web_fetch`). A bot whose sandbox keeps it off the
+network (`read-only`, or `workspace-write` without `network`) is offered
+neither web tool and runs neither, from its next call, while they stay
+among its tools for when its network is set. An
 existing bot keeps its own,
 so `--tools` while continuing one is a usage error.
 `run --fallback PROVIDER/MODEL` gives a new bot a model, in its family, that

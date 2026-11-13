@@ -2,12 +2,21 @@
 //! side chat's Sonny, beside the conversation instead of over it. Its
 //! output is read as a terminal reads it (vt100), and keys, pastes and
 //! the mouse go to it as a terminal would send them. What it asks the
-//! terminal at start (the background, the cursor, which terminal this
-//! is) is answered here, as the terminal Sonny runs in would. What it
-//! copies (OSC 52) is kept for Sonny to put on the clipboard, as the
-//! terminal Sonny runs in would have.
+//! terminal (the theme's colors and its light or dark, the cursor, which
+//! terminal this is) is answered here with what the terminal Sonny runs in
+//! said, as that terminal would; and once it asks for color-scheme
+//! reports (mode 2031), each switch between light and dark that terminal
+//! makes, and each color it answers anew, is reported to it, so it follows
+//! the theme as the main window does. What it copies (OSC 52) is kept for
+//! Sonny to put on the clipboard, as the terminal Sonny runs in would
+//! have.
 use std::io::{Read, Write};
-use std::sync::{Arc, Mutex};
+use std::sync::{
+    Arc, Mutex,
+    atomic::{AtomicBool, Ordering},
+};
+
+use crate::term::{Rgb, Theme};
 
 use portable_pty::{CommandBuilder, MasterPty, PtySize};
 use ratatui::{
@@ -25,17 +34,20 @@ pub struct Embedded {
     size: (u16, u16),
     copied: Arc<Mutex<Vec<String>>>,
     opened: Arc<Mutex<Option<String>>>,
+    /// The program asked for color-scheme reports (mode 2031).
+    follows: Arc<AtomicBool>,
+    /// The light or dark and the colors the program was last told of.
+    told: (bool, Theme),
 }
 
 impl Embedded {
     /// `command` started on a terminal `rows` by `cols`, its screen read
-    /// on a thread that calls `drawn` after each read. `light` is the
-    /// background Sonny's own terminal has, told to it when it asks.
+    /// on a thread that calls `drawn` after each read. What it asks of the
+    /// theme is answered with what Sonny's own terminal says as it asks.
     pub fn spawn(
         command: CommandBuilder,
         rows: u16,
         cols: u16,
-        light: bool,
         drawn: impl Fn() + Send + 'static,
     ) -> Result<Self, String> {
         let (rows, cols) = (rows.max(2), cols.max(10));
@@ -65,6 +77,8 @@ impl Embedded {
         let opened = Arc::new(Mutex::new(None));
         let (screen, replies, copies) = (parser.clone(), writer.clone(), copied.clone());
         let opens = opened.clone();
+        let follows = Arc::new(AtomicBool::new(false));
+        let following = follows.clone();
         std::thread::spawn(move || {
             let mut buf = [0u8; 16 * 1024];
             // The start of a question a read cut off, kept for the next.
@@ -83,7 +97,13 @@ impl Embedded {
                 for piece in cut {
                     match piece {
                         Piece::Output(bytes) => parser.process(bytes),
-                        Piece::Asked(query) => answers.push(answer(query, &parser, light)),
+                        Piece::Asked(query) => answers.push(answer(
+                            query,
+                            &parser,
+                            crate::term::light(),
+                            crate::term::theme(),
+                        )),
+                        Piece::Follows(on) => following.store(on, Ordering::Relaxed),
                         Piece::Copied(payload) => {
                             if let Some(text) = copy_text(payload)
                                 && let Ok(mut copies) = copies.lock()
@@ -122,7 +142,23 @@ impl Embedded {
             size: (rows, cols),
             copied,
             opened,
+            follows,
+            told: (crate::term::light(), crate::term::theme()),
         })
+    }
+
+    /// The program told, once it asked for color-scheme reports, that the
+    /// terminal Sonny runs in is `now` light or dark with these colors,
+    /// when that changed since it was last told: as a terminal reports a
+    /// switch, so it asks the colors that go with it, answered with these.
+    /// Whether it was told.
+    fn tell(&mut self, now: (bool, Theme)) -> bool {
+        if now == self.told || !self.follows.load(Ordering::Relaxed) {
+            return false;
+        }
+        self.told = now;
+        self.send(scheme(now.0).as_bytes());
+        true
     }
 
     /// The agent the program, an agent's Sonny, asked to show in its
@@ -235,6 +271,8 @@ impl Embedded {
         if area.width == 0 || area.height == 0 {
             return None;
         }
+        // Drawn again as the terminal switches: its theme told first.
+        self.tell((crate::term::light(), crate::term::theme()));
         let size = (area.height, area.width);
         if size != self.size {
             self.size = size;
@@ -318,6 +356,13 @@ fn color(color: vt100::Color) -> Color {
 enum Query {
     /// OSC 11: the background color.
     Background,
+    /// OSC 10: the foreground color.
+    Foreground,
+    /// OSC 4's colors 1 and 2: the theme's red and green.
+    Red,
+    Green,
+    /// DSR 996: the color scheme, light or dark.
+    Scheme,
     /// DA1: which terminal this is.
     Device,
     /// DSR 6: where the cursor is.
@@ -328,6 +373,8 @@ enum Query {
 enum Piece<'a> {
     Output(&'a [u8]),
     Asked(Query),
+    /// Color-scheme reports (mode 2031) asked for, or stopped.
+    Follows(bool),
     /// OSC 52's `c;BASE64`: text the program put on the clipboard.
     Copied(&'a [u8]),
     /// [`OPEN`]'s agent: the one the program asks to show in its place.
@@ -373,18 +420,32 @@ fn agent_name(bytes: &[u8]) -> Option<String> {
     fits.then(|| name.to_owned())
 }
 
-const ASKS: [(&[u8], Query); 4] = [
+const ASKS: [(&[u8], Query); 11] = [
     (b"\x1b]11;?\x1b\\", Query::Background),
     (b"\x1b]11;?\x07", Query::Background),
+    (b"\x1b]10;?\x1b\\", Query::Foreground),
+    (b"\x1b]10;?\x07", Query::Foreground),
+    (b"\x1b]4;1;?\x1b\\", Query::Red),
+    (b"\x1b]4;1;?\x07", Query::Red),
+    (b"\x1b]4;2;?\x1b\\", Query::Green),
+    (b"\x1b]4;2;?\x07", Query::Green),
+    (b"\x1b[?996n", Query::Scheme),
     (b"\x1b[c", Query::Device),
     (b"\x1b[6n", Query::Cursor),
 ];
+
+/// Color-scheme reports (mode 2031) asked for, and stopped.
+const FOLLOWS: [(&[u8], bool); 2] = [(b"\x1b[?2031h", true), (b"\x1b[?2031l", false)];
 
 /// Output cut where it asks the terminal something or copies, so each is
 /// handled after the output before it, as a terminal would; and the end
 /// of it that may be the start of one the next read finishes, held back.
 fn pieces(bytes: &[u8]) -> (Vec<Piece<'_>>, &[u8]) {
-    let starts = || ASKS.iter().map(|(seq, _)| *seq).chain([COPY, OPEN]);
+    let starts = || {
+        (ASKS.iter().map(|(seq, _)| *seq))
+            .chain(FOLLOWS.iter().map(|(seq, _)| *seq))
+            .chain([COPY, OPEN])
+    };
     let longest = starts().map(<[u8]>::len).max().unwrap_or(0);
     let held = (bytes.len().saturating_sub(longest - 1)..bytes.len())
         .find(|&at| {
@@ -404,6 +465,15 @@ fn pieces(bytes: &[u8]) -> (Vec<Piece<'_>>, &[u8]) {
                 out.push(Piece::Output(&bytes[from..at]));
             }
             out.push(Piece::Asked(*query));
+            at += seq.len();
+            from = at;
+            continue;
+        }
+        if let Some((seq, on)) = FOLLOWS.iter().find(|(seq, _)| bytes[at..].starts_with(seq)) {
+            if from < at {
+                out.push(Piece::Output(&bytes[from..at]));
+            }
+            out.push(Piece::Follows(*on));
             at += seq.len();
             from = at;
             continue;
@@ -461,18 +531,37 @@ fn copy_text(payload: &[u8]) -> Option<String> {
     Some(String::from_utf8_lossy(&bytes).into_owned())
 }
 
-fn answer(query: Query, parser: &vt100::Parser, light: bool) -> Vec<u8> {
+/// The answer to `query` from a terminal that is `light` or dark with
+/// `theme`'s colors: none for a color it did not say, as a terminal that
+/// does not know the question; white or black for a background it did not
+/// say.
+fn answer(query: Query, parser: &vt100::Parser, light: bool, theme: Theme) -> Vec<u8> {
+    let white_or_black = if light { (255, 255, 255) } else { (0, 0, 0) };
     match query {
-        Query::Background => match light {
-            true => b"\x1b]11;rgb:ffff/ffff/ffff\x1b\\".to_vec(),
-            false => b"\x1b]11;rgb:0000/0000/0000\x1b\\".to_vec(),
-        },
+        Query::Background => osc("11", Some(theme.background.unwrap_or(white_or_black))),
+        Query::Foreground => osc("10", theme.foreground),
+        Query::Red => osc("4;1", theme.red),
+        Query::Green => osc("4;2", theme.green),
+        Query::Scheme => scheme(light).into_bytes(),
         Query::Device => b"\x1b[?62;22c".to_vec(),
         Query::Cursor => {
             let (row, col) = parser.screen().cursor_position();
             format!("\x1b[{};{}R", row + 1, col + 1).into_bytes()
         }
     }
+}
+
+/// An OSC color's answer, `ESC ] CODE ; rgb:RRRR/GGGG/BBBB ST`, as xterm
+/// gives it; none for no color.
+fn osc(code: &str, rgb: Option<Rgb>) -> Vec<u8> {
+    rgb.map_or_else(Vec::new, |(r, g, b)| {
+        format!("\x1b]{code};rgb:{r:02x}{r:02x}/{g:02x}{g:02x}/{b:02x}{b:02x}\x1b\\").into_bytes()
+    })
+}
+
+/// A color-scheme report (mode 2031): `CSI ? 997 ; 1 n` dark, `2` light.
+fn scheme(light: bool) -> String {
+    format!("\x1b[?997;{}n", if light { 2 } else { 1 })
 }
 
 /// A key as an xterm sends it; `application` is the cursor keys' mode
@@ -640,7 +729,7 @@ mod tests {
             "-c",
             "printf 'hi\\033]7700;open=shop.fix\\033\\\\'; exec sleep 30",
         ]);
-        let program = Embedded::spawn(command, 5, 20, false, || {}).unwrap();
+        let program = Embedded::spawn(command, 5, 20, || {}).unwrap();
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         let opened = loop {
             match program.opened() {
@@ -659,7 +748,95 @@ mod tests {
     fn the_cursor_is_where_the_output_left_it() {
         let mut parser = vt100::Parser::new(nonzero(10), nonzero(20), 0);
         parser.process(b"\x1b[3;5H");
-        assert_eq!(answer(Query::Cursor, &parser, true), b"\x1b[3;5R");
+        let theme = Theme::default();
+        assert_eq!(answer(Query::Cursor, &parser, true, theme), b"\x1b[3;5R");
+    }
+
+    #[test]
+    fn the_theme_is_answered_as_the_terminal_sonny_runs_in_said_it() {
+        let (cut, rest) = pieces(
+            b"\x1b]11;?\x1b\\\x1b]10;?\x1b\\\x1b]4;1;?\x1b\\\x1b]4;2;?\x07\x1b[?996na\x1b[?2031hb\x1b[?2031l",
+        );
+        assert!(rest.is_empty());
+        assert_eq!(
+            cut,
+            [
+                Piece::Asked(Query::Background),
+                Piece::Asked(Query::Foreground),
+                Piece::Asked(Query::Red),
+                Piece::Asked(Query::Green),
+                Piece::Asked(Query::Scheme),
+                Piece::Output(b"a"),
+                Piece::Follows(true),
+                Piece::Output(b"b"),
+                Piece::Follows(false),
+            ]
+        );
+        // A mode a read cuts off waits for the rest.
+        assert_eq!(
+            pieces(b"a\x1b[?203"),
+            (vec![Piece::Output(b"a")], &b"\x1b[?203"[..])
+        );
+        let parser = vt100::Parser::new(nonzero(10), nonzero(20), 0);
+        let dark = Theme {
+            foreground: Some((0xdd, 0xdd, 0xdd)),
+            background: Some((0x1e, 0x1e, 0x2e)),
+            red: Some((0xf3, 0x8b, 0xa8)),
+            green: None,
+        };
+        let asked = |query, light, theme| answer(query, &parser, light, theme);
+        assert_eq!(
+            asked(Query::Background, false, dark),
+            b"\x1b]11;rgb:1e1e/1e1e/2e2e\x1b\\"
+        );
+        assert_eq!(
+            asked(Query::Foreground, false, dark),
+            b"\x1b]10;rgb:dddd/dddd/dddd\x1b\\"
+        );
+        assert_eq!(
+            asked(Query::Red, false, dark),
+            b"\x1b]4;1;rgb:f3f3/8b8b/a8a8\x1b\\"
+        );
+        // A color not said is not answered; a background not said is
+        // white or black.
+        assert!(asked(Query::Green, false, dark).is_empty());
+        assert_eq!(
+            asked(Query::Background, true, Theme::default()),
+            b"\x1b]11;rgb:ffff/ffff/ffff\x1b\\"
+        );
+        assert_eq!(asked(Query::Scheme, false, dark), b"\x1b[?997;1n");
+        assert_eq!(asked(Query::Scheme, true, dark), b"\x1b[?997;2n");
+    }
+
+    #[test]
+    fn a_program_that_follows_the_theme_is_told_each_switch() {
+        // It asks for reports, then shows the first it is sent.
+        let mut command = CommandBuilder::new("sh");
+        command.args([
+            "-c",
+            "stty raw -echo; printf '\\033[?2031h'; head -c 9 | tr '\\033' E; exec sleep 30",
+        ]);
+        let mut program = Embedded::spawn(command, 5, 20, || {}).unwrap();
+        let light = (true, Theme::default());
+        let dark = (false, Theme::default());
+        program.told = light;
+        // Nothing changed: nothing to tell.
+        assert!(!program.tell(light));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !program.tell(dark) {
+            assert!(std::time::Instant::now() < deadline, "never asked");
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        // Told once.
+        assert!(!program.tell(dark));
+        let shown = loop {
+            let screen = program.parser.lock().unwrap().screen().contents();
+            if screen.contains("997") || std::time::Instant::now() >= deadline {
+                break screen;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        };
+        assert!(shown.contains("E[?997;1n"), "{shown:?}");
     }
 
     #[test]
