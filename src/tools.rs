@@ -773,24 +773,9 @@ impl Credentials {
         text
     }
     /// How many of `text`'s last bytes could begin a credential that more
-    /// output would finish, or a secret field whose value more output
-    /// would carry: what a stream holds back until it can redact. What it
-    /// shows never ends inside a whole credential.
-    pub fn unfinished(&self, text: &[u8]) -> usize {
-        let set = self.current();
-        let open = open_field(text, &set.fields).value;
-        self.unfinished_after(&set, text, open, false)
-    }
-    /// How many of `text`'s last bytes could begin a credential that more
-    /// output would finish, the last `open` held besides. A whole
-    /// credential across the cut is shown at once, or, `exact`, held.
-    fn unfinished_after(
-        &self,
-        set: &CredentialSet,
-        text: &[u8],
-        open: usize,
-        exact: bool,
-    ) -> usize {
+    /// output would finish: what a stream holds back until it can redact.
+    /// A whole credential across the cut is held with them.
+    fn unfinished(set: &CredentialSet, text: &[u8]) -> usize {
         let values = || {
             set.values
                 .iter()
@@ -803,33 +788,29 @@ impl Credentials {
                     .find(|&n| text.ends_with(&value[..n]))
             })
             .max()
-            .unwrap_or(0)
-            .max(open);
-        // Exact, a whole credential across the cut is held with what
-        // follows it: the start held may finish a longer one, which
-        // whole-text redaction replaces first. Past `CREDENTIAL_HOLD` of
-        // such, as in a run of one that ends with its own start, and
-        // otherwise, it is shown whole, as one that ends with its own
-        // start is to a terminal at once.
+            .unwrap_or(0);
+        // A whole credential across the cut is held with what follows it:
+        // the start held may finish a longer one, which whole-text
+        // redaction replaces first. Past `CREDENTIAL_HOLD` of such, as in a
+        // run of one that ends with its own start, it is shown whole.
         let start = text.len() - started;
         let mut cut = start;
-        while exact
-            && let Some(first) = values()
-                .filter_map(|value| {
-                    let from = (cut + 1).saturating_sub(value.len());
-                    let to = (cut + value.len() - 1).min(text.len());
-                    let window = text.get(from..to)?;
-                    let at = window.windows(value.len()).position(|w| w == value)?;
-                    Some(from + at)
-                })
-                .min()
+        while let Some(first) = values()
+            .filter_map(|value| {
+                let from = (cut + 1).saturating_sub(value.len());
+                let to = (cut + value.len() - 1).min(text.len());
+                let window = text.get(from..to)?;
+                let at = window.windows(value.len()).position(|w| w == value)?;
+                Some(from + at)
+            })
+            .min()
         {
             cut = first;
             if start - cut > CREDENTIAL_HOLD {
                 break;
             }
         }
-        if exact && start - cut <= CREDENTIAL_HOLD {
+        if start - cut <= CREDENTIAL_HOLD {
             return text.len() - cut;
         }
         let mut cut = start;
@@ -846,28 +827,6 @@ impl Credentials {
             cut = end;
         }
         text.len() - cut
-    }
-    /// How many of `text`'s last bytes open a secret field whose value has
-    /// not started: a name, or a name and its separator. They are shown,
-    /// and kept so the next text is redacted as read after them.
-    pub fn opening(&self, text: &[u8]) -> usize {
-        let set = self.current();
-        let open = open_field(text, &set.fields);
-        open.name - open.value
-    }
-    /// `text` redacted as it reads after `before`, already shown: a value
-    /// after a field's name shown earlier is still redacted.
-    pub fn redact_after(&self, before: &str, text: String) -> String {
-        if before.is_empty() {
-            return self.redact(text);
-        }
-        let mut whole = self.redact(format!("{before}{text}"));
-        if whole.starts_with(before) {
-            whole.replace_range(..before.len(), "");
-            whole
-        } else {
-            self.redact(text)
-        }
     }
 }
 
@@ -905,10 +864,7 @@ impl Redacting {
         // A character cut at the piece's end waits for the rest of it,
         // whatever came before.
         let whole = self.held.len() - unfinished_char(&self.held);
-        let kept = self
-            .credentials
-            .unfinished_after(&set, &self.held[..whole], 0, true)
-            .min(whole);
+        let kept = Credentials::unfinished(&set, &self.held[..whole]).min(whole);
         let rest = self.held.split_off(whole - kept);
         let read = std::mem::replace(&mut self.held, rest);
         self.pass(&set, read, false)
@@ -1456,117 +1412,6 @@ fn redact_fields(text: String, fields: &[String]) -> String {
     }
     out.push_str(&text[at..]);
     out
-}
-
-/// A secret field still open at a text's end, in bytes from that end.
-#[derive(Clone, Copy, Default)]
-struct Open {
-    /// Where its name starts: a name that may be one's start, a name and
-    /// separator with no value yet, or a name and a value not ended.
-    name: usize,
-    /// Where its value starts, when one has and not ended: held back so it
-    /// is redacted whole, at most `FIELD_HOLD` bytes of it. The name before
-    /// it is not secret, so it is shown: a prompt such as `Password: `
-    /// reaches whoever is to answer it.
-    value: usize,
-}
-
-fn open_field(text: &[u8], fields: &[String]) -> Open {
-    const FIELD_HOLD: usize = 4096;
-    // Four bytes of a field's start, so short words go out as typed.
-    const NAME_START: usize = 4;
-    let word = |b: u8| b.is_ascii_alphanumeric() || b == b'_' || b == b'-';
-    let tail = &text[text.len().saturating_sub(FIELD_HOLD)..];
-    let shortest = fields.iter().map(String::len).min().unwrap_or(0);
-    let mut i = 0;
-    while i < tail.len() {
-        if !word(tail[i]) || (i > 0 && word(tail[i - 1])) {
-            i += 1;
-            continue;
-        }
-        let start = i;
-        while i < tail.len() && word(tail[i]) {
-            i += 1;
-        }
-        // A word shorter than every field cannot end with one; the last
-        // may still begin one.
-        if i - start < shortest && i < tail.len() {
-            continue;
-        }
-        if i == tail.len() {
-            let name = field_key(&String::from_utf8_lossy(&tail[start..i]));
-            // The last word: it may be the start of a field's name.
-            // Bytes, not characters: a field's name may be any text.
-            let begins = fields.iter().any(|field| {
-                (NAME_START.min(field.len())..=field.len())
-                    .any(|n| name.as_bytes().ends_with(&field.as_bytes()[..n]))
-            });
-            let name = if begins { tail.len() - start } else { 0 };
-            return Open {
-                name,
-                ..Open::default()
-            };
-        }
-        if !fields
-            .iter()
-            .any(|field| key_ends_with(&tail[start..i], field))
-        {
-            continue;
-        }
-        // As `redact_fields` reads one: a quote, a separator, a quote.
-        let mut j = i;
-        if j < tail.len() && matches!(tail[j], b'"' | b'\'') {
-            j += 1;
-        }
-        while j < tail.len() && matches!(tail[j], b' ' | b'\t') {
-            j += 1;
-        }
-        let name = tail.len() - start;
-        if j == tail.len() {
-            return Open {
-                name,
-                ..Open::default()
-            };
-        }
-        if !matches!(tail[j], b'=' | b':') {
-            continue;
-        }
-        j += 1;
-        while j < tail.len() && matches!(tail[j], b' ' | b'\t') {
-            j += 1;
-        }
-        let quote = tail.get(j).copied().filter(|b| matches!(b, b'"' | b'\''));
-        if quote.is_some() {
-            j += 1;
-        }
-        // Where its value ends, read as `redact_fields` reads it: an
-        // escaped quote is part of a quoted value.
-        let value = j;
-        while j < tail.len() {
-            let b = tail[j];
-            let ends = match quote {
-                Some(q) => b == q || b == b'\n',
-                None => {
-                    b.is_ascii_whitespace() || matches!(b, b',' | b';' | b'"' | b'\'' | b'}' | b']')
-                }
-            };
-            if ends {
-                break;
-            }
-            j = match (quote, b) {
-                (Some(_), b'\\') => j + 2,
-                _ => j + 1,
-            };
-        }
-        if j >= tail.len() {
-            return Open {
-                name,
-                value: tail.len() - value,
-            };
-        }
-        i = j;
-    }
-    Open::default()
 }
 
 /// Replace the body of each PEM block in `text` whose header names one of

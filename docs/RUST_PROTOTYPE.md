@@ -2833,10 +2833,12 @@ until the command ends or the read's time runs out, and the read's result is
 what the command wrote meanwhile. A steer waiting for the boundary keeps the
 read live. Output merges stdout and stderr, as a terminal
 does, keeps its last 64 KiB unread, counting what it drops, and is redacted
-like any other; a secret field's value, cut off at the end of a read, waits
-for the next one so it is redacted whole, while its name and separator are
-shown at once, so a prompt such as `Password: ` reaches the bot, and the
-next read is redacted as read after them. A
+as one stream across its reads, exactly as the whole would be however the
+reads cut it, as a [retained output's](#retained-outputs) file is: what may
+still be redacted (the end that may begin a credential, a value not yet
+known to be secret) waits for the next read, while a field's name and
+separator are shown at once, so a prompt such as `Password: ` reaches the
+bot. A
 terminal takes no process slot and no timeout: it runs until
 it exits or is killed, across turns, and `wait` on its handle reports how it
 ended, with what no write read. It takes a `--max-lasting` slot before it
