@@ -62,16 +62,17 @@ def pct(values, p):
 
 def from_store(path, window):
     """What the store's timestamps say about the window's turns: the wait
-    from acceptance to start, and the pacing and retries each turn took."""
+    from the message's submission to its turn's start, and the pacing and
+    retries each turn took."""
     db = sqlite3.connect(f'file:{path}?mode=ro', uri=True)
     turns = set(window)
-    accepted = dict(db.execute("SELECT turn, written_ms FROM events WHERE kind='accepted'"))
+    sent = dict(db.execute('SELECT id, sent_ms FROM messages WHERE sent_ms IS NOT NULL'))
     waits, paced_ms, retries, paced, retried = [], 0, 0, 0, 0
     for turn, started, pm, rt in db.execute('SELECT id, started_ms, paced_ms, retries FROM turns'):
         if turn not in turns:
             continue
-        if started is not None and turn in accepted:
-            waits.append(started - accepted[turn])
+        if started is not None and turn in sent:
+            waits.append(started - sent[turn])
         paced_ms += pm or 0
         retries += rt or 0
         paced += bool(pm)
@@ -174,7 +175,8 @@ async def run(args):
         controls = [control] + [await Conn.open(sock) for _ in range(args.controls - 1)]
         ctl = {b: controls[i % len(controls)] for i, b in enumerate(bots)}
         fire = await Conn.open(sock)
-        kinds = {'kinds': args.kinds.split(',')} if args.kinds else {}
+        # Bots are resubmitted on turn_finished, so a filter always keeps it.
+        kinds = {'kinds': sorted(set(args.kinds.split(',')) | {'turn_finished'})} if args.kinds else {}
         r = await fire.request('follow', bot='*', after=0, **kinds)
         assert 'result' in r, r
         seq = {b: 0 for b in bots}
@@ -185,6 +187,7 @@ async def run(args):
         stopping = [False]
 
         trace = []
+        refused = []
         replies = []
 
         def submit(bot):
@@ -193,8 +196,15 @@ async def run(args):
             fut = ctl[bot].send('submit', bot=bot, request_id=f'r{seq[bot]}', prompt=f'hello {seq[bot]}',
                          delivery='reject')
             sent = time.time() * 1000
-            if measuring[0]:
-                fut.add_done_callback(lambda f, sent=sent: replies.append(time.time() * 1000 - sent))
+
+            def answered(f, sent=sent, measured=measuring[0]):
+                # A refused submission starts no turn, so its bot would
+                # silently drop out of the workload: the screen fails.
+                if 'error' in f.result():
+                    refused.append((bot, f.result()['error']))
+                elif measured:
+                    replies.append(time.time() * 1000 - sent)
+            fut.add_done_callback(answered)
 
         def on_event(m):
             if m.get('event') != 'turn_finished':
@@ -232,6 +242,8 @@ async def run(args):
             await asyncio.sleep(1)
             rss_peak_sample = max(rss_peak_sample, psutil.Process(daemon.pid).memory_info().rss)
         measuring[0] = False
+        if refused:
+            raise RuntimeError(f'{len(refused)} submissions refused, first {refused[0]}')
         t1 = time.monotonic()
         th1, mock1 = thread_cpu(daemon.pid), proc_cpu(mock.pid)
         me1 = time.process_time()

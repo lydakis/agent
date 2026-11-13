@@ -8684,5 +8684,29 @@ alternating rounds each:
 | `next_ready` looks in the window | 7,104, 8,081, 7,856 | 0, 0, 0 |
 | loop time waiting on `next_ready` | 80%, 74%, 76% | 0% |
 
-The next ceiling is the store's single writer, at about 1.2 ms of wall
-time per turn (#900).
+Daemon and Sonny screen (`bench.perf_gate`), the Perf workflow's Linux
+runner, base main afe098f against head 109e113, alternating rounds:
+
+| Bench | Measure | Base | Head | Change |
+| --- | --- | ---: | ---: | ---: |
+| admission | lone submit CPU, ms | 27.708 | 28.121 | +1.5% |
+| admission | burst submit p99, ms | 2.844 | 2.971 | +4.5% |
+| completion | release to terminal p99, ms | 7.919 | 8.522 | +7.6% |
+| footprint | idle RSS, MiB | 16.002 | 16.07 | +0.4% |
+| footprint | per idle bot, KiB | 1.874 | 1.802 | -3.8% |
+| footprint | RSS after a turn each, MiB | 30.041 | 39.121 | +30.2% |
+| footprint | CPU per turn, ms | 0.726 | 0.722 | -0.5% |
+| lifecycle | CPU, s | 0.395 | 0.385 | -2.5% |
+| lifecycle | p95 turn, ms | 577.713 | 612.176 | +6.0% |
+| lifecycle | peak RSS, MiB | 24.385 | 24.736 | +1.4% |
+
+Store work per turn falls on head: `bench.footprint` counts 7.00 jobs a
+turn against 7.36 to 7.39, and half the commits (0.26 to 0.35 a turn
+against 0.51 to 0.60), since an end no longer queues a look behind it. The
+gate warned on no row. The RSS after a turn each is the allocator's
+high-water mark from 1,000 turns at once, and moves by whole MiB between
+runs: three alternating `bench.footprint --repeat 2` rounds on a 4-CPU
+Linux cloud box gave 29.3 to 32.9 MiB on base and 28.9 to 36.0 on head,
+both with a median of 31.3. The Sonny rows are untouched by the change.
+
+The next ceiling is the store's single writer (#900).
