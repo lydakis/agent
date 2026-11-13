@@ -42,6 +42,9 @@ pub const ARTIFACT_BYTES: usize = 1024 * 1024;
 /// Each end kept of a stream past `ARTIFACT_BYTES`, leaving room for the
 /// marker that counts the dropped middle.
 const KEPT_END: usize = (ARTIFACT_BYTES - 256) / 2;
+/// The most of one stream a file in a bot's outputs folder holds, written
+/// as the command runs: a sanity bound on one that writes without end.
+pub const SPILL_BYTES: u64 = 1 << 30;
 const FILE_BYTES: usize = 4 * 1024 * 1024;
 const WRITE_BYTES: usize = 1024 * 1024;
 const DEFAULT_SHELL_TIMEOUT_MS: u64 = 120_000;
@@ -120,7 +123,7 @@ impl Tool {
                 "properties":{"text":{"type":"string"}},"required":["text"],"additionalProperties":false}),
             ),
             Tool::Shell => (
-                "Run a noninteractive bash command (sh where bash is not installed) in the workspace, or in workdir when given (relative to the workspace unless absolute). stdout and stderr are returned separately; each is truncated to a head and tail beyond 64 KiB, with up to 1 MiB of it retained: past that, its first and last 512 KiB, and the command keeps running. Default timeout 120 s, maximum 600 s; with background=true there is no timeout unless timeout_ms sets one, of up to a day. A command that times out is killed and returns its output so far with timed_out. Every result reports wall_time_ms. Commands run with no terminal: TERM=dumb, NO_COLOR=1, and cat as the pager; AI_AGENT=agent tells tools an agent runs them. When the command returns or times out, every process it started is killed, so `cmd &` does not outlive it. With background=true the command is started and a proc handle is returned immediately; collect its result later with wait. If no wait collects it, its end comes as a message once no turn of yours runs: {\"finished\":{\"proc:N\":{how it ended}}}; wait on the handle reads the output. A steer that arrives while a command runs moves it to the background: the result is its proc handle with steered=true, and the command keeps running. A background command runs until it exits, its timeout_ms passes, kill=true on its handle stops it, or the daemon stops. With detach=true the command starts in its own session and its pid is returned at once; nothing tracks it and only a daemon pause kills it, so it outlives the turn and the daemon. Its output is discarded unless the command redirects it to a file. With tty=true it runs in a terminal, for a REPL or a program that prompts: the result is what it wrote within yield_time_ms (default 1000) and, while it runs, a proc handle for write_stdin.",
+                "Run a noninteractive bash command (sh where bash is not installed) in the workspace, or in workdir when given (relative to the workspace unless absolute). stdout and stderr are returned separately; each is truncated to a head and tail beyond 64 KiB, and retained whole in a file the result names under files, up to 1 GiB, or, where there is no such file, up to 1 MiB: past that, its first and last 512 KiB. The command keeps running. Default timeout 120 s, maximum 600 s; with background=true there is no timeout unless timeout_ms sets one, of up to a day. A command that times out is killed and returns its output so far with timed_out. Every result reports wall_time_ms. Commands run with no terminal: TERM=dumb, NO_COLOR=1, and cat as the pager; AI_AGENT=agent tells tools an agent runs them. When the command returns or times out, every process it started is killed, so `cmd &` does not outlive it. With background=true the command is started and a proc handle is returned immediately; collect its result later with wait. If no wait collects it, its end comes as a message once no turn of yours runs: {\"finished\":{\"proc:N\":{how it ended}}}; wait on the handle reads the output. A steer that arrives while a command runs moves it to the background: the result is its proc handle with steered=true, and the command keeps running. A background command runs until it exits, its timeout_ms passes, kill=true on its handle stops it, or the daemon stops. With detach=true the command starts in its own session and its pid is returned at once; nothing tracks it and only a daemon pause kills it, so it outlives the turn and the daemon. Its output is discarded unless the command redirects it to a file. With tty=true it runs in a terminal, for a REPL or a program that prompts: the result is what it wrote within yield_time_ms (default 1000) and, while it runs, a proc handle for write_stdin.",
                 json!({"type":"object","properties":{"command":{"type":"string"},
                 "workdir":{"type":"string"},
                 "timeout_ms":{"type":"integer","minimum":1,"maximum":MAX_BACKGROUND_TIMEOUT_MS},
@@ -817,6 +820,114 @@ impl Credentials {
     }
 }
 
+/// A stream redacted piece by piece as [`Credentials::redact`] would
+/// redact it whole: what may begin a credential, a secret field's value or
+/// a secret PEM block that more output would finish is held until it can
+/// be told, and each piece is redacted as read after the end of the last,
+/// so a field's name in one piece still marks its value in the next.
+pub struct Redacting {
+    credentials: Credentials,
+    /// Read and not yet redacted.
+    held: Vec<u8>,
+    /// The end of what was told, redacted: what the next piece reads after.
+    told: String,
+}
+
+/// The end of a stream's told text the next piece is redacted after: room
+/// for any field's name and its separator.
+const TOLD_CONTEXT: usize = 256;
+
+/// The most of an unfinished PEM block held back: far past any key's, so
+/// a block still open past it is no key and goes on as read.
+const BLOCK_HOLD: usize = 64 * 1024;
+
+impl Redacting {
+    pub fn new(credentials: Credentials) -> Self {
+        Redacting {
+            credentials,
+            held: Vec::new(),
+            told: String::new(),
+        }
+    }
+
+    /// `bytes`, the stream's next, and what before them was held: as much
+    /// as can be told now, redacted.
+    pub fn feed(&mut self, bytes: &[u8]) -> String {
+        self.held.extend_from_slice(bytes);
+        let mut whole = match std::str::from_utf8(&self.held) {
+            Err(error) if error.error_len().is_none() => error.valid_up_to(),
+            _ => self.held.len(),
+        };
+        let mut joined = Vec::with_capacity(self.told.len() + whole);
+        joined.extend_from_slice(self.told.as_bytes());
+        joined.extend_from_slice(&self.held[..whole]);
+        let held = (self.credentials.unfinished(&joined))
+            .max(open_block(&joined, &self.credentials.current().blocks))
+            .min(whole);
+        whole -= held;
+        let rest = self.held.split_off(whole);
+        let read = std::mem::replace(&mut self.held, rest);
+        let read = String::from_utf8(read)
+            .unwrap_or_else(|error| String::from_utf8_lossy(error.as_bytes()).into_owned());
+        let told = self.credentials.redact_after(&self.told, read);
+        self.told.push_str(&told);
+        let cut = self.told.len().saturating_sub(TOLD_CONTEXT);
+        let cut = (cut..=self.told.len())
+            .find(|&at| self.told.is_char_boundary(at))
+            .unwrap_or(self.told.len());
+        self.told.drain(..cut);
+        told
+    }
+
+    /// What is still held, at the stream's end, redacted.
+    pub fn finish(self) -> String {
+        let rest = String::from_utf8_lossy(&self.held).into_owned();
+        self.credentials.redact_after(&self.told, rest)
+    }
+}
+
+/// How many of `text`'s last bytes may be a PEM block named by `blocks`
+/// that more output would close, or the start of one's marker: held so
+/// the block is redacted whole, up to `BLOCK_HOLD`.
+fn open_block(text: &[u8], blocks: &[String]) -> usize {
+    const BEGIN: &[u8] = b"-----BEGIN ";
+    if blocks.is_empty() {
+        return 0;
+    }
+    let find =
+        |haystack: &[u8], needle: &[u8]| haystack.windows(needle.len()).position(|w| w == needle);
+    let marker = (1..BEGIN.len())
+        .rev()
+        .find(|&n| text.ends_with(&BEGIN[..n]))
+        .unwrap_or(0);
+    let from = text.len().saturating_sub(BLOCK_HOLD);
+    let Some(begin) = (text[from..].windows(BEGIN.len()))
+        .rposition(|w| w == BEGIN)
+        .map(|at| from + at)
+    else {
+        return marker;
+    };
+    let block = &text[begin..];
+    if find(block, b"-----END ").is_some() {
+        return marker;
+    }
+    // A header that is whole names a block or not; one still being read
+    // may.
+    let named = match find(&block[BEGIN.len()..], b"-----") {
+        Some(end) => {
+            let header = &block[..BEGIN.len() + end];
+            blocks
+                .iter()
+                .any(|name| find(header, name.as_bytes()).is_some())
+        }
+        None => true,
+    };
+    match named {
+        true => block.len(),
+        false => marker,
+    }
+}
+
 const REDACTED: &str = "[REDACTED]";
 /// Shorter values are flags, placeholders and counts, not secrets; so are
 /// values without both letters and digits.
@@ -1197,6 +1308,23 @@ impl Files {
                 recorded: Default::default(),
             })
         }))
+    }
+    /// These and `other`'s, as one: the files removed together unless the
+    /// store records them.
+    pub fn join(self, other: Files) -> Files {
+        match (self.0, other.0) {
+            (None, files) | (files, None) => Files(files),
+            (Some(first), Some(second)) => {
+                let files = (first.files.iter().chain(&second.files).cloned()).collect();
+                // Their removal is the joined set's now.
+                for owned in [&first, &second] {
+                    owned
+                        .recorded
+                        .store(true, std::sync::atomic::Ordering::Relaxed);
+                }
+                Files::new(files)
+            }
+        }
     }
     /// The store's record names them now: they last as it does.
     pub fn recorded(&self) {
@@ -2105,6 +2233,7 @@ impl Registry {
                     sandbox,
                     self.place(),
                     tokio::sync::oneshot::channel().0,
+                    None,
                 )
                 .await
             }
@@ -2261,13 +2390,30 @@ impl Registry {
         elapsed: Duration,
     ) -> Outcome {
         let mut artifacts = Vec::new();
-        let mut preview = |name: &'static str, captured: Captured| {
+        let mut files = Files::default();
+        let mut preview = |name: &'static str, mut captured: Captured| {
+            let spilled = captured.spilled.take();
+            let total = captured.len() as u64 + captured.dropped;
             let (bytes, dropped) = captured.finish();
             // Reuse the pipe buffer for ordinary UTF-8 output. Invalid
             // bytes still get the same lossy decoding as before.
             let text = String::from_utf8(bytes)
                 .unwrap_or_else(|error| String::from_utf8_lossy(error.as_bytes()).into_owned());
             let mut text = self.redact(text);
+            // Written whole to a file as it ran: the file is the stream's
+            // retained copy, and the bytes here only what the model sees.
+            if let Some(spilled) = spilled {
+                let retained = match total.saturating_sub(spilled.saved) {
+                    0 => "the full output is retained".to_owned(),
+                    short => format!(
+                        "its first {} bytes are retained, and the {short} after them were not, past the {} GiB a retained stream holds",
+                        spilled.saved,
+                        SPILL_BYTES >> 30
+                    ),
+                };
+                files = std::mem::take(&mut files).join(spilled.files);
+                return truncated(&text, &retained);
+            }
             if text.len() <= PREVIEW_BYTES {
                 return text;
             }
@@ -2296,7 +2442,7 @@ impl Registry {
         Outcome {
             output: output.to_string(),
             artifacts,
-            files: Files::default(),
+            files,
             parts: Vec::new(),
             failed: !success,
         }
@@ -2333,6 +2479,7 @@ impl Registry {
         sandbox: Option<Arc<Policy>>,
         place: Place,
         started: tokio::sync::oneshot::Sender<()>,
+        spill: Option<Spill>,
     ) -> impl Future<Output = Result<Outcome>> + Send + 'static {
         let registry = self.clone();
         async move {
@@ -2356,6 +2503,7 @@ impl Registry {
                     &registry,
                     &environment,
                     sandbox.as_deref(),
+                    spill.as_ref(),
                 )
                 .await?
             };
@@ -2386,6 +2534,7 @@ impl Registry {
         sandbox: Option<Arc<Policy>>,
         queued: Queued,
         done: tokio::sync::oneshot::Sender<Result<Outcome>>,
+        spill: Option<Spill>,
     ) {
         let registry = self.clone();
         let mut queued = queued;
@@ -2412,6 +2561,7 @@ impl Registry {
                         &registry,
                         &environment,
                         sandbox.as_deref(),
+                        spill.as_ref(),
                     )
                     .await?
                 };
@@ -2651,6 +2801,75 @@ pub fn page_lines(text: &str, offset: usize, limit: usize) -> Result<String> {
     page(text.lines(), offset, limit, PREVIEW_BYTES, false)
 }
 
+/// `page_lines` of a retained stream's file, read a line at a time up to
+/// the page and counted past it, so a file of a gigabyte is never held
+/// whole. None when it is gone or no longer a file; links are not followed.
+#[cfg(unix)]
+pub fn page_file(file: &str, offset: usize, limit: usize) -> Result<Option<String>> {
+    use std::io::BufRead;
+    use std::os::unix::fs::OpenOptionsExt;
+    let Ok(opened) = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(file)
+    else {
+        return Ok(None);
+    };
+    if !opened.metadata()?.is_file() {
+        return Ok(None);
+    }
+    let mut reader = std::io::BufReader::with_capacity(256 << 10, opened);
+    // The page's lines, as `str::lines` reads them; each kept to just past
+    // the page's bound, which is all `page` needs to refuse a longer one,
+    // and none kept once the page is full.
+    let first = offset - 1;
+    let (mut window, mut kept) = (Vec::<String>::new(), 0);
+    let (mut total, mut line, mut partial) = (0usize, Vec::new(), false);
+    let shown =
+        |total: usize, kept: usize| total >= first && total < first + limit && kept < PREVIEW_BYTES;
+    let ended =
+        |line: &mut Vec<u8>, total: &mut usize, kept: &mut usize, window: &mut Vec<String>| {
+            if shown(*total, *kept) {
+                if line.last() == Some(&b'\r') {
+                    line.pop();
+                }
+                let text = String::from_utf8_lossy(line).into_owned();
+                *kept += text.len();
+                window.push(text);
+            }
+            line.clear();
+            *total += 1;
+        };
+    loop {
+        let read = reader.fill_buf()?;
+        if read.is_empty() {
+            break;
+        }
+        let (end, newline) = match read.iter().position(|&b| b == b'\n') {
+            Some(at) => (at, true),
+            None => (read.len(), false),
+        };
+        if shown(total, kept) {
+            let room = (PREVIEW_BYTES + 1).saturating_sub(line.len());
+            line.extend_from_slice(&read[..end.min(room)]);
+        }
+        reader.consume(end + usize::from(newline));
+        partial = !newline;
+        if newline {
+            ended(&mut line, &mut total, &mut kept, &mut window);
+        }
+    }
+    if partial {
+        ended(&mut line, &mut total, &mut kept, &mut window);
+    }
+    let lines = (0..total).map(|index| {
+        (index.checked_sub(first))
+            .and_then(|at| window.get(at))
+            .map_or("", String::as_str)
+    });
+    page(lines, offset, limit, PREVIEW_BYTES, false).map(Some)
+}
+
 /// The widest piece `page_pieces` numbers as a line.
 pub const PIECE_BYTES: usize = 4096;
 
@@ -2790,10 +3009,6 @@ fn boundary(text: &str, mut index: usize) -> usize {
 /// Head and tail of an oversized output, with the omission stated.
 /// `dropped` counts the bytes the retained text itself left out.
 fn truncate(text: &str, dropped: u64) -> String {
-    let half = PREVIEW_BYTES / 2;
-    let head = &text[..boundary(text, half)];
-    let tail_start = boundary(text, text.len() - half);
-    let omitted = text.len() - head.len() - (text.len() - tail_start);
     let retained = if dropped == 0 {
         "the full output is retained".to_owned()
     } else {
@@ -2801,6 +3016,15 @@ fn truncate(text: &str, dropped: u64) -> String {
             "{dropped} more past 1 MiB were not kept, and its first and last {KEPT_END} bytes are retained"
         )
     };
+    truncated(text, &retained)
+}
+
+/// Head and tail of an oversized output, saying what is `retained`.
+fn truncated(text: &str, retained: &str) -> String {
+    let half = PREVIEW_BYTES / 2;
+    let head = &text[..boundary(text, half)];
+    let tail_start = boundary(text, text.len() - half);
+    let omitted = text.len() - head.len() - (text.len() - tail_start);
     format!(
         "{head}\n[... {omitted} bytes omitted; {retained}: see this result's artifacts and read them with the read tool ...]\n{}",
         &text[tail_start..]
@@ -2859,14 +3083,105 @@ impl Registry {
 }
 
 /// What a stream wrote, bounded: all of it up to `ARTIFACT_BYTES`, past
-/// that its first and last `KEPT_END` bytes and a count of the rest.
+/// that its first and last `KEPT_END` bytes and a count of the rest. With
+/// a [`Spill`], a stream that passes the bound is written whole to a file
+/// as it is read, and these bytes are only what the model is shown.
 #[derive(Default)]
 struct Captured {
     head: Vec<u8>,
     tail: std::collections::VecDeque<u8>,
     dropped: u64,
+    /// Where the whole stream goes once it passes the bound, the stream's
+    /// name, and what redacts it there.
+    spill: Option<(Spill, &'static str, Credentials)>,
+    /// What writes it there, once it has passed.
+    writer: Option<Writer>,
+    /// The file that holds it, once its writer is done.
+    spilled: Option<Spilled>,
 }
+
+/// Where a command's streams go whole as it runs, once one passes
+/// `ARTIFACT_BYTES`: a file each, `FOLDER/NAME-STREAM`, in the bot's
+/// outputs folder. What a stream within the bound writes never reaches it.
+#[derive(Clone)]
+pub struct Spill {
+    pub folder: PathBuf,
+    pub name: String,
+    /// Whether the folder may hold them, asked on a blocking worker as a
+    /// stream first passes the bound: not while the bot's commands may
+    /// write there, since one could put a link there for the daemon.
+    pub usable: Arc<dyn Fn() -> bool + Send + Sync>,
+}
+
+/// A stream's writer: what was read goes to it in pieces, on a blocking
+/// worker, so the runtime's thread never waits on the disk. A full line of
+/// pieces makes the reader wait, and the command with it.
+struct Writer {
+    /// Closed once the writer stops taking more: at its bound, or failed.
+    pieces: Option<tokio::sync::mpsc::Sender<Vec<u8>>>,
+    done: tokio::task::JoinHandle<Option<Spilled>>,
+}
+
+/// A stream written to its file: `saved` bytes of it, all of it unless
+/// it passed `SPILL_BYTES`.
+struct Spilled {
+    files: Files,
+    saved: u64,
+}
+
+/// Pieces of a stream waiting for its writer: a few reads' worth.
+const SPILL_PIECES: usize = 16;
+
 impl Captured {
+    fn spilling(spill: Option<&Spill>, stream: &'static str, registry: &Registry) -> Self {
+        Captured {
+            spill: spill.map(|spill| (spill.clone(), stream, registry.credentials.clone())),
+            ..Captured::default()
+        }
+    }
+
+    /// Hand `bytes`, just read, to the writer, starting it with all read
+    /// before when they take the stream past the bound.
+    async fn spill(&mut self, bytes: &[u8]) {
+        if self.writer.is_none() {
+            if self.len() + bytes.len() <= ARTIFACT_BYTES {
+                return;
+            }
+            let Some((spill, stream, credentials)) = self.spill.take() else {
+                return;
+            };
+            // Past the bound nothing was dropped yet: the head and tail are
+            // all of it so far.
+            let mut first = Vec::with_capacity(self.len());
+            first.extend_from_slice(&self.head);
+            first.extend(self.tail.iter());
+            let (pieces, received) = tokio::sync::mpsc::channel(SPILL_PIECES);
+            let done = tokio::task::spawn_blocking(move || {
+                spill_stream(&spill, stream, &credentials, first, received)
+            });
+            self.writer = Some(Writer {
+                pieces: Some(pieces),
+                done,
+            });
+        }
+        let Some(writer) = &mut self.writer else {
+            return;
+        };
+        if let Some(pieces) = &writer.pieces
+            && pieces.send(bytes.to_vec()).await.is_err()
+        {
+            writer.pieces = None;
+        }
+    }
+
+    /// Wait for the writer, when the stream had one, to finish its file.
+    async fn settle(&mut self) {
+        if let Some(Writer { pieces, done }) = self.writer.take() {
+            drop(pieces);
+            self.spilled = done.await.ok().flatten();
+        }
+    }
+
     fn len(&self) -> usize {
         self.head.len() + self.tail.len()
     }
@@ -2887,6 +3202,7 @@ impl Captured {
             mut head,
             mut tail,
             mut dropped,
+            ..
         } = self;
         // Output after the last trim can leave a dropped tail long, short of
         // the room the marker needs.
@@ -2908,6 +3224,62 @@ impl Captured {
     }
 }
 
+/// Write a stream whole to its file in `spill`'s folder, redacted as it
+/// goes: `first`, then each piece as it comes, up to `SPILL_BYTES`. None
+/// when the folder may not hold it or a write fails, the file removed, and
+/// the stream's bounded copy is kept as before. Run on a blocking worker.
+fn spill_stream(
+    spill: &Spill,
+    stream: &'static str,
+    credentials: &Credentials,
+    first: Vec<u8>,
+    mut pieces: tokio::sync::mpsc::Receiver<Vec<u8>>,
+) -> Option<Spilled> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    if !(spill.usable)() {
+        return None;
+    }
+    let path = spill.folder.join(format!("{}-{stream}", spill.name));
+    let file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(&path)
+        .ok()?;
+    let mut out = std::io::BufWriter::with_capacity(256 << 10, file);
+    let mut redacting = Redacting::new(credentials.clone());
+    let mut saved = 0u64;
+    let mut piece = Some(first);
+    let written = (|| {
+        while let Some(bytes) = piece.take() {
+            let fits = (bytes.len() as u64).min(SPILL_BYTES - saved) as usize;
+            out.write_all(redacting.feed(&bytes[..fits]).as_bytes())?;
+            saved += fits as u64;
+            if fits < bytes.len() {
+                break;
+            }
+            piece = pieces.blocking_recv();
+        }
+        // Past the bound the reader stops sending once this end closes.
+        pieces.close();
+        out.write_all(redacting.finish().as_bytes())?;
+        out.flush()?;
+        // On disk before the store records it, its name with it.
+        out.get_ref().sync_all()?;
+        std::fs::File::open(&spill.folder)?.sync_all()
+    })();
+    if written.is_err() {
+        let _ = std::fs::remove_file(&path);
+        return None;
+    }
+    Some(Spilled {
+        files: Files::new(vec![(stream, path.to_str()?.to_owned())]),
+        saved,
+    })
+}
+
 /// Append a pipe's output to `captured` until it closes. What arrived stays
 /// there if the read is cancelled, as it is at a shell timeout.
 async fn capture(pipe: &mut (impl AsyncRead + Unpin), captured: &mut Captured) -> Result<()> {
@@ -2926,6 +3298,9 @@ async fn capture(pipe: &mut (impl AsyncRead + Unpin), captured: &mut Captured) -
         let read = pipe.read(&mut chunk).await?;
         if read == 0 {
             return Ok(());
+        }
+        if captured.spill.is_some() || captured.writer.is_some() {
+            captured.spill(&chunk[..read]).await;
         }
         captured.keep(&chunk[..read]);
         // Past the bound nothing more is shown, so a runaway writer is
@@ -3279,6 +3654,7 @@ async fn detach(
 const PIPES_END: Duration = Duration::from_millis(100);
 
 #[cfg(unix)]
+#[allow(clippy::too_many_arguments)]
 async fn shell(
     command: &str,
     workspace: &Path,
@@ -3286,6 +3662,7 @@ async fn shell(
     registry: &Registry,
     environment: &[(String, String)],
     sandbox: Option<&Policy>,
+    spill: Option<&Spill>,
 ) -> Result<(Captured, Captured, Exit, Duration)> {
     use std::process::Stdio;
     use tokio::process::Child;
@@ -3326,7 +3703,10 @@ async fn shell(
         .stderr
         .take()
         .ok_or(Error::new("shell_pipe_failed"))?;
-    let (mut out, mut err) = (Captured::default(), Captured::default());
+    let (mut out, mut err) = (
+        Captured::spilling(spill, "stdout", registry),
+        Captured::spilling(spill, "stderr", registry),
+    );
     let status = {
         let reads = async {
             tokio::try_join!(
@@ -3374,7 +3754,10 @@ async fn shell(
         status
     };
     let exit = status.map_or(Exit::TimedOut, Exit::Status);
-    Ok((out, err, exit, started.elapsed()))
+    let elapsed = started.elapsed();
+    // The files that hold streams past the bound are whole once read.
+    tokio::join!(out.settle(), err.settle());
+    Ok((out, err, exit, elapsed))
 }
 
 #[cfg(not(unix))]
@@ -3385,6 +3768,7 @@ async fn shell(
     _: &Registry,
     _: &[(String, String)],
     _: Option<&Policy>,
+    _: Option<&Spill>,
 ) -> Result<(Captured, Captured, Exit, Duration)> {
     fail("shell_platform_unsupported")
 }
@@ -3577,6 +3961,7 @@ mod tests {
                 None,
                 place,
                 started,
+                None,
             ));
             (run, running)
         };
@@ -3890,6 +4275,191 @@ mod tests {
         let error = run("gone").await.unwrap_err();
         assert_eq!(error.code, "path_not_found");
         assert!(error.detail.unwrap().contains("gone"));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// A stream redacted piece by piece reads as the whole redacted at
+    /// once, however it is cut: a credential, a secret field's value and a
+    /// secret PEM block that span pieces are still redacted.
+    #[test]
+    fn a_stream_redacted_in_pieces_reads_as_the_whole_redacted() {
+        let credentials = Credentials::default();
+        credentials.set("TOKEN", "tok3n-fake-fake-fake9");
+        let fields = ["password", "api_key", "SessionToken"].map(String::from);
+        credentials.redact_also(&fields, &["PRIVATE KEY".to_owned()]);
+        let text = "start tok3n-fake-fake-fake9 é\npassword: fake8fake8fake8\n\
+            {\"api_key\": \"fake9fake9fake9x\", \"n\": 1}\nexport AWS_SESSION_TOKEN=abc123def456ghi\n\
+            -----BEGIN RSA PRIVATE KEY-----\nMIIEsecret\nAAAA\n-----END RSA PRIVATE KEY-----\n\
+            -----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----\nend tok3n-fake-fake-fake9";
+        let whole = credentials.redact(text.to_owned());
+        assert!(!whole.contains("fake8") && !whole.contains("fake9") && !whole.contains("abc123"));
+        assert!(!whole.contains("secret") && whole.contains("MIIB"));
+        for size in 1..=text.len() {
+            let mut redacting = Redacting::new(credentials.clone());
+            let mut out = String::new();
+            for piece in text.as_bytes().chunks(size) {
+                out.push_str(&redacting.feed(piece));
+            }
+            out.push_str(&redacting.finish());
+            assert_eq!(out, whole, "in pieces of {size}");
+        }
+    }
+    #[test]
+    fn joined_files_are_removed_together_unless_recorded() {
+        let dir = std::env::temp_dir().join(format!("agent-files-join-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = |name: &str| {
+            let path = dir.join(name);
+            std::fs::write(&path, "x").unwrap();
+            path.to_str().unwrap().to_owned()
+        };
+        let (a, b) = (file("a"), file("b"));
+        let joined =
+            Files::new(vec![("stdout", a.clone())]).join(Files::new(vec![("stderr", b.clone())]));
+        assert_eq!(joined.len(), 2);
+        drop(joined);
+        assert!(!Path::new(&a).exists() && !Path::new(&b).exists());
+        let (c, d) = (file("c"), file("d"));
+        let joined =
+            Files::new(vec![("stdout", c.clone())]).join(Files::new(vec![("stderr", d.clone())]));
+        joined.recorded();
+        drop(joined);
+        assert!(Path::new(&c).exists() && Path::new(&d).exists());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+    /// A file's line pages read as a stored copy's, without holding it.
+    #[cfg(unix)]
+    #[test]
+    fn a_file_pages_as_its_text_does() {
+        let dir = std::env::temp_dir().join(format!("agent-page-file-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("out");
+        let long = "x".repeat(PREVIEW_BYTES);
+        let texts = [
+            String::new(),
+            "\n".to_owned(),
+            "one".to_owned(),
+            "one\r\ntwo\n\nfour".to_owned(),
+            (1..=3000)
+                .map(|n| format!("line {n} {}\n", "é".repeat(n % 40)))
+                .collect(),
+            format!("a\n{long}\nb\n"),
+        ];
+        for text in &texts {
+            std::fs::write(&file, text).unwrap();
+            let path = file.to_str().unwrap();
+            for (offset, limit) in [
+                (1, 1),
+                (1, 5000),
+                (2, 2),
+                (4, 1),
+                (1500, 10),
+                (2999, 5),
+                (4000, 3),
+            ] {
+                let want = page_lines(text, offset, limit).map_err(|error| error.code);
+                let got = page_file(path, offset, limit).map_err(|error| error.code);
+                assert_eq!(
+                    got,
+                    want.map(Some),
+                    "{offset} {limit} of {:?}",
+                    &text[..text.len().min(40)]
+                );
+            }
+        }
+        assert_eq!(
+            page_file(dir.join("gone").to_str().unwrap(), 1, 1).unwrap(),
+            None
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+    /// A stream past the bound goes whole to its file in the bot's outputs
+    /// folder as the command runs, redacted, every byte of its middle with
+    /// it; the result names the file and keeps no cut copy. A folder its
+    /// commands may write gets nothing, the cut copy kept as before.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_stream_past_the_bound_goes_whole_to_its_file() {
+        let dir = std::env::temp_dir().join(format!("agent-spill-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("outputs")).unwrap();
+        let registry = Registry::new("shell").unwrap();
+        registry.credentials.set("TOKEN", "tok3n-fake-fake-fake9");
+        // 3 MiB of numbered lines, a credential among them.
+        let command = "for i in $(seq 1 30000); do printf 'line %06d %0100d\\n' $i 0; \
+            [ $i = 15000 ] && echo tok3n-fake-fake-fake9; done; echo err >&2";
+        let spill = |usable: bool| Spill {
+            folder: dir.join("outputs"),
+            name: format!("7-call{usable}"),
+            usable: Arc::new(move || usable),
+        };
+        let run = |spill: Spill| {
+            registry.foreground(
+                command.into(),
+                dir.clone(),
+                60_000,
+                Vec::new(),
+                None,
+                registry.place(),
+                tokio::sync::oneshot::channel().0,
+                Some(spill),
+            )
+        };
+        let outcome = run(spill(true)).await.unwrap();
+        assert!(
+            outcome.artifacts.is_empty(),
+            "{:?}",
+            outcome.artifacts.len()
+        );
+        let [(stream, file)] = &outcome.files[..] else {
+            panic!("{:?}", &outcome.files[..]);
+        };
+        assert_eq!(*stream, "stdout");
+        assert!(file.ends_with("outputs/7-calltrue-stdout"), "{file}");
+        let whole = std::fs::read_to_string(file).unwrap();
+        let lines: Vec<&str> = whole.lines().collect();
+        assert_eq!(lines.len(), 30001);
+        assert_eq!(lines[15000], "[REDACTED]");
+        assert!(
+            lines[..15000]
+                .iter()
+                .enumerate()
+                .all(|(n, line)| line.starts_with(&format!("line {:06} ", n + 1)))
+        );
+        assert!(!whole.contains("tok3n"));
+        let value: serde_json::Value = serde_json::from_str(&outcome.output).unwrap();
+        let shown = value["stdout"].as_str().unwrap();
+        assert!(
+            shown.contains("bytes omitted; the full output is retained"),
+            "{}",
+            &shown[..200]
+        );
+        assert!(shown.starts_with("line 000001"));
+        assert!(shown.ends_with(&format!("line 030000 {}\n", "0".repeat(100))));
+        assert_eq!(value["stderr"], "err\n");
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(
+            std::fs::metadata(file).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        // Unrecorded, the file goes with its outcome.
+        let file = file.clone();
+        drop(outcome);
+        for _ in 0..100 {
+            if !Path::new(&file).exists() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(!Path::new(&file).exists());
+        // A folder the bot's commands may write holds nothing.
+        let outcome = run(spill(false)).await.unwrap();
+        assert!(outcome.files.is_empty());
+        assert_eq!(outcome.artifacts.len(), 1);
+        assert!(outcome.output.contains("more past 1 MiB were not kept"));
+        assert_eq!(std::fs::read_dir(dir.join("outputs")).unwrap().count(), 0);
         std::fs::remove_dir_all(dir).unwrap();
     }
 }

@@ -39,10 +39,9 @@ fn encode(raw: &[u8]) -> Option<Vec<u8>> {
     (out.len() < raw.len() - raw.len() / 8).then_some(out)
 }
 
-/// The most a retained stream holds: `ARTIFACT_BYTES` of output made
-/// valid UTF-8, each invalid byte at most three. Past `ARTIFACT_BYTES`
-/// the store keeps a stream as it is, never encoded.
-const RETAINED_BYTES: usize = 3 * ARTIFACT_BYTES;
+/// The most a retained stream's file holds: `SPILL_BYTES` of output, each
+/// invalid byte made at most three, as a stored copy's are.
+const FILE_RETAINED_BYTES: u64 = 3 * crate::tools::SPILL_BYTES;
 
 pub(super) fn put(db: &Connection, turn: i64, call: &str, stream: &str, raw: &[u8]) -> Result<()> {
     let encoded = encode(raw);
@@ -94,6 +93,16 @@ pub(super) fn remove(files: &[String]) {
     }
 }
 
+/// The file that holds a retained output, when one does.
+pub(super) fn file(db: &Connection, turn: i64, call: &str, stream: &str) -> Result<Option<String>> {
+    Ok(db
+        .prepare_cached(
+            "SELECT file FROM artifacts WHERE turn=?1 AND call_id=?2 AND stream=?3 AND file IS NOT NULL",
+        )?
+        .query_row(params![turn, call, stream], |r| r.get(0))
+        .optional()?)
+}
+
 /// A page of a retained output's file, as a stored copy is paged; none
 /// when the file is gone or is no longer a file. Links are not followed,
 /// and opening never waits on a pipe put in its place.
@@ -114,7 +123,7 @@ fn read_file(file: &str, offset: u64, limit: usize) -> Result<Option<(u64, Vec<u
     }
     let total = found.len();
     // One that is larger was not written here.
-    if total > RETAINED_BYTES as u64 {
+    if total > FILE_RETAINED_BYTES {
         return fail("storage_error");
     }
     if offset > total {

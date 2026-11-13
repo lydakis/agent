@@ -54,6 +54,14 @@ const BOT_APPROVALS: &str = "SELECT a.id,b.name,a.turn,a.call_id,a.name,a.node,a
        AND a.turn IS NOT b.running_turn
      ORDER BY 1 LIMIT ?3";
 
+/// A retained stream for the model's `read`: a page of the store's copy,
+/// or the path of the file that holds it, for the caller to page.
+#[derive(Debug, PartialEq, Eq)]
+pub enum ArtifactLines {
+    Page(String),
+    File(String),
+}
+
 /// How a bot's newest turn that counts ended: one that ran, or one that
 /// failed before it started. A message steered into a running turn, one
 /// riding the next call, and one cancelled while it waited in line never
@@ -14141,7 +14149,9 @@ impl Database {
             fail("artifact_not_found")
         }
     }
-    /// A retained stream as text, for the model's own `read`.
+    /// A retained stream as text, for the model's own `read`: a page of
+    /// the store's copy, or the file that holds it, which may run to a
+    /// gigabyte and so is paged by the caller off the storage worker.
     pub fn artifact_lines(
         &self,
         name: &str,
@@ -14150,16 +14160,20 @@ impl Database {
         stream: &str,
         offset: usize,
         limit: usize,
-    ) -> Result<String> {
+    ) -> Result<ArtifactLines> {
         if offset == 0 || !(1..=5000).contains(&limit) {
             return fail("invalid_tool_arguments");
         }
         self.authorize_artifact(name, turn, call_id)?;
+        if let Some(file) = artifact::file(&self.conn, turn, call_id, stream)? {
+            return Ok(ArtifactLines::File(file));
+        }
         let Some((_, data)) = artifact::read(&self.conn, turn, call_id, stream, 0, usize::MAX)?
         else {
             return self.missing_artifact(turn);
         };
         crate::tools::page_lines(&String::from_utf8_lossy(&data), offset, limit)
+            .map(ArtifactLines::Page)
     }
     /// A recorded tool result on the bot's own lineage, as text, for the
     /// model's own `read` of what an elided result's stub names. `checked`
