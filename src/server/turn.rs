@@ -3060,7 +3060,7 @@ impl Turn {
         let tools = self.registry.encoded(
             provider.family(),
             provider.grammars(),
-            &record.tools,
+            &record.offered(),
             &record.declared,
             record.sandboxed(),
         )?;
@@ -4429,7 +4429,7 @@ impl Turn {
         route: Option<&str>,
         summary_retry_ms: Option<u64>,
     ) -> Result<Option<Stop>> {
-        let (turn, allowed) = (self.turn, record.callable());
+        let turn = self.turn;
         let mut calls = calls.into_iter();
         while let Some(call) = calls.next() {
             // Nor any tool: the calls not yet started are answered as not
@@ -4529,7 +4529,7 @@ impl Turn {
             let prepared = if let Some(tool) = record.declared(&call.name) {
                 agent_runtime::tools::check_declared(tool, &call.arguments)
                     .map(|()| Prepared::Declared(tool.result.clone()))
-            } else if allowed.iter().any(|name| name == &call.name) {
+            } else if record.calls(&call.name) {
                 self.registry.prepare(&call.name, &call.arguments)
             } else {
                 Err(Error::with("tool_not_available", call.name.as_str()))
@@ -4903,7 +4903,7 @@ impl Turn {
                 Ok(Ruling::None | Ruling::Allow)
             )
             || record.declared(&call.name).is_some()
-            || !record.callable().iter().any(|name| name == &call.name)
+            || !record.calls(&call.name)
             || (call.name == "shell" && record.sandboxed() && !record.confines(call, workspace))
         {
             return None;
@@ -5298,7 +5298,7 @@ impl Turn {
     fn load_holds(&self, record: &Bot, call: &ToolCall, workspace: &std::path::Path) -> bool {
         if self.registry.admits()
             || record.declared(&call.name).is_some()
-            || !record.callable().iter().any(|name| name == &call.name)
+            || !record.calls(&call.name)
         {
             return false;
         }
@@ -6058,7 +6058,7 @@ impl Lifts {
         let prepared = if let Some(tool) = bot.declared(&call.name) {
             agent_runtime::tools::check_declared(tool, &call.arguments)
                 .map(|()| Prepared::Declared(tool.result.clone()))
-        } else if bot.callable().iter().any(|name| name == &call.name) {
+        } else if bot.calls(&call.name) {
             self.registry.prepare(&call.name, &call.arguments)
         } else {
             Err(Error::with("tool_not_available", call.name.as_str()))
@@ -6450,7 +6450,7 @@ fn withhold_thinking(context: &Context, error: &Error) -> Option<Strip> {
 /// Whether the bot may search the web: its provider declares the search
 /// when it offers one, and a fork's allowed list narrows it as any tool.
 fn searches(record: &agent_runtime::store::Bot) -> bool {
-    record.callable().iter().any(|tool| tool == "web_search")
+    record.calls("web_search")
 }
 
 /// Whether a turn whose budget is spent makes one more call, without tool

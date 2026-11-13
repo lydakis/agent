@@ -595,6 +595,13 @@ impl Settings {
 const INHERITED: [&str; 2] = ["rules", "env"];
 /// The settings that make a bot's sandbox, which change together.
 pub const SANDBOX: [&str; 4] = ["sandbox", "writable", "network", "unix_sockets"];
+
+/// Whether the daemon's tool `name` reaches the web past a bot's sandbox:
+/// `web_fetch`, which the daemon answers, and `web_search`, which the
+/// provider does.
+pub fn web(name: &str) -> bool {
+    matches!(name, "web_fetch" | "web_search")
+}
 /// Every setting's name, as `create` and `configure` take it.
 pub const SETTINGS: [&str; 23] = [
     "context_bytes",
@@ -1001,7 +1008,37 @@ impl Bot {
     }
     /// Whether the bot may call `name`, the daemon's tool or a declared one.
     pub fn may_call(&self, name: &str) -> bool {
+        self.calls(name) || self.declared(name).is_some()
+    }
+    /// Whether `name` is among what the bot may call, whatever its sandbox
+    /// allows now: a web tool an offline bot keeps counts, so a fork's
+    /// allowed list may name it and gets it when the network is set.
+    pub fn entitled(&self, name: &str) -> bool {
         self.callable().iter().any(|tool| tool == name) || self.declared(name).is_some()
+    }
+    /// Whether the bot may call the daemon's tool `name` now: one it may
+    /// call, unless its sandbox keeps it off the network and the tool
+    /// reaches the web, which the daemon and the provider would reach for
+    /// it past the sandbox.
+    pub fn calls(&self, name: &str) -> bool {
+        self.callable().iter().any(|tool| tool == name) && !(self.offline() && web(name))
+    }
+    /// Whether its sandbox keeps it off the network: a read-only one, or a
+    /// workspace-write one without the network.
+    pub fn offline(&self) -> bool {
+        self.sandboxed() && !self.settings.network
+    }
+    /// Its tools as offered to the model now: [`Bot::calls`]'s, so an
+    /// offline bot is offered no web tool, from its next call on.
+    pub fn offered(&self) -> std::borrow::Cow<'_, [String]> {
+        match self.offline() && self.tools.iter().any(|tool| web(tool)) {
+            true => (self.tools.iter())
+                .filter(|tool| !web(tool))
+                .cloned()
+                .collect::<Vec<_>>()
+                .into(),
+            false => self.tools.as_slice().into(),
+        }
     }
     /// The bot id that keys this bot's provider prompt cache.
     pub fn cache_bot(&self) -> i64 {
@@ -12519,7 +12556,7 @@ impl Database {
             Some(allow) => {
                 let mut allowed: Vec<String> = Vec::with_capacity(allow.len());
                 for tool in allow {
-                    if !parent.may_call(tool) {
+                    if !parent.entitled(tool) {
                         return fail_with(
                             "allow_not_in_source",
                             format!("{source} may not call {tool}"),
