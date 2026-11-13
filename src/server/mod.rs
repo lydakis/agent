@@ -2226,8 +2226,8 @@ pub async fn run(config: Configuration) -> Result<()> {
     let handles = Handles::new(resume_sender);
     // A pool wakes a turn parked on its full ramp when a place frees.
     let (pool_wake_sender, mut pool_wakes) = mpsc::unbounded_channel();
-    let wake: agent_runtime::provider::pace::Wake = Arc::new(move |bot, turn| {
-        let _ = pool_wake_sender.send((bot, turn));
+    let wake: agent_runtime::provider::pace::Wake = Arc::new(move |woken| {
+        let _ = pool_wake_sender.send(woken);
     });
     transport.set_wake(wake);
     let mut publisher = tokio::spawn(publish(publications, hub.clone(), handles.clone()));
@@ -2436,6 +2436,11 @@ pub async fn run(config: Configuration) -> Result<()> {
     // admissions are answered and their turns end like any other, unless
     // the stdio owner's output is what failed.
     let served: Result<()> = async {
+        // When places a pool kept for woken turns lapse, oldest first.
+        let mut ramp_lapses = std::collections::BTreeMap::<
+            tokio::time::Instant,
+            Vec<std::sync::Weak<agent_runtime::provider::pace::Pace>>,
+        >::new();
         loop {
             if service.draining() && service.active.is_empty() {
                 break;
@@ -2446,6 +2451,7 @@ pub async fn run(config: Configuration) -> Result<()> {
             let expiry = service.expiry;
             let lapses = service.lapses;
             let holds = service.holds;
+            let ramp_lapse = ramp_lapses.keys().next().copied();
             tokio::select! {
                 _ = stdout_closed.wait_for(|closed| *closed), if stdio_owner => return fail("output_closed"),
                 Some(error) = failures.recv() => return Err(error),
@@ -2494,8 +2500,14 @@ pub async fn run(config: Configuration) -> Result<()> {
                         last_activity = std::time::Instant::now();
                     }
                 }
-                Some((bot, turn)) = pool_wakes.recv() => {
-                    service.pool_wake(bot, turn);
+                Some(woken) = pool_wakes.recv() => match woken {
+                    agent_runtime::provider::pace::Woken::Turn(bot, turn) => service.pool_wake(bot, turn),
+                    agent_runtime::provider::pace::Woken::Lapse(at, pace) => ramp_lapses.entry(at).or_default().push(pace),
+                },
+                _ = tokio::time::sleep_until(ramp_lapse.unwrap_or_else(tokio::time::Instant::now)), if ramp_lapse.is_some() => {
+                    if let Some((_, pools)) = ramp_lapses.pop_first() {
+                        pools.iter().filter_map(std::sync::Weak::upgrade).for_each(|pace| pace.lapse());
+                    }
                 }
                 Some((bot, turn)) = resumes.recv(), if service.has_capacity() => {
                     let chore = std::time::Instant::now();

@@ -15,6 +15,7 @@ use std::{
     time::Duration,
 };
 // Tokio's clock, so the pool pauses and advances with the runtime under test.
+use std::sync::Weak;
 use tokio::time::Instant;
 
 /// Rate-limit waits below this threshold stay in the gate.
@@ -32,8 +33,15 @@ pub struct Report {
     pub dispatched: bool,
 }
 
-/// Resumes a parked turn now: the daemon's own wake-up for it.
-pub type Wake = Arc<dyn Fn(String, i64) + Send + Sync>;
+/// What a pool asks of the daemon's run loop, which owns every wake-up.
+pub enum Woken {
+    /// Resume this parked turn now: a place on the ramp is kept for it.
+    Turn(String, i64),
+    /// Call `Pace::lapse` on this pool then, to pass on a kept place its
+    /// turn never came back for.
+    Lapse(Instant, Weak<Pace>),
+}
+pub type Wake = Arc<dyn Fn(Woken) + Send + Sync>;
 
 /// A turn asking for a call, and how to wake it once parked: a caller
 /// that finds a ramp's window full parks, and a settle wakes it.
@@ -64,7 +72,7 @@ impl Drop for Queued<'_> {
         let mut state = self.pace.state.lock().unwrap();
         if let Some(ramp) = state.ramp.as_mut() {
             ramp.forget(&waiter.bot, waiter.turn);
-            ramp.wake(Instant::now());
+            ramp.wake(Instant::now(), &self.pace.this);
         }
         drop(state);
         self.pace.changed.notify_one();
@@ -89,7 +97,10 @@ impl Pools {
         if let Some(pace) = pools.get(model) {
             return pace.clone();
         }
-        let pace = Arc::new(Pace::default());
+        let pace = Arc::new_cyclic(|this| Pace {
+            this: this.clone(),
+            ..Default::default()
+        });
         pools.insert(model.to_owned(), pace.clone());
         pace
     }
@@ -138,6 +149,9 @@ pub struct Pace {
     gate: tokio::sync::Mutex<()>,
     state: Mutex<State>,
     changed: tokio::sync::Notify,
+    /// The pool itself, for the run loop to call back when a kept place
+    /// lapses.
+    this: Weak<Pace>,
 }
 /// One limited quantity: its learned allowance and the estimates reserved
 /// against it by calls that have not yet been accounted for by headers.
@@ -229,16 +243,23 @@ impl Ramp {
         self.queued.retain(|w| !(w.bot == bot && w.turn == turn));
         self.promised.retain(|(b, t, _)| !(b == bot && *t == turn));
     }
-    /// Wake parked turns, oldest first, for the places the window has free.
-    fn wake(&mut self, now: Instant) {
+    /// Wake parked turns, oldest first, for the places the window has free,
+    /// and have the run loop look again when the places kept for them
+    /// lapse, so one that never comes back does not hold its place.
+    fn wake(&mut self, now: Instant, pace: &Weak<Pace>) {
         self.promised.retain(|(_, _, until)| *until > now);
+        let mut last = None;
         while !self.full() {
             let Some(waiter) = self.queued.pop_front() else {
                 break;
             };
             self.promised
                 .push((waiter.bot.clone(), waiter.turn, now + PROMISE));
-            (waiter.wake)(waiter.bot, waiter.turn);
+            (waiter.wake)(Woken::Turn(waiter.bot.clone(), waiter.turn));
+            last = Some(waiter.wake);
+        }
+        if let Some(wake) = last {
+            wake(Woken::Lapse(now + PROMISE, pace.clone()));
         }
     }
 }
@@ -580,7 +601,7 @@ impl Drop for Reservation<'_> {
             && ramp.generation == generation
         {
             ramp.flying = ramp.flying.saturating_sub(1);
-            ramp.wake(Instant::now());
+            ramp.wake(Instant::now(), &self.pace.this);
         }
         if !self.request_reported {
             state.reserved_requests -= 1;
@@ -771,7 +792,7 @@ impl Pace {
                         // A place kept for a woken turn that never came
                         // back goes to the next parked one.
                         if let Some(ramp) = state.ramp.as_mut() {
-                            ramp.wake(now);
+                            ramp.wake(now, &self.this);
                         }
                         let wait = match left {
                             Some(left) if !left.is_zero() => left,
@@ -790,11 +811,15 @@ impl Pace {
                                     None => {
                                         state.tickets += 1;
                                         let notify = Arc::new(tokio::sync::Notify::new());
-                                        let woken = notify.clone();
+                                        let ticket = notify.clone();
                                         let waiter = Waiter {
                                             bot: String::new(),
                                             turn: -state.tickets,
-                                            wake: Arc::new(move |_, _| woken.notify_one()),
+                                            wake: Arc::new(move |woken: Woken| {
+                                                if let Woken::Turn(..) = woken {
+                                                    ticket.notify_one();
+                                                }
+                                            }),
                                         };
                                         queued.ticket = Some((waiter.clone(), notify));
                                         waiter
@@ -865,6 +890,16 @@ impl Pace {
                 _ = changed => {},
             }
         }
+    }
+    /// The run loop's call when a place kept for a woken turn lapses: the
+    /// place goes to the next parked turn, if that turn has not come back.
+    pub fn lapse(&self) {
+        let mut state = self.state.lock().unwrap();
+        if let Some(ramp) = state.ramp.as_mut() {
+            ramp.wake(Instant::now(), &self.this);
+        }
+        drop(state);
+        self.changed.notify_one();
     }
     /// How much longer a rate limit closes this pool, if it does.
     pub fn blocked_for(&self) -> Option<Duration> {
@@ -980,11 +1015,11 @@ impl Pace {
             }
             let done = ramp.window >= RAMP_DONE;
             match done {
-                false => ramp.wake(Instant::now()),
+                false => ramp.wake(Instant::now(), &self.this),
                 // Every turn still parked on it goes now.
                 true => {
                     for waiter in state.ramp.take().into_iter().flat_map(|r| r.queued) {
-                        (waiter.wake)(waiter.bot, waiter.turn);
+                        (waiter.wake)(Woken::Turn(waiter.bot, waiter.turn));
                     }
                 }
             }
@@ -1687,7 +1722,11 @@ mod tests {
             Waiter {
                 bot: format!("bot{turn}"),
                 turn,
-                wake: Arc::new(move |_, turn| woken.lock().unwrap().push(turn)),
+                wake: Arc::new(move |w| {
+                    if let Woken::Turn(_, turn) = w {
+                        woken.lock().unwrap().push(turn)
+                    }
+                }),
             }
         };
         let (one, two) = (waiter(1), waiter(2));
@@ -1732,7 +1771,11 @@ mod tests {
             Waiter {
                 bot: format!("bot{turn}"),
                 turn,
-                wake: Arc::new(move |_, turn| woken.lock().unwrap().push(turn)),
+                wake: Arc::new(move |w| {
+                    if let Woken::Turn(_, turn) = w {
+                        woken.lock().unwrap().push(turn)
+                    }
+                }),
             }
         };
         let one = waiter(1);
@@ -1759,6 +1802,44 @@ mod tests {
         later.unwrap();
     }
 
+    /// A woken turn that never comes back, on a pool that sees no other
+    /// call, does not hold its place past its lapse: the run loop calls the
+    /// pool back then, and the place goes to the next parked turn.
+    #[tokio::test(start_paused = true)]
+    async fn the_run_loop_passes_on_a_place_its_turn_never_came_back_for() {
+        let pools = Pools::default();
+        let pace = pools.get("model");
+        let (woken, lapses) = (
+            Arc::new(Mutex::new(Vec::new())),
+            Arc::new(Mutex::new(Vec::new())),
+        );
+        let waiter = |turn: i64| {
+            let (woken, lapses) = (woken.clone(), lapses.clone());
+            Waiter {
+                bot: format!("bot{turn}"),
+                turn,
+                wake: Arc::new(move |w| match w {
+                    Woken::Turn(_, turn) => woken.lock().unwrap().push(turn),
+                    Woken::Lapse(at, pace) => lapses.lock().unwrap().push((at, pace)),
+                }),
+            }
+        };
+        pace.limited(None);
+        tokio::time::advance(Duration::from_secs(2)).await;
+        let first = ask(&pace, None).await.0.unwrap();
+        for turn in [1, 2] {
+            assert!(ask(&pace, Some(&waiter(turn))).await.0.is_err());
+        }
+        drop(first);
+        assert_eq!(*woken.lock().unwrap(), [1]);
+        let (at, kept_by) = lapses.lock().unwrap().pop().unwrap();
+        assert_eq!(at, Instant::now() + PROMISE);
+        tokio::time::advance(PROMISE).await;
+        assert_eq!(*woken.lock().unwrap(), [1], "nothing looked again");
+        kept_by.upgrade().unwrap().lapse();
+        assert_eq!(*woken.lock().unwrap(), [1, 2]);
+    }
+
     /// A caller that gives up while queued on a ramp gives its place up.
     #[tokio::test(start_paused = true)]
     async fn a_caller_that_gives_up_leaves_the_ramp_s_queue() {
@@ -1769,7 +1850,11 @@ mod tests {
             turn: 2,
             wake: {
                 let woken = woken.clone();
-                Arc::new(move |_, turn| woken.lock().unwrap().push(turn))
+                Arc::new(move |w| {
+                    if let Woken::Turn(_, turn) = w {
+                        woken.lock().unwrap().push(turn)
+                    }
+                })
             },
         };
         pace.limited(None);
@@ -1793,7 +1878,11 @@ mod tests {
             Waiter {
                 bot: format!("bot{turn}"),
                 turn,
-                wake: Arc::new(move |_, turn| woken.lock().unwrap().push(turn)),
+                wake: Arc::new(move |w| {
+                    if let Woken::Turn(_, turn) = w {
+                        woken.lock().unwrap().push(turn)
+                    }
+                }),
             }
         };
         pace.limited(None);

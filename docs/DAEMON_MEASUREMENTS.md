@@ -9172,8 +9172,10 @@ while it waits, as a refund wait does (#940 follows that up).
 A turn that finds its pool's ramp full now parks, holding no task and no
 active slot. When one of the ramp's calls settles, or an answer widens the
 window, the pool wakes the oldest parked turn, and the window keeps that
-place for it for up to 5 s. The daemon resumes the turn at once; one
-woken while its park is still landing resumes as soon as the park lands.
+place for it for up to 5 s; then the run loop calls the pool back, and a
+place its turn never came back for goes to the next parked turn. The
+daemon resumes the turn at once; one woken while its park is still
+landing resumes as soon as the park lands.
 A turn that is never woken comes back after 30 s, and the end of the ramp
 wakes every turn still parked on it. A call that is not a turn's own (a
 summary beside it, a search) cannot park: it takes its place in the same
