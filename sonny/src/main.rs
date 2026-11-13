@@ -15676,6 +15676,9 @@ impl App {
             // Refused by no one: its time ran out.
             Some(_) => Some(transcript::Decided::Lapsed),
             None if data["denied"] == true => Some(transcript::Decided::Lapsed),
+            // A step denied with no gate refusing it: its caller stopped
+            // waiting, and it never ran.
+            None if data["decision"] == "deny" => Some(transcript::Decided::Gone),
             None => (verdicts.iter().filter(|v| v["allow"] == true))
                 .fold(None, |best: Option<bool>, v| {
                     Some(best.unwrap_or(false) || you(v))
@@ -24890,6 +24893,33 @@ mod tests {
         let texts = app.screen.texts();
         assert!(
             texts.contains(&"✗ The reviewer denied make deploy".to_owned()),
+            "{texts:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_step_abandoned_after_one_gate_allowed_it_is_not_allowed() {
+        let client = daemon_answering(|_| json!({})).await;
+        let mut app = app(client);
+        app.width = 80;
+        app.approvals
+            .push(json!({"turn": 5, "call_id": "c2/open", "name": "shell",
+            "gates": ["manual", "auto"], "arguments": {"command": "make deploy"}}));
+        app.show_asked();
+        app.flush();
+        app.heard_verdict(
+            "b",
+            Some(5),
+            &json!({"call_id": "c2/open", "decision": "deny",
+            "reason": "its client stopped waiting",
+            "approvals": [{"tag": "manual", "by": "tui", "allow": true}]}),
+        );
+        app.approvals.clear();
+        app.fold_written();
+        app.flush();
+        let texts = app.screen.texts();
+        assert!(
+            texts.contains(&"⏸ Request for make deploy no longer waits".to_owned()),
             "{texts:?}"
         );
     }
