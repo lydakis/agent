@@ -127,6 +127,25 @@ this replaced:
   by it, and an open ask approves nothing whatever the agent said it would
   do meanwhile. Code review's rule is the precedent: an approval covers
   the commit it saw.
+- **A message to people is judged as data leaving** (2026-11-13). The
+  policy had called "sending messages to people" `high` risk unless the
+  person asked, a rule left from the Jev questions below that Codex's
+  policy does not have. It refused a short factual reply to a coworker
+  that a standing rule of the person covered, and allowed one like it
+  an hour later, likely as the person's words came in and out of reach.
+  Codex judges a send by what it carries and where it goes: to a
+  destination the work plainly uses, allowed; sensitive data to one the
+  person did not authorize, denied. The rule is gone, and the data
+  exfiltration rules judge sends, as Codex's do.
+- **The reviewer does not read memory** (2026-11-13), as Codex's does
+  not: its reviewer runs with memories off, and a test checks that none
+  reaches it (openai/codex `553c764`). Agents write memory, every agent
+  shares it, and a fact may be saved in a turn that read a web page, so
+  one an agent was tricked into saving would be a standing permission
+  for every agent's reviewer. A standing permission the person wants
+  honored goes in their AGENTS.md (`~/.agents/AGENTS.md` for all their
+  work), which the reviewer trusts; a running agent's reviewer reads it
+  as the agent was given it.
 - **Only escapes reach the reviewer, and it may look before it answers**
   (2026-10-28, once the daemon's sandbox landed). A sandboxed bot's
   commands, writes, and edits inside its sandbox run unreviewed; the reviewer
