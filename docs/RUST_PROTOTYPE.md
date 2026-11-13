@@ -523,6 +523,21 @@ removed `artifact_pruned` (see Retention).
 <a id="retained-outputs"></a>A bot with an `outputs` folder keeps each such
 stream there whole instead, as `TURN-CALL_ID-STREAM`, and its result lists
 those paths as `files` beside `artifacts`, so any command or tool reads them.
+A shell stream that passes 1 MiB is written there as it is read, every byte of
+it, never its first and last 512 KiB alone: memory keeps only what the model is
+shown. Its pieces go through a short line to a writer that writes them in
+batches on blocking workers, so the runtime's thread never waits on the disk
+and a quiet stream holds no worker; a full line makes the command wait, and a
+command that has ended is waited for while its streams wait on the disk. The
+writer redacts as it goes, exactly as the whole would be redacted however the
+stream is cut: each pass (credentials, then secret PEM blocks, then secret
+fields' values) reads the stream byte by byte as it reads a whole text, holding
+only what may still be redacted: the end that may begin a credential, a value
+not yet known to be secret (past 1 MiB it is told as redacted). A secret
+block's body and a secret value are dropped as they come. A stream stops being written at
+1 GiB, and its result says how many bytes the file holds and how many it does
+not. A stream within 1 MiB never reaches the writer: its file is written once,
+after the command, as below.
 The store keeps one row per stream naming the file and none of its bytes
 (schema 68), and `artifact` and `read artifact=` read the file. Each file is
 made new (0600, never through a link) and synced with its folder before the
@@ -535,8 +550,11 @@ removes them. Retention and deletion remove a turn's files once removing its
 records commits; a file removed by hand reads `artifact_not_found`. A daemon
 that dies between writing a file and recording its call leaves the file, which
 no record names.
-Line pages are assembled on the storage worker; only the bounded page crosses
-into the async runtime. Byte-oriented protocol pages continue to use SQL slicing.
+Line pages of a stored copy are assembled on the storage worker; only the
+bounded page crosses into the async runtime. A file's line pages are read on a
+blocking worker a line at a time, up to the page and counted past it, so a file
+of a gigabyte is never held whole. Byte-oriented protocol pages continue to use
+SQL slicing, or read the file's page alone.
 
 ## Limits
 
@@ -2760,10 +2778,11 @@ counts it (one counter, one comparison per accepted command). `stats` reports
 it as `queued_processes`, a subset of `running_processes`, which counts every
 accepted background command whose result is not yet recorded and every
 foreground command running now. stdout and stderr are each
-retained up to 1 MiB; beyond 64 KiB the model receives a head and tail with the
-omission stated and the full stream is stored as an artifact retrievable through
-the `artifact` operation, or written to the bot's `outputs` folder (see
-[retained outputs](#retained-outputs)). Output is redacted before it is stored or sent,
+retained up to 1 MiB, past that their first and last 512 KiB; beyond 64 KiB the
+model receives a head and tail with the omission stated and the retained stream
+is stored as an artifact retrievable through the `artifact` operation. A bot with
+an `outputs` folder keeps the whole stream there instead, written as the command
+runs, up to 1 GiB (see [retained outputs](#retained-outputs)). Output is redacted before it is stored or sent,
 artifacts included, as every tool's result is: each credential the daemon
 holds, wherever it appears; the value printed after a field name ending in
 one the daemon was started with (`--redact-field`, any case, with or without

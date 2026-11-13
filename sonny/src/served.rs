@@ -1573,8 +1573,12 @@ async fn script(
         let lent = json!({"input": input, "bot": bot, "timeout_ms": left(call).as_millis() as u64,
             "whole": whole, "store": client.store().unwrap_or_default()});
         let answer = crate::link::call(&machine, EXEC, lent, Some(&steps)).await?;
-        if let (Some(file), Some(text)) = (&whole, answer["whole"].as_str()) {
-            let _ = std::fs::write(file, text);
+        // Up to megabytes, so off the runtime; its owner's alone, as a
+        // file saved here is.
+        if let (Some(file), Some(text)) = (whole, answer["whole"].as_str()) {
+            let text = text.to_owned();
+            let _ =
+                tokio::task::spawn_blocking(move || crate::exec::save_whole(&file, &text)).await;
         }
         return Ok(answer["answer"].clone());
     }

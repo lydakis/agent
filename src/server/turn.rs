@@ -19,11 +19,13 @@ use agent_runtime::{
     rules::Ruling,
     sandbox::Policy,
     store::{
-        AfterTurn, Answer, Bot, CallAnswer, Charge, ContextPrefix, ContextUsage, Database,
-        ElisionPlan, Gated, Halt, Halted, Lifted, LiftedRun, Limit, Settings, Slot, Spend, Store,
-        Strip, TURN_VIEW_ACCOUNTING, Waiting, Window, unserved,
+        AfterTurn, Answer, ArtifactLines, Bot, CallAnswer, Charge, ContextPrefix, ContextUsage,
+        Database, ElisionPlan, Gated, Halt, Halted, Lifted, LiftedRun, Limit, Settings, Slot,
+        Spend, Store, Strip, TURN_VIEW_ACCOUNTING, Waiting, Window, unserved,
     },
-    tools::{Cord, Files, Outcome, POLL_YIELD_MS, Place, Prepared, ReadSource, Registry, Stopper},
+    tools::{
+        Cord, Files, Outcome, POLL_YIELD_MS, Place, Prepared, ReadSource, Registry, Spill, Stopper,
+    },
 };
 use bytes::Bytes;
 use futures_util::{StreamExt, stream};
@@ -4780,6 +4782,18 @@ impl Turn {
                             db.artifact_lines(&bot, owner, &ref_call, &stream, offset, limit)
                         })
                         .await;
+                    // A file, up to a gigabyte, is paged on a blocking
+                    // worker, read up to the page and counted past it.
+                    let text = match text {
+                        Ok(ArtifactLines::Page(page)) => Ok(page),
+                        Ok(ArtifactLines::File(file)) => tokio::task::spawn_blocking(move || {
+                            agent_runtime::tools::page_file(&file, offset, limit)
+                        })
+                        .await
+                        .unwrap_or_else(|_| fail("storage_error"))
+                        .and_then(|page| page.ok_or(Error::new("artifact_not_found"))),
+                        Err(error) => Err(error),
+                    };
                     match text {
                         Ok(page) => Outcome::text(self.registry.redact_text(page)),
                         Err(error) => failure(error),
@@ -4827,6 +4841,8 @@ impl Turn {
                 }) => {
                     let (started, running) = oneshot::channel();
                     let place = self.registry.place();
+                    let spill = (self.outputs(record, workspace))
+                        .map(|outputs| outputs.spill(self.turn, &call.call_id));
                     let run = self.registry.foreground(
                         command,
                         Prepared::folder(workspace, workdir.as_deref()),
@@ -4835,6 +4851,7 @@ impl Turn {
                         sandbox,
                         place.clone(),
                         started,
+                        spill,
                     );
                     match self.run_tool(run, Some((&self.lift, running))).await? {
                         Ran::Done(Ok(outcome)) => {
@@ -5061,6 +5078,8 @@ impl Turn {
             } => {
                 let (started, running) = oneshot::channel();
                 let place = self.registry.place();
+                let spill = (self.outputs(record, workspace))
+                    .map(|outputs| outputs.spill(self.turn, &call_id));
                 let mut run = Box::pin(self.registry.foreground(
                     command,
                     Prepared::folder(workspace, workdir.as_deref()),
@@ -5069,6 +5088,7 @@ impl Turn {
                     sandbox,
                     place.clone(),
                     started,
+                    spill,
                 ));
                 let lifted = async {
                     // A run that ends before it starts wins the race below.
@@ -5857,6 +5877,7 @@ impl Turn {
             .op("process_start", move |db| db.process_start(turn, &started))
             .await?;
         let (sender, receiver) = oneshot::channel();
+        let spill = (outputs.clone()).map(|outputs| outputs.spill(self.turn, call_id));
         self.registry.background(
             self.registry.stopper(id),
             owner,
@@ -5867,6 +5888,7 @@ impl Turn {
             sandbox,
             queued,
             sender,
+            spill,
         );
         self.collect(id, call_id, receiver, outputs, None);
         Ok(Outcome::text(
@@ -6109,6 +6131,7 @@ impl Lifts {
             Ok(prepared)
         });
         let terminal = matches!(prepared, Ok(Prepared::Terminal { .. }));
+        let spill = (outputs.clone()).map(|outputs| outputs.spill(turn, &call.call_id));
         self.collect(
             &bot.name,
             turn,
@@ -6135,6 +6158,7 @@ impl Lifts {
                     sandbox,
                     queued,
                     sender,
+                    spill,
                 ),
                 Err(error) => {
                     let _ = sender.send(Err(error));
@@ -6620,15 +6644,7 @@ impl Outputs {
         if outcome.artifacts.is_empty() {
             return outcome;
         }
-        let name: String = call_id
-            .chars()
-            .map(
-                |c| match c.is_ascii_alphanumeric() || c == '_' || c == '-' {
-                    true => c,
-                    false => '_',
-                },
-            )
-            .collect();
+        let name = file_name(call_id);
         let artifacts = std::mem::take(&mut outcome.artifacts);
         // A turn stopped while this runs drops what it returns, and the
         // files with it: no record will name them.
@@ -6673,9 +6689,20 @@ impl Outputs {
         // A task that failed took the data with it: the cut text stands alone.
         if let Ok(Kept { stored, files }) = kept {
             outcome.artifacts = stored;
-            outcome.files = files;
+            outcome.files = std::mem::take(&mut outcome.files).join(files);
         }
         outcome
+    }
+
+    /// Where a command's streams go whole as it runs, past the bound, as
+    /// `keep` would name their files: only while the bot's sandbox cannot
+    /// write the folder, as `keep` checks, there when one passes it.
+    fn spill(self, turn: i64, call_id: &str) -> Spill {
+        Spill {
+            folder: self.folder.clone(),
+            name: format!("{turn}-{}", file_name(call_id)),
+            usable: Arc::new(move || !self.exposed()),
+        }
     }
 
     /// Whether the bot's commands may write the folder, made first so the
@@ -6722,6 +6749,19 @@ impl Outputs {
             Err(_) => true,
         }
     }
+}
+
+/// A call's id as part of a file's name: letters, digits, `_` and `-`.
+fn file_name(call_id: &str) -> String {
+    call_id
+        .chars()
+        .map(
+            |c| match c.is_ascii_alphanumeric() || c == '_' || c == '-' {
+                true => c,
+                false => '_',
+            },
+        )
+        .collect()
 }
 
 /// A call's cut streams once kept: those the store keeps, and the files
@@ -8160,6 +8200,7 @@ mod tests {
             None,
             registry.place(),
             started,
+            None,
         ));
         running.await.unwrap();
         assert!(!registry.admits());

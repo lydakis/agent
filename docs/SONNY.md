@@ -1055,13 +1055,16 @@ script runs in QuickJS with no files, network or timers, at most 256 MB and
 10 minutes, four at once in the tool host and sixteen alive (more wait
 their turn), and returns
 at most 10,000 tokens, longer output keeping its start and end and saving
-the whole to a file; saved outputs are kept a week. A first
+the whole to a file, written as the script prints, up to 1 GB, the result
+saying when the file holds less and why (its owner's alone); saved outputs
+are kept a week. A first
 line such as
 `// @exec: {"max_output_tokens": 1000, "timeout_ms": 60000}` sets those.
 Its time counts from the call: waiting for a place and starting servers
 to list their tools spend it. What lives outside its 256 MB is bounded as
-it runs: its output past 1 MB keeps its first half and its latest, as
-Codex keeps a command's; eight of its calls are in flight at once, and a
+it runs: memory keeps only the output's budget, at most 1 MB, its first
+half and its latest, as Codex keeps a command's, while the file gets every
+byte; eight of its calls are in flight at once, and a
 result over 16 MB is refused, as rmcp refuses such a message. Two tools
 whose identifiers would be the same (`my-server` and `my_server`'s
 `search`) are neither on `tools`, the description saying why.
