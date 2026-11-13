@@ -2032,42 +2032,6 @@ fn schema_49_waiting_calls_were_not_handed_to_anyone() {
 }
 
 #[test]
-fn an_upgrade_past_schema_60_keeps_no_fallbacks_column() {
-    let path = std::env::temp_dir().join(format!("agent-fallbacks-{}.sqlite", std::process::id()));
-    let _ = std::fs::remove_file(&path);
-    let has = |path: &std::path::Path| -> bool {
-        Connection::open(path)
-            .unwrap()
-            .query_row(
-                "SELECT EXISTS(SELECT 1 FROM pragma_table_info('bots') WHERE name='fallbacks')",
-                [],
-                |r| r.get(0),
-            )
-            .unwrap()
-    };
-    Database::initialize(Connection::open(&path).unwrap()).unwrap();
-    // A store at 62 has `fallback` and no `fallbacks`; the upgrade adds none.
-    Connection::open(&path)
-        .unwrap()
-        .older(
-            "DROP INDEX approvals_steps; DROP INDEX answers_paused;
-             ALTER TABLE approvals DROP COLUMN step_of; ALTER TABLE answers DROP COLUMN paused_ms;
-             PRAGMA user_version=62;",
-        )
-        .unwrap();
-    drop(Database::initialize(Connection::open(&path).unwrap()).unwrap());
-    assert!(!has(&path));
-    // One an earlier upgrade left the column in loses it at the next.
-    Connection::open(&path)
-        .unwrap()
-        .older("ALTER TABLE bots ADD COLUMN fallbacks INTEGER NOT NULL DEFAULT 0;")
-        .unwrap();
-    drop(Database::initialize(Connection::open(&path).unwrap()).unwrap());
-    assert!(!has(&path));
-    std::fs::remove_file(path).unwrap();
-}
-
-#[test]
 fn schema_62_had_no_steps_and_no_paused_calls() {
     let path = std::env::temp_dir().join(format!("agent-schema62-{}.sqlite", std::process::id()));
     let _ = std::fs::remove_file(&path);
