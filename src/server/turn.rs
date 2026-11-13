@@ -15,7 +15,7 @@ use agent_runtime::{
     Error, Result,
     codec::split_model,
     fail,
-    provider::{Chain, Delta, Items, Provider, Report, Request as ModelRequest, ToolCall},
+    provider::{Asker, Chain, Delta, Items, Provider, Report, Request as ModelRequest, ToolCall},
     rules::Ruling,
     sandbox::Policy,
     store::{
@@ -3953,6 +3953,12 @@ impl Turn {
                         // the cache the bot's calls write.
                         web_search: searches(record),
                         fallback_credit: fallback.as_ref().and_then(|to| to.credit.as_deref()),
+                        // The turn's own call parks it on a full ramp, to
+                        // be woken when a place frees; one beside it waits.
+                        asker: match accounting.beside {
+                            true => Asker::Beside,
+                            false => Asker::Turn(self.bot.as_str(), self.turn),
+                        },
                         cache_key: Some(&cache_key),
                         items,
                         // A summary beside the turn's call keeps off the
