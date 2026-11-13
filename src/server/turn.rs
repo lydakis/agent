@@ -5811,7 +5811,7 @@ impl Turn {
         call_id: &str,
         command: String,
         workspace: PathBuf,
-        timeout_ms: u64,
+        timeout_ms: Option<u64>,
         environment: Vec<(String, String)>,
         sandbox: Option<Arc<Policy>>,
         outputs: Option<Outputs>,
@@ -8118,7 +8118,7 @@ mod tests {
         let busy = tokio::spawn(registry.foreground(
             "sleep 30".into(),
             dir.clone(),
-            60_000,
+            Some(60_000),
             Vec::new(),
             None,
             registry.place(),

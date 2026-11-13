@@ -120,7 +120,7 @@ impl Tool {
                 "properties":{"text":{"type":"string"}},"required":["text"],"additionalProperties":false}),
             ),
             Tool::Shell => (
-                "Run a noninteractive bash command (sh where bash is not installed) in the workspace, or in workdir when given (relative to the workspace unless absolute). stdout and stderr are returned separately; each is truncated to a head and tail beyond 64 KiB, with up to 1 MiB of it retained: past that, its first and last 512 KiB, and the command keeps running. Default timeout 120 s, maximum 600 s, or a day with background=true; a command that times out returns its output so far with timed_out. Every result reports wall_time_ms. Commands run with no terminal: TERM=dumb, NO_COLOR=1, and cat as the pager; AI_AGENT=agent tells tools an agent runs them. When the command returns or times out, every process it started is killed, so `cmd &` does not outlive it. With background=true the command is started and a proc handle is returned immediately; collect its result later with wait. If no wait collects it, its end comes as a message once no turn of yours runs: {\"finished\":{\"proc:N\":{how it ended}}}; wait on the handle reads the output. A steer that arrives while a command runs moves it to the background: the result is its proc handle with steered=true, and the command keeps running. A background command runs until it exits, times out, or the daemon stops. With detach=true the command starts in its own session and its pid is returned at once; nothing tracks it and only a daemon pause kills it, so it outlives the turn and the daemon. Its output is discarded unless the command redirects it to a file. With tty=true it runs in a terminal, for a REPL or a program that prompts: the result is what it wrote within yield_time_ms (default 1000) and, while it runs, a proc handle for write_stdin.",
+                "Run a noninteractive bash command (sh where bash is not installed) in the workspace, or in workdir when given (relative to the workspace unless absolute). stdout and stderr are returned separately; each is truncated to a head and tail beyond 64 KiB, with up to 1 MiB of it retained: past that, its first and last 512 KiB, and the command keeps running. Default timeout 120 s, maximum 600 s; with background=true there is no timeout unless timeout_ms sets one, of up to a day. A command that times out is killed and returns its output so far with timed_out. Every result reports wall_time_ms. Commands run with no terminal: TERM=dumb, NO_COLOR=1, and cat as the pager; AI_AGENT=agent tells tools an agent runs them. When the command returns or times out, every process it started is killed, so `cmd &` does not outlive it. With background=true the command is started and a proc handle is returned immediately; collect its result later with wait. If no wait collects it, its end comes as a message once no turn of yours runs: {\"finished\":{\"proc:N\":{how it ended}}}; wait on the handle reads the output. A steer that arrives while a command runs moves it to the background: the result is its proc handle with steered=true, and the command keeps running. A background command runs until it exits, its timeout_ms passes, kill=true on its handle stops it, or the daemon stops. With detach=true the command starts in its own session and its pid is returned at once; nothing tracks it and only a daemon pause kills it, so it outlives the turn and the daemon. Its output is discarded unless the command redirects it to a file. With tty=true it runs in a terminal, for a REPL or a program that prompts: the result is what it wrote within yield_time_ms (default 1000) and, while it runs, a proc handle for write_stdin.",
                 json!({"type":"object","properties":{"command":{"type":"string"},
                 "workdir":{"type":"string"},
                 "timeout_ms":{"type":"integer","minimum":1,"maximum":MAX_BACKGROUND_TIMEOUT_MS},
@@ -1043,7 +1043,9 @@ pub enum Prepared {
     /// against the turn's folder ([`Prepared::folder`]), as Codex's do.
     Shell {
         command: String,
-        timeout_ms: u64,
+        /// `None` runs it until it exits: a background command given no
+        /// `timeout_ms`, as Codex's unified exec runs one.
+        timeout_ms: Option<u64>,
         background: bool,
         workdir: Option<String>,
     },
@@ -1841,7 +1843,12 @@ impl Registry {
                 }
                 Prepared::Shell {
                     command: args.command,
-                    timeout_ms: args.timeout_ms.unwrap_or(DEFAULT_SHELL_TIMEOUT_MS),
+                    // A background command holds no turn, so only a timeout
+                    // its call names ends it, as Codex's unified exec does.
+                    timeout_ms: match args.background {
+                        true => args.timeout_ms,
+                        false => Some(args.timeout_ms.unwrap_or(DEFAULT_SHELL_TIMEOUT_MS)),
+                    },
                     background: args.background,
                     workdir,
                 }
@@ -2321,7 +2328,7 @@ impl Registry {
         &self,
         command: String,
         workspace: PathBuf,
-        timeout_ms: u64,
+        timeout_ms: Option<u64>,
         environment: Vec<(String, String)>,
         sandbox: Option<Arc<Policy>>,
         place: Place,
@@ -2345,7 +2352,7 @@ impl Registry {
                 shell(
                     &command,
                     &workspace,
-                    Duration::from_millis(timeout_ms),
+                    timeout_ms.map(Duration::from_millis),
                     &registry,
                     &environment,
                     sandbox.as_deref(),
@@ -2365,15 +2372,16 @@ impl Registry {
     /// acquired inside the task, so starting never blocks the caller; the
     /// result carries the same bounded preview and artifacts as a foreground
     /// command, or the error a foreground command would have returned.
-    /// `timeout_ms` bounds the command's running time; the place in line is
-    /// bounded by `queue`, not by the clock.
+    /// `timeout_ms` bounds the command's running time, and `None` leaves it
+    /// running until it exits, is killed or the daemon stops; the place in
+    /// line is bounded by `queue`, not by the clock.
     #[allow(clippy::too_many_arguments)]
     pub fn background(
         &self,
         stopper: Stopper,
         command: String,
         workspace: PathBuf,
-        timeout_ms: u64,
+        timeout_ms: Option<u64>,
         environment: Vec<(String, String)>,
         sandbox: Option<Arc<Policy>>,
         queued: Queued,
@@ -2400,7 +2408,7 @@ impl Registry {
                     shell(
                         &command,
                         &workspace,
-                        Duration::from_millis(timeout_ms),
+                        timeout_ms.map(Duration::from_millis),
                         &registry,
                         &environment,
                         sandbox.as_deref(),
@@ -3274,7 +3282,7 @@ const PIPES_END: Duration = Duration::from_millis(100);
 async fn shell(
     command: &str,
     workspace: &Path,
-    timeout: Duration,
+    timeout: Option<Duration>,
     registry: &Registry,
     environment: &[(String, String)],
     sandbox: Option<&Policy>,
@@ -3327,7 +3335,13 @@ async fn shell(
             )
         };
         tokio::pin!(reads);
-        let deadline = tokio::time::sleep(timeout);
+        // No timeout arms no timer: the command's own end is all it waits on.
+        let deadline = async {
+            match timeout {
+                Some(timeout) => tokio::time::sleep(timeout).await,
+                None => std::future::pending().await,
+            }
+        };
         tokio::pin!(deadline);
         // The command's own return ends it, not its pipes' end: a job it
         // left running holds them open for as long as it runs, and goes
@@ -3367,7 +3381,7 @@ async fn shell(
 async fn shell(
     _: &str,
     _: &Path,
-    _: Duration,
+    _: Option<Duration>,
     _: &Registry,
     _: &[(String, String)],
     _: Option<&Policy>,
@@ -3558,7 +3572,7 @@ mod tests {
             let run = tokio::spawn(registry.foreground(
                 command.into(),
                 dir.clone(),
-                60_000,
+                Some(60_000),
                 Vec::new(),
                 None,
                 place,
@@ -3759,6 +3773,62 @@ mod tests {
             redact("-----BEGIN PRIVATE KEY-----\r\nMIIE\r\n-----END PRIVATE KEY-----\r\n"),
             "-----BEGIN PRIVATE KEY-----\r\n[REDACTED]\n-----END PRIVATE KEY-----\r\n"
         );
+    }
+    /// A background command given no timeout_ms runs until it exits, as
+    /// Codex's unified exec runs one: no deadline is armed for it, so a
+    /// paused clock, which skips straight to the next deadline whenever the
+    /// runtime waits, still sees it finish. One whose call names a
+    /// timeout_ms, even a day, is killed at it and says timed_out, and a
+    /// foreground command keeps its 120 s default.
+    #[cfg(unix)]
+    #[tokio::test(start_paused = true)]
+    async fn a_background_command_without_a_timeout_runs_until_it_exits() {
+        let registry = Registry::new("shell").unwrap();
+        let run = |arguments: serde_json::Value, id: i64| {
+            let Ok(Prepared::Shell {
+                command,
+                timeout_ms,
+                background: true,
+                ..
+            }) = registry.prepare("shell", &arguments.to_string())
+            else {
+                panic!("{arguments} is not a background command");
+            };
+            let (sender, receiver) = tokio::sync::oneshot::channel();
+            registry.background(
+                registry.stopper(id),
+                command,
+                std::env::temp_dir(),
+                timeout_ms,
+                Vec::new(),
+                None,
+                registry.queue().unwrap(),
+                sender,
+            );
+            async move {
+                let outcome = receiver.await.unwrap().unwrap();
+                serde_json::from_str::<serde_json::Value>(&outcome.output).unwrap()
+            }
+        };
+        let command = "sleep 0.2; echo done";
+        let ran = run(json!({"command":command,"background":true}), 1).await;
+        assert_eq!(ran["stdout"], "done\n", "{ran}");
+        assert_eq!(ran["exit_code"], 0);
+        assert!(ran.get("timed_out").is_none(), "{ran}");
+        let bounded =
+            json!({"command":command,"background":true,"timeout_ms":MAX_BACKGROUND_TIMEOUT_MS});
+        let cut = run(bounded, 2).await;
+        assert_eq!(cut["timed_out"], true, "{cut}");
+        assert_eq!(cut["success"], false);
+        assert!(cut["exit_code"].is_null());
+        assert!(matches!(
+            registry.prepare("shell", r#"{"command":"true"}"#),
+            Ok(Prepared::Shell {
+                timeout_ms: Some(DEFAULT_SHELL_TIMEOUT_MS),
+                background: false,
+                ..
+            })
+        ));
     }
     #[cfg(unix)]
     #[test]
