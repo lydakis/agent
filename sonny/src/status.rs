@@ -49,8 +49,11 @@ pub struct Row {
 /// Where a task stands, as `/status` groups the tasks, in its order.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Group {
-    /// Waiting on the person's approval or answer, or failed.
+    /// Waiting on the person's approval or answer, or held on a cause
+    /// they can fix.
     NeedsYou,
+    /// Its last turn failed: it asks nothing, but it stopped short.
+    Failed,
     /// A turn running, queued, rate limited, or waiting on other tasks.
     Working,
     /// Its turn ended, stopped, or never started, with nothing open; a
@@ -63,11 +66,12 @@ pub enum Group {
 }
 
 impl Group {
-    /// The group as a word for scripts: `needs_you`, `working`, `idle`,
-    /// `done`.
+    /// The group as a word for scripts: `needs_you`, `failed`, `working`,
+    /// `idle`, `done`.
     pub fn key(self) -> &'static str {
         match self {
             Group::NeedsYou => "needs_you",
+            Group::Failed => "failed",
             Group::Working => "working",
             Group::Idle => "idle",
             Group::Done => "done",
@@ -80,6 +84,7 @@ impl Group {
         match self {
             Group::NeedsYou if n == 1 => "needs you",
             Group::NeedsYou => "need you",
+            Group::Failed => "failed",
             Group::Working => "working",
             Group::Idle => "idle",
             Group::Done => "done",
@@ -89,6 +94,7 @@ impl Group {
     fn heading(self) -> &'static str {
         match self {
             Group::NeedsYou => "Needs you",
+            Group::Failed => "Failed",
             Group::Working => "Working",
             Group::Idle => "Idle",
             Group::Done => "Done",
@@ -102,10 +108,11 @@ impl Group {
 pub fn group(state: &str, running: bool, asking: bool, done: bool) -> Group {
     match state {
         _ if done && !running => Group::Done,
-        "needs you" | "failed" => Group::NeedsYou,
+        "needs you" => Group::NeedsYou,
         // Held on a cause the person can fix: theirs to set right.
         _ if state.starts_with(HELD) => Group::NeedsYou,
         _ if asking => Group::NeedsYou,
+        "failed" => Group::Failed,
         _ if running => Group::Working,
         _ => Group::Idle,
     }
@@ -268,9 +275,9 @@ fn listing(rows: &[Row]) -> Listing<'_> {
     let mut listed: Vec<&Row> = rows.iter().filter(|r| r.name == "lead").collect();
     for row in &tasks {
         match top(row) {
-            // One that needs the person is listed there too.
+            // One that needs the person or failed is listed there too.
             Some(parent) => {
-                if row.group == Group::NeedsYou {
+                if matches!(row.group, Group::NeedsYou | Group::Failed) {
                     listed.push(row);
                 }
                 helping.insert(row.bot.as_str());
@@ -287,10 +294,11 @@ fn listing(rows: &[Row]) -> Listing<'_> {
 }
 
 /// How many agents each of `/status`'s groups lists, as its head and its
-/// headings count them: the footer shows these same four.
+/// headings count them: the footer shows these same counts.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Counts {
     pub needs_you: usize,
+    pub failed: usize,
     pub working: usize,
     pub idle: usize,
     pub done: usize,
@@ -300,12 +308,22 @@ impl Counts {
     pub fn of(self, group: Group) -> usize {
         match group {
             Group::NeedsYou => self.needs_you,
+            Group::Failed => self.failed,
             Group::Working => self.working,
             Group::Idle => self.idle,
             Group::Done => self.done,
         }
     }
 }
+
+/// `/status`'s groups in the page's order.
+const GROUPS: [Group; 5] = [
+    Group::NeedsYou,
+    Group::Failed,
+    Group::Working,
+    Group::Idle,
+    Group::Done,
+];
 
 /// See [`Counts`].
 pub fn counts(rows: &[Row]) -> Counts {
@@ -316,6 +334,7 @@ fn tally(listed: &[&Row]) -> Counts {
     let n = |group| listed.iter().filter(|r| r.group == group).count();
     Counts {
         needs_you: n(Group::NeedsYou),
+        failed: n(Group::Failed),
         working: n(Group::Working),
         idle: n(Group::Idle),
         done: n(Group::Done),
@@ -348,7 +367,7 @@ pub fn card(
     // order: the agents listed there, a task's helpers inside its own.
     let mut head = vec![Span::raw(project.to_owned()).bold()];
     let counted = tally(&listed);
-    for group in [Group::NeedsYou, Group::Working, Group::Idle, Group::Done] {
+    for group in GROUPS {
         let n = counted.of(group);
         if n > 0 {
             head.push(Span::raw(" · ").dim());
@@ -362,7 +381,7 @@ pub fn card(
         Details::Quiet => false,
     };
     let trackers = details != Details::Quiet;
-    for group in [Group::NeedsYou, Group::Working, Group::Idle, Group::Done] {
+    for group in GROUPS {
         let in_group: Vec<&&Row> = listed.iter().filter(|r| r.group == group).collect();
         if in_group.is_empty() {
             continue;
@@ -400,7 +419,7 @@ pub fn card(
                 helped.len(),
                 if helped.len() == 1 { "" } else { "s" }
             );
-            for state in [Group::NeedsYou, Group::Working] {
+            for state in [Group::NeedsYou, Group::Failed, Group::Working] {
                 let k = helped.iter().filter(|h| h.group == state).count();
                 if k > 0 {
                     said.push_str(&format!(", {k} {}", state.counted(k)));
@@ -426,13 +445,27 @@ pub fn card(
 
 /// Something broken around the agents, which `/status` says under its
 /// heading after a red `✗`: a companion that keeps restarting, turns held
-/// on a cause the person can fix, a temporary folder low on room. When all
-/// is well it says nothing.
+/// on a cause the person can fix, a temporary folder low on room, failures
+/// `/background` lists that the person has not seen. When all is well it
+/// says nothing.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Alert {
     pub said: String,
     /// Where to look, muted under it.
     pub detail: String,
+    /// The view a click on it opens, as a button link names it.
+    pub opens: Option<&'static str>,
+}
+
+/// The failures `/background` lists that the person has not seen there,
+/// `n` of them: the footer's `✗` counts them with the failed agents and
+/// opens `/status`, which says so and opens `/background` on a click.
+pub fn background_alert(n: usize) -> Option<Alert> {
+    (n > 0).then(|| Alert {
+        said: format!("{n} failed in the background"),
+        detail: "/background says what".to_owned(),
+        opens: Some("background"),
+    })
 }
 
 /// How long a companion's run must last to count as healthy, as the
@@ -472,6 +505,7 @@ pub fn companion_alerts(companions: &serde_json::Value, now_ms: u64, logs: &str)
                     if restarts == 1 { "" } else { "s" }
                 ),
                 detail: format!("its log: {logs}/{name}.log"),
+                opens: None,
             }
         })
         .collect()
@@ -508,6 +542,7 @@ pub fn temp_alerts(temp: &serde_json::Value) -> Vec<Alert> {
             Some(Alert {
                 said: format!("temp folder {path}: {left}"),
                 detail: String::new(),
+                opens: None,
             })
         })
         .collect()
@@ -600,6 +635,7 @@ pub fn held_alerts(listed: &serde_json::Value) -> Vec<Alert> {
                     }
                 ),
                 detail: fix,
+                opens: None,
             }
         })
         .collect()
@@ -628,7 +664,7 @@ pub fn alert_lines(alert: &Alert, width: usize) -> Vec<Line<'static>> {
 /// One agent's lines, after `indent`: its mark, name, state and time,
 /// at the right its code reviews, and with `trackers` what it follows,
 /// what runs for it and where its window is too; under it, with `details` or
-/// while it waits on the person, its latest step, and with `details` its
+/// while it waits on the person or failed, its latest step, and with `details` its
 /// model and profile too.
 fn row_lines(
     row: &Row,
@@ -707,7 +743,8 @@ fn row_lines(
             ));
         }
     }
-    if !row.latest.is_empty() && (details || row.group == Group::NeedsYou) {
+    let says = matches!(row.group, Group::NeedsYou | Group::Failed);
+    if !row.latest.is_empty() && (details || says) {
         // The agent's words, read as the Markdown they are.
         let line = Line::from(crate::transcript::inline(&row.latest, Default::default())).dim();
         out.extend(crate::transcript::capped(
@@ -853,7 +890,10 @@ mod tests {
         assert_eq!(group("needs you", true, false, false), Group::NeedsYou);
         // A question asked ends the turn; it still needs the person.
         assert_eq!(group("idle", false, true, false), Group::NeedsYou);
-        assert_eq!(group("failed", false, false, false), Group::NeedsYou);
+        // A failed turn asks nothing: a group of its own, unless its
+        // agent also asks something.
+        assert_eq!(group("failed", false, false, false), Group::Failed);
+        assert_eq!(group("failed", false, true, false), Group::NeedsYou);
         // A pull request shows on the row, not as a group of its own.
         assert_eq!(group("idle", false, false, false), Group::Idle);
         assert_eq!(group("stopped", false, false, false), Group::Idle);
@@ -1017,6 +1057,54 @@ mod tests {
         let lines = text(&opened);
         assert_eq!(lines[lines.len() - 2], "Done · 1 ▾");
         assert_eq!(lines[lines.len() - 1], " ✓ old done · took 42s");
+    }
+
+    #[test]
+    fn what_failed_is_its_own_group_after_what_needs_you() {
+        let rows = [
+            row("lead", "working", Group::Working),
+            Row {
+                latest: "asks: staging or prod?".into(),
+                ..row("ask", "needs you", Group::NeedsYou)
+            },
+            Row {
+                latest: "provider_failed: login expired".into(),
+                ..row("broke", "failed", Group::Failed)
+            },
+            Row {
+                maker: "calc.broke".into(),
+                ..row("helper", "failed", Group::Failed)
+            },
+        ];
+        let card = card("calc", &rows, 80, &[], Details::Quiet, &[]);
+        assert_eq!(
+            text(&card),
+            [
+                "calc · 1 needs you · 2 failed · 1 working",
+                "",
+                "Needs you · 1",
+                " ? ask needs you · took 42s",
+                "   └ asks: staging or prod?",
+                "",
+                "Failed · 2",
+                " ✗ broke failed · took 42s",
+                "   └ provider_failed: login expired",
+                "   ▸ 1 helper, 1 failed",
+                " ✗ helper failed · took 42s",
+                "",
+                "Working · 1",
+                " ● lead working · 42s",
+            ]
+        );
+        let counted = counts(&rows);
+        assert_eq!(
+            (counted.needs_you, counted.failed, counted.working),
+            (1, 2, 1)
+        );
+        assert_eq!(background_alert(0), None);
+        let alert = background_alert(2).unwrap();
+        assert_eq!(alert.said, "2 failed in the background");
+        assert_eq!(alert.opens, Some("background"));
     }
 
     #[test]
