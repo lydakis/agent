@@ -2774,6 +2774,23 @@ fn validate_provider(
     Ok(())
 }
 
+/// A turn's run, with a panic in it ending that turn alone, failed with
+/// `turn_panicked` and the panic's words, rather than the daemon and every
+/// turn running in it. The turn's own state unwinds with it, and its finish
+/// commits as any failed turn's does.
+async fn contained(run: impl Future<Output = turn::Exit>) -> turn::Exit {
+    use futures_util::FutureExt;
+    match std::panic::AssertUnwindSafe(run).catch_unwind().await {
+        Ok(exit) => exit,
+        Err(panic) => {
+            let said = (panic.downcast_ref::<&str>().copied())
+                .or_else(|| panic.downcast_ref::<String>().map(String::as_str))
+                .unwrap_or("a panic with no message");
+            turn::Exit::Finished(Some(Error::with("turn_panicked", said)))
+        }
+    }
+}
+
 impl Service {
     /// Hold a request that came in on sandboxed bot `caller`'s own socket to
     /// what that bot may do: use and read bots, and make bots that inherit
@@ -3852,7 +3869,7 @@ impl Service {
             // interrupt cannot mistake this task for an unreaped parked turn.
             let mut cancelled = cancelled;
             task.enter_ahead().await;
-            let mut exit = task.execute(cancelled.clone()).await;
+            let mut exit = contained(task.execute(cancelled.clone())).await;
             task.leave_ahead().await;
             // An interrupt that came as the turn parked, after it last
             // looked, still ends it: its requester was told it would.
@@ -6422,6 +6439,44 @@ mod tests {
         );
         assert!(change(json!({"settings": {"rules": {}}})).rules_only());
         assert!(!change(json!({"settings": {"rules": {}, "speed": null}})).rules_only());
+    }
+
+    /// A panic in a turn fails that turn with its words; the daemon goes on.
+    #[tokio::test]
+    async fn a_panicking_turn_fails_alone() {
+        let crashed = |exit: turn::Exit| match exit {
+            turn::Exit::Finished(Some(error)) => (error.code, error.detail),
+            _ => panic!("the turn did not finish"),
+        };
+        let said = contained(async {
+            if true {
+                panic!("no entry found for key");
+            }
+            turn::Exit::Parked
+        })
+        .await;
+        assert_eq!(
+            crashed(said),
+            (
+                "turn_panicked".into(),
+                Some("no entry found for key".into())
+            )
+        );
+        let formatted = contained(async {
+            if true {
+                panic!("index {} out of range", 3);
+            }
+            turn::Exit::Parked
+        })
+        .await;
+        assert_eq!(
+            crashed(formatted).1.as_deref(),
+            Some("index 3 out of range")
+        );
+        assert!(matches!(
+            contained(async { turn::Exit::Parked }).await,
+            turn::Exit::Parked
+        ));
     }
 
     #[test]

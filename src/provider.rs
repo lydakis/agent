@@ -88,10 +88,15 @@ pub fn refused_mid_stream(error: &Error) -> bool {
 }
 
 /// Whether a reply was cut short by the model's own output cap, which a turn
-/// drops and goes on past.
+/// drops and goes on past. Other incomplete answers carry facts too (the
+/// provider's request id) without `limit`, so it is looked up, not indexed.
 pub fn was_cut_short(error: &Error) -> bool {
     error.code == "provider_incomplete"
-        && (error.facts.as_ref()).is_some_and(|facts| facts["limit"] == "max_tokens")
+        && (error.facts.as_ref()).is_some_and(|facts| {
+            facts
+                .get("limit")
+                .is_some_and(|limit| limit == "max_tokens")
+        })
 }
 
 /// JSON-encoded bytes one tool call id may take. Real ids run tens of bytes;
@@ -3554,8 +3559,10 @@ mod tests {
     }
 
     /// The provider's id for a request is kept with the failure it ended
-    /// in: a refusal inside a 200's stream, an HTTP error, and a 200 that
-    /// is not a stream.
+    /// in: a refusal inside a 200's stream, an HTTP error, a 200 that is not
+    /// a stream, and a stream that ends incomplete. That last one's facts
+    /// hold the id but no `limit`, and telling whether the output cap cut it
+    /// must not take `limit` as given: 0.9.4's daemon panicked on it.
     #[tokio::test]
     async fn a_failure_keeps_the_provider_s_request_id() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -3581,6 +3588,14 @@ mod tests {
                     "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\n",
                     "x-request-id: req_013\r\ncontent-length: 2\r\nconnection: close\r\n\r\n{}",
                 ),
+                concat!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\n",
+                    "request-id: req_014\r\nconnection: close\r\n\r\n",
+                    "event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":",
+                    "{\"stop_reason\":\"model_context_window_exceeded\"},",
+                    "\"usage\":{\"output_tokens\":0}}\n\n",
+                    "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
+                ),
             ];
             for reply in replies {
                 let (mut socket, _) = listener.accept().await.unwrap();
@@ -3597,7 +3612,7 @@ mod tests {
             Provider::new(Transport::new(0, 1).unwrap(), Family::Anthropic, &url, None).unwrap();
         let tools = none();
         let mut errors = Vec::new();
-        for _ in 0..3 {
+        for _ in 0..4 {
             let request = Request {
                 model: "m",
                 instructions: "",
@@ -3636,6 +3651,18 @@ mod tests {
             errors[2].facts.as_ref().unwrap()["provider_request_id"],
             "req_013"
         );
+        assert_eq!(errors[3].code, "provider_incomplete");
+        assert_eq!(
+            Value::Object(*errors[3].facts.clone().unwrap()),
+            json!({"provider_request_id":"req_014"})
+        );
+        assert!(!was_cut_short(&errors[3]));
+        // The output cap's own cut keeps its id and still reads as one.
+        let capped = with_request(
+            cut_short("max_tokens", 9, None),
+            Some(&reqwest::header::HeaderValue::from_static("req_015")),
+        );
+        assert!(was_cut_short(&capped));
     }
 
     #[test]
