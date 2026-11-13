@@ -7119,6 +7119,9 @@ impl App {
             *events = fresh;
             self.down = false;
             self.notice = None;
+            // What happened while away is not known turn by turn: a kept
+            // done window stays open from here on, as any other.
+            self.kept.showing = false;
             self.context = caught.context.or(self.context);
             self.window = caught.window.or(self.window);
             self.compacted = caught.compacted.clone().or(self.compacted.take());
