@@ -1408,7 +1408,30 @@ class AutoApproverTests(ModelFixture):
         self.assertIn('must not attempt to achieve the same outcome', reason)
         state = self.judge.requests.get(timeout=5)['state']
         self.assertEqual(state['earlier_prompts'], [{'by': 'person', 'text': 'shell:printf safe > out'}])
+        # Shown there, the person's words are not shown twice.
+        self.assertNotIn('persons_words', state)
         self.assertEqual(self.judge.requests.qsize(), 0)
+
+    def test_the_persons_words_stay_in_view_behind_a_clients_notes(self):
+        # Notes a client sends fill the earlier prompts' share; the
+        # person's own words before them have a share of their own, as
+        # Codex keeps every message its person wrote.
+        daemon = self.daemon()
+        self.approver(daemon)
+        rule = daemon.request('submit', bot='Bob', request_id='rule',
+                              prompt='answer coworkers yourself')['result']['message']
+        self.assertEqual(daemon.finished(rule)['data']['status'], 'completed')
+        for n in range(4):
+            note = daemon.request('submit', bot='Bob', request_id=f'note-{n}', origin='lookout',
+                                  prompt='n' * (20 * 1024))['result']['message']
+            self.assertEqual(daemon.finished(note)['data']['status'], 'completed')
+        turn = daemon.request('submit', bot='Bob', request_id='send',
+                              prompt='shell:printf DANGER')['result']['message']
+        self.assertEqual(daemon.finished(turn)['data']['status'], 'completed')
+        state = self.judge.requests.get(timeout=5)['state']
+        self.assertTrue(all(p['by'] == 'model' for p in state['earlier_prompts']), state['earlier_prompts'])
+        self.assertEqual(state['persons_words'], [{'text': 'answer coworkers yourself'}])
+        self.assertNotIn('persons_words_cut', state)
 
     def test_a_model_the_daemon_serves_judges(self):
         asked = queue.Queue()
