@@ -4624,8 +4624,8 @@ mod tests {
         // file still named.
         registry
             .credentials
-            .redact_also(&["password".to_owned()], &[]);
-        let secrets = "for i in $(seq 1 1200); do printf 'password=a%01000d\\n' $i; done";
+            .redact_also(&["sesame".to_owned()], &[]);
+        let secrets = "for i in $(seq 1 1200); do printf 'sesame=a%01000d\\n' $i; done";
         let outcome = registry
             .foreground(
                 secrets.into(),
@@ -4643,7 +4643,7 @@ mod tests {
         let shown = value["stdout"].as_str().unwrap();
         assert!(shown.len() < PREVIEW_BYTES, "{}", shown.len());
         assert!(
-            shown.starts_with("password=[REDACTED]\n"),
+            shown.starts_with("sesame=[REDACTED]\n"),
             "{}",
             &shown[..60]
         );
@@ -4653,7 +4653,7 @@ mod tests {
             panic!("{:?}", &outcome.files[..]);
         };
         let whole = std::fs::read_to_string(file).unwrap();
-        assert_eq!(whole, "password=[REDACTED]\n".repeat(1200));
+        assert_eq!(whole, "sesame=[REDACTED]\n".repeat(1200));
         let file = file.clone();
         drop(outcome);
         for _ in 0..100 {
