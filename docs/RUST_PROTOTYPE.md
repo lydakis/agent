@@ -3282,12 +3282,36 @@ model can act on it; the service wakes a parked one then from its own
 schedule, so a waiting call costs a row and no timer. A later call's gate that
 lapses first ends the wait as `tool_unserved` and the turn as it ends one
 waiting on a verdict. A message that joins the turn lifts the wait as it
-lifts a verdict's (see [tool approval](#tool-approval)): the call becomes a
+lifts a verdict's (see [tool approval](#tool-approval)) when the tool is
+declared with `lift` (protocol 70, below) or a step of the call waits on a
+gate: the call becomes a
 `proc:` handle answered `"waits_for":"answer"`, its client still lists,
 takes and answers it, and the answer ends the command, told as
-`{"answer": TEXT}`. An interrupt ends the call as cancelled, like any
+`{"answer": TEXT}`. Any other call keeps the message for its answer. An interrupt ends the call as cancelled, like any
 running call. A call that does not fit its
 parameters is refused at once and waits for no answer.
+
+Protocol version 70 adds `lift` to a tool a client answers (only with
+`answered_by`; `invalid_declare` otherwise), default `false` and reported
+only when `true`. Protocol 64 let a steer lift every call waiting for its
+client's answer, so a client's quick tools (a note, a memory, a reaction)
+came back as `proc:` handles whenever a message arrived, each needing a
+`wait` call, and a refusal could reach the agent only after it had moved
+on. Codex never moves a running tool aside for a new message: the message
+waits for the call to return, and a long command yields on its own. Now a
+steer lifts a call its client answers only when the tool is declared with
+`"lift": true`, a tool whose calls may run for minutes or wait on a person
+(Sonny marks `exec`, `browser` and `desktop`), and only once the call has
+waited the 250 ms grace a foreground `shell` command gets; or, at once,
+when a step of the call waits on a gate, since that is a wait for a
+verdict, which a steer always lifts. Any other call is answered first and
+the steer joins the turn at the next boundary. A call of a tool that
+lifts holds live for the whole grace, whatever the bot's
+`approval_hold_ms`, so it never parks inside it and is lifted live rather
+than parked and woken again; parked, a steer resumes the turn only when the call
+lifts, and a step that starts waiting on a gate while a steer waits wakes
+it (or the live turn) then. Calls waiting for their approval, and `shell`
+commands, are lifted as before.
 
 Protocol version 22 lets a declared tool take free-form text, as
 `apply_patch` does: a tool declared with `grammar`, a Lark grammar its
@@ -3419,9 +3443,9 @@ keeping the shorter expiry. A bot carries at most 8 gates: a `create` or
   and resumes the turn only if it parked on that call and the call is now
   decided; a verdict for a call after a `wait` waits in the store.
 - **A message lifts the wait** (protocol 64, schema 91). A steer that
-  joins the turn while a call waits for its verdict, held live (after the
-  same 250 ms grace a foreground `shell` gets) or parked, wakes the turn
-  and lifts the call: one commit writes a `processes` row for it, gives
+  joins the turn while a call waits for its verdict, held live or parked,
+  wakes the turn and lifts the call (a call its client answers only as
+  protocol 70 says, under [answered tools](#declared-tools)): one commit writes a `processes` row for it, gives
   its request `process` (an indexed column), and answers the call with
   `{"handle":"proc:N","background":true,"steered":true,"waits_for":"approval"}`,
   so the round goes on and the turn reads the message. `call_lifted`

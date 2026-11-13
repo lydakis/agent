@@ -183,9 +183,12 @@ tries its held turns at once.
   once with its unresolved handles pending (still valid) and `steered: true`,
   and a foreground `shell` command still running 250 ms after the steer
   moves to the background and returns its `proc:` handle, as does a call
-  waiting for its approval or its client's answer, which waits on past the
-  turn and reports back as a background command does. `queue`
-  deliveries leave both alone.
+  waiting for its approval, which waits on past the turn and reports back
+  as a background command does. A call its client answers is lifted the
+  same way only when its tool is declared with `lift` (and has waited
+  250 ms) or a step of it waits for approval; any other is answered first,
+  as Codex lets a running tool return, and the steer joins the turn
+  right after. `queue` deliveries leave all of these alone.
   A steer with an explicit workspace or model that differs from the running
   turn stays queued and runs separately with those choices.
   `attach` adds a message that needs no reply to the bot's next model call,
