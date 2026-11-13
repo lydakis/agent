@@ -134,7 +134,7 @@ pub fn tool() -> Value {
                 "markdown": {"type": "string", "maxLength": NOTE_BYTES,
                     "description": "The note, as Markdown."},
                 "template": {"type": "string",
-                    "description": "Or Markdown with Jinja blanks Sonny keeps filled: source('name').latest, file('path'), tasks(), task('name'), now(), |ago, |time, |fromjson."},
+                    "description": "Or Markdown with Jinja blanks Sonny keeps filled: source('name').latest/.topics, file('path'), tasks(), task('name'), now(), |ago, |time, |fromjson."},
                 "file": {"type": "string", "minLength": 1,
                     "description": "Or a file to show, absolute or from your folder."},
                 "from": {"type": "string", "pattern": "^[A-Za-z0-9._-]{1,128}/[a-z0-9][a-z0-9-]{0,39}$",

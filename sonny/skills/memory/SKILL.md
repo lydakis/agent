@@ -144,8 +144,9 @@ fact's text and description templates, Markdown with blanks as Jinja
 writes them:
 
 - `source('NAME').latest.text`, `.at` and `.events` (newest first): what
-  one of the person's sources printed lately; `.up` and `.down_since`
-  while it is down
+  one of the person's sources printed lately; `.topics`: each topic's
+  newest event however old, such as each pull request's last word;
+  `.up` and `.down_since` while it is down
 - `file('PATH')`: a file in your folder, `| fromjson` making JSON fields
   of it
 - `now()`, and `| ago` and `| time` for a time in seconds

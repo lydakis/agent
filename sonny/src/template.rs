@@ -21,6 +21,8 @@ const FUEL: u64 = 100_000;
 const DEPTH: usize = 50;
 /// The most events a source's blank holds, newest first.
 const EVENTS: usize = 50;
+/// The most topics a source's blank holds, each its newest event.
+const TOPICS: usize = 200;
 /// The most a render writes, cut on a character's edge.
 const OUTPUT: usize = 64 * 1024;
 
@@ -126,26 +128,31 @@ const TASKS: &str = "tasks() and task() fill margin notes only: a fact outlives 
 
 /// The sources `template` names by a literal, `source('NAME')`, and
 /// whether it calls `tasks()` or `task()`, in its blanks and tags alone:
-/// text outside them, `{% raw %}` blocks and comments are words.
+/// text outside them, `{% raw %}` blocks, comments and quoted words are
+/// words.
 fn named(template: &str) -> (Vec<String>, bool) {
     let (mut sources, mut tasks) = (Vec::new(), false);
     let mut rest = template;
     let mut raw = false;
-    while let Some(at) = rest.find(['{']) {
+    while let Some(at) = rest.find('{') {
         let after = &rest[at..];
-        let close = match after.get(..2) {
-            Some("{{") => "}}",
-            Some("{%") => "%}",
+        let (close, quoted) = match after.get(..2) {
+            Some("{{") if !raw => ("}}", true),
+            Some("{%") => ("%}", true),
+            Some("{#") if !raw => ("#}", false),
             _ => {
                 rest = &after[1..];
                 continue;
             }
         };
-        let Some(end) = after[2..].find(close) else {
+        let Some(end) = closing(&after[2..], close, quoted) else {
             break;
         };
         let code = &after[2..2 + end];
         rest = &after[2 + end + 2..];
+        if close == "#}" {
+            continue;
+        }
         let tag = code.trim_matches(|c: char| c == '-' || c == '+' || c.is_whitespace());
         if close == "%}" && (tag == "raw" || tag == "endraw") {
             raw = tag == "raw";
@@ -154,31 +161,79 @@ fn named(template: &str) -> (Vec<String>, bool) {
         if raw {
             continue;
         }
-        for (i, _) in code.match_indices('(') {
-            let before = &code[..i];
-            let word_at = before
-                .rfind(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
-                .map_or(0, |at| at + 1);
-            let word = &before[word_at..];
-            // A global's call, not an attribute's.
-            if before[..word_at].trim_end().ends_with('.') {
-                continue;
-            }
-            match word {
-                "tasks" | "task" => tasks = true,
-                "source" => {
-                    let arg = code[i + 1..].trim_start();
-                    if let Some(quote) = arg.chars().next().filter(|c| *c == '\'' || *c == '"')
-                        && let Some(end) = arg[1..].find(quote)
-                    {
-                        sources.push(arg[1..1 + end].to_owned());
-                    }
-                }
-                _ => {}
-            }
-        }
+        calls(code, |name, arg| match name {
+            "tasks" | "task" => tasks = true,
+            "source" => sources.extend(arg.map(str::to_owned)),
+            _ => {}
+        });
     }
     (sources, tasks)
+}
+
+/// Where `close` first ends `code`, outside quotes when `quoted`.
+fn closing(code: &str, close: &str, quoted: bool) -> Option<usize> {
+    if !quoted {
+        return code.find(close);
+    }
+    let mut chars = code.char_indices();
+    while let Some((at, c)) = chars.next() {
+        match c {
+            '\'' | '"' => skip_quoted(&mut chars, c),
+            _ if code[at..].starts_with(close) => return Some(at),
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Past the end of a word quoted by `quote`, its escapes included.
+fn skip_quoted(chars: &mut std::str::CharIndices<'_>, quote: char) {
+    while let Some((_, c)) = chars.next() {
+        match c {
+            '\\' => _ = chars.next(),
+            _ if c == quote => break,
+            _ => {}
+        }
+    }
+}
+
+/// Each call of a global in the blank or tag `code`, by its name and its
+/// first argument when that is a plain quoted word: quoted words and
+/// attributes' calls (`x.task()`) are not calls of one.
+fn calls(code: &str, mut call: impl FnMut(&str, Option<&str>)) {
+    let mut chars = code.char_indices();
+    let mut attribute = false;
+    while let Some((at, c)) = chars.next() {
+        match c {
+            '\'' | '"' => {
+                skip_quoted(&mut chars, c);
+                attribute = false;
+            }
+            '.' => attribute = true,
+            c if c.is_alphabetic() || c == '_' => {
+                let end = code[at..]
+                    .find(|c: char| !(c.is_alphanumeric() || c == '_'))
+                    .map_or(code.len(), |len| at + len);
+                let after = code[end..].trim_start();
+                if !attribute && let Some(args) = after.strip_prefix('(') {
+                    call(&code[at..end], first_word(args.trim_start()));
+                }
+                attribute = false;
+                for _ in code[at + c.len_utf8()..end].chars() {
+                    chars.next();
+                }
+            }
+            c if c.is_whitespace() => {}
+            _ => attribute = false,
+        }
+    }
+}
+
+/// The quoted word `args` starts with, when it has no escapes.
+fn first_word(args: &str) -> Option<&str> {
+    let quote = args.chars().next().filter(|c| *c == '\'' || *c == '"')?;
+    let word = &args[1..1 + args[1..].find(quote)?];
+    (!word.contains('\\')).then_some(word)
 }
 
 /// Why a blank cannot read `name`: no source of that name is set up.
@@ -308,6 +363,7 @@ fn blanks(env: &mut Environment<'static>, data: &Data, reads: &Arc<Mutex<Reads>>
             ("down_since", log.down.map_or(Value::from(()), Value::from)),
             ("latest", log.events.first().map_or(Value::from(()), value)),
             ("events", log.events.iter().map(value).collect()),
+            ("topics", log.topics.iter().map(value).collect()),
         ];
         Ok(Value::from_pairs(fields))
     });
@@ -431,6 +487,9 @@ fn recent_file(store: &Path, name: &str) -> PathBuf {
 struct Log {
     /// Newest first, as blanks give them.
     events: Vec<Json>,
+    /// Each topic's newest event, newest first: the lookout keeps one for
+    /// each however old.
+    topics: Vec<Json>,
     /// When it started failing, in seconds since the epoch, while the
     /// lookout's newest word on it is that it is down.
     down: Option<i64>,
@@ -462,22 +521,30 @@ fn log(file: &Path) -> (Stamp, Arc<Log>) {
         .filter(|word| (word["id"].as_str()).is_some_and(|id| id.starts_with("lookout.down.")))
         .and_then(|word| word["since_ms"].as_u64().or(word["at_ms"].as_u64()))
         .map(|ms| (ms / 1000) as i64);
-    let events: Vec<Json> = kept()
-        .filter(|kept| kept["lookout"] != true)
-        .take(EVENTS)
-        .map(|kept| {
-            json!({
-                "text": kept["text"],
-                "id": kept["id"],
-                "topic": kept["topic"],
-                "from": kept["from"],
-                "url": kept["url"],
-                "at": kept["at_ms"].as_u64().map(|ms| ms / 1000),
-                "fields": kept["fields"],
-            })
+    let blank = |kept: &Json| {
+        json!({
+            "text": kept["text"],
+            "id": kept["id"],
+            "topic": kept["topic"],
+            "from": kept["from"],
+            "url": kept["url"],
+            "at": kept["at_ms"].as_u64().map(|ms| ms / 1000),
+            "fields": kept["fields"],
         })
+    };
+    let printed = || kept().filter(|kept| kept["lookout"] != true);
+    let events: Vec<Json> = printed().take(EVENTS).map(|kept| blank(&kept)).collect();
+    let mut seen = BTreeSet::new();
+    let topics: Vec<Json> = printed()
+        .filter(|kept| (kept["topic"].as_str()).is_some_and(|topic| seen.insert(topic.to_owned())))
+        .take(TOPICS)
+        .map(|kept| blank(&kept))
         .collect();
-    let log = Arc::new(Log { events, down });
+    let log = Arc::new(Log {
+        events,
+        topics,
+        down,
+    });
     cache.insert(file.to_owned(), (stamp, log.clone()));
     (stamp, log)
 }
@@ -560,6 +627,11 @@ mod tests {
         let words = "source('typo') and tasks() {% raw %}{{ source('typo') }}{% endraw %} \
             {{ file('prs.txt') | length }}";
         assert_eq!(named(words), (vec![], false));
+        // Nor are quoted words and comments, whatever their characters.
+        let quoted = "{{ file('tasks().txt') }}{# {{ source('missing') }} #}{{ file('café(1).txt') }}\
+            {{ \"}} source('x')\" }}{{ 'it\\'s tasks()' }}";
+        assert_eq!(named(quoted), (vec![], false));
+        assert_eq!(named("{{ \"}}\" ~ source('typo') }}"), (vec!["typo".to_owned()], false));
         assert_eq!(
             named("{{ x.task(1) }} {{- source( 'ci' ).latest -}}"),
             (vec!["ci".to_owned()], false)
@@ -601,6 +673,21 @@ mod tests {
             &data,
         );
         assert_eq!(text.unwrap(), "green at 2, 2 kept");
+        // Each topic's newest event, newest first.
+        let pr = |n: u64, state: &str, at: u64| {
+            json!({"source": "ci", "text": format!("#{n} {state}"), "topic": n.to_string(),
+                "fields": {"state": state}, "at_ms": at * 1000, "seq": 1})
+            .to_string()
+        };
+        let prs = [pr(1, "open", 1), pr(2, "open", 2), pr(1, "green", 3), pr(2, "merged", 4)];
+        std::fs::write(dir.join("ci.jsonl"), prs.join("\n") + "\n" + &log).unwrap();
+        let (text, _) = render(
+            "{% for pr in source('ci').topics if pr.fields.state != 'merged' %}{{ pr.text }} {% endfor %}\
+             {{ source('ci').topics | length }}",
+            &data,
+        );
+        assert_eq!(text.unwrap(), "#1 green 2");
+        std::fs::write(dir.join("ci.jsonl"), &log).unwrap();
         assert_eq!(reads.sources, BTreeSet::from(["ci".to_owned()]));
         assert!(reads.down.is_empty());
         // The lookout says it is down: the blank and what it read say so,

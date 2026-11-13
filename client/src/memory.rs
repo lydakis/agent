@@ -73,6 +73,10 @@ pub fn fill_with(fill: &'static dyn Fill) {
 /// The most a live fact's description fills to in an index's head: it
 /// stays one line, as every description is.
 const LIVE_LINE: usize = 300;
+/// The most of a live fact's fill a read gives, cut on a character's edge
+/// with how much more it filled to: beside the fact's own file, it fits
+/// a tool's answer.
+const FILLED: usize = 32 * 1024;
 
 /// `memory show|read|search|save|rm|index|check|changed|cleanup|schedule`,
 /// as `~/.agent/memory` runs it.
@@ -990,11 +994,23 @@ fn read(dir: &Path, folder: &Path, name: &str) -> Result<Value, String> {
             .map_or("", |(_, body)| body)
             .trim();
         match fill.fill(body, folder) {
-            Ok(filled) => found["filled"] = json!(filled),
+            Ok(filled) => found["filled"] = json!(cut_filled(filled)),
             Err(why) => found["unfilled"] = json!(why),
         }
     }
     Ok(found)
+}
+
+/// `filled`, at most [`FILLED`] bytes and a line saying what it cut.
+fn cut_filled(mut filled: String) -> String {
+    if filled.len() > FILLED {
+        let total = filled.len();
+        filled.truncate(filled.floor_char_boundary(FILLED));
+        filled.push_str(&format!(
+            "\n[cut: it filled to {total} bytes, {FILLED} shown]"
+        ));
+    }
+    filled
 }
 
 /// `index` with each live fact's description filled from `folder`, as an
@@ -2339,6 +2355,17 @@ mod tests {
             let name = folder.file_name().unwrap().to_string_lossy();
             Ok(template.replace("{{ x }}", &format!("{name}\n")))
         }
+    }
+
+    #[test]
+    fn a_fill_too_long_for_a_reply_is_cut_on_a_character_and_says_so() {
+        assert_eq!(cut_filled("short".into()), "short");
+        let long = "é".repeat(FILLED);
+        let cut = cut_filled(long.clone());
+        let (shown, said) = cut.rsplit_once('\n').unwrap();
+        assert_eq!(shown.len(), FILLED);
+        assert!(long.starts_with(shown));
+        assert_eq!(said, format!("[cut: it filled to {} bytes, {FILLED} shown]", long.len()));
     }
 
     #[test]

@@ -1904,7 +1904,9 @@ is Markdown with blanks, as Jinja writes them (MiniJinja), that Sonny
 fills and fills again whenever what they read changes, with no call from
 the agent and nothing more in its history: `source('ci').latest.text`
 and `.events` (what one of your sources printed lately, newest first;
-`.up` and `.down_since` while the lookout says it is down),
+`.topics`, each topic's newest event however old, such as each pull
+request's last word, which the lookout keeps for 200 topics; `.up` and
+`.down_since` while the lookout says it is down),
 `file('state.json')` (a file in its folder, `| fromjson` making JSON
 fields of it), `tasks()` and `task('NAME')` (where its tasks stand, as
 `/status` reads them), `now()`, and `| ago` and `| time` for a time in
