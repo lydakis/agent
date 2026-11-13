@@ -98,7 +98,12 @@ pacer, Sonny's windows and Sky, the lookout, approvals, and upgrades
 shares everything under `~/.agent` and `~/.agents`: settings, prices,
 logins, memory, the commons, automations and task folders. Run one for a
 build under test or an eval, on a store in a temporary folder, and stop it
-when done.
+when done. An `agent` command run from inside a bot's turn never starts a
+daemon on the store that turn runs on, which its shell inherits as
+`AGENT_STORE`, as it never replaces the daemon there: with that daemon
+down, it is `daemon_unavailable`, so a build of the bot's own never takes
+the person's store. On a `--store` of the bot's own it starts one as
+anyone would.
 
 The daemon's [limits](RUST_PROTOTYPE.md#limits) come from `[daemon]` in
 `~/.agent/config.toml` where the command line sets none, each a number or
