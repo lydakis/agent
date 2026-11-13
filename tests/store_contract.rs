@@ -3581,6 +3581,7 @@ fn schema_78_counts_a_call_left_unanswered_before_the_upgrade_as_taken() {
             expire_ms: None,
             grammar: None,
             steps: false,
+            lift: false,
             inherit: Inherit::All,
             kind: None,
         };
@@ -5187,6 +5188,7 @@ fn declared_tools_pass_to_created_bots_and_forks_and_a_forks_allow_narrows_them(
         expire_ms: None,
         grammar: None,
         steps: false,
+        lift: false,
         kind: None,
     };
     // The lead's own tool, which a bot it creates does not take.
@@ -5200,6 +5202,7 @@ fn declared_tools_pass_to_created_bots_and_forks_and_a_forks_allow_narrows_them(
         expire_ms: None,
         grammar: None,
         steps: false,
+        lift: false,
         kind: None,
     };
     let declared = [react.clone()];
@@ -5300,6 +5303,7 @@ fn a_tool_declared_for_some_generations_goes_that_far_down_and_no_further() {
         expire_ms: None,
         grammar: None,
         steps: false,
+        lift: false,
         kind: None,
     };
     let (lead, _) = db
@@ -5365,6 +5369,7 @@ fn a_call_is_taken_once_and_a_second_take_is_refused_so_it_never_runs_twice() {
         expire_ms: None,
         grammar: None,
         steps: false,
+        lift: false,
         inherit: Inherit::All,
         kind: None,
     };
@@ -5459,6 +5464,7 @@ fn waiting_calls_page_past_held_answers_and_an_answer_out_of_time_is_refused() {
         expire_ms: None,
         grammar: None,
         steps: false,
+        lift: false,
         inherit: Inherit::All,
         kind: None,
     };
@@ -5534,6 +5540,7 @@ fn a_parked_answer_s_pictures_are_stored_once_its_result_is() {
         expire_ms: None,
         grammar: None,
         steps: false,
+        lift: false,
         inherit: Inherit::All,
         kind: None,
     };
@@ -17328,6 +17335,7 @@ fn a_waiting_step_ended_in_a_group_that_fails_is_told_of_once_one_commits() {
         expire_ms: None,
         grammar: None,
         steps: true,
+        lift: false,
         inherit: Inherit::All,
         kind: None,
     };
@@ -18850,6 +18858,7 @@ fn stepping_turn(db: &mut Database, gated: bool) -> (i64, ToolCall) {
         expire_ms: None,
         grammar: None,
         steps: true,
+        lift: false,
         inherit: Inherit::All,
         kind: Some("mcp".into()),
     };
@@ -20235,6 +20244,7 @@ fn a_lifted_answered_call_takes_its_answer_or_is_stopped_and_outlives_a_restart(
         expire_ms: None,
         grammar: None,
         steps: false,
+        lift: false,
         inherit: Inherit::All,
         kind: None,
     };
@@ -20343,6 +20353,7 @@ fn a_lifted_answered_call_keeps_its_time_steps_listing_and_audit_row() {
         expire_ms: Some(600_000),
         grammar: None,
         steps: true,
+        lift: false,
         inherit: Inherit::All,
         kind: None,
     };

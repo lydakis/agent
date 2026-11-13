@@ -1247,6 +1247,9 @@ pub fn tool() -> Option<Value> {
         // The agent's gate judges the actions agent-browser asks to
         // confirm, not the call.
         "steps": true,
+        // A browser command may run for minutes, so a message for the agent lifts
+        // a call still running past the grace, as it lifts a command.
+        "lift": true,
     }))
 }
 
