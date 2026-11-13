@@ -229,11 +229,15 @@ fn calls(code: &str, mut call: impl FnMut(&str, Option<&str>)) {
     }
 }
 
-/// The quoted word `args` starts with, when it has no escapes.
+/// The quoted word `args` starts with, when it is the whole first
+/// argument and has no escapes.
 fn first_word(args: &str) -> Option<&str> {
     let quote = args.chars().next().filter(|c| *c == '\'' || *c == '"')?;
-    let word = &args[1..1 + args[1..].find(quote)?];
-    (!word.contains('\\')).then_some(word)
+    let end = 1 + args[1..].find(quote)?;
+    let word = &args[1..end];
+    // The whole argument, not the first part of a name built from parts.
+    let whole = args[end + 1..].trim_start().starts_with([')', ',']);
+    (whole && !word.contains('\\')).then_some(word)
 }
 
 /// Why a blank cannot read `name`: no source of that name is set up.
@@ -638,6 +642,11 @@ mod tests {
         assert_eq!(
             named("{{ x.task(1) }} {{- source( 'ci' ).latest -}}"),
             (vec!["ci".to_owned()], false)
+        );
+        // A name built from parts is left to the render.
+        assert_eq!(
+            named("{{ source('re' ~ 'lease').latest }}"),
+            (vec![], false)
         );
     }
 
