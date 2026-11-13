@@ -1535,6 +1535,7 @@ async fn a_terminal_takes_typed_input_and_reports_its_end() {
         sockets: Vec::new(),
         walled: Vec::new(),
         owned: Vec::new(),
+        daemons: Vec::new(),
     });
     let error = tools
         .write_stdin(1, 3, "x\n", None, false, Some(confined))
