@@ -3265,6 +3265,27 @@ struct Denial {
     reason: String,
 }
 
+/// A call waiting on the person as [`App::show_asked`] wrote it out:
+/// its rows, tagged [`screen::Tag::Request`] with `tag`, and enough to
+/// fold them to one row once it is answered, as Codex keeps only the
+/// decision of an approval it asked.
+struct Written {
+    tag: u64,
+    /// Whether a blank row before it is its own.
+    gap: bool,
+    rows: Vec<Line<'static>>,
+    name: String,
+    arguments: Value,
+    /// The agent whose call it is, when not this window's.
+    from: Option<String>,
+    /// What came of it, once heard.
+    decided: Option<transcript::Decided>,
+    /// Folded to its verdict: it waits no more.
+    folded: bool,
+    /// Folded, opened whole again by a click or Ctrl+O.
+    open: bool,
+}
+
 /// Calls alike, drawn as one: what they did, whom each did it to, and
 /// each one's own rows, shown under it while open.
 struct Fold {
@@ -3934,6 +3955,13 @@ struct App {
     /// and Enter on an empty composer brings them back. A later turn's
     /// call of the same id is another.
     calls_aside: std::collections::HashSet<(String, i64, String)>,
+    /// The calls waiting on the person written out here, by bot, turn and
+    /// call, folded once they wait no more.
+    written: HashMap<(String, i64, String), Written>,
+    /// How many were written, which numbers the next.
+    written_count: u64,
+    /// How many were kept at the last look for ones trimmed away.
+    written_kept: usize,
     /// The lead's open questions for the person, oldest first: its `ask`
     /// calls not yet answered, nor set aside, and its tasks' open ones,
     /// pinned here as they come ([`App::pin_task_asks`]).
@@ -5839,6 +5867,9 @@ impl App {
             raised: Vec::new(),
             raised_read: Default::default(),
             calls_aside: Default::default(),
+            written: HashMap::new(),
+            written_count: 0,
+            written_kept: 0,
             asks: Vec::new(),
             focus: None,
             aside: Vec::new(),
@@ -6252,6 +6283,13 @@ impl App {
                         fleet.zen = zen;
                         fleet.event(&event)
                     });
+                    // A call of an agent below, written out here, decided.
+                    if matches!(event["event"].as_str(), Some("tool_started" | "tool_completed"))
+                        && let Some(bot) = event["bot"].as_str().filter(|bot| *bot != self.bot)
+                    {
+                        let bot = bot.to_owned();
+                        self.heard_verdict(&bot, event["turn"].as_i64(), &event["data"]);
+                    }
                     if let Some(fleet) = &mut self.fleet
                         && !fleet.returned.is_empty()
                     {
@@ -7867,6 +7905,17 @@ impl App {
         if let Some(key) = button.strip_prefix("card/") {
             self.card_clicked(key);
         }
+        // A request folded to its verdict, opened whole or folded again.
+        if let Some(tag) = (button.strip_prefix("request/")).and_then(|tag| tag.parse::<u64>().ok())
+            && let Some(key) = (self.written.iter())
+                .find(|(_, written)| written.tag == tag && written.folded)
+                .map(|(key, _)| key.clone())
+        {
+            if let Some(written) = self.written.get_mut(&key) {
+                written.open = !written.open;
+            }
+            self.draw_written(&key);
+        }
         if let Some(command) = (button.strip_prefix("copy/")).and_then(|id| self.commands.get(id)) {
             term::copy(command);
             self.notice = Some("copied".into());
@@ -8485,7 +8534,18 @@ impl App {
         let opens = |fold: &Fold| transcript::unfolds(&fold.whats, &fold.calls);
         let open = self.folds.values().any(|fold| opens(fold) && !fold.open)
             || self.clusters.values().any(|cluster| !cluster.open)
-            || self.relayed.values().any(|relayed| relayed.text.is_none());
+            || self.relayed.values().any(|relayed| relayed.text.is_none())
+            || (self.written.values()).any(|written| written.folded && !written.open);
+        let written: Vec<(String, i64, String)> = (self.written.iter())
+            .filter(|(_, written)| written.folded && written.open != open)
+            .map(|(key, _)| key.clone())
+            .collect();
+        for key in written {
+            if let Some(written) = self.written.get_mut(&key) {
+                written.open = open;
+            }
+            self.draw_written(&key);
+        }
         let folds: Vec<usize> = (self.folds.iter())
             .filter(|(_, fold)| opens(fold))
             .map(|(at, _)| *at)
@@ -10266,6 +10326,10 @@ impl App {
                 let name = data["name"].as_str().unwrap_or("tool").to_owned();
                 let id = data["call_id"].as_str().unwrap_or("");
                 self.reviewing.remove(id);
+                // Started, it was allowed, here or anywhere: it waits no more.
+                let bot = self.bot.clone();
+                self.heard_verdict(&bot, turn, data);
+                self.approvals.retain(|call| call["call_id"] != id);
                 // A long call's event carries a preview; the call is kept whole.
                 let arguments = match data["arguments_truncated"] == true {
                     true => self.call(id).await.map(|(_, arguments)| arguments),
@@ -10316,7 +10380,10 @@ impl App {
                 if data["denied"] == true {
                     // It never ran: nothing it would have done follows.
                     shown.1 = true;
-                    if !self.words() {
+                    let bot = self.bot.clone();
+                    self.heard_verdict(&bot, turn, data);
+                    // One written out here says it where it was asked.
+                    if !self.words() && !self.folds_here(&bot, turn, id) {
                         self.commit_denied(&name, &arguments, &reason);
                     }
                     // The approver's, not the person's: `/retry` may
@@ -11440,6 +11507,25 @@ impl App {
                 return;
             }
             Err(error) => self.notice = Some(error.to_string()),
+            // Written out here, its copy folds to the verdict in place.
+            Ok(_)
+                if self.folds_here(
+                    &bot,
+                    call["turn"].as_i64(),
+                    call["call_id"].as_str().unwrap_or_default(),
+                ) =>
+            {
+                let decided = match decision {
+                    "allow" => transcript::Decided::Allowed {
+                        you: true,
+                        kept: kept.map(str::to_owned),
+                    },
+                    _ => transcript::Decided::Denied { you: true },
+                };
+                if let Some(written) = self.written.get_mut(&self.aside_key(&call)) {
+                    written.decided = Some(decided);
+                }
+            }
             Ok(_) if decision == "allow" => {
                 let name = call["name"].as_str().unwrap_or("tool");
                 let lines = transcript::allowed(
@@ -15370,6 +15456,8 @@ impl App {
         if self.asked.as_ref() == Some(&id) {
             return;
         }
+        let call = call.clone();
+        let call = &call;
         let name = call["name"].as_str().unwrap_or("tool").to_owned();
         let arguments = &call["arguments"];
         let what = arguments["command"]
@@ -15426,7 +15514,154 @@ impl App {
         // What the agent said before the call reads before it, a step as
         // the call's start would make it.
         self.end_live(Words::Step);
-        self.commit(lines);
+        // Written again, brought back after Esc: the copy above goes, so
+        // one call has one copy here, the one by the keys.
+        let key = self.aside_key(call);
+        let from = call["bot"]
+            .as_str()
+            .filter(|bot| *bot != self.bot)
+            .map(str::to_owned);
+        let arguments = arguments.clone();
+        if let Some(old) = self.written.remove(&key) {
+            self.flush();
+            (self.screen).replace_tagged(screen::Tag::Request(old.tag), Vec::new(), Vec::new());
+        }
+        self.forget_written();
+        let tag = self.written_count;
+        self.written_count += 1;
+        let gap = self.any_history;
+        let at = self.pending.len();
+        self.commit(lines.clone());
+        let mark = screen::Mark::Tag(screen::Tag::Request(tag));
+        (self.marks).extend((at..self.pending.len()).map(|row| (row, mark.clone())));
+        self.written.insert(
+            key,
+            Written {
+                tag,
+                gap,
+                rows: lines,
+                name,
+                arguments,
+                from,
+                decided: None,
+                folded: false,
+                open: false,
+            },
+        );
+    }
+
+    /// The calls written out here that wait on the person no more, folded
+    /// to their verdict in place, as Codex keeps only an approval's
+    /// decision: the hoisted copy in a lead's window and the call's own in
+    /// its agent's alike, whoever answered it and wherever.
+    fn fold_written(&mut self) {
+        if self.written.values().all(|written| written.folded) {
+            return;
+        }
+        let waiting: std::collections::HashSet<(String, i64, String)> =
+            (self.approvals.iter().chain(&self.raised))
+                .map(|call| self.aside_key(call))
+                .collect();
+        let done: Vec<(String, i64, String)> = (self.written.iter())
+            .filter(|(key, written)| !written.folded && !waiting.contains(*key))
+            .map(|(key, _)| key.clone())
+            .collect();
+        for key in done {
+            if let Some(written) = self.written.get_mut(&key) {
+                written.folded = true;
+            }
+            self.draw_written(&key);
+        }
+    }
+
+    /// A folded request drawn again where it is: its verdict, a click on
+    /// which opens the request whole under it, or folds it again.
+    fn draw_written(&mut self, key: &(String, i64, String)) {
+        let Some(written) = self.written.get(key) else {
+            return;
+        };
+        let decided = (written.decided.clone()).unwrap_or(transcript::Decided::Gone);
+        let line = transcript::decided(
+            &written.name,
+            &written.arguments,
+            written.from.as_deref(),
+            &decided,
+            &self.workspace,
+            self.width,
+        );
+        let mut rows = Vec::new();
+        if written.gap {
+            rows.push(Line::default());
+        }
+        let at = rows.len();
+        rows.push(line);
+        if written.open {
+            rows.extend(written.rows.iter().cloned());
+        }
+        let link = screen::Mark::Link(format!("{}request/{}", screen::BUTTON, written.tag));
+        let tag = screen::Tag::Request(written.tag);
+        self.flush();
+        if !self.screen.replace_tagged(tag, rows, vec![(at, link)]) {
+            // Trimmed away: nothing of it is left to fold.
+            self.written.remove(key);
+        }
+    }
+
+    /// What came of a call written out here, as an event of `bot`'s says
+    /// (its start, or its end refused): its verdicts, the person's first.
+    fn heard_verdict(&mut self, bot: &str, turn: Option<i64>, data: &Value) {
+        let key = (
+            bot.to_owned(),
+            turn.unwrap_or(-1),
+            data["call_id"].as_str().unwrap_or_default().to_owned(),
+        );
+        let Some(written) = self.written.get_mut(&key) else {
+            return;
+        };
+        if written.decided.is_some() {
+            return;
+        }
+        let verdicts = data["approvals"].as_array().cloned().unwrap_or_default();
+        let you = |verdict: &Value| verdict["by"] != "approver";
+        let by = |verdict: &Value| verdict["by"].as_str().is_some_and(|by| !by.is_empty());
+        written.decided = match verdicts.iter().find(|v| v["allow"] == false) {
+            Some(no) if by(no) => Some(transcript::Decided::Denied { you: you(no) }),
+            // Refused by no one: its time ran out.
+            Some(_) => Some(transcript::Decided::Lapsed),
+            None if data["denied"] == true => Some(transcript::Decided::Lapsed),
+            None => (verdicts.iter().filter(|v| v["allow"] == true))
+                .fold(None, |best: Option<bool>, v| {
+                    Some(best.unwrap_or(false) || you(v))
+                })
+                .map(|you| transcript::Decided::Allowed { you, kept: None }),
+        };
+    }
+
+    /// Whether `bot`'s call was written out here and is still there to
+    /// fold: its verdict is drawn in its place, not again under it.
+    fn folds_here(&self, bot: &str, turn: Option<i64>, call: &str) -> bool {
+        let key = (bot.to_owned(), turn.unwrap_or(-1), call.to_owned());
+        (self.written.get(&key))
+            .is_some_and(|written| self.screen.has(screen::Tag::Request(written.tag)))
+    }
+
+    /// Lets go of the requests the screen trimmed away, looked at each
+    /// time they double, so the look costs a row per request.
+    fn forget_written(&mut self) {
+        if self.written.len() < 64.max(2 * self.written_kept) {
+            return;
+        }
+        let screen = &self.screen;
+        let marks = &self.marks;
+        self.written.retain(|_, written| {
+            let tag = screen::Tag::Request(written.tag);
+            !written.folded
+                || screen.has(tag)
+                || marks
+                    .iter()
+                    .any(|(_, mark)| *mark == screen::Mark::Tag(tag))
+        });
+        self.written_kept = self.written.len();
     }
 
     /// What this window's tab says of its agent, from what the window
@@ -15479,6 +15714,7 @@ impl App {
         // multiplexer, as the person still has it to answer.
         used::asking(&self.bot, !self.asks.is_empty());
         self.tell_status();
+        self.fold_written();
         self.show_asked();
         self.margin_back();
         // /status beside the conversation, gone once the pane is.
@@ -24298,6 +24534,129 @@ mod tests {
     /// call; set aside with Esc, the keys typing again, and brought back
     /// with Enter.
     #[tokio::test]
+    async fn an_answered_request_folds_to_its_verdict_where_it_was_written() {
+        let client = daemon_answering(|asked| match asked["op"].as_str() {
+            Some("approvals") if asked["bot"] == "shop.fix" => json!({"approvals": [
+                {"bot": "shop.fix", "turn": 4, "call_id": "c1", "request": 1,
+                    "name": "shell", "gates": ["auto"],
+                    "asked": [{"tag": "auto", "reason": "It publishes the crate."}],
+                    "arguments": {"command": "cargo publish",
+                        "justification": "Releasing needs the registry."}}]}),
+            _ => json!({}),
+        })
+        .await;
+        let (_, events) = daemon_with_events(json!({}), |_| json!({})).await;
+        let mut fleet = Fleet::in_memory(client.clone(), events, "home", "home.lead");
+        fleet.raised.insert("shop.fix".into());
+        fleet
+            .needs
+            .held(vec![needs::Held::new("shop.fix", 4, "c1")], |_| true);
+        let mut app = app(client);
+        app.bot = "home.lead".into();
+        app.width = 80;
+        app.fleet = Some(fleet);
+        // This window's own call waits too, written out after the task's.
+        app.approvals
+            .push(json!({"turn": 7, "call_id": "o1", "name": "shell",
+            "gates": ["manual"], "arguments": {"command": "git push"}}));
+        app.raise_approvals().await;
+        app.show_asked();
+        app.flush();
+        assert!(app.screen.texts().contains(&"⏸ Allow shell?".to_owned()));
+        // Its own is answered first, in another window: its start says so.
+        app.daemon(
+            json!({"event": "tool_started", "bot": "home.lead", "turn": 7,
+            "data": {"call_id": "o1", "name": "shell",
+                "arguments": json!({"command": "git push"}).to_string(),
+                "approvals": [{"tag": "manual", "by": "tui", "allow": true}]}}),
+        )
+        .await;
+        app.fold_written();
+        app.show_asked();
+        app.flush();
+        let texts = app.screen.texts();
+        assert!(
+            texts.contains(&"✓ You allowed git push".to_owned()),
+            "{texts:?}"
+        );
+        assert_eq!(
+            texts.iter().filter(|row| *row == "⏸ Allow shell?").count(),
+            1
+        );
+        // The task's, answered here: folded to the verdict, no line under it.
+        let key = |code| Event::Key(event::KeyEvent::new(code, KeyModifiers::NONE));
+        app.key(key(KeyCode::Char('y'))).await;
+        app.fold_written();
+        app.flush();
+        let texts = app.screen.texts();
+        assert_eq!(
+            texts
+                .iter()
+                .filter(|row| !row.is_empty())
+                .collect::<Vec<_>>(),
+            [
+                "✓ You allowed git push",
+                "✓ You allowed cargo publish · shop.fix"
+            ],
+            "{texts:?}"
+        );
+        // A click opens it whole under its verdict, and folds it again.
+        let tag = app.written[&("shop.fix".to_owned(), 4, "c1".to_owned())].tag;
+        app.press(&format!("request/{tag}")).await;
+        let texts = app.screen.texts();
+        let at = texts
+            .iter()
+            .position(|row| row == "✓ You allowed cargo publish · shop.fix");
+        assert_eq!(
+            texts[at.unwrap() + 1..at.unwrap() + 4],
+            [
+                "↳ From shop.fix",
+                "⏸ Allow shell?",
+                "  Reason: Releasing needs the registry."
+            ]
+        );
+        app.press(&format!("request/{tag}")).await;
+        assert_eq!(app.screen.texts().len(), at.unwrap() + 1);
+    }
+
+    #[test]
+    fn a_decided_request_says_who_decided_and_what() {
+        let shell = json!({"command": "cargo publish --allow-dirty\nmore"});
+        let row = |decided: &transcript::Decided, from| {
+            transcript::seen(&transcript::decided(
+                "shell", &shell, from, decided, "/w", 80,
+            ))
+        };
+        use transcript::Decided::*;
+        assert_eq!(
+            row(
+                &Allowed {
+                    you: true,
+                    kept: Some("cargo".into())
+                },
+                None
+            ),
+            "✓ You allowed cargo publish --allow-dirty, and cargo from now on"
+        );
+        assert_eq!(
+            row(&Denied { you: false }, Some("shop.fix")),
+            "✗ The reviewer denied cargo publish --allow-dirty · shop.fix"
+        );
+        assert_eq!(
+            row(&Lapsed, None),
+            "✗ Request timed out for cargo publish --allow-dirty"
+        );
+        assert_eq!(
+            row(&Gone, None),
+            "⏸ Request for cargo publish --allow-dirty no longer waits"
+        );
+        // A long command is cut to the row.
+        let long = json!({"command": "x".repeat(200)});
+        let line = transcript::decided("shell", &long, None, &Denied { you: true }, "/w", 40);
+        assert!(transcript::seen(&line).chars().count() <= 40);
+    }
+
+    #[tokio::test]
     async fn a_followed_tasks_approval_waits_and_is_answered_in_the_window_youre_in() {
         let sent = Arc::new(std::sync::Mutex::new(Vec::new()));
         let seen = sent.clone();
@@ -24371,13 +24730,21 @@ mod tests {
         assert_eq!(app.input.trim(), "y");
         assert!(sent.lock().unwrap().is_empty());
         assert_eq!(text(&[app.status_line()]), ["⏸ 1 approval set aside"]);
-        // With nothing typed, Enter brings it back, written out again.
+        // With nothing typed, Enter brings it back, written out again by
+        // the keys, the copy above gone: one copy of a call here.
+        let first = text(&app.pending);
         app.input.set("");
         app.key(key(KeyCode::Enter)).await;
         assert!(app.waiting().is_some());
         app.show_asked();
         let again = app.pending.len() - 6;
-        assert_eq!(text(&app.pending[again..]), text(&app.pending[..6]));
+        assert_eq!(text(&app.pending[again..]), first);
+        app.flush();
+        let shown = app.screen.texts();
+        assert_eq!(
+            shown.iter().filter(|row| *row == "⏸ Allow shell?").count(),
+            1
+        );
         // An answer that failed leaves it waiting here, to answer again.
         app.key(key(KeyCode::Char('n'))).await;
         assert!(sent.lock().unwrap().is_empty());
