@@ -10378,7 +10378,6 @@ impl App {
                     (false, "completed") => limit,
                     _ => detail,
                 };
-                let line = transcript::finished(status, shown, seconds);
                 self.close_live();
                 // A turn that only reacted ends as a reaction under the
                 // message, with no line under it.
@@ -10386,9 +10385,22 @@ impl App {
                 let words =
                     (self.live.as_ref()).is_some_and(|live| live.spilled || !live.rows.is_empty());
                 let ended = status == "completed";
-                let only_reacted = !words
-                    && !self.bot_reactions.is_empty()
+                // Nothing drawn since the person's message: the turn did
+                // nothing else before it ended.
+                let untouched = !words
                     && self.answering.as_ref().map(|(_, at, _)| *at) == Some(self.rows_drawn);
+                let only_reacted = untouched && !self.bot_reactions.is_empty();
+                // A refusal says so in plain words, with the provider's
+                // facts, in place of its code; one of the request that
+                // carried the person's words from here and nothing since,
+                // that those never reached the agent.
+                let line = match detail {
+                    "provider_refusal" => {
+                        let reached = !untouched || turn.is_none() || turn != self.yours;
+                        transcript::refused(data, reached, self.prose())
+                    }
+                    _ => vec![transcript::finished(status, shown, seconds)],
+                };
                 if only_reacted {
                     self.draw_bot_reactions();
                 }
@@ -10408,14 +10420,14 @@ impl App {
                     Some(live) if ended && self.words() => self.write_words(live, Words::Reply),
                     None if ended && self.words() => {}
                     Some(live) if !live.spilled && !live.rows.is_empty() && ended => {
-                        self.commit(vec![line]);
+                        self.commit(line);
                         self.write_words(Live { gap: true, ..live }, Words::Reply);
                     }
                     live => {
                         if let Some(live) = live {
                             self.write_words(live, Words::Reply);
                         }
-                        self.commit(vec![line]);
+                        self.commit(line);
                     }
                 }
                 self.draw_bot_reactions();
@@ -21095,6 +21107,52 @@ mod tests {
         app.daemon(turn_event("turn_finished", 2, json!({"status": "failed"})))
             .await;
         assert_eq!(rows(&app)[2], "failed for 0s");
+    }
+
+    #[tokio::test]
+    async fn a_refused_turn_says_so_in_plain_words() {
+        let client = daemon_answering(|asked| {
+            json!({"items": [{"node": asked["nodes"][0], "item": {"type": "message",
+                "role": "user", "content": [{"type": "input_text", "text": "please continue"}]}}]})
+        })
+        .await;
+        let mut app = app(client);
+        app.width = 120;
+        let rows = |app: &App| -> Vec<String> {
+            (app.pending.iter())
+                .map(|line| line.to_string())
+                .filter(|row| !row.trim().is_empty())
+                .collect()
+        };
+        let refusal = json!({"status": "failed", "error": "provider_refusal",
+            "detail": "category cyber", "category": "cyber",
+            "explanation": "This request was flagged.", "fallback": null});
+        // The person's words were the request: they never reached the agent.
+        app.yours = Some(1);
+        app.daemon(turn_event("accepted", 1, json!({"node": 1})))
+            .await;
+        app.daemon(turn_event("turn_finished", 1, refusal.clone()))
+            .await;
+        let shown = rows(&app);
+        assert_eq!(
+            shown[shown.len() - 3..],
+            [
+                "✗ The provider declined this request (cyber); your message did not reach the agent.",
+                "  This request was flagged.",
+                "  No fallback is set for this model.",
+            ]
+        );
+        // Declined after the turn did something: no word on the message.
+        app.yours = Some(2);
+        app.daemon(turn_event("accepted", 2, json!({"node": 2})))
+            .await;
+        app.commit(vec![Line::from("• Ran ls")]);
+        app.daemon(turn_event("turn_finished", 2, refusal)).await;
+        let shown = rows(&app);
+        assert_eq!(
+            shown[shown.len() - 3],
+            "✗ The provider declined this request (cyber)."
+        );
     }
 
     #[tokio::test]
