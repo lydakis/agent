@@ -52,6 +52,19 @@ pub struct Waiter {
     pub wake: Wake,
 }
 
+/// What a call does when it finds its pool's ramp full.
+#[derive(Clone, Copy)]
+pub enum Ask<'a> {
+    /// Waits in the ramp's line, in process.
+    Waits,
+    /// A turn's own call: parks, holding nothing live, and is woken when a
+    /// place frees.
+    Parks(&'a Waiter),
+    /// A call beside a turn's own (its summary) gives up, to be tried again
+    /// later, rather than wait in line behind its own turn.
+    Defers,
+}
+
 impl Waiter {
     fn is(&self, other: &Waiter) -> bool {
         self.bot == other.bot && self.turn == other.turn
@@ -701,21 +714,22 @@ impl Pace {
             elapsed_ms: &mut report.paced_ms,
             started: Instant::now(),
         };
-        self.acquire_cost(cost, &mut report.park_for, None).await
+        self.acquire_cost(cost, &mut report.park_for, Ask::Waits)
+            .await
     }
-    /// As `acquire_reported`, for a turn that can park on a full ramp and
-    /// be woken when a place frees.
-    pub(super) async fn acquire_waking(
+    /// As `acquire_reported`, for a call that parks or gives up on a full
+    /// ramp rather than wait in line.
+    pub(super) async fn acquire_asked(
         &self,
         cost: Cost,
         report: &mut Report,
-        waiter: Option<&Waiter>,
+        ask: Ask<'_>,
     ) -> crate::Result<Reservation<'_>> {
         let _time = WaitTime {
             elapsed_ms: &mut report.paced_ms,
             started: Instant::now(),
         };
-        self.acquire_cost(cost, &mut report.park_for, waiter).await
+        self.acquire_cost(cost, &mut report.park_for, ask).await
     }
     /// Hold the caller until the pool can afford one request of `tokens`,
     /// then reserve it until headers, final usage, or cancellation account
@@ -731,7 +745,7 @@ impl Pace {
                 output: 0,
             },
             park_for,
-            None,
+            Ask::Waits,
         )
         .await
     }
@@ -739,7 +753,7 @@ impl Pace {
         &'a self,
         cost: Cost,
         park_for: &mut Option<Duration>,
-        waiter: Option<&Waiter>,
+        ask: Ask<'_>,
     ) -> crate::Result<Reservation<'a>> {
         let started = Instant::now();
         let costs = cost.dims();
@@ -760,7 +774,10 @@ impl Pace {
             let wait = {
                 let mut state = self.state.lock().unwrap();
                 let own = queued.ticket.as_ref().map(|(w, _)| w.clone());
-                let waiter = waiter.or(own.as_ref());
+                let waiter = match ask {
+                    Ask::Parks(waiter) => Some(waiter),
+                    Ask::Waits | Ask::Defers => own.as_ref(),
+                };
                 let now = Instant::now();
                 for (dim, cost) in state.tokens.iter().zip(costs) {
                     if let Some(limit) = dim.bucket.per_minute
@@ -806,6 +823,11 @@ impl Pace {
                                 .as_ref()
                                 .is_some_and(|r| r.full() && !r.promised_to(waiter)) =>
                             {
+                                if let Ask::Defers = ask {
+                                    *park_for = Some(RAMP_PARK);
+                                    state.counts.parked += 1;
+                                    return Err(crate::Error::new("provider_paced"));
+                                }
                                 let waiter = match waiter {
                                     Some(waiter) => waiter.clone(),
                                     None => {
@@ -1707,7 +1729,8 @@ mod tests {
             input: 10,
             output: 0,
         };
-        let call = pace.acquire_cost(cost, &mut park_for, waiter).await;
+        let ask = waiter.map_or(Ask::Waits, Ask::Parks);
+        let call = pace.acquire_cost(cost, &mut park_for, ask).await;
         (call, park_for)
     }
 
@@ -1840,6 +1863,47 @@ mod tests {
         assert_eq!(*woken.lock().unwrap(), [1, 2]);
     }
 
+    /// A call beside a turn's own (its summary) gives up on a full ramp, to
+    /// be tried again later, rather than wait in line behind its own turn,
+    /// which could not come back for its place while it waits.
+    #[tokio::test(start_paused = true)]
+    async fn a_call_beside_a_turn_gives_up_on_a_full_ramp() {
+        let pace = Pace::default();
+        let woken = Arc::new(Mutex::new(Vec::new()));
+        let one = Waiter {
+            bot: "bot1".into(),
+            turn: 1,
+            wake: {
+                let woken = woken.clone();
+                Arc::new(move |w| {
+                    if let Woken::Turn(_, turn) = w {
+                        woken.lock().unwrap().push(turn)
+                    }
+                })
+            },
+        };
+        pace.limited(None);
+        tokio::time::advance(Duration::from_secs(2)).await;
+        let first = ask(&pace, None).await.0.unwrap();
+        assert!(ask(&pace, Some(&one)).await.0.is_err());
+        let mut park_for = None;
+        let cost = Cost {
+            input: 10,
+            output: 0,
+        };
+        let beside = tokio::time::timeout(
+            Duration::from_secs(1),
+            pace.acquire_cost(cost, &mut park_for, Ask::Defers),
+        )
+        .await
+        .expect("a call beside its turn waited in line");
+        assert_eq!(beside.err().unwrap().code, "provider_paced");
+        assert_eq!(park_for, Some(RAMP_PARK));
+        drop(first);
+        assert_eq!(*woken.lock().unwrap(), [1]);
+        assert!(ask(&pace, Some(&one)).await.0.is_ok());
+    }
+
     /// A caller that gives up while queued on a ramp gives its place up.
     #[tokio::test(start_paused = true)]
     async fn a_caller_that_gives_up_leaves_the_ramp_s_queue() {
@@ -1897,7 +1961,7 @@ mod tests {
                         output: 0,
                     },
                     &mut park_for,
-                    Some(&waiter(turn)),
+                    Ask::Parks(&waiter(turn)),
                 )
                 .await;
             assert!(call.is_err());
@@ -2017,7 +2081,7 @@ mod tests {
                     output: 500,
                 },
                 &mut None,
-                None,
+                Ask::Waits,
             )
             .await
             .unwrap();
@@ -2030,7 +2094,7 @@ mod tests {
                     output: 500,
                 },
                 &mut None,
-                None,
+                Ask::Waits,
             )
             .await
             .unwrap();

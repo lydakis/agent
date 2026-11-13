@@ -450,6 +450,19 @@ pub struct Provider {
     set: Option<(Arc<str>, Arc<Windows>, Arc<Speeds>)>,
 }
 
+/// Who asks for a call.
+#[derive(Clone, Copy, Debug)]
+pub enum Asker<'a> {
+    /// Waits in line for a place on its pool's full ramp.
+    Waits,
+    /// A turn's own call, by bot and turn: on a full ramp it parks, and is
+    /// woken when a place frees.
+    Turn(&'a str, i64),
+    /// A call beside a turn's own (its summary): on a full ramp it gives
+    /// up for now rather than wait behind its own turn.
+    Beside,
+}
+
 /// Streamed text or thinking, with the index of the response's output item
 /// it belongs to: deltas of one item are one message, or one block of
 /// thinking, as the response keeps them.
@@ -635,9 +648,9 @@ pub struct Request<'a> {
     /// Which bot is asking, and where the items sit in its history, so a
     /// socket provider can send only what the server has not seen.
     pub chain: Option<Chain<'a>>,
-    /// The bot and turn asking, when a turn makes the call: one that finds
-    /// its pool's ramp full parks, and is woken when a place frees.
-    pub asker: Option<(&'a str, i64)>,
+    /// Who asks for the call, which decides what it does when its pool's
+    /// ramp is full.
+    pub asker: Asker<'a>,
     /// The turn's sticky-routing token, one slot per turn. The ChatGPT Codex
     /// endpoint returns it on a turn's first response and routes each later
     /// request carrying it to the server that holds the turn's cache; the
@@ -1370,17 +1383,20 @@ impl Provider {
             input: self.input_estimate(&pace, prefix.len() + request.items.weight, output),
             output,
         };
-        let waiter = request
-            .asker
-            .zip(self.transport.wake.get())
-            .map(|((bot, turn), wake)| pace::Waiter {
+        let waiter = match (request.asker, self.transport.wake.get()) {
+            (Asker::Turn(bot, turn), Some(wake)) => Some(pace::Waiter {
                 bot: bot.to_owned(),
                 turn,
                 wake: wake.clone(),
-            });
-        let mut reservation = pace
-            .acquire_waking(estimate, report, waiter.as_ref())
-            .await?;
+            }),
+            _ => None,
+        };
+        let ask = match (request.asker, &waiter) {
+            (_, Some(waiter)) => pace::Ask::Parks(waiter),
+            (Asker::Beside, None) => pace::Ask::Defers,
+            _ => pace::Ask::Waits,
+        };
+        let mut reservation = pace.acquire_asked(estimate, report, ask).await?;
         // Bound request startup until response headers arrive; release before
         // reading SSE so established streams are not capped at this limit.
         let admission = self.admit().await?;
@@ -2725,7 +2741,7 @@ mod tests {
                 output_schema: None,
                 web_search: false,
                 fallback_credit: None,
-                asker: None,
+                asker: Asker::Waits,
                 cache_key: None,
                 items: Items::empty(),
                 chain: None,
@@ -2759,7 +2775,7 @@ mod tests {
                 output_schema: None,
                 web_search: false,
                 fallback_credit: Some("credit"),
-                asker: None,
+                asker: Asker::Waits,
                 cache_key: Some("k"),
                 items: Items::empty(),
                 chain: None,
@@ -2787,7 +2803,7 @@ mod tests {
                     output_schema: None,
                     web_search: false,
                     fallback_credit: None,
-                    asker: None,
+                    asker: Asker::Waits,
                     cache_key: None,
                     items: Items::empty(),
                     chain: None,
@@ -2810,7 +2826,7 @@ mod tests {
                 output_schema: None,
                 web_search: false,
                 fallback_credit: None,
-                asker: None,
+                asker: Asker::Waits,
                 cache_key: None,
                 items: Items::empty(),
                 chain: None,
@@ -2835,7 +2851,7 @@ mod tests {
                 output_schema: None,
                 web_search: false,
                 fallback_credit: None,
-                asker: None,
+                asker: Asker::Waits,
                 cache_key: None,
                 items: Items::empty(),
                 chain: None,
@@ -2864,7 +2880,7 @@ mod tests {
                 output_schema: None,
                 web_search: false,
                 fallback_credit: None,
-                asker: None,
+                asker: Asker::Waits,
                 cache_key: Some("k"),
                 items: Items::empty(),
                 chain: None,
@@ -2902,7 +2918,7 @@ mod tests {
                             output_schema: None,
                             web_search: false,
                             fallback_credit: None,
-                            asker: None,
+                            asker: Asker::Waits,
                             cache_key: None,
                             items: Items::empty(),
                             chain: None,
@@ -2964,7 +2980,7 @@ mod tests {
                         output_schema,
                         web_search: false,
                         fallback_credit: None,
-                        asker: None,
+                        asker: Asker::Waits,
                         cache_key: None,
                         items: Items::empty(),
                         chain: None,
@@ -3057,7 +3073,7 @@ mod tests {
                     output_schema: None,
                     web_search: false,
                     fallback_credit: None,
-                    asker: None,
+                    asker: Asker::Waits,
                     cache_key: None,
                     items: Items::empty(),
                     chain: None,
@@ -3159,7 +3175,7 @@ mod tests {
                     output_schema: None,
                     web_search: false,
                     fallback_credit: Some("credit"),
-                    asker: None,
+                    asker: Asker::Waits,
                     cache_key: None,
                     items: Items::empty(),
                     chain: None,
@@ -3196,7 +3212,7 @@ mod tests {
             output_schema: None,
             web_search: false,
             fallback_credit: None,
-            asker: None,
+            asker: Asker::Waits,
             cache_key: None,
             items: Items::empty(),
             chain: None,
@@ -3264,7 +3280,7 @@ mod tests {
                 output_schema: None,
                 web_search: false,
                 fallback_credit: None,
-                asker: None,
+                asker: Asker::Waits,
                 cache_key: None,
                 items: Items::empty(),
                 chain: None,
@@ -3409,7 +3425,7 @@ mod tests {
                     output_schema: None,
                     web_search: false,
                     fallback_credit: None,
-                    asker: None,
+                    asker: Asker::Waits,
                     cache_key: None,
                     items,
                     chain: None,
@@ -3510,7 +3526,7 @@ mod tests {
                 output_schema: None,
                 web_search: false,
                 fallback_credit: None,
-                asker: None,
+                asker: Asker::Waits,
                 cache_key: None,
                 items: Items::empty(),
                 chain: None,
@@ -3580,7 +3596,7 @@ mod tests {
                 output_schema: None,
                 web_search: false,
                 fallback_credit: None,
-                asker: None,
+                asker: Asker::Waits,
                 cache_key: None,
                 items: Items::empty(),
                 chain: None,
@@ -3670,7 +3686,7 @@ mod tests {
                 output_schema: None,
                 web_search: false,
                 fallback_credit: None,
-                asker: None,
+                asker: Asker::Waits,
                 cache_key: None,
                 items: Items::empty(),
                 chain: None,
@@ -3770,7 +3786,7 @@ mod tests {
             output_schema: None,
             web_search: false,
             fallback_credit: None,
-            asker: None,
+            asker: Asker::Waits,
             cache_key: None,
             items: Items::empty(),
             chain: None,
@@ -3846,7 +3862,7 @@ mod tests {
             output_schema: None,
             web_search: false,
             fallback_credit: None,
-            asker: None,
+            asker: Asker::Waits,
             cache_key: None,
             items: Items::empty(),
             chain: None,
@@ -3957,7 +3973,7 @@ mod tests {
             output_schema: None,
             web_search: false,
             fallback_credit: None,
-            asker: None,
+            asker: Asker::Waits,
             cache_key: None,
             items: Items::empty(),
             chain: Some(Chain {
@@ -4047,7 +4063,7 @@ mod tests {
             output_schema: None,
             web_search: false,
             fallback_credit: None,
-            asker: None,
+            asker: Asker::Waits,
             cache_key: None,
             items: Items::empty(),
             chain: Some(Chain {
@@ -4118,7 +4134,7 @@ mod tests {
             output_schema: None,
             web_search: false,
             fallback_credit: None,
-            asker: None,
+            asker: Asker::Waits,
             cache_key: None,
             items: Items::empty(),
             chain: None,
@@ -4173,7 +4189,7 @@ mod tests {
             output_schema: None,
             web_search: false,
             fallback_credit: None,
-            asker: None,
+            asker: Asker::Waits,
             items: Items::empty(),
             chain: None,
             route: None,
@@ -4243,7 +4259,7 @@ mod tests {
             output_schema: None,
             web_search: false,
             fallback_credit: None,
-            asker: None,
+            asker: Asker::Waits,
             items: Items::empty(),
             chain: None,
             route: None,
@@ -4295,7 +4311,7 @@ mod tests {
             output_schema: None,
             web_search: false,
             fallback_credit: None,
-            asker: None,
+            asker: Asker::Waits,
             items: Items::empty(),
             chain: None,
             route: None,
@@ -4343,7 +4359,7 @@ mod tests {
                 output_schema: None,
                 web_search: false,
                 fallback_credit: None,
-                asker: None,
+                asker: Asker::Waits,
                 items: Items::empty(),
                 chain: None,
                 route: None,
@@ -4382,7 +4398,7 @@ mod tests {
             output_schema: None,
             web_search: false,
             fallback_credit: None,
-            asker: None,
+            asker: Asker::Waits,
             items: Items::empty(),
             chain: None,
             route: None,
@@ -4433,7 +4449,7 @@ mod tests {
             output_schema: None,
             web_search: false,
             fallback_credit: None,
-            asker: None,
+            asker: Asker::Waits,
             cache_key: None,
             items: Items::empty(),
             chain: None,
@@ -4509,7 +4525,7 @@ mod tests {
                     output_schema: None,
                     web_search: false,
                     fallback_credit: None,
-                    asker: None,
+                    asker: Asker::Waits,
                     cache_key: None,
                     items: Items::empty(),
                     chain: None,
@@ -4743,7 +4759,7 @@ mod tests {
             output_schema: None,
             web_search: false,
             fallback_credit: None,
-            asker: None,
+            asker: Asker::Waits,
             cache_key: None,
             items: Items::empty(),
             chain: None,
