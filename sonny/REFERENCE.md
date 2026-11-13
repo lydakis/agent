@@ -995,15 +995,16 @@ has something on it, or is off the screen, no time shows.
 - `/status` shows the project's agents in the pane beside the
   conversation, grouped by where they stand, the lead first in its group,
   under a head that counts each group that has any
-  (`calc · 1 needs you · 2 working · 1 idle · 3 done`, no total): **Needs you** (waiting on your
-  approval, asking you a question, held on something only you can fix,
-  such as a ChatGPT sign-in, or failed),
+  (`calc · 1 needs you · 1 failed · 2 working · 1 idle · 3 done`, no total): **Needs you** (waiting on your
+  approval, asking you a question, or held on something only you can fix,
+  such as a ChatGPT sign-in), **Failed** (its last turn failed; it asks
+  nothing, and says what went wrong under it),
   **Working** (a turn running, queued, rate limited, waiting on other
   tasks, or `waiting on its reviewer` while the reviewer weighs a call), **Idle**
   (its turn ended, stopped, or never started, with nothing open; a pull
   request its last reply linked shows on its row), and **Done** (marked
   done). Each agent is one line: its mark, name, state and time; one
-  that needs you says what for under it. That is all it shows as it opens; `m` shows more and hides it
+  that needs you says what for under it, one that failed why. That is all it shows as it opens; `m` shows more and hides it
   again: at each row's right edge, dim, the rest of what it tracks: what it follows (a source with an
   `icon` in `[sonny.sources.NAME]` shows as that icon, as it does wherever
   Sonny names that source: `/background` and the "From your sources" row), a pull or merge
@@ -1013,7 +1014,7 @@ has something on it, or is off the screen, no time shows.
   `Done · 3 ▸`). A click on either, or `i` and `d`
   with the keys in the pane, opens them, and the same folds them again.
   The helpers a task started fold under it (`▸ 2 helpers, 1 working`),
-  a helper that needs you listed under Needs you too; a click on that
+  a helper that needs you or failed listed in its group too; a click on that
   line, or → on the picked task, opens them, and ← folds them. As threads in a claude.ai project are
   resolved, a task marks itself done with the `mark_done` tool once
   nothing is left to do in it, such as when its pull request merged or
@@ -1060,7 +1061,8 @@ has something on it, or is off the screen, no time shows.
   on something only you can fix, with how to fix it, and a temporary
   folder every agent's commands share with under a tenth of its space or
   inodes left (`temp folder /tmp: 3% inodes left`, from the daemon's
-  `stats`, read every 30 seconds). When all is well it
+  `stats`, read every 30 seconds), and how many of `/background`'s
+  failures you have not seen yet. When all is well it
   says nothing; the lookout's own line is in `/background`. Each Sonny start keeps the reviewer again on its own binary
   and build, with the model it has, so an upgrade restarts it with the
   lookout and the tool host.
@@ -1078,8 +1080,10 @@ has something on it, or is off the screen, no time shows.
   it), or whose run went out and whose turn then failed (as
   when the machine was offline or a login expired), and a server the
   nightly memory cleanup could not read. Your own agents' failures, such as
-  the memory cleanup's, show in every window. The footer then says
-  `✗ 1` with a red `✗`, and a click on it opens `/background`. An agent sees the same in its `automations` tool, whose rows
+  the memory cleanup's, show in every window. The footer's red `✗`
+  counts them with the failed agents until you look here, and
+  `/status` says how many under its heading, a click there opening
+  `/background`. An agent sees the same in its `automations` tool, whose rows
   say how the turn their last run sent ended. Automations and follows are
   what the agents' `automations` and `follows` tools make.
 
@@ -1368,8 +1372,9 @@ has something on it, or is off the screen, no time shows.
   deadline is a one-off automation (`/background`) the tool host sets,
   `[sonny] ask_wait_minutes` from the ask (60 by default, 0 for none,
   which makes every ask wait) unless the agent sets its own for work on a
-  clock. It runs nothing once you answer or write to that agent, since the
-  conversation moved on; when it runs, it is Sonny's words, never yours,
+  clock. Your answer, picked or typed, removes it once the agent
+  takes it up, as the agent's close does; it runs nothing once you answer or write to that agent, since the
+  conversation moved on, nor for an ask whose call failed and showed no card; when it runs, it is Sonny's words, never yours,
   so it allows nothing that needs your own. Pick another option later and
   the agent undoes what it did. Open
   questions are read from the history Sonny replays (its `ask` calls not
@@ -1464,7 +1469,8 @@ turn of the task numbered after that one reopens it.
 ## Shared settings
 
 Settings Sonny keeps for every folder are in `~/.agent/config.toml`'s
-`[sonny]`, which `/config` shows: the chime (`chime`, on by default) and
+`[sonny]`, which `/config` shows: the chime (`chime`, off by default; `/sound` or
+`chime = true` turns it on) and
 the view (`steps` and `verbose`, both off by default), besides the efforts and the side chat
 above. `/config` lists the keys under their table's name, a value set in
 the file plain and a default muted, so what you changed stands out.
@@ -1863,9 +1869,12 @@ of the footer says what you talk to and where (the permissions mark, the
 model as pickers name it, its effort, the folder and its branch), and the
 right what wants you (needs you, failed, working, at rest, `✎`, the
 context). Its counts of the agents are the ones `/status` heads its
-groups with, marks and numbers only: `? 2  ● 3  ○ 13` needs you,
-working, and at rest; what is done asks nothing of you, and `/status`
-counts it. The agent's name is left to the
+groups with, marks and numbers only: `? 2  ✗ 1  ● 3  ○ 13` needs you,
+failed, working, and at rest; what is done asks nothing of you, and `/status`
+counts it. The `✗` also counts what failed in `/background` that you
+have not seen there; a click on it opens `/status`, which lists the
+failed agents and says how many failed in the background, a click there
+opening `/background`. The agent's name is left to the
 composer, which says it. When the window is too narrow for all of it,
 items give way in one order, as Powerline drops its lowest segments
 first: at rest first, words before marks, marks before whole

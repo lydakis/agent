@@ -4561,16 +4561,16 @@ impl Turn {
                 }),
                 other => other,
             };
-            let answered = record
-                .declared(&call.name)
-                .is_some_and(|tool| tool.answered_by.is_some());
+            let declared = record.declared(&call.name);
+            let answered = declared.is_some_and(|tool| tool.answered_by.is_some());
+            let lifts = declared.is_some_and(|tool| tool.lift);
             // A terminal whose end this result shows its bot.
             let mut seen = None;
             let outcome = match prepared {
                 // A declared tool runs nothing: its meaning is its client's,
                 // and so is its answer, when its client gives one.
                 Ok(Prepared::Declared(_)) if answered => match self
-                    .await_answer(&call.call_id, &mut calls, route, summary_retry_ms)
+                    .await_answer(&call.call_id, lifts, &mut calls, route, summary_retry_ms)
                     .await?
                 {
                     ControlFlow::Continue(Some(outcome)) => outcome,
@@ -5396,10 +5396,15 @@ impl Turn {
     /// Wait for an answered call's answer: live for the hold, then parked
     /// like `wait`, holding no task and no slot, until the answer comes or
     /// the call's time runs out. Answers wake the task through the worker,
-    /// so each check is one job and no commit.
+    /// so each check is one job and no commit. A message for the turn
+    /// lifts the call only when its tool `lifts` (once it has waited the
+    /// grace a command gets) or one of its steps waits on a gate (at
+    /// once, as a gated call is lifted); any other call is answered first,
+    /// and the turn takes the message at its next boundary.
     async fn await_answer(
         &self,
         call_id: &str,
+        lifts: bool,
         calls: &mut std::vec::IntoIter<ToolCall>,
         route: Option<&str>,
         summary_retry_ms: Option<u64>,
@@ -5407,8 +5412,10 @@ impl Turn {
         let turn = self.turn;
         // A client that answers is a program, near at hand: a short hold
         // takes its answer live, and a slower one parks without the slot.
-        let hold = tokio::time::Instant::now()
-            + Duration::from_millis(self.settings().approval_hold_ms().min(ANSWER_HOLD_MS));
+        let started = tokio::time::Instant::now();
+        let hold =
+            started + Duration::from_millis(self.settings().approval_hold_ms().min(ANSWER_HOLD_MS));
+        let graced = started + LIFT_GRACE;
         loop {
             let id = call_id.to_owned();
             let (notify, expires_ms) = match self
@@ -5419,28 +5426,48 @@ impl Turn {
                 CallAnswer::Given(outcome) => return Ok(ControlFlow::Continue(Some(outcome))),
                 CallAnswer::Pending { notify, expires_ms } => (notify, expires_ms),
             };
+            // No deadline while a step of the call waits on a gate: it
+            // waits on a verdict, as a gated call does.
+            let gated = expires_ms.is_none();
+            let liftable = gated || lifts;
             // A message for the turn lifts the call to the background: its
             // answer comes later, as the command's result.
-            if self.lift.is_armed() {
+            if liftable && self.lift.is_armed() && (gated || tokio::time::Instant::now() >= graced)
+            {
                 match self.lift_call(call_id, None).await? {
                     true => return Ok(ControlFlow::Continue(None)),
                     false => continue,
                 }
             }
-            // No deadline while a step of the call waits on a gate.
             let lapse = expires_ms.map(|at| {
                 tokio::time::Instant::now() + Duration::from_millis(at.saturating_sub(now_ms()))
             });
-            let wake = lapse.map_or(hold, |lapse| lapse.min(hold));
+            // A call of a tool that lifts waits out its grace live, never
+            // parked inside it: a steer that resumes a parked call lifts it
+            // at once, so parking first would cut the grace short.
+            let held = match lifts {
+                true => hold.max(graced),
+                false => hold,
+            };
+            let wake = lapse.map_or(held, |lapse| lapse.min(held));
+            let lifted = async {
+                match liftable {
+                    true => self.lift.lifted().await,
+                    false => std::future::pending().await,
+                }
+            };
             if tokio::time::Instant::now() < wake {
                 tokio::select! {
                     () = notify.notified() => continue,
                     () = tokio::time::sleep_until(wake) => {}
-                    () = self.lift.lifted() => continue,
+                    () = lifted => continue,
                 }
             }
-            // A call out of time is answered by the next check.
-            if lapse.is_some_and(|lapse| tokio::time::Instant::now() >= lapse) {
+            // A call out of time is answered by the next check, and one
+            // past its grace is lifted by it.
+            if lapse.is_some_and(|lapse| tokio::time::Instant::now() >= lapse)
+                || (liftable && self.lift.is_armed())
+            {
                 continue;
             }
             let pending: Vec<ToolCall> = calls.as_slice().to_vec();
