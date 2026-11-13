@@ -57,13 +57,14 @@ const ENDED: [&str; 3] = ["completed", "failed", "interrupted"];
 /// The statuses of a message still waiting in line.
 const IN_LINE: [&str; 3] = ["queued", "attached", "ready"];
 
-/// What every worker is told after its folder's rules.
-const TOLD: &str = "You are one agent in a workflow: a script another agent wrote runs you, and \
-passes your final reply to its next step in code. Your final reply is that step's value, not a \
-message to a person: give exactly what the prompt asks for, as data, with no greeting, summary \
-of your process or sign-off. No one reads your conversation or answers questions while you work, \
-so decide for yourself and say in the reply what you assumed. Do what the prompt asks and \
-nothing more; change files only when it says to.";
+/// What every worker is told after its folder's rules, as Sonny ships it
+/// beside its roles.
+const WORKFLOW: &str = include_str!("../../agents/workflow.md");
+
+/// [`WORKFLOW`] without its front matter.
+fn told_text() -> &'static str {
+    agent_client::policy::front_matter(WORKFLOW).1.trim()
+}
 
 /// Whether agents have the `workflow` tool: `[sonny.workflows] enabled`.
 pub fn on() -> bool {
@@ -864,7 +865,7 @@ impl Run {
 
 /// What a worker in `dir` is told: the folder's rules and skills, the
 /// memory of the project whose lead's folder is `roles`, the profile
-/// `role` from there when given, and [`TOLD`].
+/// `role` from there when given, and [`WORKFLOW`].
 fn compose(dir: &Path, roles: &Path, role: Option<&str>) -> Result<Told, String> {
     let memory = agent_client::policy::memory_indexes(roles).map_err(|e| e.to_string())?;
     let role = role
@@ -873,7 +874,7 @@ fn compose(dir: &Path, roles: &Path, role: Option<&str>) -> Result<Told, String>
     let composed = agent_client::policy::instructions(dir, role.as_ref(), &memory)
         .map_err(|e| format!("{}: {e}", e.code()))?;
     Ok(Told {
-        instructions: format!("{}\n\n{TOLD}", composed.text),
+        instructions: format!("{}\n\n{}", composed.text, told_text()),
         model: role.as_ref().and_then(|role| role.model.clone()),
         tools: role.and_then(|role| role.tools),
     })
