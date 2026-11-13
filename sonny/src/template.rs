@@ -21,6 +21,8 @@ const FUEL: u64 = 100_000;
 const DEPTH: usize = 50;
 /// The most events a source's blank holds, newest first.
 const EVENTS: usize = 50;
+/// The most topics a source's blank holds, each its newest event.
+const TOPICS: usize = 200;
 /// The most a render writes, cut on a character's edge.
 const OUTPUT: usize = 64 * 1024;
 
@@ -89,6 +91,203 @@ pub fn render(template: &str, data: &Data) -> (Result<String, String>, Reads) {
     (rendered, reads)
 }
 
+/// The sources the person set up whose events a blank reads: the commons
+/// keeps none.
+pub fn configured_sources() -> Arc<Vec<String>> {
+    Arc::new(
+        (crate::lookout::sources::configured()
+            .unwrap_or_default()
+            .into_iter())
+        .filter(|source| !source.command.is_empty())
+        .map(|source| source.name)
+        .collect(),
+    )
+}
+
+/// Live memory facts' blanks, filled as a read or a new agent finds them:
+/// the person's sources, files in the agent's folder and the clock. Not
+/// tasks, which a fact outlives.
+pub struct Live;
+
+impl Live {
+    fn data(folder: &Path) -> Data {
+        Data {
+            store: (crate::STORE.get().cloned())
+                .or_else(|| crate::daemon_paths(None, None).ok().map(|(store, _)| store)),
+            sources: configured_sources(),
+            folder: folder.to_owned(),
+            tasks: Default::default(),
+            now: SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .map_or(0, |d| d.as_secs() as i64),
+        }
+    }
+}
+
+const TASKS: &str = "tasks() and task() fill margin notes only: a fact outlives its tasks";
+
+/// The sources `template` names by a literal, `source('NAME')`, and
+/// whether it calls `tasks()` or `task()`, in its blanks and tags alone:
+/// text outside them, `{% raw %}` blocks, comments and quoted words are
+/// words.
+fn named(template: &str) -> (Vec<String>, bool) {
+    let (mut sources, mut tasks) = (Vec::new(), false);
+    let mut rest = template;
+    let mut raw = false;
+    while let Some(at) = rest.find('{') {
+        let after = &rest[at..];
+        let (close, quoted) = match after.get(..2) {
+            Some("{{") if !raw => ("}}", true),
+            Some("{%") => ("%}", true),
+            Some("{#") if !raw => ("#}", false),
+            _ => {
+                rest = &after[1..];
+                continue;
+            }
+        };
+        let Some(end) = closing(&after[2..], close, quoted) else {
+            break;
+        };
+        let code = &after[2..2 + end];
+        rest = &after[2 + end + 2..];
+        if close == "#}" {
+            continue;
+        }
+        let tag = code.trim_matches(|c: char| c == '-' || c == '+' || c.is_whitespace());
+        if close == "%}" && (tag == "raw" || tag == "endraw") {
+            raw = tag == "raw";
+            continue;
+        }
+        if raw {
+            continue;
+        }
+        calls(code, |name, arg| match name {
+            "tasks" | "task" => tasks = true,
+            "source" => sources.extend(arg.map(str::to_owned)),
+            _ => {}
+        });
+    }
+    (sources, tasks)
+}
+
+/// Where `close` first ends `code`, outside quotes when `quoted`.
+fn closing(code: &str, close: &str, quoted: bool) -> Option<usize> {
+    if !quoted {
+        return code.find(close);
+    }
+    let mut chars = code.char_indices();
+    while let Some((at, c)) = chars.next() {
+        match c {
+            '\'' | '"' => skip_quoted(&mut chars, c),
+            _ if code[at..].starts_with(close) => return Some(at),
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Past the end of a word quoted by `quote`, its escapes included.
+fn skip_quoted(chars: &mut std::str::CharIndices<'_>, quote: char) {
+    while let Some((_, c)) = chars.next() {
+        match c {
+            '\\' => _ = chars.next(),
+            _ if c == quote => break,
+            _ => {}
+        }
+    }
+}
+
+/// Each call of a global in the blank or tag `code`, by its name and its
+/// first argument when that is a plain quoted word: quoted words and
+/// attributes' calls (`x.task()`) are not calls of one.
+fn calls(code: &str, mut call: impl FnMut(&str, Option<&str>)) {
+    let mut chars = code.char_indices();
+    let mut attribute = false;
+    while let Some((at, c)) = chars.next() {
+        match c {
+            '\'' | '"' => {
+                skip_quoted(&mut chars, c);
+                attribute = false;
+            }
+            '.' => attribute = true,
+            c if c.is_alphabetic() || c == '_' => {
+                let end = code[at..]
+                    .find(|c: char| !(c.is_alphanumeric() || c == '_'))
+                    .map_or(code.len(), |len| at + len);
+                let after = code[end..].trim_start();
+                if !attribute && let Some(args) = after.strip_prefix('(') {
+                    call(&code[at..end], first_word(args.trim_start()));
+                }
+                attribute = false;
+                for _ in code[at + c.len_utf8()..end].chars() {
+                    chars.next();
+                }
+            }
+            c if c.is_whitespace() => {}
+            _ => attribute = false,
+        }
+    }
+}
+
+/// The quoted word `args` starts with, when it is the whole first
+/// argument and has no escapes.
+fn first_word(args: &str) -> Option<&str> {
+    let quote = args.chars().next().filter(|c| *c == '\'' || *c == '"')?;
+    let end = 1 + args[1..].find(quote)?;
+    let word = &args[1..end];
+    // The whole argument, not the first part of a name built from parts.
+    let whole = args[end + 1..].trim_start().starts_with([')', ',']);
+    (whole && !word.contains('\\')).then_some(word)
+}
+
+/// Why a blank cannot read `name`: no source of that name is set up.
+fn no_source(name: &str, sources: &[String]) -> String {
+    let yours = match sources.is_empty() {
+        true => "you have none set up".to_owned(),
+        false => format!("yours are {}", sources.join(", ")),
+    };
+    format!("no source named {name}: {yours}")
+}
+
+/// A live fact's `template` filled from `data`, or why not.
+fn live(template: &str, data: &Data) -> Result<String, String> {
+    let (filled, reads) = render(template, data);
+    if reads.tasks {
+        return Err(TASKS.into());
+    }
+    filled
+}
+
+/// Why `template` cannot be a live fact's: it does not read as one, or
+/// names a source never set up or the tasks. What a later read may fill,
+/// such as a file not written yet, does not refuse it.
+fn live_check(template: &str, data: &Data) -> Result<(), String> {
+    check(template)?;
+    // Named in the text, each is checked whether or not a render gets to
+    // it now: a blank before it may wait on a file not written yet.
+    let (sources, tasks) = named(template);
+    if tasks {
+        return Err(TASKS.into());
+    }
+    if let Some(name) = sources.iter().find(|name| !data.sources.contains(name)) {
+        return Err(no_source(name, &data.sources));
+    }
+    match live(template, data) {
+        Err(why) if why.contains("no source named ") || why.contains("tasks()") => Err(why),
+        _ => Ok(()),
+    }
+}
+
+impl agent_client::memory::Fill for Live {
+    fn check(&self, template: &str, folder: &Path) -> Result<(), String> {
+        live_check(template, &Self::data(folder))
+    }
+
+    fn fill(&self, template: &str, folder: &Path) -> Result<String, String> {
+        live(template, &Self::data(folder))
+    }
+}
+
 /// Where a render writes: it stops the render once past [`OUTPUT`], so a
 /// loop that prints much never holds more than that.
 struct Capped(Vec<u8>);
@@ -147,11 +346,7 @@ fn blanks(env: &mut Environment<'static>, data: &Data, reads: &Arc<Mutex<Reads>>
             reads.sources.insert(name.clone());
         });
         if !d.sources.contains(&name) {
-            let yours = match d.sources.is_empty() {
-                true => "you have none set up".to_owned(),
-                false => format!("yours are {}", d.sources.join(", ")),
-            };
-            return Err(failed(format!("no source named {name}: {yours}")));
+            return Err(failed(no_source(&name, &d.sources)));
         }
         let log = (d.store.as_deref()).map_or_else(Default::default, |store| {
             let file = recent_file(store, &name);
@@ -172,6 +367,7 @@ fn blanks(env: &mut Environment<'static>, data: &Data, reads: &Arc<Mutex<Reads>>
             ("down_since", log.down.map_or(Value::from(()), Value::from)),
             ("latest", log.events.first().map_or(Value::from(()), value)),
             ("events", log.events.iter().map(value).collect()),
+            ("topics", log.topics.iter().map(value).collect()),
         ];
         Ok(Value::from_pairs(fields))
     });
@@ -295,6 +491,9 @@ fn recent_file(store: &Path, name: &str) -> PathBuf {
 struct Log {
     /// Newest first, as blanks give them.
     events: Vec<Json>,
+    /// Each topic's newest event, newest first: the lookout keeps one for
+    /// each however old.
+    topics: Vec<Json>,
     /// When it started failing, in seconds since the epoch, while the
     /// lookout's newest word on it is that it is down.
     down: Option<i64>,
@@ -326,22 +525,30 @@ fn log(file: &Path) -> (Stamp, Arc<Log>) {
         .filter(|word| (word["id"].as_str()).is_some_and(|id| id.starts_with("lookout.down.")))
         .and_then(|word| word["since_ms"].as_u64().or(word["at_ms"].as_u64()))
         .map(|ms| (ms / 1000) as i64);
-    let events: Vec<Json> = kept()
-        .filter(|kept| kept["lookout"] != true)
-        .take(EVENTS)
-        .map(|kept| {
-            json!({
-                "text": kept["text"],
-                "id": kept["id"],
-                "topic": kept["topic"],
-                "from": kept["from"],
-                "url": kept["url"],
-                "at": kept["at_ms"].as_u64().map(|ms| ms / 1000),
-                "fields": kept["fields"],
-            })
+    let blank = |kept: &Json| {
+        json!({
+            "text": kept["text"],
+            "id": kept["id"],
+            "topic": kept["topic"],
+            "from": kept["from"],
+            "url": kept["url"],
+            "at": kept["at_ms"].as_u64().map(|ms| ms / 1000),
+            "fields": kept["fields"],
         })
+    };
+    let printed = || kept().filter(|kept| kept["lookout"] != true);
+    let events: Vec<Json> = printed().take(EVENTS).map(|kept| blank(&kept)).collect();
+    let mut seen = BTreeSet::new();
+    let topics: Vec<Json> = printed()
+        .filter(|kept| (kept["topic"].as_str()).is_some_and(|topic| seen.insert(topic.to_owned())))
+        .take(TOPICS)
+        .map(|kept| blank(&kept))
         .collect();
-    let log = Arc::new(Log { events, down });
+    let log = Arc::new(Log {
+        events,
+        topics,
+        down,
+    });
     cache.insert(file.to_owned(), (stamp, log.clone()));
     (stamp, log)
 }
@@ -379,6 +586,71 @@ mod tests {
     }
 
     #[test]
+    fn a_live_fact_fills_from_sources_files_and_the_clock_but_never_from_tasks() {
+        let dir = tempfile_dir("live-fact");
+        let data = Data {
+            sources: Arc::new(vec!["ci".into()]),
+            ..data(&dir)
+        };
+        // A file not written yet fills later: the fact is kept, and a read
+        // says why it does not fill now.
+        let fact = "PRs open: {{ file('prs.txt') }}, as of {{ 999_940 | ago }}";
+        assert_eq!(live_check(fact, &data), Ok(()));
+        assert!(live(fact, &data).unwrap_err().contains("prs.txt"));
+        std::fs::write(dir.join("prs.txt"), "#886").unwrap();
+        assert_eq!(live(fact, &data).unwrap(), "PRs open: #886, as of 1m ago");
+        // A source with no events yet fills too.
+        assert_eq!(live_check("{{ source('ci').latest }}", &data), Ok(()));
+        // Refused: a source never set up, the tasks, and what is no
+        // template at all.
+        let refused = live_check("{{ source('deploys').latest }}", &data).unwrap_err();
+        assert!(refused.contains("no source named deploys"), "{refused}");
+        for tasks in ["{{ tasks() | length }}", "{{ task('calc.add').state }}"] {
+            let refused = live_check(tasks, &data).unwrap_err();
+            assert!(
+                refused.starts_with("tasks() and task() fill margin notes only"),
+                "{refused}"
+            );
+        }
+        assert!(live_check("{{ open", &data).is_err());
+        // A file not written yet before them hides neither.
+        std::fs::remove_file(dir.join("prs.txt")).unwrap();
+        let late = "{{ file('prs.txt') }} {{ source(\"typo\").latest.text }}";
+        assert!(
+            live_check(late, &data)
+                .unwrap_err()
+                .contains("no source named typo")
+        );
+        let late = "{{ file('prs.txt') }}{% for t in tasks() %}{{ t.name }}{% endfor %}";
+        assert!(
+            live_check(late, &data)
+                .unwrap_err()
+                .starts_with("tasks() and task()")
+        );
+        // Words outside the blanks, raw blocks and attributes are not calls.
+        let words = "source('typo') and tasks() {% raw %}{{ source('typo') }}{% endraw %} \
+            {{ file('prs.txt') | length }}";
+        assert_eq!(named(words), (vec![], false));
+        // Nor are quoted words and comments, whatever their characters.
+        let quoted = "{{ file('tasks().txt') }}{# {{ source('missing') }} #}{{ file('café(1).txt') }}\
+            {{ \"}} source('x')\" }}{{ 'it\\'s tasks()' }}";
+        assert_eq!(named(quoted), (vec![], false));
+        assert_eq!(
+            named("{{ \"}}\" ~ source('typo') }}"),
+            (vec!["typo".to_owned()], false)
+        );
+        assert_eq!(
+            named("{{ x.task(1) }} {{- source( 'ci' ).latest -}}"),
+            (vec!["ci".to_owned()], false)
+        );
+        // A name built from parts is left to the render.
+        assert_eq!(
+            named("{{ source('re' ~ 'lease').latest }}"),
+            (vec![], false)
+        );
+    }
+
+    #[test]
     fn a_file_blank_reads_from_the_folder_and_json_becomes_fields() {
         let dir = tempfile_dir("file-blank");
         std::fs::write(dir.join("pr.json"), r#"{"state": "open", "checks": 3}"#).unwrap();
@@ -413,6 +685,26 @@ mod tests {
             &data,
         );
         assert_eq!(text.unwrap(), "green at 2, 2 kept");
+        // Each topic's newest event, newest first.
+        let pr = |n: u64, state: &str, at: u64| {
+            json!({"source": "ci", "text": format!("#{n} {state}"), "topic": n.to_string(),
+                "fields": {"state": state}, "at_ms": at * 1000, "seq": 1})
+            .to_string()
+        };
+        let prs = [
+            pr(1, "open", 1),
+            pr(2, "open", 2),
+            pr(1, "green", 3),
+            pr(2, "merged", 4),
+        ];
+        std::fs::write(dir.join("ci.jsonl"), prs.join("\n") + "\n" + &log).unwrap();
+        let (text, _) = render(
+            "{% for pr in source('ci').topics if pr.fields.state != 'merged' %}{{ pr.text }} {% endfor %}\
+             {{ source('ci').topics | length }}",
+            &data,
+        );
+        assert_eq!(text.unwrap(), "#1 green 2");
+        std::fs::write(dir.join("ci.jsonl"), &log).unwrap();
         assert_eq!(reads.sources, BTreeSet::from(["ci".to_owned()]));
         assert!(reads.down.is_empty());
         // The lookout says it is down: the blank and what it read say so,
