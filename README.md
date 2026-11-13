@@ -8,7 +8,9 @@ events. Bots delegate by running the same `agent` command you do.
 Agent is built for programs first. A script, a CI job, an app, or another bot
 drives it through a CLI whose default output is JSON Lines, or through the
 daemon's socket protocol. `--pretty` gives people a readable view of the same
-events.
+events. For a terminal client that coordinates tasks for you, see [Sonny](#sonny).
+
+[Quickstart](#quickstart) · [CLI reference](docs/CLI.md) · [Documentation](docs/README.md)
 
 ```sh
 agent run --pretty --new --bot lead -- "Fix the failing test, and have a helper check the README"
@@ -24,9 +26,14 @@ The model's words are scripted for this recording; the daemon, the bots, and eve
 
 ## Install
 
-Agent runs on macOS and Linux. Build it from source with
-[Rust](https://rustup.rs); rustup fetches the toolchain pinned in
-[rust-toolchain.toml](rust-toolchain.toml).
+Agent runs on macOS and Linux. With [Homebrew](https://brew.sh):
+
+```sh
+brew install lydakis/agent/agent
+```
+
+Or build from source with [Rust](https://rustup.rs). Rustup uses the
+version pinned in [rust-toolchain.toml](rust-toolchain.toml):
 
 ```sh
 git clone https://github.com/lydakis/agent
@@ -34,101 +41,53 @@ cd agent
 cargo install --locked --path .
 ```
 
-That puts `agent` in `~/.cargo/bin`. With [Homebrew](https://brew.sh),
-`brew install lydakis/agent/agent` builds the same from a release's source;
-`brew install lydakis/agent/sonny` adds [Sonny](#sonny), the terminal
-client, and pulls in `agent`, `ripgrep` and
-[agent-browser](https://github.com/vercel-labs/agent-browser) with it. If Homebrew refuses the tap as
-untrusted, run `brew trust lydakis/agent` first.
-
-On Linux without Homebrew (which does not run on ARM Linux), install Sonny
-and its daemon from the latest release's static build, checked against its
-published sha256:
-
-```sh
-curl -fsSL https://raw.githubusercontent.com/lydakis/agent/main/install.sh | sh
-```
-
-It unpacks `sonny-VERSION-linux-ARCH.tar.gz` (x86_64 or aarch64) under
-`~/.local/opt`, links `~/.local/bin/sonny`, and installs bubblewrap (the
-sandbox) and ripgrep with the system's package manager when they are
-missing; `PREFIX` installs elsewhere, `SONNY_VERSION` picks a release and
-`SONNY_PACKAGES=0` leaves the system's packages alone. [install.sh](install.sh)
-is short enough to read first. Later, `sonny update` updates either install
-(Homebrew or this one) to the latest release and switches the running
-daemon and open windows to it.
-
-For Sonny from main without a version tag, use the nightly Homebrew channel
-(macOS or Linux):
-
-```sh
-brew unlink sonny                         # if the stable formula is installed
-brew install lydakis/agent/sonny-nightly
-# Later:
-brew update
-brew reinstall lydakis/agent/sonny-nightly
-```
-
-Nightly fetches current main on every install or reinstall and builds Sonny
-and its daemon together from that checkout. No `--HEAD`, version tag or wait
-for the nightly workflow is needed. Use `reinstall` to update: Homebrew's
-`upgrade` can skip a formula whose version has not changed. `sonny --version`
-and `sonny agent --version` show the built commit. The nightly workflow checks
-the recipe at 07:17 UTC; stable `sonny` and the Linux installer above continue
-to install versioned releases. Both Homebrew channels build from source.
+Cargo installs `agent` in `~/.cargo/bin`; make sure that directory is on your
+`PATH`. For Sonny, Linux release binaries, or nightly builds, see
+[Sonny's installation guide](sonny/README.md#install).
 
 ## Quickstart
 
-Set the key for any provider you use, and pick a default model as
-`PROVIDER/MODEL`:
+Choose a provider and a model. For example, with an Anthropic API key:
 
 ```sh
-export OPENAI_API_KEY=...       # models named openai/MODEL
-export ANTHROPIC_API_KEY=...    # anthropic/MODEL
-export OPENROUTER_API_KEY=...   # openrouter/VENDOR/MODEL
+export ANTHROPIC_API_KEY=...  # your key
+export AGENT_PROVIDER=anthropic
 export AGENT_MODEL=anthropic/claude-opus-5-5
 ```
 
-For Amazon Bedrock, use your usual AWS credentials (`AWS_PROFILE`, SSO, or keys
-in the environment); no region is needed. A Bedrock API key in
-`AWS_BEARER_TOKEN_BEDROCK` works too, with `AWS_REGION` set to the key's region. Start the daemon with `--provider bedrock` and name Claude
-models by their cross-region inference profile, like
-`bedrock/global.anthropic.claude-opus-5-5`, which AWS routes to whichever
-region holds the model (from any source region the profile supports), or `--provider bedrock-openai` for `bedrock-openai/openai.gpt-6-sol`
-on Bedrock Mantle, or `--provider bedrock-openai-runtime` for the models
-Bedrock runtime's OpenAI-compatible endpoint serves, by inference profile
-(`bedrock-openai-runtime/us.openai.gpt-6-sol`).
-`AGENT_PROVIDER` takes the place of `--provider` for any provider, so
-`export AGENT_PROVIDER=bedrock AGENT_MODEL=bedrock/global.anthropic.claude-sonnet-5`
-needs no flags.
-To keep them instead, put `provider = "bedrock"` and
-`model = "bedrock/global.anthropic.claude-sonnet-5"` in `~/.agent/config.toml`;
-the shell's variables come first. An edit to `provider` there applies to a
-running daemon's next turns without a restart; running turns finish where
-they started.
-For a ChatGPT Go, Plus or Pro plan, run `agent login chatgpt` once and start
-the daemon with `--provider chatgpt`; it signs in through OpenAI's
-[Sign in with ChatGPT](https://developers.openai.com/siwc/token-sharing-open-source)
-and keeps the token fresh itself.
-Each daemon start rewrites `~/.agent/models.discovered` from what your
-providers list (`agent models --discover` does it on demand). Your own
-`~/.agent/models` goes on top: a `PROVIDER/MODEL` line adds a model or puts
-it first with your note, and `-PROVIDER/MODEL` hides one. Sonny and your
-agents offer the two together.
-
-Each bot has its own model, so bots on different providers can run side by
-side in one daemon. Other OpenAI Responses-compatible gateways
-can be added with `--provider`; see [providers and models](docs/RUST_PROTOTYPE.md#providers-and-models).
-
-From your project directory, start a bot:
+From your project directory, start a named bot:
 
 ```sh
 agent run --pretty --new --bot scout -- "What does this repository do?"
 ```
 
-The first command starts the daemon in the background. Bots and their history
-live in `~/.agent/state.sqlite`, so they survive restarts of the daemon and of
-your machine. Leave out `--pretty` to get the raw event stream.
+The first command starts the daemon in the background. Conversations live in
+`~/.agent/state.sqlite` and survive daemon and machine restarts. `--new`
+creates the named bot; leave it out to continue that conversation.
+`--pretty` renders events for people; omit it for JSON Lines.
+
+The CLI runs tools with your permissions unless you select a
+[sandbox](docs/RUST_PROTOTYPE.md#sandbox). Sonny sandboxes agents by default.
+
+### Other providers and models
+
+| Provider | Authentication | Model name |
+| --- | --- | --- |
+| OpenAI | `OPENAI_API_KEY` | `openai/MODEL` |
+| Anthropic | `ANTHROPIC_API_KEY` | `anthropic/MODEL` |
+| OpenRouter | `OPENROUTER_API_KEY` | `openrouter/VENDOR/MODEL` |
+| ChatGPT | `agent login chatgpt` | `chatgpt/MODEL` |
+| Amazon Bedrock | AWS credentials or a Bedrock API key | Depends on the endpoint; see [Bedrock setup](docs/RUST_PROTOTYPE.md#providers-and-models) |
+
+Set `AGENT_PROVIDER` to the provider you use and `AGENT_MODEL` to its model.
+To save defaults instead, put `provider` and `model` in
+`~/.agent/config.toml`; environment variables take precedence.
+
+`agent models --discover` refreshes the available models. Discovery also runs
+at daemon startup. Add choices or notes in `~/.agent/models`, or hide a model
+with a `-PROVIDER/MODEL` line. Each bot keeps its own model, so different
+providers can run side by side. See [providers and models](docs/RUST_PROTOTYPE.md#providers-and-models)
+for endpoint configuration, Bedrock profiles, and custom gateways.
 
 ### Continue a bot
 
@@ -138,12 +97,10 @@ Name the bot again to give it its next turn in the same conversation:
 agent run --pretty --bot scout -- "Which parts are tested?"
 ```
 
-A bot keeps the model, instructions, and tools it was created with until a
-client changes them. `--model` on a later turn overrides the model for that
-turn only. Between turns, a client can give a bot a new model of the same
-provider, new instructions, or new approval gates with the socket protocol's
-`configure`, as Sonny does when you switch a lead's model or its skills and
-memory change; see the [software protocol](docs/RUST_PROTOTYPE.md#software-protocol).
+A bot keeps its model, instructions, and tools until a client changes them.
+`--model` on a later turn overrides the model for that turn only. The socket
+protocol's [`configure`](docs/RUST_PROTOTYPE.md#software-protocol) changes
+persistent settings between turns.
 
 ### Leave it running and come back
 
@@ -155,7 +112,7 @@ agent follow --pretty --bot scout
 ```
 
 To start without waiting, use `--detach`. It prints a JSON handle that a script
-can wait on:
+can wait on (this example uses `jq`):
 
 ```sh
 handle=$(agent run --detach --bot scout -- "Run the test suite and summarize the failures" | jq -r .handle)
@@ -173,10 +130,12 @@ Send more instructions into the turn that's already running:
 agent run --bot scout --delivery steer -- "Skip the integration tests"
 ```
 
-Or stop it: `agent interrupt --bot scout`. A message to a busy bot steers its
-running turn unless you say otherwise: `--delivery queue` lines it up behind,
-and `--delivery reject` refuses it. A queued message it has not started
-can be taken back with `agent interrupt --bot scout --turn N`.
+Stop it with `agent interrupt --bot scout`. By default, a message to a busy
+bot steers its running turn. Use `--delivery queue` to wait behind it or
+`--delivery reject` to refuse busy bots. Supplying `--workspace` or
+`--turn-budget-tokens` defaults to queue instead; `AGENT_DELIVERY` can also
+set the default. Cancel a queued message with
+`agent interrupt --bot scout --turn N`.
 
 ## Let bots delegate
 
@@ -228,85 +187,32 @@ tools of its own that its bots call.
 
 ## Sonny
 
-[Sonny](sonny/README.md) is a terminal client over the same socket. Opened
-in a folder, it is that project's lead: it starts tasks, each in its own copy
-of the folder, lays them out in Rex, Herdr or cmux, and hears what they did. It
-also gives every agent [triggers, memory, skills and your MCP servers](docs/SONNY.md),
-the last through scripts that call many tools and return only what they print.
+[Sonny](sonny/README.md) is a terminal client for coordinating several tasks.
+Open it in a project folder and talk to that project's **lead**. The lead
+starts tasks, hears their updates, and brings you questions and decisions.
+Tasks can work in separate worktrees and open in Rex, Herdr, or cmux.
+
+```sh
+brew install lydakis/agent/sonny
+sonny  # from your project's folder
+```
+
+First-run setup helps you connect a provider, choose a model, and import MCP
+servers. Sonny also gives agents [memory, skills, and automations](docs/SONNY.md).
+The [lookout](docs/LOOKOUT.md) brings in task updates and news from configured
+sources. `/status` shows the work; `/config` changes settings.
 
 ### When to use Sonny
 
-For one quick task, use Claude Code or Codex: you ask, you watch, and the
-answer comes straight back, with no lead between you and the work. That is a
-recommendation from using both, not a measured comparison. They keep your
-attention on one task; Sonny lets you spend less attention across many. It
-is for the work you don't want to watch closely: five things rather than
-one, each needing a question answered or a decision now and then, while
-mail, chat and other people keep adding to it.
-
-You hand the folder's lead several things at once. It starts a task for
-each and hears how every turn ended through the [lookout](docs/LOOKOUT.md),
-so you don't check on them. What needs you comes to you: a task's question
-or a decision reaches the lead, and the footer counts it (`? 1 needs you`).
-News from outside comes in the same way, from the lookout's
-[sources](docs/LOOKOUT.md#sources) such as a chat poller or a mailbox. The
-lead can read further through your MCP servers, and weighs what it hears
-against the work it holds. Memory keeps how you work, so a correction holds
-for every later agent.
-
-It asks for a different habit: step back and ask for more. If you'd rather
-watch one thing get done, open Codex or Claude Code. If you have several,
-give them to the lead, and spend your attention on its questions and
-decisions instead of on watching.
+Use Sonny when you want to hand off several things and respond as they need
+you. For one task you want to follow closely, Claude Code or Codex may be a
+simpler fit. This is a recommendation from use, not a measured comparison.
 
 ### Install and first run
 
-```sh
-brew install lydakis/agent/sonny        # or, on Linux, install.sh above
-sonny                                   # in your project's folder
-```
-
-The first run looks at what your machine already has (a provider key, a
-ChatGPT sign-in, your AWS profiles), asks how your agents reach a model only
-when nothing does, and offers the providers' models ranked, the first marked
-so Enter takes it, then offers the MCP servers Claude Code, Codex, OpenCode
-or Kiro already have. With nothing ready and Claude Code, Codex, OpenCode or
-Kiro on the machine, it also offers to let that agent set Sonny up with you,
-in a session of its own, since it reaches a model already. `sonny setup` asks
-again; with flags (`--provider`, `--profile`, `--key-stdin`, `--model`,
-`--import-mcp`, `--json`) it asks nothing, for scripts and agents, and the
-`sonny-setup` skill tells any agent how to use them. As Codex does, it keeps the settings in
-`~/.agent/config.toml` and any key in `~/.agent/env`, readable only by you,
-which `agent` gives every daemon it starts, whoever asks it to, so nothing
-goes in your shell profile. Tool shells never get the keys the daemon's
-providers use; as in Codex, `[shell_environment_policy]` with
-`ignore_default_excludes = false` also leaves out every variable named like
-`*KEY*`, `*SECRET*` or `*TOKEN*`, and `exclude` lists more. Bots search the web where their provider offers
-it, as Codex's do: OpenAI with an API key, Anthropic, and GPT on Bedrock Mantle. Every
-bot can also read a page with `web_fetch`, which the daemon runs itself. Put
-`web_search = "disabled"` in `config.toml` to leave both out of new bots, or
-`web_search_off = ["bedrock-openai/xai.*"]` to leave search out for models
-whose provider's search refuses them.
-A message one agent sends another reaches its model with a line naming the
-sender, so no agent takes it for yours; `senders = "hidden"` leaves that out.
-A note sent with `--delivery attach` rides on the bot's next call and goes as a
-steer if none comes within `attach_wait` (`1d` unless `config.toml` says
-otherwise; `"0"` waits as long as it takes).
-A turn stopped by something only you can fix (a sign-in, a key, a usage
-limit, a provider that is down) waits for you rather than failing, for
-`hold` (`5d` unless `config.toml` says otherwise; `"0"` fails at once):
-`agent held` lists what waits and `agent retry` tries it again now.
-A request a provider's safety classifiers decline ends the turn, unless
-`[fallbacks]` names another model for the turn's own; that model then answers
-that request alone, for every agent once the daemon starts again
-([CLI.md](docs/CLI.md)). A model's context window, which
-sets when its agents compact, is what its provider lists, else Anthropic's published one for Claude, else
-200K; `[context_windows]` sets it by model, as `"bedrock/*openai.*" =
-1000000`, the most specific pattern winning, also lower on purpose.
-A price sheet, `~/.agent/prices.toml` (or the file `prices` in the config
-names), gives what a million tokens cost by the same patterns, and Sonny's
-`/usage` shows each model's cost and the total; nothing is bundled, so
-prices never go stale behind your back.
+See the [Sonny quickstart](sonny/README.md) for installation, setup, everyday
+controls, and permissions. Advanced settings and integrations are in the
+[Sonny reference](sonny/REFERENCE.md).
 
 ## How fast is it?
 
@@ -345,7 +251,7 @@ harnesses' numbers drift by up to about 20% between screens with the same
 binaries, so compare harnesses within one screen, not across screens.
 
 The [performance tools](docs/BENCHMARKS.md) reproduce these runs against the
-same synthetic provider, and [docs/](docs) holds the design record and
+same synthetic provider, and the [docs index](docs/README.md) links to the design record and
 measurements behind every decision.
 
 ## Status
@@ -371,6 +277,8 @@ runs unconfined, as `danger-full-access` does. Sonny sandboxes its leads and
 tasks by default. See [sandbox](docs/RUST_PROTOTYPE.md#sandbox).
 
 ## When you need more
+
+The [documentation index](docs/README.md) groups guides by task. Start here:
 
 - **Every command and flag:** `agent --help`, `agent COMMAND --help`, or the
   [CLI contract](docs/CLI.md).
