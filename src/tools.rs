@@ -3217,20 +3217,29 @@ async fn detach(
             return Err(error);
         }
     };
-    tokio::spawn(watch_detached(
-        registry.pulls.subscribe(),
-        Some(child),
-        detached.pid,
-        sandboxed,
-        started,
-        tracked,
-        held,
-    ));
-    Ok(detached)
+    // The watcher owns the child from here, before anything is awaited:
+    // a caller dropped meanwhile leaves no command that nothing watches.
+    let (read, since) = tokio::sync::oneshot::channel();
+    let pulls = registry.pulls.subscribe();
+    tokio::spawn(async move {
+        // Its leader's start, read off the runtime thread as every file is.
+        let pid = detached.pid;
+        let since = tokio::task::spawn_blocking(move || leader_since(pid))
+            .await
+            .ok()
+            .flatten();
+        let _ = read.send(since);
+        watch_detached(pulls, Some(child), pid, sandboxed, started, tracked, held).await;
+    });
+    Ok(Detached {
+        since: since.await.ok().flatten(),
+        ..detached
+    })
 }
 
-/// A detached command started: its child, what finds it, whether a
-/// sandbox holds it, when it started, and what it holds while it runs.
+/// A detached command started: its child, its pid (its leader's start is
+/// read once its watcher owns it), whether a sandbox holds it, when it
+/// started, and what it holds while it runs.
 #[cfg(unix)]
 type Spawned = (
     tokio::process::Child,
@@ -3282,13 +3291,14 @@ async fn spawn_detached(
     let started = std::time::Instant::now();
     let child = process.spawn().map_err(|e| not_started(e, workspace))?;
     let pid = child.id().ok_or(Error::new("shell_spawn_failed"))?;
-    // Read off the runtime thread, as every file is.
-    let since = tokio::task::spawn_blocking(move || leader_since(pid))
-        .await
-        .ok()
-        .flatten();
     let held: Box<dyn Send> = Box::new((permit, held, listening));
-    Ok((child, Detached { pid, since }, sandboxed, started, held))
+    Ok((
+        child,
+        Detached { pid, since: None },
+        sandboxed,
+        started,
+        held,
+    ))
 }
 
 /// Watch detached command `pid` until nothing it left in its group runs:
