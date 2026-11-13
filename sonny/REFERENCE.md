@@ -1935,7 +1935,9 @@ with the same blanks, drawn as a `◇ live` block where it called the tool
 and kept filled there as a note is. The tool host fills it once as it is
 called and answers what it shows and when, so the agent writes its reply
 knowing what the block says; that answer is all the agent's history keeps,
-however often the block changes after. Only blocks in view, or within a
+however often the block changes after. The host does not know where the
+tasks stand, so a block that reads them answers that it fills only in the
+window, never a count of none. Only blocks in view, or within a
 view of it, are looked at, once a second; one scrolled far back is filled
 again once it comes near.
 

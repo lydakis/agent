@@ -63,7 +63,13 @@ pub fn answer(
     crate::template::refusal(template, data, crate::template::To::Window)
         .map_err(|why| (crate::template::REFUSED, why))?;
     let at = crate::asks::clock(data.now, data.now);
-    Ok(match crate::template::render(template, data).0 {
+    let (filled, reads) = crate::template::render(template, data);
+    Ok(match filled {
+        // The host does not know where the tasks stand: what it filled
+        // from none would tell the agent a count the window never shows.
+        _ if reads.tasks => "Shown live in the conversation, kept filled as it changes; \
+            it reads the tasks, which only the window knows, so it does not fill here."
+            .to_owned(),
         Ok(text) => agent_client::memory::cut_filled(format!(
             "Shown live in the conversation, kept filled as it changes. At {at} it shows:\n{text}"
         )),
@@ -394,8 +400,19 @@ mod tests {
             answer("{{ source('nope').latest }}", &data).unwrap_err().0,
             "live_template"
         );
-        let later = answer("{{ task('calc.add').state }}", &data).unwrap();
+        let later = answer("{{ 'x' | length }} {{ nope.state }}", &data).unwrap();
         assert!(later.starts_with("Shown live in the conversation; it does not fill here yet"));
+        // No tasks here is not none: a block that reads them shows no count.
+        for tasks in [
+            "{{ tasks() | length }} tasks",
+            "{{ task('calc.add').state }}",
+        ] {
+            let shown = answer(tasks, &data).unwrap();
+            assert!(
+                shown.contains("only the window knows") && !shown.contains("0 tasks"),
+                "{shown}"
+            );
+        }
         // What it shows the agent is at most what a prompt keeps.
         let big = answer("{% for i in range(9000) %}0123456789{% endfor %}", &data).unwrap();
         assert!(big.len() < 33 * 1024 && big.contains("[cut: it filled to "));

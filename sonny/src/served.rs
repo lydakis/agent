@@ -782,8 +782,8 @@ async fn called(name: &str, arguments: &Value) -> Answer {
                 store: Some(store),
                 sources: crate::template::configured_sources(),
                 folder: here,
-                // The host does not read where the tasks stand: a blank
-                // that names one is filled in the window.
+                // The host does not read where the tasks stand: the answer
+                // says a block that reads them fills only in the window.
                 tasks: Default::default(),
                 now: std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
