@@ -4914,11 +4914,13 @@ impl Service {
                     })
                     .await?;
                 let (waiters, retained) = self.handles.stats();
-                // A folder read and the process's own record, off the run loop.
-                let ((open_files, file_limit), process) = tokio::task::spawn_blocking(|| {
+                // A folder read, the process's own record and a statvfs on
+                // each temporary folder, off the run loop.
+                let ((open_files, file_limit), process, temp) = tokio::task::spawn_blocking(|| {
                     (
                         agent_runtime::open_files::count(),
                         agent_runtime::footprint::read(),
+                        agent_runtime::sandbox::temporary_room(),
                     )
                 })
                 .await
@@ -4967,6 +4969,9 @@ impl Service {
                     "files": {"open": open_files, "limit": file_limit},
                     // Its memory, threads and processor time.
                     "process": process,
+                    // The room left in the temporary folders every agent's
+                    // commands share; inodes can run out with space to spare.
+                    "temp": temp,
                     "commands": self.commands.snapshot(),
                     "draining": self.draining(),
                     "paused": self.paused,

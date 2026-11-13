@@ -408,7 +408,8 @@ pub fn card(
 
 /// Something broken around the agents, which `/status` says under its
 /// heading after a red `✗`: a companion that keeps restarting, turns held
-/// on a cause the person can fix. When all is well it says nothing.
+/// on a cause the person can fix, a temporary folder low on room. When all
+/// is well it says nothing.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Alert {
     pub said: String,
@@ -454,6 +455,42 @@ pub fn companion_alerts(companions: &serde_json::Value, now_ms: u64, logs: &str)
                 ),
                 detail: format!("its log: {logs}/{name}.log"),
             }
+        })
+        .collect()
+}
+
+/// Under what share of its space or of its inodes left a temporary folder
+/// is an alert.
+const TEMP_LOW: f64 = 0.10;
+
+/// The temporary folders every agent's commands share (`stats`' `temp`)
+/// with under a tenth of their space or inodes left, each one line that
+/// says how much: when either runs out, every agent's temporary writes
+/// fail at once ("No space left on device"), inodes with space to spare.
+/// A file system that keeps no inode count (a zero total, or as many free
+/// as in all) is read by its space alone.
+pub fn temp_alerts(temp: &serde_json::Value) -> Vec<Alert> {
+    let low = |free: &serde_json::Value, total: &serde_json::Value| {
+        let (free, total) = (free.as_u64()?, total.as_u64()?);
+        let share = free as f64 / total as f64;
+        (total > 0 && free < total && share < TEMP_LOW).then(|| (share * 100.0).floor() as u64)
+    };
+    (temp.as_array().into_iter().flatten())
+        .filter_map(|room| {
+            let path = crate::tilde(room["path"].as_str()?);
+            let left = match (
+                low(&room["bytes_free"], &room["bytes_total"]),
+                low(&room["inodes_free"], &room["inodes_total"]),
+            ) {
+                (Some(space), Some(inodes)) => format!("{space}% space, {inodes}% inodes left"),
+                (Some(space), None) => format!("{space}% space left"),
+                (None, Some(inodes)) => format!("{inodes}% inodes left"),
+                (None, None) => return None,
+            };
+            Some(Alert {
+                said: format!("temp folder {path}: {left}"),
+                detail: String::new(),
+            })
         })
         .collect()
 }
@@ -716,6 +753,37 @@ mod tests {
             lines[1].to_string(),
             "  its log: ~/.agent/state.sqlite.companions/sonny-reviewer.log"
         );
+    }
+
+    #[test]
+    fn a_temporary_folder_low_on_space_or_inodes_is_one_line_saying_how_much() {
+        let room = |path: &str, bytes: (u64, u64), inodes: (u64, u64)| {
+            serde_json::json!({"path": path, "bytes_free": bytes.0, "bytes_total": bytes.1,
+                "inodes_free": inodes.0, "inodes_total": inodes.1})
+        };
+        let temp = serde_json::json!([
+            // Space to spare, inodes gone: what failed every agent's writes.
+            room("/tmp", (75, 100), (3_000, 100_000)),
+            room("/var/tmp", (4, 100), (90, 100)),
+            room("/both", (9, 100), (1, 100)),
+            room("/fine", (10, 100), (10, 100)),
+            // No inode count kept, or as many as are free.
+            room("/btrfs", (50, 100), (0, 0)),
+            room("/apfs", (50, 100), (7, 7)),
+        ]);
+        let alerts = temp_alerts(&temp);
+        let said: Vec<&str> = alerts.iter().map(|a| a.said.as_str()).collect();
+        assert_eq!(
+            said,
+            [
+                "temp folder /tmp: 3% inodes left",
+                "temp folder /var/tmp: 4% space left",
+                "temp folder /both: 9% space, 1% inodes left",
+            ]
+        );
+        // The fact alone: no advice under it.
+        assert!(alerts.iter().all(|a| a.detail.is_empty()));
+        assert!(temp_alerts(&serde_json::Value::Null).is_empty());
     }
 
     #[test]
