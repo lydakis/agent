@@ -513,6 +513,32 @@ AGENT_HEAP_PROFILE=$PWD/.local/bench/heap.json .local/venv/bin/python -m bench.f
 Allocation tracing slows the daemon by an order of magnitude, so the profiled
 run uses a long reply delay to reach the same overlap; its timings mean nothing.
 
+## Scaling with streaming bots
+
+`bench.scale_screen` asks how one daemon scales with the number of bots
+streaming at once. N bots take text turns back to back through one socket
+daemon against `bench.streaming_model`, an asyncio Responses endpoint that
+serves thousands of concurrent streams and paces its deltas to the clock.
+One firehose follower (`follow *`, as a Sonny window does) sees every event
+and resubmits each bot as its turn ends. The screen reads `stats` at the
+start and end of a measured window and reports the deltas (turns and tokens
+a second, CPU and store jobs per turn, per-op store timings), per-thread
+daemon CPU from `/proc` (Linux), the model's own CPU, how long each
+`submit` took to answer, and, from the store's own timestamps, how long each
+turn waited to start and how much it was paced or retried.
+
+`--jitter` spreads call lengths so turns end at different times, as real
+ones do. `--tpm` makes the model a provider with a tokens-per-minute limit
+that answers 429 with `retry-after-ms`; `--no-headers` hides the limit from
+the pacer, as Bedrock does.
+
+```sh
+.local/venv/bin/python -m bench.scale_screen --bots 2048 --jitter 0.5 \
+  --seconds 20 --out .local/bench/scale-2048
+.local/venv/bin/python -m bench.scale_screen --bots 64 --tpm 200000 \
+  --no-headers --out .local/bench/scale-64-blind
+```
+
 ## Sustained live load
 
 `bench.sustained` keeps N bots taking turns back to back for M minutes through
