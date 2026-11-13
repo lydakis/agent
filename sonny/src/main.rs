@@ -17176,6 +17176,12 @@ impl App {
                 spans.push(Span::raw(" · ").dim());
                 spans.extend(aside);
             }
+            // What the turn said meanwhile (a retry, the round limit, a
+            // steer that failed), which its end clears.
+            if let Some(notice) = &self.notice {
+                spans.push(Span::raw(" · ").dim());
+                spans.push(Span::raw(notice.clone()));
+            }
             return Line::from(spans);
         }
         if !aside.is_empty() {
@@ -23066,6 +23072,12 @@ mod tests {
         assert!(!app.status_line().to_string().contains("tab to queue"));
         app.input.set("after this");
         assert!(app.status_line().to_string().contains("tab to queue"));
+        // A notice set while it runs is said beside it.
+        app.notice = Some("the model retried; its reply may repeat".into());
+        assert!(
+            (app.status_line().to_string()).ends_with(" · the model retried; its reply may repeat")
+        );
+        app.notice = None;
         app.key(tab()).await;
         assert!(app.input.is_empty());
         // A turn of its own, once the running one ends: it may move the
