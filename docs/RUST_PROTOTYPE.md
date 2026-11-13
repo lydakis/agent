@@ -2742,7 +2742,12 @@ names one, of up to a day: as Codex's unified exec runs a command, it runs
 until it exits, `write_stdin` with `kill: true` on its handle stops it, or
 the daemon stops, and only a `timeout_ms` it was given ends it with
 `timed_out`. A command a steer moves to the background keeps the timeout it
-started with. Commands are at
+started with. Each bot keeps at most 64 background commands, steered ones
+included, as Codex keeps a session's processes: starting one past them kills
+the one the bot started or waited on least recently, whose handle says it was
+killed for that (`stopped`), so a bot that loses track of what it started
+cannot hold the process bound forever. Another bot's commands and detached
+commands never count. Commands are at
 most 16 KiB. At most `--max-processes` child processes run at once across the
 service, foreground or background; waiting never counts. Background commands
 the service has accepted but not started are bounded by the same number: when
