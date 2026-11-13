@@ -8655,3 +8655,54 @@ not touch: Sonny's only change is one label in the transcript's match on
 tool names. The same lookout note p95 fell 14% at the other size in the
 same run, and quiet window CPU has swung by 16% and 33% on earlier screens
 with no Sonny change (above), so both are the runner's spread.
+
+## No web tool for a sandbox off the network
+
+A bot whose sandbox keeps it off the network (`read-only`, or
+`workspace-write` without `network`) is neither offered nor runs
+`web_fetch` or `web_search`. What each path pays:
+
+- **A model call**: one bool check for the hosted search, and the tool
+  list borrowed as before. Only an offline bot that has a web tool builds
+  a filtered copy of its tool names, which the encoding cache keys as it
+  keys any selection.
+- **A tool call**: the "may it call this" check reads the same list, plus
+  one bool and a name match for an offline bot.
+- **The store**: nothing new.
+
+Daemon and Sonny screen (`bench.perf_gate`), the Perf workflow's Linux
+runner, base main c5fa712 against head 2b40ff0, alternating rounds:
+
+| Bench | Measure | Base | Head | Change |
+| --- | --- | ---: | ---: | ---: |
+| admission | lone submit CPU, ms | 36.892 | 37.18 | +0.8% |
+| admission | burst submit p99, ms | 4.296 | 4.295 | -0.0% |
+| completion | release to terminal p99, ms | 11.706 | 11.487 | -1.9% |
+| footprint | idle RSS, MiB | 15.799 | 15.973 | +1.1% |
+| footprint | per idle bot, KiB | 1.862 | 1.778 | -4.5% |
+| footprint | RSS after a turn each, MiB | 30.268 | 29.131 | -3.8% |
+| footprint | CPU per turn, ms | 1.02 | 1.027 | +0.7% |
+| sonny | lookout CPU per 1k deltas at 10x1, ms | 12.5 | 18.75 | +50.0% |
+| sonny | lookout CPU per 1k deltas at 10x10, ms | 5.625 | 5.625 | +0.0% |
+| sonny | lookout CPU per 1k deltas at 10x100, ms | 5.315 | 5.25 | -1.2% |
+| sonny | lookout CPU per 1k deltas at 100x10, ms | 5.56 | 5.625 | +1.2% |
+| sonny | lookout seated at 100x10, s | 0.1 | 0.1 | +0.0% |
+| sonny | lookout note p95 at 10x100, ms | 2448.0 | 2456.0 | +0.3% |
+| sonny | lookout note p95 at 100x10, ms | 2492.0 | 2458.0 | -1.4% |
+| sonny | quiet window CPU, ms/s | 0.95 | 1.325 | +39.5% |
+| sonny | quiet window reads, KiB/s | 0.24 | 0.24 | +0.0% |
+| sonny | quiet window requests, /s | 0.685 | 0.68 | -0.7% |
+| sonny | quiet window RSS, MiB | 24.0 | 23.95 | -0.2% |
+| sonny | sky replay CPU per 1k lines, ms | 13.135 | 13.29 | +1.2% |
+| sonny | sky replay RSS, MiB | 75.75 | 77.3 | +2.0% |
+| lifecycle | CPU, s | 0.54 | 0.525 | -2.8% |
+| lifecycle | p95 turn, ms | 585.158 | 577.885 | -1.2% |
+| lifecycle | peak RSS, MiB | 24.209 | 24.643 | +1.8% |
+
+Store work per turn is the same on both sides, and every daemon row is
+within 2%, or lower, on head (none of these benches runs an offline bot
+with a web tool, so they measure the check every bot pays). The two Sonny
+rows that moved belong to code this change doesn't touch: no Sonny source
+changed. The lookout's 10x1 row counts a handful of 6 ms ticks, so one
+tick is the 50%, and quiet window CPU has swung by 16% to 33% on earlier
+screens with no Sonny change. Both are the runner's spread.
