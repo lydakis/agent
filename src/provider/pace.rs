@@ -129,6 +129,9 @@ struct State {
     /// How many calls the pool lets fly at once after a refusal it could
     /// not foresee, while it learns again what the provider takes.
     ramp: Option<Ramp>,
+    /// Ramps begun, so a call admitted under an ended ramp never settles
+    /// into a later one.
+    ramps: u64,
 }
 
 /// After a refusal from a pool that knows no allowance (a provider that
@@ -142,6 +145,8 @@ struct State {
 /// again. A refusal that names a ramp limit (Anthropic's
 /// `ramp_limit_exceeded`) ramps a pool whatever it knows.
 struct Ramp {
+    /// Which ramp this is (`State::ramps` when it began).
+    generation: u64,
     window: u32,
     /// Where growth turns from doubling to one call a round, once a
     /// refusal has come while ramping.
@@ -425,8 +430,9 @@ pub struct Reservation<'a> {
     dispatched: bool,
     request_reported: bool,
     pub waited: Duration,
-    /// Admitted under a ramp, whose window it holds until it settles.
-    ramped: bool,
+    /// Admitted under a ramp (its generation), whose window it holds until
+    /// it settles.
+    ramp: Option<u64>,
 }
 impl Reservation<'_> {
     /// Call immediately before polling the HTTP send future.
@@ -478,8 +484,9 @@ impl Reservation<'_> {
 impl Drop for Reservation<'_> {
     fn drop(&mut self) {
         let mut state = self.pace.state.lock().unwrap();
-        if self.ramped
+        if let Some(generation) = self.ramp
             && let Some(ramp) = state.ramp.as_mut()
+            && ramp.generation == generation
         {
             ramp.flying = ramp.flying.saturating_sub(1);
         }
@@ -642,8 +649,9 @@ impl Pace {
                         let left = due.map(|(at, _)| at.saturating_duration_since(now));
                         let wait = match left {
                             Some(left) if !left.is_zero() => left,
-                            // A full ramp waits for a call to settle, which
-                            // wakes the gate.
+                            // A full ramp waits for one of its calls to
+                            // settle, which wakes the gate: like a wait on
+                            // a refund, it is a wait on calls in flight.
                             _ if state.ramp.as_ref().is_some_and(|r| r.flying >= r.window) => {
                                 Duration::from_secs(60)
                             }
@@ -654,7 +662,10 @@ impl Pace {
                                 dim.reserved += cost;
                             }
                             state.reserved_requests += 1;
-                            let ramped = state.ramp.as_mut().map(|r| r.flying += 1).is_some();
+                            let ramp = state.ramp.as_mut().map(|r| {
+                                r.flying += 1;
+                                r.generation
+                            });
                             let waited = started.elapsed();
                             state.counts.admitted += 1;
                             if waited >= Duration::from_millis(1) {
@@ -669,7 +680,7 @@ impl Pace {
                                 dispatched: false,
                                 request_reported: false,
                                 waited,
-                                ramped,
+                                ramp,
                             });
                         }
                         wait
@@ -720,7 +731,9 @@ impl Pace {
         if open && (ramp || blind) {
             match state.ramp.as_mut() {
                 None => {
+                    state.ramps += 1;
                     state.ramp = Some(Ramp {
+                        generation: state.ramps,
                         window: 1,
                         threshold: None,
                         flying: 0,
@@ -1474,6 +1487,28 @@ mod tests {
         assert_eq!(window(&pace), Some(4));
         pace.accepted();
         assert_eq!(window(&pace), Some(5));
+    }
+
+    /// A call admitted under a ramp that has since ended frees nothing in
+    /// a later one.
+    #[tokio::test(start_paused = true)]
+    async fn a_call_from_an_ended_ramp_holds_no_place_in_a_new_one() {
+        let pace = Pace::default();
+        pace.limited(None);
+        tokio::time::advance(Duration::from_secs(2)).await;
+        let old = sent(&pace, 10).await.unwrap();
+        for _ in 0..RAMP_DONE {
+            pace.accepted();
+        }
+        assert!(pace.state.lock().unwrap().ramp.is_none());
+        pace.limited(None);
+        tokio::time::advance(Duration::from_secs(5)).await;
+        let new = sent(&pace, 10).await.unwrap();
+        drop(old);
+        let flying = |pace: &Pace| pace.state.lock().unwrap().ramp.as_ref().map(|r| r.flying);
+        assert_eq!(flying(&pace), Some(1));
+        drop(new);
+        assert_eq!(flying(&pace), Some(0));
     }
 
     /// A pool that knows its allowance paces by it and does not ramp; a

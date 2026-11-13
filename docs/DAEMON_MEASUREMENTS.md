@@ -8990,3 +8990,24 @@ this checks the paths every call takes:
 
 Store work per turn is the same (7.001 jobs a turn on both), and the gate
 warned on no row.
+
+A caller that finds the window full waits in the gate for one of the
+ramp's calls to settle, as a call waiting on a refund from calls in flight
+does. Parking it instead was measured and lost on both counts, 45 s
+windows, same box and settings:
+
+| Bots | How a full window waits | Turns a second | CPU per turn, ms | Store jobs per turn |
+| ---: | --- | ---: | ---: | ---: |
+| 64 | before (no ramp) | 9.40 | 11.7 | 143.1 |
+| 64 | in the gate | 9.33 | 1.7 | 11.0 |
+| 64 | parked for its calls' time | 8.73 | 4.0 | 40.9 |
+| 64 | parked in a queue, a share apart | 8.68 | 2.2 | 14.4 |
+| 256 | before (no ramp) | 7.46 | 11.2 | 105.3 |
+| 256 | in the gate | 7.46 | 2.0 | 10.2 |
+| 256 | parked for its calls' time | 5.62 | 17.9 | 229.3 |
+| 256 | parked in a queue, a share apart | 4.40 | 4.7 | 31.3 |
+
+A parked caller cannot be woken by a settle, so it comes back on a guess:
+too soon and it parks again (the store work), too late and the window sits
+idle (the lost turns). Waiting in the gate holds the bot's active slot
+while it waits, as a refund wait does (#940 follows that up).
