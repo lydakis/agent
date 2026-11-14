@@ -46,8 +46,9 @@ pub struct View {
     at: Option<Instant>,
     /// The row ↑ and ↓ picked, by its place in the list.
     pub pick: Option<usize>,
-    /// The handle a first x asked to stop, waiting for the second.
-    stopping: Option<String>,
+    /// The stop `x` asked, by handle and what it names, waiting for
+    /// Enter: the one confirm.
+    stopping: Option<(String, String)>,
     /// What the last stop asked, or came to.
     pub said: Option<String>,
     /// What a stop running beside the window came to, once it has.
@@ -94,12 +95,11 @@ impl View {
             Ok(page) => {
                 self.error = None;
                 self.rows = page["processes"].as_array().cloned().unwrap_or_default();
-                self.pick = self
-                    .pick
-                    .filter(|_| !self.rows.is_empty())
-                    .map(|at| at.min(self.rows.len() - 1));
+                // With rows, one is always picked: the first to start.
+                self.pick = (!self.rows.is_empty())
+                    .then(|| self.pick.unwrap_or(0).min(self.rows.len() - 1));
                 // A stop asked of a row that has gone since is no stop.
-                if let Some(handle) = &self.stopping
+                if let Some((handle, _)) = &self.stopping
                     && !self.rows.iter().any(|row| row["handle"] == *handle)
                 {
                     self.stopping = None;
@@ -131,13 +131,27 @@ impl View {
             };
         }
         let word = |row: &Value, field: &str| row[field].as_str().unwrap_or_default().to_owned();
-        // Any key but a second x lets a stop asked for go.
-        let stopping = self.stopping.take();
+        // A stop asked for: only Enter says yes, any other key keeps it
+        // running, and says so.
+        if let Some((handle, _)) = self.stopping.take() {
+            if key.code != KeyCode::Enter {
+                self.said = Some("not stopped".into());
+                return Key::Stay;
+            }
+            let bot = (self.rows.iter())
+                .find(|row| row["handle"] == *handle)
+                .map(|row| word(row, "bot"));
+            self.said = None;
+            return match bot {
+                Some(bot) => Key::Stop { bot, handle },
+                None => Key::Stay,
+            };
+        }
         match key.code {
             KeyCode::Esc => Key::Close,
             KeyCode::Enter => match self.picked() {
                 Some(row) => Key::Open(word(row, "bot")),
-                None => Key::Close,
+                None => Key::Stay,
             },
             KeyCode::Up | KeyCode::Char('k') => {
                 self.pick = Some(self.pick.map_or(0, |at| at.saturating_sub(1)));
@@ -150,16 +164,20 @@ impl View {
             }
             KeyCode::Char('x') => {
                 let Some(row) = self.picked() else {
-                    self.said = Some("pick a command with ↑↓ first".into());
+                    self.said = Some("nothing runs to stop".into());
                     return Key::Stay;
                 };
-                let (bot, handle) = (word(row, "bot"), word(row, "handle"));
-                if stopping.as_deref() == Some(handle.as_str()) {
-                    self.said = None;
-                    return Key::Stop { bot, handle };
-                }
-                self.said = Some(format!("x again stops {handle} and all it started"));
-                self.stopping = Some(handle);
+                let handle = word(row, "handle");
+                let command = row["command"].as_str().unwrap_or_default();
+                let command: String = (command.chars())
+                    .map(|c| if c.is_control() { ' ' } else { c })
+                    .collect();
+                let what = match command.trim() {
+                    "" => handle.clone(),
+                    command => crate::transcript::cut(command, 32),
+                };
+                self.said = None;
+                self.stopping = Some((handle, what));
                 Key::Stay
             }
             KeyCode::Char('a') => {
@@ -229,11 +247,18 @@ impl View {
             let picked = self.pick == Some(at);
             out.push(line(row, name, name_width, width, now_ms, picked));
         }
-        if let Some(said) = &self.said {
-            out.push(Line::default());
-            out.push(Line::from(said.clone()).fg(Color::Yellow));
-        }
         out
+    }
+
+    /// The pane's foot: the stop to confirm, else what the last one said.
+    pub fn footer(&self) -> Option<Line<'static>> {
+        if let Some((_, what)) = &self.stopping {
+            return Some(Line::from(vec![
+                Span::raw(format!("Stop {what} and all it started?")).bold(),
+                Span::raw(" It can't be undone.").dim(),
+            ]));
+        }
+        self.said.clone().map(Line::from)
     }
 
     /// A bot's name as the card shows it: short in the project, whole
@@ -251,6 +276,11 @@ impl View {
             false => "a every project",
         };
         use crate::hint::{Enter, Esc, Keys};
+        if self.stopping.is_some() {
+            return (Keys::new().enter(Enter::Confirm("stop")))
+                .esc(Esc::Cancel)
+                .text();
+        }
         let (key, does) = scope.split_once(' ').unwrap_or((scope, ""));
         (Keys::new().pick().enter(Enter::Open))
             .key("x", "stop")
@@ -366,17 +396,30 @@ mod tests {
         assert!(card[3].contains("fix") && card[3].contains("detached pid 4242"));
         assert!(card[3].ends_with("npm run dev more"), "{card:?}");
         assert!(card.iter().all(|line| line.width() <= 80), "{card:?}");
-        // Nothing picked, nothing stopped.
+        // It opens with its first row picked.
+        assert_eq!(view.picked_row(), Some(2));
+        press(&mut view, KeyCode::Down);
+        press(&mut view, KeyCode::Down);
+        // x asks once, naming the command; any key but Enter keeps it
+        // running and says so; Enter stops it. Never x twice.
         assert_eq!(press(&mut view, KeyCode::Char('x')), Key::Stay);
-        press(&mut view, KeyCode::Down);
-        press(&mut view, KeyCode::Down);
-        // A first x asks; another key lets it go; two in a row stop.
+        let foot = view.footer().unwrap().to_string();
+        assert_eq!(
+            foot,
+            "Stop npm run dev more and all it started? It can't be undone."
+        );
+        assert_eq!(view.keys(), "enter stop · esc cancel");
         assert_eq!(press(&mut view, KeyCode::Char('x')), Key::Stay);
-        assert!(view.said.as_deref().unwrap().contains("proc:9"));
-        press(&mut view, KeyCode::Down);
+        assert_eq!(view.footer().unwrap().to_string(), "not stopped");
         assert_eq!(press(&mut view, KeyCode::Char('x')), Key::Stay);
         assert_eq!(
-            press(&mut view, KeyCode::Char('x')),
+            press(&mut view, KeyCode::Esc),
+            Key::Stay,
+            "esc cancels, not closes"
+        );
+        assert_eq!(press(&mut view, KeyCode::Char('x')), Key::Stay);
+        assert_eq!(
+            press(&mut view, KeyCode::Enter),
             Key::Stop {
                 bot: "shop.fix".into(),
                 handle: "proc:9".into()

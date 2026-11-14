@@ -431,7 +431,9 @@ impl View {
 
     /// The fact a removal waits on is kept: a key went elsewhere.
     pub fn keep(&mut self) {
-        self.confirm = None;
+        if self.confirm.take().is_some() {
+            self.notice = Some("not removed".into());
+        }
     }
 
     /// How many pages are open over the list.
@@ -903,9 +905,8 @@ impl View {
     pub fn footer(&self) -> Option<Line<'static>> {
         if let Some((_, name)) = &self.confirm {
             return Some(Line::from(vec![
-                Span::raw("Remove "),
-                Span::raw(name.clone()).bold(),
-                Span::raw("? It can't be undone."),
+                Span::raw(format!("Remove {name}?")).bold(),
+                Span::raw(" It can't be undone.").dim(),
             ]));
         }
         self.notice
