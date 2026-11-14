@@ -3,9 +3,9 @@ use agent_runtime::{
     codec::Family,
     provider::{ModelTokens, ToolCall, Usage},
     store::{
-        Answered, Binding, Blocked, Bot, CacheTtl, CompactionPlan, ContextUsage, Counts, Database,
-        Decision, Delivery, Fork, Gate, Gated, Halt, Halted, Lifted, Limit, Planning, ProcessKind,
-        QuoteRef, Settings, Strip, Trailer, TurnBudget, TurnOptions, Wake,
+        Answered, ApprovalPolicy, Binding, Blocked, Bot, CacheTtl, CompactionPlan, ContextUsage,
+        Counts, Database, Decision, Delivery, Fork, Gate, Gated, Halt, Halted, Lifted, Limit,
+        Planning, ProcessKind, QuoteRef, Settings, Strip, Trailer, TurnBudget, TurnOptions, Wake,
     },
     tools::{Declared, Inherit, Outcome},
 };
@@ -803,7 +803,8 @@ fn gates_are_capped_before_a_bot_is_written() {
 }
 
 /// A bot that a sandboxed bot makes takes its sandbox unless it names a
-/// stricter one, as Codex's subagents inherit their parent's.
+/// stricter one, as Codex's subagents inherit their parent's; one asked
+/// for looser is refused, never made otherwise than asked.
 #[test]
 fn a_bot_made_by_a_sandboxed_bot_is_no_less_sandboxed() {
     use agent_runtime::sandbox::Mode;
@@ -823,7 +824,7 @@ fn a_bot_made_by_a_sandboxed_bot_is_no_less_sandboxed() {
         )
         .unwrap()
         .0;
-    let made = |db: &mut Database, name: &str, settings: Settings| {
+    let asked = |db: &mut Database, name: &str, settings: Settings| {
         db.create(
             name,
             Some("/elsewhere"),
@@ -834,29 +835,87 @@ fn a_bot_made_by_a_sandboxed_bot_is_no_less_sandboxed() {
                 ..binding()
             },
         )
-        .unwrap()
-        .0
-        .settings
+        .map(|(bot, _)| bot.settings)
     };
+    let made =
+        |db: &mut Database, name: &str, settings: Settings| asked(db, name, settings).unwrap();
     let unconfined = made(&mut db, "Bob", Settings::default());
     assert_eq!(unconfined.sandbox, Some(Mode::WorkspaceWrite));
     assert_eq!(unconfined.writable, ["/shared"]);
-    let full = made(
-        &mut db,
-        "Cid",
+    // Asked for more than its creator has: refused, saying what, and
+    // nothing is made.
+    let refused = |settings: Settings, what: &str| {
+        let mut db = crate::db();
+        let ann = db
+            .create(
+                "Ann",
+                Some("/work"),
+                Binding {
+                    settings: Settings {
+                        sandbox: Some(Mode::WorkspaceWrite),
+                        writable: vec!["/shared".into()],
+                        ..Settings::default()
+                    },
+                    ..binding()
+                },
+            )
+            .unwrap()
+            .0;
+        let error = db
+            .create(
+                "Kid",
+                Some("/elsewhere"),
+                Binding {
+                    settings,
+                    created_by: Some(ann.name.as_str()),
+                    created_by_id: Some(ann.bot_id),
+                    ..binding()
+                },
+            )
+            .unwrap_err();
+        assert_eq!(error.code, "invalid_setting", "{what}");
+        assert!(
+            error.detail.as_deref().unwrap_or("").starts_with(what),
+            "{what}: {error:?}"
+        );
+        assert_eq!(db.inspect("Kid").unwrap_err().code, "bot_not_found");
+    };
+    refused(
         Settings {
             sandbox: Some(Mode::DangerFullAccess),
             ..Settings::default()
         },
+        "sandbox",
     );
-    assert_eq!(full.sandbox, Some(Mode::WorkspaceWrite));
+    refused(
+        Settings {
+            sandbox: Some(Mode::WorkspaceWrite),
+            network: true,
+            ..Settings::default()
+        },
+        "network",
+    );
+    refused(
+        Settings {
+            writable: vec!["/other".into()],
+            ..Settings::default()
+        },
+        "writable",
+    );
+    refused(
+        Settings {
+            sandbox: Some(Mode::WorkspaceWrite),
+            unix_sockets: vec!["/run/other.sock".into()],
+            ..Settings::default()
+        },
+        "unix_sockets",
+    );
     let networked = made(
         &mut db,
         "Dee",
         Settings {
             sandbox: Some(Mode::WorkspaceWrite),
             writable: vec!["/other".into()],
-            network: true,
             ..Settings::default()
         },
     );
@@ -872,6 +931,35 @@ fn a_bot_made_by_a_sandboxed_bot_is_no_less_sandboxed() {
     );
     assert_eq!(read_only.sandbox, Some(Mode::ReadOnly));
     assert!(read_only.writable.is_empty());
+    // One that never asks makes only bots that never ask, asked or not.
+    let never = made(
+        &mut db,
+        "Fay",
+        Settings {
+            sandbox: Some(Mode::WorkspaceWrite),
+            approval_policy: Some(ApprovalPolicy::Never),
+            ..Settings::default()
+        },
+    );
+    assert!(never.never_asks());
+    let fay = db.inspect("Fay").unwrap();
+    let kid = db
+        .create(
+            "Gus",
+            Some("/elsewhere"),
+            Binding {
+                created_by: Some(fay.name.as_str()),
+                created_by_id: Some(fay.bot_id),
+                ..binding()
+            },
+        )
+        .unwrap()
+        .0;
+    assert!(kid.settings.never_asks());
+    let unasked = vec!["approval_policy".to_owned()];
+    db.set_settings("Gus", None, &unasked, &Settings::default())
+        .unwrap();
+    assert!(db.inspect("Gus").unwrap().settings.never_asks());
     // An unconfined creator imposes nothing.
     assert_eq!(
         Settings::default().under(&Settings::default()),
@@ -965,6 +1053,143 @@ fn a_sandboxed_bot_waits_for_a_verdict_only_on_an_escape() {
                 call.call_id
             ),
             false => assert_eq!(announced.err().unwrap().code, "invalid_tool_state"),
+        }
+    }
+}
+
+/// A bot that never asks keeps its gates, yet no call of it waits on one:
+/// each call they would hold is refused instead, an escape as under no
+/// gate, as under Codex's approval policy `never`.
+#[test]
+fn a_bot_asked_for_with_no_gate_under_a_gated_creator_is_refused_once_made_never() {
+    let mut db = db();
+    let tools = ["shell".to_owned()];
+    let gate = Gate {
+        tag: "auto".into(),
+        tools: tools.to_vec(),
+        expire_ms: None,
+    };
+    let (ann, _) = db
+        .create(
+            "Ann",
+            Some("/synthetic"),
+            Binding {
+                tools: &tools,
+                gate: Some(&gate),
+                ..binding()
+            },
+        )
+        .unwrap();
+    let (cy, _) = db
+        .create(
+            "Cy",
+            Some("/synthetic"),
+            Binding {
+                request_id: Some("make-cy"),
+                ..binding()
+            },
+        )
+        .unwrap();
+    let under = |db: &Database, name: &str, key: Option<&str>| {
+        db.ungated_under(name, key, Some(&ann.name), Some(ann.bot_id))
+    };
+    // Asked for by a gated creator: refused, saying it would keep them.
+    assert_eq!(under(&db, "Kid", None).unwrap_err().code, "invalid_gate");
+    // An ungated creator may make one.
+    db.ungated_under("Kid", None, Some(&cy.name), Some(cy.bot_id))
+        .unwrap();
+    // A name already held, or one this keyed request made and deleted
+    // since, is the creation's to answer, so a resend gets what it made
+    // whatever its creator has become since.
+    under(&db, "Cy", None).unwrap();
+    db.delete_bot("Cy").unwrap();
+    under(&db, "Cy", Some("make-cy")).unwrap();
+    // A name a deletion freed is free for any other creation.
+    assert_eq!(under(&db, "Cy", None).unwrap_err().code, "invalid_gate");
+}
+
+#[test]
+fn a_bot_that_never_asks_announces_nothing_its_gates_hold() {
+    let mut db = db();
+    let tools = ["shell".to_owned(), "write".to_owned(), "echo".to_owned()];
+    let gate = Gate {
+        tag: "auto".into(),
+        tools: tools.to_vec(),
+        expire_ms: None,
+    };
+    let never = |sandbox| Settings {
+        sandbox,
+        approval_policy: Some(ApprovalPolicy::Never),
+        ..Settings::default()
+    };
+    for (name, sandbox) in [
+        ("Bob", Some(agent_runtime::sandbox::Mode::WorkspaceWrite)),
+        ("Cy", None),
+    ] {
+        let binding = Binding {
+            tools: &tools,
+            gate: Some(&gate),
+            settings: never(sandbox),
+            ..binding()
+        };
+        db.create(name, Some("/synthetic"), binding).unwrap();
+    }
+    let call = |id: &str, name: &str, arguments: Value| {
+        let arguments = arguments.to_string();
+        let item = json!({"type":"function_call","id":format!("fc_{id}"),"call_id":id,
+            "name":name,"arguments":arguments});
+        let call = ToolCall {
+            name: name.into(),
+            call_id: id.into(),
+            arguments,
+            custom: false,
+        };
+        (Bytes::from(serde_json::to_vec(&item).unwrap()), call)
+    };
+    let folder = std::path::Path::new("/synthetic");
+    for (name, refused) in [
+        ("Bob", vec!["up", "outside", "say"]),
+        ("Cy", vec!["plain", "up", "outside", "say"]),
+    ] {
+        let turn = db
+            .begin(
+                name,
+                "request",
+                "work",
+                true,
+                &TurnOptions::default(),
+                allow_provider,
+            )
+            .unwrap()
+            .turn;
+        let round = [
+            call("plain", "shell", json!({"command":"make"})),
+            call(
+                "up",
+                "shell",
+                json!({"command":"git push","sandbox_permissions":"require_escalated"}),
+            ),
+            call(
+                "outside",
+                "write",
+                json!({"path":"/etc/hosts","content":"x"}),
+            ),
+            call("say", "echo", json!({"text":"hi"})),
+        ];
+        let (items, calls): (Vec<_>, Vec<_>) = round.into_iter().unzip();
+        db.append(turn, items, &calls, None).unwrap();
+        let bot = db.inspect(name).unwrap();
+        let rules = Default::default();
+        assert!(calls.iter().all(|call| !bot.gated(call, folder, &rules)));
+        let unasked: Vec<&str> = (calls.iter())
+            .filter(|call| bot.unasked(call, folder, &rules))
+            .map(|call| call.call_id.as_str())
+            .collect();
+        assert_eq!(unasked, refused, "{name}");
+        // Nothing waits for a verdict: no call was announced.
+        for call in &calls {
+            let announced = db.approval_start(turn, call, false, 0);
+            assert_eq!(announced.err().unwrap().code, "invalid_tool_state");
         }
     }
 }
@@ -5175,7 +5400,8 @@ fn a_bot_keeps_its_settings_and_a_fork_copies_them() {
         json!({"context_bytes":4096,"context_items":4096,"note_turns":48,"compact_at":75,
             "compact_keep":25,"compact_tokens":null,"keep_turns":1,"max_rounds":null,"max_drops":3,"approval_hold_ms":2000,"max_output_tokens":null,
             "cache_ttl":"1h","speed":"fast","sandbox":null,"writable":[],"network":false,"outputs":null,"trailer":["sender"],
-            "quiet_background":false,"hold_ms":432000000,"unix_sockets":[],"rules":null,"env":{}})
+            "quiet_background":false,"hold_ms":432000000,"unix_sockets":[],"rules":null,"env":{},
+            "approval_policy":null})
     );
     // Retention follows the bot's own setting.
     for n in 1..=3 {
@@ -19302,6 +19528,11 @@ fn the_trail_says_who_approved_or_denied_each_gated_call() {
 /// A running turn of Lead, whose declared `run` tool has steps, gated by
 /// `manual` when `gated`.
 fn stepping_turn(db: &mut Database, gated: bool) -> (i64, ToolCall) {
+    stepping_turn_under(db, gated, Settings::default())
+}
+
+/// A stepping turn of Lead under `settings`.
+fn stepping_turn_under(db: &mut Database, gated: bool, settings: Settings) -> (i64, ToolCall) {
     let run = Declared {
         name: "run".into(),
         description: "Run.".into(),
@@ -19326,6 +19557,7 @@ fn stepping_turn(db: &mut Database, gated: bool) -> (i64, ToolCall) {
         Binding {
             declared: Some(std::slice::from_ref(&run)),
             gate: gated.then_some(&gate),
+            settings,
             ..binding()
         },
     )
@@ -19453,6 +19685,39 @@ fn a_tool_hosts_steps_are_kept_with_the_facts_it_declares() {
         .err()
         .unwrap();
     assert_eq!(unknown.code, "no_allowed_step");
+}
+
+#[test]
+fn a_step_a_bot_that_never_asks_would_be_asked_is_refused_and_ran_nowhere() {
+    use agent_runtime::store::{Step, audit::Facts};
+    let mut db = db();
+    let never = Settings {
+        approval_policy: Some(ApprovalPolicy::Never),
+        ..Settings::default()
+    };
+    let (turn, _) = stepping_turn_under(&mut db, true, never);
+    let writes = Facts::given(Some("mcp"), Some("external"), Some("write")).unwrap();
+    let stepped = db
+        .step_announce(
+            "Lead",
+            turn,
+            "c1",
+            "1",
+            "send",
+            json!({"to":"x"}),
+            false,
+            writes,
+            0,
+        )
+        .unwrap();
+    let Step::Decided(decision) = stepped.step else {
+        panic!("a step that never asks is decided at once");
+    };
+    assert_eq!(decision["decision"], "deny");
+    assert_eq!(
+        facts(&trail(&db)[0]),
+        json!(["send", "mcp", null, "nobody", "write", "denied"])
+    );
 }
 
 #[test]

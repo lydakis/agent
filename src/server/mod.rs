@@ -4674,12 +4674,21 @@ impl Service {
                 if let Some(key) = &request_id {
                     name("request_id", key)?;
                 }
-                let gate = gate(
-                    approve,
-                    approver,
-                    approve_expire_ms,
-                    self.registry.tool_count() + MAX_DECLARED,
-                )?;
+                // `approve: []` alone asks for no gate: a root bot has none,
+                // and a bot made by another, which keeps its creator's, is
+                // refused rather than given them unasked.
+                let ungated = approver.is_none()
+                    && approve_expire_ms.is_none()
+                    && approve.as_ref().is_some_and(Vec::is_empty);
+                let gate = match ungated {
+                    true => None,
+                    false => gate(
+                        approve,
+                        approver,
+                        approve_expire_ms,
+                        self.registry.tool_count() + MAX_DECLARED,
+                    )?,
+                };
                 name("bot", &bot)?;
                 if let Some(creator) = &created_by {
                     name("created_by", creator)?;
@@ -4755,6 +4764,14 @@ impl Service {
                 let follower = (bound.events.packets > 0).then(|| bot.clone());
                 let answer = store
                     .queue("create", move |db| {
+                        if ungated {
+                            db.ungated_under(
+                                &bot,
+                                request_id.as_deref(),
+                                created_by.as_deref(),
+                                created_by_id,
+                            )?;
+                        }
                         let (created, event) = db.create(
                             &bot,
                             path.as_deref(),

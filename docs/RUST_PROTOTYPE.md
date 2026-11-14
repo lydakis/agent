@@ -627,6 +627,7 @@ when it sets either.
 | `max_rounds` (`--max-rounds`) | Model calls each turn may make; the last goes with no tool call allowed, and the turn fails `tool_round_limit` past it. | none |
 | `max_drops` (`--max-drops`) | Replies in a row the model's own output cap may cut short in a turn; each before the last is dropped and the model told, and the last ends the turn `provider_incomplete`. | 3 |
 | `keep_turns` (`--keep-turns`) | After each of its turns finishes, prune the bot to this many turns' records (see [Retention](#retention)). | none |
+| `approval_policy` (`--approval never`) | `never`: a call a gate would hold is refused with `approval_refused` and no one is asked, as Codex's `approval_policy = "never"` refuses what would need approval; the bot keeps its gates, so what they name is what it refuses, and a call its sandbox confines still runs inside it. A bot another made takes its creator's `never`, and it can't be configured away from a bot whose creator never asks (see [tool approval](#tool-approval)). | none (ask) |
 | `approval_hold_ms` (`--approval-hold`) | Milliseconds a gated call waits live for its verdict before its turn parks (see [tool approval](#tool-approval)), and a terminal read waits live for its output before its turn parks. 0 parks at once; at most 3,600,000. | 2,000 |
 | `max_output_tokens` (`--max-output-tokens`) | Generated tokens per model call, including reasoning, summaries included. Anthropic calls use the model's full output limit (read inside Bedrock ids) unless this is set; set, it is sent as `max_tokens`, at least 2,048 so a legacy thinking budget of 1,024 or more fits beside the answer. Bedrock holds input plus this bound against quota from a call's start, on both endpoints (the model's maximum when it is unset), so a bound near real output buys throughput there. | none |
 | `cache_ttl` (`--cache-ttl`) | Anthropic prompt-cache lifetime, `5m` or `1h`, on every cache marker of a request: the instructions', the request's own, and the pinned compaction summary's and note's, since the API refuses a longer lifetime after a shorter one. `1h` bills each write at twice the input rate instead of 1.25 times. Responses providers are unaffected. Bedrock takes `1h` for Claude 4.5 and later and may refuse it for older Claude (its prompt-caching guide, read 2026-10-28), so calls to older Claude there keep five minutes whatever this says, also after `configure` switches a bot to one. A bot whose summarizer or fallback is such a model keeps five minutes on every call, since those calls carry the same pinned blocks. `inspect` reports a lifetime never set as `null`, so a client's own default can tell it from `5m` someone chose. | unset (`5m`) |
@@ -3105,7 +3106,13 @@ A bot that a sandboxed bot makes (its `created_by`), or forks, takes the
 creator's sandbox and `writable` folders unless it names a stricter sandbox,
 and reaches the network only if both do, as Codex's subagents inherit their
 parent's sandbox. It takes its creator's [command rules](#command-rules)
-too, always.
+too, always. A `create` that asks for more than that is refused with
+`invalid_setting`, naming the setting, and nothing is made: a looser
+sandbox, the network or a socket its creator doesn't reach, `writable`
+folders under a sandbox that drops them. Nothing asked for is loosened or
+tightened in silence; what is left unasked is its creator's. Its `rules`
+and `env` are its creator's whatever it is made with, as they always were:
+no client picks them for a bot another makes.
 
 On Linux, bubblewrap needs an empty folder on the host to mount a missing
 `.git` read-only over: the daemon makes it, and records it as its own in a
@@ -3273,7 +3280,8 @@ them when they change, as do the bots it makes; configuring `rules` on it
 is `invalid_setting`. So no bot loosens the rules by making another. Once its
 creator is deleted, a bot keeps the rules it had and is given its own from
 then on, as no creator's sandbox holds it either; Sonny gives such an agent
-its rules as it gives a root one.
+the person's rules, but their `allow` rules only as it had them, so none
+lets out of its sandbox a command its creator could not.
 
 A sandbox never lets a bot write the files its rules come from:
 `serve --protect-path PATH`, which repeats, keeps a path read-only in
