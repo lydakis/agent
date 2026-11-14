@@ -10247,6 +10247,12 @@ impl App {
         let drawn = data["node"]
             .as_i64()
             .is_some_and(|node| node <= self.seen_node);
+        // A message taken in is out of line, its node drawn or not: one
+        // staged from a `queued` event heard after history drew it too.
+        if kind == "steered" {
+            self.staged
+                .retain(|(staged, _)| Some(*staged) != data["message"].as_i64());
+        }
         if drawn && matches!(kind, "steered" | "message" | "tool_completed") {
             return;
         }
@@ -10367,8 +10373,6 @@ impl App {
                 }
             }
             "steered" => {
-                self.staged
-                    .retain(|(staged, _)| Some(*staged) != data["message"].as_i64());
                 // A reaction was drawn when it was sent.
                 if let Some(node) = data["node"].as_i64()
                     && let Some(item) = self.items(&[node]).await.first()
@@ -21863,6 +21867,15 @@ mod tests {
         assert_eq!(app.staged, [(2, "look at the logs".to_owned())]);
         assert_eq!(app.steering, [2]);
         app.daemon(turn_event("steered", 1, json!({"message": 2})))
+            .await;
+        assert!(app.staged.is_empty());
+        // Taken in before this window read history, which drew it: its
+        // `queued` and `steered` heard after still leave nothing staged.
+        app.seen_node = 20;
+        app.daemon(queued(6, json!({"status": "queued", "delivery": "steer"})))
+            .await;
+        assert_eq!(app.staged.len(), 1);
+        app.daemon(turn_event("steered", 1, json!({"message": 6, "node": 12})))
             .await;
         assert!(app.staged.is_empty());
     }
