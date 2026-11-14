@@ -1004,9 +1004,10 @@ has something on it, or is off the screen, no time shows.
 
   ![The call allowed, and cargo test outside the sandbox from now on](../docs/sonny/permissions-allowed.png)
 - `/retry` lists the calls the reviewer denied while Sonny watched, with
-  the reason for each. Enter writes the call out whole, and a second
-  Enter sends your approval of that exact call as your own message, so
-  the agent may retry it once; the retry is still reviewed, and the
+  the reason for each. Enter writes the call out whole and asks once
+  (`Allow one retry of shell? It can't be undone.`); Enter again sends
+  your approval of that exact call as your own message, so the agent may
+  retry it once, and any other key allows nothing; the retry is still reviewed, and the
   reviewer reads your words as consent. Codex calls this `/approve`.
 - `/status` shows the project's agents in the pane beside the
   conversation, grouped by where they stand, the lead first in its group,
@@ -1104,7 +1105,7 @@ has something on it, or is off the screen, no time shows.
   when each runs, its message and what its last run did, and the
   lookout's follows, with how many checks each asked for in the last
   day. `↑`/`↓` picks one, Enter (or a click) goes to the agent it wakes,
-  `r` runs an automation now, and `d` pressed twice removes it; the follow Sonny keeps for a lead's tasks stays. What runs
+  `r` runs an automation now, and `x` removes it once Enter confirms; the follow Sonny keeps for a lead's tasks stays. What runs
   there while healthy asks nothing of you, so the footer leaves it out.
   What failed is listed first, with a red `✗` and the error: an automation
   whose run failed (one that ended on it stays listed until `d` removes
@@ -1913,7 +1914,13 @@ plain words; then sections, a bold name and a muted count; then rows,
 the pick reversed from the row's first word to one column past its last.
 An empty view says so in one sentence, then one muted line on how it
 fills; a view still reading says `reading…`, and one that could not says
-`✗ could not read …: why`. A list cut short ends `… N more`. An agent
+`✗ could not read …: why`. A list cut short ends `… N more`. What can't
+be undone (compacting, removing an automation, a follow or a fact,
+stopping a command and all it started, allowing a retry) asks once, in
+words that name it, over the composer or in the pane's foot: `Remove
+nightly? It can't be undone.` with `enter remove · esc cancel`. Only
+Enter says yes; any other key says no, and a notice says so (`not
+removed`). An agent
 shown beside opens no pane of its own: asked for a view or the margin, it
 says views open in the main window, where Ctrl+G moves it.
 
