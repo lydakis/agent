@@ -2265,6 +2265,15 @@ pub fn asked(name: &str, arguments: &Value, workspace: &str) -> Asked {
             })
             .collect()
     };
+    // The fields the words do not say yet, so nothing a call does is
+    // left out of what the person approves.
+    let rest = |said: &[&str]| -> Vec<String> {
+        let mut rest = arguments.clone();
+        if let Some(rest) = rest.as_object_mut() {
+            rest.retain(|key, _| !said.contains(&key.as_str()));
+        }
+        fields(&rest)
+    };
     let lines = |text: &str| text.lines().map(str::to_owned).collect::<Vec<_>>();
     // A verb and what it acts on: `Start the task readme?`, `starting readme`.
     let words = |ask: String, doing: String, to: String, detail: Vec<String>| Asked {
@@ -2317,11 +2326,16 @@ pub fn asked(name: &str, arguments: &Value, workspace: &str) -> Asked {
         }
         ("start_task", ..) => {
             let task = text("name").unwrap_or("a task");
+            let mut detail = text("brief").map(lines).unwrap_or_default();
+            if arguments["setup"] == true {
+                detail.push("Runs the folder's .agents/setup first, outside the sandbox.".into());
+            }
+            detail.extend(rest(&["name", "brief", "setup"]));
             words(
                 format!("Start the task {task}?"),
                 format!("starting {task}"),
                 format!("start {task}"),
-                text("brief").map(lines).unwrap_or_default(),
+                detail,
             )
         }
         ("remove_task", ..) => {
@@ -2338,7 +2352,7 @@ pub fn asked(name: &str, arguments: &Value, workspace: &str) -> Asked {
                     format!("Remove the task {task}?"),
                     format!("removing {task}"),
                     format!("remove {task}"),
-                    Vec::new(),
+                    rest(&["task", "name", "discard"]),
                 ),
             }
         }
@@ -2366,18 +2380,26 @@ pub fn asked(name: &str, arguments: &Value, workspace: &str) -> Asked {
                     .or_else(|| arguments[key]["name"].as_str())
                     .map(str::to_owned)
             };
-            // Every change the call makes is named, in the order it is
-            // made: one call can remove one and add another.
-            let mut changes: Vec<([&str; 2], String)> = [
-                ("remove", "removing", "remove"),
+            // Each change the call makes is named, in the order it is
+            // made: a follows call removes one and then adds another; an
+            // automations call makes only the first of add, remove, run.
+            let (add, remove, run) = (
                 ("add", "adding", "add"),
+                ("remove", "removing", "remove"),
                 ("run", "running", "run"),
-            ]
-            .into_iter()
-            .filter_map(|(key, doing, to)| {
-                named(key).map(|it| ([doing, to], format!("the {what} {it}")))
-            })
-            .collect();
+            );
+            let order = match name {
+                "automations" => [add, remove, run],
+                _ => [remove, add, run],
+            };
+            let mut changes: Vec<([&str; 2], String)> = (order.into_iter())
+                .filter_map(|(key, doing, to)| {
+                    named(key).map(|it| ([doing, to], format!("the {what} {it}")))
+                })
+                .collect();
+            if name == "automations" {
+                changes.truncate(1);
+            }
             if changes.is_empty() {
                 changes.push((["changing", "change"], format!("your {what}s")));
             }
@@ -2393,18 +2415,25 @@ pub fn asked(name: &str, arguments: &Value, workspace: &str) -> Asked {
             if let Some(first) = question.get_mut(..1) {
                 first.make_ascii_uppercase();
             }
+            // What it adds, when it adds one.
+            let adds = changes.iter().any(|(verb, _)| verb[1] == "add");
             words(
                 format!("{question}?"),
                 said(0),
                 to,
-                fields(&arguments["add"]),
+                match adds {
+                    true => fields(&arguments["add"]),
+                    false => Vec::new(),
+                },
             )
         }
         ("exec", ..) => words(
             "Run a script that calls your MCP servers?".into(),
             "running a script".into(),
             "run a script".into(),
-            text("input").map(lines).unwrap_or_default(),
+            (text("input").map(lines).unwrap_or_default().into_iter())
+                .chain(rest(&["input"]))
+                .collect(),
         ),
         ("workflow", ..) => match text("stop") {
             Some(run) => words(
@@ -5157,6 +5186,20 @@ mod real_calls {
             ("starting readme", "start readme")
         );
         assert_eq!(detail, ["Write the README.", "Keep it short."]);
+        // Setup runs outside the sandbox, and the approval says so; what
+        // else the call sets is a field under it.
+        let (_, _, _, detail) = words(
+            "start_task",
+            json!({"name": "readme", "brief": "Write it.", "setup": true, "model": "openai/gpt-6"}),
+        );
+        assert_eq!(
+            detail,
+            [
+                "Write it.",
+                "Runs the folder's .agents/setup first, outside the sandbox.",
+                "model: openai/gpt-6"
+            ]
+        );
         let (question, _, _, detail) = words(
             "automations",
             json!({"add": {"name": "nightly", "every": "1d"}}),
@@ -5183,12 +5226,21 @@ mod real_calls {
             words("automations", json!({})).0,
             "Change your automations?"
         );
+        // An automations call makes only its add, so only the add is
+        // asked about.
+        let (question, _, _, detail) = words(
+            "automations",
+            json!({"remove": "old", "add": {"name": "nightly", "every": "1d"}}),
+        );
+        assert_eq!(question, "Add the automation nightly?");
+        assert_eq!(detail, ["every: 1d", "name: nightly"]);
+        let (question, _, _, detail) = words("automations", json!({"remove": "old"}));
+        assert_eq!(question, "Remove the automation old?");
+        assert!(detail.is_empty());
         assert_eq!(
             words("write", json!({"path": "/w/src/a.rs"})).0,
             "Write src/a.rs?"
         );
-        // A tool Sonny has no words for: its name, its fields as lines,
-        // never JSON.
         // Discard drops work, and the question says so; a plain removal
         // does not.
         assert_eq!(
@@ -5208,6 +5260,8 @@ mod real_calls {
         assert_eq!(question, "Stop the workflow run wf_1?");
         assert_eq!(doing, "stopping the workflow run wf_1");
         assert!(detail.is_empty());
+        // A tool Sonny has no words for: its name, its fields as lines,
+        // never JSON.
         let (question, _, _, detail) = words("linear.save_issue", json!({"title": "Fix it"}));
         assert_eq!(question, "Let it use linear.save_issue?");
         assert_eq!(detail, ["title: Fix it"]);
