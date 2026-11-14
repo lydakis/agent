@@ -2740,23 +2740,17 @@ impl Lookout {
         }
         // What waits keeps its place: a task's events stay in the order
         // they happened, however their reads finished.
-        let (mut ready, held): (Vec<_>, Vec<_>) = std::mem::take(&mut self.heard)
+        let (ready, held): (Vec<_>, Vec<_>) = std::mem::take(&mut self.heard)
             .into_iter()
             .enumerate()
             .partition(|(_, heard)| self.ready(heard, now) && !self.blocked(heard));
         // A bounded note, always at least one event: the rest wait for the
         // next.
-        let (mut bytes, mut quotes) = (0, 0);
-        let take = (ready.iter())
-            .take_while(|(_, heard)| {
-                bytes += sources::bytes(heard);
-                quotes += usize::from(heard.event.quote.is_some());
-                bytes <= sources::NOTE_BYTES && quotes <= sources::NOTE_QUOTES
-            })
-            .count()
-            .max(1);
-        let sent: Vec<sources::Heard> = ready.drain(..take).map(|(_, heard)| heard).collect();
-        let mut rest = ready;
+        let chosen = bounded(&ready);
+        let (sent, rest): (Vec<_>, Vec<_>) =
+            (ready.into_iter().enumerate()).partition(|(at, _)| chosen[*at]);
+        let sent: Vec<sources::Heard> = sent.into_iter().map(|(_, (_, heard))| heard).collect();
+        let mut rest: Vec<_> = rest.into_iter().map(|(_, waiting)| waiting).collect();
         rest.extend(held);
         rest.sort_unstable_by_key(|(place, _)| *place);
         self.heard = rest.into_iter().map(|(_, heard)| heard).collect();
@@ -3154,10 +3148,66 @@ fn note_key(sent: &[sources::Heard]) -> Vec<String> {
     (sent.iter())
         .map(|heard| {
             let event = &heard.event;
-            let id = event.id.as_deref().unwrap_or_default();
-            format!("{}/{id}/{}/{}", event.source, event.at_ms, event.seq)
+            match (event.source == activity::SOURCE, event.id.as_deref()) {
+                // A task's event is named by its task, turn and kind, as
+                // the stream says it again after a restart.
+                (true, Some(id)) => format!("{}/{id}", event.source),
+                (_, id) => {
+                    let id = id.unwrap_or_default();
+                    format!("{}/{id}/{}/{}", event.source, event.at_ms, event.seq)
+                }
+            }
         })
         .collect()
+}
+
+/// Which of the ready events, in the order they wait, the next note
+/// carries: those that steer first, each with what waits before it in
+/// its task, then the rest in order while they fit; never more than a
+/// note holds, but always one.
+fn bounded(ready: &[(usize, sources::Heard)]) -> Vec<bool> {
+    let mut chosen = vec![false; ready.len()];
+    let (mut bytes, mut quotes) = (0, 0);
+    fn task(heard: &sources::Heard) -> Option<Option<&str>> {
+        (heard.event.source == activity::SOURCE).then_some(heard.event.topic.as_deref())
+    }
+    let mut add = |chosen: &mut [bool], group: &[usize]| {
+        let more: usize = group.iter().map(|at| sources::bytes(&ready[*at].1)).sum();
+        let quoted: usize = (group.iter())
+            .map(|at| usize::from(ready[*at].1.event.quote.is_some()))
+            .sum();
+        let empty = !chosen.contains(&true);
+        if !empty && (bytes + more > sources::NOTE_BYTES || quotes + quoted > sources::NOTE_QUOTES)
+        {
+            return false;
+        }
+        (bytes, quotes) = (bytes + more, quotes + quoted);
+        for at in group {
+            chosen[*at] = true;
+        }
+        true
+    };
+    for (at, (_, heard)) in ready.iter().enumerate() {
+        if !heard.event.steer {
+            continue;
+        }
+        let group: Vec<usize> = (0..=at)
+            .filter(|before| {
+                !chosen[*before]
+                    && (*before == at
+                        || task(heard).is_some() && task(&ready[*before].1) == task(heard))
+            })
+            .collect();
+        if !add(&mut chosen, &group) {
+            break;
+        }
+    }
+    for at in 0..ready.len() {
+        if !chosen[at] && !add(&mut chosen, &[at]) {
+            break;
+        }
+    }
+    chosen
 }
 
 /// An event whose quote the daemon refused: it names the person's
@@ -3892,6 +3942,33 @@ mod tests {
             .collect();
         assert_eq!(froms, ["calc.docs", "calc.fix replied, completed"]);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_steer_goes_in_the_next_note_with_what_waits_before_it_in_its_task() {
+        let big = "x".repeat(sources::NOTE_BYTES / 2);
+        let heard = |event: sources::Event, order| {
+            let subs = vec!["chat".to_owned()];
+            (0, sources::Heard { event, subs, order })
+        };
+        let task = |text: &str, steer| sources::Event {
+            source: activity::SOURCE.into(),
+            topic: Some("calc.fix".into()),
+            steer,
+            ..slack(text, false)
+        };
+        let ready = [
+            heard(slack(&big, false), 0),
+            heard(slack(&big, false), 0),
+            heard(task("asked", false), 1),
+            heard(slack(&big, false), 0),
+            heard(task("the person wrote", true), 2),
+        ];
+        // The steer and what came before it in its task, then the rest
+        // in order while they fit.
+        assert_eq!(bounded(&ready), [true, false, true, false, true]);
+        // One that fits nothing else still goes.
+        assert_eq!(bounded(&ready[..1]), [true]);
     }
 
     #[test]

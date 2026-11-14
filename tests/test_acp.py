@@ -224,8 +224,10 @@ class AcpTests(ModelFixture):
         [ended] = [u for u in updates if u['sessionUpdate'] == 'tool_call_update' and 'status' in u]
         self.assertEqual(ended['status'], 'completed')
         self.assertIn('Started calc.fix', ended['content'][0]['content']['text'])
-        self.assertIn('done', ''.join(u['content']['text'] for u in updates
-                                      if u['sessionUpdate'] == 'agent_message_chunk'))
+        # The lead's words after the call reach the client: its own, or its
+        # answer to the lookout note that joins the turn when the task ends.
+        self.assertTrue(''.join(u['content']['text'] for u in updates
+                                if u['sessionUpdate'] == 'agent_message_chunk'))
         # The thread was the lead it asked for, which T3 Code's words never
         # reached: Sonny took the person's out of them.
         [turn] = self.daemon.request('turns', bot='calc.lead')['result']['turns']
