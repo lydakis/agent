@@ -8291,6 +8291,16 @@ impl App {
             }
         }
         if let Some(bot) = (button.strip_prefix("task/")).or(button.strip_prefix("agent/")) {
+            // `/status`'s row clicked is picked too, as the keys pick it.
+            let width = self.width.max(40);
+            if button.starts_with("task/")
+                && let Some(watch) = &mut self.watch
+            {
+                let picked = Picked::Agent(bot.to_owned());
+                if let Some(at) = card_picks(watch, width).iter().position(|p| *p == picked) {
+                    watch.pick = Some(at);
+                }
+            }
             self.open_picked(bot);
         }
         if let Some(bot) = button.strip_prefix("other/") {
@@ -13269,7 +13279,12 @@ impl App {
             }
             // A folding group's heading in `/status`: opened or folded.
             "group" => {
+                let width = self.width.max(40);
                 if let Some(watch) = &mut self.watch {
+                    let group = Picked::Group(group_of(id));
+                    if let Some(at) = card_picks(watch, width).iter().position(|p| *p == group) {
+                        watch.pick = Some(at);
+                    }
                     watch.toggle(group_of(id));
                 }
             }
@@ -13376,6 +13391,28 @@ impl App {
             },
             "background" if self.options.side.is_none() => self.background(),
             "status" | "background" => {}
+            // A row of a list in the pane clicked: picked, then `enter`.
+            "row" => {
+                let Ok(at) = id.parse::<usize>() else {
+                    return;
+                };
+                if let Some(watch) = &mut self.watch {
+                    if let Some(view) = &mut watch.background {
+                        view.pick_at(at);
+                    } else if let Some(view) = &mut watch.commons {
+                        view.pick_at(at);
+                    } else if let Some(view) = &mut watch.ps {
+                        view.pick_at(at);
+                    } else if let Some(view) = &mut watch.audit {
+                        view.pick_at(at);
+                    } else {
+                        return;
+                    }
+                }
+                self.pane_keys = true;
+                let enter = Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+                self.full_screen(&enter);
+            }
             _ => self.press_row(what).await,
         }
     }
@@ -16947,7 +16984,7 @@ impl App {
             } else if let Some(view) = &watch.background {
                 // Its card, with what was done or the keys the pick takes
                 // kept in view under it.
-                let (card, at) = view.card(width);
+                let (card, at, starts) = view.card_rows(width);
                 let lines: Vec<Line<'static>> = card
                     .into_iter()
                     .map(|line| {
@@ -16956,7 +16993,8 @@ impl App {
                         Line::from(spans).style(line.style)
                     })
                     .collect();
-                pane.set_card(lines, &view.keys());
+                let marks = row_marks(&lines, &starts);
+                pane.set_card_marked(lines, marks, &view.keys());
                 pane.foot = view.footer();
                 // A new pick is scrolled to, with the two rows under it.
                 if watch.picked != Some(at) {
@@ -16991,7 +17029,7 @@ impl App {
                     }
                 }
             } else if let Some(view) = &watch.commons {
-                let (card, at) = view.card(width);
+                let (card, at, starts) = view.card_rows(width);
                 let lines: Vec<Line<'static>> = card
                     .into_iter()
                     .map(|line| {
@@ -17000,7 +17038,8 @@ impl App {
                         Line::from(spans).style(line.style)
                     })
                     .collect();
-                pane.set_card(lines, &view.keys());
+                let marks = row_marks(&lines, &starts);
+                pane.set_card_marked(lines, marks, &view.keys());
                 pane.foot = view.footer();
                 if view.reading() {
                     // A thread just opened starts at its top, after the
@@ -17027,7 +17066,8 @@ impl App {
                         Line::from(spans).style(line.style)
                     })
                     .collect();
-                pane.set_card(lines, &view.keys());
+                let marks = row_marks(&lines, &view.starts());
+                pane.set_card_marked(lines, marks, &view.keys());
                 pane.foot = None;
                 if let Some(at) = view.picked_row()
                     && watch.picked != Some(at)
@@ -17045,7 +17085,8 @@ impl App {
                         Line::from(spans).style(line.style)
                     })
                     .collect();
-                pane.set_card(lines, &view.keys());
+                let marks = row_marks(&lines, &view.starts());
+                pane.set_card_marked(lines, marks, &view.keys());
                 pane.foot = None;
                 // A new pick is scrolled to, with the two rows under it.
                 if let Some(at) = view.picked_row()
@@ -18323,6 +18364,30 @@ fn watch_card(
         })
         .collect();
     (lines, folding, marks)
+}
+
+/// The marks that make each row of a list in the pane a button: a click
+/// on any line of the row at `starts[at]`, up to the next row or a blank
+/// line, picks it and presses `enter`, as the keys would.
+fn row_marks(lines: &[Line<'static>], starts: &[usize]) -> Vec<(usize, screen::Mark)> {
+    let mut sorted: Vec<usize> = starts.to_vec();
+    sorted.sort_unstable();
+    let mut marks = Vec::new();
+    for (at, &start) in starts.iter().enumerate() {
+        let next = (sorted.iter())
+            .find(|&&other| other > start)
+            .copied()
+            .unwrap_or(lines.len());
+        let link = format!("{}row/{at}", screen::BUTTON);
+        let end = next.min(lines.len());
+        for (row, line) in lines.iter().enumerate().take(end).skip(start) {
+            if row > start && line.width() == 0 {
+                break;
+            }
+            marks.push((row, screen::Mark::Link(link.clone())));
+        }
+    }
+    marks
 }
 
 /// A row `/status`'s keys pick: an agent, or the heading of a group that
@@ -28358,6 +28423,35 @@ mod tests {
         assert!(app.beside().is_none(), "never this window's own agent");
         app.key(key(KeyCode::Enter)).await;
         assert!(app.pane.is_none(), "closed, as Esc closes it");
+    }
+
+    #[test]
+    fn a_click_on_any_line_of_a_listed_row_is_that_row() {
+        let lines: Vec<Line<'static>> = ["head", "", "a", "  a more", "", "b", "c", "  c more"]
+            .into_iter()
+            .map(Line::from)
+            .collect();
+        let marks = row_marks(&lines, &[2, 6, 5]);
+        let at = |row| {
+            (marks.iter()).find_map(|(r, mark)| match mark {
+                screen::Mark::Link(link) if *r == row => link.rsplit('/').next(),
+                _ => None,
+            })
+        };
+        let rows: Vec<Option<&str>> = (0..lines.len()).map(at).collect();
+        assert_eq!(
+            rows,
+            [
+                None,
+                None,
+                Some("0"),
+                Some("0"),
+                None,
+                Some("2"),
+                Some("1"),
+                Some("1")
+            ]
+        );
     }
 
     #[tokio::test]

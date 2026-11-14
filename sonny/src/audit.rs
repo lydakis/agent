@@ -151,6 +151,22 @@ impl View {
         Key::Stay
     }
 
+    /// The row of the card each row starts on, in their order: one line
+    /// each under the heading.
+    pub fn starts(&self) -> Vec<usize> {
+        match self.error {
+            Some(_) => Vec::new(),
+            None => (0..self.rows.len()).map(|at| at + 2).collect(),
+        }
+    }
+
+    /// The row at `at` picked, as a click picks it.
+    pub fn pick_at(&mut self, at: usize) {
+        if at < self.rows.len() {
+            self.pick = Some(at);
+        }
+    }
+
     /// The row of the card the picked call is on, to keep it in view.
     pub fn picked_row(&self) -> Option<usize> {
         self.pick.map(|at| at + 2)

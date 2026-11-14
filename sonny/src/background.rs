@@ -736,7 +736,24 @@ impl View {
     }
 
     /// The card, and the row the picked item starts on.
+    #[cfg(test)]
     pub fn card(&self, width: usize) -> (Vec<Line<'static>>, usize) {
+        let (out, at, _) = self.card_rows(width);
+        (out, at)
+    }
+
+    /// The item at `at` picked, as a click picks it.
+    pub fn pick_at(&mut self, at: usize) {
+        if at < self.items.len() {
+            self.selected = at;
+            self.confirm = None;
+        }
+    }
+
+    /// [`View::card`], and the row each item starts on, by its place
+    /// among the items.
+    pub fn card_rows(&self, width: usize) -> (Vec<Line<'static>>, usize, Vec<usize>) {
+        let mut starts = vec![0; self.items.len()];
         let mut out =
             vec![Line::from(format!("{} · in the background", self.scope.project)).bold()];
         if !self.lookout.is_empty() {
@@ -754,7 +771,7 @@ impl View {
                 )
                 .dim(),
             );
-            return (out, 0);
+            return (out, 0, Vec::new());
         }
         // What failed first, whatever it is; then the rest by kind.
         let section = |item: &Item| match (&item.failed, item.kind) {
@@ -780,10 +797,11 @@ impl View {
                 if index == self.selected {
                     at = out.len();
                 }
+                starts[index] = out.len();
                 out.extend(self.item_lines(item, index == self.selected, width));
             }
         }
-        (out, at)
+        (out, at, starts)
     }
 
     fn item_lines(&self, item: &Item, picked: bool, width: usize) -> Vec<Line<'static>> {
