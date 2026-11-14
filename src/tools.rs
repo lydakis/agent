@@ -1490,11 +1490,13 @@ fn pem_text(line: &str) -> &str {
 }
 
 /// Whether `line`, its end's `\r` and the spaces or tabs around it taken
-/// off, is a line of a key's body: base64, the RFC 1421 headers of an
-/// encrypted key, or empty, as a key's reader takes them.
+/// off, is a line of a key's body: base64 with any spaces or tabs, the RFC
+/// 1421 headers of an encrypted key, or empty, as a key's reader takes
+/// them.
 fn pem_line(line: &str) -> bool {
     let line = pem_text(line).trim_matches([' ', '\t']);
-    let base64 = |b: &u8| b.is_ascii_alphanumeric() || matches!(b, b'+' | b'/' | b'=');
+    let base64 =
+        |b: &u8| b.is_ascii_alphanumeric() || matches!(b, b'+' | b'/' | b'=' | b' ' | b'\t');
     line.is_empty()
         || (line.len() <= PEM_LINE
             && (line.starts_with("Proc-Type:") || line.starts_with("DEK-Info:")))
@@ -5276,7 +5278,7 @@ mod tests {
         // body lines, as a key's reader takes them.
         assert_eq!(
             redact(
-                "-----BEGIN PRIVATE KEY-----   \n\n  MIIE\n\tAAAA \n-----END PRIVATE KEY-----\n"
+                "-----BEGIN PRIVATE KEY-----   \n\n  MIIE\n\tAAAA \nMIIEvQIB ADAN\tBgkq\n-----END PRIVATE KEY-----\n"
             ),
             "-----BEGIN PRIVATE KEY-----   \n[REDACTED]\n-----END PRIVATE KEY-----\n"
         );
