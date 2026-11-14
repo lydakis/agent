@@ -13,6 +13,37 @@ pub struct Agent {
     pub name: String,
     /// What it is doing and where, muted beside its name.
     pub about: String,
+    /// Its state, as the state table names it.
+    pub state: String,
+}
+
+/// What a `bots` row says its agent is doing, as `/status` reads it: needs
+/// you while it `waits` on the person; else held on a cause, waiting,
+/// rate limited or working while a turn runs; an ended one as its end
+/// did; one never run starting.
+fn state(bot: &Value, waits: bool) -> String {
+    if waits {
+        return "needs you".to_owned();
+    }
+    let blocked = &bot["waiting_on"]["blocked"];
+    if blocked.is_object() {
+        let code = blocked["code"].as_str().unwrap_or("");
+        let (what, _) = crate::status::held_cause(code, blocked["detail"].as_str());
+        return format!("{}{what}", crate::status::HELD);
+    }
+    match (bot["running_turn"].is_null(), bot["status"].as_str()) {
+        // A call a reviewer weighs waits on no one here.
+        (false, Some("waiting")) if bot["waiting_on"]["approval"] == true => {
+            "waiting on its reviewer".to_owned()
+        }
+        (false, Some("waiting")) => "waiting".to_owned(),
+        (false, Some("paced")) => "rate limited".to_owned(),
+        (false, _) => "working".to_owned(),
+        (true, _) => match &bot["last"] {
+            Value::Null => "starting".to_owned(),
+            last => crate::started::state(last),
+        },
+    }
 }
 
 pub struct Picker {
@@ -25,9 +56,11 @@ pub struct Picker {
 impl Picker {
     /// The agents in `bots` (the daemon's `bots` rows), ordered for a
     /// window of `current` in folder `workspace`, of project `project` or
-    /// of none; `beside` picked when listed.
+    /// of none; `beside` picked when listed. Those `waits` names wait on
+    /// the person, as [`crate::needs`] reads it.
     pub fn new(
         bots: &[Value],
+        waits: impl Fn(&str) -> bool,
         current: &str,
         project: Option<&str>,
         workspace: &str,
@@ -70,9 +103,11 @@ impl Picker {
         let agents: Vec<Agent> = rows
             .into_iter()
             .map(|bot| {
+                // Its mark says idle; any other state is said in words too.
+                let state = state(bot, waits(bot["name"].as_str().unwrap_or("")));
                 let mut about = Vec::new();
-                if !bot["running_turn"].is_null() {
-                    about.push("working".to_owned());
+                if state != crate::started::IDLE {
+                    about.push(state.clone());
                 }
                 // Another project's folder tells it apart; this project's
                 // are this folder or its copies, which say nothing more.
@@ -84,6 +119,7 @@ impl Picker {
                 Agent {
                     name: bot["name"].as_str().unwrap_or("").to_owned(),
                     about: about.join(" · "),
+                    state,
                 }
             })
             .collect();
@@ -165,12 +201,20 @@ mod tests {
 
     fn bots() -> Vec<Value> {
         vec![
-            json!({"name": "blog.lead", "workspace": "/w/blog", "running_turn": null}),
+            json!({"name": "blog.lead", "workspace": "/w/blog", "running_turn": null,
+                "last": {"status": "completed"}}),
             json!({"name": "shop.fix", "workspace": "/w/shop/.copies/fix", "running_turn": 3}),
-            json!({"name": "shop.lead", "workspace": "/w/shop", "running_turn": null}),
-            json!({"name": "shop.lead.web", "workspace": "/w/shop", "running_turn": null}),
+            json!({"name": "shop.lead.ok", "workspace": "/w/shop", "running_turn": 6,
+                "status": "waiting", "waiting_on": {"approval": true}}),
+            json!({"name": "shop.lead.rv", "workspace": "/w/shop", "running_turn": 7,
+                "status": "waiting", "waiting_on": {"approval": true}}),
+            json!({"name": "shop.lead", "workspace": "/w/shop", "running_turn": null,
+                "last": {"status": "failed", "error": "provider_http_500"}}),
+            json!({"name": "shop.lead.web", "workspace": "/w/shop", "running_turn": 5,
+                "status": "waiting", "waiting_on": {"blocked": {"code": "provider_http_401"}}}),
             json!({"name": "shop.lead.side-1", "workspace": "/w/shop", "expire_ms": 9}),
-            json!({"name": "notes", "workspace": "/w/notes", "running_turn": null}),
+            json!({"name": "notes", "workspace": "/w/notes", "running_turn": null,
+                "last": {"status": "interrupted"}}),
             json!({"name": ".reviewer.auto", "workspace": "/", "running_turn": null}),
         ]
     }
@@ -185,6 +229,7 @@ mod tests {
     fn the_folders_leads_come_first_then_the_projects_then_other_leads() {
         let picker = Picker::new(
             &bots(),
+            |bot| bot == "shop.lead.ok",
             "shop.lead",
             Some("shop"),
             "/w/shop",
@@ -195,6 +240,8 @@ mod tests {
             names(&picker),
             [
                 "shop.lead",
+                "shop.lead.ok",
+                "shop.lead.rv",
                 "shop.lead.web",
                 "shop.fix",
                 "blog.lead",
@@ -202,15 +249,41 @@ mod tests {
             ]
         );
         // The first that is not this window is picked.
-        assert_eq!(picker.chosen().as_deref(), Some("shop.lead.web"));
+        assert_eq!(picker.chosen().as_deref(), Some("shop.lead.ok"));
         let about: Vec<&str> = picker.agents.iter().map(|a| a.about.as_str()).collect();
-        assert_eq!(about, ["", "", "working", "/w/blog", "/w/notes"]);
+        // Idle is said by its mark alone; every other state in words too.
+        assert_eq!(
+            about,
+            [
+                "failed",
+                "needs you",
+                "waiting on its reviewer",
+                "held: API key refused",
+                "working",
+                "/w/blog",
+                "interrupted · /w/notes"
+            ]
+        );
+        let states: Vec<&str> = picker.agents.iter().map(|a| a.state.as_str()).collect();
+        assert_eq!(
+            states,
+            [
+                "failed",
+                "needs you",
+                "waiting on its reviewer",
+                "held: API key refused",
+                "working",
+                "idle",
+                "interrupted"
+            ]
+        );
     }
 
     #[test]
     fn the_agent_beside_is_picked_and_typing_narrows() {
         let mut picker = Picker::new(
             &bots(),
+            |bot| bot == "shop.lead.ok",
             "shop.lead",
             Some("shop"),
             "/w/shop",
@@ -220,7 +293,7 @@ mod tests {
         assert_eq!(picker.chosen().as_deref(), Some("shop.fix"));
         // Narrowed, the best that is not this window is picked.
         picker.narrow("lead".into());
-        assert_eq!(picker.chosen().as_deref(), Some("shop.lead.web"));
+        assert_eq!(picker.chosen().as_deref(), Some("shop.lead.ok"));
         picker.narrow("blog".into());
         assert_eq!(names(&picker), ["blog.lead"]);
         assert_eq!(picker.chosen().as_deref(), Some("blog.lead"));
@@ -234,8 +307,16 @@ mod tests {
 
     #[test]
     fn a_window_of_no_folders_lead_lists_every_agent() {
-        let picker = Picker::new(&bots(), "notes", None, "/w/notes", None, Picks::default());
+        let picker = Picker::new(
+            &bots(),
+            |_| false,
+            "notes",
+            None,
+            "/w/notes",
+            None,
+            Picks::default(),
+        );
         assert_eq!(names(&picker)[0], "blog.lead");
-        assert_eq!(names(&picker).len(), 5);
+        assert_eq!(names(&picker).len(), 7);
     }
 }

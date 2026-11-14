@@ -431,8 +431,8 @@ fn setup_runs_in_the_tasks_folder_and_a_failing_one_starts_nothing() {
          echo \"${OPENAI_API_KEY:-none} ${LAB_TOKEN:-none} ${AWS_SECRET_ACCESS_KEY:-none}\" > keys\nexit \"${SETUP_EXIT:-0}\"\n",
     )
     .unwrap();
-    std::fs::create_dir_all(lab.home.join(".agent")).unwrap();
-    let env = lab.home.join(".agent/env");
+    std::fs::create_dir_all(lab.home.join(".agent/keys")).unwrap();
+    let env = lab.home.join(".agent/keys/env");
     std::fs::write(&env, "LAB_TOKEN=t-lab\n").unwrap();
     std::fs::set_permissions(&env, std::fs::Permissions::from_mode(0o600)).unwrap();
     std::fs::set_permissions(&setup, std::fs::Permissions::from_mode(0o755)).unwrap();

@@ -22,6 +22,8 @@ pub struct Item {
     pub about: String,
     pub current: bool,
     pub found: Vec<usize>,
+    /// The state's mark before the name, as [`crate::status::sign`] draws it.
+    pub sign: Option<Span<'static>>,
 }
 
 impl Item {
@@ -31,7 +33,14 @@ impl Item {
             about: about.into(),
             current: false,
             found: Vec::new(),
+            sign: None,
         }
+    }
+
+    /// The state's mark, drawn before the name.
+    pub fn sign(mut self, sign: Span<'static>) -> Self {
+        self.sign = Some(sign);
+        self
     }
 
     /// The chars of its name that matched what was typed.
@@ -69,13 +78,18 @@ pub fn lines(items: &[Item], pick: usize, width: usize, room: usize) -> Vec<Line
         // takes two.
         let pad = " ".repeat(wide.saturating_sub(item.name.width()));
         let name = format!("{}{pad}", item.name);
-        let room = width.saturating_sub(mark.width() + wide + 4);
+        let signed = items.iter().any(|item| item.sign.is_some());
+        let room = width.saturating_sub(mark.width() + wide + 4 + 2 * usize::from(signed));
         let about = match item.about.is_empty() {
             true => String::new(),
             false => format!("  {}", crate::transcript::cut(&item.about, room)),
         };
         let picked = at == pick;
         let mut row = vec![Span::raw(mark)];
+        if signed {
+            row.push(item.sign.clone().unwrap_or_else(|| Span::raw(" ")));
+            row.push(Span::raw(" "));
+        }
         row.extend(marked(&name, &item.found, picked));
         row.push(match picked {
             true => Span::raw(format!("{about} ")).reversed(),

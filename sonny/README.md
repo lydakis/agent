@@ -121,6 +121,7 @@ Closing its window leaves the daemon and running turns alive.
 | Change model and effort | `/model` |
 | Change settings | `/config` |
 | Review automations and other background work | `/background` |
+| Read and remove what agents remember | `/memory` |
 | Inspect token usage | `/usage` |
 | List commands or keyboard shortcuts | `/`, or `?` with an empty composer |
 
@@ -153,7 +154,7 @@ explains how Auto decides.
 ## Configuration
 
 Settings live in `~/.agent/config.toml`; credentials live in
-`~/.agent/env`, readable only by you. Project settings live in
+`~/.agent/keys/env`, readable only by you. Project settings live in
 `.agents/project.toml`. Use `/config` to inspect defaults and change settings.
 
 ### Roles for leads and tasks

@@ -1698,13 +1698,15 @@ impl View {
     }
 
     /// What the keys do, as the pane's title says it.
-    pub fn keys(&self) -> &'static str {
+    pub fn keys(&self) -> String {
+        use crate::hint::{Enter, Esc, Keys};
         match (&self.open, self.threads.len()) {
-            (Some(_), _) => "↑↓ scroll · esc back",
-            (None, 0) => "esc close",
-            (None, 1) => "enter read · esc close",
-            (None, _) => "↑↓ pick · enter read · esc close",
+            (Some(_), _) => Keys::new().key("↑↓", "scroll").esc(Esc::Back),
+            (None, 0) => Keys::new().esc(Esc::Close),
+            (None, 1) => Keys::new().enter(Enter::Open).esc(Esc::Close),
+            (None, _) => Keys::new().pick().enter(Enter::Open).esc(Esc::Close),
         }
+        .text()
     }
 }
 
@@ -2400,7 +2402,7 @@ mod tests {
         let listed = text(view.card(60).0);
         let at = |needle: &str| listed.iter().position(|l| l.contains(needle)).unwrap();
         assert!(at("New one") < at("Old one"), "{listed:?}");
-        assert_eq!(view.keys(), "↑↓ pick · enter read · esc close");
+        assert_eq!(view.keys(), "↑↓ pick · enter open · esc close");
         assert_eq!(view.footer(), None);
         view.key(KeyEvent::from(KeyCode::Down));
         view.key(KeyEvent::from(KeyCode::Enter));

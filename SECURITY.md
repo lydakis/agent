@@ -105,7 +105,7 @@ vulnerability, whether or not the code's own documentation agrees.
   macOS, with the mode names, writable folders and profiles ported from
   Codex ([sandbox](docs/RUST_PROTOTYPE.md#sandbox)). Reads stay open in
   every mode: a confined command can read any file the person can,
-  `~/.agent/env` and the store included, and its model provider sees what
+  `~/.agent/keys/env` and the store included, and its model provider sees what
   it reads.
 - A sandboxed bot never runs unconfined for want of a sandbox: creating one
   fails with `sandbox_unavailable` when bubblewrap or `sandbox-exec` is
@@ -159,8 +159,10 @@ vulnerability, whether or not the code's own documentation agrees.
   unconfined with the caller's full permissions. That is the daemon's
   default; Sonny's default is a sandbox.
 - Only `shell`, `write`, `edit`, `apply_patch` and `write_stdin` are
-  confined. `read`, `history` and `web_fetch` run in the daemon itself,
-  so `web_fetch` works for a bot whose network is off.
+  confined. `read`, `history` and `web_fetch` run in the daemon itself:
+  a bot whose network is off is neither offered nor runs `web_fetch`
+  (above), and a sandboxed bot's `read` still refuses the folders kept
+  from it (`--unreadable`), alone or in a batch.
 
 ### Approvals
 
@@ -191,7 +193,7 @@ vulnerability, whether or not the code's own documentation agrees.
 
 ### Credentials and secrets
 
-- Provider keys come from the environment or `~/.agent/env`, which Sonny
+- Provider keys come from the environment or `~/.agent/keys/env`, which Sonny
   writes `0600` and refuses to read when group or others can. Nothing
   writes a key into a shell profile or into `config.toml`.
 - The ChatGPT sign-in keeps its tokens in `~/.agent/chatgpt.json`,
@@ -211,8 +213,8 @@ vulnerability, whether or not the code's own documentation agrees.
   `ignore_default_excludes = false`, and `exclude` names more. The
   daemon's companions (Sonny's reviewer, lookout and tool host) inherit
   its environment whole, provider keys included.
-- A secret found while importing an MCP server goes to `~/.agent/env`,
-  never to `config.toml`. Sonny's home backup leaves `~/.agent/env`,
+- A secret found while importing an MCP server goes to `~/.agent/keys/env`,
+  never to `config.toml`. Sonny's home backup leaves `~/.agent/keys/env`,
   logins, the store and any `config.toml` that holds a secret off the
   remote repository.
 - The daemon never logs a credential's value, and this repository holds
@@ -246,7 +248,8 @@ vulnerability, whether or not the code's own documentation agrees.
   redirects, reads at most 4 MiB, and sends no credentials. It does not
   refuse private, loopback or link-local addresses: a bot with
   `web_fetch` can read what the daemon's host can reach on its own
-  networks, with the bot's network on or off. Set
+  networks while its network is on; a bot off the network has no
+  `web_fetch`. Set
   `web_search = "disabled"` to leave it out of new bots.
 - Sonny marks a memory fact or commons post saved in a turn that read
   outside content through web search, `web_fetch`, the browser or an MCP
@@ -287,7 +290,7 @@ approval gate as a call that leaves the sandbox would; `memory` and
   `watch` list names, so its command and those files must be ones no
   agent can write: keep them outside every agent's folders.
 - **MCP servers** run as the person outside every sandbox, started from
-  `~/.agent/config.toml` with `~/.agent/env` in their environment. An
+  `~/.agent/config.toml` with `~/.agent/keys/env` in their environment. An
   agent reaches them only through `exec`, a QuickJS script with no files,
   network or timers, and each call a script makes is checked on its own by
   the server's `approval_mode`; the default asks only for a tool the

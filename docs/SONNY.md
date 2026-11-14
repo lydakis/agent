@@ -290,7 +290,7 @@ rewritten to the lineage when Sonny next opens on that store. When it fires, Son
 runs with `--trigger-fire` and those arguments. It connects to
 the daemon, and when none answers and the store is known, starts one for it
 on that socket as Sonny does, with the `agent` Sonny finds and the login shell's environment,
-and `agent` adds `~/.agent/env` as for every daemon it starts. A fire submits with `delivery: queue`, so a working bot gets
+and `agent` adds `~/.agent/keys/env` as for every daemon it starts. A fire submits with `delivery: queue`, so a working bot gets
 it after its turn and never has it cut in. A repeating automation first
 looks for one of its own fires still waiting behind the bot's work: if one
 is, it skips that fire (`bot_busy`) rather than let fires pile up, as
@@ -518,6 +518,15 @@ each blank as written. The fact's file never changes as its data does,
 so a change in the data is no memory news. Only Sonny fills: the daemon
 links no template engine, and an agent composed by `agent run --agents`
 reads a live description as it is written.
+
+The person reads memory in `/memory`, in the pane: each folder's index,
+never every fact's file (a `work` fact's file alone, for what it is and
+when it was saved), read off the screen thread when the view opens, on
+`a` and after a removal. A fact opens with
+[`memory::peek`](../client/src/memory.rs), which reads it as `read` does
+but records no read, so the person's browsing never hides a fact no agent
+needs from the cleanup's unread check. Its `x` removes through the tool's
+own `remove`.
 
 Sonny's agents read and save memory with the `memory` tool, which Sonny's
 tool host answers outside the agent's sandbox, so a sandboxed agent still
@@ -1075,8 +1084,8 @@ starts a new run with an earlier run's answers, so only calls that changed
 cost model calls. `stop` interrupts a run's workers; it ends as stopped.
 
 `/status` shows each run that has not ended as one row in Working, under
-the agent that started it: its name, current phase and agents running, done
-and failed, and on `m` each phase's counts, its last `log()` line and its
+the agent that started it: its name, current phase and its agents
+working, finished and failed (`Verify · 12 working, 31 finished, 2 failed`), and on `m` each phase's counts, its last `log()` line and its
 output tokens. A window reads only what each journal gained since its last
 look. With a run's row picked, `s` stops it: the window leaves a `stop`
 file in the run's folder, and the host running it stops it within a
@@ -1093,7 +1102,7 @@ names so an entry can be copied across:
 ```toml
 [sonny.mcp_servers.linear]
 url = "https://mcp.linear.app/mcp"
-bearer_token_env_var = "LINEAR_TOKEN"      # from the environment or ~/.agent/env
+bearer_token_env_var = "LINEAR_TOKEN"      # from the environment or ~/.agent/keys/env
 description = "Issues and projects in Linear"
 
 [sonny.mcp_servers.playwright]
@@ -1130,7 +1139,7 @@ folder's, and `--json` only prints what it found. First-run setup offers the
 same. A name Sonny has already, or that an agent earlier in that list has,
 is skipped, and the other agents' files are left as they were. A secret
 written into a server's entry (an `env` value named like a key or token, or
-a literal `Authorization: Bearer`) goes to `~/.agent/env`, which stdio
+a literal `Authorization: Bearer`) goes to `~/.agent/keys/env`, which stdio
 servers are started with and `bearer_token_env_var` names, never to
 `config.toml`; a value that only names a variable (`${VAR}`, `{env:VAR}`)
 is left to the environment, and the import says when that variable is not
