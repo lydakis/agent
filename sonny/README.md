@@ -33,17 +33,17 @@ your package manager. Make sure `~/.local/bin` is on your `PATH`.
 `PREFIX` changes the install location, `SONNY_VERSION` selects a release,
 and `SONNY_PACKAGES=0` skips package installation.
 
-### Updating
+### Upgrading
 
 ```sh
-sonny update
+sonny upgrade
 ```
 
-This updates a Homebrew or installer install to the latest release (a
+This upgrades a Homebrew or installer install to the latest release (a
 nightly install to current `main`). It replaces the running daemon with the
 new one, and running turns continue on it. Open Sonny windows reopen on the
 new version and keep what you typed. See
-[docs/SONNY.md](../docs/SONNY.md#updating) for each step.
+[docs/SONNY.md](../docs/SONNY.md#upgrading) for each step.
 
 ### Nightly builds
 
@@ -157,11 +157,11 @@ Settings live in `~/.agent/config.toml`; credentials live in
 `~/.agent/keys/env`, readable only by you. Project settings live in
 `.agents/project.toml`. Use `/config` to inspect defaults and change settings.
 
-### Roles for leads and tasks
+### Profiles for leads and tasks
 
 Customize the `lead` and `task` profiles, or define your own. See
-[roles and project overrides](REFERENCE.md#roles-for-leads-and-tasks).
-Sonny preserves your edits to shipped roles and skills and offers new
+[profiles and project overrides](REFERENCE.md#profiles-for-leads-and-tasks).
+Sonny preserves your edits to shipped profiles and skills and offers new
 versions during upgrades.
 
 ### Effort for leads and tasks

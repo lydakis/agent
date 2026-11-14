@@ -8,8 +8,8 @@
 //! person asked for.
 //!
 //! `sonny setup backup URL` sets it up, and restores a home the repository
-//! already holds, which is how a new machine starts; `sonny home sync` is
-//! what the scheduler runs, and `sonny home status` says how the last one went.
+//! already holds, which is how a new machine starts; `sonny backup sync`
+//! is what the scheduler runs, and `sonny backup status` says how the last one went.
 //!
 //! Memory is copied without its own `.git`: a commit inside
 //! `~/.agents/memory` would make `memory changed` find nothing and skip the
@@ -37,7 +37,7 @@ const AUTOMATIONS: &str = "automations.json";
 /// copy has no other, and removed by the next sync, which writes the list
 /// under its new name. It goes with upgrade migration `automations-folder`.
 const TRIGGERS: &str = "triggers.json";
-pub const USAGE: &str = "usage: home sync | home status\n       setup backup [URL]";
+pub const USAGE: &str = "usage: backup sync | backup status\n       setup backup [URL]";
 
 /// Where the home, its copy and what its syncs did live.
 pub struct Places {
@@ -62,7 +62,7 @@ impl Places {
     }
 }
 
-/// `sonny home ARGS`: one JSON value on stdout, or a typed error on stderr.
+/// `sonny backup ARGS`: one JSON value on stdout, or a typed error on stderr.
 pub fn cli(args: &[String]) -> i32 {
     let done = Places::home().and_then(|places| match args {
         [verb] if verb == "sync" => sync(&places, None),

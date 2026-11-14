@@ -237,7 +237,7 @@ fn project() -> Value {
         "name": PROJECT,
         "description": "Make a new project in a folder, when the person asks for one, or for work in a \
             subfolder that is its own repository but not a project yet: its .agents/project.toml and its lead, \
-            which opens in a home of its own beside yours. The result names the lead, which never sees this \
+            which opens in a workspace of its own beside yours. The result names the lead, which never sees this \
             conversation, so brief it as you would a task. A folder that is a project already keeps its lead \
             and its settings.",
         "parameters": {

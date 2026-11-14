@@ -3186,7 +3186,7 @@ pub fn at_start() {
     std::thread::spawn(refresh_now);
 }
 
-/// [`at_start`]'s work, done here and now: `sonny update` waits for it.
+/// [`at_start`]'s work, done here and now: `sonny upgrade` waits for it.
 pub fn refresh_now() {
     let (Ok(places), Some(sonny)) = (Places::home(), crate::skills::sonny_path()) else {
         return;

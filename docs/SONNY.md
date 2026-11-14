@@ -14,14 +14,14 @@ configure them. For installation and everyday controls, start with the
 Automations are Sonny's ([trigger.rs](../sonny/src/trigger.rs)). An automation wakes an agent with a
 message when something happens: a time comes, a file is written, a
 repository's HEAD moves, or someone runs it by name. The message is a new turn in the agent's own conversation; an automation
-may also start the agent it names on its first fire. Sonny's scheduler
+may also start the agent it names on its first run. Sonny's scheduler
 watches ([The scheduler](#the-scheduler)): one process per HOME, which the
 system runs as its one job of Sonny's (a LaunchAgent on a Mac, a systemd
-user service on Linux), so an automation fires with Sonny closed, and a time
-the machine slept through fires once when it wakes (as launchd's
+user service on Linux), so an automation runs with Sonny closed, and a time
+the machine slept through runs once when it wakes (as launchd's
 `StartCalendarInterval` and a `Persistent=true` timer coalesce missed
 times; cron skips them). The daemon has no clock or watcher of its own, and
-no process of an automation runs between its fires: while nothing happens an
+no process of an automation is left between its runs: while nothing happens an
 automation costs its definition and the scheduler's look, and no model call.
 A lead hears of its tasks' turns from Sonny's task updates and lookout, not
 from automations.
@@ -37,14 +37,14 @@ A look acts on nothing and runs as any read does, also for an agent whose
 sandbox no one reviews. An add, a removal or a run is a step its gate decides
 first (`approve_step`), as a script's calls are, and is refused, as the
 other ways out of its sandbox are, for a confined agent with no gate.
-A row whose last fire sent a turn says how that turn ended, as the daemon
+A row whose last run sent a turn says how that turn ended, as the daemon
 has it: `last.turn_status`, and `last.turn_error` when it did not complete,
 so an agent sees the failure the person sees in `/background`. It does not
-have to look: when a turn a fire sent fails (not one whose model said
+have to look: when a turn a run sent fails (not one whose model said
 nothing), the lookout tells the agent that added a `start` automation, else
-the agent the fire messaged, with a steer: read in its next model call, or
+the agent the run messaged, with a steer: read in its next model call, or
 waking it when idle (`[automation NAME · TIME · turn N it sent BOT failed:
-WHY]`). A fire with `reply_to` passes the failure on with its
+WHY]`). A run with `reply_to` passes the failure on with its
 answer instead.
 It waits for a verdict wherever the agent's other calls do (`/permissions`),
 since an automation runs as the person and its `if` command outside any
@@ -65,9 +65,9 @@ Every reply is one JSON value on stdout; a failure is one
 `{"error": CODE, "detail": ...}` on stderr with exit 1.
 
 **Shadow runs.** `--shadow` is a dry run, for moving a job from elsewhere
-onto an automation. Each fire forks its agent where it is now (a `--start`
-automation whose agent no fire made yet first makes that agent, as its first
-fire would, and sends it nothing)
+onto an automation. Each run forks its agent where it is now (a `--start`
+automation whose agent no run made yet first makes that agent, as its first
+run would, and sends it nothing)
 into `BOT.shadow-HEX`, a copy in the read-only sandbox, with no shell, no
 gate a person or a model answers, the person's command rules without their
 `allow` rules, and of Sonny's tools only
@@ -100,7 +100,7 @@ it filled to is at most 32 KiB. A shadow run fills the same way.
 or 1, or runs past 60 s, fails the run, with the end of what it wrote to
 stderr. The agent that hears of the automation (`--reply-to`, else the agent
 that added a `--start` automation, else the agent it messages) is told once
-when it breaks, and once when it works again, as alerts fire on a change
+when it breaks, and once when it works again, as alerts go off on a change
 of state rather than on every check; the row's `checked.told` keeps
 whether the break was told. While the daemon is paused (`/pause`), a gate
 does not run: its run waits for the resume, as the turn a run sends then
@@ -110,60 +110,60 @@ waits for it.
 divide an hour, hours that divide a day, or `1d`, and waits at least one
 full interval before its first message; calendar ticks before that earliest
 time do nothing. `--in` and `--at` are one-offs within a year, which remove
-themselves once fired (`--in` rounds up to the next whole minute, since
+themselves once they have run (`--in` rounds up to the next whole minute, since
 calendar times are minutes; `--at` refuses a part out of range or extra parts);
 `--cron` is read as cron reads it, a day or a weekday when both are given,
-up to 1,024 calendar entries. `--file PATH` fires when the file is written,
+up to 1,024 calendar entries. `--file PATH` runs when the file is written,
 or a file is added to or removed from it when it is a folder (the
 scheduler looks at it every two seconds); it need not exist yet, and it may not be in
 `~/.agent/automations` or be its daemon's store (or its `-wal` and `-shm`, by
-any name, a hard link included), which every fire writes: `add` refuses one, and a fire that finds its path
+any name, a hard link included), which every run writes: `add` refuses one, and a run that finds its path
 became one (a link moved) ends the automation, sending nothing and keeping a
 `failed` row that says why. A shell that
 names its daemon's socket and not its store cannot add one, since its store
 is not known to check. `--commit REPO` sends when a commit was made: the scheduler wakes it on any write
 to the repository's own HEAD log, which git writes on every move of HEAD,
-and the fire asks git one question, `git rev-list -n1 --since=LOOKED NEW
+and the run asks git one question, `git rev-list -n1 --since=LOOKED NEW
 --not OLD`: whether HEAD now reaches a commit the HEAD it last saw did not,
 committed since it last looked. A commit, an amend, a merge, a cherry-pick,
 a rebase that rewrote commits, or a pull of work committed since sends; a
 checkout, a reset, or a fast-forward to commits that were already there
-sends nothing, and the fire keeps where HEAD went. A HEAD the repository no
+sends nothing, and the run keeps where HEAD went. A HEAD the repository no
 longer has (it was made again) counts as unknown. `add` records where HEAD
 is, a repository with no commit yet included, before the scheduler watches, and
-when a commit came in between asks for a fire that looks as the scheduler would
+when a commit came in between asks for a run that looks as the scheduler would
 (a `wake.` ask), so the commit is sent once. A repository where git keeps
 no HEAD log (`core.logAllRefUpdates` false, or a bare one by default) is
 refused, and adding the same automation again watches the git folder the
 repository has now, recording where its HEAD is in place of the old one's.
 git is the one on the `PATH` `add` ran with, which the definition keeps. With no
-WHEN, only `run` runs it (its `when` reads `on demand`); `run` while a fire still runs is sent by that
-fire once it is done.
+WHEN, only `run` runs it (its `when` reads `on demand`); `run` while a run is still going is sent by that
+run once it is done.
 
 **Whom.** `add` defaults to the agent whose shell runs it (`AGENT_BOT`,
 which must still match `AGENT_BOT_ID`); `--agent` names another. Either is
 pinned by its id: an agent deleted since, or a new agent under its name, is not
 reached (`bot_not_found`), and the automation ends. `--start NAME --model
 PROVIDER/MODEL [--effort LEVEL]` names an agent that does not exist yet:
-the first fire makes it as Sonny makes an agent (the daemon's `create`,
+the first run makes it as Sonny makes an agent (the daemon's `create`,
 in the folder `add` ran in, with that folder's composed policy, the
 default tools and Sonny's own a task has: the memory tool, and `exec` while
 an MCP server is on, so an agent no one opens reaches the person's servers
 as one they open does; one an automation made before it had them takes them at
-its next fire, gated as its mode gates the rest), gated by the reviewer
+its next run, gated as its mode gates the rest), gated by the reviewer
 and sandboxed to its folder as `sonny --new` makes one (`auto`), with the
 person's fallback for its model: one way to make an agent, so an agent no
 one opens never runs with more reach than one they do. A call the reviewer
 doubts waits in `/approvals`, as any agent's does. One an automation made
 before then, with no sandbox and no gate, is confined so at its next
-fire; one the person put in `full` stays there. It is made by the agent that added the automation when one did, so
-it shows under that agent, and gives it the fire's message. Its id is kept with the automation's
-state when the fire settles, and later fires message it. A name an agent already has is refused at
-`add` (`bot_exists`), and an agent of that name made before the first fire
-makes that fire fail, naming it. The agent that added it is pinned by its
+run; one the person put in `full` stays there. It is made by the agent that added the automation when one did, so
+it shows under that agent, and gives it the run's message. Its id is kept with the automation's
+state when the run settles, and later runs message it. A name an agent already has is refused at
+`add` (`bot_exists`), and an agent of that name made before the first run
+makes that run fail, naming it. The agent that added it is pinned by its
 id too: once it is deleted, `create` fails with `creator_not_found`, and the
 automation ends, keeping its row, as when its `--reply-to` agent is gone. The `create` carries the automation's own
-request id, so a fire cut short after the daemon made the agent asks again
+request id, so a run cut short after the daemon made the agent asks again
 and gets that same agent, and no other.
 
 `--fresh` (with `--start`) makes a new agent for each run instead, `NAME-N`
@@ -172,10 +172,10 @@ lives in files and memory, as a cron job's does. Sonny's own nightly memory
 cleanup runs so; an automation an agent sets up keeps one agent unless asked.
 Each is made as the one agent above is. A run is numbered when its time
 passes its `--if`, and the number is on the automation's row (`run`) before
-its agent is made: a fire cut short and taken again is another attempt at
+its agent is made: a run cut short and taken again is another attempt at
 the same run, whose `create` (request id `trigger-GENERATION-N`) and
 message (`…ID.run`) the daemon takes once. Runs go one at a time: a run's
-fire waits for the run before to end (the daemon's `wait`, up to a day; a
+run waits for the run before to end (the daemon's `wait`, up to a day; a
 run still working then is skipped), reads how it ended, and says so on its
 first line when it did not finish (`[automation NAME · run N · TIME · WHY]`,
 then `Run N-1 did not finish: failed: provider_failed. Its conversation is
@@ -192,13 +192,13 @@ that carries on one cut short changes it as its own. `--fresh` and
 `--shadow` do not go together, and an automation replaced with or without
 `--fresh` starts its agents over.
 
-**What else.** `--reply-to BOT` keeps the fire's process until the turn it
+**What else.** `--reply-to BOT` keeps the run's process until the turn it
 sent ends (the daemon's `wait`, up to a day), then steers that turn's
-answer to BOT, pinned by id, as the lookout tells a task's update; the scheduler starts no second fire of the automation
-meanwhile, so a repeating one skips the times that turn spans. The fire's
+answer to BOT, pinned by id, as the lookout tells a task's update; the scheduler starts no second run of the automation
+meanwhile, so a repeating one skips the times that turn spans. The run's
 request id then ends `.to.ID`, BOT's id, so the lookout does not also tell
 that agent of the turn as a task update, unless that answer has not
-reached it 15 s after the turn ended. A fire cut short while it waits
+reached it 15 s after the turn ended. A run cut short while it waits
 (the Mac restarted) passes no answer on: nothing resumes that wait. An
 answer the daemon cut short is
 marked so in its first line; a turn that ended saying nothing passes on an
@@ -218,15 +218,15 @@ the memory cleanup), runs as the person. The definition says which
 says neither and could be an agent's, so it does not run: each check fails,
 told once, until the automation is added again, but for Sonny's own two,
 known by their whole text. It answers as `test`
-and `grep -q` do: exit 0 sends, and exit 1 skips that fire and records
+and `grep -q` do: exit 0 sends, and exit 1 skips that run and records
 nothing but, for `--commit`, that its commit was seen; any other exit, a
-signal or a command that is not there could not check, and fails the fire
+signal or a command that is not there could not check, and fails the run
 (below). So a heartbeat whose check finds
 nothing to do costs one process and no model call. A one-off whose check
 says no ends, listed as not sent.
-`--runs N` ends the automation once N messages went out; a fire after that
+`--runs N` ends the automation once N messages went out; a run after that
 (its end could not unload it) only tries to end it again.
-`--until 'YYYY-MM-DD HH:MM'`, local time, ends it at that time: its first fire
+`--until 'YYYY-MM-DD HH:MM'`, local time, ends it at that time: its first run
 from then sends nothing and ends it, its row saying `last ended: its until
 came`. A follow's `until` and `runs` end it the same way (LOOKOUT.md).
 `--turn-budget-tokens N` submits each message with that turn cap, so one
@@ -239,9 +239,9 @@ history. `--budget-counts work` with it counts the run's work instead, what
 it adds and writes, not the history it re-reads, as the memory cleanup's
 cap does. Each message the
 agent gets starts with one line, `[automation NAME · YYYY-MM-DD HH:MM · why]`,
-the local fire time and what fired it (its time, `file PATH`, `commit REPO
-at SHA`, or `fired`), so a
-catch-up fire after sleep reads as late; an
+the local run time and what started it (its time, `file PATH`, `commit REPO
+at SHA`, or `run now`), so a
+catch-up run after sleep reads as late; an
 answer passed on by `--reply-to` starts with the agent and turn it is from.
 Submissions carry `origin: "automation"`, and a passed-on answer carries
 `from: {bot, turn}`, the turn it is; task updates carry `origin:
@@ -258,20 +258,20 @@ first. A name differing from another only in case is refused
 (`name_taken`), since macOS folders would give both one file, and `rm` finds
 an automation only by the name as stored; `rm` of a name not there is
 `automation_not_found`. `ls` returns 64 automations per page, with `next_after`
-for `--after NAME`; only the current page's messages are retained. `run NAME` asks for a fire and returns
-`{"name", "ran": true}`; what the fire did shows in `ls`. An ask is a file
+for `--after NAME`; only the current page's messages are retained. `run NAME` asks for a run and returns
+`{"name", "ran": true}`; what the run did shows in `ls`. An ask is a file
 in the automation's queue folder, `~/.agent/automations/NAME.asks`, and a ring
-of the scheduler's doorbell: the scheduler runs the automation's fire while an
-ask is there, one at a time, and runs it again when a fire ends with one
-still there. Each ask is one fire: the fire moves the oldest out of the queue into
+of the scheduler's doorbell: the scheduler runs the automation's run while an
+ask is there, one at a time, and runs it again when a run ends with one
+still there. Each ask is one run: the run moves the oldest out of the queue into
 `NAME.taking`, which the scheduler also looks at, sends whatever its time or
 watched path, queues behind work rather than skipping it, and removes the
-ask once done; one a fire was cut short on is the next fire's, and its
+ask once done; one a run was cut short on is the next run's, and its
 message has the same `request_id`, named by the ask, so the daemon takes it
 once. A queue that cannot be read, or an ask that cannot be moved out of it
 or removed once done, would have the scheduler run it for ever, so the
 automation ends, saying why (`asks_stuck`). An automation that goes takes its asks
-with it. Nothing else starts a fire: the scheduler is the only thing that
+with it. Nothing else starts a run: the scheduler is the only thing that
 runs one.
 
 Each is one file, `~/.agent/automations/jobs/NAME.json`, its definition: what
@@ -284,28 +284,28 @@ both), the store lineage its daemon announced, the one-off's time, the
 repository, the folder, the reply agent and its id, the gate, the run limit,
 and the message. The lineage is drawn when the store is made and kept when
 its file is replaced or copied, so a store put back from a copy keeps its
-automations. A fire whose daemon announces another store (a reused
+automations. A run whose daemon announces another store (a reused
 socket) sends nothing and records `store_mismatch`. An automation made when
 automations kept the store file's identity, which a replaced file loses, is
-rewritten to the lineage when Sonny next opens on that store. When it fires, Sonny
+rewritten to the lineage when Sonny next opens on that store. When it runs, Sonny
 runs with `--trigger-fire` and those arguments. It connects to
 the daemon, and when none answers and the store is known, starts one for it
 on that socket as Sonny does, with the `agent` Sonny finds and the login shell's environment,
-and `agent` adds `~/.agent/keys/env` as for every daemon it starts. A fire submits with `delivery: queue`, so a working bot gets
+and `agent` adds `~/.agent/keys/env` as for every daemon it starts. A run submits with `delivery: queue`, so a working bot gets
 it after its turn and never has it cut in. A repeating automation first
-looks for one of its own fires still waiting behind the bot's work: if one
-is, it skips that fire (`bot_busy`) rather than let fires pile up, as
-anacron runs a missed job once; a fire that waits is `late`. A one-off, and
-a fire `run` asked for, always goes. A one-off's
-calendar entry has no year, so a fire more than two days before its time
+looks for one of its own runs still waiting behind the bot's work: if one
+is, it skips that run (`bot_busy`) rather than let runs pile up, as
+anacron runs a missed job once; a run that waits is `late`. A one-off, and
+a run `run` asked for, always goes. A one-off's
+calendar entry has no year, so a run more than two days before its time
 does nothing (the slack keeps a one-off whose Mac changed time zone since,
 since the scheduler follows the new zone's clock), and one more than half a year
 after it is that entry's next year: it sends nothing and ends as `missed`.
-What the fire did (`sent` with the turn and any `reply`, `skipped`, `gone`,
+What the run did (`sent` with the turn and any `reply`, `skipped`, `gone`,
 `missed` or `failed` with why), with the messages sent so far, the agent it
 started and the commit it saw, is kept in `~/.agent/automations/NAME.json`,
 which `ls` and `show` return. Automations are local to this machine. Only
-the scheduler runs a fire, so no two of one automation ever run at once.
+the scheduler starts a run, so no two of one automation ever run at once.
 
 An automation's state is two things: its definition and its state file. Every
 change keeps them either whole or as they were, and anything else a failure
@@ -315,13 +315,13 @@ can leave is listed and removable:
   scheduler can run (no user manager on Linux), the definition goes again
   and `add` refuses with `automations_unsupported`. A definition there
   already, readable or not, is never replaced: `rm` first. Each
-  installation has a generation ID, and listing and fires only use a state
+  installation has a generation ID, and listing and runs only use a state
   file of the current generation, so an automation made again under an ended
   one's name starts afresh.
-- **Firing** records its result and ends an automation that is over (a one-off,
+- **Running** records its result and ends an automation that is over (a one-off,
   one whose agent, `--reply-to` agent or, for `--start`, adding agent is
   gone, one that reached `--runs` or its `--until`), both under the lock
-  and only while the definition is still the one it fired for: an automation
+  and only while the definition is still the one it ran for: an automation
   removed while its message went out is left as it now is. A one-off that
   delivered keeps its last result until its turn is known to have ended:
   whoever asks the daemon how it ended (`/background`, the footer's count,
@@ -336,9 +336,9 @@ can leave is listed and removable:
   says no to at its time leaves nothing, its result included: nothing came
   of it to tell, as an ask's deadline once the ask was answered.
 - **Removing** deletes the definition, the queue and the state file, so it
-  reaches an ended row and a live automation alike. A fire of it that runs
+  reaches an ended row and a live automation alike. A run of it that goes on
   meanwhile runs to its end, and records nothing, as for an automation removed
-  while it fired.
+  while it ran.
 - **Listing** shows a one-off still there two days after its time as
   `missed: true` (the scheduler did not run it, as when the machine was
   off, or its end was cut short), and a
@@ -346,7 +346,7 @@ can leave is listed and removable:
   removes.
 
 The files are written, synced, renamed and their folder synced; deletions
-sync their folder too. `add`, `rm`, `run`, a fire's result and end, and
+sync their folder too. `add`, `rm`, `run`, a run's result and end, and
 Sonny's refresh take a lock (`~/.agent/automations/.lock`) around their
 changes, and the refresh reads each definition again under it. Sonny's
 start removes the temporary of a write that died before its rename: every
@@ -380,23 +380,23 @@ that finds no scheduler running starts it.
 
 The job runs `sonny scheduler`. It reads the definitions in
 `~/.agent/automations/jobs` when that folder changes, and runs an automation's
-fire when one of its calendar times comes (once for any number missed while
+run when one of its calendar times comes (once for any number missed while
 the machine slept or the scheduler was not running: it keeps when it last
 looked at each automation in `~/.agent/automations/.scheduler/looked`), when the path it
 watches changes (a write after the automation was added and before the
-scheduler first read it included), and while its queue holds an ask. One fire of an automation
-runs at a time, also across a restart of the scheduler: a fire holds a lock
+scheduler first read it included), and while its queue holds an ask. One run of an automation
+runs at a time, also across a restart of the scheduler: a run holds a lock
 on its own file in `~/.agent/automations/.scheduler` while it runs, which a daemon
-it starts does not inherit. At most four fires per core (eight at least)
+it starts does not inherit. At most four runs per core (eight at least)
 run at once, as make's and cargo's jobs scale with the machine: a burst of
-due automations waits its turn, and a place a fire leaves goes to the automation
-that has waited longest, not to one just served. A fire that cannot start
+due automations waits its turn, and a place a run leaves goes to the automation
+that has waited longest, not to one just served. A run that cannot start
 stays due, and is tried again after a wait that doubles from a second up to
-five minutes; one whose lock a fire from before a restart of the scheduler
+five minutes; one whose lock a run from before a restart of the scheduler
 holds waits the same way, up to a minute, or, due only for an ask, leaves
 the ask in its queue for the next look. An ask that comes while its
-automation's fire runs is looked at when that fire ends. A ring of its doorbell, the FIFO `~/.agent/automations/.ring`, has it
-look again at once, and so does a fire that ends; else it sleeps until the
+automation's run is going is looked at when that run ends. A ring of its doorbell, the FIFO `~/.agent/automations/.ring`, has it
+look again at once, and so does a run that ends; else it sleeps until the
 next calendar time, and at most a minute, and looks at watched paths every
 two seconds. A lock of its own there keeps one scheduler per HOME. It also
 runs what Sonny once gave the system jobs of their own for: the daemon at
@@ -409,15 +409,15 @@ machine's time zone changes (where `/etc/localtime` points, or the file
 there), as the C library keeps the zone it read at the start: the new one
 works out each calendar time again from the times kept; when its HOME is gone (a test's
 HOME deleted with its scheduler running) it lets its own job go and ends.
-A fire whose HOME is gone sends nothing.
+A run whose HOME is gone sends nothing.
 
-A daemon a fire starts runs in a scope of its own on Linux
+A daemon a run starts lives in a scope of its own on Linux
 (`systemd-run --user --scope`), as a desktop starts an app, so it outlives
-the fire and is not the scheduler's; the job stops only the scheduler
-itself (`KillMode=process`, `AbandonProcessGroup`). A fire runs with
+the run and is not the scheduler's; the job stops only the scheduler
+itself (`KillMode=process`, `AbandonProcessGroup`). A run has
 `XDG_CONFIG_HOME` and `XDG_DATA_HOME` as `add` had them, besides `HOME`,
 `SHELL` and `PATH`. The user manager runs while you are logged in, as
-LaunchAgents do; for automations to fire while you are logged out,
+LaunchAgents do; for automations to run while you are logged out,
 `loginctl enable-linger`. With no user manager running (no
 `systemd/private` in `XDG_RUNTIME_DIR`, or in `/run/user/UID` when that is
 unset), `add` refuses with `automations_unsupported`.
@@ -438,10 +438,10 @@ go and makes the job again as `sonny.scheduler.TAG`, once (retired at
 Automations were triggers before 0.8.0. The first Sonny, scheduler or
 script of 0.8.0 to look moves `~/.agent/triggers` to
 `~/.agent/automations` (unless a folder is there already), but only while
-nothing works in it: no change to its files, no fire running (a fire of the
+nothing works in it: no change to its files, no run going (a run of the
 old Sonny keeps its paths to its end) and no other scheduler. Until then
 each works in the old folder, and the scheduler moves it within a minute of
-the last fire ending, then runs again from the new one. The old path stays
+the last run ending, then runs again from the new one. The old path stays
 as a link to the new folder, so what chose it just before the move (an
 `add` still asking its daemon, say) writes where everything else reads; one
 that finds neither between the move and the link is told
@@ -683,7 +683,7 @@ each run starts an agent of its own (`--fresh`), `memory-cleanup-N`, in
 `~/.agents/memory` on the model given, and sends it "Clean up memory as the
 memory-cleanup skill says." The automation's `--if` runs `changed`, which Sonny answers true also
 when the person wrote to any agent since the last finished cleanup
-started (starting a stopped daemon to read it, as a fire would), so a night after nothing was saved or removed and nothing said
+started (starting a stopped daemon to read it, as a run would), so a night after nothing was saved or removed and nothing said
 costs no turn. Each turn is capped at 1,000,000 tokens, and each night
 starts a conversation of its own, so a call carries only that night's work.
 It is on by default: the first Sonny to open a lead schedules it on that
@@ -861,9 +861,9 @@ when none) and a resume from whoever resumed (the `resumed` notice's `by`),
 from the notices every session hears, and a pause already holding from
 `ready`; a replay has none, since the notices are not events.
 
-## Updating
+## Upgrading
 
-`sonny update` brings Sonny and its daemon to the latest release, the way
+`sonny upgrade` brings Sonny and its daemon to the latest release, the way
 `codex update` and `claude update` update theirs
 ([update.rs](../sonny/src/update.rs)). It tells how Sonny was installed by
 where its program is, as Codex does:
@@ -880,18 +880,19 @@ where its program is, as Codex does:
   `PREFIX/bin/sonny` are linked to it, each link made beside the old one
   and moved over it. Earlier versions stay, as install.sh leaves them.
   `--download` stops once it is unpacked and checked, switching nothing;
-  the next `sonny update` finds it there and links it.
+  the next `sonny upgrade` finds it there and links it.
 - Anything else (a checkout's build, `cargo install`) is left to how it was
   built, and the rest below still runs for this build.
 
 Brew runs from `/`, as Codex runs its updater, so no project's own
-configuration takes part. One update runs at a time, under a lock on
+configuration takes part. One upgrade runs at a time, under a lock on
 `~/.agent/sonny/update.lock` that names the process holding it, as Claude
 Code's updater does; and none runs from an agent's shell, since replacing
 the daemon waits on that agent's own turn.
 
-The old Sonny then runs the new one (`sonny update --installed VERSION`,
-which every later release keeps), which does the rest, since only it knows
+The old Sonny then runs the new one (`sonny upgrade --installed VERSION`,
+which every later release keeps; 0.10 also takes an older Sonny's
+`sonny update --installed VERSION`, for that release only), which does the rest, since only it knows
 how: `agent start --replace` replaces the daemon running now with the
 new one's, whether or not the protocol changed (an upgrade that kept the
 protocol would otherwise leave the old daemon running), and even when it
@@ -908,7 +909,7 @@ each step; the last is `Successfully updated from OLD to version NEW` (`to the
 newest build of VERSION` for a nightly), or `Sonny is up to date
 (VERSION)`, when the daemon is replaced only if it runs another release.
 
-![sonny update, from a release tarball install of 0.9.4 to 0.9.5](sonny/sonny-update.png)
+![sonny upgrade, from a release tarball install of 0.9.4 to 0.9.5](sonny/sonny-update.png)
 
 ![sonny update naming the lead role and plan skill whose new text waits beside the person's edited copies](sonny/sonny-update-kept.png)
 
@@ -919,7 +920,7 @@ stay on the old release. A plain `agent start` replaces only the daemon.
 
 Each open window notes the program it started from. When it loses the
 daemon and the Sonny installed where it runs from is another program
-(`sonny update`, or `brew upgrade` and install.sh run by hand), it reopens
+(`sonny upgrade`, or `brew upgrade` and install.sh run by hand), it reopens
 on that one in place, in the same terminal, with its own arguments, on the
 same agent, and with what was typed in its composer back in it unsent,
 pasted pictures and all, as `/new` hands its first message on in a file; the reopened window says
@@ -1363,15 +1364,15 @@ idempotent `add`, `run`, `--runs`, `--if`, the commit check, move, each
 lifecycle step with no scheduler to run them, the scheduler's next times
 and its job, moving an earlier Sonny's per-automation jobs, and skills an edit
 makes the person's. With `AGENT_TEST_RUNTIME=1` after a release build and
-`cargo build -p sonny`, `python3 -m unittest tests.test_trigger` fires
+`cargo build -p sonny`, `python3 -m unittest tests.test_trigger` runs
 automations against a real daemon, including one that starts its stopped
 daemon with only a login shell's provider key, and runs `sonny scheduler`
 itself under a scratch `HOME`: of two schedulers one leaves it to the
-other, a one-off fires at its minute and ends itself, a write fires a file
+other, a one-off runs at its minute and ends itself, a write starts a file
 automation (the same `add` again being that automation, a different one refused
 naming `when`), `run` by name starts the stopped daemon, and a scheduler
 whose HOME is deleted lets its job go. On a Mac `AGENT_TEST_LAUNCHD=1`, and
 on Linux with a user manager running `AGENT_TEST_SYSTEMD=1`, add one test
 of the real system: the first automation writes the scheduler's job, the
-system runs it, it fires a one-off, and later adds and replaces leave the
+system runs it, it runs a one-off, and later adds and replaces leave the
 job's file as it was.

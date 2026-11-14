@@ -294,6 +294,12 @@ pub const MIGRATIONS: &[Migration] = &[
         id: crate::config::TAB_WORDS,
         retire: "0.12.0",
     },
+    // `sonny update` is `sonny upgrade`; an older Sonny that installed
+    // this one still hands off as `sonny update --installed` (0.10.0).
+    Migration {
+        id: "update-hand-off",
+        retire: "0.11.0",
+    },
     // A project file's `threads_*` keys become `task_*`, once for each
     // file, before Sonny first reads it (`crate::project::read`) (0.10.0).
     Migration {
