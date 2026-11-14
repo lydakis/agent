@@ -1492,15 +1492,22 @@ fn pem_text(line: &str) -> &str {
 /// Whether `line`, its end's `\r` and the spaces or tabs around it taken
 /// off, is a line of a key's body: base64 with any spaces or tabs, the RFC
 /// 1421 headers of an encrypted key, or empty, as a key's reader takes
-/// them.
+/// them. What a search or a listing puts before each line it shows (a
+/// path, a number, `:`, `-` or a tab between them) is not read: base64
+/// holds none of those, so a body's line is what follows the last of
+/// them. A marker's dashes are never a body's.
 fn pem_line(line: &str) -> bool {
     let line = pem_text(line).trim_matches([' ', '\t']);
-    let base64 =
-        |b: &u8| b.is_ascii_alphanumeric() || matches!(b, b'+' | b'/' | b'=' | b' ' | b'\t');
-    line.is_empty()
-        || (line.len() <= PEM_LINE
-            && (line.starts_with("Proc-Type:") || line.starts_with("DEK-Info:")))
-        || line.as_bytes().iter().take(PEM_LINE).all(base64)
+    let head = &line[..line.floor_char_boundary(PEM_LINE)];
+    if head.contains("-----") {
+        return false;
+    }
+    if line.len() <= PEM_LINE && (head.contains("Proc-Type:") || head.contains("DEK-Info:")) {
+        return true;
+    }
+    let body = head.rsplit([':', '-', '\t']).next().unwrap_or("");
+    let base64 = |b: &u8| b.is_ascii_alphanumeric() || matches!(b, b'+' | b'/' | b'=' | b' ');
+    body.as_bytes().iter().all(base64)
 }
 
 /// A secret block's body, read line by line after its header: the lines
@@ -5282,6 +5289,35 @@ mod tests {
             ),
             "-----BEGIN PRIVATE KEY-----   \n[REDACTED]\n-----END PRIVATE KEY-----\n"
         );
+        // A search's numbers and paths before each line, as `rg -n` and
+        // `grep -n -A` print them: the body is still hidden to its END,
+        // and the line after it shows.
+        for (head, sep) in [("", ":"), ("keys/id.pem:", ":"), ("keys/id.pem-", "-")] {
+            let prefix = |n: usize| format!("{head}{n}{sep}");
+            let end = "after";
+            let text = format!(
+                "{}-----BEGIN OPENSSH PRIVATE KEY-----\n{}b3BlbnNzaC1rZXktdjEAAAAA\n{}QyNTUxOQAAACA=\n\
+                 {}-----END OPENSSH PRIVATE KEY-----\n{}{end}\n",
+                prefix(1),
+                prefix(2),
+                prefix(3),
+                prefix(4),
+                prefix(5)
+            );
+            let hidden = redact(&text);
+            assert!(
+                !hidden.contains("b3Blbn") && !hidden.contains("QyNTUx"),
+                "{hidden}"
+            );
+            assert!(
+                hidden.ends_with(&format!(
+                    "[REDACTED]\n{}-----END OPENSSH PRIVATE KEY-----\n{}{end}\n",
+                    prefix(4),
+                    prefix(5)
+                )),
+                "{hidden}"
+            );
+        }
         // Many starts on one long line read it once, whole or in pieces.
         let starts = "-----BEGIN ".repeat(40_000) + "\nend\n";
         let began = std::time::Instant::now();
