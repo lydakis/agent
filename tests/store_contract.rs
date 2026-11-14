@@ -17695,6 +17695,9 @@ fn a_trimmed_row_a_fallback_and_summaries_leave_a_turns_time_as_it_ran() {
     db.append(turn, vec![item], &[shell.clone(), read.clone()], None)
         .unwrap();
     db.tool_start(turn, &shell, false, false).unwrap();
+    // The read's own time is 0.5 s more than what passes here: a slow
+    // runner's time counts too.
+    let since = std::time::Instant::now();
     db.tool_start(turn, &read, false, false).unwrap();
     // The command's row goes while both run; the read started 0.5 s ago.
     let conn = Connection::open(&path).unwrap();
@@ -17706,6 +17709,7 @@ fn a_trimmed_row_a_fallback_and_summaries_leave_a_turns_time_as_it_ran() {
     .unwrap();
     db.tool_finish(turn, "s1", &result("ok")).unwrap();
     db.tool_finish(turn, "r1", &result("ok")).unwrap();
+    let ran = since.elapsed().as_millis() as i64;
     // A fallback's round: 3 tokens from the attempt that failed, 40 from
     // the one that answered, which its time is.
     let attempt = |model: &str, output| ModelTokens {
@@ -17751,7 +17755,7 @@ fn a_trimmed_row_a_fallback_and_summaries_leave_a_turns_time_as_it_ran() {
     let time = &usage["time"];
     // The command counts with no time and leaves the read's whole.
     let tool_ms = time["tool_ms"].as_i64().unwrap();
-    assert!((500..900).contains(&tool_ms), "{time}");
+    assert!((500..=502 + ran).contains(&tool_ms), "{time} in {ran} ms");
     assert_eq!(
         [
             &time["tool_calls"],
