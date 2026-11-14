@@ -23,6 +23,7 @@ mod cache;
 mod calls;
 mod cmux;
 mod colors;
+mod commands;
 mod commons;
 mod config;
 mod context;
@@ -57,6 +58,7 @@ mod margin;
 mod math;
 mod mcp;
 mod mcp_import;
+mod memory;
 mod mermaid;
 mod models;
 mod mux;
@@ -69,7 +71,6 @@ mod place;
 mod plan;
 mod project;
 mod prompt;
-mod ps;
 mod reactions;
 mod recall;
 mod resolved;
@@ -369,7 +370,7 @@ struct Options {
 
 fn usage() -> String {
     "usage: sonny [--store PATH] [--socket PATH] [--model PROVIDER/MODEL] [--no-layout] [--rex-host HOST] [--no-sound]\n\
-     \x20      [--agent NAME [--new [--workspace DIR]] | --lead NAME | --new-lead [NAME]]\n\
+     \x20      [--agent NAME [--new [--folder DIR]] | --lead NAME | --new-lead [NAME]]\n\
      With no --agent, the folder's lead you last wrote to, its first made with --model the\n\
      first time; --lead opens another of the folder's leads, --new-lead makes one. Its\n\
      tasks open beside it in Rex, Herdr or cmux, each in a git worktree of its own. Type /status\n\
@@ -390,7 +391,7 @@ fn usage() -> String {
      tasks; sonny tool-host answers its agents' calls of Sonny's tools. Sonny starts both.\n\
      sonny agent ARGS... runs Sonny's own `agent` with ARGS, whatever `agent` is on PATH.\n\
      sonny setup asks again for the provider and the default model, as the first run does.\n\
-     sonny update [--download] updates Sonny and its daemon to the latest release, as it was\n\
+     sonny upgrade [--download] upgrades Sonny and its daemon to the latest release, as it was\n\
      installed, replaces the running daemon with the new one and has open windows reopen on it.\n\
      sonny acp [--store PATH] [--socket PATH] speaks the Agent Client Protocol on stdio\n\
      for T3 Code: a thread is its folder's lead, and each task opens as a thread of its own."
@@ -457,7 +458,7 @@ async fn show(
 }
 
 /// A tab for `bot`, a task `caller` just started asking for one: placed
-/// as a task's window is, within `[sonny] task_windows`, closing the
+/// as a task's window is, within `[sonny] most_task_tabs`, closing the
 /// lead's least recently used task tabs for room, never one the person has
 /// not looked at yet nor one that holds its place. What to tell `caller`
 /// beside the start, if anything.
@@ -488,7 +489,7 @@ async fn task_tab(caller: &str, bot: &str) -> Result<String, String> {
         .unwrap_or_else(|| format!("{project}.lead"));
     let lineage = lineage_of(&bots, &lead, lead == format!("{project}.lead"));
     let mut room = room_for(&project, &lineage, &HashMap::new(), Arc::new(used::held));
-    room.most = agent_client::config::load().map_or(0, |c| c.sonny.task_windows as usize);
+    room.most = agent_client::config::load().map_or(0, |c| c.sonny.most_task_tabs as usize);
     let command = [
         me.to_string_lossy().into_owned(),
         "--socket".into(),
@@ -664,7 +665,10 @@ async fn read_status(
         // for none, so the next refresh tries again.
         let head = json!([bot["bot_id"], bot["head"]]);
         let latest = match status_read.remove(name) {
-            Some((seen, latest)) if seen == head && !bot["head"].is_null() => Some(latest),
+            // No history yet: nothing to read, and nothing asked of the
+            // daemon for it, however many such agents a project holds.
+            _ if bot["head"].is_null() => Some(Latest::default()),
+            Some((seen, latest)) if seen == head => Some(latest),
             _ => {
                 fresh = true;
                 let latest = read_latest(client, name).await;
@@ -716,11 +720,11 @@ async fn read_status(
                     .collect();
                 format!("waiting on {}", on.join(", "))
             }
-            (true, Some("paced")) => "rate limited".into(),
+            (true, Some("paced")) => status::paced(&ran["waiting_on"], now),
             (true, _) => "working".into(),
             (false, Some("completed")) => started::IDLE.into(),
             (false, Some("failed")) if ran["error"] == EMPTY => started::QUIET.into(),
-            (false, Some("interrupted")) => "stopped".into(),
+            (false, Some("interrupted")) => started::INTERRUPTED.into(),
             (false, Some(other)) => other.to_owned(),
             (false, None) => "idle".into(),
         };
@@ -809,7 +813,7 @@ async fn read_status(
             }
             Some((tab, None)) => format!("tab {tab}"),
             // Its window waits for room, until a click on the row.
-            None if (view.aside)(name) => "window set aside for room".into(),
+            None if (view.aside)(name) => "tab set aside for room".into(),
             None => String::new(),
         };
         // This window's turns run on its own model, when it has one.
@@ -905,34 +909,34 @@ fn reads_file(store: &std::path::Path, lead: &str) -> std::path::PathBuf {
 }
 
 /// The folder of [`reads_file`]s beside `store`.
-fn reads_dir(store: &std::path::Path) -> std::path::PathBuf {
+pub(crate) fn reads_dir(store: &std::path::Path) -> std::path::PathBuf {
     let mut dir = store.as_os_str().to_owned();
     dir.push(".status-reads");
     std::path::PathBuf::from(dir)
 }
 
 /// Every agent's question as some window or the sky last read it beside
-/// `store`, by this build from the daemon `identity` names: each with the
-/// turn it ended, the newest where two kept one. The sky reads again only
-/// the agents that ran since.
+/// `store`, read as this build reads one ([`seen_stamp`]) from the daemon
+/// `identity` names: each with the turn it ended, the newest where two
+/// kept one. The sky reads again only the agents that ran since.
 pub(crate) fn kept_seen(
     store: &std::path::Path,
     identity: Option<&str>,
 ) -> HashMap<String, (i64, Seen)> {
     #[derive(serde::Deserialize)]
     struct Kept {
-        build: String,
+        reads: String,
         seen: HashMap<String, (i64, Seen)>,
     }
     let store = agent_client::socket::canonical_store(store).unwrap_or_else(|_| store.into());
-    let build = reads_build(identity);
+    let stamp = seen_stamp(identity);
     let mut seen: HashMap<String, (i64, Seen)> = HashMap::new();
     let files = std::fs::read_dir(reads_dir(&store)).into_iter().flatten();
     for file in files.flatten() {
         let Some(kept) = std::fs::read(file.path())
             .ok()
             .and_then(|bytes| serde_json::from_slice::<Kept>(&bytes).ok())
-            .filter(|kept| kept.build == build)
+            .filter(|kept| kept.reads == stamp)
         else {
             continue;
         };
@@ -977,6 +981,15 @@ fn reads_build(identity: Option<&str>) -> String {
     )
 }
 
+/// What a question read is kept under: how this build reads one
+/// ([`needs::READS`]), and the daemon's store it was read from. A new
+/// build that reads questions as the last one did takes what that one
+/// read, so the first sky after an upgrade reads only the agents that ran
+/// since; [`reads_build`] keeps `/status`'s other reads per build.
+pub(crate) fn seen_stamp(identity: Option<&str>) -> String {
+    format!("{:016x} {}", needs::READS, identity.unwrap_or(""))
+}
+
 /// Take what an earlier window kept of each agent's history, where this
 /// one has nothing newer: the same head is the same history, and an ended
 /// turn's question is the same question, so a window opened later reads
@@ -991,21 +1004,25 @@ fn take_reads(
     #[derive(serde::Deserialize)]
     struct Kept {
         build: String,
+        reads: String,
         latest: HashMap<String, (Value, Latest)>,
         seen: HashMap<String, (i64, Seen)>,
     }
     let Some(kept) = std::fs::read(reads_file(store, lead))
         .ok()
         .and_then(|bytes| serde_json::from_slice::<Kept>(&bytes).ok())
-        .filter(|kept| kept.build == reads_build(identity))
     else {
         return;
     };
-    for (name, read) in kept.latest {
-        status_read.entry(name).or_insert(read);
+    if kept.build == reads_build(identity) {
+        for (name, read) in kept.latest {
+            status_read.entry(name).or_insert(read);
+        }
     }
-    for (name, seen) in kept.seen {
-        asks_seen.entry(name).or_insert(seen);
+    if kept.reads == seen_stamp(identity) {
+        for (name, seen) in kept.seen {
+            asks_seen.entry(name).or_insert(seen);
+        }
     }
 }
 
@@ -1035,29 +1052,33 @@ fn write_reads(
     #[derive(serde::Serialize)]
     struct Kept<'a> {
         build: String,
+        reads: String,
         latest: &'a HashMap<String, (Value, Latest)>,
         seen: HashMap<&'a String, &'a (i64, Seen)>,
     }
     let kept = Kept {
         build: reads_build(identity),
+        reads: seen_stamp(identity),
         latest: status_read,
         seen,
     };
     if let Ok(bytes) = serde_json::to_vec(&kept) {
-        // History excerpts: only the person reads them, as with the store.
-        use std::os::unix::fs::PermissionsExt;
-        let file = reads_file(store, lead);
-        if let Some(dir) = file.parent()
-            && std::fs::create_dir_all(dir)
-                .and_then(|()| {
-                    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
-                })
-                .is_err()
-        {
-            return;
-        }
-        let _ = agent_client::files::replace_mode(&file, &bytes, 0o600);
+        keep_beside(&reads_file(store, lead), &bytes);
     }
+}
+
+/// Write `bytes` to `file` among the reads kept beside a store, whole.
+/// History excerpts: only the person reads them, as with the store.
+pub(crate) fn keep_beside(file: &std::path::Path, bytes: &[u8]) {
+    use std::os::unix::fs::PermissionsExt;
+    if let Some(dir) = file.parent()
+        && std::fs::create_dir_all(dir)
+            .and_then(|()| std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)))
+            .is_err()
+    {
+        return;
+    }
+    let _ = agent_client::files::replace_mode(file, bytes, 0o600);
 }
 
 /// `bot`'s latest step, question and pull request; none when a read
@@ -1601,7 +1622,7 @@ fn installed_agent(me: &std::path::Path) -> Vec<PathBuf> {
 /// `sonny agent ARGS...`: the `agent` Sonny itself starts, run with
 /// ARGS in place of this process, so the person reaches it whatever else
 /// is called `agent` on their PATH. It gives a daemon it starts the keys
-/// in ~/.agent/env, as for every other starter.
+/// in ~/.agent/keys/env, as for every other starter.
 fn pass_to_agent(args: &[String]) -> Result<(), String> {
     let bin = agent_bin_or_missing()?;
     let mut command = std::process::Command::new(&bin);
@@ -1609,7 +1630,7 @@ fn pass_to_agent(args: &[String]) -> Result<(), String> {
     Err(format!("{}: {error}", bin.display()))
 }
 
-/// What to tell the person when `~/.agent/env` sets one of Agent's own
+/// What to tell the person when `~/.agent/keys/env` sets one of Agent's own
 /// names, which it never gives a daemon (`agent_client::env_file::refused`):
 /// providers are set by `provider` in `~/.agent/config.toml` (a shell's own
 /// `AGENT_PROVIDER` still wins, for scripts).
@@ -1892,7 +1913,7 @@ fn start_daemon(
 }
 
 /// [`start_daemon`], replacing the daemon running now, whatever its
-/// release, as `sonny update` switches to the new one (`agent start
+/// release, as `sonny upgrade` switches to the new one (`agent start
 /// --replace`).
 fn start_daemon_replacing(
     store: &std::path::Path,
@@ -1936,7 +1957,7 @@ fn start_daemon_with(
     if let Some(runtime) = std::env::var_os("XDG_RUNTIME_DIR").filter(|_| scoped) {
         command.env("XDG_RUNTIME_DIR", runtime);
     }
-    // The CLI gives the daemon the keys in ~/.agent/env itself.
+    // The CLI gives the daemon the keys in ~/.agent/keys/env itself.
     command.env("AGENT_BIN", &bin).env_remove(named::PROGRAM);
     command.arg("start");
     if replace {
@@ -2019,7 +2040,7 @@ fn parse() -> Result<Options, String> {
             "--agent" => bot = Some(value()?),
             "--new" => new = true,
             "--model" => model = Some(value()?),
-            "--workspace" => workspace = Some(value()?),
+            "--folder" => workspace = Some(value()?),
             "--no-layout" => layout = false,
             "--rex-host" => rex_host = Some(value()?),
             "--no-sound" => sound = false,
@@ -2070,7 +2091,7 @@ fn reopen(bot: &str) -> Vec<String> {
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--new" | "--reopened" => {}
-            "--workspace" | "--lead" | "--agent" | "--window-place" | "--send-file"
+            "--folder" | "--lead" | "--agent" | "--window-place" | "--send-file"
             | "--draft-file" => {
                 args.next();
             }
@@ -2181,12 +2202,19 @@ fn main() -> std::process::ExitCode {
         Some((verb, rest)) if verb == "sky" => sky_cli(rest),
         Some((verb, rest)) if verb == "status" => status_cli(rest),
         // The person runs this, from a terminal of their own.
-        Some((verb, rest)) if verb == "update" => update::cli(rest),
+        Some((verb, rest)) if verb == "upgrade" => update::cli(rest),
+        // An older Sonny's hand-off after it installed this one, under the
+        // name before 0.10.0 (`upgrade::MIGRATIONS`, "update-hand-off").
+        Some((verb, rest))
+            if verb == "update" && rest.first().is_some_and(|arg| arg == "--installed") =>
+        {
+            update::cli(rest)
+        }
         // An agent's shell runs this, before it opens anything in a terminal.
         Some((verb, rest)) if verb == "where" => where_cli(rest),
         // An agent's shell runs this, for zen it was asked for in words.
         Some((verb, rest)) if verb == "zen" => zen::cli(rest),
-        Some((verb, rest)) if verb == "home" => {
+        Some((verb, rest)) if verb == "backup" => {
             return std::process::ExitCode::from(home::cli(rest) as u8);
         }
         // Unlisted: the job `sonny.start_at_boot` keeps.
@@ -2584,10 +2612,8 @@ async fn run() -> Result<(), String> {
     // Sonny opens on its defaults, said, rather than not at all.
     app.warnings.extend(unread);
     app.sounds.chime = settings.chime;
-    app.verbose = settings.verbose;
-    app.words_only = !settings.steps;
+    app.set_view(settings.view);
     app.colors = settings.project_colors;
-    app.colors_set = settings.project_colors;
     app.pinned = settings.project_color.clone();
     set_measure(settings.text_width);
     margin::set_limits(settings.margin_notes, settings.margin_note_lines);
@@ -2645,7 +2671,6 @@ async fn run() -> Result<(), String> {
     {
         app.notice = Some(said);
     }
-    app.lead = project::lead(&app.options.socket, &bot);
     // The lookout knows no leads: it watches a lead's tasks because Sonny
     // subscribes it to them, before the lookout starts so it reads the file.
     if let Some(project) = &project
@@ -2658,24 +2683,19 @@ async fn run() -> Result<(), String> {
         app.warnings.push(error);
     }
     // The lead told what its folder tells it today (skills and memory added
-    // since it was made), unless its instructions were set some other way;
-    // a file of the folder's it cannot use is left out, and said.
+    // since it was made), whatever set its instructions before; a file of
+    // the folder's it cannot use is left out, and said.
     if project.is_some()
         && let Some(dir) = moving
             .as_deref()
             .or(bot["workspace"].as_str().map(std::path::Path::new))
     {
         let chosen = project::chosen(&app.options.store, &name);
-        match project::review(dir, &bot, &app.lead, fresh, chosen.as_deref()) {
-            Ok((reviewed, left_out)) => {
+        app.holds = bot["instructions"].as_str().unwrap_or_default().to_owned();
+        match project::review(dir, &app.holds, chosen.as_deref()) {
+            Ok((taken, left_out)) => {
                 app.warnings.extend(left_out);
-                match reviewed {
-                    project::Instructions::Stale(text) => app.instruct = Some(text),
-                    project::Instructions::Current => {}
-                    project::Instructions::Kept { missing } => {
-                        app.notice = Some(project::Instructions::kept_notice(&missing))
-                    }
-                }
+                app.instruct = taken;
             }
             Err(error) => app
                 .warnings
@@ -2688,7 +2708,7 @@ async fn run() -> Result<(), String> {
             "{name} works in {}; your next message brings it back here",
             tilde(bot["workspace"].as_str().unwrap_or("another folder"))
         ));
-        // The project's folder from now: what /model and /instructions
+        // The project's folder from now: what /model and the lead's instructions
         // write and read, before the move itself.
         app.workspace = dir.display().to_string();
         app.move_to = Some(app.workspace.clone());
@@ -2790,7 +2810,7 @@ async fn run() -> Result<(), String> {
         }
         return Err(format!("could not open {other}: {error}"));
     }
-    // Sonny was updated while this window was open: it goes on as the new
+    // Sonny was upgraded while this window was open: it goes on as the new
     // Sonny, in this same terminal, on the same agent, with what was typed.
     if let (Ok(()), Some(program)) = (&result, app.reopen_on.take()) {
         use std::os::unix::process::CommandExt;
@@ -2964,7 +2984,7 @@ async fn create(client: &Client, options: &Options, bot: &str) -> Result<(), Str
     let memory = agent_client::policy::memory_indexes(&workspace).map_err(|e| e.to_string())?;
     let composed =
         agent_client::policy::instructions(&workspace, None, &memory).map_err(|e| e.to_string())?;
-    let info = agent_client::project::read(&workspace)?;
+    let info = crate::project::read(&workspace)?;
     let instructions = project::as_task(&workspace, &info, &composed.text)?;
     let mut asked = json!({"bot": bot, "workspace": workspace, "model": model,
         "instructions": instructions, "request_id": unique("tui-create")});
@@ -3020,9 +3040,7 @@ pub(crate) fn made(
     if let Some(outputs) = outputs() {
         settings.insert("outputs".into(), json!(outputs));
     }
-    if config.hide_senders {
-        settings.insert("hide_senders".into(), json!(true));
-    }
+    settings.insert("trailer".into(), json!(crate::stamp::trailer(&config)));
     if let Some(ms) = config.hold_ms {
         settings.insert("hold_ms".into(), json!(ms));
     }
@@ -3034,7 +3052,7 @@ pub(crate) fn made(
     let tools: Vec<String> = tools.into_iter().map(String::from).collect();
     let tools = approvals::gateable(&tools, &declare);
     if let Value::Object(fields) = asked {
-        fields.extend(approvals::create_gate(mode, &tools));
+        fields.extend(approvals::gate(mode, &tools));
     }
     Ok(())
 }
@@ -3481,6 +3499,15 @@ struct Denial {
     reason: String,
 }
 
+/// What the one confirm over the composer asks before: it can't be undone.
+#[derive(Clone, Debug, PartialEq)]
+enum Confirm {
+    /// `/compact`.
+    Compact,
+    /// `/retry` of this call, written out above for the person to read.
+    Retry(Denial),
+}
+
 /// A call waiting on the person as [`App::show_asked`] wrote it out:
 /// its rows, tagged [`screen::Tag::Request`] with `tag`, and enough to
 /// fold them to one row once it is answered, as Codex keeps only the
@@ -3657,6 +3684,24 @@ fn boosts(providers: &Value, model: &str, effort: Option<&str>) -> Vec<String> {
 /// Ctrl+\, which moves the keys between the conversation and the pane:
 /// no terminal or multiplexer takes it, as many take Shift+Tab. Without
 /// the keyboard protocol it arrives as Ctrl+4.
+/// The arrow `h` `j` `k` or `l` is in a pane, as in a file browser's
+/// list: never with Ctrl, Alt or Super.
+fn vim_arrow(key: &KeyEvent) -> Option<KeyCode> {
+    if key
+        .modifiers
+        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER)
+    {
+        return None;
+    }
+    match key.code {
+        KeyCode::Char('h') => Some(KeyCode::Left),
+        KeyCode::Char('j') => Some(KeyCode::Down),
+        KeyCode::Char('k') => Some(KeyCode::Up),
+        KeyCode::Char('l') => Some(KeyCode::Right),
+        _ => None,
+    }
+}
+
 fn switches(key: &KeyEvent) -> bool {
     key.modifiers.contains(KeyModifiers::CONTROL) && matches!(key.code, KeyCode::Char('\\' | '4'))
 }
@@ -3681,13 +3726,14 @@ const HISTORY_NODES: usize = 400;
 /// The most denials `/retry` offers.
 const DENIALS: usize = 8;
 
-/// What the person sends to approve one retry of a denied call: their own
-/// words, so the judge reads the consent, as Codex words it.
+/// What the person sends to allow one retry of a denied call: their own
+/// words, so the reviewer reads the consent, as Codex words it, in the
+/// Rulebook's word for it.
 fn approval(denial: &Denial) -> String {
     format!(
-        "I approve one retry of the action the reviewer denied: {} {}\n\n\
-         Treat this as approval to perform that exact action in the same context in which it \
-         was originally requested. Do not assume this also authorizes similar operations with \
+        "I allow one retry of the action the reviewer denied: {} {}\n\n\
+         Treat this as permission to perform that exact action in the same context in which it \
+         was originally requested. Do not assume this also allows similar operations with \
          different payloads.",
         denial.name, denial.arguments
     )
@@ -3713,7 +3759,7 @@ fn denied_why(denied: &Denial) -> String {
 /// else as its arguments.
 fn retry_shown(denial: &Denial) -> Vec<Line<'static>> {
     let mut lines = vec![Line::from(
-        Span::raw(format!("Approve one retry of {}?", denial.name)).bold(),
+        Span::raw(format!("{}, as the reviewer denied it:", denial.name)).bold(),
     )];
     let what = match (denial.arguments["command"].as_str(), &denial.arguments) {
         (Some(command), Value::Object(fields)) => {
@@ -3761,20 +3807,15 @@ struct Running {
     acted: bool,
 }
 
-/// The lists of a setting's values `/permissions` and `/fast` open over
-/// the composer.
+/// The lists of a setting's values `/permissions` opens over the composer.
 #[derive(Clone, Copy, PartialEq)]
 enum Choice {
     Permissions,
-    Speed,
 }
 
-/// The speeds `/fast` lists, each where the model serves it.
-const SPEEDS: [(&str, &str); 3] = [
-    ("standard", "the model's own speed and price"),
-    ("fast", "faster, at a higher price per token"),
-    ("ultrafast", "fastest, at a higher price still"),
-];
+/// The speeds `/model`'s speed row steps through, each where the model
+/// serves it: its own, then faster at a higher price per token.
+const SPEEDS: [&str; 3] = ["standard", "fast", "ultrafast"];
 
 /// The tier faster than standard a bot's record says it is served at.
 fn speed(record: &Value) -> Option<String> {
@@ -3808,49 +3849,60 @@ fn hold(unsent: &mut Vec<String>, record: String) {
     }
 }
 
-/// The slash commands, as the menu lists them: name and what it does.
-/// `/agents` and `/ps` also open `/status`, `/automations` and `/lookout`
-/// open `/background`, `/forum` opens `/commons`, and `/settings` opens
-/// `/config`, unlisted.
-const COMMANDS: [(&str, &str); 31] = [
+/// Why `prompt` is not sent, when it reads as a command that none of the
+/// commands took: one slash word that names no command, or a command
+/// given words it doesn't take. A message that only starts with a slash
+/// word, such as a path, is words for the agent.
+fn unknown_command(prompt: &str) -> Option<String> {
+    let mut words = prompt.split_whitespace();
+    let word = words.next()?;
+    let name = word.strip_prefix('/')?;
+    if name.is_empty() || !(name.chars()).all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    {
+        return None;
+    }
+    let known = COMMANDS.iter().any(|(command, _)| *command == word);
+    match (known, words.next().is_some()) {
+        (true, _) => Some(format!("{word} takes nothing after it")),
+        (false, false) => Some(format!("no command {word} · / lists them")),
+        (false, true) => None,
+    }
+}
+
+/// The slash commands, as the menu lists them when nothing is typed past
+/// the slash: name and what it does, in the Sonny Rulebook's order (talk,
+/// agents, this agent, work without you, every project, Sonny). Each
+/// has one name.
+const COMMANDS: [(&str, &str); 26] = [
     ("/side", "Start a side chat with a copy of this agent"),
-    ("/model", "Pick the model and effort"),
+    ("/zen", "Talk about one thing and keep the rest for later"),
+    ("/reply", "Quote one of the agent's replies to answer it"),
+    ("/react", "React to one of the agent's replies"),
+    ("/copy", "Copy the last reply as Markdown"),
+    ("/status", "Show this project's agents"),
+    ("/switch", "Open any agent in this window"),
+    ("/new", "Start a lead or a task here"),
     (
-        "/fast",
-        "Choose how fast this agent is served, and at what price",
+        "/memory",
+        "Show what agents remember about you and this project",
     ),
-    (
-        "/compact",
-        "Summarize the lead's conversation before its next call",
-    ),
+    ("/model", "Pick the model, effort and speed"),
     (
         "/permissions",
         "Choose what agents may do, and who approves the rest",
     ),
     ("/retry", "Allow one retry of a call the reviewer denied"),
     (
-        "/instructions",
-        "Reload the lead's instructions from its folder",
+        "/compact",
+        "Summarize this agent's conversation to free context",
     ),
-    ("/status", "Show this project's agents"),
-    ("/switch", "Open any agent in this window"),
+    ("/context", "Show what fills this agent's context"),
     (
-        "/new",
-        "Start an agent here: a lead or a task, in the profile you pick",
+        "/background",
+        "Show what runs without you: automations, follows, commands",
     ),
-    (
-        "/zen",
-        "Talk with the agent about one thing, the rest held back; /zen again ends it",
-    ),
-    (
-        "/margin",
-        "Show or close the agent's notes beside the conversation",
-    ),
-    ("/background", "Run or remove automations and follows"),
-    (
-        "/ps",
-        "Show the commands the agents left running, and stop one",
-    ),
+    ("/pause", "Pause every agent until /resume"),
+    ("/resume", "Let the agents go on"),
     ("/commons", "Read what the agents of every project share"),
     ("/sky", "Watch every agent light up as they talk"),
     ("/usage", "Show the tokens the agents spent, over time"),
@@ -3858,26 +3910,18 @@ const COMMANDS: [(&str, &str); 31] = [
         "/audit",
         "Show every tool call the agents made: where it ran, who allowed it",
     ),
-    ("/context", "Show what fills the agent's context"),
-    ("/pause", "Stop every agent until /resume, saying why"),
-    ("/resume", "Let the agents go on after a pause"),
+    ("/config", "Change settings"),
+    ("/verbose", "Show every tool call, or go back to your view"),
+    (
+        "/margin",
+        "Show or close the agent's notes beside the conversation",
+    ),
     ("/mcp", "List the MCP servers agents' scripts call"),
-    ("/config", "Change the settings in ~/.agent/config.toml"),
-    ("/sound", "Turn the chime when work ends on or off"),
-    (
-        "/verbose",
-        "Show every tool call, or only what moves the work on",
-    ),
-    (
-        "/colors",
-        "Color each reply by the followed project it is about (experimental)",
-    ),
-    ("/react", "React to one of the agent's replies"),
-    ("/reply", "Answer one of the agent's replies, quoted"),
-    ("/copy", "Copy the last reply as Markdown"),
-    ("/open", "Open the last HTML page in your browser"),
     ("/quit", "Quit; the agents keep working"),
 ];
+
+/// `/zen`'s line while zen is on.
+const ZEN_ENDS: &str = "End zen and hear what was kept";
 
 /// Every key Sonny takes and what it does, as `?` lists them; a tip in
 /// the empty composer names only these.
@@ -3907,12 +3951,14 @@ const SHORTCUTS: [(&str, &str); 21] = [
 
 /// The slash menu's keys, while it is open: Tab completes the pick's name
 /// until it is whole.
-fn menu_keys(menu: &[(&str, &str, Vec<usize>)], pick: usize, typed: &str) -> Option<&'static str> {
+fn menu_keys(menu: &[(&str, &str, Vec<usize>)], pick: usize, typed: &str) -> Option<hint::Keys> {
     let picked = menu.get(pick.min(menu.len().checked_sub(1)?))?.0;
-    Some(match typed == picked {
-        true => "  ↑↓ pick · enter run · esc close",
-        false => "  ↑↓ pick · tab complete · enter run · esc close",
-    })
+    let keys = hint::Keys::new().pick().enter(hint::Enter::Run);
+    let keys = match typed == picked {
+        true => keys,
+        false => keys.key("tab", "complete"),
+    };
+    Some(keys.esc(hint::Esc::Close))
 }
 
 use needs::Seen;
@@ -4014,10 +4060,10 @@ struct Watch {
     usage: Option<usage::View>,
     /// `/audit` holds it instead.
     audit: Option<audit::View>,
-    /// `/ps` holds it instead.
-    ps: Option<ps::View>,
     /// `/commons` holds it instead.
     commons: Option<commons::View>,
+    /// `/memory` holds it instead.
+    memory: Option<memory::View>,
     /// `/sky` holds it instead.
     sky: Option<sky::View>,
     /// The row of the picked item (`/background`'s, `/commons`'s or
@@ -4091,7 +4137,8 @@ impl Search {
     /// find, then the keys; and the column the cursor goes in.
     fn keys(&self) -> (Line<'static>, u16) {
         let mut keys = vec![Span::raw(SEARCH_LABEL).dim(), Span::raw(self.typed.clone())];
-        keys.extend(hint::spans("  ↑↓ pick · enter edit · esc cancel"));
+        let pick = hint::Keys::new().pick().enter(hint::Enter::Choose);
+        keys.extend(hint::spans(&format!("  {}", pick.esc(hint::Esc::Cancel))));
         let cursor = SEARCH_LABEL.width() + self.typed.width();
         (Line::from(keys), cursor as u16)
     }
@@ -4334,8 +4381,13 @@ struct App {
     /// Whether picks are kept in the person's file, as they are once the
     /// screen is up: `/switch` reads the agents they picked from it.
     picks_kept: bool,
-    /// `/compact` asks before it compacts: Enter says yes.
-    confirming: bool,
+    /// When the last call waiting on the person left the screen: for
+    /// [`LEFT_KEYS`] after, a lone `y`, `n` or `a` meant for it is
+    /// dropped, never typed as the start of a message.
+    approval_left: Option<Instant>,
+    /// What asks once, over the composer, before it can't be undone:
+    /// Enter says yes, any other key no.
+    confirming: Option<Confirm>,
     /// The bot's latest replies, by node, with their first lines: what
     /// `/react` offers, newest last.
     replies: Vec<(i64, String)>,
@@ -4438,6 +4490,8 @@ struct App {
     /// What a click opens around the composer, by row and columns: the
     /// footer's counts, and the agent the composer's guess came from.
     opens_at: Vec<(u16, std::ops::Range<u16>, String)>,
+    /// What a click on `/model`'s footer does, by row and columns.
+    model_at: Vec<(u16, std::ops::Range<u16>, models::Click)>,
     /// The mouse button went down on the composer's text, on what: a
     /// spot, word or line a drag selects from, and where the text was
     /// drawn then, kept while the button is down so a redraw that scrolls
@@ -4518,8 +4572,10 @@ struct App {
     /// the calls that move the work on.
     verbose: bool,
     /// Only what the person said and the agent's words, its questions and
-    /// what failed: none of the steps between (`[sonny] steps`, off).
+    /// what failed: none of the steps between (`[sonny] view = "words"`).
     words_only: bool,
+    /// `[sonny] view` as last read: `/verbose` goes back to it.
+    view: agent_client::config::View,
     /// The newest plan the words-only view was told, for the margin.
     plan_told: Option<u64>,
     /// The focus the agent is in zen on: only the person's turns and the
@@ -4529,11 +4585,8 @@ struct App {
     /// than the person: another agent, a task's news, the lookout.
     elsewhere: bool,
     /// Experimental: replies about one followed project are barred in its
-    /// color (`/colors`, `[sonny] project_colors`).
+    /// color (`[sonny] project_colors`).
     colors: bool,
-    /// `[sonny] project_colors` as last read: a change in `/config` sets
-    /// `colors` to it.
-    colors_set: bool,
     /// The color each project pins, `[sonny.projects.NAME] color`.
     pinned: BTreeMap<String, String>,
     /// The followed projects and their colors' slots, as last read, and
@@ -4555,8 +4608,10 @@ struct App {
     restored: Option<trigger::Restored>,
     /// The folder the next message moves the bot to: its lead moved away.
     move_to: Option<String>,
-    /// The name under which Sonny notes the instructions it wrote.
-    lead: String,
+    /// The instructions the lead holds, as this window last saw or sent
+    /// them: at each idle point its folder's are composed again and sent
+    /// when they differ.
+    holds: String,
     /// When to connect again, while it or the fleet's is down.
     retry: Option<Instant>,
     /// The daemon is newer than this window: it connects and starts
@@ -4586,7 +4641,7 @@ struct App {
     /// The prompt-cache lifetime a bot made before Sonny gave its model
     /// one takes, set once no turn runs.
     cache: Option<&'static str>,
-    /// `/fast`: the speed picked, set once no turn runs.
+    /// `/model`'s speed picked, set once no turn runs.
     pace: Option<&'static str>,
     /// The bot's tools, which its permissions row gates.
     tools: Vec<String>,
@@ -4599,7 +4654,7 @@ struct App {
     state: Option<String>,
     /// Its `env` setting, waiting to name its state folder in its shell.
     env: Option<Value>,
-    /// `/permissions` or `/fast`, open over the composer.
+    /// `/permissions`, open over the composer.
     choosing: Option<(Choice, list::Picker)>,
     /// The rows `/permissions` lists, as the config had them when it opened.
     rows: Vec<approvals::Mode>,
@@ -4612,9 +4667,6 @@ struct App {
     /// denials as they were when it opened: one that comes or ages out
     /// while it is open moves no row onto another call.
     approving: Option<(Vec<Denial>, list::Picker)>,
-    /// The denied call written out whole for the person to read, which a
-    /// second Enter then approves.
-    approve_shown: Option<String>,
     /// The mode picked, set once no turn runs.
     gating: Option<&'static str>,
     /// The mode picked, still to give the agents the lead made: one busy
@@ -4787,11 +4839,11 @@ struct Fleet {
     began: HashMap<String, std::time::SystemTime>,
     /// When the person last used a task's window ([`used::when`]).
     used_when: fn(&str) -> Option<std::time::SystemTime>,
-    /// `[sonny] task_windows` and `task_tabs`, read as the file changes.
+    /// `[sonny] most_task_tabs` and `task_tabs`, read as the file changes.
     windows: Arc<std::sync::Mutex<TaskWindows>>,
 }
 
-/// `[sonny] task_windows` and `task_tabs` as the config file last said
+/// `[sonny] most_task_tabs` and `task_tabs` as the config file last said
 /// them, read again only once the file changed, so that a change in
 /// `/config` from any window holds from the next task window on.
 #[derive(Default)]
@@ -4824,7 +4876,7 @@ impl TaskWindows {
             let sonny = agent_client::config::load()
                 .map(|c| c.sonny)
                 .unwrap_or_default();
-            self.most = sonny.task_windows as usize;
+            self.most = sonny.most_task_tabs as usize;
             self.tabs = sonny.task_tabs;
         }
     }
@@ -4837,7 +4889,7 @@ fn made_room(closed: &[String], project: &str, most: usize) -> String {
         .map(|bot| bot.strip_prefix(&tasks).unwrap_or(bot))
         .collect();
     format!(
-        "closed {}'s window for room ({most} task windows at most, in /config); /status opens it again",
+        "closed {}'s tab for room ({most} task tabs at most, in /config); /status opens it again",
         names.join(", ")
     )
 }
@@ -4847,7 +4899,7 @@ fn made_room(closed: &[String], project: &str, most: usize) -> String {
 fn no_room(bot: &str, project: &str, most: usize) -> String {
     let name = bot.strip_prefix(&format!("{project}.")).unwrap_or(bot);
     format!(
-        "{name} opened no window: {most} task windows at most (in /config) and you have not looked at those open yet; /status opens it"
+        "{name} opened no tab: {most} task tabs at most (in /config) and you have not looked at those open yet; /status opens it"
     )
 }
 
@@ -4887,7 +4939,7 @@ fn seat_profile(
     match lead {
         // One `/new` made in a role of its own runs as that.
         true => project::chosen(store, bot).or_else(|| {
-            agent_client::project::read(folder)
+            crate::project::read(folder)
                 .ok()
                 .and_then(|info| project::lead_profile(&info).ok())
         }),
@@ -4930,7 +4982,7 @@ fn inner_projects<'a>(names: impl Iterator<Item = &'a str>, project: &str) -> Ve
 enum Kin {
     /// One of its tasks: a window here.
     Task,
-    /// Another project's lead: a home of its own, opened when asked for.
+    /// Another project's lead: a workspace of its own, opened when asked for.
     Lead(String),
     None,
 }
@@ -5900,7 +5952,7 @@ impl Fleet {
                 started::IDLE => Some((sound::Alert::TaskDone, format!("{short} finished"))),
                 started::QUIET => Some((
                     sound::Alert::TaskDone,
-                    format!("{short} finished, saying nothing"),
+                    format!("{short} finished, no reply"),
                 )),
                 "failed" => Some((sound::Alert::Failed, format!("{short} failed"))),
                 "needs you" => Some((sound::Alert::NeedsYou, format!("{short} needs you"))),
@@ -5975,7 +6027,7 @@ impl Fleet {
                                 started::IDLE
                             }
                             Some("failed") if data["error"] == EMPTY => started::QUIET,
-                            Some("interrupted") => "stopped",
+                            Some("interrupted") => started::INTERRUPTED,
                             _ => "failed",
                         },
                     );
@@ -6180,7 +6232,8 @@ impl App {
             reactions: reactions::Reactions::default(),
             picks: fuzzy::Picks::default(),
             picks_kept: false,
-            confirming: false,
+            confirming: None,
+            approval_left: None,
             replies: Vec::new(),
             quoting: false,
             reacting: None,
@@ -6222,6 +6275,7 @@ impl App {
             closed: None,
             composer_at: None,
             opens_at: Vec::new(),
+            model_at: Vec::new(),
             composing: None,
             composer_click: None,
             margin: margin::Margin::default(),
@@ -6255,11 +6309,11 @@ impl App {
             woken: Arc::new(tokio::sync::Notify::new()),
             verbose: false,
             words_only: false,
+            view: agent_client::config::View::Words,
             plan_told: None,
             zen: None,
             elsewhere: false,
             colors: false,
-            colors_set: false,
             pinned: BTreeMap::new(),
             palette: None,
             bar: None,
@@ -6268,7 +6322,7 @@ impl App {
             upgrades: None,
             restored: None,
             move_to: None,
-            lead: String::new(),
+            holds: String::new(),
             retry: None,
             upgraded: false,
             picker: None,
@@ -6299,7 +6353,6 @@ impl App {
             reviewing: std::collections::HashSet::new(),
             denials: Vec::new(),
             approving: None,
-            approve_shown: None,
             gating: approvals::refresh(record),
             spread: None,
             last_reply: String::new(),
@@ -6396,7 +6449,7 @@ impl App {
         }
         if self.options.reopened {
             self.notice = Some(format!(
-                "Sonny was updated; this window reopened on {}",
+                "Sonny was upgraded; this window reopened on {}",
                 env!("CARGO_PKG_VERSION")
             ));
         }
@@ -6629,7 +6682,9 @@ impl App {
                     w.read.elapsed() > Duration::from_secs(2)
                         || w.usage.as_ref().is_some_and(usage::View::due)
                         || w.audit.as_ref().is_some_and(audit::View::due)
-                        || w.ps.as_ref().is_some_and(ps::View::due)
+                        || w.background
+                            .as_ref()
+                            .is_some_and(background::View::commands_due)
                 })
             {
                 self.reread().await;
@@ -6643,6 +6698,11 @@ impl App {
             if let Some(program) = self.pane.as_ref().and_then(|p| p.program.as_ref()) {
                 for text in program.copied() {
                     term::copy(&text);
+                }
+                // It had nothing left to do with Esc, or Tab with nothing
+                // typed: the conversation has the keys again.
+                if program.left() {
+                    self.pane_keys = false;
                 }
             }
             self.pane_switched();
@@ -6886,6 +6946,39 @@ impl App {
         }
     }
 
+    /// The window shows `view`, as `[sonny] view` sets it.
+    fn set_view(&mut self, view: agent_client::config::View) {
+        use agent_client::config::View;
+        self.view = view;
+        self.verbose = view == View::Verbose;
+        // Verbose left with `/verbose` shows the steps.
+        self.words_only = view == View::Words;
+    }
+
+    /// A lead takes its folder's instructions at each idle point: composed
+    /// again as a turn ends, and sent by the [`App::configure`] that
+    /// follows when they changed. A file of the folder's it cannot use is
+    /// left out, and said, and the lead told.
+    async fn folder_instructions(&mut self) {
+        if self.project.is_none() || self.options.side.is_some() {
+            return;
+        }
+        let chosen = project::chosen(&self.options.store, &self.bot);
+        let dir = std::path::Path::new(&self.workspace);
+        match project::review(dir, &self.holds, chosen.as_deref()) {
+            Ok((None, _)) => {}
+            Ok((Some(text), left_out)) => {
+                self.instruct = Some(text);
+                self.notice = project::warnings_notice(&left_out, true);
+                if let Err(error) = project::tell_warnings(&self.client, &self.bot, &left_out).await
+                {
+                    self.notice = Some(format!("the lead's instructions: {error}"));
+                }
+            }
+            Err(error) => self.notice = Some(format!("the lead's instructions: {error}")),
+        }
+    }
+
     /// The lead's instructions as composed on attach, sent once no turn
     /// runs; the next turn reads them.
     ///
@@ -6963,8 +7056,8 @@ impl App {
                 if let Some(declare) = &declare {
                     self.declared = declare.clone();
                 }
-                if let Some(text) = &text {
-                    project::wrote(&self.lead, text);
+                if let Some(text) = text {
+                    self.holds = text;
                 }
                 if let Some((model, effort)) = switch {
                     // A lead's project file says what it runs, for the next
@@ -7068,34 +7161,42 @@ impl App {
         )));
     }
 
-    /// The rows `/fast` lists: standard, and each tier faster than it
-    /// the bot's model serves.
-    fn speed_rows(&self) -> Vec<(&'static str, &'static str)> {
-        let serves = self.speeds();
+    /// The speeds `/model` steps through for `model`: standard, and each
+    /// tier faster than it the model serves.
+    fn speeds_of(&self, model: &str) -> Vec<&'static str> {
+        let serves = self.client.speeds(model);
         (SPEEDS.into_iter())
-            .filter(|(speed, _)| *speed == "standard" || serves.iter().any(|s| s == speed))
+            .filter(|speed| *speed == "standard" || serves.iter().any(|s| s == speed))
             .collect()
+    }
+
+    /// Keeps `/model`'s speed to what its picked model serves, as the pick
+    /// moves.
+    fn fit_speed(&mut self) {
+        let speeds = (self.picker.as_ref())
+            .and_then(models::Picker::chosen)
+            .map(|(model, _)| self.speeds_of(&model))
+            .unwrap_or_default();
+        if let Some(picker) = &mut self.picker {
+            picker.fit(&speeds);
+        }
+    }
+
+    /// A click on `/model`'s footer: on a value, ← and → move to it; on
+    /// `‹` or `›`, they step it.
+    fn model_click(&mut self, click: models::Click) {
+        let speeds = (self.picker.as_ref())
+            .and_then(models::Picker::chosen)
+            .map(|(model, _)| self.speeds_of(&model))
+            .unwrap_or_default();
+        if let Some(picker) = &mut self.picker {
+            picker.click(click, &speeds);
+        }
     }
 
     /// A call the reviewer denied, as `/retry` lists it.
     fn denied_what(&self, denied: &Denial) -> String {
         transcript::action(&denied.name, &denied.arguments, &self.workspace)
-    }
-
-    /// Serves the bot at `speed` from now, or from when no turn runs.
-    async fn pace_at(&mut self, speed: &'static str) {
-        let now = (self.pace).unwrap_or(self.speed.as_deref().unwrap_or("standard"));
-        if speed == now {
-            return;
-        }
-        self.pace = Some(speed);
-        self.notice = Some(match (self.configure().await, self.pace.is_some()) {
-            (true, _) if speed == "standard" => "standard speed from the next call".into(),
-            (true, _) => format!("{speed} from the next call, at a higher price per token"),
-            (false, true) => "applies when idle".into(),
-            // Refused: the notice already says why.
-            (false, false) => return,
-        });
     }
 
     /// The tiers faster than standard the bot's model serves.
@@ -7189,13 +7290,17 @@ impl App {
                 let hidden = agent_client::models::path()
                     .map(|path| agent_client::models::hidden(&path))
                     .unwrap_or_default();
-                self.picker = Some(models::Picker::new(
-                    &listing,
-                    self.client.providers(),
-                    &hidden,
-                    model,
-                    effort,
-                ));
+                let mut picker =
+                    models::Picker::new(&listing, self.client.providers(), &hidden, model, effort);
+                // On the pick still waiting for the turn to end, if any.
+                picker.speed = (self.pace).unwrap_or(match self.speed_shown() {
+                    Some(speed) => SPEEDS
+                        .into_iter()
+                        .find(|s| *s == speed)
+                        .unwrap_or("standard"),
+                    None => "standard",
+                });
+                self.picker = Some(picker);
             }
             Err(error) => self.notice = Some(error),
         }
@@ -7447,7 +7552,7 @@ impl App {
     /// what happened meanwhile: the bot's new items, and a turn that ended
     /// or began. Tried again every two seconds until it works.
     async fn reattach(&mut self, events: &mut Events) {
-        // Sonny was updated while this window was open: the daemon it lost
+        // Sonny was upgraded while this window was open: the daemon it lost
         // is likely the old one, and what this window would start again is
         // its own older build. It reopens on the new one, in place.
         if let Some(program) = update::installed_since() {
@@ -8222,6 +8327,16 @@ impl App {
             }
         }
         if let Some(bot) = (button.strip_prefix("task/")).or(button.strip_prefix("agent/")) {
+            // `/status`'s row clicked is picked too, as the keys pick it.
+            let width = self.width.max(40);
+            if button.starts_with("task/")
+                && let Some(watch) = &mut self.watch
+            {
+                let picked = Picked::Agent(bot.to_owned());
+                if let Some(at) = card_picks(watch, width).iter().position(|p| *p == picked) {
+                    watch.pick = Some(at);
+                }
+            }
             self.open_picked(bot);
         }
         if let Some(bot) = button.strip_prefix("other/") {
@@ -9577,7 +9692,7 @@ impl App {
             reference.node = newest;
         }
         if let Some(path) = reference.file() {
-            reference.file_read(margin::read(&path).ok());
+            reference.file_read(margin::read(&path, &[]).ok());
         }
     }
 
@@ -11151,6 +11266,7 @@ impl App {
                     "interrupted" => "idle",
                     _ => "error",
                 });
+                self.folder_instructions().await;
                 self.configure().await;
                 // Only this view knows whether the turn said anything, so it
                 // rings for the end of every turn of its own; the project's
@@ -11158,7 +11274,7 @@ impl App {
                 match status {
                     _ if quiet => {}
                     "completed" => {
-                        let what = format!("{} is done", self.bot);
+                        let what = format!("{} finished", self.bot);
                         self.sounds.alert(sound::Alert::LeadDone, &what)
                     }
                     "interrupted" => {}
@@ -11265,22 +11381,23 @@ impl App {
             background: None,
             usage: None,
             audit: None,
-            ps: None,
             commons: None,
+            memory: None,
             sky: None,
             picked: None,
             pick: None,
             helpers: Vec::new(),
             more: false,
         });
-        // Picked already, the agent named last in what shows: Enter opens
-        // the one the conversation just pointed to.
-        if let Some(named) = self.screen.last_agent()
-            && let Some(watch) = &mut self.watch
-        {
-            watch.pick = card_bots(watch, self.width.max(40))
-                .iter()
-                .position(|bot| *bot == named);
+        // The first row picked, or the agent named last in what shows:
+        // Enter opens the one the conversation just pointed to.
+        let named = self.screen.last_agent();
+        if let Some(watch) = &mut self.watch {
+            let picks = card_picks(watch, self.width.max(40));
+            watch.pick = (named.and_then(|named| {
+                (picks.iter()).position(|picked| *picked == Picked::Agent(named.clone()))
+            }))
+            .or((!picks.is_empty()).then_some(0));
         }
         self.open_pane(pane::Pane::card("status", PICK_KEYS));
     }
@@ -11309,8 +11426,8 @@ impl App {
             background: Some(view),
             usage: None,
             audit: None,
-            ps: None,
             commons: None,
+            memory: None,
             sky: None,
             picked: None,
             pick: None,
@@ -11356,7 +11473,10 @@ impl App {
         let wide = pane::width(self.full_width, kept(self.full_width));
         let width = card_width(wide);
         let mut pane = pane::Pane::card("context", "esc close");
-        pane.set_card(context::card(&self.bot, &parts, width), "esc close");
+        pane.set_card(
+            context::card(&spoken(&self.bot), &parts, width),
+            "esc close",
+        );
         self.context_read = Some((parts, Some(width)));
         self.watch = None;
         self.open_pane(pane);
@@ -11378,8 +11498,8 @@ impl App {
             background: None,
             usage: Some(view),
             audit: None,
-            ps: None,
             commons: None,
+            memory: None,
             sky: None,
             picked: None,
             pick: None,
@@ -11405,8 +11525,8 @@ impl App {
             background: None,
             usage: None,
             audit: Some(view),
-            ps: None,
             commons: None,
+            memory: None,
             sky: None,
             picked: None,
             pick: None,
@@ -11422,37 +11542,10 @@ impl App {
         view.loaded(read.map_err(|error| error.to_string()));
     }
 
-    /// The commands the project's agents left running, or every agent's,
-    /// oldest first: `/ps` in the pane, as `/status` is, until Esc.
-    async fn ps(&mut self) {
-        let scope = self.scope();
-        let project = scope.project.clone();
-        let mut view = ps::View::new(scope);
-        self.read_ps(&mut view).await;
-        self.watch = Some(Watch {
-            project,
-            rows: Vec::new(),
-            read: Instant::now(),
-            alerts: Vec::new(),
-            open: Vec::new(),
-            background: None,
-            usage: None,
-            audit: None,
-            ps: Some(view),
-            commons: None,
-            sky: None,
-            picked: None,
-            pick: None,
-            helpers: Vec::new(),
-            more: false,
-        });
-        self.open_pane(pane::Pane::card("ps", STATUS_KEYS));
-    }
-
-    /// `view` read from the daemon again.
-    async fn read_ps(&self, view: &mut ps::View) {
+    /// The commands `view` lists read from the daemon again.
+    async fn read_commands(&self, view: &mut background::View) {
         // Every page, as the daemon hands them, into one list.
-        let (mut query, mut rows) = (view.query(), Vec::new());
+        let (mut query, mut rows) = (view.commands_query(), Vec::new());
         let read = loop {
             match self.client.request("processes", query.clone()).await {
                 Ok(mut page) => {
@@ -11467,14 +11560,14 @@ impl App {
                 Err(error) => break Err(error.to_string()),
             }
         };
-        view.loaded(read);
+        view.commands_loaded(read);
     }
 
-    /// Stop `bot`'s command `handle` from `/ps`, beside the window, which
-    /// answers meanwhile: what it came to shows on the card, and the list
-    /// is read again at once.
+    /// Stop `bot`'s command `handle` from `/background`, beside the
+    /// window, which answers meanwhile: what it came to shows under the
+    /// card, and the commands are read again at once.
     fn stop_process(&mut self, bot: String, handle: String) {
-        let Some(view) = self.watch.as_mut().and_then(|w| w.ps.as_mut()) else {
+        let Some(view) = self.watch.as_mut().and_then(|w| w.background.as_mut()) else {
             return;
         };
         let said = view.stopping(&handle);
@@ -11490,6 +11583,51 @@ impl App {
             *said.lock().unwrap_or_else(|e| e.into_inner()) = Some(words);
             woken.notify_one();
         });
+    }
+
+    /// What agents saved to memory about the person and this project:
+    /// `/memory` in the pane, as `/commons` is, until Esc. Read off the
+    /// screen thread as it opens, and again only on `a` or a removal.
+    fn memory_view(&mut self) {
+        let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else {
+            self.notice = Some("no HOME, so no memory".into());
+            return;
+        };
+        // A task in a folder of its own works for its lead's project, as
+        // the memory tool finds it, while a live fact's file blanks read
+        // the task's own files, as its agent's do.
+        let folder = PathBuf::from(&self.workspace);
+        let source = task::source_folder(&folder);
+        let project = agent_client::policy::project(source.as_deref().unwrap_or(&folder))
+            .ok()
+            .flatten();
+        let woken = self.woken.clone();
+        let view = memory::View::open(
+            memory::Places {
+                home,
+                project,
+                folder,
+            },
+            Arc::new(move || woken.notify_one()),
+        );
+        self.watch = Some(Watch {
+            project: self.scope().project,
+            rows: Vec::new(),
+            read: Instant::now(),
+            alerts: Vec::new(),
+            open: Vec::new(),
+            background: None,
+            usage: None,
+            audit: None,
+            commons: None,
+            memory: Some(view),
+            sky: None,
+            picked: None,
+            pick: None,
+            helpers: Vec::new(),
+            more: false,
+        });
+        self.open_pane(pane::Pane::card("memory", STATUS_KEYS));
     }
 
     /// What the agents of every project share: `/commons` in the pane,
@@ -11508,8 +11646,8 @@ impl App {
             background: None,
             usage: None,
             audit: None,
-            ps: None,
             commons: Some(commons::View::open(&home)),
+            memory: None,
             sky: None,
             picked: None,
             pick: None,
@@ -11531,8 +11669,8 @@ impl App {
             background: None,
             usage: None,
             audit: None,
-            ps: None,
             commons: None,
+            memory: None,
             sky: Some(sky::View::open(self.options.socket.clone(), self.store())),
             picked: None,
             pick: None,
@@ -11563,10 +11701,21 @@ impl App {
         if self.watch.as_ref().is_some_and(|w| w.sky.is_some()) {
             return;
         }
-        if let Some(watch) = &mut self.watch
-            && let Some(view) = &mut watch.background
-        {
+        if let Some(mut view) = self.watch.as_mut().and_then(|w| w.background.take()) {
             view.reload();
+            if view.commands_due() {
+                self.read_commands(&mut view).await;
+            }
+            if let Some(watch) = &mut self.watch {
+                watch.background = Some(view);
+                watch.read = Instant::now();
+            }
+            return;
+        }
+        // `/memory` reads when it opens, on `a` and after a removal only.
+        if let Some(watch) = &mut self.watch
+            && watch.memory.is_some()
+        {
             watch.read = Instant::now();
             return;
         }
@@ -11575,16 +11724,6 @@ impl App {
         {
             view.reload();
             watch.read = Instant::now();
-            return;
-        }
-        if let Some(mut view) = self.watch.as_mut().and_then(|w| w.ps.take()) {
-            if view.due() {
-                self.read_ps(&mut view).await;
-            }
-            if let Some(watch) = &mut self.watch {
-                watch.ps = Some(view);
-                watch.read = Instant::now();
-            }
             return;
         }
         if let Some(mut view) = self.watch.as_mut().and_then(|w| w.audit.take()) {
@@ -11874,6 +12013,28 @@ impl App {
         read_latest(&self.client, bot).await.unwrap_or_default()
     }
 
+    /// A call that ran no command, said as what it did, as its row in the
+    /// conversation says it, never by its tool's name alone.
+    fn did(name: &str, arguments: &Value) -> String {
+        if let Some(said) = calls::declared(name, arguments, false) {
+            return format!("{} {}", said.verb, said.what).trim().to_owned();
+        }
+        let field = |key: &str| arguments[key].as_str().unwrap_or("").trim().to_owned();
+        let (verb, what) = match name {
+            "read" => ("Read", field("path")),
+            "write" => ("Wrote", field("path")),
+            "edit" | "apply_patch" => ("Edited", field("path")),
+            "wait" => ("Waited", String::new()),
+            "write_stdin" => ("Typed into", field("handle")),
+            margin::TOOL if arguments["title"].is_string() => ("Noted", field("title")),
+            margin::TOOL => ("Changed a note", String::new()),
+            live::TOOL => ("Updated a live block", String::new()),
+            reactions::TOOL => ("Reacted", field("emoji")),
+            _ => ("Called", name.to_owned()),
+        };
+        format!("{verb} {}", first_line(&what)).trim().to_owned()
+    }
+
     /// The newest of history `entries` that reads as a step, as a line.
     fn step(entries: &[Value]) -> String {
         for entry in entries {
@@ -11891,7 +12052,7 @@ impl App {
                             Some(said) => format!("{} {}", said.verb, said.what).trim().to_owned(),
                             None => format!("$ {}", first_line(command)),
                         },
-                        None => format!("{name} {}", arguments["path"].as_str().unwrap_or("")),
+                        None => Self::did(name, &arguments),
                     };
                 }
                 (_, Some("user")) => {
@@ -12201,6 +12362,21 @@ impl App {
     }
 
     /// `/compact`, once the person said yes.
+    /// `/retry`'s call confirmed: the person's approval of that exact
+    /// call sent, once, and it leaves the list.
+    async fn retry(&mut self, denied: Denial) {
+        let kept = self.denials.clone();
+        self.denials.retain(|d| d.call_id != denied.call_id);
+        let sent = self.send(approval(&denied), None, false, false, &[]).await;
+        self.notice = Some(match sent {
+            Ok(()) => "allowed one retry; the retry is still reviewed".into(),
+            Err(error) => {
+                self.denials = kept;
+                error
+            }
+        });
+    }
+
     async fn compact(&mut self) {
         self.notice = Some(
             match self
@@ -12228,13 +12404,22 @@ impl App {
         {
             return Vec::new();
         }
-        let names = COMMANDS.iter().map(|(name, _)| &name[1..]);
+        // `/resume` is listed only while the agents are paused; `/zen`
+        // says it ends zen while it is on.
+        let listed: Vec<(&'static str, &'static str)> = (COMMANDS.iter())
+            .filter(|(name, _)| *name != "/resume" || self.paused.is_some())
+            .map(|&(name, about)| match name {
+                "/zen" if self.zen.is_some() => (name, ZEN_ENDS),
+                _ => (name, about),
+            })
+            .collect();
+        let names = listed.iter().map(|(name, _)| &name[1..]);
         fuzzy::rank(names, &self.input[1..], |name| {
             self.picks.weight_now(&format!("/{name}"))
         })
         .into_iter()
         .map(|(at, found)| {
-            let (name, about) = COMMANDS[at];
+            let (name, about) = listed[at];
             (name, about, found.at.iter().map(|at| at + 1).collect())
         })
         .collect()
@@ -12291,6 +12476,11 @@ impl App {
                 let over_pane = self.pane.as_ref().is_some_and(|p| p.area.contains(at));
                 let down = matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left));
                 if down {
+                    // A press outside the pane takes the keys from it, and
+                    // with them what was asked there.
+                    if !over_pane {
+                        self.keep_asked();
+                    }
                     self.pane_mouse = over_pane;
                     self.pane_keys = over_pane;
                     // The keys go to the pane: the conversation's find ends.
@@ -12307,6 +12497,16 @@ impl App {
                 // from: what it opens; a right click on the agent, the
                 // other way to it, as on its name anywhere.
                 let right = matches!(mouse.kind, MouseEventKind::Down(MouseButton::Right));
+                if down
+                    && self.picker.is_some()
+                    && let Some(&(_, _, click)) =
+                        (self.model_at.iter()).find(|(row, columns, _)| {
+                            mouse.row == *row && columns.contains(&mouse.column)
+                        })
+                {
+                    self.model_click(click);
+                    return true;
+                }
                 if (down || right)
                     && let Some((_, _, opens)) = (self.opens_at.iter()).find(|(row, columns, _)| {
                         mouse.row == *row && columns.contains(&mouse.column)
@@ -12427,6 +12627,19 @@ impl App {
             Some(true) if !program => &esc,
             _ => key,
         };
+        // `h` `j` `k` `l` are the arrows in every pane but a program's,
+        // unlisted.
+        let arrow;
+        let key = match (self.pane_keys && !program && self.finding.is_none())
+            .then(|| vim_arrow(key))
+            .flatten()
+        {
+            Some(code) => {
+                arrow = KeyEvent::new(code, KeyModifiers::NONE);
+                &arrow
+            }
+            None => key,
+        };
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         let copy =
             key.code == KeyCode::Char('c') && (ctrl || key.modifiers.contains(KeyModifiers::SUPER));
@@ -12443,14 +12656,15 @@ impl App {
             && watch.background.is_none()
             && watch.usage.is_none()
             && watch.audit.is_none()
-            && watch.ps.is_none()
             && watch.commons.is_none()
+            && watch.memory.is_none()
+            && watch.sky.is_none()
         {
-            let bots = card_bots(watch, self.width.max(40));
-            if !bots.is_empty() {
-                let last = bots.len() - 1;
+            let picks = card_picks(watch, self.width.max(40));
+            if !picks.is_empty() {
+                let last = picks.len() - 1;
                 // A pick the list no longer has (resolved agents hidden) is
-                // no pick: Enter opens only the agent marked `›`.
+                // no pick: Enter opens only the row marked `›`.
                 let pick = watch.pick.filter(|pick| *pick <= last);
                 let pick = match (key.code, pick) {
                     (KeyCode::Up, Some(at)) => Some(at.saturating_sub(1)),
@@ -12459,16 +12673,23 @@ impl App {
                     (KeyCode::Down, None) => Some(0),
                     (_, pick) => pick,
                 };
-                if key.code == KeyCode::Enter {
-                    if let Some(at) = pick {
-                        let bot = bots[at].clone();
-                        self.open_picked(&bot);
+                let picked = pick.and_then(|at| picks.get(at).cloned());
+                match (key.code, picked) {
+                    // Enter goes to the picked agent; on a heading it
+                    // does the heading's one thing, opening or folding.
+                    (KeyCode::Enter, Some(Picked::Agent(bot))) => self.open_picked(&bot),
+                    (KeyCode::Enter, Some(Picked::Group(group))) => {
+                        if let Some(watch) = &mut self.watch {
+                            watch.toggle(group);
+                        }
                     }
-                } else if let Some(watch) = &mut self.watch {
-                    watch.pick = pick;
-                    // → shows the picked task's helpers under it, ← folds them.
-                    if let (KeyCode::Right | KeyCode::Left, Some(at)) = (key.code, pick) {
-                        watch.helpers_of(&bots[at], Some(key.code == KeyCode::Right));
+                    (KeyCode::Left | KeyCode::Right, Some(picked)) => {
+                        self.status_fold(picked, key.code == KeyCode::Right);
+                    }
+                    _ => {
+                        if let Some(watch) = &mut self.watch {
+                            watch.pick = pick;
+                        }
                     }
                 }
                 return true;
@@ -12502,7 +12723,7 @@ impl App {
                         | KeyCode::Home
                         | KeyCode::End
                 );
-                if scrolls || (copy && pane.screen.selected().is_some()) {
+                if scrolls || switches(key) || (copy && pane.screen.selected().is_some()) {
                     view.keep();
                 }
                 match key.code {
@@ -12515,11 +12736,58 @@ impl App {
                     KeyCode::PageDown => pane.screen.page(false),
                     KeyCode::Home => pane.screen.hold(usize::MAX),
                     KeyCode::End => pane.screen.latest(),
-                    _ => {
-                        if view.key(*key) == background::Key::Close {
-                            self.close_pane(true);
-                        }
+                    _ => match view.key(*key) {
+                        background::Key::Stay => {}
+                        background::Key::Close => self.close_pane(true),
+                        background::Key::Open(bot) => self.enter_agent(&bot),
+                        background::Key::Stop { bot, handle } => self.stop_process(bot, handle),
+                    },
+                }
+                return true;
+            }
+            // `/memory` takes its own keys: picking, folding, opening a
+            // fact and its links, removing.
+            if self.pane_keys
+                && pane.is_card()
+                && let Some(view) = self.watch.as_mut().and_then(|w| w.memory.as_mut())
+            {
+                let scrolls = matches!(
+                    key.code,
+                    KeyCode::Tab
+                        | KeyCode::PageUp
+                        | KeyCode::PageDown
+                        | KeyCode::Home
+                        | KeyCode::End
+                );
+                if scrolls || switches(key) || (copy && pane.screen.selected().is_some()) {
+                    view.keep();
+                }
+                let depth = view.depth();
+                match key.code {
+                    _ if switches(key) || key.code == KeyCode::Tab => self.pane_keys = false,
+                    _ if copy && let Some(text) = pane.screen.selected() => {
+                        pane.screen.unselect();
+                        self.copied(&text);
                     }
+                    // As in every pane, Ctrl+C closes it; it quits only
+                    // from the composer.
+                    KeyCode::Char('c') if ctrl => self.close_pane(true),
+                    KeyCode::PageUp => pane.screen.page(true),
+                    KeyCode::PageDown => pane.screen.page(false),
+                    KeyCode::Home => pane.screen.hold(usize::MAX),
+                    KeyCode::End => pane.screen.latest(),
+                    _ => match view.key(*key, pane.screen.in_view()) {
+                        memory::Key::Close => self.close_pane(true),
+                        memory::Key::Scroll(up) => pane.screen.scroll(if up { 1 } else { -1 }),
+                        memory::Key::Open(url) => self.follow(&url),
+                        // A page opened or left is scrolled to anew.
+                        memory::Key::Stay if view.depth() != depth => {
+                            if let Some(watch) = &mut self.watch {
+                                watch.picked = None;
+                            }
+                        }
+                        memory::Key::Stay => {}
+                    },
                 }
                 return true;
             }
@@ -12535,8 +12803,21 @@ impl App {
                         pane.screen.unselect();
                         self.copied(&text);
                     }
-                    KeyCode::Up if reading => pane.screen.scroll(1),
-                    KeyCode::Down if reading => pane.screen.scroll(-1),
+                    // A thread read is a page: ↑↓ pick its links, as Lynx
+                    // does, and scroll where none is left that way.
+                    KeyCode::Up if reading && !pane.screen.pick_link(false, pane.is_margin()) => {
+                        pane.screen.scroll(1)
+                    }
+                    KeyCode::Down if reading && !pane.screen.pick_link(true, pane.is_margin()) => {
+                        pane.screen.scroll(-1)
+                    }
+                    KeyCode::Up | KeyCode::Down if reading => {}
+                    KeyCode::Enter | KeyCode::Right
+                        if reading && let Some(url) = pane.screen.picked_link() =>
+                    {
+                        let url = url.to_owned();
+                        self.follow(&url);
+                    }
                     KeyCode::PageUp => pane.screen.page(true),
                     KeyCode::PageDown => pane.screen.page(false),
                     KeyCode::Char(' ') if reading => pane.screen.page(false),
@@ -12553,33 +12834,6 @@ impl App {
                             }
                         }
                     }
-                }
-                return true;
-            }
-            // `/ps` takes its own keys: a pick, its stop, whose.
-            if self.pane_keys
-                && pane.is_card()
-                && let Some(view) = self.watch.as_mut().and_then(|w| w.ps.as_mut())
-            {
-                match key.code {
-                    _ if switches(key) || key.code == KeyCode::Tab => self.pane_keys = false,
-                    _ if copy && let Some(text) = pane.screen.selected() => {
-                        pane.screen.unselect();
-                        self.copied(&text);
-                    }
-                    KeyCode::PageUp => pane.screen.page(true),
-                    KeyCode::PageDown | KeyCode::Char(' ') => pane.screen.page(false),
-                    KeyCode::Home => pane.screen.hold(usize::MAX),
-                    KeyCode::End => pane.screen.latest(),
-                    _ => match view.key(*key) {
-                        ps::Key::Stay => {}
-                        ps::Key::Close => self.close_pane(true),
-                        ps::Key::Open(bot) => {
-                            self.close_pane(true);
-                            self.open_agent(&bot, false);
-                        }
-                        ps::Key::Stop { bot, handle } => self.stop_process(bot, handle),
-                    },
                 }
                 return true;
             }
@@ -12601,10 +12855,7 @@ impl App {
                     _ => match view.key(*key) {
                         audit::Key::Stay => {}
                         audit::Key::Close => self.close_pane(true),
-                        audit::Key::Open(bot) => {
-                            self.close_pane(true);
-                            self.open_agent(&bot, false);
-                        }
+                        audit::Key::Open(bot) => self.enter_agent(&bot),
                     },
                 }
                 return true;
@@ -12648,6 +12899,22 @@ impl App {
                         self.close_pane(true)
                     }
                     KeyCode::Esc => {}
+                    // Ctrl+C copies what is selected here, else closes the
+                    // pane: it quits only from the composer.
+                    _ if copy && let Some(text) = pane.screen.selected() => {
+                        pane.screen.unselect();
+                        self.copied(&text);
+                    }
+                    KeyCode::Char('c') if ctrl => self.close_pane(true),
+                    // A star picked in `/sky`: Enter goes to its agent.
+                    KeyCode::Enter
+                        if pane.is_card()
+                            && let Some(bot) = (self.watch.as_ref())
+                                .and_then(|w| w.sky.as_ref())
+                                .and_then(|view| view.picked().map(str::to_owned)) =>
+                    {
+                        self.enter_agent(&bot)
+                    }
                     // `/sky`'s own keys: its legend, zen, the models' colours,
                     // a star picked and centred on; Esc lets go of the pick
                     // and the centre before it closes the pane.
@@ -12662,24 +12929,24 @@ impl App {
                             && watch.background.is_none()
                             && watch.usage.is_none()
                             && watch.audit.is_none()
-                            && watch.ps.is_none()
                             && watch.commons.is_none()
+                            && watch.memory.is_none()
                             && watch.sky.is_none() =>
                     {
                         watch.more = !watch.more
                     }
                     // `/status` stops the workflow picked.
-                    KeyCode::Char('s')
+                    KeyCode::Char('x')
                         if pane.is_card()
                             && let Some(watch) = &self.watch
                             && watch.background.is_none()
                             && watch.usage.is_none()
                             && watch.audit.is_none()
-                            && watch.ps.is_none()
                             && watch.commons.is_none()
+                            && watch.memory.is_none()
                             && watch.sky.is_none()
-                            && let Some(bot) = watch.pick.and_then(|pick| {
-                                card_bots(watch, self.width.max(40)).into_iter().nth(pick)
+                            && let Some(Picked::Agent(bot)) = watch.pick.and_then(|pick| {
+                                card_picks(watch, self.width.max(40)).into_iter().nth(pick)
                             })
                             && let (_, Some(run)) = workflow::view::split(&bot) =>
                     {
@@ -12688,26 +12955,21 @@ impl App {
                             Err(error) => error,
                         });
                     }
-                    // `/status` opens or folds its idle and done tasks.
-                    KeyCode::Char(key @ ('i' | 'd'))
-                        if pane.is_card()
-                            && let Some(watch) = &mut self.watch =>
-                    {
-                        watch.toggle(match key {
-                            'i' => status::Group::Idle,
-                            _ => status::Group::Done,
-                        })
-                    }
                     _ if switches(key) || key.code == KeyCode::Tab => self.pane_keys = false,
-                    _ if copy && let Some(text) = pane.screen.selected() => {
-                        pane.screen.unselect();
-                        self.copied(&text);
-                    }
                     // The picture or drawing shown, opened bigger outside Sonny.
                     KeyCode::Char('o')
                         if let Some(path) = pane.bigger().map(std::path::Path::to_path_buf) =>
                     {
                         self.open_bigger(&path)
+                    }
+                    // The link picked in a page of text opens, as a click
+                    // on it does.
+                    KeyCode::Enter | KeyCode::Right
+                        if !pane.is_card()
+                            && let Some(url) = pane.screen.picked_link() =>
+                    {
+                        let url = url.to_owned();
+                        self.follow(&url);
                     }
                     // Back and forward through what the pane has shown.
                     // Back to the margin from the first thing over it, as ‹ goes.
@@ -12715,17 +12977,27 @@ impl App {
                         self.step_pane(true);
                     }
                     KeyCode::Right if pane.can_go(false) => self.go(false),
-                    KeyCode::Up => pane.screen.scroll(1),
-                    KeyCode::Down => pane.screen.scroll(-1),
+                    // A page of text: ↑↓ pick its links in view, as Lynx
+                    // does, and scroll where none is left that way.
+                    KeyCode::Up
+                        if pane.is_card() || !pane.screen.pick_link(false, pane.is_margin()) =>
+                    {
+                        pane.screen.scroll(1)
+                    }
+                    KeyCode::Down
+                        if pane.is_card() || !pane.screen.pick_link(true, pane.is_margin()) =>
+                    {
+                        pane.screen.scroll(-1)
+                    }
+                    KeyCode::Up | KeyCode::Down => {}
                     KeyCode::PageUp => pane.screen.page(true),
                     KeyCode::PageDown | KeyCode::Char(' ') => pane.screen.page(false),
                     KeyCode::Home => pane.screen.hold(usize::MAX),
                     KeyCode::End => pane.screen.latest(),
-                    // Anything else is for the composer, as it was typed.
-                    _ => {
-                        self.pane_keys = false;
-                        return false;
-                    }
+                    // A pane that has the keys keeps them: a key it does
+                    // not list does nothing, and is never typed into the
+                    // composer.
+                    _ => {}
                 }
                 return true;
             }
@@ -12855,9 +13127,67 @@ impl App {
         self.open_pane(pane);
     }
 
+    /// `→` (`open`) or `←` on `/status`'s picked row, as a file browser's
+    /// list does: → opens a folded heading or a task's helpers; ← folds
+    /// what the row opened, else the group it is in, picking its heading,
+    /// else steps the pane back, and at the first page does nothing.
+    fn status_fold(&mut self, picked: Picked, open: bool) {
+        let width = self.width.max(40);
+        let Some(watch) = &mut self.watch else {
+            return;
+        };
+        match picked {
+            Picked::Group(group) => {
+                if watch.open.contains(&group) != open {
+                    watch.toggle(group);
+                } else if !open && self.pane.as_ref().is_some_and(pane::Pane::goes_back) {
+                    self.step_pane(true);
+                }
+            }
+            Picked::Agent(bot) if open => watch.helpers_of(&bot, Some(true)),
+            Picked::Agent(bot) if watch.helpers.contains(&bot) => {
+                watch.helpers_of(&bot, Some(false))
+            }
+            Picked::Agent(bot) => {
+                let group = (watch.rows.iter())
+                    .find(|row| row.bot == bot)
+                    .map(|row| row.group)
+                    .filter(|group| watch.open.contains(group));
+                match group {
+                    Some(group) => {
+                        watch.toggle(group);
+                        watch.pick = (card_picks(watch, width).iter())
+                            .position(|picked| *picked == Picked::Group(group));
+                    }
+                    None if self.pane.as_ref().is_some_and(pane::Pane::goes_back) => {
+                        self.step_pane(true);
+                    }
+                    None => {}
+                }
+            }
+        }
+    }
+
+    /// `enter` on a row of `bot`'s: the view closes and the agent opens
+    /// where a click on its blue name does; on this window's own agent
+    /// the view only closes.
+    fn enter_agent(&mut self, bot: &str) {
+        self.close_pane(true);
+        if bot != self.bot {
+            self.open_agent(bot, false);
+        }
+    }
+
     /// `pane` beside the conversation, with the keys; what was selected
     /// or being found in the conversation let go.
     fn open_pane(&mut self, mut pane: pane::Pane) {
+        // An agent drawn in another's pane opens none of its own: what
+        // it would show goes, and the person is told where views open.
+        if self.options.embedded {
+            self.watch = None;
+            self.notice = Some(BESIDE.into());
+            return;
+        }
         self.closed = None;
         // Over the margin, kept under it to go back to; what else was
         // open goes.
@@ -12880,6 +13210,7 @@ impl App {
     /// keys stay there, and is put aside for Ctrl+]; the margin itself
     /// stays closed until asked for.
     fn close_pane(&mut self, keep: bool) {
+        self.keep_asked();
         match self.pane.take() {
             Some(open) if open.is_margin() => {
                 self.margin.close(true);
@@ -12907,6 +13238,10 @@ impl App {
     /// so one opened to look at stays, empty or not.
     fn margin_back(&mut self) {
         use agent_client::config::MarginOpens;
+        // Drawn in another's pane, it has no pane for the margin.
+        if self.options.embedded {
+            return;
+        }
         let posted = self.margin.posted();
         let fresh = std::mem::replace(&mut self.margin_posted, posted) != posted;
         if fresh && self.margin_opens == MarginOpens::Always && self.margin.closed() {
@@ -12932,6 +13267,10 @@ impl App {
 
     /// `/margin`: the margin shown, with the keys, or closed.
     fn toggle_margin(&mut self) {
+        if self.options.embedded {
+            self.notice = Some(BESIDE.into());
+            return;
+        }
         // Not open though not closed, empty or set never to open by
         // itself, it is not shown either.
         let shown = !self.margin.closed()
@@ -12998,13 +13337,25 @@ impl App {
                 self.jump = Some((pin, JUMP_PAGES));
             }
             "back" => self.close_pane(true),
+            // A row or a link in `/memory`.
+            "memory" => {
+                if let Some(view) = self.watch.as_mut().and_then(|w| w.memory.as_mut()) {
+                    let leaves = view.click(id);
+                    self.pane_keys = true;
+                    if let Some(url) = leaves {
+                        self.follow(&url);
+                    }
+                }
+            }
             // A folding group's heading in `/status`: opened or folded.
             "group" => {
+                let width = self.width.max(40);
                 if let Some(watch) = &mut self.watch {
-                    watch.toggle(match id {
-                        "i" => status::Group::Idle,
-                        _ => status::Group::Done,
-                    });
+                    let group = Picked::Group(group_of(id));
+                    if let Some(at) = card_picks(watch, width).iter().position(|p| *p == group) {
+                        watch.pick = Some(at);
+                    }
+                    watch.toggle(group_of(id));
                 }
             }
             // A task's helpers in `/status`: shown under it, or folded.
@@ -13110,6 +13461,26 @@ impl App {
             },
             "background" if self.options.side.is_none() => self.background(),
             "status" | "background" => {}
+            // A row of a list in the pane clicked: picked, then `enter`.
+            "row" => {
+                let Ok(at) = id.parse::<usize>() else {
+                    return;
+                };
+                if let Some(watch) = &mut self.watch {
+                    if let Some(view) = &mut watch.background {
+                        view.pick_at(at);
+                    } else if let Some(view) = &mut watch.commons {
+                        view.pick_at(at);
+                    } else if let Some(view) = &mut watch.audit {
+                        view.pick_at(at);
+                    } else {
+                        return;
+                    }
+                }
+                self.pane_keys = true;
+                let enter = Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+                self.full_screen(&enter);
+            }
             _ => self.press_row(what).await,
         }
     }
@@ -13151,6 +13522,14 @@ impl App {
             self.act(what);
             return;
         }
+        // A page a reply drew opens in the browser, to be used there.
+        if transcript::browser_page(link) {
+            self.notice = Some(match open(link) {
+                Ok(()) => "opened in your browser".to_owned(),
+                Err(error) => error,
+            });
+            return;
+        }
         if link.starts_with("file://") {
             match self.preview(link) {
                 // After the file shown, as a browser goes on to a page.
@@ -13183,6 +13562,18 @@ impl App {
     /// thing it showed closes it, and forward with it closed opens again
     /// the one closed last. Whether there was somewhere to go.
     fn step_pane(&mut self, back: bool) -> bool {
+        // What can't be undone and was asked for is kept: leaving or
+        // stepping through the pane is a key that says no.
+        self.keep_asked();
+        // A view's own pages go back first, as `←` on them does.
+        if back
+            && let Some(watch) = &mut self.watch
+            && let Some(view) = &mut watch.memory
+            && view.back()
+        {
+            watch.picked = None;
+            return true;
+        }
         match &self.pane {
             Some(pane) if pane.can_go(back) => {
                 let keys = self.pane_keys;
@@ -13206,6 +13597,21 @@ impl App {
             _ => return false,
         }
         true
+    }
+
+    /// A stop or a removal asked for in the pane's view, kept: only Enter
+    /// in the view itself says yes, so a view put aside, stepped past or
+    /// opened again never comes back armed.
+    fn keep_asked(&mut self) {
+        let Some(watch) = &mut self.watch else {
+            return;
+        };
+        if let Some(view) = &mut watch.background {
+            view.keep();
+        }
+        if let Some(view) = &mut watch.memory {
+            view.keep();
+        }
     }
 
     /// The pane back (`back`) or forward to what it showed, as it was left.
@@ -13371,6 +13777,12 @@ impl App {
             term::heard(reply);
             return;
         }
+        // A stop or a removal asked for in the pane lives only while the
+        // keys stay there: whatever took them away (a click, Ctrl+\, a
+        // paste) said no, so the view never waits armed for their return.
+        if !self.pane_keys {
+            self.keep_asked();
+        }
         // A key, a click, a paste or the window coming to the front: the
         // person is here, not in another terminal's Sonny.
         if let Some(marker) = &mut self.marker
@@ -13503,54 +13915,39 @@ impl App {
                     let Some(denied) = denials.get(at).cloned() else {
                         return;
                     };
-                    // The person approves only what they have read:
-                    // the whole call first, then a second Enter.
-                    if self.approve_shown.as_deref() != Some(denied.call_id.as_str()) {
-                        let lines = retry_shown(&denied);
-                        // Past what the screen keeps, the start would
-                        // scroll away unread.
-                        if lines.len() > RETRY_ROWS {
-                            self.notice = Some(format!(
-                                "{} lines is too long to read here: say in a message what to retry",
-                                lines.len() - 1
-                            ));
-                            return;
-                        }
-                        self.approve_shown = Some(denied.call_id.clone());
-                        self.commit(lines);
-                        self.notice = Some("enter again to approve this exact call".into());
+                    // The person approves only what they have read: the
+                    // whole call written out, then the one confirm.
+                    let lines = retry_shown(&denied);
+                    // Past what the screen keeps, the start would
+                    // scroll away unread.
+                    if lines.len() > RETRY_ROWS {
+                        self.notice = Some(format!(
+                            "{} lines is too long to read here: say in a message what to retry",
+                            lines.len() - 1
+                        ));
                         return;
                     }
                     self.approving = None;
-                    self.approve_shown = None;
-                    let kept = self.denials.clone();
-                    self.denials.retain(|d| d.call_id != denied.call_id);
-                    let sent = self.send(approval(&denied), None, false, false, &[]).await;
-                    self.notice = Some(match sent {
-                        Ok(()) => "approved one retry; the retry is still reviewed".into(),
-                        Err(error) => {
-                            self.denials = kept;
-                            error
-                        }
-                    });
+                    self.commit(lines);
+                    self.confirming = Some(Confirm::Retry(denied));
                 }
-                list::Act::Close => {
-                    self.approving = None;
-                    self.approve_shown = None;
-                }
+                list::Act::Close => self.approving = None,
                 list::Act::Stay | list::Act::Other => {}
             }
             return;
         }
-        if self.confirming {
+        if self.confirming.is_some() {
             if let Event::Key(key) = &event
                 && key.kind != KeyEventKind::Release
+                && let Some(confirm) = self.confirming.take()
             {
-                // Only Enter says yes; anything else keeps the conversation.
-                self.confirming = false;
-                match key.code {
-                    KeyCode::Enter => self.compact().await,
-                    _ => self.notice = Some("not compacted".into()),
+                // Only Enter says yes; any other key says no, and so does
+                // the notice.
+                match (key.code, confirm) {
+                    (KeyCode::Enter, Confirm::Compact) => self.compact().await,
+                    (KeyCode::Enter, Confirm::Retry(denied)) => self.retry(denied).await,
+                    (_, Confirm::Compact) => self.notice = Some("not compacted".into()),
+                    (_, Confirm::Retry(_)) => self.notice = Some("not allowed".into()),
                 }
             }
             return;
@@ -13578,15 +13975,6 @@ impl App {
                                 self.notice = Some("applies when idle".into());
                             }
                         }
-                        // Another client may have moved the bot to a
-                        // provider that serves fewer tiers since the list
-                        // opened: its last row, rather than one gone.
-                        Choice::Speed => {
-                            let rows = self.speed_rows();
-                            if let Some((speed, _)) = rows.get(at.min(rows.len() - 1)) {
-                                self.pace_at(speed).await;
-                            }
-                        }
                     }
                 }
                 list::Act::Close => self.choosing = None,
@@ -13608,17 +13996,13 @@ impl App {
             self.agent_opens = settings.agent_opens;
             margin::set_limits(settings.margin_notes, settings.margin_note_lines);
             self.set_template_settings(&settings);
-            if self.verbose != settings.verbose || self.words_only == settings.steps {
-                self.verbose = settings.verbose;
-                self.words_only = !settings.steps;
+            if self.view != settings.view {
+                self.set_view(settings.view);
                 self.repaint = true;
             }
             // A new default for project colors, or a new pin, takes now.
-            if self.colors_set != settings.project_colors || self.pinned != settings.project_color {
-                if self.colors_set != settings.project_colors {
-                    self.colors = settings.project_colors;
-                }
-                self.colors_set = settings.project_colors;
+            if self.colors != settings.project_colors || self.pinned != settings.project_color {
+                self.colors = settings.project_colors;
                 self.pinned = settings.project_color;
                 self.palette = None;
                 self.repaint = true;
@@ -13661,11 +14045,23 @@ impl App {
             }
             return;
         }
-        if let Some(picker) = &mut self.picker {
+        if self.picker.is_some() {
+            // The speeds the picked model serves: Tab moves ← and → to
+            // them only where there is more than one.
+            let speeds = (self.picker.as_ref())
+                .and_then(models::Picker::chosen)
+                .map(|(model, _)| self.speeds_of(&model))
+                .unwrap_or_default();
+            let Some(picker) = &mut self.picker else {
+                return;
+            };
             match event {
                 Event::Key(key) if key.kind != KeyEventKind::Release => match key.code {
                     KeyCode::Up => picker.up(),
                     KeyCode::Down => picker.down(),
+                    KeyCode::Tab => picker.on_speed = !picker.on_speed && speeds.len() > 1,
+                    KeyCode::Left if picker.on_speed => picker.step_speed(&speeds, -1),
+                    KeyCode::Right if picker.on_speed => picker.step_speed(&speeds, 1),
                     KeyCode::Left => picker.less(),
                     KeyCode::Right => picker.more(),
                     KeyCode::Backspace => {
@@ -13680,12 +14076,38 @@ impl App {
                     KeyCode::Esc => self.picker = None,
                     KeyCode::Enter => {
                         if let Some(chosen) = picker.chosen() {
+                            // A speed the picked model does not serve is
+                            // standard.
+                            let speed = Some(picker.speed)
+                                .filter(|speed| speeds.contains(speed))
+                                .unwrap_or("standard");
                             self.picker = None;
-                            self.switch = Some(chosen);
-                            self.configure().await;
-                            if self.switch.is_some() {
-                                self.notice = Some("applies when idle".into());
+                            let now = (self.pace).unwrap_or(
+                                self.speed.as_deref().map_or("standard", |now| {
+                                    SPEEDS.into_iter().find(|s| *s == now).unwrap_or("standard")
+                                }),
+                            );
+                            if speed != now {
+                                self.pace = Some(speed);
                             }
+                            let model = (self.switch.as_ref().map(|(m, e)| (m.clone(), e.clone())))
+                                .unwrap_or((self.model.clone(), self.effort.clone()));
+                            if chosen != model {
+                                self.switch = Some(chosen);
+                            }
+                            let faster = self.pace.filter(|speed| *speed != "standard");
+                            self.notice = match self.configure().await {
+                                true => faster.map(|speed| {
+                                    format!(
+                                        "{speed} from the next call, at a higher price per token"
+                                    )
+                                }),
+                                false if self.switch.is_some() || self.pace.is_some() => {
+                                    Some("applies when idle".into())
+                                }
+                                // Refused: the notice already says why.
+                                false => self.notice.take(),
+                            };
                         }
                     }
                     _ => {}
@@ -13694,6 +14116,7 @@ impl App {
                 Event::Resize(width, _) => self.width = width as usize,
                 _ => {}
             }
+            self.fit_speed();
             return;
         }
         let menu = self.menu();
@@ -13795,6 +14218,16 @@ impl App {
                     {
                         self.always(&prefix).await;
                     }
+                    // An approval just left: a y, n or a meant for it is
+                    // dropped, not typed into an empty composer.
+                    KeyCode::Char('y' | 'n' | 'a')
+                        if !ctrl
+                            && !alt
+                            && self.input.is_empty()
+                            && self.waiting().is_none()
+                            && self
+                                .approval_left
+                                .is_some_and(|at| at.elapsed() < LEFT_KEYS) => {}
                     // The prompts sent before, found by typing, as a shell's
                     // and Claude Code's Ctrl+R.
                     KeyCode::Char('r') if ctrl => self.search(),
@@ -13891,6 +14324,12 @@ impl App {
                         self.asked = None;
                     }
                     KeyCode::Enter => self.submit().await,
+                    // Drawn beside another conversation, Tab with nothing
+                    // typed gives that one the keys back, while a turn
+                    // runs too: there is nothing to queue.
+                    KeyCode::Tab if self.options.embedded && self.input.is_empty() => {
+                        embed::give_back()
+                    }
                     // Tab sends it to run once the running turn ends, as
                     // Codex queues; Enter steers.
                     KeyCode::Tab if self.running.is_some() => self.submit_as(true).await,
@@ -13926,6 +14365,15 @@ impl App {
                                 .client
                                 .request("interrupt", json!({"bot": self.bot, "turn": turn}))
                                 .await;
+                        } else if self.options.embedded {
+                            // What was typed is cleared; with nothing left
+                            // to do here, the conversation it is drawn
+                            // beside has the keys again, and its next Esc
+                            // closes this.
+                            match self.input.is_empty() {
+                                true => embed::give_back(),
+                                false => self.discard(),
+                            }
                         } else if self.options.side.is_some() {
                             // Back to the agent; the copy goes once idle.
                             if self.input.is_empty() {
@@ -13935,6 +14383,14 @@ impl App {
                             }
                         } else if !self.asks.is_empty() {
                             self.chatting = !self.chatting;
+                        } else if self
+                            .pane
+                            .as_ref()
+                            .is_some_and(|pane| pane.program.is_some())
+                        {
+                            // The agent beside gave the keys back: this
+                            // Esc closes it.
+                            self.close_pane(false);
                         }
                     }
                     _ => {}
@@ -14096,16 +14552,7 @@ impl App {
             self.toggle_margin();
             return;
         }
-        if prompt == "/ps" {
-            self.input.clear();
-            if self.options.side.is_some() {
-                self.notice = Some("/ps is for the agent itself, not a side chat".into());
-            } else {
-                self.ps().await;
-            }
-            return;
-        }
-        if matches!(prompt.as_str(), "/status" | "/agents") {
+        if prompt == "/status" {
             self.input.clear();
             // The side chat already holds the screen /status would take.
             if self.options.side.is_some() {
@@ -14115,7 +14562,12 @@ impl App {
             }
             return;
         }
-        if matches!(prompt.as_str(), "/commons" | "/forum") {
+        if prompt == "/memory" {
+            self.input.clear();
+            self.memory_view();
+            return;
+        }
+        if prompt == "/commons" {
             self.input.clear();
             self.commons();
             return;
@@ -14143,7 +14595,7 @@ impl App {
             }
             return;
         }
-        if matches!(prompt.as_str(), "/background" | "/automations" | "/lookout") {
+        if prompt == "/background" {
             self.input.clear();
             if self.options.side.is_some() {
                 self.notice = Some("/background is for the agent itself, not a side chat".into());
@@ -14162,48 +14614,17 @@ impl App {
             let lines = mcp::card();
             // In the place of `/status` or `/background`, if open.
             self.watch = None;
-            let mut pane = pane::Pane::card("MCP servers", "esc close");
+            let mut pane = pane::Pane::card("mcp", "esc close");
             pane.set_card(lines, "esc close");
             self.open_pane(pane);
             return;
         }
-        if prompt == "/open" {
-            self.input.clear();
-            let page = transcript::PAGE.lock().ok().and_then(|page| page.clone());
-            self.notice = Some(match page {
-                Some(page) => match open(&page.to_string_lossy()) {
-                    Ok(()) => "opened in your browser".to_owned(),
-                    Err(error) => error,
-                },
-                None => "no HTML page in this conversation yet".into(),
-            });
-            return;
-        }
-        if matches!(prompt.as_str(), "/config" | "/settings") {
+        if prompt == "/config" {
             self.input.clear();
             match config::View::open() {
                 Ok(view) => self.config = Some(view),
                 Err(error) => self.notice = Some(error),
             }
-            return;
-        }
-        if prompt == "/fast" {
-            self.input.clear();
-            let rows = self.speed_rows();
-            if rows.len() < 2 {
-                self.notice = Some(format!(
-                    "{} runs at standard speed only",
-                    models::label(&self.model)
-                ));
-                return;
-            }
-            // On the pick still waiting for the turn to end, if there is one.
-            let now = (self.pace).unwrap_or(self.speed_shown().unwrap_or("standard"));
-            let at = rows.iter().position(|(speed, _)| *speed == now);
-            let rows = (self.speed_rows().into_iter())
-                .map(|(speed, about)| (speed.to_owned(), about.to_owned()))
-                .collect();
-            self.choosing = Some((Choice::Speed, list::Picker::new(rows, at.unwrap_or(0))));
             return;
         }
         if prompt == "/model" {
@@ -14216,36 +14637,6 @@ impl App {
             });
             self.listing = Some(receive);
             self.notice = Some("listing models…".into());
-            return;
-        }
-        if prompt == "/instructions" {
-            self.input.clear();
-            if self.project.is_none() {
-                self.notice = Some("only a folder's lead takes its folder's instructions".into());
-                return;
-            }
-            let chosen = project::chosen(&self.options.store, &self.bot);
-            match project::instructions(std::path::Path::new(&self.workspace), chosen.as_deref()) {
-                Ok(composed) => {
-                    self.instruct = Some(composed.text);
-                    if self.configure().await {
-                        self.notice = Some("the lead has its folder's instructions".into());
-                    } else if self.instruct.is_some() {
-                        self.notice = Some("applies when idle".into());
-                    }
-                    // What it goes without is said over either, and told.
-                    if let Some(said) = project::warnings_notice(&composed.left_out, true) {
-                        self.notice = Some(said);
-                        if let Err(error) =
-                            project::tell_warnings(&self.client, &self.bot, &composed.left_out)
-                                .await
-                        {
-                            self.notice = Some(format!("the lead's instructions: {error}"));
-                        }
-                    }
-                }
-                Err(error) => self.notice = Some(format!("the lead's instructions: {error}")),
-            }
             return;
         }
         if prompt == "/resume" {
@@ -14280,7 +14671,7 @@ impl App {
         // `destructiveHint` does: Enter compacts, Esc keeps the conversation.
         if prompt == "/compact" {
             self.input.clear();
-            self.confirming = true;
+            self.confirming = Some(Confirm::Compact);
             return;
         }
         if prompt == "/react" || prompt == "/reply" {
@@ -14351,60 +14742,21 @@ impl App {
             });
             return;
         }
-        if prompt == "/sound" {
-            self.input.clear();
-            let mut settings = settings::Settings::load();
-            settings.chime = !self.sounds.chime;
-            self.notice = Some(match settings.save() {
-                Ok(()) => {
-                    self.sounds.chime = settings.chime;
-                    if settings.chime {
-                        "chime on"
-                    } else {
-                        "chime off"
-                    }
-                    .to_owned()
-                }
-                Err(error) => error,
-            });
-            return;
-        }
+        // Every tool call in this window, or back to the view `/config`
+        // sets: nothing is written.
         if prompt == "/verbose" {
             self.input.clear();
-            let mut settings = settings::Settings::load();
-            settings.verbose = !self.verbose;
-            self.notice = Some(match settings.save() {
-                Ok(()) => {
-                    self.verbose = settings.verbose;
-                    // What is already drawn is drawn again in the new view.
-                    self.repaint = true;
-                    match (self.verbose, self.words_only) {
-                        (true, _) => "verbose: every tool call",
-                        (false, true) => "words only: what you said and what came back",
-                        (false, false) => "steps: replies, tasks, questions and the plan",
-                    }
-                    .to_owned()
-                }
-                Err(error) => error,
-            });
-            return;
-        }
-        if prompt == "/colors" {
-            self.input.clear();
-            self.colors = !self.colors;
-            self.palette = None;
-            // What is already drawn is drawn again with colors or without,
-            // once no turn runs.
+            self.verbose = !self.verbose;
+            // What is already drawn is drawn again in the new view.
             self.repaint = true;
-            let followed = self.palette().len();
-            self.notice = Some(match (self.colors, followed) {
-                (false, _) => "project colors off".to_owned(),
-                (true, 0) => {
-                    "project colors on: this agent follows no other project's lead".to_owned()
+            self.notice = Some(
+                match (self.verbose, self.words_only) {
+                    (true, _) => "verbose: every tool call, until /verbose again",
+                    (false, true) => "words: what you said and what came back",
+                    (false, false) => "steps: replies, tasks, questions and the plan",
                 }
-                (true, 1) => "project colors on, for the 1 project followed".to_owned(),
-                (true, n) => format!("project colors on, for the {n} projects followed"),
-            });
+                .to_owned(),
+            );
             return;
         }
         if prompt == "/quit" {
@@ -14443,6 +14795,11 @@ impl App {
             self.input.clear();
             self.pictures.clear();
             self.side(question.trim().to_owned(), &pictures).await;
+            return;
+        }
+        // A slash word no command took is answered, and stays to be fixed.
+        if let Some(why) = unknown_command(&prompt) {
+            self.notice = Some(why);
             return;
         }
         // What is sent while a question is in focus answers it, as the
@@ -14558,14 +14915,8 @@ impl App {
         // A steer never moves a bot, so a moved lead comes back with the
         // next message that starts a turn.
         let workspace = (!steer).then(|| self.move_to.clone()).flatten();
-        // The person's words carry when they were sent; a record of what
-        // Sonny did for them is read as it is.
-        let sent = match origin {
-            None => stamp::now(&prompt),
-            Some(_) => prompt.clone(),
-        };
         // An answer goes once, whichever window sends it ([`answer_once`]).
-        let submitted = json!({"bot": self.bot, "prompt": sent, "delivery": delivery,
+        let submitted = json!({"bot": self.bot, "prompt": prompt, "delivery": delivery,
             "model": model, "workspace": workspace, "effort": effort, "origin": origin,
             "images": attach::submitted(pictures)});
         let reply = match asks::answer_of(&prompt, origin) {
@@ -14629,7 +14980,7 @@ impl App {
         let Some(task) = ask.task.clone() else {
             return Err("that question is not a task's".into());
         };
-        let submitted = json!({"bot": task.bot, "prompt": stamp::now(prompt),
+        let submitted = json!({"bot": task.bot, "prompt": prompt,
             "delivery": "steer", "images": attach::submitted(pictures)});
         let reply = answer_once(&self.client, &ask.id, submitted).await?;
         self.task_answers.push(TaskAnswer {
@@ -15609,7 +15960,7 @@ impl App {
     /// and nothing open over it.
     fn suggested(&self) -> Option<&suggest::Guess> {
         let open = self.listing_open()
-            || self.confirming
+            || self.confirming.is_some()
             || self.choosing.is_some()
             || self.approving.is_some()
             || self.reacting.is_some()
@@ -15694,7 +16045,7 @@ impl App {
                 .request(
                     "submit",
                     json!({"bot": name, "bot_id": forked["bot_id"], "request_id": format!("{name}.1"),
-                        "prompt": stamp::now(&question), "delivery": "steer", "model": self.turn_model,
+                        "prompt": question, "delivery": "steer", "model": self.turn_model,
                         "images": attach::submitted(pictures)}),
                 )
                 .await
@@ -15796,7 +16147,7 @@ impl App {
             return;
         }
         let dir = std::path::Path::new(&self.workspace);
-        let default = (agent_client::project::read(dir))
+        let default = (crate::project::read(dir))
             .and_then(|info| project::lead_profile(&info))
             .unwrap_or_else(|_| "lead".to_owned());
         match new::profiles(dir, &default) {
@@ -15932,6 +16283,7 @@ impl App {
             // Named even when every task runs as it, so its model and
             // tools apply; its words are told once.
             profile: Some(profile.name.clone()),
+            permissions: None,
             setup: false,
             model: None,
             effort: None,
@@ -15941,6 +16293,7 @@ impl App {
             builds_on: None,
             env,
             made_by: Some(self.bot.clone()),
+            providers: Value::Null,
         };
         let (here, project, starter) = (dir.to_owned(), project.to_owned(), self.bot.clone());
         tokio::task::spawn_blocking(move || {
@@ -16030,9 +16383,20 @@ impl App {
                 break;
             }
         }
+        // What waits on the person, as `/status` says it: a call on their
+        // approval, read now, or a question this window follows.
+        let held: std::collections::HashSet<String> = (needs::listing(&self.client, None).await)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|held| held.bot)
+            .collect();
+        let fleet = self.fleet.as_ref();
+        let waits =
+            |bot: &str| held.contains(bot) || fleet.is_some_and(|fleet| fleet.needs.waits(bot));
         let beside = self.beside();
         let mut picker = switch::Picker::new(
             &bots,
+            waits,
             &self.bot,
             self.project.as_deref(),
             &self.workspace,
@@ -16080,13 +16444,17 @@ impl App {
         let listing = watch.background.is_none()
             && watch.usage.is_none()
             && watch.audit.is_none()
-            && watch.ps.is_none()
             && watch.commons.is_none()
+            && watch.memory.is_none()
             && watch.sky.is_none();
-        let bots = card_bots(watch, self.width.max(40));
+        let picks = card_picks(watch, self.width.max(40));
         (open && listing)
-            .then(|| watch.pick.and_then(|at| bots.get(at).cloned()))
+            .then(|| watch.pick.and_then(|at| picks.get(at).cloned()))
             .flatten()
+            .and_then(|picked| match picked {
+                Picked::Agent(bot) => Some(bot),
+                Picked::Group(_) => None,
+            })
             .filter(|bot| *bot != self.bot)
     }
 
@@ -16129,7 +16497,9 @@ impl App {
     /// whole.
     fn show_asked(&mut self) {
         let Some(call) = self.waiting() else {
-            self.asked = None;
+            if self.asked.take().is_some() {
+                self.approval_left = Some(Instant::now());
+            }
             return;
         };
         let id = json!([call["bot"], call["call_id"]]);
@@ -16140,11 +16510,8 @@ impl App {
         let call = &call;
         let name = call["name"].as_str().unwrap_or("tool").to_owned();
         let arguments = &call["arguments"];
-        let what = arguments["command"]
-            .as_str()
-            .or_else(|| arguments["path"].as_str())
-            .map(str::to_owned)
-            .unwrap_or_else(|| arguments.to_string());
+        // What it will do, in words: never a function's name and JSON.
+        let asked = transcript::asked(&name, arguments, &self.workspace);
         let mut lines = Vec::new();
         // By the agent's whole name, as a task's question is, which opens
         // it as any agent's name drawn does.
@@ -16153,21 +16520,21 @@ impl App {
         }
         lines.push(Line::from(vec![
             Span::raw("⏸ ").fg(Color::Yellow),
-            Span::raw(format!("Allow {name}?")).bold(),
+            Span::raw(asked.question).bold(),
         ]));
-        // The agent's own words for why it asks, as Codex's `Reason:`.
+        // Under it, muted: the agent's own words for why it asks, as
+        // Codex's `Reason:`, then the command or the brief in full.
         if let Some(reason) = (arguments["justification"].as_str())
             .map(str::trim)
             .filter(|reason| !reason.is_empty())
         {
-            let mut reason = reason.lines();
-            lines.push(Line::from(vec![
-                Span::raw("  Reason: "),
-                Span::raw(reason.next().unwrap_or_default().to_owned()).italic(),
-            ]));
-            lines.extend(reason.map(|line| Line::from(Span::raw(format!("  {line}")).italic())));
+            lines.extend(
+                reason
+                    .lines()
+                    .map(|line| Line::from(format!("  {line}")).dim()),
+            );
         }
-        lines.extend(what.lines().map(|line| Line::from(format!("  {line}"))));
+        lines.extend((asked.detail.iter()).map(|line| Line::from(format!("  {line}")).dim()));
         // A command run in another folder than the agent's says which.
         if let Some(workdir) = arguments["workdir"].as_str().filter(|w| !w.is_empty()) {
             lines.push(Line::from(format!("  in {}", tilde(workdir))).dim());
@@ -16555,6 +16922,7 @@ impl App {
         }
         let mut composer_at = None;
         let mut opens_at = Vec::new();
+        let mut model_at = Vec::new();
         // The reply's open line, wrapped as it will be written: it grows
         // here row by row until its newline writes it into the history.
         let mut open_rows = self.open_rows(width.min(measure()));
@@ -16628,7 +16996,7 @@ impl App {
             } else if let Some(view) = &watch.background {
                 // Its card, with what was done or the keys the pick takes
                 // kept in view under it.
-                let (card, at) = view.card(width);
+                let (card, at, starts) = view.card_rows(width);
                 let lines: Vec<Line<'static>> = card
                     .into_iter()
                     .map(|line| {
@@ -16637,15 +17005,43 @@ impl App {
                         Line::from(spans).style(line.style)
                     })
                     .collect();
-                pane.set_card(lines, &view.keys());
+                let marks = row_marks(&lines, &starts);
+                pane.set_card_marked(lines, marks, &view.keys());
                 pane.foot = view.footer();
                 // A new pick is scrolled to, with the two rows under it.
                 if watch.picked != Some(at) {
                     watch.picked = Some(at);
                     pane.screen.keep_in_view(at, 2);
                 }
+            } else if let Some(view) = &mut watch.memory {
+                view.drain();
+                // A page open: the title's ‹ goes back from it.
+                pane.page = view.on_page();
+                // Drawn anew only when something changed, as a long list
+                // costs a frame.
+                if view.fresh(width) {
+                    let (card, at, marks) = view.card(width);
+                    let lines: Vec<Line<'static>> = card
+                        .into_iter()
+                        .map(|line| {
+                            let mut spans = vec![Span::raw(" ")];
+                            spans.extend(line.spans);
+                            Line::from(spans).style(line.style)
+                        })
+                        .collect();
+                    pane.set_card_marked(lines, marks, &view.keys());
+                    pane.foot = view.footer();
+                    // A new pick, or a new page, is scrolled to.
+                    if watch.picked != Some(at) {
+                        watch.picked = Some(at);
+                        match view.on_page() && at == 0 {
+                            true => pane.screen.show_row(0, 0),
+                            false => pane.screen.keep_in_view(at, 2),
+                        }
+                    }
+                }
             } else if let Some(view) = &watch.commons {
-                let (card, at) = view.card(width);
+                let (card, at, starts) = view.card_rows(width);
                 let lines: Vec<Line<'static>> = card
                     .into_iter()
                     .map(|line| {
@@ -16654,7 +17050,8 @@ impl App {
                         Line::from(spans).style(line.style)
                     })
                     .collect();
-                pane.set_card(lines, view.keys());
+                let marks = row_marks(&lines, &starts);
+                pane.set_card_marked(lines, marks, &view.keys());
                 pane.foot = view.footer();
                 if view.reading() {
                     // A thread just opened starts at its top, after the
@@ -16664,28 +17061,6 @@ impl App {
                         pane.screen.show_row(0, 0);
                     }
                 } else if watch.picked != Some(at) {
-                    watch.picked = Some(at);
-                    pane.screen.keep_in_view(at, 2);
-                }
-            } else if let Some(view) = &watch.ps {
-                let now_ms = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_millis() as i64;
-                let lines: Vec<Line<'static>> = view
-                    .card(width, now_ms)
-                    .into_iter()
-                    .map(|line| {
-                        let mut spans = vec![Span::raw(" ")];
-                        spans.extend(line.spans);
-                        Line::from(spans).style(line.style)
-                    })
-                    .collect();
-                pane.set_card(lines, &view.keys());
-                pane.foot = None;
-                if let Some(at) = view.picked_row()
-                    && watch.picked != Some(at)
-                {
                     watch.picked = Some(at);
                     pane.screen.keep_in_view(at, 2);
                 }
@@ -16699,7 +17074,8 @@ impl App {
                         Line::from(spans).style(line.style)
                     })
                     .collect();
-                pane.set_card(lines, &view.keys());
+                let marks = row_marks(&lines, &view.starts());
+                pane.set_card_marked(lines, marks, &view.keys());
                 pane.foot = None;
                 // A new pick is scrolled to, with the two rows under it.
                 if let Some(at) = view.picked_row()
@@ -16721,7 +17097,7 @@ impl App {
                 pane.set_card(lines, &view.keys());
                 pane.foot = None;
             } else {
-                let (mut lines, fold_keys, marks) = watch_card(watch, width);
+                let (mut lines, folding, marks) = watch_card(watch, width);
                 let mut picked = None;
                 // The agent picked from the keys is drawn as the picker
                 // draws its pick, reversed.
@@ -16731,13 +17107,16 @@ impl App {
                     list::pick(line);
                     picked = Some(row);
                 }
-                let mut keys = status_keys(watch, &fold_keys);
+                let mut keys = status_keys(watch, folding);
                 // A workflow's row picked can be stopped.
                 if let Some((_, screen::Mark::Link(link))) =
                     watch.pick.and_then(|pick| marks.get(pick))
                     && link.contains(workflow::view::MARK)
                 {
-                    keys.push_str(" · s stop workflow");
+                    keys = hint::fit(
+                        &keys.replace(" · esc close", " · x stop workflow · esc close"),
+                        usize::MAX,
+                    );
                 }
                 pane.set_card_marked(lines, marks, &keys);
                 // Scrolled to once, as a new pick, so the page keys still
@@ -16764,7 +17143,7 @@ impl App {
             let width = card_width(wide);
             if *laid != Some(width) {
                 *laid = Some(width);
-                pane.set_card(context::card(&self.bot, parts, width), "esc close");
+                pane.set_card(context::card(&spoken(&self.bot), parts, width), "esc close");
             }
         }
         // The links drawn, to be written again as hyperlinks.
@@ -16858,7 +17237,9 @@ impl App {
                     _ => "  ".to_owned(),
                 };
                 let mut keys = vec![Span::raw(place)];
-                keys.extend(hint::spans("↑ older · ↓ newer · esc stop"));
+                let search =
+                    (hint::Keys::new().key("↑", "older").key("↓", "newer")).esc(hint::Esc::Close);
+                keys.extend(hint::spans(&search.text()));
                 let keys = Line::from(keys);
                 frame.render_widget(Paragraph::new(keys), footer);
                 return;
@@ -16881,17 +17262,20 @@ impl App {
                 let (asked, keys) = match self.quoting {
                     true => (
                         "which reply to answer? type to narrow",
-                        "  ↑↓ pick · enter quote · esc close",
+                        hint::Keys::new().pick().enter(hint::Enter::Choose),
                     ),
                     false => (
                         "which reply to react to? type to narrow",
-                        "  ↑↓ pick · enter react · esc close",
+                        hint::Keys::new().pick().enter(hint::Enter::Choose),
                     ),
                 };
                 let (line, cursor) = list.line(asked);
                 frame.render_widget(Paragraph::new(line), composer);
                 frame.set_cursor_position((composer.x + cursor, composer.y));
-                let keys = Line::from(hint::spans(keys));
+                let keys = Line::from(hint::under(
+                    &keys.esc(hint::Esc::Close),
+                    footer.width.into(),
+                ));
                 frame.render_widget(Paragraph::new(keys), footer);
                 return;
             }
@@ -16914,53 +17298,40 @@ impl App {
                     list::lines(&items, list.at(), width, composer.y as usize),
                     composer,
                 );
-                let (line, cursor) = list.line("reviewer denials: approve one retry");
+                let (line, cursor) = list.line("reviewer denials: allow one retry");
                 frame.render_widget(Paragraph::new(line), composer);
                 frame.set_cursor_position((composer.x + cursor, composer.y));
                 let keys = Line::from(hint::spans(
-                    "  ↑↓ pick · enter read, again approve one retry · esc close",
+                    "  ↑↓ pick · enter read, again allow one retry · esc close",
                 ));
                 frame.render_widget(Paragraph::new(keys), footer);
                 return;
             }
-            if let Some((Choice::Speed, list)) = &self.choosing {
-                let now = self.speed_shown().unwrap_or("standard");
-                let rows = self.speed_rows();
-                let items: Vec<list::Item> = (list.shown().iter())
-                    .filter_map(|&(at, ref found)| {
-                        let (speed, about) = rows.get(at)?;
-                        Some(
-                            list::Item::new(*speed, *about)
-                                .current(*speed == now)
-                                .found(found),
-                        )
-                    })
-                    .collect();
-                over(
-                    frame,
-                    list::lines(&items, list.at(), width, composer.y as usize),
-                    composer,
-                );
-                let (line, cursor) = list.line("speed for this agent");
-                frame.render_widget(Paragraph::new(line), composer);
-                frame.set_cursor_position((composer.x + cursor, composer.y));
-                let keys = Line::from(hint::spans("  ↑↓ pick · enter choose · esc close"));
-                frame.render_widget(Paragraph::new(keys), footer);
-                return;
-            }
-            if self.confirming {
-                let name = match &self.project {
-                    Some(project) => lead_title(project, &self.bot),
-                    None => self.bot.clone(),
+            if let Some(confirm) = &self.confirming {
+                let (question, verb) = match confirm {
+                    Confirm::Compact => {
+                        let name = match &self.project {
+                            Some(project) => lead_title(project, &self.bot),
+                            None => self.bot.clone(),
+                        };
+                        (format!("Compact {name}'s conversation?"), "compact")
+                    }
+                    Confirm::Retry(denied) => {
+                        (format!("Allow one retry of {}?", denied.name), "allow")
+                    }
                 };
                 // The question first, as a decision card's is; why it asks muted.
                 let line = Line::from(vec![
                     Span::raw("› ").bold(),
-                    Span::raw(format!("Compact {name}'s conversation?")).bold(),
+                    Span::raw(question).bold(),
                     Span::raw(" It can't be undone.").dim(),
                 ]);
                 frame.render_widget(Paragraph::new(line), composer);
-                let keys = Line::from(hint::spans("  enter compact · esc cancel"));
+                let keys = hint::Keys::new().enter(hint::Enter::Confirm(verb));
+                let keys = Line::from(hint::under(
+                    &keys.esc(hint::Esc::Cancel),
+                    footer.width.into(),
+                ));
                 frame.render_widget(Paragraph::new(keys), footer);
                 return;
             }
@@ -16989,13 +17360,20 @@ impl App {
                 let (line, cursor) = list.line("permissions");
                 frame.render_widget(Paragraph::new(line), composer);
                 frame.set_cursor_position((composer.x + cursor, composer.y));
-                let keys = Line::from(hint::spans("  ↑↓ pick · enter choose · esc close"));
+                let keys = hint::Keys::new().pick().enter(hint::Enter::Choose);
+                let keys = Line::from(hint::under(
+                    &keys.esc(hint::Esc::Close),
+                    footer.width.into(),
+                ));
                 frame.render_widget(Paragraph::new(keys), footer);
                 return;
             }
             if let Some(view) = &self.config {
                 // Every setting where there is room, over the rows above.
-                let rows = view.rows(composer.y.saturating_sub(frame.area().y) as usize);
+                let rows = view.rows(
+                    composer.width as usize,
+                    composer.y.saturating_sub(frame.area().y) as usize,
+                );
                 let area = ratatui::layout::Rect {
                     y: composer.y.saturating_sub(rows.len() as u16),
                     height: rows.len() as u16,
@@ -17051,7 +17429,7 @@ impl App {
                 let (line, cursor) = list.line(&making.asked());
                 frame.render_widget(Paragraph::new(line), composer);
                 frame.set_cursor_position((composer.x + cursor, composer.y));
-                let keys = Line::from(hint::spans(making.keys()));
+                let keys = Line::from(hint::under(&making.keys(), footer.width.into()));
                 frame.render_widget(Paragraph::new(keys), footer);
                 return;
             }
@@ -17059,6 +17437,7 @@ impl App {
                 let items: Vec<list::Item> = (agents.rows().into_iter())
                     .map(|(agent, found)| {
                         list::Item::new(agent.name.clone(), agent.about.clone())
+                            .sign(status::sign(&agent.state))
                             .current(agent.name == agents.current)
                             .found(&found)
                     })
@@ -17072,8 +17451,9 @@ impl App {
                 let (line, cursor) = agents.line("type to narrow");
                 frame.render_widget(Paragraph::new(line), composer);
                 frame.set_cursor_position((composer.x + cursor, composer.y));
-                let keys = "  ↑↓ pick · enter switch · esc close";
-                frame.render_widget(Paragraph::new(Line::from(hint::spans(keys))), footer);
+                let keys = hint::Keys::new().pick().enter(hint::Enter::Open);
+                let keys = hint::under(&keys.esc(hint::Esc::Close), footer.width.into());
+                frame.render_widget(Paragraph::new(Line::from(keys)), footer);
                 return;
             }
             if let Some(picker) = &self.picker {
@@ -17115,13 +17495,54 @@ impl App {
                     composer.x + 2 + picker.filter.width() as u16,
                     composer.y,
                 ));
+                // The row ← and → move is bold; Tab moves them to the
+                // other, where the picked model serves more than one speed.
+                let speeds = (picker.chosen())
+                    .map(|(model, _)| self.speeds_of(&model))
+                    .unwrap_or_default();
+                let on_speed = picker.on_speed && speeds.len() > 1;
+                let value = |shown: String, on: bool| match on {
+                    true => Span::raw(format!("‹ {shown} ›")).bold(),
+                    false => Span::raw(shown),
+                };
                 let mut keys = vec![
                     Span::raw("  effort ").dim(),
-                    Span::raw(format!("‹ {effort} ›")).bold(),
+                    value(effort.to_owned(), !on_speed),
                 ];
-                keys.extend(hint::spans(
-                    "  ↑↓ pick · ←→ effort · enter switch · esc close",
-                ));
+                if speeds.len() > 1 {
+                    let speed = Some(picker.speed)
+                        .filter(|speed| speeds.contains(speed))
+                        .unwrap_or("standard");
+                    keys.push(Span::raw(" · speed ").dim());
+                    keys.push(value(speed.to_owned(), on_speed));
+                }
+                // A click on a name or value moves ← and → to it; on `‹`
+                // or `›`, steps it. The arrows go first, to be found first.
+                let mut x = footer.x;
+                let mut names = Vec::new();
+                for (pair, click) in keys
+                    .chunks(2)
+                    .zip([models::Click::Effort, models::Click::Speed])
+                {
+                    let start = x;
+                    x += pair.iter().map(|span| span.width() as u16).sum::<u16>();
+                    names.push((footer.y, start..x, click));
+                    if (click == models::Click::Speed) == on_speed {
+                        let shown = pair[1].width() as u16;
+                        model_at.push((footer.y, x - shown..x - shown + 1, models::Click::Less));
+                        model_at.push((footer.y, x - 1..x, models::Click::More));
+                    }
+                }
+                model_at.extend(names);
+                let mut pick = (hint::Keys::new().pick().enter(hint::Enter::Choose))
+                    .key("←→", if on_speed { "speed" } else { "effort" });
+                if speeds.len() > 1 {
+                    pick = pick.key("tab", if on_speed { "effort" } else { "speed" });
+                }
+                let pick = pick.esc(hint::Esc::Close);
+                let room =
+                    usize::from(footer.width).saturating_sub(Line::from(keys.clone()).width());
+                keys.extend(hint::under(&pick, room));
                 let keys = Line::from(keys);
                 frame.render_widget(Paragraph::new(keys), footer);
                 return;
@@ -17176,7 +17597,10 @@ impl App {
             // The menu's keys while it is open, as every list over the
             // composer has them, saying what Enter does with the pick.
             let (line, opens) = match menu_keys(&menu, self.pick, &self.input) {
-                Some(keys) => (Line::from(hint::spans(keys)), Vec::new()),
+                Some(keys) => (
+                    Line::from(hint::under(&keys, footer.width.into())),
+                    Vec::new(),
+                ),
                 None => self.footer(width.min(measure())),
             };
             frame.render_widget(Paragraph::new(line), footer);
@@ -17200,6 +17624,7 @@ impl App {
         let linked = self.links_written.changed(linked, drawn.buffer);
         self.composer_at = composer_at;
         self.opens_at = opens_at;
+        self.model_at = model_at;
         // Over themselves, the cursor kept where the frame left it.
         if !linked.is_empty() {
             execute!(
@@ -17312,17 +17737,30 @@ impl App {
                     self.asks.len(),
                     width.saturating_sub(prompt::LEAD),
                 ),
-                _ if self.new_brief() => said("What should it do?", "enter start · esc back"),
-                _ if self.react_to.is_some() => said("An emoji for that reply", "esc cancel"),
+                _ if self.new_brief() => said(
+                    "What should it do?",
+                    &(hint::Keys::new().enter(hint::Enter::Confirm("start")))
+                        .esc(hint::Esc::Back)
+                        .text(),
+                ),
+                _ if self.react_to.is_some() => said(
+                    "An emoji for that reply",
+                    &hint::Keys::new().esc(hint::Esc::Cancel).text(),
+                ),
                 // Answered with its keys, until Esc sets it aside.
-                _ if self.waiting().is_some() => said("An approval waits", "esc type a message"),
+                _ if self.waiting().is_some() => said(
+                    "An approval waits",
+                    &hint::Keys::new().esc(hint::Esc::WriteInstead).text(),
+                ),
                 _ if self.calls_waiting().1 > 0 => said("A message of your own", "enter approval"),
                 _ if !self.asks.is_empty() => said("A message of your own", "esc answer"),
                 Some(_) => vec![Span::raw(format!("Steer {name}")).dim()],
                 None => vec![Span::raw(format!("Message {name}")).dim()],
             };
+            // Muted while the pane has the keys: typing goes there.
             let lead = match answering {
                 Some(_) => Span::raw("? ").bold().fg(Color::Yellow),
+                None if self.pane_keys => Span::raw("› ").dim(),
                 None => Span::raw("› ").bold(),
             };
             let mut spans = vec![lead];
@@ -17344,7 +17782,7 @@ impl App {
         // A shell command is marked as one while it is typed.
         let shell = self.input.starts_with('!');
         let selected = self.input.selection();
-        let keep = match self.confirming
+        let keep = match self.confirming.is_some()
             || self.choosing.is_some()
             || self.approving.is_some()
             || self.listing_open()
@@ -17384,6 +17822,7 @@ impl App {
                 let lead = match part.start {
                     0 if shell => Span::raw("› ").bold().fg(Color::Magenta),
                     0 if answering.is_some() => Span::raw("? ").bold().fg(Color::Yellow),
+                    0 if self.pane_keys => Span::raw("› ").dim(),
                     0 => Span::raw("› ").bold(),
                     _ => Span::raw("  "),
                 };
@@ -17405,8 +17844,9 @@ impl App {
         // the approval keys wait for the resume.
         if let Some(pause) = &self.paused {
             let by = pause["by"].as_str().unwrap_or("you");
+            // `■` and its words, as an interrupted turn: `⏸` is an approval.
             let mut line = vec![
-                Span::raw("⏸ ").fg(Color::Red),
+                Span::raw("■ ").dim(),
                 Span::raw("Every agent is paused").bold(),
                 Span::raw(format!(" by {by}: ")).dim(),
                 Span::raw(first_line(pause["reason"].as_str().unwrap_or_default())),
@@ -17715,7 +18155,7 @@ impl App {
         pulse.see(waiting, Instant::now());
         self.needs_pulse.set(pulse);
         if waiting > 0 {
-            let mut forms = footer::count("?", Color::Yellow, waiting, false);
+            let mut forms = footer::count(status::sign("needs you"), waiting, false);
             if pulse.on(Instant::now()) {
                 forms.iter_mut().flatten().for_each(footer::beat);
             }
@@ -17759,18 +18199,18 @@ impl App {
         // `/status` lists both.
         let failed = counts.failed + self.failed;
         if failed > 0 {
-            let forms = footer::count("✗", Color::Red, failed, false);
+            let forms = footer::count(status::sign("failed"), failed, false);
             items.push(Item::new(Slot::Failed, forms).opens("status"));
         }
         if working > 0 {
-            let forms = footer::count("●", Color::Cyan, working, true);
+            let forms = footer::count(status::sign("working"), working, true);
             items.push(Item::new(Slot::Working, forms).opens("status"));
         }
         // At rest, they may be given work. What is done, and what runs in
         // the background while healthy, ask nothing of the person: /status
         // and /background list them.
         if counts.idle > 0 {
-            let forms = footer::count(status::IDLE_MARK, Color::Green, counts.idle, true);
+            let forms = footer::count(status::sign(started::IDLE), counts.idle, true);
             items.push(Item::new(Slot::Idle, forms).opens("status"));
         }
         // How full the next round is, as what is left of its window: no
@@ -17823,40 +18263,43 @@ fn over(frame: &mut ratatui::Frame, rows: Vec<Line<'static>>, below: ratatui::la
     frame.render_widget(Paragraph::new(rows), area);
 }
 
+/// How long after an approval leaves the screen a lone `y`, `n` or `a`
+/// is still taken as meant for it, and dropped.
+const LEFT_KEYS: Duration = Duration::from_secs(1);
+/// What an agent drawn in another's pane says of a view asked for: it
+/// opens none of its own, and Ctrl+G, which the Sonny it is drawn in
+/// takes, moves it to the main window, where views open.
+const BESIDE: &str = "views open in the main window: ctrl+g moves this agent there";
 /// What the pane's title row says the keys do on `/status`.
 const STATUS_KEYS: &str = "esc close";
-const SKY_KEYS: &str = "↑↓←→ pick · m models · r replay · z zen · ? legend · esc close";
+const SKY_KEYS: &str =
+    "↑↓←→ pick · enter open · c center · m models · r replay · z zen · ? legend · esc close";
 const SKY_REPLAY_KEYS: &str = sky::REPLAY_KEYS;
 
 /// What the title row says the keys do on `/status` itself.
 const PICK_KEYS: &str = "↑↓ pick · enter open · esc close";
 
 /// The agents `/status` lists, in its order: what its keys pick from.
-fn card_bots(watch: &Watch, width: usize) -> Vec<String> {
+fn card_picks(watch: &Watch, width: usize) -> Vec<Picked> {
     (watch_card(watch, width).2)
         .into_iter()
-        .filter_map(|(_, mark)| match mark {
-            screen::Mark::Link(link) => link
-                .strip_prefix(&format!("{}task/", screen::BUTTON))
-                .map(str::to_owned),
+        .map_while(|(_, mark)| match mark {
+            screen::Mark::Link(link) => Picked::from_link(&link),
             _ => None,
         })
         .collect()
 }
 
 /// `/status`'s card at `width`, each line after a space, its times
-/// running turns counted on from when its rows were read; the keys of the
-/// groups in it that fold; and the line each agent starts on, which a
-/// click opens in the pane (this window's own closes `/status`), then
-/// each folding group's heading, which a click opens or folds.
+/// running turns counted on from when its rows were read; whether a row
+/// in it folds; and the rows the keys pick, in the order drawn: each
+/// agent, which a click opens in the pane (this window's own closes
+/// `/status`), and each folding group's heading, which a click opens or
+/// folds.
 fn watch_card(
     watch: &Watch,
     width: usize,
-) -> (
-    Vec<Line<'static>>,
-    Vec<&'static str>,
-    Vec<(usize, screen::Mark)>,
-) {
+) -> (Vec<Line<'static>>, bool, Vec<(usize, screen::Mark)>) {
     let since = watch.read.elapsed().as_secs();
     let rows: Vec<status::Row> = watch
         .rows
@@ -17880,8 +18323,15 @@ fn watch_card(
         &watch.helpers,
     );
     let picked = (watch.pick)
-        .and_then(|at| listed.named.get(at))
-        .map(|(_, bot)| bot.clone());
+        .and_then(|at| {
+            picks_in_order(&listed.named, &listed.folds)
+                .into_iter()
+                .nth(at)
+        })
+        .and_then(|(_, picked)| match picked {
+            Picked::Agent(bot) => Some(bot),
+            Picked::Group(_) => None,
+        });
     let status::Card {
         lines: mut card,
         named,
@@ -17912,27 +18362,13 @@ fn watch_card(
     let added = above.len();
     card.splice(1..1, above);
     let below = |at: usize| at + if at >= 1 { added } else { 0 };
-    // The agents first, in their order, which the keys pick by; then the
-    // headings that open and fold their groups.
-    let mut marks: Vec<(usize, screen::Mark)> = (named.into_iter())
-        .map(|(at, bot)| (below(at), bot))
-        .map(|(at, bot)| {
-            (
-                at,
-                screen::Mark::Link(format!("{}task/{bot}", screen::BUTTON)),
-            )
-        })
+    // The rows the keys pick first, in the order they are drawn: each
+    // agent, and each heading that opens and folds its group.
+    let folding = !folds.is_empty() || !helpers.is_empty();
+    let mut marks: Vec<(usize, screen::Mark)> = (picks_in_order(&named, &folds).into_iter())
+        .map(|(at, picked)| (below(at), screen::Mark::Link(picked.link())))
         .collect();
-    let mut fold_keys: Vec<&str> = folds.iter().map(|(_, group)| group_key(*group)).collect();
-    fold_keys.dedup();
-    if !helpers.is_empty() {
-        fold_keys.push("→");
-    }
     marks.extend(opening);
-    marks.extend(folds.into_iter().map(|(at, group)| {
-        let link = format!("{}group/{}", screen::BUTTON, group_key(group));
-        (below(at), screen::Mark::Link(link))
-    }));
     marks.extend(helpers.into_iter().map(|(at, bot)| {
         let link = format!("{}helpers/{bot}", screen::BUTTON);
         (below(at), screen::Mark::Link(link))
@@ -17945,47 +18381,103 @@ fn watch_card(
             Line::from(spans).style(line.style)
         })
         .collect();
-    (lines, fold_keys, marks)
+    (lines, folding, marks)
 }
 
-/// The key that opens or folds `group` in `/status`, and its name in a
-/// button: `i` idle, `d` done.
-fn group_key(group: status::Group) -> &'static str {
-    match group {
-        status::Group::Idle => "i",
-        _ => "d",
-    }
-}
-
-/// The keys `/status`'s title row names: the picks, then the key of
-/// each group that folds there (`keys`), as it would change it.
-fn status_keys(watch: &Watch, keys: &[&str]) -> String {
-    let mut said = String::from("↑↓ pick · enter open");
-    for key in keys {
-        if *key == "→" {
-            said.push_str(" · →← helpers");
-            continue;
+/// The marks that make each row of a list in the pane a button: a click
+/// on any line of the row at `starts[at]`, up to the next row or a blank
+/// line, picks it and presses `enter`, as the keys would.
+fn row_marks(lines: &[Line<'static>], starts: &[usize]) -> Vec<(usize, screen::Mark)> {
+    let mut sorted: Vec<usize> = starts.to_vec();
+    sorted.sort_unstable();
+    let mut marks = Vec::new();
+    for (at, &start) in starts.iter().enumerate() {
+        let next = (sorted.iter())
+            .find(|&&other| other > start)
+            .copied()
+            .unwrap_or(lines.len());
+        let link = format!("{}row/{at}", screen::BUTTON);
+        let end = next.min(lines.len());
+        for (row, line) in lines.iter().enumerate().take(end).skip(start) {
+            if row > start && line.spans.iter().all(|span| span.content.trim().is_empty()) {
+                break;
+            }
+            marks.push((row, screen::Mark::Link(link.clone())));
         }
-        let group = match *key {
-            "i" => status::Group::Idle,
-            _ => status::Group::Done,
-        };
-        let verb = match watch.open.contains(&group) {
-            true => "fold",
-            false => "show",
-        };
-        let name = match group {
-            status::Group::Idle => "idle",
-            _ => "done",
-        };
-        said.push_str(&format!(" · {key} {verb} {name}"));
     }
-    said.push_str(match watch.more {
-        true => " · m less",
-        false => " · m more",
-    });
-    said.push_str(" · esc close");
-    said
+    marks
+}
+
+/// A row `/status`'s keys pick: an agent, or the heading of a group that
+/// folds.
+#[derive(Clone, Debug, PartialEq)]
+enum Picked {
+    Agent(String),
+    Group(status::Group),
+}
+
+impl Picked {
+    /// The button a click on its row presses.
+    fn link(&self) -> String {
+        match self {
+            Picked::Agent(bot) => format!("{}task/{bot}", screen::BUTTON),
+            Picked::Group(group) => format!("{}group/{}", screen::BUTTON, group_id(*group)),
+        }
+    }
+
+    /// The row a button names, if it is one the keys pick.
+    fn from_link(link: &str) -> Option<Self> {
+        let button = link.strip_prefix(screen::BUTTON)?;
+        if let Some(bot) = button.strip_prefix("task/") {
+            return Some(Picked::Agent(bot.to_owned()));
+        }
+        button
+            .strip_prefix("group/")
+            .map(|id| Picked::Group(group_of(id)))
+    }
+}
+
+/// The agents and the folding groups' headings of a card, by the row
+/// each is drawn on, in that order.
+fn picks_in_order(
+    named: &[(usize, String)],
+    folds: &[(usize, status::Group)],
+) -> Vec<(usize, Picked)> {
+    let mut picks: Vec<(usize, Picked)> = (named.iter())
+        .map(|(at, bot)| (*at, Picked::Agent(bot.clone())))
+        .chain(folds.iter().map(|(at, group)| (*at, Picked::Group(*group))))
+        .collect();
+    picks.sort_by_key(|(at, _)| *at);
+    picks
+}
+
+/// A folding group's name in its heading's button.
+fn group_id(group: status::Group) -> &'static str {
+    match group {
+        status::Group::Idle => "idle",
+        _ => "done",
+    }
+}
+
+fn group_of(id: &str) -> status::Group {
+    match id {
+        "idle" => status::Group::Idle,
+        _ => status::Group::Done,
+    }
+}
+
+/// The keys `/status`'s title row names: the picks, → and ← where a row
+/// folds (`folding`), more or less.
+fn status_keys(watch: &Watch, folding: bool) -> String {
+    let mut said = hint::Keys::new().pick().enter(hint::Enter::Open);
+    if folding {
+        said = said.key("→←", "fold");
+    }
+    let more = match watch.more {
+        true => "less",
+        false => "more",
+    };
+    said.key("m", more).esc(hint::Esc::Close).text()
 }
 
 /// Codex's sweep: a brighter band moving across the phase every two seconds.
@@ -18200,8 +18692,8 @@ fn quiet_message(text: &str) -> bool {
 }
 
 /// A message item's text: a prompt's own words, without the line the
-/// daemon adds after them naming who sent it or the time Sonny stamped on
-/// them.
+/// daemon adds after them naming who sent it and when, or the `[Sent …]`
+/// line an older Sonny stored with them.
 fn text(item: &Value) -> String {
     match (&item["role"], &item["content"]) {
         (role, Value::Array(parts)) if role == "user" => (parts.iter())
@@ -18610,17 +19102,20 @@ mod tests {
     }
 
     #[test]
-    fn a_message_is_drawn_without_the_time_it_was_sent() {
-        let sent = stamp::stamped("ship it", 1_793_473_920);
+    fn a_message_is_drawn_without_the_daemon_s_line_after_it() {
         let item = json!({"type": "message", "role": "user", "content": [
-            {"type": "input_text", "text": sent},
-            {"type": "input_text", "text": "[Sent by lookout.tasks.]"}]});
+            {"type": "input_text", "text": "ship it"},
+            {"type": "input_text", "text": "[Message lead/4. Sent Sat 31 Oct 2026 16:12, UTC-04:00.]"}]});
         assert_eq!(text(&item), "ship it");
+        let stored = json!({"type": "message", "role": "user", "content": [
+            {"type": "input_text", "text": "ship it\n\n[Sent Sat 31 Oct 2026 16:12, UTC-04:00.]"},
+            {"type": "input_text", "text": "[Message lead/4, written by george.]"}]});
+        assert_eq!(text(&stored), "ship it");
     }
 
-    /// The words a submit carried, without the time Sonny stamped on them.
+    /// The words a submit carried.
     fn words_sent(asked: &Value) -> &str {
-        stamp::unstamped(asked["prompt"].as_str().unwrap_or_default())
+        asked["prompt"].as_str().unwrap_or_default()
     }
 
     #[test]
@@ -18675,7 +19170,10 @@ mod tests {
             (2, call("ran", "shell", "{}")),
             (3, result("ran")),
             (4, call("here", "react", r#"{"emoji":"👍"}"#)),
-            (5, call("there", "react", r#"{"emoji":"👍","bot":"other"}"#)),
+            (
+                5,
+                call("there", "react", r#"{"emoji":"👍","agent":"other"}"#),
+            ),
             (6, result("here")),
             (6, result("there")),
         ];
@@ -19365,7 +19863,7 @@ mod tests {
             .await;
         assert_eq!(
             shown(&app),
-            "⏸ Every agent is paused by calc.a: the migration deletes rows · /resume"
+            "■ Every agent is paused by calc.a: the migration deletes rows · /resume"
         );
         // It names whose turns it parked, so one can be stopped first.
         let parked = json!({"reason": "the migration deletes rows", "by": "calc.a", "at_ms": 1,
@@ -19374,7 +19872,7 @@ mod tests {
             .await;
         assert_eq!(
             shown(&app),
-            "⏸ Every agent is paused by calc.a: the migration deletes rows · parked calc.a, shop.b, web.c +3 · /resume"
+            "■ Every agent is paused by calc.a: the migration deletes rows · parked calc.a, shop.b, web.c +3 · /resume"
         );
         // In the window of one it parked, Esc ends that one's turn.
         let bot = app.bot.clone();
@@ -19393,7 +19891,7 @@ mod tests {
         assert_eq!(
             shown(&app),
             format!(
-                "⏸ Every agent is paused by calc.a: rows · parked {bot} · Esc ends this one · /resume"
+                "■ Every agent is paused by calc.a: rows · parked {bot} · Esc ends this one · /resume"
             )
         );
         app.running = None;
@@ -19407,7 +19905,7 @@ mod tests {
             .push(json!({"name": "shell", "arguments": {"command": "rm -rf rows"}}));
         assert_eq!(
             shown(&app),
-            "⏸ Every agent is paused by calc.a: the migration deletes rows · /resume · an approval waits"
+            "■ Every agent is paused by calc.a: the migration deletes rows · /resume · an approval waits"
         );
         app.daemon(json!({"event": "resumed", "pause": pause, "durable": false}))
             .await;
@@ -19546,6 +20044,74 @@ mod tests {
             read["said"],
             json!([answer, older, last, entry(3, "Review the cart change.")])
         );
+    }
+
+    #[tokio::test]
+    async fn status_reads_nothing_of_agents_with_no_history() {
+        let dir = std::env::temp_dir().join(format!("status-unread-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = dir.join("state.sqlite");
+        resolved::keep(&store, "shop.done", 0, "c1").unwrap();
+        task::note_profile(&store, "shop.noted", "reviewer").unwrap();
+        let asked = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = asked.clone();
+        let client = daemon_answering(move |ask| {
+            let op = ask["op"].as_str().unwrap_or_default().to_owned();
+            seen.lock().unwrap().push(op.clone());
+            match op.as_str() {
+                "bots" => {
+                    let bots: Vec<Value> = ["shop.lead", "shop.done", "shop.noted", "shop.new"]
+                        .iter()
+                        .map(|name| json!({"name": name, "bot_id": 1, "head": null, "last": null}))
+                        .collect();
+                    json!({"bots": bots, "next_after": null})
+                }
+                "approvals" => json!({"approvals": []}),
+                _ => json!({"error": {"code": "unexpected", "message": op}}),
+            }
+        })
+        .await;
+        let scope = background::Scope {
+            glob: "shop.*".into(),
+            project: "shop".into(),
+            lead: "shop.lead".into(),
+        };
+        let view = StatusView {
+            bot: "",
+            asks: &[],
+            approvals: &[],
+            turn_model: None,
+            places: Default::default(),
+            aside: &|_| false,
+            details: true,
+        };
+        let (mut latest, mut asks) = (HashMap::new(), HashMap::new());
+        let read = read_status(
+            &client,
+            &store,
+            scope,
+            &HashMap::new(),
+            &mut latest,
+            &mut asks,
+            view,
+        )
+        .await
+        .unwrap();
+        // No history to read: no agent's is asked for, on any read.
+        assert!(
+            asked
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|op| !op.starts_with("history"))
+        );
+        let row = |bot: &str| read.rows.iter().find(|row| row.bot == bot).unwrap();
+        assert_eq!(row("shop.done").group.key(), "done");
+        assert_eq!(row("shop.new").group.key(), "idle");
+        assert_eq!(row("shop.noted").profile, "reviewer");
+        assert_eq!(row("shop.new").profile, "");
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[tokio::test]
@@ -19771,7 +20337,7 @@ mod tests {
         let names: Vec<&str> = rows.iter().map(|row| row.name.as_str()).collect();
         assert_eq!(names, ["lead", "workflow audit"]);
         let row = &rows[1];
-        assert_eq!(row.state, "Find · 1 running");
+        assert_eq!(row.state, "Find · 1 working");
         assert_eq!(row.group, status::Group::Working);
         assert_eq!(
             workflow::view::split(&row.bot),
@@ -19781,7 +20347,7 @@ mod tests {
         workflow::view::stop(&store, "run12345").unwrap();
         assert!(run.join(workflow::view::STOP).exists());
         let (_, rows) = app.status_rows().await.unwrap();
-        assert_eq!(rows[1].state, "Find · 1 running · stopping");
+        assert_eq!(rows[1].state, "Find · 1 working · stopping");
         // Once it ends it is no row.
         std::fs::write(run.join("result.json"), "{}").unwrap();
         let (_, rows) = app.status_rows().await.unwrap();
@@ -19846,12 +20412,19 @@ mod tests {
             |path: &std::path::Path| std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode(&kept), 0o600);
         assert_eq!(mode(kept.parent().unwrap()), 0o700);
-        // What another build kept is read again.
+        // Another build reads each agent's latest items again, and its
+        // question only when it reads questions otherwise.
         let mut file: Value = serde_json::from_slice(&std::fs::read(&kept).unwrap()).unwrap();
         file["build"] = json!("another");
         std::fs::write(&kept, file.to_string()).unwrap();
         open().await;
-        assert_eq!(histories.load(Ordering::SeqCst), 10);
+        assert_eq!(histories.load(Ordering::SeqCst), 8);
+        let mut file: Value = serde_json::from_slice(&std::fs::read(&kept).unwrap()).unwrap();
+        file["build"] = json!("another");
+        file["reads"] = json!("read otherwise");
+        std::fs::write(&kept, file.to_string()).unwrap();
+        open().await;
+        assert_eq!(histories.load(Ordering::SeqCst), 12);
         std::fs::remove_dir_all(home).unwrap();
     }
 
@@ -20575,7 +21148,7 @@ mod tests {
             if asked["op"] == "submit" {
                 seen.lock()
                     .unwrap()
-                    .push(stamp::unstamped(asked["prompt"].as_str().unwrap()).to_owned());
+                    .push(asked["prompt"].as_str().unwrap().to_owned());
             }
             json!({"message": 2, "turn": 2})
         })
@@ -21054,20 +21627,52 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn colors_toggle_in_the_window_and_draw_again() {
+    async fn the_menu_lists_resume_only_while_paused_and_zen_says_it_ends_it() {
         let mut app = app(zen_daemon().await);
-        app.input.set("/colors");
-        app.submit().await;
-        assert!(app.colors && app.repaint);
+        app.input.set("/");
+        let listed = |app: &App| -> Vec<(&str, &str)> {
+            (app.menu().iter())
+                .map(|(name, about, _)| (*name, *about))
+                .collect()
+        };
+        let all = listed(&app);
+        assert_eq!(all.len(), 25);
         assert_eq!(
-            app.notice.as_deref(),
-            Some("project colors on: this agent follows no other project's lead")
+            all[0],
+            ("/side", "Start a side chat with a copy of this agent")
         );
-        app.repaint = false;
-        app.input.set("/colors");
-        app.submit().await;
-        assert!(!app.colors && app.repaint);
-        assert_eq!(app.notice.as_deref(), Some("project colors off"));
+        assert!(all.iter().all(|(name, _)| *name != "/resume"));
+        assert!(all.contains(&("/zen", "Talk about one thing and keep the rest for later")));
+        app.paused = Some(json!({"reason": "lunch"}));
+        assert!(listed(&app).contains(&("/resume", "Let the agents go on")));
+        app.zen = Some("the rounding".into());
+        assert!(listed(&app).contains(&("/zen", ZEN_ENDS)));
+    }
+
+    #[tokio::test]
+    async fn a_retired_command_is_answered_and_never_sent() {
+        let mut app = app(zen_daemon().await);
+        for word in [
+            "/sound",
+            "/colors",
+            "/open",
+            "/instructions",
+            "/fast",
+            "/ps",
+            "/agents",
+            "/automations",
+            "/lookout",
+            "/forum",
+            "/settings",
+        ] {
+            assert!(COMMANDS.iter().all(|(name, _)| *name != word), "{word}");
+            app.input.set(word);
+            app.submit().await;
+            let said = format!("no command {word} · / lists them");
+            assert_eq!(app.notice.as_deref(), Some(said.as_str()));
+            // It stays to be fixed: nothing is sent.
+            assert_eq!(app.input.trim(), word);
+        }
     }
 
     #[tokio::test]
@@ -21401,7 +22006,7 @@ mod tests {
         assert!(app.repaint);
         let prompts: Vec<String> = (asked.lock().unwrap().iter())
             .filter(|op| op["op"] == "submit")
-            .map(|op| stamp::unstamped(op["prompt"].as_str().unwrap_or("")).to_owned())
+            .map(|op| op["prompt"].as_str().unwrap_or("").to_owned())
             .collect();
         assert_eq!(prompts, ["/zen the receipts' currency", "/zen off"]);
     }
@@ -21632,7 +22237,7 @@ mod tests {
         assert!(app.reviewing.is_empty());
         let rows: Vec<String> = app.pending.iter().map(|l| l.to_string()).collect();
         assert!(
-            rows.contains(&"✗ Request denied for git push --force origin main".to_owned()),
+            rows.contains(&"✗ The reviewer denied git push --force origin main".to_owned()),
             "{rows:?}"
         );
         assert!(
@@ -21658,30 +22263,36 @@ mod tests {
         };
         app.denials.insert(0, other.clone());
         let enter = || Event::Key(event::KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
-        // The first Enter writes the whole call out; nothing is sent yet.
+        // Picked, the whole call is written out and the one confirm
+        // asks; nothing is sent yet. Any key but Enter says no.
         app.key(enter()).await;
-        assert_eq!(
-            app.approving.as_ref().and_then(|(_, list)| list.chosen()),
-            Some(0)
-        );
+        assert!(app.approving.is_none());
+        assert!(matches!(app.confirming, Some(Confirm::Retry(_))));
         assert!(sent.lock().unwrap().is_empty());
         let rows: Vec<String> = app.pending.iter().map(|l| l.to_string()).collect();
         assert!(
             rows.ends_with(&[
-                "Approve one retry of shell?".to_owned(),
+                "shell, as the reviewer denied it:".to_owned(),
                 "  git push --force origin main".to_owned()
             ]),
             "{rows:?}"
         );
+        app.key(Event::Key(KeyCode::Char('y').into())).await;
+        assert!(app.confirming.is_none() && sent.lock().unwrap().is_empty());
+        assert_eq!(app.notice.as_deref(), Some("not allowed"));
+        app.input.set("/retry");
+        app.submit().await;
         app.key(enter()).await;
-        assert!(app.approving.is_none());
+        assert!(matches!(&app.confirming, Some(Confirm::Retry(d)) if d.call_id != "c0"));
+        app.key(enter()).await;
+        assert!(app.confirming.is_none());
         assert_eq!(app.denials, [other]);
         app.denials.clear();
         let prompt = sent.lock().unwrap()[0].as_str().unwrap().to_owned();
         assert!(prompt.starts_with(
-            "I approve one retry of the action the reviewer denied: shell {\"command\":\"git push --force origin main\"}"
+            "I allow one retry of the action the reviewer denied: shell {\"command\":\"git push --force origin main\"}"
         ));
-        assert!(prompt.contains("Do not assume this also authorizes similar operations"));
+        assert!(prompt.contains("Do not assume this also allows similar operations"));
         // Nothing left to approve.
         app.input.set("/retry");
         app.submit().await;
@@ -21693,10 +22304,7 @@ mod tests {
         let shell = json!({"command": "cargo test --release"});
         let once = transcript::allowed("shell", &shell, None, "/w", 80);
         assert_eq!(once.len(), 1);
-        assert_eq!(
-            once[0].to_string(),
-            "✓ Request allowed for cargo test --release"
-        );
+        assert_eq!(once[0].to_string(), "✓ You allowed cargo test --release");
         let kept = transcript::allowed("shell", &shell, Some("cargo test"), "/w", 80);
         assert_eq!(
             kept[1].to_string(),
@@ -21719,7 +22327,10 @@ mod tests {
         assert_eq!(denial(&output(r#"{"exit_code":0}"#)), None);
         let lines = transcript::denied("write", &json!({"path": "/w/src/a.rs"}), "", "/w", 80);
         assert_eq!(lines.len(), 1);
-        assert_eq!(lines[0].to_string(), "✗ Request denied for write src/a.rs");
+        assert_eq!(
+            lines[0].to_string(),
+            "✗ The reviewer denied writing src/a.rs"
+        );
         assert_eq!(reviewing(3), "Reviewing 3 approval requests");
         // Its retry is approved only after the whole of it is shown.
         let write = Denial {
@@ -21729,7 +22340,7 @@ mod tests {
             reason: String::new(),
         };
         let shown: Vec<String> = retry_shown(&write).iter().map(|l| l.to_string()).collect();
-        assert_eq!(shown[0], "Approve one retry of write?");
+        assert_eq!(shown[0], "write, as the reviewer denied it:");
         assert!(
             shown
                 .iter()
@@ -22067,7 +22678,7 @@ mod tests {
     #[tokio::test]
     async fn a_window_opened_again_shows_the_steer_still_waiting() {
         // Sent from a window since closed: the turn has not taken it in.
-        let said = stamp::stamped("also check the deploy notes", 1_700_000_000);
+        let said = "also check the deploy notes";
         let client = daemon_answering(move |asked| match asked["op"].as_str() {
             Some("messages") => json!({"messages": [
                 {"message": 4, "status": "queued", "delivery": "steer"},
@@ -23843,35 +24454,49 @@ mod tests {
         let _ = std::fs::remove_dir_all(workspace);
     }
 
+    /// `/model` typed, and its picker open once the listing is in.
+    async fn model_picker(app: &mut App) {
+        app.input.set("/model");
+        app.submit().await;
+        for _ in 0..400 {
+            app.listed();
+            if app.picker.is_some() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        panic!("the picker opens: {:?}", app.notice);
+    }
+
     #[tokio::test]
-    async fn fast_lists_the_speeds_its_model_serves_and_picks_one() {
+    async fn model_steps_through_the_speeds_its_model_serves_and_picks_one() {
         let asked = Arc::new(std::sync::Mutex::new(Vec::new()));
         let seen = asked.clone();
         let providers = json!({"anthropic": {"speeds": {"claude-opus-5-5": ["fast"]}},
             "bedrock": {"speeds": {"us.openai.gpt-6.1-sol": ["ultrafast"]}},
             "openai": {"speeds": {"gpt-6.1-sol": ["fast", "ultrafast"]}}});
-        let client = daemon_serving(providers, move |request| {
-            seen.lock().unwrap().push(request.clone());
-            json!({"bot": "b", "changed": ["speed"]})
+        let client = daemon_serving(providers, move |request| match request["op"].as_str() {
+            Some("provider_models") => json!({"providers": {}}),
+            _ => {
+                seen.lock().unwrap().push(request.clone());
+                json!({"bot": "b", "changed": ["speed"]})
+            }
         })
         .await;
         let mut app = app(client);
         let key = |code: KeyCode| Event::Key(event::KeyEvent::new(code, KeyModifiers::NONE));
+        let row = |app: &App| app.picker.as_ref().map(|p| (p.speed, p.on_speed));
         app.model = "anthropic/claude-opus-5-5".into();
-        app.input.set("/fast");
-        app.submit().await;
-        // Standard and the one tier Anthropic serves, standard in effect.
-        assert!(matches!(&app.choosing, Some((Choice::Speed, list)) if list.chosen() == Some(0)));
-        assert_eq!(
-            app.speed_rows(),
-            [
-                ("standard", "the model's own speed and price"),
-                ("fast", "faster, at a higher price per token")
-            ]
-        );
-        app.key(key(KeyCode::Down)).await;
+        assert_eq!(app.speeds_of(&app.model), ["standard", "fast"]);
+        model_picker(&mut app).await;
+        // ← and → move effort until Tab moves them to speed.
+        assert_eq!(row(&app), Some(("standard", false)));
+        app.key(key(KeyCode::Tab)).await;
+        app.key(key(KeyCode::Right)).await;
+        app.key(key(KeyCode::Right)).await;
+        assert_eq!(row(&app), Some(("fast", true)));
         app.key(key(KeyCode::Enter)).await;
-        assert!(app.choosing.is_none());
+        assert!(app.picker.is_none());
         assert_eq!(
             app.notice.as_deref(),
             Some("fast from the next call, at a higher price per token")
@@ -23879,39 +24504,34 @@ mod tests {
         assert_eq!(app.speed.as_deref(), Some("fast"));
         let footer = app.footer_line(200).to_string();
         assert!(footer.contains("Opus 5.5 fast"), "{footer}");
-        // It opens again on what is in effect.
-        app.input.set("/fast");
-        app.submit().await;
-        assert!(matches!(&app.choosing, Some((Choice::Speed, list)) if list.chosen() == Some(1)));
-        // Enter on it changes nothing; Esc closes the list.
+        // It opens again on what is in effect; Enter on it changes nothing.
+        model_picker(&mut app).await;
+        assert_eq!(row(&app), Some(("fast", false)));
         app.key(key(KeyCode::Enter)).await;
         assert_eq!(asked.lock().unwrap().len(), 1);
-        app.input.set("/fast");
-        app.submit().await;
-        app.key(key(KeyCode::Up)).await;
+        model_picker(&mut app).await;
+        app.key(key(KeyCode::Tab)).await;
+        app.key(key(KeyCode::Left)).await;
         app.key(key(KeyCode::Enter)).await;
-        assert_eq!(
-            app.notice.as_deref(),
-            Some("standard speed from the next call")
-        );
         assert_eq!(app.speed, None);
         let speeds: Vec<_> = (asked.lock().unwrap().iter())
             .map(|sent| sent["settings"]["speed"].clone())
             .collect();
         assert_eq!(speeds, [json!("fast"), json!("standard")]);
-        // Nothing to pick where the model runs at standard alone, though
-        // another on its provider serves a faster tier.
+        // No speed row where the model runs at standard alone, though
+        // another on its provider serves a faster tier: Tab does nothing.
         app.model = "bedrock/us.xai.grok-4.7".into();
-        app.input.set("/fast");
-        app.submit().await;
-        assert!(app.choosing.is_none());
-        let notice = app.notice.clone().unwrap();
-        assert!(notice.ends_with("runs at standard speed only"), "{notice}");
+        model_picker(&mut app).await;
+        app.key(key(KeyCode::Tab)).await;
+        assert_eq!(row(&app), Some(("standard", false)));
+        app.key(key(KeyCode::Esc)).await;
         app.model = "openai/gpt-6.1-sol".into();
-        app.input.set("/fast");
-        app.submit().await;
-        assert_eq!(app.speed_rows().len(), 3);
-        app.key(key(KeyCode::Up)).await;
+        assert_eq!(app.speeds_of(&app.model).len(), 3);
+        model_picker(&mut app).await;
+        app.key(key(KeyCode::Tab)).await;
+        for _ in 0..3 {
+            app.key(key(KeyCode::Right)).await;
+        }
         app.key(key(KeyCode::Enter)).await;
         assert_eq!(app.speed.as_deref(), Some("ultrafast"));
         // On a model that does not serve it, the footer shows none: its
@@ -23922,15 +24542,63 @@ mod tests {
         app.model = "openai/gpt-6.1-sol".into();
         let footer = app.footer_line(200).to_string();
         assert!(footer.contains("ultrafast"), "{footer}");
-        // Moved meanwhile to a model serving fewer tiers, the list
-        // takes its last row rather than one that is gone.
-        app.input.set("/fast");
-        app.submit().await;
-        assert!(matches!(&app.choosing, Some((Choice::Speed, list)) if list.chosen() == Some(2)));
+    }
+
+    #[tokio::test]
+    async fn model_speed_follows_the_picked_model_and_a_click_moves_or_steps_it() {
+        let providers = json!({"anthropic": {"family": "anthropic",
+            "speeds": {"claude-opus-5-5": ["fast"]}}});
+        let client = daemon_serving(providers, move |request| match request["op"].as_str() {
+            Some("provider_models") => json!({"providers": {"anthropic": {"family": "anthropic",
+                "models": [{"id": "claude-opus-5-5"}, {"id": "claude-sonnet-5-5"}]}}}),
+            _ => json!({"bot": "b", "changed": ["speed"]}),
+        })
+        .await;
+        let mut app = app(client);
+        let key = |code: KeyCode| Event::Key(event::KeyEvent::new(code, KeyModifiers::NONE));
+        let row = |app: &App| app.picker.as_ref().map(|p| (p.speed, p.on_speed));
         app.model = "anthropic/claude-opus-5-5".into();
-        app.key(key(KeyCode::Enter)).await;
-        assert!(app.choosing.is_none());
-        assert_eq!(app.speed.as_deref(), Some("fast"));
+        model_picker(&mut app).await;
+        app.key(key(KeyCode::Tab)).await;
+        app.key(key(KeyCode::Right)).await;
+        assert_eq!(row(&app), Some(("fast", true)));
+        // A model that serves standard alone shows it, ← and → back on
+        // effort; moving back does not bring the old pick with it.
+        app.key(key(KeyCode::Down)).await;
+        assert_eq!(row(&app), Some(("standard", false)));
+        app.key(key(KeyCode::Up)).await;
+        assert_eq!(row(&app), Some(("standard", false)));
+        // A click on speed moves ← and → to it, one on `›` steps it, and
+        // one on effort moves them back.
+        use ratatui::crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+        app.model_at = vec![
+            (9, 14..15, models::Click::Less),
+            (9, 19..20, models::Click::More),
+            (9, 2..20, models::Click::Effort),
+            (9, 20..34, models::Click::Speed),
+        ];
+        let click = |column| {
+            Event::Mouse(MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column,
+                row: 9,
+                modifiers: KeyModifiers::NONE,
+            })
+        };
+        app.key(click(25)).await;
+        assert_eq!(row(&app), Some(("standard", true)));
+        app.key(click(19)).await;
+        assert_eq!(row(&app), Some(("fast", true)));
+        app.key(click(14)).await;
+        assert_eq!(row(&app), Some(("standard", true)));
+        app.key(click(5)).await;
+        assert_eq!(row(&app), Some(("standard", false)));
+        let effort = |app: &App| {
+            app.picker
+                .as_ref()
+                .and_then(|p| p.effort().map(str::to_owned))
+        };
+        assert_eq!(effort(&app), None);
     }
 
     #[tokio::test]
@@ -24836,7 +25504,7 @@ mod tests {
         }
         app.read_tasks().await;
         let rows = drawn(&mut app);
-        assert_eq!(rows[1], "  ✓ quiet  no reply  Fix quiet");
+        assert_eq!(rows[1], "  ○ quiet  no reply  Fix quiet");
         assert_eq!(rows[2], "  ✗ bad    failed    Fix bad");
     }
 
@@ -25156,6 +25824,166 @@ mod tests {
             card.iter().any(|row| row.contains("turns 1 to 3")),
             "{card:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn drawn_beside_another_it_opens_no_pane_of_its_own() {
+        let client = daemon_answering(|request| match request["op"].as_str() {
+            Some("inspect") => json!({"name": "b", "instructions": "", "tools": [],
+                "declared": []}),
+            _ => json!({}),
+        })
+        .await;
+        let mut app = app(client);
+        app.options.embedded = true;
+        for command in ["/context", "/status", "/margin"] {
+            app.notice = None;
+            app.input.set(command);
+            app.submit().await;
+            assert!(app.pane.is_none() && app.watch.is_none(), "{command}");
+            assert_eq!(app.notice.as_deref(), Some(BESIDE), "{command}");
+        }
+    }
+
+    #[tokio::test]
+    async fn drawn_beside_another_esc_and_tab_give_the_keys_back() {
+        use std::sync::atomic::Ordering;
+        let mut app = app(daemon_answering(|_| json!({})).await);
+        app.options.embedded = true;
+        let press = |code| Event::Key(event::KeyEvent::new(code, KeyModifiers::NONE));
+        let gave = || embed::GAVE_BACK.load(Ordering::Relaxed);
+        let before = gave();
+        // Esc first clears what was typed; with nothing left, it gives
+        // the keys back, as Tab with nothing typed does.
+        app.input.set("half a thought");
+        app.key(press(KeyCode::Esc)).await;
+        assert!(app.input.is_empty() && !app.quit);
+        assert_eq!(gave(), before);
+        app.key(press(KeyCode::Esc)).await;
+        assert_eq!(gave(), before + 1);
+        app.key(press(KeyCode::Tab)).await;
+        assert_eq!(gave(), before + 2);
+        assert!(!app.quit);
+    }
+
+    #[tokio::test]
+    async fn a_pane_with_the_keys_keeps_them_and_q_does_nothing() {
+        let client = daemon_answering(|request| match request["op"].as_str() {
+            Some("inspect") => json!({"name": "b", "instructions": "", "tools": [],
+                "declared": []}),
+            _ => json!({}),
+        })
+        .await;
+        let mut app = app(client);
+        app.input.set("/context");
+        app.submit().await;
+        assert!(app.pane.is_some() && app.pane_keys);
+        let press = |code| Event::Key(event::KeyEvent::new(code, KeyModifiers::NONE));
+        // A key the view does not list is not typed into the composer,
+        // `q` included; ← at the first page and `h` neither move the keys.
+        for code in [
+            KeyCode::Char('q'),
+            KeyCode::Char('x'),
+            KeyCode::Char('/'),
+            KeyCode::Left,
+            KeyCode::Char('h'),
+            KeyCode::Char('j'),
+            KeyCode::Char('k'),
+        ] {
+            app.key(press(code)).await;
+            assert!(app.pane.is_some() && app.pane_keys, "{code:?}");
+            assert!(app.input.is_empty(), "{code:?}");
+        }
+        // Tab with nothing typed moves the keys, both ways; Esc closes.
+        app.key(press(KeyCode::Tab)).await;
+        assert!(app.pane.is_some() && !app.pane_keys);
+        app.key(press(KeyCode::Tab)).await;
+        assert!(app.pane_keys);
+        app.key(press(KeyCode::Esc)).await;
+        assert!(app.pane.is_none());
+    }
+
+    #[tokio::test]
+    async fn ctrl_c_in_the_pane_closes_it_and_quits_only_from_the_composer() {
+        let client = daemon_answering(|request| match request["op"].as_str() {
+            Some("inspect") => json!({"name": "b", "instructions": "", "tools": [],
+                "declared": []}),
+            _ => json!({}),
+        })
+        .await;
+        let mut app = app(client);
+        let ctrl_c = || {
+            Event::Key(event::KeyEvent::new(
+                KeyCode::Char('c'),
+                KeyModifiers::CONTROL,
+            ))
+        };
+        // `/memory`, which takes its own keys, closes the same way.
+        app.input.set("/memory");
+        app.submit().await;
+        assert!(app.pane.is_some());
+        app.pane_keys = true;
+        app.key(ctrl_c()).await;
+        assert!(app.pane.is_none() && !app.pane_keys && !app.quit);
+        app.input.set("/context");
+        app.submit().await;
+        assert!(app.pane.is_some());
+        app.pane_keys = true;
+        app.key(ctrl_c()).await;
+        assert!(app.pane.is_none() && !app.pane_keys && !app.quit);
+        app.key(ctrl_c()).await;
+        assert!(app.quit);
+    }
+
+    #[tokio::test]
+    async fn a_slash_word_that_names_no_command_is_answered_not_sent() {
+        let sent = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = sent.clone();
+        let client = daemon_answering(move |asked| {
+            if asked["op"] == "submit" {
+                seen.lock()
+                    .unwrap()
+                    .push(asked["prompt"].as_str().unwrap().to_owned());
+            }
+            json!({"message": 2, "turn": 2})
+        })
+        .await;
+        let mut app = app(client);
+        for (typed, said) in [
+            ("/stauts", "no command /stauts · / lists them"),
+            ("/status foo", "/status takes nothing after it"),
+            ("/copy now", "/copy takes nothing after it"),
+        ] {
+            app.input.set(typed);
+            app.submit().await;
+            assert_eq!(app.notice.as_deref(), Some(said));
+            // Kept, to be fixed and sent again.
+            assert_eq!(&*app.input, typed);
+        }
+        // Words that only start with a slash word, or a path, go as written.
+        for typed in ["/etc/hosts", "/tmp is full", "/ alone"] {
+            app.input.set(typed);
+            app.submit().await;
+        }
+        assert_eq!(
+            *sent.lock().unwrap(),
+            ["/etc/hosts", "/tmp is full", "/ alone"]
+        );
+    }
+
+    #[test]
+    fn unknown_command_reads_only_slash_words() {
+        assert_eq!(
+            unknown_command("/zen-mode").as_deref(),
+            Some("no command /zen-mode · / lists them")
+        );
+        assert_eq!(
+            unknown_command("/model gpt").as_deref(),
+            Some("/model takes nothing after it")
+        );
+        for words in ["hello", "/", "/etc/hosts", "/a.txt", "/x y", "!ls"] {
+            assert_eq!(unknown_command(words), None, "{words}");
+        }
     }
 
     #[tokio::test]
@@ -25639,6 +26467,30 @@ mod tests {
     /// call; set aside with Esc, the keys typing again, and brought back
     /// with Enter.
     #[tokio::test]
+    async fn a_y_n_or_a_just_after_an_approval_leaves_is_dropped_not_typed() {
+        let mut app = app(daemon_answering(|_| json!({})).await);
+        let key = |c| Event::Key(event::KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+        // An approval was on screen and has gone.
+        app.asked = Some(json!(["b", "c1"]));
+        app.show_asked();
+        assert!(app.asked.is_none() && app.approval_left.is_some());
+        for c in ['y', 'n', 'a'] {
+            app.key(key(c)).await;
+        }
+        assert!(app.input.is_empty(), "meant for the approval, dropped");
+        // Other letters are typed, and once a message is started so are
+        // these.
+        app.key(key('h')).await;
+        app.key(key('y')).await;
+        assert_eq!(&*app.input, "hy");
+        // A second on, a lone y starts a message again.
+        app.input.clear();
+        app.approval_left = Some(Instant::now() - LEFT_KEYS);
+        app.key(key('y')).await;
+        assert_eq!(&*app.input, "y");
+    }
+
+    #[tokio::test]
     async fn an_answered_request_folds_to_its_verdict_where_it_was_written() {
         let client = daemon_answering(|asked| match asked["op"].as_str() {
             Some("approvals") if asked["bot"] == "shop.fix" => json!({"approvals": [
@@ -25667,7 +26519,7 @@ mod tests {
         app.raise_approvals().await;
         app.show_asked();
         app.flush();
-        assert!(app.screen.texts().contains(&"⏸ Allow shell?".to_owned()));
+        assert!(app.screen.texts().contains(&"⏸ Run git push?".to_owned()));
         // Its own is answered first, in another window: its start says so.
         app.daemon(
             json!({"event": "tool_started", "bot": "home.lead", "turn": 7,
@@ -25685,7 +26537,10 @@ mod tests {
             "{texts:?}"
         );
         assert_eq!(
-            texts.iter().filter(|row| *row == "⏸ Allow shell?").count(),
+            texts
+                .iter()
+                .filter(|row| *row == "⏸ Run cargo publish?")
+                .count(),
             1
         );
         // The task's, answered here: folded to the verdict, no line under it.
@@ -25716,8 +26571,8 @@ mod tests {
             texts[at.unwrap() + 1..at.unwrap() + 4],
             [
                 "↳ From shop.fix",
-                "⏸ Allow shell?",
-                "  Reason: Releasing needs the registry."
+                "⏸ Run cargo publish?",
+                "  Releasing needs the registry."
             ]
         );
         app.press(&format!("request/{tag}")).await;
@@ -25773,7 +26628,7 @@ mod tests {
         app.approvals.clear();
         app.fold_written();
         let texts = app.screen.texts();
-        assert!(texts.contains(&"⏸ Request for make deploy no longer waits".to_owned()));
+        assert!(texts.contains(&"– The request to run make deploy went away".to_owned()));
         app.daemon(json!({"event": "tool_started", "bot": "b", "turn": 6,
             "data": {"call_id": "c2", "name": "shell", "arguments": "{}",
                 "approvals": [{"tag": "manual", "by": "tui", "allow": true}]}}))
@@ -25888,7 +26743,7 @@ mod tests {
         app.flush();
         let texts = app.screen.texts();
         assert!(
-            texts.contains(&"⏸ Request for make deploy no longer waits".to_owned()),
+            texts.contains(&"– The request to run make deploy went away".to_owned()),
             "{texts:?}"
         );
     }
@@ -25918,7 +26773,7 @@ mod tests {
         app.flush();
         let texts = app.screen.texts();
         assert!(
-            texts.contains(&"⏸ Request for make deploy no longer waits".to_owned()),
+            texts.contains(&"– The request to run make deploy went away".to_owned()),
             "{texts:?}"
         );
     }
@@ -25976,7 +26831,7 @@ mod tests {
         app.flush();
         let texts = app.screen.texts();
         assert!(
-            texts.contains(&"✗ Request timed out for make deploy".to_owned()),
+            texts.contains(&"✗ The request to run make deploy timed out".to_owned()),
             "{texts:?}"
         );
     }
@@ -26041,11 +26896,11 @@ mod tests {
         );
         assert_eq!(
             row(&Lapsed, None),
-            "✗ Request timed out for cargo publish --allow-dirty"
+            "✗ The request to run cargo publish --allow-dirty timed out"
         );
         assert_eq!(
             row(&Gone, None),
-            "⏸ Request for cargo publish --allow-dirty no longer waits"
+            "– The request to run cargo publish --allow-dirty went away"
         );
         // A long command is cut to the row.
         let long = json!({"command": "x".repeat(200)});
@@ -26109,8 +26964,8 @@ mod tests {
             text(&app.pending),
             [
                 "↳ From shop.fix",
-                "⏸ Allow shell?",
-                "  Reason: Releasing needs the registry.",
+                "⏸ Run cargo publish?",
+                "  Releasing needs the registry.",
                 "  cargo publish",
                 "  It publishes the crate.",
                 "  Nothing the person said asks for it.",
@@ -26139,7 +26994,10 @@ mod tests {
         app.flush();
         let shown = app.screen.texts();
         assert_eq!(
-            shown.iter().filter(|row| *row == "⏸ Allow shell?").count(),
+            shown
+                .iter()
+                .filter(|row| *row == "⏸ Run cargo publish?")
+                .count(),
             1
         );
         // An answer that failed leaves it waiting here, to answer again.
@@ -26377,7 +27235,7 @@ mod tests {
             if asked["op"] == "submit" {
                 seen.lock()
                     .unwrap()
-                    .push(stamp::unstamped(asked["prompt"].as_str().unwrap()).to_owned());
+                    .push(asked["prompt"].as_str().unwrap().to_owned());
             }
             json!({"message": 2, "turn": 2})
         })
@@ -26596,7 +27454,7 @@ mod tests {
         let to = sent.lock().unwrap().last().cloned().unwrap();
         assert_eq!(to["bot"], "calc.ask");
         // Words typed while it is in focus answer it, once.
-        let prompt = stamp::unstamped(to["prompt"].as_str().unwrap());
+        let prompt = to["prompt"].as_str().unwrap();
         assert_eq!(prompt, "You asked (ask:2/q1): Signed in?\n\ndone");
         assert_eq!(to["request_id"], json!(asks::request_id("ask:2/q1", 0)));
         assert!(app.asks.is_empty());
@@ -26709,8 +27567,8 @@ mod tests {
                 .map(|row| row.place.clone())
                 .unwrap()
         };
-        assert_eq!(place(&rows, "calc.b"), "window set aside for room");
-        assert_ne!(place(&rows, "calc.a"), "window set aside for room");
+        assert_eq!(place(&rows, "calc.b"), "tab set aside for room");
+        assert_ne!(place(&rows, "calc.a"), "tab set aside for room");
         // A call of its held for the person: what needs them keeps its
         // window, so it opens, past the limit, and the new one stays.
         let fleet = app.fleet.as_mut().unwrap();
@@ -27208,16 +28066,13 @@ mod tests {
         );
         let counter = opens[0].0.clone();
         // Its marks and colors as /status's rows: yellow ? for what needs
-        // the person, cyan ● at work, green ○ at rest; no ✓, as done
+        // the person, cyan ● at work, a muted ○ at rest; no ✓, as done
         // asks nothing.
         let marks: Vec<_> = (line.spans.iter())
             .filter(|span| ["?", "●", "○", "✓"].contains(&&*span.content))
             .map(|span| span.style.fg)
             .collect();
-        assert_eq!(
-            marks,
-            [Some(Color::Yellow), Some(Color::Cyan), Some(Color::Green)]
-        );
+        assert_eq!(marks, [Some(Color::Yellow), Some(Color::Cyan), None]);
         app.opens_at = vec![(
             20,
             10 + counter.start..10 + counter.end,
@@ -27306,8 +28161,8 @@ mod tests {
             background: None,
             usage: None,
             audit: None,
-            ps: None,
             commons: None,
+            memory: None,
             sky: None,
             picked: None,
             pick: None,
@@ -27765,8 +28620,8 @@ mod tests {
             background: None,
             usage: None,
             audit: None,
-            ps: None,
             commons: None,
+            memory: None,
             sky: None,
             picked: None,
             pick: None,
@@ -27792,10 +28647,115 @@ mod tests {
         }
         app.key(key(KeyCode::Down)).await;
         assert_eq!(pick(&app), Some(0));
-        assert_eq!(card_bots(app.watch.as_ref().unwrap(), 80)[0], "calc.lead");
+        assert_eq!(
+            card_picks(app.watch.as_ref().unwrap(), 80)[0],
+            Picked::Agent("calc.lead".into())
+        );
         assert!(app.beside().is_none(), "never this window's own agent");
         app.key(key(KeyCode::Enter)).await;
         assert!(app.pane.is_none(), "closed, as Esc closes it");
+    }
+
+    #[test]
+    fn a_click_on_any_line_of_a_listed_row_is_that_row() {
+        // Padded a column, as the views' cards are drawn: the blank row
+        // under a row ends it, so the heading after it is no one's.
+        let lines: Vec<Line<'static>> = [
+            "head", "", "a", "  a more", "", "Heading", "b", "c", "  c more",
+        ]
+        .into_iter()
+        .map(|text| Line::from(format!(" {text}")))
+        .collect();
+        let marks = row_marks(&lines, &[2, 7, 6]);
+        let at = |row| {
+            (marks.iter()).find_map(|(r, mark)| match mark {
+                screen::Mark::Link(link) if *r == row => link.rsplit('/').next(),
+                _ => None,
+            })
+        };
+        let rows: Vec<Option<&str>> = (0..lines.len()).map(at).collect();
+        assert_eq!(
+            rows,
+            [
+                None,
+                None,
+                Some("0"),
+                Some("0"),
+                None,
+                None,
+                Some("2"),
+                Some("1"),
+                Some("1")
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn status_folds_its_groups_from_the_keys_as_a_file_browser_does() {
+        let mut app = app(daemon_answering(|_| json!({})).await);
+        let row = |name: &str, group| status::Row {
+            name: name.into(),
+            bot: format!("calc.{name}"),
+            state: "idle".into(),
+            group,
+            ..Default::default()
+        };
+        app.open_pane(pane::Pane::card("status", PICK_KEYS));
+        app.watch = Some(Watch {
+            project: "calc".into(),
+            rows: vec![
+                row("add", status::Group::Working),
+                row("neg", status::Group::Idle),
+            ],
+            read: Instant::now(),
+            alerts: Vec::new(),
+            open: Vec::new(),
+            background: None,
+            usage: None,
+            audit: None,
+            commons: None,
+            memory: None,
+            sky: None,
+            picked: None,
+            pick: Some(0),
+            helpers: Vec::new(),
+            more: false,
+        });
+        let key = |code| Event::Key(event::KeyEvent::new(code, KeyModifiers::NONE));
+        let picks = |app: &App| card_picks(app.watch.as_ref().unwrap(), 80);
+        let picked = |app: &App| picks(app)[app.watch.as_ref().unwrap().pick.unwrap()].clone();
+        let idle = Picked::Group(status::Group::Idle);
+        // The folded heading is a row of its own, after the working agent.
+        assert_eq!(
+            picks(&app),
+            [Picked::Agent("calc.add".into()), idle.clone()]
+        );
+        app.key(key(KeyCode::Char('j'))).await;
+        assert_eq!(picked(&app), idle);
+        // → opens it, its agent listed under it; ← on that agent folds the
+        // group it is in and picks its heading; Enter opens it again.
+        app.key(key(KeyCode::Right)).await;
+        assert!(picks(&app).contains(&Picked::Agent("calc.neg".into())));
+        app.key(key(KeyCode::Down)).await;
+        assert_eq!(picked(&app), Picked::Agent("calc.neg".into()));
+        app.key(key(KeyCode::Left)).await;
+        assert_eq!(picked(&app), idle);
+        assert_eq!(picks(&app).len(), 2);
+        app.key(key(KeyCode::Enter)).await;
+        assert_eq!(picks(&app).len(), 3);
+        // `i` and `d` are no keys of its: the pane keeps them.
+        app.key(key(KeyCode::Char('i'))).await;
+        assert_eq!(picks(&app).len(), 3);
+        assert!(app.input.is_empty() && app.pane_keys);
+        // ← on the open heading folds it; again, at the first page, nothing.
+        app.key(key(KeyCode::Left)).await;
+        app.key(key(KeyCode::Left)).await;
+        assert_eq!(picks(&app).len(), 2);
+        assert!(app.pane.is_some() && app.pane_keys);
+        assert_eq!(
+            status_keys(app.watch.as_ref().unwrap(), true),
+            "↑↓ pick · enter open · →← fold · m more · esc close"
+        );
     }
 
     #[tokio::test]
@@ -27936,7 +28896,7 @@ mod tests {
         let (keys, cursor) = app.searching.as_ref().unwrap().keys();
         assert_eq!(
             keys.to_string(),
-            "  find fix  ↑↓ pick · enter edit · esc cancel"
+            "  find fix  ↑↓ pick · enter choose · esc cancel"
         );
         assert_eq!(cursor, 10);
         // Ctrl+R again goes further back, as a shell's does.
@@ -28006,31 +28966,36 @@ mod tests {
                 .collect::<Vec<_>>()
         };
         app.input.set("/co");
-        assert_eq!(first(&app), ["/compact", "/commons", "/context", "/config"]);
-        let keys = |app: &App| menu_keys(&app.menu(), app.pick, &app.input);
+        assert_eq!(first(&app), ["/copy", "/compact", "/context", "/commons"]);
+        let keys = |app: &App| menu_keys(&app.menu(), app.pick, &app.input).map(|k| k.text());
         assert_eq!(
             keys(&app),
-            Some("  ↑↓ pick · tab complete · enter run · esc close")
+            Some("↑↓ pick · enter run · tab complete · esc close".to_owned())
         );
+        app.input.set("/com");
+        assert_eq!(first(&app)[0], "/compact");
         // Enter on part of its name picks /compact as any other command,
         // and it asks first; any key but Enter keeps the conversation.
         app.key(enter()).await;
-        assert!(app.confirming && app.input.is_empty());
+        assert!(app.confirming.is_some() && app.input.is_empty());
         app.key(Event::Key(event::KeyEvent::new(
             KeyCode::Char('x'),
             KeyModifiers::NONE,
         )))
         .await;
-        assert!(!app.confirming && !compacted());
+        assert!(app.confirming.is_none() && !compacted());
         assert_eq!(app.notice.as_deref(), Some("not compacted"));
         assert!(app.input.is_empty(), "the key that said no is not typed");
         // Typed whole, it asks too; Enter compacts.
         app.input.set("/compact");
-        assert_eq!(keys(&app), Some("  ↑↓ pick · enter run · esc close"));
+        assert_eq!(
+            keys(&app),
+            Some("↑↓ pick · enter run · esc close".to_owned())
+        );
         app.key(enter()).await;
-        assert!(app.confirming && !compacted());
+        assert!(app.confirming.is_some() && !compacted());
         app.key(enter()).await;
-        assert!(!app.confirming && compacted());
+        assert!(app.confirming.is_none() && compacted());
         // Any other command runs on part of its name, and what was run
         // more ranks first among the names that start the same.
         for _ in 0..3 {
@@ -28042,7 +29007,7 @@ mod tests {
         assert_eq!(first(&app)[0], "/copy");
         assert_eq!(
             keys(&app),
-            Some("  ↑↓ pick · tab complete · enter run · esc close")
+            Some("↑↓ pick · enter run · tab complete · esc close".to_owned())
         );
         // Its letters in order find a command.
         app.input.set("/cms");
@@ -28584,6 +29549,62 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_stop_asked_in_background_is_kept_when_the_pane_closes_or_steps() {
+        let mut app = app(daemon_answering(|_| json!({})).await);
+        let asked = |app: &mut App| {
+            let view = app
+                .watch
+                .as_mut()
+                .and_then(|w| w.background.as_mut())
+                .unwrap();
+            // The command's row, after the items.
+            for _ in 0..64 {
+                if view.keys().contains("x stop") {
+                    break;
+                }
+                view.key(event::KeyEvent::from(KeyCode::Down));
+            }
+            view.key(event::KeyEvent::from(KeyCode::Char('x')));
+            assert_eq!(view.keys(), "enter stop · esc cancel");
+        };
+        let keys = |app: &App| {
+            app.watch
+                .as_ref()
+                .and_then(|w| w.background.as_ref())
+                .unwrap()
+                .keys()
+        };
+        app.background();
+        app.watch
+            .as_mut()
+            .and_then(|w| w.background.as_mut())
+            .unwrap()
+            .commands_loaded(Ok(json!({"processes": [{"handle": "proc:4",
+                "bot": "calc.lead", "kind": "background", "command": "cargo build",
+                "started_ms": 1_000, "pid": null}]})));
+        // Put aside and opened again with Ctrl+]: nothing armed.
+        asked(&mut app);
+        app.close_pane(true);
+        assert!(app.step_pane(false));
+        assert_ne!(keys(&app), "enter stop · esc cancel");
+        // Stepped back past it with Ctrl+[ and forward again: the same.
+        asked(&mut app);
+        assert!(app.step_pane(true));
+        assert!(app.step_pane(false));
+        assert_ne!(keys(&app), "enter stop · esc cancel");
+        // The keys taken from the pane, by a click on the composer or
+        // Ctrl+\, and given back: the same.
+        asked(&mut app);
+        app.pane_keys = false;
+        app.key(Event::Key(event::KeyEvent::new(
+            KeyCode::Char('\\'),
+            KeyModifiers::CONTROL,
+        )))
+        .await;
+        assert_ne!(keys(&app), "enter stop · esc cancel");
+    }
+
+    #[tokio::test]
     async fn back_from_what_is_over_the_margin_is_the_margin_and_forward_lays_it_over_again() {
         let mut app = app(daemon_with(json!([])).await);
         let post = json!({"id": "repro", "title": "Repro", "markdown": "x"});
@@ -28723,7 +29744,7 @@ mod tests {
         app.fold_notes(false);
         let rows = texts(&app);
         assert_eq!(rows[2], "• Updated the plan · 1/3 · → Fix");
-        assert!(rows.iter().any(|r| r.contains("✔ Test")), "{rows:?}");
+        assert!(rows.iter().any(|r| r.contains("✓ Test")), "{rows:?}");
         // Gone from the screen, they are forgotten.
         app.screen.clear();
         app.refold = true;

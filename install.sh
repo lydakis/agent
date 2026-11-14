@@ -11,7 +11,7 @@
 # download), unpacks it to PREFIX/opt/sonny-VERSION-linux-ARCH, points
 # PREFIX/opt/sonny at it and links PREFIX/bin/sonny to its Sonny. Earlier
 # versions stay where they are, since a running daemon may still use one.
-# Later, `sonny update` does the same for the next release and switches the
+# Later, `sonny upgrade` does the same for the next release and switches the
 # running daemon and open windows to it.
 #
 # It also installs, with the system's package manager (through sudo when

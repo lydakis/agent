@@ -263,6 +263,7 @@ fn large_artifacts_remain_exact_after_reopen_and_background_completion() {
             name: "shell".into(),
             call_id: "call".into(),
             arguments: "{}".into(),
+            links: Default::default(),
         };
         db.append(turn, vec![], std::slice::from_ref(&call), None)
             .unwrap();

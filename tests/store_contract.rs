@@ -3,9 +3,9 @@ use agent_runtime::{
     codec::Family,
     provider::{ModelTokens, ToolCall, Usage},
     store::{
-        Answered, Binding, Blocked, Bot, CacheTtl, CompactionPlan, ContextUsage, Counts, Database,
-        Decision, Delivery, Fork, Gate, Gated, Halt, Halted, Lifted, Limit, Planning, ProcessKind,
-        QuoteRef, Settings, Strip, TurnBudget, TurnOptions, Wake,
+        Answered, ApprovalPolicy, Binding, Blocked, Bot, CacheTtl, CompactionPlan, ContextUsage,
+        Counts, Database, Decision, Delivery, Fork, Gate, Gated, Halt, Halted, Lifted, Limit,
+        Planning, ProcessKind, QuoteRef, Settings, Strip, Trailer, TurnBudget, TurnOptions, Wake,
     },
     tools::{Declared, Inherit, Outcome},
 };
@@ -433,6 +433,7 @@ fn unfinished_tools_are_answered_truthfully_without_disabling_the_bot() {
                 name: "write".into(),
                 call_id: id.into(),
                 arguments: r#"{"path":"file","content":"hello"}"#.into(),
+                links: Default::default(),
             });
             let items = match family {
                 Family::Responses => calls.iter().map(|call| json!({"type":"function_call","call_id":call.call_id,"name":call.name,"arguments":call.arguments})).collect::<Vec<_>>(),
@@ -543,6 +544,7 @@ fn restart_repairs_unanswered_tools_once_including_previously_blocked_bots() {
                 name: "write".into(),
                 call_id: "c1".into(),
                 arguments: "{}".into(),
+                links: Default::default(),
             };
             // Keep a completed call in the same turn. A pruned migration
             // must repair only the unanswered suffix, not duplicate results.
@@ -638,6 +640,7 @@ fn tool_results_and_cursor_events_commit_together() {
         name: "echo".into(),
         call_id: "c1".into(),
         arguments: "{}".into(),
+        links: Default::default(),
     };
     db.append(turn, vec![], std::slice::from_ref(&call), None)
         .unwrap();
@@ -696,6 +699,7 @@ fn shell_call(item_id: &str, call_id: &str, command: &str) -> (Bytes, ToolCall) 
         name: "shell".into(),
         call_id: call_id.into(),
         arguments,
+        links: Default::default(),
     };
     (serde_json::to_vec(&item).unwrap().into(), call)
 }
@@ -803,7 +807,8 @@ fn gates_are_capped_before_a_bot_is_written() {
 }
 
 /// A bot that a sandboxed bot makes takes its sandbox unless it names a
-/// stricter one, as Codex's subagents inherit their parent's.
+/// stricter one, as Codex's subagents inherit their parent's; one asked
+/// for looser is refused, never made otherwise than asked.
 #[test]
 fn a_bot_made_by_a_sandboxed_bot_is_no_less_sandboxed() {
     use agent_runtime::sandbox::Mode;
@@ -823,7 +828,7 @@ fn a_bot_made_by_a_sandboxed_bot_is_no_less_sandboxed() {
         )
         .unwrap()
         .0;
-    let made = |db: &mut Database, name: &str, settings: Settings| {
+    let asked = |db: &mut Database, name: &str, settings: Settings| {
         db.create(
             name,
             Some("/elsewhere"),
@@ -834,29 +839,87 @@ fn a_bot_made_by_a_sandboxed_bot_is_no_less_sandboxed() {
                 ..binding()
             },
         )
-        .unwrap()
-        .0
-        .settings
+        .map(|(bot, _)| bot.settings)
     };
+    let made =
+        |db: &mut Database, name: &str, settings: Settings| asked(db, name, settings).unwrap();
     let unconfined = made(&mut db, "Bob", Settings::default());
     assert_eq!(unconfined.sandbox, Some(Mode::WorkspaceWrite));
     assert_eq!(unconfined.writable, ["/shared"]);
-    let full = made(
-        &mut db,
-        "Cid",
+    // Asked for more than its creator has: refused, saying what, and
+    // nothing is made.
+    let refused = |settings: Settings, what: &str| {
+        let mut db = crate::db();
+        let ann = db
+            .create(
+                "Ann",
+                Some("/work"),
+                Binding {
+                    settings: Settings {
+                        sandbox: Some(Mode::WorkspaceWrite),
+                        writable: vec!["/shared".into()],
+                        ..Settings::default()
+                    },
+                    ..binding()
+                },
+            )
+            .unwrap()
+            .0;
+        let error = db
+            .create(
+                "Kid",
+                Some("/elsewhere"),
+                Binding {
+                    settings,
+                    created_by: Some(ann.name.as_str()),
+                    created_by_id: Some(ann.bot_id),
+                    ..binding()
+                },
+            )
+            .unwrap_err();
+        assert_eq!(error.code, "invalid_setting", "{what}");
+        assert!(
+            error.detail.as_deref().unwrap_or("").starts_with(what),
+            "{what}: {error:?}"
+        );
+        assert_eq!(db.inspect("Kid").unwrap_err().code, "bot_not_found");
+    };
+    refused(
         Settings {
             sandbox: Some(Mode::DangerFullAccess),
             ..Settings::default()
         },
+        "sandbox",
     );
-    assert_eq!(full.sandbox, Some(Mode::WorkspaceWrite));
+    refused(
+        Settings {
+            sandbox: Some(Mode::WorkspaceWrite),
+            network: true,
+            ..Settings::default()
+        },
+        "network",
+    );
+    refused(
+        Settings {
+            writable: vec!["/other".into()],
+            ..Settings::default()
+        },
+        "writable",
+    );
+    refused(
+        Settings {
+            sandbox: Some(Mode::WorkspaceWrite),
+            unix_sockets: vec!["/run/other.sock".into()],
+            ..Settings::default()
+        },
+        "unix_sockets",
+    );
     let networked = made(
         &mut db,
         "Dee",
         Settings {
             sandbox: Some(Mode::WorkspaceWrite),
             writable: vec!["/other".into()],
-            network: true,
             ..Settings::default()
         },
     );
@@ -872,6 +935,35 @@ fn a_bot_made_by_a_sandboxed_bot_is_no_less_sandboxed() {
     );
     assert_eq!(read_only.sandbox, Some(Mode::ReadOnly));
     assert!(read_only.writable.is_empty());
+    // One that never asks makes only bots that never ask, asked or not.
+    let never = made(
+        &mut db,
+        "Fay",
+        Settings {
+            sandbox: Some(Mode::WorkspaceWrite),
+            approval_policy: Some(ApprovalPolicy::Never),
+            ..Settings::default()
+        },
+    );
+    assert!(never.never_asks());
+    let fay = db.inspect("Fay").unwrap();
+    let kid = db
+        .create(
+            "Gus",
+            Some("/elsewhere"),
+            Binding {
+                created_by: Some(fay.name.as_str()),
+                created_by_id: Some(fay.bot_id),
+                ..binding()
+            },
+        )
+        .unwrap()
+        .0;
+    assert!(kid.settings.never_asks());
+    let unasked = vec!["approval_policy".to_owned()];
+    db.set_settings("Gus", None, &unasked, &Settings::default())
+        .unwrap();
+    assert!(db.inspect("Gus").unwrap().settings.never_asks());
     // An unconfined creator imposes nothing.
     assert_eq!(
         Settings::default().under(&Settings::default()),
@@ -918,6 +1010,7 @@ fn a_sandboxed_bot_waits_for_a_verdict_only_on_an_escape() {
             call_id: id.into(),
             arguments,
             custom: false,
+            links: Default::default(),
         };
         (Bytes::from(serde_json::to_vec(&item).unwrap()), call)
     };
@@ -965,6 +1058,144 @@ fn a_sandboxed_bot_waits_for_a_verdict_only_on_an_escape() {
                 call.call_id
             ),
             false => assert_eq!(announced.err().unwrap().code, "invalid_tool_state"),
+        }
+    }
+}
+
+/// A bot that never asks keeps its gates, yet no call of it waits on one:
+/// each call they would hold is refused instead, an escape as under no
+/// gate, as under Codex's approval policy `never`.
+#[test]
+fn a_bot_asked_for_with_no_gate_under_a_gated_creator_is_refused_once_made_never() {
+    let mut db = db();
+    let tools = ["shell".to_owned()];
+    let gate = Gate {
+        tag: "auto".into(),
+        tools: tools.to_vec(),
+        expire_ms: None,
+    };
+    let (ann, _) = db
+        .create(
+            "Ann",
+            Some("/synthetic"),
+            Binding {
+                tools: &tools,
+                gate: Some(&gate),
+                ..binding()
+            },
+        )
+        .unwrap();
+    let (cy, _) = db
+        .create(
+            "Cy",
+            Some("/synthetic"),
+            Binding {
+                request_id: Some("make-cy"),
+                ..binding()
+            },
+        )
+        .unwrap();
+    let under = |db: &Database, name: &str, key: Option<&str>| {
+        db.ungated_under(name, key, Some(&ann.name), Some(ann.bot_id))
+    };
+    // Asked for by a gated creator: refused, saying it would keep them.
+    assert_eq!(under(&db, "Kid", None).unwrap_err().code, "invalid_gate");
+    // An ungated creator may make one.
+    db.ungated_under("Kid", None, Some(&cy.name), Some(cy.bot_id))
+        .unwrap();
+    // A name already held, or one this keyed request made and deleted
+    // since, is the creation's to answer, so a resend gets what it made
+    // whatever its creator has become since.
+    under(&db, "Cy", None).unwrap();
+    db.delete_bot("Cy").unwrap();
+    under(&db, "Cy", Some("make-cy")).unwrap();
+    // A name a deletion freed is free for any other creation.
+    assert_eq!(under(&db, "Cy", None).unwrap_err().code, "invalid_gate");
+}
+
+#[test]
+fn a_bot_that_never_asks_announces_nothing_its_gates_hold() {
+    let mut db = db();
+    let tools = ["shell".to_owned(), "write".to_owned(), "echo".to_owned()];
+    let gate = Gate {
+        tag: "auto".into(),
+        tools: tools.to_vec(),
+        expire_ms: None,
+    };
+    let never = |sandbox| Settings {
+        sandbox,
+        approval_policy: Some(ApprovalPolicy::Never),
+        ..Settings::default()
+    };
+    for (name, sandbox) in [
+        ("Bob", Some(agent_runtime::sandbox::Mode::WorkspaceWrite)),
+        ("Cy", None),
+    ] {
+        let binding = Binding {
+            tools: &tools,
+            gate: Some(&gate),
+            settings: never(sandbox),
+            ..binding()
+        };
+        db.create(name, Some("/synthetic"), binding).unwrap();
+    }
+    let call = |id: &str, name: &str, arguments: Value| {
+        let arguments = arguments.to_string();
+        let item = json!({"type":"function_call","id":format!("fc_{id}"),"call_id":id,
+            "name":name,"arguments":arguments});
+        let call = ToolCall {
+            name: name.into(),
+            call_id: id.into(),
+            arguments,
+            custom: false,
+            links: Default::default(),
+        };
+        (Bytes::from(serde_json::to_vec(&item).unwrap()), call)
+    };
+    let folder = std::path::Path::new("/synthetic");
+    for (name, refused) in [
+        ("Bob", vec!["up", "outside", "say"]),
+        ("Cy", vec!["plain", "up", "outside", "say"]),
+    ] {
+        let turn = db
+            .begin(
+                name,
+                "request",
+                "work",
+                true,
+                &TurnOptions::default(),
+                allow_provider,
+            )
+            .unwrap()
+            .turn;
+        let round = [
+            call("plain", "shell", json!({"command":"make"})),
+            call(
+                "up",
+                "shell",
+                json!({"command":"git push","sandbox_permissions":"require_escalated"}),
+            ),
+            call(
+                "outside",
+                "write",
+                json!({"path":"/etc/hosts","content":"x"}),
+            ),
+            call("say", "echo", json!({"text":"hi"})),
+        ];
+        let (items, calls): (Vec<_>, Vec<_>) = round.into_iter().unzip();
+        db.append(turn, items, &calls, None).unwrap();
+        let bot = db.inspect(name).unwrap();
+        let rules = Default::default();
+        assert!(calls.iter().all(|call| !bot.gated(call, folder, &rules)));
+        let unasked: Vec<&str> = (calls.iter())
+            .filter(|call| bot.unasked(call, folder, &rules))
+            .map(|call| call.call_id.as_str())
+            .collect();
+        assert_eq!(unasked, refused, "{name}");
+        // Nothing waits for a verdict: no call was announced.
+        for call in &calls {
+            let announced = db.approval_start(turn, call, false, 0);
+            assert_eq!(announced.err().unwrap().code, "invalid_tool_state");
         }
     }
 }
@@ -1112,6 +1343,7 @@ fn lapsing_round(db: &mut Database, calls: &[(&str, &str)]) -> (i64, Vec<ToolCal
                 name: name.into(),
                 call_id: call_id.into(),
                 arguments,
+                links: Default::default(),
             };
             (serde_json::to_vec(&item).unwrap().into(), call)
         })
@@ -1157,6 +1389,7 @@ fn a_turn_parks_on_the_load_gate_before_its_command_and_wakes_to_run_it() {
             name: "shell".into(),
             call_id: call_id.into(),
             arguments: json!({"command":"true"}).to_string(),
+            links: Default::default(),
         })
         .collect();
     let items = round
@@ -1462,6 +1695,7 @@ fn a_long_field_hides_no_other_in_a_listing() {
         name: "shell".into(),
         call_id: "s1".into(),
         arguments,
+        links: Default::default(),
     };
     db.append(
         turn,
@@ -2860,11 +3094,11 @@ fn a_quote_names_a_turn_that_has_the_words() {
 }
 
 #[test]
-fn a_bot_that_hides_senders_reads_quoted_words_without_their_lines() {
+fn a_bot_with_no_trailer_reads_quoted_words_without_their_lines() {
     let mut db = db();
     db.create("Bob", Some("/synthetic"), binding()).unwrap();
     let mut quiet = binding();
-    quiet.settings.hide_senders = true;
+    quiet.settings.trailer = Some(Vec::new());
     db.create("Carol", Some("/synthetic"), quiet).unwrap();
     let asked = db
         .begin(
@@ -3652,6 +3886,7 @@ fn schema_78_counts_a_call_left_unanswered_before_the_upgrade_as_taken() {
                 call_id: format!("c{n}"),
                 arguments: "{}".into(),
                 custom: false,
+                links: Default::default(),
             })
             .collect();
         db.append(turn, vec![], &calls, None).unwrap();
@@ -3947,11 +4182,11 @@ fn schema_68_events_had_no_times() {
 }
 
 #[test]
-fn a_bot_that_hides_senders_reads_only_the_words() {
+fn a_bot_with_no_trailer_reads_only_the_words() {
     let mut db = db();
     db.create("Bob", Some("/synthetic"), binding()).unwrap();
     let mut quiet = binding();
-    quiet.settings.hide_senders = true;
+    quiet.settings.trailer = Some(Vec::new());
     db.create("Carol", Some("/synthetic"), quiet).unwrap();
     let person = db
         .begin(
@@ -3985,8 +4220,70 @@ fn a_bot_that_hides_senders_reads_only_the_words() {
         json!([{"type": "input_text", "text": "delegated work"}])
     );
     assert_eq!(
-        db.inspect("Carol").unwrap().settings.resolved()["hide_senders"],
-        true
+        db.inspect("Carol").unwrap().settings.resolved()["trailer"],
+        json!([])
+    );
+}
+
+#[test]
+fn a_bot_whose_trailer_names_the_time_reads_when_each_message_was_sent() {
+    let mut db = db();
+    db.create("Bob", Some("/synthetic"), binding()).unwrap();
+    let mut timed = binding();
+    timed.settings.trailer = Some(vec![Trailer::Sender, Trailer::Time]);
+    db.create("Carol", Some("/synthetic"), timed).unwrap();
+    let mut clock = binding();
+    clock.settings.trailer = Some(vec![Trailer::Time]);
+    db.create("Dan", Some("/synthetic"), clock).unwrap();
+    let person = db
+        .begin(
+            "Bob",
+            "p1",
+            "work",
+            true,
+            &TurnOptions::default(),
+            allow_provider,
+        )
+        .unwrap()
+        .turn;
+    let from_bob = TurnOptions {
+        from: Some(("Bob".into(), person)),
+        ..TurnOptions::default()
+    };
+    let line = |db: &mut Database, bot: &str, options: &TurnOptions| {
+        let started = db
+            .begin(bot, "b1", "delegated work", true, options, allow_provider)
+            .unwrap();
+        let node = started.entry.unwrap()["data"]["node"].as_i64().unwrap();
+        let item = read_item(db, bot, node).unwrap();
+        assert_eq!(item["content"][0]["text"], "delegated work");
+        item["content"][1]["text"].as_str().unwrap().to_owned()
+    };
+    // Who wrote it, then when, in the daemon's local time.
+    let said = line(&mut db, "Carol", &from_bob);
+    let sent = said
+        .strip_prefix("[Message Carol/")
+        .and_then(|rest| rest.split_once(", written by the agent Bob in Bob/"))
+        .and_then(|(_, rest)| rest.split_once(", not by a person. Sent "))
+        .map(|(_, when)| when)
+        .unwrap_or_else(|| panic!("{said}"));
+    let when = sent.strip_suffix(".]").unwrap_or_else(|| panic!("{said}"));
+    let (day, zone) = when.split_once(", UTC").unwrap_or_else(|| panic!("{said}"));
+    assert_eq!(day.split(' ').count(), 5, "{said}");
+    assert_eq!(zone.len(), 6, "{said}");
+    // The time alone: no sender.
+    let said = line(&mut db, "Dan", &from_bob);
+    assert!(said.starts_with("[Message Dan/"), "{said}");
+    assert!(!said.contains("written by"), "{said}");
+    assert!(said.contains(". Sent ") && said.ends_with(".]"), "{said}");
+    assert_eq!(
+        db.inspect("Dan").unwrap().settings.resolved()["trailer"],
+        json!(["time"])
+    );
+    // The default names the sender alone.
+    assert_eq!(
+        db.inspect("Bob").unwrap().settings.resolved()["trailer"],
+        json!(["sender"])
     );
 }
 
@@ -4443,6 +4740,7 @@ fn a_prompts_read_names_the_files_its_left_out_calls_wrote() {
             name: name.into(),
             call_id: id.into(),
             arguments,
+            links: Default::default(),
         };
         (Bytes::from(serde_json::to_vec(&item).unwrap()), call)
     };
@@ -5112,8 +5410,9 @@ fn a_bot_keeps_its_settings_and_a_fork_copies_them() {
         serde_json::to_value(&bob).unwrap()["settings"],
         json!({"context_bytes":4096,"context_items":4096,"note_turns":48,"compact_at":75,
             "compact_keep":25,"compact_tokens":null,"keep_turns":1,"max_rounds":null,"max_drops":3,"approval_hold_ms":2000,"max_output_tokens":null,
-            "cache_ttl":"1h","speed":"fast","sandbox":null,"writable":[],"network":false,"outputs":null,"hide_senders":false,
-            "quiet_background":false,"hold_ms":432000000,"unix_sockets":[],"rules":null,"env":{}})
+            "cache_ttl":"1h","speed":"fast","sandbox":null,"writable":[],"network":false,"outputs":null,"trailer":["sender"],
+            "quiet_background":false,"hold_ms":432000000,"unix_sockets":[],"rules":null,"env":{},
+            "approval_policy":null})
     );
     // Retention follows the bot's own setting.
     for n in 1..=3 {
@@ -5440,6 +5739,7 @@ fn a_call_is_taken_once_and_a_second_take_is_refused_so_it_never_runs_twice() {
             call_id: format!("c{n}"),
             arguments: "{}".into(),
             custom: false,
+            links: Default::default(),
         })
         .collect();
     db.append(turn, vec![], &calls, None).unwrap();
@@ -5535,6 +5835,7 @@ fn waiting_calls_page_past_held_answers_and_an_answer_out_of_time_is_refused() {
             call_id: format!("c{n}"),
             arguments: "{}".into(),
             custom: false,
+            links: Default::default(),
         })
         .collect();
     db.append(turn, vec![], &calls, None).unwrap();
@@ -5610,6 +5911,7 @@ fn a_parked_answer_s_pictures_are_stored_once_its_result_is() {
         call_id: "c1".into(),
         arguments: "{}".into(),
         custom: false,
+        links: Default::default(),
     };
     db.append(turn, vec![], std::slice::from_ref(&call), None)
         .unwrap();
@@ -5786,6 +6088,7 @@ fn artifacts_are_scoped_to_the_owning_bot_and_lineage_checks_use_depth() {
         name: "shell".into(),
         call_id: "c1".into(),
         arguments: "{}".into(),
+        links: Default::default(),
     };
     db.append(turn, vec![], std::slice::from_ref(&call), None)
         .unwrap();
@@ -7811,6 +8114,7 @@ fn forks_start_at_any_answered_message_and_default_to_the_head() {
         name: "echo".into(),
         call_id: "c1".into(),
         arguments: "{}".into(),
+        links: Default::default(),
     };
     let call_item: Bytes = serde_json::to_vec(&json!({"type":"function_call","name":"echo",
         "call_id":"c1","arguments":"{}"}))
@@ -7937,6 +8241,7 @@ fn call(call_id: &str) -> (Bytes, ToolCall) {
         name: "echo".into(),
         call_id: call_id.into(),
         arguments: "{}".into(),
+        links: Default::default(),
     };
     (item, call)
 }
@@ -8378,6 +8683,7 @@ fn forks_preserve_reasoning_pairs_and_require_every_parallel_result() {
             name: "echo".into(),
             call_id: id.into(),
             arguments: "{}".into(),
+            links: Default::default(),
         })
         .collect();
     let mut items = vec![reasoning.clone()];
@@ -8504,6 +8810,7 @@ fn anthropic_forks_check_the_whole_tool_batch_after_a_checkpoint() {
             name: "echo".into(),
             call_id: id.into(),
             arguments: "{}".into(),
+            links: Default::default(),
         })
         .collect();
     let blocks: Vec<Value> = calls
@@ -9957,6 +10264,7 @@ fn ready_turns_wait_for_a_slot_and_survive_interrupted_predecessors() {
         name: "echo".into(),
         call_id: "call-1".into(),
         arguments: "{}".into(),
+        links: Default::default(),
     };
     db.append(first.turn, vec![assistant("calling")], &[call], None)
         .unwrap();
@@ -10077,6 +10385,7 @@ fn retention_preserves_unfinished_turns_and_their_completed_prefix() {
         name: "echo".into(),
         call_id: "live".into(),
         arguments: "{}".into(),
+        links: Default::default(),
     };
     db.append(first.turn, vec![], std::slice::from_ref(&call), None)
         .unwrap();
@@ -10902,6 +11211,50 @@ fn schema_46_settings_keep_turns_as_prune_names_it() {
 }
 
 #[test]
+fn schema_98_hidden_senders_become_an_empty_trailer() {
+    let path = std::env::temp_dir().join(format!("agent-schema98-{}.sqlite", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+    let quiet = Settings {
+        trailer: Some(Vec::new()),
+        ..Settings::default()
+    };
+    let made = |settings: &Settings| Binding {
+        settings: settings.clone(),
+        request_id: Some("once"),
+        starts_line: false,
+        ..binding()
+    };
+    {
+        let mut db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
+        db.create("Bob", Some("/synthetic"), made(&quiet)).unwrap();
+        db.create("Carol", Some("/synthetic"), made(&Settings::default()))
+            .unwrap();
+    }
+    // Before 99 a bot hid its senders with `hide_senders`, in its settings,
+    // its creation and a change kept for its turn's end.
+    Connection::open(&path)
+        .unwrap()
+        .execute_batch(
+            "UPDATE bots SET settings='{\"hide_senders\":true}',
+             creation=json_set(json_remove(creation,'$.request.settings.trailer'),'$.request.settings.hide_senders',json('true'))
+             WHERE name='Bob';
+             UPDATE bots SET configure_pending='{\"settings\":{\"hide_senders\":true}}' WHERE name='Carol';
+             PRAGMA user_version=98;",
+        )
+        .unwrap();
+    let mut db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
+    // It names nothing, and a resend of its creation is still the same request.
+    let (again, event) = db.create("Bob", Some("/synthetic"), made(&quiet)).unwrap();
+    assert_eq!((again.settings, event), (quiet, None));
+    assert_eq!(
+        db.inspect("Carol").unwrap().configure_pending,
+        Some(json!({"settings": {"trailer": []}}))
+    );
+    drop(db);
+    std::fs::remove_file(path).unwrap();
+}
+
+#[test]
 fn schema_47_turns_take_their_own_token_cap() {
     let path = std::env::temp_dir().join(format!("agent-schema47-{}.sqlite", std::process::id()));
     let _ = std::fs::remove_file(&path);
@@ -11659,6 +12012,7 @@ fn a_halt_says_a_call_it_cut_off_has_an_unknown_outcome_and_one_it_never_started
             name: "write".into(),
             call_id: id.into(),
             arguments: r#"{"path":"file","content":"hello"}"#.into(),
+            links: Default::default(),
         });
         let items = calls
             .iter()
@@ -13647,6 +14001,7 @@ fn exchange(db: &mut Database, turn: i64, call_id: &str, output: &str) -> (i64, 
         name: "shell".into(),
         call_id: call_id.into(),
         arguments: "{}".into(),
+        links: Default::default(),
     };
     let item = json!({"type":"function_call","call_id":call_id,"name":"shell","arguments":"{}"});
     let entries = db
@@ -13781,6 +14136,7 @@ fn pictures_count_at_their_weight_and_go_whole() {
         call_id: "c1".into(),
         arguments: "{}".into(),
         custom: false,
+        links: Default::default(),
     };
     let item = json!({"type":"function_call","call_id":"c1","name":"read","arguments":"{}"});
     db.append(
@@ -14017,6 +14373,7 @@ fn a_current_turn_over_budget_fits_once_its_answered_results_are_elided() {
                 name: "shell".into(),
                 call_id: format!("c{n}"),
                 arguments: "{}".into(),
+                links: Default::default(),
             };
             let item = match family {
                 Family::Responses => {
@@ -14228,6 +14585,7 @@ fn a_result_s_text_parts_elide_together() {
         name: "shell".into(),
         call_id: "c0".into(),
         arguments: "{}".into(),
+        links: Default::default(),
     };
     let item = json!({"type":"function_call","call_id":"c0","name":"shell","arguments":"{}"});
     db.append(
@@ -14277,6 +14635,7 @@ fn a_custom_tool_s_pictures_are_read_without_their_bytes() {
         name: "shot".into(),
         call_id: "c0".into(),
         arguments: "page".into(),
+        links: Default::default(),
     };
     let item = json!({"type":"custom_tool_call","call_id":"c0","name":"shot","input":"page"});
     db.append(
@@ -15648,6 +16007,7 @@ fn a_fork_narrows_what_it_may_call_and_never_widens() {
         call_id: "c".into(),
         arguments: r#"{"command":"true"}"#.into(),
         custom: false,
+        links: Default::default(),
     };
     let folder = std::path::Path::new("/synthetic");
     assert!(
@@ -15702,6 +16062,7 @@ fn a_fork_narrows_what_it_may_call_and_never_widens() {
         name: "read".into(),
         call_id: "r2".into(),
         arguments: arguments.clone(),
+        links: Default::default(),
     };
     let item = json!({"type":"function_call","id":"fc_3","call_id":"r2","name":"read","arguments":arguments});
     let entries = db
@@ -17684,6 +18045,7 @@ fn a_waiting_step_ended_in_a_group_that_fails_is_told_of_once_one_commits() {
         call_id: "c1".into(),
         arguments: "{}".into(),
         custom: false,
+        links: Default::default(),
     };
     db.append(turn, vec![], std::slice::from_ref(&call), None)
         .unwrap();
@@ -19088,6 +19450,7 @@ fn read_call(call_id: &str) -> ToolCall {
         name: "read".into(),
         call_id: call_id.into(),
         arguments: json!({"path":"/synthetic/a"}).to_string(),
+        links: Default::default(),
     }
 }
 
@@ -19196,6 +19559,11 @@ fn the_trail_says_who_approved_or_denied_each_gated_call() {
 /// A running turn of Lead, whose declared `run` tool has steps, gated by
 /// `manual` when `gated`.
 fn stepping_turn(db: &mut Database, gated: bool) -> (i64, ToolCall) {
+    stepping_turn_under(db, gated, Settings::default())
+}
+
+/// A stepping turn of Lead under `settings`.
+fn stepping_turn_under(db: &mut Database, gated: bool, settings: Settings) -> (i64, ToolCall) {
     let run = Declared {
         name: "run".into(),
         description: "Run.".into(),
@@ -19220,6 +19588,7 @@ fn stepping_turn(db: &mut Database, gated: bool) -> (i64, ToolCall) {
         Binding {
             declared: Some(std::slice::from_ref(&run)),
             gate: gated.then_some(&gate),
+            settings,
             ..binding()
         },
     )
@@ -19240,6 +19609,7 @@ fn stepping_turn(db: &mut Database, gated: bool) -> (i64, ToolCall) {
         call_id: "c1".into(),
         arguments: "{}".into(),
         custom: false,
+        links: Default::default(),
     };
     db.append(turn, vec![], std::slice::from_ref(&call), None)
         .unwrap();
@@ -19347,6 +19717,39 @@ fn a_tool_hosts_steps_are_kept_with_the_facts_it_declares() {
         .err()
         .unwrap();
     assert_eq!(unknown.code, "no_allowed_step");
+}
+
+#[test]
+fn a_step_a_bot_that_never_asks_would_be_asked_is_refused_and_ran_nowhere() {
+    use agent_runtime::store::{Step, audit::Facts};
+    let mut db = db();
+    let never = Settings {
+        approval_policy: Some(ApprovalPolicy::Never),
+        ..Settings::default()
+    };
+    let (turn, _) = stepping_turn_under(&mut db, true, never);
+    let writes = Facts::given(Some("mcp"), Some("external"), Some("write")).unwrap();
+    let stepped = db
+        .step_announce(
+            "Lead",
+            turn,
+            "c1",
+            "1",
+            "send",
+            json!({"to":"x"}),
+            false,
+            writes,
+            0,
+        )
+        .unwrap();
+    let Step::Decided(decision) = stepped.step else {
+        panic!("a step that never asks is decided at once");
+    };
+    assert_eq!(decision["decision"], "deny");
+    assert_eq!(
+        facts(&trail(&db)[0]),
+        json!(["send", "mcp", null, "nobody", "write", "denied"])
+    );
 }
 
 #[test]
@@ -20623,6 +21026,7 @@ fn a_lifted_answered_call_takes_its_answer_or_is_stopped_and_outlives_a_restart(
                 call_id: format!("c{n}"),
                 arguments: "{}".into(),
                 custom: false,
+                links: Default::default(),
             })
             .collect();
         db.append(turn, vec![], &calls, None).unwrap();
@@ -20735,6 +21139,7 @@ fn a_lifted_answered_call_keeps_its_time_steps_listing_and_audit_row() {
         call_id: "c1".into(),
         arguments: "{}".into(),
         custom: false,
+        links: Default::default(),
     };
     db.append(turn, vec![], std::slice::from_ref(&call), None)
         .unwrap();

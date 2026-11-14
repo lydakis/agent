@@ -53,7 +53,7 @@ impl Step {
 /// What this Sonny's upgrade asks agents to do. A new one is a file in
 /// `sonny/upgrades` and a row here, named in its feature's history.
 pub const STEPS: &[Step] = &[
-    // A reviewer model set as `AGENT_JUDGE` in ~/.agent/env, unread since
+    // A reviewer model set as `AGENT_JUDGE` in ~/.agent/keys/env, unread since
     // 0.8.0, moves to `[reviewer] model` (0.9.0).
     Step {
         id: "judge-env",
@@ -129,7 +129,7 @@ fn names_old_handle(text: &str) -> bool {
     })
 }
 
-/// Whether `~/.agent/env` sets no `AGENT_JUDGE`, the reviewer's model
+/// Whether `~/.agent/keys/env` sets no `AGENT_JUDGE`, the reviewer's model
 /// before 0.8.0, which is `[reviewer] model` now.
 fn judge_env_done() -> bool {
     agent_client::env_file::path().is_none_or(|file| no_judge_in(&file))
@@ -275,6 +275,37 @@ pub const MIGRATIONS: &[Migration] = &[
         id: crate::approvals::NESTED_GONE,
         retire: "0.11.0",
     },
+    // Messages older Sonnys stored with a `[Sent …]` line after the words
+    // draw without it (`stamp::unstamped`), now that the daemon's line
+    // carries the time (0.10.0).
+    Migration {
+        id: "sent-stamp",
+        retire: "0.12.0",
+    },
+    // `[sonny] steps` and `verbose`, two switches, become one `view`
+    // (0.10.0).
+    Migration {
+        id: crate::config::VIEW_ONE,
+        retire: "0.12.0",
+    },
+    // `[sonny] task_windows` becomes `most_task_tabs`, and `side_chat =
+    // "fork"` `"work"` (0.10.0).
+    Migration {
+        id: crate::config::TAB_WORDS,
+        retire: "0.12.0",
+    },
+    // `sonny update` is `sonny upgrade`; an older Sonny that installed
+    // this one still hands off as `sonny update --installed` (0.10.0).
+    Migration {
+        id: "update-hand-off",
+        retire: "0.11.0",
+    },
+    // A project file's `threads_*` keys become `task_*`, once for each
+    // file, before Sonny first reads it (`crate::project::read`) (0.10.0).
+    Migration {
+        id: agent_client::project::TASK_KEYS,
+        retire: "0.12.0",
+    },
 ];
 
 /// `run` once for each `record`: a file of the ids done, a line each,
@@ -287,6 +318,16 @@ pub fn once(record: &Path, id: &str, run: impl FnOnce() -> bool) -> bool {
         "{id} is not in upgrade::MIGRATIONS"
     );
     run_once(record, id, run)
+}
+
+/// `once` for each `what` the migration `id` changes on its own, such as
+/// each project file: recorded as `ID WHAT`.
+pub fn once_for(record: &Path, id: &str, what: &str, run: impl FnOnce() -> bool) -> bool {
+    debug_assert!(
+        MIGRATIONS.iter().any(|m| m.id == id),
+        "{id} is not in upgrade::MIGRATIONS"
+    );
+    run_once(record, &format!("{id} {what}"), run)
 }
 
 fn run_once(record: &Path, id: &str, run: impl FnOnce() -> bool) -> bool {
@@ -461,6 +502,35 @@ mod tests {
         assert_eq!(run(true), (true, true));
         assert_eq!(run(true), (false, true));
         assert_eq!(lines(&record), ["copy"]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_project_files_keys_are_renamed_once_and_not_again_after_a_checkout() {
+        use agent_client::project::{FILE, TASK_KEYS, rename_task_keys};
+        let dir = std::env::temp_dir().join(format!("sonny-task-keys-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let (record, project) = (dir.join("migrated"), dir.join("shop"));
+        std::fs::create_dir_all(project.join(".agents")).unwrap();
+        let file = project.join(FILE);
+        let what = file.to_string_lossy().into_owned();
+        let old = "name = \"shop\"\nthreads_in = \"project\"\n";
+        let rename = || once_for(&record, TASK_KEYS, &what, || rename_task_keys(&project));
+        // Nothing to rename is not recorded, so a file written later is.
+        std::fs::write(&file, "name = \"shop\"\n").unwrap();
+        assert!(!rename());
+        std::fs::write(&file, old).unwrap();
+        assert!(rename());
+        let renamed = "name = \"shop\"\ntask_in = \"project\"\n";
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), renamed);
+        assert_eq!(lines(&record), [format!("{TASK_KEYS} {what}")]);
+        // A checkout that brings the old keys back is left for the read to
+        // refuse by name.
+        std::fs::write(&file, old).unwrap();
+        assert!(rename());
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), old);
+        let error = agent_client::project::read(&project).unwrap_err();
+        assert!(error.contains("it is called task_in now"), "{error}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

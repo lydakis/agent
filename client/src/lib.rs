@@ -2,9 +2,11 @@
 //! JSONL requests correlated by `id`, notifications forwarded on a channel.
 //! Shared by Sonny and the CLI; nothing here depends on the runtime crate.
 pub mod approver;
+pub mod clock;
 pub mod config;
 pub mod env_file;
 pub mod files;
+pub mod hidden;
 pub mod judge;
 pub mod memory;
 pub mod models;
@@ -114,7 +116,7 @@ pub fn default_tools(
 
 /// The socket protocol's version in `ready`. The daemon and its clients ship
 /// together, so a client refuses a daemon of any other version.
-pub const PROTOCOL: u64 = 74;
+pub const PROTOCOL: u64 = 75;
 /// How long the daemon holds a turn on a cause a person can fix before it
 /// fails with it, for a bot that sets no `hold_ms`: five days, as mail is
 /// retried (RFC 5321 suggests four to five) before it is returned.

@@ -45,6 +45,10 @@ pub struct Start {
     pub name: String,
     pub brief: String,
     pub profile: Option<String>,
+    /// One of the person's `/permissions` rows to hold the task in, at
+    /// least as tightly as its starter is held; without one, it works in
+    /// its starter's sandbox, under its starter's gate.
+    pub permissions: Option<String>,
     pub setup: bool,
     pub model: Option<String>,
     pub effort: Option<String>,
@@ -52,7 +56,7 @@ pub struct Start {
     /// git, the lead's folder itself.
     pub own_folder: bool,
     /// The lead's folder itself, rather than a worktree of it, as a
-    /// project's tasks all work when its `threads_in` says so.
+    /// project's tasks all work when its `task_in` says so.
     pub here: bool,
     /// A folder inside the lead's that the task works at instead of the
     /// lead's own, such as a repository it holds, of which the task then
@@ -71,6 +75,9 @@ pub struct Start {
     /// that lead's task while its brief stays the person's words; an
     /// agent's shell starts tasks as its own agent.
     pub made_by: Option<String>,
+    /// The daemon's providers, as its `ready` names them, from which the
+    /// tools a task gets by default are known: null when none were read.
+    pub providers: Value,
 }
 
 /// Start the task `start` asks for in `project`, whose lead's folder is
@@ -122,7 +129,7 @@ pub fn start(here: &Path, project: &str, starter: &str, start: &Start) -> Result
     command.envs(start.env.iter().map(|(key, value)| (key, value)));
     let config = agent_client::config::load()?;
 
-    let info = agent_client::project::read(here)?;
+    let info = crate::project::read(here)?;
     let mut flags = match &start.profile {
         Some(role) => vec!["--profile".to_owned(), role.clone()],
         None => vec!["--agents".to_owned()],
@@ -146,7 +153,7 @@ pub fn start(here: &Path, project: &str, starter: &str, start: &Start) -> Result
     let folder = (start.folder.as_deref())
         .or(theirs.as_deref())
         .filter(|f| !f.trim().is_empty());
-    if folder.is_some() && (start.own_folder || info["threads_in"] == "project") {
+    if folder.is_some() && (start.own_folder || info["task_in"] == "project") {
         return Err(match start.own_folder {
             true => "folder and own_folder each give the task its folder; give one".into(),
             false => "this project's tasks all work in this folder; start it without folder".into(),
@@ -178,9 +185,28 @@ pub fn start(here: &Path, project: &str, starter: &str, start: &Start) -> Result
     // it in a sandbox too unless the lead has none; and the lead's state
     // folder, which the task writes as the lead does.
     let lead = bot_record(&agent, &start.env, starter);
-    let mode = (lead.as_ref())
+    let held = (lead.as_ref())
         .and_then(crate::approvals::mode)
         .unwrap_or_else(crate::approvals::default);
+    // A row asked for holds it at least as tightly as its starter, or the
+    // start is refused, never made looser in silence.
+    let (mode, picked) = match start.permissions.as_deref().map(str::trim) {
+        Some(row) => {
+            let Some(found) = crate::approvals::find(row) else {
+                return Err(format!(
+                    "{row:?} is no /permissions row; the rows are {}",
+                    crate::approvals::names().join(", ")
+                ));
+            };
+            if let Some(why) =
+                (lead.as_ref()).and_then(|lead| crate::approvals::looser(&found, lead))
+            {
+                return Err(why);
+            }
+            (found.name, Some(found))
+        }
+        None => (held, None),
+    };
     let state = match &lead {
         Some(lead) => crate::state::of(lead, starter),
         None => crate::state::folder(starter),
@@ -190,7 +216,7 @@ pub fn start(here: &Path, project: &str, starter: &str, start: &Start) -> Result
         .and_then(Value::as_str)
         != Some("danger-full-access");
     let mut place = match () {
-        () if info["threads_in"] == "project" => in_place(here, name, true),
+        () if info["task_in"] == "project" => in_place(here, name, true),
         () if start.here && folder.is_none() => in_place(here, name, false),
         () if start.own_folder => own_folder(here, name)?,
         () => {
@@ -389,9 +415,30 @@ pub fn start(here: &Path, project: &str, starter: &str, start: &Start) -> Result
     // A task works in its lead's mode's sandbox: confined to its folder,
     // committing to its repository and running the commands the config
     // lets out of it, or, in `full`, unconfined, as nothing would answer a
-    // call that asks to leave.
-    for (key, value) in crate::approvals::sandbox(mode, &place.dir, state.as_deref()) {
-        let flag = format!("--{key}");
+    // call that asks to leave. Without a row of its own, no more than its
+    // starter has; with one, under the gate the row adds to its starter's.
+    let mut sandbox = crate::approvals::sandbox(mode, &place.dir, state.as_deref());
+    match (&picked, &lead) {
+        (None, Some(lead)) => crate::approvals::within(&mut sandbox, lead),
+        (Some(row), lead) => {
+            if let Some(approval) = crate::approvals::added(row, lead.as_ref()) {
+                flags.extend(["--approval".to_owned(), approval.to_owned()]);
+                let search = (config.web_search, config.web_search_off.as_slice());
+                let list = approved(row, &flags, lead.as_ref(), &start.providers, search);
+                flags.extend(list.into_iter().flatten());
+            }
+        }
+        (None, None) => {}
+    }
+    for (key, value) in sandbox {
+        // Asked for as the gate's `--approval never`.
+        if key == "approval_policy" {
+            continue;
+        }
+        let flag = match key.as_str() {
+            "unix_sockets" => "--unix-socket".to_owned(),
+            key => format!("--{key}"),
+        };
         match value {
             Value::String(value) => flags.extend([flag, value]),
             Value::Bool(true) => flags.push(flag),
@@ -618,13 +665,67 @@ struct Picks {
     speed: Option<String>,
 }
 
+/// The `--approve` list for the gate a task in `row` adds to its maker's,
+/// as Sonny gates the row: the tools it will have, its own as the CLI picks
+/// them (`--tools`, else its model's defaults) and the ones it inherits
+/// from `maker` that Sonny gates, but those the row leaves ungated, such
+/// as reads. None when its tools can't be known here, which leaves the
+/// list to the CLI.
+fn approved(
+    row: &crate::approvals::Mode,
+    flags: &[String],
+    maker: Option<&Value>,
+    providers: &Value,
+    (search, off): (agent_client::config::WebSearch, &[String]),
+) -> Option<[String; 2]> {
+    let named = |name: &str| {
+        let at = flags.iter().position(|flag| {
+            flag == name || flag.strip_prefix(name).is_some_and(|r| r.starts_with('='))
+        })?;
+        match flags[at].split_once('=') {
+            Some((_, value)) => Some(value.to_owned()),
+            None => flags.get(at + 1).cloned(),
+        }
+    };
+    let own: Vec<String> = match named("--tools") {
+        Some(tools) => tools
+            .split(',')
+            .filter(|t| !t.is_empty())
+            .map(str::to_owned)
+            .collect(),
+        None if providers.is_object() => {
+            agent_client::default_tools(providers, &named("--model")?, search, off)
+                .into_iter()
+                .map(str::to_owned)
+                .collect()
+        }
+        None => return None,
+    };
+    // Its maker's declarations, those it passes on.
+    let inherited: Vec<Value> = (maker.map(|maker| &maker["declared"]))
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|tool| tool["inherit"] != false && tool["inherit"] != 0)
+        .cloned()
+        .collect();
+    let tools = crate::approvals::gateable(&own, &Value::Array(inherited));
+    let gate = crate::approvals::gate(row.name, &tools);
+    let approve: Vec<&str> = (gate.get("approve").and_then(Value::as_array))
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .collect();
+    (!approve.is_empty()).then(|| ["--approve".to_owned(), approve.join(",")])
+}
+
 /// The run flags with the task's model, effort and speed, unless they
-/// name their own: the project's `threads_model`, else the lead's (`lead`,
+/// name their own: the project's `task_model`, else the lead's (`lead`,
 /// its AGENT_MODEL and AGENT_EFFORT, and the speed its record holds), so a
-/// role (--profile) never swaps it; the project's `threads_effort`, else
+/// role (--profile) never swaps it; the project's `task_effort`, else
 /// the config's `[sonny] task_effort` (`task`), else the lead's own when
 /// the task runs its model; and the speed the same way, from
-/// `threads_speed` and `[sonny] task_speed`. Standard needs no flag.
+/// `task_speed` and `[sonny] task_speed`. Standard needs no flag.
 fn with_defaults(info: &Value, flags: &[&String], lead: Picks, task: Picks) -> Vec<String> {
     let mut flags: Vec<String> = flags.iter().map(|flag| flag.to_string()).collect();
     // A value flag is --flag VALUE or --flag=VALUE.
@@ -645,7 +746,7 @@ fn with_defaults(info: &Value, flags: &[&String], lead: Picks, task: Picks) -> V
     let model = match value(&flags, "--model") {
         Some(model) => model,
         None => {
-            let model = info["threads_model"]
+            let model = info["task_model"]
                 .as_str()
                 .map(str::to_owned)
                 .or(lead_model.clone());
@@ -656,7 +757,7 @@ fn with_defaults(info: &Value, flags: &[&String], lead: Picks, task: Picks) -> V
         }
     };
     if value(&flags, "--effort").is_none() {
-        let effort = info["threads_effort"]
+        let effort = info["task_effort"]
             .as_str()
             .map(str::to_owned)
             .or(task.effort)
@@ -666,7 +767,7 @@ fn with_defaults(info: &Value, flags: &[&String], lead: Picks, task: Picks) -> V
         }
     }
     if value(&flags, "--speed").is_none() {
-        let speed = info["threads_speed"]
+        let speed = info["task_speed"]
             .as_str()
             .map(str::to_owned)
             .or(task.speed)
@@ -1660,7 +1761,7 @@ fn within(copy: &Path, prefix: &Path) -> PathBuf {
 
 /// The provider credentials this process may hold, as the daemon keeps
 /// them from a bot's shell: the well-known keys, Bedrock's, the key a
-/// provider in `AGENT_PROVIDER` names, and what `~/.agent/env` sets.
+/// provider in `AGENT_PROVIDER` names, and what `~/.agent/keys/env` sets.
 pub(crate) fn kept_keys() -> Vec<String> {
     let mut keys: Vec<String> = [
         "ANTHROPIC_API_KEY",
@@ -2041,6 +2142,57 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_tighter_row_gates_the_task_as_sonny_gates_the_row() {
+        use agent_client::config::WebSearch;
+        let row = crate::approvals::find("ask").unwrap();
+        let providers = serde_json::json!({"openai": {"family": "responses", "web_search": false}});
+        let maker = serde_json::json!({"declared": [{"name": "start_task"},
+            {"name": "new_project", "inherit": false}, {"name": "memory"}]});
+        let flags: Vec<String> = ["--model", "openai/m"].map(str::to_owned).to_vec();
+        let off: Vec<String> = Vec::new();
+        let [flag, list] = approved(
+            &row,
+            &flags,
+            Some(&maker),
+            &providers,
+            (WebSearch::Disabled, &off),
+        )
+        .unwrap();
+        assert_eq!(flag, "--approve");
+        let list: Vec<&str> = list.split(',').collect();
+        // Its own tools and the ones it inherits that Sonny gates, not
+        // reads, nor what its maker keeps from it.
+        for tool in ["shell", "write", "apply_patch", "start_task"] {
+            assert!(list.contains(&tool), "{tool} not in {list:?}");
+        }
+        for tool in ["read", "wait", "history", "memory", "new_project"] {
+            assert!(!list.contains(&tool), "{tool} in {list:?}");
+        }
+        // A role's tools are the ones it has.
+        let named: Vec<String> = ["--tools", "read,shell"].map(str::to_owned).to_vec();
+        let [_, list] = approved(
+            &row,
+            &named,
+            None,
+            &Value::Null,
+            (WebSearch::Disabled, &off),
+        )
+        .unwrap();
+        assert_eq!(list, "shell");
+        // Without the daemon's providers its tools aren't known here.
+        assert!(
+            approved(
+                &row,
+                &flags,
+                None,
+                &Value::Null,
+                (WebSearch::Disabled, &off)
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
     fn a_task_at_work_is_left_as_it_is_and_says_how_it_can_be_cleaned_up() {
         let said = busy("fix", 4);
         assert!(said.contains("its turn 4 has not ended"), "{said}");
@@ -2339,13 +2491,13 @@ mod tests {
             ["--model", "a/lead", "--effort", "xhigh"]
         );
         // The project's file over both.
-        let file = serde_json::json!({"threads_effort": "medium"});
+        let file = serde_json::json!({"task_effort": "medium"});
         assert_eq!(
             run(file, &[], Some("xhigh")),
             ["--model", "a/lead", "--effort", "medium"]
         );
         // Another model leaves the lead's effort, which was set for its own.
-        let file = serde_json::json!({"threads_model": "b/other"});
+        let file = serde_json::json!({"task_model": "b/other"});
         assert_eq!(run(file.clone(), &[], None), ["--model", "b/other"]);
         assert_eq!(
             run(file, &[], Some("low")),
@@ -2398,7 +2550,7 @@ mod tests {
             run(none.clone(), &["--model", "b/other"], Some("fast"), None),
             ["--model", "b/other"]
         );
-        let other = serde_json::json!({"threads_model": "b/other"});
+        let other = serde_json::json!({"task_model": "b/other"});
         assert_eq!(
             run(other.clone(), &[], Some("fast"), None),
             ["--model", "b/other"]
@@ -2409,12 +2561,12 @@ mod tests {
             ["--model", "b/other", "--speed", "ultrafast"]
         );
         // The project's file over the config and the lead, standard too.
-        let file = serde_json::json!({"threads_speed": "standard"});
+        let file = serde_json::json!({"task_speed": "standard"});
         assert_eq!(
             run(file, &[], Some("fast"), Some("ultrafast")),
             ["--model", "a/lead"]
         );
-        let file = serde_json::json!({"threads_speed": "ultrafast"});
+        let file = serde_json::json!({"task_speed": "ultrafast"});
         assert_eq!(
             run(file, &[], None, Some("fast")),
             ["--model", "a/lead", "--speed", "ultrafast"]
@@ -2430,6 +2582,7 @@ mod tests {
             name: "fix".into(),
             brief: String::new(),
             profile: None,
+            permissions: None,
             setup: false,
             model: None,
             effort: None,
@@ -2439,6 +2592,7 @@ mod tests {
             builds_on: None,
             env: vec![("AGENT_STORE".into(), store.to_string_lossy().into_owned())],
             made_by: None,
+            providers: Value::Null,
         };
         // The store a window's `--store` names, not the one Sonny's own
         // environment would find.
@@ -2516,7 +2670,7 @@ mod tests {
             "---\nmodel: a/b\ntools: [shell, read]\n---\nReview it.\n",
         )
         .unwrap();
-        let project = std::cell::RefCell::new(serde_json::json!({"threads_profile": "task"}));
+        let project = std::cell::RefCell::new(serde_json::json!({"task_profile": "task"}));
         let told = |flags: &[&str]| {
             let flags: Vec<String> = flags.iter().map(|f| f.to_string()).collect();
             told(
@@ -2565,7 +2719,7 @@ mod tests {
             "---\nextends: task\n---\nShip small.\n",
         )
         .unwrap();
-        *project.borrow_mut() = serde_json::json!({"threads_profile": "worker"});
+        *project.borrow_mut() = serde_json::json!({"task_profile": "worker"});
         let flags = told(&["--agents"]).unwrap();
         let text = flags.last().unwrap();
         assert!(
@@ -2595,13 +2749,13 @@ mod tests {
             );
         }
         std::fs::remove_file(dir.join(".agents/agents/Worker.md")).unwrap();
-        *project.borrow_mut() = serde_json::json!({"threads_profile": "nobody"});
+        *project.borrow_mut() = serde_json::json!({"task_profile": "nobody"});
         assert!(
             told(&["--agents"])
                 .unwrap_err()
                 .starts_with("profile_not_found")
         );
-        *project.borrow_mut() = serde_json::json!({"threads_profile": "task"});
+        *project.borrow_mut() = serde_json::json!({"task_profile": "task"});
 
         assert_eq!(told(&["--model", "x/y"]).unwrap(), ["--model", "x/y"]);
         assert!(told(&["--profile", "nobody"]).is_err());

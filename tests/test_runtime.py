@@ -23,8 +23,6 @@ from bench.runtime_client import PROTECTING, Client, node_item, poll, serve_args
 
 # Longer than 256 bytes, with text a shell would run if pasted unquoted.
 ODD_CALL_ID = "odd $(touch pwned) 'x'\n" + 'L' * 300
-# The line Sonny ends a message to a bot with: when it was sent.
-SENT = re.compile(r'\n\n\[Sent [A-Z][a-z]{2} \d{1,2} [A-Z][a-z]{2} \d{4} \d{2}:\d{2}, UTC[+-]\d{2}:\d{2}\.\]$')
 
 
 
@@ -112,6 +110,17 @@ class Model(http.server.BaseHTTPRequestHandler):
                 self.wfile.write(body)
                 self.wfile.flush()
                 return
+            refused = getattr(self.server, 'refused_reasoning', None)
+            if refused and any(i.get('type') == 'reasoning' and i.get('encrypted_content') == refused
+                               for i in request.get('input', [])):
+                # A provider that can no longer read a reasoning item's state.
+                body = b'{"error":{"message":"invalid encrypted view"}}'
+                self.send_response(400)
+                self.send_header('Content-Length', str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+                self.wfile.flush()
+                return
             if is_summary(request) and getattr(self.server, 'compaction_refusals', 0):
                 self.server.compaction_refusals -= 1
                 body = b'{"error":{"message":"synthetic compaction rate limit"}}'
@@ -132,8 +141,6 @@ class Model(http.server.BaseHTTPRequestHandler):
             # An automation's message comes after its one-line header.
             if user.startswith('[automation ') and '\n' in user:
                 user = user.split('\n', 1)[1]
-            # Sonny's message ends with a line naming when it was sent.
-            user = SENT.sub('', user)
             if user in getattr(self.server, 'unauthorized_prompts', ()):
                 # A key the provider refuses: the person's to fix.
                 body = b'{"error":{"message":"synthetic bad key"}}'
@@ -825,7 +832,7 @@ class AnthropicModel(http.server.BaseHTTPRequestHandler):
                     blocks.append({'type': 'text', 'text': 'echo:' + last['content'][0]['content']})
                 stop = 'refusal' if details else 'end_turn'
             else:
-                user = SENT.sub('', last['content'][0]['text'])
+                user = last['content'][0]['text']
                 before = request['messages'][-2]['content'] if len(request['messages']) > 1 else []
                 if (isinstance(before, list) and before and before[0].get('type') == 'tool_result'
                         and str(before[0].get('content', '')).startswith('refuse:all')):
@@ -1195,7 +1202,7 @@ class AnthropicRuntimeTests(unittest.TestCase):
         self.assertEqual(client.finished(turn)['data']['status'], 'completed')
         model.requests.get(timeout=1)
         after = model.requests.get(timeout=1)
-        self.assertEqual(SENT.sub('', after['messages'][0]['content'][0]['text']), words)
+        self.assertEqual(after['messages'][0]['content'][0]['text'], words)
 
     def test_configure_takes_every_setting_create_takes(self):
         client, model, path = self.start()
@@ -1305,14 +1312,14 @@ class AnthropicRuntimeTests(unittest.TestCase):
         client.request('submit', bot='Bob', request_id='s1', prompt=words, delivery='steer', person='pat')
         self.assertEqual(client.finished(turn)['data']['error'], 'provider_refusal')
         declined = model.requests.get(timeout=5)
-        self.assertEqual(SENT.sub('', declined['messages'][-1]['content'][0]['text']), words)
+        self.assertEqual(declined['messages'][-1]['content'][0]['text'], words)
         # It goes again, as it was sent, as the next turn's own message;
         # in the declined turn the model reads that it did.
         client.receive(lambda m: m.get('event') == 'turn_finished' and m.get('turn', 0) > turn
                        and m['data']['status'] == 'completed')
         again = model.requests.get(timeout=5)
         sent = [m['content'] for m in again['messages']]
-        self.assertEqual(SENT.sub('', sent[-1][0]['text']), words)
+        self.assertEqual(sent[-1][0]['text'], words)
         # Back in line, it is a message of its own, with its own number.
         self.assertRegex(sent[-1][1]['text'], r'^\[Message Bob/\d+, written by pat\.\]$')
         noted = [block.get('text', block.get('content', '')).rstrip() for blocks in sent[2:-1] for block in blocks]
@@ -3016,6 +3023,50 @@ class RuntimeTests(ModelFixture):
             '[shell_environment_policy]\nignore_default_excludes = false\nexclude = ["aws_*"]\n')
         # A daemon started after takes the defaults and the listed names.
         self.assertEqual(seen('Ann'), 'unset:unset:unset:kept')
+
+    def test_a_400_on_replayed_reasoning_resends_without_it_and_later_turns_leave_it_out(self):
+        client = self.client()
+        client.request('create', bot='Bob', workspace=str(self.path))
+        reasoning = {'type': 'reasoning', 'id': 'rs_old', 'summary': [], 'encrypted_content': 'old-state'}
+        turn = lambda n, text: client.finished(client.request(
+            'submit', bot='Bob', request_id=str(n), prompt=text)['result']['message'])['data']
+        self.model.history_reasoning = reasoning
+        self.assertEqual(turn(0, 'first')['status'], 'completed')
+        self.model.history_reasoning = None
+        self.assertEqual(turn(1, 'second')['status'], 'completed')
+        sent = [self.model.requests.get(timeout=1) for _ in range(2)]
+        self.assertIn(reasoning, sent[1]['input'])
+        # The provider can no longer read it: the request goes once more
+        # without the reasoning, and the turn says so.
+        self.model.refused_reasoning = 'old-state'
+        self.assertEqual(turn(2, 'third')['status'], 'completed')
+        refused, resent = (self.model.requests.get(timeout=1) for _ in range(2))
+        self.assertIn(reasoning, refused['input'])
+        self.assertNotIn('reasoning', [i.get('type') for i in resent['input']])
+        self.assertIn('reply:second', json.dumps(resent['input']))
+        self.assertTrue(any(m.get('event') == 'retry' and m['data'].get('thinking_withheld') for m in client.saved))
+        # Later turns, after a restart too, leave it out without asking.
+        client.close()
+        client = self.client()
+        self.assertEqual(turn(3, 'fourth')['status'], 'completed')
+        later = self.model.requests.get(timeout=1)
+        self.assertNotIn('reasoning', [i.get('type') for i in later['input']])
+        self.assertTrue(self.model.requests.empty())
+        # Its summary leaves it out too, and its request is as long as said.
+        # Another model summarizes, so the summary is a request of its own
+        # over the span rather than a copy of the bot's call.
+        self.model.models = ('synthetic-model', 'synthetic-small')
+        client.request('configure', bot='Bob', compaction_instructions='Summarize.',
+                       compaction_model='openai/synthetic-small')
+        self.assertFalse(client.request('compact', bot='Bob')['result']['duplicate'])
+        self.assertNotIn('compaction', turn(4, 'fifth'))
+        self.assertIsNotNone(client.request('inspect', bot='Bob')['result']['compaction'])
+        sent = []
+        while not self.model.requests.empty():
+            sent.append(self.model.requests.get(timeout=1))
+        self.assertTrue(any(is_summary(request) for request in sent))
+        for request in sent:
+            self.assertNotIn('reasoning', [i.get('type') for i in request['input']])
 
     def test_history_pages_recover_an_omitted_long_message(self):
         client = self.client(tools='echo,history', settings={'context_items': 6})

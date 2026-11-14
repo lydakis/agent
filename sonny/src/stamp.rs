@@ -1,37 +1,34 @@
-//! When Sonny sent a message, on the message itself. A model has no clock:
-//! the time it started at falls out with compaction, and over a long
-//! conversation it guesses. So, as chat harnesses stamp each message they
-//! pass a model, the person's words and the lookout's notes end with a
-//! line naming the local time they were sent. The line comes after the
-//! words, so what the model read before stays cached, and Sonny draws the
-//! words without it.
+//! When a message was sent. A model has no clock: the time it started at
+//! falls out with compaction, and over a long conversation it guesses. So,
+//! as chat harnesses stamp each message they pass a model, every agent
+//! Sonny makes has the daemon end each message's line with the local time
+//! it was sent (`trailer`), after the words, so what the model read before
+//! stays cached; Sonny draws the words without it. Older Sonnys put the
+//! time in the words themselves, and the window draws those without it
+//! too. The window's own times are read here as well.
 
-/// The line's start and end: `[Sent Sat 31 Oct 2026 16:12, UTC-04:00.]`.
+pub use agent_client::clock::when;
+use agent_client::clock::{DAYS, MONTHS, local};
+
+/// What the line after each message names for the model of an agent
+/// Sonny makes: the config's `trailer`, else who sent it and when.
+pub fn trailer(config: &agent_client::config::Config) -> Vec<String> {
+    match &config.trailer {
+        Some(trailer) => trailer.clone(),
+        None => vec!["sender".into(), "time".into()],
+    }
+}
+
+/// The line older Sonnys put after the words they sent, stored with them:
+/// `[Sent Sat 31 Oct 2026 16:12, UTC-04:00.]`.
 const OPEN: &str = "\n\n[Sent ";
 const CLOSE: &str = ".]";
 
-const DAYS: [&str; 7] = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
-pub const MONTHS: [&str; 12] = [
-    "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
-];
-
-/// `prompt` with the line naming `epoch` (seconds) in local time after it.
-pub fn stamped(prompt: &str, epoch: i64) -> String {
-    format!("{prompt}{OPEN}{}{CLOSE}", when(epoch))
-}
-
-fn epoch_now() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| d.as_secs() as i64)
-}
-
-/// `prompt` stamped now.
-pub fn now(prompt: &str) -> String {
-    stamped(prompt, epoch_now())
-}
-
-/// A message's words without the line `stamped` put after them.
+/// A stored message's words without the `[Sent …]` line an older Sonny
+/// put after them, so weeks of history draw as they did. Drawing only:
+/// the stored words, and what the model reads, stay as they are. Deleted
+/// in 0.12.0 (`upgrade::MIGRATIONS`, "sent-stamp"); older history then
+/// shows the line again.
 pub fn unstamped(text: &str) -> &str {
     let Some(at) = text.rfind(OPEN) else {
         return text;
@@ -47,9 +44,8 @@ pub fn unstamped(text: &str) -> &str {
     }
 }
 
-/// Whether `text` is a sentence Sonny once put after the time, while
-/// quiet mode was (gone in 0.9.1): kept so the conversations it stamped
-/// draw as their words still.
+/// Whether `text` is a sentence Sonny once put after the time while quiet
+/// mode was (gone in 0.9.1).
 fn was_away_or_back(text: &str) -> bool {
     (text.starts_with("The person is away since ")
         || text.starts_with("The person is back; they were away since "))
@@ -77,32 +73,10 @@ fn names_a_time(line: &str) -> bool {
         && [1, 2, 4, 5].iter().all(|&i| zone[i].is_ascii_digit())
 }
 
-/// `epoch` (seconds) in local time.
-pub fn local(epoch: i64) -> libc::tm {
-    // SAFETY: localtime_r fills the zeroed struct it is given and nothing else.
-    unsafe {
-        let mut tm: libc::tm = std::mem::zeroed();
-        libc::localtime_r(&(epoch as libc::time_t), &mut tm);
-        tm
-    }
-}
-
-/// `epoch` in local time, its weekday and its offset from UTC.
-pub fn when(epoch: i64) -> String {
-    let tm = local(epoch);
-    let offset = tm.tm_gmtoff / 60;
-    format!(
-        "{} {} {} {} {:02}:{:02}, UTC{}{:02}:{:02}",
-        DAYS[tm.tm_wday.rem_euclid(7) as usize],
-        tm.tm_mday,
-        MONTHS[tm.tm_mon.rem_euclid(12) as usize],
-        tm.tm_year + 1900,
-        tm.tm_hour,
-        tm.tm_min,
-        if offset < 0 { '-' } else { '+' },
-        offset.abs() / 60,
-        offset.abs() % 60,
-    )
+fn epoch_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs() as i64)
 }
 
 /// When a message the window shows was written, `ms` its Unix time in
@@ -181,27 +155,16 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_stamped_message_reads_as_its_words_again() {
-        let sent = stamped("fix the build", 1_793_473_920);
-        assert!(sent.starts_with("fix the build\n\n[Sent "), "{sent}");
-        assert!(sent.ends_with(".]"), "{sent}");
-        assert!(names_a_time(
-            &sent["fix the build\n\n[Sent ".len()..sent.len() - 2]
-        ));
+    fn a_stamp_an_older_sonny_stored_is_drawn_as_the_words() {
+        let sent = format!("fix the build{OPEN}{}{CLOSE}", when(1_793_473_920));
         assert_eq!(unstamped(&sent), "fix the build");
-        // Twice is still once more each.
-        assert_eq!(unstamped(&stamped(&sent, 0)), sent);
-    }
-
-    #[test]
-    fn a_stamp_older_sonnys_wrote_saying_the_person_was_away_or_back_reads_as_the_words_too() {
+        // Only the last one goes.
+        let twice = format!("{sent}{OPEN}{}{CLOSE}", when(0));
+        assert_eq!(unstamped(&twice), sent);
         let away = "look at the build\n\n[Sent Sat 7 Nov 2026 16:12, UTC-04:00. The person is away since Fri 6 Nov 19:40; their hours are Mon-Fri 09:00-19:00.]";
         assert_eq!(unstamped(away), "look at the build");
         let back = "morning\n\n[Sent Sat 7 Nov 2026 16:12, UTC-04:00. The person is back; they were away since Fri 6 Nov 19:40.]";
         assert_eq!(unstamped(back), "morning");
-        // A sentence of the person's own after a time is theirs.
-        let typed = "see\n\n[Sent Sat 31 Oct 2026 16:12, UTC-04:00. Then I left.]";
-        assert_eq!(unstamped(typed), typed);
     }
 
     #[test]
@@ -209,16 +172,13 @@ mod tests {
         for text in [
             "plain",
             "see\n\n[Sent by the person.]",
+            "see\n\n[Sent Sat 31 Oct 2026 16:12, UTC-04:00. Then I left.]",
             "see\n\n[Sent Sat 31 Oct 2026 16:12, UTC-04:00.] and more",
             "see\n\n[Sent Sat 31 Oct 2026 16:12.]",
             "see\n\n[Sent Someday 31 Oct 2026 16:12, UTC-04:00.]",
         ] {
             assert_eq!(unstamped(text), text);
         }
-        assert_eq!(
-            unstamped("see\n\n[Sent Sat 31 Oct 2026 16:12, UTC-04:00.]"),
-            "see"
-        );
     }
 
     fn at(year: i32, month: i32, day: i32, weekday: i32, hour: i32, minute: i32) -> libc::tm {

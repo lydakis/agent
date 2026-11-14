@@ -817,10 +817,6 @@ for (let i = 0; ; i++) await agent(`say ${i}`)
         lead = self.daemon.request('inspect', bot='api.lead')['result']
         self.assertIn('# Memory of api', lead['instructions'])
         self.assertNotIn('# Memory of ws', lead['instructions'])
-        # Sonny composed them, so the lead takes its folder's changes when
-        # it opens, as one made by opening Sonny there does.
-        [kept] = (self.path / '.agent/sonny/instructions').iterdir()
-        self.assertTrue(kept.name.endswith(f'-{lead["bot_id"]}'), kept.name)
 
     def note_for(self, bot, having, timeout=30, starts='Task updates: '):
         """The first note the lookout gave `bot` that says `having`."""

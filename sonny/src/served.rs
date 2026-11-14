@@ -132,9 +132,9 @@ fn start() -> Value {
             task a git worktree of its lead's repository on the branch agent/NAME, from the last commit (a task's \
             own helper, from the last commit on that task's branch), so uncommitted changes are not in it; outside git, the task works in this folder itself, shared with you and \
             its other tasks. With own_folder, it gets an empty folder of its own instead, where it makes what it \
-            changes, such as a workspace made with this folder's tooling, as the brief says how, and reads this \
+            changes, such as a checkout made with this folder's tooling, as the brief says how, and reads this \
             folder where it is. With setup, the folder's .agents/setup runs in the task's folder first. The task starts there with this folder's rules, skills and \
-            memory, in the role named, and the brief as its first message. Paths in this folder that the brief \
+            memory, as the profile named, and the brief as its first message. Paths in this folder that the brief \
             names are turned into the task's own. The result is the task's turn handle; its work comes back on \
             its branch, here already as it commits.",
         "parameters": {
@@ -146,15 +146,19 @@ fn start() -> Value {
                 "brief": {"type": "string", "minLength": 1,
                     "description": "Everything the task needs, since it never sees your conversation."},
                 "profile": {"type": "string", "minLength": 1,
-                    "description": "A role listed under Profiles that fits the task; without one, it \
-                        starts in no role."},
+                    "description": "A profile listed under Profiles that fits the task; without one, it \
+                        starts with none."},
+                "permissions": {"type": "string", "minLength": 1,
+                    "description": "One of the person's /permissions rows to hold the task tighter \
+                        than you, such as one that refuses what would need approval; one looser \
+                        than yours is refused. Without one, it works as you do."},
                 "folder": {"type": "string", "minLength": 1,
                     "description": "A folder inside this one to start the task at instead of here, \
                         relative or absolute, in a git repository, such as one this folder holds: the task \
                         then gets a worktree of that repository and works at that folder in it."},
                 "own_folder": {"type": "boolean",
                     "description": "An empty folder of the task's own instead of a worktree or this folder: \
-                        for work that makes its own copy of what it changes, such as a workspace on another \
+                        for work that makes its own copy of what it changes, such as a checkout of another \
                         branch made with this folder's tooling, or that must not touch this folder."},
                 "tab": {"type": "boolean",
                     "description": "A tab of its own, for a task the person will want to watch or talk to, \
@@ -165,7 +169,7 @@ fn start() -> Value {
                 "model": {"type": "string", "minLength": 1,
                     "description": "PROVIDER/MODEL, one of the models \"$AGENT_BIN\" models lists with \
                         the person's notes on them, when the work suits another model than yours; \
-                        without one, the project's threads_model, else yours."},
+                        without one, the project's task_model, else yours."},
                 "effort": {"type": "string", "minLength": 1,
                     "description": "The task's effort level, when the work calls for one."},
                 "reason": {"type": "string", "minLength": 1,
@@ -233,7 +237,7 @@ fn project() -> Value {
         "name": PROJECT,
         "description": "Make a new project in a folder, when the person asks for one, or for work in a \
             subfolder that is its own repository but not a project yet: its .agents/project.toml and its lead, \
-            which opens in a home of its own beside yours. The result names the lead, which never sees this \
+            which opens in a workspace of its own beside yours. The result names the lead, which never sees this \
             conversation, so brief it as you would a task. A folder that is a project already keeps its lead \
             and its settings.",
         "parameters": {
@@ -243,11 +247,11 @@ fn project() -> Value {
                 "model": {"type": "string", "minLength": 1,
                     "description": "The lead's PROVIDER/MODEL, as the person picked; else yours."},
                 "effort": {"type": "string", "minLength": 1, "description": "The lead's effort level."},
-                "threads_model": {"type": "string", "minLength": 1,
+                "task_model": {"type": "string", "minLength": 1,
                     "description": "PROVIDER/MODEL for the project's tasks, when the person picked one."},
-                "threads_effort": {"type": "string", "minLength": 1,
+                "task_effort": {"type": "string", "minLength": 1,
                     "description": "The tasks' effort level."},
-                "threads_in": {"type": "string", "enum": ["worktree", "project"],
+                "task_in": {"type": "string", "enum": ["worktree", "project"],
                     "description": "project when the person wants every task to work in the project's \
                         folder itself."}
             },
@@ -360,7 +364,7 @@ fn automations() -> Value {
                             "description": "Runs when this file is written."},
                         "commit": {"type": "string", "minLength": 1,
                             "description": "Runs when this repository gets a new commit."},
-                        "bot": {"type": "string", "minLength": 1,
+                        "agent": {"type": "string", "minLength": 1,
                             "description": "The agent it messages; you when neither this nor start is given."},
                         "start": {
                             "type": "object",
@@ -371,7 +375,7 @@ fn automations() -> Value {
                             },
                             "required": ["name", "model"],
                             "additionalProperties": false,
-                            "description": "An agent the first run makes, in your folder as a task is made, \
+                            "description": "An agent the first run starts, in your folder as a task is started, \
                                 and later runs message."
                         },
                         "reply_to": {"type": "string", "minLength": 1,
@@ -643,10 +647,27 @@ async fn called(name: &str, arguments: &Value) -> Answer {
                     ));
                 }
             }
+            // A row asked for gates the task as Sonny gates that row, over
+            // the tools it will have, which the daemon's providers decide.
+            let providers = match text("permissions").is_some() {
+                true => match crate::daemon_paths(None, None) {
+                    Ok((_, socket)) => match Client::connect(&socket).await {
+                        Ok((client, _events)) => {
+                            let providers = client.providers().clone();
+                            client.close().await;
+                            providers
+                        }
+                        Err(_) => Value::Null,
+                    },
+                    Err(_) => Value::Null,
+                },
+                false => Value::Null,
+            };
             let start = crate::task::Start {
                 name: text("name").unwrap_or_default(),
                 brief: text("brief").unwrap_or_default(),
                 profile: text("profile"),
+                permissions: text("permissions"),
                 setup: arguments["setup"] == true,
                 model: text("model"),
                 effort: text("effort"),
@@ -657,6 +678,7 @@ async fn called(name: &str, arguments: &Value) -> Answer {
                 builds_on: (!line.lead).then(|| caller.clone()),
                 env: Vec::new(),
                 made_by: None,
+                providers,
             };
             let started = crate::task::start(&line.folder, &line.project, &caller, &start)
                 .map_err(|e| ("task_not_started", e))?;

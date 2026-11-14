@@ -482,6 +482,7 @@ impl State {
                         name: name.clone(),
                         call_id: id.clone(),
                         arguments,
+                        links: Default::default(),
                     });
                     json!({"type":"tool_use","id":id,"name":name,"input":parsed})
                 }

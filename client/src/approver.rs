@@ -139,7 +139,7 @@ macro_rules! policy {
 - Printing or copying a secret's value somewhere new, or changing credentials or access permissions (creating, rotating, or revoking keys; changing who can access something), is `high` risk.
 ## Persistent security weakening
 - Broad, persistent, or production-impacting weakening of a security setting or boundary is `high` risk; deny it unless authorization covers the exact setting, target, and blast radius.
-- Changing the person's agent settings or keys directly (`~/.agent/config.toml`, `~/.agent/env`) is such a weakening: deny it unless the person asked for that exact change.
+- Changing the person's agent settings or keys directly (`~/.agent/config.toml`, `~/.agent/keys/env`) is such a weakening: deny it unless the person asked for that exact change.
 ## Destructive actions
 - Deleting or overwriting data that cannot be got back, dropping a database, breaking production services, rewriting history others have (a force push to a shared or default branch), and broad unrequested git cleanup or resets are `high` risk. Deny them without the person's authorization.
 - Git actions on one of the agent's own work branches, including a one-ref `--force-with-lease` push to it, are `low` or `medium`.
@@ -2516,7 +2516,7 @@ mod tests {
             "tool --config=~/.agent/config.toml",
             // Quoted apart from its home, it is read as conservatively as
             // a path outside every given folder.
-            "echo x > \"$HOME\"/.agent/env",
+            "echo x > \"$HOME\"/.agent/keys/env",
             // A `.agent` outside every given folder, wherever it is.
             "rm -rf /opt/other/.agent",
             // The worktrees' folder itself, Sonny's records in it, and a

@@ -20,16 +20,88 @@ const KEYS: [&str; 11] = [
     "model",
     "effort",
     "profile",
-    "threads_model",
-    "threads_effort",
-    "threads_speed",
-    "threads_profile",
-    "threads_in",
+    "task_model",
+    "task_effort",
+    "task_speed",
+    "task_profile",
+    "task_in",
     "subfolders",
 ];
-/// Where a project's threads work: each in its own worktree, or all in
+/// The migration that renames a project file's `threads_*` keys, as
+/// 0.9 wrote them, to the `task_*` they are since 0.10.0 (`rename_task_keys`):
+/// Sonny runs it once for each file, before it first reads it, until it
+/// retires (Sonny's `upgrade::MIGRATIONS`).
+pub const TASK_KEYS: &str = "project-task-keys";
+/// Each key before 0.10.0, and its name since.
+const RENAMED: [(&str, &str); 5] = [
+    ("threads_model", "task_model"),
+    ("threads_effort", "task_effort"),
+    ("threads_speed", "task_speed"),
+    ("threads_profile", "task_profile"),
+    ("threads_in", "task_in"),
+];
+
+/// `text`, the project file parsed as `table`, with its `threads_*` keys
+/// renamed `task_*` in place, comments and order kept; none when it has
+/// none, or when the renamed file would not read as the same settings
+/// (a key in quotes, a line the rename does not find), which is then
+/// refused as an unknown key.
+fn task_keys(text: &str, table: &toml::Table) -> Option<String> {
+    if !RENAMED.iter().any(|(old, _)| table.contains_key(*old)) {
+        return None;
+    }
+    let renamed: String = (text.split_inclusive('\n'))
+        .map(|line| {
+            let start = line.len() - line.trim_start().len();
+            let rest = &line[start..];
+            let found = RENAMED.iter().find(|(old, _)| {
+                rest.strip_prefix(old)
+                    .is_some_and(|after| after.trim_start().starts_with('='))
+            });
+            match found {
+                Some((old, new)) => format!("{}{new}{}", &line[..start], &rest[old.len()..]),
+                None => line.to_owned(),
+            }
+        })
+        .collect();
+    let after: toml::Table = renamed.parse().ok()?;
+    let mut expected = table.clone();
+    for (old, new) in RENAMED {
+        if let Some(value) = expected.remove(old)
+            && expected.insert(new.to_owned(), value).is_some()
+        {
+            return None;
+        }
+    }
+    (after == expected).then_some(renamed)
+}
+
+/// The project file in `dir` with its `threads_*` keys renamed `task_*`
+/// (`TASK_KEYS`), written in place: whether it renamed them. A file with
+/// none renames nothing; one that does not parse, or would not read as the
+/// same settings renamed, is left as it is, for `read` to refuse.
+pub fn rename_task_keys(dir: &Path) -> bool {
+    let path = dir.join(FILE);
+    let Ok(text) = std::fs::read_to_string(&path) else {
+        return false;
+    };
+    let Ok(table) = text.parse::<toml::Table>() else {
+        return false;
+    };
+    let Some(renamed) = task_keys(&text, &table) else {
+        return false;
+    };
+    let temp = path.with_extension(format!("toml.{}.tmp", std::process::id()));
+    let written = std::fs::write(&temp, &renamed).and_then(|()| std::fs::rename(&temp, &path));
+    if written.is_err() {
+        let _ = std::fs::remove_file(&temp);
+    }
+    written.is_ok()
+}
+
+/// Where a project's tasks work: each in its own worktree, or all in
 /// the project folder.
-pub const THREADS_IN: [&str; 2] = ["worktree", "project"];
+pub const TASK_IN: [&str; 2] = ["worktree", "project"];
 /// What a folder below the project's is when no project file of its own
 /// says otherwise: a project of its own, or this project's.
 pub const SUBFOLDERS: [&str; 2] = ["own", "project"];
@@ -97,9 +169,9 @@ pub fn read(dir: &Path) -> Result<Value, String> {
         let name = default_name(dir);
         return Ok(json!({
             "dir": dir, "name": name, "coordinator": format!("{name}.lead"),
-            "model": null, "effort": null, "profile": null, "threads_model": null,
-            "threads_effort": null, "threads_speed": null, "threads_profile": null,
-            "threads_in": "worktree",
+            "model": null, "effort": null, "profile": null, "task_model": null,
+            "task_effort": null, "task_speed": null, "task_profile": null,
+            "task_in": "worktree",
             "subfolders": "own", "file": false,
         }));
     };
@@ -107,11 +179,10 @@ pub fn read(dir: &Path) -> Result<Value, String> {
         .parse()
         .map_err(|e: toml::de::Error| invalid(e.message()))?;
     if let Some(key) = table.keys().find(|key| !KEYS.contains(&key.as_str())) {
-        return Err(invalid(&match key.as_str() {
-            "reasoning" => "unknown key reasoning: it is called effort now".to_owned(),
-            "threads_reasoning" => {
-                "unknown key threads_reasoning: it is called threads_effort now".to_owned()
-            }
+        let renamed = RENAMED.iter().find(|(old, _)| old == key);
+        return Err(invalid(&match (key.as_str(), renamed) {
+            ("reasoning", _) => "unknown key reasoning: it is called effort now".to_owned(),
+            (_, Some((old, new))) => format!("unknown key {old}: it is called {new} now"),
             _ => format!("unknown key {key}"),
         }));
     }
@@ -140,18 +211,15 @@ pub fn read(dir: &Path) -> Result<Value, String> {
         }
         Ok(value)
     };
-    let (effort, threads_model, threads_effort) = (
-        said("effort")?,
-        said("threads_model")?,
-        said("threads_effort")?,
-    );
-    let threads_speed = said("threads_speed")?;
-    if threads_speed
+    let (effort, task_model, task_effort) =
+        (said("effort")?, said("task_model")?, said("task_effort")?);
+    let task_speed = said("task_speed")?;
+    if task_speed
         .as_deref()
         .is_some_and(|speed| !crate::config::SPEEDS.contains(&speed))
     {
         return Err(invalid(
-            "threads_speed must be \"standard\", \"fast\" or \"ultrafast\"",
+            "task_speed must be \"standard\", \"fast\" or \"ultrafast\"",
         ));
     }
     // Profiles are looked up when the agents are made.
@@ -167,10 +235,10 @@ pub fn read(dir: &Path) -> Result<Value, String> {
         }
         Ok(value)
     };
-    let (profile, threads_profile) = (named("profile")?, named("threads_profile")?);
-    let threads_in = field("threads_in")?.unwrap_or_else(|| "worktree".into());
-    if !THREADS_IN.contains(&threads_in.as_str()) {
-        return Err(invalid("threads_in must be \"worktree\" or \"project\""));
+    let (profile, task_profile) = (named("profile")?, named("task_profile")?);
+    let task_in = field("task_in")?.unwrap_or_else(|| "worktree".into());
+    if !TASK_IN.contains(&task_in.as_str()) {
+        return Err(invalid("task_in must be \"worktree\" or \"project\""));
     }
     let subfolders = field("subfolders")?.unwrap_or_else(|| "own".into());
     if !SUBFOLDERS.contains(&subfolders.as_str()) {
@@ -178,9 +246,9 @@ pub fn read(dir: &Path) -> Result<Value, String> {
     }
     Ok(json!({
         "dir": dir, "name": name, "coordinator": coordinator, "model": model,
-        "effort": effort, "profile": profile, "threads_model": threads_model,
-        "threads_effort": threads_effort, "threads_speed": threads_speed,
-        "threads_profile": threads_profile, "threads_in": threads_in,
+        "effort": effort, "profile": profile, "task_model": task_model,
+        "task_effort": task_effort, "task_speed": task_speed,
+        "task_profile": task_profile, "task_in": task_in,
         "subfolders": subfolders, "file": true,
     }))
 }
@@ -199,12 +267,12 @@ pub fn tasks_rule(in_project: bool) -> String {
 
 /// The task rule a project's file sets, as its coordinator is told it.
 pub fn rule(info: &Value) -> String {
-    tasks_rule(info["threads_in"] == "project")
+    tasks_rule(info["task_in"] == "project")
 }
 
-/// What a new project's threads run on and where they work.
+/// What a new project's tasks run on and where they work.
 #[derive(Debug, Default)]
-pub struct Threads<'a> {
+pub struct Tasks<'a> {
     pub model: Option<&'a str>,
     pub effort: Option<&'a str>,
     pub in_project: bool,
@@ -217,7 +285,7 @@ pub fn write(
     name: &str,
     model: &str,
     effort: Option<&str>,
-    threads: &Threads,
+    tasks: &Tasks,
 ) -> Result<(), String> {
     if !valid_name(name) {
         return Err("project_invalid: name must be 1-64 of A-Z a-z 0-9 - _ .".into());
@@ -236,15 +304,15 @@ pub fn write(
     if let Some(level) = some(effort) {
         text.push_str(&format!("effort = {}\n", quote(level)));
     }
-    if let Some(model) = some(threads.model) {
-        text.push_str(&format!("threads_model = {}\n", quote(model)));
+    if let Some(model) = some(tasks.model) {
+        text.push_str(&format!("task_model = {}\n", quote(model)));
     }
-    if let Some(level) = some(threads.effort) {
-        text.push_str(&format!("threads_effort = {}\n", quote(level)));
+    if let Some(level) = some(tasks.effort) {
+        text.push_str(&format!("task_effort = {}\n", quote(level)));
     }
     text.push_str(&format!(
-        "threads_in = {}\n",
-        quote(THREADS_IN[usize::from(threads.in_project)])
+        "task_in = {}\n",
+        quote(TASK_IN[usize::from(tasks.in_project)])
     ));
     let failed = |e: std::io::Error| match e.kind() {
         std::io::ErrorKind::AlreadyExists => {
@@ -298,7 +366,7 @@ fn place_new(
 }
 
 /// What a project's creator asked for: the coordinator's model and effort,
-/// and its threads' picks (none: they run as the client starting them
+/// and its tasks' picks (none: they run as the client starting them
 /// says, in worktrees). A folder whose file names a model keeps the file's
 /// settings instead, and the picks are not used, except an effort the file
 /// does not name.
@@ -306,7 +374,7 @@ fn place_new(
 pub struct Picks {
     pub model: Option<String>,
     pub effort: Option<String>,
-    pub threads: Option<ThreadPicks>,
+    pub tasks: Option<TaskPicks>,
     /// The person's `web_search`, for a coordinator its role gives no tools.
     pub web_search: crate::config::WebSearch,
     /// The person's `web_search_off`, models it gets no search on.
@@ -314,7 +382,7 @@ pub struct Picks {
 }
 
 #[derive(Debug, Default)]
-pub struct ThreadPicks {
+pub struct TaskPicks {
     pub model: Option<String>,
     pub effort: Option<String>,
     pub in_project: bool,
@@ -400,7 +468,7 @@ pub async fn create(
     };
     let rule = match file {
         true => rule(&info),
-        false => tasks_rule(picks.threads.as_ref().is_some_and(|t| t.in_project)),
+        false => tasks_rule(picks.tasks.as_ref().is_some_and(|t| t.in_project)),
     };
     let instructions = format!(
         "{}\n\n{rule}",
@@ -467,13 +535,13 @@ pub async fn create(
         Err(error) => return Err(coded(error)),
     };
     if !file {
-        let t = picks.threads.as_ref();
+        let t = picks.tasks.as_ref();
         write(
             dir,
             name,
             model,
             effort,
-            &Threads {
+            &Tasks {
                 model: t.and_then(|t| t.model.as_deref()),
                 effort: t.and_then(|t| t.effort.as_deref()),
                 in_project: t.is_some_and(|t| t.in_project),
@@ -494,12 +562,12 @@ mod tests {
 
     #[test]
     fn the_rule_says_where_tasks_work() {
-        let info = json!({"threads_in": "worktree"});
+        let info = json!({"task_in": "worktree"});
         assert!(
             rule(&info)
                 .ends_with("Elsewhere tasks share this folder, unless one is started in an empty folder of its own.")
         );
-        let shared = json!({"threads_in": "project"});
+        let shared = json!({"task_in": "project"});
         assert!(
             rule(&shared)
                 .ends_with("Every task works in this folder, with no worktree of its own.")
@@ -568,7 +636,7 @@ mod tests {
         let picks = Picks {
             model: Some("alpha/one".into()),
             effort: Some("high".into()),
-            threads: Some(ThreadPicks {
+            tasks: Some(TaskPicks {
                 model: Some("beta/it's".into()),
                 effort: Some("low".into()),
                 in_project: true,
@@ -632,9 +700,9 @@ mod tests {
             (
                 &file["model"],
                 &file["effort"],
-                &file["threads_model"],
-                &file["threads_effort"],
-                &file["threads_in"]
+                &file["task_model"],
+                &file["task_effort"],
+                &file["task_in"]
             ),
             (
                 &json!("alpha/one"),
@@ -723,7 +791,7 @@ mod tests {
             !dir.join(FILE).exists(),
             "a model the daemon refuses is not saved"
         );
-        // The role's model, when nothing is picked; its threads in worktrees.
+        // The role's model, when nothing is picked; its tasks in worktrees.
         let made = make(
             &daemon,
             &dir,
@@ -805,7 +873,7 @@ mod tests {
             "demo",
             "alpha/one",
             Some("low"),
-            &Threads {
+            &Tasks {
                 model: Some("beta/two"),
                 effort: None,
                 in_project: false,
@@ -816,7 +884,7 @@ mod tests {
         let picks = Picks {
             model: Some("gamma/three".into()),
             effort: Some("max".into()),
-            threads: None,
+            tasks: None,
             web_search: Default::default(),
             web_search_off: Vec::new(),
         };
@@ -833,7 +901,7 @@ mod tests {
         );
         // A kept file that names no effort takes the picked one.
         let dir = root("kept-effort");
-        write(&dir, "plain", "alpha/one", None, &Threads::default()).unwrap();
+        write(&dir, "plain", "alpha/one", None, &Tasks::default()).unwrap();
         let daemon = Fake::default();
         make(&daemon, &dir, &json!({"instructions": "rules"}), &picks).unwrap();
         let calls = daemon.calls.lock().unwrap().clone();
@@ -857,14 +925,14 @@ mod tests {
     #[test]
     fn a_written_file_reads_back_and_is_never_overwritten() {
         let dir = root("write");
-        let threads = Threads {
+        let tasks = Tasks {
             model: Some("beta/two"),
             effort: Some("low"),
             in_project: true,
         };
-        write(&dir, "demo", "alpha/one", Some("high"), &threads).unwrap();
+        write(&dir, "demo", "alpha/one", Some("high"), &tasks).unwrap();
         // One that appeared since the folder was read is kept and reported.
-        let refused = write(&dir, "other", "beta/two", None, &Threads::default()).unwrap_err();
+        let refused = write(&dir, "other", "beta/two", None, &Tasks::default()).unwrap_err();
         assert!(refused.starts_with("project_changed: "), "{refused}");
         let project = read(&dir).unwrap();
         assert_eq!(project["name"], "demo");
@@ -873,14 +941,14 @@ mod tests {
         assert_eq!(project["effort"], "high");
         assert_eq!(
             (
-                &project["threads_model"],
-                &project["threads_effort"],
-                &project["threads_in"]
+                &project["task_model"],
+                &project["task_effort"],
+                &project["task_in"]
             ),
             (&json!("beta/two"), &json!("low"), &json!("project"))
         );
         assert_eq!(project["file"], true);
-        assert!(write(&dir, "bad name", "alpha/one", None, &Threads::default()).is_err());
+        assert!(write(&dir, "bad name", "alpha/one", None, &Tasks::default()).is_err());
         std::fs::remove_dir_all(dir.parent().unwrap()).unwrap();
     }
 
@@ -896,10 +964,10 @@ mod tests {
         .unwrap_err();
         assert_eq!(error.to_string(), "synthetic disk full");
         assert!(!path.exists(), "no partial project file");
-        // A threads' effort needs no threads' model: theirs is the lead's.
-        let alone = Threads {
+        // A task effort needs no task model: theirs is the lead's.
+        let alone = Tasks {
             effort: Some("high"),
-            ..Threads::default()
+            ..Tasks::default()
         };
         write(&dir, "demo", "alpha/one", None, &alone).unwrap();
         let project = read(&dir).unwrap();
@@ -907,9 +975,9 @@ mod tests {
             (
                 &project["name"],
                 &project["effort"],
-                &project["threads_model"],
-                &project["threads_effort"],
-                &project["threads_in"]
+                &project["task_model"],
+                &project["task_effort"],
+                &project["task_in"]
             ),
             (
                 &json!("demo"),
@@ -928,6 +996,46 @@ mod tests {
     }
 
     #[test]
+    fn a_files_threads_keys_become_task_keys_in_their_own_step() {
+        let dir = root("task-keys");
+        std::fs::create_dir_all(dir.join(".agents")).unwrap();
+        // No file yet: nothing to rename.
+        assert!(!rename_task_keys(&dir));
+        let before = "# mine\nname = \"demo\"\n  threads_model = \"a/b\" # pinned\nthreads_effort=\"high\"\nthreads_in = \"project\"\n";
+        std::fs::write(dir.join(FILE), before).unwrap();
+        // Reading alone renames nothing: the old key is refused by name.
+        let error = read(&dir).unwrap_err();
+        assert!(
+            error.contains("unknown key threads_effort: it is called task_effort now"),
+            "{error}"
+        );
+        assert_eq!(std::fs::read_to_string(dir.join(FILE)).unwrap(), before);
+        assert!(rename_task_keys(&dir));
+        assert_eq!(
+            std::fs::read_to_string(dir.join(FILE)).unwrap(),
+            "# mine\nname = \"demo\"\n  task_model = \"a/b\" # pinned\ntask_effort=\"high\"\ntask_in = \"project\"\n"
+        );
+        let info = read(&dir).unwrap();
+        assert_eq!(
+            (&info["task_model"], &info["task_effort"], &info["task_in"]),
+            (&json!("a/b"), &json!("high"), &json!("project"))
+        );
+        // A renamed file has nothing left to rename.
+        assert!(!rename_task_keys(&dir));
+        // Both names at once read as two settings: left as it was.
+        let both = "name = \"demo\"\nthreads_model = \"a/b\"\ntask_model = \"c/d\"\n";
+        std::fs::write(dir.join(FILE), both).unwrap();
+        assert!(!rename_task_keys(&dir));
+        assert!(
+            read(&dir)
+                .unwrap_err()
+                .contains("unknown key threads_model")
+        );
+        assert_eq!(std::fs::read_to_string(dir.join(FILE)).unwrap(), both);
+        std::fs::remove_dir_all(dir.parent().unwrap()).unwrap();
+    }
+
+    #[test]
     fn an_invalid_file_is_an_error_not_the_defaults() {
         let dir = root("invalid");
         std::fs::create_dir_all(dir.join(".agents")).unwrap();
@@ -936,12 +1044,12 @@ mod tests {
             "model = \"alpha/one\"",
             "name = 7",
             "name = \"demo\"\ncoordinator = \"other.lead\"",
-            "name = \"demo\"\nthreads_in = \"elsewhere\"",
-            "name = \"demo\"\nthreads_effort = \"\"",
+            "name = \"demo\"\ntask_in = \"elsewhere\"",
+            "name = \"demo\"\ntask_effort = \"\"",
             "name = \"demo\"\nsubfolders = \"mine\"",
-            "name = \"demo\"\nthreads_model = \"\"",
+            "name = \"demo\"\ntask_model = \"\"",
             "name = \"demo\"\nprofile = \"../lead\"",
-            "name = \"demo\"\nthreads_profile = \"\"",
+            "name = \"demo\"\ntask_profile = \"\"",
         ] {
             std::fs::write(dir.join(FILE), text).unwrap();
             let error = read(&dir).unwrap_err();
@@ -951,12 +1059,12 @@ mod tests {
         assert_eq!(read(&dir).unwrap()["subfolders"], "project");
         std::fs::write(
             dir.join(FILE),
-            "name = \"demo\"\nprofile = \"my-lead\"\nthreads_profile = \"worker\"",
+            "name = \"demo\"\nprofile = \"my-lead\"\ntask_profile = \"worker\"",
         )
         .unwrap();
         let info = read(&dir).unwrap();
         assert_eq!(
-            (&info["profile"], &info["threads_profile"]),
+            (&info["profile"], &info["task_profile"]),
             (&json!("my-lead"), &json!("worker"))
         );
         std::fs::remove_dir_all(dir.parent().unwrap()).unwrap();

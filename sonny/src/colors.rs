@@ -1,4 +1,4 @@
-//! Project colors, experimental (`/colors`, `[sonny] project_colors`): in
+//! Project colors, experimental (`[sonny] project_colors`): in
 //! a window that follows other projects' leads, a reply its agent writes
 //! because one followed project's agents woke it wears that project's
 //! color down its first column, so back-to-back replies read as the same

@@ -12,12 +12,14 @@ each setting is; what to set is the person's call.
 ## Where they live
 
 - `~/.agent/config.toml`: the settings below, for every project. `/config`
-  in Sonny lists and changes them; a key set back to its default has its
-  line taken out. Edit it by hand too: the person's comments and order
+  in Sonny lists and changes those a person changes, under its groups by
+  the plain names the table's last column gives; those that only tune are
+  set in the file alone. A key set back to its default has its line taken
+  out. Edit it by hand too: the person's comments and order
   stay. A setting is read when its time comes (a new agent, a new turn);
   one marked "read when it starts" waits for the daemon or Sonny to start
   again (`sonny agent shutdown` stops the daemon; Sonny starts it).
-- `~/.agent/env`: provider keys only, one `NAME=value` a line, readable by
+- `~/.agent/keys/env`: provider keys only, one `NAME=value` a line, readable by
   the person alone. `sonny setup --provider NAME --key-stdin` puts a key
   there; never write one anywhere else (see the sonny-setup skill).
 - `.agents/project.toml` in a project's folder: that project's own picks,
@@ -53,6 +55,12 @@ each setting is; what to set is the person's call.
   ledger, `~/.docker`), the person adds it to a row's `writable` and
   picks that row: ask them for it, naming the folder, rather than keeping
   a copy per agent or running the command outside the sandbox.
+- `[sandbox] unreadable` in the config: folders, from `/` or `~/`, that
+  no sandboxed command reads, writes, links or renames and the `read` tool
+  refuses, as Codex's `deny_read` (`unreadable = ["~/.aws"]`). Empty by
+  default, so agents can use what the person keeps at home, such as a
+  browser's session cookies; `~/.agent/keys` is always unreadable. A
+  folder not there yet is made, private. Read when the daemon starts.
 - `[context_windows]` in the config: a model's context window in
   tokens, which sets when its agents compact, by `PROVIDER/MODEL` with `*`
   wildcards (`"bedrock/*openai.*" = 1000000`), over what its provider
@@ -137,9 +145,9 @@ A key `table.key` goes under `[table]`; a bare key goes at the top.
 | --- | --- | --- |
 | `model` | the lead's model | `model` |
 | `effort` | a new lead's effort | `sonny.lead_effort` |
-| `threads_model` | each new task's model | the lead's |
-| `threads_effort` | each new task's effort | `sonny.task_effort` |
-| `threads_speed` | each new task's speed: `standard`, `fast` or `ultrafast` | `sonny.task_speed` |
+| `task_model` | each new task's model | the lead's |
+| `task_effort` | each new task's effort | `sonny.task_effort` |
+| `task_speed` | each new task's speed: `standard`, `fast` or `ultrafast` | `sonny.task_speed` |
 | `profile` | the profile the lead runs as | `sonny.lead_profile` |
-| `threads_profile` | the profile every other agent is told | `sonny.task_profile` |
+| `task_profile` | the profile every other agent is told | `sonny.task_profile` |
 | `subfolders = "project"` | folders below open this project's lead | |

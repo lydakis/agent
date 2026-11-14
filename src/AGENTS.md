@@ -11,7 +11,7 @@ here, check it against these, and discuss any daemon change with George first:
   no CLI flags in tool descriptions or notes. Model-facing text is the client's.
 - No fixed limit that decides how a bot works (rounds, what counts as a
   secret, what to keep); capacity bounds that protect the daemon are fine.
-- Known exceptions, chosen: the sender line (`hide_senders`), provider-key
+- Known exceptions, chosen: the line after a prompt (`trailer`), provider-key
   stripping and redaction, Codex's `[shell_environment_policy]`.
 
 ## Words

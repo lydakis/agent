@@ -9412,3 +9412,395 @@ The capture is this worktree's ignored `.local/bench/publish-screen-20261113/`.
 The parent checkout's `.local/bench/publish-20261113/` keeps binary hashes,
 compiler/test/process logs, gate output and the sequential screen runner.
 No paid providers or release artifacts were used.
+
+## Per-bot trailer: the time after each message (protocol 75, schema 99)
+
+2026-11-14, a 4-core x86_64 Linux cloud host, release builds of main
+`9556455` (base) against the trailer branch. `after_words`, which runs when a
+turn takes in its message and for each steer it absorbs, now reads the
+message's `sent_ms` in the same cached row read and, for a bot whose
+`trailer` names `time`, appends its local time to the line (one
+`localtime_r` and one format, stored with the prompt's node, so the cache
+keeps it). The line is built in one allocation, as the sender's line alone
+was. Binaries by SHA-256:
+
+- Base: `42af1d65ffd82d5e5b1e58f2d2cfa63dffaedb5b07c88a873f3e90360d2bd9a3`.
+- Head: `21d004a710a48aa58dba41ad23fc856cb1dc2406660f2828d72e5412f60067ff`
+  (first build), `a0643238f5ac01bb9c8400731913050c93b8d940535992ad3ad4bf1f35f7c5aa`
+  (one-allocation line, the steering rescreen).
+- Time on: the head built with `["sender", "time"]` as the default, so every
+  bot of the screens pays for the time:
+  `f102808feb28dbd7b9491a1926b1d80a8127244011048f98707a519d85b37079`.
+
+The four native screens, two alternating rounds (admission and completion
+at three repeats, footprint at two, lifecycle at one, 32 bots, socket echo,
+five tool schemas); completion got six more rounds of five, three of them in
+reversed order, since its p99 moves most. `bench.perf_gate` reports no
+failures or warnings for either side, and store work per turn is unchanged.
+
+| Bench | Measure | Base | Head | Time on |
+| --- | --- | ---: | ---: | ---: |
+| admission | lone submit CPU, ms | 29.413 | 27.995 | 30.952 |
+| admission | burst submit p99, ms | 3.503 | 3.42 | 3.767 |
+| completion | release to terminal p99, ms (median of 36 runs) | 10.05 | 10.41 | 10.67 |
+| footprint | idle RSS, MiB | 16.281 | 16.506 | 16.4 |
+| footprint | per idle bot, KiB | 1.952 | 1.902 | 1.836 |
+| footprint | RSS after a turn each, MiB | 35.104 | 31.582 | 31.865 |
+| footprint | CPU per turn, ms | 0.778 | 0.748 | 0.81 |
+| lifecycle | CPU, s | 0.455 | 0.485 | n/a |
+| lifecycle | p95 turn, ms | 576.83 | 582.691 | n/a |
+| lifecycle | peak RSS, MiB | 24.564 | 24.977 | n/a |
+
+Completion's p99 ranges overlap on every side (base 7.91–13.10 ms, head
+8.31–15.53, time on 8.26–13.87); in the reversed-order rounds base was the
+slowest (11.11 ms against 10.53 head and 10.15 time on). The time is
+written at turn start, before completion's timer. Lifecycle and
+`active_steering` check every request's history against the one they
+expect, so a time line fails them by design; they ran on the head, whose
+bots name the sender alone, as before.
+
+At the high end, `fleet_screen` with 512 bots, 64 active and 64 parked, two
+rounds each:
+
+| Measure | Base | Head | Time on |
+| --- | --- | --- | --- |
+| creates per second | 1371, 1274 | 1524, 1261 | 1381, 1248 |
+| turns per second at the bound | 122.2, 122.0 | 123.8, 123.4 | 121.4, 122.2 |
+| burst p95, ms | 510, 510 | 507, 508 | 509, 510 |
+| RSS parked, MiB | 25.41, 24.73 | 25.27, 24.44 | 25.41, 25.00 |
+| restart ready, s | 0.040, 0.041 | 0.035, 0.036 | 0.036, 0.044 |
+
+`active_steering` (20 rounds of 40 steers per bot, the absorb path), six
+invocations at 32 bots, half with base first and half with head first,
+pooled (24 runs per side per shape), and two at 8 bots:
+
+| Bots | Output items | Measure | Base | Head | Change | Mann-Whitney z |
+| ---: | ---: | --- | ---: | ---: | ---: | ---: |
+| 32 | 1 | daemon CPU, s (mean) | 10.65 | 11.04 | +3.7% | 1.44 |
+| 32 | 1 | boundary p95, ms | 213.1 | 219.8 | +3.1% | 1.34 |
+| 32 | 1 | peak RSS, MiB | 34.53 | 34.34 | -0.6% | -2.04 |
+| 32 | 48 | daemon CPU, s (mean) | 13.48 | 13.58 | +0.8% | 0.62 |
+| 32 | 48 | boundary p95, ms | 368.0 | 373.6 | +1.5% | 0.31 |
+| 8 | 1 | daemon CPU, s (median) | 2.72 | 2.70 | -0.7% | |
+| 8 | 48 | daemon CPU, s (median) | 3.40 | 3.51 | +3.2% | |
+
+No CPU or latency difference is significant (|z| < 1.96); request bytes
+and the stored histories are identical on both sides. The 32-bot runs
+absorb 25,600 steers, so the 0.39 s mean CPU gap would be 15 µs per steer,
+against one more column in a row read already made and the same string
+built once: the gap is the runner's spread (one shape's runs span
+8.8–13.8 s on either side).
+
+On GitHub's runner the Perf workflow's screen of the branch reported no
+failures or warnings (admission -1.2% and -2.9%, completion +0.1%,
+lifecycle CPU -0.9% and p95 -2.9%, footprint CPU per turn -2.9%).
+
+## A bot that never asks, and made bots held to their maker (#983)
+
+2026-11-14, Linux 6.18 cloud VM, 4 CPUs, Python 3 and the bench venv.
+Base is main `9556455`; head is this pull request with the second review
+round applied. Both are local release builds with the same locked
+dependencies. Binary SHA-256:
+
+- Base: `42af1d65ffd82d5e5b1e58f2d2cfa63dffaedb5b07c88a873f3e90360d2bd9a3`.
+- Head: `2c89990d3857991aac6524a289b23c75743e9e01d6bff1e24fd4275466bb97d0`.
+
+On the tool-execution path, each call adds one comparison
+(`approval_policy` is `never`), which short-circuits for every bot that
+doesn't set it. A bot that sets it gets a refused call as one storage job,
+the same job a gate's denial uses. On `create`, the made-bot checks
+(`Settings::beyond`, and a name lookup for a create asking for no gate)
+read only the creator's row the store already reads. There are no new
+per-bot fields beyond the one setting, and no new tasks or timers. The
+schema, sync policy and publication-after-commit boundaries are unchanged.
+
+### Required matched screen
+
+The four daemon screens ran in base/head/head/base order, with the Perf
+workflow's settings. Admission and completion use five measured repeats,
+footprint uses two (1,000 bots), and lifecycle uses one (32 bots, socket
+echo, five tool schemas). Each invocation has its usual excluded warmup.
+Footprint and lifecycle then ran three more times on each side, in
+head/base/base/head/head/base order, because the first two lifecycle runs
+on this shared VM were 0.37 to 0.47 s. The table gives the medians over
+every measured run.
+
+| Bench | Measure | Base | Head | Change |
+| --- | --- | ---: | ---: | ---: |
+| admission | lone submit CPU, ms | 25.984 | 25.428 | -2.1% |
+| admission | burst submit p99, ms | 3.477 | 3.340 | -3.9% |
+| completion | release to terminal p99, ms | 8.473 | 9.281 | +9.5% |
+| footprint | idle RSS, MiB | 16.43 | 16.586 | +1.0% |
+| footprint | per idle bot, KiB | 2.096 | 2.074 | -1.0% |
+| footprint | RSS after a turn each, MiB | 34.096 | 32.846 | -3.7% |
+| footprint | CPU per turn, ms | 0.699 | 0.733 | +4.9% |
+| lifecycle | CPU, s | 0.42 | 0.42 | +0.0% |
+| lifecycle | p95 turn, ms | 575.052 | 575.298 | +0.0% |
+| lifecycle | peak RSS, MiB | 24.797 | 25.363 | +2.3% |
+
+`bench.perf_gate` reports no count failures and no warnings: store work
+per turn is the same. The timing moves fall inside each other's ranges:
+
+- Footprint CPU per turn: base 0.595 to 0.743 ms, head 0.672 to 0.741 ms.
+- Lifecycle CPU: base 0.40 to 0.44 s, head 0.39 to 0.44 s.
+
+### Approval overhead at 1 and 400 bots
+
+`bench.approval_overhead`, on the same binaries before the review round,
+in alternating runs. The low end is 1 bot × 200 turns × 3 rounds; the high
+end is 400 bots × 8 turns × 5 rounds. Arms are `ungated`, and `held` (one
+gated `shell` call per turn, allowed within the hold).
+
+| Scale | Arm | CPU ms/turn, base → head | p50 ms | Store B/turn | Jobs/turn |
+| --- | --- | --- | --- | --- | --- |
+| 1 | ungated | 4.80 → 4.65 | 7.8 → 8.2 | 4772 → 4772 | 31.52 → 31.52 |
+| 1 | held | 5.40 → 5.00 | 9.1 → 8.7 | 5120 → 5120 | 33.52 → 33.52 |
+| 400 | ungated | 1.488 → 1.497 | 498 → 504 | 3269 → 3268 | 11.333 → 11.336 |
+| 400 | held | 2.141 → 2.197 | 770 → 767 | 3596 → 3594 | 13.266 → 13.267 |
+
+Ranges overlap at 400 held: base 2.11 to 2.25, head 2.14 to 2.29.
+
+## Unreadable folders (deny_read) screen
+
+Screens the change that hides `~/.agent/keys` (and any `--unreadable`
+folder) from sandboxed commands and the read tool. Base is main at
+`9556455`, head is `a8ddd2a`, both built with the release profile on one
+Linux host with 4 CPUs and run alternately, two rounds of base then head:
+admission and completion at five repeats, footprint at two, lifecycle at
+one (32 bots, socket echo, five tool schemas). Binaries by SHA-256:
+
+- Base: `42af1d65…a9d3`.
+- Head: `c18b179a…913e`.
+
+`bench.perf_gate` reports no failures or warnings.
+
+| Bench | Measure | Base | Head | Change |
+| --- | --- | ---: | ---: | ---: |
+| admission | lone submit CPU, ms | 34.738 | 36.206 | +4.2% |
+| admission | burst submit p99, ms | 4.316 | 4.239 | -1.8% |
+| completion | release to terminal p99, ms | 10.334 | 10.031 | -2.9% |
+| footprint | idle RSS, MiB | 16.266 | 16.176 | -0.6% |
+| footprint | per idle bot, KiB | 1.924 | 1.992 | +3.5% |
+| footprint | RSS after a turn each, MiB | 30.648 | 34.66 | +13.1% |
+| footprint | CPU per turn, ms | 0.783 | 0.812 | +3.7% |
+| lifecycle | CPU, s | 0.54 | 0.53 | -1.9% |
+| lifecycle | p95 turn, ms | 582.213 | 581.903 | -0.1% |
+| lifecycle | peak RSS, MiB | 24.787 | 24.926 | +0.6% |
+
+The footprint "RSS after a turn" row is noise: two more rounds gave base
+32.7, 33.6, 33.3, 39.3 MiB and head 31.6, 39.5, 30.8, 30.1 MiB, so across
+all eight runs each side spans about 30 to 39 MiB with medians of 32.1
+(base) and 32.7 (head). Footprint and lifecycle run unsandboxed, so they
+do not reach the new code. What the change adds is bounded: one
+`readlink` of `/proc/self/fd` (or `F_GETPATH` on macOS) per read-tool call,
+only for a sandboxed bot with hidden folders, and one `is_dir` stat per
+hidden folder inside the `spawn_blocking` that `sandbox::hold` already runs
+before each command. Nothing new runs on the runtime thread. No paid
+providers were used.
+
+## A key's own lines hidden, and only them (#978)
+
+Block redaction (`--redact-block`, which Sonny always sets to
+`PRIVATE KEY`) runs over every tool output, so it is on the hot path for
+every Sonny-run daemon. What each path pays now:
+
+- **Text with no block start**: the same one search for `-----BEGIN ` as
+  before.
+- **A header**: its closing dashes are found by a dash search, and the
+  header must end its line (or, as JSON holds a key, end in an escaped
+  line end).
+- **A secret block's body**: one search for its END within 256 KiB of its
+  header, stopping at another block's BEGIN that starts a line. With no
+  END, its lines are read one at a time and only a key's own lines are
+  hidden.
+- **A key that JSON holds**: its line is searched for its END, then the
+  text before that END for a line's end, an unescaped quote and another
+  block's BEGIN at an escaped line's start. Each search goes on from where
+  the last header's stopped, so a line of many headers is read once.
+- **Memory**: a stream holds at most 256 KiB of a secret block's body
+  while it looks for its END, and at most 64 KiB of an escaped one's.
+- **The store**: nothing new.
+
+The redaction path itself, `Credentials::redact` over 64 KiB pieces
+(whole) and `Redacting` fed 8 KiB pieces (stream), `PRIVATE KEY` as the
+block, release builds, best of 25, three alternating rounds, minimum
+over the rounds. 2026-11-14, Linux 6.18 cloud VM, 4 CPUs. Base is main
+`a5312f0`; head is `30ea8f6`.
+
+| Text | Path | Base ms | Head ms | Change |
+| --- | --- | ---: | ---: | ---: |
+| code, 4 MiB, no block | whole | 1.38 | 1.41 | +2% |
+| code, 4 MiB, no block | stream | 0.57 | 0.58 | +2% |
+| code with a key every 4 KiB, 4 MiB | whole | 1.90 | 1.56 | -18% |
+| code with a key every 4 KiB, 4 MiB | stream | 0.80 | 0.81 | +1% |
+| rules, tables and certificates, 4 MiB | whole | 4.36 | 4.45 | +2% |
+| rules, tables and certificates, 4 MiB | stream | 3.74 | 4.04 | +8% |
+| rules and tables, 4 MiB | whole | 3.55 | 3.81 | +7% |
+| rules and tables, 4 MiB | stream | 2.86 | 2.91 | +2% |
+| certificates only, 3.9 MiB | whole | 5.25 | 5.33 | +2% |
+| certificates only, 3.9 MiB | stream | 4.94 | 5.64 | +14% |
+| keys JSON holds, one per line, 3 MiB | whole | 6.91 | 3.21 | -54% |
+| keys JSON holds, one per line, 3 MiB | stream | 1.99 | 3.02 | +52% |
+
+What moves: a stream of certificates pays about 10 ns more per header
+that names no secret block (the header's line end is now checked, and the
+escaped form tried), and a stream of keys that JSON holds about 70 ns more
+per key, for the searches that tell a key from a pattern (its END, then a
+line's end, the string's end or another BEGIN before it). The whole text
+of those keys reads in half the time. Code with no block, code with keys
+in it, and rules stay within the run-to-run spread (rules whole moved
+between -4% and +7% over rounds of the same builds).
+
+### Required matched screen
+
+The four daemon screens never set `--redact-block`, so they don't reach
+the changed code; they check that nothing else moved. The Perf workflow
+ran them on this pull request's head `9c5c844` (its last change is to a
+test only), merged onto main `04d9a55`, against base `a5312f0`, in two
+alternating rounds on one runner. Admission and completion use five
+measured repeats, footprint two (1,000 bots), lifecycle one (32 bots,
+socket echo, five tool schemas).
+
+| Bench | Measure | Base | Head | Change |
+| --- | --- | ---: | ---: | ---: |
+| admission | lone submit CPU, ms | 23.222 | 22.763 | -2.0% |
+| admission | burst submit p99, ms | 2.281 | 2.327 | +2.0% |
+| completion | release to terminal p99, ms | 6.304 | 6.425 | +1.9% |
+| footprint | idle RSS, MiB | 16.4 | 16.398 | 0.0% |
+| footprint | per idle bot, KiB | 1.976 | 1.808 | -8.5% |
+| footprint | RSS after a turn each, MiB | 57.572 | 63.117 | +9.6% |
+| footprint | CPU per turn, ms | 0.592 | 0.609 | +2.9% |
+| lifecycle | CPU, s | 0.31 | 0.28 | -9.7% |
+| lifecycle | p95 turn, ms | 571.835 | 570.227 | -0.3% |
+| lifecycle | peak RSS, MiB | 25.182 | 24.883 | -1.2% |
+
+`bench.perf_gate` reports no count failures: store work per turn is the
+same. Its one warning is the footprint's RSS after a turn each, the
+high-water mark of 1,000 concurrent turns that redact no block: head's
+four runs were 46.1 to 68.2 MiB and base's 54.2 to 60.4 MiB, so the
+ranges overlap, and head's lowest run is below every base run.
+
+## Links followed in a write's path (#1003)
+
+2026-11-14, Linux 6.18 cloud VM, 4 CPUs, Python 3 and the bench venv.
+Base is main `f12b4ff`; head is this pull request at `ac5130d`. The later
+review rounds read links from the path as given, keep what was read with
+a call that parks, and keep one entry per path instead of every link on
+the way, which makes judging cheaper; none of it runs on these screens. Both are local release builds (`--bin agent`) with
+the same locked dependencies. Binary SHA-256:
+
+- Base: `b43971e30e59a3d8bb8e03df8fa02a6f99c684ccfe20a96f995df6791f2ed965`.
+- Head: `7c538a222d2d54064187ea5d7a5f95d209b715f91386e400d94eb1c00af9617c`.
+
+What the change adds is per call, never per bot: for a bot in
+`workspace-write` mode, each `write`, `edit` or `apply_patch` call has
+the links in its paths read once, in `spawn_blocking`, before the round
+judges it (an `lstat` and, for a link, a `readlink` per path part in a
+folder the bot can't change, at most 40 links per path). Where each path
+leads travels with the call, one entry per path it names, so judging is
+one lookup per path and reads no file on the runtime thread. A call that
+parks keeps it in the turn's stored `waiting` row; a call that reads
+nothing stores nothing. Other modes, other tools and shell calls do
+no new work, and nothing grows with the number of agents: no table, task
+or timer is added. The protocol and schema are unchanged.
+
+### Required matched screen
+
+The four daemon screens ran in base/head order for two rounds, with the
+Perf workflow's settings. Admission and completion use five measured
+repeats, footprint uses two (1,000 bots), and lifecycle uses one (32
+bots, socket echo, five tool schemas). Each invocation has its usual
+excluded warmup. Medians over every measured run:
+
+| Bench | Measure | Base | Head | Change |
+| --- | --- | ---: | ---: | ---: |
+| admission | lone submit CPU, ms | 41.519 | 39.187 | -5.6% |
+| admission | burst submit p99, ms | 4.397 | 5.187 | +18.0% |
+| completion | release to terminal p99, ms | 12.096 | 11.178 | -7.6% |
+| footprint | idle RSS, MiB | 16.379 | 16.346 | -0.2% |
+| footprint | per idle bot, KiB | 1.972 | 1.9 | -3.7% |
+| footprint | RSS after a turn each, MiB | 34.689 | 36.908 | +6.4% |
+| footprint | CPU per turn, ms | 0.927 | 1.059 | +14.2% |
+| lifecycle | CPU, s | 0.625 | 0.65 | +4.0% |
+| lifecycle | p95 turn, ms | 585.281 | 585.215 | -0.0% |
+| lifecycle | peak RSS, MiB | 25.191 | 25.297 | +0.4% |
+
+`bench.perf_gate` reports no count failures and no warnings: store work
+per turn is the same on both sides. The two larger timing moves fall
+inside each other's ranges, on screens that never reach the new code
+(admission and footprint call no tools):
+
+- Admission burst p99: base 4.23 to 7.47 ms, head 4.04 to 7.01 ms.
+- Footprint CPU per turn: base 0.907 to 1.049 ms, head 0.999 to 1.065 ms.
+
+## Reasoning a provider refuses, withheld for Responses bots
+
+2026-11-14, Linux 6.18 cloud VM, 4 CPUs, Python 3 and the bench venv.
+Base is main `f12b4ff`; head is this change on it. Both are local release
+builds (`--bin agent`) with the same locked dependencies. Binary SHA-256:
+
+- Base: `b43971e30e59a3d8bb8e03df8fa02a6f99c684ccfe20a96f995df6791f2ed965`.
+- Head: `a064e8c6c033becd437e6b5c0cac88601530c19dda69647ce6624f65c7b374f6`.
+
+A Responses bot whose reasoning no provider has refused does no new work
+on a model call: no fingerprint is hashed, nothing is written, and no
+reasoning item is read apart from the window. Only after a 400 on
+replayed reasoning does a bot resend once without it, and from then on
+it reads which of its items are reasoning, so it can leave them out. That
+is per bot and per call, and nothing grows with the number of agents. The
+protocol and schema are unchanged.
+
+### Required matched screen
+
+The four daemon screens ran in base/head order for two rounds, with the
+Perf workflow's settings. Admission and completion use five measured
+repeats, footprint uses two (1,000 bots), and lifecycle uses one (32
+bots, socket echo, five tool schemas). Medians over every measured run:
+
+| Bench | Measure | Base | Head | Change |
+| --- | --- | ---: | ---: | ---: |
+| admission | lone submit CPU, ms | 41.519 | 42.832 | +3.2% |
+| admission | burst submit p99, ms | 4.397 | 5.376 | +22.3% |
+| completion | release to terminal p99, ms | 12.096 | 12.58 | +4.0% |
+| footprint | idle RSS, MiB | 16.379 | 16.334 | -0.3% |
+| footprint | per idle bot, KiB | 1.972 | 2.112 | +7.1% |
+| footprint | RSS after a turn each, MiB | 34.689 | 37.52 | +8.2% |
+| footprint | CPU per turn, ms | 0.927 | 0.925 | -0.2% |
+| lifecycle | CPU, s | 0.625 | 0.635 | +1.6% |
+| lifecycle | p95 turn, ms | 585.281 | 599.275 | +2.4% |
+| lifecycle | peak RSS, MiB | 25.191 | 25.688 | +2.0% |
+
+`bench.perf_gate` reports no count failures and no warnings: store work
+per turn is the same. The larger moves fall inside each other's ranges,
+on screens that make no Responses model call (admission and footprint):
+
+- Admission burst p99: base 4.23 to 7.47 ms, head 4.41 to 8.1 ms.
+- Footprint per idle bot: base 1.852 to 2.064 KiB, head 1.932 to 2.248 KiB.
+- Footprint RSS after a turn: base 33.0 to 41.9 MiB, head 32.2 to 43.5 MiB.
+
+### Responses turns at 8 and 5,000 agents
+
+At the low end, `bench.scale_screen --bots 8 --jitter 0.5 --seconds 20`,
+with a streaming Responses model and back-to-back turns so the windows
+grow, in alternating runs:
+
+| Run | Turns | Daemon CPU ms/turn | Store jobs/turn | p50 ms | p95 ms | Peak RSS MiB |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| base 1 | 66 | 6.15 | 10.95 | 2449 | 3320 | 21.9 |
+| base 2 | 72 | 5.76 | 11.03 | 2100 | 3322 | 21.8 |
+| head 1 | 73 | 6.00 | 11.03 | 2354 | 3252 | 21.9 |
+| head 2 | 67 | 6.16 | 10.96 | 2471 | 3342 | 21.9 |
+| head 3 | 67 | 6.16 | 11.01 | 2423 | 3322 | 21.8 |
+
+At 5,000 stored agents, `bench.fleet_screen --bots 5000 --max-active 64
+--parked 1000 --delay-ms 100 --no-restart`:
+
+| Run | Create/s | Turns/s | p50 ms | p95 ms | Max ms | Peak RSS MiB | Park s | Drain s |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| base 1 | 757 | 473.3 | 109 | 113 | 122 | 26.35 | 1.96 | 1.58 |
+| base 2 | 746 | 427.1 | 110 | 114 | 163 | 25.73 | 2.41 | 1.80 |
+| head 1 | 776 | 478.7 | 109 | 113 | 125 | 26.10 | 1.95 | 1.57 |
+| head 2 | 715 | 465.1 | 109 | 113 | 159 | 26.09 | 2.22 | 1.57 |
+
+Store jobs per turn are the same on both sides at both scales, and the
+timing moves fall within run-to-run spread.

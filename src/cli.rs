@@ -21,7 +21,7 @@ const COMMANDS: &[Command] = &[
         about: "Send a prompt to a bot, or make one with --new; prints the turn as it runs",
         usage: "run [OPTIONS] [--] PROMPT...",
         flags: "--bot --new --created-by --fork --allow --expires --detach --delivery --attach-wait --turn --model --workspace --effort --turn-budget-tokens --budget-counts --image --quote --agents --profile --request-id --bot-id --pretty --no-spawn",
-        settings: "--tools --instructions --instructions-file --budget-tokens --compaction-instructions --compaction-instructions-file --compaction-model --no-compaction --fallback --approval --approve --context-bytes --context-items --note-turns --compact-at --compact-keep --compact-tokens --max-rounds --max-drops --keep-turns --approval-hold --max-output-tokens --cache-ttl --speed --sandbox --writable --network --hide-senders --quiet-background --hold --unix-socket --outputs",
+        settings: "--tools --instructions --instructions-file --budget-tokens --compaction-instructions --compaction-instructions-file --compaction-model --no-compaction --fallback --approval --approve --context-bytes --context-items --note-turns --compact-at --compact-keep --compact-tokens --max-rounds --max-drops --keep-turns --approval-hold --max-output-tokens --cache-ttl --speed --sandbox --writable --network --trailer --quiet-background --hold --unix-socket --outputs",
         startup: true,
     },
     Command {
@@ -261,7 +261,7 @@ const COMMANDS: &[Command] = &[
         name: "serve",
         about: "Run the daemon in the foreground; other commands start it for you",
         usage: "serve --store PATH --provider SPEC... [OPTIONS]",
-        flags: "--shell-exclude --redact-field --redact-block --protect --protect-existing --protect-path --wall --own-copy --context-window --speeds --fallbacks --models --provider-config --await-owner",
+        flags: "--shell-exclude --redact-field --redact-block --protect --protect-existing --protect-path --wall --unreadable --own-copy --context-window --speeds --fallbacks --models --provider-config --await-owner",
         settings: "",
         startup: true,
     },
@@ -500,6 +500,10 @@ fn print_flags(flags: &str) {
                 "FOLDER",
                 "Keep every sandboxed command, the network on or not, from connecting to the Unix sockets in FOLDER, made private (mode 700) if missing; a wall for sockets, not a way to hide files: on Linux the folder shows empty to a sandboxed command, on macOS its files stay readable, and the read tool, which the daemon answers outside any sandbox, reads them on both; repeatable",
             ),
+            "--unreadable" => (
+                "FOLDER",
+                "Keep every sandboxed command from reading, writing, linking to or renaming FOLDER or what is in it, by its absolute path, and the read tool from reading them for a sandboxed bot, as Codex's deny_read; made private (mode 700) if missing; clients pass ~/.agent/keys; repeatable",
+            ),
             "--own-copy" => (
                 "FOLDER",
                 "On Linux, show the system folder FOLDER in every sandbox from a read-only copy the person owns, kept in step with it, for files a program takes only from root or the person; repeatable",
@@ -570,9 +574,9 @@ fn print_flags(flags: &str) {
                 "PATH",
                 "Where a new bot's tool outputs cut for the model are written whole, one file per stream; default the outputs folder beside the store",
             ),
-            "--hide-senders" => (
-                "",
-                "A new bot's model reads what other bots and clients send it with no line naming the sender",
+            "--trailer" => (
+                "LIST",
+                "What the line after each message's words names for a new bot's model: sender, time, both comma-separated, or \"\" for no line; default sender",
             ),
             "--quiet-background" => (
                 "",
@@ -600,7 +604,7 @@ fn print_flags(flags: &str) {
             ),
             "--approval" => (
                 "MODE",
-                "A new bot's approval: full, manual, or auto; default AGENT_APPROVAL or full",
+                "A new bot's approval: full, manual, auto, or never (refuse what would need approval, asking no one, also under a gate it keeps from its creator); default AGENT_APPROVAL or full",
             ),
             "--approve" => (
                 "LIST",
@@ -802,6 +806,7 @@ pub fn prepare(args: Vec<String>) -> Result<Option<Vec<String>>> {
                     | "--protect-existing"
                     | "--protect-path"
                     | "--wall"
+                    | "--unreadable"
                     | "--own-copy"
                     | "--context-window"
                     | "--speeds"
@@ -827,7 +832,6 @@ pub fn prepare(args: Vec<String>) -> Result<Option<Vec<String>>> {
                 | "--no-compaction"
                 | "--agents"
                 | "--network"
-                | "--hide-senders"
                 | "--quiet-background"
                 | "--discover"
         ) {
@@ -990,7 +994,7 @@ pub fn prepare(args: Vec<String>) -> Result<Option<Vec<String>>> {
             "--sandbox",
             "--writable",
             "--network",
-            "--hide-senders",
+            "--trailer",
             "--quiet-background",
             "--hold",
             "--unix-socket",
@@ -1006,7 +1010,7 @@ pub fn prepare(args: Vec<String>) -> Result<Option<Vec<String>>> {
     {
         return fail_with(
             "usage",
-            "instructions, budget, approval, sandbox, senders and compaction are creation options; use --new",
+            "instructions, budget, approval, sandbox, trailer and compaction are creation options; use --new",
         );
     }
     Ok(Some(out))

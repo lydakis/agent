@@ -372,7 +372,7 @@ mod tests {
         };
         for gates in [
             json!([{"tag": "ci", "tools": ["shell"]}]),
-            json!([{"tag": "auto", "tools": ["shell"]}, {"tag": "manual", "tools": ["shell"]}]),
+            json!([{"tag": "auto", "tools": ["shell"]}, {"tag": "ci", "tools": ["shell"]}]),
         ] {
             let custom = declare(
                 &json!({"gates": gates, "declared": tools(a_lead())}),

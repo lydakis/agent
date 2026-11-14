@@ -148,7 +148,7 @@ writes them:
   newest event however old, such as each pull request's last word;
   `.up` and `.down_since` while it is down
 - `file('PATH')`: a file in your folder, `| fromjson` making JSON fields
-  of it
+  of it; never one in a folder kept from agents (`read_denied`)
 - `now()`, and `| ago` and `| time` for a time in seconds
 
 ```

@@ -262,7 +262,18 @@ pinned the same day (Gemini CLI `2fe7c2d`, goose `04ed836`, OpenHands SDK
   Tool definitions never change, so the prompt cache is untouched. This is
   a guard against accidents, not a boundary: the creator is declared by
   the shell's environment, and a command that clears it creates an ungated
-  bot. The approver sees that command first.
+  bot. The approver sees that command first. A `create` that asks for no
+  gate at all (`approve: []`) for a bot whose creator has one is refused
+  with `invalid_gate`: it would keep its creator's anyway.
+- **`approval_policy: "never"` refuses instead of asking,** as Codex's
+  `never` does. The bot keeps its gates, and a call any of them would hold
+  is denied at once with `approval_refused`, its audit row saying no one
+  was asked; no `approval_requested` is written. A call its sandbox
+  confines runs inside it as before, and one that asks to leave is
+  `escalation_refused`. A bot made by a bot that never asks never asks
+  either, and configuring it can't change that, so a made bot is held
+  like its maker or tighter, never looser. A command an `allow` rule
+  lets out of the sandbox still runs, as in Codex.
 - **The request rides the plan commit.** When `append` records a model
   response whose calls include gated tools, the same transaction marks
   those `tools` rows as needing a verdict and writes one

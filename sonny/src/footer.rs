@@ -85,13 +85,10 @@ impl Item {
 }
 
 /// A count as the state table writes it: its mark in its hue, then the
-/// number, no word (the marks differ, so they read without colour);
+/// number, no word (the marks differ, so they read without color);
 /// gone last when `goes`.
-pub fn count(mark: &'static str, color: Color, n: usize, goes: bool) -> Vec<Vec<Span<'static>>> {
-    let mut forms = vec![vec![
-        Span::raw(mark).fg(color),
-        Span::raw(format!(" {n}")).dim(),
-    ]];
+pub fn count(mark: Span<'static>, n: usize, goes: bool) -> Vec<Vec<Span<'static>>> {
+    let mut forms = vec![vec![mark, Span::raw(format!(" {n}")).dim()]];
     if goes {
         forms.push(Vec::new());
     }
@@ -261,10 +258,19 @@ mod tests {
                     "",
                 ],
             ),
-            Item::new(Slot::Needs, count("?", Color::Yellow, 1, false)).opens("status"),
-            Item::new(Slot::Failed, count("✗", Color::Red, 1, false)).opens("background"),
-            Item::new(Slot::Working, count("●", Color::Cyan, 2, true)).opens("status"),
-            Item::new(Slot::Idle, count("○", Color::Green, 4, true)).opens("status"),
+            Item::new(
+                Slot::Needs,
+                count(crate::status::sign("needs you"), 1, false),
+            )
+            .opens("status"),
+            Item::new(Slot::Failed, count(crate::status::sign("failed"), 1, false))
+                .opens("background"),
+            Item::new(
+                Slot::Working,
+                count(crate::status::sign("working"), 2, true),
+            )
+            .opens("status"),
+            Item::new(Slot::Idle, count(crate::status::sign("idle"), 4, true)).opens("status"),
             Item::new(
                 Slot::LowContext,
                 vec![

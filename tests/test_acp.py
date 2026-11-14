@@ -14,7 +14,13 @@ import unittest
 
 from bench.socket_client import SocketClient
 from bench.targets import clean_env
-from tests.test_runtime import SENT, ModelFixture
+from tests.test_runtime import ModelFixture
+
+# The daemon's line after a message Sonny's agents read: who wrote it, then
+# when it was sent.
+# As Sonny makes its agents.
+SONNY_MADE = {'trailer': ['sender', 'time']}
+SENT = r' Sent [A-Z][a-z]{2} \d{1,2} [A-Z][a-z]{2} \d{4} \d{2}:\d{2}, UTC[+-]\d{2}:\d{2}\.'
 from tests.test_served import declared
 
 
@@ -228,9 +234,8 @@ class AcpTests(ModelFixture):
         self.assertRegex(started['toolCallId'], rf"^{turn['turn']}/.+")
         self.assertEqual(ended['toolCallId'], started['toolCallId'])
         prompts = self.daemon.request('prompts', bot='calc.lead', turn=turn['turn'])['result']['prompts']
-        # Stamped with when it was sent, as every message Sonny passes on.
-        self.assertRegex(prompts[0]['text'], SENT)
-        self.assertEqual(SENT.sub('', prompts[0]['text']), 'script')
+        # The words as written: the daemon's line after them says when.
+        self.assertEqual(prompts[0]['text'], 'script')
 
         # The task opens as the lead thread's child, with its brief as the
         # first message, through this thread's own tools.
@@ -608,7 +613,7 @@ class AcpTests(ModelFixture):
         repo = self.repo()
         self.daemon.request('create', bot='calc.lead', workspace=str(repo), model='openai/synthetic-model',
                             instructions='Lead.', declare=[declared('start_task', inherit=False)],
-                            approve=['start_task'], approver='manual')
+                            approve=['start_task'], approver='manual', settings=SONNY_MADE)
         env = {k: v for k, v in self.env.items() if not k.startswith('T3_')}
         thread = Thread(self, env, repo)
         thread.answer_of(thread.ask('initialize', {'protocolVersion': 2, 'clientCapabilities': {},
@@ -627,11 +632,10 @@ class AcpTests(ModelFixture):
                                                '_meta': {'person': 'ana'}})
         [asked] = [m for m in thread.until(lambda m: m.get('method') == 'session/request_permission')
                    if m.get('method') == 'session/request_permission']
-        # The model read who wrote it, after the words and their time.
+        # The model read the words, then who wrote them and when.
         content = self.model.requests.get(timeout=5)['input'][-1]['content']
-        self.assertRegex(content[0]['text'], SENT)
-        self.assertTrue(content[0]['text'].startswith('script\n\n'))
-        self.assertRegex(content[1]['text'], r'^\[Message calc\.lead/\d+, written by ana\.\]$')
+        self.assertEqual(content[0]['text'], 'script')
+        self.assertRegex(content[1]['text'], rf'^\[Message calc\.lead/\d+, written by ana\.{SENT}\]$')
         thread.send({'id': asked['id'], 'result': {'outcome': {'outcome': 'selected', 'optionId': 'deny'},
                                                    '_meta': {'person': 'bo'}}})
         answered, _ = thread.answer_of(prompt)
@@ -647,7 +651,7 @@ class AcpTests(ModelFixture):
         words of the person the client names."""
         repo = self.repo()
         self.daemon.request('create', bot='calc.lead', workspace=str(repo), model='openai/synthetic-model',
-                            instructions='Lead.', declare=[declared('react')])
+                            instructions='Lead.', declare=[declared('react')], settings=SONNY_MADE)
         self.daemon.request('create', bot='calc.lead.billing', workspace=str(repo),
                             model='openai/synthetic-model', instructions='Lead.')
         env = {k: v for k, v in self.env.items() if not k.startswith('T3_')}
@@ -699,7 +703,7 @@ class AcpTests(ModelFixture):
         self.assertIn('> done\n\n🎉', said)
         self.assertEqual(said.count('> done\n\n🎉'), 1)
         self.assertIn('👍', said)
-        self.assertRegex(said[said.index('👍') + 1], r'^\[Message calc\.lead/\d+, written by ana\.\]$')
+        self.assertRegex(said[said.index('👍') + 1], rf'^\[Message calc\.lead/\d+, written by ana\.{SENT}\]$')
         # Taken off: off in the window too, and the lead is not told.
         self.assertIn('result', react({'messageId': older, 'emoji': '🎉', 'remove': True}))
         self.assertEqual(json.loads(file.read_text()), {})
@@ -777,10 +781,10 @@ class AcpTests(ModelFixture):
                  if item.get('role') == 'user' and isinstance(item.get('content'), list)
                  for part in item['content'] if 'text' in part}
         database_answer = next(t for t in texts if t.startswith('You asked (') and 'Which database?' in t)
-        self.assertRegex(database_answer, r'^You asked \(ask:\d+/script-0\): Which database\?\n\nPostgres\n\n\[Sent ')
+        self.assertRegex(database_answer, r'^You asked \(ask:\d+/script-0\): Which database\?\n\nPostgres$')
         cache_answer = next(t for t in texts if t.startswith('You asked (') and 'Which cache?' in t)
-        self.assertRegex(cache_answer, r'^You asked \(ask:\d+/script-0\.1\): Which cache\?\n\nNone\n\n\[Sent ')
-        self.assertTrue(any(re.fullmatch(r'\[Message calc\.lead\.script/\d+, written by ana\.\]', t)
+        self.assertRegex(cache_answer, r'^You asked \(ask:\d+/script-0\.1\): Which cache\?\n\nNone$')
+        self.assertTrue(any(re.fullmatch(rf'\[Message calc\.lead\.script/\d+, written by ana\.{SENT}\]', t)
                             for t in texts), texts)
         # Once the person's answers are in, a question asked live comes as a
         # form on the call that put it; declined, it waits on.
@@ -883,7 +887,7 @@ class AcpTests(ModelFixture):
         self.assertNotIn('toolCallId', database['params'])
         thread.send({'id': database['id'], 'result': {'action': 'accept', 'content': {'pick': '2'}}})
         [answer] = until_answered('calc.fix', 1)
-        self.assertRegex(answer, r'^You asked \(ask:\d+/script-0\): Which database\?\n\nPostgres\n\n\[Sent ')
+        self.assertRegex(answer, r'^You asked \(ask:\d+/script-0\): Which database\?\n\nPostgres$')
         thread.send({'id': cache['id'], 'result': {'action': 'accept', 'content': {'pick': '1'}}})
         self.assertIn('Which cache?\n\nNone', until_answered('calc.fix', 2)[-1])
         self.assertEqual(self.daemon.request('turns', bot='calc.lead')['result']['turns'], [])

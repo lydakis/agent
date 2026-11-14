@@ -5,7 +5,8 @@
 //! (Apache-2.0; see NOTICE), and kept in step with them.
 //!
 //! A bot with a sandbox writes only its roots: its folder, the folders its
-//! client named, and the temporary directories. Reading stays open. Inside
+//! client named, and the temporary directories. Reading stays open but for
+//! the paths the daemon keeps unreadable, as Codex's `deny_read`. Inside
 //! each root, what git, agent configuration and AWS profiles run or trust
 //! stays read-only, and so does the daemon's own store. Network is off
 //! unless the bot's client turned it on.
@@ -108,6 +109,10 @@ pub struct Policy {
     /// copy of it, bound read-only in its place: `(copy, place)`.
     #[serde(default)]
     pub owned: Vec<(PathBuf, PathBuf)>,
+    /// The folders its commands may not read, nor write, link to or
+    /// rename, and the `read` tool doesn't read for it
+    /// ([`Daemon::unreadable`]).
+    pub unreadable: Vec<PathBuf>,
 }
 
 impl Policy {
@@ -171,13 +176,56 @@ impl Policy {
             helper: daemon.helper.clone(),
             sockets: Vec::new(),
             walled: daemon.walled.clone(),
-            owned: owned(&daemon.owned),
+            // None that holds or is in a folder it may not read: its copy
+            // would show what the folder hides, at a name of its own.
+            owned: owned(
+                &(daemon.owned.iter())
+                    .filter(|place| {
+                        !(daemon.unreadable.iter())
+                            .any(|hidden| hidden.starts_with(place) || place.starts_with(hidden))
+                    })
+                    .cloned()
+                    .collect::<Vec<_>>(),
+            ),
             daemons,
+            // One under another is masked with it: a mask under one
+            // already closed would have nowhere to go.
+            unreadable: (daemon.unreadable.iter())
+                .filter(|hidden| {
+                    !(daemon.unreadable.iter())
+                        .any(|other| other != *hidden && hidden.starts_with(other))
+                })
+                .fold(Vec::new(), |mut kept, hidden| {
+                    if !kept.contains(hidden) {
+                        kept.push(hidden.clone());
+                    }
+                    kept
+                }),
         }))
     }
 
     /// This policy, its commands also reaching the Unix sockets at or under
     /// `paths`, absolute paths its settings name.
+    /// What a sandboxed bot's `read` keeps to when no command sandbox is
+    /// built for it, as the daemon reads for it outside any: `daemon`'s
+    /// folders no sandboxed bot reads, and nothing else. A command run in it
+    /// would write nothing and reach no network.
+    pub fn reads(daemon: &Daemon) -> Policy {
+        Policy {
+            roots: Vec::new(),
+            network: false,
+            socket: None,
+            capability: None,
+            listening: None,
+            helper: None,
+            sockets: Vec::new(),
+            walled: Vec::new(),
+            daemons: Vec::new(),
+            owned: Vec::new(),
+            unreadable: daemon.unreadable.clone(),
+        }
+    }
+
     pub fn with_sockets(mut self, paths: &[String]) -> Policy {
         self.sockets.extend(paths.iter().map(PathBuf::from));
         self
@@ -191,6 +239,20 @@ impl Policy {
         real(path).is_some_and(|path| self.writes(&path))
     }
 
+    /// Whether a command in this sandbox may read `path`, an absolute path:
+    /// all but what is kept unreadable and what is under it, by the real
+    /// path a read follows links to.
+    pub fn can_read(&self, path: &Path) -> bool {
+        real(path).is_some_and(|path| !self.hides(&path))
+    }
+
+    /// Whether `path`, a real path, is kept unreadable, or is under what is.
+    fn hides(&self, path: &Path) -> bool {
+        self.unreadable
+            .iter()
+            .any(|hidden| path.starts_with(hidden))
+    }
+
     /// Whether a command in this sandbox may remove `path`, an absolute
     /// path: the name itself in the folder that holds it, so a link is
     /// judged where it lies, as removing it would remove it there, not by
@@ -202,22 +264,24 @@ impl Policy {
         real(folder).is_some_and(|folder| self.writes(&folder.join(name)))
     }
 
-    /// Whether the deepest root that holds `path`, a real path, lets it be
-    /// written.
+    /// Whether `path`, a real path, is not kept unreadable and the deepest
+    /// root that holds it lets it be written.
     fn writes(&self, path: &Path) -> bool {
-        self.roots
-            .iter()
-            .rev()
-            .find(|root| path.starts_with(&root.path))
-            .is_some_and(|root| {
-                !root
-                    .read_only
-                    .iter()
-                    .chain(&root.missing)
-                    .chain(&root.left)
-                    .chain(&root.others)
-                    .any(|kept| path.starts_with(kept))
-            })
+        !self.hides(path)
+            && self
+                .roots
+                .iter()
+                .rev()
+                .find(|root| path.starts_with(&root.path))
+                .is_some_and(|root| {
+                    !root
+                        .read_only
+                        .iter()
+                        .chain(&root.missing)
+                        .chain(&root.left)
+                        .chain(&root.others)
+                        .any(|kept| path.starts_with(kept))
+                })
     }
 }
 
@@ -387,9 +451,11 @@ pub fn confinable(tool: &str) -> bool {
 /// command that asks to escalate, or a write, edit or patch of a path
 /// outside every folder the bot may write. `root` is the bot's folder and `folder`
 /// the turn's, against which a relative path is read. Decided from the call
-/// and the folders' names alone, never from the files as they are now, so
-/// the round that announces a call and the run that starts it agree; a
-/// confined write is still checked against the real path when it runs.
+/// and the folders' names, with only the links the bot can't change
+/// followed as [`learn`] read them for this call (`links`, carried with
+/// it), so the round that announces a call, the store that records it and
+/// the run that starts it agree; a confined write is still checked against
+/// the real path when it runs.
 pub fn escapes(
     mode: Mode,
     root: Option<&Path>,
@@ -397,26 +463,180 @@ pub fn escapes(
     tool: &str,
     arguments: &str,
     folder: &Path,
+    links: &Links,
 ) -> bool {
     let Ok(arguments) = serde_json::from_str::<serde_json::Value>(arguments) else {
         return false;
     };
+    if tool == "shell" {
+        return arguments["sandbox_permissions"] == "require_escalated";
+    }
+    let writable = writable_paths(mode, root, writable);
+    // A patch escapes when any file it changes would.
+    any_written(tool, &arguments, |path, removed| {
+        let named = lexical(&folder.join(path));
+        // A path [`learn`] did not follow is judged as spelled.
+        let escapes = |removed| {
+            let target = links.target(path, removed).unwrap_or(&named);
+            outside(mode, &writable, &named, target)
+        };
+        // A removal takes the entry, but the tool also checks what it
+        // leads to before running it, so it escapes when either is
+        // outside.
+        escapes(removed) || (removed && escapes(false))
+    })
+}
+
+/// Whether `test` holds for any path a write, edit or patch call writes
+/// or removes, told which: a removed one is the folder's entry, never what
+/// a link there leads to.
+fn any_written(
+    tool: &str,
+    arguments: &serde_json::Value,
+    mut test: impl FnMut(&str, bool) -> bool,
+) -> bool {
     match tool {
-        "shell" => arguments["sandbox_permissions"] == "require_escalated",
         "write" | "edit" => arguments["path"]
             .as_str()
-            .is_some_and(|path| outside(mode, root, writable, folder, path)),
-        // A patch escapes when any file it changes would.
+            .is_some_and(|path| test(path, false)),
         "apply_patch" => arguments["input"]
             .as_str()
             .and_then(|input| crate::tools::Patch::parse(input).ok())
             .is_some_and(|patch| {
-                patch
-                    .paths()
-                    .any(|path| outside(mode, root, writable, folder, path))
+                patch.written().any(|path| test(path, false))
+                    || patch.removed().any(|path| test(path, true))
             }),
         _ => false,
     }
+}
+
+/// Where a write, edit or patch call's paths lead, each with the links
+/// in it followed whose folders the bot can't change ([`judged`]), by the
+/// path as the call gives it and whether the call removes it. Read once
+/// by [`learn`], off the runtime thread, and carried with the call, so
+/// every judgment of it reads no file, looks up one entry per path, and
+/// agrees; a path not in it (unread, or a link that couldn't be told) is
+/// judged as spelled. Kept with a call that parks, so it resumes judged
+/// as it was announced. One entry per path the call names, so it is no
+/// bigger than the call. Calls are equal whatever was read for them.
+#[derive(Clone, Debug, Default)]
+pub struct Links(Option<std::sync::Arc<std::collections::HashMap<(String, bool), PathBuf>>>);
+
+/// [`Links`] as kept: each path, whether it is removed, and where it
+/// leads. [`learn`] keeps no target that isn't UTF-8, so none is lost.
+type KeptLinks = Option<Vec<(String, bool, String)>>;
+
+impl serde::Serialize for Links {
+    fn serialize<S: serde::Serializer>(
+        &self,
+        serializer: S,
+    ) -> std::result::Result<S::Ok, S::Error> {
+        let kept: KeptLinks = self.0.as_deref().map(|links| {
+            links
+                .iter()
+                .filter_map(|((path, removed), to)| {
+                    Some((path.clone(), *removed, to.to_str()?.to_owned()))
+                })
+                .collect()
+        });
+        kept.serialize(serializer)
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for Links {
+    fn deserialize<D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> std::result::Result<Self, D::Error> {
+        let kept = <KeptLinks as serde::Deserialize>::deserialize(deserializer)?;
+        Ok(Links(kept.map(|links| {
+            std::sync::Arc::new(
+                links
+                    .into_iter()
+                    .map(|(path, removed, to)| ((path, removed), PathBuf::from(to)))
+                    .collect(),
+            )
+        })))
+    }
+}
+
+impl PartialEq for Links {
+    fn eq(&self, _: &Self) -> bool {
+        true
+    }
+}
+
+impl Eq for Links {}
+
+impl Links {
+    /// Whether [`learn`] read them.
+    pub fn read(&self) -> bool {
+        self.0.is_some()
+    }
+
+    /// Whether [`learn`] has not read them: nothing to keep.
+    pub fn unread(&self) -> bool {
+        self.0.is_none()
+    }
+
+    /// Where `path`, as the call gives it, leads, if [`learn`] read it.
+    fn target(&self, path: &str, removed: bool) -> Option<&PathBuf> {
+        self.0.as_deref()?.get(&(path.to_owned(), removed))
+    }
+}
+
+/// Read where a call's paths lead, `tool` with `arguments`, for a bot in
+/// `mode`: each link followed in the path as given, so a `..` after one
+/// leaves where it leads, as the kernel reads it. Blocks: run it off the
+/// runtime thread.
+pub fn learn(
+    mode: Mode,
+    root: Option<&Path>,
+    writable: &[String],
+    tool: &str,
+    arguments: &str,
+    folder: &Path,
+) -> Links {
+    let writable = writable_paths(mode, root, writable);
+    let mut links = std::collections::HashMap::new();
+    if let Ok(arguments) = serde_json::from_str::<serde_json::Value>(arguments) {
+        any_written(tool, &arguments, |path, removed| {
+            // A removal is judged as the entry and as what it leads to.
+            let ways: &[bool] = if removed { &[true, false] } else { &[false] };
+            for &removed in ways {
+                let read = |path: &Path| Some(read_link(path));
+                let target = judgeable(path)
+                    .then(|| {
+                        let changeable = |dir: &Path| changeable(mode, &writable, dir);
+                        judged(&folder.join(path), changeable, read, removed)
+                    })
+                    .flatten()
+                    // Kept only as a name a parked call can keep whole, so
+                    // the call is judged the same once it resumes.
+                    .filter(|target| target.to_str().is_some());
+                if let Some(target) = target {
+                    links.insert((path.to_owned(), removed), target);
+                }
+            }
+            false
+        });
+    }
+    Links(Some(std::sync::Arc::new(links)))
+}
+
+/// What the link at `path` names; `None` when it is no link or can't be
+/// read.
+fn read_link(path: &Path) -> Option<PathBuf> {
+    std::fs::symlink_metadata(path)
+        .is_ok_and(|meta| meta.file_type().is_symlink())
+        .then(|| std::fs::read_link(path).ok())
+        .flatten()
+}
+
+/// Whether a write's path is one whose links are followed: one a write
+/// could name, of up to 4096 bytes (as the tools take) with no NUL byte.
+/// Any other is judged as spelled, and the tool refuses it anyway.
+fn judgeable(path: &str) -> bool {
+    path.len() <= 4096 && !path.contains('\0')
 }
 
 /// The words of each command in a plain script, as bash reads them; `None`
@@ -482,24 +702,82 @@ pub(crate) fn commands(script: &str) -> Option<Vec<Vec<String>>> {
     Some(commands)
 }
 
-/// Whether `path`, read against `folder`, lies outside every folder a bot
-/// in `mode` may write.
-fn outside(
-    mode: Mode,
-    root: Option<&Path>,
-    writable: &[String],
-    folder: &Path,
-    path: &str,
-) -> bool {
-    let target = lexical(&folder.join(path));
-    let inside = |dir: &Path| target.starts_with(dir);
+/// Whether a path, `named` as spelled and `target` with links followed,
+/// lies outside every folder a bot in `mode` may write.
+fn outside(mode: Mode, writable: &[PathBuf], named: &Path, target: &Path) -> bool {
+    // Inside as spelled or as followed: a folder may be given by a link.
+    let inside = |dir: &Path| named.starts_with(dir) || target.starts_with(dir);
     let temporary = temporary()
         .iter()
         .any(|(named, real)| mode == Mode::WorkspaceWrite && (inside(named) || inside(real)));
-    !(temporary
-        || writable_paths(mode, root, writable)
-            .iter()
-            .any(|dir| inside(dir)))
+    !(temporary || writable.iter().any(|dir| inside(dir)))
+}
+
+/// Whether a bot that writes `writable` may change what is in `dir`.
+fn changeable(mode: Mode, writable: &[PathBuf], dir: &Path) -> bool {
+    writable.iter().any(|root| dir.starts_with(root))
+        || (mode == Mode::WorkspaceWrite
+            && temporary().iter().any(|(named, _)| dir.starts_with(named)))
+}
+
+/// `path` with each link in it followed whose folder the bot can't
+/// write (`changeable` false), as a home or system folder reached through
+/// a link: such a link stays as it is between the round that judges a
+/// call and the run that starts it. A link in a folder the bot writes is
+/// left as spelled, as Codex substitutes no mutable link's target. Each
+/// target is read by name, as the path itself is. `link` says what a path
+/// links to, `Some(None)` for no link; `None` when it can't say, and then
+/// so does this. A `removed` path's last part is the folder's entry, as a
+/// removal takes it, so a link there is not followed.
+fn judged(
+    path: &Path,
+    changeable: impl Fn(&Path) -> bool,
+    mut link: impl FnMut(&Path) -> Option<Option<PathBuf>>,
+    removed: bool,
+) -> Option<PathBuf> {
+    // As many links as Linux follows in one path.
+    const LINKS: usize = 40;
+    let mut out = PathBuf::new();
+    let mut rest: Vec<_> = path
+        .components()
+        .rev()
+        .map(|part| part.as_os_str().to_owned())
+        .collect();
+    let mut followed = 0;
+    while let Some(part) = rest.pop() {
+        // A `..` or `.` in a target is read by name, as in the path.
+        if part == "." {
+            continue;
+        }
+        if part == ".." {
+            out.pop();
+            continue;
+        }
+        let next = out.join(&part);
+        let followable = followed < LINKS
+            && !out.as_os_str().is_empty()
+            && !(removed && rest.is_empty())
+            && !changeable(&out);
+        let target = match followable {
+            true => link(&next)?,
+            false => None,
+        };
+        let Some(target) = target else {
+            out = next;
+            continue;
+        };
+        followed += 1;
+        // The target's parts are read on from where the link was, or
+        // from the top when it names a whole path.
+        if target.is_absolute() {
+            out = PathBuf::from("/");
+        }
+        rest.extend(target.components().rev().filter_map(|part| match part {
+            Component::RootDir | Component::Prefix(_) => None,
+            part => Some(part.as_os_str().to_owned()),
+        }));
+    }
+    Some(out)
 }
 
 /// `path` with `.` dropped and `..` taken back, by name alone.
@@ -553,6 +831,15 @@ pub struct Daemon {
     /// overflow user's. Each is shown from a read-only copy the person
     /// owns (`--own-copy`). The client starting the daemon names them.
     pub owned: Vec<PathBuf>,
+    /// Folders no sandboxed command reads, nor writes, links to or renames,
+    /// nor anything in them, and the `read` tool doesn't read for a
+    /// sandboxed bot (`--unreadable`), as Codex's `deny_read`: the person's
+    /// keys, which a command that read them could send anywhere the
+    /// network reaches. The client starting the daemon names them. Each by
+    /// its real path once it exists; a missing one by the real path of the
+    /// folder it would be made in. Folders, not files: a file replaced by
+    /// a rename, as one is saved whole, would take its Linux mask with it.
+    pub unreadable: Vec<PathBuf>,
     /// Where the person's daemons list themselves ([`known`]), whose
     /// stores and sockets every root and policy keeps out of reach as it
     /// does this daemon's own.
@@ -733,6 +1020,13 @@ fn root(path: &Path, daemon: &Daemon, others: &[known::Known]) -> Result<Root> {
     {
         hold_journals(store);
         read_only.extend(store_files(store).filter(|file| file.exists()));
+    }
+    // A folder it may not read is masked as each command starts, made
+    // first if it is gone ([`hold`]), so none is ever open to a command.
+    for kept in (daemon.unreadable.iter()).filter(|kept| kept.starts_with(path)) {
+        if std::fs::symlink_metadata(kept).is_ok_and(|found| found.file_type().is_symlink()) {
+            return linked(kept);
+        }
     }
     // A walled folder too: renamed, or a socket made in it, it would let
     // one out past its rule.
@@ -1011,6 +1305,21 @@ mod linux {
         args.extend(["--ro-bind", "/", "/", "--dev", "/dev"].map(String::from));
         for root in &policy.roots {
             args.extend(["--bind".into(), path(&root.path), path(&root.path)]);
+            // Each folder between the root and a folder it may not read,
+            // bound on itself so no command renames it: moved, it would
+            // take the folder out from under its mask and its name, as
+            // Seatbelt anchors them. First, under what is kept read-only.
+            let mut anchored: Vec<&Path> = (policy.unreadable.iter())
+                .filter(|hidden| hidden.starts_with(&root.path))
+                .flat_map(|hidden| hidden.ancestors().skip(1))
+                .filter(|folder| folder.starts_with(&root.path) && *folder != root.path)
+                .collect();
+            anchored.sort();
+            anchored.dedup();
+            anchored.sort_by_key(|folder| depth(folder));
+            for folder in anchored {
+                args.extend(["--bind".into(), path(folder), path(folder)]);
+            }
             let mut kept: Vec<&PathBuf> = root.read_only.iter().collect();
             kept.sort_by_key(|path| depth(path));
             for kept in kept {
@@ -1092,6 +1401,29 @@ mod linux {
         // program checks the owner of, over the folders themselves.
         for (copy, place) in &policy.owned {
             args.extend(["--ro-bind".into(), path(copy), path(place)]);
+        }
+        // A folder it may not read, out of sight, as Codex hides its
+        // deny_read folders: empty and closed, over every other mount, so
+        // nothing shown later opens it again. [`super::hold`] made it if it
+        // was gone. What changes in it, the keys file replaced by a rename
+        // among them, stays behind the mask, which a rename over a file
+        // would take down.
+        // One in a walled folder is out of sight with it already, the
+        // walled folder an empty one with no place for its mask.
+        for hidden in (policy.unreadable.iter()).filter(|hidden| {
+            !policy
+                .walled
+                .iter()
+                .any(|walled| hidden.starts_with(walled))
+        }) {
+            args.extend([
+                "--perms".into(),
+                "000".into(),
+                "--tmpfs".into(),
+                path(hidden),
+                "--remount-ro".into(),
+                path(hidden),
+            ]);
         }
         args.extend(["--unshare-user", "--unshare-pid", "--unshare-ipc"].map(String::from));
         if !policy.network {
@@ -1681,7 +2013,10 @@ pub struct Hold(
 /// each walled folder something removed since: bubblewrap mounts over every
 /// one and has no mount point to make on a read-only root, and a command
 /// left without the wall would reach the sockets of one made again while it
-/// runs. One that cannot be made is left to fail its command, closed.
+/// runs. Each folder it may not read that is gone is made the same way: on
+/// Linux it is masked where it is, and one made while the command ran
+/// would be open to it. One that cannot be made is left to fail its
+/// command, closed.
 pub async fn hold(policy: &Policy) -> Hold {
     let (paths, walled): (Vec<PathBuf>, Vec<PathBuf>) = match cfg!(target_os = "linux") {
         true => (
@@ -1694,16 +2029,17 @@ pub async fn hold(policy: &Policy) -> Hold {
         ),
         false => (Vec::new(), Vec::new()),
     };
+    let hidden = policy.unreadable.clone();
     let left = policy
         .roots
         .iter()
         .flat_map(|root| root.left.iter().cloned())
         .collect();
-    let held = match paths.is_empty() && walled.is_empty() {
+    let held = match paths.is_empty() && walled.is_empty() && hidden.is_empty() {
         true => Vec::new(),
         false => tokio::task::spawn_blocking(move || {
             use std::os::unix::fs::DirBuilderExt;
-            for folder in walled.iter().filter(|folder| !folder.is_dir()) {
+            for folder in (walled.iter().chain(&hidden)).filter(|folder| !folder.is_dir()) {
                 let _ = std::fs::DirBuilder::new()
                     .recursive(true)
                     .mode(0o700)
@@ -1887,6 +2223,7 @@ pub fn seatbelt(policy: &Policy) -> (String, Vec<(String, PathBuf)>) {
         .chain(&policy.socket)
         .chain(&policy.walled)
         .chain(&policy.daemons)
+        .chain(&policy.unreadable)
         .flat_map(|kept| kept.ancestors().skip(1))
         .filter(|folder| {
             policy
@@ -1978,6 +2315,17 @@ pub fn seatbelt(policy: &Policy) -> (String, Vec<(String, PathBuf)>) {
         sections.push(format!(
             "(allow system-socket (socket-domain AF_UNIX))\n\
              (allow network-outbound (remote unix-socket (subpath (param \"{key}\"))))"
+        ));
+    }
+    // Never what it may not read, nor written, made or linked to under
+    // another name, as Codex denies its deny_read paths: after every allow,
+    // so the deny wins.
+    for hidden in &policy.unreadable {
+        let key = param(hidden);
+        sections.push(format!(
+            "(deny file-read* (subpath (param \"{key}\")))\n\
+             (deny file-write* (subpath (param \"{key}\")))\n\
+             (deny file-link (subpath (param \"{key}\")))"
         ));
     }
     sections.push(SEATBELT_PREFERENCES.to_owned());
@@ -2153,6 +2501,76 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
     }
 
+    /// What the daemon keeps unreadable no command reads, writes, links to
+    /// or renames, in its roots or out of them, by any link to it, nor
+    /// anything in it; the rest of what it may read and write is as it was.
+    #[test]
+    fn an_unreadable_folder_is_closed_to_every_command() {
+        let base = std::env::temp_dir().join(format!("agent-sandbox-hide-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(base.join("work/keys")).unwrap();
+        std::fs::create_dir_all(base.join("home/keys")).unwrap();
+        std::fs::write(base.join("home/keys/env"), "KEY=x").unwrap();
+        let base = std::fs::canonicalize(&base).unwrap();
+        let (work, home, keys) = (
+            base.join("work"),
+            base.join("home/keys"),
+            base.join("work/keys"),
+        );
+        std::os::unix::fs::symlink(&home, work.join("linked")).unwrap();
+        // A folder shown from the person's copy that holds one, or is in
+        // one, isn't copied: the copy would show it at a name of its own.
+        let daemon = Daemon {
+            unreadable: vec![home.clone(), keys.clone()],
+            owned: vec![base.join("home"), home.join("sub")],
+            ..protecting()
+        };
+        let policy = Policy::new(Some(Mode::WorkspaceWrite), Some(&work), &[], true, &daemon)
+            .unwrap()
+            .unwrap();
+        assert!(policy.owned.is_empty());
+        for hidden in [
+            &home,
+            &home.join("env"),
+            &work.join("linked/env"),
+            &keys,
+            &keys.join("id"),
+        ] {
+            assert!(!policy.can_read(hidden), "{}", hidden.display());
+            assert!(!policy.can_write(hidden), "{}", hidden.display());
+        }
+        assert!(!policy.can_remove(&keys));
+        assert!(policy.can_read(&base.join("home")) && policy.can_read(&work.join("notes")));
+        assert!(policy.can_write(&work.join("notes")));
+        let (profile, params) = seatbelt(&policy);
+        for hidden in [&home, &keys] {
+            let (key, _) = params.iter().find(|(_, path)| path == hidden).unwrap();
+            for operation in ["file-read*", "file-write*", "file-link"] {
+                let rule = format!("(deny {operation} (subpath (param \"{key}\")))");
+                assert!(profile.contains(&rule), "{rule}");
+            }
+        }
+        // After the allow it overrides.
+        let allow = profile.find("(allow file-read*)").unwrap();
+        assert!(profile.rfind("(deny file-read*").unwrap() > allow);
+        #[cfg(target_os = "linux")]
+        {
+            // Closed over every other mount, the person's copies too.
+            let mut policy = policy.clone();
+            policy.owned = vec![(base.join("copy"), keys.clone())];
+            let args = linux::args(&policy, false);
+            for hidden in [&home, &keys] {
+                let hidden = hidden.to_string_lossy();
+                let mask = args
+                    .windows(4)
+                    .position(|w| w[0] == "000" && w[1] == "--tmpfs" && w[2] == hidden)
+                    .unwrap();
+                assert!(!args[mask..].iter().any(|arg| arg == "--ro-bind"));
+            }
+        }
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
     #[test]
     fn a_call_escapes_by_asking_or_by_writing_outside_its_roots() {
         let root = Path::new("/work/project");
@@ -2164,6 +2582,7 @@ mod tests {
                 tool,
                 &arguments.to_string(),
                 Path::new("/work/project/sub"),
+                &Links::default(),
             )
         };
         assert!(!escapes("shell", serde_json::json!({"command":"make"})));
@@ -2204,6 +2623,98 @@ mod tests {
             "apply_patch",
             serde_json::json!({"input":"not a patch"})
         ));
+        // A link the bot can't change is followed: a home reached through
+        // one is the folder it names. One in a folder the bot writes is
+        // not, so a write through it is judged by its spelling.
+        let base = std::env::temp_dir().join(format!("agent-escapes-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let real = std::fs::canonicalize(std::env::temp_dir())
+            .unwrap()
+            .join(format!("agent-escapes-{}", std::process::id()));
+        let home = real.join("home/person");
+        let project = home.join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::create_dir_all(real.join("fixed")).unwrap();
+        std::os::unix::fs::symlink(&home, real.join("fixed/me")).unwrap();
+        std::os::unix::fs::symlink("../../../fixed", project.join("out")).unwrap();
+        let fixed = |dir: &Path| dir.starts_with(&project);
+        // Judging reads no file: a link not read for the call leaves the
+        // path unjudged, so it is taken as spelled.
+        let unread = real.join("fixed/me/project/a.txt");
+        assert_eq!(judged(&unread, fixed, |_| None, false), None);
+        let followed = |path: &Path, removed| {
+            // The test's folders are in the temporary folder, which every
+            // bot writes: judged as if its links were in a fixed folder.
+            judged(path, fixed, |path| Some(read_link(path)), removed).unwrap()
+        };
+        assert_eq!(followed(&unread, false), project.join("a.txt"));
+        // A `..` after a followed link reads from where it led.
+        assert_eq!(
+            followed(&real.join("fixed/me/../person/project/b"), false),
+            project.join("b")
+        );
+        // Through a link in the project, as spelled.
+        assert_eq!(
+            followed(&project.join("out/me/x"), false),
+            project.join("out/me/x")
+        );
+        // A removal takes the link itself, not where it leads.
+        assert_eq!(
+            followed(&real.join("fixed/me"), true),
+            real.join("fixed/me")
+        );
+        assert_eq!(followed(&real.join("fixed/me"), false), home);
+        // What was read goes with the call: a link changed since changes
+        // nothing a call already read judges by, and a call read later
+        // sees the change.
+        let arguments = serde_json::json!({"path": unread, "content": ""}).to_string();
+        let learn = || {
+            super::learn(
+                Mode::ReadOnly,
+                None,
+                &[],
+                "write",
+                &arguments,
+                Path::new("/"),
+            )
+        };
+        let given = unread.to_str().unwrap();
+        let link = |links: &Links| links.target(given, false).cloned();
+        let first = learn();
+        assert!(first.read() && !Links::default().read());
+        assert_eq!(link(&first), Some(project.join("a.txt")));
+        // One entry per path the call names, whatever it passed.
+        assert_eq!(first.0.as_deref().map(|links| links.len()), Some(1));
+        // Kept with a parked call, it comes back as read.
+        let kept: Links = serde_json::from_str(&serde_json::to_string(&first).unwrap()).unwrap();
+        assert_eq!(link(&kept), Some(project.join("a.txt")));
+        assert!(serde_json::from_str::<Links>("null").unwrap().unread());
+        std::fs::remove_file(real.join("fixed/me")).unwrap();
+        std::os::unix::fs::symlink(real.join("fixed"), real.join("fixed/me")).unwrap();
+        assert_eq!(link(&first), Some(project.join("a.txt")));
+        assert_eq!(link(&learn()), Some(real.join("fixed/project/a.txt")));
+        // A removal is kept both as the entry and as what it leads to.
+        let gone = real.join("fixed/me");
+        let patch = format!(
+            "*** Begin Patch\n*** Delete File: {}\n*** End Patch",
+            gone.display()
+        );
+        let removal = super::learn(
+            Mode::ReadOnly,
+            None,
+            &[],
+            "apply_patch",
+            &serde_json::json!({ "input": patch }).to_string(),
+            Path::new("/"),
+        );
+        let given = gone.to_str().unwrap();
+        assert_eq!(removal.target(given, true), Some(&gone));
+        assert_eq!(removal.target(given, false), Some(&real.join("fixed")));
+        // A path no tool takes is never read.
+        assert!(judgeable(&"a".repeat(4096)));
+        assert!(!judgeable(&"a".repeat(4097)));
+        assert!(!judgeable("a\0b"));
+        let _ = std::fs::remove_dir_all(&base);
         // Read-only writes nowhere, so every write asks.
         assert!(super::escapes(
             Mode::ReadOnly,
@@ -2211,7 +2722,8 @@ mod tests {
             &[],
             "write",
             r#"{"path":"a.txt","content":""}"#,
-            root
+            root,
+            &Links::default()
         ));
     }
 
@@ -2786,6 +3298,7 @@ mod tests {
             walled: Vec::new(),
             owned: Vec::new(),
             daemons: Vec::new(),
+            unreadable: Vec::new(),
         };
         let (profile, params) = seatbelt(&policy);
         let size = profile.len()

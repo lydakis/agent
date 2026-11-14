@@ -4,7 +4,7 @@ For installation and your first task, start with the [quickstart](README.md).
 This reference covers settings, integrations, controls, and their detailed behavior.
 
 [Installation](#installation) · [Projects](#projects-and-leads) ·
-[Setup](#provider-setup) · [Configuration](#roles-for-leads-and-tasks) ·
+[Setup](#provider-setup) · [Configuration](#profiles-for-leads-and-tasks) ·
 [Terminal layout](#terminal-layout) · [ACP](#acp-clients) ·
 [Keyboard](#writing-messages) · [Commands](#commands) ·
 [Display](#conversation-display)
@@ -31,13 +31,13 @@ latest one into `~/.local`:
 
     curl -fsSL https://raw.githubusercontent.com/lydakis/agent/main/install.sh | sh
 
-`sonny update` updates either install to the latest release, replaces the
+`sonny upgrade` upgrades either install to the latest release, replaces the
 running daemon with the new one (its running turns continue on it) and has
-open windows reopen on it ([docs/SONNY.md](../docs/SONNY.md#updating)).
+open windows reopen on it ([docs/SONNY.md](../docs/SONNY.md#upgrading)).
 
 For main without a version tag, `brew install lydakis/agent/sonny-nightly`
 fetches current main and builds Sonny and its matching daemon together. If
-stable Sonny is installed, run `brew unlink sonny` first. Update with
+stable Sonny is installed, run `brew unlink sonny` first. Upgrade with
 `brew update` and `brew reinstall lydakis/agent/sonny-nightly`: a reinstall
 fetches the latest main commit even when the formula's version is unchanged.
 No `--HEAD` or wait for a scheduled build is needed. `sonny --version` and
@@ -115,7 +115,7 @@ ships, the roles of a lead (`lead`, one that extends it, and the project's
 own, marked `•`) before the rest, each with its description. Then, for an
 agent that is not a lead, where it works: a worktree of its own (first in a
 git repository), this folder beside the lead, or an empty folder; a project
-whose tasks all work in its folder (`threads_in = "project"`) asks nothing.
+whose tasks all work in its folder (`task_in = "project"`) asks nothing.
 Then the first message, written in the composer under what it will start;
 Enter starts the agent with it and the window becomes that agent's. A lead
 stays in this folder, as every lead does, named NAME or after the message's
@@ -133,7 +133,8 @@ Claude Code's agents take `isolation` each time.
 that one thing and hold everything else back, and shows only your turns and
 its questions, in the middle of the window, under a footer of the focus and
 what needs you; it interrupts only with a question, and `/zen` again ends it
-and has the agent say what it held. The focus is the agent's to
+and has the agent say what it held (the slash menu says so while zen is on:
+"End zen and hear what was kept"). The focus is the agent's to
 read: a few hurried words are enough, and the footer shows the focus in its
 words. Asking in words ("let's go into zen on the receipts") works too.
 
@@ -147,7 +148,7 @@ skills and memory of the folder are the same for all of them.
 
 ## Provider setup
 
-`~/.agent/env` (`KEY=VALUE` lines, readable only by you) holds the provider
+`~/.agent/keys/env` (`KEY=VALUE` lines, readable only by you) holds the provider
 keys, and `AWS_PROFILE` for Bedrock, which `agent` applies over your shell's
 to every daemon it starts, whoever starts it; it does not set Agent's own
 names, so an `AGENT_` name there (`AGENT_PROVIDER` among them) is passed
@@ -210,8 +211,8 @@ that may be rebuilt or lost: memory, skills and profiles (`~/.agents`) and
 `~/.agent/config.toml` are copied into a clone of URL, a private git
 repository, at `~/agent-home`, committed and pushed every ten minutes by
 Sonny's scheduler, the one background job Sonny keeps
-([docs/SONNY.md](../docs/SONNY.md#the-scheduler)), which runs `sonny home
-sync`. Keys in `~/.agent/env`, logins and the daemon's store
+([docs/SONNY.md](../docs/SONNY.md#the-scheduler)), which runs `sonny backup
+sync`. Keys in `~/.agent/keys/env`, logins and the daemon's store
 stay out, and so does a `config.toml` that holds a secret itself (an MCP
 server's `http_headers`, or a key named like a token), which the sync names
 and leaves behind while memory still goes. Memory's own git history stays
@@ -219,7 +220,7 @@ out too, since a commit inside `~/.agents/memory` would make the nightly
 cleanup find nothing to do. On a machine that never synced, setup first
 restores what the repository holds, keeping a `config.toml` it replaces as
 `config.toml.before-restore`: a new box is `install.sh`, then `sonny setup
-backup URL`. `sonny home status` says how the last sync went. Pushing uses
+backup URL`. `sonny backup status` says how the last sync went. Pushing uses
 the person's own git credentials, read from the login shell. Sonny names
 no host for the repository. First-run setup offers it last, once, and an
 empty answer skips it; until backup is set up, the first lead after an
@@ -240,7 +241,7 @@ brings back the companions it keeps, the lookout and the tool host among
 them. Turning it off leaves the scheduler for automations, and a running
 daemon running.
 
-## Roles and upgrades
+## Profiles and upgrades
 
 A lead's transcript starts with a welcome, as Claude Code's does: Sonny,
 the robot the client is named for, as a portrait drawn in half blocks,
@@ -273,7 +274,7 @@ for anything that cannot be undone. A folder's own
 `.agents/agents/lead.md` or `task.md` comes first. The task settings from `.agents/project.toml` are composed after
 the lead's role, not kept in the file.
 
-### Roles for leads and tasks
+### Profiles for leads and tasks
 
 A lead runs as the `lead` profile and every other agent is told the `task`
 one, unless set to another. Another kind of lead is a profile of its own,
@@ -293,7 +294,7 @@ and a project file names it for its lead:
 | What | `~/.agent/config.toml` | `.agents/project.toml` |
 | --- | --- | --- |
 | The profile a lead runs as | `[sonny] lead_profile` | `profile` |
-| The profile every other agent is told | `[sonny] task_profile` | `threads_profile` |
+| The profile every other agent is told | `[sonny] task_profile` | `task_profile` |
 
 Sonny ships one such profile, `superlead` ([agents/superlead.md](agents/superlead.md)),
 written to `~/.agents/agents` beside the others and used by no lead
@@ -307,7 +308,7 @@ The project's wins, then the config's, then `lead` and `task`. A name that
 is not a profile in the folder's or the person's `.agents/agents` (nor one
 Sonny ships) stops the lead or task from being made, with
 `profile_not_found`. The profile is read when the lead's instructions are
-composed, so `/instructions` takes a change. `extends` and `skills` work
+composed, so a change takes at the lead's next idle point. `extends` and `skills` work
 in any profile ([CLIENT.md](../docs/CLIENT.md)); a profile that extends
 `lead` or `task` is not offered to agents as a role to start a peer in.
 
@@ -323,12 +324,13 @@ at its model's own effort (`AGENT_EFFORT` when its model is
 | What | `~/.agent/config.toml` | `.agents/project.toml` |
 | --- | --- | --- |
 | A new lead's effort | `[sonny] lead_effort` | `effort` |
-| Each new task's model | (the lead's) | `threads_model` |
-| Each new task's effort | `[sonny] task_effort` | `threads_effort` |
-| Each new task's speed (`standard`, `fast` or `ultrafast`) | `[sonny] task_speed` | `threads_speed` |
+| Each new task's model | (the lead's) | `task_model` |
+| Each new task's effort | `[sonny] task_effort` | `task_effort` |
+| Each new task's speed (`standard`, `fast` or `ultrafast`) | `[sonny] task_speed` | `task_speed` |
 | The reviewer's model, for agents in Auto ([REVIEWER.md](REVIEWER.md)) | `[reviewer] model`, `effort` | |
-| What `/side`'s copy may do | `[sonny] side_chat` (`fork`, the default, or `answer`) | |
-| The chime, the agent's steps, and every tool call drawn | `[sonny] chime`, `steps`, `verbose` (true or false) | |
+| How long a call in Auto waits for the reviewer's verdict before it goes to you | `[reviewer] timeout_ms` (90000 by default, as Codex's; 0 for as long as it takes) | |
+| What `/side`'s copy may do | `[sonny] side_chat` (`work`, the default, or `answer`) | |
+| The chime, and what the conversation shows | `[sonny] chime` (true or false), `view` (`words`, the default, `steps` or `verbose`) | |
 | The widest the conversation is written | `[sonny] text_width` (100 by default, at least 40, 0 for the window's whole width) | |
 | A guess at your next message | `[sonny] suggest` (true, the default, or false) | |
 | An idea or a tip where no guess is obvious | `[sonny] suggest_ideas` (true, the default, or false) | |
@@ -339,7 +341,7 @@ at its model's own effort (`AGENT_EFFORT` when its model is
 | Margin notes of your own, filled as their blanks change | `[sonny.notes.NAME] markdown`, `live`, `title` | |
 | Where a click on an agent's name goes | `[sonny] agent_opens` (`tab`, the default, or `beside`) | |
 | Which tasks open in a tab | `[sonny] task_tabs` (`asked`, the default, or `every`) | |
-| Task windows a lead keeps open | `[sonny] task_windows` (32 by default, 0 for no limit) | |
+| Task tabs a lead keeps open | `[sonny] most_task_tabs` (32 by default, 0 for no limit) | |
 | The daemon started with the machine | `[sonny] start_at_boot` (true or false, the default) | |
 | News from outside for the lookout | `[sonny.sources.NAME] command`, `every` | |
 
@@ -352,7 +354,7 @@ lead's effort after it is made.
 ## Terminal layout
 
 A lead moved to another
-folder (`--workspace`) comes back with the next message Sonny sends it from
+folder (`agent run --workspace`) comes back with the next message Sonny sends it from
 its own, history and all. When Sonny runs in a Rex block (`rex` found as
 `$REX`, on the PATH, or in the Mac app), a Herdr pane (`herdr` found as
 `$HERDR` or on the PATH) or a cmux tab (`cmux` found as the tab's own CLI,
@@ -364,7 +366,7 @@ same way. A task the lead (or one of its tasks) starts gets a window there
 without taking focus, its block (pane, cmux tab) labelled with the task's
 name, when someone asks for one: its starter, which asks when it judges you
 will want to watch it or talk to it (`start_task`'s `tab`, within
-`task_windows` as any task's window), an agent that shows it, you, from `/status` or a click on its name, or the task itself
+`most_task_tabs` as any task's tab), an agent that shows it, you, from `/status` or a click on its name, or the task itself
 coming to need you. The others, such as reviewers and a lead's own helpers,
 work without one; `/status` and the footer count them. With `[sonny]
 task_tabs = "every"`, each task gets its window as a turn of its starts. In Rex, each window reports OSC 7501 status, so Rex
@@ -414,27 +416,27 @@ project whose lead is in no multiplexer gets none, and its agents get no
 layout skill. A tab asked for stays until you or an agent close it, or the
 task is marked done. With `task_tabs = "every"`, a task's window
 closes once its work is taken: its turn completed and the lead (or the task
-that started it) waited on it. One that failed, stopped or waits on you stays
+that started it) waited on it. One that failed, was interrupted or waits on you stays
 open, and a task given more work opens again; ask the lead to show one, or
-run `sonny --agent NAME`. A lead keeps `[sonny] task_windows` of its tasks'
-windows open, 32 by default (0 for no limit), as VS Code's editor limit
-keeps editors: past it, a new one closes the window you used least
-recently, as each window's own Sonny saw you focus, type or click there
-(marked in `~/.agent/sonny/used/`). Only the lead's own tasks' windows
+run `sonny --agent NAME`. A lead keeps `[sonny] most_task_tabs` of its tasks'
+tabs open, 32 by default (0 for no limit), as VS Code's editor limit
+keeps editors: past it, a new one closes the tab you used least
+recently, as each tab's own Sonny saw you focus, type or click there
+(marked in `~/.agent/sonny/used/`). Only the lead's own tasks' tabs
 count and close, as another lead of the folder keeps its own; tasks shown
-together in one window count once and close together. One that
+together in one tab count once and close together. One that
 needs you (an approval, or a question open in it) or failed is never
 closed for room, as the
-lead heard or as that window's own Sonny last said (kept in
+lead heard or as that tab's own Sonny last said (kept in
 `~/.agent/sonny/held/`, so it holds across either one starting again);
-with no other, the limit is passed. A window you have not looked at yet is
+with no other, the limit is passed. A tab you have not looked at yet is
 not one you used least recently, so it is not closed for room either: while
-only such windows could make room, a new task's window does not open (the
-status row says so) and waits for you, as one closed for room does. A window closed for room stays closed while its
+only such tabs could make room, a new task's tab does not open (the
+status row says so) and waits for you, as one closed for room does. A tab closed for room stays closed while its
 task works on, and `/status` (or its name) opens it again, also after the
 lead starts again (kept in `~/.agent/sonny/aside/`); its `/status` row
-says `window set aside for room`. A task set aside that comes to need you
-opens its window again on its own, as what needs you keeps its window. `--rex-host HOST` puts the session on another Rex
+says `tab set aside for room`. A task set aside that comes to need you
+opens its tab again on its own, as what needs you keeps its tab. `--rex-host HOST` puts the session on another Rex
 server; `--no-layout` turns the layout off. Sonny writes a skill for each
 multiplexer the machine has to `~/.agents/skills` (`rex-windows`,
 `herdr-panes` and `cmux-tabs`, from `skills/`). Each sends the agent to
@@ -795,49 +797,61 @@ has something on it, or is off the screen, no time shows.
   agents, in `/status`, or to the lookout.
 
   ![A side chat forked with every tool writes a file beside the lead](../docs/sonny/side-fork.png)
-- `/config` (or `/settings`) lists every key `~/.agent/config.toml` takes,
-  with its value or what its default is, over the composer. ↑/↓ picks
-  one; ←/→ steps a key with a few values (efforts, `web_search`,
-  `senders`, `side_chat`, `chime`, `steps`, `verbose`, `margin_opens`, `agent_opens`, `suggest`,
-  `start_at_boot`) through them
-  and its default; Enter types one that takes a name (`model`, `provider`,
-  `reviewer.model`, the profiles), empty for its default; ⌫
-  takes a key back to its default. Each change is written at once, the
+- `/config` is a list over the composer like any other: at most eight
+  rows, the settings a person changes under seven groups (Models, Agents,
+  View, Margin, Tabs, Commons and sky, This machine), each by a plain
+  name with its value and a one-line label. A value set in the file is in
+  ink and a default muted. Typing narrows it to the settings it finds, by
+  name or label, best first. ↑/↓ picks one; ←/→ steps a setting with a
+  few values (efforts, the view, switches) through them and its default;
+  Enter types one that takes a name or a number (`model`, `provider`,
+  the profiles, `text width`), empty for its default; ⌫ with nothing typed,
+  or Delete, takes a setting back to its default. The file keeps its
+  table names, and the settings that only tune (the sky haiku's
+  `sky_haiku_daily`, `sky_haiku_keep`, `sky_haiku_window`,
+  `sky_haiku_margin` and `sky_haiku_hold`, `commons_invite_tokens`,
+  `tool_processes` and `lookout_waiting`) stay in the file, listed in the
+  `sonny-config` skill. Each change is written at once, the
   file's comments and order kept, and a file that does not read is
   refused by name, as every reader refuses it. What the file gives an
-  agent when it is made, `senders` and `hold`, every agent Sonny made
+  agent when it is made, `trailer` and `hold`, every agent Sonny made
   takes within seconds of the file changing, or, at work, once its turn
   ends. `[fallbacks]`, like `[speeds]` and `[context_windows]`, is the
   daemon's: every agent takes it once the daemon starts again.
 
-  ![/config over the composer, side_chat set to fork](../docs/sonny/config.png)
+  ![/config: the Models group under its bold name, a model set in ink and the defaults muted](../docs/sonny/config-groups.png)
+
+  `trailer` (senders, in `/config`) is what an agent's model reads in the daemon's line after
+  each message: `sender, time` by default for Sonny's agents (`[Message
+  site.lead/2. Sent Fri 13 Nov 2026 23:21, UTC-05:00.]`), `sender`,
+  `time` or `none`. Sonny draws the words without the line.
+
+  ![/config narrowed by typing view: → steps the view to verbose, saved](../docs/sonny/config-view.png)
 - `/model` picks the lead's model, from every model its provider family
   lists, each by its name and provider (`Opus 5.5 · bedrock`) with its id
-  muted after them, found by either, and its effort (←/→), and writes them to the project's
-  `.agents/project.toml` when the folder has one. A pick made while a turn
-  runs shows in the footer and applies when the lead is idle; one that
-  another client overtakes is dropped.
-- `/fast` picks how fast the lead's calls are served, from a list of
-  standard and each faster tier its provider serves: `fast` (Claude's
-  fast mode, OpenAI's priority tier) and `ultrafast`, each at a higher
-  price per token. The footer names the speed after the effort; a pick
-  made while a turn runs applies when the lead is idle. A provider that
-  serves standard alone, as Bedrock does for Claude, says so instead.
+  muted after them, found by either, its effort and its speed, and writes
+  the model and effort to the project's `.agents/project.toml` when the
+  folder has one. It always opens with ←/→ on the effort; Tab moves them
+  to the speed and back: standard, then each faster tier the picked model
+  serves, `fast` (Claude's fast mode, OpenAI's priority tier) and
+  `ultrafast`, each at a higher price per token. `‹ ›` sit only on the
+  value ←/→ change. A model served at standard alone, as Bedrock serves
+  Claude, has no speed row, and ←/→ go back to the effort; moving to a
+  model that lacks the picked speed shows standard. A click on `effort` or
+  `speed` moves ←/→ there, and a click on `‹` or `›` steps it. The footer
+  names the speed after the effort. A pick made while a turn runs shows in the footer and applies
+  when the lead is idle; one that another client overtakes is dropped.
   The tasks an agent starts on its own model run at its speed, as its
-  helpers do at theirs, unless `threads_speed` or `[sonny] task_speed`
-  names one; a task whose provider does not serve that speed starts at
+  helpers do at theirs, unless the project file's `task_speed` or
+  `[sonny] task_speed` names one; a task whose provider does not serve that speed starts at
   standard, and the start says so.
 
-  ![/fast: standard in effect, fast and ultrafast with what each costs](../docs/sonny/fast-mode-menu.png)
+  ![/model: the speed row picked with Tab, fast beside the effort](../docs/sonny/model-speed.png)
 - `/compact` asks first, then summarizes the lead's conversation before
   its next model call: at the running turn's next step, or before an idle lead's next
   reply. The daemon also compacts on its own once a call's input reaches
   the bot's `compact_tokens`, which follows the model's context window
   unless set (900,000 tokens on a 1M window).
-- `/instructions` gives the lead its folder's instructions again: its
-  role, `AGENTS.md`, skills and memory. Sonny does this on its own when
-  it opens a lead whose instructions it saw composed from the folder, and
-  leaves ones set any other way alone.
 - `/permissions` picks what agents may do, and who approves the rest, as
   Codex's `/permissions` pairs a sandbox with a reviewer:
 
@@ -855,9 +869,9 @@ has something on it, or is off the screen, no time shows.
   the sandbox waits for whoever approves; while the reviewer looks at one
   the status row says `Reviewing approval request` (Sonny keeps
   `sonny reviewer` as the daemon's companion when nothing serves it), and
-  a denied call is drawn as `✗ Request denied for …` with the reviewer's
-  reason, in either view; one you allow is drawn as `✓ Request allowed
-  for …`, as Codex records each decision. The status row above the
+  a denied call is drawn as `✗ The reviewer denied …` with the reviewer's
+  reason, in either view; one you allow is drawn as `✓ You allowed …`, as
+  Codex records each decision. The status row above the
   composer shows only the keys, since the call is written out whole right
   above it. The footer leads with the row unless it is the one new leads
   start in, each with its mark as Claude Code marks its modes: `⏵⏵ full
@@ -957,9 +971,12 @@ has something on it, or is off the screen, no time shows.
   any other daemon's socket or its agents' sockets, or those of the
   programs Sonny runs for agents outside the sandbox (`~/.agent/run`).
   A call to run outside the sandbox that may start a daemon waits for
-  you, never the reviewer alone. It leaves open reads of anything
-  you can read, as Codex's `workspace-write` does, your SSH keys, cloud
-  credentials and other projects included; the network, in every row but
+  you, never the reviewer alone. Nor can it read `~/.agent/keys`, the folder
+  of the keys the daemon runs with, which no agent's command needs (the `read` tool
+  refuses it too), nor any folder you list as `[sandbox] unreadable` in
+  `~/.agent/config.toml`, read when the daemon starts. It leaves open reads of anything
+  else you can read, as Codex's `workspace-write` does, your SSH keys, cloud
+  credentials and other projects included unless you list them; the network, in every row but
   Read only; and, while the network is on, every other Unix socket that a
   program signed in as you listens on, such as ssh-agent, MCPX and
   Docker, each of which acts as you. So the sandbox keeps an agent from
@@ -974,9 +991,17 @@ has something on it, or is off the screen, no time shows.
   sandbox, from the agent's next call. A call approved to run outside the
   sandbox still reaches whatever you can.
 
-  A call that waits on you is written out as Codex's approval shows it:
-  `⏸ Allow shell?`, the agent's own reason for it as `Reason:`, the
-  command, and what the reviewer doubted, whole. The calls of your lead's
+  A call that waits on you says what will happen, in words, never as a
+  function call: `⏸ Run git push origin main outside the sandbox?`,
+  `⏸ Start the task readme?`, `⏸ Add the automation nightly?`. Under it,
+  muted, come the agent's own reason, the command or the brief in full (a
+  tool Sonny has no words for lists its fields, never JSON), and what the
+  reviewer doubted, whole. Decided, it folds to one row that still says
+  what: `✓ You allowed starting readme`, `✓ The reviewer allowed git
+  status`, `✗ You denied git push origin main`, or, muted, `– The request
+  to start halves went away`. For a second after an approval leaves the
+  screen, a lone `y`, `n` or `a` meant for it is dropped instead of
+  starting a message. The calls of your lead's
   tasks wait in its window too, and, where the lead runs in a multiplexer
   (which is how its window follows other agents), so do those of the leads
   it follows by name (`follows`) and their tasks, at any depth, each under
@@ -984,6 +1009,8 @@ has something on it, or is off the screen, no time shows.
   you answer where you are, on that agent's own call, and it is gone from
   every window once answered in any. The questions they ask pin there the
   same way.
+
+  ![An approval in words: Run git push origin main outside the sandbox?, the agent's reason and the command muted under it](../docs/sonny/approval-words.png)
 
   ![An approval from a task, with its reason and the reviewer's note, waiting in its lead's window](../docs/sonny/approval-raised.png)
 
@@ -993,9 +1020,10 @@ has something on it, or is off the screen, no time shows.
 
   ![The call allowed, and cargo test outside the sandbox from now on](../docs/sonny/permissions-allowed.png)
 - `/retry` lists the calls the reviewer denied while Sonny watched, with
-  the reason for each. Enter writes the call out whole, and a second
-  Enter sends your approval of that exact call as your own message, so
-  the agent may retry it once; the retry is still reviewed, and the
+  the reason for each. Enter writes the call out whole and asks once
+  (`Allow one retry of shell? It can't be undone.`); Enter again sends
+  your approval of that exact call as your own message, so the agent may
+  retry it once, and any other key allows nothing; the retry is still reviewed, and the
   reviewer reads your words as consent. Codex calls this `/approve`.
 - `/status` shows the project's agents in the pane beside the
   conversation, grouped by where they stand, the lead first in its group,
@@ -1004,11 +1032,20 @@ has something on it, or is off the screen, no time shows.
   approval, asking you a question, or held on something only you can fix,
   such as a ChatGPT sign-in), **Failed** (its last turn failed; it asks
   nothing, and says what went wrong under it),
-  **Working** (a turn running, queued, rate limited, waiting on other
-  tasks, or `waiting on its reviewer` while the reviewer weighs a call), **Idle**
-  (its turn ended, stopped, or never started, with nothing open; a pull
-  request its last reply linked shows on its row), and **Done** (marked
-  done). Each agent is one line: its mark, name, state and time; one
+  **Working** (a turn running, queued, rate limited, starting, waiting on
+  other tasks, or `waiting on its reviewer` while the reviewer weighs a
+  call; a turn its pool holds more than five minutes says until when,
+  `rate limited until 14:05`, one a stop parked says `parked by a
+  restart`, which the next start goes on with, and one the pull cord
+  parked says `paused`), **Idle** (its turn ended with nothing open,
+  `idle`; ended without words, `no reply`; or you ended it,
+  `interrupted`; a pull request its last reply linked shows on its row),
+  and **Done** (marked done). One table gives every state its mark, for
+  the footer, `/status`, the tasks a lead started and `/switch` alike:
+  `?` needs you or held, `✗` failed, `●` working, `◌` waiting, queued,
+  rate limited, parked, paused or starting, `○` idle or no reply, `■`
+  interrupted, `✓` done; all but the first three muted.
+  Each agent is one line: its mark, name, state and time; one
   that needs you says what for under it, one that failed why. That is all it shows as it opens; `m` shows more and hides it
   again: at each row's right edge, dim, the rest of what it tracks: what it follows (a source with an
   `icon` in `[sonny.sources.NAME]` shows as that icon, as it does wherever
@@ -1016,11 +1053,13 @@ has something on it, or is off the screen, no time shows.
   request link its last reply holds, its background work
   and its window, and under the picked agent its model and profile, and
   its latest step. Idle and Done fold to their headings (`Idle · 5 ▸`,
-  `Done · 3 ▸`). A click on either, or `i` and `d`
-  with the keys in the pane, opens them, and the same folds them again.
+  `Done · 3 ▸`), each heading a row the keys pick: a click on it, `→` or
+  Enter opens it, and `←` folds it again, as does `←` on an agent in it.
+  `/status` opens with its first row picked.
   The helpers a task started fold under it (`▸ 2 helpers, 1 working`),
   a helper that needs you or failed listed in its group too; a click on that
-  line, or → on the picked task, opens them, and ← folds them. As threads in a claude.ai project are
+  line, or → on the picked task, opens them, and ← folds them. `x` stops a
+  picked workflow. As threads in a claude.ai project are
   resolved, a task marks itself done with the `mark_done` tool once
   nothing is left to do in it, such as when its pull request merged or
   you dropped the work, and the lead can mark any of its tasks done the
@@ -1044,20 +1083,24 @@ has something on it, or is off the screen, no time shows.
   its project's default. An agent with
   automations or follows of its own shows `↻ 2 automations` there too. A click on an agent's name goes
   to it as a click on a task in a roster does (below), and so does
-  Enter on the agent ↑ and ↓ pick (`›`). This window's own agent is a
+  Enter on the agent ↑ and ↓ pick (reversed, as every view draws its pick). This window's own agent is a
   row like any other: picking it closes `/status`, back to the
   conversation. ‹ in its title,
   or Ctrl+[ from the conversation, goes back to `/status`. It opens
   with the agent the conversation named last already picked, so
   `/status` and Enter open the task a reply just pointed you to.
 
-  ![/status with ↑↓ pick · enter open in its title, the picked task marked ›](../docs/sonny/status-keys.png)
+  ![/status with ↑↓ pick · enter open in its title, the picked task reversed](../docs/sonny/status-keys.png)
 
   ![/status with Idle open and the lead picked, its row shown reversed](../docs/sonny/status-lead-picked.png)
 
   ![/status naming each agent's profile beside its model: superlead, task, reviewer](../docs/sonny/status-profile.png)
 
   ![A task opened from /status in the pane, its ‹ going back to /status](../docs/sonny/status-opens-agent.png)
+
+  ![/status with backup paused by the pull cord and migrate rate limited until 11:40, its pool closed for two hours](../docs/sonny/status-paced-reasons.png)
+
+  ![A task whose command a restart cut: a muted ■ before Ran ./deploy.sh, and under it cut by a restart: it may have run, and was not run again](../docs/sonny/call-cut-by-restart.png)
 
   Under its heading, `/status` says only what is broken around the
   agents, each with a red `✗`: a companion of the daemon that keeps
@@ -1072,13 +1115,21 @@ has something on it, or is off the screen, no time shows.
   and build, with the model it has, so an upgrade restarts it with the
   lookout and the tool host.
 
-- `/background` (or `/automations`, `/lookout`) lists, in the pane beside the
+- `/background` lists, in the pane beside the
   conversation, what runs for the project's agents with
   no one typing: the automations that wake them, with
-  when each runs, its message and what its last run did, and the
+  when each runs, its message and what its last run did, the
   lookout's follows, with how many checks each asked for in the last
-  day. `↑`/`↓` picks one, `r` runs an automation now, and `d` pressed twice
-  removes it; the follow Sonny keeps for a lead's tasks stays. What runs
+  day, and last the commands the agents left running, as Codex's `/ps`
+  shows its background terminals: each background command, terminal,
+  detached service and call waiting on its approval, oldest first, with
+  its agent, how long it has run, a detached one's pid and the start of
+  its command, read from the daemon's `processes` every two seconds while
+  it is open. `↑`/`↓` picks one, Enter (or a click) goes to the agent it
+  wakes, or that left the command running, `r` runs an automation now,
+  and `x` removes an automation or follow, or stops a command with all it
+  started (`stop_process`, beside the window), once Enter confirms; any
+  other key keeps it. The follow Sonny keeps for a lead's tasks stays. What runs
   there while healthy asks nothing of you, so the footer leaves it out.
   What failed is listed first, with a red `✗` and the error: an automation
   whose run failed (one that ended on it stays listed until `d` removes
@@ -1101,8 +1152,8 @@ has something on it, or is off the screen, no time shows.
   stacked bars over time (output, input read fresh, and input read from the
   provider's cache), by agent and by model: each model by its name, its
   provider in a muted column beside it, and one model's ids from one
-  provider (two Bedrock regions', say) on one row. `d`, `w` and `m` show the last
-  day, week or month, `a` every agent in the store, by project, and `c`
+  provider (two Bedrock regions', say) on one row. `←` and `→` show the last
+  day, week or month, `a` every project's agents, by project, and `c`
   hides the cached reads, so what the provider charges most for stands out.
   Under the models, Speed says how fast each answered its calls: output
   tokens a second from send to answer, and the time to its first output, on
@@ -1125,7 +1176,7 @@ has something on it, or is off the screen, no time shows.
   compaction freed and the room it left.
 
   ![/context in the pane: a grid of a hundred cells, each part in its own mark, beside the list of parts](../docs/sonny/context-card.png)
-- `/commons` (or `/forum`) shows, in the pane beside the conversation, the
+- `/commons` shows, in the pane beside the conversation, the
   threads the agents of every project share in the commons, newest first,
   each with who started it, how many posts it has, who wrote last and how
   often agents read it. Enter reads one; each post there names who wrote it
@@ -1134,12 +1185,44 @@ has something on it, or is off the screen, no time shows.
   reading there is not counted as an agent's.
 
   ![/commons in the pane](../docs/sonny/commons.png)
+- `/memory` shows, in the pane beside the conversation, what agents saved to
+  memory: Work under way, newest first, with how long since each was saved;
+  This project's facts; and About you, the facts kept about you in every
+  project, folded at first. Each row has the fact's name, its type (left
+  unsaid when it is its section's own: `project` under a project, `user`
+  under About you) and its index flags (`live`, `external`, `confirmed N`, `pushed back N`), its
+  description, and `verified DATE` at the right edge. It reads each
+  folder's `MEMORY.md`, and a work fact's own file, since an index lists
+  work by name and date alone. A live fact's description is filled as a
+  starting agent reads it. `a` widens it to every project, one folded
+  section each with this one first and open; `a` again narrows it back.
+  ↑↓ pick, → or Enter opens a fact or a folded section, or steps into an
+  open one; ← folds it, and a click on a heading opens or folds it.
+  An open fact is a page: its text as Markdown, filled now when it is
+  live, under one muted line with its type, flags, verified date and
+  `from SOURCE`, where an agent's `NAME/N` is the page's first link and
+  opens that agent. Another fact's exact name in the text is a link, as
+  Lynx's are: ↑↓ pick among the links in view and scroll when none is left
+  that way, → or Enter opens one (a fact as the next page), and ← or the
+  title's ‹ walks back. `x` removes the picked fact after `Remove NAME?
+  It can't be undone.`, `enter remove · esc cancel`, through the memory
+  tool's own `remove`, so the index stays right; any other key says `not
+  removed`. It reads off the screen thread when it opens, on `a`, and after a
+  removal, never on a timer. Your reading there is not counted as an
+  agent's, so it never keeps a fact from the nightly cleanup's 30-day
+  unread check.
+
+  ![/memory in the pane](../docs/sonny/memory.png)
 - `/sky` draws every agent the daemon keeps, in the pane: leads on the inner
   ring, the agents each one made fanned out behind it, you in the middle,
   on a circle as 0.7.0 drew it, stretched to fill a wide pane (up to twice
   as wide as high). It opens whole: "Catching up with who is here…" until
   every agent, what each did and holds, and what each asks are read, then
-  the sky, its counts and its log at once. Projects keep their places in
+  the sky, its counts and its log at once. An idle agent whose question
+  was never read, as every agent on a store's first sky, does not hold it:
+  the sky shows, the footer says `reading what 182 agents ask`, and each
+  `?` appears as its read lands; what was read is kept as it comes, so a
+  sky closed halfway leaves the next one less. Projects keep their places in
   the order they started,
   each arm as wide as the square root of its size, and the agents that made
   none sit on the outer edge, as a tree's leaves do, so the sky fills to
@@ -1225,7 +1308,7 @@ has something on it, or is off the screen, no time shows.
   `NO_COLOR` honoured, and `sonny sky --center NAME` starts on an agent
   (its name, label or project) and `sonny sky --replay [WHEN]` plays the
   past back from WHEN (`2h`, `30m` or `1d` ago, or a time such as `02:10`;
-  an hour ago when not said); `q` leaves it, and a daemon that goes is
+  an hour ago when not said); Esc leaves it, and a daemon that goes is
   followed again once it is back.
 
   ![/sky in the pane](../docs/sonny/sky.gif)
@@ -1239,6 +1322,8 @@ has something on it, or is off the screen, no time shows.
   ![/sky: a reviewer's no streaking red onto an agent, a hand-off yellow, a schedule's tick flashing as it fires](../docs/sonny/sky-origins.gif)
 
   ![/sky with states and its chat log](../docs/sonny/sky-states.png)
+
+  ![/sky's first open on a store of 5,000 agents, shown while it reads what 182 still ask](../docs/sonny/sky-first-open.png)
 
   ![/sky in zen](../docs/sonny/sky-zen.png)
 
@@ -1255,7 +1340,8 @@ has something on it, or is off the screen, no time shows.
   ![/sky with its legend](../docs/sonny/sky-legend.png)
 - `/pause REASON` stops every agent, in every project, until `/resume`:
   running turns stop where they are and continue on `/resume`, and what
-  arrives meanwhile waits, across restarts too.
+  arrives meanwhile waits, across restarts too. The slash menu lists
+  `/resume` only while the agents are paused.
   Every window says who paused and why, and which agents it parked; Esc in
   one of their windows ends that agent's turn before you resume.
   `agent pauses` lists every pause, who pulled it and who let it go.
@@ -1413,18 +1499,18 @@ has something on it, or is off the screen, no time shows.
   ![Where each question stands: one answered, one withdrawn with why, one set aside, and the composer answering an open one in words](../docs/sonny/question-states-dark.png)
 
   ![A task's question: the lead's task updates say shop.wire asks you, and wire, opened from the margin's ↗, shows the decision in the pane](../docs/sonny/ask-from-task.png)
-- `/copy` puts the last reply on the clipboard; `/open` opens the last
-  HTML page in a browser; `/sound` turns the chime off or on; `/verbose`
+- `/copy` puts the last reply on the clipboard; `/verbose`
   switches between the clean view and every tool call; `/quit`
-  leaves the agents working.
-- `/colors` (experimental) colors a busy lead's window by project: when
+  leaves the agents working. An HTML page a reply shows has its file's
+  path under it, which opens it in a browser on a click.
+- Project colors (experimental, `[sonny] project_colors`) color a busy
+  lead's window by project: when
   the lead follows other projects' leads, a reply it writes because one
   of those projects woke it wears that project's colored bar down its
   left edge, so you can tell whether back-to-back replies are about the
   same project; your own turns stay plain. Each followed project takes one
   of six colors in the followed leads' order, `[sonny.projects.NAME]
-  color = "jade"` pins one, and `[sonny] project_colors = true` turns it
-  on in every window.
+  color = "jade"` pins one.
 
   ![Project colors on: replies about atlas, shop and blog each wear their project's bar; your own turns stay plain](../docs/sonny/project-colors-dark.png)
 
@@ -1474,13 +1560,14 @@ turn of the task numbered after that one reopens it.
 ## Shared settings
 
 Settings Sonny keeps for every folder are in `~/.agent/config.toml`'s
-`[sonny]`, which `/config` shows: the chime (`chime`, off by default; `/sound` or
+`[sonny]`, which `/config` shows: the chime (`chime`, off by default;
 `chime = true` turns it on) and
-the view (`steps` and `verbose`, both off by default), besides the efforts and the side chat
-above. `/config` lists the keys under their table's name, a value set in
-the file plain and a default muted, so what you changed stands out.
-
-![/config: keys under agent, [reviewer] and [sonny], set values plain and defaults muted](../docs/sonny/config-reviewer.png)
+the view (`view`: `words` by default, `steps`, or `verbose` for every
+tool call), besides the efforts and the side chat above. `/config` lists
+them under their groups, a value set in the file in ink and a default
+muted, so what you changed stands out. A config that sets the old
+`steps` or `verbose` switches is rewritten once to the one `view` they
+showed.
 
 ## Skills and background services
 
@@ -1590,7 +1677,7 @@ them is drawn: no calls, no news from tasks, no messages between agents,
 no notes put in the margin, no `Worked for …` line. The plan shows in the
 margin. A message you send while the agent works waits with a mark by its
 arrow, no words: `›↪` a steer, which goes in when the call under way ends,
-and `›⋯` a queued message, for after the turn. `[sonny] steps = true`
+and `›⋯` a queued message, for after the turn. `[sonny] view = "steps"`
 brings back the steps, the view below, and `/verbose` draws every call.
 
 ![Words only: a lead asked to check the work, its words as two tasks report in, and nothing between](../docs/sonny/words-only.png)
@@ -1603,8 +1690,8 @@ waited for, a question to you, the plan, memory, an automation, a window
 opened). Commands, reads and edits are left out: agents are people you
 talk to, and the clean view shows what they say and what reaches you, not
 the work inside their turn. `/verbose` draws every
-call, the conversation so far included, and is kept with the other
-settings; `/verbose` again goes back to clean.
+call, the conversation so far included, in this window only; `/verbose`
+again goes back to the view `/config` sets.
 
 Some rows are buttons. A call that starts, messages, waits for or
 changes agents is one row that says what it did and to whom, never what
@@ -1638,17 +1725,17 @@ calc.add, calc.neg and calc.div ▸`), and `/verbose` draws each call as
 ever. Quiet rows
 one after another (calls folded, notes put in the margin, messages
 between agents) sit together, with no blank row between. Words that only
-rode along on a call, an attach note from an automation that found the
-agent busy or from another agent, are no message: once the agent reads
-them they hang right under what that call carried, your message or the
-step it joined, as `📎 From an automation ▸`, and a click opens them the
+rode along on a call, an attach note from another agent, are no message:
+once the agent reads them they hang right under what that call carried,
+your message or the step it joined, as `📎 From calc.add ▸`, and a click
+opens them the
 same way. Nothing says such words are waiting: they ask nothing of you, so
 they turn up only once the agent has read them. None waits more than a
 day (`attach_wait` in `config.toml`): one no call took in by then reaches
 the agent as a message of its own. Your reactions and the margin notes you
 close wait for your next word instead, which is what they are about. A turn that ends
-with the model saying nothing (`empty_completion`) ends quietly, not as a
-failure.
+with the model saying nothing (`empty_completion`) reads `no reply`, not
+a failure, and its notification says `fix finished, no reply`.
 
 ![Memory saves folded into one row, and a question whose options are buttons](../docs/sonny/fold-and-ask.png)
 
@@ -1770,7 +1857,8 @@ while you have scrolled back leave the view still, and PgDn or Enter
 takes you back to the latest. Copying needs no key held:
 a drag selects and copies when you let go, a double click takes a word and
 a triple click its line, Ctrl+C copies a selection instead of
-interrupting, and Esc clears it. The copy is the text as written: a line
+interrupting, and Esc clears it. With the keys in the pane and nothing
+selected, Ctrl+C closes the pane; it quits Sonny only from the composer. The copy is the text as written: a line
 wrapped over rows comes back as one line, without the bullets and indents
 Sonny drew around it. A click on a web link opens it in the browser, and
 a click on a file opens it in a pane beside the conversation: code in
@@ -1817,14 +1905,56 @@ redraws it by hand, as in a shell.
 With nothing typed, `?` lists every key beside the conversation. Every
 hint on screen is written one way, as Codex writes them: the key, then
 what it does muted, `·` between them (`↑↓ pick · enter open · esc
-close`). Every list over the composer (the slash menu, `/model`,
-`/switch`, `/new`, `/permissions`, `/fast`, `/retry`, a reply to react to
+close`). Each view names its keys once, and the same few words say what
+`esc` and `enter` do everywhere: `esc` closes, goes back, cancels, or
+leaves a question for your own words; `enter` opens, runs, chooses, goes
+on, saves, or says a confirm's own verb (`enter compact`). A line too
+long for its row drops pairs from the right, keeping `esc`, then
+`enter`. Every list over the composer (the slash menu, `/model`,
+`/switch`, `/new`, `/permissions`, `/retry`, a reply to react to
 or answer, Ctrl+R) is one list: up to 8 rows under a blank one, the pick
 in reverse video, `•` before what is in effect, and its keys where the
 footer was. Each narrows as you type, found by its name or what it is,
 and Backspace back to nothing picks the row it opened on; a question an
 agent asks keeps its options as they are, since their order is its
 recommendation.
+
+Every view in the pane takes the keys one way, as a file browser's list
+does. `↑` `↓` move the pick, and `h` `j` `k` `l` are the arrows there;
+a view with rows opens with its first row picked, and a page of text (a
+file, a commons thread, the margin) picks among the links in view, as
+Lynx does, scrolling where none is left that way. `→` opens what the
+picked row holds and `←` folds it; with nothing to fold, `←` steps the
+pane back a page, and it never moves the keys. Enter goes to the picked
+row's agent, where a click on its blue name goes (on this window's own
+agent it closes the view), and otherwise does the row's one thing: it
+never closes a view for any other reason. A click on a row picks it and
+presses Enter. Esc closes the view; an agent shown beside first does
+what Esc does there (clears what is typed, stops its turn), then gives
+the keys back, and the next Esc closes it. Tab with nothing typed moves
+the keys between the conversation and the pane, both ways, the agent
+beside included; while the pane has them the composer's `›` is muted,
+and a key the view does not name does nothing (`q` included), never
+typed into the composer.
+
+Every view is laid out the same way, too. Its title row is the command
+that opens it (`mcp`, not "MCP servers") and the keys it takes. Under it
+the head says whose view it is, bold: the project (`shop`), `every
+project` when `a` widens it, or one agent as you say it (`shop lead`),
+then muted facts after ` · `. What is broken comes next, as a red `✗` and
+plain words; then sections, a bold name and a muted count; then rows,
+the pick reversed from the row's first word to one column past its last.
+An empty view says so in one sentence, then one muted line on how it
+fills; a view still reading says `reading…`, and one that could not says
+`✗ could not read …: why`. A list cut short ends `… N more`. What can't
+be undone (compacting, removing an automation, a follow or a fact,
+stopping a command and all it started, allowing a retry) asks once, in
+words that name it, over the composer or in the pane's foot: `Remove
+nightly? It can't be undone.` with `enter remove · esc cancel`. Only
+Enter says yes; any other key says no, and a notice says so (`not
+removed`). An agent
+shown beside opens no pane of its own: asked for a view or the margin, it
+says views open in the main window, where Ctrl+G moves it.
 
 ![? with nothing typed: every key beside the conversation](../docs/sonny/shortcuts.png)
 
@@ -1845,6 +1975,14 @@ conversation.
 ![/co with /compact marked, then /compact asking: compact the lead's conversation? It can't be undone · enter compact · esc cancel](../docs/sonny/slash-compact-confirm.png)
 
 ![/co after /commons was run: /commons ranks first; /cms finds /commons with c, m and s in bold](../docs/sonny/slash-ranked-fuzzy.png)
+
+A slash word that names no command is answered, not sent: `/stauts`
+says `no command /stauts · / lists them` and stays in the composer to be
+fixed. So does a command given words it doesn't take (`/status foo`). A
+message that only starts with a slash word, such as a path
+(`/etc/hosts is wrong`), goes to the agent as written.
+
+![/stauts answered with no command /stauts · / lists them, the typo kept in the composer](../docs/sonny/slash-no-command.png)
 
 ### Margin and footer
 
@@ -1908,16 +2046,24 @@ the agent and nothing more in its history: `source('ci').latest.text`
 and `.events` (what one of your sources printed lately, newest first;
 `.topics`, each topic's newest event however old, such as each pull
 request's last word, which the lookout keeps for 200 topics; `.up` and
-`.down_since` while the lookout says it is down),
-`file('state.json')` (a file in its folder, `| fromjson` making JSON
-fields of it), `tasks()` and `task('NAME')` (where its tasks stand, as
-`/status` reads them), `now()`, and `| ago` and `| time` for a time in
-seconds. A blank never runs a command or reaches the network, so an agent
+`.down_since` while the lookout says it is down; `source('ci:TOPIC')`
+reads that topic's events alone, as a subscription to `NAME:TOPIC`
+hears them), `file('state.json')` (a file in its folder, `| fromjson`
+making JSON fields of it; one in a folder kept from agents, `~/.agent/keys`
+and the config's `[sandbox] unreadable`, is refused with `read_denied`,
+whatever link or path leads there), `modified('state.json')` (when it
+last changed, none while it is not there, refused as `file()` is), `tasks()` and `task('NAME')`
+(where its tasks stand, as `/status` reads them), `now()`, and `| ago`
+and `| time` for a time in seconds; Jinja's own filters, such as
+`selectattr`, `sort` and `tojson`, work as well. A blank never runs a command or reaches the network, so an agent
 that wants something no source covers writes it to a file from its own
 commands. The tool host fills the template once as it is posted and
 answers what it shows; a template that does not read as one, names a
-source you have not set up, or fills to more lines than a note holds is
-refused (`live_template`, `margin_note_too_long`). The window then
+source you have not set up, does not fill now (a file not written yet,
+a field a source's events lack), or fills to more lines than a note holds
+is refused (`live_template`, `margin_note_too_long`), so a broken note
+never reaches the margin. A template's error names its line and quotes
+the blank that failed (``line 1, `file('pr.json')`: ...``). The window then
 watches only what the last fill read, once a second (a source's log, a
 file, the tasks as the footer counts them, the minute for a clock), and a
 fill that fails later keeps what it showed with why under it. Under its
@@ -1928,6 +2074,8 @@ a note's, a memory fact's or an automation's message, is checked the same
 way as it is written and refused as `live_template`; one shown in a window
 fills again as what it read changes, while one that goes into a prompt
 fills once as it goes, so the prompt never changes under the model.
+
+![A live block after the agent's first try was refused, still showing the pull request open with, under it, line 1, `fromjson`: not JSON once pr.json was cut short](../docs/sonny/live-template-says-what-failed.png)
 
 An agent can show something live in the conversation too, with its `live`
 tool: asked the time, or which pull requests are open, it gives Markdown
