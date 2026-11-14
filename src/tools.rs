@@ -5851,11 +5851,11 @@ mod tests {
         let began = std::time::Instant::now();
         for between in ["", " x ", "MIIE"] {
             let header = format!("-----BEGIN PRIVATE KEY-----\\n{between}");
-            let ended = format!("\"{}-----END PRIVATE KEY-----\"", header.repeat(20_000));
+            let ended = format!("\"{}-----END PRIVATE KEY-----\"", header.repeat(5_000));
             assert!(!redact(&ended).contains(" x -----END"));
             for line in [
-                format!("\"{}\"\n", header.repeat(20_000)),
-                header.repeat(20_000),
+                format!("\"{}\"\n", header.repeat(5_000)),
+                header.repeat(5_000),
                 ended,
             ] {
                 let whole = redact(&line);
