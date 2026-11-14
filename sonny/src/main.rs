@@ -11549,10 +11549,13 @@ impl App {
             return;
         };
         // A task in a folder of its own works for its lead's project, as
-        // the memory tool finds it.
-        let here = PathBuf::from(&self.workspace);
-        let folder = task::source_folder(&here).unwrap_or(here);
-        let project = agent_client::policy::project(&folder).ok().flatten();
+        // the memory tool finds it, while a live fact's file blanks read
+        // the task's own files, as its agent's do.
+        let folder = PathBuf::from(&self.workspace);
+        let source = task::source_folder(&folder);
+        let project = agent_client::policy::project(source.as_deref().unwrap_or(&folder))
+            .ok()
+            .flatten();
         let woken = self.woken.clone();
         let view = memory::View::open(
             memory::Places {
@@ -12658,6 +12661,7 @@ impl App {
                     _ => match view.key(*key, pane.screen.in_view()) {
                         memory::Key::Close => self.close_pane(true),
                         memory::Key::Scroll(up) => pane.screen.scroll(if up { 1 } else { -1 }),
+                        memory::Key::Open(url) => self.follow(&url),
                         // A page opened or left is scrolled to anew.
                         memory::Key::Stay if view.depth() != depth => {
                             if let Some(watch) = &mut self.watch {
@@ -13152,8 +13156,11 @@ impl App {
             // A row or a link in `/memory`.
             "memory" => {
                 if let Some(view) = self.watch.as_mut().and_then(|w| w.memory.as_mut()) {
-                    view.click(id);
+                    let leaves = view.click(id);
                     self.pane_keys = true;
+                    if let Some(url) = leaves {
+                        self.follow(&url);
+                    }
                 }
             }
             // A folding group's heading in `/status`: opened or folded.
@@ -13341,6 +13348,15 @@ impl App {
     /// thing it showed closes it, and forward with it closed opens again
     /// the one closed last. Whether there was somewhere to go.
     fn step_pane(&mut self, back: bool) -> bool {
+        // A view's own pages go back first, as `←` on them does.
+        if back
+            && let Some(watch) = &mut self.watch
+            && let Some(view) = &mut watch.memory
+            && view.back()
+        {
+            watch.picked = None;
+            return true;
+        }
         match &self.pane {
             Some(pane) if pane.can_go(back) => {
                 let keys = self.pane_keys;
@@ -16809,23 +16825,29 @@ impl App {
                 }
             } else if let Some(view) = &mut watch.memory {
                 view.drain();
-                let (card, at, marks) = view.card(width);
-                let lines: Vec<Line<'static>> = card
-                    .into_iter()
-                    .map(|line| {
-                        let mut spans = vec![Span::raw(" ")];
-                        spans.extend(line.spans);
-                        Line::from(spans).style(line.style)
-                    })
-                    .collect();
-                pane.set_card_marked(lines, marks, &view.keys());
-                pane.foot = view.footer();
-                // A new pick, or a new page, is scrolled to.
-                if watch.picked != Some(at) {
-                    watch.picked = Some(at);
-                    match view.on_page() && at == 0 {
-                        true => pane.screen.show_row(0, 0),
-                        false => pane.screen.keep_in_view(at, 2),
+                // A page open: the title's ‹ goes back from it.
+                pane.page = view.on_page();
+                // Drawn anew only when something changed, as a long list
+                // costs a frame.
+                if view.fresh(width) {
+                    let (card, at, marks) = view.card(width);
+                    let lines: Vec<Line<'static>> = card
+                        .into_iter()
+                        .map(|line| {
+                            let mut spans = vec![Span::raw(" ")];
+                            spans.extend(line.spans);
+                            Line::from(spans).style(line.style)
+                        })
+                        .collect();
+                    pane.set_card_marked(lines, marks, &view.keys());
+                    pane.foot = view.footer();
+                    // A new pick, or a new page, is scrolled to.
+                    if watch.picked != Some(at) {
+                        watch.picked = Some(at);
+                        match view.on_page() && at == 0 {
+                            true => pane.screen.show_row(0, 0),
+                            false => pane.screen.keep_in_view(at, 2),
+                        }
                     }
                 }
             } else if let Some(view) = &watch.commons {

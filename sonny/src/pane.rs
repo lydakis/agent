@@ -98,6 +98,9 @@ pub struct Pane {
     margin: bool,
     /// The margin is under it, which its title's arrow goes back to.
     pub over: bool,
+    /// The view in it shows a page of its own, which its title's arrow
+    /// goes back from first.
+    pub page: bool,
     /// It has the window to itself, the conversation a key away, as a
     /// window too narrow for both shows one at a time.
     pub alone: bool,
@@ -218,6 +221,7 @@ impl Pane {
             marks: Vec::new(),
             margin: false,
             over: false,
+            page: false,
             alone: false,
             switch_at: None,
             focused: false,
@@ -321,7 +325,7 @@ impl Pane {
     /// Whether back goes somewhere: to what was shown before, or to the
     /// margin under it.
     pub fn goes_back(&self) -> bool {
-        self.over || !self.back.is_empty()
+        self.over || self.page || !self.back.is_empty()
     }
 
     /// Whether the title shows ‹ and ›: while either goes somewhere.
@@ -350,6 +354,7 @@ impl Pane {
             marks: Vec::new(),
             margin: false,
             over: false,
+            page: false,
             alone: false,
             switch_at: None,
             focused: false,
@@ -384,6 +389,7 @@ impl Pane {
             marks: Vec::new(),
             margin: false,
             over: false,
+            page: false,
             alone: false,
             switch_at: None,
             focused: false,

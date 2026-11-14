@@ -159,8 +159,15 @@ struct Page {
     /// The link picked, by its place among those drawn.
     pick: Option<usize>,
     /// Where each link was last drawn: its row, its columns on that row,
-    /// and the fact it opens.
-    links: Vec<(usize, u16, u16, Option<String>, String)>,
+    /// and what it opens.
+    links: Vec<(usize, u16, u16, Target)>,
+}
+
+/// What a link on a page opens: a fact, or the agent it came from.
+#[derive(Clone, Debug, PartialEq)]
+enum Target {
+    Fact(Option<String>, String),
+    Agent(String),
 }
 
 /// What a read off the screen thread came to.
@@ -176,6 +183,8 @@ pub enum Key {
     Close,
     /// Scroll the page one row: up (true) or down.
     Scroll(bool),
+    /// Follow a link outside the view: the agent a fact came from.
+    Open(String),
 }
 
 /// The view's link to its clicks: a button's address is this, then what
@@ -199,6 +208,11 @@ pub struct View {
     /// The fact `x` asked to remove, waiting on `enter`.
     confirm: Option<(Option<String>, String)>,
     notice: Option<String>,
+    /// Bumped on every change, so a frame that changes nothing draws
+    /// nothing anew.
+    changed: u64,
+    /// The width, change and minute last drawn at.
+    drawn: Option<(usize, u64, u64)>,
 }
 
 const WORK: &str = "work";
@@ -233,7 +247,18 @@ impl View {
             pages: Vec::new(),
             confirm: None,
             notice: None,
+            changed: 0,
+            drawn: None,
         }
+    }
+
+    /// Whether the card at `width` differs from the one last drawn: on a
+    /// change, a new width, or a new minute for the work rows' ages.
+    pub fn fresh(&mut self, width: usize) -> bool {
+        let now = (width, self.changed, now_ms() / 60_000);
+        let fresh = self.drawn != Some(now);
+        self.drawn = Some(now);
+        fresh
     }
 
     /// Read the listing again off the screen thread, after removing
@@ -274,6 +299,7 @@ impl View {
     pub fn drain(&mut self) -> bool {
         let done: Vec<Done> = std::mem::take(&mut *lock(&self.done));
         let any = !done.is_empty();
+        self.changed += any as u64;
         for done in done {
             match done {
                 Done::Listed(listing, notice) => self.listed(listing, notice),
@@ -421,8 +447,11 @@ impl View {
     /// A key, with the rows of the page now in view, for `↑` `↓` to pick
     /// among the links there before scrolling.
     pub fn key(&mut self, key: KeyEvent, in_view: std::ops::Range<usize>) -> Key {
+        self.changed += 1;
         let confirm = self.confirm.take();
-        self.notice = None;
+        // Any key but `enter` lets a removal go, and says so.
+        self.notice =
+            (confirm.is_some() && key.code != KeyCode::Enter).then(|| "not removed".to_owned());
         let code = match key.code {
             KeyCode::Char('k') => KeyCode::Up,
             KeyCode::Char('j') => KeyCode::Down,
@@ -450,7 +479,7 @@ impl View {
             KeyCode::Down => {
                 self.selected = (self.selected + 1).min(self.items().len().saturating_sub(1));
             }
-            KeyCode::Right | KeyCode::Enter => self.go_in(code == KeyCode::Enter),
+            KeyCode::Right | KeyCode::Enter => self.go_in(),
             KeyCode::Left => self.go_out(),
             KeyCode::Char('a') if !self.reading => {
                 self.every = !self.every;
@@ -467,14 +496,13 @@ impl View {
     }
 
     /// `→` or `enter` on the pick: a fact opens; a folded section opens,
-    /// and `enter` folds an open one.
-    fn go_in(&mut self, enter: bool) {
+    /// and on an open one the pick steps in to its first fact. `←` folds.
+    fn go_in(&mut self) {
         match self.items().get(self.selected).cloned() {
             Some(Item::Fact { scope, name }) => self.open_fact(scope, name),
             Some(Item::Heading(key)) => {
-                let open = self.is_open(&key);
-                if !open || enter {
-                    self.folds.insert(key, !open);
+                if !self.is_open(&key) {
+                    self.folds.insert(key, true);
                 } else {
                     // Open already: in to its first fact.
                     self.selected += 1;
@@ -488,7 +516,11 @@ impl View {
     /// `←` on the pick: its section folds, the pick on its heading.
     fn go_out(&mut self) {
         let items = self.items();
-        let Some(heading) = items[..=self.selected.min(items.len().saturating_sub(1))]
+        // Nothing listed yet, or nothing left: nothing to fold.
+        if items.is_empty() {
+            return;
+        }
+        let Some(heading) = items[..=self.selected.min(items.len() - 1)]
             .iter()
             .rposition(|item| matches!(item, Item::Heading(_)))
         else {
@@ -529,7 +561,7 @@ impl View {
                 KeyCode::Right | KeyCode::Enter => page
                     .pick
                     .and_then(|at| page.links.get(at))
-                    .map(|(.., scope, name)| (scope.clone(), name.clone())),
+                    .map(|link| link.3.clone()),
                 KeyCode::Left => {
                     self.pages.pop();
                     None
@@ -537,30 +569,57 @@ impl View {
                 _ => None,
             },
         };
-        if let Some((scope, name)) = follow {
-            self.open_fact(scope, name);
+        self.follow(follow)
+    }
+
+    /// Open what a link targets: a fact as the next page, an agent
+    /// outside the view.
+    fn follow(&mut self, target: Option<Target>) -> Key {
+        match target {
+            Some(Target::Fact(scope, name)) => self.open_fact(scope, name),
+            Some(Target::Agent(agent)) => {
+                return Key::Open(format!("{}{agent}", crate::links::AGENT));
+            }
+            None => {}
         }
         Key::Stay
     }
 
+    /// Back a page, as `←` there and the title's `‹` go. Whether there
+    /// was one to leave.
+    pub fn back(&mut self) -> bool {
+        self.changed += 1;
+        self.pages.pop().is_some()
+    }
+
     /// A click on one of the view's buttons, `what` past [`BUTTON`]: a
-    /// row picked and opened, as `enter` does; a link followed.
-    pub fn click(&mut self, what: &str) {
-        self.confirm = None;
+    /// row picked and opened, a heading opened or folded; a link
+    /// followed. The address to follow when it leaves the view.
+    pub fn click(&mut self, what: &str) -> Option<String> {
+        self.changed += 1;
+        self.notice = self.confirm.take().map(|_| "not removed".to_owned());
         if let Some(at) = what.strip_prefix("row/").and_then(|at| at.parse().ok()) {
-            if at < self.items().len() {
-                self.selected = at;
-                self.go_in(true);
+            self.selected = at;
+            match self.items().get(at).cloned() {
+                Some(Item::Heading(key)) => {
+                    let open = self.is_open(&key);
+                    self.folds.insert(key, !open);
+                }
+                Some(Item::Fact { .. }) => self.go_in(),
+                None => {}
             }
         } else if let Some(at) = what
             .strip_prefix("link/")
             .and_then(|at| at.parse::<usize>().ok())
             && let Some(page) = self.pages.last_mut()
-            && let Some((.., scope, name)) = page.links.get(at).cloned()
+            && let Some(link) = page.links.get(at).cloned()
         {
             page.pick = Some(at);
-            self.open_fact(scope, name);
+            if let Key::Open(url) = self.follow(Some(link.3)) {
+                return Some(url);
+            }
         }
+        None
     }
 
     /// The card at `width`, the row the pick is on, and the buttons on
@@ -625,7 +684,6 @@ impl View {
             let open = self.is_open(&key);
             out.push(Line::default());
             let mut heading = vec![
-                Span::raw("  "),
                 Span::raw(title).bold(),
                 Span::raw(format!(" · {}", facts.len())).dim(),
             ];
@@ -644,7 +702,7 @@ impl View {
             let scope = (listing.scopes.iter()).find(|s| key == scope_key(s.project.as_deref()));
             if let Some(error) = scope.and_then(|s| s.error.as_ref()) {
                 out.push(Line::from(vec![
-                    Span::raw("  "),
+                    Span::raw(" "),
                     Span::raw("✗ ").fg(Color::Red),
                     Span::raw(format!("could not read memory: {error}")),
                 ]));
@@ -664,7 +722,7 @@ impl View {
                 let (first, rest) = match (key == WORK, self.work_of(scope, name)) {
                     (true, Some(work)) => self.work_row(work, now, width),
                     _ => match self.fact_of(scope, name) {
-                        Some(fact) => fact_row(fact, width),
+                        Some(fact) => fact_row(fact, own_kind(&key), width),
                         None => (Line::from(name.clone()), Vec::new()),
                     },
                 };
@@ -679,7 +737,7 @@ impl View {
         }
         if listing.more > 0 {
             out.push(Line::default());
-            out.push(Line::from(format!("  … {} more projects", listing.more)).dim());
+            out.push(Line::from(format!("… {} more projects", listing.more)).dim());
         }
         (out, at, marks)
     }
@@ -697,7 +755,7 @@ impl View {
             right.push(ago(now.saturating_sub(work.saved_ms) / 1000));
         }
         let first = edge(
-            vec![Span::raw("  "), Span::raw(work.name.clone()).bold()],
+            vec![Span::raw(" "), Span::raw(work.name.clone()).bold()],
             right.join(" · "),
             width,
         );
@@ -744,12 +802,18 @@ impl View {
         // Where it came from shares the row when there is room, else takes
         // the next, never split.
         let about = about.join(" · ");
+        // The agent is the page's first link, picked as any other is.
+        page.links.clear();
         let mut from = vec![Span::raw("from ").dim()];
         let mut agent_at = None;
         match crate::calls::handle_parts(&peeked.source) {
             Some((agent, number)) => {
                 agent_at = Some((5, agent.width(), agent.to_owned()));
-                from.push(Span::raw(agent.to_owned()).fg(Color::Blue));
+                let mut name = Span::raw(agent.to_owned()).fg(Color::Blue);
+                if page.pick == Some(0) {
+                    name = name.add_modifier(Modifier::REVERSED);
+                }
+                from.push(name);
                 from.push(Span::raw(format!("/{number}")).dim());
             }
             None => from.push(Span::raw(peeked.source.clone()).dim()),
@@ -769,13 +833,14 @@ impl View {
             )),
         }
         if let Some((at, wide, agent)) = agent_at {
-            let start = (offset + at + 1) as u16;
-            let buttons = vec![(
-                start,
-                start + wide as u16,
-                format!("{}{agent}", crate::links::AGENT),
-            )];
-            marks.push((out.len(), crate::screen::Mark::Buttons(buttons)));
+            let (start, end) = ((offset + at) as u16, (offset + at + wide) as u16);
+            let button = format!("{}{BUTTON}link/0", crate::screen::BUTTON);
+            marks.push((
+                out.len(),
+                crate::screen::Mark::Buttons(vec![(start + 1, end + 1, button)]),
+            ));
+            page.links
+                .push((out.len(), start, end, Target::Agent(agent)));
         }
         out.extend(crate::transcript::wrap(
             Line::from(from),
@@ -805,7 +870,6 @@ impl View {
             width,
             (Line::from(""), Line::from("")),
         );
-        page.links.clear();
         for line in lines {
             let row = out.len();
             let mut line = line;
@@ -820,7 +884,8 @@ impl View {
                     to_col + 1,
                     format!("{}{BUTTON}link/{at}", crate::screen::BUTTON),
                 ));
-                page.links.push((row, from_col, to_col, scope, name));
+                page.links
+                    .push((row, from_col, to_col, Target::Fact(scope, name)));
             }
             if !row_buttons.is_empty() {
                 marks.push((row, crate::screen::Mark::Buttons(row_buttons)));
@@ -845,7 +910,13 @@ impl View {
         }
         self.notice
             .as_ref()
-            .map(|notice| Line::from(notice.clone()))
+            .map(|notice| match notice.strip_prefix("✗ ") {
+                Some(why) => Line::from(vec![
+                    Span::raw("✗ ").fg(Color::Red),
+                    Span::raw(why.to_owned()),
+                ]),
+                None => Line::from(notice.clone()),
+            })
     }
 
     /// What the keys do, as the pane's title says it.
@@ -856,7 +927,7 @@ impl View {
         if let Some(page) = self.pages.last() {
             return match page.links.is_empty() {
                 true => "↑↓ scroll · ← back · esc close".into(),
-                false => "↑↓ pick · enter follow · ← back · esc close".into(),
+                false => "↑↓ pick · enter open · ← back · esc close".into(),
             };
         }
         let items = self.items();
@@ -866,7 +937,9 @@ impl View {
         }
         match items.get(self.selected) {
             Some(Item::Fact { .. }) => keys.push("enter open"),
-            Some(Item::Heading(key)) if self.is_open(key) => keys.push("enter fold"),
+            // `enter` on an open heading steps in, as `→` does, and `←`
+            // folds: neither needs saying.
+            Some(Item::Heading(key)) if self.is_open(key) => {}
             Some(Item::Heading(_)) => keys.push("enter open"),
             None => {}
         }
@@ -922,37 +995,73 @@ fn flags(fact: &Listed) -> Vec<String> {
     out
 }
 
-/// A lasting fact's row: its name, its type and flags muted, and at the
-/// right edge when it was last verified; what it is under it. Where the
-/// row has no room for its flags, they take a muted row of their own.
-fn fact_row(fact: &Listed, width: usize) -> (Line<'static>, Vec<Line<'static>>) {
-    let flags = flags(fact).join(" · ");
+/// A lasting fact's row: its name, its type (unless it is its section's
+/// own) and flags muted, and at the right edge when it was last verified;
+/// what it is under it. Where the row has no room for its flags, they
+/// take a muted row of their own.
+fn fact_row(fact: &Listed, own: &str, width: usize) -> (Line<'static>, Vec<Line<'static>>) {
+    let mut flags = flags(fact);
+    flags.retain(|flag| flag != own);
+    let flags = flags.join(" · ");
     let verified = format!("verified {}", day(&fact.verified));
-    let name = || vec![Span::raw("  "), Span::raw(fact.name.clone()).bold()];
+    let name = || vec![Span::raw(" "), Span::raw(fact.name.clone()).bold()];
     let mut left = name();
-    left.push(Span::raw(format!(" {flags}")).dim());
-    if fits(&left, &verified, width) {
+    if !flags.is_empty() {
+        left.push(Span::raw(format!(" {flags}")).dim());
+    }
+    if flags.is_empty() || fits(&left, &verified, width) {
         return (
             edge(left, verified, width),
             described(&fact.description, width),
         );
     }
-    let mut rest = vec![Line::from(format!("    {flags}")).dim()];
+    let mut rest = vec![Line::from(format!("{DESCRIBED}{flags}")).dim()];
     rest.extend(described(&fact.description, width));
     (edge(name(), verified, width), rest)
 }
+
+/// The type every fact in a section has, which its rows leave unsaid.
+fn own_kind(section: &str) -> &'static str {
+    match section {
+        YOU => "user",
+        WORK => "work",
+        _ => "project",
+    }
+}
+
+/// Where a row's description and flags start: under its name, two in.
+const DESCRIBED: &str = "   ";
 
 /// A row's description, under its name, in at most two rows.
 fn described(description: &str, width: usize) -> Vec<Line<'static>> {
     if description.is_empty() {
         return Vec::new();
     }
-    crate::transcript::capped(
+    let mut rows = crate::transcript::wrap(
         Line::from(description.to_owned()),
-        width,
-        Span::raw("    "),
-        2,
-    )
+        width.saturating_sub(1).max(8),
+        Span::raw(DESCRIBED),
+        Span::raw(DESCRIBED),
+    );
+    if rows.len() > 2 {
+        rows.truncate(2);
+        if let Some(last) = rows.last_mut() {
+            while last.spans.len() > 1
+                && last
+                    .spans
+                    .last()
+                    .is_some_and(|s| s.content.trim().is_empty())
+            {
+                last.spans.pop();
+            }
+            if let Some(span) = last.spans.last_mut() {
+                let kept = span.content.trim_end().len();
+                span.content.to_mut().truncate(kept);
+            }
+            last.spans.push(Span::raw("…"));
+        }
+    }
+    rows
 }
 
 /// Whether `left` and `right` share a row `width` wide, a cell kept clear
@@ -1202,30 +1311,31 @@ mod tests {
         let (lines, at, _) = view.card(80);
         let lines = text(&lines);
         assert_eq!(lines[0], "tally · 3 facts · 1 about you");
-        assert!(lines.contains(&"  Work under way · 1".to_owned()));
+        assert!(lines.contains(&"Work under way · 1".to_owned()));
         assert!(
             lines
                 .iter()
-                .any(|l| l.starts_with("  rounding-fix") && l.ends_with("now"))
+                .any(|l| l.starts_with(" rounding-fix") && l.ends_with("now"))
         );
-        assert!(lines.contains(&"    what rounding-fix says".to_owned()));
-        assert!(lines.contains(&"  This project · 1".to_owned()));
+        assert!(lines.contains(&"   what rounding-fix says".to_owned()));
+        assert!(lines.contains(&"This project · 1".to_owned()));
         let row = lines
             .iter()
-            .find(|l| l.starts_with("  release-signing"))
+            .find(|l| l.starts_with(" release-signing"))
             .unwrap();
-        assert!(row.contains(" project · confirmed 2") && row.contains("verified "));
+        // Its type is its section's own, so left unsaid.
+        assert!(row.starts_with(" release-signing confirmed 2") && row.contains("verified "));
         // Too narrow for its flags, a row gives them a row of their own.
         let narrow = text(&view.card(36).0);
-        let row = (narrow.iter()).position(|l| l.starts_with("  release-signing"));
+        let row = (narrow.iter()).position(|l| l.starts_with(" release-signing"));
         let row = row.unwrap();
         assert!(narrow[row].contains("verified "));
-        assert_eq!(narrow[row + 1], "    project · confirmed 2");
+        assert_eq!(narrow[row + 1], "   confirmed 2");
         // The person's facts start folded.
-        assert!(lines.contains(&"  About you · 1 ▸".to_owned()));
+        assert!(lines.contains(&"About you · 1 ▸".to_owned()));
         assert!(!lines.iter().any(|l| l.contains("short-replies")));
         // The pick starts on the first fact.
-        assert!(lines[at].starts_with("  rounding-fix"));
+        assert!(lines[at].starts_with(" rounding-fix"));
         // → on the folded heading opens it.
         for _ in 0..3 {
             view.key(key(KeyCode::Down), 0..0);
@@ -1240,7 +1350,22 @@ mod tests {
         // ← folds it again.
         view.key(key(KeyCode::Down), 0..0);
         view.key(key(KeyCode::Left), 0..0);
-        assert!(text(&view.card(80).0).contains(&"  About you · 1 ▸".to_owned()));
+        assert!(text(&view.card(80).0).contains(&"About you · 1 ▸".to_owned()));
+        // enter opens a folded heading; on an open one it steps in, as →
+        // does, and says nothing of itself.
+        assert!(view.keys().contains("enter open"));
+        view.key(key(KeyCode::Enter), 0..0);
+        assert!(!view.keys().contains("enter"));
+        view.key(key(KeyCode::Enter), 0..0);
+        let (lines, at, _) = view.card(80);
+        assert!(text(&lines)[at].starts_with(" short-replies"));
+        // A click on a heading folds or opens it.
+        let heading = view
+            .items()
+            .iter()
+            .position(|i| *i == Item::Heading(YOU.into()));
+        view.click(&format!("row/{}", heading.unwrap()));
+        assert!(text(&view.card(80).0).contains(&"About you · 1 ▸".to_owned()));
         let _ = std::fs::remove_dir_all(&places.home);
     }
 
@@ -1249,7 +1374,11 @@ mod tests {
         let places = places("empty");
         let mut view = View::empty(places.clone(), Arc::new(|| {}));
         assert_eq!(text(&view.card(80).0)[2], "reading…");
+        // ← with nothing listed yet, or nothing at all, does nothing.
+        assert!(matches!(view.key(key(KeyCode::Left), 0..0), Key::Stay));
         view.listed(list(&places, false), None);
+        assert!(matches!(view.key(key(KeyCode::Left), 0..0), Key::Stay));
+        assert!(matches!(view.key(key(KeyCode::Char('h')), 0..0), Key::Stay));
         let lines = text(&view.card(80).0);
         assert_eq!(
             lines[2..],
@@ -1263,11 +1392,11 @@ mod tests {
             .unwrap();
         view.listed(list(&places, false), None);
         let lines = text(&view.card(80).0);
-        assert!(lines.contains(&"  This project · 0".to_owned()));
+        assert!(lines.contains(&"This project · 0".to_owned()));
         assert!(
             lines
                 .iter()
-                .any(|l| l.starts_with("  ✗ could not read memory: "))
+                .any(|l| l.starts_with(" ✗ could not read memory: "))
         );
         let _ = std::fs::remove_dir_all(&places.home);
     }
@@ -1306,14 +1435,14 @@ mod tests {
         settle(&mut view);
         let lines = text(&view.card(80).0);
         assert_eq!(lines[0], "every project · 3 facts");
-        let tally = lines.iter().position(|l| l == "  tally · 1").unwrap();
-        let calc = lines.iter().position(|l| l == "  calc · 1 ▸").unwrap();
+        let tally = lines.iter().position(|l| l == "tally · 1").unwrap();
+        let calc = lines.iter().position(|l| l == "calc · 1 ▸").unwrap();
         assert!(tally < calc);
         // Work from every project, its project at the right edge.
         assert!(
             lines
                 .iter()
-                .any(|l| l.starts_with("  halves") && l.ends_with("calc · now"))
+                .any(|l| l.starts_with(" halves") && l.ends_with("calc · now"))
         );
         assert!(view.keys().contains("a this project"));
         let _ = std::fs::remove_dir_all(&places.home);
@@ -1356,9 +1485,10 @@ mod tests {
             shown[1].starts_with("project · verified ")
                 && shown[1].ends_with("· from tally.lead/4")
         );
-        // The agent's name opens it.
+        // The agent's name is the page's first link.
+        let first = format!("{}{BUTTON}link/0", crate::screen::BUTTON);
         assert!(marks.iter().any(|(row, mark)| *row == 1
-            && matches!(mark, crate::screen::Mark::Buttons(b) if b[0].2 == "sonny:agent/tally.lead")));
+            && matches!(mark, crate::screen::Mark::Buttons(b) if b[0].2 == first)));
         // Too narrow for both, where it came from takes its own row, whole,
         // and the agent's name opens it from there.
         let (lines, _, marks) = view.card(30);
@@ -1366,23 +1496,45 @@ mod tests {
         assert_eq!(shown[2], "from tally.lead/4");
         assert!(marks.iter().any(|(row, mark)| *row == 2
             && matches!(mark, crate::screen::Mark::Buttons(b) if b[0].0 == 6 && b[0].1 == 16)));
-        // Two links, each a whole name.
+        // Then two fact names, each whole.
+        view.card(80);
         let page = view.pages.last().unwrap();
-        let names: Vec<&str> = page.links.iter().map(|l| l.4.as_str()).collect();
-        assert_eq!(names, ["vault-access", "vault-access-old"]);
-        assert_eq!(view.keys(), "↑↓ pick · enter follow · ← back · esc close");
-        // ↓ picks the first link in view, enter follows it.
+        let targets: Vec<Target> = page.links.iter().map(|l| l.3.clone()).collect();
+        let fact = |name: &str| Target::Fact(Some("tally".into()), name.into());
+        assert_eq!(
+            targets,
+            [
+                Target::Agent("tally.lead".into()),
+                fact("vault-access"),
+                fact("vault-access-old")
+            ]
+        );
+        assert_eq!(view.keys(), "↑↓ pick · enter open · ← back · esc close");
+        // ↓ picks the first link in view, the agent; enter opens it outside
+        // the view, as a click on it does.
+        let agent = Key::Open("sonny:agent/tally.lead".into());
+        assert_eq!(view.key(key(KeyCode::Down), 0..50), Key::Stay);
+        assert_eq!(view.key(key(KeyCode::Enter), 0..50), agent);
+        assert_eq!(
+            view.click("link/0").as_deref(),
+            Some("sonny:agent/tally.lead")
+        );
+        // The next, a fact, opens as a page.
+        view.card(80);
         assert_eq!(view.key(key(KeyCode::Down), 0..50), Key::Stay);
         view.key(key(KeyCode::Enter), 0..50);
         settle(&mut view);
         assert_eq!(text(&view.card(80).0)[0], "vault-access");
-        assert_eq!(view.keys(), "↑↓ scroll · ← back · esc close");
-        // With no link, ↓ scrolls.
+        // Past its last link in view, ↓ scrolls.
+        view.card(80);
+        assert_eq!(view.key(key(KeyCode::Down), 0..50), Key::Stay);
         assert_eq!(view.key(key(KeyCode::Down), 0..50), Key::Scroll(false));
         view.key(key(KeyCode::Left), 0..0);
         assert_eq!(text(&view.card(80).0)[0], "release-signing");
-        view.key(key(KeyCode::Left), 0..0);
+        // The title's ‹ goes back as ← does, and not past the list.
+        assert!(view.back());
         assert!(!view.on_page());
+        assert!(!view.back());
         // The person's opens are not counted as reads.
         assert!(
             !places
@@ -1417,9 +1569,9 @@ mod tests {
             "Remove release-signing? It can't be undone."
         );
         assert_eq!(view.keys(), "enter remove · esc cancel");
-        // Esc cancels, and keeps the view open.
+        // Esc cancels, says so, and keeps the view open.
         assert_eq!(view.key(key(KeyCode::Esc), 0..0), Key::Stay);
-        assert!(view.footer().is_none());
+        assert_eq!(view.footer().unwrap().to_string(), "not removed");
         view.key(key(KeyCode::Char('x')), 0..0);
         view.key(key(KeyCode::Enter), 0..0);
         settle(&mut view);
@@ -1433,6 +1585,11 @@ mod tests {
             std::fs::read_to_string(places.home.join(".agents/memory/projects/tally/MEMORY.md"))
                 .unwrap();
         assert!(!index.contains("release-signing") && index.contains("rounding"));
+        // A removal that fails says why, its mark in red.
+        view.notice = Some("✗ could not remove rounding: busy".into());
+        let footer = view.footer().unwrap();
+        assert_eq!(footer.spans[0].style.fg, Some(Color::Red));
+        assert_eq!(footer.to_string(), "✗ could not remove rounding: busy");
         let _ = std::fs::remove_dir_all(&places.home);
     }
 
