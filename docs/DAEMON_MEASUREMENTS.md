@@ -9597,3 +9597,85 @@ only for a sandboxed bot with hidden folders, and one `is_dir` stat per
 hidden folder inside the `spawn_blocking` that `sandbox::hold` already runs
 before each command. Nothing new runs on the runtime thread. No paid
 providers were used.
+
+## A key's own lines hidden, and only them (#978)
+
+Block redaction (`--redact-block`, which Sonny always sets to
+`PRIVATE KEY`) runs over every tool output, so it is on the hot path for
+every Sonny-run daemon. What each path pays now:
+
+- **Text with no block start**: the same one search for `-----BEGIN ` as
+  before.
+- **A header**: its closing dashes are found by a dash search, and the
+  header must end its line (or, as JSON holds a key, end in an escaped
+  line end).
+- **A secret block's body**: one search for its END within 256 KiB of its
+  header, stopping at another block's BEGIN that starts a line. With no
+  END, its lines are read one at a time and only a key's own lines are
+  hidden.
+- **A key that JSON holds**: its line is searched for its END, then the
+  text before that END for a line's end, an unescaped quote and another
+  block's BEGIN at an escaped line's start. Each search goes on from where
+  the last header's stopped, so a line of many headers is read once.
+- **Memory**: a stream holds at most 256 KiB of a secret block's body
+  while it looks for its END, and at most 64 KiB of an escaped one's.
+- **The store**: nothing new.
+
+The redaction path itself, `Credentials::redact` over 64 KiB pieces
+(whole) and `Redacting` fed 8 KiB pieces (stream), `PRIVATE KEY` as the
+block, release builds, best of 25, three alternating rounds, minimum
+over the rounds. 2026-11-14, Linux 6.18 cloud VM, 4 CPUs. Base is main
+`a5312f0`; head is `30ea8f6`.
+
+| Text | Path | Base ms | Head ms | Change |
+| --- | --- | ---: | ---: | ---: |
+| code, 4 MiB, no block | whole | 1.38 | 1.41 | +2% |
+| code, 4 MiB, no block | stream | 0.57 | 0.58 | +2% |
+| code with a key every 4 KiB, 4 MiB | whole | 1.90 | 1.56 | -18% |
+| code with a key every 4 KiB, 4 MiB | stream | 0.80 | 0.81 | +1% |
+| rules, tables and certificates, 4 MiB | whole | 4.36 | 4.45 | +2% |
+| rules, tables and certificates, 4 MiB | stream | 3.74 | 4.04 | +8% |
+| rules and tables, 4 MiB | whole | 3.55 | 3.81 | +7% |
+| rules and tables, 4 MiB | stream | 2.86 | 2.91 | +2% |
+| certificates only, 3.9 MiB | whole | 5.25 | 5.33 | +2% |
+| certificates only, 3.9 MiB | stream | 4.94 | 5.64 | +14% |
+| keys JSON holds, one per line, 3 MiB | whole | 6.91 | 3.21 | -54% |
+| keys JSON holds, one per line, 3 MiB | stream | 1.99 | 3.02 | +52% |
+
+What moves: a stream of certificates pays about 10 ns more per header
+that names no secret block (the header's line end is now checked, and the
+escaped form tried), and a stream of keys that JSON holds about 70 ns more
+per key, for the searches that tell a key from a pattern (its END, then a
+line's end, the string's end or another BEGIN before it). The whole text
+of those keys reads in half the time. Code with no block, code with keys
+in it, and rules stay within the run-to-run spread (rules whole moved
+between -4% and +7% over rounds of the same builds).
+
+### Required matched screen
+
+The four daemon screens never set `--redact-block`, so they don't reach
+the changed code; they check that nothing else moved. The Perf workflow
+ran them on this pull request's head `9c5c844` (its last change is to a
+test only), merged onto main `04d9a55`, against base `a5312f0`, in two
+alternating rounds on one runner. Admission and completion use five
+measured repeats, footprint two (1,000 bots), lifecycle one (32 bots,
+socket echo, five tool schemas).
+
+| Bench | Measure | Base | Head | Change |
+| --- | --- | ---: | ---: | ---: |
+| admission | lone submit CPU, ms | 23.222 | 22.763 | -2.0% |
+| admission | burst submit p99, ms | 2.281 | 2.327 | +2.0% |
+| completion | release to terminal p99, ms | 6.304 | 6.425 | +1.9% |
+| footprint | idle RSS, MiB | 16.4 | 16.398 | 0.0% |
+| footprint | per idle bot, KiB | 1.976 | 1.808 | -8.5% |
+| footprint | RSS after a turn each, MiB | 57.572 | 63.117 | +9.6% |
+| footprint | CPU per turn, ms | 0.592 | 0.609 | +2.9% |
+| lifecycle | CPU, s | 0.31 | 0.28 | -9.7% |
+| lifecycle | p95 turn, ms | 571.835 | 570.227 | -0.3% |
+| lifecycle | peak RSS, MiB | 25.182 | 24.883 | -1.2% |
+
+`bench.perf_gate` reports no count failures: store work per turn is the
+same. Its one warning is the footprint's RSS after a turn each, the
+high-water mark of 1,000 concurrent turns that redact no block: head's
+four runs were 46.1 to 68.2 MiB and base's 54.2 to 60.4 MiB, so the
+ranges overlap, and head's lowest run is below every base run.
