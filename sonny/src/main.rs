@@ -720,7 +720,7 @@ async fn read_status(
             (true, _) => "working".into(),
             (false, Some("completed")) => started::IDLE.into(),
             (false, Some("failed")) if ran["error"] == EMPTY => started::QUIET.into(),
-            (false, Some("interrupted")) => "stopped".into(),
+            (false, Some("interrupted")) => started::INTERRUPTED.into(),
             (false, Some(other)) => other.to_owned(),
             (false, None) => "idle".into(),
         };
@@ -5938,7 +5938,7 @@ impl Fleet {
                 started::IDLE => Some((sound::Alert::TaskDone, format!("{short} finished"))),
                 started::QUIET => Some((
                     sound::Alert::TaskDone,
-                    format!("{short} finished, saying nothing"),
+                    format!("{short} finished, no reply"),
                 )),
                 "failed" => Some((sound::Alert::Failed, format!("{short} failed"))),
                 "needs you" => Some((sound::Alert::NeedsYou, format!("{short} needs you"))),
@@ -6013,7 +6013,7 @@ impl Fleet {
                                 started::IDLE
                             }
                             Some("failed") if data["error"] == EMPTY => started::QUIET,
-                            Some("interrupted") => "stopped",
+                            Some("interrupted") => started::INTERRUPTED,
                             _ => "failed",
                         },
                     );
@@ -11196,7 +11196,7 @@ impl App {
                 match status {
                     _ if quiet => {}
                     "completed" => {
-                        let what = format!("{} is done", self.bot);
+                        let what = format!("{} finished", self.bot);
                         self.sounds.alert(sound::Alert::LeadDone, &what)
                     }
                     "interrupted" => {}
@@ -11912,6 +11912,28 @@ impl App {
         read_latest(&self.client, bot).await.unwrap_or_default()
     }
 
+    /// A call that ran no command, said as what it did, as its row in the
+    /// conversation says it, never by its tool's name alone.
+    fn did(name: &str, arguments: &Value) -> String {
+        if let Some(said) = calls::declared(name, arguments, false) {
+            return format!("{} {}", said.verb, said.what).trim().to_owned();
+        }
+        let field = |key: &str| arguments[key].as_str().unwrap_or("").trim().to_owned();
+        let (verb, what) = match name {
+            "read" => ("Read", field("path")),
+            "write" => ("Wrote", field("path")),
+            "edit" | "apply_patch" => ("Edited", field("path")),
+            "wait" => ("Waited", String::new()),
+            "write_stdin" => ("Typed into", field("handle")),
+            margin::TOOL if arguments["title"].is_string() => ("Noted", field("title")),
+            margin::TOOL => ("Changed a note", String::new()),
+            live::TOOL => ("Updated a live block", String::new()),
+            reactions::TOOL => ("Reacted", field("emoji")),
+            _ => ("Called", name.to_owned()),
+        };
+        format!("{verb} {}", first_line(&what)).trim().to_owned()
+    }
+
     /// The newest of history `entries` that reads as a step, as a line.
     fn step(entries: &[Value]) -> String {
         for entry in entries {
@@ -11929,7 +11951,7 @@ impl App {
                             Some(said) => format!("{} {}", said.verb, said.what).trim().to_owned(),
                             None => format!("$ {}", first_line(command)),
                         },
-                        None => format!("{name} {}", arguments["path"].as_str().unwrap_or("")),
+                        None => Self::did(name, &arguments),
                     };
                 }
                 (_, Some("user")) => {
@@ -17105,6 +17127,7 @@ impl App {
                 let items: Vec<list::Item> = (agents.rows().into_iter())
                     .map(|(agent, found)| {
                         list::Item::new(agent.name.clone(), agent.about.clone())
+                            .sign(status::sign(&agent.state))
                             .current(agent.name == agents.current)
                             .found(&found)
                     })
@@ -17451,8 +17474,9 @@ impl App {
         // the approval keys wait for the resume.
         if let Some(pause) = &self.paused {
             let by = pause["by"].as_str().unwrap_or("you");
+            // `■` and its words, as an interrupted turn: `⏸` is an approval.
             let mut line = vec![
-                Span::raw("⏸ ").fg(Color::Red),
+                Span::raw("■ ").dim(),
                 Span::raw("Every agent is paused").bold(),
                 Span::raw(format!(" by {by}: ")).dim(),
                 Span::raw(first_line(pause["reason"].as_str().unwrap_or_default())),
@@ -17761,7 +17785,7 @@ impl App {
         pulse.see(waiting, Instant::now());
         self.needs_pulse.set(pulse);
         if waiting > 0 {
-            let mut forms = footer::count("?", Color::Yellow, waiting, false);
+            let mut forms = footer::count(status::sign("needs you"), waiting, false);
             if pulse.on(Instant::now()) {
                 forms.iter_mut().flatten().for_each(footer::beat);
             }
@@ -17805,18 +17829,18 @@ impl App {
         // `/status` lists both.
         let failed = counts.failed + self.failed;
         if failed > 0 {
-            let forms = footer::count("✗", Color::Red, failed, false);
+            let forms = footer::count(status::sign("failed"), failed, false);
             items.push(Item::new(Slot::Failed, forms).opens("status"));
         }
         if working > 0 {
-            let forms = footer::count("●", Color::Cyan, working, true);
+            let forms = footer::count(status::sign("working"), working, true);
             items.push(Item::new(Slot::Working, forms).opens("status"));
         }
         // At rest, they may be given work. What is done, and what runs in
         // the background while healthy, ask nothing of the person: /status
         // and /background list them.
         if counts.idle > 0 {
-            let forms = footer::count(status::IDLE_MARK, Color::Green, counts.idle, true);
+            let forms = footer::count(status::sign(started::IDLE), counts.idle, true);
             items.push(Item::new(Slot::Idle, forms).opens("status"));
         }
         // How full the next round is, as what is left of its window: no
@@ -19411,7 +19435,7 @@ mod tests {
             .await;
         assert_eq!(
             shown(&app),
-            "⏸ Every agent is paused by calc.a: the migration deletes rows · /resume"
+            "■ Every agent is paused by calc.a: the migration deletes rows · /resume"
         );
         // It names whose turns it parked, so one can be stopped first.
         let parked = json!({"reason": "the migration deletes rows", "by": "calc.a", "at_ms": 1,
@@ -19420,7 +19444,7 @@ mod tests {
             .await;
         assert_eq!(
             shown(&app),
-            "⏸ Every agent is paused by calc.a: the migration deletes rows · parked calc.a, shop.b, web.c +3 · /resume"
+            "■ Every agent is paused by calc.a: the migration deletes rows · parked calc.a, shop.b, web.c +3 · /resume"
         );
         // In the window of one it parked, Esc ends that one's turn.
         let bot = app.bot.clone();
@@ -19439,7 +19463,7 @@ mod tests {
         assert_eq!(
             shown(&app),
             format!(
-                "⏸ Every agent is paused by calc.a: rows · parked {bot} · Esc ends this one · /resume"
+                "■ Every agent is paused by calc.a: rows · parked {bot} · Esc ends this one · /resume"
             )
         );
         app.running = None;
@@ -19453,7 +19477,7 @@ mod tests {
             .push(json!({"name": "shell", "arguments": {"command": "rm -rf rows"}}));
         assert_eq!(
             shown(&app),
-            "⏸ Every agent is paused by calc.a: the migration deletes rows · /resume · an approval waits"
+            "■ Every agent is paused by calc.a: the migration deletes rows · /resume · an approval waits"
         );
         app.daemon(json!({"event": "resumed", "pause": pause, "durable": false}))
             .await;
@@ -19817,7 +19841,7 @@ mod tests {
         let names: Vec<&str> = rows.iter().map(|row| row.name.as_str()).collect();
         assert_eq!(names, ["lead", "workflow audit"]);
         let row = &rows[1];
-        assert_eq!(row.state, "Find · 1 running");
+        assert_eq!(row.state, "Find · 1 working");
         assert_eq!(row.group, status::Group::Working);
         assert_eq!(
             workflow::view::split(&row.bot),
@@ -19827,7 +19851,7 @@ mod tests {
         workflow::view::stop(&store, "run12345").unwrap();
         assert!(run.join(workflow::view::STOP).exists());
         let (_, rows) = app.status_rows().await.unwrap();
-        assert_eq!(rows[1].state, "Find · 1 running · stopping");
+        assert_eq!(rows[1].state, "Find · 1 working · stopping");
         // Once it ends it is no row.
         std::fs::write(run.join("result.json"), "{}").unwrap();
         let (_, rows) = app.status_rows().await.unwrap();
@@ -24889,7 +24913,7 @@ mod tests {
         }
         app.read_tasks().await;
         let rows = drawn(&mut app);
-        assert_eq!(rows[1], "  ✓ quiet  no reply  Fix quiet");
+        assert_eq!(rows[1], "  ○ quiet  no reply  Fix quiet");
         assert_eq!(rows[2], "  ✗ bad    failed    Fix bad");
     }
 
@@ -27337,16 +27361,13 @@ mod tests {
         );
         let counter = opens[0].0.clone();
         // Its marks and colors as /status's rows: yellow ? for what needs
-        // the person, cyan ● at work, green ○ at rest; no ✓, as done
+        // the person, cyan ● at work, a muted ○ at rest; no ✓, as done
         // asks nothing.
         let marks: Vec<_> = (line.spans.iter())
             .filter(|span| ["?", "●", "○", "✓"].contains(&&*span.content))
             .map(|span| span.style.fg)
             .collect();
-        assert_eq!(
-            marks,
-            [Some(Color::Yellow), Some(Color::Cyan), Some(Color::Green)]
-        );
+        assert_eq!(marks, [Some(Color::Yellow), Some(Color::Cyan), None]);
         app.opens_at = vec![(
             20,
             10 + counter.start..10 + counter.end,
@@ -28852,7 +28873,7 @@ mod tests {
         app.fold_notes(false);
         let rows = texts(&app);
         assert_eq!(rows[2], "• Updated the plan · 1/3 · → Fix");
-        assert!(rows.iter().any(|r| r.contains("✔ Test")), "{rows:?}");
+        assert!(rows.iter().any(|r| r.contains("✓ Test")), "{rows:?}");
         // Gone from the screen, they are forgotten.
         app.screen.clear();
         app.refold = true;

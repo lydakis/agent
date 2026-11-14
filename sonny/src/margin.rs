@@ -1519,20 +1519,22 @@ fn cut(text: &str, most: usize) -> &str {
 }
 
 /// A note's first row: its title, `live` while the running turn changes
-/// it, and its buttons on the right; and where those buttons are.
+/// it, the agent it is about as a blue name that opens it, and its buttons
+/// on the right; and where those buttons are.
 fn head(note: &Note, width: usize, live: bool) -> (Line<'static>, crate::screen::Buttons) {
-    let right = match note.opens {
-        Some(_) => "↗  ↩  ↑  ×",
-        None => "↩  ↑  ×",
-    };
+    // The agent by its name in the project, as its row in `/status` reads.
+    let agent =
+        (note.opens.as_deref()).map(|bot| bot.split_once('.').map_or(bot, |(_, name)| name));
+    let named = agent.map_or(0, |name| name.width() + 2);
+    let right = "↩  ↑  ×";
     let tail = match live {
         true => " live",
         false => "",
     };
-    let room = width.saturating_sub(right.width() + tail.width() + 4);
+    let room = width.saturating_sub(named + right.width() + tail.width() + 4);
     let title = crate::transcript::cut(&note.title, room);
     let used = 3 + title.width() + tail.width();
-    let gap = width.saturating_sub(used + right.width()).max(1);
+    let gap = width.saturating_sub(used + named + right.width()).max(1);
     let opens = (used + gap) as u16;
     let mut spans = vec![
         Span::raw(" ✎ ").dim(),
@@ -1543,14 +1545,15 @@ fn head(note: &Note, width: usize, live: bool) -> (Line<'static>, crate::screen:
     let id = &note.id;
     let mut buttons = Vec::new();
     // The agent it is about opens beside the conversation, as a click on
-    // that agent's row does.
-    if let Some(agent) = &note.opens {
-        spans.extend([Span::raw("↗").fg(Color::Cyan), Span::raw("  ")]);
-        buttons.push((opens, opens + 1, format!("{BUTTON}task/{agent}")));
+    // that agent's row or any blue name does.
+    if let (Some(name), Some(bot)) = (agent, &note.opens) {
+        spans.extend([Span::raw(name.to_owned()).fg(Color::Blue), Span::raw("  ")]);
+        let end = opens + name.width() as u16;
+        buttons.push((opens, end, format!("{BUTTON}task/{bot}")));
     }
     // ↩ answers it, quoted where the person writes, as a message's own
     // mark does.
-    let reply = opens + 3 * u16::from(note.opens.is_some());
+    let reply = opens + named as u16;
     let up = reply + 3;
     spans.extend([
         Span::raw(crate::screen::REPLY).dim(),
@@ -2500,9 +2503,14 @@ mod tests {
             (lines[1].to_string(), buttons.unwrap())
         };
         let (head, opened) = buttons(&mut margin);
-        assert!(head.ends_with("↗  ↩  ↑  ×"), "{head}");
+        // The agent's name, blue, opens it: `↗` is the main view's alone.
+        assert!(head.ends_with("wire  ↩  ↑  ×"), "{head}");
+        assert!(!head.contains('↗'), "{head}");
         let cols: Vec<char> = head.chars().collect();
-        assert_eq!(cols[opened[0].0 as usize], '↗');
+        assert_eq!(
+            cols[opened[0].0 as usize..opened[0].1 as usize],
+            ['w', 'i', 'r', 'e']
+        );
         assert_eq!(opened[0].2, format!("{BUTTON}task/shop.wire"));
         assert_eq!(cols[opened[2].0 as usize], '↑');
         assert_eq!(cols[opened[3].0 as usize], '×');

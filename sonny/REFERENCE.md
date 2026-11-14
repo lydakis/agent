@@ -414,7 +414,7 @@ project whose lead is in no multiplexer gets none, and its agents get no
 layout skill. A tab asked for stays until you or an agent close it, or the
 task is marked done. With `task_tabs = "every"`, a task's window
 closes once its work is taken: its turn completed and the lead (or the task
-that started it) waited on it. One that failed, stopped or waits on you stays
+that started it) waited on it. One that failed, was interrupted or waits on you stays
 open, and a task given more work opens again; ask the lead to show one, or
 run `sonny --agent NAME`. A lead keeps `[sonny] task_windows` of its tasks'
 windows open, 32 by default (0 for no limit), as VS Code's editor limit
@@ -1004,11 +1004,16 @@ has something on it, or is off the screen, no time shows.
   approval, asking you a question, or held on something only you can fix,
   such as a ChatGPT sign-in), **Failed** (its last turn failed; it asks
   nothing, and says what went wrong under it),
-  **Working** (a turn running, queued, rate limited, waiting on other
-  tasks, or `waiting on its reviewer` while the reviewer weighs a call), **Idle**
-  (its turn ended, stopped, or never started, with nothing open; a pull
-  request its last reply linked shows on its row), and **Done** (marked
-  done). Each agent is one line: its mark, name, state and time; one
+  **Working** (a turn running, queued, rate limited, starting, waiting on
+  other tasks, or `waiting on its reviewer` while the reviewer weighs a
+  call), **Idle** (its turn ended with nothing open, `idle`; ended without
+  words, `no reply`; or you ended it, `interrupted`; a pull request its
+  last reply linked shows on its row), and **Done** (marked done). One
+  table gives every state its mark, for the footer, `/status`, the tasks
+  a lead started and `/switch` alike: `?` needs you or held, `✗` failed,
+  `●` working, `◌` waiting, queued, rate limited or starting, `○` idle or
+  no reply, `■` interrupted, `✓` done; all but the first three muted.
+  Each agent is one line: its mark, name, state and time; one
   that needs you says what for under it, one that failed why. That is all it shows as it opens; `m` shows more and hides it
   again: at each row's right edge, dim, the rest of what it tracks: what it follows (a source with an
   `icon` in `[sonny.sources.NAME]` shows as that icon, as it does wherever
@@ -1647,8 +1652,8 @@ they turn up only once the agent has read them. None waits more than a
 day (`attach_wait` in `config.toml`): one no call took in by then reaches
 the agent as a message of its own. Your reactions and the margin notes you
 close wait for your next word instead, which is what they are about. A turn that ends
-with the model saying nothing (`empty_completion`) ends quietly, not as a
-failure.
+with the model saying nothing (`empty_completion`) reads `no reply`, not
+a failure, and its notification says `fix finished, no reply`.
 
 ![Memory saves folded into one row, and a question whose options are buttons](../docs/sonny/fold-and-ask.png)
 

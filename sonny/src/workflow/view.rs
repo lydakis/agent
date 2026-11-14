@@ -55,7 +55,7 @@ impl Live {
         format!("{}{MARK}{}", self.caller, self.id)
     }
 
-    /// Its row's state: `Verify · 12 running, 31 done, 2 failed`.
+    /// Its row's state: `Verify · 12 working, 31 finished, 2 failed`.
     pub fn state(&self) -> String {
         let mut said = match self.phase.as_str() {
             "" => String::new(),
@@ -89,12 +89,12 @@ impl Live {
     }
 }
 
-/// `2 running, 3 done, 1 failed`, leaving out what is none; `starting`
-/// before any agent.
+/// `2 working, 3 finished, 1 failed`, leaving out what is none;
+/// `starting` before any agent.
 fn counted(counts: Counts) -> String {
     let said: Vec<String> = [
-        (counts.running, "running"),
-        (counts.done, "done"),
+        (counts.running, "working"),
+        (counts.done, "finished"),
         (counts.failed, "failed"),
     ]
     .into_iter()
@@ -355,10 +355,10 @@ mod tests {
         }
         let live = fold.live();
         assert_eq!((live.running, live.done, live.failed), (2, 2, 2));
-        assert_eq!(live.state(), "Verify · 2 running, 2 done, 2 failed");
+        assert_eq!(live.state(), "Verify · 2 working, 2 finished, 2 failed");
         assert_eq!(
             live.more(),
-            "Find: 1 running, 2 done · Verify: 1 running, 2 failed · 1 of 2 checked · 10 output tokens"
+            "Find: 1 working, 2 finished · Verify: 1 working, 2 failed · 1 of 2 checked · 10 output tokens"
         );
         // Run again from the top, what was running is asked again.
         fold.take(&json!({"t": "replay"}));

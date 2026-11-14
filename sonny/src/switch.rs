@@ -13,6 +13,29 @@ pub struct Agent {
     pub name: String,
     /// What it is doing and where, muted beside its name.
     pub about: String,
+    /// Its state, as the state table names it.
+    pub state: String,
+}
+
+/// What a `bots` row says its agent is doing, as `/status` reads it: held
+/// on a cause, waiting, rate limited or working while a turn runs; an
+/// ended one as its end did; one never run starting.
+fn state(bot: &Value) -> String {
+    let blocked = &bot["waiting_on"]["blocked"];
+    if blocked.is_object() {
+        let code = blocked["code"].as_str().unwrap_or("");
+        let (what, _) = crate::status::held_cause(code, blocked["detail"].as_str());
+        return format!("{}{what}", crate::status::HELD);
+    }
+    match (bot["running_turn"].is_null(), bot["status"].as_str()) {
+        (false, Some("waiting")) => "waiting".to_owned(),
+        (false, Some("paced")) => "rate limited".to_owned(),
+        (false, _) => "working".to_owned(),
+        (true, _) => match &bot["last"] {
+            Value::Null => "starting".to_owned(),
+            last => crate::started::state(last),
+        },
+    }
 }
 
 pub struct Picker {
@@ -70,9 +93,11 @@ impl Picker {
         let agents: Vec<Agent> = rows
             .into_iter()
             .map(|bot| {
+                // Its mark says idle; any other state is said in words too.
+                let state = state(bot);
                 let mut about = Vec::new();
-                if !bot["running_turn"].is_null() {
-                    about.push("working".to_owned());
+                if state != crate::started::IDLE {
+                    about.push(state.clone());
                 }
                 // Another project's folder tells it apart; this project's
                 // are this folder or its copies, which say nothing more.
@@ -84,6 +109,7 @@ impl Picker {
                 Agent {
                     name: bot["name"].as_str().unwrap_or("").to_owned(),
                     about: about.join(" · "),
+                    state,
                 }
             })
             .collect();
@@ -165,12 +191,16 @@ mod tests {
 
     fn bots() -> Vec<Value> {
         vec![
-            json!({"name": "blog.lead", "workspace": "/w/blog", "running_turn": null}),
+            json!({"name": "blog.lead", "workspace": "/w/blog", "running_turn": null,
+                "last": {"status": "completed"}}),
             json!({"name": "shop.fix", "workspace": "/w/shop/.copies/fix", "running_turn": 3}),
-            json!({"name": "shop.lead", "workspace": "/w/shop", "running_turn": null}),
-            json!({"name": "shop.lead.web", "workspace": "/w/shop", "running_turn": null}),
+            json!({"name": "shop.lead", "workspace": "/w/shop", "running_turn": null,
+                "last": {"status": "failed", "error": "provider_http_500"}}),
+            json!({"name": "shop.lead.web", "workspace": "/w/shop", "running_turn": 5,
+                "status": "waiting", "waiting_on": {"blocked": {"code": "provider_http_401"}}}),
             json!({"name": "shop.lead.side-1", "workspace": "/w/shop", "expire_ms": 9}),
-            json!({"name": "notes", "workspace": "/w/notes", "running_turn": null}),
+            json!({"name": "notes", "workspace": "/w/notes", "running_turn": null,
+                "last": {"status": "interrupted"}}),
             json!({"name": ".reviewer.auto", "workspace": "/", "running_turn": null}),
         ]
     }
@@ -204,7 +234,28 @@ mod tests {
         // The first that is not this window is picked.
         assert_eq!(picker.chosen().as_deref(), Some("shop.lead.web"));
         let about: Vec<&str> = picker.agents.iter().map(|a| a.about.as_str()).collect();
-        assert_eq!(about, ["", "", "working", "/w/blog", "/w/notes"]);
+        // Idle is said by its mark alone; every other state in words too.
+        assert_eq!(
+            about,
+            [
+                "failed",
+                "held: API key refused",
+                "working",
+                "/w/blog",
+                "interrupted · /w/notes"
+            ]
+        );
+        let states: Vec<&str> = picker.agents.iter().map(|a| a.state.as_str()).collect();
+        assert_eq!(
+            states,
+            [
+                "failed",
+                "held: API key refused",
+                "working",
+                "idle",
+                "interrupted"
+            ]
+        );
     }
 
     #[test]

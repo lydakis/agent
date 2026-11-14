@@ -320,7 +320,10 @@ impl View {
         ])];
         if let Some(error) = &self.error {
             out.push(Line::default());
-            out.push(Line::from(format!("could not read usage: {error}")).fg(Color::Yellow));
+            out.push(Line::from(vec![
+                Span::raw("✗ ").fg(Color::Red),
+                Span::raw(format!("couldn't read usage: {error}")),
+            ]));
         }
         let Some(read) = &self.read else {
             if self.error.is_none() {

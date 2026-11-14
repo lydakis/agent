@@ -186,9 +186,10 @@ impl View {
         }
         let mut out = vec![Line::from(head), Line::default()];
         if let Some(error) = &self.error {
-            out.push(
-                Line::from(format!("could not read the audit trail: {error}")).fg(Color::Yellow),
-            );
+            out.push(Line::from(vec![
+                Span::raw("✗ ").fg(Color::Red),
+                Span::raw(format!("couldn't read the audit trail: {error}")),
+            ]));
             return out;
         }
         if self.at.is_none() && self.rows.is_empty() {
