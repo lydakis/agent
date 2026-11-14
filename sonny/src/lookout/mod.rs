@@ -3176,8 +3176,9 @@ fn bounded(ready: &[(usize, sources::Heard)]) -> Vec<bool> {
         let quoted: usize = (group.iter())
             .map(|at| usize::from(ready[*at].1.event.quote.is_some()))
             .sum();
-        let empty = !chosen.contains(&true);
-        if !empty && (bytes + more > sources::NOTE_BYTES || quotes + quoted > sources::NOTE_QUOTES)
+        // Only a lone event goes past the bounds, so a note is never empty.
+        let alone = group.len() == 1 && !chosen.contains(&true);
+        if !alone && (bytes + more > sources::NOTE_BYTES || quotes + quoted > sources::NOTE_QUOTES)
         {
             return false;
         }
@@ -3199,6 +3200,13 @@ fn bounded(ready: &[(usize, sources::Heard)]) -> Vec<bool> {
             })
             .collect();
         if !add(&mut chosen, &group) {
+            // Too much waits before it in its task: what fits goes, in
+            // order, and the steer follows in a later note.
+            for at in group {
+                if !add(&mut chosen, &[at]) {
+                    break;
+                }
+            }
             break;
         }
     }
@@ -3969,6 +3977,16 @@ mod tests {
         assert_eq!(bounded(&ready), [true, false, true, false, true]);
         // One that fits nothing else still goes.
         assert_eq!(bounded(&ready[..1]), [true]);
+        // A steer with more before it in its task than a note holds: the
+        // task's events go in order while they fit, the steer later.
+        let third = "x".repeat(sources::NOTE_BYTES / 3);
+        let much = [
+            heard(task(&third, false), 1),
+            heard(task(&third, false), 2),
+            heard(task(&third, false), 3),
+            heard(task("the person wrote", true), 4),
+        ];
+        assert_eq!(bounded(&much), [true, true, false, false]);
     }
 
     #[test]
