@@ -45,7 +45,9 @@ fn a_live_block_reads_no_file_in_a_folder_kept_from_agents() {
     std::fs::write(cookies.join("jar"), "SESSION=listed\n").unwrap();
     std::fs::write(work.join("notes.md"), "plain notes\n").unwrap();
     std::os::unix::fs::symlink(&keys, work.join("to-keys")).unwrap();
-    let output = |markdown: &str| live(&home, &work, markdown)["output"].to_string();
+    // What the agent is answered: the fill, or why it was refused, since
+    // a block that does not fill now is refused.
+    let output = |markdown: &str| live(&home, &work, markdown).to_string();
     // A file of the agent's own fills, and so do the person's cookies,
     // which the config does not list.
     assert!(output("{{ file(\"notes.md\") }}").contains("plain notes"));
