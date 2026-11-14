@@ -17480,7 +17480,7 @@ impl App {
                     rows.push(Line::from(vec![
                         Span::raw("    "),
                         Span::raw("✗ ").fg(Color::Red),
-                        Span::raw(refused.clone()),
+                        Span::raw(refused.clone()).dim(),
                     ]));
                 }
                 over(frame, rows, composer);
