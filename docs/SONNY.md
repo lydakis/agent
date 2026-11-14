@@ -1026,11 +1026,12 @@ named it works as its maker does, its sandbox no wider than its maker's.
 to hold a task tighter: one no one approves for refuses whatever would
 need approval (the daemon's `approval_policy` `never`), and one whose
 approver holds tighter adds its gate to the one the task keeps from its
-maker. A row looser than its maker, in sandbox, network, sockets or who
+maker. A row looser than its maker, in sandbox, network, sockets, folders
+it writes, commits to a repository the maker doesn't commit to, or who
 approves, is refused with why, and so is one the maker's gate fits no row
 of. The tool host gives an agent whose maker is gone the person's command
-rules, but its `allow` rules only as it had them already, so none lets a
-command out of the sandbox its maker could not.
+rules, but its `allow` rules and pinned program paths only as it had them
+already, so none lets a command out of the sandbox its maker could not.
 
 ## Workflows
 

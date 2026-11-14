@@ -191,17 +191,18 @@ pub fn looser(row: &Mode, maker: &Value) -> Option<String> {
         Some("workspace-write") => 1,
         _ => 2,
     };
-    let (mine, network, reached, own) = match &row.sandbox {
-        Sandbox::Full => (None, true, Vec::new(), Vec::new()),
-        Sandbox::ReadOnly => (Some("read-only"), false, Vec::new(), Vec::new()),
+    let (mine, network, git, reached, own) = match &row.sandbox {
+        Sandbox::Full => (None, true, true, Vec::new(), Vec::new()),
+        Sandbox::ReadOnly => (Some("read-only"), false, false, Vec::new(), Vec::new()),
         Sandbox::Workspace {
             network,
+            git,
             unix_sockets,
             writable,
-            ..
         } => (
             Some("workspace-write"),
             *network,
+            *git,
             sockets(unix_sockets),
             real(writable),
         ),
@@ -217,6 +218,15 @@ pub fn looser(row: &Mode, maker: &Value) -> Option<String> {
     if rank(theirs) == 1 && mine == theirs {
         if network && !settings["network"].as_bool().unwrap_or(false) {
             return Some(format!("{name} reaches the network, which you don't"));
+        }
+        // A maker whose folder is in a repository, one whose git folder a
+        // row that commits would write, commits only when it writes one.
+        let repository = (maker["workspace"].as_str())
+            .and_then(|dir| repository(std::path::Path::new(dir)))
+            .is_some();
+        let committing = (list(settings, "writable").iter()).any(|path| path.ends_with(".git"));
+        if git && !committing && repository {
+            return Some(format!("{name} commits to its repository, which you don't"));
         }
         let yours = list(settings, "unix_sockets");
         if let Some(socket) = reached.iter().find(|socket| !yours.contains(socket)) {
@@ -1721,6 +1731,24 @@ mod tests {
         let mut inside = auto.clone();
         inside["workspace"] = json!(elsewhere);
         assert_eq!(looser(&wider, &inside), None);
+        // In a repository its maker doesn't commit to, a row that commits
+        // is refused, and one that doesn't is taken.
+        crate::task::git(&elsewhere, &["init", "-q"]).unwrap();
+        let why = looser(&row("auto"), &inside).unwrap();
+        assert!(why.contains("commits to its repository"), "{why}");
+        let uncommitting = Mode {
+            name: "uncommitting",
+            sandbox: Sandbox::Workspace {
+                network: true,
+                git: false,
+                writable: Vec::new(),
+                unix_sockets: Vec::new(),
+            },
+            ..row("auto")
+        };
+        assert_eq!(looser(&uncommitting, &inside), None);
+        inside["settings"]["writable"] = json!([elsewhere.join(".git")]);
+        assert_eq!(looser(&row("auto"), &inside), None);
         std::fs::remove_dir_all(&elsewhere).unwrap();
         let asking = maker(json!([shell("manual")]), working.clone());
         assert!(looser(&row("auto"), &asking).is_some());

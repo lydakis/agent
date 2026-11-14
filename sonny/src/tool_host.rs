@@ -428,9 +428,10 @@ fn configured(record: &Value, given: &Given<'_>) -> Option<serde_json::Map<Strin
 
 /// The command rules of an agent another agent made, once that maker is
 /// gone: the person's, `given`, with only the `allow` rules it `had`
-/// already, as its maker's, by their words. So it never runs outside its
-/// sandbox what its maker could not, while the rules that ask or refuse,
-/// and any `allow` the person takes back, still reach it.
+/// already, as its maker's, by their words, and only the program paths
+/// it had pinned. So it never runs outside its sandbox what its maker
+/// could not, while the rules that ask or refuse, and any `allow` or path
+/// the person takes back, still reach it.
 fn orphan_rules(
     given: Option<&agent_client::rules::Policy>,
     had: &Value,
@@ -442,6 +443,14 @@ fn orphan_rules(
         rule.decision != Decision::Allow
             || (had.prefix_rules.iter())
                 .any(|old| old.decision == Decision::Allow && old.pattern == rule.pattern)
+    });
+    // A path pinned since lets the name's `allow` rules out by it, so only
+    // the paths it had stay; a name left with none is unpinned, where its
+    // rules may still ask or refuse but never allow.
+    rules.host_executables.retain(|name, paths| {
+        let old = had.host_executables.get(name);
+        paths.retain(|path| old.is_some_and(|old| old.contains(path)));
+        !paths.is_empty()
     });
     Some(rules).filter(|rules| *rules != Policy::default())
 }
@@ -616,6 +625,26 @@ mod tests {
             configured(&agent(Value::Null, Value::Null), &allowed).map(Value::Object),
             Some(json!({"settings": {"rules": allowing}}))
         );
+        // A program path the person pins since lets none of its maker's
+        // `allow` rules out by it; one it had pinned still does.
+        let pinning: agent_client::rules::Policy = serde_json::from_value(json!({
+            "prefix_rules": [{"pattern": ["cargo", "test"], "decision": "allow"}],
+            "host_executables": {"cargo": ["/opt/bin/cargo", "/usr/bin/cargo"]}
+        }))
+        .unwrap();
+        let pinned = Given {
+            rules: Some(&pinning),
+            ..ruled
+        };
+        let had = json!({
+            "prefix_rules": [{"pattern": ["cargo", "test"], "decision": "allow"}],
+            "host_executables": {"cargo": ["/usr/bin/cargo"]}
+        });
+        assert_eq!(configured(&agent(had, json!(8)), &pinned), None);
+        let unpinned = json!({
+            "prefix_rules": [{"pattern": ["cargo", "test"], "decision": "allow"}]
+        });
+        assert_eq!(configured(&agent(unpinned, json!(8)), &pinned), None);
     }
 
     #[test]
