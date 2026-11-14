@@ -5077,8 +5077,12 @@ pub fn watch(
                     // dark, drawn with on the next frame.
                     event::Event::Reply(reply) => crate::term::heard(&reply),
                     event::Event::Key(key) if key.kind != event::KeyEventKind::Release => {
-                        // Esc lets go of the pick and the centre before it leaves.
-                        if !view.press(key.code) && quits(&key) {
+                        // Ctrl+C leaves at once, never taken for `c`; Esc
+                        // lets go of the pick and the center before it
+                        // leaves. Other keys with Ctrl are the terminal's.
+                        let ctrl = key.modifiers.contains(event::KeyModifiers::CONTROL);
+                        if (ctrl && quits(&key)) || (!ctrl && !view.press(key.code) && quits(&key))
+                        {
                             return Ok(());
                         }
                     }

@@ -14245,14 +14245,15 @@ impl App {
                         self.asked = None;
                     }
                     KeyCode::Enter => self.submit().await,
-                    // Tab sends it to run once the running turn ends, as
-                    // Codex queues; Enter steers.
-                    KeyCode::Tab if self.running.is_some() => self.submit_as(true).await,
                     // Drawn beside another conversation, Tab with nothing
-                    // typed gives that one the keys back.
+                    // typed gives that one the keys back, while a turn
+                    // runs too: there is nothing to queue.
                     KeyCode::Tab if self.options.embedded && self.input.is_empty() => {
                         embed::give_back()
                     }
+                    // Tab sends it to run once the running turn ends, as
+                    // Codex queues; Enter steers.
+                    KeyCode::Tab if self.running.is_some() => self.submit_as(true).await,
                     KeyCode::Esc if self.react_to.is_some() => self.react_to = None,
                     // `/new`'s first message: back to its last list, the
                     // words kept for when it comes back.
@@ -18424,7 +18425,7 @@ fn row_marks(lines: &[Line<'static>], starts: &[usize]) -> Vec<(usize, screen::M
         let link = format!("{}row/{at}", screen::BUTTON);
         let end = next.min(lines.len());
         for (row, line) in lines.iter().enumerate().take(end).skip(start) {
-            if row > start && line.width() == 0 {
+            if row > start && line.spans.iter().all(|span| span.content.trim().is_empty()) {
                 break;
             }
             marks.push((row, screen::Mark::Link(link.clone())));
@@ -28470,11 +28471,15 @@ mod tests {
 
     #[test]
     fn a_click_on_any_line_of_a_listed_row_is_that_row() {
-        let lines: Vec<Line<'static>> = ["head", "", "a", "  a more", "", "b", "c", "  c more"]
-            .into_iter()
-            .map(Line::from)
-            .collect();
-        let marks = row_marks(&lines, &[2, 6, 5]);
+        // Padded a column, as the views' cards are drawn: the blank row
+        // under a row ends it, so the heading after it is no one's.
+        let lines: Vec<Line<'static>> = [
+            "head", "", "a", "  a more", "", "Heading", "b", "c", "  c more",
+        ]
+        .into_iter()
+        .map(|text| Line::from(format!(" {text}")))
+        .collect();
+        let marks = row_marks(&lines, &[2, 7, 6]);
         let at = |row| {
             (marks.iter()).find_map(|(r, mark)| match mark {
                 screen::Mark::Link(link) if *r == row => link.rsplit('/').next(),
@@ -28489,6 +28494,7 @@ mod tests {
                 None,
                 Some("0"),
                 Some("0"),
+                None,
                 None,
                 Some("2"),
                 Some("1"),
