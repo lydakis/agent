@@ -12648,6 +12648,9 @@ impl App {
                         pane.screen.unselect();
                         self.copied(&text);
                     }
+                    // As in every pane, Ctrl+C closes it; it quits only
+                    // from the composer.
+                    KeyCode::Char('c') if ctrl => self.close_pane(true),
                     KeyCode::PageUp => pane.screen.page(true),
                     KeyCode::PageDown => pane.screen.page(false),
                     KeyCode::Home => pane.screen.hold(usize::MAX),
@@ -25352,16 +25355,23 @@ mod tests {
         })
         .await;
         let mut app = app(client);
-        app.input.set("/context");
-        app.submit().await;
-        assert!(app.pane.is_some());
-        app.pane_keys = true;
         let ctrl_c = || {
             Event::Key(event::KeyEvent::new(
                 KeyCode::Char('c'),
                 KeyModifiers::CONTROL,
             ))
         };
+        // `/memory`, which takes its own keys, closes the same way.
+        app.input.set("/memory");
+        app.submit().await;
+        assert!(app.pane.is_some());
+        app.pane_keys = true;
+        app.key(ctrl_c()).await;
+        assert!(app.pane.is_none() && !app.pane_keys && !app.quit);
+        app.input.set("/context");
+        app.submit().await;
+        assert!(app.pane.is_some());
+        app.pane_keys = true;
         app.key(ctrl_c()).await;
         assert!(app.pane.is_none() && !app.pane_keys && !app.quit);
         app.key(ctrl_c()).await;
@@ -25376,7 +25386,7 @@ mod tests {
             if asked["op"] == "submit" {
                 seen.lock()
                     .unwrap()
-                    .push(stamp::unstamped(asked["prompt"].as_str().unwrap()).to_owned());
+                    .push(asked["prompt"].as_str().unwrap().to_owned());
             }
             json!({"message": 2, "turn": 2})
         })
