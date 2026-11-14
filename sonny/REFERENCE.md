@@ -1031,11 +1031,13 @@ has something on it, or is off the screen, no time shows.
   request link its last reply holds, its background work
   and its window, and under the picked agent its model and profile, and
   its latest step. Idle and Done fold to their headings (`Idle · 5 ▸`,
-  `Done · 3 ▸`). A click on either, or `i` and `d`
-  with the keys in the pane, opens them, and the same folds them again.
+  `Done · 3 ▸`), each heading a row the keys pick: a click on it, `→` or
+  Enter opens it, and `←` folds it again, as does `←` on an agent in it.
+  `/status` opens with its first row picked.
   The helpers a task started fold under it (`▸ 2 helpers, 1 working`),
   a helper that needs you or failed listed in its group too; a click on that
-  line, or → on the picked task, opens them, and ← folds them. As threads in a claude.ai project are
+  line, or → on the picked task, opens them, and ← folds them. `x` stops a
+  picked workflow. As threads in a claude.ai project are
   resolved, a task marks itself done with the `mark_done` tool once
   nothing is left to do in it, such as when its pull request merged or
   you dropped the work, and the lead can mark any of its tasks done the
@@ -1092,8 +1094,8 @@ has something on it, or is off the screen, no time shows.
   no one typing: the automations that wake them, with
   when each runs, its message and what its last run did, and the
   lookout's follows, with how many checks each asked for in the last
-  day. `↑`/`↓` picks one, `r` runs an automation now, and `d` pressed twice
-  removes it; the follow Sonny keeps for a lead's tasks stays. What runs
+  day. `↑`/`↓` picks one, Enter (or a click) goes to the agent it wakes,
+  `r` runs an automation now, and `d` pressed twice removes it; the follow Sonny keeps for a lead's tasks stays. What runs
   there while healthy asks nothing of you, so the footer leaves it out.
   What failed is listed first, with a red `✗` and the error: an automation
   whose run failed (one that ended on it stays listed until `d` removes
@@ -1116,7 +1118,7 @@ has something on it, or is off the screen, no time shows.
   stacked bars over time (output, input read fresh, and input read from the
   provider's cache), by agent and by model: each model by its name, its
   provider in a muted column beside it, and one model's ids from one
-  provider (two Bedrock regions', say) on one row. `d`, `w` and `m` show the last
+  provider (two Bedrock regions', say) on one row. `←` and `→` show the last
   day, week or month, `a` every agent in the store, by project, and `c`
   hides the cached reads, so what the provider charges most for stands out.
   Under the models, Speed says how fast each answered its calls: output
@@ -1268,7 +1270,7 @@ has something on it, or is off the screen, no time shows.
   `NO_COLOR` honoured, and `sonny sky --center NAME` starts on an agent
   (its name, label or project) and `sonny sky --replay [WHEN]` plays the
   past back from WHEN (`2h`, `30m` or `1d` ago, or a time such as `02:10`;
-  an hour ago when not said); `q` leaves it, and a daemon that goes is
+  an hour ago when not said); Esc leaves it, and a daemon that goes is
   followed again once it is back.
 
   ![/sky in the pane](../docs/sonny/sky.gif)
@@ -1874,6 +1876,24 @@ footer was. Each narrows as you type, found by its name or what it is,
 and Backspace back to nothing picks the row it opened on; a question an
 agent asks keeps its options as they are, since their order is its
 recommendation.
+
+Every view in the pane takes the keys one way, as a file browser's list
+does. `↑` `↓` move the pick, and `h` `j` `k` `l` are the arrows there;
+a view with rows opens with its first row picked, and a page of text (a
+file, a commons thread, the margin) picks among the links in view, as
+Lynx does, scrolling where none is left that way. `→` opens what the
+picked row holds and `←` folds it; with nothing to fold, `←` steps the
+pane back a page, and it never moves the keys. Enter goes to the picked
+row's agent, where a click on its blue name goes (on this window's own
+agent it closes the view), and otherwise does the row's one thing: it
+never closes a view for any other reason. A click on a row picks it and
+presses Enter. Esc closes the view; an agent shown beside first does
+what Esc does there (clears what is typed, stops its turn), then gives
+the keys back, and the next Esc closes it. Tab with nothing typed moves
+the keys between the conversation and the pane, both ways, the agent
+beside included; while the pane has them the composer's `›` is muted,
+and a key the view does not name does nothing (`q` included), never
+typed into the composer.
 
 ![? with nothing typed: every key beside the conversation](../docs/sonny/shortcuts.png)
 
