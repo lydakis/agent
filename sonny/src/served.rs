@@ -148,6 +148,10 @@ fn start() -> Value {
                 "profile": {"type": "string", "minLength": 1,
                     "description": "A role listed under Profiles that fits the task; without one, it \
                         starts in no role."},
+                "permissions": {"type": "string", "minLength": 1,
+                    "description": "One of the person's /permissions rows to hold the task tighter \
+                        than you, such as one that refuses what would need approval; one looser \
+                        than yours is refused. Without one, it works as you do."},
                 "folder": {"type": "string", "minLength": 1,
                     "description": "A folder inside this one to start the task at instead of here, \
                         relative or absolute, in a git repository, such as one this folder holds: the task \
@@ -647,6 +651,7 @@ async fn called(name: &str, arguments: &Value) -> Answer {
                 name: text("name").unwrap_or_default(),
                 brief: text("brief").unwrap_or_default(),
                 profile: text("profile"),
+                permissions: text("permissions"),
                 setup: arguments["setup"] == true,
                 model: text("model"),
                 effort: text("effort"),

@@ -45,6 +45,10 @@ pub struct Start {
     pub name: String,
     pub brief: String,
     pub profile: Option<String>,
+    /// One of the person's `/permissions` rows to hold the task in, at
+    /// least as tightly as its starter is held; without one, it works in
+    /// its starter's sandbox, under its starter's gate.
+    pub permissions: Option<String>,
     pub setup: bool,
     pub model: Option<String>,
     pub effort: Option<String>,
@@ -178,9 +182,28 @@ pub fn start(here: &Path, project: &str, starter: &str, start: &Start) -> Result
     // it in a sandbox too unless the lead has none; and the lead's state
     // folder, which the task writes as the lead does.
     let lead = bot_record(&agent, &start.env, starter);
-    let mode = (lead.as_ref())
+    let held = (lead.as_ref())
         .and_then(crate::approvals::mode)
         .unwrap_or_else(crate::approvals::default);
+    // A row asked for holds it at least as tightly as its starter, or the
+    // start is refused, never made looser in silence.
+    let (mode, picked) = match start.permissions.as_deref().map(str::trim) {
+        Some(row) => {
+            let Some(found) = crate::approvals::find(row) else {
+                return Err(format!(
+                    "{row:?} is no /permissions row; the rows are {}",
+                    crate::approvals::names().join(", ")
+                ));
+            };
+            if let Some(why) =
+                (lead.as_ref()).and_then(|lead| crate::approvals::looser(&found, lead))
+            {
+                return Err(why);
+            }
+            (found.name, Some(found))
+        }
+        None => (held, None),
+    };
     let state = match &lead {
         Some(lead) => crate::state::of(lead, starter),
         None => crate::state::folder(starter),
@@ -389,9 +412,27 @@ pub fn start(here: &Path, project: &str, starter: &str, start: &Start) -> Result
     // A task works in its lead's mode's sandbox: confined to its folder,
     // committing to its repository and running the commands the config
     // lets out of it, or, in `full`, unconfined, as nothing would answer a
-    // call that asks to leave.
-    for (key, value) in crate::approvals::sandbox(mode, &place.dir, state.as_deref()) {
-        let flag = format!("--{key}");
+    // call that asks to leave. Without a row of its own, no more than its
+    // starter has; with one, under the gate the row adds to its starter's.
+    let mut sandbox = crate::approvals::sandbox(mode, &place.dir, state.as_deref());
+    match (&picked, &lead) {
+        (None, Some(lead)) => crate::approvals::within(&mut sandbox, lead),
+        (Some(row), lead) => {
+            if let Some(approval) = crate::approvals::added(row, lead.as_ref()) {
+                flags.extend(["--approval".to_owned(), approval.to_owned()]);
+            }
+        }
+        (None, None) => {}
+    }
+    for (key, value) in sandbox {
+        // Asked for as the gate's `--approval never`.
+        if key == "approval_policy" {
+            continue;
+        }
+        let flag = match key.as_str() {
+            "unix_sockets" => "--unix-socket".to_owned(),
+            key => format!("--{key}"),
+        };
         match value {
             Value::String(value) => flags.extend([flag, value]),
             Value::Bool(true) => flags.push(flag),
@@ -2430,6 +2471,7 @@ mod tests {
             name: "fix".into(),
             brief: String::new(),
             profile: None,
+            permissions: None,
             setup: false,
             model: None,
             effort: None,

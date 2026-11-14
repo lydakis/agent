@@ -173,6 +173,134 @@ pub fn find(name: &str) -> Option<Mode> {
     builtin(name).or_else(|| modes().into_iter().find(|mode| mode.name == name))
 }
 
+/// Every row's name, as `/permissions` lists them.
+pub fn names() -> Vec<&'static str> {
+    modes().into_iter().map(|mode| mode.name).collect()
+}
+
+/// Why `row` would hold an agent that `maker`, as `inspect` gives it,
+/// makes more loosely than `maker` is held, if it would: a sandbox that
+/// lets it do more, or a gate that asks less, so a row an agent picks for
+/// one it makes only ever holds it tighter, as Codex's subagents keep
+/// their parent's sandbox and approvals.
+pub fn looser(row: &Mode, maker: &Value) -> Option<String> {
+    let settings = &maker["settings"];
+    let theirs = settings["sandbox"].as_str();
+    let rank = |sandbox: Option<&str>| match sandbox {
+        Some("read-only") => 0,
+        Some("workspace-write") => 1,
+        _ => 2,
+    };
+    let (mine, network, reached) = match &row.sandbox {
+        Sandbox::Full => (None, true, Vec::new()),
+        Sandbox::ReadOnly => (Some("read-only"), false, Vec::new()),
+        Sandbox::Workspace {
+            network,
+            unix_sockets,
+            ..
+        } => (Some("workspace-write"), *network, sockets(unix_sockets)),
+    };
+    let name = row.name;
+    if rank(mine) > rank(theirs) {
+        return Some(format!(
+            "{name} runs {}, looser than your sandbox ({})",
+            mine.unwrap_or("with no sandbox"),
+            theirs.unwrap_or("none")
+        ));
+    }
+    if rank(theirs) == 1 && mine == theirs {
+        if network && !settings["network"].as_bool().unwrap_or(false) {
+            return Some(format!("{name} reaches the network, which you don't"));
+        }
+        let yours = list(settings, "unix_sockets");
+        if let Some(socket) = reached.iter().find(|socket| !yours.contains(socket)) {
+            return Some(format!(
+                "{name} reaches the socket {socket}, which you don't"
+            ));
+        }
+    }
+    let Some(yours) = reviewer(maker) else {
+        return Some(format!(
+            "your gate is none of Sonny's rows, so no row is known to be as tight; start it \
+             without {name}"
+        ));
+    };
+    let sandboxed = rank(theirs) < 2;
+    if hold(row.reviewer, mine.is_some()) < hold(yours, sandboxed) {
+        let who = |reviewer: Reviewer, sandboxed: bool| match reviewer {
+            Reviewer::Model => "the reviewer model approves",
+            Reviewer::You => "the person approves",
+            Reviewer::None if sandboxed => "nothing that needs approval runs",
+            Reviewer::None => "nothing is reviewed",
+        };
+        return Some(format!(
+            "in {name} {}, looser than yours, where {}",
+            who(row.reviewer, mine.is_some()),
+            who(yours, sandboxed)
+        ));
+    }
+    None
+}
+
+/// The `--approval` mode an agent made in `row` takes beside the gate it
+/// keeps from `maker`: `never` for a sandboxed row no one approves for,
+/// and the row's own approver when it holds tighter than the maker.
+pub fn added(row: &Mode, maker: Option<&Value>) -> Option<&'static str> {
+    let sandboxed = !matches!(row.sandbox, Sandbox::Full);
+    let theirs = maker.map_or(0, |maker| {
+        let confined = matches!(
+            maker["settings"]["sandbox"].as_str(),
+            Some("workspace-write" | "read-only")
+        );
+        reviewer(maker).map_or(0, |reviewer| hold(reviewer, confined))
+    });
+    match row.reviewer {
+        Reviewer::None if sandboxed => Some(NEVER),
+        _ if hold(row.reviewer, sandboxed) <= theirs => None,
+        Reviewer::Model => Some("auto"),
+        Reviewer::You => Some("manual"),
+        Reviewer::None => None,
+    }
+}
+
+/// `fields`, sandbox fields as [`sandbox`] gives them, held to the
+/// sandbox of `maker`, as `inspect` gives it: what Sonny asks for an agent
+/// it makes for another with no row named, which then works as its maker
+/// does. A row that fit its maker when it was made may give more than the
+/// maker has now, which the daemon would refuse.
+pub fn within(fields: &mut Map<String, Value>, maker: &Value) {
+    let settings = &maker["settings"];
+    let theirs = settings["sandbox"].as_str();
+    if !matches!(theirs, Some("workspace-write" | "read-only")) {
+        return;
+    }
+    let mine = fields.get("sandbox").and_then(Value::as_str);
+    if theirs == Some("read-only") && mine != Some("read-only") {
+        fields.insert("sandbox".into(), json!("read-only"));
+        for key in ["writable", "network", "unix_sockets"] {
+            fields.remove(key);
+        }
+        return;
+    }
+    if mine == Some("danger-full-access") {
+        fields.insert("sandbox".into(), json!("workspace-write"));
+    }
+    if !settings["network"].as_bool().unwrap_or(false) {
+        fields.insert("network".into(), json!(false));
+    }
+    let yours = list(settings, "unix_sockets");
+    if let Some(Value::Array(reached)) = fields.get_mut("unix_sockets") {
+        reached.retain(|socket| {
+            socket
+                .as_str()
+                .is_some_and(|s| yours.iter().any(|y| y == s))
+        });
+        if reached.is_empty() {
+            fields.remove("unix_sockets");
+        }
+    }
+}
+
 /// The row a new lead starts in: the config's `default_permissions`, else
 /// `auto`.
 pub fn default() -> &'static str {
@@ -215,14 +343,39 @@ pub fn mark(name: &str) -> Option<&'static str> {
 }
 
 /// Who approves for a bot, from its record's gates: `None` for a gate
-/// Sonny did not set.
+/// Sonny did not set. One that never asks has no one approve, whatever
+/// gates it keeps from its maker; one with its maker's `auto` gate and
+/// its own `manual` one waits for the person too.
 fn reviewer(record: &Value) -> Option<Reviewer> {
+    if record["settings"]["approval_policy"] == NEVER {
+        return Some(Reviewer::None);
+    }
     let gates = record["gates"].as_array().map(Vec::as_slice).unwrap_or(&[]);
-    match gates {
-        [] => Some(Reviewer::None),
-        [gate] if gate["tag"] == "auto" => Some(Reviewer::Model),
-        [gate] if gate["tag"] == "manual" => Some(Reviewer::You),
-        _ => None,
+    let mut reviewer = Reviewer::None;
+    for gate in gates {
+        reviewer = match gate["tag"].as_str() {
+            Some("manual") => Reviewer::You,
+            Some("auto") if reviewer != Reviewer::You => Reviewer::Model,
+            Some("auto") => reviewer,
+            _ => return None,
+        };
+    }
+    Some(reviewer)
+}
+
+/// The daemon's `approval_policy` that refuses what a gate would ask about.
+const NEVER: &str = "never";
+
+/// How tightly `reviewer` holds an agent in `sandbox`: one no one approves
+/// for in a sandbox refuses everything that would need approval, so holds
+/// it tightest; the person holds it tighter than the reviewer model, which
+/// holds it tighter than no sandbox at all.
+fn hold(reviewer: Reviewer, sandboxed: bool) -> u8 {
+    match reviewer {
+        Reviewer::None if sandboxed => 3,
+        Reviewer::You => 2,
+        Reviewer::Model => 1,
+        Reviewer::None => 0,
     }
 }
 
@@ -341,7 +494,8 @@ pub fn refresh(record: &Value) -> Option<&'static str> {
 /// bot has but those that touch only its own records or only read waits
 /// for whoever approves, unless no one does. Reads run unjudged, as
 /// Codex's sandboxes let reads through: what leaves the sandbox is a
-/// write, a command or a call out. No gate is `create`'s no fields.
+/// write, a command or a call out. No gate is an empty `approve`, which
+/// `create` takes as asking for none and `configure` as taking it off.
 pub fn gate(name: &str, tools: &[String]) -> Map<String, Value> {
     let reviewer = find(name).map_or(Reviewer::None, |mode| mode.reviewer);
     let approve: Vec<&String> = tools
@@ -364,22 +518,6 @@ pub fn gate(name: &str, tools: &[String]) -> Map<String, Value> {
         Value::Object(fields) => fields,
         _ => Map::new(),
     }
-}
-
-/// [`gate`]'s fields for `create`, where no gate is no fields: an empty
-/// `approve` is how `configure` takes a gate off, and `create`, with no
-/// gate to take off, refuses one (`invalid_gate`). So a lead made in
-/// `full`, or in a row of the person's that no one approves for, starts.
-pub fn create_gate(name: &str, tools: &[String]) -> Map<String, Value> {
-    let mut fields = gate(name, tools);
-    if fields
-        .get("approve")
-        .and_then(Value::as_array)
-        .is_some_and(Vec::is_empty)
-    {
-        fields.remove("approve");
-    }
-    fields
 }
 
 /// The sandbox fields, as `configure` takes them and `create`'s settings
@@ -439,8 +577,10 @@ fn sandbox_with(name: &str, workspace: &std::path::Path) -> Map<String, Value> {
 
 /// The sandbox fields of `mode` in `workspace`.
 fn fields(mode: &Mode, workspace: &std::path::Path) -> Map<String, Value> {
-    let fields = match &mode.sandbox {
-        Sandbox::Full => return confined(json!({"sandbox": "danger-full-access"})),
+    let mut fields = match &mode.sandbox {
+        Sandbox::Full => {
+            return confined(json!({"sandbox": "danger-full-access", "approval_policy": null}));
+        }
         Sandbox::ReadOnly => json!({"sandbox": "read-only"}),
         Sandbox::Workspace {
             network,
@@ -467,6 +607,12 @@ fn fields(mode: &Mode, workspace: &std::path::Path) -> Map<String, Value> {
             }
             fields
         }
+    };
+    // A row no one approves for refuses what would need approval, also
+    // under a gate its agent keeps from the agent that made it.
+    fields["approval_policy"] = match mode.reviewer {
+        Reviewer::None => json!(NEVER),
+        _ => Value::Null,
     };
     confined(fields)
 }
@@ -814,6 +960,7 @@ pub fn sandboxed_as(record: &Value, fields: &Map<String, Value>) -> bool {
     let fields = Value::Object(fields.clone());
     let settings = &record["settings"];
     settings["sandbox"] == fields["sandbox"]
+        && settings["approval_policy"] == fields["approval_policy"]
         && set(settings, "writable") == set(&fields, "writable")
         && set(settings, "unix_sockets") == set(&fields, "unix_sockets")
         && settings["network"].as_bool().unwrap_or(false)
@@ -1138,7 +1285,8 @@ mod tests {
         let dir = std::fs::canonicalize(&dir).unwrap();
         crate::task::git(&dir, &["init", "-q"]).unwrap();
         let git = dir.join(".git").display().to_string();
-        let confined = json!({"sandbox": "workspace-write", "writable": [git], "network": true});
+        let confined = json!({"sandbox": "workspace-write", "writable": [git], "network": true,
+            "approval_policy": null});
         for mode in ["auto", "ask"] {
             let fields = sandbox_with(mode, &dir);
             assert_eq!(Value::Object(fields.clone()), confined);
@@ -1149,14 +1297,14 @@ mod tests {
         let reading = sandbox_with("read-only", &dir);
         assert_eq!(
             Value::Object(reading.clone()),
-            json!({"sandbox": "read-only"})
+            json!({"sandbox": "read-only", "approval_policy": null})
         );
         assert!(sandboxed_as(&json!({"settings": reading}), &reading));
         assert_eq!(Value::Object(sandbox_with("auto", &dir)), confined);
         let full = sandbox_with("full", &dir);
         assert_eq!(
             Value::Object(full.clone()),
-            json!({"sandbox": "danger-full-access"})
+            json!({"sandbox": "danger-full-access", "approval_policy": null})
         );
         // A task the person moves to `full` leaves its sandbox with the
         // gate, and one already there is left alone.
@@ -1284,12 +1432,6 @@ mod tests {
         let reader: Vec<String> = ["read", "wait"].map(String::from).to_vec();
         assert_eq!(Value::Object(gate("auto", &reader)), json!({"approve": []}));
         assert!(gate("auto", &tools).get("approve_expire_ms").is_none());
-        // `create` refuses the empty `approve` that takes a gate off, so a
-        // lead made ungated, in `full` or with nothing to gate, sends none.
-        assert_eq!(create_gate("full", &tools), Map::new());
-        assert_eq!(create_gate("auto", &reader), Map::new());
-        assert_eq!(create_gate("auto", &tools), gate("auto", &tools));
-        assert_eq!(create_gate("ask", &tools), gate("ask", &tools));
         // An auto gate that still lapses is set again, a made bot's too.
         let lapsing = json!({"gates": [{"tag": "auto", "tools": ["shell"], "expire_ms": 45000}]});
         assert_eq!(refresh(&lapsing), Some("auto"));
@@ -1368,7 +1510,8 @@ mod tests {
         let strict = record(&modes[5], &reviewing);
         assert_eq!(
             strict["settings"],
-            json!({"sandbox": "workspace-write", "writable": [], "network": false})
+            json!({"sandbox": "workspace-write", "writable": [], "network": false,
+                "approval_policy": null})
         );
         assert_eq!(mode_in(&strict, &modes), Some("strict"));
         // As Sonny gives it, with the zen folder too, still strict.
@@ -1484,6 +1627,117 @@ mod tests {
         crate::task::git(&dir, &["init", "-q"]).unwrap();
         assert_eq!(mode_in(&record, &modes), Some("offline"));
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn an_agent_made_by_another_is_held_tighter_never_looser() {
+        let row = |name| builtin(name).unwrap();
+        // A row of the person's own that no one approves for, confined.
+        let sealed_row = Mode {
+            name: "sealed",
+            reviewer: Reviewer::None,
+            ..row("ask")
+        };
+        let shell = |tag: &str| json!({"tag": tag, "tools": ["shell"]});
+        let maker = |gates: Value, settings: Value| json!({"gates": gates, "settings": settings});
+        let working = json!({"sandbox": "workspace-write", "network": true});
+        let auto = maker(json!([shell("auto")]), working.clone());
+        // Its maker's auto gate with its own manual one waits for the
+        // person; one that never asks has no one approve, whatever gates
+        // it keeps; a gate Sonny did not set is no row's.
+        assert_eq!(
+            reviewer(&json!({"gates": [shell("auto"), shell("manual")]})),
+            Some(Reviewer::You)
+        );
+        let never = maker(
+            json!([shell("auto")]),
+            json!({"sandbox": "workspace-write", "network": true, "approval_policy": "never"}),
+        );
+        assert_eq!(reviewer(&never), Some(Reviewer::None));
+        assert_eq!(reviewer(&json!({"gates": [shell("ci")]})), None);
+
+        // As tight as its maker or tighter is taken.
+        for name in ["auto", "ask", "read-only"] {
+            assert_eq!(looser(&row(name), &auto), None, "{name}");
+        }
+        assert_eq!(looser(&sealed_row, &auto), None);
+        // Out of its maker's sandbox, off to a network its maker can't
+        // reach, or asking less of fewer, it is refused.
+        let why = looser(&row("full"), &auto).unwrap();
+        assert!(why.contains("looser than your sandbox"), "{why}");
+        let reading = maker(json!([shell("manual")]), json!({"sandbox": "read-only"}));
+        assert!(looser(&row("ask"), &reading).is_some());
+        assert_eq!(looser(&row("read-only"), &reading), None);
+        let offline = maker(
+            json!([shell("auto")]),
+            json!({"sandbox": "workspace-write", "network": false}),
+        );
+        let why = looser(&row("auto"), &offline).unwrap();
+        assert!(why.contains("network"), "{why}");
+        let why = looser(&row("ask"), &never).unwrap();
+        assert!(why.contains("nothing that needs approval runs"), "{why}");
+        assert_eq!(looser(&sealed_row, &never), None);
+        let asking = maker(json!([shell("manual")]), working.clone());
+        assert!(looser(&row("auto"), &asking).is_some());
+        assert_eq!(looser(&row("ask"), &asking), None);
+        let why = looser(
+            &row("read-only"),
+            &maker(json!([shell("ci")]), json!({"sandbox": "read-only"})),
+        )
+        .unwrap();
+        assert!(why.contains("none of Sonny's rows"), "{why}");
+
+        // What it asks beside the gate it keeps: never for a confined row
+        // no one approves for, its own approver when that holds tighter.
+        assert_eq!(added(&sealed_row, Some(&auto)), Some("never"));
+        assert_eq!(added(&row("ask"), Some(&auto)), Some("manual"));
+        assert_eq!(added(&row("auto"), Some(&auto)), None);
+        assert_eq!(added(&row("ask"), Some(&asking)), None);
+        assert_eq!(added(&row("auto"), None), Some("auto"));
+        assert_eq!(added(&row("full"), Some(&auto)), None);
+
+        // A row no one approves for refuses what would need approval, and
+        // a record that does not is not in it.
+        let nowhere = std::path::Path::new("/nonexistent/sonny");
+        let sealed = fields(&sealed_row, nowhere);
+        assert_eq!(sealed["approval_policy"], "never");
+        let asked = fields(&row("ask"), nowhere);
+        assert_eq!(asked["approval_policy"], Value::Null);
+        assert!(sandboxed_as(&json!({"settings": sealed}), &sealed));
+        assert!(!sandboxed_as(&json!({"settings": asked}), &sealed));
+
+        // With no row named, no more than its maker has.
+        let mut wide = confined(json!({"sandbox": "workspace-write", "writable": ["/w"],
+            "network": true, "unix_sockets": ["/a.sock", "/b.sock"], "approval_policy": null}));
+        within(
+            &mut wide,
+            &maker(
+                json!([]),
+                json!({"sandbox": "workspace-write", "unix_sockets": ["/b.sock"]}),
+            ),
+        );
+        assert_eq!(
+            Value::Object(wide.clone()),
+            json!({"sandbox": "workspace-write", "writable": ["/w"], "network": false,
+                "unix_sockets": ["/b.sock"], "approval_policy": null})
+        );
+        within(&mut wide, &reading);
+        assert_eq!(
+            Value::Object(wide),
+            json!({"sandbox": "read-only", "approval_policy": null})
+        );
+        let mut free = fields(&row("full"), nowhere);
+        within(&mut free, &auto);
+        assert_eq!(
+            Value::Object(free.clone()),
+            json!({"sandbox": "workspace-write", "approval_policy": null})
+        );
+        let mut kept = fields(&row("full"), nowhere);
+        within(
+            &mut kept,
+            &maker(json!([]), json!({"sandbox": "danger-full-access"})),
+        );
+        assert_eq!(kept["sandbox"], "danger-full-access");
     }
 
     #[test]

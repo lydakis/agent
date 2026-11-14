@@ -600,7 +600,7 @@ fn print_flags(flags: &str) {
             ),
             "--approval" => (
                 "MODE",
-                "A new bot's approval: full, manual, or auto; default AGENT_APPROVAL or full",
+                "A new bot's approval: full, manual, auto, or never (refuse what would need approval, asking no one, also under a gate it keeps from its creator); default AGENT_APPROVAL or full",
             ),
             "--approve" => (
                 "LIST",

@@ -343,6 +343,23 @@ pub struct Settings {
     /// with a variable that changes what runs.
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub env: std::collections::BTreeMap<String, String>,
+    /// `never`: a call that would wait on one of its gates is refused
+    /// instead, and no one is asked, as under Codex's approval policy
+    /// `never`. Its gates stay, so what they hold back stays held back. A
+    /// bot made by another that never asks never asks either. Unset, its
+    /// gates are asked.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub approval_policy: Option<ApprovalPolicy>,
+}
+/// Why a call that would need approval fails on a bot that never asks.
+pub const NEVER_ASKS: &str =
+    "approval_policy is never: this call would need approval, and no one is asked; do without it";
+/// How a bot's gated calls are decided, by Codex's `approval_policy`
+/// names: only `never` changes what its gates do.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ApprovalPolicy {
+    Never,
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize, Serialize)]
 pub enum CacheTtl {
@@ -407,6 +424,10 @@ impl Settings {
     pub fn max_drops(&self) -> usize {
         self.max_drops.unwrap_or(MAX_DROPS)
     }
+    /// Whether a call that would wait on a gate is refused instead.
+    pub fn never_asks(&self) -> bool {
+        self.approval_policy == Some(ApprovalPolicy::Never)
+    }
     pub fn approval_hold_ms(&self) -> u64 {
         self.approval_hold_ms.unwrap_or(2000)
     }
@@ -426,11 +447,14 @@ impl Settings {
     /// creator's sandbox and writable folders unless it names a stricter
     /// sandbox, and reaches the network only if both do. Every child goes
     /// by its creator's command rules and `env`, so none is made to get
-    /// past them.
+    /// past them, and never asks when its creator never asks.
     pub fn under(mut self, creator: &Settings) -> Settings {
         use crate::sandbox::Mode;
         self.rules = creator.rules.clone();
         self.env = creator.env.clone();
+        if creator.never_asks() {
+            self.approval_policy = creator.approval_policy;
+        }
         let sandboxed = |settings: &Settings| {
             matches!(
                 settings.sandbox,
@@ -454,6 +478,40 @@ impl Settings {
         }
         self.network &= creator.network;
         self
+    }
+    /// What of these settings, asked for a bot that a bot with
+    /// `creator`'s settings makes, [`Settings::under`] would not keep as
+    /// asked: a sandbox looser than its creator's, said, so the bot is
+    /// refused rather than made otherwise than asked. Those left unasked
+    /// take its creator's, and its `rules` and `env` are its creator's
+    /// whatever it asks, as no client picks them for a bot another makes.
+    pub fn beyond(&self, creator: &Settings) -> Option<String> {
+        let held = self.clone().under(creator);
+        let creator_sandbox = || {
+            creator.sandbox.map_or("none", |mode| match mode {
+                crate::sandbox::Mode::ReadOnly => "read-only",
+                crate::sandbox::Mode::WorkspaceWrite => "workspace-write",
+                crate::sandbox::Mode::DangerFullAccess => "danger-full-access",
+            })
+        };
+        let why = if self.sandbox.is_some() && held.sandbox != self.sandbox {
+            format!(
+                "sandbox: a bot made by another is confined at least as its creator is ({})",
+                creator_sandbox()
+            )
+        } else if self.network && !held.network {
+            "network: a bot made by another reaches the network only if its creator does".into()
+        } else if !self.writable.is_empty() && held.writable != self.writable {
+            format!(
+                "writable: a bot made by another writes only within its creator's sandbox ({})",
+                creator_sandbox()
+            )
+        } else if !self.unix_sockets.is_empty() && held.unix_sockets != self.unix_sockets {
+            "unix_sockets: a bot made by another reaches only the sockets its creator does".into()
+        } else {
+            return None;
+        };
+        Some(why)
     }
     pub fn cache_hour(&self) -> bool {
         self.cache_ttl == Some(CacheTtl::Hour)
@@ -590,7 +648,7 @@ impl Settings {
             "hide_senders":self.hide_senders,"quiet_background":self.quiet_background,
             "hold_ms":self.hold_ms(),
             "unix_sockets":self.unix_sockets,
-            "rules":self.rules,"env":self.env})
+            "rules":self.rules,"env":self.env,"approval_policy":self.approval_policy})
     }
     fn stored(&self) -> Result<Option<String>> {
         Ok((*self != Self::default())
@@ -611,7 +669,7 @@ pub fn web(name: &str) -> bool {
     matches!(name, "web_fetch" | "web_search")
 }
 /// Every setting's name, as `create` and `configure` take it.
-pub const SETTINGS: [&str; 23] = [
+pub const SETTINGS: [&str; 24] = [
     "context_bytes",
     "context_items",
     "note_turns",
@@ -635,6 +693,7 @@ pub const SETTINGS: [&str; 23] = [
     "unix_sockets",
     "rules",
     "env",
+    "approval_policy",
 ];
 /// Settings as their stored fields, those at their defaults left out.
 fn settings_map(settings: &Settings) -> Result<serde_json::Map<String, Value>> {
@@ -942,8 +1001,19 @@ impl Bot {
     /// sandbox confines runs without a verdict: only an escape is gated,
     /// as in Codex. A command a rule asks about waits, sandbox or not; one
     /// a rule allows or forbids doesn't. A call whose steps go to the gate
-    /// one by one waits for none as a whole.
+    /// one by one waits for none as a whole. A bot that never asks waits
+    /// for nothing: such a call is [`Bot::unasked`] instead.
     pub fn gated(&self, call: &ToolCall, workspace: &std::path::Path, rules: &Rules) -> bool {
+        !self.settings.never_asks() && self.held(call, workspace, rules)
+    }
+    /// Whether this call would wait for a verdict, but the bot never asks,
+    /// so it is refused: an escape from the sandbox as when no gate holds
+    /// it, any other call for needing approval.
+    pub fn unasked(&self, call: &ToolCall, workspace: &std::path::Path, rules: &Rules) -> bool {
+        self.settings.never_asks() && self.held(call, workspace, rules)
+    }
+    /// Whether one of the bot's gates holds this call back, asked or not.
+    fn held(&self, call: &ToolCall, workspace: &std::path::Path, rules: &Rules) -> bool {
         gated(&self.gates, &call.name)
             && self.may_call(&call.name)
             && !self.declared(&call.name).is_some_and(|tool| tool.steps)
@@ -3517,6 +3587,21 @@ impl Database {
             _ => fail("creator_identity_required"),
         }
     }
+    /// Refuse a bot asked for with no gate, made by a bot that has gates,
+    /// which it would keep: asked for none, it is not given them unasked.
+    pub fn ungated_under(&self, creator: Option<&str>, expected: Option<i64>) -> Result<()> {
+        let Some((id, _)) = Self::creator(&self.conn, creator, expected)? else {
+            return Ok(());
+        };
+        if Self::creator_gates(&self.conn, Some(id))?.is_empty() {
+            return Ok(());
+        }
+        fail_with(
+            "invalid_gate",
+            "a bot made by another keeps its creator's gates; approval_policy never refuses \
+             what they would ask about instead",
+        )
+    }
     /// The gates of the bot a client creates for, already validated: a bot
     /// cannot create or fork its way out of its own gates.
     fn creator_gates(conn: &Connection, creator: Option<i64>) -> Result<Vec<Gate>> {
@@ -3669,8 +3754,8 @@ impl Database {
     }
     /// Replace the settings `named` with `given`'s, a setting `given`
     /// leaves at its default going back to it, and keep the rest. A bot
-    /// another bot made keeps no weaker a sandbox than its creator's, as
-    /// when it was made. The settings that changed, by name, the sandbox
+    /// another bot made keeps no weaker a sandbox than its creator's, and
+    /// never asks while its creator never asks, as when it was made. The settings that changed, by name, the sandbox
     /// and the folders, network and sockets that go with it as `sandbox`.
     pub fn set_settings(
         &mut self,
@@ -3723,7 +3808,8 @@ impl Database {
                 format!("{key}: a bot made by another goes by its creator's {key}"),
             );
         }
-        let confining = named.iter().any(|key| SANDBOX.contains(&key.as_str()));
+        let confining =
+            (named.iter()).any(|key| SANDBOX.contains(&key.as_str()) || key == "approval_policy");
         if confining && let Some(creator) = bot.created_by_id {
             let creator = self
                 .conn
@@ -4138,7 +4224,12 @@ impl Database {
         let inherited = Self::creator_gates(&tx, created_by_id)?;
         let gates = stored_gates(&merge_gates(inherited.iter().chain(binding.gate), &tools))?;
         let settings = match Self::creator_settings(&tx, created_by_id)? {
-            Some(creator) => binding.settings.clone().under(&creator),
+            Some(creator) => {
+                if let Some(why) = binding.settings.beyond(&creator) {
+                    return fail_with("invalid_setting", why);
+                }
+                binding.settings.clone().under(&creator)
+            }
             None => binding.settings.clone(),
         };
         tx.execute(
@@ -9082,6 +9173,33 @@ impl Database {
             tx.commit()?;
             return Ok(Stepped {
                 step: Step::Decided(json!({"call_id":id,"decision":"allow","approvals":[]})),
+                notify: None,
+                wake: false,
+                lifted: None,
+            });
+        }
+        // A bot that never asks has a step a gate would hold refused, with
+        // no one asked.
+        if bot.settings.never_asks() {
+            let tx = self.conn.savepoint()?;
+            audit::insert(
+                &tx,
+                now_ms as i64,
+                bot.bot_id,
+                &bot.name,
+                turn,
+                call_id,
+                Some(step),
+                tool,
+                facts,
+                "nobody",
+                "denied",
+                &arguments.to_string(),
+            )?;
+            tx.commit()?;
+            return Ok(Stepped {
+                step: Step::Decided(json!({"call_id":id,"decision":"deny",
+                    "reason":NEVER_ASKS,"approvals":[]})),
                 notify: None,
                 wake: false,
                 lifted: None,
@@ -18769,6 +18887,7 @@ mod tests {
                 ..Default::default()
             }),
             env: [("A".to_owned(), "1".to_owned())].into(),
+            approval_policy: Some(ApprovalPolicy::Never),
         };
         let mut names: Vec<String> = settings_map(&all)
             .unwrap()

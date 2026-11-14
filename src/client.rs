@@ -142,8 +142,11 @@ struct Options {
     /// `run --attach-wait`: how long an attached message waits, in
     /// milliseconds; 0 as long as it takes.
     attach_wait_ms: Option<u64>,
-    /// A new bot's approval mode and gated tools.
+    /// A new bot's approval mode and gated tools, and whether the mode
+    /// was asked for with `--approval` rather than taken from
+    /// `AGENT_APPROVAL`.
     approval: Option<String>,
+    approval_asked: bool,
     approve: Option<String>,
     /// `answer`: the call, its request number, the gate, and the reason.
     call: Option<String>,
@@ -222,6 +225,7 @@ fn parse(args: &[String]) -> Result<Options> {
         approval: std::env::var("AGENT_APPROVAL")
             .ok()
             .filter(|mode| !mode.is_empty()),
+        approval_asked: false,
         approve: None,
         call: None,
         request: None,
@@ -291,7 +295,10 @@ fn parse(args: &[String]) -> Result<Options> {
                     "--model" => options.model = Some(value),
                     "--profile" => options.profile = Some(value),
                     "--delivery" => options.delivery = Some(value),
-                    "--approval" => options.approval = Some(value),
+                    "--approval" => {
+                        options.approval = Some(value);
+                        options.approval_asked = true;
+                    }
                     "--approve" => options.approve = Some(value),
                     "--allow" => options.allow = Some(value),
                     "--call" => options.call = Some(value),
@@ -1562,10 +1569,13 @@ fn require_approver(connection: &mut Connection) -> Result<()> {
 }
 
 /// The gate a new bot asks for, as `create` or `fork` fields. The mode
-/// comes from --approval or AGENT_APPROVAL, `full` by default: no gate.
+/// comes from --approval or AGENT_APPROVAL, `full` by default: no gate,
+/// asked for as none when --approval names it, so a bot made by another,
+/// which keeps its creator's gates, is refused rather than given them.
 /// `manual` gates --approve, or every tool the bot has but those never
 /// gated (`UNGATED`), for a person or a program to answer; `auto`
-/// leaves `read` ungated too.
+/// leaves `read` ungated too. `never` asks for no gate and the setting
+/// that refuses what any gate it keeps would ask about.
 fn requested_gate(options: &Options, tools: &[String]) -> Result<Value> {
     // The tools gated: --approve, or every tool but the ungated ones.
     let approve = |ungated: &[&str]| -> Result<Vec<String>> {
@@ -1588,11 +1598,12 @@ fn requested_gate(options: &Options, tools: &[String]) -> Result<Value> {
         Ok(approve)
     };
     match options.approval.as_deref().unwrap_or("full") {
-        "full" if options.approve.is_some() => fail_with(
+        "full" | "never" if options.approve.is_some() => fail_with(
             "usage",
             "--approve names tools for an approver; use --approval manual or auto",
         ),
-        "full" => Ok(json!({})),
+        "full" if options.approval_asked => Ok(json!({"approve": []})),
+        "full" | "never" => Ok(json!({})),
         // A bot with only ungated tools has nothing to wait for.
         "manual" => Ok(match approve(&UNGATED)? {
             approve if approve.is_empty() => json!({}),
@@ -1607,7 +1618,7 @@ fn requested_gate(options: &Options, tools: &[String]) -> Result<Value> {
         }),
         mode => fail_with(
             "usage",
-            format!("unknown approval mode {mode}; use full, manual, or auto"),
+            format!("unknown approval mode {mode}; use full, manual, auto, or never"),
         ),
     }
 }
@@ -2099,6 +2110,9 @@ fn run(options: &Options) -> Result<i32> {
                 .collect(),
         };
         let mut settings = options.settings.clone();
+        if options.approval.as_deref() == Some("never") {
+            settings.insert("approval_policy".into(), json!("never"));
+        }
         if config()?.hide_senders {
             settings.entry("hide_senders").or_insert(json!(true));
         }
