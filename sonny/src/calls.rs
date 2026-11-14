@@ -591,9 +591,20 @@ pub fn agent_inside(command: &str) -> bool {
             else {
                 return false;
             };
-            let cut = |p: &str| matches!(p.split_whitespace().next(), Some("head" | "tail" | "jq"));
-            if !simple.piped.as_deref().is_none_or(cut) {
-                return false;
+            // Every stage after it only cuts what it prints.
+            let mut piped = simple.piped.clone();
+            while let Some(stage) = piped {
+                let Some(next) = crate::shell::simple(&stage).filter(|_| !writes_elsewhere(&stage))
+                else {
+                    return false;
+                };
+                if !matches!(
+                    next.words.first().map(String::as_str),
+                    Some("head" | "tail" | "jq")
+                ) {
+                    return false;
+                }
+                piped = next.piped;
             }
             let Some((program, words)) = simple.words.split_first() else {
                 return false;
@@ -1401,6 +1412,7 @@ Keep the rest.'"#,
             r#""$AGENT_BIN" models"#,
             r#""$AGENT_BIN" ls --name 'a>b' 2>&1"#,
             r#""$AGENT_BIN" ls 2>/dev/null"#,
+            r#""$AGENT_BIN" ls --pretty | jq -r '.name | ascii_upcase' | head -5"#,
         ] {
             assert!(agent_inside(inside), "{inside}");
         }
@@ -1418,6 +1430,8 @@ Keep the rest.'"#,
             r#"git push && "$AGENT_BIN" run --bot shop.lead -- pushed"#,
             r#""$AGENT_BIN" ls > "$HOME/report.json""#,
             r#""$AGENT_BIN" turns --bot shop.fix >> /tmp/out 2>&1"#,
+            r#""$AGENT_BIN" ls | head | tee "$HOME/report.json""#,
+            r#""$AGENT_BIN" ls | jq . | sh"#,
             "",
         ] {
             assert!(!agent_inside(outside), "{outside}");

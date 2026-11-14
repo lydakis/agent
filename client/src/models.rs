@@ -46,18 +46,7 @@ pub fn discovered(path: &Path) -> PathBuf {
 /// the catalog's they did not name, less every model they hide; each once.
 /// No files is no list.
 pub fn read(path: &Path) -> Result<Vec<Model>, Error> {
-    fn invalid(path: &Path) -> impl Fn((usize, &'static str)) -> Error + '_ {
-        move |(line, reason)| {
-            Error::with(
-                "models_invalid",
-                &format!("{}:{line}: {reason}", path.display()),
-            )
-        }
-    }
-    let mine = match read_file(path, true)? {
-        Some(text) => lines(&text).map_err(invalid(path))?,
-        None => Vec::new(),
-    };
+    let mine = lines_at(path)?;
     // Only discovery writes the catalog, never through a link.
     let catalog = discovered(path);
     let listed = match read_file(&catalog, false)? {
@@ -82,6 +71,32 @@ pub fn read(path: &Path) -> Result<Vec<Model>, Error> {
         }
     }
     Ok(models)
+}
+
+/// The models the person lists at `path`, in their order, less those
+/// they hide: their own lines only, none of the catalog's.
+pub fn mine(path: &Path) -> Result<Vec<Model>, Error> {
+    let listed = lines_at(path)?.into_iter();
+    Ok(listed
+        .filter_map(|(hide, model)| (!hide).then_some(model))
+        .collect())
+}
+
+/// The person's lines at `path`, each a model and whether it hides it.
+fn lines_at(path: &Path) -> Result<Vec<(bool, Model)>, Error> {
+    match read_file(path, true)? {
+        Some(text) => lines(&text).map_err(invalid(path)),
+        None => Ok(Vec::new()),
+    }
+}
+
+fn invalid(path: &Path) -> impl Fn((usize, &'static str)) -> Error + '_ {
+    move |(line, reason)| {
+        Error::with(
+            "models_invalid",
+            &format!("{}:{line}: {reason}", path.display()),
+        )
+    }
 }
 
 /// A list file's text, or none where there is none: a regular file of at
@@ -642,6 +657,29 @@ mod tests {
 
     fn ids(models: &[super::Model]) -> Vec<&str> {
         models.iter().map(|m| m.id.as_str()).collect()
+    }
+
+    #[test]
+    fn the_persons_own_models_leave_out_the_catalog() {
+        let dir = temp("mine");
+        let list = dir.join("models");
+        std::fs::write(&list, "openai/a  # fast\n-openai/b\nopenai/c\n").unwrap();
+        std::fs::write(
+            super::discovered(&list),
+            "openai/b  # B\nopenai/d  # D, 200k tokens\n",
+        )
+        .unwrap();
+        let mine = super::mine(&list).unwrap();
+        assert_eq!(ids(&mine), ["openai/a", "openai/c"]);
+        assert_eq!(mine[0].note.as_deref(), Some("fast"));
+        // What clients offer still reads both.
+        assert_eq!(
+            ids(&super::read(&list).unwrap()),
+            ["openai/a", "openai/c", "openai/d"]
+        );
+        // No list of the person's is no models, whatever the catalog holds.
+        std::fs::remove_file(&list).unwrap();
+        assert!(super::mine(&list).unwrap().is_empty());
     }
 
     #[test]

@@ -186,10 +186,11 @@ const NOTED_BYTES: usize = 2048;
 
 /// The models the person wrote a note on in `~/.agent/models`, each with
 /// its note, for the start tool's model parameter; none, the command that
-/// lists every model.
+/// lists every model. Only their own lines: discovery's catalog notes what
+/// the providers report, not what the person thinks of a model.
 fn noted_models() -> String {
     let listed = agent_client::models::path()
-        .and_then(|path| agent_client::models::read(&path).ok())
+        .and_then(|path| agent_client::models::mine(&path).ok())
         .unwrap_or_default();
     let mut said = String::new();
     for model in &listed {
