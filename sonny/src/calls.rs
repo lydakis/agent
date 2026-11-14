@@ -672,9 +672,11 @@ pub fn agent_inside(command: &str) -> bool {
     let parts = crate::shell::parts(command);
     !parts.is_empty()
         && parts.iter().all(|part| {
-            let Some(simple) = crate::shell::simple(part)
-                .filter(|_| !redirects_elsewhere(part) && !substitutes(part))
-            else {
+            let Some(simple) = crate::shell::simple(part).filter(|_| {
+                // `$'...'` quotes by other rules (`\'` is a quote in
+                // it), so a line using it is not read here at all.
+                !part.contains("$'") && !redirects_elsewhere(part) && !substitutes(part)
+            }) else {
                 return false;
             };
             // Every stage after it only cuts what it prints.
@@ -1656,6 +1658,7 @@ Keep the rest.'"#,
             r#""$AGENT_BIN" ls | jq 'include "x"; .'"#,
             r#""$AGENT_BIN" run --bot shop.fix --detach - < /private/secret.txt"#,
             r#""$AGENT_BIN" ls | jq . < /private/report.json"#,
+            r#""$AGENT_BIN" run --bot shop.fix --detach -- $'say \'hello' > "$HOME/report.json""#,
             r#""$AGENT_BIN" run --bot shop.fix --detach -- "say \"hello" > "$HOME/report.json""#,
             "\"$AGENT_BIN\" ls \\\n> \"$HOME/report.json\"",
             "\"$AGENT_BIN\" run --bot shop.fix --detach -- \\\n\"$(touch ~/r)\"",
