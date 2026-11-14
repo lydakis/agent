@@ -9732,3 +9732,75 @@ inside each other's ranges, on screens that never reach the new code
 
 - Admission burst p99: base 4.23 to 7.47 ms, head 4.04 to 7.01 ms.
 - Footprint CPU per turn: base 0.907 to 1.049 ms, head 0.999 to 1.065 ms.
+
+## Reasoning a provider refuses, withheld for Responses bots
+
+2026-11-14, Linux 6.18 cloud VM, 4 CPUs, Python 3 and the bench venv.
+Base is main `f12b4ff`; head is this change on it. Both are local release
+builds (`--bin agent`) with the same locked dependencies. Binary SHA-256:
+
+- Base: `b43971e30e59a3d8bb8e03df8fa02a6f99c684ccfe20a96f995df6791f2ed965`.
+- Head: `a064e8c6c033becd437e6b5c0cac88601530c19dda69647ce6624f65c7b374f6`.
+
+A Responses bot whose reasoning no provider has refused does no new work
+on a model call: no fingerprint is hashed, nothing is written, and no
+reasoning item is read apart from the window. Only after a 400 on
+replayed reasoning does a bot resend once without it, and from then on
+it reads which of its items are reasoning, so it can leave them out. That
+is per bot and per call, and nothing grows with the number of agents. The
+protocol and schema are unchanged.
+
+### Required matched screen
+
+The four daemon screens ran in base/head order for two rounds, with the
+Perf workflow's settings. Admission and completion use five measured
+repeats, footprint uses two (1,000 bots), and lifecycle uses one (32
+bots, socket echo, five tool schemas). Medians over every measured run:
+
+| Bench | Measure | Base | Head | Change |
+| --- | --- | ---: | ---: | ---: |
+| admission | lone submit CPU, ms | 41.519 | 42.832 | +3.2% |
+| admission | burst submit p99, ms | 4.397 | 5.376 | +22.3% |
+| completion | release to terminal p99, ms | 12.096 | 12.58 | +4.0% |
+| footprint | idle RSS, MiB | 16.379 | 16.334 | -0.3% |
+| footprint | per idle bot, KiB | 1.972 | 2.112 | +7.1% |
+| footprint | RSS after a turn each, MiB | 34.689 | 37.52 | +8.2% |
+| footprint | CPU per turn, ms | 0.927 | 0.925 | -0.2% |
+| lifecycle | CPU, s | 0.625 | 0.635 | +1.6% |
+| lifecycle | p95 turn, ms | 585.281 | 599.275 | +2.4% |
+| lifecycle | peak RSS, MiB | 25.191 | 25.688 | +2.0% |
+
+`bench.perf_gate` reports no count failures and no warnings: store work
+per turn is the same. The larger moves fall inside each other's ranges,
+on screens that make no Responses model call (admission and footprint):
+
+- Admission burst p99: base 4.23 to 7.47 ms, head 4.41 to 8.1 ms.
+- Footprint per idle bot: base 1.852 to 2.064 KiB, head 1.932 to 2.248 KiB.
+- Footprint RSS after a turn: base 33.0 to 41.9 MiB, head 32.2 to 43.5 MiB.
+
+### Responses turns at 8 and 5,000 agents
+
+At the low end, `bench.scale_screen --bots 8 --jitter 0.5 --seconds 20`,
+with a streaming Responses model and back-to-back turns so the windows
+grow, in alternating runs:
+
+| Run | Turns | Daemon CPU ms/turn | Store jobs/turn | p50 ms | p95 ms | Peak RSS MiB |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| base 1 | 66 | 6.15 | 10.95 | 2449 | 3320 | 21.9 |
+| base 2 | 72 | 5.76 | 11.03 | 2100 | 3322 | 21.8 |
+| head 1 | 73 | 6.00 | 11.03 | 2354 | 3252 | 21.9 |
+| head 2 | 67 | 6.16 | 10.96 | 2471 | 3342 | 21.9 |
+| head 3 | 67 | 6.16 | 11.01 | 2423 | 3322 | 21.8 |
+
+At 5,000 stored agents, `bench.fleet_screen --bots 5000 --max-active 64
+--parked 1000 --delay-ms 100 --no-restart`:
+
+| Run | Create/s | Turns/s | p50 ms | p95 ms | Max ms | Peak RSS MiB | Park s | Drain s |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| base 1 | 757 | 473.3 | 109 | 113 | 122 | 26.35 | 1.96 | 1.58 |
+| base 2 | 746 | 427.1 | 110 | 114 | 163 | 25.73 | 2.41 | 1.80 |
+| head 1 | 776 | 478.7 | 109 | 113 | 125 | 26.10 | 1.95 | 1.57 |
+| head 2 | 715 | 465.1 | 109 | 113 | 159 | 26.09 | 2.22 | 1.57 |
+
+Store jobs per turn are the same on both sides at both scales, and the
+timing moves fall within run-to-run spread.

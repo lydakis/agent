@@ -6031,7 +6031,18 @@ impl Database {
         strip: impl Into<Strip>,
         elided: i64,
     ) -> Result<Vec<u8>> {
-        let strip = strip.into();
+        self.items_sent(ids, strip.into(), false, elided)
+    }
+    /// [`Self::items_by_ids`], and with `reasoning` a Responses reasoning
+    /// item `strip` names left out whole too, as [`Self::reasoning_of`]
+    /// counts it.
+    pub fn items_sent(
+        &self,
+        ids: &[i64],
+        strip: Strip,
+        reasoning: bool,
+        elided: i64,
+    ) -> Result<Vec<u8>> {
         let mut statement = self
             .conn
             .prepare_cached("SELECT item,thinking FROM nodes WHERE id=?")?;
@@ -6054,6 +6065,9 @@ impl Database {
             }
             statement.query_row([id], |r| {
                 let item = r.get_ref(0)?.as_blob()?;
+                if reasoning && strip.strips(*id) && super::context::reasoning(item) {
+                    return Ok(());
+                }
                 let item = match (strip.strips(*id) && r.get::<_, i64>(1)? > 0)
                     .then(|| super::without_thinking(item))
                     .flatten()
@@ -6198,6 +6212,28 @@ impl Database {
             .query_row([name], |r| r.get(0))
             .optional()?
             .flatten())
+    }
+    /// Bytes a Responses request saves for each of `ids` that `strip`
+    /// names and that is a reasoning item, left out whole with its
+    /// separator; 0 for the rest.
+    pub fn reasoning_of(&self, ids: &[i64], strip: Strip) -> Result<Vec<u32>> {
+        let mut statement = self
+            .conn
+            .prepare_cached("SELECT item FROM nodes WHERE id=?")?;
+        ids.iter()
+            .map(|id| {
+                if !strip.strips(*id) {
+                    return Ok(0);
+                }
+                Ok(statement.query_row([id], |r| {
+                    let item = r.get_ref(0)?.as_blob()?;
+                    Ok(match super::context::reasoning(item) {
+                        true => (item.len() + 1).min(u32::MAX as usize) as u32,
+                        false => 0,
+                    })
+                })?)
+            })
+            .collect()
     }
     /// Bytes each node loses without its thinking blocks.
     pub fn thinking_of(&self, ids: &[i64]) -> Result<Vec<u32>> {
