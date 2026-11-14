@@ -1357,7 +1357,7 @@ impl Started {
             // winner can still be recovering its store before binding the
             // socket.
             match startup_remaining(deadline) {
-                Ok(left) => std::thread::sleep(Duration::from_millis(50).min(left)),
+                Ok(left) => std::thread::sleep(Duration::from_millis(5).min(left)),
                 Err(error) => return Err(timed_out(&mut self, error)),
             }
         }
