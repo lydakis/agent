@@ -17776,6 +17776,7 @@ fn schema_98_clocks_the_timed_turns_from_the_audit_trail() {
         clocked_turn(&path, &mut db, 0, "1");
         let timed = clocked_turn(&path, &mut db, 2_000, "2");
         let lifted = clocked_turn(&path, &mut db, 2_000, "3");
+        let pruned = clocked_turn(&path, &mut db, 2_000, "4");
         // The third turn's read went to the background, as a lifted call
         // does: its row ended with its process, not in its turn. Its
         // command ran as a terminal does, with a process of its own that
@@ -17793,7 +17794,17 @@ fn schema_98_clocks_the_timed_turns_from_the_audit_trail() {
             [lifted],
         )
         .unwrap();
-        assert!(timed < lifted);
+        // The fourth turn's read was lifted too, but retention has since
+        // removed its turn's events, so only its end, after its turn's,
+        // tells.
+        conn.execute(
+            "UPDATE audit SET ms=ms+60000 WHERE turn=?1 AND call_id='r4'",
+            [pruned],
+        )
+        .unwrap();
+        conn.execute("DELETE FROM events WHERE turn=?1", [pruned])
+            .unwrap();
+        assert!(timed < lifted && lifted < pruned);
     }
     let conn = Connection::open(&path).unwrap();
     conn.execute_batch(
@@ -17810,10 +17821,11 @@ fn schema_98_clocks_the_timed_turns_from_the_audit_trail() {
     let db = Database::initialize(conn).unwrap();
     let usage = db.usage(None, 0, None, 64).unwrap();
     let time = &usage["time"];
-    // Two calls together in the second turn, 1 s; the third turn's command
-    // alone, 1 s, its process notwithstanding; its lifted read left out.
+    // Two calls together in the second turn, 1 s; the third and fourth
+    // turns' commands alone, 1 s each, their processes notwithstanding;
+    // their lifted reads left out.
     let tool_ms = time["tool_ms"].as_i64().unwrap();
-    assert!((2_000..2_400).contains(&tool_ms), "{time}");
+    assert!((3_000..3_600).contains(&tool_ms), "{time}");
     assert_eq!(
         [
             &time["turns"],
@@ -17823,11 +17835,11 @@ fn schema_98_clocks_the_timed_turns_from_the_audit_trail() {
             &time["first_token_ms"]
         ],
         [
-            &json!(2),
             &json!(3),
-            &json!(2),
-            &json!(4_000),
-            &json!(1_000)
+            &json!(4),
+            &json!(3),
+            &json!(6_000),
+            &json!(1_500)
         ]
     );
     drop(db);

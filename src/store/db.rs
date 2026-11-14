@@ -17909,9 +17909,10 @@ fn migrate_since_73(conn: &Connection, from: i32) -> Result<()> {
 /// 97 -> 98: the tool calls and tool time of every turn with timed model
 /// calls, from its rows in the audit trail that ended, as a call ending in
 /// its turn counts them: a call lifted to the background (its `call_lifted`
-/// event) is left out, a terminal's call with a process of its own is not.
-/// The trail is in time order, so it is read from the first of those
-/// turns' starts on.
+/// event) is left out, and so is one that ended after its turn did, as a
+/// lifted call whose turn's events retention removed did; a terminal's
+/// call with a process of its own is not. The trail is in time order, so
+/// it is read from the first of those turns' starts on.
 fn clock_timed_turns(conn: &Connection) -> Result<()> {
     let first: Option<i64> = conn.query_row(
         "SELECT MIN(started_ms) FROM turns WHERE timed_rounds>0",
@@ -17924,8 +17925,9 @@ fn clock_timed_turns(conn: &Connection) -> Result<()> {
     let from = audit::first_at(conn, first)?;
     let mut clocks: HashMap<i64, (i64, i64, i64)> = HashMap::new();
     let mut rows = conn.prepare(
-        "SELECT a.turn,a.at_ms,a.at_ms+a.ms FROM audit a
+        "SELECT a.turn,a.at_ms,a.at_ms+a.ms FROM audit a JOIN turns t ON t.id=a.turn
          WHERE a.id>=? AND a.step IS NULL AND a.ms IS NOT NULL
+             AND (t.finished_ms IS NULL OR a.at_ms+a.ms<=t.finished_ms)
              AND NOT EXISTS(SELECT 1 FROM events e WHERE e.turn=a.turn AND e.kind='call_lifted'
                  AND e.data->>'$.call_id'=a.call_id)
          ORDER BY a.turn,a.at_ms",
