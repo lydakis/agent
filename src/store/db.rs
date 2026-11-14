@@ -1083,9 +1083,48 @@ impl Bot {
                         &call.name,
                         &call.arguments,
                         workspace,
+                        &call.links,
                     )
             }
         }
+    }
+    /// The reads [`crate::sandbox::learn`] makes for these calls, to run
+    /// off the runtime thread before any of them is judged: each write,
+    /// edit or patch not read yet, or every one when `fresh`. `None` when
+    /// the bot writes no folder of its own or no call needs reading.
+    pub fn links_to_learn(
+        &self,
+        calls: &[ToolCall],
+        workspace: &std::path::Path,
+        fresh: bool,
+    ) -> Option<impl FnOnce(&mut [ToolCall]) + Send + 'static> {
+        use crate::sandbox::{Mode, learn};
+        let wanted = move |call: &ToolCall| {
+            matches!(call.name.as_str(), "write" | "edit" | "apply_patch")
+                && (fresh || !call.links.read())
+        };
+        if self.settings.sandbox != Some(Mode::WorkspaceWrite) || !calls.iter().any(wanted) {
+            return None;
+        }
+        let root = self
+            .workspace
+            .as_deref()
+            .map_or(workspace, std::path::Path::new)
+            .to_owned();
+        let writable = self.settings.writable.clone();
+        let folder = workspace.to_owned();
+        Some(move |calls: &mut [ToolCall]| {
+            for call in calls.iter_mut().filter(|call| wanted(call)) {
+                call.links = learn(
+                    Mode::WorkspaceWrite,
+                    Some(&root),
+                    &writable,
+                    &call.name,
+                    &call.arguments,
+                    &folder,
+                );
+            }
+        })
     }
     /// The tools this bot may call: its allowed list, else its tools.
     pub fn callable(&self) -> &[String] {
@@ -19094,6 +19133,7 @@ mod tests {
             call_id: "c".into(),
             arguments: json!({"input":input}).to_string(),
             custom: true,
+            links: Default::default(),
         };
         let data = started(&call);
         assert_eq!(data["arguments_truncated"], true);
@@ -19136,6 +19176,7 @@ mod tests {
                 call_id: "c".into(),
                 arguments: arguments.to_string(),
                 custom: false,
+                links: Default::default(),
             };
             let data = started(&call);
             assert_eq!(data["arguments_truncated"], true, "{name}");
