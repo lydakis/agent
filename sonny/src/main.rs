@@ -6411,35 +6411,10 @@ impl App {
                 Some(key) = keys.recv() => {
                     keyed = true;
                     heard = Instant::now();
-                    let wheel = is_wheel(&key);
-                    // Over the pane (the margin, a preview, a side chat),
-                    // the conversation's older pages are not waited on.
-                    let chat = match &key {
-                        Event::Mouse(mouse) => !(self.pane.as_ref())
-                            .is_some_and(|p| p.area.contains((mouse.column, mouse.row).into())),
-                        _ => true,
-                    };
+                    let (wheel, chat) = (is_wheel(&key), self.over_chat(&key));
                     self.key(key).await;
-                    // The wheel's notches that came while the last frame
-                    // was drawn are taken before the next: a burst is one
-                    // frame, not one each that a slower terminal works
-                    // through after the wheel stops. Only notches: anything
-                    // else (a key answering what the frame shows) waits for
-                    // the frame, and so does a notch near the conversation's
-                    // first row drawn, so older pages are drawn before it.
-                    for _ in 0..keys.len() {
-                        if !wheel
-                            || self.quit
-                            || (chat && self.older.is_some() && self.screen.near_top())
-                        {
-                            break;
-                        }
-                        let Ok(key) = keys.try_recv() else { break };
-                        if !is_wheel(&key) {
-                            held = Some(key);
-                            break;
-                        }
-                        self.key(key).await;
+                    if wheel {
+                        held = self.wheel_burst(&mut keys, chat).await;
                     }
                 }
                 _ = tokio::time::sleep(undrawn.map_or(Duration::ZERO, |at| DRAW_EVERY.saturating_sub(at.elapsed()))), if undrawn.is_some() => {}
@@ -6641,6 +6616,42 @@ impl App {
                 self.repaint = false;
                 self.repaint(terminal).await?;
             }
+        }
+    }
+
+    /// After a notch of the wheel, the notches that came while the last
+    /// frame was drawn, taken before the next: a burst is one frame, not
+    /// one each that a slower terminal works through after the wheel
+    /// stops. Only notches: the first event that is not one is given back,
+    /// to be taken after the frame, as a key may answer what the frame
+    /// shows. The burst stops once the window is quitting, and over the
+    /// conversation (`chat`) near its first row drawn while older pages
+    /// remain, so they are drawn before the rest of it.
+    async fn wheel_burst(
+        &mut self,
+        keys: &mut tokio::sync::mpsc::UnboundedReceiver<Event>,
+        chat: bool,
+    ) -> Option<Event> {
+        for _ in 0..keys.len() {
+            if self.quit || (chat && self.older.is_some() && self.screen.near_top()) {
+                break;
+            }
+            let Ok(key) = keys.try_recv() else { break };
+            if !is_wheel(&key) {
+                return Some(key);
+            }
+            self.key(key).await;
+        }
+        None
+    }
+
+    /// Whether `event` is over the conversation rather than the pane (the
+    /// margin, a preview, a side chat).
+    fn over_chat(&self, event: &Event) -> bool {
+        match event {
+            Event::Mouse(mouse) => !(self.pane.as_ref())
+                .is_some_and(|p| p.area.contains((mouse.column, mouse.row).into())),
+            _ => true,
         }
     }
 
@@ -18753,6 +18764,76 @@ mod tests {
         assert_eq!(at("old/gpt", None), ["high"]);
         assert!(at("openai/gpt", Some("xhigh")).is_empty());
         assert!(at("nowhere/x", None).is_empty());
+    }
+
+    /// A window on 400 rows, drawn 10 high, and the wheel's notch.
+    async fn wheel_app() -> (App, Event) {
+        let client = daemon_answering(|_| json!({})).await;
+        let mut app = app(client);
+        app.screen
+            .push((0..400).map(|i| Line::from(format!("row {i}"))).collect());
+        let area = Rect::new(0, 0, 80, 10);
+        app.screen
+            .render(area, &mut ratatui::buffer::Buffer::empty(area), |_| None);
+        let notch = Event::Mouse(event::MouseEvent {
+            kind: event::MouseEventKind::ScrollUp,
+            column: 1,
+            row: 1,
+            modifiers: KeyModifiers::NONE,
+        });
+        (app, notch)
+    }
+
+    #[tokio::test]
+    async fn a_burst_of_the_wheel_is_taken_before_the_frame_and_a_key_after_it() {
+        let (mut app, notch) = wheel_app().await;
+        let (tx, mut keys) = tokio::sync::mpsc::unbounded_channel();
+        let key = Event::Key(event::KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE));
+        for event in [
+            notch.clone(),
+            notch.clone(),
+            notch.clone(),
+            key,
+            notch.clone(),
+        ] {
+            tx.send(event).unwrap();
+        }
+        app.key(notch).await;
+        let back = app.screen.back();
+        let held = app.wheel_burst(&mut keys, true).await;
+        // The three notches waiting, then the key held for after the frame.
+        assert_eq!(app.screen.back(), back * 4);
+        assert!(matches!(held, Some(Event::Key(_))));
+        assert!(app.input.is_empty(), "the key waits for the frame");
+        assert_eq!(keys.len(), 1, "what came after the key waits too");
+    }
+
+    #[tokio::test]
+    async fn a_burst_stops_once_the_window_quits() {
+        let (mut app, notch) = wheel_app().await;
+        let (tx, mut keys) = tokio::sync::mpsc::unbounded_channel();
+        tx.send(notch.clone()).unwrap();
+        app.quit = true;
+        assert!(app.wheel_burst(&mut keys, true).await.is_none());
+        assert_eq!(keys.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_burst_waits_for_older_pages_near_the_first_row_but_not_over_the_pane() {
+        let (mut app, notch) = wheel_app().await;
+        let (tx, mut keys) = tokio::sync::mpsc::unbounded_channel();
+        tx.send(notch.clone()).unwrap();
+        app.older = Some(1);
+        app.screen.scroll(isize::MAX);
+        assert!(app.screen.near_top());
+        app.wheel_burst(&mut keys, true).await;
+        assert_eq!(keys.len(), 1, "older pages are drawn first");
+        app.wheel_burst(&mut keys, false).await;
+        assert_eq!(keys.len(), 0, "the pane's notches do not wait on them");
+        app.older = None;
+        tx.send(notch).unwrap();
+        app.wheel_burst(&mut keys, true).await;
+        assert_eq!(keys.len(), 0, "no older pages, nothing to wait for");
     }
 
     #[tokio::test]
