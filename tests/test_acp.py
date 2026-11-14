@@ -583,6 +583,11 @@ class AcpTests(ModelFixture):
         answered, _ = reopened.answer_of(reopened.ask('session/resume', {
             'sessionId': task['sessionId'], 'cwd': str(repo), 'mcpServers': []}))
         self.assertEqual(answered['result']['configOptions'][-1]['currentValue'], 'calc.fix')
+        # The task's own turn, on its brief, may still run, and a prompt
+        # sent meanwhile joins it as a steer: wait for its end first.
+        [brief] = self.daemon.request('turns', bot='calc.fix')['result']['turns']
+        ended = self.daemon.followers['calc.fix'].finished(brief['turn'], timeout=30)
+        self.assertEqual(ended['data']['status'], 'completed', ended)
         before = len(self.daemon.request('turns', bot='calc.fix')['result']['turns'])
         answered, _ = reopened.answer_of(reopened.ask('session/prompt', {
             'sessionId': task['sessionId'], 'prompt': [{'type': 'text', 'text': 'how is it going?'}]}))
