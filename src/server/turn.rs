@@ -5766,11 +5766,14 @@ impl Turn {
                     delivery = "queue";
                 }
                 // The same call made again, after a restart, sends nothing
-                // new: its id is the call's own unless the bot named one.
+                // new: its id is the call's own unless the bot named one,
+                // as a digest of the whole call id, so two calls never share it.
                 let request_id = request_id.unwrap_or_else(|| {
-                    let call: String = (call_id.chars())
-                        .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
-                        .take(96)
+                    let digest =
+                        aws_lc_rs::digest::digest(&aws_lc_rs::digest::SHA256, call_id.as_bytes());
+                    let call: String = digest.as_ref()[..16]
+                        .iter()
+                        .map(|b| format!("{b:02x}"))
                         .collect();
                     format!("tool-{}-{call}", self.turn)
                 });

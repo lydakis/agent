@@ -645,8 +645,10 @@ as one.
   `wait`, `inspect`, `models` without `--discover`, `usage`, `audit`,
   `stats`, or a `fork --allow ''`, with only the flags known to change
   nothing the sandbox decides (no `--workspace`, `--model`, `--image`,
-  `--store` or `--socket`), piped only into `head`, `tail` or `jq`, with no
-  redirection to a file and no command run inside it (`$(...)`, a
+  `--store` or `--socket`), piped only into `head` or `tail` with a count
+  and no file, or `jq` with one filter that loads no module and no flag
+  that names a file, with no redirection from or to a file (a
+  here-document is fine) and no command run inside it (`$(...)`, a
   backquote). The reason says to run it again without
   escalating, and that the `send_message`, `list_agents` and `pause_agents`
   tools do the same. Like a Codex command rule with `decision = "forbidden"`

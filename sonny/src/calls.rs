@@ -590,26 +590,102 @@ const STATUSES: &[&str] = &[
 /// flag but those known to change nothing the sandbox decides. Another
 /// store or socket, a new agent, a move, models discovered into the home
 /// or anything else on the line is not.
+/// A pipe stage that reads nothing but what is piped into it: `head` or
+/// `tail` with a count and no file, or `jq` with one filter that loads no
+/// module and flags that name no file. Anything else may read a file the
+/// sandbox hides.
+fn reads_only_its_input(words: &[String]) -> bool {
+    let Some((program, args)) = words.split_first() else {
+        return false;
+    };
+    let count = |w: &str| {
+        let w = w.strip_prefix('+').unwrap_or(w);
+        !w.is_empty() && w.chars().all(|c| c.is_ascii_digit())
+    };
+    match program.as_str() {
+        "head" | "tail" => {
+            let mut args = args.iter();
+            while let Some(arg) = args.next() {
+                let arg = arg.as_str();
+                let ok = match arg {
+                    "-n" | "-c" | "--lines" | "--bytes" => args.next().is_some_and(|w| count(w)),
+                    "-q" | "-v" | "--quiet" | "--silent" | "--verbose" => true,
+                    _ => {
+                        if let Some(n) = arg
+                            .strip_prefix("--lines=")
+                            .or(arg.strip_prefix("--bytes="))
+                        {
+                            count(n)
+                        } else if let Some(n) = arg.strip_prefix("-n").or(arg.strip_prefix("-c")) {
+                            count(n)
+                        } else {
+                            arg.strip_prefix('-').is_some_and(count)
+                        }
+                    }
+                };
+                if !ok {
+                    return false;
+                }
+            }
+            true
+        }
+        "jq" => {
+            let mut filters = 0;
+            let mut args = args.iter();
+            while let Some(arg) = args.next() {
+                let arg = arg.as_str();
+                let ok = match arg {
+                    "--arg" | "--argjson" => args.next().is_some() && args.next().is_some(),
+                    "--indent" => args.next().is_some_and(|w| count(w)),
+                    "--raw-output"
+                    | "--raw-output0"
+                    | "--join-output"
+                    | "--compact-output"
+                    | "--exit-status"
+                    | "--slurp"
+                    | "--null-input"
+                    | "--ascii-output"
+                    | "--sort-keys"
+                    | "--tab"
+                    | "--color-output"
+                    | "--monochrome-output" => true,
+                    _ if arg.starts_with("--") => false,
+                    _ if arg.len() > 1 && arg.starts_with('-') => {
+                        arg[1..].chars().all(|c| "rjcesnaSCM".contains(c))
+                    }
+                    filter => {
+                        filters += 1;
+                        !(filter.contains("import") || filter.contains("include"))
+                    }
+                };
+                if !ok {
+                    return false;
+                }
+            }
+            filters == 1
+        }
+        _ => false,
+    }
+}
+
 pub fn agent_inside(command: &str) -> bool {
     let parts = crate::shell::parts(command);
     !parts.is_empty()
         && parts.iter().all(|part| {
             let Some(simple) = crate::shell::simple(part)
-                .filter(|_| !writes_elsewhere(part) && !substitutes(part))
+                .filter(|_| !redirects_elsewhere(part) && !substitutes(part))
             else {
                 return false;
             };
             // Every stage after it only cuts what it prints.
             let mut piped = simple.piped.clone();
             while let Some(stage) = piped {
-                let Some(next) = crate::shell::simple(&stage).filter(|_| !writes_elsewhere(&stage))
+                let Some(next) =
+                    crate::shell::simple(&stage).filter(|_| !redirects_elsewhere(&stage))
                 else {
                     return false;
                 };
-                if !matches!(
-                    next.words.first().map(String::as_str),
-                    Some("head" | "tail" | "jq")
-                ) {
+                if next.stdin.is_some() || !reads_only_its_input(&next.words) {
                     return false;
                 }
                 piped = next.piped;
@@ -703,11 +779,12 @@ pub fn agent_inside(command: &str) -> bool {
         })
 }
 
-/// Whether a command sends its output somewhere by a redirection, which
-/// the sandbox may not let it write: any `>` outside quotes but a copy of
-/// one stream to another (`2>&1`) or a discard (`>/dev/null`). A
-/// here-document's text, after the first line, is the command's input.
-fn writes_elsewhere(command: &str) -> bool {
+/// Whether a command reaches a file by a redirection, which the sandbox may
+/// not let it read or write: any `<` outside quotes but a here-document or
+/// here-string (`<<`, `<<<`), and any `>` but a copy of one stream to
+/// another (`2>&1`) or a discard (`>/dev/null`). A here-document's text,
+/// after the first line, is the command's input.
+fn redirects_elsewhere(command: &str) -> bool {
     let line = command.lines().next().unwrap_or("");
     let (mut quote, mut chars) = (None, line.char_indices().peekable());
     while let Some((at, c)) = chars.next() {
@@ -717,6 +794,14 @@ fn writes_elsewhere(command: &str) -> bool {
             (None, '\'') | (None, '"') => quote = Some(c),
             (None, '\\') => {
                 chars.next();
+            }
+            (None, '<') => {
+                if chars.peek().map(|&(_, c)| c) != Some('<') {
+                    return true;
+                }
+                while chars.peek().is_some_and(|&(_, c)| c == '<') {
+                    chars.next();
+                }
             }
             (None, '>') => {
                 let rest = line[at + 1..].trim_start_matches('>').trim_start();
@@ -1504,6 +1589,8 @@ Keep the rest.'"#,
             r#""$AGENT_BIN" ls --name 'a>b' 2>&1"#,
             r#""$AGENT_BIN" ls 2>/dev/null"#,
             r#""$AGENT_BIN" ls --pretty | jq -r '.name | ascii_upcase' | head -5"#,
+            r#""$AGENT_BIN" ls | tail -n +2 | head --lines=3 | jq -rc --arg b x '.[$b]'"#,
+            "\"$AGENT_BIN\" run --bot shop.fix --detach - <<<'Done.'",
             r#""$AGENT_BIN" run --bot shop.fix --detach -- 'Run $(make test) and say'"#,
             "\"$AGENT_BIN\" run --bot shop.lead --detach - <<'EOF'\nRan $(make) and `ls`.\nEOF",
         ] {
@@ -1535,6 +1622,15 @@ Keep the rest.'"#,
             r#""$AGENT_BIN" turns --bot shop.fix >> /tmp/out 2>&1"#,
             r#""$AGENT_BIN" ls | head | tee "$HOME/report.json""#,
             r#""$AGENT_BIN" ls | jq . | sh"#,
+            r#""$AGENT_BIN" ls | head /private/report.txt"#,
+            r#""$AGENT_BIN" ls | tail -n 5 /private/report.txt"#,
+            r#""$AGENT_BIN" ls | jq . /private/report.json"#,
+            r#""$AGENT_BIN" ls | jq --slurpfile x /private/r.json ."#,
+            r#""$AGENT_BIN" ls | jq -f /private/filter.jq"#,
+            r#""$AGENT_BIN" ls | jq -L /private 'import "x" as x; .'"#,
+            r#""$AGENT_BIN" ls | jq 'include "x"; .'"#,
+            r#""$AGENT_BIN" run --bot shop.fix --detach - < /private/secret.txt"#,
+            r#""$AGENT_BIN" ls | jq . < /private/report.json"#,
             r#""$AGENT_BIN" run --bot shop.lead --detach -- "$(touch "$HOME/report.json"; printf done)""#,
             r#""$AGENT_BIN" run --bot shop.lead --detach -- `touch ~/r; echo done`"#,
             r#""$AGENT_BIN" run --bot shop.lead --detach -- "$(<(cat ~/x))""#,

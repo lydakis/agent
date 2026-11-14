@@ -1,5 +1,6 @@
 """An agent's own tools for other agents: send_message, list_agents and
 pause_agents, made as the calling bot."""
+import hashlib
 import json
 import os
 import time
@@ -42,8 +43,10 @@ class AgentToolsTests(ModelFixture):
         listed = client.request('messages', bot='shop.fix', after=0)['result']['messages']
         self.assertEqual(listed[0]['from'], {'bot': 'shop.lead', 'turn': turn}, listed[0])
         self.assertEqual(listed[0]['delivery'], 'steer')
-        # The same call made again sends nothing new: its id is the call's.
-        again = client.request('submit', bot='shop.fix', request_id=f'tool-{turn}-send_message-1',
+        # The same call made again sends nothing new: its id is the call's,
+        # by a digest of the whole call id.
+        call = hashlib.sha256(b'send_message-1').hexdigest()[:32]
+        again = client.request('submit', bot='shop.fix', request_id=f'tool-{turn}-{call}',
                                prompt='hi', delivery='steer', **{'from': {'bot': 'shop.lead', 'turn': turn}})
         self.assertTrue(again['result']['duplicate'], again)
 
