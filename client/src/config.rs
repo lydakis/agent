@@ -182,6 +182,14 @@ pub struct Config {
     pub reviewer: ReviewerModel,
     pub shell_environment_policy: ShellEnvironmentPolicy,
     pub sonny: Sonny,
+    /// `[sandbox] unreadable`: folders, from `/` or `~/`, that no sandboxed
+    /// command reads, writes, links or renames, and the `read` tool
+    /// refuses, besides `~/.agent/keys`, which is always one. Empty by
+    /// default, so an agent may use what the person keeps in their home
+    /// (session cookies, a cloud CLI's sign-in) unless they list it. The
+    /// agent CLI starts the daemon with each as `--unreadable`. See
+    /// `unreadable`.
+    pub unreadable: Vec<String>,
     /// `[daemon]`: each limit the agent CLI starts a daemon with, by key,
     /// as the formula the file gives; see `DAEMON_LIMITS` and `formula`.
     pub daemon: BTreeMap<String, String>,
@@ -1623,6 +1631,32 @@ fn parse(text: &str) -> Result<Config, String> {
             }
             continue;
         }
+        if name == "sandbox" {
+            for (key, value) in section {
+                if key != "unreadable" {
+                    return Err(format!("unknown key sandbox.{key}"));
+                }
+                let invalid =
+                    || "sandbox.unreadable is a list of folders from / or ~/, as [\"~/.aws\"]";
+                let folders = value.as_array().ok_or_else(invalid)?;
+                for folder in folders {
+                    let folder = folder.as_str().ok_or_else(invalid)?;
+                    let rooted = folder.starts_with('/')
+                        || folder
+                            .strip_prefix("~/")
+                            .is_some_and(|rest| !rest.is_empty());
+                    if !rooted {
+                        return Err(format!(
+                            "sandbox.unreadable holds folders from / or ~/, not {folder:?}"
+                        ));
+                    }
+                    if !config.unreadable.iter().any(|known| known == folder) {
+                        config.unreadable.push(folder.to_owned());
+                    }
+                }
+            }
+            continue;
+        }
         let keys: &[&str] = match name.as_str() {
             "reviewer" => &["model", "effort"],
             "shell_environment_policy" => &["ignore_default_excludes", "exclude"],
@@ -2156,6 +2190,18 @@ pub const SHEET_LIMIT: u64 = 1024 * 1024;
 /// shape; a tier with none is priced at standard. The patterns come most
 /// specific first, as `price` looks them up. Nothing is priced unless the
 /// person says.
+/// The folders `[sandbox] unreadable` lists, each from `/` or with `~/` read
+/// as `$HOME`: none that names `~/` when `HOME` is unset, as `prices` does.
+pub fn unreadable(config: &Config) -> Vec<PathBuf> {
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    (config.unreadable.iter())
+        .filter_map(|folder| match folder.strip_prefix("~/") {
+            Some(rest) => home.as_ref().map(|home| home.join(rest)),
+            None => Some(PathBuf::from(folder)),
+        })
+        .collect()
+}
+
 pub fn prices(config: &Config) -> Result<Vec<(String, Prices)>, String> {
     let file = match &config.prices {
         Some(file) => match file.strip_prefix("~/") {
@@ -2503,6 +2549,29 @@ mod tests {
         let config = parse("[sonny.links.box]\nhost = \"box\"\ncalls = 2\n").unwrap();
         assert_eq!(config.sonny.links["box"].calls, Some(2));
         assert!(parse("[sonny.links.box]\nhost = \"box\"\ncalls = 0\n").is_err());
+    }
+
+    #[test]
+    fn unreadable_folders_are_none_unless_listed_and_named_from_root_or_home() {
+        assert!(parse("").unwrap().unreadable.is_empty());
+        let config =
+            parse("[sandbox]\nunreadable = [\"~/.aws\", \"/srv/keys\", \"~/.aws\"]\n").unwrap();
+        assert_eq!(config.unreadable, ["~/.aws", "/srv/keys"]);
+        let home = std::env::var_os("HOME").map(PathBuf::from).unwrap();
+        assert_eq!(
+            unreadable(&config),
+            [home.join(".aws"), PathBuf::from("/srv/keys")]
+        );
+        for wrong in [
+            "unreadable = \".aws\"",
+            "unreadable = [\".aws\"]",
+            "unreadable = [\"~\"]",
+            "unreadable = [\"~/\"]",
+            "unreadable = [1]",
+            "hidden = [\"/srv\"]",
+        ] {
+            assert!(parse(&format!("[sandbox]\n{wrong}\n")).is_err(), "{wrong}");
+        }
     }
 
     #[test]

@@ -53,6 +53,12 @@ each setting is; what to set is the person's call.
   ledger, `~/.docker`), the person adds it to a row's `writable` and
   picks that row: ask them for it, naming the folder, rather than keeping
   a copy per agent or running the command outside the sandbox.
+- `[sandbox] unreadable` in the config: folders, from `/` or `~/`, that
+  no sandboxed command reads, writes, links or renames and the `read` tool
+  refuses, as Codex's `deny_read` (`unreadable = ["~/.aws"]`). Empty by
+  default, so agents can use what the person keeps at home, such as a
+  browser's session cookies; `~/.agent/keys` is always unreadable. A
+  folder not there yet is made, private. Read when the daemon starts.
 - `[context_windows]` in the config: a model's context window in
   tokens, which sets when its agents compact, by `PROVIDER/MODEL` with `*`
   wildcards (`"bedrock/*openai.*" = 1000000`), over what its provider

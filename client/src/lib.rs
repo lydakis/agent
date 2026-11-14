@@ -6,6 +6,7 @@ pub mod clock;
 pub mod config;
 pub mod env_file;
 pub mod files;
+pub mod hidden;
 pub mod judge;
 pub mod memory;
 pub mod models;

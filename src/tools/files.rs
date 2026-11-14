@@ -48,9 +48,7 @@ async fn open_regular(path: &Path, write: bool, hidden: &[PathBuf]) -> Result<to
     let (target, hidden) = (path.to_owned(), hidden.to_vec());
     let (file, denied) = tokio::task::spawn_blocking(move || {
         let file = options.open(&target)?;
-        let denied = !hidden.is_empty()
-            && opened(&file)
-                .is_none_or(|opened| hidden.iter().any(|hidden| opened.starts_with(hidden)));
+        let denied = agent_client::hidden::holds(&hidden, &file);
         Ok::<_, std::io::Error>((file, denied))
     })
     .await
@@ -70,32 +68,6 @@ async fn open_regular(path: &Path, write: bool, hidden: &[PathBuf]) -> Result<to
         return fail("file_not_regular");
     }
     Ok(file)
-}
-
-/// The path the kernel holds for an open file: where it is, whatever
-/// links led to it or were swapped since. `None` where the system can't
-/// say, which a caller with paths to keep refuses.
-#[cfg(target_os = "linux")]
-fn opened(file: &impl std::os::fd::AsRawFd) -> Option<PathBuf> {
-    std::fs::read_link(format!("/proc/self/fd/{}", file.as_raw_fd())).ok()
-}
-
-#[cfg(target_os = "macos")]
-fn opened(file: &impl std::os::fd::AsRawFd) -> Option<PathBuf> {
-    use std::os::unix::ffi::OsStrExt;
-    let mut path = [0u8; libc::PATH_MAX as usize];
-    // SAFETY: F_GETPATH writes at most MAXPATHLEN (PATH_MAX) bytes,
-    // NUL-terminated, into the buffer.
-    if unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETPATH, path.as_mut_ptr()) } == -1 {
-        return None;
-    }
-    let end = path.iter().position(|byte| *byte == 0)?;
-    Some(PathBuf::from(std::ffi::OsStr::from_bytes(&path[..end])))
-}
-
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
-fn opened(_: &impl std::os::fd::AsRawFd) -> Option<PathBuf> {
-    None
 }
 
 /// A file's bytes, up to the tools' limit; `hidden` as [`open_regular`]
