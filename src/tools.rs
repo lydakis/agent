@@ -1555,18 +1555,25 @@ fn pem_end(body: &str, from: usize, last: bool) -> Option<Option<usize>> {
     const BEGIN: &str = "-----BEGIN ";
     let window = body.floor_char_boundary(BODY_HOLD + END.len() - 1);
     let mut at = ceil_char(body, from.saturating_sub(BEGIN.len()).min(window));
+    // Where the line read now starts, kept as the search moves on so no
+    // text is read twice.
+    let mut line = body[..at].rfind('\n').map_or(0, |n| n + 1);
     while let Some(n) = body[at..window].find("-----") {
         let dashes = at + n;
-        let tail = &body[dashes..];
-        if tail.starts_with(END) {
-            // From its line's start when only what a search or the read
-            // tool puts before a line is there, so that shows.
-            let line = body[..dashes].rfind('\n').map_or(0, |n| n + 1);
-            let before = &body[line..dashes];
-            let prefix = before.is_empty() || before.ends_with([':', '-', '\t', ' ']);
-            return Some(Some(if prefix { line } else { dashes }));
+        if let Some(n) = body[at..dashes].rfind('\n') {
+            line = at + n + 1;
         }
-        if tail.starts_with(BEGIN) {
+        let tail = &body[dashes..];
+        // A marker starts its line, after at most what a search or the
+        // read tool puts before each line; one inside text, such as an
+        // armored key's `Comment:`, is that text.
+        let starts = line_prefix(&body[line..dashes]);
+        if tail.starts_with(END) {
+            // Hidden to that line's start when only such a prefix is
+            // before it, so that shows.
+            return Some(Some(if starts { line } else { dashes }));
+        }
+        if tail.starts_with(BEGIN) && starts {
             return Some(None);
         }
         if !last && (END.starts_with(tail) || BEGIN.starts_with(tail)) {
@@ -1578,6 +1585,14 @@ fn pem_end(body: &str, from: usize, last: bool) -> Option<Option<usize>> {
         true => Some(None),
         false => None,
     }
+}
+
+/// Whether `before`, what precedes a marker on its line, is only spaces or
+/// what a search or the read tool puts before each line it shows: a path
+/// or a number ending in `:`, `-` or a tab, with no space inside it.
+fn line_prefix(before: &str) -> bool {
+    let before = before.trim_start_matches(' ');
+    before.is_empty() || (!before.contains(' ') && before.ends_with([':', '-', '\t']))
 }
 
 /// The most backslashes a key's escaped line end is read with: JSON
@@ -5603,6 +5618,20 @@ mod tests {
             let mut redacting = Redacting::new(credentials.clone());
             let mut out = String::new();
             for piece in armored.as_bytes().chunks(size) {
+                out.push_str(&redacting.feed(piece));
+            }
+            out.push_str(&redacting.finish());
+            assert_eq!(out, hidden, "in pieces of {size}");
+        }
+        // A BEGIN inside an armored key's `Comment:` is that comment's
+        // text: the key is still hidden through its own END.
+        let commented = "-----BEGIN PGP PRIVATE KEY BLOCK-----\nComment: example -----BEGIN CERTIFICATE-----\n\nlQOYBGfake\n-----END PGP PRIVATE KEY BLOCK-----\nafter\n";
+        let hidden = "-----BEGIN PGP PRIVATE KEY BLOCK-----\n[REDACTED]\n-----END PGP PRIVATE KEY BLOCK-----\nafter\n";
+        assert_eq!(redact(commented), hidden);
+        for size in 1..=commented.len() {
+            let mut redacting = Redacting::new(credentials.clone());
+            let mut out = String::new();
+            for piece in commented.as_bytes().chunks(size) {
                 out.push_str(&redacting.feed(piece));
             }
             out.push_str(&redacting.finish());
