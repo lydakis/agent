@@ -4410,6 +4410,10 @@ struct App {
     /// Whether picks are kept in the person's file, as they are once the
     /// screen is up: `/switch` reads the agents they picked from it.
     picks_kept: bool,
+    /// When the last call waiting on the person left the screen: for
+    /// [`LEFT_KEYS`] after, a lone `y`, `n` or `a` meant for it is
+    /// dropped, never typed as the start of a message.
+    approval_left: Option<Instant>,
     /// What asks once, over the composer, before it can't be undone:
     /// Enter says yes, any other key no.
     confirming: Option<Confirm>,
@@ -6255,6 +6259,7 @@ impl App {
             picks: fuzzy::Picks::default(),
             picks_kept: false,
             confirming: None,
+            approval_left: None,
             replies: Vec::new(),
             quoting: false,
             reacting: None,
@@ -14223,6 +14228,16 @@ impl App {
                     {
                         self.always(&prefix).await;
                     }
+                    // An approval just left: a y, n or a meant for it is
+                    // dropped, not typed into an empty composer.
+                    KeyCode::Char('y' | 'n' | 'a')
+                        if !ctrl
+                            && !alt
+                            && self.input.is_empty()
+                            && self.waiting().is_none()
+                            && self
+                                .approval_left
+                                .is_some_and(|at| at.elapsed() < LEFT_KEYS) => {}
                     // The prompts sent before, found by typing, as a shell's
                     // and Claude Code's Ctrl+R.
                     KeyCode::Char('r') if ctrl => self.search(),
@@ -16602,7 +16617,9 @@ impl App {
     /// whole.
     fn show_asked(&mut self) {
         let Some(call) = self.waiting() else {
-            self.asked = None;
+            if self.asked.take().is_some() {
+                self.approval_left = Some(Instant::now());
+            }
             return;
         };
         let id = json!([call["bot"], call["call_id"]]);
@@ -16613,11 +16630,8 @@ impl App {
         let call = &call;
         let name = call["name"].as_str().unwrap_or("tool").to_owned();
         let arguments = &call["arguments"];
-        let what = arguments["command"]
-            .as_str()
-            .or_else(|| arguments["path"].as_str())
-            .map(str::to_owned)
-            .unwrap_or_else(|| arguments.to_string());
+        // What it will do, in words: never a function's name and JSON.
+        let asked = transcript::asked(&name, arguments, &self.workspace);
         let mut lines = Vec::new();
         // By the agent's whole name, as a task's question is, which opens
         // it as any agent's name drawn does.
@@ -16626,21 +16640,21 @@ impl App {
         }
         lines.push(Line::from(vec![
             Span::raw("⏸ ").fg(Color::Yellow),
-            Span::raw(format!("Allow {name}?")).bold(),
+            Span::raw(asked.question).bold(),
         ]));
-        // The agent's own words for why it asks, as Codex's `Reason:`.
+        // Under it, muted: the agent's own words for why it asks, as
+        // Codex's `Reason:`, then the command or the brief in full.
         if let Some(reason) = (arguments["justification"].as_str())
             .map(str::trim)
             .filter(|reason| !reason.is_empty())
         {
-            let mut reason = reason.lines();
-            lines.push(Line::from(vec![
-                Span::raw("  Reason: "),
-                Span::raw(reason.next().unwrap_or_default().to_owned()).italic(),
-            ]));
-            lines.extend(reason.map(|line| Line::from(Span::raw(format!("  {line}")).italic())));
+            lines.extend(
+                reason
+                    .lines()
+                    .map(|line| Line::from(format!("  {line}")).dim()),
+            );
         }
-        lines.extend(what.lines().map(|line| Line::from(format!("  {line}"))));
+        lines.extend((asked.detail.iter()).map(|line| Line::from(format!("  {line}")).dim()));
         // A command run in another folder than the agent's says which.
         if let Some(workdir) = arguments["workdir"].as_str().filter(|w| !w.is_empty()) {
             lines.push(Line::from(format!("  in {}", tilde(workdir))).dim());
@@ -18378,6 +18392,9 @@ fn over(frame: &mut ratatui::Frame, rows: Vec<Line<'static>>, below: ratatui::la
     frame.render_widget(Paragraph::new(rows), area);
 }
 
+/// How long after an approval leaves the screen a lone `y`, `n` or `a`
+/// is still taken as meant for it, and dropped.
+const LEFT_KEYS: Duration = Duration::from_secs(1);
 /// What an agent drawn in another's pane says of a view asked for: it
 /// opens none of its own, and Ctrl+G, which the Sonny it is drawn in
 /// takes, moves it to the main window, where views open.
@@ -22314,7 +22331,7 @@ mod tests {
         assert!(app.reviewing.is_empty());
         let rows: Vec<String> = app.pending.iter().map(|l| l.to_string()).collect();
         assert!(
-            rows.contains(&"✗ Request denied for git push --force origin main".to_owned()),
+            rows.contains(&"✗ The reviewer denied git push --force origin main".to_owned()),
             "{rows:?}"
         );
         assert!(
@@ -22381,10 +22398,7 @@ mod tests {
         let shell = json!({"command": "cargo test --release"});
         let once = transcript::allowed("shell", &shell, None, "/w", 80);
         assert_eq!(once.len(), 1);
-        assert_eq!(
-            once[0].to_string(),
-            "✓ Request allowed for cargo test --release"
-        );
+        assert_eq!(once[0].to_string(), "✓ You allowed cargo test --release");
         let kept = transcript::allowed("shell", &shell, Some("cargo test"), "/w", 80);
         assert_eq!(
             kept[1].to_string(),
@@ -22407,7 +22421,10 @@ mod tests {
         assert_eq!(denial(&output(r#"{"exit_code":0}"#)), None);
         let lines = transcript::denied("write", &json!({"path": "/w/src/a.rs"}), "", "/w", 80);
         assert_eq!(lines.len(), 1);
-        assert_eq!(lines[0].to_string(), "✗ Request denied for write src/a.rs");
+        assert_eq!(
+            lines[0].to_string(),
+            "✗ The reviewer denied writing src/a.rs"
+        );
         assert_eq!(reviewing(3), "Reviewing 3 approval requests");
         // Its retry is approved only after the whole of it is shown.
         let write = Denial {
@@ -26487,6 +26504,30 @@ mod tests {
     /// call; set aside with Esc, the keys typing again, and brought back
     /// with Enter.
     #[tokio::test]
+    async fn a_y_n_or_a_just_after_an_approval_leaves_is_dropped_not_typed() {
+        let mut app = app(daemon_answering(|_| json!({})).await);
+        let key = |c| Event::Key(event::KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+        // An approval was on screen and has gone.
+        app.asked = Some(json!(["b", "c1"]));
+        app.show_asked();
+        assert!(app.asked.is_none() && app.approval_left.is_some());
+        for c in ['y', 'n', 'a'] {
+            app.key(key(c)).await;
+        }
+        assert!(app.input.is_empty(), "meant for the approval, dropped");
+        // Other letters are typed, and once a message is started so are
+        // these.
+        app.key(key('h')).await;
+        app.key(key('y')).await;
+        assert_eq!(&*app.input, "hy");
+        // A second on, a lone y starts a message again.
+        app.input.clear();
+        app.approval_left = Some(Instant::now() - LEFT_KEYS);
+        app.key(key('y')).await;
+        assert_eq!(&*app.input, "y");
+    }
+
+    #[tokio::test]
     async fn an_answered_request_folds_to_its_verdict_where_it_was_written() {
         let client = daemon_answering(|asked| match asked["op"].as_str() {
             Some("approvals") if asked["bot"] == "shop.fix" => json!({"approvals": [
@@ -26515,7 +26556,7 @@ mod tests {
         app.raise_approvals().await;
         app.show_asked();
         app.flush();
-        assert!(app.screen.texts().contains(&"⏸ Allow shell?".to_owned()));
+        assert!(app.screen.texts().contains(&"⏸ Run git push?".to_owned()));
         // Its own is answered first, in another window: its start says so.
         app.daemon(
             json!({"event": "tool_started", "bot": "home.lead", "turn": 7,
@@ -26533,7 +26574,10 @@ mod tests {
             "{texts:?}"
         );
         assert_eq!(
-            texts.iter().filter(|row| *row == "⏸ Allow shell?").count(),
+            texts
+                .iter()
+                .filter(|row| *row == "⏸ Run cargo publish?")
+                .count(),
             1
         );
         // The task's, answered here: folded to the verdict, no line under it.
@@ -26564,8 +26608,8 @@ mod tests {
             texts[at.unwrap() + 1..at.unwrap() + 4],
             [
                 "↳ From shop.fix",
-                "⏸ Allow shell?",
-                "  Reason: Releasing needs the registry."
+                "⏸ Run cargo publish?",
+                "  Releasing needs the registry."
             ]
         );
         app.press(&format!("request/{tag}")).await;
@@ -26621,7 +26665,7 @@ mod tests {
         app.approvals.clear();
         app.fold_written();
         let texts = app.screen.texts();
-        assert!(texts.contains(&"⏸ Request for make deploy no longer waits".to_owned()));
+        assert!(texts.contains(&"– The request to run make deploy went away".to_owned()));
         app.daemon(json!({"event": "tool_started", "bot": "b", "turn": 6,
             "data": {"call_id": "c2", "name": "shell", "arguments": "{}",
                 "approvals": [{"tag": "manual", "by": "tui", "allow": true}]}}))
@@ -26736,7 +26780,7 @@ mod tests {
         app.flush();
         let texts = app.screen.texts();
         assert!(
-            texts.contains(&"⏸ Request for make deploy no longer waits".to_owned()),
+            texts.contains(&"– The request to run make deploy went away".to_owned()),
             "{texts:?}"
         );
     }
@@ -26766,7 +26810,7 @@ mod tests {
         app.flush();
         let texts = app.screen.texts();
         assert!(
-            texts.contains(&"⏸ Request for make deploy no longer waits".to_owned()),
+            texts.contains(&"– The request to run make deploy went away".to_owned()),
             "{texts:?}"
         );
     }
@@ -26824,7 +26868,7 @@ mod tests {
         app.flush();
         let texts = app.screen.texts();
         assert!(
-            texts.contains(&"✗ Request timed out for make deploy".to_owned()),
+            texts.contains(&"✗ The request to run make deploy timed out".to_owned()),
             "{texts:?}"
         );
     }
@@ -26889,11 +26933,11 @@ mod tests {
         );
         assert_eq!(
             row(&Lapsed, None),
-            "✗ Request timed out for cargo publish --allow-dirty"
+            "✗ The request to run cargo publish --allow-dirty timed out"
         );
         assert_eq!(
             row(&Gone, None),
-            "⏸ Request for cargo publish --allow-dirty no longer waits"
+            "– The request to run cargo publish --allow-dirty went away"
         );
         // A long command is cut to the row.
         let long = json!({"command": "x".repeat(200)});
@@ -26957,8 +27001,8 @@ mod tests {
             text(&app.pending),
             [
                 "↳ From shop.fix",
-                "⏸ Allow shell?",
-                "  Reason: Releasing needs the registry.",
+                "⏸ Run cargo publish?",
+                "  Releasing needs the registry.",
                 "  cargo publish",
                 "  It publishes the crate.",
                 "  Nothing the person said asks for it.",
@@ -26987,7 +27031,10 @@ mod tests {
         app.flush();
         let shown = app.screen.texts();
         assert_eq!(
-            shown.iter().filter(|row| *row == "⏸ Allow shell?").count(),
+            shown
+                .iter()
+                .filter(|row| *row == "⏸ Run cargo publish?")
+                .count(),
             1
         );
         // An answer that failed leaves it waiting here, to answer again.

@@ -863,9 +863,9 @@ has something on it, or is off the screen, no time shows.
   the sandbox waits for whoever approves; while the reviewer looks at one
   the status row says `Reviewing approval request` (Sonny keeps
   `sonny reviewer` as the daemon's companion when nothing serves it), and
-  a denied call is drawn as `✗ Request denied for …` with the reviewer's
-  reason, in either view; one you allow is drawn as `✓ Request allowed
-  for …`, as Codex records each decision. The status row above the
+  a denied call is drawn as `✗ The reviewer denied …` with the reviewer's
+  reason, in either view; one you allow is drawn as `✓ You allowed …`, as
+  Codex records each decision. The status row above the
   composer shows only the keys, since the call is written out whole right
   above it. The footer leads with the row unless it is the one new leads
   start in, each with its mark as Claude Code marks its modes: `⏵⏵ full
@@ -985,9 +985,17 @@ has something on it, or is off the screen, no time shows.
   sandbox, from the agent's next call. A call approved to run outside the
   sandbox still reaches whatever you can.
 
-  A call that waits on you is written out as Codex's approval shows it:
-  `⏸ Allow shell?`, the agent's own reason for it as `Reason:`, the
-  command, and what the reviewer doubted, whole. The calls of your lead's
+  A call that waits on you says what will happen, in words, never as a
+  function call: `⏸ Run git push origin main outside the sandbox?`,
+  `⏸ Start the task readme?`, `⏸ Add the automation nightly?`. Under it,
+  muted, come the agent's own reason, the command or the brief in full (a
+  tool Sonny has no words for lists its fields, never JSON), and what the
+  reviewer doubted, whole. Decided, it folds to one row that still says
+  what: `✓ You allowed starting readme`, `✓ The reviewer allowed git
+  status`, `✗ You denied git push origin main`, or, muted, `– The request
+  to start halves went away`. For a second after an approval leaves the
+  screen, a lone `y`, `n` or `a` meant for it is dropped instead of
+  starting a message. The calls of your lead's
   tasks wait in its window too, and, where the lead runs in a multiplexer
   (which is how its window follows other agents), so do those of the leads
   it follows by name (`follows`) and their tasks, at any depth, each under
@@ -995,6 +1003,8 @@ has something on it, or is off the screen, no time shows.
   you answer where you are, on that agent's own call, and it is gone from
   every window once answered in any. The questions they ask pin there the
   same way.
+
+  ![An approval in words: Run git push origin main outside the sandbox?, the agent's reason and the command muted under it](../docs/sonny/approval-words.png)
 
   ![An approval from a task, with its reason and the reviewer's note, waiting in its lead's window](../docs/sonny/approval-raised.png)
 
