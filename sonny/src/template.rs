@@ -144,10 +144,10 @@ impl Live {
 
 /// The blanks and filters a window's live template has, as the tools
 /// that write one say them.
-pub const BLANKS: &str = "Blanks: source('name'), or source('name:topic') for one topic: .latest, \
-    .events newest first, .topics each topic's newest; an event has text, at, topic, from, url, fields. \
-    file('path'), modified('path') (a time), tasks(), task('name'), now(). Filters: ago, time, fromjson, \
-    and Jinja's own such as selectattr, rejectattr, sort, map, join, length, tojson.";
+pub const BLANKS: &str = "Blanks: source('name') or source('name:topic'): .latest, .events newest \
+    first, .topics each topic's newest; an event has text, at, topic, from, url, fields. file('path'), \
+    modified('path'), tasks(), task('name'), now(). Filters: ago, time, fromjson, and Jinja's own \
+    (selectattr, sort, map, join, tojson).";
 
 /// The code every live template is refused with, wherever it is written.
 pub const REFUSED: &str = "live_template";
