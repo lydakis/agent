@@ -1,5 +1,5 @@
-//! `/model`: the lead's model and effort, picked from what its provider
-//! family lists. A bot changes model only within its family, since its
+//! `/model`: the lead's model, effort and speed, picked from what its
+//! provider family lists. A bot changes model only within its family, since its
 //! history is in that family's shape.
 use serde_json::Value;
 
@@ -12,6 +12,11 @@ pub struct Picker {
     /// No effort first: the provider's default.
     efforts: Vec<Option<String>>,
     effort: usize,
+    /// The speed picked: `standard`, or a faster tier where the picked
+    /// model serves it.
+    pub speed: &'static str,
+    /// Tab moved ← and → from effort to speed.
+    pub on_speed: bool,
     /// Why a provider of the family listed nothing.
     pub refused: Vec<String>,
 }
@@ -96,6 +101,8 @@ impl Picker {
             pick,
             efforts,
             effort,
+            speed: "standard",
+            on_speed: false,
             refused,
         }
     }

@@ -9,15 +9,20 @@
 //! fire went out and whose turn then failed, as when the machine was
 //! offline or a login expired, the daemon saying how the turn ended; and a
 //! server the nightly memory cleanup could not read, by the fact it saves.
+//! Last, the commands the agents left running, which the daemon is asked
+//! for (`commands`): Enter opens a row's agent, and x stops one.
+use crate::commands::{self, Commands};
 use crate::{kept, lookout, trigger};
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::{
     style::{Color, Stylize},
     text::{Line, Span},
 };
-use serde_json::Value;
+use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
+use unicode_width::UnicodeWidthStr;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Kind {
@@ -566,6 +571,11 @@ pub struct View {
     selected: usize,
     /// The item the first `d` picked, by kind, agent and name.
     confirm: Option<(Kind, String, String)>,
+    /// The commands the agents left running, picked after the items.
+    commands: Commands,
+    /// The stop `x` asked of a command, by handle and what it names,
+    /// waiting for Enter.
+    stopping: Option<(String, String)>,
     notice: Option<String>,
 }
 
@@ -576,6 +586,11 @@ pub enum Key {
     Close,
     /// The agent the picked row is for, to go to.
     Open(String),
+    /// Stop this agent's command, by its handle.
+    Stop {
+        bot: String,
+        handle: String,
+    },
 }
 
 impl View {
@@ -597,10 +612,53 @@ impl View {
             icons: HashMap::new(),
             selected: 0,
             confirm: None,
+            commands: Commands::default(),
+            stopping: None,
             notice: None,
         };
         view.reload();
         view
+    }
+
+    /// Every row that can be picked: the items, then the commands.
+    fn rows(&self) -> usize {
+        self.items.len() + self.commands.rows.len()
+    }
+
+    /// The command picked, when the pick is past the items.
+    fn command(&self) -> Option<&Value> {
+        (self.selected.checked_sub(self.items.len())).and_then(|at| self.commands.rows.get(at))
+    }
+
+    /// Whether the commands should be read again now.
+    pub fn commands_due(&self) -> bool {
+        self.commands.due()
+    }
+
+    /// The `processes` request for the project's commands.
+    pub fn commands_query(&self) -> Value {
+        json!({"bot": self.scope.glob})
+    }
+
+    /// What the read of the commands came back with.
+    pub fn commands_loaded(&mut self, page: Result<Value, String>) {
+        if let Some(came) = self.commands.loaded(page) {
+            self.notice = Some(came);
+        }
+        self.selected = self.selected.min(self.rows().saturating_sub(1));
+        // A stop asked of a command that has gone since is no stop.
+        if let Some((handle, _)) = &self.stopping
+            && !(self.commands.rows.iter()).any(|row| row["handle"] == *handle)
+        {
+            self.stopping = None;
+        }
+    }
+
+    /// A stop of `handle` going out: it says so until it comes to
+    /// something, which goes in what this returns.
+    pub fn stopping(&mut self, handle: &str) -> Arc<Mutex<Option<String>>> {
+        self.notice = Some(format!("stopping {handle}…"));
+        self.commands.came()
     }
 
     /// Read it all again, the pick kept on the same row where it still is.
@@ -617,7 +675,7 @@ impl View {
         self.selected = picked
             .and_then(|k| self.items.iter().position(|i| key_of(i) == k))
             .unwrap_or(self.selected)
-            .min(self.items.len().saturating_sub(1));
+            .min(self.rows().saturating_sub(1));
         // A removal waits only on the row it was asked for, still picked.
         if self.confirm.is_some() && self.items.get(self.selected).map(key_of) != self.confirm {
             self.confirm = None;
@@ -635,38 +693,64 @@ impl View {
         }
     }
 
-    /// The item a removal was asked for is kept: a key went elsewhere.
+    /// The item a removal was asked for is kept, or the command a stop
+    /// was: a key went elsewhere.
     pub fn keep(&mut self) {
         if self.confirm.take().is_some() {
             self.notice = Some("not removed".into());
+        }
+        if self.stopping.take().is_some() {
+            self.notice = Some("not stopped".into());
         }
     }
 
     pub fn key(&mut self, key: KeyEvent) -> Key {
         self.notice = None;
+        let plain = !key
+            .modifiers
+            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER);
+        let close = key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL);
         // A removal asked for: only Enter, with no modifier, says yes;
         // any other key keeps the row, and says so, and Ctrl+C closes too.
         if let Some(asked) = self.confirm.take() {
-            let plain = !key
-                .modifiers
-                .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER);
             match self.items.iter().find(|item| key_of(item) == asked) {
                 Some(item) if key.code == KeyCode::Enter && plain => self.remove(&item.clone()),
                 _ => self.notice = Some("not removed".into()),
             }
-            let close =
-                key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL);
             return if close { Key::Close } else { Key::Stay };
+        }
+        // A stop asked for: the same, for the command it would stop.
+        if let Some((handle, _)) = self.stopping.take() {
+            if key.code != KeyCode::Enter || !plain {
+                self.notice = Some("not stopped".into());
+                return if close { Key::Close } else { Key::Stay };
+            }
+            let row = self
+                .commands
+                .rows
+                .iter()
+                .find(|row| row["handle"] == *handle);
+            return match row.and_then(|row| row["bot"].as_str()) {
+                Some(bot) => Key::Stop {
+                    bot: bot.to_owned(),
+                    handle,
+                },
+                None => Key::Stay,
+            };
         }
         match key.code {
             KeyCode::Esc => return Key::Close,
             // Enter goes to the agent the row is for: the one an
-            // automation wakes, the subscriber.
+            // automation wakes, the subscriber, the one that left a
+            // command running.
             KeyCode::Enter => {
                 if let Some(item) = self.items.get(self.selected)
                     && !item.bot.is_empty()
                 {
                     return Key::Open(item.bot.clone());
+                }
+                if let Some(bot) = self.command().and_then(|row| row["bot"].as_str()) {
+                    return Key::Open(bot.to_owned());
                 }
             }
             KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
@@ -680,9 +764,14 @@ impl View {
                 ) => {}
             KeyCode::Up | KeyCode::Char('k') => self.selected = self.selected.saturating_sub(1),
             KeyCode::Down | KeyCode::Char('j') => {
-                self.selected = (self.selected + 1).min(self.items.len().saturating_sub(1));
+                self.selected = (self.selected + 1).min(self.rows().saturating_sub(1));
             }
             KeyCode::Char('r') => self.fire(),
+            KeyCode::Char('x') | KeyCode::Delete if self.command().is_some() => {
+                let row = self.command().cloned().unwrap_or_default();
+                let handle = row["handle"].as_str().unwrap_or_default().to_owned();
+                self.stopping = Some((handle, commands::what(&row)));
+            }
             KeyCode::Char('x') | KeyCode::Delete => {
                 let Some(item) = self.items.get(self.selected).cloned() else {
                     return Key::Stay;
@@ -712,6 +801,9 @@ impl View {
 
     fn fire(&mut self) {
         let Some(item) = self.items.get(self.selected) else {
+            if self.command().is_some() {
+                self.notice = Some("only an automation runs now".into());
+            }
             return;
         };
         if item.kind != Kind::Trigger {
@@ -756,9 +848,11 @@ impl View {
 
     /// The item at `at` picked, as a click picks it.
     pub fn pick_at(&mut self, at: usize) {
-        // Any click takes back a removal that was asked: only Enter removes.
+        // Any click takes back a removal or a stop that was asked: only
+        // Enter removes or stops.
         self.confirm = None;
-        if at < self.items.len() {
+        self.stopping = None;
+        if at < self.rows() {
             self.selected = at;
         }
     }
@@ -766,13 +860,24 @@ impl View {
     /// [`View::card`], and the row each item starts on, by its place
     /// among the items.
     pub fn card_rows(&self, width: usize) -> (Vec<Line<'static>>, usize, Vec<usize>) {
-        let mut starts = vec![0; self.items.len()];
+        self.card_at(width, now_ms() as i64)
+    }
+
+    /// [`View::card_rows`] as of `now_ms`, which the commands' ages count
+    /// to.
+    fn card_at(&self, width: usize, now_ms: i64) -> (Vec<Line<'static>>, usize, Vec<usize>) {
+        let mut starts = vec![0; self.rows()];
         let mut out = vec![Line::from(self.scope.project.clone()).bold()];
         if !self.lookout.is_empty() {
             out.push(Line::from(self.lookout.clone()).dim());
         }
         let mut at = 0;
-        if self.items.is_empty() {
+        // Said empty once the commands are read too, a moment after it
+        // opens.
+        if self.rows() == 0 && !self.commands.read() {
+            return (out, 0, Vec::new());
+        }
+        if self.rows() == 0 && self.commands.error.is_none() {
             out.push(Line::default());
             out.push(Line::from(
                 "Nothing runs in the background for these agents.",
@@ -782,6 +887,9 @@ impl View {
                     "An agent adds an automation with its automations tool, and a follow with its follows tool.",
                 )
                 .dim(),
+            );
+            out.push(
+                Line::from("A command an agent leaves running shows here until it ends.").dim(),
             );
             return (out, 0, Vec::new());
         }
@@ -811,6 +919,32 @@ impl View {
                 }
                 starts[index] = out.len();
                 out.extend(self.item_lines(item, index == self.selected, width));
+            }
+        }
+        if let Some(error) = &self.commands.error {
+            out.push(Line::default());
+            out.push(Line::from(vec![
+                Span::raw("✗ ").fg(Color::Red),
+                Span::raw(format!("could not read what runs: {error}")),
+            ]));
+        } else if !self.commands.rows.is_empty() {
+            out.push(Line::default());
+            out.push(Line::from(vec![
+                Span::raw("Commands").bold(),
+                Span::raw(format!(" · {}", self.commands.rows.len())).dim(),
+            ]));
+            let names: Vec<String> = (self.commands.rows.iter())
+                .map(|row| self.scope.short(row["bot"].as_str().unwrap_or("?")))
+                .collect();
+            let name_width = names.iter().map(|n| n.width()).max().unwrap_or(0).min(20);
+            for (place, (row, name)) in self.commands.rows.iter().zip(&names).enumerate() {
+                let index = self.items.len() + place;
+                if index == self.selected {
+                    at = out.len();
+                }
+                starts[index] = out.len();
+                let picked = index == self.selected;
+                out.push(commands::line(row, name, name_width, width, now_ms, picked));
             }
         }
         (out, at, starts)
@@ -893,6 +1027,12 @@ impl View {
     /// The line under the card: what was done, the removal to confirm, or
     /// the keys the picked row takes.
     pub fn footer(&self) -> Option<Line<'static>> {
+        if let Some((_, what)) = &self.stopping {
+            return Some(Line::from(vec![
+                Span::raw(format!("Stop {what} and all it started?")).bold(),
+                Span::raw(" It can't be undone.").dim(),
+            ]));
+        }
         if let Some((_, _, name)) = &self.confirm {
             return Some(Line::from(vec![
                 Span::raw(format!("Remove {name}?")).bold(),
@@ -913,9 +1053,20 @@ impl View {
                 .esc(Esc::Cancel)
                 .text();
         }
+        if self.stopping.is_some() {
+            return (Keys::new().enter(crate::hint::Enter::Confirm("stop")))
+                .esc(Esc::Cancel)
+                .text();
+        }
         let mut keys = Keys::new();
-        if self.items.len() > 1 {
+        if self.rows() > 1 {
             keys = keys.pick();
+        }
+        if self.command().is_some() {
+            return (keys.enter(crate::hint::Enter::Open))
+                .key("x", "stop")
+                .esc(Esc::Close)
+                .text();
         }
         if self
             .items
@@ -1055,6 +1206,8 @@ mod tests {
             icons,
             selected: 0,
             confirm: None,
+            commands: Commands::default(),
+            stopping: None,
             notice: None,
         };
         let rows: Vec<String> = (view.card(100).0.iter())
@@ -1372,6 +1525,8 @@ mod tests {
             icons: HashMap::new(),
             selected: 1,
             confirm: None,
+            commands: Commands::default(),
+            stopping: None,
             notice: None,
         };
         let (card, at) = view.card(100);
@@ -1429,6 +1584,8 @@ mod tests {
             icons: HashMap::new(),
             selected: 0,
             confirm: None,
+            commands: Commands::default(),
+            stopping: None,
             notice: None,
         };
         let text = |view: &View| -> Vec<String> {
@@ -1504,6 +1661,80 @@ mod tests {
         assert_eq!(view.confirm, None);
         assert!(view.notice.as_deref().unwrap().starts_with("Sonny keeps"));
         assert_eq!(press(&mut view, KeyCode::Esc), Key::Close);
+        // The commands the agents left running come last, picked after
+        // the items: Enter opens a row's agent, x asks once to stop it.
+        assert_eq!(view.commands_query(), json!({"bot": "calc.*"}));
+        assert!(view.commands_due());
+        view.commands_loaded(Ok(json!({"processes": [
+            {"handle": "proc:4", "bot": "calc.lead", "kind": "background",
+             "command": "cargo build", "started_ms": 1_000, "pid": null},
+            {"handle": "proc:9", "bot": "calc.fix", "kind": "detached",
+             "command": "npm run dev\nmore", "started_ms": 1_000, "pid": 4242},
+        ]})));
+        assert!(!view.commands_due());
+        let lines: Vec<String> = (view.card_at(80, 1_000 + 125_000).0.iter())
+            .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect())
+            .collect();
+        let at = lines.iter().position(|l| l == "Commands · 2").unwrap();
+        assert_eq!(lines[at - 1], "");
+        assert!(lines[at + 1].contains(" 2m lead") && lines[at + 1].contains("cargo build"));
+        assert!(lines[at + 2].contains("fix") && lines[at + 2].contains("detached pid 4242"));
+        assert_eq!(at + 3, lines.len(), "the commands come last");
+        press(&mut view, KeyCode::Down);
+        assert_eq!(view.card_at(80, 0).1, at + 1);
+        assert_eq!(view.keys(), "↑↓ pick · enter open · x stop · esc close");
+        assert_eq!(
+            press(&mut view, KeyCode::Enter),
+            Key::Open("calc.lead".into())
+        );
+        press(&mut view, KeyCode::Down);
+        press(&mut view, KeyCode::Down);
+        assert_eq!(press(&mut view, KeyCode::Char('x')), Key::Stay);
+        assert_eq!(
+            view.footer().unwrap().to_string(),
+            "Stop npm run dev more and all it started? It can't be undone."
+        );
+        assert_eq!(view.keys(), "enter stop · esc cancel");
+        assert_eq!(press(&mut view, KeyCode::Esc), Key::Stay, "esc cancels");
+        assert_eq!(view.footer().unwrap().to_string(), "not stopped");
+        // Enter with a modifier keeps it running too; Ctrl+C keeps it and
+        // closes.
+        for modifier in [KeyModifiers::CONTROL, KeyModifiers::ALT] {
+            press(&mut view, KeyCode::Char('x'));
+            let enter = KeyEvent::new(KeyCode::Enter, modifier);
+            assert_eq!(view.key(enter), Key::Stay);
+            assert_eq!(view.footer().unwrap().to_string(), "not stopped");
+        }
+        press(&mut view, KeyCode::Char('x'));
+        let close = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
+        assert_eq!(view.key(close), Key::Close);
+        assert_ne!(view.keys(), "enter stop · esc cancel");
+        press(&mut view, KeyCode::Char('x'));
+        assert_eq!(
+            press(&mut view, KeyCode::Enter),
+            Key::Stop {
+                bot: "calc.fix".into(),
+                handle: "proc:9".into()
+            }
+        );
+        let came = view.stopping("proc:9");
+        assert_eq!(view.footer().unwrap().to_string(), "stopping proc:9…");
+        *came.lock().unwrap() = Some("stopped proc:9".into());
+        assert!(
+            view.commands_due(),
+            "a stop that came to something reads at once"
+        );
+        view.commands_loaded(Ok(json!({"processes": []})));
+        assert_eq!(view.notice.as_deref(), Some("stopped proc:9"));
+        assert_eq!(view.selected, 1, "the pick stays on a row that is there");
+        view.commands_loaded(Err("daemon down".into()));
+        let lines: Vec<String> = (view.card(80).0.iter())
+            .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect())
+            .collect();
+        assert_eq!(
+            lines.last().unwrap(),
+            "✗ could not read what runs: daemon down"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

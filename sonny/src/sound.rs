@@ -2,7 +2,7 @@
 //! or stops on them. One Sonny rings for a project: the lead's, which sees
 //! every agent in it; the windows it opens for tasks stay quiet.
 //!
-//! The sound is off until `[sonny] chime = true` or `/sound` turns it on.
+//! The sound is off until `[sonny] chime = true` turns it on.
 //! On a Mac it is one of the system's (`SONNY_SOUND_DONE=Pop`, a file's
 //! path, or `off` changes one); elsewhere it is the terminal bell.
 //! The notification is OSC 777, which Rex shows as a desktop notification.
@@ -35,7 +35,7 @@ impl Alert {
 
 pub struct Sounds {
     on: bool,
-    /// `[sonny] chime`, off by default, and `/sound`: off keeps the
+    /// `[sonny] chime`, off by default: off keeps the
     /// notifications and drops the sound.
     pub chime: bool,
     last: Option<(Instant, Alert)>,

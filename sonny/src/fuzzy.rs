@@ -2,7 +2,7 @@
 //! `/model` and `sonny setup`'s pickers. A row matches when the letters
 //! typed are in its name in order, the first of them starting the name or
 //! a word in it, as VS Code's command palette matches: `/cms` finds
-//! `/commons`, and `/co` does not find `/instructions`. Rows rank in tiers
+//! `/commons`, and `/co` does not find `/background`. Rows rank in tiers
 //! as Codex's mention popup and Claude Code's command search rank them:
 //! the whole name, then a name it starts, then a word in the name it
 //! starts, then the letters. Within a tier, what the person picked more

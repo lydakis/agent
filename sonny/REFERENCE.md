@@ -133,7 +133,8 @@ Claude Code's agents take `isolation` each time.
 that one thing and hold everything else back, and shows only your turns and
 its questions, in the middle of the window, under a footer of the focus and
 what needs you; it interrupts only with a question, and `/zen` again ends it
-and has the agent say what it held. The focus is the agent's to
+and has the agent say what it held (the slash menu says so while zen is on:
+"End zen and hear what was kept"). The focus is the agent's to
 read: a few hurried words are enough, and the footer shows the focus in its
 words. Asking in words ("let's go into zen on the receipts") works too.
 
@@ -307,7 +308,7 @@ The project's wins, then the config's, then `lead` and `task`. A name that
 is not a profile in the folder's or the person's `.agents/agents` (nor one
 Sonny ships) stops the lead or task from being made, with
 `profile_not_found`. The profile is read when the lead's instructions are
-composed, so `/instructions` takes a change. `extends` and `skills` work
+composed, so a change takes at the lead's next idle point. `extends` and `skills` work
 in any profile ([CLIENT.md](../docs/CLIENT.md)); a profile that extends
 `lead` or `task` is not offered to agents as a role to start a peer in.
 
@@ -796,7 +797,7 @@ has something on it, or is off the screen, no time shows.
   agents, in `/status`, or to the lookout.
 
   ![A side chat forked with every tool writes a file beside the lead](../docs/sonny/side-fork.png)
-- `/config` (or `/settings`) lists every key `~/.agent/config.toml` takes,
+- `/config` lists every key `~/.agent/config.toml` takes,
   with its value or what its default is, over the composer. ↑/↓ picks
   one; ←/→ steps a key with a few values (efforts, `web_search`,
   `trailer`, `side_chat`, `chime`, `steps`, `verbose`, `margin_opens`, `agent_opens`, `suggest`,
@@ -822,31 +823,26 @@ has something on it, or is off the screen, no time shows.
   ![/config after one step: trailer = ["sender"] saved](../docs/sonny/config-trailer-sender.png)
 - `/model` picks the lead's model, from every model its provider family
   lists, each by its name and provider (`Opus 5.5 · bedrock`) with its id
-  muted after them, found by either, and its effort (←/→), and writes them to the project's
-  `.agents/project.toml` when the folder has one. A pick made while a turn
-  runs shows in the footer and applies when the lead is idle; one that
-  another client overtakes is dropped.
-- `/fast` picks how fast the lead's calls are served, from a list of
-  standard and each faster tier its provider serves: `fast` (Claude's
-  fast mode, OpenAI's priority tier) and `ultrafast`, each at a higher
-  price per token. The footer names the speed after the effort; a pick
-  made while a turn runs applies when the lead is idle. A provider that
-  serves standard alone, as Bedrock does for Claude, says so instead.
+  muted after them, found by either, its effort and its speed, and writes
+  the model and effort to the project's `.agents/project.toml` when the
+  folder has one. ←/→ step the effort; Tab moves them to the speed and
+  back: standard, then each faster tier the picked model serves, `fast`
+  (Claude's fast mode, OpenAI's priority tier) and `ultrafast`, each at a
+  higher price per token. A model served at standard alone, as Bedrock
+  serves Claude, has no speed row. The footer names the speed after the
+  effort. A pick made while a turn runs shows in the footer and applies
+  when the lead is idle; one that another client overtakes is dropped.
   The tasks an agent starts on its own model run at its speed, as its
   helpers do at theirs, unless `threads_speed` or `[sonny] task_speed`
   names one; a task whose provider does not serve that speed starts at
   standard, and the start says so.
 
-  ![/fast: standard in effect, fast and ultrafast with what each costs](../docs/sonny/fast-mode-menu.png)
+  ![/model: the speed row picked with Tab, fast beside the effort](../docs/sonny/model-speed.png)
 - `/compact` asks first, then summarizes the lead's conversation before
   its next model call: at the running turn's next step, or before an idle lead's next
   reply. The daemon also compacts on its own once a call's input reaches
   the bot's `compact_tokens`, which follows the model's context window
   unless set (900,000 tokens on a 1M window).
-- `/instructions` gives the lead its folder's instructions again: its
-  role, `AGENTS.md`, skills and memory. Sonny does this on its own when
-  it opens a lead whose instructions it saw composed from the folder, and
-  leaves ones set any other way alone.
 - `/permissions` picks what agents may do, and who approves the rest, as
   Codex's `/permissions` pairs a sandbox with a reviewer:
 
@@ -1110,13 +1106,21 @@ has something on it, or is off the screen, no time shows.
   and build, with the model it has, so an upgrade restarts it with the
   lookout and the tool host.
 
-- `/background` (or `/automations`, `/lookout`) lists, in the pane beside the
+- `/background` lists, in the pane beside the
   conversation, what runs for the project's agents with
   no one typing: the automations that wake them, with
-  when each runs, its message and what its last run did, and the
+  when each runs, its message and what its last run did, the
   lookout's follows, with how many checks each asked for in the last
-  day. `↑`/`↓` picks one, Enter (or a click) goes to the agent it wakes,
-  `r` runs an automation now, and `x` removes it once Enter confirms; the follow Sonny keeps for a lead's tasks stays. What runs
+  day, and last the commands the agents left running, as Codex's `/ps`
+  shows its background terminals: each background command, terminal,
+  detached service and call waiting on its approval, oldest first, with
+  its agent, how long it has run, a detached one's pid and the start of
+  its command, read from the daemon's `processes` every two seconds while
+  it is open. `↑`/`↓` picks one, Enter (or a click) goes to the agent it
+  wakes, or that left the command running, `r` runs an automation now,
+  and `x` removes an automation or follow, or stops a command with all it
+  started (`stop_process`, beside the window), once Enter confirms; any
+  other key keeps it. The follow Sonny keeps for a lead's tasks stays. What runs
   there while healthy asks nothing of you, so the footer leaves it out.
   What failed is listed first, with a red `✗` and the error: an automation
   whose run failed (one that ended on it stays listed until `d` removes
@@ -1163,7 +1167,7 @@ has something on it, or is off the screen, no time shows.
   compaction freed and the room it left.
 
   ![/context in the pane: a grid of a hundred cells, each part in its own mark, beside the list of parts](../docs/sonny/context-card.png)
-- `/commons` (or `/forum`) shows, in the pane beside the conversation, the
+- `/commons` shows, in the pane beside the conversation, the
   threads the agents of every project share in the commons, newest first,
   each with who started it, how many posts it has, who wrote last and how
   often agents read it. Enter reads one; each post there names who wrote it
@@ -1321,7 +1325,8 @@ has something on it, or is off the screen, no time shows.
   ![/sky with its legend](../docs/sonny/sky-legend.png)
 - `/pause REASON` stops every agent, in every project, until `/resume`:
   running turns stop where they are and continue on `/resume`, and what
-  arrives meanwhile waits, across restarts too.
+  arrives meanwhile waits, across restarts too. The slash menu lists
+  `/resume` only while the agents are paused.
   Every window says who paused and why, and which agents it parked; Esc in
   one of their windows ends that agent's turn before you resume.
   `agent pauses` lists every pause, who pulled it and who let it go.
@@ -1479,18 +1484,18 @@ has something on it, or is off the screen, no time shows.
   ![Where each question stands: one answered, one withdrawn with why, one set aside, and the composer answering an open one in words](../docs/sonny/question-states-dark.png)
 
   ![A task's question: the lead's task updates say shop.wire asks you, and wire, opened from the margin's ↗, shows the decision in the pane](../docs/sonny/ask-from-task.png)
-- `/copy` puts the last reply on the clipboard; `/open` opens the last
-  HTML page in a browser; `/sound` turns the chime off or on; `/verbose`
+- `/copy` puts the last reply on the clipboard; `/verbose`
   switches between the clean view and every tool call; `/quit`
-  leaves the agents working.
-- `/colors` (experimental) colors a busy lead's window by project: when
+  leaves the agents working. An HTML page a reply shows has its file's
+  path under it, which opens it in a browser on a click.
+- Project colors (experimental, `[sonny] project_colors`) color a busy
+  lead's window by project: when
   the lead follows other projects' leads, a reply it writes because one
   of those projects woke it wears that project's colored bar down its
   left edge, so you can tell whether back-to-back replies are about the
   same project; your own turns stay plain. Each followed project takes one
   of six colors in the followed leads' order, `[sonny.projects.NAME]
-  color = "jade"` pins one, and `[sonny] project_colors = true` turns it
-  on in every window.
+  color = "jade"` pins one.
 
   ![Project colors on: replies about atlas, shop and blog each wear their project's bar; your own turns stay plain](../docs/sonny/project-colors-dark.png)
 
@@ -1540,7 +1545,7 @@ turn of the task numbered after that one reopens it.
 ## Shared settings
 
 Settings Sonny keeps for every folder are in `~/.agent/config.toml`'s
-`[sonny]`, which `/config` shows: the chime (`chime`, off by default; `/sound` or
+`[sonny]`, which `/config` shows: the chime (`chime`, off by default;
 `chime = true` turns it on) and
 the view (`steps` and `verbose`, both off by default), besides the efforts and the side chat
 above. `/config` lists the keys under their table's name, a value set in
@@ -1890,7 +1895,7 @@ leaves a question for your own words; `enter` opens, runs, chooses, goes
 on, saves, or says a confirm's own verb (`enter compact`). A line too
 long for its row drops pairs from the right, keeping `esc`, then
 `enter`. Every list over the composer (the slash menu, `/model`,
-`/switch`, `/new`, `/permissions`, `/fast`, `/retry`, a reply to react to
+`/switch`, `/new`, `/permissions`, `/retry`, a reply to react to
 or answer, Ctrl+R) is one list: up to 8 rows under a blank one, the pick
 in reverse video, `•` before what is in effect, and its keys where the
 footer was. Each narrows as you type, found by its name or what it is,

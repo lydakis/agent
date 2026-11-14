@@ -944,12 +944,9 @@ pub fn inline(text: &str, base: Style) -> Vec<Span<'static>> {
     spans
 }
 
-/// The HTML page a reply showed last, for `/open`.
-pub static PAGE: std::sync::Mutex<Option<std::path::PathBuf>> = std::sync::Mutex::new(None);
-
 /// A ```html fence, drawn as the page by a headless browser and kept in
-/// a file `/open` shows in the browser; its first lines as code where it
-/// cannot be drawn.
+/// a file whose path, under it, opens in the browser on a click; its first
+/// lines as code where it cannot be drawn.
 fn page(source: &str, width: usize) -> Vec<Line<'static>> {
     let dir = std::env::temp_dir().join("sonny-pages");
     let name = format!(
@@ -999,12 +996,9 @@ fn page(source: &str, width: usize) -> Vec<Line<'static>> {
     };
     out.push(Line::from(vec![
         Span::raw("    ↗ ").fg(Color::Cyan),
-        Span::raw("/open").bold(),
+        Span::raw(path.display().to_string()),
         Span::raw(more).dim(),
     ]));
-    if let Ok(mut page) = PAGE.lock() {
-        *page = Some(path);
-    }
     out
 }
 

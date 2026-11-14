@@ -26,7 +26,7 @@ pub struct Settings {
     /// The most lines a margin note runs to.
     pub margin_note_lines: u64,
     /// Experimental: whether a window that follows other leads opens with
-    /// project colors on; `/colors` toggles them there.
+    /// project colors on.
     pub project_colors: bool,
     /// The color each project pins, by project.
     pub project_color: std::collections::BTreeMap<String, String>,
