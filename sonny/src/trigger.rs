@@ -74,7 +74,7 @@ const REPLY_WAIT_MS: u64 = 86_400_000;
 /// How long `fire` waits for launchd's run of the job to say what came of
 /// it: its gate's whole time, and then some for the send.
 const FIRE_WAIT: Duration = Duration::from_secs(90);
-pub const USAGE: &str = "usage: automation add [--name NAME] [WHEN] [--bot NAME | --start NAME --model PROVIDER/MODEL [--effort LEVEL] [--fresh]] [--reply-to BOT] [--if CMD] [--runs N] [--until 'YYYY-MM-DD HH:MM'] [--turn-budget-tokens N [--budget-counts work]] [--shadow] [--live] [--replace] -- MESSAGE\n         WHEN: --every N{m,h,d} | --in N{m,h} | --at 'YYYY-MM-DD HH:MM' | --cron 'MIN HOUR DAY MONTH WEEKDAY' | --file PATH | --commit REPO; none: only run runs it\n       automation ls [--after NAME]\n       automation show NAME\n       automation run NAME\n       automation rm NAME";
+pub const USAGE: &str = "usage: automation add [--name NAME] [WHEN] [--agent NAME | --start NAME --model PROVIDER/MODEL [--effort LEVEL] [--fresh]] [--reply-to AGENT] [--if CMD] [--runs N] [--until 'YYYY-MM-DD HH:MM'] [--turn-budget-tokens N [--budget-counts work]] [--shadow] [--live] [--replace] -- MESSAGE\n         WHEN: --every N{m,h,d} | --in N{m,h} | --at 'YYYY-MM-DD HH:MM' | --cron 'MIN HOUR DAY MONTH WEEKDAY' | --file PATH | --commit REPO; none: only run runs it\n       automation ls [--after NAME]\n       automation show NAME\n       automation run NAME\n       automation rm NAME";
 
 /// The system's own scheduler, which keeps Sonny's one job.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -2987,7 +2987,7 @@ fn parse_add(args: &[String], now: i64) -> Result<Add, String> {
                 when
             }
             "--name"
-            | "--bot"
+            | "--agent"
             | "--start"
             | "--model"
             | "--effort"
@@ -3012,7 +3012,7 @@ fn parse_add(args: &[String], now: i64) -> Result<Add, String> {
     };
     let mut take = |flag: &str| v.remove(flag);
     let (bot, start, model, effort) = (
-        take("--bot"),
+        take("--agent"),
         take("--start"),
         take("--model"),
         take("--effort"),
@@ -3024,7 +3024,7 @@ fn parse_add(args: &[String], now: i64) -> Result<Add, String> {
         (None, ..) => return Err(bad("--model and --effort go with --start".into())),
     };
     if bot.is_some() && start.is_some() {
-        return Err(bad("one of --bot or --start".into()));
+        return Err(bad("one of --agent or --start".into()));
     }
     if fresh && start.is_none() {
         return Err(bad("--fresh goes with --start".into()));
@@ -3186,7 +3186,7 @@ pub fn at_start() {
     std::thread::spawn(refresh_now);
 }
 
-/// [`at_start`]'s work, done here and now: `sonny update` waits for it.
+/// [`at_start`]'s work, done here and now: `sonny upgrade` waits for it.
 pub fn refresh_now() {
     let (Ok(places), Some(sonny)) = (Places::home(), crate::skills::sonny_path()) else {
         return;
@@ -3764,7 +3764,7 @@ fn add_args(asked: &Value) -> Vec<String> {
         ("cron", "--cron"),
         ("file", "--file"),
         ("commit", "--commit"),
-        ("bot", "--bot"),
+        ("agent", "--agent"),
         ("reply_to", "--reply-to"),
         ("if", "--if"),
         ("until", "--until"),
@@ -3952,7 +3952,9 @@ fn add_as(places: &Places, args: &[String], agents_gate: bool) -> Result<Value, 
         .or_else(|| asked.start.as_ref().map(|s| s.0.clone()))
         .or_else(|| asked.bot.clone())
         .or_else(|| shell.as_ref().map(|s| s.0.clone()))
-        .ok_or("invalid_automation: --bot NAME or --start NAME, or run it from an agent's shell")?;
+        .ok_or(
+            "invalid_automation: --agent NAME or --start NAME, or run it from an agent's shell",
+        )?;
     let (target, reply_to, store_id) = runtime()?.block_on(async {
         let client = connect(&socket, &daemon).await?;
         let resolved = async {
@@ -3977,7 +3979,7 @@ fn add_as(places: &Places, args: &[String], agents_gate: bool) -> Result<Value, 
                         match bot_id(&client, start).await {
                             Ok(_) => {
                                 return Err(format!(
-                                    "bot_exists: {start} is an agent already; message it with --bot {start}"
+                                    "bot_exists: {start} is an agent already; message it with --agent {start}"
                                 ));
                             }
                             Err(error) if error.starts_with("bot_not_found") => {}
@@ -4013,7 +4015,7 @@ fn add_as(places: &Places, args: &[String], agents_gate: bool) -> Result<Value, 
                     }
                 }
                 (None, None, None) => {
-                    return Err("invalid_automation: --bot NAME or --start NAME, or run it from an agent's shell".into());
+                    return Err("invalid_automation: --agent NAME or --start NAME, or run it from an agent's shell".into());
                 }
             };
             let reply_to = match &asked.reply_to {
@@ -9479,7 +9481,7 @@ pub(crate) mod tests {
     fn add_takes_one_when_one_target_and_a_message() {
         let now = clock(2026, 9, 28, 23, 52);
         let words = |s: &str| s.split(' ').map(str::to_owned).collect::<Vec<_>>();
-        let asked = parse_add(&words("--every 30m --bot p.x -- check the PR"), now).unwrap();
+        let asked = parse_add(&words("--every 30m --agent p.x -- check the PR"), now).unwrap();
         assert_eq!(
             (asked.bot.as_deref(), asked.message.as_str()),
             (Some("p.x"), "check the PR")
@@ -9521,13 +9523,13 @@ pub(crate) mod tests {
             "--every 30m --",
             "--start p.r -- x",
             "--model a/m -- x",
-            "--bot p.x --start p.r --model a/m -- x",
+            "--agent p.x --start p.r --model a/m -- x",
             "--fresh -- x",
-            "--bot p.x --fresh -- x",
+            "--agent p.x --fresh -- x",
             "--start p.r --model a/m --fresh --shadow -- x",
             "--runs 0 -- x",
             "--runs 9223372036854775808 -- x",
-            "--bot a --bot b -- x",
+            "--agent a --agent b -- x",
             "--wat x -- x",
         ] {
             assert!(

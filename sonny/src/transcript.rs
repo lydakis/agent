@@ -2672,7 +2672,7 @@ const KEPT: [&str; 28] = [
     "Saved to memory",
     "Updated in memory",
     "Removed from memory",
-    "Scheduled",
+    "Added the automation",
     "Removed the automation",
     "Ran the automation",
     "Added the project",
@@ -2709,7 +2709,7 @@ const FOLDS: [&str; 24] = [
     "Saved to memory",
     "Updated in memory",
     "Removed from memory",
-    "Scheduled",
+    "Added the automation",
     "Removed the automation",
     "Ran the automation",
     "Followed",
@@ -2935,7 +2935,7 @@ fn drawn(
                     claim(&mut printed, &|v| {
                         v.get("session").is_some() && v.get("bot").is_some()
                     });
-                } else if first.verb == "Scheduled" {
+                } else if first.verb == "Added the automation" {
                     own = claim(&mut printed, &|v| {
                         v.get("when").is_some() || v.get("error").is_some()
                     })
@@ -3770,8 +3770,8 @@ mod tests {
             call("Followed", "leads"),
             call("Saved to memory", "flow"),
             call("Saved to memory", "taste"),
-            call("Scheduled", "lead.next"),
-            call("Scheduled", "lead.next"),
+            call("Added the automation", "lead.next"),
+            call("Added the automation", "lead.next"),
         ];
         assert_eq!(
             did(&done),
@@ -3779,7 +3779,7 @@ mod tests {
                 "sent 3 to calc.add, calc.neg",
                 "followed leads",
                 "saved 2 memories",
-                "scheduled lead.next ×2",
+                "added the automation lead.next ×2",
             ]
         );
         assert_eq!(
@@ -4439,7 +4439,7 @@ mod tests {
             [
                 "• Ran git worktree list",
                 "  └ /repo d7e2b9e [main]",
-                "• Scheduled watch · every 10m",
+                "• Added the automation watch · every 10m",
                 "  └ Check the tasks, then report",
                 "• Saved to memory flow",
             ],
@@ -5097,7 +5097,7 @@ mod tests {
         assert_eq!(
             scheduled,
             [
-                "✗ Couldn't schedule every 30m",
+                "✗ Couldn't add the automation every 30m",
                 "  └ automations_unsupported: only macOS",
                 "    Check the queue."
             ]

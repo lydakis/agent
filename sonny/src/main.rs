@@ -370,7 +370,7 @@ struct Options {
 
 fn usage() -> String {
     "usage: sonny [--store PATH] [--socket PATH] [--model PROVIDER/MODEL] [--no-layout] [--rex-host HOST] [--no-sound]\n\
-     \x20      [--agent NAME [--new [--workspace DIR]] | --lead NAME | --new-lead [NAME]]\n\
+     \x20      [--agent NAME [--new [--folder DIR]] | --lead NAME | --new-lead [NAME]]\n\
      With no --agent, the folder's lead you last wrote to, its first made with --model the\n\
      first time; --lead opens another of the folder's leads, --new-lead makes one. Its\n\
      tasks open beside it in Rex, Herdr or cmux, each in a git worktree of its own. Type /status\n\
@@ -391,7 +391,7 @@ fn usage() -> String {
      tasks; sonny tool-host answers its agents' calls of Sonny's tools. Sonny starts both.\n\
      sonny agent ARGS... runs Sonny's own `agent` with ARGS, whatever `agent` is on PATH.\n\
      sonny setup asks again for the provider and the default model, as the first run does.\n\
-     sonny update [--download] updates Sonny and its daemon to the latest release, as it was\n\
+     sonny upgrade [--download] upgrades Sonny and its daemon to the latest release, as it was\n\
      installed, replaces the running daemon with the new one and has open windows reopen on it.\n\
      sonny acp [--store PATH] [--socket PATH] speaks the Agent Client Protocol on stdio\n\
      for T3 Code: a thread is its folder's lead, and each task opens as a thread of its own."
@@ -458,7 +458,7 @@ async fn show(
 }
 
 /// A tab for `bot`, a task `caller` just started asking for one: placed
-/// as a task's window is, within `[sonny] task_windows`, closing the
+/// as a task's window is, within `[sonny] most_task_tabs`, closing the
 /// lead's least recently used task tabs for room, never one the person has
 /// not looked at yet nor one that holds its place. What to tell `caller`
 /// beside the start, if anything.
@@ -489,7 +489,7 @@ async fn task_tab(caller: &str, bot: &str) -> Result<String, String> {
         .unwrap_or_else(|| format!("{project}.lead"));
     let lineage = lineage_of(&bots, &lead, lead == format!("{project}.lead"));
     let mut room = room_for(&project, &lineage, &HashMap::new(), Arc::new(used::held));
-    room.most = agent_client::config::load().map_or(0, |c| c.sonny.task_windows as usize);
+    room.most = agent_client::config::load().map_or(0, |c| c.sonny.most_task_tabs as usize);
     let command = [
         me.to_string_lossy().into_owned(),
         "--socket".into(),
@@ -813,7 +813,7 @@ async fn read_status(
             }
             Some((tab, None)) => format!("tab {tab}"),
             // Its window waits for room, until a click on the row.
-            None if (view.aside)(name) => "window set aside for room".into(),
+            None if (view.aside)(name) => "tab set aside for room".into(),
             None => String::new(),
         };
         // This window's turns run on its own model, when it has one.
@@ -1913,7 +1913,7 @@ fn start_daemon(
 }
 
 /// [`start_daemon`], replacing the daemon running now, whatever its
-/// release, as `sonny update` switches to the new one (`agent start
+/// release, as `sonny upgrade` switches to the new one (`agent start
 /// --replace`).
 fn start_daemon_replacing(
     store: &std::path::Path,
@@ -2040,7 +2040,7 @@ fn parse() -> Result<Options, String> {
             "--agent" => bot = Some(value()?),
             "--new" => new = true,
             "--model" => model = Some(value()?),
-            "--workspace" => workspace = Some(value()?),
+            "--folder" => workspace = Some(value()?),
             "--no-layout" => layout = false,
             "--rex-host" => rex_host = Some(value()?),
             "--no-sound" => sound = false,
@@ -2091,7 +2091,7 @@ fn reopen(bot: &str) -> Vec<String> {
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--new" | "--reopened" => {}
-            "--workspace" | "--lead" | "--agent" | "--window-place" | "--send-file"
+            "--folder" | "--lead" | "--agent" | "--window-place" | "--send-file"
             | "--draft-file" => {
                 args.next();
             }
@@ -2202,12 +2202,19 @@ fn main() -> std::process::ExitCode {
         Some((verb, rest)) if verb == "sky" => sky_cli(rest),
         Some((verb, rest)) if verb == "status" => status_cli(rest),
         // The person runs this, from a terminal of their own.
-        Some((verb, rest)) if verb == "update" => update::cli(rest),
+        Some((verb, rest)) if verb == "upgrade" => update::cli(rest),
+        // An older Sonny's hand-off after it installed this one, under the
+        // name before 0.10.0 (`upgrade::MIGRATIONS`, "update-hand-off").
+        Some((verb, rest))
+            if verb == "update" && rest.first().is_some_and(|arg| arg == "--installed") =>
+        {
+            update::cli(rest)
+        }
         // An agent's shell runs this, before it opens anything in a terminal.
         Some((verb, rest)) if verb == "where" => where_cli(rest),
         // An agent's shell runs this, for zen it was asked for in words.
         Some((verb, rest)) if verb == "zen" => zen::cli(rest),
-        Some((verb, rest)) if verb == "home" => {
+        Some((verb, rest)) if verb == "backup" => {
             return std::process::ExitCode::from(home::cli(rest) as u8);
         }
         // Unlisted: the job `sonny.start_at_boot` keeps.
@@ -2605,8 +2612,7 @@ async fn run() -> Result<(), String> {
     // Sonny opens on its defaults, said, rather than not at all.
     app.warnings.extend(unread);
     app.sounds.chime = settings.chime;
-    app.verbose = settings.verbose;
-    app.words_only = !settings.steps;
+    app.set_view(settings.view);
     app.colors = settings.project_colors;
     app.pinned = settings.project_color.clone();
     set_measure(settings.text_width);
@@ -2804,7 +2810,7 @@ async fn run() -> Result<(), String> {
         }
         return Err(format!("could not open {other}: {error}"));
     }
-    // Sonny was updated while this window was open: it goes on as the new
+    // Sonny was upgraded while this window was open: it goes on as the new
     // Sonny, in this same terminal, on the same agent, with what was typed.
     if let (Ok(()), Some(program)) = (&result, app.reopen_on.take()) {
         use std::os::unix::process::CommandExt;
@@ -2978,7 +2984,7 @@ async fn create(client: &Client, options: &Options, bot: &str) -> Result<(), Str
     let memory = agent_client::policy::memory_indexes(&workspace).map_err(|e| e.to_string())?;
     let composed =
         agent_client::policy::instructions(&workspace, None, &memory).map_err(|e| e.to_string())?;
-    let info = agent_client::project::read(&workspace)?;
+    let info = crate::project::read(&workspace)?;
     let instructions = project::as_task(&workspace, &info, &composed.text)?;
     let mut asked = json!({"bot": bot, "workspace": workspace, "model": model,
         "instructions": instructions, "request_id": unique("tui-create")});
@@ -3720,13 +3726,14 @@ const HISTORY_NODES: usize = 400;
 /// The most denials `/retry` offers.
 const DENIALS: usize = 8;
 
-/// What the person sends to approve one retry of a denied call: their own
-/// words, so the judge reads the consent, as Codex words it.
+/// What the person sends to allow one retry of a denied call: their own
+/// words, so the reviewer reads the consent, as Codex words it, in the
+/// Rulebook's word for it.
 fn approval(denial: &Denial) -> String {
     format!(
-        "I approve one retry of the action the reviewer denied: {} {}\n\n\
-         Treat this as approval to perform that exact action in the same context in which it \
-         was originally requested. Do not assume this also authorizes similar operations with \
+        "I allow one retry of the action the reviewer denied: {} {}\n\n\
+         Treat this as permission to perform that exact action in the same context in which it \
+         was originally requested. Do not assume this also allows similar operations with \
          different payloads.",
         denial.name, denial.arguments
     )
@@ -4565,8 +4572,10 @@ struct App {
     /// the calls that move the work on.
     verbose: bool,
     /// Only what the person said and the agent's words, its questions and
-    /// what failed: none of the steps between (`[sonny] steps`, off).
+    /// what failed: none of the steps between (`[sonny] view = "words"`).
     words_only: bool,
+    /// `[sonny] view` as last read: `/verbose` goes back to it.
+    view: agent_client::config::View,
     /// The newest plan the words-only view was told, for the margin.
     plan_told: Option<u64>,
     /// The focus the agent is in zen on: only the person's turns and the
@@ -4830,11 +4839,11 @@ struct Fleet {
     began: HashMap<String, std::time::SystemTime>,
     /// When the person last used a task's window ([`used::when`]).
     used_when: fn(&str) -> Option<std::time::SystemTime>,
-    /// `[sonny] task_windows` and `task_tabs`, read as the file changes.
+    /// `[sonny] most_task_tabs` and `task_tabs`, read as the file changes.
     windows: Arc<std::sync::Mutex<TaskWindows>>,
 }
 
-/// `[sonny] task_windows` and `task_tabs` as the config file last said
+/// `[sonny] most_task_tabs` and `task_tabs` as the config file last said
 /// them, read again only once the file changed, so that a change in
 /// `/config` from any window holds from the next task window on.
 #[derive(Default)]
@@ -4867,7 +4876,7 @@ impl TaskWindows {
             let sonny = agent_client::config::load()
                 .map(|c| c.sonny)
                 .unwrap_or_default();
-            self.most = sonny.task_windows as usize;
+            self.most = sonny.most_task_tabs as usize;
             self.tabs = sonny.task_tabs;
         }
     }
@@ -4880,7 +4889,7 @@ fn made_room(closed: &[String], project: &str, most: usize) -> String {
         .map(|bot| bot.strip_prefix(&tasks).unwrap_or(bot))
         .collect();
     format!(
-        "closed {}'s window for room ({most} task windows at most, in /config); /status opens it again",
+        "closed {}'s tab for room ({most} task tabs at most, in /config); /status opens it again",
         names.join(", ")
     )
 }
@@ -4890,7 +4899,7 @@ fn made_room(closed: &[String], project: &str, most: usize) -> String {
 fn no_room(bot: &str, project: &str, most: usize) -> String {
     let name = bot.strip_prefix(&format!("{project}.")).unwrap_or(bot);
     format!(
-        "{name} opened no window: {most} task windows at most (in /config) and you have not looked at those open yet; /status opens it"
+        "{name} opened no tab: {most} task tabs at most (in /config) and you have not looked at those open yet; /status opens it"
     )
 }
 
@@ -4930,7 +4939,7 @@ fn seat_profile(
     match lead {
         // One `/new` made in a role of its own runs as that.
         true => project::chosen(store, bot).or_else(|| {
-            agent_client::project::read(folder)
+            crate::project::read(folder)
                 .ok()
                 .and_then(|info| project::lead_profile(&info).ok())
         }),
@@ -4973,7 +4982,7 @@ fn inner_projects<'a>(names: impl Iterator<Item = &'a str>, project: &str) -> Ve
 enum Kin {
     /// One of its tasks: a window here.
     Task,
-    /// Another project's lead: a home of its own, opened when asked for.
+    /// Another project's lead: a workspace of its own, opened when asked for.
     Lead(String),
     None,
 }
@@ -6300,6 +6309,7 @@ impl App {
             woken: Arc::new(tokio::sync::Notify::new()),
             verbose: false,
             words_only: false,
+            view: agent_client::config::View::Words,
             plan_told: None,
             zen: None,
             elsewhere: false,
@@ -6439,7 +6449,7 @@ impl App {
         }
         if self.options.reopened {
             self.notice = Some(format!(
-                "Sonny was updated; this window reopened on {}",
+                "Sonny was upgraded; this window reopened on {}",
                 env!("CARGO_PKG_VERSION")
             ));
         }
@@ -6934,6 +6944,15 @@ impl App {
                 "telling the agent what Sonny opened without: {error}"
             ));
         }
+    }
+
+    /// The window shows `view`, as `[sonny] view` sets it.
+    fn set_view(&mut self, view: agent_client::config::View) {
+        use agent_client::config::View;
+        self.view = view;
+        self.verbose = view == View::Verbose;
+        // Verbose left with `/verbose` shows the steps.
+        self.words_only = view == View::Words;
     }
 
     /// A lead takes its folder's instructions at each idle point: composed
@@ -7533,7 +7552,7 @@ impl App {
     /// what happened meanwhile: the bot's new items, and a turn that ended
     /// or began. Tried again every two seconds until it works.
     async fn reattach(&mut self, events: &mut Events) {
-        // Sonny was updated while this window was open: the daemon it lost
+        // Sonny was upgraded while this window was open: the daemon it lost
         // is likely the old one, and what this window would start again is
         // its own older build. It reopens on the new one, in place.
         if let Some(program) = update::installed_since() {
@@ -12350,7 +12369,7 @@ impl App {
         self.denials.retain(|d| d.call_id != denied.call_id);
         let sent = self.send(approval(&denied), None, false, false, &[]).await;
         self.notice = Some(match sent {
-            Ok(()) => "approved one retry; the retry is still reviewed".into(),
+            Ok(()) => "allowed one retry; the retry is still reviewed".into(),
             Err(error) => {
                 self.denials = kept;
                 error
@@ -13977,9 +13996,8 @@ impl App {
             self.agent_opens = settings.agent_opens;
             margin::set_limits(settings.margin_notes, settings.margin_note_lines);
             self.set_template_settings(&settings);
-            if self.verbose != settings.verbose || self.words_only == settings.steps {
-                self.verbose = settings.verbose;
-                self.words_only = !settings.steps;
+            if self.view != settings.view {
+                self.set_view(settings.view);
                 self.repaint = true;
             }
             // A new default for project colors, or a new pin, takes now.
@@ -14724,24 +14742,21 @@ impl App {
             });
             return;
         }
+        // Every tool call in this window, or back to the view `/config`
+        // sets: nothing is written.
         if prompt == "/verbose" {
             self.input.clear();
-            let mut settings = settings::Settings::load();
-            settings.verbose = !self.verbose;
-            self.notice = Some(match settings.save() {
-                Ok(()) => {
-                    self.verbose = settings.verbose;
-                    // What is already drawn is drawn again in the new view.
-                    self.repaint = true;
-                    match (self.verbose, self.words_only) {
-                        (true, _) => "verbose: every tool call",
-                        (false, true) => "words only: what you said and what came back",
-                        (false, false) => "steps: replies, tasks, questions and the plan",
-                    }
-                    .to_owned()
+            self.verbose = !self.verbose;
+            // What is already drawn is drawn again in the new view.
+            self.repaint = true;
+            self.notice = Some(
+                match (self.verbose, self.words_only) {
+                    (true, _) => "verbose: every tool call, until /verbose again",
+                    (false, true) => "words: what you said and what came back",
+                    (false, false) => "steps: replies, tasks, questions and the plan",
                 }
-                Err(error) => error,
-            });
+                .to_owned(),
+            );
             return;
         }
         if prompt == "/quit" {
@@ -16132,7 +16147,7 @@ impl App {
             return;
         }
         let dir = std::path::Path::new(&self.workspace);
-        let default = (agent_client::project::read(dir))
+        let default = (crate::project::read(dir))
             .and_then(|info| project::lead_profile(&info))
             .unwrap_or_else(|_| "lead".to_owned());
         match new::profiles(dir, &default) {
@@ -17283,11 +17298,11 @@ impl App {
                     list::lines(&items, list.at(), width, composer.y as usize),
                     composer,
                 );
-                let (line, cursor) = list.line("reviewer denials: approve one retry");
+                let (line, cursor) = list.line("reviewer denials: allow one retry");
                 frame.render_widget(Paragraph::new(line), composer);
                 frame.set_cursor_position((composer.x + cursor, composer.y));
                 let keys = Line::from(hint::spans(
-                    "  ↑↓ pick · enter read, again approve one retry · esc close",
+                    "  ↑↓ pick · enter read, again allow one retry · esc close",
                 ));
                 frame.render_widget(Paragraph::new(keys), footer);
                 return;
@@ -17355,7 +17370,10 @@ impl App {
             }
             if let Some(view) = &self.config {
                 // Every setting where there is room, over the rows above.
-                let rows = view.rows(composer.y.saturating_sub(frame.area().y) as usize);
+                let rows = view.rows(
+                    composer.width as usize,
+                    composer.y.saturating_sub(frame.area().y) as usize,
+                );
                 let area = ratatui::layout::Rect {
                     y: composer.y.saturating_sub(rows.len() as u16),
                     height: rows.len() as u16,
@@ -19152,7 +19170,10 @@ mod tests {
             (2, call("ran", "shell", "{}")),
             (3, result("ran")),
             (4, call("here", "react", r#"{"emoji":"👍"}"#)),
-            (5, call("there", "react", r#"{"emoji":"👍","bot":"other"}"#)),
+            (
+                5,
+                call("there", "react", r#"{"emoji":"👍","agent":"other"}"#),
+            ),
             (6, result("here")),
             (6, result("there")),
         ];
@@ -22269,9 +22290,9 @@ mod tests {
         app.denials.clear();
         let prompt = sent.lock().unwrap()[0].as_str().unwrap().to_owned();
         assert!(prompt.starts_with(
-            "I approve one retry of the action the reviewer denied: shell {\"command\":\"git push --force origin main\"}"
+            "I allow one retry of the action the reviewer denied: shell {\"command\":\"git push --force origin main\"}"
         ));
-        assert!(prompt.contains("Do not assume this also authorizes similar operations"));
+        assert!(prompt.contains("Do not assume this also allows similar operations"));
         // Nothing left to approve.
         app.input.set("/retry");
         app.submit().await;
@@ -27542,8 +27563,8 @@ mod tests {
                 .map(|row| row.place.clone())
                 .unwrap()
         };
-        assert_eq!(place(&rows, "calc.b"), "window set aside for room");
-        assert_ne!(place(&rows, "calc.a"), "window set aside for room");
+        assert_eq!(place(&rows, "calc.b"), "tab set aside for room");
+        assert_ne!(place(&rows, "calc.a"), "tab set aside for room");
         // A call of its held for the person: what needs them keeps its
         // window, so it opens, past the limit, and the new one stays.
         let fleet = app.fleet.as_mut().unwrap();

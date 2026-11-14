@@ -4,7 +4,7 @@ For installation and your first task, start with the [quickstart](README.md).
 This reference covers settings, integrations, controls, and their detailed behavior.
 
 [Installation](#installation) · [Projects](#projects-and-leads) ·
-[Setup](#provider-setup) · [Configuration](#roles-for-leads-and-tasks) ·
+[Setup](#provider-setup) · [Configuration](#profiles-for-leads-and-tasks) ·
 [Terminal layout](#terminal-layout) · [ACP](#acp-clients) ·
 [Keyboard](#writing-messages) · [Commands](#commands) ·
 [Display](#conversation-display)
@@ -31,13 +31,13 @@ latest one into `~/.local`:
 
     curl -fsSL https://raw.githubusercontent.com/lydakis/agent/main/install.sh | sh
 
-`sonny update` updates either install to the latest release, replaces the
+`sonny upgrade` upgrades either install to the latest release, replaces the
 running daemon with the new one (its running turns continue on it) and has
-open windows reopen on it ([docs/SONNY.md](../docs/SONNY.md#updating)).
+open windows reopen on it ([docs/SONNY.md](../docs/SONNY.md#upgrading)).
 
 For main without a version tag, `brew install lydakis/agent/sonny-nightly`
 fetches current main and builds Sonny and its matching daemon together. If
-stable Sonny is installed, run `brew unlink sonny` first. Update with
+stable Sonny is installed, run `brew unlink sonny` first. Upgrade with
 `brew update` and `brew reinstall lydakis/agent/sonny-nightly`: a reinstall
 fetches the latest main commit even when the formula's version is unchanged.
 No `--HEAD` or wait for a scheduled build is needed. `sonny --version` and
@@ -115,7 +115,7 @@ ships, the roles of a lead (`lead`, one that extends it, and the project's
 own, marked `•`) before the rest, each with its description. Then, for an
 agent that is not a lead, where it works: a worktree of its own (first in a
 git repository), this folder beside the lead, or an empty folder; a project
-whose tasks all work in its folder (`threads_in = "project"`) asks nothing.
+whose tasks all work in its folder (`task_in = "project"`) asks nothing.
 Then the first message, written in the composer under what it will start;
 Enter starts the agent with it and the window becomes that agent's. A lead
 stays in this folder, as every lead does, named NAME or after the message's
@@ -211,7 +211,7 @@ that may be rebuilt or lost: memory, skills and profiles (`~/.agents`) and
 `~/.agent/config.toml` are copied into a clone of URL, a private git
 repository, at `~/agent-home`, committed and pushed every ten minutes by
 Sonny's scheduler, the one background job Sonny keeps
-([docs/SONNY.md](../docs/SONNY.md#the-scheduler)), which runs `sonny home
+([docs/SONNY.md](../docs/SONNY.md#the-scheduler)), which runs `sonny backup
 sync`. Keys in `~/.agent/keys/env`, logins and the daemon's store
 stay out, and so does a `config.toml` that holds a secret itself (an MCP
 server's `http_headers`, or a key named like a token), which the sync names
@@ -220,7 +220,7 @@ out too, since a commit inside `~/.agents/memory` would make the nightly
 cleanup find nothing to do. On a machine that never synced, setup first
 restores what the repository holds, keeping a `config.toml` it replaces as
 `config.toml.before-restore`: a new box is `install.sh`, then `sonny setup
-backup URL`. `sonny home status` says how the last sync went. Pushing uses
+backup URL`. `sonny backup status` says how the last sync went. Pushing uses
 the person's own git credentials, read from the login shell. Sonny names
 no host for the repository. First-run setup offers it last, once, and an
 empty answer skips it; until backup is set up, the first lead after an
@@ -241,7 +241,7 @@ brings back the companions it keeps, the lookout and the tool host among
 them. Turning it off leaves the scheduler for automations, and a running
 daemon running.
 
-## Roles and upgrades
+## Profiles and upgrades
 
 A lead's transcript starts with a welcome, as Claude Code's does: Sonny,
 the robot the client is named for, as a portrait drawn in half blocks,
@@ -274,7 +274,7 @@ for anything that cannot be undone. A folder's own
 `.agents/agents/lead.md` or `task.md` comes first. The task settings from `.agents/project.toml` are composed after
 the lead's role, not kept in the file.
 
-### Roles for leads and tasks
+### Profiles for leads and tasks
 
 A lead runs as the `lead` profile and every other agent is told the `task`
 one, unless set to another. Another kind of lead is a profile of its own,
@@ -294,7 +294,7 @@ and a project file names it for its lead:
 | What | `~/.agent/config.toml` | `.agents/project.toml` |
 | --- | --- | --- |
 | The profile a lead runs as | `[sonny] lead_profile` | `profile` |
-| The profile every other agent is told | `[sonny] task_profile` | `threads_profile` |
+| The profile every other agent is told | `[sonny] task_profile` | `task_profile` |
 
 Sonny ships one such profile, `superlead` ([agents/superlead.md](agents/superlead.md)),
 written to `~/.agents/agents` beside the others and used by no lead
@@ -324,13 +324,13 @@ at its model's own effort (`AGENT_EFFORT` when its model is
 | What | `~/.agent/config.toml` | `.agents/project.toml` |
 | --- | --- | --- |
 | A new lead's effort | `[sonny] lead_effort` | `effort` |
-| Each new task's model | (the lead's) | `threads_model` |
-| Each new task's effort | `[sonny] task_effort` | `threads_effort` |
-| Each new task's speed (`standard`, `fast` or `ultrafast`) | `[sonny] task_speed` | `threads_speed` |
+| Each new task's model | (the lead's) | `task_model` |
+| Each new task's effort | `[sonny] task_effort` | `task_effort` |
+| Each new task's speed (`standard`, `fast` or `ultrafast`) | `[sonny] task_speed` | `task_speed` |
 | The reviewer's model, for agents in Auto ([REVIEWER.md](REVIEWER.md)) | `[reviewer] model`, `effort` | |
 | How long a call in Auto waits for the reviewer's verdict before it goes to you | `[reviewer] timeout_ms` (90000 by default, as Codex's; 0 for as long as it takes) | |
-| What `/side`'s copy may do | `[sonny] side_chat` (`fork`, the default, or `answer`) | |
-| The chime, the agent's steps, and every tool call drawn | `[sonny] chime`, `steps`, `verbose` (true or false) | |
+| What `/side`'s copy may do | `[sonny] side_chat` (`work`, the default, or `answer`) | |
+| The chime, and what the conversation shows | `[sonny] chime` (true or false), `view` (`words`, the default, `steps` or `verbose`) | |
 | The widest the conversation is written | `[sonny] text_width` (100 by default, at least 40, 0 for the window's whole width) | |
 | A guess at your next message | `[sonny] suggest` (true, the default, or false) | |
 | An idea or a tip where no guess is obvious | `[sonny] suggest_ideas` (true, the default, or false) | |
@@ -341,7 +341,7 @@ at its model's own effort (`AGENT_EFFORT` when its model is
 | Margin notes of your own, filled as their blanks change | `[sonny.notes.NAME] markdown`, `live`, `title` | |
 | Where a click on an agent's name goes | `[sonny] agent_opens` (`tab`, the default, or `beside`) | |
 | Which tasks open in a tab | `[sonny] task_tabs` (`asked`, the default, or `every`) | |
-| Task windows a lead keeps open | `[sonny] task_windows` (32 by default, 0 for no limit) | |
+| Task tabs a lead keeps open | `[sonny] most_task_tabs` (32 by default, 0 for no limit) | |
 | The daemon started with the machine | `[sonny] start_at_boot` (true or false, the default) | |
 | News from outside for the lookout | `[sonny.sources.NAME] command`, `every` | |
 
@@ -354,7 +354,7 @@ lead's effort after it is made.
 ## Terminal layout
 
 A lead moved to another
-folder (`--workspace`) comes back with the next message Sonny sends it from
+folder (`agent run --workspace`) comes back with the next message Sonny sends it from
 its own, history and all. When Sonny runs in a Rex block (`rex` found as
 `$REX`, on the PATH, or in the Mac app), a Herdr pane (`herdr` found as
 `$HERDR` or on the PATH) or a cmux tab (`cmux` found as the tab's own CLI,
@@ -366,7 +366,7 @@ same way. A task the lead (or one of its tasks) starts gets a window there
 without taking focus, its block (pane, cmux tab) labelled with the task's
 name, when someone asks for one: its starter, which asks when it judges you
 will want to watch it or talk to it (`start_task`'s `tab`, within
-`task_windows` as any task's window), an agent that shows it, you, from `/status` or a click on its name, or the task itself
+`most_task_tabs` as any task's tab), an agent that shows it, you, from `/status` or a click on its name, or the task itself
 coming to need you. The others, such as reviewers and a lead's own helpers,
 work without one; `/status` and the footer count them. With `[sonny]
 task_tabs = "every"`, each task gets its window as a turn of its starts. In Rex, each window reports OSC 7501 status, so Rex
@@ -418,25 +418,25 @@ task is marked done. With `task_tabs = "every"`, a task's window
 closes once its work is taken: its turn completed and the lead (or the task
 that started it) waited on it. One that failed, was interrupted or waits on you stays
 open, and a task given more work opens again; ask the lead to show one, or
-run `sonny --agent NAME`. A lead keeps `[sonny] task_windows` of its tasks'
-windows open, 32 by default (0 for no limit), as VS Code's editor limit
-keeps editors: past it, a new one closes the window you used least
-recently, as each window's own Sonny saw you focus, type or click there
-(marked in `~/.agent/sonny/used/`). Only the lead's own tasks' windows
+run `sonny --agent NAME`. A lead keeps `[sonny] most_task_tabs` of its tasks'
+tabs open, 32 by default (0 for no limit), as VS Code's editor limit
+keeps editors: past it, a new one closes the tab you used least
+recently, as each tab's own Sonny saw you focus, type or click there
+(marked in `~/.agent/sonny/used/`). Only the lead's own tasks' tabs
 count and close, as another lead of the folder keeps its own; tasks shown
-together in one window count once and close together. One that
+together in one tab count once and close together. One that
 needs you (an approval, or a question open in it) or failed is never
 closed for room, as the
-lead heard or as that window's own Sonny last said (kept in
+lead heard or as that tab's own Sonny last said (kept in
 `~/.agent/sonny/held/`, so it holds across either one starting again);
-with no other, the limit is passed. A window you have not looked at yet is
+with no other, the limit is passed. A tab you have not looked at yet is
 not one you used least recently, so it is not closed for room either: while
-only such windows could make room, a new task's window does not open (the
-status row says so) and waits for you, as one closed for room does. A window closed for room stays closed while its
+only such tabs could make room, a new task's tab does not open (the
+status row says so) and waits for you, as one closed for room does. A tab closed for room stays closed while its
 task works on, and `/status` (or its name) opens it again, also after the
 lead starts again (kept in `~/.agent/sonny/aside/`); its `/status` row
-says `window set aside for room`. A task set aside that comes to need you
-opens its window again on its own, as what needs you keeps its window. `--rex-host HOST` puts the session on another Rex
+says `tab set aside for room`. A task set aside that comes to need you
+opens its tab again on its own, as what needs you keeps its tab. `--rex-host HOST` puts the session on another Rex
 server; `--no-layout` turns the layout off. Sonny writes a skill for each
 multiplexer the machine has to `~/.agents/skills` (`rex-windows`,
 `herdr-panes` and `cmux-tabs`, from `skills/`). Each sends the agent to
@@ -797,14 +797,21 @@ has something on it, or is off the screen, no time shows.
   agents, in `/status`, or to the lookout.
 
   ![A side chat forked with every tool writes a file beside the lead](../docs/sonny/side-fork.png)
-- `/config` lists every key `~/.agent/config.toml` takes,
-  with its value or what its default is, over the composer. ↑/↓ picks
-  one; ←/→ steps a key with a few values (efforts, `web_search`,
-  `trailer`, `side_chat`, `chime`, `steps`, `verbose`, `margin_opens`, `agent_opens`, `suggest`,
-  `start_at_boot`) through them
-  and its default; Enter types one that takes a name (`model`, `provider`,
-  `reviewer.model`, the profiles), empty for its default; ⌫
-  takes a key back to its default. Each change is written at once, the
+- `/config` is a list over the composer like any other: at most eight
+  rows, the settings a person changes under seven groups (Models, Agents,
+  View, Margin, Tabs, Commons and sky, This machine), each by a plain
+  name with its value and a one-line label. A value set in the file is in
+  ink and a default muted. Typing narrows it to the settings it finds, by
+  name or label, best first. ↑/↓ picks one; ←/→ steps a setting with a
+  few values (efforts, the view, switches) through them and its default;
+  Enter types one that takes a name or a number (`model`, `provider`,
+  the profiles, `text width`), empty for its default; ⌫ with nothing typed,
+  or Delete, takes a setting back to its default. The file keeps its
+  table names, and the settings that only tune (the sky haiku's
+  `sky_haiku_daily`, `sky_haiku_keep`, `sky_haiku_window`,
+  `sky_haiku_margin` and `sky_haiku_hold`, `commons_invite_tokens`,
+  `tool_processes` and `lookout_waiting`) stay in the file, listed in the
+  `sonny-config` skill. Each change is written at once, the
   file's comments and order kept, and a file that does not read is
   refused by name, as every reader refuses it. What the file gives an
   agent when it is made, `trailer` and `hold`, every agent Sonny made
@@ -812,15 +819,14 @@ has something on it, or is off the screen, no time shows.
   ends. `[fallbacks]`, like `[speeds]` and `[context_windows]`, is the
   daemon's: every agent takes it once the daemon starts again.
 
-  ![/config over the composer, side_chat set to fork](../docs/sonny/config.png)
+  ![/config: the Models group under its bold name, a model set in ink and the defaults muted](../docs/sonny/config-groups.png)
 
-  `trailer` is what an agent's model reads in the daemon's line after
+  `trailer` (senders, in `/config`) is what an agent's model reads in the daemon's line after
   each message: `sender, time` by default for Sonny's agents (`[Message
   site.lead/2. Sent Fri 13 Nov 2026 23:21, UTC-05:00.]`), `sender`,
   `time` or `none`. Sonny draws the words without the line.
 
-  ![/config with trailer picked: sender, time, Sonny's default](../docs/sonny/config-trailer.png)
-  ![/config after one step: trailer = ["sender"] saved](../docs/sonny/config-trailer-sender.png)
+  ![/config narrowed by typing view: → steps the view to verbose, saved](../docs/sonny/config-view.png)
 - `/model` picks the lead's model, from every model its provider family
   lists, each by its name and provider (`Opus 5.5 · bedrock`) with its id
   muted after them, found by either, its effort and its speed, and writes
@@ -836,8 +842,8 @@ has something on it, or is off the screen, no time shows.
   names the speed after the effort. A pick made while a turn runs shows in the footer and applies
   when the lead is idle; one that another client overtakes is dropped.
   The tasks an agent starts on its own model run at its speed, as its
-  helpers do at theirs, unless `threads_speed` or `[sonny] task_speed`
-  names one; a task whose provider does not serve that speed starts at
+  helpers do at theirs, unless the project file's `task_speed` or
+  `[sonny] task_speed` names one; a task whose provider does not serve that speed starts at
   standard, and the start says so.
 
   ![/model: the speed row picked with Tab, fast beside the effort](../docs/sonny/model-speed.png)
@@ -1556,11 +1562,12 @@ turn of the task numbered after that one reopens it.
 Settings Sonny keeps for every folder are in `~/.agent/config.toml`'s
 `[sonny]`, which `/config` shows: the chime (`chime`, off by default;
 `chime = true` turns it on) and
-the view (`steps` and `verbose`, both off by default), besides the efforts and the side chat
-above. `/config` lists the keys under their table's name, a value set in
-the file plain and a default muted, so what you changed stands out.
-
-![/config: keys under agent, [reviewer] and [sonny], set values plain and defaults muted](../docs/sonny/config-reviewer.png)
+the view (`view`: `words` by default, `steps`, or `verbose` for every
+tool call), besides the efforts and the side chat above. `/config` lists
+them under their groups, a value set in the file in ink and a default
+muted, so what you changed stands out. A config that sets the old
+`steps` or `verbose` switches is rewritten once to the one `view` they
+showed.
 
 ## Skills and background services
 
@@ -1671,7 +1678,7 @@ them is drawn: no calls, no news from tasks, no messages between agents,
 no notes put in the margin, no `Worked for …` line. The plan shows in the
 margin. A message you send while the agent works waits with a mark by its
 arrow, no words: `›↪` a steer, which goes in when the call under way ends,
-and `›⋯` a queued message, for after the turn. `[sonny] steps = true`
+and `›⋯` a queued message, for after the turn. `[sonny] view = "steps"`
 brings back the steps, the view below, and `/verbose` draws every call.
 
 ![Words only: a lead asked to check the work, its words as two tasks report in, and nothing between](../docs/sonny/words-only.png)
@@ -1684,8 +1691,8 @@ waited for, a question to you, the plan, memory, an automation, a window
 opened). Commands, reads and edits are left out: agents are people you
 talk to, and the clean view shows what they say and what reaches you, not
 the work inside their turn. `/verbose` draws every
-call, the conversation so far included, and is kept with the other
-settings; `/verbose` again goes back to clean.
+call, the conversation so far included, in this window only; `/verbose`
+again goes back to the view `/config` sets.
 
 Some rows are buttons. A call that starts, messages, waits for or
 changes agents is one row that says what it did and to whom, never what
