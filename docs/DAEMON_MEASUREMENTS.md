@@ -9645,7 +9645,7 @@ excluded warmup. Medians over every measured run:
 `bench.perf_gate` reports no count failures and no warnings: store work
 per turn is the same on both sides. The two larger timing moves fall
 inside each other's ranges, on screens that never reach the new code
-(admission runs no tools, footprint's bots aren't in `workspace-write`):
+(admission and footprint call no tools):
 
 - Admission burst p99: base 4.23 to 7.47 ms, head 4.04 to 7.01 ms.
 - Footprint CPU per turn: base 0.907 to 1.049 ms, head 0.999 to 1.065 ms.
