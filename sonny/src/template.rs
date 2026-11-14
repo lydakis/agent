@@ -88,7 +88,7 @@ pub fn check(template: &str) -> Result<(), String> {
     let env = environment();
     env.template_from_str(template)
         .map(drop)
-        .map_err(|e| said(&e))
+        .map_err(|e| said(&e, template))
 }
 
 /// `template` with its blanks filled from `data`, or why it could not be,
@@ -102,7 +102,7 @@ pub fn render(template: &str, data: &Data) -> (Result<String, String>, Reads) {
         .and_then(|t| t.render_captured_to((), &mut out).map(drop))
         .or_else(|e| match out.full() {
             true => Ok(()),
-            false => Err(said(&e)),
+            false => Err(said(&e, template)),
         })
         .map(|()| cut(String::from_utf8_lossy(&out.0).into_owned(), OUTPUT));
     let reads = reads.lock().map(|r| r.clone()).unwrap_or_default();
@@ -141,6 +141,13 @@ impl Live {
         }
     }
 }
+
+/// The blanks and filters a window's live template has, as the tools
+/// that write one say them.
+pub const BLANKS: &str = "Blanks: source('name') or source('name:topic'): .latest, .events newest \
+    first, .topics each topic's newest; an event has text, at, topic, from, url, fields. file('path'), \
+    modified('path'), tasks(), task('name'), now(). Filters: ago, time, fromjson, and Jinja's own \
+    (selectattr, sort, map, join, tojson).";
 
 /// The code every live template is refused with, wherever it is written.
 pub const REFUSED: &str = "live_template";
@@ -194,7 +201,9 @@ fn named(template: &str) -> (Vec<String>, bool) {
         }
         calls(code, |name, arg| match name {
             "tasks" | "task" => tasks = true,
-            "source" => sources.extend(arg.map(str::to_owned)),
+            "source" => {
+                sources.extend(arg.map(|named| crate::lookout::sources::named(named).0.to_owned()))
+            }
             _ => {}
         });
     }
@@ -291,9 +300,11 @@ fn live(template: &str, data: &Data) -> Result<String, String> {
 
 /// Why `template` cannot be a live one whose fill goes `to`: it does not
 /// read as one, names a source never set up, or, going into a prompt,
-/// the tasks. What a later fill may find, such as a file not written
-/// yet, does not refuse it. The one check every live template is written
-/// past, refused as [`REFUSED`].
+/// the tasks. Shown in a window, it shows now, so a fill that fails now
+/// refuses it too, unless it reads the tasks, which only the window
+/// knows. Going into a prompt, what a later fill may find, such as a file
+/// not written yet, does not refuse it. The one check every live template
+/// is written past, refused as [`REFUSED`].
 pub fn refusal(template: &str, data: &Data, to: To) -> Result<(), String> {
     check(template)?;
     // Named in the text, each is checked whether or not a render gets to
@@ -309,6 +320,7 @@ pub fn refusal(template: &str, data: &Data, to: To) -> Result<(), String> {
     match filled {
         Err(why) if why.contains("no source named ") => Err(why),
         _ if reads.tasks && to == To::Prompt => Err(TASKS.into()),
+        Err(why) if to == To::Window && !reads.tasks => Err(why),
         _ => Ok(()),
     }
 }
@@ -384,6 +396,8 @@ pub fn changed(reads: &Reads) -> bool {
 /// nothing fails the render, while `{% if %}` may still ask about one.
 fn environment() -> Environment<'static> {
     let mut env = Environment::new();
+    // Spans to quote, not the debug dump a test build would print.
+    env.set_debug(false);
     env.set_undefined_behavior(UndefinedBehavior::SemiStrict);
     env.set_fuel(Some(FUEL));
     env.set_recursion_limit(DEPTH);
@@ -398,7 +412,9 @@ fn blanks(env: &mut Environment<'static>, data: &Data, reads: &Arc<Mutex<Reads>>
         }
     };
     let (r, d) = (reads.clone(), data.clone());
-    env.add_function("source", move |name: String| -> Result<Value, Error> {
+    env.add_function("source", move |named: String| -> Result<Value, Error> {
+        let (name, topic) = crate::lookout::sources::named(&named);
+        let name = name.to_owned();
         read(&r, &|reads| {
             reads.sources.insert(name.clone());
         });
@@ -407,7 +423,7 @@ fn blanks(env: &mut Environment<'static>, data: &Data, reads: &Arc<Mutex<Reads>>
         }
         let log = (d.store.as_deref()).map_or_else(Default::default, |store| {
             let file = recent_file(store, &name);
-            let (stamp, log) = log(&file);
+            let (stamp, log) = log(&file, topic);
             read(&r, &|reads| {
                 reads.seen.insert(file.clone(), stamp);
             });
@@ -420,6 +436,7 @@ fn blanks(env: &mut Environment<'static>, data: &Data, reads: &Arc<Mutex<Reads>>
         }
         let fields = [
             ("name", Value::from(name.as_str())),
+            ("topic", topic.map_or(Value::from(()), Value::from)),
             ("up", Value::from(log.down.is_none())),
             ("down_since", log.down.map_or(Value::from(()), Value::from)),
             ("latest", log.events.first().map_or(Value::from(()), value)),
@@ -441,6 +458,18 @@ fn blanks(env: &mut Environment<'static>, data: &Data, reads: &Arc<Mutex<Reads>>
         });
         let hidden = kept.get_or_init(hidden).as_ref().map_err(failed)?;
         crate::margin::read(&path, hidden).map_err(failed)
+    });
+    let (r, d) = (reads.clone(), data.clone());
+    let kept = Arc::new(std::sync::OnceLock::new());
+    env.add_function("modified", move |path: String| -> Result<Value, Error> {
+        let path = d.folder.join(path.trim());
+        let stamp = stamp(&path);
+        read(&r, &|reads| {
+            reads.files.insert(path.clone());
+            reads.seen.insert(path.clone(), stamp);
+        });
+        let hidden = kept.get_or_init(hidden).as_ref().map_err(failed)?;
+        modified(&path, hidden).map_err(failed)
     });
     let (r, d) = (reads.clone(), data.clone());
     env.add_function("tasks", move || {
@@ -508,20 +537,68 @@ fn hidden() -> Result<Vec<PathBuf>, String> {
         .collect())
 }
 
+/// When the file at `path` last changed, in seconds, none while it is not
+/// there; refused, as `file()` is, when what was opened is in one of
+/// `hidden`, so a blank can't tell when a key changed either.
+fn modified(path: &Path, hidden: &[PathBuf]) -> Result<Value, String> {
+    use std::os::unix::fs::OpenOptionsExt;
+    // A pipe opened without O_NONBLOCK would hold the window up.
+    let Ok(file) = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK)
+        .open(path)
+    else {
+        return Ok(Value::from(()));
+    };
+    if agent_client::hidden::holds(hidden, &file) {
+        return Err(format!(
+            "read_denied: {} is kept unreadable from agents",
+            path.display()
+        ));
+    }
+    let since = |at: SystemTime| at.duration_since(SystemTime::UNIX_EPOCH).ok();
+    Ok(
+        match file
+            .metadata()
+            .and_then(|meta| meta.modified())
+            .ok()
+            .and_then(since)
+        {
+            Some(at) => Value::from(at.as_secs() as i64),
+            None => Value::from(()),
+        },
+    )
+}
+
 fn failed(why: impl Into<String>) -> Error {
     Error::new(ErrorKind::InvalidOperation, why.into())
 }
 
-/// A template's error in one line, where it is in the template: the kind
-/// of error, its detail and the line.
-fn said(error: &Error) -> String {
+/// The most of a failing expression an error quotes.
+const QUOTED: usize = 80;
+
+/// A template's error in one line, where it is in `template`: the line,
+/// the expression that failed as written there, and the kind of error or
+/// its detail.
+fn said(error: &Error, template: &str) -> String {
     let what = match error.detail() {
         Some(detail) => detail.to_owned(),
         None => error.kind().to_string(),
     };
-    match error.line() {
-        Some(line) => format!("line {line}: {what}"),
-        None => what,
+    // The detail may name it already, as an undefined name's does.
+    let at = (error.range())
+        .and_then(|range| template.get(range))
+        .map(|text| text.split_whitespace().collect::<Vec<_>>().join(" "))
+        .filter(|text| !text.is_empty() && !what.contains(text.as_str()))
+        .map(|text| match text.len() > QUOTED {
+            true => format!("{}…", cut(text, QUOTED)),
+            false => text,
+        });
+    match (error.line(), at) {
+        (Some(line), Some(at)) => format!("line {line}, `{at}`: {what}"),
+        (Some(line), None) => format!("line {line}: {what}"),
+        (None, Some(at)) => format!("`{at}`: {what}"),
+        (None, None) => what,
     }
 }
 
@@ -570,10 +647,10 @@ struct Log {
     down: Option<i64>,
 }
 
-/// The source log `file`, read again only once it changed, and how it
-/// stood before it was read.
-fn log(file: &Path) -> (Stamp, Arc<Log>) {
-    type Cache = HashMap<PathBuf, (Stamp, Arc<Log>)>;
+/// The source log `file`, its events on `topic` alone when one is named,
+/// read again only once it changed, and how it stood before it was read.
+fn log(file: &Path, topic: Option<&str>) -> (Stamp, Arc<Log>) {
+    type Cache = HashMap<(PathBuf, Option<String>), (Stamp, Arc<Log>)>;
     static READ: OnceLock<Mutex<Cache>> = OnceLock::new();
     let stamp = stamp(file);
     if stamp.1.is_none() {
@@ -583,7 +660,8 @@ fn log(file: &Path) -> (Stamp, Arc<Log>) {
         .get_or_init(Default::default)
         .lock()
         .unwrap_or_else(|e| e.into_inner());
-    if let Some((at, log)) = cache.get(file)
+    let key = (file.to_owned(), topic.map(str::to_owned));
+    if let Some((at, log)) = cache.get(&key)
         && *at == stamp
     {
         return (stamp, log.clone());
@@ -607,7 +685,11 @@ fn log(file: &Path) -> (Stamp, Arc<Log>) {
             "fields": kept["fields"],
         })
     };
-    let printed = || kept().filter(|kept| kept["lookout"] != true);
+    let printed = || {
+        kept()
+            .filter(|kept| kept["lookout"] != true)
+            .filter(|kept| topic.is_none_or(|topic| kept["topic"] == topic))
+    };
     let events: Vec<Json> = printed().take(EVENTS).map(|kept| blank(&kept)).collect();
     let mut seen = BTreeSet::new();
     let topics: Vec<Json> = printed()
@@ -620,7 +702,7 @@ fn log(file: &Path) -> (Stamp, Arc<Log>) {
         topics,
         down,
     });
-    cache.insert(file.to_owned(), (stamp, log.clone()));
+    cache.insert(key, (stamp, log.clone()));
     (stamp, log)
 }
 
@@ -671,9 +753,12 @@ mod tests {
                 .contains("no source named ci")
         );
         assert!(refusal("{% if %}", &data, To::Window).is_err());
-        // A file not written yet fills later, in a window as in a prompt.
+        // Shown now, it must fill now: a file not written yet is refused,
+        // saying which, though a prompt fills later and takes it.
+        let why = refusal("{{ file('later.txt') }}", &data, To::Window).unwrap_err();
+        assert!(why.starts_with("line 1, `file('later.txt')`: "), "{why}");
         assert_eq!(
-            refusal("{{ file('later.txt') }}", &data, To::Window),
+            refusal("{{ file('later.txt') }}", &data, To::Prompt),
             Ok(())
         );
     }
@@ -756,6 +841,50 @@ mod tests {
         assert!(!changed(&reads));
         std::fs::write(dir.join("pr.json"), r#"{"state": "merged", "checks": 3}"#).unwrap();
         assert!(changed(&reads), "a change shows");
+        // When a file last changed, which `ago` reads; none for one not there.
+        let data = Data {
+            now: SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap()
+                .as_secs() as i64
+                + 120,
+            ..data(&dir)
+        };
+        let (text, reads) = render(
+            "{{ modified('pr.json') | ago }} {{ modified('gone.json') is none }}",
+            &data,
+        );
+        assert_eq!(text.unwrap(), "2m ago True");
+        assert_eq!(
+            reads.files,
+            BTreeSet::from([dir.join("pr.json"), dir.join("gone.json")])
+        );
+        std::fs::write(dir.join("gone.json"), "{}").unwrap();
+        assert!(changed(&reads), "a file written since shows");
+    }
+
+    #[test]
+    fn modified_refuses_a_file_in_a_kept_folder_by_where_it_leads() {
+        let dir = tempfile_dir("modified-kept");
+        let keys = dir.join("keys");
+        std::fs::create_dir_all(&keys).unwrap();
+        std::fs::write(keys.join("env"), "KEY=x").unwrap();
+        std::fs::write(dir.join("plain"), "x").unwrap();
+        let link = dir.join("link");
+        let _ = std::fs::remove_file(&link);
+        std::os::unix::fs::symlink(keys.join("env"), &link).unwrap();
+        let hidden = [std::fs::canonicalize(&keys).unwrap()];
+        for path in [keys.join("env"), link] {
+            let refused = modified(&path, &hidden).unwrap_err();
+            assert!(refused.starts_with("read_denied: "), "{refused}");
+        }
+        assert!(
+            modified(&dir.join("plain"), &hidden)
+                .unwrap()
+                .as_i64()
+                .is_some()
+        );
+        assert!(modified(&dir.join("gone"), &hidden).unwrap().is_none());
     }
 
     #[test]
@@ -797,6 +926,19 @@ mod tests {
             &data,
         );
         assert_eq!(text.unwrap(), "#1 green 2");
+        // One topic's events alone, however busy the others: what a blank
+        // reads is the source, as a subscription to NAME:TOPIC is.
+        let (text, one) = render(
+            "{{ source('ci:1').topic }}: {% for e in source('ci:1').events %}{{ e.text }}, {% endfor %}\
+             {{ source('ci:1').latest.text }} {{ source('ci:3').latest is none }}",
+            &data,
+        );
+        assert_eq!(text.unwrap(), "1: #1 green, #1 open, #1 green True");
+        assert_eq!(one.sources, BTreeSet::from(["ci".to_owned()]));
+        assert_eq!(
+            refusal("{{ source('cl:1').latest }}", &data, To::Prompt).unwrap_err(),
+            "no source named cl: yours are ci"
+        );
         std::fs::write(dir.join("ci.jsonl"), &log).unwrap();
         assert_eq!(reads.sources, BTreeSet::from(["ci".to_owned()]));
         assert!(reads.down.is_empty());
@@ -820,7 +962,7 @@ mod tests {
         let (text, _) = render("{{ source('cl').latest.text }}", &data);
         assert_eq!(
             text.unwrap_err(),
-            "line 1: no source named cl: yours are ci"
+            "line 1, `source('cl')`: no source named cl: yours are ci"
         );
     }
 
@@ -835,7 +977,14 @@ mod tests {
         assert!(text.is_err());
         assert!(start.elapsed() < std::time::Duration::from_secs(1));
         let (text, _) = render("one\n{{ taks }}", &data(&dir));
-        assert!(text.unwrap_err().starts_with("line 2: "));
+        assert_eq!(text.unwrap_err(), "line 2, `taks`: undefined value");
+        // Of three blanks on a line, the error quotes the one that failed.
+        let (text, _) = render(
+            "{{ now() }} {{ (file('x') | fromjson).a }} {{ 1 }}",
+            &data(&dir),
+        );
+        let why = text.unwrap_err();
+        assert!(why.starts_with("line 1, `file('x')`: "), "{why}");
         // Asking about a name that is not there is fine.
         let (text, _) = render("{% if missing %}x{% else %}none{% endif %}", &data(&dir));
         assert_eq!(text.unwrap(), "none");

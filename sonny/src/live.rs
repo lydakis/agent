@@ -42,7 +42,7 @@ pub fn tool() -> Value {
             "type": "object",
             "properties": {
                 "markdown": {"type": "string", "minLength": 1, "maxLength": crate::template::OUTPUT,
-                    "description": "Blanks: source('name').latest/.topics, file('path'), tasks(), task('name'), now(), |ago, |time, |fromjson."}
+                    "description": crate::template::BLANKS}
             },
             "required": ["markdown"],
             "additionalProperties": false
@@ -52,7 +52,7 @@ pub fn tool() -> Value {
 }
 
 /// What a `live` call is answered, filled from `data` as the tool host
-/// has it: refused as every live template is when it could never fill;
+/// has it: refused as every live template is when it does not fill now;
 /// else what it shows now and when, as the agent reads it, at most what a
 /// prompt keeps, or why it does not fill yet, as a blank that names a
 /// task the window fills.
@@ -363,7 +363,10 @@ mod tests {
         assert_eq!(rows[0].trim(), "◇ live");
         assert!(rows[1].contains("follows state.json"), "{rows:?}");
         assert!(rows.iter().any(|row| row.contains("PR is merged")));
-        assert!(rows.iter().any(|row| row.contains("⟨line 1: not JSON")));
+        assert!(
+            rows.iter()
+                .any(|row| row.contains("⟨line 1, `fromjson`: not JSON"))
+        );
         assert!(watch.retain(|key| key != "a") && watch.get("a").is_none());
         std::fs::remove_dir_all(&dir).unwrap();
     }
@@ -400,8 +403,10 @@ mod tests {
             answer("{{ source('nope').latest }}", &data).unwrap_err().0,
             "live_template"
         );
-        let later = answer("{{ 'x' | length }} {{ nope.state }}", &data).unwrap();
-        assert!(later.starts_with("Shown live in the conversation; it does not fill here yet"));
+        // One that does not fill now is refused, saying what failed.
+        let (code, why) = answer("{{ 'x' | length }} {{ nope.state }}", &data).unwrap_err();
+        assert_eq!(code, "live_template");
+        assert!(why.contains("nope"), "{why}");
         // No tasks here is not none: a block that reads them shows no count.
         for tasks in [
             "{{ tasks() | length }} tasks",

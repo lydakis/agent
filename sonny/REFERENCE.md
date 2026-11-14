@@ -1018,13 +1018,17 @@ has something on it, or is off the screen, no time shows.
   nothing, and says what went wrong under it),
   **Working** (a turn running, queued, rate limited, starting, waiting on
   other tasks, or `waiting on its reviewer` while the reviewer weighs a
-  call), **Idle** (its turn ended with nothing open, `idle`; ended without
-  words, `no reply`; or you ended it, `interrupted`; a pull request its
-  last reply linked shows on its row), and **Done** (marked done). One
-  table gives every state its mark, for the footer, `/status`, the tasks
-  a lead started and `/switch` alike: `?` needs you or held, `✗` failed,
-  `●` working, `◌` waiting, queued, rate limited or starting, `○` idle or
-  no reply, `■` interrupted, `✓` done; all but the first three muted.
+  call; a turn its pool holds more than five minutes says until when,
+  `rate limited until 14:05`, one a stop parked says `parked by a
+  restart`, which the next start goes on with, and one the pull cord
+  parked says `paused`), **Idle** (its turn ended with nothing open,
+  `idle`; ended without words, `no reply`; or you ended it,
+  `interrupted`; a pull request its last reply linked shows on its row),
+  and **Done** (marked done). One table gives every state its mark, for
+  the footer, `/status`, the tasks a lead started and `/switch` alike:
+  `?` needs you or held, `✗` failed, `●` working, `◌` waiting, queued,
+  rate limited, parked, paused or starting, `○` idle or no reply, `■`
+  interrupted, `✓` done; all but the first three muted.
   Each agent is one line: its mark, name, state and time; one
   that needs you says what for under it, one that failed why. That is all it shows as it opens; `m` shows more and hides it
   again: at each row's right edge, dim, the rest of what it tracks: what it follows (a source with an
@@ -1077,6 +1081,10 @@ has something on it, or is off the screen, no time shows.
   ![/status naming each agent's profile beside its model: superlead, task, reviewer](../docs/sonny/status-profile.png)
 
   ![A task opened from /status in the pane, its ‹ going back to /status](../docs/sonny/status-opens-agent.png)
+
+  ![/status with backup paused by the pull cord and migrate rate limited until 11:40, its pool closed for two hours](../docs/sonny/status-paced-reasons.png)
+
+  ![A task whose command a restart cut: a muted ■ before Ran ./deploy.sh, and under it cut by a restart: it may have run, and was not run again](../docs/sonny/call-cut-by-restart.png)
 
   Under its heading, `/status` says only what is broken around the
   agents, each with a red `✗`: a companion of the daemon that keeps
@@ -2006,18 +2014,24 @@ the agent and nothing more in its history: `source('ci').latest.text`
 and `.events` (what one of your sources printed lately, newest first;
 `.topics`, each topic's newest event however old, such as each pull
 request's last word, which the lookout keeps for 200 topics; `.up` and
-`.down_since` while the lookout says it is down),
-`file('state.json')` (a file in its folder, `| fromjson` making JSON
-fields of it; one in a folder kept from agents, `~/.agent/keys` and the
-config's `[sandbox] unreadable`, is refused with `read_denied`, whatever
-link or path leads there), `tasks()` and `task('NAME')` (where its tasks stand, as
-`/status` reads them), `now()`, and `| ago` and `| time` for a time in
-seconds. A blank never runs a command or reaches the network, so an agent
+`.down_since` while the lookout says it is down; `source('ci:TOPIC')`
+reads that topic's events alone, as a subscription to `NAME:TOPIC`
+hears them), `file('state.json')` (a file in its folder, `| fromjson`
+making JSON fields of it; one in a folder kept from agents, `~/.agent/keys`
+and the config's `[sandbox] unreadable`, is refused with `read_denied`,
+whatever link or path leads there), `modified('state.json')` (when it
+last changed, none while it is not there, refused as `file()` is), `tasks()` and `task('NAME')`
+(where its tasks stand, as `/status` reads them), `now()`, and `| ago`
+and `| time` for a time in seconds; Jinja's own filters, such as
+`selectattr`, `sort` and `tojson`, work as well. A blank never runs a command or reaches the network, so an agent
 that wants something no source covers writes it to a file from its own
 commands. The tool host fills the template once as it is posted and
 answers what it shows; a template that does not read as one, names a
-source you have not set up, or fills to more lines than a note holds is
-refused (`live_template`, `margin_note_too_long`). The window then
+source you have not set up, does not fill now (a file not written yet,
+a field a source's events lack), or fills to more lines than a note holds
+is refused (`live_template`, `margin_note_too_long`), so a broken note
+never reaches the margin. A template's error names its line and quotes
+the blank that failed (``line 1, `file('pr.json')`: ...``). The window then
 watches only what the last fill read, once a second (a source's log, a
 file, the tasks as the footer counts them, the minute for a clock), and a
 fill that fails later keeps what it showed with why under it. Under its
@@ -2028,6 +2042,8 @@ a note's, a memory fact's or an automation's message, is checked the same
 way as it is written and refused as `live_template`; one shown in a window
 fills again as what it read changes, while one that goes into a prompt
 fills once as it goes, so the prompt never changes under the model.
+
+![A live block after the agent's first try was refused, still showing the pull request open with, under it, line 1, `fromjson`: not JSON once pr.json was cut short](../docs/sonny/live-template-says-what-failed.png)
 
 An agent can show something live in the conversation too, with its `live`
 tool: asked the time, or which pull requests are open, it gives Markdown

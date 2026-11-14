@@ -232,6 +232,23 @@ impl Patch {
         })
     }
 
+    /// Every path the patch writes, as written in it: each added and
+    /// updated file, and the destination of each move.
+    pub fn written(&self) -> impl Iterator<Item = &str> {
+        self.changes.iter().filter_map(|change| match change {
+            Change::Add { path, .. }
+            | Change::Update {
+                path,
+                move_to: None,
+                ..
+            } => Some(path.as_str()),
+            Change::Update {
+                move_to: Some(to), ..
+            } => Some(to.as_str()),
+            Change::Delete { .. } => None,
+        })
+    }
+
     /// Every path the patch writes or removes, as written in it: each
     /// added, updated and deleted file, and both ends of a move. Nothing
     /// is touched before a caller has seen them all.

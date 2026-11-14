@@ -665,7 +665,10 @@ async fn read_status(
         // for none, so the next refresh tries again.
         let head = json!([bot["bot_id"], bot["head"]]);
         let latest = match status_read.remove(name) {
-            Some((seen, latest)) if seen == head && !bot["head"].is_null() => Some(latest),
+            // No history yet: nothing to read, and nothing asked of the
+            // daemon for it, however many such agents a project holds.
+            _ if bot["head"].is_null() => Some(Latest::default()),
+            Some((seen, latest)) if seen == head => Some(latest),
             _ => {
                 fresh = true;
                 let latest = read_latest(client, name).await;
@@ -717,7 +720,7 @@ async fn read_status(
                     .collect();
                 format!("waiting on {}", on.join(", "))
             }
-            (true, Some("paced")) => "rate limited".into(),
+            (true, Some("paced")) => status::paced(&ran["waiting_on"], now),
             (true, _) => "working".into(),
             (false, Some("completed")) => started::IDLE.into(),
             (false, Some("failed")) if ran["error"] == EMPTY => started::QUIET.into(),
@@ -20150,6 +20153,74 @@ mod tests {
             read["said"],
             json!([answer, older, last, entry(3, "Review the cart change.")])
         );
+    }
+
+    #[tokio::test]
+    async fn status_reads_nothing_of_agents_with_no_history() {
+        let dir = std::env::temp_dir().join(format!("status-unread-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = dir.join("state.sqlite");
+        resolved::keep(&store, "shop.done", 0, "c1").unwrap();
+        task::note_profile(&store, "shop.noted", "reviewer").unwrap();
+        let asked = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = asked.clone();
+        let client = daemon_answering(move |ask| {
+            let op = ask["op"].as_str().unwrap_or_default().to_owned();
+            seen.lock().unwrap().push(op.clone());
+            match op.as_str() {
+                "bots" => {
+                    let bots: Vec<Value> = ["shop.lead", "shop.done", "shop.noted", "shop.new"]
+                        .iter()
+                        .map(|name| json!({"name": name, "bot_id": 1, "head": null, "last": null}))
+                        .collect();
+                    json!({"bots": bots, "next_after": null})
+                }
+                "approvals" => json!({"approvals": []}),
+                _ => json!({"error": {"code": "unexpected", "message": op}}),
+            }
+        })
+        .await;
+        let scope = background::Scope {
+            glob: "shop.*".into(),
+            project: "shop".into(),
+            lead: "shop.lead".into(),
+        };
+        let view = StatusView {
+            bot: "",
+            asks: &[],
+            approvals: &[],
+            turn_model: None,
+            places: Default::default(),
+            aside: &|_| false,
+            details: true,
+        };
+        let (mut latest, mut asks) = (HashMap::new(), HashMap::new());
+        let read = read_status(
+            &client,
+            &store,
+            scope,
+            &HashMap::new(),
+            &mut latest,
+            &mut asks,
+            view,
+        )
+        .await
+        .unwrap();
+        // No history to read: no agent's is asked for, on any read.
+        assert!(
+            asked
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|op| !op.starts_with("history"))
+        );
+        let row = |bot: &str| read.rows.iter().find(|row| row.bot == bot).unwrap();
+        assert_eq!(row("shop.done").group.key(), "done");
+        assert_eq!(row("shop.new").group.key(), "idle");
+        assert_eq!(row("shop.noted").profile, "reviewer");
+        assert_eq!(row("shop.new").profile, "");
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[tokio::test]
