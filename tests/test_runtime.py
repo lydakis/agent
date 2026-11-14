@@ -23,8 +23,6 @@ from bench.runtime_client import PROTECTING, Client, node_item, poll, serve_args
 
 # Longer than 256 bytes, with text a shell would run if pasted unquoted.
 ODD_CALL_ID = "odd $(touch pwned) 'x'\n" + 'L' * 300
-# The line Sonny ends a message to a bot with: when it was sent.
-SENT = re.compile(r'\n\n\[Sent [A-Z][a-z]{2} \d{1,2} [A-Z][a-z]{2} \d{4} \d{2}:\d{2}, UTC[+-]\d{2}:\d{2}\.\]$')
 
 
 
@@ -132,8 +130,6 @@ class Model(http.server.BaseHTTPRequestHandler):
             # An automation's message comes after its one-line header.
             if user.startswith('[automation ') and '\n' in user:
                 user = user.split('\n', 1)[1]
-            # Sonny's message ends with a line naming when it was sent.
-            user = SENT.sub('', user)
             if user in getattr(self.server, 'unauthorized_prompts', ()):
                 # A key the provider refuses: the person's to fix.
                 body = b'{"error":{"message":"synthetic bad key"}}'
@@ -825,7 +821,7 @@ class AnthropicModel(http.server.BaseHTTPRequestHandler):
                     blocks.append({'type': 'text', 'text': 'echo:' + last['content'][0]['content']})
                 stop = 'refusal' if details else 'end_turn'
             else:
-                user = SENT.sub('', last['content'][0]['text'])
+                user = last['content'][0]['text']
                 before = request['messages'][-2]['content'] if len(request['messages']) > 1 else []
                 if (isinstance(before, list) and before and before[0].get('type') == 'tool_result'
                         and str(before[0].get('content', '')).startswith('refuse:all')):
@@ -1195,7 +1191,7 @@ class AnthropicRuntimeTests(unittest.TestCase):
         self.assertEqual(client.finished(turn)['data']['status'], 'completed')
         model.requests.get(timeout=1)
         after = model.requests.get(timeout=1)
-        self.assertEqual(SENT.sub('', after['messages'][0]['content'][0]['text']), words)
+        self.assertEqual(after['messages'][0]['content'][0]['text'], words)
 
     def test_configure_takes_every_setting_create_takes(self):
         client, model, path = self.start()
@@ -1305,14 +1301,14 @@ class AnthropicRuntimeTests(unittest.TestCase):
         client.request('submit', bot='Bob', request_id='s1', prompt=words, delivery='steer', person='pat')
         self.assertEqual(client.finished(turn)['data']['error'], 'provider_refusal')
         declined = model.requests.get(timeout=5)
-        self.assertEqual(SENT.sub('', declined['messages'][-1]['content'][0]['text']), words)
+        self.assertEqual(declined['messages'][-1]['content'][0]['text'], words)
         # It goes again, as it was sent, as the next turn's own message;
         # in the declined turn the model reads that it did.
         client.receive(lambda m: m.get('event') == 'turn_finished' and m.get('turn', 0) > turn
                        and m['data']['status'] == 'completed')
         again = model.requests.get(timeout=5)
         sent = [m['content'] for m in again['messages']]
-        self.assertEqual(SENT.sub('', sent[-1][0]['text']), words)
+        self.assertEqual(sent[-1][0]['text'], words)
         # Back in line, it is a message of its own, with its own number.
         self.assertRegex(sent[-1][1]['text'], r'^\[Message Bob/\d+, written by pat\.\]$')
         noted = [block.get('text', block.get('content', '')).rstrip() for blocks in sent[2:-1] for block in blocks]
