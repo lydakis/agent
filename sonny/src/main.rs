@@ -12477,6 +12477,11 @@ impl App {
                 let over_pane = self.pane.as_ref().is_some_and(|p| p.area.contains(at));
                 let down = matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left));
                 if down {
+                    // A press outside the pane takes the keys from it, and
+                    // with them what was asked there.
+                    if !over_pane {
+                        self.keep_asked();
+                    }
                     self.pane_mouse = over_pane;
                     self.pane_keys = over_pane;
                     // The keys go to the pane: the conversation's find ends.
@@ -13799,6 +13804,12 @@ impl App {
         if let Event::Reply(reply) = &event {
             term::heard(reply);
             return;
+        }
+        // A stop or a removal asked for in the pane lives only while the
+        // keys stay there: whatever took them away (a click, Ctrl+\, a
+        // paste) said no, so the view never waits armed for their return.
+        if !self.pane_keys {
+            self.keep_asked();
         }
         // A key, a click, a paste or the window coming to the front: the
         // person is here, not in another terminal's Sonny.
@@ -29487,6 +29498,16 @@ mod tests {
         asked(&mut app);
         assert!(app.step_pane(true));
         assert!(app.step_pane(false));
+        assert_ne!(keys(&app), "enter stop · esc cancel");
+        // The keys taken from the pane, by a click on the composer or
+        // Ctrl+\, and given back: the same.
+        asked(&mut app);
+        app.pane_keys = false;
+        app.key(Event::Key(event::KeyEvent::new(
+            KeyCode::Char('\\'),
+            KeyModifiers::CONTROL,
+        )))
+        .await;
         assert_ne!(keys(&app), "enter stop · esc cancel");
     }
 
