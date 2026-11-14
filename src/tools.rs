@@ -987,11 +987,11 @@ impl BlockStream {
             out.push_str(&text[at..begin]);
             at = begin;
             let from = at + BEGIN.len();
-            let line_ends = text[from..].contains('\n');
-            let closed = match text[from..].find('\n') {
-                Some(n) => text[from..from + n].contains("-----"),
-                None => text[from..].contains("-----"),
-            };
+            // The closing dashes first, as `pem_header` reads them.
+            let dash = text[from..].find("-----").map(|n| from + n);
+            let closed = dash.is_some_and(|dash| !text[from..dash].contains('\n'));
+            // No dashes after: no later block starts, so this is read once.
+            let line_ends = dash.is_some() || text[from..].contains('\n');
             if !closed && (line_ends || last) {
                 // No header line here: read on after its start.
                 out.push_str(BEGIN);
@@ -1012,7 +1012,7 @@ impl BlockStream {
                 return out;
             }
             let Some(header) = pem_header(&text, at, last) else {
-                let dashes = from + text[from..].find("-----").unwrap_or(0) + 5;
+                let dashes = dash.unwrap_or(from) + 5;
                 if !last && matches!(&text.as_bytes()[dashes..], [] | [b'\r']) {
                     // The line's end may follow.
                     self.held = text[at..].to_owned();
@@ -1441,8 +1441,13 @@ fn redact_blocks(text: String, blocks: &[String]) -> String {
 fn pem_header(text: &str, begin: usize, last: bool) -> Option<usize> {
     const BEGIN: &str = "-----BEGIN ";
     let from = begin + BEGIN.len();
-    let line = text[from..].find('\n').map_or(text.len(), |n| from + n);
-    let dashes = from + text[from..line].find("-----")? + 5;
+    // The closing dashes first: the next are at the latest the next
+    // block's, so no text is read twice however many starts a line holds.
+    let dashes = from + text[from..].find("-----")?;
+    if text[from..dashes].contains('\n') {
+        return None;
+    }
+    let dashes = dashes + 5;
     match &text.as_bytes()[dashes..] {
         [b'\r', b'\n', ..] => Some(dashes + 2),
         [b'\n', ..] => Some(dashes + 1),
@@ -1460,6 +1465,16 @@ const PEM_LINE: usize = 64 * 1024;
 /// after them.
 fn pem_line(line: &str, after_info: bool) -> bool {
     let line = line.strip_suffix('\r').unwrap_or(line);
+    // The number the read tool puts before each line it shows.
+    let numbered = line.trim_start_matches(' ');
+    let digits = numbered.len()
+        - numbered
+            .trim_start_matches(|c: char| c.is_ascii_digit())
+            .len();
+    let line = match numbered[digits..].strip_prefix('\t') {
+        Some(rest) if digits > 0 => rest,
+        _ => line,
+    };
     let base64 = |b: &u8| b.is_ascii_alphanumeric() || matches!(b, b'+' | b'/' | b'=');
     (line.is_empty() && after_info)
         || (line.len() <= PEM_LINE
@@ -5229,6 +5244,24 @@ mod tests {
         }
         out.push_str(&redacting.finish());
         assert_eq!(out, redact(&long));
+        // As the read tool shows it, each line numbered.
+        let numbered = "     1\t-----BEGIN PRIVATE KEY-----\n     2\tMIIE+/a=\n     3\tAAAA\n     4\t-----END PRIVATE KEY-----\n";
+        assert_eq!(
+            redact(numbered),
+            "     1\t-----BEGIN PRIVATE KEY-----\n[REDACTED]\n     4\t-----END PRIVATE KEY-----\n"
+        );
+        // Many starts on one long line read it once, whole or in pieces.
+        let starts = "-----BEGIN ".repeat(40_000) + "\nend\n";
+        let began = std::time::Instant::now();
+        assert_eq!(redact(&starts), starts);
+        let mut redacting = Redacting::new(credentials.clone());
+        let mut out = String::new();
+        for piece in starts.as_bytes().chunks(8192) {
+            out.push_str(&redacting.feed(piece));
+        }
+        out.push_str(&redacting.finish());
+        assert_eq!(out, starts);
+        assert!(began.elapsed() < std::time::Duration::from_secs(5));
         // An encrypted key's headers and their blank line are its body.
         assert_eq!(
             redact(
