@@ -623,6 +623,22 @@ as one.
   reads words, so one that spells the name another way is left to the
   reviewer, and a command an allow rule lets out is not reviewed at all, as in
   Codex.
+- **An escalated `agent` command that works inside is refused at once**
+  (2026-11-14). Agents asked to run `agent run`, `ls` and the like
+  outside their sandbox out of habit, though their own socket answers them
+  inside it as themselves: each one waited on the reviewer, and one it
+  could not finish went to the person. Sonny's reviewer now denies, before
+  asking its model, an escalated shell call whose every command is an
+  `agent` client command that does the same inside: a message to an agent
+  there is (`run --bot` with no `--new` or `--fork`), `ls`, `turns`,
+  `wait`, `inspect`, `models` without `--discover`, `usage`, `audit`,
+  `stats`, or a `fork --allow ''`. The reason says to run it again without
+  escalating, and that the `send_message`, `list_agents` and `pause_agents`
+  tools do the same. Like a Codex command rule with `decision = "forbidden"`
+  and its `justification`, it is unassessed, so it never counts toward the
+  breaker and no person is asked. Another store, `start`, `serve`, a new
+  agent, `answer`, `configure` and anything else on the line still go to
+  the reviewer and, past it, the person.
 - **What it is good for.** Catching the overeager or mistaken action a
   person would have stopped: the deleted branch, the force push, the token
   pasted into a request. Anthropic reports its pipeline let 17% of real

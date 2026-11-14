@@ -82,6 +82,9 @@ enum Tool {
     WebSearch,
     WebFetch,
     WriteStdin,
+    SendMessage,
+    ListAgents,
+    PauseAgents,
 }
 impl Tool {
     fn parse(name: &str) -> Option<Tool> {
@@ -97,6 +100,9 @@ impl Tool {
             "web_search" => Tool::WebSearch,
             "web_fetch" => Tool::WebFetch,
             "write_stdin" => Tool::WriteStdin,
+            "send_message" => Tool::SendMessage,
+            "list_agents" => Tool::ListAgents,
+            "pause_agents" => Tool::PauseAgents,
             _ => return None,
         })
     }
@@ -113,6 +119,9 @@ impl Tool {
             Tool::WebSearch => "web_search",
             Tool::WebFetch => "web_fetch",
             Tool::WriteStdin => "write_stdin",
+            Tool::SendMessage => "send_message",
+            Tool::ListAgents => "list_agents",
+            Tool::PauseAgents => "pause_agents",
         }
     }
     fn schema(self) -> ToolSchema {
@@ -182,6 +191,36 @@ impl Tool {
                 "chars":{"type":"string","maxLength":INPUT_BYTES},
                 "yield_time_ms":{"type":"integer","minimum":0,"maximum":MAX_YIELD_MS},"kill":{"type":"boolean"}},
                 "required":["handle"],"additionalProperties":false}),
+            ),
+            // An agent's own requests to the daemon, made as that agent
+            // ([`Agents`]): what its shell's `agent` would send, held to
+            // what the bot's own socket allows.
+            Tool::SendMessage => (
+                "Send a message to another agent, by its whole name, as yours: the daemon says under it who wrote it. delivery steer (the default) joins its running turn at its next step, or starts a turn when none runs; queue waits for a turn of its own after what it has in line. interrupt=true first stops its running turn, if it has one, then delivers the message as a new turn: say why you stopped it and what to do instead. You may interrupt only an agent you made. quote names turns whose words the daemon copies after yours, each with who wrote them: BOT/N for the message that agent's turn N took in, BOT/N:reply for the reply that turn ended with. Sending a request_id again starts nothing new. Returns the message's handle, BOT/N, which wait and history take, and whether it started a turn, joined one (steered) or waits (queued).",
+                json!({"type":"object","properties":{
+                "to":{"type":"string","minLength":1,"maxLength":128,"description":"The agent's whole name, such as shop.fix."},
+                "message":{"type":"string","minLength":1},
+                "delivery":{"enum":["steer","queue"]},
+                "interrupt":{"type":"boolean"},
+                "quote":{"type":"array","items":{"type":"string","minLength":3,"maxLength":256},"maxItems":16},
+                "request_id":{"type":"string","minLength":1,"maxLength":128}},
+                "required":["to","message"],"additionalProperties":false}),
+            ),
+            Tool::ListAgents => (
+                "List agents, by name: each one's status, its running turn, what it waits on, its folder, model and maker, and how its last turn ended. name is a pattern where * is any run of characters and ? any one, such as *.lead or shop.*; without one, this project's agents, named as you are up to the first dot. running=true lists only those with a turn running. approvals=true lists instead the calls waiting on an approval, each with its agent, turn, tool and the start of its arguments. Pages hold up to limit (default 50, at most 256); pass next_after as after for the next.",
+                json!({"type":"object","properties":{
+                "name":{"type":"string","minLength":1,"maxLength":256},
+                "running":{"type":"boolean"},
+                "approvals":{"type":"boolean"},
+                "after":{"type":["string","integer"]},
+                "limit":{"type":"integer","minimum":1,"maximum":256}},
+                "additionalProperties":false}),
+            ),
+            Tool::PauseAgents => (
+                "Stop every agent at once, yourself included: each running turn parks where it is, nothing starts, and only the person lets them go on. Only for harm someone must look at now, such as data being lost, money being spent or messages going out. reason says what you saw.",
+                json!({"type":"object","properties":{
+                "reason":{"type":"string","minLength":1,"maxLength":4096}},
+                "required":["reason"],"additionalProperties":false}),
             ),
             Tool::Wait => (
                 "Suspend until every handle resolves, without holding any execution capacity. Handles are 'BOT/N' (a message sent to a peer agent, numbered as run gives it) or 'proc:N' (a background or detached shell, or a call a message moved to the background). Each result reports the outcome: for a message that opened a turn, that turn's status and final text, with before_steer, the last text it wrote before it was steered, when it ended on a reply to a steer; for one another turn took in, status taken and that turn's number, to wait on in turn; or a process's output and exit code.
@@ -564,7 +603,20 @@ pub struct Registry {
     /// Bytes of tool output being redacted off the runtime at once; see
     /// `off_runtime`.
     heavy: Arc<Semaphore>,
+    /// How a bot's own tools reach the daemon, as that bot ([`Agents`]).
+    requests: Option<Requests>,
 }
+/// A request made of the daemon as bot `bot_id`, answered as a request on
+/// that bot's own socket is: the answer, or the daemon's refusal.
+pub type Requests = Arc<
+    dyn Fn(
+            i64,
+            serde_json::Value,
+        )
+            -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<serde_json::Value>> + Send>>
+        + Send
+        + Sync,
+>;
 type Encodings = Arc<std::sync::Mutex<HashMap<(Family, String), Arc<RawValue>>>>;
 /// What a file that is not text holds, named by its first bytes, as `file`
 /// would: a NUL in its first 8 KiB marks one as binary, as git decides.
@@ -1461,6 +1513,57 @@ fn redact_blocks(mut text: String, blocks: &[String]) -> String {
     text
 }
 
+/// What an agent asks of the daemon with its own tools: what its shell's
+/// `agent` would send, made as that agent and held to what the bot's own
+/// socket allows it.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Agents {
+    /// A message to `to`, after stopping its running turn when `interrupt`.
+    Send {
+        to: String,
+        message: String,
+        /// `steer` or `queue`.
+        delivery: &'static str,
+        interrupt: bool,
+        /// `{"bot","message","reply"?}`, as `submit` takes them.
+        quotes: Vec<serde_json::Value>,
+        request_id: Option<String>,
+    },
+    /// Agents by name, or the calls waiting on an approval.
+    List {
+        name: Option<String>,
+        running: bool,
+        approvals: bool,
+        after: serde_json::Value,
+        limit: usize,
+    },
+    /// Pull the cord on every agent.
+    Pause { reason: String },
+}
+
+/// A quote's handle, `BOT/N` or `BOT/N:reply`, as `submit` takes it.
+fn quote(handle: &str) -> Result<serde_json::Value> {
+    let (handle, reply) = match handle.strip_suffix(":reply") {
+        Some(handle) => (handle, true),
+        None => (handle, false),
+    };
+    let parsed = handle.rsplit_once('/').and_then(|(bot, message)| {
+        let message = message.parse::<i64>().ok().filter(|message| *message > 0)?;
+        (!bot.is_empty() && !bot.contains(':')).then_some((bot, message))
+    });
+    let Some((bot, message)) = parsed else {
+        return fail_with(
+            "invalid_tool_arguments",
+            format!("{handle:?} is no BOT/N or BOT/N:reply"),
+        );
+    };
+    let mut quote = json!({"bot":bot,"message":message});
+    if reply {
+        quote["reply"] = json!(true);
+    }
+    Ok(quote)
+}
+
 pub enum Prepared {
     Echo(String),
     /// Each command runs in `workdir` when its call names one, read
@@ -1518,6 +1621,9 @@ pub enum Prepared {
         /// Search the turns before this one.
         before: Option<i64>,
     },
+    /// A request the bot makes of the daemon as itself. Resolved by the
+    /// runtime, never by the registry.
+    Agents(Agents),
     /// Resolved by the runtime, never by the registry.
     Wait {
         handles: Vec<String>,
@@ -1737,9 +1843,9 @@ impl Registry {
     /// of them a bot may call is the bot's own, chosen at creation.
     pub fn all() -> Result<Self> {
         Self::new(if cfg!(unix) {
-            "echo,shell,read,write,edit,apply_patch,wait,history,web_search,web_fetch,write_stdin"
+            "echo,shell,read,write,edit,apply_patch,wait,history,web_search,web_fetch,write_stdin,send_message,list_agents,pause_agents"
         } else {
-            "echo,read,write,edit,apply_patch,wait,history,web_search,web_fetch"
+            "echo,read,write,edit,apply_patch,wait,history,web_search,web_fetch,send_message,list_agents,pause_agents"
         })
     }
     pub fn new(names: &str) -> Result<Self> {
@@ -1776,6 +1882,7 @@ impl Registry {
             daemon: Arc::default(),
             encodings: Arc::default(),
             heavy: Arc::new(Semaphore::new(heavy_bytes())),
+            requests: None,
         })
     }
     /// A bot's selection must name registered tools, each once.
@@ -2111,6 +2218,23 @@ impl Registry {
     }
     pub fn daemon(&self) -> &Daemon {
         &self.daemon
+    }
+    /// How bots' own tools reach the daemon ([`Agents`]).
+    pub fn with_requests(mut self, requests: Requests) -> Self {
+        self.requests = Some(requests);
+        self
+    }
+    /// Make `request` of the daemon as bot `bot_id`; `agents_unavailable`
+    /// in a daemon that serves no requests.
+    pub async fn request(
+        &self,
+        bot_id: i64,
+        request: serde_json::Value,
+    ) -> Result<serde_json::Value> {
+        match &self.requests {
+            Some(requests) => requests(bot_id, request).await,
+            None => fail("agents_unavailable"),
+        }
     }
     pub fn names(&self) -> Vec<&'static str> {
         self.tools.iter().map(|t| t.name()).collect()
@@ -2463,6 +2587,91 @@ impl Registry {
                     }
                 }
             }
+            Tool::SendMessage => {
+                #[derive(Deserialize)]
+                #[serde(deny_unknown_fields)]
+                struct Send {
+                    to: String,
+                    message: String,
+                    delivery: Option<String>,
+                    #[serde(default)]
+                    interrupt: bool,
+                    #[serde(default)]
+                    quote: Vec<String>,
+                    request_id: Option<String>,
+                }
+                let args: Send = serde_json::from_str(args).map_err(invalid)?;
+                let delivery = match args.delivery.as_deref() {
+                    None | Some("steer") => "steer",
+                    Some("queue") => "queue",
+                    Some(other) => {
+                        return fail_with(
+                            "invalid_tool_arguments",
+                            format!("delivery is steer or queue, not {other:?}"),
+                        );
+                    }
+                };
+                if args.to.is_empty() || args.to.len() > 128 || args.message.is_empty() {
+                    return fail_with("invalid_tool_arguments", "to and message are needed");
+                }
+                if args.quote.len() > 16 {
+                    return fail_with("invalid_tool_arguments", "at most 16 quotes");
+                }
+                Prepared::Agents(Agents::Send {
+                    to: args.to,
+                    message: args.message,
+                    delivery,
+                    interrupt: args.interrupt,
+                    quotes: args.quote.iter().map(|q| quote(q)).collect::<Result<_>>()?,
+                    request_id: args.request_id,
+                })
+            }
+            Tool::ListAgents => {
+                #[derive(Deserialize)]
+                #[serde(deny_unknown_fields)]
+                struct List {
+                    name: Option<String>,
+                    #[serde(default)]
+                    running: bool,
+                    #[serde(default)]
+                    approvals: bool,
+                    #[serde(default)]
+                    after: serde_json::Value,
+                    limit: Option<usize>,
+                }
+                let args: List = serde_json::from_str(args).map_err(invalid)?;
+                let limit = args.limit.unwrap_or(50);
+                if !(1..=256).contains(&limit)
+                    || args
+                        .name
+                        .as_ref()
+                        .is_some_and(|n| n.is_empty() || n.len() > 256)
+                    || (args.running && args.approvals)
+                {
+                    return fail_with(
+                        "invalid_tool_arguments",
+                        "limit is 1 to 256, name 1 to 256 bytes, and running and approvals don't mix",
+                    );
+                }
+                Prepared::Agents(Agents::List {
+                    name: args.name,
+                    running: args.running,
+                    approvals: args.approvals,
+                    after: args.after,
+                    limit,
+                })
+            }
+            Tool::PauseAgents => {
+                #[derive(Deserialize)]
+                #[serde(deny_unknown_fields)]
+                struct Pause {
+                    reason: String,
+                }
+                let args: Pause = serde_json::from_str(args).map_err(invalid)?;
+                Prepared::Agents(Agents::Pause {
+                    reason: args.reason,
+                })
+            }
             Tool::Wait => {
                 let args: Wait = serde_json::from_str(args).map_err(invalid)?;
                 if args.handles.is_empty()
@@ -2569,6 +2778,7 @@ impl Registry {
                 ))
             }
             Prepared::Wait { .. } => fail("wait_requires_runtime"),
+            Prepared::Agents(_) => fail("agents_require_runtime"),
             Prepared::Terminal { .. } | Prepared::WriteStdin { .. } => {
                 fail("terminal_requires_runtime")
             }

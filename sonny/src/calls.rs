@@ -46,6 +46,7 @@ pub fn attempted(verb: &str) -> String {
         "Looked" => "look",
         "Moved" => "move",
         "Opened" => "open",
+        "Paused" => "pause",
         "Pruned" => "prune",
         "Queued" => "queue",
         "Read" => "read",
@@ -576,6 +577,62 @@ const STATUSES: &[&str] = &[
     "paced",
 ];
 
+/// Whether a command line only runs `agent` commands that do the same in
+/// the agent's sandbox as out of it, on its own daemon, as itself: a
+/// message to an agent there is, a list, turns read, a wait, a look-up,
+/// models, usage, audit, stats, or a fork that may write nothing. Another
+/// store, a new agent, models discovered into the home or anything else
+/// on the line is not.
+pub fn agent_inside(command: &str) -> bool {
+    let parts = crate::shell::parts(command);
+    !parts.is_empty()
+        && parts.iter().all(|part| {
+            let Some(simple) = crate::shell::simple(part) else {
+                return false;
+            };
+            let cut = |p: &str| matches!(p.split_whitespace().next(), Some("head" | "tail" | "jq"));
+            if !simple.piped.as_deref().is_none_or(cut) {
+                return false;
+            }
+            let Some((program, words)) = simple.words.split_first() else {
+                return false;
+            };
+            if !matches!(program.as_str(), "$AGENT_BIN" | "${AGENT_BIN}" | "agent")
+                || (words.iter()).any(|w| w == "--store" || w.starts_with("--store="))
+            {
+                return false;
+            }
+            let mut words = words;
+            while let Some(first) = words.first().filter(|w| w.starts_with("--")) {
+                let skip = match SWITCHES.contains(&first.as_str()) || first.contains('=') {
+                    true => 1,
+                    false => 2,
+                };
+                let Some(rest) = words.get(skip..) else {
+                    return false;
+                };
+                words = rest;
+            }
+            let Some((verb, rest)) = words.split_first() else {
+                return false;
+            };
+            let args = Args::new(rest);
+            match verb.as_str() {
+                "run" => {
+                    args.value(&["--bot"]).is_some()
+                        && !args.has("--new")
+                        && args.value(&["--fork"]).is_none()
+                }
+                "fork" => args.value(&["--allow"]) == Some(""),
+                "models" => !args.has("--discover"),
+                "ls" | "turns" | "history" | "wait" | "inspect" | "usage" | "audit" | "stats" => {
+                    true
+                }
+                _ => false,
+            }
+        })
+}
+
 /// The bot and number a `BOT/N` handle names.
 pub fn handle_parts(handle: &str) -> Option<(&str, i64)> {
     let (bot, number) = handle.rsplit_once('/')?;
@@ -915,6 +972,99 @@ pub fn declared(name: &str, arguments: &Value, failed: bool) -> Option<Said> {
     }
 }
 
+/// A call of the daemon's tools for other agents, said as the `agent` verbs
+/// they stand for are: the message sent and how it landed, the agents
+/// listed with each one's status, or the cord pulled and why.
+pub fn agents(name: &str, arguments: &Value, output: Option<&str>, failed: bool) -> Option<Said> {
+    let reply: Option<Value> = output.and_then(|o| serde_json::from_str(o.trim()).ok());
+    let mut said = Said {
+        verb: String::new(),
+        what: String::new(),
+        under: Vec::new(),
+        failed,
+        output: None,
+    };
+    match name {
+        "send_message" => {
+            let to = arguments["to"].as_str()?.trim();
+            said.what = to.to_owned();
+            let status = reply.as_ref().and_then(|r| r["status"].as_str());
+            let interrupted = reply
+                .as_ref()
+                .is_some_and(|r| !r["interrupted_turn"].is_null());
+            said.verb = match (status, arguments["delivery"].as_str()) {
+                _ if interrupted => "Interrupted",
+                // Asked to, but it had no turn running: a message alone.
+                (Some("running"), _) => "Started a turn for",
+                (None, _) if arguments["interrupt"] == true => "Interrupted",
+                (_, Some("queue")) => "Queued for",
+                _ => "Steered",
+            }
+            .into();
+            // A message in line has no turn yet; the one it opens has its number.
+            if let Some(turn) = reply
+                .as_ref()
+                .and_then(|r| r["handle"].as_str())
+                .and_then(handle_parts)
+                .map(|(_, n)| n)
+            {
+                said.what = format!("{to} · turn {turn}");
+            }
+            if let Some(message) = arguments["message"]
+                .as_str()
+                .filter(|m| !m.trim().is_empty())
+            {
+                said.under
+                    .push(Line::from(first_line(message)).italic().dim());
+            }
+        }
+        "list_agents" if arguments["approvals"] == true => {
+            said.verb = "Checked approvals".into();
+            let calls = reply
+                .as_ref()
+                .and_then(|r| r["approvals"].as_array().cloned());
+            for call in calls.into_iter().flatten() {
+                let agent = call["agent"].as_str().unwrap_or_default();
+                let tool = call["tool"].as_str().unwrap_or_default();
+                said.under.push(dim(format!("{agent} wants {tool}")));
+            }
+        }
+        "list_agents" => {
+            said.verb = match arguments["name"].as_str() {
+                None if arguments["running"] == true => "Listed running agents".into(),
+                None => "Listed this project's agents".into(),
+                Some("*.lead") => "Listed every project's lead".into(),
+                Some(pattern) => match pattern.strip_suffix(".*") {
+                    Some(project) if !project.contains(['*', '?']) => {
+                        format!("Listed {project}'s agents")
+                    }
+                    _ => format!("Listed agents named {pattern}"),
+                },
+            };
+            let rows = reply.as_ref().and_then(|r| r["agents"].as_array().cloned());
+            for row in rows.into_iter().flatten() {
+                let status = row["status"].as_str().unwrap_or_default().to_owned();
+                said.under.push(Line::from(vec![
+                    crate::status::mark(&status),
+                    Span::raw(row["name"].as_str().unwrap_or_default().to_owned()),
+                    Span::raw(format!(" {status}")).dim(),
+                ]));
+            }
+        }
+        "pause_agents" => {
+            said.verb = "Paused every agent".into();
+            if let Some(reason) = arguments["reason"]
+                .as_str()
+                .filter(|r| !r.trim().is_empty())
+            {
+                said.under.push(dim(first_line(reason)));
+            }
+        }
+        _ => return None,
+    }
+    Some(said)
+}
+
 /// A `plan` call said in one row: how far it has got and the step under
 /// way, as an earlier plan reads once a newer one shows in full.
 pub fn plan_short(items: &[String]) -> Said {
@@ -1207,6 +1357,139 @@ Keep the rest.'"#,
         );
         // An agent that runs no Sonny tool is said some other way.
         assert!(declared("start_task", &serde_json::json!({}), false).is_none());
+    }
+
+    #[test]
+    fn only_agent_commands_that_work_in_the_sandbox_read_as_inside() {
+        for inside in [
+            r#""$AGENT_BIN" run --bot shop.fix --detach --delivery steer -- 'Use the cache; then test'"#,
+            "\"$AGENT_BIN\" run --bot shop.lead --detach - <<'EOF'\nDone (all of it).\nEOF",
+            r#""$AGENT_BIN" ls --name "${AGENT_BOT%%.*}.*" --pretty | jq -r .name"#,
+            r#""$AGENT_BIN" turns --bot shop.fix && "$AGENT_BIN" wait shop.fix/4"#,
+            r#"agent --pretty inspect --bot shop.fix"#,
+            r#""$AGENT_BIN" fork --bot shop.fix --allow '' -- 'What is left?'"#,
+            r#""$AGENT_BIN" models"#,
+        ] {
+            assert!(agent_inside(inside), "{inside}");
+        }
+        for outside in [
+            r#""$AGENT_BIN" run --new --bot shop.x -- go"#,
+            r#""$AGENT_BIN" run -- go"#,
+            r#""$AGENT_BIN" run --bot shop.y --fork shop.fix -- go"#,
+            r#""$AGENT_BIN" --store /tmp/s ls"#,
+            r#"AGENT_STORE=/tmp/s "$AGENT_BIN" ls"#,
+            r#""$AGENT_BIN" start"#,
+            r#""$AGENT_BIN" answer --bot shop.fix --turn 3 --allow"#,
+            r#""$AGENT_BIN" models --discover"#,
+            r#""$AGENT_BIN" fork --bot shop.fix -- go"#,
+            r#""$AGENT_BIN" ls | sh"#,
+            r#"git push && "$AGENT_BIN" run --bot shop.lead -- pushed"#,
+            "",
+        ] {
+            assert!(!agent_inside(outside), "{outside}");
+        }
+    }
+
+    #[test]
+    fn the_daemon_tools_for_agents_read_as_the_verbs_they_stand_for() {
+        use serde_json::json;
+        let send = |arguments: Value, reply: Value| {
+            let said = agents("send_message", &arguments, Some(&reply.to_string()), false).unwrap();
+            (
+                said.verb,
+                said.what,
+                said.under.iter().map(text).collect::<Vec<_>>(),
+            )
+        };
+        let message = json!({"to": "shop.fix", "message": "Use the cache\nthen test"});
+        assert_eq!(
+            send(
+                message.clone(),
+                json!({"status": "running", "handle": "shop.fix/4"})
+            ),
+            (
+                "Started a turn for".into(),
+                "shop.fix · turn 4".into(),
+                vec!["Use the cache".into()]
+            )
+        );
+        assert_eq!(
+            send(
+                message.clone(),
+                json!({"status": "queued", "handle": "shop.fix/5"})
+            )
+            .0,
+            "Steered"
+        );
+        let queued = json!({"to": "shop.fix", "message": "m", "delivery": "queue"});
+        assert_eq!(send(queued, json!({"status": "queued"})).0, "Queued for");
+        let interrupt = json!({"to": "shop.fix", "message": "m", "interrupt": true});
+        assert_eq!(
+            send(
+                interrupt.clone(),
+                json!({"status": "queued", "interrupted_turn": 3})
+            )
+            .0,
+            "Interrupted"
+        );
+        // It had no turn running: the message started one.
+        assert_eq!(
+            send(interrupt.clone(), json!({"status": "running"})).0,
+            "Started a turn for"
+        );
+        assert_eq!(
+            agents("send_message", &interrupt, None, false)
+                .unwrap()
+                .verb,
+            "Interrupted"
+        );
+
+        let listed =
+            |arguments: Value| agents("list_agents", &arguments, None, false).unwrap().verb;
+        assert_eq!(listed(json!({})), "Listed this project's agents");
+        assert_eq!(
+            listed(json!({"name": "*.lead"})),
+            "Listed every project's lead"
+        );
+        assert_eq!(listed(json!({"name": "web.*"})), "Listed web's agents");
+        assert_eq!(
+            listed(json!({"name": "*fix*"})),
+            "Listed agents named *fix*"
+        );
+        assert_eq!(listed(json!({"running": true})), "Listed running agents");
+        let rows = json!({"agents": [{"name": "shop.fix", "status": "running"}]}).to_string();
+        let said = agents("list_agents", &json!({}), Some(&rows), false).unwrap();
+        assert!(
+            text(&said.under[0]).ends_with("shop.fix running"),
+            "{:?}",
+            said.under
+        );
+        let waiting = json!({"approvals": [{"agent": "shop.fix", "tool": "shell"}]}).to_string();
+        let said = agents(
+            "list_agents",
+            &json!({"approvals": true}),
+            Some(&waiting),
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            (said.verb.as_str(), text(&said.under[0]).as_str()),
+            ("Checked approvals", "shop.fix wants shell")
+        );
+
+        let said = agents(
+            "pause_agents",
+            &json!({"reason": "emails going out"}),
+            None,
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            (said.verb.as_str(), text(&said.under[0]).as_str()),
+            ("Paused every agent", "emails going out")
+        );
+        assert_eq!(attempted(&said.verb), "Couldn't pause every agent");
+        assert!(agents("wait", &json!({}), None, false).is_none());
     }
 
     #[test]

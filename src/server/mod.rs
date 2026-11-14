@@ -2132,6 +2132,7 @@ pub async fn run(config: Configuration) -> Result<()> {
         config.socket.is_some(),
     );
     let registry = registry
+        .with_requests(own_requests(sender.clone(), sessions_next.clone()))
         .with_credentials(credentials)
         .with_environment(environment)
         .with_daemon(daemon)
@@ -2962,6 +2963,56 @@ async fn contained(run: impl Future<Output = turn::Exit>) -> turn::Exit {
             turn::Exit::Finished(Some(Error::with("turn_panicked", said)))
         }
     }
+}
+
+/// How a bot's own tools reach the daemon: each request on a session of
+/// its own, answered as that bot, as its own socket answers the `agent` in
+/// its shell, held to the same limits and refused the same way.
+fn own_requests(
+    sender: session::Sender,
+    next: std::sync::Arc<std::sync::atomic::AtomicU64>,
+) -> agent_runtime::tools::Requests {
+    std::sync::Arc::new(move |bot, mut request| {
+        let (sender, next) = (sender.clone(), next.clone());
+        Box::pin(async move {
+            let session = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let (output, mut lines) = Output::in_process();
+            request["id"] = json!(1);
+            let parsed = serde_json::from_value::<Request>(request)
+                .map_err(|error| Error::with("invalid_request", error.to_string()));
+            let gone = || Error::new("daemon_draining");
+            sender
+                .send(session::Inbound::Open(session, output, Some(bot), None))
+                .await
+                .map_err(|_| gone())?;
+            let answer = async {
+                let read = std::time::Instant::now();
+                let credit = session::Credit::default();
+                (sender
+                    .send(session::Inbound::Request(session, parsed, credit, read))
+                    .await)
+                    .map_err(|_| gone())?;
+                // The session's ready line, and any event, come before the
+                // answer under its id.
+                while let Some(line) = lines.next().await {
+                    let mut line: Value = serde_json::from_slice(&line)?;
+                    if line["id"] != 1 {
+                        continue;
+                    }
+                    let Some(code) = line["error"].as_str() else {
+                        return Ok(line["result"].take());
+                    };
+                    let mut error = Error::new(code);
+                    error.detail = line["detail"].as_str().map(str::to_owned);
+                    return Err(error);
+                }
+                Err(gone())
+            }
+            .await;
+            let _ = sender.send(session::Inbound::Closed(session)).await;
+            answer
+        })
+    })
 }
 
 impl Service {

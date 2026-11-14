@@ -2395,7 +2395,7 @@ pub fn clean(
 }
 
 /// What the clean view keeps, by what Sonny says a call did.
-const KEPT: [&str; 28] = [
+const KEPT: [&str; 29] = [
     "Started",
     "Started a turn for",
     "Steered",
@@ -2424,6 +2424,7 @@ const KEPT: [&str; 28] = [
     "Unfollowed",
     "Opened a tab",
     "Opened a split",
+    "Paused every agent",
 ];
 
 fn kept(said: &crate::calls::Said) -> bool {
@@ -2484,6 +2485,9 @@ pub fn folds(
     }
     let said = match name {
         "shell" => crate::calls::said(arguments["command"].as_str()?, output.unwrap_or(""), false)?,
+        "send_message" | "list_agents" | "pause_agents" => {
+            crate::calls::agents(name, arguments, output, false)?
+        }
         _ => crate::calls::declared(name, arguments, false)?,
     };
     // A task's name, not the turn it started.
@@ -2565,8 +2569,11 @@ fn drawn(
     let field = |key: &str| arguments[key].as_str().unwrap_or("").to_owned();
     let elbow = || Span::raw("  └ ").dim();
     let gap = || Span::raw("    ");
-    // A tool Sonny declares, said as what it does.
-    if let Some(mut said) = crate::calls::declared(name, arguments, failed) {
+    // A tool Sonny declares, or the daemon's for other agents, said as
+    // what it does.
+    if let Some(mut said) = crate::calls::declared(name, arguments, failed)
+        .or_else(|| crate::calls::agents(name, arguments, output, failed))
+    {
         if clean && !kept(&said) {
             return Vec::new();
         }

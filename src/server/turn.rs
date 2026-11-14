@@ -25,7 +25,8 @@ use agent_runtime::{
         listed_command, unserved,
     },
     tools::{
-        Cord, Files, Outcome, POLL_YIELD_MS, Place, Prepared, ReadSource, Registry, Spill, Stopper,
+        Agents, Cord, Files, Outcome, POLL_YIELD_MS, Place, Prepared, ReadSource, Registry, Spill,
+        Stopper,
     },
 };
 use bytes::Bytes;
@@ -4819,6 +4820,12 @@ impl Turn {
                     Ok(outcome) => outcome,
                     Err(error) => failure(error),
                 },
+                Ok(Prepared::Agents(asked)) => {
+                    match self.agents(&call.call_id, record.bot_id, asked).await {
+                        Ok(outcome) => outcome,
+                        Err(error) => failure(error),
+                    }
+                }
                 Ok(Prepared::History {
                     bot,
                     turn: wanted,
@@ -5692,6 +5699,148 @@ impl Turn {
 
     /// A page of the audit trail for the bot to read, redacted as its
     /// other reads of history are.
+    /// What the bot asked of the daemon with its own tools, made as the
+    /// bot on a session of its own ([`Registry::request`]), so the bot's
+    /// own socket's limits hold, and its answer as the call's result.
+    async fn agents(&self, call_id: &str, bot_id: i64, asked: Agents) -> Result<Outcome> {
+        let request = |request: Value| self.registry.request(bot_id, request);
+        let answer = match asked {
+            Agents::Send {
+                to,
+                message,
+                delivery,
+                interrupt,
+                quotes,
+                request_id,
+            } => {
+                let mut interrupted = Value::Null;
+                let mut delivery = delivery;
+                if interrupt {
+                    let target = request(json!({"op":"inspect","bot":to})).await?;
+                    if let Some(turn) = target["running_turn"].as_i64() {
+                        request(json!({"op":"interrupt","bot":to,"turn":turn}))
+                            .await
+                            .map_err(|error| match error.code.as_str() {
+                                "not_permitted" => Error::with(
+                                    "not_permitted",
+                                    format!("{to} is not an agent you made, so you may not interrupt it; send it a message instead"),
+                                ),
+                                _ => error,
+                            })?;
+                        interrupted = json!(turn);
+                    }
+                    // Its own turn, after the one stopped.
+                    delivery = "queue";
+                }
+                // The same call made again, after a restart, sends nothing
+                // new: its id is the call's own unless the bot named one.
+                let request_id = request_id.unwrap_or_else(|| {
+                    let call: String = (call_id.chars())
+                        .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+                        .take(96)
+                        .collect();
+                    format!("tool-{}-{call}", self.turn)
+                });
+                let sent = request(json!({"op":"submit","bot":to,"request_id":request_id,
+                    "prompt":message,"delivery":delivery,
+                    "from":{"bot":self.bot,"turn":self.turn},
+                    "quotes":(!quotes.is_empty()).then_some(quotes)}))
+                .await?;
+                let mut answer = json!({"status":sent["status"]});
+                if let Some(message) = sent["message"].as_i64() {
+                    answer["handle"] = json!(format!("{to}/{message}"));
+                }
+                if sent["duplicate"] == true {
+                    answer["duplicate"] = json!(true);
+                }
+                if !interrupted.is_null() {
+                    answer["interrupted_turn"] = interrupted;
+                }
+                answer
+            }
+            Agents::List {
+                name,
+                running,
+                approvals: false,
+                after,
+                limit,
+            } => {
+                let name = name.or_else(|| self.project_agents());
+                let page = request(json!({"op":"bots","name":name,"active":running,
+                    "limit":limit,"after":after.as_str()}))
+                .await?;
+                let agents: Vec<Value> = (page["bots"].as_array().into_iter().flatten())
+                    .map(|bot| {
+                        let mut row = json!({"name":bot["name"],"status":bot["status"]});
+                        for (field, from) in [
+                            ("running_turn", "running_turn"),
+                            ("waiting_on", "waiting_on"),
+                            ("last", "last"),
+                            ("folder", "workspace"),
+                            ("made_by", "created_by"),
+                        ] {
+                            if !bot[from].is_null() {
+                                row[field] = bot[from].clone();
+                            }
+                        }
+                        row["model"] = json!(format!(
+                            "{}/{}",
+                            bot["provider"].as_str().unwrap_or_default(),
+                            bot["model"].as_str().unwrap_or_default()
+                        ));
+                        row
+                    })
+                    .collect();
+                json!({"agents":agents,"next_after":page["next_after"]})
+            }
+            Agents::List {
+                name,
+                approvals: true,
+                after,
+                limit,
+                ..
+            } => {
+                let name = name.or_else(|| self.project_agents());
+                let page = request(json!({"op":"approvals","after":after.as_i64().unwrap_or(0),
+                    "limit":limit}))
+                .await?;
+                let calls: Vec<Value> = (page["approvals"].as_array().into_iter().flatten())
+                    .filter(|call| {
+                        name.as_deref().is_none_or(|pattern| {
+                            agent_runtime::tools::name_matches(
+                                pattern,
+                                call["bot"].as_str().unwrap_or_default(),
+                            )
+                        })
+                    })
+                    .map(|call| {
+                        let arguments = call["request"]
+                            .as_str()
+                            .map_or_else(|| call["request"].to_string(), str::to_owned);
+                        let mut start: String = arguments.chars().take(300).collect();
+                        if start.len() < arguments.len() {
+                            start.push('…');
+                        }
+                        json!({"agent":call["bot"],"turn":call["turn"],"tool":call["name"],
+                            "arguments":start,
+                            "waiting_on":(call["gates"].as_array().into_iter().flatten())
+                                .map(|gate| gate["tag"].clone()).collect::<Vec<_>>()})
+                    })
+                    .collect();
+                json!({"approvals":calls,"next_after":page["next_after"]})
+            }
+            Agents::Pause { reason } => request(json!({"op":"pause","reason":reason})).await?,
+        };
+        Ok(Outcome::text(answer.to_string()))
+    }
+
+    /// This bot's project's agents, as a name pattern: those named as it
+    /// is up to the first dot, or every agent for a name with none.
+    fn project_agents(&self) -> Option<String> {
+        let (project, _) = self.bot.split_once('.')?;
+        Some(format!("{project}.*"))
+    }
+
     async fn history_audit(
         &self,
         call_id: &str,
@@ -6367,6 +6516,7 @@ impl Lifts {
             }
             Ok(
                 Prepared::Wait { .. }
+                | Prepared::Agents(_)
                 | Prepared::History { .. }
                 | Prepared::HistoryAudit(_)
                 | Prepared::HistorySearch { .. }

@@ -846,13 +846,22 @@ holds, every window says above the footer who paused and why, and whose
 running turns it parked (the first three, and how many more), so the one doing
 harm can be stopped first: in that agent's window the line adds `Esc ends this
 one`, and Esc ends its parked turn before `/resume`. Agents pull the
-same cord from their shell with `"$AGENT_BIN" pause --reason WHY`, and get no
-tool for it: `task.md` and `lead.md` say to, when they see agents doing harm
+same cord with the daemon's `pause_agents` tool, as themselves: `task.md` and `lead.md` say to, when they see agents doing harm
 someone needs to look at, and that resuming is the person's call.
 `/sky` shows a pull from whoever pulled it (the `pause`'s `by`, the person
 when none) and a resume from whoever resumed (the `resumed` notice's `by`),
 from the notices every session hears, and a pause already holding from
 `ready`; a replay has none, since the notices are not events.
+
+![A lead pulling the cord with the pause_agents tool, its reason under the row, and the banner every window shows](sonny/agent-tools-pause.png)
+
+Agents message, list and pause each other with the daemon's own tools,
+`send_message`, `list_agents` and `pause_agents`, which every agent has by
+default; Sonny draws them as it drew the `agent` commands they replace:
+`Steered`, `Queued for` or `Started a turn for` with the message under it,
+the agents listed with each one's status, the calls awaiting approval.
+
+![The steps view: messages sent with send_message folded into one row, list_agents with each agent's status, and a check of approvals](sonny/agent-tools-verbose.png)
 
 ## Updating
 

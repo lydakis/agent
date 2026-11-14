@@ -622,6 +622,9 @@ mod tests {
                     "apply_patch",
                     "wait",
                     "history",
+                    "send_message",
+                    "list_agents",
+                    "pause_agents",
                     "web_fetch"
                 ]),
                 &json!("keep")
