@@ -935,6 +935,8 @@ struct BlockStream {
     held: String,
     /// Inside a secret block's body.
     body: Option<PemBody>,
+    /// How far the held key's escaped line was read.
+    scan: LineScan,
 }
 
 /// The most of a block's header held back for its end: far past any
@@ -950,6 +952,7 @@ impl BlockStream {
         const BEGIN: &str = "-----BEGIN ";
         let mut out = String::with_capacity(text.len());
         let mut text = std::mem::take(&mut self.held) + text;
+        let mut scan = std::mem::take(&mut self.scan);
         // Read on from `at`: nothing before it is moved again.
         let mut at = 0;
         loop {
@@ -959,6 +962,7 @@ impl BlockStream {
                 if !line.is_empty() {
                     text = line + &text[at..];
                     at = 0;
+                    scan = LineScan::default();
                 }
                 if body.searching {
                     let rest = &text[at..];
@@ -1039,9 +1043,10 @@ impl BlockStream {
                     self.held = text[at..].to_owned();
                     return out;
                 }
-                match pem_escaped(&text, at, last) {
+                match pem_escaped(&text, at, last, &mut scan) {
                     Escaped::More => {
                         self.held = text[at..].to_owned();
+                        self.scan = scan.from(at);
                         return out;
                     }
                     Escaped::Key {
@@ -1492,14 +1497,18 @@ fn redact_blocks(text: String, blocks: &[String]) -> String {
     const BEGIN: &str = "-----BEGIN ";
     let mut out = String::with_capacity(text.len());
     let mut rest = text.as_str();
+    let mut scan = LineScan::default();
     while let Some(begin) = rest.find(BEGIN) {
         let Some(header) = pem_header(rest, begin, true) else {
+            // Read in the whole text, so its line's scan is kept.
+            let base = text.len() - rest.len();
             if let Escaped::Key {
                 escape,
                 header,
                 end,
-            } = pem_escaped(rest, begin, true)
+            } = pem_escaped(&text, base + begin, true, &mut scan)
             {
+                let (escape, header, end) = (escape - base, header - base, end - base);
                 out.push_str(&rest[..header]);
                 let named = blocks
                     .iter()
@@ -1658,7 +1667,7 @@ enum Escaped {
 /// that is not escaped), then its END marker, all on the line. A header
 /// with no END after it on its line, or a string's end between, is a
 /// pattern or a quote, not a key.
-fn pem_escaped(text: &str, begin: usize, last: bool) -> Escaped {
+fn pem_escaped(text: &str, begin: usize, last: bool, scan: &mut LineScan) -> Escaped {
     const BEGIN: &str = "-----BEGIN ";
     const END: &str = "-----END ";
     let more = match last {
@@ -1706,59 +1715,131 @@ fn pem_escaped(text: &str, begin: usize, last: bool) -> Escaped {
         _ => return Escaped::No,
     };
     let header = dashes + escaped;
-    let bytes = text.as_bytes();
     // Its line, read to at most a line's worth with room for an END that
-    // starts at its end: a line's end is code, not a key.
-    let region = &text[header..text.floor_char_boundary(header + PEM_LINE + END.len())];
-    let mut line = region;
-    if let Some(n) = line.find('\n') {
-        line = &line[..n];
-    }
-    if let Some(n) = line.find('\r') {
-        line = &line[..n];
-    }
-    let ended = line.len() < region.len() || text.len() >= header + PEM_LINE + END.len();
-    let end = match find_marker(line, END) {
-        Some(0) => find_marker(&line[1..], END).map(|n| n + 1),
+    // starts at its end, up to the first thing that ends it: its END, a
+    // line's end (code, not a key), a quote after an even run of
+    // backslashes (the string's end, so what follows is code), or another
+    // block's BEGIN at an escaped line's start. One inside a line, such as
+    // an armored key's `Comment:`, is that line's text.
+    let limit = text.floor_char_boundary(header + PEM_LINE + END.len());
+    let bytes = text.as_bytes();
+    // A search goes on a marker's length before where the last stopped,
+    // at a char's start.
+    let floor = |a: usize| text.floor_char_boundary(a);
+    let find_end = |a: usize, b: usize| find_marker(&text[floor(a)..b], END).map(|n| floor(a) + n);
+    let end = match scan.end.get(header, limit, END.len() - 1, find_end) {
+        Some(end) if end == header => scan.end.get(header + 1, limit, END.len() - 1, find_end),
         end => end,
     };
-    if end.is_some_and(|n| n > PEM_LINE) {
-        return Escaped::No;
-    }
-    let upto = end.unwrap_or(line.len());
-    // A quote after an even run of backslashes ends the string, so what
-    // follows is code, not the key.
-    let quoted = line[..upto].match_indices('"').any(|(q, _)| {
-        let run = line.as_bytes()[..q]
-            .iter()
-            .rev()
-            .take_while(|&&b| b == b'\\');
-        run.count() % 2 == 0
+    // Only what comes before its END is looked for.
+    let to = end.unwrap_or(limit);
+    let newline = scan
+        .newline
+        .get(header, to, 0, |a, b| text[a..b].find('\n').map(|n| a + n));
+    let carriage = scan
+        .carriage
+        .get(header, to, 0, |a, b| text[a..b].find('\r').map(|n| a + n));
+    let quote = scan.quote.get(header, to, 0, |a, b| {
+        text[a..b]
+            .match_indices('"')
+            .map(|(q, _)| a + q)
+            .find(|&q| {
+                let run = bytes[..q].iter().rev().take_while(|&&b| b == b'\\');
+                run.count() % 2 == 0
+            })
     });
-    // Another block's BEGIN at an escaped line's start ends this one; one
-    // inside a line, such as an armored key's `Comment:`, is that line's
-    // text.
-    let mut begins = false;
-    let mut at = 0;
-    while let Some(p) = find_marker(&line[at..], BEGIN).map(|n| at + n) {
-        if p >= upto {
-            break;
+    let begins = scan.begin.get(header, to, BEGIN.len() - 1, |a, b| {
+        let mut at = floor(a);
+        while let Some(p) = find_marker(&text[at..b], BEGIN).map(|n| at + n) {
+            if matches!(bytes[p - 1], b'n' | b'r') && bytes[p - 2] == b'\\' {
+                return Some(p);
+            }
+            at = p + 1;
         }
-        if matches!(bytes[header + p - 1], b'n' | b'r') && bytes[header + p - 2] == b'\\' {
-            begins = true;
-            break;
-        }
-        at = p + 1;
-    }
+        None
+    });
+    let stopped = [newline, carriage, quote, begins]
+        .iter()
+        .any(Option::is_some);
     match end {
-        _ if quoted || begins => Escaped::No,
+        _ if stopped => Escaped::No,
+        Some(end) if end - header > PEM_LINE => Escaped::No,
         Some(end) => Escaped::Key {
             escape: dashes,
             header,
-            end: header + end,
+            end,
         },
-        None if ended => Escaped::No,
+        None if text.len() >= header + PEM_LINE + END.len() => Escaped::No,
         None => more,
+    }
+}
+
+/// Where the next of each thing that ends an escaped key's line is, as far
+/// as it was looked for: kept from one header to the next of a text, and
+/// while a stream holds a key's line, so however many headers a line holds
+/// it is read once.
+#[derive(Default)]
+struct LineScan {
+    end: Next,
+    begin: Next,
+    quote: Next,
+    newline: Next,
+    carriage: Next,
+}
+
+impl LineScan {
+    /// The same, for the text from `at` on.
+    fn from(self, at: usize) -> Self {
+        // One found before `at`, for an earlier header, is looked for again.
+        let next = |next: Next| match next.found {
+            Some(found) if found < at => Next::default(),
+            found => Next {
+                from: next.from.saturating_sub(at),
+                upto: next.upto.saturating_sub(at),
+                found: found.map(|found| found - at),
+            },
+        };
+        Self {
+            end: next(self.end),
+            begin: next(self.begin),
+            quote: next(self.quote),
+            newline: next(self.newline),
+            carriage: next(self.carriage),
+        }
+    }
+}
+
+/// The first of something at or after `from`, as far as `upto`.
+#[derive(Default, Clone, Copy)]
+struct Next {
+    from: usize,
+    upto: usize,
+    found: Option<usize>,
+}
+
+impl Next {
+    /// The first at or after `at` and before `limit`: `find` looks between
+    /// two places, and a search goes on from where the last stopped, less
+    /// `back` for a marker cut there.
+    fn get(
+        &mut self,
+        at: usize,
+        limit: usize,
+        back: usize,
+        find: impl Fn(usize, usize) -> Option<usize>,
+    ) -> Option<usize> {
+        let known = self.from <= at && self.found.is_none_or(|found| found >= at);
+        if !known {
+            *self = Next {
+                from: at,
+                upto: limit,
+                found: find(at, limit),
+            };
+        } else if self.found.is_none() && self.upto < limit {
+            self.found = find(self.upto.saturating_sub(back).max(at), limit);
+            self.upto = limit;
+        }
+        self.found.filter(|&found| found < limit)
     }
 }
 
@@ -5764,6 +5845,34 @@ mod tests {
         out.push_str(&redacting.finish());
         assert_eq!(out, whole);
         assert_eq!(whole, headers);
+        assert!(began.elapsed() < std::time::Duration::from_secs(5));
+        // Many escaped headers on one line read it once, whole or in
+        // pieces, whatever is between them.
+        let began = std::time::Instant::now();
+        for between in ["", " x ", "MIIE"] {
+            let header = format!("-----BEGIN PRIVATE KEY-----\\n{between}");
+            let ended = format!("\"{}-----END PRIVATE KEY-----\"", header.repeat(20_000));
+            assert!(!redact(&ended).contains(" x -----END"));
+            for line in [
+                format!("\"{}\"\n", header.repeat(20_000)),
+                header.repeat(20_000),
+                ended,
+            ] {
+                let whole = redact(&line);
+                if !line.contains("-----END") {
+                    assert_eq!(whole, line);
+                }
+                for size in [512, 8192] {
+                    let mut redacting = Redacting::new(credentials.clone());
+                    let mut out = String::new();
+                    for piece in line.as_bytes().chunks(size) {
+                        out.push_str(&redacting.feed(piece));
+                    }
+                    out.push_str(&redacting.finish());
+                    assert_eq!(out, whole);
+                }
+            }
+        }
         assert!(began.elapsed() < std::time::Duration::from_secs(5));
         // An escaped header with no END on its line, or code between it
         // and one, is a pattern: kept.
