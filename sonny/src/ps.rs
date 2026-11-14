@@ -200,7 +200,10 @@ impl View {
     }
 
     /// The row at `at` picked, as a click picks it.
+    /// A click picks a row, and takes back a stop that was asked: only
+    /// Enter stops.
     pub fn pick_at(&mut self, at: usize) {
+        self.stopping = None;
         if at < self.rows.len() {
             self.pick = Some(at);
         }
@@ -378,7 +381,7 @@ mod tests {
     }
 
     #[test]
-    fn it_lists_the_projects_commands_and_stops_one_on_a_second_x() {
+    fn it_lists_the_projects_commands_and_stops_one_on_enter_only() {
         let mut view = View::new(scope());
         assert_eq!(view.query(), json!({"bot": "shop.*"}));
         assert!(view.due());
@@ -417,6 +420,14 @@ mod tests {
             Key::Stay,
             "esc cancels, not closes"
         );
+        // A click on a row takes the stop back: the Enter it brings opens.
+        assert_eq!(press(&mut view, KeyCode::Char('x')), Key::Stay);
+        view.pick_at(0);
+        assert_eq!(
+            press(&mut view, KeyCode::Enter),
+            Key::Open("shop.lead".into())
+        );
+        press(&mut view, KeyCode::Down);
         assert_eq!(press(&mut view, KeyCode::Char('x')), Key::Stay);
         assert_eq!(
             press(&mut view, KeyCode::Enter),

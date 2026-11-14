@@ -751,9 +751,10 @@ impl View {
 
     /// The item at `at` picked, as a click picks it.
     pub fn pick_at(&mut self, at: usize) {
+        // Any click takes back a removal that was asked: only Enter removes.
+        self.confirm = None;
         if at < self.items.len() {
             self.selected = at;
-            self.confirm = None;
         }
     }
 
