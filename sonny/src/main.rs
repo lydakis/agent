@@ -2605,8 +2605,7 @@ async fn run() -> Result<(), String> {
     // Sonny opens on its defaults, said, rather than not at all.
     app.warnings.extend(unread);
     app.sounds.chime = settings.chime;
-    app.verbose = settings.verbose;
-    app.words_only = !settings.steps;
+    app.set_view(settings.view);
     app.colors = settings.project_colors;
     app.pinned = settings.project_color.clone();
     set_measure(settings.text_width);
@@ -4565,8 +4564,10 @@ struct App {
     /// the calls that move the work on.
     verbose: bool,
     /// Only what the person said and the agent's words, its questions and
-    /// what failed: none of the steps between (`[sonny] steps`, off).
+    /// what failed: none of the steps between (`[sonny] view = "words"`).
     words_only: bool,
+    /// `[sonny] view` as last read: `/verbose` goes back to it.
+    view: agent_client::config::View,
     /// The newest plan the words-only view was told, for the margin.
     plan_told: Option<u64>,
     /// The focus the agent is in zen on: only the person's turns and the
@@ -6300,6 +6301,7 @@ impl App {
             woken: Arc::new(tokio::sync::Notify::new()),
             verbose: false,
             words_only: false,
+            view: agent_client::config::View::Words,
             plan_told: None,
             zen: None,
             elsewhere: false,
@@ -6934,6 +6936,15 @@ impl App {
                 "telling the agent what Sonny opened without: {error}"
             ));
         }
+    }
+
+    /// The window shows `view`, as `[sonny] view` sets it.
+    fn set_view(&mut self, view: agent_client::config::View) {
+        use agent_client::config::View;
+        self.view = view;
+        self.verbose = view == View::Verbose;
+        // Verbose left with `/verbose` shows the steps.
+        self.words_only = view == View::Words;
     }
 
     /// A lead takes its folder's instructions at each idle point: composed
@@ -13977,9 +13988,8 @@ impl App {
             self.agent_opens = settings.agent_opens;
             margin::set_limits(settings.margin_notes, settings.margin_note_lines);
             self.set_template_settings(&settings);
-            if self.verbose != settings.verbose || self.words_only == settings.steps {
-                self.verbose = settings.verbose;
-                self.words_only = !settings.steps;
+            if self.view != settings.view {
+                self.set_view(settings.view);
                 self.repaint = true;
             }
             // A new default for project colors, or a new pin, takes now.
@@ -14724,24 +14734,21 @@ impl App {
             });
             return;
         }
+        // Every tool call in this window, or back to the view `/config`
+        // sets: nothing is written.
         if prompt == "/verbose" {
             self.input.clear();
-            let mut settings = settings::Settings::load();
-            settings.verbose = !self.verbose;
-            self.notice = Some(match settings.save() {
-                Ok(()) => {
-                    self.verbose = settings.verbose;
-                    // What is already drawn is drawn again in the new view.
-                    self.repaint = true;
-                    match (self.verbose, self.words_only) {
-                        (true, _) => "verbose: every tool call",
-                        (false, true) => "words only: what you said and what came back",
-                        (false, false) => "steps: replies, tasks, questions and the plan",
-                    }
-                    .to_owned()
+            self.verbose = !self.verbose;
+            // What is already drawn is drawn again in the new view.
+            self.repaint = true;
+            self.notice = Some(
+                match (self.verbose, self.words_only) {
+                    (true, _) => "verbose: every tool call, until /verbose again",
+                    (false, true) => "words: what you said and what came back",
+                    (false, false) => "steps: replies, tasks, questions and the plan",
                 }
-                Err(error) => error,
-            });
+                .to_owned(),
+            );
             return;
         }
         if prompt == "/quit" {
@@ -17355,7 +17362,10 @@ impl App {
             }
             if let Some(view) = &self.config {
                 // Every setting where there is room, over the rows above.
-                let rows = view.rows(composer.y.saturating_sub(frame.area().y) as usize);
+                let rows = view.rows(
+                    composer.width as usize,
+                    composer.y.saturating_sub(frame.area().y) as usize,
+                );
                 let area = ratatui::layout::Rect {
                     y: composer.y.saturating_sub(rows.len() as u16),
                     height: rows.len() as u16,

@@ -12,8 +12,10 @@ each setting is; what to set is the person's call.
 ## Where they live
 
 - `~/.agent/config.toml`: the settings below, for every project. `/config`
-  in Sonny lists and changes them; a key set back to its default has its
-  line taken out. Edit it by hand too: the person's comments and order
+  in Sonny lists and changes those a person changes, under its groups by
+  the plain names the table's last column gives; those that only tune are
+  set in the file alone. A key set back to its default has its line taken
+  out. Edit it by hand too: the person's comments and order
   stay. A setting is read when its time comes (a new agent, a new turn);
   one marked "read when it starts" waits for the daemon or Sonny to start
   again (`sonny agent shutdown` stops the daemon; Sonny starts it).

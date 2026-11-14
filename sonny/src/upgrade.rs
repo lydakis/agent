@@ -282,6 +282,12 @@ pub const MIGRATIONS: &[Migration] = &[
         id: "sent-stamp",
         retire: "0.12.0",
     },
+    // `[sonny] steps` and `verbose`, two switches, become one `view`
+    // (0.10.0).
+    Migration {
+        id: crate::config::VIEW_ONE,
+        retire: "0.12.0",
+    },
 ];
 
 /// `run` once for each `record`: a file of the ids done, a line each,

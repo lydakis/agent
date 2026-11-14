@@ -330,7 +330,7 @@ at its model's own effort (`AGENT_EFFORT` when its model is
 | The reviewer's model, for agents in Auto ([REVIEWER.md](REVIEWER.md)) | `[reviewer] model`, `effort` | |
 | How long a call in Auto waits for the reviewer's verdict before it goes to you | `[reviewer] timeout_ms` (90000 by default, as Codex's; 0 for as long as it takes) | |
 | What `/side`'s copy may do | `[sonny] side_chat` (`fork`, the default, or `answer`) | |
-| The chime, the agent's steps, and every tool call drawn | `[sonny] chime`, `steps`, `verbose` (true or false) | |
+| The chime, and what the conversation shows | `[sonny] chime` (true or false), `view` (`words`, the default, `steps` or `verbose`) | |
 | The widest the conversation is written | `[sonny] text_width` (100 by default, at least 40, 0 for the window's whole width) | |
 | A guess at your next message | `[sonny] suggest` (true, the default, or false) | |
 | An idea or a tip where no guess is obvious | `[sonny] suggest_ideas` (true, the default, or false) | |
@@ -797,14 +797,21 @@ has something on it, or is off the screen, no time shows.
   agents, in `/status`, or to the lookout.
 
   ![A side chat forked with every tool writes a file beside the lead](../docs/sonny/side-fork.png)
-- `/config` lists every key `~/.agent/config.toml` takes,
-  with its value or what its default is, over the composer. ↑/↓ picks
-  one; ←/→ steps a key with a few values (efforts, `web_search`,
-  `trailer`, `side_chat`, `chime`, `steps`, `verbose`, `margin_opens`, `agent_opens`, `suggest`,
-  `start_at_boot`) through them
-  and its default; Enter types one that takes a name (`model`, `provider`,
-  `reviewer.model`, the profiles), empty for its default; ⌫
-  takes a key back to its default. Each change is written at once, the
+- `/config` is a list over the composer like any other: at most eight
+  rows, the settings a person changes under seven groups (Models, Agents,
+  View, Margin, Tabs, Commons and sky, This machine), each by a plain
+  name with its value and a one-line label. A value set in the file is in
+  ink and a default muted. Typing narrows it to the settings it finds, by
+  name or label, best first. ↑/↓ picks one; ←/→ steps a setting with a
+  few values (efforts, the view, switches) through them and its default;
+  Enter types one that takes a name or a number (`model`, `provider`,
+  the profiles, `text width`), empty for its default; ⌫ with nothing typed,
+  or Delete, takes a setting back to its default. The file keeps its
+  table names, and the settings that only tune (the sky haiku's
+  `sky_haiku_daily`, `sky_haiku_keep`, `sky_haiku_window`,
+  `sky_haiku_margin` and `sky_haiku_hold`, `commons_invite_tokens`,
+  `tool_processes` and `lookout_waiting`) stay in the file, listed in the
+  `sonny-config` skill. Each change is written at once, the
   file's comments and order kept, and a file that does not read is
   refused by name, as every reader refuses it. What the file gives an
   agent when it is made, `trailer` and `hold`, every agent Sonny made
@@ -812,15 +819,14 @@ has something on it, or is off the screen, no time shows.
   ends. `[fallbacks]`, like `[speeds]` and `[context_windows]`, is the
   daemon's: every agent takes it once the daemon starts again.
 
-  ![/config over the composer, side_chat set to fork](../docs/sonny/config.png)
+  ![/config: the Models group under its bold name, a model set in ink and the defaults muted](../docs/sonny/config-groups.png)
 
-  `trailer` is what an agent's model reads in the daemon's line after
+  `trailer` (senders, in `/config`) is what an agent's model reads in the daemon's line after
   each message: `sender, time` by default for Sonny's agents (`[Message
   site.lead/2. Sent Fri 13 Nov 2026 23:21, UTC-05:00.]`), `sender`,
   `time` or `none`. Sonny draws the words without the line.
 
-  ![/config with trailer picked: sender, time, Sonny's default](../docs/sonny/config-trailer.png)
-  ![/config after one step: trailer = ["sender"] saved](../docs/sonny/config-trailer-sender.png)
+  ![/config narrowed by typing view: → steps the view to verbose, saved](../docs/sonny/config-view.png)
 - `/model` picks the lead's model, from every model its provider family
   lists, each by its name and provider (`Opus 5.5 · bedrock`) with its id
   muted after them, found by either, its effort and its speed, and writes
@@ -1556,11 +1562,12 @@ turn of the task numbered after that one reopens it.
 Settings Sonny keeps for every folder are in `~/.agent/config.toml`'s
 `[sonny]`, which `/config` shows: the chime (`chime`, off by default;
 `chime = true` turns it on) and
-the view (`steps` and `verbose`, both off by default), besides the efforts and the side chat
-above. `/config` lists the keys under their table's name, a value set in
-the file plain and a default muted, so what you changed stands out.
-
-![/config: keys under agent, [reviewer] and [sonny], set values plain and defaults muted](../docs/sonny/config-reviewer.png)
+the view (`view`: `words` by default, `steps`, or `verbose` for every
+tool call), besides the efforts and the side chat above. `/config` lists
+them under their groups, a value set in the file in ink and a default
+muted, so what you changed stands out. A config that sets the old
+`steps` or `verbose` switches is rewritten once to the one `view` they
+showed.
 
 ## Skills and background services
 
@@ -1670,7 +1677,7 @@ them is drawn: no calls, no news from tasks, no messages between agents,
 no notes put in the margin, no `Worked for …` line. The plan shows in the
 margin. A message you send while the agent works waits with a mark by its
 arrow, no words: `›↪` a steer, which goes in when the call under way ends,
-and `›⋯` a queued message, for after the turn. `[sonny] steps = true`
+and `›⋯` a queued message, for after the turn. `[sonny] view = "steps"`
 brings back the steps, the view below, and `/verbose` draws every call.
 
 ![Words only: a lead asked to check the work, its words as two tasks report in, and nothing between](../docs/sonny/words-only.png)
@@ -1683,8 +1690,8 @@ waited for, a question to you, the plan, memory, an automation, a window
 opened). Commands, reads and edits are left out: agents are people you
 talk to, and the clean view shows what they say and what reaches you, not
 the work inside their turn. `/verbose` draws every
-call, the conversation so far included, and is kept with the other
-settings; `/verbose` again goes back to clean.
+call, the conversation so far included, in this window only; `/verbose`
+again goes back to the view `/config` sets.
 
 Some rows are buttons. A call that starts, messages, waits for or
 changes agents is one row that says what it did and to whom, never what
