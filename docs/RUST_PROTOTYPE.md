@@ -489,7 +489,9 @@ duplicate, status, cursor, handle}`, with `turn` only when the message
 opened one. `messages` (protocol) lists a bot's messages as views,
 each with `message`, `turn` (null until taken), `delivery`, `node`,
 `sent_ms`, `taken_ms`, its sender, its effective effort and folder and a
-prompt preview, paged as `turns` is; `turns` lists runs only, so steers and
+prompt preview, paged as `turns` is, and with `waiting` only those still in
+line, `queued` or `ready` (protocol 74), which a window that opens on a busy
+bot reads to show what waits there; `turns` lists runs only, so steers and
 attached messages never hide what a bot did. `wait` on a message's handle
 resolves when it is taken, withdrawn or failed, or for a turn's opener when
 the turn ends; `interrupt` names a message (`turn` keeps its field name)

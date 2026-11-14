@@ -630,7 +630,7 @@ fn lifted(
 /// Whether a turn's prompt, as `accepted` or `steered` tells it, is the
 /// person's: no agent sent it, nor a client from outside, nor another
 /// person.
-fn from_person(data: &Value) -> bool {
+pub fn from_person(data: &Value) -> bool {
     data["from"]["bot"].is_null()
         && data["origin"].as_str().is_none_or(str::is_empty)
         && data["person"].is_null()

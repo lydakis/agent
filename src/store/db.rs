@@ -14192,7 +14192,10 @@ impl Database {
     /// A page of a bot's messages between `after` and `before`, as `turns`
     /// pages its runs: each as sent, with where it stands (in line, taken
     /// in by `turn`, withdrawn or failed), its words previewed, when it was
-    /// sent and taken in, and the effort it ran at or asked for.
+    /// sent and taken in, and the effort it ran at or asked for. With
+    /// `waiting`, only those still in line (`queued` or `ready`), read
+    /// through the line's own indexes rather than every message the bot
+    /// was sent.
     pub fn messages(
         &self,
         name: &str,
@@ -14200,6 +14203,7 @@ impl Database {
         before: Option<i64>,
         limit: usize,
         newest: bool,
+        waiting: bool,
     ) -> Result<Value> {
         self.inspect(name)?;
         if after < 0 || before.is_some_and(|b| b < 1) || !(1..=256).contains(&limit) {
@@ -14209,6 +14213,13 @@ impl Database {
             );
         }
         let order = if newest { "DESC" } else { "ASC" };
+        let line = match waiting {
+            true => {
+                "AND m.id IN (SELECT id FROM messages WHERE bot=?1 AND status='queued'
+                    UNION ALL SELECT id FROM messages WHERE bot=?1 AND status='ready')"
+            }
+            false => "",
+        };
         let mut statement = self.conn.prepare_cached(&format!(
             "SELECT {TURN_VIEW},{PREVIEW},m.delivery,m.node,m.sent_ms,m.taken_ms,
                     m.from_bot,m.from_turn,m.origin,m.person,
@@ -14217,7 +14228,7 @@ impl Database {
                             ELSE r.bot_reasoning END) END,
                     COALESCE(r.workspace,m.workspace)
              FROM {MESSAGE_FROM} LEFT JOIN turns r ON r.id=m.turn {PREVIEW_NODE}
-             WHERE m.bot=?1 AND m.id>?2 AND m.id<?3 ORDER BY m.id {order} LIMIT ?4"
+             WHERE m.bot=?1 AND m.id>?2 AND m.id<?3 {line} ORDER BY m.id {order} LIMIT ?4"
         ))?;
         let before = before.unwrap_or(i64::MAX);
         let mut rows = statement.query(params![name, after, before, (limit + 1) as i64])?;

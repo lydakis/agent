@@ -199,6 +199,9 @@ fn tick_draws(moving: bool, lively: bool, drawn: Option<Duration>) -> bool {
 }
 /// How much history is shown on attach.
 const HISTORY_ITEMS: u64 = 200;
+/// The most of a waiting message's words read to stage it: all the
+/// daemon gives one `prompts` read, past what a staged row shows unfolded.
+const PROMPT_READ_BYTES: usize = 256 * 1024;
 /// How much older history is drawn at a time as the view nears its top:
 /// a page drawn while the wheel turns, so small enough not to stall it.
 const OLDER_ITEMS: u64 = 50;
@@ -6231,6 +6234,8 @@ impl App {
         self.margin = margin::Margin::load(self.reactions_key.as_deref());
         self.picked = reactions::Picked::load(self.reactions_key.as_deref());
         self.history().await;
+        // What was sent and still waits, wherever it was sent from.
+        self.restage().await;
         // A turn already running: its clock, and any call it waits on.
         if let Some(turn) = self.running.as_ref().map(|r| r.turn) {
             if let Ok(page) = self
@@ -7394,7 +7399,7 @@ impl App {
             self.compacted = caught.compacted.clone().or(self.compacted.take());
             self.history_after(self.seen_node.max(self.options.side.unwrap_or(0)))
                 .await;
-            self.unstage_landed().await;
+            self.restage().await;
             let now = record["running_turn"].as_i64();
             // A turn that ended while away ends here as its event would have.
             if let Some(turn) = self.running.as_ref().map(|r| r.turn)
@@ -9937,37 +9942,91 @@ impl App {
         unpaired
     }
 
-    /// Drop the staged prompts that landed while Sonny was away, whose
-    /// `accepted` or `steered` it missed: those no longer waiting in line.
-    async fn unstage_landed(&mut self) {
-        let ids = self.staged.iter().map(|(message, _)| *message);
-        let (Some(first), Some(last)) = (ids.clone().min(), ids.max()) else {
-            return;
-        };
-        // Every message from the first staged to the last, a page at a
-        // time: other clients may have sent many between them.
-        let mut waiting: Vec<i64> = Vec::new();
-        let mut after = first - 1;
+    /// What waits in the bot's line, staged as this window's own sends
+    /// are, each marked with what it waits for: the person's words not
+    /// yet taken in, whichever window or client sent them, and whatever
+    /// this window staged that still waits. A window knows only the sends
+    /// it saw, so one opened again (Sonny restarted, `/switch` there and
+    /// back) or reconnected reads the line; a staged prompt that landed
+    /// meanwhile goes. Unread, the staged stay as they are.
+    async fn restage(&mut self) {
+        let mut waiting: Vec<Value> = Vec::new();
+        let mut after = 0;
         loop {
-            let asked = json!({"bot": self.bot, "after": after, "before": last + 1, "limit": 256});
+            let asked = json!({"bot": self.bot, "after": after, "limit": 256, "waiting": true});
             let Ok(page) = self.client.request("messages", asked).await else {
-                // Unread, they stay as they are.
                 return;
             };
-            waiting.extend(
-                page["messages"]
-                    .as_array()
-                    .into_iter()
-                    .flatten()
-                    .filter(|row| matches!(row["status"].as_str(), Some("queued" | "ready")))
-                    .filter_map(|row| row["message"].as_i64()),
-            );
+            waiting.extend(page["messages"].as_array().into_iter().flatten().cloned());
             match page["next_after"].as_i64() {
                 Some(next) => after = next,
                 None => break,
             }
         }
-        self.staged.retain(|(turn, _)| waiting.contains(turn));
+        let mut staged = Vec::new();
+        for row in &waiting {
+            let Some(message) = row["message"].as_i64() else {
+                continue;
+            };
+            let kept = self.staged.iter().find(|(sent, _)| *sent == message);
+            let prompt = match kept {
+                Some((_, prompt)) => prompt.clone(),
+                None if needs::from_person(row) => match self.prompt_of(message).await {
+                    Some(prompt) => prompt,
+                    None => continue,
+                },
+                None => continue,
+            };
+            staged.push((message, prompt));
+            self.waits_as(message, row["delivery"].as_str());
+        }
+        self.staged = staged;
+        let staged = &self.staged;
+        let waiting = |sent: &i64| staged.iter().any(|(turn, _)| turn == sent);
+        self.queued.retain(waiting);
+        self.steering.retain(waiting);
+    }
+
+    /// The person's words in line that another window or client sent,
+    /// staged here as they are there, from the `queued` event that says
+    /// they wait: this window's own were staged as it sent them.
+    async fn stage_sent_elsewhere(&mut self, event: &Value) {
+        let data = &event["data"];
+        let Some(message) = event["message"].as_i64() else {
+            return;
+        };
+        if data["lapsed"] == true
+            || !needs::from_person(data)
+            || self.staged.iter().any(|(sent, _)| *sent == message)
+        {
+            return;
+        }
+        if let Some(prompt) = self.prompt_of(message).await {
+            self.staged.push((message, prompt));
+            self.waits_as(message, data["delivery"].as_str());
+        }
+    }
+
+    /// A staged message marked with what it waits for, by how it was
+    /// sent: a queued one the turn's end, a steer the call under way.
+    fn waits_as(&mut self, message: i64, delivery: Option<&str>) {
+        let marks = match delivery {
+            Some("queue") => &mut self.queued,
+            Some("steer") => &mut self.steering,
+            _ => return,
+        };
+        if !marks.contains(&message) {
+            marks.push(message);
+        }
+    }
+
+    /// A message's words as the person wrote them, read whole from the
+    /// store: what its staged row shows.
+    async fn prompt_of(&self, message: i64) -> Option<String> {
+        let asked = json!({"bot": self.bot, "turn": message, "bytes": PROMPT_READ_BYTES});
+        let read = self.client.request("prompts", asked).await.ok()?;
+        let text = read["prompts"][0]["text"].as_str()?;
+        Some(stamp::unstamped(text).to_owned())
     }
 
     /// The folder the agent works in, where its pictures' paths start:
@@ -10249,6 +10308,12 @@ impl App {
         let drawn = data["node"]
             .as_i64()
             .is_some_and(|node| node <= self.seen_node);
+        // A message taken in is out of line, its node drawn or not: one
+        // staged from a `queued` event heard after history drew it too.
+        if kind == "steered" {
+            self.staged
+                .retain(|(staged, _)| Some(*staged) != data["message"].as_i64());
+        }
         if drawn && matches!(kind, "steered" | "message" | "tool_completed") {
             return;
         }
@@ -10267,6 +10332,9 @@ impl App {
                 "tool_started" | "text_delta" | "message" => running.acted = true,
                 _ => {}
             }
+        }
+        if kind == "queued" {
+            self.stage_sent_elsewhere(&event).await;
         }
         match kind {
             // Changed by this or another client: the footer and the
@@ -10370,8 +10438,6 @@ impl App {
                 }
             }
             "steered" => {
-                self.staged
-                    .retain(|(staged, _)| Some(*staged) != data["message"].as_i64());
                 // A reaction was drawn when it was sent.
                 if let Some(node) = data["node"].as_i64()
                     && let Some(item) = self.items(&[node]).await.first()
@@ -21824,21 +21890,20 @@ mod tests {
 
     #[tokio::test]
     async fn on_reconnecting_only_prompts_still_waiting_stay_staged() {
-        // Two pages, from the first staged turn on.
-        let client =
-            daemon_answering(
-                |asked| match (asked["op"].as_str(), asked["after"].as_i64()) {
-                    (Some("messages"), Some(4)) => json!({"messages": [
-                {"message": 5, "status": "taken"},
-                {"message": 6, "status": "running"},
-            ], "next_after": 6}),
-                    (Some("messages"), Some(6)) => json!({"messages": [
-                {"message": 7, "status": "queued"},
-            ], "next_after": null}),
-                    _ => json!({}),
-                },
-            )
-            .await;
+        // Two pages of what waits in line, nothing else.
+        let client = daemon_answering(|asked| {
+            assert_eq!(asked["waiting"], true);
+            match (asked["op"].as_str(), asked["after"].as_i64()) {
+                (Some("messages"), Some(0)) => json!({"messages": [
+                    {"message": 7, "status": "queued", "delivery": "queue"},
+                ], "next_after": 7}),
+                (Some("messages"), Some(7)) => json!({"messages": [
+                    {"message": 9, "status": "queued", "delivery": "steer", "origin": "lookout"},
+                ], "next_after": null}),
+                _ => json!({}),
+            }
+        })
+        .await;
         let mut app = app(client);
         app.staged = vec![
             (5, "a".into()),
@@ -21846,8 +21911,107 @@ mod tests {
             (7, "c".into()),
             (8, "d".into()),
         ];
-        app.unstage_landed().await;
+        app.queued = vec![7, 8];
+        app.restage().await;
+        // Its words as this window kept them; a note the lookout sent is
+        // not the person's, so it is not staged.
         assert_eq!(app.staged, [(7, "c".to_owned())]);
+        assert_eq!(app.queued, [7]);
+    }
+
+    #[tokio::test]
+    async fn a_window_opened_again_shows_the_steer_still_waiting() {
+        // Sent from a window since closed: the turn has not taken it in.
+        let said = stamp::stamped("also check the deploy notes", 1_700_000_000);
+        let client = daemon_answering(move |asked| match asked["op"].as_str() {
+            Some("messages") => json!({"messages": [
+                {"message": 4, "status": "queued", "delivery": "steer"},
+                {"message": 5, "status": "queued", "delivery": "steer", "from": {"bot": "b.task", "turn": 2}},
+                {"message": 6, "status": "queued", "delivery": "queue"},
+            ], "next_after": null}),
+            Some("prompts") => match asked["turn"].as_i64() {
+                Some(4) => json!({"prompts": [{"message": 4, "text": said}]}),
+                Some(6) => json!({"prompts": [{"message": 6, "text": "then the release"}]}),
+                turn => panic!("read {turn:?}, which is not the person's"),
+            },
+            _ => json!({}),
+        })
+        .await;
+        let mut app = app(client);
+        app.daemon(turn_event("accepted", 3, json!({}))).await;
+        app.restage().await;
+        assert_eq!(
+            app.staged,
+            [
+                (4, "also check the deploy notes".to_owned()),
+                (6, "then the release".to_owned())
+            ]
+        );
+        let rows: Vec<String> = app.staged_rows(80).iter().map(|l| l.to_string()).collect();
+        assert_eq!(
+            rows,
+            [
+                "",
+                "›↪ also check the deploy notes",
+                "",
+                "›⋯ then the release",
+                ""
+            ]
+        );
+        // Taken in, it lands and is staged no more.
+        app.daemon(turn_event("steered", 3, json!({"message": 4})))
+            .await;
+        assert_eq!(app.staged, [(6, "then the release".to_owned())]);
+    }
+
+    #[tokio::test]
+    async fn a_steer_sent_from_another_window_is_staged_here_too() {
+        let client = daemon_answering(|asked| match asked["op"].as_str() {
+            Some("prompts") => {
+                json!({"prompts": [{"message": asked["turn"], "text": "look at the logs"}]})
+            }
+            _ => json!({}),
+        })
+        .await;
+        let mut app = app(client);
+        app.daemon(turn_event("accepted", 1, json!({}))).await;
+        let queued = |message: i64, data: Value| json!({"event": "queued", "bot": "b", "turn": null, "message": message, "data": data});
+        app.daemon(queued(2, json!({"status": "queued", "delivery": "steer"})))
+            .await;
+        // A task's update, an automation's message and a lapsed note are
+        // not the person's words: nothing stages them.
+        app.daemon(queued(
+            3,
+            json!({"status": "queued", "delivery": "steer", "from": {"bot": "b.task", "turn": 1}}),
+        ))
+        .await;
+        app.daemon(queued(
+            4,
+            json!({"status": "queued", "delivery": "queue", "origin": "automation"}),
+        ))
+        .await;
+        app.daemon(queued(
+            5,
+            json!({"status": "queued", "delivery": "steer", "lapsed": true}),
+        ))
+        .await;
+        // Heard again, it is staged once.
+        app.daemon(queued(2, json!({"status": "queued", "delivery": "steer"})))
+            .await;
+        assert_eq!(app.staged, [(2, "look at the logs".to_owned())]);
+        assert_eq!(app.steering, [2]);
+        app.daemon(turn_event("steered", 1, json!({"message": 2})))
+            .await;
+        assert!(app.staged.is_empty());
+        // Taken in before this window read history, which drew it: its
+        // `queued` and `steered` heard after still leave nothing staged.
+        app.seen_node = 20;
+        app.daemon(queued(6, json!({"status": "queued", "delivery": "steer"})))
+            .await;
+        assert_eq!(app.staged.len(), 1);
+        app.daemon(turn_event("steered", 1, json!({"message": 6, "node": 12})))
+            .await;
+        assert!(app.staged.is_empty());
     }
 
     #[tokio::test]
