@@ -97,8 +97,9 @@ sandboxed command's reach, the network on or not. So a second daemon on
 the machine is no way out of the first one's sandbox, nor the first out of
 the second's. An entry stays while its store does, so an idle store is kept
 too. A daemon that cannot write the list, as one started inside a sandbox
-cannot, runs all the same and says so in its log; it can do nothing its
-sandbox does not allow. A command that was already running when a new
+cannot, refuses to start with `daemon_not_listed`, naming the folder and
+the error: no other daemon's sandbox would keep its store and socket. A
+command that was already running when a new
 daemon listed itself keeps the sandbox it started with.
 
 One daemon per person is the shape everything else assumes. A second one,
