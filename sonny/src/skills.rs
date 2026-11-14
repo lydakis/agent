@@ -876,6 +876,41 @@ fn upgraded_with(
     })
 }
 
+/// Each skill or role of Sonny's whose new text waits beside the
+/// person's edited copy: its word and name, and where each is, in order.
+pub fn staged(home: &Path) -> Vec<(&'static str, String, PathBuf, PathBuf)> {
+    let names = |dir: PathBuf, role: bool| -> Vec<String> {
+        let mut names: Vec<String> = (std::fs::read_dir(dir).into_iter().flatten())
+            .filter_map(|entry| entry.ok()?.file_name().into_string().ok())
+            .filter(|name| !name.starts_with('.'))
+            .filter_map(|name| match role {
+                true => name.strip_suffix(".md").map(str::to_owned),
+                false => Some(name),
+            })
+            .collect();
+        names.sort();
+        names
+    };
+    let kinds = [
+        (Kind::Role, names(upgrades(home).join("agents"), true)),
+        (Kind::Skill, names(upgrades(home).join("skills"), false)),
+    ];
+    let mut waiting = Vec::new();
+    for (kind, names) in kinds {
+        for name in names {
+            let new = staged_files(home, kind, &name);
+            let new: Vec<(&str, &str)> =
+                new.iter().map(|(f, t)| (f.as_str(), t.as_str())).collect();
+            if new.is_empty() || holds(&copy(&home.join(".agents"), kind, &name), &new) {
+                continue;
+            }
+            let staged = named(&copy(&upgrades(home), kind, &name), kind, &name);
+            waiting.push((kind.word(), name.clone(), theirs(home, kind, &name), staged));
+        }
+    }
+    waiting
+}
+
 /// Sonny's new text of `name`, each file by its name.
 fn staged_files(home: &Path, kind: Kind, name: &str) -> Vec<(String, String)> {
     let dir = copy(&upgrades(home), kind, name);
@@ -1168,6 +1203,19 @@ mod tests {
             "{note}"
         );
         assert!(note.contains("- the plan skill: theirs at "), "{note}");
+        // `sonny update` names each that waits, the person's copy and Sonny's.
+        assert_eq!(
+            super::staged(&home),
+            [
+                ("role", "lead".to_owned(), role.clone(), staged.clone()),
+                (
+                    "skill",
+                    "plan".to_owned(),
+                    home.join(".agents/skills/plan"),
+                    home.join(".agent/sonny/upgrades/skills/plan")
+                ),
+            ]
+        );
         // Not told, they wait for the next bot.
         upgrades.back();
         let upgrades = upgraded_in(&home).unwrap();
