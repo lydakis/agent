@@ -12879,6 +12879,15 @@ impl App {
                         self.copied(&text);
                     }
                     KeyCode::Char('c') if ctrl => self.close_pane(true),
+                    // A star picked in `/sky`: Enter goes to its agent.
+                    KeyCode::Enter
+                        if pane.is_card()
+                            && let Some(bot) = (self.watch.as_ref())
+                                .and_then(|w| w.sky.as_ref())
+                                .and_then(|view| view.picked().map(str::to_owned)) =>
+                    {
+                        self.enter_agent(&bot)
+                    }
                     // `/sky`'s own keys: its legend, zen, the models' colours,
                     // a star picked and centred on; Esc lets go of the pick
                     // and the centre before it closes the pane.
@@ -18255,7 +18264,8 @@ fn over(frame: &mut ratatui::Frame, rows: Vec<Line<'static>>, below: ratatui::la
 
 /// What the pane's title row says the keys do on `/status`.
 const STATUS_KEYS: &str = "esc close";
-const SKY_KEYS: &str = "↑↓←→ pick · m models · r replay · z zen · ? legend · esc close";
+const SKY_KEYS: &str =
+    "↑↓←→ pick · enter open · c center · m models · r replay · z zen · ? legend · esc close";
 const SKY_REPLAY_KEYS: &str = sky::REPLAY_KEYS;
 
 /// What the title row says the keys do on `/status` itself.
