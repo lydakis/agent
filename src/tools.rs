@@ -1555,26 +1555,40 @@ fn pem_end(body: &str, from: usize, last: bool) -> Option<Option<usize>> {
     const BEGIN: &str = "-----BEGIN ";
     let window = body.floor_char_boundary(BODY_HOLD + END.len() - 1);
     let mut at = ceil_char(body, from.saturating_sub(BEGIN.len()).min(window));
-    // Where the line read now starts, kept as the search moves on so no
-    // text is read twice.
+    // Where the line read now starts, and what its text before the
+    // marker read so far holds, kept as the search moves on so no text is
+    // read twice: a marker starts its line after at most spaces or what a
+    // search or the read tool puts before each line (a path or a number
+    // ending in `:`, `-` or a tab, with no space inside it).
     let mut line = body[..at].rfind('\n').map_or(0, |n| n + 1);
+    let (mut scan, mut word, mut gap) = (line, false, false);
     while let Some(n) = body[at..window].find("-----") {
         let dashes = at + n;
         if let Some(n) = body[at..dashes].rfind('\n') {
             line = at + n + 1;
+            (scan, word, gap) = (line, false, false);
         }
         let tail = &body[dashes..];
-        // A marker starts its line, after at most what a search or the
-        // read tool puts before each line; one inside text, such as an
-        // armored key's `Comment:`, is that text.
-        let starts = line_prefix(&body[line..dashes]);
-        if tail.starts_with(END) {
-            // Hidden to that line's start when only such a prefix is
-            // before it, so that shows.
-            return Some(Some(if starts { line } else { dashes }));
-        }
-        if tail.starts_with(BEGIN) && starts {
-            return Some(None);
+        let (end, begin) = (tail.starts_with(END), tail.starts_with(BEGIN));
+        if end || begin {
+            for &b in &body.as_bytes()[scan..dashes] {
+                match b {
+                    b' ' => gap |= word,
+                    _ => word = true,
+                }
+            }
+            scan = dashes;
+            // One inside text, such as an armored key's `Comment:`, is
+            // that text.
+            let starts = !gap && (!word || body[line..dashes].ends_with([':', '-', '\t']));
+            if end {
+                // Hidden to that line's start when only such a prefix is
+                // before it, so that shows.
+                return Some(Some(if starts { line } else { dashes }));
+            }
+            if starts {
+                return Some(None);
+            }
         }
         if !last && (END.starts_with(tail) || BEGIN.starts_with(tail)) {
             return None;
@@ -1585,14 +1599,6 @@ fn pem_end(body: &str, from: usize, last: bool) -> Option<Option<usize>> {
         true => Some(None),
         false => None,
     }
-}
-
-/// Whether `before`, what precedes a marker on its line, is only spaces or
-/// what a search or the read tool puts before each line it shows: a path
-/// or a number ending in `:`, `-` or a tab, with no space inside it.
-fn line_prefix(before: &str) -> bool {
-    let before = before.trim_start_matches(' ');
-    before.is_empty() || (!before.contains(' ') && before.ends_with([':', '-', '\t']))
 }
 
 /// The most backslashes a key's escaped line end is read with: JSON
@@ -5637,6 +5643,24 @@ mod tests {
             out.push_str(&redacting.finish());
             assert_eq!(out, hidden, "in pieces of {size}");
         }
+        // A long body line of dashes and BEGINs inside it is read once.
+        let dashed = format!(
+            "-----BEGIN PRIVATE KEY-----\n{}\n-----END PRIVATE KEY-----\n",
+            "a -----x a -----BEGIN x ".repeat(8_000)
+        );
+        let began = std::time::Instant::now();
+        assert_eq!(
+            redact(&dashed),
+            "-----BEGIN PRIVATE KEY-----\n[REDACTED]\n-----END PRIVATE KEY-----\n"
+        );
+        let mut redacting = Redacting::new(credentials.clone());
+        let mut out = String::new();
+        for piece in dashed.as_bytes().chunks(8192) {
+            out.push_str(&redacting.feed(piece));
+        }
+        out.push_str(&redacting.finish());
+        assert_eq!(out, redact(&dashed));
+        assert!(began.elapsed() < std::time::Duration::from_secs(2));
         // A body line run into its END is hidden with it.
         assert_eq!(
             redact("-----BEGIN PRIVATE KEY-----\nMIIE\nAAAA-----END PRIVATE KEY-----\n"),
