@@ -20,12 +20,15 @@ import sys
 from pathlib import Path
 
 # Clauses a listing formats in by name, each planned with every value it
-# takes: keep in step with `list`, `usage` and `turns` in src/store/db.rs.
+# takes: keep in step with `list`, `usage`, `turns` and `messages` in
+# src/store/db.rs.
 OPTIONAL = {'{glob}': ('', " AND t.bot GLOB ?3 AND t.bot >= ?4 AND t.bot < ?4 || CAST(x'ff' AS TEXT)"),
             '{from}': ('name > ?1', "name >= max(?1 || char(1), ?5) AND name < ?5 || CAST(x'ff' AS TEXT) AND name GLOB ?3"),
             '{maker}': ('', ' AND created_by_id = ?4'),
             '{running}': ('', ' AND running_turn IS NOT NULL'),
-            '{order}': ('ASC', 'DESC')}
+            '{order}': ('ASC', 'DESC'),
+            '{line}': ('', "AND m.id IN (SELECT id FROM messages WHERE bot=?1 AND status='queued' "
+                           "UNION ALL SELECT id FROM messages WHERE bot=?1 AND status='ready')")}
 
 STRUCTURAL_SCANS = {'SCAN CONSTANT ROW', 'SCAN c', 'SCAN chain', 'SCAN held', 'SCAN kin', 'SCAN sqlite_master',
                     'SCAN sqlite_sequence'}
