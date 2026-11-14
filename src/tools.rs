@@ -960,6 +960,23 @@ impl BlockStream {
                     text = line + &text[at..];
                     at = 0;
                 }
+                if body.searching {
+                    let rest = &text[at..];
+                    match pem_end(rest, body.searched, last) {
+                        None => {
+                            body.searched = rest.len();
+                            self.held = rest.to_owned();
+                            return out;
+                        }
+                        Some(Some(end)) => {
+                            out.push_str(if end > 0 { "[REDACTED]\n" } else { "" });
+                            self.body = None;
+                            at += end;
+                            continue;
+                        }
+                        Some(None) => body.searching = false,
+                    }
+                }
                 match body.take(&text[at..], last) {
                     Some((len, told)) => {
                         out.push_str(told);
@@ -1057,7 +1074,10 @@ impl BlockStream {
             out.push_str(&text[at..header]);
             at = header;
             if named {
-                self.body = Some(PemBody::default());
+                self.body = Some(PemBody {
+                    searching: true,
+                    ..PemBody::default()
+                });
             }
         }
     }
@@ -1472,6 +1492,11 @@ fn redact_blocks(text: String, blocks: &[String]) -> String {
             .any(|block| rest[begin..header].contains(block.as_str()));
         rest = &rest[header..];
         if named {
+            if let Some(Some(end)) = pem_end(rest, 0, true) {
+                out.push_str(if end > 0 { "[REDACTED]\n" } else { "" });
+                rest = &rest[end..];
+                continue;
+            }
             let mut body = PemBody::default();
             let (len, told) = body.take(rest, true).expect("the text's end ends the body");
             out.push_str(told);
@@ -1514,6 +1539,51 @@ fn pem_header(text: &str, begin: usize, last: bool) -> Option<usize> {
 /// The most spaces or tabs a key's header may end with.
 const PEM_SPACES: usize = 1024;
 
+/// The most of a secret block's body looked through for its END marker:
+/// far past any key's, armored PGP keys with their subkeys among them.
+const BODY_HOLD: usize = 256 * 1024;
+
+/// Where the line of a secret block's END marker starts in `body`, the
+/// text after its header, when one starts within [`BODY_HOLD`] and before
+/// any other block's BEGIN: the whole block is hidden through it, whatever
+/// its lines hold, as a key's reader takes them. `Some(None)` when none
+/// does, `None` when more text may still tell. `from` is how much of
+/// `body` was looked through before. Each search stops at the next BEGIN,
+/// so many headers read their text once.
+fn pem_end(body: &str, from: usize, last: bool) -> Option<Option<usize>> {
+    const END: &str = "-----END ";
+    const BEGIN: &str = "-----BEGIN ";
+    let window = body.floor_char_boundary(BODY_HOLD + END.len() - 1);
+    let mut at = ceil_char(body, from.saturating_sub(BEGIN.len()).min(window));
+    while let Some(n) = body[at..window].find("-----") {
+        let dashes = at + n;
+        let tail = &body[dashes..];
+        if tail.starts_with(END) {
+            // From its line's start when only what a search or the read
+            // tool puts before a line is there, so that shows.
+            let line = body[..dashes].rfind('\n').map_or(0, |n| n + 1);
+            let before = &body[line..dashes];
+            let prefix = before.is_empty() || before.ends_with([':', '-', '\t', ' ']);
+            return Some(Some(if prefix { line } else { dashes }));
+        }
+        if tail.starts_with(BEGIN) {
+            return Some(None);
+        }
+        if !last && (END.starts_with(tail) || BEGIN.starts_with(tail)) {
+            return None;
+        }
+        at = dashes + 1;
+    }
+    match last || window < body.len() || body.len() >= BODY_HOLD + END.len() - 1 {
+        true => Some(None),
+        false => None,
+    }
+}
+
+/// The most backslashes a key's escaped line end is read with: JSON
+/// inside JSON, and deeper, far past any real one.
+const PEM_ESCAPES: usize = 16;
+
 /// A key's block as a JSON string holds it, all on one line.
 enum Escaped {
     /// Its header runs to `header`, the escaped line end that closes it
@@ -1551,6 +1621,9 @@ fn pem_escaped(text: &str, begin: usize, last: bool) -> Escaped {
     }
     let bytes = &text.as_bytes()[dashes..];
     let slashes = bytes.iter().take_while(|&&b| b == b'\\').count();
+    if slashes > PEM_ESCAPES {
+        return Escaped::No;
+    }
     let escaped = match (slashes, bytes.get(slashes)) {
         (0, Some(_)) => return Escaped::No,
         (_, None) => return more,
@@ -1639,13 +1712,18 @@ fn pem_line(line: &str) -> bool {
     body.as_bytes().iter().all(base64)
 }
 
-/// A secret block's body, read line by line after its header: the lines
+/// A secret block's body with no END marker within [`BODY_HOLD`] of its
+/// header, read line by line after its header: the lines
 /// that read as a key's are told as one `[REDACTED]` line, and the first
 /// that does not, an `END` marker or anything else, is told as it is. So a
 /// key cut short hides only itself, and a line that merely looks like a
 /// header hides nothing after it.
 #[derive(Default)]
 struct PemBody {
+    /// Still looking for its END marker ([`pem_end`]), all of it held.
+    searching: bool,
+    /// How much of the held body was looked through for its END.
+    searched: usize,
     /// Some of its lines were taken.
     any: bool,
     /// Inside a line too long to hold that reads as a key's: dropped up to
@@ -5493,6 +5571,51 @@ mod tests {
                 assert_eq!(out, hidden, "in pieces of {size}");
             }
         }
+        // A whole block is hidden through its END, whatever its lines
+        // hold: an armored key's headers among them.
+        let armored = "-----BEGIN PGP PRIVATE KEY BLOCK-----\nComment: A fixture (no identity) <x@y>\n\nlQOYBGfake\n=AbCd\n-----END PGP PRIVATE KEY BLOCK-----\nafter\n";
+        let hidden = "-----BEGIN PGP PRIVATE KEY BLOCK-----\n[REDACTED]\n-----END PGP PRIVATE KEY BLOCK-----\nafter\n";
+        assert_eq!(redact(armored), hidden);
+        for size in 1..=armored.len() {
+            let mut redacting = Redacting::new(credentials.clone());
+            let mut out = String::new();
+            for piece in armored.as_bytes().chunks(size) {
+                out.push_str(&redacting.feed(piece));
+            }
+            out.push_str(&redacting.finish());
+            assert_eq!(out, hidden, "in pieces of {size}");
+        }
+        // A body line run into its END is hidden with it.
+        assert_eq!(
+            redact("-----BEGIN PRIVATE KEY-----\nMIIE\nAAAA-----END PRIVATE KEY-----\n"),
+            "-----BEGIN PRIVATE KEY-----\n[REDACTED]\n-----END PRIVATE KEY-----\n"
+        );
+        // A header then a run of backslashes is read once, and held no
+        // longer than an escape is.
+        let slashes = format!("-----BEGIN PRIVATE KEY-----{}", "\\".repeat(4 << 20));
+        let began = std::time::Instant::now();
+        let mut redacting = Redacting::new(credentials.clone());
+        let mut out = String::new();
+        for piece in slashes.as_bytes().chunks(8192) {
+            out.push_str(&redacting.feed(piece));
+        }
+        out.push_str(&redacting.finish());
+        assert_eq!(out, slashes);
+        assert!(began.elapsed() < std::time::Duration::from_secs(5));
+        // Many headers with no END read their text once, whole or in
+        // pieces: each looks for its END only up to the next BEGIN.
+        let headers = "-----BEGIN PRIVATE KEY-----\nprint(1)\n".repeat(40_000);
+        let began = std::time::Instant::now();
+        let whole = redact(&headers);
+        let mut redacting = Redacting::new(credentials.clone());
+        let mut out = String::new();
+        for piece in headers.as_bytes().chunks(8192) {
+            out.push_str(&redacting.feed(piece));
+        }
+        out.push_str(&redacting.finish());
+        assert_eq!(out, whole);
+        assert_eq!(whole, headers);
+        assert!(began.elapsed() < std::time::Duration::from_secs(5));
         // An escaped header with no END on its line, or code between it
         // and one, is a pattern: kept.
         for kept in [
