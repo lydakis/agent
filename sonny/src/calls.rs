@@ -587,7 +587,8 @@ pub fn agent_inside(command: &str) -> bool {
     let parts = crate::shell::parts(command);
     !parts.is_empty()
         && parts.iter().all(|part| {
-            let Some(simple) = crate::shell::simple(part) else {
+            let Some(simple) = crate::shell::simple(part).filter(|_| !writes_elsewhere(part))
+            else {
                 return false;
             };
             let cut = |p: &str| matches!(p.split_whitespace().next(), Some("head" | "tail" | "jq"));
@@ -631,6 +632,35 @@ pub fn agent_inside(command: &str) -> bool {
                 _ => false,
             }
         })
+}
+
+/// Whether a command sends its output somewhere by a redirection, which
+/// the sandbox may not let it write: any `>` outside quotes but a copy of
+/// one stream to another (`2>&1`) or a discard (`>/dev/null`). A
+/// here-document's text, after the first line, is the command's input.
+fn writes_elsewhere(command: &str) -> bool {
+    let line = command.lines().next().unwrap_or("");
+    let (mut quote, mut chars) = (None, line.char_indices().peekable());
+    while let Some((at, c)) = chars.next() {
+        match (quote, c) {
+            (Some(q), c) if c == q => quote = None,
+            (Some(_), _) => {}
+            (None, '\'') | (None, '"') => quote = Some(c),
+            (None, '\\') => {
+                chars.next();
+            }
+            (None, '>') => {
+                let rest = line[at + 1..].trim_start_matches('>').trim_start();
+                let duplicated =
+                    rest.starts_with('&') && rest[1..].starts_with(|c: char| c.is_ascii_digit());
+                if !duplicated && !rest.starts_with("/dev/null") {
+                    return true;
+                }
+            }
+            _ => {}
+        }
+    }
+    false
 }
 
 /// The bot and number a `BOT/N` handle names.
@@ -1369,6 +1399,8 @@ Keep the rest.'"#,
             r#"agent --pretty inspect --bot shop.fix"#,
             r#""$AGENT_BIN" fork --bot shop.fix --allow '' -- 'What is left?'"#,
             r#""$AGENT_BIN" models"#,
+            r#""$AGENT_BIN" ls --name 'a>b' 2>&1"#,
+            r#""$AGENT_BIN" ls 2>/dev/null"#,
         ] {
             assert!(agent_inside(inside), "{inside}");
         }
@@ -1384,6 +1416,8 @@ Keep the rest.'"#,
             r#""$AGENT_BIN" fork --bot shop.fix -- go"#,
             r#""$AGENT_BIN" ls | sh"#,
             r#"git push && "$AGENT_BIN" run --bot shop.lead -- pushed"#,
+            r#""$AGENT_BIN" ls > "$HOME/report.json""#,
+            r#""$AGENT_BIN" turns --bot shop.fix >> /tmp/out 2>&1"#,
             "",
         ] {
             assert!(!agent_inside(outside), "{outside}");

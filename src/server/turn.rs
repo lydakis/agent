@@ -5818,17 +5818,16 @@ impl Turn {
                 let calls: Vec<Value> = (page["approvals"].as_array().into_iter().flatten())
                     .filter(|call| {
                         name.as_deref().is_none_or(|pattern| {
-                            agent_runtime::tools::name_matches(
-                                pattern,
-                                call["bot"].as_str().unwrap_or_default(),
-                            )
+                            glob(pattern, call["bot"].as_str().unwrap_or_default())
                         })
                     })
                     .map(|call| {
-                        let arguments = match &call["arguments"] {
+                        // Redacted whole, before the cut, so a cut through
+                        // a secret cannot keep part of it.
+                        let arguments = self.registry.redact_text(match &call["arguments"] {
                             Value::String(text) => text.clone(),
                             other => other.to_string(),
-                        };
+                        });
                         let mut start: String = arguments.chars().take(300).collect();
                         if start.len() < arguments.len() {
                             start.push('…');
@@ -5841,7 +5840,7 @@ impl Turn {
             }
             Agents::Pause { reason } => request(json!({"op":"pause","reason":reason})).await?,
         };
-        Ok(Outcome::text(answer.to_string()))
+        Ok(Outcome::text(self.registry.redact_text(answer.to_string())))
     }
 
     /// This bot's project's agents, as a name pattern: those named as it
@@ -7881,6 +7880,36 @@ fn failure(error: Error) -> Outcome {
     }
 }
 
+/// Whether `name` matches `pattern`, as the store's bot listing matches
+/// names: `*` any run of characters, `?` any one, case kept.
+fn glob(pattern: &str, name: &str) -> bool {
+    let (pattern, name): (Vec<char>, Vec<char>) =
+        (pattern.chars().collect(), name.chars().collect());
+    let (mut p, mut n, mut star, mut from) = (0, 0, None, 0);
+    while n < name.len() {
+        match pattern.get(p) {
+            Some('*') => {
+                star = Some(p);
+                from = n;
+                p += 1;
+            }
+            Some(&c) if c == '?' || c == name[n] => {
+                p += 1;
+                n += 1;
+            }
+            _ => match star {
+                Some(at) => {
+                    p = at + 1;
+                    from += 1;
+                    n = from;
+                }
+                None => return false,
+            },
+        }
+    }
+    pattern[p..].iter().all(|&c| c == '*')
+}
+
 /// `settings` with five minutes for an hour where any of the `models` a
 /// request may go to must keep five minutes, as a longer marker may not
 /// follow a shorter one. A model on a provider unknown here or of another
@@ -7941,6 +7970,26 @@ fn priced_at(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn approvals_match_names_as_the_bot_listing_does() {
+        for (pattern, name) in [
+            ("shop.*", "shop.fix"),
+            ("*.lead", "web.lead"),
+            ("s?op.*", "shop.x"),
+            ("*", "a"),
+        ] {
+            assert!(super::glob(pattern, name), "{pattern} {name}");
+        }
+        for (pattern, name) in [
+            ("shop.*", "Shop.fix"),
+            ("shop.lead", "Shop.lead"),
+            ("*.lead", "web.lead2"),
+            ("?", ""),
+        ] {
+            assert!(!super::glob(pattern, name), "{pattern} {name}");
+        }
+    }
+
     #[test]
     fn a_lifted_results_parts_are_only_ever_its_pictures() {
         use agent_runtime::codec::Part;
