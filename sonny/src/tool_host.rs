@@ -390,12 +390,9 @@ fn configured(record: &Value, given: &Given<'_>) -> Option<serde_json::Map<Strin
     if !record["fallback"].is_null() {
         fields.insert("fallback".into(), Value::Null);
     }
-    let hidden = record["settings"]["hide_senders"]
-        .as_bool()
-        .unwrap_or(false);
-    if hidden != given.config.hide_senders {
-        let hide = given.config.hide_senders.then_some(true);
-        settings.insert("hide_senders".into(), json!(hide));
+    let trailer = json!(crate::stamp::trailer(given.config));
+    if record["settings"]["trailer"] != trailer {
+        settings.insert("trailer".into(), trailer);
     }
     // As long as the config says, or the daemon's own when it says none.
     let hold = given.config.hold_ms.unwrap_or(agent_client::HOLD_MS);
@@ -408,11 +405,14 @@ fn configured(record: &Value, given: &Given<'_>) -> Option<serde_json::Map<Strin
     // person's, without what they let run outside the sandbox.
     let shadow =
         (record["name"].as_str()).is_some_and(|name| crate::trigger::shadow_source(name).is_some());
-    let rules = match shadow {
-        true => json!(crate::trigger::shadow_rules(given.rules)),
-        false => json!(given.rules),
-    };
+    // One whose maker is gone goes by the person's rules too, but is let
+    // out of its sandbox by none it didn't have from its maker.
     let creator = record["created_by_id"].as_i64();
+    let rules = match (shadow, creator) {
+        (true, _) => json!(crate::trigger::shadow_rules(given.rules)),
+        (false, Some(_)) => json!(orphan_rules(given.rules, &record["settings"]["rules"])),
+        (false, None) => json!(given.rules),
+    };
     let own = creator.is_none_or(|creator| !given.live.contains(&creator));
     if own && record["settings"]["rules"] != rules {
         settings.insert("rules".into(), rules);
@@ -421,6 +421,35 @@ fn configured(record: &Value, given: &Given<'_>) -> Option<serde_json::Map<Strin
         fields.insert("settings".into(), Value::Object(settings));
     }
     (!fields.is_empty()).then_some(fields)
+}
+
+/// The command rules of an agent another agent made, once that maker is
+/// gone: the person's, `given`, with only the `allow` rules it `had`
+/// already, as its maker's, by their words, and only the program paths
+/// it had pinned. So it never runs outside its sandbox what its maker
+/// could not, while the rules that ask or refuse, and any `allow` or path
+/// the person takes back, still reach it.
+fn orphan_rules(
+    given: Option<&agent_client::rules::Policy>,
+    had: &Value,
+) -> Option<agent_client::rules::Policy> {
+    use agent_client::rules::{Decision, Policy};
+    let had: Policy = serde_json::from_value(had.clone()).unwrap_or_default();
+    let mut rules = given?.clone();
+    rules.prefix_rules.retain(|rule| {
+        rule.decision != Decision::Allow
+            || (had.prefix_rules.iter())
+                .any(|old| old.decision == Decision::Allow && old.pattern == rule.pattern)
+    });
+    // A path pinned since lets the name's `allow` rules out by it, so only
+    // the paths it had stay; a name left with none is unpinned, where its
+    // rules may still ask or refuse but never allow.
+    rules.host_executables.retain(|name, paths| {
+        let old = had.host_executables.get(name);
+        paths.retain(|path| old.is_some_and(|old| old.contains(path)));
+        !paths.is_empty()
+    });
+    Some(rules).filter(|rules| *rules != Policy::default())
 }
 
 /// `record` with the `configure` the daemon keeps for its turn's end laid
@@ -457,9 +486,10 @@ mod tests {
     #[test]
     fn an_agent_follows_what_config_gives_its_model() {
         let mut config = agent_client::config::Config::default();
-        let agent = |fallback: Value, hidden: bool| {
+        let (both, sender) = (json!(["sender", "time"]), json!(["sender"]));
+        let agent = |fallback: Value, trailer: &Value| {
             json!({"provider": "anthropic", "model": "claude", "fallback": fallback,
-                "settings": {"hide_senders": hidden},
+                "settings": {"trailer": trailer},
                 "declared": [{"name": "start_task", "answered_by": crate::served::TAG}]})
         };
         fn given(config: &agent_client::config::Config) -> Given<'_> {
@@ -470,47 +500,63 @@ mod tests {
                 live: &NONE,
             }
         }
+        // Sonny's agents name who sent each message and when.
         assert_eq!(
-            configured(&agent(Value::Null, false), &given(&config)),
+            configured(&agent(Value::Null, &both), &given(&config)),
             None
+        );
+        assert_eq!(
+            configured(&agent(Value::Null, &sender), &given(&config)).map(Value::Object),
+            Some(json!({"settings": {"trailer": both}}))
         );
         // The daemon gives the config's fallback, so the agent keeps none.
         config
             .fallbacks
             .insert("anthropic/claude".into(), "anthropic/other".into());
-        config.hide_senders = true;
+        config.trailer = Some(Vec::new());
         assert_eq!(
-            configured(&agent(Value::Null, false), &given(&config)).map(Value::Object),
-            Some(json!({"settings": {"hide_senders": true}}))
+            configured(&agent(Value::Null, &both), &given(&config)).map(Value::Object),
+            Some(json!({"settings": {"trailer": []}}))
         );
-        assert_eq!(configured(&agent(Value::Null, true), &given(&config)), None);
+        assert_eq!(
+            configured(&agent(Value::Null, &json!([])), &given(&config)),
+            None
+        );
         // One an older Sonny copied in goes, whatever the config says.
         assert_eq!(
-            configured(&agent(json!("anthropic/other"), true), &given(&config)).map(Value::Object),
+            configured(
+                &agent(json!("anthropic/other"), &json!([])),
+                &given(&config)
+            )
+            .map(Value::Object),
             Some(json!({"fallback": null}))
         );
         let config = agent_client::config::Config::default();
         assert_eq!(
-            configured(&agent(json!("anthropic/other"), true), &given(&config)).map(Value::Object),
-            Some(json!({"fallback": null, "settings": {"hide_senders": null}}))
+            configured(
+                &agent(json!("anthropic/other"), &json!([])),
+                &given(&config)
+            )
+            .map(Value::Object),
+            Some(json!({"fallback": null, "settings": {"trailer": both}}))
         );
         // A change the daemon keeps for the turn's end counts as made: a
         // file that takes it back asks again, and one that matches it
         // asks nothing.
-        let mut busy = agent(Value::Null, false);
-        busy["configure_pending"] = json!({"settings": {"hide_senders": true}});
+        let mut busy = agent(Value::Null, &both);
+        busy["configure_pending"] = json!({"settings": {"trailer": ["time"]}});
         assert_eq!(
             configured(&busy, &given(&config)).map(Value::Object),
-            Some(json!({"settings": {"hide_senders": null}}))
+            Some(json!({"settings": {"trailer": both}}))
         );
         let mut config = agent_client::config::Config {
-            hide_senders: true,
+            trailer: Some(vec!["time".into()]),
             ..Default::default()
         };
         assert_eq!(configured(&busy, &given(&config)), None);
         // A hold reset kept for the turn's end, and then a hold of its own
         // in the file: the file's goes over the reset.
-        let mut held = agent(Value::Null, true);
+        let mut held = agent(Value::Null, &json!(["time"]));
         held["settings"]["hold_ms"] = json!(agent_client::HOLD_MS);
         held["configure_pending"] = json!({"settings": {"hold_ms": null}});
         config.hold_ms = Some(5);
@@ -520,7 +566,7 @@ mod tests {
         );
         let config = agent_client::config::Config::default();
         // Another client's bot is its own.
-        let mut other = agent(json!("x/y"), true);
+        let mut other = agent(json!("x/y"), &sender);
         other["declared"] = json!([]);
         assert_eq!(configured(&other, &given(&config)), None);
     }
@@ -546,7 +592,7 @@ mod tests {
         };
         let agent = |rules: Value, creator: Value| {
             json!({"provider": "anthropic", "model": "claude", "fallback": null,
-                "settings": {"rules": rules}, "created_by_id": creator,
+                "settings": {"rules": rules, "trailer": ["sender", "time"]}, "created_by_id": creator,
                 "declared": [{"name": "start_task", "answered_by": crate::served::TAG}]})
         };
         assert_eq!(
@@ -566,6 +612,53 @@ mod tests {
             configured(&agent(Value::Null, json!(8)), &ruled).map(Value::Object),
             Some(json!({"settings": {"rules": policy}}))
         );
+        // The person's `allow` rules reach it only if its maker had them:
+        // the rules that ask or refuse it takes, the ones that let a
+        // command out of its sandbox only as it had them already.
+        let allowing: agent_client::rules::Policy = serde_json::from_value(json!({
+            "prefix_rules": [
+                {"pattern": ["git", "push"], "decision": "prompt", "source": "default.rules:1"},
+                {"pattern": ["cargo", "test"], "decision": "allow", "source": "default.rules:2"}
+            ]
+        }))
+        .unwrap();
+        let allowed = Given {
+            rules: Some(&allowing),
+            ..ruled
+        };
+        assert_eq!(
+            configured(&agent(Value::Null, json!(8)), &allowed).map(Value::Object),
+            Some(json!({"settings": {"rules": policy}}))
+        );
+        assert_eq!(
+            configured(&agent(json!(allowing), json!(8)), &allowed),
+            None
+        );
+        // A root agent is the person's own, and takes them all.
+        assert_eq!(
+            configured(&agent(Value::Null, Value::Null), &allowed).map(Value::Object),
+            Some(json!({"settings": {"rules": allowing}}))
+        );
+        // A program path the person pins since lets none of its maker's
+        // `allow` rules out by it; one it had pinned still does.
+        let pinning: agent_client::rules::Policy = serde_json::from_value(json!({
+            "prefix_rules": [{"pattern": ["cargo", "test"], "decision": "allow"}],
+            "host_executables": {"cargo": ["/opt/bin/cargo", "/usr/bin/cargo"]}
+        }))
+        .unwrap();
+        let pinned = Given {
+            rules: Some(&pinning),
+            ..ruled
+        };
+        let had = json!({
+            "prefix_rules": [{"pattern": ["cargo", "test"], "decision": "allow"}],
+            "host_executables": {"cargo": ["/usr/bin/cargo"]}
+        });
+        assert_eq!(configured(&agent(had, json!(8)), &pinned), None);
+        let unpinned = json!({
+            "prefix_rules": [{"pattern": ["cargo", "test"], "decision": "allow"}]
+        });
+        assert_eq!(configured(&agent(unpinned, json!(8)), &pinned), None);
     }
 
     #[test]

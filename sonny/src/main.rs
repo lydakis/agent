@@ -901,9 +901,68 @@ async fn read_status(
 /// window, beside the store: one file a lead, as each lead's card reads its
 /// own agents, so leads sharing a store never undo each other's.
 fn reads_file(store: &std::path::Path, lead: &str) -> std::path::PathBuf {
+    reads_dir(store).join(format!("{lead}.json"))
+}
+
+/// The folder of [`reads_file`]s beside `store`.
+pub(crate) fn reads_dir(store: &std::path::Path) -> std::path::PathBuf {
     let mut dir = store.as_os_str().to_owned();
     dir.push(".status-reads");
-    std::path::PathBuf::from(dir).join(format!("{lead}.json"))
+    std::path::PathBuf::from(dir)
+}
+
+/// Every agent's question as some window or the sky last read it beside
+/// `store`, read as this build reads one ([`seen_stamp`]) from the daemon
+/// `identity` names: each with the turn it ended, the newest where two
+/// kept one. The sky reads again only the agents that ran since.
+pub(crate) fn kept_seen(
+    store: &std::path::Path,
+    identity: Option<&str>,
+) -> HashMap<String, (i64, Seen)> {
+    #[derive(serde::Deserialize)]
+    struct Kept {
+        reads: String,
+        seen: HashMap<String, (i64, Seen)>,
+    }
+    let store = agent_client::socket::canonical_store(store).unwrap_or_else(|_| store.into());
+    let stamp = seen_stamp(identity);
+    let mut seen: HashMap<String, (i64, Seen)> = HashMap::new();
+    let files = std::fs::read_dir(reads_dir(&store)).into_iter().flatten();
+    for file in files.flatten() {
+        let Some(kept) = std::fs::read(file.path())
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<Kept>(&bytes).ok())
+            .filter(|kept| kept.reads == stamp)
+        else {
+            continue;
+        };
+        for (name, read) in kept.seen {
+            match seen.get(&name) {
+                Some((turn, _)) if *turn >= read.0 => {}
+                _ => {
+                    seen.insert(name, read);
+                }
+            }
+        }
+    }
+    seen
+}
+
+/// Keep what the sky read of every agent's question for the next one,
+/// beside the leads' own (a leading dot, as no lead is named).
+pub(crate) fn keep_sky_seen(
+    store: &std::path::Path,
+    identity: Option<&str>,
+    seen: &HashMap<String, (i64, Seen)>,
+) {
+    let store = agent_client::socket::canonical_store(store).unwrap_or_else(|_| store.into());
+    write_reads(
+        &store,
+        ".sky",
+        identity,
+        &HashMap::new(),
+        seen.iter().collect(),
+    );
 }
 
 /// The build that kept them, which another may read a history otherwise,
@@ -916,6 +975,15 @@ fn reads_build(identity: Option<&str>) -> String {
         option_env!("SONNY_COMMIT").unwrap_or(""),
         identity.unwrap_or("")
     )
+}
+
+/// What a question read is kept under: how this build reads one
+/// ([`needs::READS`]), and the daemon's store it was read from. A new
+/// build that reads questions as the last one did takes what that one
+/// read, so the first sky after an upgrade reads only the agents that ran
+/// since; [`reads_build`] keeps `/status`'s other reads per build.
+pub(crate) fn seen_stamp(identity: Option<&str>) -> String {
+    format!("{:016x} {}", needs::READS, identity.unwrap_or(""))
 }
 
 /// Take what an earlier window kept of each agent's history, where this
@@ -932,21 +1000,25 @@ fn take_reads(
     #[derive(serde::Deserialize)]
     struct Kept {
         build: String,
+        reads: String,
         latest: HashMap<String, (Value, Latest)>,
         seen: HashMap<String, (i64, Seen)>,
     }
     let Some(kept) = std::fs::read(reads_file(store, lead))
         .ok()
         .and_then(|bytes| serde_json::from_slice::<Kept>(&bytes).ok())
-        .filter(|kept| kept.build == reads_build(identity))
     else {
         return;
     };
-    for (name, read) in kept.latest {
-        status_read.entry(name).or_insert(read);
+    if kept.build == reads_build(identity) {
+        for (name, read) in kept.latest {
+            status_read.entry(name).or_insert(read);
+        }
     }
-    for (name, seen) in kept.seen {
-        asks_seen.entry(name).or_insert(seen);
+    if kept.reads == seen_stamp(identity) {
+        for (name, seen) in kept.seen {
+            asks_seen.entry(name).or_insert(seen);
+        }
     }
 }
 
@@ -962,32 +1034,47 @@ fn keep_reads(
     let seen: HashMap<&String, &(i64, Seen)> = (asks_seen.iter())
         .filter(|(name, _)| status_read.contains_key(*name))
         .collect();
+    write_reads(store, lead, identity, status_read, seen);
+}
+
+/// [`keep_reads`]'s file for `lead`, written whole.
+fn write_reads(
+    store: &std::path::Path,
+    lead: &str,
+    identity: Option<&str>,
+    status_read: &HashMap<String, (Value, Latest)>,
+    seen: HashMap<&String, &(i64, Seen)>,
+) {
     #[derive(serde::Serialize)]
     struct Kept<'a> {
         build: String,
+        reads: String,
         latest: &'a HashMap<String, (Value, Latest)>,
         seen: HashMap<&'a String, &'a (i64, Seen)>,
     }
     let kept = Kept {
         build: reads_build(identity),
+        reads: seen_stamp(identity),
         latest: status_read,
         seen,
     };
     if let Ok(bytes) = serde_json::to_vec(&kept) {
-        // History excerpts: only the person reads them, as with the store.
-        use std::os::unix::fs::PermissionsExt;
-        let file = reads_file(store, lead);
-        if let Some(dir) = file.parent()
-            && std::fs::create_dir_all(dir)
-                .and_then(|()| {
-                    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
-                })
-                .is_err()
-        {
-            return;
-        }
-        let _ = agent_client::files::replace_mode(&file, &bytes, 0o600);
+        keep_beside(&reads_file(store, lead), &bytes);
     }
+}
+
+/// Write `bytes` to `file` among the reads kept beside a store, whole.
+/// History excerpts: only the person reads them, as with the store.
+pub(crate) fn keep_beside(file: &std::path::Path, bytes: &[u8]) {
+    use std::os::unix::fs::PermissionsExt;
+    if let Some(dir) = file.parent()
+        && std::fs::create_dir_all(dir)
+            .and_then(|()| std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)))
+            .is_err()
+    {
+        return;
+    }
+    let _ = agent_client::files::replace_mode(file, bytes, 0o600);
 }
 
 /// `bot`'s latest step, question and pull request; none when a read
@@ -2201,8 +2288,12 @@ fn sky_cli(args: &[String]) -> Result<(), String> {
         }
     }
     let (store, socket) = daemon_paths(store, socket)?;
+    // Two workers, as a window has: on one, the connection's reader, which
+    // reads the past as fast as the daemon sends it, ran ahead of the
+    // follow taking it, and a sky of 400 agents let its connection go
+    // halfway through 40,000 past events and tried again 3 s later.
     let runtime = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(1)
+        .worker_threads(2)
         .enable_all()
         .build()
         .map_err(|e| e.to_string())?;
@@ -2454,10 +2545,7 @@ async fn run() -> Result<(), String> {
     // items instead of replayed events, so the replay is skipped. The bot
     // is read after that, so a turn that ended during the replay is seen
     // as ended.
-    client
-        .request("follow", json!({"bot": name, "after": 0}))
-        .await
-        .map_err(|e| e.to_string())?;
+    follow_bot(&client, &name).await?;
     let caught = caught_up(&mut events).await;
     let bot = client
         .request("inspect", json!({"bot": name}))
@@ -2949,9 +3037,7 @@ pub(crate) fn made(
     if let Some(outputs) = outputs() {
         settings.insert("outputs".into(), json!(outputs));
     }
-    if config.hide_senders {
-        settings.insert("hide_senders".into(), json!(true));
-    }
+    settings.insert("trailer".into(), json!(crate::stamp::trailer(&config)));
     if let Some(ms) = config.hold_ms {
         settings.insert("hold_ms".into(), json!(ms));
     }
@@ -2963,7 +3049,7 @@ pub(crate) fn made(
     let tools: Vec<String> = tools.into_iter().map(String::from).collect();
     let tools = approvals::gateable(&tools, &declare);
     if let Value::Object(fields) = asked {
-        fields.extend(approvals::create_gate(mode, &tools));
+        fields.extend(approvals::gate(mode, &tools));
     }
     Ok(())
 }
@@ -3104,11 +3190,20 @@ fn tilde(path: &str) -> String {
     }
 }
 
+/// A name no other call makes, in this process or another: two calls in
+/// the same millisecond differ by their count. A request id made here is
+/// the daemon's idempotency key, so two requests must never share one.
 fn unique(prefix: &str) -> String {
+    static COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default();
-    format!("{prefix}-{}-{}", now.as_millis(), std::process::id())
+    let count = COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    format!(
+        "{prefix}-{}-{}-{count}",
+        now.as_millis(),
+        std::process::id()
+    )
 }
 
 /// The agent a side chat is a copy of, from the name `/side` gives it,
@@ -3191,6 +3286,30 @@ fn report_status(state: &str, bot: &str) {
     };
     let _ = write!(stdout, "\x1b]2;{title}\x07");
     let _ = stdout.flush();
+}
+
+/// Follow `bot` from the start of its turn before last: what the window
+/// needs of the replay ([`caught_up`]) is the context its last model round
+/// left, which that turn or the one after it holds, and a pause since the
+/// greeting. Its history is drawn from its items, so the events of every
+/// turn before, as many as the agent ever made, are not read again.
+async fn follow_bot(client: &Client, bot: &str) -> Result<(), String> {
+    let newest = client
+        .request("turns", json!({"bot": bot, "newest": true, "limit": 2}))
+        .await
+        .map_err(|e| e.to_string())?;
+    let since = (newest["turns"].as_array().into_iter().flatten())
+        .filter_map(|turn| turn["started_ms"].as_i64())
+        .min();
+    let follow = match since {
+        Some(since) => json!({"bot": bot, "since_ms": since}),
+        None => json!({"bot": bot, "after": 0}),
+    };
+    client
+        .request("follow", follow)
+        .await
+        .map(|_| ())
+        .map_err(|e| e.to_string())
 }
 
 /// Read past a follow's replay as it arrives, so a long one cannot fill
@@ -3701,6 +3820,27 @@ fn hold(unsent: &mut Vec<String>, record: String) {
     unsent.push(record);
     while unsent.len() > 1 && unsent.iter().map(String::len).sum::<usize>() > UNSENT_BYTES {
         unsent.remove(0);
+    }
+}
+
+/// Why `prompt` is not sent, when it reads as a command that none of the
+/// commands took: one slash word that names no command, or a command
+/// given words it doesn't take. A message that only starts with a slash
+/// word, such as a path, is words for the agent.
+fn unknown_command(prompt: &str) -> Option<String> {
+    const UNLISTED: [&str; 5] = ["/agents", "/automations", "/lookout", "/forum", "/settings"];
+    let mut words = prompt.split_whitespace();
+    let word = words.next()?;
+    let name = word.strip_prefix('/')?;
+    if name.is_empty() || !(name.chars()).all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    {
+        return None;
+    }
+    let known = COMMANDS.iter().any(|(command, _)| *command == word) || UNLISTED.contains(&word);
+    match (known, words.next().is_some()) {
+        (true, _) => Some(format!("{word} takes nothing after it")),
+        (false, false) => Some(format!("no command {word} · / lists them")),
+        (false, true) => None,
     }
 }
 
@@ -7358,10 +7498,7 @@ impl App {
         }
         let lead = async {
             let (client, mut fresh) = connect(&self.options, Asking::Never).await?;
-            client
-                .request("follow", json!({"bot": self.bot, "after": 0}))
-                .await
-                .map_err(|e| e.to_string())?;
+            follow_bot(&client, &self.bot).await?;
             let caught = caught_up(&mut fresh).await;
             // Read after the replay, so a turn that ends meanwhile arrives
             // as an event rather than lost between the two.
@@ -10026,7 +10163,7 @@ impl App {
         let asked = json!({"bot": self.bot, "turn": message, "bytes": PROMPT_READ_BYTES});
         let read = self.client.request("prompts", asked).await.ok()?;
         let text = read["prompts"][0]["text"].as_str()?;
-        Some(stamp::unstamped(text).to_owned())
+        Some(text.to_owned())
     }
 
     /// The folder the agent works in, where its pictures' paths start:
@@ -12547,6 +12684,13 @@ impl App {
                         self.close_pane(true)
                     }
                     KeyCode::Esc => {}
+                    // Ctrl+C copies what is selected here, else closes the
+                    // pane: it quits only from the composer.
+                    _ if copy && let Some(text) = pane.screen.selected() => {
+                        pane.screen.unselect();
+                        self.copied(&text);
+                    }
+                    KeyCode::Char('c') if ctrl => self.close_pane(true),
                     // `/sky`'s own keys: its legend, zen, the models' colours,
                     // a star picked and centred on; Esc lets go of the pick
                     // and the centre before it closes the pane.
@@ -12598,10 +12742,6 @@ impl App {
                         })
                     }
                     _ if switches(key) || key.code == KeyCode::Tab => self.pane_keys = false,
-                    _ if copy && let Some(text) = pane.screen.selected() => {
-                        pane.screen.unselect();
-                        self.copied(&text);
-                    }
                     // The picture or drawing shown, opened bigger outside Sonny.
                     KeyCode::Char('o')
                         if let Some(path) = pane.bigger().map(std::path::Path::to_path_buf) =>
@@ -14344,6 +14484,11 @@ impl App {
             self.side(question.trim().to_owned(), &pictures).await;
             return;
         }
+        // A slash word no command took is answered, and stays to be fixed.
+        if let Some(why) = unknown_command(&prompt) {
+            self.notice = Some(why);
+            return;
+        }
         // What is sent while a question is in focus answers it, as the
         // row over the composer says: an option's number picks that
         // option, words are the answer as written. Esc first makes them
@@ -14457,14 +14602,8 @@ impl App {
         // A steer never moves a bot, so a moved lead comes back with the
         // next message that starts a turn.
         let workspace = (!steer).then(|| self.move_to.clone()).flatten();
-        // The person's words carry when they were sent; a record of what
-        // Sonny did for them is read as it is.
-        let sent = match origin {
-            None => stamp::now(&prompt),
-            Some(_) => prompt.clone(),
-        };
         // An answer goes once, whichever window sends it ([`answer_once`]).
-        let submitted = json!({"bot": self.bot, "prompt": sent, "delivery": delivery,
+        let submitted = json!({"bot": self.bot, "prompt": prompt, "delivery": delivery,
             "model": model, "workspace": workspace, "effort": effort, "origin": origin,
             "images": attach::submitted(pictures)});
         let reply = match asks::answer_of(&prompt, origin) {
@@ -14528,7 +14667,7 @@ impl App {
         let Some(task) = ask.task.clone() else {
             return Err("that question is not a task's".into());
         };
-        let submitted = json!({"bot": task.bot, "prompt": stamp::now(prompt),
+        let submitted = json!({"bot": task.bot, "prompt": prompt,
             "delivery": "steer", "images": attach::submitted(pictures)});
         let reply = answer_once(&self.client, &ask.id, submitted).await?;
         self.task_answers.push(TaskAnswer {
@@ -15593,7 +15732,7 @@ impl App {
                 .request(
                     "submit",
                     json!({"bot": name, "bot_id": forked["bot_id"], "request_id": format!("{name}.1"),
-                        "prompt": stamp::now(&question), "delivery": "steer", "model": self.turn_model,
+                        "prompt": question, "delivery": "steer", "model": self.turn_model,
                         "images": attach::submitted(pictures)}),
                 )
                 .await
@@ -15831,6 +15970,7 @@ impl App {
             // Named even when every task runs as it, so its model and
             // tools apply; its words are told once.
             profile: Some(profile.name.clone()),
+            permissions: None,
             setup: false,
             model: None,
             effort: None,
@@ -15840,6 +15980,7 @@ impl App {
             builds_on: None,
             env,
             made_by: Some(self.bot.clone()),
+            providers: Value::Null,
         };
         let (here, project, starter) = (dir.to_owned(), project.to_owned(), self.bot.clone());
         tokio::task::spawn_blocking(move || {
@@ -18099,13 +18240,11 @@ fn quiet_message(text: &str) -> bool {
 }
 
 /// A message item's text: a prompt's own words, without the line the
-/// daemon adds after them naming who sent it or the time Sonny stamped on
-/// them.
+/// daemon adds after them naming who sent it and when.
 fn text(item: &Value) -> String {
     match (&item["role"], &item["content"]) {
         (role, Value::Array(parts)) if role == "user" => (parts.iter())
             .find_map(|part| part["text"].as_str())
-            .map(stamp::unstamped)
             .unwrap_or_default()
             .to_owned(),
         (_, content) => joined(content),
@@ -18247,6 +18386,14 @@ fn zen_notice(on: bool) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Request ids made in one millisecond, as two reactions sent back to
+    /// back, are still two requests to the daemon.
+    #[test]
+    fn names_made_in_the_same_millisecond_differ() {
+        let names: std::collections::HashSet<_> = (0..1000).map(|_| unique("acp")).collect();
+        assert_eq!(names.len(), 1000);
+    }
 
     #[test]
     fn an_env_file_that_sets_agent_s_own_names_is_told_they_are_not_read() {
@@ -18501,17 +18648,16 @@ mod tests {
     }
 
     #[test]
-    fn a_message_is_drawn_without_the_time_it_was_sent() {
-        let sent = stamp::stamped("ship it", 1_793_473_920);
+    fn a_message_is_drawn_without_the_daemon_s_line_after_it() {
         let item = json!({"type": "message", "role": "user", "content": [
-            {"type": "input_text", "text": sent},
-            {"type": "input_text", "text": "[Sent by lookout.tasks.]"}]});
+            {"type": "input_text", "text": "ship it"},
+            {"type": "input_text", "text": "[Message lead/4. Sent Sat 31 Oct 2026 16:12, UTC-04:00.]"}]});
         assert_eq!(text(&item), "ship it");
     }
 
-    /// The words a submit carried, without the time Sonny stamped on them.
+    /// The words a submit carried.
     fn words_sent(asked: &Value) -> &str {
-        stamp::unstamped(asked["prompt"].as_str().unwrap_or_default())
+        asked["prompt"].as_str().unwrap_or_default()
     }
 
     #[test]
@@ -19593,6 +19739,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_window_follows_its_agent_from_its_turn_before_last_not_its_first_event() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let follows = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (seen, fresh) = (follows.clone(), Arc::new(AtomicBool::new(false)));
+        let new = fresh.clone();
+        let client =
+            daemon_answering(
+                move |asked| match asked["op"].as_str().unwrap_or_default() {
+                    // Newest first: one running, the one before it ended.
+                    "turns" if new.load(Ordering::SeqCst) => {
+                        json!({"turns": [], "next_before": null})
+                    }
+                    "turns" => {
+                        json!({"turns": [{"turn": 9, "status": "running", "started_ms": 9_000},
+                {"turn": 7, "status": "completed", "started_ms": 7_000}], "next_before": 7})
+                    }
+                    "follow" => {
+                        seen.lock().unwrap().push(asked.clone());
+                        json!({})
+                    }
+                    _ => json!({"error": {"code": "unexpected", "message": asked.to_string()}}),
+                },
+            )
+            .await;
+        follow_bot(&client, "shop.lead").await.unwrap();
+        // An agent that ran no turn yet has no events to skip.
+        fresh.store(true, Ordering::SeqCst);
+        follow_bot(&client, "shop.lead").await.unwrap();
+        let follows = follows.lock().unwrap();
+        assert_eq!(follows[0]["since_ms"], 7_000);
+        assert!(follows[0]["after"].is_null());
+        assert_eq!(follows[1]["after"], 0);
+        assert!(follows[1]["since_ms"].is_null());
+    }
+
+    #[tokio::test]
     async fn a_running_workflow_is_one_row_under_its_caller_and_s_stops_it() {
         let client = daemon_answering(|asked| match asked["op"].as_str().unwrap_or_default() {
             "bots" => json!({"bots": [{"name": "shop.lead", "bot_id": 1, "head": 1,
@@ -19701,12 +19883,19 @@ mod tests {
             |path: &std::path::Path| std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode(&kept), 0o600);
         assert_eq!(mode(kept.parent().unwrap()), 0o700);
-        // What another build kept is read again.
+        // Another build reads each agent's latest items again, and its
+        // question only when it reads questions otherwise.
         let mut file: Value = serde_json::from_slice(&std::fs::read(&kept).unwrap()).unwrap();
         file["build"] = json!("another");
         std::fs::write(&kept, file.to_string()).unwrap();
         open().await;
-        assert_eq!(histories.load(Ordering::SeqCst), 10);
+        assert_eq!(histories.load(Ordering::SeqCst), 8);
+        let mut file: Value = serde_json::from_slice(&std::fs::read(&kept).unwrap()).unwrap();
+        file["build"] = json!("another");
+        file["reads"] = json!("read otherwise");
+        std::fs::write(&kept, file.to_string()).unwrap();
+        open().await;
+        assert_eq!(histories.load(Ordering::SeqCst), 12);
         std::fs::remove_dir_all(home).unwrap();
     }
 
@@ -20430,7 +20619,7 @@ mod tests {
             if asked["op"] == "submit" {
                 seen.lock()
                     .unwrap()
-                    .push(stamp::unstamped(asked["prompt"].as_str().unwrap()).to_owned());
+                    .push(asked["prompt"].as_str().unwrap().to_owned());
             }
             json!({"message": 2, "turn": 2})
         })
@@ -21256,7 +21445,7 @@ mod tests {
         assert!(app.repaint);
         let prompts: Vec<String> = (asked.lock().unwrap().iter())
             .filter(|op| op["op"] == "submit")
-            .map(|op| stamp::unstamped(op["prompt"].as_str().unwrap_or("")).to_owned())
+            .map(|op| op["prompt"].as_str().unwrap_or("").to_owned())
             .collect();
         assert_eq!(prompts, ["/zen the receipts' currency", "/zen off"]);
     }
@@ -21922,7 +22111,7 @@ mod tests {
     #[tokio::test]
     async fn a_window_opened_again_shows_the_steer_still_waiting() {
         // Sent from a window since closed: the turn has not taken it in.
-        let said = stamp::stamped("also check the deploy notes", 1_700_000_000);
+        let said = "also check the deploy notes";
         let client = daemon_answering(move |asked| match asked["op"].as_str() {
             Some("messages") => json!({"messages": [
                 {"message": 4, "status": "queued", "delivery": "steer"},
@@ -25014,6 +25203,82 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn ctrl_c_in_the_pane_closes_it_and_quits_only_from_the_composer() {
+        let client = daemon_answering(|request| match request["op"].as_str() {
+            Some("inspect") => json!({"name": "b", "instructions": "", "tools": [],
+                "declared": []}),
+            _ => json!({}),
+        })
+        .await;
+        let mut app = app(client);
+        app.input.set("/context");
+        app.submit().await;
+        assert!(app.pane.is_some());
+        app.pane_keys = true;
+        let ctrl_c = || {
+            Event::Key(event::KeyEvent::new(
+                KeyCode::Char('c'),
+                KeyModifiers::CONTROL,
+            ))
+        };
+        app.key(ctrl_c()).await;
+        assert!(app.pane.is_none() && !app.pane_keys && !app.quit);
+        app.key(ctrl_c()).await;
+        assert!(app.quit);
+    }
+
+    #[tokio::test]
+    async fn a_slash_word_that_names_no_command_is_answered_not_sent() {
+        let sent = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = sent.clone();
+        let client = daemon_answering(move |asked| {
+            if asked["op"] == "submit" {
+                seen.lock()
+                    .unwrap()
+                    .push(asked["prompt"].as_str().unwrap().to_owned());
+            }
+            json!({"message": 2, "turn": 2})
+        })
+        .await;
+        let mut app = app(client);
+        for (typed, said) in [
+            ("/stauts", "no command /stauts · / lists them"),
+            ("/status foo", "/status takes nothing after it"),
+            ("/agents now", "/agents takes nothing after it"),
+        ] {
+            app.input.set(typed);
+            app.submit().await;
+            assert_eq!(app.notice.as_deref(), Some(said));
+            // Kept, to be fixed and sent again.
+            assert_eq!(&*app.input, typed);
+        }
+        // Words that only start with a slash word, or a path, go as written.
+        for typed in ["/etc/hosts", "/tmp is full", "/ alone"] {
+            app.input.set(typed);
+            app.submit().await;
+        }
+        assert_eq!(
+            *sent.lock().unwrap(),
+            ["/etc/hosts", "/tmp is full", "/ alone"]
+        );
+    }
+
+    #[test]
+    fn unknown_command_reads_only_slash_words() {
+        assert_eq!(
+            unknown_command("/zen-mode").as_deref(),
+            Some("no command /zen-mode · / lists them")
+        );
+        assert_eq!(
+            unknown_command("/model gpt").as_deref(),
+            Some("/model takes nothing after it")
+        );
+        for words in ["hello", "/", "/etc/hosts", "/a.txt", "/x y", "!ls"] {
+            assert_eq!(unknown_command(words), None, "{words}");
+        }
+    }
+
+    #[tokio::test]
     async fn a_fork_s_compaction_is_read_from_its_source_s_events() {
         use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
         let dir = std::env::temp_dir().join(format!("sonny-compacted-{}", unique("t")));
@@ -26232,7 +26497,7 @@ mod tests {
             if asked["op"] == "submit" {
                 seen.lock()
                     .unwrap()
-                    .push(stamp::unstamped(asked["prompt"].as_str().unwrap()).to_owned());
+                    .push(asked["prompt"].as_str().unwrap().to_owned());
             }
             json!({"message": 2, "turn": 2})
         })
@@ -26451,7 +26716,7 @@ mod tests {
         let to = sent.lock().unwrap().last().cloned().unwrap();
         assert_eq!(to["bot"], "calc.ask");
         // Words typed while it is in focus answer it, once.
-        let prompt = stamp::unstamped(to["prompt"].as_str().unwrap());
+        let prompt = to["prompt"].as_str().unwrap();
         assert_eq!(prompt, "You asked (ask:2/q1): Signed in?\n\ndone");
         assert_eq!(to["request_id"], json!(asks::request_id("ask:2/q1", 0)));
         assert!(app.asks.is_empty());

@@ -142,8 +142,11 @@ struct Options {
     /// `run --attach-wait`: how long an attached message waits, in
     /// milliseconds; 0 as long as it takes.
     attach_wait_ms: Option<u64>,
-    /// A new bot's approval mode and gated tools.
+    /// A new bot's approval mode and gated tools, and whether the mode
+    /// was asked for with `--approval` rather than taken from
+    /// `AGENT_APPROVAL`.
     approval: Option<String>,
+    approval_asked: bool,
     approve: Option<String>,
     /// `answer`: the call, its request number, the gate, and the reason.
     call: Option<String>,
@@ -222,6 +225,7 @@ fn parse(args: &[String]) -> Result<Options> {
         approval: std::env::var("AGENT_APPROVAL")
             .ok()
             .filter(|mode| !mode.is_empty()),
+        approval_asked: false,
         approve: None,
         call: None,
         request: None,
@@ -257,12 +261,6 @@ fn parse(args: &[String]) -> Result<Options> {
                 options.settings.insert("network".to_owned(), json!(true));
                 options.settings_flags.push("--network".to_owned());
             }
-            "--hide-senders" => {
-                options
-                    .settings
-                    .insert("hide_senders".to_owned(), json!(true));
-                options.settings_flags.push("--hide-senders".to_owned());
-            }
             "--quiet-background" => {
                 options
                     .settings
@@ -291,7 +289,10 @@ fn parse(args: &[String]) -> Result<Options> {
                     "--model" => options.model = Some(value),
                     "--profile" => options.profile = Some(value),
                     "--delivery" => options.delivery = Some(value),
-                    "--approval" => options.approval = Some(value),
+                    "--approval" => {
+                        options.approval = Some(value);
+                        options.approval_asked = true;
+                    }
                     "--approve" => options.approve = Some(value),
                     "--allow" => options.allow = Some(value),
                     "--call" => options.call = Some(value),
@@ -473,6 +474,18 @@ fn parse(args: &[String]) -> Result<Options> {
                         if !options.settings_flags.iter().any(|f| f == flag) {
                             options.settings_flags.push(flag.to_owned());
                         }
+                    }
+                    "--trailer" => {
+                        let parts: Vec<&str> = value.split(',').filter(|p| !p.is_empty()).collect();
+                        if let Some(part) = parts.iter().find(|p| !matches!(**p, "sender" | "time"))
+                        {
+                            return fail_with(
+                                "usage",
+                                format!("--trailer lists sender and time, not {part}"),
+                            );
+                        }
+                        options.settings.insert("trailer".to_owned(), json!(parts));
+                        options.settings_flags.push(flag.to_owned());
                     }
                     "--outputs" => {
                         let path = std::path::absolute(&value)?;
@@ -1357,7 +1370,7 @@ impl Started {
             // winner can still be recovering its store before binding the
             // socket.
             match startup_remaining(deadline) {
-                Ok(left) => std::thread::sleep(Duration::from_millis(50).min(left)),
+                Ok(left) => std::thread::sleep(Duration::from_millis(5).min(left)),
                 Err(error) => return Err(timed_out(&mut self, error)),
             }
         }
@@ -1536,11 +1549,30 @@ fn author() -> Result<Value> {
     }
 }
 
-/// Whether a bot record has a gate the `auto` approver answers.
+/// The tools a bot record declares, and passes to the bots it makes, that
+/// one of its gates holds back.
+fn held_declared(bot: &Value) -> Vec<&str> {
+    let gated = |name: &str| {
+        (bot["gates"].as_array().into_iter().flatten())
+            .any(|gate| (gate["tools"].as_array().into_iter().flatten()).any(|tool| tool == name))
+    };
+    // `false`, or no generations left, is kept from the bots it makes.
+    let passed =
+        |tool: &&Value| !matches!(&tool["inherit"], Value::Bool(false)) && tool["inherit"] != 0;
+    (bot["declared"].as_array().into_iter().flatten())
+        .filter(passed)
+        .filter_map(|tool| tool["name"].as_str())
+        .filter(|name| gated(name))
+        .collect()
+}
+
+/// Whether a bot record has a gate the `auto` approver answers: none for
+/// a bot that never asks, whatever gates it keeps.
 fn answered_by_auto(bot: &Value) -> bool {
-    bot["gates"]
-        .as_array()
-        .is_some_and(|gates| gates.iter().any(|gate| gate["tag"] == "auto"))
+    bot["settings"]["approval_policy"] != "never"
+        && bot["gates"]
+            .as_array()
+            .is_some_and(|gates| gates.iter().any(|gate| gate["tag"] == "auto"))
 }
 
 /// An `auto` bot needs an approver serving `auto`, such as the one Sonny
@@ -1562,10 +1594,13 @@ fn require_approver(connection: &mut Connection) -> Result<()> {
 }
 
 /// The gate a new bot asks for, as `create` or `fork` fields. The mode
-/// comes from --approval or AGENT_APPROVAL, `full` by default: no gate.
+/// comes from --approval or AGENT_APPROVAL, `full` by default: no gate,
+/// asked for as none when --approval names it, so a bot made by another,
+/// which keeps its creator's gates, is refused rather than given them.
 /// `manual` gates --approve, or every tool the bot has but those never
 /// gated (`UNGATED`), for a person or a program to answer; `auto`
-/// leaves `read` ungated too.
+/// leaves `read` ungated too. `never` asks for no gate and the setting
+/// that refuses what any gate it keeps would ask about.
 fn requested_gate(options: &Options, tools: &[String]) -> Result<Value> {
     // The tools gated: --approve, or every tool but the ungated ones.
     let approve = |ungated: &[&str]| -> Result<Vec<String>> {
@@ -1588,11 +1623,12 @@ fn requested_gate(options: &Options, tools: &[String]) -> Result<Value> {
         Ok(approve)
     };
     match options.approval.as_deref().unwrap_or("full") {
-        "full" if options.approve.is_some() => fail_with(
+        "full" | "never" if options.approve.is_some() => fail_with(
             "usage",
             "--approve names tools for an approver; use --approval manual or auto",
         ),
-        "full" => Ok(json!({})),
+        "full" if options.approval_asked => Ok(json!({"approve": []})),
+        "full" | "never" => Ok(json!({})),
         // A bot with only ungated tools has nothing to wait for.
         "manual" => Ok(match approve(&UNGATED)? {
             approve if approve.is_empty() => json!({}),
@@ -1607,7 +1643,7 @@ fn requested_gate(options: &Options, tools: &[String]) -> Result<Value> {
         }),
         mode => fail_with(
             "usage",
-            format!("unknown approval mode {mode}; use full, manual, or auto"),
+            format!("unknown approval mode {mode}; use full, manual, auto, or never"),
         ),
     }
 }
@@ -2099,8 +2135,11 @@ fn run(options: &Options) -> Result<i32> {
                 .collect(),
         };
         let mut settings = options.settings.clone();
-        if config()?.hide_senders {
-            settings.entry("hide_senders").or_insert(json!(true));
+        if options.approval.as_deref() == Some("never") {
+            settings.insert("approval_policy".into(), json!("never"));
+        }
+        if let Some(trailer) = &config()?.trailer {
+            settings.entry("trailer").or_insert(json!(trailer));
         }
         if let Some(ms) = config()?.hold_ms {
             settings.entry("hold_ms").or_insert(json!(ms));
@@ -2118,7 +2157,24 @@ fn run(options: &Options) -> Result<i32> {
             "compaction_instructions":options.compaction_instructions,
             "compaction_model":options.compaction_model,"fallback":fallback,
             "settings":settings,"request_id":request_id});
-        if let Value::Object(gate) = requested_gate(options, &tools)? {
+        if let Value::Object(mut gate) = requested_gate(options, &tools)? {
+            // The tools its creator declared, which it inherits, held by
+            // its own gate too where its creator's gates hold them, so a
+            // gate it asks for beside its creator's reaches them as well.
+            if options.approve.is_none()
+                && gate.contains_key("approver")
+                && let Some(by) = &created_by
+            {
+                let maker =
+                    connection.request("inspect", json!({"bot": by, "bot_id": created_by_id}))?;
+                if let Some(Value::Array(approve)) = gate.get_mut("approve") {
+                    for name in held_declared(&maker) {
+                        if !approve.iter().any(|have| have == name) {
+                            approve.push(json!(name));
+                        }
+                    }
+                }
+            }
             // An approver first, so a gate nobody serves leaves no bot behind.
             if gate.get("approver").is_some_and(|tag| tag == "auto") {
                 require_approver(&mut connection)?;
@@ -3971,33 +4027,68 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_made_bot_s_own_gate_holds_the_tools_it_inherits_as_its_creator_s_do() {
+        let maker = json!({"gates": [{"tag": "auto", "tools": ["shell", "start_task"]}],
+            "declared": [{"name": "start_task"}, {"name": "memory"}]});
+        assert_eq!(held_declared(&maker), ["start_task"]);
+        // One it keeps from the bots it makes is none of theirs to gate.
+        let kept = json!({"gates": [{"tag": "auto", "tools": ["new_project", "start_task"]}],
+            "declared": [{"name": "new_project", "inherit": false},
+                {"name": "start_task", "inherit": 2}]});
+        assert_eq!(held_declared(&kept), ["start_task"]);
+        assert!(held_declared(&json!({"declared": [{"name": "start_task"}]})).is_empty());
+    }
+
+    #[test]
+    fn a_bot_that_never_asks_needs_no_approver() {
+        let auto = json!([{"tag": "auto", "tools": ["shell"]}]);
+        assert!(answered_by_auto(&json!({"gates": auto, "settings": {}})));
+        assert!(!answered_by_auto(&json!({"gates": auto,
+            "settings": {"approval_policy": "never"}})));
+        assert!(!answered_by_auto(
+            &json!({"gates": [{"tag": "manual", "tools": ["shell"]}]})
+        ));
+    }
+
+    #[test]
     fn a_daemon_that_says_it_starts_is_waited_for_past_the_first_deadline() {
         use std::io::Write;
         let dir = std::env::temp_dir().join(format!("agent-starting-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        let socket = dir.join("s.sock");
-        let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
-        let daemon = std::thread::spawn(move || {
-            let (mut stream, _) = listener.accept().unwrap();
-            for _ in 0..4 {
-                stream
-                    .write_all(b"{\"event\":\"starting\",\"protocol\":1,\"pid\":7}\n")
-                    .unwrap();
-                std::thread::sleep(Duration::from_millis(150));
+        // The daemon's `starting` line is in before the client reads, so
+        // what the first deadline sees is the line, not how soon a thread
+        // is scheduled to write it.
+        let (stream, mut daemon) = std::os::unix::net::UnixStream::pair().unwrap();
+        daemon
+            .write_all(b"{\"event\":\"starting\",\"protocol\":1,\"pid\":7}\n")
+            .unwrap();
+        let (deadline, first) = std::sync::mpsc::channel::<Instant>();
+        let late = std::thread::spawn(move || {
+            // Its ready line comes only once the first deadline has passed:
+            // the `starting` line gave it more time.
+            let first = first.recv().unwrap();
+            while let Some(left) = first.checked_duration_since(Instant::now()) {
+                std::thread::sleep(left + Duration::from_millis(1));
             }
-            stream
+            daemon
                 .write_all(b"{\"event\":\"ready\",\"pid\":7}\n")
                 .unwrap();
-            stream
+            daemon
         });
-        // Its ready line comes well after the first deadline: each
-        // `starting` gives it more time.
-        let connection =
-            Connection::greeted_until(&socket, Instant::now() + Duration::from_millis(200))
-                .unwrap();
-        assert_eq!(connection.ready, json!({"event": "ready", "pid": 7}));
-        drop(daemon.join().unwrap());
+        let mut connection = Connection {
+            writer: stream.try_clone().unwrap(),
+            reader: BufReader::new(stream),
+            next: 0,
+            pending: VecDeque::new(),
+            ready: Value::Null,
+        };
+        let first = Instant::now() + Duration::from_millis(200);
+        deadline.send(first).unwrap();
+        let ready = connection.read_ready(first).unwrap();
+        assert_eq!(ready, json!({"event": "ready", "pid": 7}));
+        assert!(Instant::now() > first);
+        drop(late.join().unwrap());
         // One that says nothing is not waited for past it.
         let listener = std::os::unix::net::UnixListener::bind(dir.join("quiet.sock")).unwrap();
         let quiet = Connection::greeted_until(
