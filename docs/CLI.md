@@ -66,7 +66,11 @@ keeps it read-only where it exists; a client passes `.git`, `.agents` and
 keeps PATH, by its absolute path, read-only in every sandbox and from being
 made there; the CLI passes `~/.agent/rules`, where Sonny reads the
 [command rules](RUST_PROTOTYPE.md#command-rules) it gives its bots, so no
-bot writes its own. `serve --wall FOLDER` keeps every sandboxed command,
+bot writes its own. `serve --unreadable FOLDER` keeps FOLDER and what is in
+it from every sandboxed command's reads, writes, links and renames, as
+Codex's `deny_read`, and the `read` tool refuses it for a sandboxed bot
+(`read_denied`); it is made private (mode 700) if missing. The CLI passes
+`~/.agent/keys`, which holds `env`, the keys it starts the daemon with. `serve --wall FOLDER` keeps every sandboxed command,
 the network on or not, from connecting to the Unix sockets in FOLDER,
 which it makes private (mode 700) if missing; the CLI passes
 `~/.agent/run`, where clients such as Sonny keep the sockets of programs
@@ -519,7 +523,7 @@ separated by whitespace), else `provider` in `~/.agent/config.toml` (the
 same), else the providers whose key variable is set; a
 running daemon is not checked against either. With none of them, starting
 fails with `provider_required`.
-A daemon `agent` starts gets the `KEY=VALUE` lines of `~/.agent/env` over
+A daemon `agent` starts gets the `KEY=VALUE` lines of `~/.agent/keys/env` over
 `agent`'s own environment (an empty value unsets the name), so it has the
 same keys whoever starts it: Sonny, an automation's check, a script or cron.
 The file is read only then, never for a command a running daemon answers.

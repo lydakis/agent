@@ -48,6 +48,11 @@ class ApprovalTests(ModelFixture):
         output = node_item(client, bot, completed['data']['node'])['result']['output']
         return completed['data'], json.loads(output)
 
+    def read_output(self, client, call_id, bot='Bob'):
+        events = client.request('events', bot=bot, after=0, limit=256)['result']['events']
+        completed = [e for e in events if e['event'] == 'tool_completed' and e['data']['call_id'] == call_id][-1]
+        return node_item(client, bot, completed['data']['node'])['result']['output']
+
     def events(self, client, turn, kind, bot='Bob'):
         events = client.request('events', bot=bot, after=0, limit=256)['result']['events']
         return [e['data'] for e in events if e.get('turn') == turn and e['event'] == kind]
@@ -497,6 +502,63 @@ class ApprovalTests(ModelFixture):
         # The one that asks to leave it still runs alone, and is refused.
         self.assertEqual(self.tool_output(client, 'shell-3')[1]['error'], 'escalation_refused')
         self.assertEqual(list(outside.iterdir()), [])
+
+    def test_a_sandboxed_bot_s_reads_keep_out_of_the_folders_kept_from_it(self):
+        # The daemon reads for the bot outside any sandbox, alone or in a
+        # batch of reads, and refuses a file in a folder kept from it.
+        keys = self.path / 'keys'
+        keys.mkdir()
+        (keys / 'env').write_text('OPENAI_API_KEY=sk-kept\n')
+        (self.path / 'notes').write_text('plain notes\n')
+        client = self.client('read,wait', extra=('--unreadable', str(keys)),
+                             settings={'sandbox': 'workspace-write'})
+        client.request('create', bot='Bob', workspace=str(self.path))
+        hidden = str(keys / 'env')
+        for calls in ([['read', {'path': hidden}]],
+                      [['read', {'path': hidden}], ['read', {'path': 'notes'}]]):
+            with self.subTest(calls=len(calls)):
+                turn = client.request('submit', bot='Bob', request_id=f't{len(calls)}',
+                                      prompt='calls:' + json.dumps(calls))['result']['message']
+                self.assertEqual(client.finished(turn)['data']['status'], 'completed')
+                denied = self.tool_output(client, 'read-1')[1]
+                self.assertEqual(denied['error'], 'read_denied', denied)
+                self.assertNotIn('sk-kept', json.dumps(denied))
+        self.assertIn('plain notes', self.read_output(client, 'read-2'))
+        # One lifted while it waits for its verdict, then allowed, too.
+        def respond(request, user):
+            if not user.startswith('lift:'):
+                return None
+            start = max(n for n, i in enumerate(request['input']) if i.get('role') == 'user'
+                        and not i['content'][0]['text'].startswith('steer:'))
+            if any(i.get('type') == 'function_call_output' for i in request['input'][start:]):
+                return 'lifted'
+            return [['read', {'path': user[5:]}]]
+        self.model.respond = respond
+        client.request('create', bot='Gated', workspace=str(self.path), tools=['read', 'wait'],
+                       approve=['read'], approver='manual', settings={'sandbox': 'workspace-write'})
+        turn = client.request('submit', bot='Gated', request_id='l', prompt='lift:' + hidden)['result']['turn']
+        asked = client.receive(lambda m: m.get('event') == 'approval_requested' and m.get('turn') == turn)
+        client.request('submit', bot='Gated', request_id='s', prompt='steer:go on', delivery='steer')
+        self.assertEqual(client.finished(turn)['data']['status'], 'completed')
+        waiting = asked['data']['calls'][0]
+        client.request('answer', bot='Gated', turn=turn, call_id=waiting['call_id'],
+                       request=waiting['request'], decision='allow', by='test')
+        ended = client.receive(lambda m: m.get('event') == 'lifted_ended' and m.get('bot') in (None, 'Gated'))
+        self.assertEqual(ended['data']['outcome'], 'allowed', ended)
+        handle = json.loads(self.read_output(client, waiting['call_id'], bot='Gated'))['handle']
+        prompt = 'calls:' + json.dumps([['wait', {'handles': [handle]}]])
+        turn = client.request('submit', bot='Gated', request_id='w', prompt=prompt, delivery='queue')['result']['message']
+        self.assertEqual(client.finished(turn)['data']['status'], 'completed')
+        lifted = self.read_output(client, 'wait-1', bot='Gated')
+        self.assertIn('read_denied', lifted)
+        self.assertNotIn('sk-kept', lifted)
+        # A bot outside any sandbox reads it, as the person would.
+        client.request('create', bot='Free', workspace=str(self.path),
+                       settings={'sandbox': 'danger-full-access'})
+        turn = client.request('submit', bot='Free', request_id='free',
+                              prompt='calls:' + json.dumps([['read', {'path': hidden}]]))['result']['message']
+        self.assertEqual(client.finished(turn)['data']['status'], 'completed')
+        self.assertIn('sk-kept', self.read_output(client, 'read-1', bot='Free'))
 
     @unittest.skipUnless(shutil.which('bwrap') or sys.platform == 'darwin', 'sandboxes need bubblewrap')
     def test_rules_given_while_a_turn_runs_rule_its_next_round(self):

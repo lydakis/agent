@@ -258,6 +258,20 @@ fn sandboxed(args: &[String]) -> Result<i32> {
             })
             .into_iter()
             .collect(),
+        // And hides the keys a daemon this CLI starts hides from its bots.
+        // Made first, as the daemon makes it, to be known by its real path.
+        unreadable: agent_client::env_file::folder()
+            .and_then(|keys| {
+                use std::os::unix::fs::DirBuilderExt;
+                std::fs::DirBuilder::new()
+                    .recursive(true)
+                    .mode(0o700)
+                    .create(&keys)
+                    .ok()?;
+                std::fs::canonicalize(&keys).ok()
+            })
+            .into_iter()
+            .collect(),
         // And what the daemon walls off, as it would for a bot.
         walled: (agent_client::config::run())
             .and_then(|run| std::fs::canonicalize(run).ok())
@@ -363,6 +377,7 @@ fn configuration(args: &[String]) -> Result<server::Configuration> {
     let (mut protected, mut protected_existing) = (Vec::new(), Vec::new());
     let mut protected_paths = Vec::new();
     let mut walled = Vec::new();
+    let mut unreadable = Vec::new();
     let mut own_copies = Vec::new();
     let mut windows = Vec::new();
     let mut speeds = Vec::new();
@@ -395,6 +410,7 @@ fn configuration(args: &[String]) -> Result<server::Configuration> {
             "--protect" => protected.push(value.clone()),
             "--protect-path" => protected_paths.push(value.into()),
             "--wall" => walled.push(value.into()),
+            "--unreadable" => unreadable.push(value.into()),
             "--own-copy" if !std::path::Path::new(value).is_absolute() => {
                 return fail_with("usage", "--own-copy needs an absolute folder");
             }
@@ -480,6 +496,7 @@ fn configuration(args: &[String]) -> Result<server::Configuration> {
         protected_existing,
         protected_paths,
         walled,
+        unreadable,
         own_copies,
         context_windows: std::sync::Arc::new(agent_runtime::provider::Windows::parse(windows)?),
         speeds: std::sync::Arc::new(agent_runtime::provider::Speeds::parse(speeds)?),

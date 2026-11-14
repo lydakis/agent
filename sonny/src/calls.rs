@@ -32,26 +32,31 @@ pub fn attempted(verb: &str) -> String {
         "Added" => "add",
         "Answered" => "answer",
         "Asked" => "ask",
+        "Called" => "call",
         "Checked" => "check",
         "Cleaned" => "clean",
         "Cleared" => "clear",
         "Discarded" => "discard",
-        "Ran" => "run",
+        "Edited" => "edit",
         "Followed" => "follow",
         "Forked" => "fork",
         "Indexed" => "index",
         "Interrupted" => "interrupt",
+        "Killed" => "kill",
         "Left" => "leave",
         "Listed" => "list",
+        "Loaded" => "load",
         "Looked" => "look",
+        "Marked" => "mark",
         "Moved" => "move",
+        "Noted" => "note",
         "Opened" => "open",
         "Paused" => "pause",
         "Pruned" => "prune",
         "Queued" => "queue",
+        "Ran" => "run",
         "Read" => "read",
         "Removed" => "remove",
-        "Resolved" => "resolve",
         "Saved" => "save",
         "Scheduled" => "schedule",
         "Started" => "start",
@@ -60,6 +65,7 @@ pub fn attempted(verb: &str) -> String {
         "Unfollowed" => "unfollow",
         "Updated" => "update",
         "Waited" => "wait",
+        "Wrote" => "write",
         _ => return format!("Failed: {}", verb.to_lowercase()),
     };
     match rest {
@@ -1075,10 +1081,10 @@ pub fn declared(name: &str, arguments: &Value, failed: bool) -> Option<Said> {
             Some(said)
         }
         crate::resolved::TOOL => Some(Said {
-            verb: "Resolved".into(),
+            verb: "Marked".into(),
             what: match arguments["task"].as_str().map(str::trim) {
-                Some(task) if !task.is_empty() => task.to_owned(),
-                _ => "this task".into(),
+                Some(task) if !task.is_empty() => format!("{task} done"),
+                _ => "this task done".into(),
             },
             under: Vec::new(),
             failed,
@@ -1224,7 +1230,7 @@ pub fn plan(items: &[String]) -> Said {
     }
     for item in items {
         let (mark, text) = match item.split_at_checked(3) {
-            Some(("[x]", text)) => ("✔", text),
+            Some(("[x]", text)) => ("✓", text),
             Some(("[>]", text)) => ("→", text),
             Some(("[ ]", text)) => ("□", text),
             // A step the bot sent without its mark is still a step.
@@ -1232,8 +1238,8 @@ pub fn plan(items: &[String]) -> Said {
         };
         let text = text.trim().to_owned();
         said.under.push(match mark {
-            "✔" => Line::from(vec![
-                Span::raw("✔ ").fg(Color::Green),
+            "✓" => Line::from(vec![
+                Span::raw("✓ ").fg(Color::Green),
                 Span::raw(text).dim(),
             ]),
             "→" => Line::from(vec![
@@ -1726,7 +1732,7 @@ Keep the rest.'"#,
         let steps = serde_json::json!({"steps": ["[x] Read", "[>] Fix", "[ ] Test", "Ship"]});
         let said = declared("plan", &steps, false).unwrap();
         let lines: Vec<String> = said.under.iter().map(text).collect();
-        assert_eq!(lines, ["✔ Read", "→ Fix", "□ Test", "□ Ship"]);
+        assert_eq!(lines, ["✓ Read", "→ Fix", "□ Test", "□ Ship"]);
         let cleared = declared("plan", &serde_json::json!({"steps": []}), false).unwrap();
         assert_eq!(cleared.verb, "Cleared the plan");
     }

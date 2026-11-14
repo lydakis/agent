@@ -730,9 +730,34 @@ async fn a_sandboxed_command_writes_only_its_roots() {
         std::fs::create_dir_all(folder).unwrap();
     }
     std::fs::write(dir.join("store"), "db").unwrap();
+    // Folders of keys it may not read: one outside its roots, one in its
+    // own folder, one deeper there, and one there that isn't yet; one
+    // inside another is closed with it.
+    let (keys, env, later) = (base.join("keys"), dir.join("env"), dir.join("later"));
+    let deep = dir.join("deep/keys");
+    // And one in a walled folder, out of sight with it.
+    let (walled, private) = (base.join("walled"), base.join("walled/keys"));
+    for (folder, key) in [
+        (&keys, "KEY=outside"),
+        (&env, "KEY=inside"),
+        (&deep, "KEY=deep"),
+        (&private, "KEY=walled"),
+    ] {
+        std::fs::create_dir_all(folder).unwrap();
+        std::fs::write(folder.join("env"), key).unwrap();
+    }
     let daemon = Daemon {
         store: Some(dir.join("store")),
         helper: Some(env!("CARGO_BIN_EXE_agent").into()),
+        unreadable: vec![
+            keys.join("inner"),
+            keys.clone(),
+            env.clone(),
+            later.clone(),
+            deep.clone(),
+            private.clone(),
+        ],
+        walled: vec![walled.clone()],
         ..protecting()
     };
     let writable = [
@@ -750,7 +775,7 @@ async fn a_sandboxed_command_writes_only_its_roots() {
         .unwrap()
         .unwrap(),
     );
-    let tools = Registry::new("shell,write,edit,apply_patch").unwrap();
+    let tools = Registry::new("shell,read,write,edit,apply_patch").unwrap();
     let run = |command: String| {
         let tools = tools.clone();
         let (dir, policy) = (dir.clone(), policy.clone());
@@ -895,6 +920,82 @@ async fn a_sandboxed_command_writes_only_its_roots() {
         .unwrap_err();
     assert_eq!(error.code, "write_denied");
     assert!(hook.symlink_metadata().is_ok());
+    // What the daemon keeps unreadable no command reads, lists, writes,
+    // renames or links to another name, and neither does the read tool, by
+    // its path or through a link. One missing is made, private, before the
+    // command starts, so none it makes is open to it.
+    for command in [
+        format!("cat {}/env", keys.display()),
+        format!("ls {}", keys.display()),
+        "cat env/env".into(),
+        "echo x > env/env".into(),
+        "mv env moved".into(),
+        "mv env/env moved".into(),
+        "mv deep moved".into(),
+        "cat deep/keys/env".into(),
+        format!("cat {}/env", private.display()),
+        "ln env/env linked".into(),
+        "echo KEY=made > later/env && cat later/env".into(),
+    ] {
+        let output = run(command.clone()).await;
+        assert_ne!(output["exit_code"], 0, "{command}: {output}");
+        let said = format!("{}{}", output["stdout"], output["stderr"]);
+        assert!(!said.contains("KEY="), "{command}: {output}");
+    }
+    assert_eq!(
+        std::fs::read_to_string(env.join("env")).unwrap(),
+        "KEY=inside"
+    );
+    assert!(!dir.join("moved").exists() && !dir.join("linked").exists());
+    assert!(deep.join("env").is_file());
+    assert!(later.is_dir() && std::fs::read_dir(&later).unwrap().next().is_none());
+    // The keys file saved whole while a command runs, staged beside it and
+    // renamed over it, stays out of the command's reach.
+    let (saved, read) = tokio::join!(
+        async {
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            std::fs::write(keys.join(".env.1"), "KEY=saved").unwrap();
+            std::fs::rename(keys.join(".env.1"), keys.join("env")).unwrap();
+        },
+        run(format!(
+            "sleep 1.5; cat {0}/env; cat {0}/.env.1; ls {0}",
+            keys.display()
+        )),
+    );
+    let () = saved;
+    let said = format!("{}{}", read["stdout"], read["stderr"]);
+    assert!(!said.contains("KEY="), "{read}");
+    // One gone since the sandbox was built is made again before the next
+    // command, which runs and doesn't read it.
+    std::fs::remove_dir_all(&env).unwrap();
+    let output = run("echo ran && ls env".into()).await;
+    assert_eq!(output["stdout"].as_str().unwrap().trim(), "ran", "{output}");
+    assert!(env.is_dir());
+    std::fs::write(env.join("env"), "KEY=inside").unwrap();
+    std::os::unix::fs::symlink(&keys, dir.join("to-keys")).unwrap();
+    let outside = keys.join("env");
+    for path in [outside.to_str().unwrap(), "env/env", "to-keys/env"] {
+        let read = tools
+            .prepare("read", &json!({ "path": path }).to_string())
+            .unwrap();
+        let error = tools
+            .execute(read, &dir, &[], Some(policy.clone()))
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, "read_denied", "{path}");
+    }
+    let error = tools
+        .execute(write("env/env"), &dir, &[], Some(policy.clone()))
+        .await
+        .unwrap_err();
+    assert_eq!(error.code, "write_denied");
+    let read = tools
+        .prepare("read", &json!({"path":"notes/b.md"}).to_string())
+        .unwrap();
+    tools
+        .execute(read, &dir, &[], Some(policy.clone()))
+        .await
+        .unwrap();
     std::fs::remove_dir_all(base).unwrap();
 }
 
@@ -1536,6 +1637,7 @@ async fn a_terminal_takes_typed_input_and_reports_its_end() {
         walled: Vec::new(),
         owned: Vec::new(),
         daemons: Vec::new(),
+        unreadable: Vec::new(),
     });
     let error = tools
         .write_stdin(1, 3, "x\n", None, false, Some(confined))

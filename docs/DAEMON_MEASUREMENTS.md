@@ -9560,6 +9560,44 @@ gated `shell` call per turn, allowed within the hold).
 
 Ranges overlap at 400 held: base 2.11 to 2.25, head 2.14 to 2.29.
 
+## Unreadable folders (deny_read) screen
+
+Screens the change that hides `~/.agent/keys` (and any `--unreadable`
+folder) from sandboxed commands and the read tool. Base is main at
+`9556455`, head is `a8ddd2a`, both built with the release profile on one
+Linux host with 4 CPUs and run alternately, two rounds of base then head:
+admission and completion at five repeats, footprint at two, lifecycle at
+one (32 bots, socket echo, five tool schemas). Binaries by SHA-256:
+
+- Base: `42af1d65…a9d3`.
+- Head: `c18b179a…913e`.
+
+`bench.perf_gate` reports no failures or warnings.
+
+| Bench | Measure | Base | Head | Change |
+| --- | --- | ---: | ---: | ---: |
+| admission | lone submit CPU, ms | 34.738 | 36.206 | +4.2% |
+| admission | burst submit p99, ms | 4.316 | 4.239 | -1.8% |
+| completion | release to terminal p99, ms | 10.334 | 10.031 | -2.9% |
+| footprint | idle RSS, MiB | 16.266 | 16.176 | -0.6% |
+| footprint | per idle bot, KiB | 1.924 | 1.992 | +3.5% |
+| footprint | RSS after a turn each, MiB | 30.648 | 34.66 | +13.1% |
+| footprint | CPU per turn, ms | 0.783 | 0.812 | +3.7% |
+| lifecycle | CPU, s | 0.54 | 0.53 | -1.9% |
+| lifecycle | p95 turn, ms | 582.213 | 581.903 | -0.1% |
+| lifecycle | peak RSS, MiB | 24.787 | 24.926 | +0.6% |
+
+The footprint "RSS after a turn" row is noise: two more rounds gave base
+32.7, 33.6, 33.3, 39.3 MiB and head 31.6, 39.5, 30.8, 30.1 MiB, so across
+all eight runs each side spans about 30 to 39 MiB with medians of 32.1
+(base) and 32.7 (head). Footprint and lifecycle run unsandboxed, so they
+do not reach the new code. What the change adds is bounded: one
+`readlink` of `/proc/self/fd` (or `F_GETPATH` on macOS) per read-tool call,
+only for a sandboxed bot with hidden folders, and one `is_dir` stat per
+hidden folder inside the `spawn_blocking` that `sandbox::hold` already runs
+before each command. Nothing new runs on the runtime thread. No paid
+providers were used.
+
 ## Agent tools: send_message, list_agents and pause_agents at 5, 700 and 5,000 bots (protocol 76, schema 100)
 
 2026-11-14, a 4-core x86_64 Linux cloud host, release builds of main

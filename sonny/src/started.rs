@@ -30,7 +30,7 @@ pub fn state(turn: &Value) -> String {
         Some("completed") => IDLE,
         Some("failed") if turn["error"] == "empty_completion" => QUIET,
         Some("failed") => "failed",
-        Some("interrupted") => "stopped",
+        Some("interrupted") => INTERRUPTED,
         Some(_) => "working",
     }
     .to_owned()
@@ -48,26 +48,15 @@ pub const DONE: &str = "done";
 /// failure, and not a reply either.
 pub const QUIET: &str = "no reply";
 
+/// The state of a task whose turn the person ended.
+pub const INTERRUPTED: &str = "interrupted";
+
 /// Whether a task in `state` waits on nothing more of its own.
 pub fn settled(state: &str) -> bool {
     matches!(
         state,
-        IDLE | DONE | QUIET | "failed" | "stopped" | "removed"
+        IDLE | DONE | QUIET | INTERRUPTED | "failed" | "removed"
     )
-}
-
-/// A state's mark and its color.
-fn sign(state: &str) -> Span<'static> {
-    match state {
-        IDLE => Span::raw(crate::status::IDLE_MARK).fg(Color::Green),
-        DONE => Span::raw("✓").dim(),
-        QUIET => Span::raw("✓").dim(),
-        "failed" => Span::raw("✗").fg(Color::Red),
-        "needs you" => Span::raw("?").fg(Color::Yellow).bold(),
-        "stopped" | "removed" => Span::raw("■").dim(),
-        "starting" => Span::raw("◌").dim(),
-        _ => Span::raw("●").fg(Color::Cyan),
-    }
 }
 
 /// A brief's first line, cut short enough to keep.
@@ -104,7 +93,7 @@ pub fn draw(tasks: &[Task], width: usize) -> Vec<(Line<'static>, Option<usize>)>
         out.push((
             Line::from(vec![
                 Span::raw("  "),
-                sign(&task.state),
+                crate::status::sign(&task.state),
                 Span::raw(" "),
                 Span::raw(format!("{:<names$}", task.name))
                     .bold()

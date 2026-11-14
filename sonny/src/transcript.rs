@@ -1923,7 +1923,7 @@ fn news(text: &str) -> Option<Vec<String>> {
             } else if status.starts_with("put a question to the person") {
                 parts.push(format!("{name} asks you"));
             } else if status.starts_with("has printed nothing") {
-                parts.push(format!("{name} quiet"));
+                parts.push(format!("{name} silent"));
             } else if let Some(who) = status.strip_suffix(" wrote in it") {
                 parts.push(format!("{who} wrote in {name}"));
             } else if let Some((count, _)) = status.split_once(" messages in it")
@@ -2429,7 +2429,7 @@ const KEPT: [&str; 29] = [
     "Asked you",
     "Updated the plan",
     "Cleared the plan",
-    "Resolved",
+    "Marked",
     "Saved to memory",
     "Updated in memory",
     "Removed from memory",
@@ -2467,7 +2467,7 @@ const FOLDS: [&str; 24] = [
     "Removed",
     "Cleaned up",
     "Discarded",
-    "Resolved",
+    "Marked",
     "Saved to memory",
     "Updated in memory",
     "Removed from memory",
@@ -2581,10 +2581,15 @@ fn drawn(
     width: usize,
     clean: bool,
 ) -> Vec<Line<'static>> {
+    // A call that failed is `✗` and what it tried, never a red bullet.
     let bullet = if failed {
-        Span::raw("• ").fg(Color::Red)
+        Span::raw("✗ ").fg(Color::Red)
     } else {
         Span::raw("• ").fg(Color::Green)
+    };
+    let verbed = |verb: &str| match failed {
+        true => crate::calls::attempted(verb),
+        false => verb.to_owned(),
     };
     let field = |key: &str| arguments[key].as_str().unwrap_or("").to_owned();
     let elbow = || Span::raw("  └ ").dim();
@@ -2711,17 +2716,20 @@ fn drawn(
                     out.extend(said_lines(said, width));
                 }
                 Err(ran) => {
-                    let bullet = if failed && i + 1 == count {
-                        Span::raw("• ").fg(Color::Red)
-                    } else {
-                        Span::raw("• ").fg(Color::Green)
+                    let failed = failed && i + 1 == count;
+                    let (bullet, verb) = match failed {
+                        true => (
+                            Span::raw("✗ ").fg(Color::Red),
+                            crate::calls::attempted("Ran"),
+                        ),
+                        false => (Span::raw("• ").fg(Color::Green), "Ran".to_owned()),
                     };
                     let commands: Vec<&str> = ran
                         .iter()
                         .map(|part| part.lines().next().unwrap_or(""))
                         .collect();
                     let line = Line::from(vec![
-                        Span::raw("Ran").bold(),
+                        Span::raw(verb).bold(),
                         Span::raw(" "),
                         Span::raw(commands.join("; ")),
                     ]);
@@ -2750,7 +2758,7 @@ fn drawn(
             .map(|(_, skill)| skill.to_owned())
     {
         let line = Line::from(vec![
-            Span::raw("Loaded the ").dim(),
+            Span::raw(verbed("Loaded") + " the ").dim(),
             Span::raw(skill).dim().bold(),
             Span::raw(" skill").dim(),
         ]);
@@ -2791,7 +2799,7 @@ fn drawn(
         _ => ("Called", format!("{name} {arguments}")),
     };
     let mut header = Line::from(vec![
-        Span::raw(verb).bold(),
+        Span::raw(verbed(verb)).bold(),
         Span::raw(" "),
         Span::raw(what.lines().next().unwrap_or("").to_owned()),
     ]);
@@ -4021,7 +4029,7 @@ mod tests {
         assert_eq!(
             text(&super::prompt(note, 160, None).0),
             [
-                "↳ Task updates · shop.fix noted · shop.web took a note away · shop.docs needs you · shop.api quiet · shop.db asks you"
+                "↳ Task updates · shop.fix noted · shop.web took a note away · shop.docs needs you · shop.api silent · shop.db asks you"
             ]
         );
     }
@@ -4509,6 +4517,50 @@ mod tests {
     }
 
     #[test]
+    fn a_plain_call_that_failed_is_a_cross_and_what_it_tried() {
+        for (name, arguments, said) in [
+            (
+                "shell",
+                serde_json::json!({"command": "cargo test"}),
+                "✗ Couldn't run cargo test",
+            ),
+            (
+                "read",
+                serde_json::json!({"path": "/w/a.rs"}),
+                "✗ Couldn't read a.rs",
+            ),
+            (
+                "wait",
+                serde_json::json!({"handles": ["calc.fix/2"]}),
+                "✗ Couldn't wait for calc.fix",
+            ),
+        ] {
+            let rows = text(&tool(name, &arguments, Some("exit 1"), true, "/w", 80));
+            assert_eq!(rows[0], said, "{rows:?}");
+            let drawn = tool(name, &arguments, Some("exit 1"), true, "/w", 80);
+            let bullet = drawn[0]
+                .spans
+                .iter()
+                .find(|span| span.content.contains('✗'));
+            assert_eq!(
+                bullet.and_then(|span| span.style.fg),
+                Some(Color::Red),
+                "{name}"
+            );
+        }
+        // The same call that worked keeps its bullet and its verb.
+        let rows = text(&tool(
+            "shell",
+            &serde_json::json!({"command": "ls"}),
+            None,
+            false,
+            "/",
+            80,
+        ));
+        assert_eq!(rows[0], "• Ran ls");
+    }
+
+    #[test]
     fn a_script_is_one_line_of_its_mcp_calls_over_what_it_printed() {
         let input = serde_json::json!({"input": "await tools.mcp__github__a({});"});
         let output = "Script completed\nWall time 1.2 seconds\nMCP calls: github 10, linear 2\nOutput:\n3 open issues";
@@ -4520,7 +4572,10 @@ mod tests {
         assert!(rows[1].contains("3 open issues"), "{rows:#?}");
         let failed = "Script terminated: it ran out of time\nWall time 600.0 seconds\nOutput:\n";
         let rows = text(&tool("exec", &input, Some(failed), true, "/", 80));
-        assert_eq!(rows[0], "• Ran a script, terminated: it ran out of time");
+        assert_eq!(
+            rows[0],
+            "✗ Couldn't run a script, terminated: it ran out of time"
+        );
     }
 
     #[test]
@@ -4597,7 +4652,8 @@ mod tests {
         .map(|line| line.spans.iter().map(|s| s.content.as_ref()).collect())
         .collect();
         assert_eq!(rows.len(), 2, "{rows:?}");
-        assert!(rows[0].contains("Edited a.rs") && !rows[0].contains('+'));
+        // Failed, it is `✗` and what it tried, never a past-tense verb.
+        assert!(rows[0].starts_with("✗ Couldn't edit a.rs") && !rows[0].contains('+'));
         assert!(rows[1].contains("edit_target_not_found"));
     }
 
@@ -4636,7 +4692,7 @@ mod tests {
             plan,
             [
                 "• Updated the plan",
-                "  └ ✔ Read the tests",
+                "  └ ✓ Read the tests",
                 "    → Fix them"
             ]
         );

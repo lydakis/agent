@@ -1152,7 +1152,7 @@ fn connect_or_start(options: &Options) -> Result<Connection> {
 }
 
 /// What a daemon this agent starts is given beyond the agent's own
-/// environment: the keys in `~/.agent/env`, over it, and the providers.
+/// environment: the keys in `~/.agent/keys/env`, over it, and the providers.
 /// Read only when a daemon starts, never for a command a daemon answers.
 struct Start {
     environment: Vec<(String, String)>,
@@ -1284,6 +1284,11 @@ fn spawn_daemon(
     // say how every bot is sandboxed.
     if let Some(home) = agent_client::config::home() {
         command.arg("--protect-path").arg(home);
+    }
+    // The keys this CLI gives the daemon, which no bot's command reads:
+    // one that could would send them anywhere the network reaches.
+    if let Some(keys) = agent_client::env_file::folder() {
+        command.arg("--unreadable").arg(keys);
     }
     // Where clients keep the sockets of the programs they run for bots
     // outside the sandbox, which do as they are asked as the person.

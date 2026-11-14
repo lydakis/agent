@@ -168,24 +168,27 @@ pub fn pull_requests(text: &str) -> Vec<String> {
     found
 }
 
-/// The mark an agent at rest reads with: open, as it may be given work,
-/// where one marked done reads `✓`.
-pub const IDLE_MARK: &str = "○";
-
-/// The mark and colour a state reads with.
-pub fn mark(state: &str) -> Span<'static> {
+/// A state's mark, alone, in its hue: the one table every surface that
+/// shows a state draws from. Muted unless it needs you, failed or works.
+pub fn sign(state: &str) -> Span<'static> {
     match state {
-        "working" => Span::raw("● ").fg(Color::Cyan),
-        "needs you" => Span::raw("? ").fg(Color::Yellow).bold(),
-        crate::started::IDLE | "completed" => Span::raw("○ ").fg(Color::Green),
-        crate::started::DONE => Span::raw("✓ ").dim(),
-        crate::started::QUIET => Span::raw("✓ ").dim(),
-        "failed" => Span::raw("✗ ").fg(Color::Red),
-        s if s.starts_with("waiting") || s == "queued" || s == "rate limited" => {
-            Span::raw("◌ ").dim()
-        }
-        _ => Span::raw("· ").dim(),
+        "needs you" => Span::raw("?").fg(Color::Yellow).bold(),
+        _ if state.starts_with(HELD) => Span::raw("?").fg(Color::Yellow).bold(),
+        "failed" => Span::raw("✗").fg(Color::Red),
+        "working" => Span::raw("●").fg(Color::Cyan),
+        _ if state.starts_with("waiting") => Span::raw("◌").dim(),
+        "queued" | "rate limited" | "starting" => Span::raw("◌").dim(),
+        crate::started::IDLE | crate::started::QUIET | "completed" => Span::raw("○").dim(),
+        crate::started::INTERRUPTED | "removed" => Span::raw("■").dim(),
+        crate::started::DONE => Span::raw("✓").dim(),
+        _ => Span::raw("·").dim(),
     }
+}
+
+/// A state's mark and the space after it, as rows lead with it.
+pub fn mark(state: &str) -> Span<'static> {
+    let sign = sign(state);
+    Span::styled(format!("{} ", sign.content), sign.style)
 }
 
 /// A reply's first line of prose: fenced blocks and headings skipped,
@@ -565,7 +568,7 @@ pub fn held_cause(code: &str, detail: Option<&str>) -> (String, String) {
         ),
         "provider_http_401" => (
             "API key refused",
-            "fix the key in ~/.agent/env and restart the daemon".to_owned(),
+            "fix the key in ~/.agent/keys/env and restart the daemon".to_owned(),
         ),
         "provider_http_403" => (
             "access refused",
@@ -896,8 +899,39 @@ mod tests {
         assert_eq!(group("failed", false, true, false), Group::NeedsYou);
         // A pull request shows on the row, not as a group of its own.
         assert_eq!(group("idle", false, false, false), Group::Idle);
-        assert_eq!(group("stopped", false, false, false), Group::Idle);
+        assert_eq!(group("interrupted", false, false, false), Group::Idle);
+        assert_eq!(group("no reply", false, false, false), Group::Idle);
         assert_eq!(group("failed", false, true, true), Group::Done);
+    }
+
+    #[test]
+    fn every_state_has_one_mark_and_only_three_have_a_hue() {
+        let yellow = Some(Color::Yellow);
+        for (state, drawn, hue) in [
+            ("needs you", "?", yellow),
+            ("held: sign in to ChatGPT", "?", yellow),
+            ("failed", "✗", Some(Color::Red)),
+            ("working", "●", Some(Color::Cyan)),
+            ("waiting on fix, docs", "◌", None),
+            ("waiting on its reviewer", "◌", None),
+            ("queued", "◌", None),
+            ("rate limited", "◌", None),
+            ("starting", "◌", None),
+            ("idle", "○", None),
+            ("no reply", "○", None),
+            ("interrupted", "■", None),
+            ("done", "✓", None),
+        ] {
+            let sign = sign(state);
+            assert_eq!((&*sign.content, sign.style.fg), (drawn, hue), "{state}");
+            // Muted is the quiet weight; the three with a hue are not.
+            let dim = sign
+                .style
+                .add_modifier
+                .contains(ratatui::style::Modifier::DIM);
+            assert_eq!(dim, hue.is_none(), "{state}");
+            assert_eq!(mark(state).content, format!("{drawn} "));
+        }
     }
 
     #[test]
