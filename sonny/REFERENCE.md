@@ -2036,6 +2036,8 @@ way as it is written and refused as `live_template`; one shown in a window
 fills again as what it read changes, while one that goes into a prompt
 fills once as it goes, so the prompt never changes under the model.
 
+![A live block after the agent's first try was refused, still showing the pull request open with, under it, line 1, `fromjson`: not JSON once pr.json was cut short](../docs/sonny/live-template-says-what-failed.png)
+
 An agent can show something live in the conversation too, with its `live`
 tool: asked the time, or which pull requests are open, it gives Markdown
 with the same blanks, drawn as a `◇ live` block where it called the tool
