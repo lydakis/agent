@@ -2860,6 +2860,16 @@ fn used(event: &Event) -> bool {
     }
 }
 
+/// A notch of the wheel.
+fn is_wheel(event: &Event) -> bool {
+    use ratatui::crossterm::event::MouseEventKind;
+    matches!(
+        event,
+        Event::Mouse(mouse)
+            if matches!(mouse.kind, MouseEventKind::ScrollUp | MouseEventKind::ScrollDown)
+    )
+}
+
 /// A new bot in the folder, with the instructions its folder gives it.
 async fn create(client: &Client, options: &Options, bot: &str) -> Result<(), String> {
     let model = options
@@ -6334,6 +6344,9 @@ impl App {
         // and once a second for what else time changes, so an idle window
         // builds a frame a second, not ten.
         let mut changed = true;
+        // An event taken while gathering a burst of the wheel's notches
+        // that was not one, handled first next time round.
+        let mut held: Option<Event> = None;
         loop {
             let due = drawn.is_none_or(|at| at.elapsed() >= DRAW_EVERY);
             let wanted = keyed || changed || self.quit;
@@ -6378,6 +6391,14 @@ impl App {
             let every = tick_every(self.moving(), heard.elapsed());
             let lively = every == LIVELY_TICK;
             let next_tick = ticked + every;
+            // The event the last burst of the wheel's notches stopped at,
+            // before any newer.
+            if let Some(key) = held.take() {
+                keyed = true;
+                heard = Instant::now();
+                self.key(key).await;
+                continue;
+            }
             tokio::select! {
                 event = events.recv(), if !self.down => {
                     changed = true;
@@ -6390,13 +6411,34 @@ impl App {
                 Some(key) = keys.recv() => {
                     keyed = true;
                     heard = Instant::now();
+                    let wheel = is_wheel(&key);
+                    // Over the pane (the margin, a preview, a side chat),
+                    // the conversation's older pages are not waited on.
+                    let chat = match &key {
+                        Event::Mouse(mouse) => !(self.pane.as_ref())
+                            .is_some_and(|p| p.area.contains((mouse.column, mouse.row).into())),
+                        _ => true,
+                    };
                     self.key(key).await;
-                    // What came while the last frame was drawn is taken
-                    // before the next: a burst of the wheel's notches is
-                    // one frame, not one each the terminal works through
-                    // after the wheel stops.
+                    // The wheel's notches that came while the last frame
+                    // was drawn are taken before the next: a burst is one
+                    // frame, not one each that a slower terminal works
+                    // through after the wheel stops. Only notches: anything
+                    // else (a key answering what the frame shows) waits for
+                    // the frame, and so does a notch near the conversation's
+                    // first row drawn, so older pages are drawn before it.
                     for _ in 0..keys.len() {
+                        if !wheel
+                            || self.quit
+                            || (chat && self.older.is_some() && self.screen.near_top())
+                        {
+                            break;
+                        }
                         let Ok(key) = keys.try_recv() else { break };
+                        if !is_wheel(&key) {
+                            held = Some(key);
+                            break;
+                        }
                         self.key(key).await;
                     }
                 }
