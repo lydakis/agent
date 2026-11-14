@@ -1161,7 +1161,14 @@ mod linux {
         // was gone. What changes in it, the keys file replaced by a rename
         // among them, stays behind the mask, which a rename over a file
         // would take down.
-        for hidden in &policy.unreadable {
+        // One in a walled folder is out of sight with it already, the
+        // walled folder an empty one with no place for its mask.
+        for hidden in (policy.unreadable.iter()).filter(|hidden| {
+            !policy
+                .walled
+                .iter()
+                .any(|walled| hidden.starts_with(walled))
+        }) {
             args.extend([
                 "--perms".into(),
                 "000".into(),

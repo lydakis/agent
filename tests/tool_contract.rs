@@ -735,10 +735,13 @@ async fn a_sandboxed_command_writes_only_its_roots() {
     // inside another is closed with it.
     let (keys, env, later) = (base.join("keys"), dir.join("env"), dir.join("later"));
     let deep = dir.join("deep/keys");
+    // And one in a walled folder, out of sight with it.
+    let (walled, private) = (base.join("walled"), base.join("walled/keys"));
     for (folder, key) in [
         (&keys, "KEY=outside"),
         (&env, "KEY=inside"),
         (&deep, "KEY=deep"),
+        (&private, "KEY=walled"),
     ] {
         std::fs::create_dir_all(folder).unwrap();
         std::fs::write(folder.join("env"), key).unwrap();
@@ -752,7 +755,9 @@ async fn a_sandboxed_command_writes_only_its_roots() {
             env.clone(),
             later.clone(),
             deep.clone(),
+            private.clone(),
         ],
+        walled: vec![walled.clone()],
         ..protecting()
     };
     let writable = [
@@ -928,6 +933,7 @@ async fn a_sandboxed_command_writes_only_its_roots() {
         "mv env/env moved".into(),
         "mv deep moved".into(),
         "cat deep/keys/env".into(),
+        format!("cat {}/env", private.display()),
         "ln env/env linked".into(),
         "echo KEY=made > later/env && cat later/env".into(),
     ] {
