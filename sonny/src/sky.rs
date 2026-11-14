@@ -1182,6 +1182,11 @@ impl View {
                     self.answered(&name, *seen);
                 }
                 Feed::Kept(from, kept) => {
+                    // Another daemon's store numbers its agents' turns
+                    // anew: what was read from the one before is no use.
+                    if self.kept_from.as_ref().is_some_and(|was| *was != from) {
+                        self.kept.clear();
+                    }
                     self.kept_from = Some(from);
                     for (name, read) in kept {
                         if self.kept.get(&name).is_none_or(|(turn, _)| *turn < read.0) {
@@ -7960,6 +7965,12 @@ mod tests {
         );
         // Another build reads none of it.
         assert!(crate::kept_seen(&store, Some("another daemon")).is_empty());
+        // Followed again on another daemon's store, nothing read from the
+        // one before is taken.
+        send.send(Feed::Kept(Some("another store".into()), HashMap::new()))
+            .unwrap();
+        view.drain();
+        assert!(view.kept.is_empty());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
