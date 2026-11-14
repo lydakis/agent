@@ -9613,7 +9613,7 @@ impl App {
             reference.node = newest;
         }
         if let Some(path) = reference.file() {
-            reference.file_read(margin::read(&path).ok());
+            reference.file_read(margin::read(&path, &[]).ok());
         }
     }
 

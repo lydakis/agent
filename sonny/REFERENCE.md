@@ -967,9 +967,10 @@ has something on it, or is off the screen, no time shows.
   A call to run outside the sandbox that may start a daemon waits for
   you, never the reviewer alone. Nor can it read `~/.agent/keys`, the folder
   of the keys the daemon runs with, which no agent's command needs (the `read` tool
-  refuses it too). It leaves open reads of anything
+  refuses it too), nor any folder you list as `[sandbox] unreadable` in
+  `~/.agent/config.toml`, read when the daemon starts. It leaves open reads of anything
   else you can read, as Codex's `workspace-write` does, your SSH keys, cloud
-  credentials and other projects included; the network, in every row but
+  credentials and other projects included unless you list them; the network, in every row but
   Read only; and, while the network is on, every other Unix socket that a
   program signed in as you listens on, such as ssh-agent, MCPX and
   Docker, each of which acts as you. So the sandbox keeps an agent from
@@ -1929,7 +1930,9 @@ and `.events` (what one of your sources printed lately, newest first;
 request's last word, which the lookout keeps for 200 topics; `.up` and
 `.down_since` while the lookout says it is down),
 `file('state.json')` (a file in its folder, `| fromjson` making JSON
-fields of it), `tasks()` and `task('NAME')` (where its tasks stand, as
+fields of it; one in a folder kept from agents, `~/.agent/keys` and the
+config's `[sandbox] unreadable`, is refused with `read_denied`, whatever
+link or path leads there), `tasks()` and `task('NAME')` (where its tasks stand, as
 `/status` reads them), `now()`, and `| ago` and `| time` for a time in
 seconds. A blank never runs a command or reaches the network, so an agent
 that wants something no source covers writes it to a file from its own

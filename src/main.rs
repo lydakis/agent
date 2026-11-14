@@ -241,6 +241,10 @@ fn sandboxed(args: &[String]) -> Result<i32> {
     // What a daemon this CLI starts keeps read-only in every root: a
     // checkout's git folder, agents' settings, cloud keys.
     let names = |names: &[&str]| names.iter().map(|name| name.to_string()).collect();
+    let listed = agent_client::config::load().map_err(|error| match error.split_once(": ") {
+        Some((code, detail)) => Error::with(code, detail),
+        None => Error::with("config_invalid", error),
+    })?;
     let daemon = Daemon {
         protected: names(&agent_client::PROTECTED),
         protected_existing: names(&agent_client::PROTECTED_EXISTING),
@@ -258,20 +262,22 @@ fn sandboxed(args: &[String]) -> Result<i32> {
             })
             .into_iter()
             .collect(),
-        // And hides the keys a daemon this CLI starts hides from its bots.
-        // Made first, as the daemon makes it, to be known by its real path.
-        unreadable: agent_client::env_file::folder()
-            .and_then(|keys| {
+        // And hides what a daemon this CLI starts hides from its bots: the
+        // keys and the person's `[sandbox] unreadable` folders. Each made
+        // first, as the daemon makes it, to be known by its real path.
+        unreadable: (agent_client::hidden::folders(&listed).into_iter())
+            .map(|folder| {
                 use std::os::unix::fs::DirBuilderExt;
                 std::fs::DirBuilder::new()
                     .recursive(true)
                     .mode(0o700)
-                    .create(&keys)
-                    .ok()?;
-                std::fs::canonicalize(&keys).ok()
+                    .create(&folder)
+                    .and_then(|()| std::fs::canonicalize(&folder))
+                    .map_err(|error| {
+                        Error::with("io_error", format!("{}: {error}", folder.display()))
+                    })
             })
-            .into_iter()
-            .collect(),
+            .collect::<Result<_>>()?,
         // And what the daemon walls off, as it would for a bot.
         walled: (agent_client::config::run())
             .and_then(|run| std::fs::canonicalize(run).ok())

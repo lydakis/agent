@@ -1193,6 +1193,9 @@ const TEMPLATE: &str = "\
 # model = \"PROVIDER/MODEL\"  who reviews calls in auto mode; unset, the agent's model
 # effort = \"low\"
 #
+# [sandbox]
+# unreadable = [\"~/.aws\"]  folders no sandboxed command reads; ~/.agent/keys always
+#
 # [sonny.mcp_servers.NAME]   an MCP server; `sonny mcp add` writes one
 ";
 

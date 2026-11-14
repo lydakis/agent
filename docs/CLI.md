@@ -70,7 +70,12 @@ bot writes its own. `serve --unreadable FOLDER` keeps FOLDER and what is in
 it from every sandboxed command's reads, writes, links and renames, as
 Codex's `deny_read`, and the `read` tool refuses it for a sandboxed bot
 (`read_denied`); it is made private (mode 700) if missing. The CLI passes
-`~/.agent/keys`, which holds `env`, the keys it starts the daemon with. `serve --wall FOLDER` keeps every sandboxed command,
+`~/.agent/keys`, which holds `env`, the keys it starts the daemon with,
+and each folder `~/.agent/config.toml` lists as `[sandbox] unreadable`,
+from `/` or `~/` (`unreadable = ["~/.aws"]`). That list is empty by default,
+so an agent may use what the person keeps at home, a browser's session
+cookies or a cloud CLI's sign-in, until they list it; a running daemon keeps
+the folders it started with. `serve --wall FOLDER` keeps every sandboxed command,
 the network on or not, from connecting to the Unix sockets in FOLDER,
 which it makes private (mode 700) if missing; the CLI passes
 `~/.agent/run`, where clients such as Sonny keep the sockets of programs

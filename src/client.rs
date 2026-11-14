@@ -1286,9 +1286,10 @@ fn spawn_daemon(
         command.arg("--protect-path").arg(home);
     }
     // The keys this CLI gives the daemon, which no bot's command reads:
-    // one that could would send them anywhere the network reaches.
-    if let Some(keys) = agent_client::env_file::folder() {
-        command.arg("--unreadable").arg(keys);
+    // one that could would send them anywhere the network reaches. And the
+    // folders the person lists as `[sandbox] unreadable`.
+    for folder in agent_client::hidden::folders(&config()?) {
+        command.arg("--unreadable").arg(folder);
     }
     // Where clients keep the sockets of the programs they run for bots
     // outside the sandbox, which do as they are asked as the person.

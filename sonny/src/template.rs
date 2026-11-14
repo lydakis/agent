@@ -429,6 +429,9 @@ fn blanks(env: &mut Environment<'static>, data: &Data, reads: &Arc<Mutex<Reads>>
         Ok(Value::from_pairs(fields))
     });
     let (r, d) = (reads.clone(), data.clone());
+    // The folders kept from agents, read once a render at its first file:
+    // an agent writes the template, and Sonny reads outside its sandbox.
+    let kept = Arc::new(std::sync::OnceLock::new());
     env.add_function("file", move |path: String| -> Result<String, Error> {
         let path = d.folder.join(path.trim());
         let stamp = stamp(&path);
@@ -436,7 +439,8 @@ fn blanks(env: &mut Environment<'static>, data: &Data, reads: &Arc<Mutex<Reads>>
             reads.files.insert(path.clone());
             reads.seen.insert(path.clone(), stamp);
         });
-        crate::margin::read(&path).map_err(failed)
+        let hidden = kept.get_or_init(hidden).as_ref().map_err(failed)?;
+        crate::margin::read(&path, hidden).map_err(failed)
     });
     let (r, d) = (reads.clone(), data.clone());
     env.add_function("tasks", move || {
@@ -494,6 +498,16 @@ fn value(json: &Json) -> Value {
 }
 
 /// What went wrong in a blank, as the template's error.
+/// The folders kept from agents ([`agent_client::hidden`]), by their real
+/// paths, as the daemon knows them; a config that does not read refuses
+/// every file.
+fn hidden() -> Result<Vec<PathBuf>, String> {
+    let config = agent_client::config::load()?;
+    Ok((agent_client::hidden::folders(&config).into_iter())
+        .map(|folder| std::fs::canonicalize(&folder).unwrap_or(folder))
+        .collect())
+}
+
 fn failed(why: impl Into<String>) -> Error {
     Error::new(ErrorKind::InvalidOperation, why.into())
 }

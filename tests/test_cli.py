@@ -1929,6 +1929,43 @@ class CliTests(ModelFixture):
                                 capture_output=True, text=True, timeout=10, cwd=self.path)
         self.assertEqual(listed.returncode, 0, listed.stderr)
 
+    @unittest.skipUnless(shutil.which('bwrap') or sys.platform == 'darwin', 'sandboxes need bubblewrap')
+    def test_the_folders_the_config_lists_as_unreadable_are_closed_to_sandboxed_commands(self):
+        # None by default: a sandboxed command reads what the person keeps
+        # at home, as an agent using their session cookies does.
+        home = self.path/'home'
+        jar = home/'cookies'/'jar'
+        jar.parent.mkdir(parents=True)
+        jar.write_text('SESSION=secret\n')
+        env = {**clean_env(), 'HOME': str(home)}
+        run = lambda *args: subprocess.run([str(self.binary), *args], env=env, capture_output=True,
+                                           text=True, timeout=20, cwd=self.path)
+        read = ['sandbox', '--', '/bin/cat', str(jar)]
+        self.assertEqual(run(*read).stdout, 'SESSION=secret\n')
+        # Listed, it is closed, and one not there yet is made, private.
+        config = home/'.agent'/'config.toml'
+        config.parent.mkdir(exist_ok=True)
+        config.write_text('[sandbox]\nunreadable = ["~/cookies", "~/later/keys"]\n')
+        hidden = run(*read)
+        self.assertNotEqual(hidden.returncode, 0)
+        self.assertNotIn('SESSION', hidden.stdout)
+        self.assertEqual((home/'later'/'keys').stat().st_mode & 0o777, 0o700)
+        # A daemon the CLI starts hides them too, beside the keys.
+        store = self.path/'listed.db'
+        started = run('start', '--store', str(store), '--provider', 'openai=responses,http://127.0.0.1:9/v1')
+        self.addCleanup(run, 'shutdown', '--store', str(store))
+        self.assertEqual(started.returncode, 0, started.stderr)
+        cmdline = Path(f'/proc/{json.loads(started.stdout)["pid"]}/cmdline')
+        if cmdline.exists():
+            args = cmdline.read_text().split('\0')
+            self.assertEqual([args[i + 1] for i, arg in enumerate(args) if arg == '--unreadable'],
+                             [str(home/'.agent'/'keys'), str(home/'cookies'), str(home/'later'/'keys')])
+        # A folder named from neither / nor ~/ is refused by name.
+        config.write_text('[sandbox]\nunreadable = ["cookies"]\n')
+        refused = run(*read)
+        self.assertEqual(refused.returncode, 125, refused.stderr)
+        self.assertIn('sandbox.unreadable', refused.stderr)
+
     def test_explicit_store_overrides_inherited_socket(self):
         client = SocketClient(self.binary, self.path/'first.db', self.url, 'echo')
         self.addCleanup(client.close)
