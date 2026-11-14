@@ -207,6 +207,9 @@ enum Feed {
     Scans(mpsc::UnboundedSender<(String, Option<i64>)>),
     /// An agent's history read for its questions: none when it could not be.
     Asked(String, Option<Box<crate::needs::Seen>>),
+    /// What windows and skies before read of each agent's questions, as
+    /// of the turn it last ended, and the daemon they were read from.
+    Kept(Option<String>, HashMap<String, (i64, crate::needs::Seen)>),
     Live(Value),
     /// An agent's model, read again after it was configured.
     Model(String, String),
@@ -310,6 +313,8 @@ struct Agent {
     made_by_id: Option<i64>,
     /// The turn it runs, when it runs one.
     running: Option<i64>,
+    /// The last turn it ended.
+    ended: Option<i64>,
     /// When it was last lit.
     lit: Option<Instant>,
     twinkle: Option<(Instant, Color, Work)>,
@@ -462,6 +467,13 @@ pub struct View {
     /// Whose questions the opening asked for and has not heard back: the
     /// sky draws once none is left, so nothing pops in after.
     unread: HashSet<String>,
+    /// Each agent's question as last read, with the turn it had ended
+    /// then: one that has run no turn since is not read again. Kept
+    /// beside the store, once the follow read what was kept there, for
+    /// the daemon it names, when it changed.
+    kept: HashMap<String, (i64, crate::needs::Seen)>,
+    kept_from: Option<Option<String>>,
+    kept_changed: bool,
     paused: bool,
     /// Where the follow reads agents' questions, once it says.
     scans: Option<mpsc::UnboundedSender<(String, Option<i64>)>>,
@@ -865,7 +877,7 @@ impl Drop for View {
 impl View {
     pub fn open(socket: PathBuf, store: PathBuf) -> Self {
         let (send, feed) = mpsc::unbounded_channel();
-        let task = tokio::spawn(follow(socket.clone(), send));
+        let task = tokio::spawn(follow(socket.clone(), store.clone(), send));
         let mut view = Self::with(socket, feed, task);
         view.resolved = store;
         view
@@ -919,6 +931,9 @@ impl View {
             live: false,
             ready: false,
             unread: HashSet::new(),
+            kept: HashMap::new(),
+            kept_from: None,
+            kept_changed: false,
             paused: false,
             scans: None,
             legend: false,
@@ -988,7 +1003,7 @@ impl View {
                 replay.ready = false;
                 tokio::spawn(tape(self.socket.clone(), replay.from, send))
             }
-            None => tokio::spawn(follow(self.socket.clone(), send)),
+            None => tokio::spawn(follow(self.socket.clone(), self.resolved.clone(), send)),
         };
         // Read afresh: agents removed meanwhile go, and who talked to whom
         // is read again from the turns kept.
@@ -1126,16 +1141,29 @@ impl View {
                     for held in calls {
                         by.entry(held.bot.clone()).or_default().push(held);
                     }
+                    let mut known = Vec::new();
                     for agent in &mut self.agents {
                         let held = by.remove(&agent.name).unwrap_or_default();
                         let name = agent.name.clone();
                         agent.waits.held(held, |bot| bot == name);
-                        if !agent.gone
-                            && let Some(scans) = &self.scans
+                        if agent.gone {
+                            continue;
+                        }
+                        // The same ended turn is the same question: one
+                        // that ran none since is not read again.
+                        let kept = (self.kept.get(&name)).filter(|(turn, _)| {
+                            agent.running.is_none() && agent.ended == Some(*turn)
+                        });
+                        if let Some((_, seen)) = kept {
+                            known.push((name, seen.clone()));
+                        } else if let Some(scans) = &self.scans
                             && scans.send((name.clone(), None)).is_ok()
                         {
                             self.unread.insert(name);
                         }
+                    }
+                    for (name, seen) in known {
+                        self.answered(&name, seen);
                     }
                 }
                 Feed::Scans(scans) => self.scans = Some(scans),
@@ -1144,11 +1172,21 @@ impl View {
                 Feed::Asked(name, Some(seen)) => {
                     self.unread.remove(&name);
                     if let Some(at) = self.agent(&name)
-                        && !self.agents[at].waits.unsure(&name)
+                        && let agent = &self.agents[at]
+                        && agent.running.is_none()
+                        && let Some(turn) = seen.turn.filter(|turn| agent.ended == Some(*turn))
                     {
-                        let running = self.agents[at].running.is_some();
-                        let ask = (*seen).open(&self.resolved, &name, running);
-                        self.agents[at].waits.asked(&name, ask);
+                        self.kept.insert(name.clone(), (turn, (*seen).clone()));
+                        self.kept_changed = true;
+                    }
+                    self.answered(&name, *seen);
+                }
+                Feed::Kept(from, kept) => {
+                    self.kept_from = Some(from);
+                    for (name, read) in kept {
+                        if self.kept.get(&name).is_none_or(|(turn, _)| *turn < read.0) {
+                            self.kept.insert(name, read);
+                        }
                     }
                 }
                 Feed::Asked(name, None) => {
@@ -1180,6 +1218,20 @@ impl View {
                 Feed::Ready => (self.live, self.ready) = (true, true),
                 Feed::Down(why) => self.down = Some(why),
             }
+        }
+        // What the opening read, kept for the next sky once it is all in,
+        // and whatever is read again after.
+        if let Some(from) = self
+            .kept_from
+            .as_ref()
+            .filter(|_| self.kept_changed && !self.opening())
+        {
+            let here: HashMap<String, (i64, crate::needs::Seen)> = (self.kept.iter())
+                .filter(|(name, _)| self.agent(name).is_some_and(|at| !self.agents[at].gone))
+                .map(|(name, read)| (name.clone(), read.clone()))
+                .collect();
+            crate::keep_sky_seen(&self.resolved, from.as_deref(), &here);
+            self.kept_changed = false;
         }
         // The tape let go of what had not played: the replay starts again
         // from what is left, seated as it was then.
@@ -1822,6 +1874,7 @@ impl View {
             .map(str::to_owned);
         agent.made_by_id = bot["created_by_id"].as_i64();
         agent.running = bot["running_turn"].as_i64();
+        agent.ended = bot["last"]["turn"].as_i64();
         agent.set_model(bot["model"].as_str().unwrap_or_default());
         Some(at)
     }
@@ -2103,6 +2156,7 @@ impl View {
             {
                 let agent = &mut self.agents[at];
                 agent.running = None;
+                agent.ended = Some(turn);
                 // Its last turn's end, past or live, says whether it failed;
                 // one that ended with nothing to say ended as it should.
                 agent.failed = data["status"] == "failed" && data["error"] != "empty_completion";
@@ -2920,6 +2974,18 @@ impl View {
     /// they have.
     fn opening(&self) -> bool {
         self.replay.is_none() && self.down.is_none() && (!self.ready || !self.unread.is_empty())
+    }
+
+    /// `name`'s question as its history says, unless an event since left
+    /// it unsure: that is read again once its turn ends.
+    fn answered(&mut self, name: &str, seen: crate::needs::Seen) {
+        if let Some(at) = self.agent(name)
+            && !self.agents[at].waits.unsure(name)
+        {
+            let running = self.agents[at].running.is_some();
+            let ask = seen.open(&self.resolved, name, running);
+            self.agents[at].waits.asked(name, ask);
+        }
     }
 
     /// The sky `cols` wide and `rows` high, what happened under it.
@@ -4797,6 +4863,8 @@ impl Sky {
 
 /// How often `sonny sky` draws: smooth enough for a spark's flight.
 const FRAME: Duration = Duration::from_millis(60);
+/// How often the sky looks for what it read while it opens.
+const OPENING: Duration = Duration::from_millis(4);
 
 /// How long `sonny sky` waits before following a daemon that went again.
 const RETRY: Duration = Duration::from_secs(3);
@@ -4861,7 +4929,10 @@ pub fn watch(
                         crate::look::Look::now().finish(frame.buffer_mut());
                     })
                     .map_err(|e| e.to_string())?;
-                if !event::poll(FRAME).map_err(|e| e.to_string())? {
+                // Opening, the reads are taken as they land, not a frame
+                // late each: the sky shows the moment they are all in.
+                let wait = if view.opening() { OPENING } else { FRAME };
+                if !event::poll(wait).map_err(|e| e.to_string())? {
                     continue;
                 }
                 match event::read().map_err(|e| e.to_string())? {
@@ -4959,7 +5030,7 @@ impl ratatui::widgets::Widget for &mut View {
 
 /// The view's own connection: every agent, then who talked to whom in the
 /// turns kept, then live. A daemon gone ends it, saying so.
-async fn follow(socket: PathBuf, send: mpsc::UnboundedSender<Feed>) {
+async fn follow(socket: PathBuf, store: PathBuf, send: mpsc::UnboundedSender<Feed>) {
     let (client, mut events) = match Client::connect(&socket).await {
         Ok(connected) => connected,
         Err(error) => {
@@ -4973,21 +5044,25 @@ async fn follow(socket: PathBuf, send: mpsc::UnboundedSender<Feed>) {
     {
         return;
     }
-    // Agents' questions are read beside the follow, one at a time, as the
-    // view asks: it ends with the view's asking.
-    let (scans, mut asked) = mpsc::unbounded_channel::<(String, Option<i64>)>();
+    // What was read before, so only the agents that ran since are read.
+    let identity = client.identity().map(str::to_owned);
+    let kept = crate::kept_seen(&store, identity.as_deref());
+    if send.send(Feed::Kept(identity, kept)).is_err() {
+        return;
+    }
+    // Agents' questions are read beside the follow, as the view asks, a
+    // few agents at once and each agent's reads in the order asked: it
+    // ends with the view's asking.
+    let (scans, asked) = mpsc::unbounded_channel::<(String, Option<i64>)>();
     if send.send(Feed::Scans(scans)).is_err() {
         return;
     }
-    let (reader, told) = (client.clone(), send.clone());
-    tokio::spawn(async move {
-        while let Some((bot, turn)) = asked.recv().await {
-            let seen = crate::needs::scan(&reader, &bot, turn).await;
-            if told.send(Feed::Asked(bot, seen.map(Box::new))).is_err() {
-                return;
-            }
-        }
-    });
+    tokio::spawn(scan_all(
+        socket.clone(),
+        client.clone(),
+        asked,
+        send.clone(),
+    ));
     // A cord already pulled when the sky opens hangs, without its drop;
     // `paused` and `resumed` notices tell of what comes after.
     if !client.paused().is_null()
@@ -5090,6 +5165,74 @@ async fn follow(socket: PathBuf, send: mpsc::UnboundedSender<Feed>) {
         }
     }
     let _ = send.send(Feed::Down("the daemon closed the connection".into()));
+}
+
+/// How many agents' histories the sky reads at once for their questions,
+/// each on a connection of its own (the daemon answers one connection's
+/// reads in turn): a few, so a sky of many agents opens in a fraction of
+/// the time one at a time takes, and the daemon's readers stay free for
+/// everyone else.
+const SCANS: usize = 4;
+
+/// Read each agent's history the view asks for, [`SCANS`] agents at once;
+/// a read asked for an agent already being read waits for it, so each
+/// agent's reads land in the order asked, the newest last. A connection
+/// that cannot be made leaves the reads to the ones there are, the
+/// follow's own at least.
+async fn scan_all(
+    socket: PathBuf,
+    client: std::sync::Arc<Client>,
+    mut asked: mpsc::UnboundedReceiver<(String, Option<i64>)>,
+    told: mpsc::UnboundedSender<Feed>,
+) {
+    type Reader = (std::sync::Arc<Client>, Option<agent_client::Events>);
+    let mut free: Vec<Reader> = vec![(client, None)];
+    let mut made = 1;
+    let mut reading = tokio::task::JoinSet::new();
+    let mut busy: HashSet<String> = HashSet::new();
+    let mut waiting: VecDeque<(String, Option<i64>)> = VecDeque::new();
+    let mut open = true;
+    loop {
+        // Start what may start: a free reader, and an agent not read now.
+        while let Some(at) = waiting.iter().position(|(bot, _)| !busy.contains(bot)) {
+            if free.is_empty() && made < SCANS {
+                made += 1;
+                if let Ok((client, events)) = Client::connect(&socket).await {
+                    free.push((client, Some(events)));
+                }
+            }
+            let Some(reader) = free.pop() else {
+                break;
+            };
+            let Some((bot, turn)) = waiting.remove(at) else {
+                break;
+            };
+            busy.insert(bot.clone());
+            reading.spawn(async move {
+                let seen = crate::needs::scan(&reader.0, &bot, turn).await;
+                (reader, bot, seen)
+            });
+        }
+        if !open && reading.is_empty() {
+            return;
+        }
+        tokio::select! {
+            next = asked.recv(), if open => match next {
+                Some(scan) => waiting.push_back(scan),
+                None => open = false,
+            },
+            Some(done) = reading.join_next() => {
+                let Ok((reader, bot, seen)) = done else {
+                    return;
+                };
+                free.push(reader);
+                busy.remove(&bot);
+                if told.send(Feed::Asked(bot, seen.map(Box::new))).is_err() {
+                    return;
+                }
+            }
+        }
+    }
 }
 
 /// A configured agent's model, read again when it changed: the event says
@@ -7608,7 +7751,7 @@ mod tests {
             }
         });
         let (send, mut feed) = mpsc::unbounded_channel();
-        follow(socket, send).await;
+        follow(socket, dir.join("state.sqlite"), send).await;
         let mut seen = Vec::new();
         while let Ok(item) = feed.try_recv() {
             seen.push(match item {
@@ -7619,6 +7762,7 @@ mod tests {
                 | Feed::Held(_)
                 | Feed::Scans(_)
                 | Feed::Asked(..)
+                | Feed::Kept(..)
                 | Feed::Down(_)
                 | Feed::Model(..)
                 | Feed::Tape(_)
@@ -7753,6 +7897,145 @@ mod tests {
             text(&view.card(80, 30)).trim(),
             "Catching up with who is here…"
         );
+    }
+
+    #[tokio::test]
+    async fn an_agent_that_ran_no_turn_since_its_question_was_read_is_not_read_again() {
+        let dir = std::env::temp_dir().join(format!("sky-kept-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = dir.join("state.sqlite");
+        let (mut view, send) = view();
+        view.resolved = store.clone();
+        let (scans, mut asked) = mpsc::unbounded_channel();
+        send.send(Feed::Scans(scans)).unwrap();
+        let read = |turn| {
+            let seen = crate::needs::Seen {
+                turn: Some(turn),
+                ..Default::default()
+            };
+            (turn, seen)
+        };
+        let kept = HashMap::from([
+            ("idle".to_owned(), read(5)),
+            ("ran".to_owned(), read(3)),
+            ("busy".to_owned(), read(7)),
+        ]);
+        send.send(Feed::Kept(None, kept)).unwrap();
+        send.send(Feed::Roll(vec![
+            json!({"name": "idle", "last": {"turn": 5}}),
+            json!({"name": "ran", "last": {"turn": 4}}),
+            json!({"name": "busy", "running_turn": 8, "last": {"turn": 7}}),
+            json!({"name": "new"}),
+        ]))
+        .unwrap();
+        send.send(Feed::Held(Vec::new())).unwrap();
+        send.send(Feed::Ready).unwrap();
+        view.drain();
+        // Only the agents that ran since, run now, or were never read.
+        let mut sent = Vec::new();
+        while let Ok((name, _)) = asked.try_recv() {
+            sent.push(name);
+        }
+        sent.sort();
+        assert_eq!(sent, ["busy", "new", "ran"]);
+        assert!(view.opening());
+        send.send(Feed::Asked("ran".into(), Some(Box::new(read(4).1))))
+            .unwrap();
+        send.send(Feed::Asked("new".into(), Some(Box::default())))
+            .unwrap();
+        send.send(Feed::Asked("busy".into(), Some(Box::new(read(8).1))))
+            .unwrap();
+        view.drain();
+        assert!(!view.opening());
+        // Kept as of the turn each ended: not a running turn's read, nor
+        // one with no turn.
+        let kept = crate::kept_seen(&store, None);
+        let turns: BTreeMap<&str, i64> = (kept.iter())
+            .map(|(name, (turn, _))| (name.as_str(), *turn))
+            .collect();
+        assert_eq!(
+            turns,
+            BTreeMap::from([("busy", 7), ("idle", 5), ("ran", 4)])
+        );
+        // Another build reads none of it.
+        assert!(crate::kept_seen(&store, Some("another daemon")).is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn agents_are_read_a_few_at_once_each_in_the_order_asked() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        let dir = std::env::temp_dir().join(format!("sky-scans-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let socket = dir.join("agent.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        let connections = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = connections.clone();
+        // A daemon whose first read of `slow` takes a while; each
+        // connection's reads are answered in turn, as the daemon's are.
+        tokio::spawn(async move {
+            let slow = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+            loop {
+                let (stream, _) = listener.accept().await.unwrap();
+                counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let slow = slow.clone();
+                tokio::spawn(async move {
+                    let (read, mut write) = stream.into_split();
+                    let ready = json!({"event": "ready", "protocol": agent_client::PROTOCOL});
+                    write
+                        .write_all(format!("{ready}\n").as_bytes())
+                        .await
+                        .unwrap();
+                    let mut lines = BufReader::new(read).lines();
+                    while let Ok(Some(line)) = lines.next_line().await {
+                        let asked: Value = serde_json::from_str(&line).unwrap();
+                        if asked["bot"] == "slow"
+                            && slow.swap(false, std::sync::atomic::Ordering::SeqCst)
+                        {
+                            tokio::time::sleep(Duration::from_millis(200)).await;
+                        }
+                        let answer = json!({"id": asked["id"], "result": {"nodes": []}});
+                        if write
+                            .write_all(format!("{answer}\n").as_bytes())
+                            .await
+                            .is_err()
+                        {
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+        let (client, _events) = Client::connect(&socket).await.unwrap();
+        let (ask, asked) = mpsc::unbounded_channel();
+        let (told, mut heard) = mpsc::unbounded_channel();
+        for (bot, turn) in [
+            ("slow", 1),
+            ("slow", 2),
+            ("a", 1),
+            ("b", 1),
+            ("c", 1),
+            ("d", 1),
+        ] {
+            ask.send((bot.to_owned(), Some(turn))).unwrap();
+        }
+        drop(ask);
+        tokio::spawn(scan_all(socket, client, asked, told));
+        let mut order = Vec::new();
+        while let Some(feed) = heard.recv().await {
+            if let Feed::Asked(bot, Some(seen)) = feed {
+                order.push(format!("{bot}{}", seen.turn.unwrap()));
+            }
+        }
+        // The rest are read while the slow one is; its two reads land in
+        // the order asked.
+        assert_eq!(order.len(), 6, "{order:?}");
+        assert_eq!(&order[4..], ["slow1", "slow2"], "{order:?}");
+        let made = connections.load(std::sync::atomic::Ordering::SeqCst);
+        assert!((2..=SCANS).contains(&made), "{made} connections");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]

@@ -898,9 +898,68 @@ async fn read_status(
 /// window, beside the store: one file a lead, as each lead's card reads its
 /// own agents, so leads sharing a store never undo each other's.
 fn reads_file(store: &std::path::Path, lead: &str) -> std::path::PathBuf {
+    reads_dir(store).join(format!("{lead}.json"))
+}
+
+/// The folder of [`reads_file`]s beside `store`.
+fn reads_dir(store: &std::path::Path) -> std::path::PathBuf {
     let mut dir = store.as_os_str().to_owned();
     dir.push(".status-reads");
-    std::path::PathBuf::from(dir).join(format!("{lead}.json"))
+    std::path::PathBuf::from(dir)
+}
+
+/// Every agent's question as some window or the sky last read it beside
+/// `store`, by this build from the daemon `identity` names: each with the
+/// turn it ended, the newest where two kept one. The sky reads again only
+/// the agents that ran since.
+pub(crate) fn kept_seen(
+    store: &std::path::Path,
+    identity: Option<&str>,
+) -> HashMap<String, (i64, Seen)> {
+    #[derive(serde::Deserialize)]
+    struct Kept {
+        build: String,
+        seen: HashMap<String, (i64, Seen)>,
+    }
+    let store = agent_client::socket::canonical_store(store).unwrap_or_else(|_| store.into());
+    let build = reads_build(identity);
+    let mut seen: HashMap<String, (i64, Seen)> = HashMap::new();
+    let files = std::fs::read_dir(reads_dir(&store)).into_iter().flatten();
+    for file in files.flatten() {
+        let Some(kept) = std::fs::read(file.path())
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<Kept>(&bytes).ok())
+            .filter(|kept| kept.build == build)
+        else {
+            continue;
+        };
+        for (name, read) in kept.seen {
+            match seen.get(&name) {
+                Some((turn, _)) if *turn >= read.0 => {}
+                _ => {
+                    seen.insert(name, read);
+                }
+            }
+        }
+    }
+    seen
+}
+
+/// Keep what the sky read of every agent's question for the next one,
+/// beside the leads' own (a leading dot, as no lead is named).
+pub(crate) fn keep_sky_seen(
+    store: &std::path::Path,
+    identity: Option<&str>,
+    seen: &HashMap<String, (i64, Seen)>,
+) {
+    let store = agent_client::socket::canonical_store(store).unwrap_or_else(|_| store.into());
+    write_reads(
+        &store,
+        ".sky",
+        identity,
+        &HashMap::new(),
+        seen.iter().collect(),
+    );
 }
 
 /// The build that kept them, which another may read a history otherwise,
@@ -959,6 +1018,17 @@ fn keep_reads(
     let seen: HashMap<&String, &(i64, Seen)> = (asks_seen.iter())
         .filter(|(name, _)| status_read.contains_key(*name))
         .collect();
+    write_reads(store, lead, identity, status_read, seen);
+}
+
+/// [`keep_reads`]'s file for `lead`, written whole.
+fn write_reads(
+    store: &std::path::Path,
+    lead: &str,
+    identity: Option<&str>,
+    status_read: &HashMap<String, (Value, Latest)>,
+    seen: HashMap<&String, &(i64, Seen)>,
+) {
     #[derive(serde::Serialize)]
     struct Kept<'a> {
         build: String,
