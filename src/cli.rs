@@ -429,7 +429,7 @@ fn print_flags(flags: &str) {
             ),
             "--max-readers" => (
                 "N",
-                "Most store reader connections, opened as reads wait; default one per CPU",
+                "Most store reader connections, opened as reads wait; default one per CPU, up to 4",
             ),
             "--max-load" => (
                 "LOAD",

@@ -30,6 +30,19 @@ Fixed-work resource and latency measurements. A time-based soak that completes
 more turns is not here, because its work changes with its speed; it is under
 [operational behavior](#operational-behavior).
 
+- **Reader ceiling of four.** Against main `c5fa7120`, the isolated
+  default patch uses `min(logical CPUs, 4)` readers, with explicit values
+  unchanged. Four matched model-free workloads (32/128 bots, 4 KiB to
+  240 KiB prompts, histories growing to roughly 2 MiB) show CPU medians
+  down 5.5–8.5% and last-turn RSS medians down 4.2–6.4%. Latency is mixed;
+  small-case p99 rises 12.9% with overlapping observed ranges. Mixed
+  searches/observations rejected two readers for short-read stalls;
+  four retains similar responsiveness at that operating point. This is a
+  resource reduction on these traces, not a general latency claim or an
+  optimum for all hosts. The four standard native screens are effectively
+  flat, with unchanged store work and no gate warnings. macOS arm64,
+  2026-11-13.
+  [Record](DAEMON_MEASUREMENTS.md#reader-pool-ceiling).
 - **Group commit, fixed work.** 192 bots, 4,608 primary turns, the same
   requests and retries in both builds, full flushing in both. The build that
   batches turn completions, which also carried the retention-publication

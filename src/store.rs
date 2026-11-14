@@ -64,9 +64,11 @@ fn owner_only(path: &Path) -> Result<()> {
 /// Reads queued for the reader connections, at least twice their most.
 const READ_JOBS: usize = 32;
 
-/// Most reader connections by default: one per logical CPU.
+/// At most four readers by default, or one per logical CPU when fewer.
+/// Leave observation reads room beside a turn's own context reads without
+/// splitting SQLite's cache budget across every CPU. Callers can raise it.
 pub fn default_readers() -> usize {
-    std::thread::available_parallelism().map_or(4, |n| n.get())
+    std::thread::available_parallelism().map_or(4, |n| n.get().min(4))
 }
 /// How long a reader past the first waits for a read before it closes: a
 /// pool's idle timeout (HikariCP's and Go's `database/sql` keep a floor of
@@ -1710,6 +1712,70 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(reader, 1);
+    }
+
+    #[tokio::test]
+    async fn the_default_pool_bounds_readers_without_blocking_writes() {
+        let store = scratch_store("default-readers").await;
+        let mut reads = Vec::new();
+        let mut gates = Vec::new();
+        // Up to four reads overlap off the runtime thread. More queue,
+        // leaving the writer independent even when every reader is held.
+        let slots = default_readers().min(4);
+        for _ in 0..slots {
+            let (gate, wait) = std::sync::mpsc::channel::<()>();
+            let (entered, inside) = oneshot::channel();
+            let reading = store.clone();
+            reads.push(tokio::spawn(async move {
+                reading
+                    .read("held", move |db| {
+                        let _ = entered.send(());
+                        let _ = wait.recv();
+                        Ok(db.pragma("checkpoint_fullfsync"))
+                    })
+                    .await
+                    .unwrap()
+            }));
+            gates.push(gate);
+            tokio::time::timeout(std::time::Duration::from_secs(10), inside)
+                .await
+                .expect("the readers overlap")
+                .unwrap();
+        }
+        let reading = store.clone();
+        let queued = tokio::spawn(async move {
+            reading
+                .read("queued", |db| Ok(db.pragma("checkpoint_fullfsync")))
+                .await
+                .unwrap()
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            while store.reader.0.state().jobs.is_empty() && !queued.is_finished() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the excess read is submitted");
+        assert!(
+            !queued.is_finished(),
+            "the default bounds reader concurrency"
+        );
+        assert_eq!(store.stats()["readers"]["open"], slots);
+        tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            store.call(|db| {
+                db.connection().execute("INSERT INTO t VALUES(7)", [])?;
+                Ok(())
+            }),
+        )
+        .await
+        .expect("held reads never block a commit")
+        .unwrap();
+        drop(gates);
+        for read in reads {
+            assert_eq!(read.await.unwrap(), 1);
+        }
+        assert_eq!(queued.await.unwrap(), 1);
     }
 
     #[tokio::test]

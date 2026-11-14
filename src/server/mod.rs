@@ -1065,8 +1065,8 @@ pub struct Configuration {
     /// Bytes of request lines read and not yet taken up, every session
     /// together; a sixteenth of physical memory by default; zero unbounded.
     pub max_input_bytes: Option<usize>,
-    /// Store reader connections serving observation reads; one per
-    /// logical CPU by default.
+    /// Store reader connections serving observation and context reads;
+    /// at most four by default (one per logical CPU when fewer), opened on demand.
     pub max_readers: Option<usize>,
     /// The 1-minute load average at which new commands wait while one is
     /// running, as make's `-l`; none by default.

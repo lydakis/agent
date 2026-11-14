@@ -9255,3 +9255,175 @@ measure is within its run-to-run spread; the call-end path is
 | lifecycle | CPU, s | 0.485 | 0.49 | +1.0% |
 | lifecycle | p95 turn, ms | 573.529 | 577.316 | +0.7% |
 | lifecycle | peak RSS, MiB | 24.502 | 24.596 | +0.4% |
+
+
+## Reader pool ceiling
+
+Measured locally on 2026-11-13, Apple M1 Max (10 logical CPUs), macOS
+27.2.1, APFS, external power, Rust 1.99.1, Python 3.12.9 and psutil 7.2.2.
+Base is main `c5fa7120b97cf2dade49ece69dbac8905c65459c`; head is that base
+plus the isolated reader-default patch. Neither the metadata
+batching patch nor checkpoint scheduling patch is included.
+
+The default reader ceiling changes from one per logical CPU to
+`min(logical CPUs, 4)`. One still opens with the store; others open on
+queued reads and retire after 30 seconds idle. Explicit `--max-readers`
+and `[daemon] readers` values are unchanged. The existing observation lane
+still takes at most all but one reader, leaving capacity for turns' own
+reads; the FIFO queues and shared 2 MiB cache budget are unchanged. No new
+threads, tasks, timers, per-bot state or storage jobs are added. SQLite work
+remains off the runtime thread, and the writer and all durability pragmas
+are unchanged. Hosts with four or fewer available CPUs keep their ceiling.
+
+### Reader-count controls and selection
+
+The main binary alone was run with `--max-readers 1`, `2`, `4`, and `12`
+across four workloads. Each has one excluded warmup and three measured
+repetitions per setting, rotating setting order each repetition: 64 runs.
+Each turn adds a prompt of the given size, then receives 20 chunks of 256
+bytes from a synthetic Responses fixture with no injected delay. The
+fixture validates request history and output for every turn. The larger
+histories accumulate through valid prompts; a preliminary oversized
+single-prompt request was refused and excluded.
+
+| Case | Bots | Turns/bot | Prompt bytes/turn | Measured daemon CPU, s: 1 / 2 / 4 / 12 readers |
+| --- | ---: | ---: | ---: | ---: |
+| small | 32 | 8 | 4,096 | 0.225 / 0.238 / 0.248 / 0.268 |
+| medium | 32 | 8 | 65,536 | 0.378 / 0.422 / 0.431 / 0.508 |
+| large | 32 | 8 | 245,760 | 0.991 / 1.033 / 1.117 / 1.138 |
+| wide | 128 | 4 | 65,536 | 0.672 / 0.714 / 0.729 / 0.794 |
+
+These are medians, not CPU rankings independent of workload. Smaller pools
+used less CPU in these controls, but latency was mixed. A separate mixed
+read/write screen rejects two as the general default: on the second burst,
+short-read p95 rises from 17.08/17.39 ms to 25.70/25.91 ms and short reads
+completed fall from 1,036/1,043 to 294/302. With two readers, observations
+share one seat, so searches hold short reads behind them. One reader also
+cannot keep an observation read beside a turn's context read.
+
+Four is the conservative candidate rather than the lowest-CPU setting.
+The mixed screen uses `bench.store_load --point heavy --bots 128 --live 64
+--turns 8 --idle-s 0`, two rounds in 12/4 then 4/12 order, using the same
+main binary and explicit reader counts. Each run seeds 128 bots and
+completes two bursts of 512 turns, while two clients read recent turns,
+one searches history, and follows replay and remain live. The window is
+128 KiB with 32 KiB prompts. Observer work is time-dependent; counts differ
+and its whole-process CPU is not an equal-work efficiency comparison.
+
+| Mixed load | Main, 12 readers | 4 readers |
+| --- | ---: | ---: |
+| first-burst short-read p95, ms | 15.49, 16.47 | 14.44, 15.59 |
+| second-burst short-read p95, ms | 17.35, 16.23 | 18.19, 17.65 |
+| second-burst short reads completed | 1,036, 1,036 | 1,029, 1,038 |
+| first-burst turn p95, ms | 174.77, 249.24 | 183.18, 185.14 |
+| second-burst turn p95, ms | 192.64, 191.03 | 216.34, 193.95 |
+| peak daemon threads | 9, 9 | 7, 7 |
+
+With four readers, short-read p95 stays 14–18 ms, with roughly 1,030
+completions in the second burst. This does not establish an optimum for arbitrary
+parallel searches, slow storage or larger fleets. A wider pool remains a
+caller choice. Lower connection count and larger cache shares are plausible
+sources of the CPU reduction; this screen does not separate their costs.
+
+
+### Matched default versus main
+
+Both binaries use the same symbolized release profile and locked dependencies.
+SHA-256:
+
+- Base: `771d9634d97c5276c1a9955253fa9b408cfe90fb779fb95bdfdefc846bf7aad6`.
+- Head: `6b230321a8269dd6e992b2e382c8f3a2a471ec7decac18319e86240b86164e17`.
+
+The four workloads above were repeated with each binary's actual default,
+without `--max-readers`: ten readers on this host for main, four on head,
+confirmed by each run's statistics. Each has an excluded warmup and five
+measured repetitions per side, reversing side order every repetition:
+48 runs. Daemon CPU is measured from readiness to the last terminal event,
+excluding startup and shutdown. Latencies include transport, the Python
+fixture's history validation, and observer work. No paid model is used and
+no service delay is injected. Configured bot count is not a claim about
+simultaneously active provider streams.
+
+Values are medians of per-run values, followed by observed min..max:
+
+| Case | Measure | Main | Head |
+| --- | --- | ---: | ---: |
+| small | CPU, ms/turn | 1.123 (1.057..1.172) | 1.028 (1.017..1.128) |
+| small | turn p50, ms | 29.417 (28.524..30.480) | 29.732 (28.885..29.939) |
+| small | turn p99, ms | 38.813 (37.238..50.637) | 43.817 (42.205..53.393) |
+| small | RSS at last turn, MiB | 29.781 (28.844..30.625) | 28.391 (27.531..29.547) |
+| medium | CPU, ms/turn | 1.925 (1.911..1.985) | 1.768 (1.743..1.803) |
+| medium | turn p50, ms | 48.978 (48.179..87.878) | 50.142 (49.285..75.233) |
+| medium | turn p99, ms | 85.507 (81.092..166.682) | 83.446 (79.876..157.301) |
+| medium | RSS at last turn, MiB | 32.203 (31.734..34.516) | 30.141 (29.531..31.391) |
+| large | CPU, ms/turn | 4.304 (4.237..4.469) | 4.066 (3.976..4.122) |
+| large | turn p50, ms | 127.028 (121.507..169.575) | 123.088 (117.739..137.004) |
+| large | turn p99, ms | 200.309 (180.695..316.823) | 183.448 (180.914..202.526) |
+| large | RSS at last turn, MiB | 41.422 (40.875..44.312) | 39.672 (39.547..40.344) |
+| wide | CPU, ms/turn | 1.576 (1.558..1.617) | 1.465 (1.424..1.467) |
+| wide | turn p50, ms | 200.796 (191.227..304.596) | 188.848 (173.955..193.294) |
+| wide | turn p99, ms | 258.002 (242.486..498.162) | 255.811 (230.075..263.890) |
+| wide | RSS at last turn, MiB | 37.953 (36.109..39.656) | 35.812 (34.266..36.781) |
+
+CPU medians fall 5.5–8.5%; medium, large and wide have nonoverlapping
+observed CPU ranges. Last-turn RSS medians fall 4.2–6.4%. Latency is
+mixed, including a 12.9% higher small-case p99 median with overlapping
+ranges. This supports reducing resource overhead on these traces, not a
+general turn-latency improvement or an optimum for every host. Linux,
+slower disks, more simultaneous deep searches and larger fleets remain
+unmeasured for this default.
+
+### Required native screen
+
+Two rounds run sequentially in base/head then head/base order. Each side
+runs `bench.admission_burst --repeat 5`, `bench.completion_burst --repeat 5`,
+`bench.footprint --repeat 2` with its default 1,000 bots, and
+`bench.lifecycle --transport socket --agents 32 --mode echo --tools
+ echo,shell,read,write,edit --repeat 1`, with each runner's warmup excluded.
+The same binaries above are used with their actual defaults.
+`bench.perf_gate` passes with unchanged store work per turn and no warnings.
+Sonny was not modified or screened.
+
+| Bench | Measure | Main | Head | Change |
+| --- | --- | ---: | ---: | ---: |
+| admission | lone submit CPU, ms | 21.964 | 22.779 | +3.7% |
+| admission | burst submit p99, ms | 2.259 | 2.249 | -0.4% |
+| completion | release to terminal p99, ms | 5.450 | 5.394 | -1.0% |
+| footprint | idle RSS, MiB | 13.125 | 13.133 | +0.1% |
+| footprint | per idle bot, KiB | 2.408 | 2.448 | +1.7% |
+| footprint | RSS after a turn each, MiB | 33.922 | 34.258 | +1.0% |
+| footprint | CPU per turn, ms | 0.456 | 0.454 | -0.5% |
+| lifecycle | CPU, s | 0.385 | 0.388 | +0.9% |
+| lifecycle | turn p95, ms | 630.815 | 630.772 | -0.0% |
+| lifecycle | peak RSS, MiB | 26.836 | 26.844 | +0.0% |
+
+These standard screens are effectively flat. The resource improvement is
+specific to the model-free workloads above, not established for every
+turn, idle state or lifecycle workload.
+
+### Verification and captures
+
+All 680 Rust tests, strict Clippy and 30 release-process integration checks
+passed. The new test first failed on main's reader ceiling, then verifies
+bounded overlapping reads, queued excess work, and writer progress while
+all readers are held. Existing tests still verify configurable wider pools,
+idle retirement and the shared cache budget. Process checks cover daemon
+sessions and replay, slow clients, shutdown, kill/restart/resume, historical
+forks, durable parks and compaction. CLI help reports the new default.
+
+Ignored captures in this worktree's `.local/bench/`:
+
+- `reader-sizing-20261113`: all reader-count controls and validation data;
+  `reader_sizing.py` reproduces the four-case plan.
+- `reader-default-20261113`: matched final default runs and full raw boundaries;
+  `reader_validate.py` is the runner.
+- `reader-mixed-20261113`: rejected two-reader mixed-load experiment;
+  `reader_mixed_two.py` is its runner.
+- `reader-mixed-four-20261113`: explicit 12/4-reader mixed-load controls;
+  `reader_mixed_four.py` is its runner.
+- `reader-screen-20261113`: required native screens;
+  `reader_screen.py` records their commands.
+
+The parent checkout's `.local/bench/reader-pool-20261113/` preserves binaries,
+the rejected two-reader binary, the runtime patch, and test/build/benchmark
+logs.
