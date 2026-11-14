@@ -810,12 +810,14 @@ fn redirects_elsewhere(command: &str) -> bool {
     let (mut quote, mut chars) = (None, line.char_indices().peekable());
     while let Some((at, c)) = chars.next() {
         match (quote, c) {
-            (Some(q), c) if c == q => quote = None,
-            (Some(_), _) => {}
-            (None, '\'') | (None, '"') => quote = Some(c),
-            (None, '\\') => {
+            (Some('\''), '\'') => quote = None,
+            (Some('\''), _) => {}
+            (_, '\\') => {
                 chars.next();
             }
+            (Some(q), c) if c == q => quote = None,
+            (Some(_), _) => {}
+            (None, '\'' | '"') => quote = Some(c),
             (None, '<') => {
                 if chars.peek().map(|&(_, c)| c) != Some('<') {
                     return true;
@@ -1612,6 +1614,7 @@ Keep the rest.'"#,
             r#""$AGENT_BIN" ls --pretty | jq -r '.name | ascii_upcase' | head -5"#,
             r#""$AGENT_BIN" ls | tail -n +2 | head --lines=3 | jq -rc --arg b x '.[$b]'"#,
             "\"$AGENT_BIN\" run --bot shop.fix --detach - <<<'Done.'",
+            r#""$AGENT_BIN" run --bot shop.fix --detach -- "say \"a > b\" now""#,
             "\"$AGENT_BIN\" run --bot shop.fix --detach \\\n  -- 'Line one\nline two'",
             r#""$AGENT_BIN" run --bot shop.fix --detach -- 'Run $(make test) and say'"#,
             "\"$AGENT_BIN\" run --bot shop.lead --detach - <<'EOF'\nRan $(make) and `ls`.\nEOF",
@@ -1653,6 +1656,7 @@ Keep the rest.'"#,
             r#""$AGENT_BIN" ls | jq 'include "x"; .'"#,
             r#""$AGENT_BIN" run --bot shop.fix --detach - < /private/secret.txt"#,
             r#""$AGENT_BIN" ls | jq . < /private/report.json"#,
+            r#""$AGENT_BIN" run --bot shop.fix --detach -- "say \"hello" > "$HOME/report.json""#,
             "\"$AGENT_BIN\" ls \\\n> \"$HOME/report.json\"",
             "\"$AGENT_BIN\" run --bot shop.fix --detach -- \\\n\"$(touch ~/r)\"",
             "\"$AGENT_BIN\" run --bot shop.fix --detach -- \"Line one\n$(touch ~/r)\"",
