@@ -754,8 +754,7 @@ impl View {
     /// among the items.
     pub fn card_rows(&self, width: usize) -> (Vec<Line<'static>>, usize, Vec<usize>) {
         let mut starts = vec![0; self.items.len()];
-        let mut out =
-            vec![Line::from(format!("{} · in the background", self.scope.project)).bold()];
+        let mut out = vec![Line::from(self.scope.project.clone()).bold()];
         if !self.lookout.is_empty() {
             out.push(Line::from(self.lookout.clone()).dim());
         }
@@ -1426,7 +1425,7 @@ mod tests {
                 .collect()
         };
         let lines = text(&view);
-        assert_eq!(lines[0], "calc · in the background");
+        assert_eq!(lines[0], "calc");
         assert_eq!(lines[3], "Automations · 1");
         assert_eq!(lines[4], "  ↻ nightly every 1d → lead ");
         assert_eq!(lines[5], "    sent 2");

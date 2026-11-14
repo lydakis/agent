@@ -11438,7 +11438,10 @@ impl App {
         let wide = pane::width(self.full_width, kept(self.full_width));
         let width = card_width(wide);
         let mut pane = pane::Pane::card("context", "esc close");
-        pane.set_card(context::card(&self.bot, &parts, width), "esc close");
+        pane.set_card(
+            context::card(&spoken(&self.bot), &parts, width),
+            "esc close",
+        );
         self.context_read = Some((parts, Some(width)));
         self.watch = None;
         self.open_pane(pane);
@@ -13169,6 +13172,13 @@ impl App {
     /// `pane` beside the conversation, with the keys; what was selected
     /// or being found in the conversation let go.
     fn open_pane(&mut self, mut pane: pane::Pane) {
+        // An agent drawn in another's pane opens none of its own: what
+        // it would show goes, and the person is told where views open.
+        if self.options.embedded {
+            self.watch = None;
+            self.notice = Some(BESIDE.into());
+            return;
+        }
         self.closed = None;
         // Over the margin, kept under it to go back to; what else was
         // open goes.
@@ -13218,6 +13228,10 @@ impl App {
     /// so one opened to look at stays, empty or not.
     fn margin_back(&mut self) {
         use agent_client::config::MarginOpens;
+        // Drawn in another's pane, it has no pane for the margin.
+        if self.options.embedded {
+            return;
+        }
         let posted = self.margin.posted();
         let fresh = std::mem::replace(&mut self.margin_posted, posted) != posted;
         if fresh && self.margin_opens == MarginOpens::Always && self.margin.closed() {
@@ -13243,6 +13257,10 @@ impl App {
 
     /// `/margin`: the margin shown, with the keys, or closed.
     fn toggle_margin(&mut self) {
+        if self.options.embedded {
+            self.notice = Some(BESIDE.into());
+            return;
+        }
         // Not open though not closed, empty or set never to open by
         // itself, it is not shown either.
         let shown = !self.margin.closed()
@@ -14544,7 +14562,7 @@ impl App {
             let lines = mcp::card();
             // In the place of `/status` or `/background`, if open.
             self.watch = None;
-            let mut pane = pane::Pane::card("MCP servers", "esc close");
+            let mut pane = pane::Pane::card("mcp", "esc close");
             pane.set_card(lines, "esc close");
             self.open_pane(pane);
             return;
@@ -17197,7 +17215,7 @@ impl App {
             let width = card_width(wide);
             if *laid != Some(width) {
                 *laid = Some(width);
-                pane.set_card(context::card(&self.bot, parts, width), "esc close");
+                pane.set_card(context::card(&spoken(&self.bot), parts, width), "esc close");
             }
         }
         // The links drawn, to be written again as hyperlinks.
@@ -18296,6 +18314,10 @@ fn over(frame: &mut ratatui::Frame, rows: Vec<Line<'static>>, below: ratatui::la
     frame.render_widget(Paragraph::new(rows), area);
 }
 
+/// What an agent drawn in another's pane says of a view asked for: it
+/// opens none of its own, and Ctrl+G, which the Sonny it is drawn in
+/// takes, moves it to the main window, where views open.
+const BESIDE: &str = "views open in the main window: ctrl+g moves this agent there";
 /// What the pane's title row says the keys do on `/status`.
 const STATUS_KEYS: &str = "esc close";
 const SKY_KEYS: &str =
@@ -25684,6 +25706,25 @@ mod tests {
             card.iter().any(|row| row.contains("turns 1 to 3")),
             "{card:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn drawn_beside_another_it_opens_no_pane_of_its_own() {
+        let client = daemon_answering(|request| match request["op"].as_str() {
+            Some("inspect") => json!({"name": "b", "instructions": "", "tools": [],
+                "declared": []}),
+            _ => json!({}),
+        })
+        .await;
+        let mut app = app(client);
+        app.options.embedded = true;
+        for command in ["/context", "/status", "/margin"] {
+            app.notice = None;
+            app.input.set(command);
+            app.submit().await;
+            assert!(app.pane.is_none() && app.watch.is_none(), "{command}");
+            assert_eq!(app.notice.as_deref(), Some(BESIDE), "{command}");
+        }
     }
 
     #[tokio::test]
