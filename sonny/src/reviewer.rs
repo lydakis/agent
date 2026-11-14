@@ -203,7 +203,7 @@ enum Judged {
         why: String,
         reply: Option<String>,
         timing: Option<judge::Timing>,
-        hung: Option<Value>,
+        hung: Option<Box<Value>>,
     },
 }
 

@@ -244,7 +244,7 @@ pub struct Failed {
     /// Where a turn still running when the check gave up was, read before
     /// its fork is removed: its status, rounds, retries and time held back,
     /// when it started, and how long since it last wrote anything.
-    pub hung: Option<Value>,
+    pub hung: Option<Box<Value>>,
 }
 
 fn failed(why: impl Into<String>) -> Failed {
@@ -503,7 +503,7 @@ pub async fn turn_with(
     let outcome = &waited["results"][handle];
     if outcome["pending"] == true {
         let failed = Failed {
-            hung: Some(hung(client, name, turn, submitted_ms).await),
+            hung: Some(Box::new(hung(client, name, turn, submitted_ms).await)),
             ..failed("the check timed out")
         };
         return (Err(failed), Some(turn));
