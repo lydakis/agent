@@ -5713,22 +5713,25 @@ impl Turn {
                 quotes,
                 request_id,
             } => {
-                let mut interrupted = Value::Null;
                 let mut delivery = delivery;
+                // The turn to stop, of a bot this one made, read before the
+                // message goes; it is stopped only once the message is in
+                // line, so a retried call, which sends nothing new, stops
+                // nothing either.
+                let mut running = None;
                 if interrupt {
                     let target = request(json!({"op":"inspect","bot":to})).await?;
-                    if let Some(turn) = target["running_turn"].as_i64() {
-                        request(json!({"op":"interrupt","bot":to,"turn":turn}))
-                            .await
-                            .map_err(|error| match error.code.as_str() {
-                                "not_permitted" => Error::with(
-                                    "not_permitted",
-                                    format!("{to} is not an agent you made, so you may not interrupt it; send it a message instead"),
-                                ),
-                                _ => error,
-                            })?;
-                        interrupted = json!(turn);
+                    let made = target["bot_id"].as_i64() == Some(bot_id)
+                        || target["created_by_id"].as_i64() == Some(bot_id);
+                    if !made {
+                        return Err(Error::with(
+                            "not_permitted",
+                            format!(
+                                "{to} was not made by this bot, so this bot may not interrupt it"
+                            ),
+                        ));
                     }
+                    running = target["running_turn"].as_i64();
                     // Its own turn, after the one stopped.
                     delivery = "queue";
                 }
@@ -5746,6 +5749,14 @@ impl Turn {
                     "from":{"bot":self.bot,"turn":self.turn},
                     "quotes":(!quotes.is_empty()).then_some(quotes)}))
                 .await?;
+                let mut interrupted = Value::Null;
+                if let Some(turn) = running
+                    && sent["duplicate"] != true
+                {
+                    // A turn that ended meanwhile answers how it ended.
+                    request(json!({"op":"interrupt","bot":to,"turn":turn})).await?;
+                    interrupted = json!(turn);
+                }
                 let mut answer = json!({"status":sent["status"]});
                 if let Some(message) = sent["message"].as_i64() {
                     answer["handle"] = json!(format!("{to}/{message}"));
@@ -5769,18 +5780,18 @@ impl Turn {
                 let page = request(json!({"op":"bots","name":name,"active":running,
                     "limit":limit,"after":after.as_str()}))
                 .await?;
-                let agents: Vec<Value> = (page["bots"].as_array().into_iter().flatten())
+                let bots: Vec<Value> = (page["bots"].as_array().into_iter().flatten())
                     .map(|bot| {
                         let mut row = json!({"name":bot["name"],"status":bot["status"]});
-                        for (field, from) in [
-                            ("running_turn", "running_turn"),
-                            ("waiting_on", "waiting_on"),
-                            ("last", "last"),
-                            ("folder", "workspace"),
-                            ("made_by", "created_by"),
+                        for field in [
+                            "running_turn",
+                            "waiting_on",
+                            "last",
+                            "workspace",
+                            "created_by",
                         ] {
-                            if !bot[from].is_null() {
-                                row[field] = bot[from].clone();
+                            if !bot[field].is_null() {
+                                row[field] = bot[field].clone();
                             }
                         }
                         row["model"] = json!(format!(
@@ -5791,7 +5802,7 @@ impl Turn {
                         row
                     })
                     .collect();
-                json!({"agents":agents,"next_after":page["next_after"]})
+                json!({"bots":bots,"next_after":page["next_after"]})
             }
             Agents::List {
                 name,
@@ -5814,17 +5825,16 @@ impl Turn {
                         })
                     })
                     .map(|call| {
-                        let arguments = call["request"]
-                            .as_str()
-                            .map_or_else(|| call["request"].to_string(), str::to_owned);
+                        let arguments = match &call["arguments"] {
+                            Value::String(text) => text.clone(),
+                            other => other.to_string(),
+                        };
                         let mut start: String = arguments.chars().take(300).collect();
                         if start.len() < arguments.len() {
                             start.push('…');
                         }
-                        json!({"agent":call["bot"],"turn":call["turn"],"tool":call["name"],
-                            "arguments":start,
-                            "waiting_on":(call["gates"].as_array().into_iter().flatten())
-                                .map(|gate| gate["tag"].clone()).collect::<Vec<_>>()})
+                        json!({"bot":call["bot"],"turn":call["turn"],"tool":call["name"],
+                            "arguments":start,"waiting_on":call["gates"]})
                     })
                     .collect();
                 json!({"approvals":calls,"next_after":page["next_after"]})

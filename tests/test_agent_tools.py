@@ -2,6 +2,7 @@
 pause_agents, made as the calling bot."""
 import json
 import os
+import time
 import unittest
 
 from tests.test_runtime import ModelFixture
@@ -55,7 +56,7 @@ class AgentToolsTests(ModelFixture):
                        ('send_message', {'to': 'shop.other', 'message': 'stop', 'interrupt': True}))
         refused = self.output(client, 'shop.lead', 'send_message-1')
         self.assertIn('not_permitted', refused)
-        self.assertIn('not an agent you made', refused)
+        self.assertIn('not made by this bot', refused)
         client.request('interrupt', bot='shop.other', turn=busy)
 
     def test_an_interrupt_stops_the_turn_of_an_agent_the_caller_made_and_queues_the_message(self):
@@ -84,13 +85,28 @@ class AgentToolsTests(ModelFixture):
                        ('list_agents', {'name': '*.lead'}),
                        ('list_agents', {'approvals': True}))
         own = json.loads(self.output(client, 'shop.lead', 'list_agents-1'))
-        self.assertEqual([a['name'] for a in own['agents']], ['shop.fix', 'shop.lead'])
-        self.assertEqual(own['agents'][1]['status'], 'running')
-        self.assertTrue(own['agents'][1]['running_turn'])
-        self.assertIn('folder', own['agents'][0])
+        self.assertEqual([a['name'] for a in own['bots']], ['shop.fix', 'shop.lead'])
+        self.assertEqual(own['bots'][1]['status'], 'running')
+        self.assertTrue(own['bots'][1]['running_turn'])
+        self.assertIn('workspace', own['bots'][0])
         leads = json.loads(self.output(client, 'shop.lead', 'list_agents-2'))
-        self.assertEqual([a['name'] for a in leads['agents']], ['shop.lead', 'web.lead'])
+        self.assertEqual([a['name'] for a in leads['bots']], ['shop.lead', 'web.lead'])
         self.assertEqual(json.loads(self.output(client, 'shop.lead', 'list_agents-3'))['approvals'], [])
+
+    def test_a_call_waiting_on_a_gate_is_listed_with_its_arguments_and_tags(self):
+        client = self.client(TOOLS)
+        client.request('create', bot='shop.lead', workspace=str(self.path))
+        client.request('create', bot='shop.fix', workspace=str(self.path), tools=['shell'],
+                       approve=['shell'], approver='manual')
+        held = client.request('submit', bot='shop.fix', request_id='held',
+                              prompt=calls(('shell', {'command': 'echo held-call'})))['result']['message']
+        client.receive(lambda m: m.get('event') == 'approval_requested' and m.get('turn') == held)
+        self.run_calls(client, 'shop.lead', 'go', ('list_agents', {'approvals': True}))
+        [waiting] = json.loads(self.output(client, 'shop.lead', 'list_agents-1'))['approvals']
+        self.assertEqual((waiting['bot'], waiting['turn'], waiting['tool'], waiting['waiting_on']),
+                         ('shop.fix', held, 'shell', ['manual']), waiting)
+        self.assertIn('echo held-call', waiting['arguments'])
+        client.request('interrupt', bot='shop.fix', turn=held)
 
     def test_the_cord_names_the_agent_that_pulled_it(self):
         client = self.client(TOOLS)
@@ -101,3 +117,10 @@ class AgentToolsTests(ModelFixture):
         self.assertEqual((paused['reason'], paused['by']), ('emails going out', 'shop.lead'))
         client.request('resume')
         client.finished(turn)
+        # The tool's own session closed though the pause parked the turn
+        # waiting on it: only this test's connection is left.
+        for _ in range(50):
+            if client.request('stats')['result']['sessions'] == 1:
+                break
+            time.sleep(0.05)
+        self.assertEqual(client.request('stats')['result']['sessions'], 1)

@@ -196,9 +196,9 @@ impl Tool {
             // ([`Agents`]): what its shell's `agent` would send, held to
             // what the bot's own socket allows.
             Tool::SendMessage => (
-                "Send a message to another agent, by its whole name, as yours: the daemon says under it who wrote it. delivery steer (the default) joins its running turn at its next step, or starts a turn when none runs; queue waits for a turn of its own after what it has in line. interrupt=true first stops its running turn, if it has one, then delivers the message as a new turn: say why you stopped it and what to do instead. You may interrupt only an agent you made. quote names turns whose words the daemon copies after yours, each with who wrote them: BOT/N for the message that agent's turn N took in, BOT/N:reply for the reply that turn ended with. Sending a request_id again starts nothing new. Returns the message's handle, BOT/N, which wait and history take, and whether it started a turn, joined one (steered) or waits (queued).",
+                "Send a message to another bot, by its whole name, as this turn: the daemon records this bot and turn as its sender. delivery steer (the default) joins the bot's running turn at its next step, or starts a turn when none runs; queue waits for a turn of its own after what it has in line. interrupt=true, for a bot this one made, stops its running turn once the message is in line, and the message starts the next turn; for any other bot it is refused. quote names turns whose words the daemon copies after the message, each with who wrote them: BOT/N for the message turn N took in, BOT/N:reply for the reply that turn ended with. A request_id sent again starts nothing new; without one, the call's own is used. Returns the message's handle, BOT/N, which wait and history take, its status (running: it started a turn; queued: it waits or joins one), and interrupted_turn when it stopped one.",
                 json!({"type":"object","properties":{
-                "to":{"type":"string","minLength":1,"maxLength":128,"description":"The agent's whole name, such as shop.fix."},
+                "to":{"type":"string","minLength":1,"maxLength":128},
                 "message":{"type":"string","minLength":1},
                 "delivery":{"enum":["steer","queue"]},
                 "interrupt":{"type":"boolean"},
@@ -207,7 +207,7 @@ impl Tool {
                 "required":["to","message"],"additionalProperties":false}),
             ),
             Tool::ListAgents => (
-                "List agents, by name: each one's status, its running turn, what it waits on, its folder, model and maker, and how its last turn ended. name is a pattern where * is any run of characters and ? any one, such as *.lead or shop.*; without one, this project's agents, named as you are up to the first dot. running=true lists only those with a turn running. approvals=true lists instead the calls waiting on an approval, each with its agent, turn, tool and the start of its arguments. Pages hold up to limit (default 50, at most 256); pass next_after as after for the next.",
+                "List bots by name: each one's status, running turn, what it waits on, workspace, model, the bot that made it (created_by), and how its last turn ended. name is a pattern where * is any run of characters and ? any one, such as *.lead or shop.*; without one, the bots named as this one is up to its first dot. running=true lists only those with a turn running. approvals=true lists instead the calls of those bots waiting on a gate, each with its bot, turn, tool, the start of its arguments, and the tags it waits on. Pages hold up to limit (default 50, at most 256); pass next_after as after for the next.",
                 json!({"type":"object","properties":{
                 "name":{"type":"string","minLength":1,"maxLength":256},
                 "running":{"type":"boolean"},
@@ -217,7 +217,7 @@ impl Tool {
                 "additionalProperties":false}),
             ),
             Tool::PauseAgents => (
-                "Stop every agent at once, yourself included: each running turn parks where it is, nothing starts, and only the person lets them go on. Only for harm someone must look at now, such as data being lost, money being spent or messages going out. reason says what you saw.",
+                "Pause the daemon: every running turn, this one included, parks where it is, and nothing starts until the daemon is resumed, which this bot cannot do. reason is recorded with the pause, with this bot as the one that paused it.",
                 json!({"type":"object","properties":{
                 "reason":{"type":"string","minLength":1,"maxLength":4096}},
                 "required":["reason"],"additionalProperties":false}),

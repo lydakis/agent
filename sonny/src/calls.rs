@@ -1024,7 +1024,7 @@ pub fn agents(name: &str, arguments: &Value, output: Option<&str>, failed: bool)
                 .as_ref()
                 .and_then(|r| r["approvals"].as_array().cloned());
             for call in calls.into_iter().flatten() {
-                let agent = call["agent"].as_str().unwrap_or_default();
+                let agent = call["bot"].as_str().unwrap_or_default();
                 let tool = call["tool"].as_str().unwrap_or_default();
                 said.under.push(dim(format!("{agent} wants {tool}")));
             }
@@ -1041,7 +1041,7 @@ pub fn agents(name: &str, arguments: &Value, output: Option<&str>, failed: bool)
                     _ => format!("Listed agents named {pattern}"),
                 },
             };
-            let rows = reply.as_ref().and_then(|r| r["agents"].as_array().cloned());
+            let rows = reply.as_ref().and_then(|r| r["bots"].as_array().cloned());
             for row in rows.into_iter().flatten() {
                 let status = row["status"].as_str().unwrap_or_default().to_owned();
                 said.under.push(Line::from(vec![
@@ -1457,14 +1457,14 @@ Keep the rest.'"#,
             "Listed agents named *fix*"
         );
         assert_eq!(listed(json!({"running": true})), "Listed running agents");
-        let rows = json!({"agents": [{"name": "shop.fix", "status": "running"}]}).to_string();
+        let rows = json!({"bots": [{"name": "shop.fix", "status": "running"}]}).to_string();
         let said = agents("list_agents", &json!({}), Some(&rows), false).unwrap();
         assert!(
             text(&said.under[0]).ends_with("shop.fix running"),
             "{:?}",
             said.under
         );
-        let waiting = json!({"approvals": [{"agent": "shop.fix", "tool": "shell"}]}).to_string();
+        let waiting = json!({"approvals": [{"bot": "shop.fix", "tool": "shell"}]}).to_string();
         let said = agents(
             "list_agents",
             &json!({"approvals": true}),

@@ -2985,7 +2985,11 @@ fn own_requests(
                 .send(session::Inbound::Open(session, output, Some(bot), None))
                 .await
                 .map_err(|_| gone())?;
-            let answer = async {
+            // Closed however the call ends, a turn cancelled while it waits
+            // (a pause parks the turn that pulled it) among them: no reader
+            // task is there to close it, as one is for a socket.
+            let _closing = Closing(Some((sender.clone(), session)));
+            async {
                 let read = std::time::Instant::now();
                 let credit = session::Credit::default();
                 (sender
@@ -3008,11 +3012,22 @@ fn own_requests(
                 }
                 Err(gone())
             }
-            .await;
-            let _ = sender.send(session::Inbound::Closed(session)).await;
-            answer
+            .await
         })
     })
+}
+
+/// An in-process session, closed when what made it is dropped.
+struct Closing(Option<(session::Sender, u64)>);
+
+impl Drop for Closing {
+    fn drop(&mut self) {
+        if let Some((sender, session)) = self.0.take() {
+            tokio::spawn(async move {
+                let _ = sender.send(session::Inbound::Closed(session)).await;
+            });
+        }
+    }
 }
 
 impl Service {
