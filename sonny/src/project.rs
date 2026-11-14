@@ -390,25 +390,17 @@ fn role_or_shipped(
     Ok(role)
 }
 
-/// A lead's instructions as Sonny composes them for `dir` now: its role,
-/// the folder's rules, skills and memory, then the project's task rule.
-/// Rex is the rex-windows skill's to
-/// explain, so they read the same in any client.
-pub fn instructions(dir: &Path, chosen: Option<&str>) -> Result<Composed, String> {
-    compose(dir, chosen)
-}
-
 /// A lead's instructions as composed now, and what was left out of them.
 pub struct Composed {
     pub text: String,
-    /// The names of the skills they list.
-    skills: Vec<String>,
     /// Each file (or the role) that could not be used, and why: the
     /// lead opens without it, and it and the person are told.
     pub left_out: Vec<String>,
 }
 
-/// The instructions for a lead in the role `chosen` or its project's.
+/// A lead's instructions as Sonny composes them for `dir` now, in the
+/// role `chosen` or its project's: its role, the folder's rules, skills
+/// and memory, then the project's task rule.
 fn compose(dir: &Path, chosen: Option<&str>) -> Result<Composed, String> {
     let mut left_out = Vec::new();
     let role = role_or_shipped(dir, chosen, &mut left_out)?;
@@ -430,11 +422,6 @@ fn folder(dir: &Path, role: &agent_client::policy::Profile) -> Result<Composed, 
     let memory = memory(dir)?;
     let composed = agent_client::policy::instructions_leaving_out(dir, Some(role), &memory)
         .map_err(|e| e.to_string())?;
-    let skills = composed
-        .skills
-        .into_iter()
-        .map(|skill| skill.name)
-        .collect();
     // Paths under the home folder as `~`, so a narrow window shows what
     // is missing; the lead's shell reads them the same.
     let home = std::env::var("HOME").unwrap_or_default();
@@ -450,7 +437,6 @@ fn folder(dir: &Path, role: &agent_client::policy::Profile) -> Result<Composed, 
         .collect();
     Ok(Composed {
         text: composed.text,
-        skills,
         left_out,
     })
 }
@@ -474,71 +460,17 @@ pub fn plain(dir: &Path) -> Result<String, String> {
     as_task(dir, &agent_client::project::read(dir)?, &composed.text)
 }
 
-/// What attaching does with a lead's instructions.
-#[derive(Debug, PartialEq)]
-pub enum Instructions {
-    /// They are what the folder composes today.
-    Current,
-    /// A client composed what they hold, and the folder has changed since:
-    /// these replace them.
-    Stale(String),
-    /// They were set some other way, or before Sonny saw this lead, and
-    /// are kept until the person asks for the folder's. `missing` names
-    /// the folder's skills they do not list, such as the layout skill
-    /// Sonny installed after they were set.
-    Kept { missing: Vec<String> },
-}
-
-impl Instructions {
-    /// What Sonny tells the person about instructions it keeps: the
-    /// command first, so a narrow pane still shows what to do.
-    pub fn kept_notice(missing: &[String]) -> String {
-        let why = "its instructions were set outside its folder's files";
-        match missing {
-            [] => "the lead's instructions were set outside its folder's files; \
-                   /instructions takes the folder's"
-                .into(),
-            [skill] => format!("/instructions gives the lead the {skill} skill: {why}"),
-            skills => format!(
-                "/instructions gives the lead the {} skills: {why}",
-                skills.join(", ")
-            ),
-        }
-    }
-}
-
-/// Whether a lead's instructions may follow the folder: only when Sonny
-/// wrote what they hold (or saw a client compose it), so instructions the
-/// person set some other way are never overwritten.
-/// With what was left out of the folder's instructions, which the lead
-/// goes without whichever it is.
+/// The folder's instructions for a lead, when they are not the ones it
+/// `held` last: a lead takes its folder's as its window opens and at each
+/// idle point after. With what was left out of them, which the lead goes
+/// without either way.
 pub fn review(
     dir: &Path,
-    bot: &Value,
-    lead: &str,
-    new: bool,
+    held: &str,
     chosen: Option<&str>,
-) -> Result<(Instructions, Vec<String>), String> {
-    let Composed {
-        text: composed,
-        skills,
-        left_out,
-    } = compose(dir, chosen)?;
-    let current = bot["instructions"].as_str().unwrap_or_default();
-    let reviewed = if current == composed {
-        wrote(lead, current);
-        Instructions::Current
-    } else if new || written(lead).is_some_and(|key| key == fingerprint(current)) {
-        Instructions::Stale(composed)
-    } else {
-        // The composed text lists each skill as "- NAME: summary (path)".
-        let missing = skills
-            .into_iter()
-            .filter(|name| !current.contains(&format!("- {name}:")))
-            .collect();
-        Instructions::Kept { missing }
-    };
-    Ok((reviewed, left_out))
+) -> Result<(Option<String>, Vec<String>), String> {
+    let Composed { text, left_out } = compose(dir, chosen)?;
+    Ok(((text != held).then_some(text), left_out))
 }
 
 /// Where a note of what a lead opened without comes from.
@@ -588,48 +520,6 @@ pub fn warnings_notice(warnings: &[String], told: bool) -> Option<String> {
         [] => None,
         [one] => Some(format!("{one}{told}")),
         [first, rest @ ..] => Some(format!("{first}; and {} more{told}", rest.len())),
-    }
-}
-
-/// What names a lead across daemons: bot ids count from one in each
-/// store, so the daemon's socket is part of the name.
-pub fn lead(socket: &Path, bot: &Value) -> String {
-    let socket = std::fs::canonicalize(socket).unwrap_or_else(|_| socket.to_owned());
-    let id = bot["bot_id"].as_i64().unwrap_or_default();
-    format!("{}-{id}", fingerprint(&socket.to_string_lossy()))
-}
-
-/// Where Sonny keeps a fingerprint of the instructions it last saw `lead`
-/// take from its folder: one file a lead, so two Sonnys never write over
-/// each other's.
-fn written_path(lead: &str) -> Option<PathBuf> {
-    std::env::var_os("HOME").map(|home| {
-        PathBuf::from(home)
-            .join(".agent/sonny/instructions")
-            .join(lead)
-    })
-}
-
-fn written(lead: &str) -> Option<String> {
-    let text = std::fs::read_to_string(written_path(lead)?).ok()?;
-    Some(text.trim().to_owned())
-}
-
-/// Note that `lead` now holds `text`, composed from its folder.
-pub fn wrote(lead: &str, text: &str) {
-    let Some(path) = written_path(lead) else {
-        return;
-    };
-    let key = fingerprint(text);
-    if written(lead).as_deref() == Some(key.as_str()) {
-        return;
-    }
-    if let Some(dir) = path.parent() {
-        let _ = std::fs::create_dir_all(dir);
-    }
-    let temp = path.with_extension(format!("{}.tmp", std::process::id()));
-    if std::fs::write(&temp, format!("{key}\n")).is_ok() {
-        let _ = std::fs::rename(&temp, &path);
     }
 }
 
@@ -1174,13 +1064,6 @@ pub async fn add(caller: &str, arguments: &Value) -> Result<Value, String> {
         .map_err(|e| format!("{}: {}", e.code, e.detail.unwrap_or_default()))?;
     let mut made = make(&client, &dir, &role(&dir, None)?, &picks, None).await;
     if let Ok(made) = &mut made {
-        // Composed from its folder, so the lead follows the folder's
-        // changes as one Sonny opened there does, when it opens.
-        if made["created"] == true
-            && let Some(text) = made["record"]["instructions"].as_str()
-        {
-            wrote(&lead(&socket, &made["record"]), text);
-        }
         open_new_lead(&client, &socket, caller, made).await;
         made.as_object_mut().map(|m| m.remove("record"));
     }
@@ -1416,7 +1299,7 @@ mod tests {
         let (base, coordination) = base.split_once(skill).unwrap();
         assert!(lead.body.starts_with(base));
         assert!(lead.body.ends_with(coordination));
-        let text = instructions(&dir, None).unwrap().text;
+        let text = compose(&dir, None).unwrap().text;
         assert!(text.contains("# Role: my-lead\n\n"), "{text}");
         // A variant of the lead is no role to start a peer in.
         assert!(!text.contains("- my-lead:"));
@@ -1430,12 +1313,7 @@ mod tests {
         assert!(lead.body.starts_with(base));
         assert!(lead.body.contains("you lead their leads"));
         assert!(lead.body.ends_with(coordination));
-        assert!(
-            !instructions(&dir, None)
-                .unwrap()
-                .text
-                .contains("- superlead:")
-        );
+        assert!(!compose(&dir, None).unwrap().text.contains("- superlead:"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1447,7 +1325,7 @@ mod tests {
         let dir = dir.canonicalize().unwrap();
         // A skill copied as a link to where it no longer is.
         std::os::unix::fs::symlink("/nowhere/review", dir.join(".agents/skills/review")).unwrap();
-        let composed = instructions(&dir, None).unwrap();
+        let composed = compose(&dir, None).unwrap();
         assert_eq!(
             composed.left_out,
             [format!(
@@ -1460,12 +1338,12 @@ mod tests {
         std::fs::create_dir_all(dir.join(".agents/agents")).unwrap();
         std::os::unix::fs::symlink("gone.md", dir.join(".agents/agents/lead.md")).unwrap();
         assert!(role(&dir, None).is_err());
-        let composed = instructions(&dir, None).unwrap();
+        let composed = compose(&dir, None).unwrap();
         assert!(composed.left_out[0].starts_with("the lead's role: instructions_unreadable: "));
         assert!(composed.left_out[0].ends_with("it runs as Sonny's own lead role"));
         assert!(composed.text.contains("# Role: lead\n\n"));
         // One picked by name is the person's to fix.
-        assert!(instructions(&dir, Some("lead")).is_err());
+        assert!(compose(&dir, Some("lead")).is_err());
         // The window says the first, and how many more.
         assert_eq!(
             warnings_notice(&["a".into(), "b".into(), "c".into()], true).as_deref(),
@@ -1599,8 +1477,8 @@ mod tests {
     }
 
     #[test]
-    fn kept_instructions_name_the_skills_they_miss() {
-        let dir = std::env::temp_dir().join(format!("sonny-kept-{}", std::process::id()));
+    fn a_lead_takes_its_folder_s_instructions_only_when_they_changed() {
+        let dir = std::env::temp_dir().join(format!("sonny-review-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join(".agents/skills/deploy")).unwrap();
         std::fs::write(
@@ -1608,30 +1486,11 @@ mod tests {
             "# Deploy\n\nShip it.",
         )
         .unwrap();
-        let lead = format!("kept-test-{}", std::process::id());
-        let missing = |instructions: &str| {
-            let bot = serde_json::json!({ "instructions": instructions });
-            match review(&dir, &bot, &lead, false, None).unwrap().0 {
-                Instructions::Kept { missing } => missing,
-                other => panic!("kept, not {other:?}"),
-            }
-        };
-        assert!(missing("set by hand").contains(&"deploy".to_owned()));
-        assert!(!missing("set by hand\n- deploy: Deploy (x)").contains(&"deploy".to_owned()));
-        assert!(
-            Instructions::kept_notice(&["herdr-panes".into()])
-                .starts_with("/instructions gives the lead the herdr-panes skill:")
-        );
+        let (taken, _) = review(&dir, "set by hand", None).unwrap();
+        let taken = taken.expect("the folder's, over what was set by hand");
+        assert!(taken.contains("- deploy:"));
+        assert_eq!(review(&dir, &taken, None).unwrap().0, None);
         let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn leads_of_two_daemons_with_one_id_have_two_names() {
-        let bot = serde_json::json!({"bot_id": 1});
-        let one = lead(Path::new("/tmp/one/state.sqlite.sock"), &bot);
-        let two = lead(Path::new("/tmp/two/state.sqlite.sock"), &bot);
-        assert_ne!(one, two);
-        assert!(one.ends_with("-1"));
     }
 
     #[test]

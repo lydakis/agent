@@ -23,6 +23,7 @@ mod cache;
 mod calls;
 mod cmux;
 mod colors;
+mod commands;
 mod commons;
 mod config;
 mod context;
@@ -70,7 +71,6 @@ mod place;
 mod plan;
 mod project;
 mod prompt;
-mod ps;
 mod reactions;
 mod recall;
 mod resolved;
@@ -2608,7 +2608,6 @@ async fn run() -> Result<(), String> {
     app.verbose = settings.verbose;
     app.words_only = !settings.steps;
     app.colors = settings.project_colors;
-    app.colors_set = settings.project_colors;
     app.pinned = settings.project_color.clone();
     set_measure(settings.text_width);
     margin::set_limits(settings.margin_notes, settings.margin_note_lines);
@@ -2666,7 +2665,6 @@ async fn run() -> Result<(), String> {
     {
         app.notice = Some(said);
     }
-    app.lead = project::lead(&app.options.socket, &bot);
     // The lookout knows no leads: it watches a lead's tasks because Sonny
     // subscribes it to them, before the lookout starts so it reads the file.
     if let Some(project) = &project
@@ -2679,24 +2677,19 @@ async fn run() -> Result<(), String> {
         app.warnings.push(error);
     }
     // The lead told what its folder tells it today (skills and memory added
-    // since it was made), unless its instructions were set some other way;
-    // a file of the folder's it cannot use is left out, and said.
+    // since it was made), whatever set its instructions before; a file of
+    // the folder's it cannot use is left out, and said.
     if project.is_some()
         && let Some(dir) = moving
             .as_deref()
             .or(bot["workspace"].as_str().map(std::path::Path::new))
     {
         let chosen = project::chosen(&app.options.store, &name);
-        match project::review(dir, &bot, &app.lead, fresh, chosen.as_deref()) {
-            Ok((reviewed, left_out)) => {
+        app.holds = bot["instructions"].as_str().unwrap_or_default().to_owned();
+        match project::review(dir, &app.holds, chosen.as_deref()) {
+            Ok((taken, left_out)) => {
                 app.warnings.extend(left_out);
-                match reviewed {
-                    project::Instructions::Stale(text) => app.instruct = Some(text),
-                    project::Instructions::Current => {}
-                    project::Instructions::Kept { missing } => {
-                        app.notice = Some(project::Instructions::kept_notice(&missing))
-                    }
-                }
+                app.instruct = taken;
             }
             Err(error) => app
                 .warnings
@@ -2709,7 +2702,7 @@ async fn run() -> Result<(), String> {
             "{name} works in {}; your next message brings it back here",
             tilde(bot["workspace"].as_str().unwrap_or("another folder"))
         ));
-        // The project's folder from now: what /model and /instructions
+        // The project's folder from now: what /model and the lead's instructions
         // write and read, before the move itself.
         app.workspace = dir.display().to_string();
         app.move_to = Some(app.workspace.clone());
@@ -3807,20 +3800,15 @@ struct Running {
     acted: bool,
 }
 
-/// The lists of a setting's values `/permissions` and `/fast` open over
-/// the composer.
+/// The lists of a setting's values `/permissions` opens over the composer.
 #[derive(Clone, Copy, PartialEq)]
 enum Choice {
     Permissions,
-    Speed,
 }
 
-/// The speeds `/fast` lists, each where the model serves it.
-const SPEEDS: [(&str, &str); 3] = [
-    ("standard", "the model's own speed and price"),
-    ("fast", "faster, at a higher price per token"),
-    ("ultrafast", "fastest, at a higher price still"),
-];
+/// The speeds `/model`'s speed row steps through, each where the model
+/// serves it: its own, then faster at a higher price per token.
+const SPEEDS: [&str; 3] = ["standard", "fast", "ultrafast"];
 
 /// The tier faster than standard a bot's record says it is served at.
 fn speed(record: &Value) -> Option<String> {
@@ -3859,7 +3847,6 @@ fn hold(unsent: &mut Vec<String>, record: String) {
 /// given words it doesn't take. A message that only starts with a slash
 /// word, such as a path, is words for the agent.
 fn unknown_command(prompt: &str) -> Option<String> {
-    const UNLISTED: [&str; 5] = ["/agents", "/automations", "/lookout", "/forum", "/settings"];
     let mut words = prompt.split_whitespace();
     let word = words.next()?;
     let name = word.strip_prefix('/')?;
@@ -3867,7 +3854,7 @@ fn unknown_command(prompt: &str) -> Option<String> {
     {
         return None;
     }
-    let known = COMMANDS.iter().any(|(command, _)| *command == word) || UNLISTED.contains(&word);
+    let known = COMMANDS.iter().any(|(command, _)| *command == word);
     match (known, words.next().is_some()) {
         (true, _) => Some(format!("{word} takes nothing after it")),
         (false, false) => Some(format!("no command {word} · / lists them")),
@@ -3875,53 +3862,40 @@ fn unknown_command(prompt: &str) -> Option<String> {
     }
 }
 
-/// The slash commands, as the menu lists them: name and what it does.
-/// `/agents` and `/ps` also open `/status`, `/automations` and `/lookout`
-/// open `/background`, `/forum` opens `/commons`, and `/settings` opens
-/// `/config`, unlisted.
-const COMMANDS: [(&str, &str); 32] = [
+/// The slash commands, as the menu lists them when nothing is typed past
+/// the slash: name and what it does, in the Sonny Rulebook's order (talk,
+/// agents, this agent, work without you, every project, Sonny). Each
+/// has one name.
+const COMMANDS: [(&str, &str); 26] = [
     ("/side", "Start a side chat with a copy of this agent"),
-    ("/model", "Pick the model and effort"),
+    ("/zen", "Talk about one thing and keep the rest for later"),
+    ("/reply", "Quote one of the agent's replies to answer it"),
+    ("/react", "React to one of the agent's replies"),
+    ("/copy", "Copy the last reply as Markdown"),
+    ("/status", "Show this project's agents"),
+    ("/switch", "Open any agent in this window"),
+    ("/new", "Start a lead or a task here"),
     (
-        "/fast",
-        "Choose how fast this agent is served, and at what price",
+        "/memory",
+        "Show what agents remember about you and this project",
     ),
-    (
-        "/compact",
-        "Summarize the lead's conversation before its next call",
-    ),
+    ("/model", "Pick the model, effort and speed"),
     (
         "/permissions",
         "Choose what agents may do, and who approves the rest",
     ),
     ("/retry", "Allow one retry of a call the reviewer denied"),
     (
-        "/instructions",
-        "Reload the lead's instructions from its folder",
+        "/compact",
+        "Summarize this agent's conversation to free context",
     ),
-    ("/status", "Show this project's agents"),
-    ("/switch", "Open any agent in this window"),
+    ("/context", "Show what fills this agent's context"),
     (
-        "/new",
-        "Start an agent here: a lead or a task, in the profile you pick",
+        "/background",
+        "Show what runs without you: automations, follows, commands",
     ),
-    (
-        "/memory",
-        "Show what agents remember about you and this project",
-    ),
-    (
-        "/zen",
-        "Talk with the agent about one thing, the rest held back; /zen again ends it",
-    ),
-    (
-        "/margin",
-        "Show or close the agent's notes beside the conversation",
-    ),
-    ("/background", "Run or remove automations and follows"),
-    (
-        "/ps",
-        "Show the commands the agents left running, and stop one",
-    ),
+    ("/pause", "Pause every agent until /resume"),
+    ("/resume", "Let the agents go on"),
     ("/commons", "Read what the agents of every project share"),
     ("/sky", "Watch every agent light up as they talk"),
     ("/usage", "Show the tokens the agents spent, over time"),
@@ -3929,26 +3903,18 @@ const COMMANDS: [(&str, &str); 32] = [
         "/audit",
         "Show every tool call the agents made: where it ran, who allowed it",
     ),
-    ("/context", "Show what fills the agent's context"),
-    ("/pause", "Stop every agent until /resume, saying why"),
-    ("/resume", "Let the agents go on after a pause"),
+    ("/config", "Change settings"),
+    ("/verbose", "Show every tool call, or go back to your view"),
+    (
+        "/margin",
+        "Show or close the agent's notes beside the conversation",
+    ),
     ("/mcp", "List the MCP servers agents' scripts call"),
-    ("/config", "Change the settings in ~/.agent/config.toml"),
-    ("/sound", "Turn the chime when work ends on or off"),
-    (
-        "/verbose",
-        "Show every tool call, or only what moves the work on",
-    ),
-    (
-        "/colors",
-        "Color each reply by the followed project it is about (experimental)",
-    ),
-    ("/react", "React to one of the agent's replies"),
-    ("/reply", "Answer one of the agent's replies, quoted"),
-    ("/copy", "Copy the last reply as Markdown"),
-    ("/open", "Open the last HTML page in your browser"),
     ("/quit", "Quit; the agents keep working"),
 ];
+
+/// `/zen`'s line while zen is on.
+const ZEN_ENDS: &str = "End zen and hear what was kept";
 
 /// Every key Sonny takes and what it does, as `?` lists them; a tip in
 /// the empty composer names only these.
@@ -4087,8 +4053,6 @@ struct Watch {
     usage: Option<usage::View>,
     /// `/audit` holds it instead.
     audit: Option<audit::View>,
-    /// `/ps` holds it instead.
-    ps: Option<ps::View>,
     /// `/commons` holds it instead.
     commons: Option<commons::View>,
     /// `/memory` holds it instead.
@@ -4519,6 +4483,8 @@ struct App {
     /// What a click opens around the composer, by row and columns: the
     /// footer's counts, and the agent the composer's guess came from.
     opens_at: Vec<(u16, std::ops::Range<u16>, String)>,
+    /// What a click on `/model`'s footer does, by row and columns.
+    model_at: Vec<(u16, std::ops::Range<u16>, models::Click)>,
     /// The mouse button went down on the composer's text, on what: a
     /// spot, word or line a drag selects from, and where the text was
     /// drawn then, kept while the button is down so a redraw that scrolls
@@ -4610,11 +4576,8 @@ struct App {
     /// than the person: another agent, a task's news, the lookout.
     elsewhere: bool,
     /// Experimental: replies about one followed project are barred in its
-    /// color (`/colors`, `[sonny] project_colors`).
+    /// color (`[sonny] project_colors`).
     colors: bool,
-    /// `[sonny] project_colors` as last read: a change in `/config` sets
-    /// `colors` to it.
-    colors_set: bool,
     /// The color each project pins, `[sonny.projects.NAME] color`.
     pinned: BTreeMap<String, String>,
     /// The followed projects and their colors' slots, as last read, and
@@ -4636,8 +4599,10 @@ struct App {
     restored: Option<trigger::Restored>,
     /// The folder the next message moves the bot to: its lead moved away.
     move_to: Option<String>,
-    /// The name under which Sonny notes the instructions it wrote.
-    lead: String,
+    /// The instructions the lead holds, as this window last saw or sent
+    /// them: at each idle point its folder's are composed again and sent
+    /// when they differ.
+    holds: String,
     /// When to connect again, while it or the fleet's is down.
     retry: Option<Instant>,
     /// The daemon is newer than this window: it connects and starts
@@ -4667,7 +4632,7 @@ struct App {
     /// The prompt-cache lifetime a bot made before Sonny gave its model
     /// one takes, set once no turn runs.
     cache: Option<&'static str>,
-    /// `/fast`: the speed picked, set once no turn runs.
+    /// `/model`'s speed picked, set once no turn runs.
     pace: Option<&'static str>,
     /// The bot's tools, which its permissions row gates.
     tools: Vec<String>,
@@ -4680,7 +4645,7 @@ struct App {
     state: Option<String>,
     /// Its `env` setting, waiting to name its state folder in its shell.
     env: Option<Value>,
-    /// `/permissions` or `/fast`, open over the composer.
+    /// `/permissions`, open over the composer.
     choosing: Option<(Choice, list::Picker)>,
     /// The rows `/permissions` lists, as the config had them when it opened.
     rows: Vec<approvals::Mode>,
@@ -6301,6 +6266,7 @@ impl App {
             closed: None,
             composer_at: None,
             opens_at: Vec::new(),
+            model_at: Vec::new(),
             composing: None,
             composer_click: None,
             margin: margin::Margin::default(),
@@ -6338,7 +6304,6 @@ impl App {
             zen: None,
             elsewhere: false,
             colors: false,
-            colors_set: false,
             pinned: BTreeMap::new(),
             palette: None,
             bar: None,
@@ -6347,7 +6312,7 @@ impl App {
             upgrades: None,
             restored: None,
             move_to: None,
-            lead: String::new(),
+            holds: String::new(),
             retry: None,
             upgraded: false,
             picker: None,
@@ -6707,7 +6672,9 @@ impl App {
                     w.read.elapsed() > Duration::from_secs(2)
                         || w.usage.as_ref().is_some_and(usage::View::due)
                         || w.audit.as_ref().is_some_and(audit::View::due)
-                        || w.ps.as_ref().is_some_and(ps::View::due)
+                        || w.background
+                            .as_ref()
+                            .is_some_and(background::View::commands_due)
                 })
             {
                 self.reread().await;
@@ -6969,6 +6936,30 @@ impl App {
         }
     }
 
+    /// A lead takes its folder's instructions at each idle point: composed
+    /// again as a turn ends, and sent by the [`App::configure`] that
+    /// follows when they changed. A file of the folder's it cannot use is
+    /// left out, and said, and the lead told.
+    async fn folder_instructions(&mut self) {
+        if self.project.is_none() || self.options.side.is_some() {
+            return;
+        }
+        let chosen = project::chosen(&self.options.store, &self.bot);
+        let dir = std::path::Path::new(&self.workspace);
+        match project::review(dir, &self.holds, chosen.as_deref()) {
+            Ok((None, _)) => {}
+            Ok((Some(text), left_out)) => {
+                self.instruct = Some(text);
+                self.notice = project::warnings_notice(&left_out, true);
+                if let Err(error) = project::tell_warnings(&self.client, &self.bot, &left_out).await
+                {
+                    self.notice = Some(format!("the lead's instructions: {error}"));
+                }
+            }
+            Err(error) => self.notice = Some(format!("the lead's instructions: {error}")),
+        }
+    }
+
     /// The lead's instructions as composed on attach, sent once no turn
     /// runs; the next turn reads them.
     ///
@@ -7046,8 +7037,8 @@ impl App {
                 if let Some(declare) = &declare {
                     self.declared = declare.clone();
                 }
-                if let Some(text) = &text {
-                    project::wrote(&self.lead, text);
+                if let Some(text) = text {
+                    self.holds = text;
                 }
                 if let Some((model, effort)) = switch {
                     // A lead's project file says what it runs, for the next
@@ -7151,34 +7142,42 @@ impl App {
         )));
     }
 
-    /// The rows `/fast` lists: standard, and each tier faster than it
-    /// the bot's model serves.
-    fn speed_rows(&self) -> Vec<(&'static str, &'static str)> {
-        let serves = self.speeds();
+    /// The speeds `/model` steps through for `model`: standard, and each
+    /// tier faster than it the model serves.
+    fn speeds_of(&self, model: &str) -> Vec<&'static str> {
+        let serves = self.client.speeds(model);
         (SPEEDS.into_iter())
-            .filter(|(speed, _)| *speed == "standard" || serves.iter().any(|s| s == speed))
+            .filter(|speed| *speed == "standard" || serves.iter().any(|s| s == speed))
             .collect()
+    }
+
+    /// Keeps `/model`'s speed to what its picked model serves, as the pick
+    /// moves.
+    fn fit_speed(&mut self) {
+        let speeds = (self.picker.as_ref())
+            .and_then(models::Picker::chosen)
+            .map(|(model, _)| self.speeds_of(&model))
+            .unwrap_or_default();
+        if let Some(picker) = &mut self.picker {
+            picker.fit(&speeds);
+        }
+    }
+
+    /// A click on `/model`'s footer: on a value, ← and → move to it; on
+    /// `‹` or `›`, they step it.
+    fn model_click(&mut self, click: models::Click) {
+        let speeds = (self.picker.as_ref())
+            .and_then(models::Picker::chosen)
+            .map(|(model, _)| self.speeds_of(&model))
+            .unwrap_or_default();
+        if let Some(picker) = &mut self.picker {
+            picker.click(click, &speeds);
+        }
     }
 
     /// A call the reviewer denied, as `/retry` lists it.
     fn denied_what(&self, denied: &Denial) -> String {
         transcript::action(&denied.name, &denied.arguments, &self.workspace)
-    }
-
-    /// Serves the bot at `speed` from now, or from when no turn runs.
-    async fn pace_at(&mut self, speed: &'static str) {
-        let now = (self.pace).unwrap_or(self.speed.as_deref().unwrap_or("standard"));
-        if speed == now {
-            return;
-        }
-        self.pace = Some(speed);
-        self.notice = Some(match (self.configure().await, self.pace.is_some()) {
-            (true, _) if speed == "standard" => "standard speed from the next call".into(),
-            (true, _) => format!("{speed} from the next call, at a higher price per token"),
-            (false, true) => "applies when idle".into(),
-            // Refused: the notice already says why.
-            (false, false) => return,
-        });
     }
 
     /// The tiers faster than standard the bot's model serves.
@@ -7272,13 +7271,17 @@ impl App {
                 let hidden = agent_client::models::path()
                     .map(|path| agent_client::models::hidden(&path))
                     .unwrap_or_default();
-                self.picker = Some(models::Picker::new(
-                    &listing,
-                    self.client.providers(),
-                    &hidden,
-                    model,
-                    effort,
-                ));
+                let mut picker =
+                    models::Picker::new(&listing, self.client.providers(), &hidden, model, effort);
+                // On the pick still waiting for the turn to end, if any.
+                picker.speed = (self.pace).unwrap_or(match self.speed_shown() {
+                    Some(speed) => SPEEDS
+                        .into_iter()
+                        .find(|s| *s == speed)
+                        .unwrap_or("standard"),
+                    None => "standard",
+                });
+                self.picker = Some(picker);
             }
             Err(error) => self.notice = Some(error),
         }
@@ -11244,6 +11247,7 @@ impl App {
                     "interrupted" => "idle",
                     _ => "error",
                 });
+                self.folder_instructions().await;
                 self.configure().await;
                 // Only this view knows whether the turn said anything, so it
                 // rings for the end of every turn of its own; the project's
@@ -11358,7 +11362,6 @@ impl App {
             background: None,
             usage: None,
             audit: None,
-            ps: None,
             commons: None,
             memory: None,
             sky: None,
@@ -11404,7 +11407,6 @@ impl App {
             background: Some(view),
             usage: None,
             audit: None,
-            ps: None,
             commons: None,
             memory: None,
             sky: None,
@@ -11477,7 +11479,6 @@ impl App {
             background: None,
             usage: Some(view),
             audit: None,
-            ps: None,
             commons: None,
             memory: None,
             sky: None,
@@ -11505,7 +11506,6 @@ impl App {
             background: None,
             usage: None,
             audit: Some(view),
-            ps: None,
             commons: None,
             memory: None,
             sky: None,
@@ -11523,38 +11523,10 @@ impl App {
         view.loaded(read.map_err(|error| error.to_string()));
     }
 
-    /// The commands the project's agents left running, or every agent's,
-    /// oldest first: `/ps` in the pane, as `/status` is, until Esc.
-    async fn ps(&mut self) {
-        let scope = self.scope();
-        let project = scope.project.clone();
-        let mut view = ps::View::new(scope);
-        self.read_ps(&mut view).await;
-        self.watch = Some(Watch {
-            project,
-            rows: Vec::new(),
-            read: Instant::now(),
-            alerts: Vec::new(),
-            open: Vec::new(),
-            background: None,
-            usage: None,
-            audit: None,
-            ps: Some(view),
-            commons: None,
-            memory: None,
-            sky: None,
-            picked: None,
-            pick: None,
-            helpers: Vec::new(),
-            more: false,
-        });
-        self.open_pane(pane::Pane::card("ps", STATUS_KEYS));
-    }
-
-    /// `view` read from the daemon again.
-    async fn read_ps(&self, view: &mut ps::View) {
+    /// The commands `view` lists read from the daemon again.
+    async fn read_commands(&self, view: &mut background::View) {
         // Every page, as the daemon hands them, into one list.
-        let (mut query, mut rows) = (view.query(), Vec::new());
+        let (mut query, mut rows) = (view.commands_query(), Vec::new());
         let read = loop {
             match self.client.request("processes", query.clone()).await {
                 Ok(mut page) => {
@@ -11569,14 +11541,14 @@ impl App {
                 Err(error) => break Err(error.to_string()),
             }
         };
-        view.loaded(read);
+        view.commands_loaded(read);
     }
 
-    /// Stop `bot`'s command `handle` from `/ps`, beside the window, which
-    /// answers meanwhile: what it came to shows on the card, and the list
-    /// is read again at once.
+    /// Stop `bot`'s command `handle` from `/background`, beside the
+    /// window, which answers meanwhile: what it came to shows under the
+    /// card, and the commands are read again at once.
     fn stop_process(&mut self, bot: String, handle: String) {
-        let Some(view) = self.watch.as_mut().and_then(|w| w.ps.as_mut()) else {
+        let Some(view) = self.watch.as_mut().and_then(|w| w.background.as_mut()) else {
             return;
         };
         let said = view.stopping(&handle);
@@ -11628,7 +11600,6 @@ impl App {
             background: None,
             usage: None,
             audit: None,
-            ps: None,
             commons: None,
             memory: Some(view),
             sky: None,
@@ -11656,7 +11627,6 @@ impl App {
             background: None,
             usage: None,
             audit: None,
-            ps: None,
             commons: Some(commons::View::open(&home)),
             memory: None,
             sky: None,
@@ -11680,7 +11650,6 @@ impl App {
             background: None,
             usage: None,
             audit: None,
-            ps: None,
             commons: None,
             memory: None,
             sky: Some(sky::View::open(self.options.socket.clone(), self.store())),
@@ -11713,11 +11682,15 @@ impl App {
         if self.watch.as_ref().is_some_and(|w| w.sky.is_some()) {
             return;
         }
-        if let Some(watch) = &mut self.watch
-            && let Some(view) = &mut watch.background
-        {
+        if let Some(mut view) = self.watch.as_mut().and_then(|w| w.background.take()) {
             view.reload();
-            watch.read = Instant::now();
+            if view.commands_due() {
+                self.read_commands(&mut view).await;
+            }
+            if let Some(watch) = &mut self.watch {
+                watch.background = Some(view);
+                watch.read = Instant::now();
+            }
             return;
         }
         // `/memory` reads when it opens, on `a` and after a removal only.
@@ -11732,16 +11705,6 @@ impl App {
         {
             view.reload();
             watch.read = Instant::now();
-            return;
-        }
-        if let Some(mut view) = self.watch.as_mut().and_then(|w| w.ps.take()) {
-            if view.due() {
-                self.read_ps(&mut view).await;
-            }
-            if let Some(watch) = &mut self.watch {
-                watch.ps = Some(view);
-                watch.read = Instant::now();
-            }
             return;
         }
         if let Some(mut view) = self.watch.as_mut().and_then(|w| w.audit.take()) {
@@ -12422,13 +12385,22 @@ impl App {
         {
             return Vec::new();
         }
-        let names = COMMANDS.iter().map(|(name, _)| &name[1..]);
+        // `/resume` is listed only while the agents are paused; `/zen`
+        // says it ends zen while it is on.
+        let listed: Vec<(&'static str, &'static str)> = (COMMANDS.iter())
+            .filter(|(name, _)| *name != "/resume" || self.paused.is_some())
+            .map(|&(name, about)| match name {
+                "/zen" if self.zen.is_some() => (name, ZEN_ENDS),
+                _ => (name, about),
+            })
+            .collect();
+        let names = listed.iter().map(|(name, _)| &name[1..]);
         fuzzy::rank(names, &self.input[1..], |name| {
             self.picks.weight_now(&format!("/{name}"))
         })
         .into_iter()
         .map(|(at, found)| {
-            let (name, about) = COMMANDS[at];
+            let (name, about) = listed[at];
             (name, about, found.at.iter().map(|at| at + 1).collect())
         })
         .collect()
@@ -12506,6 +12478,16 @@ impl App {
                 // from: what it opens; a right click on the agent, the
                 // other way to it, as on its name anywhere.
                 let right = matches!(mouse.kind, MouseEventKind::Down(MouseButton::Right));
+                if down
+                    && self.picker.is_some()
+                    && let Some(&(_, _, click)) =
+                        (self.model_at.iter()).find(|(row, columns, _)| {
+                            mouse.row == *row && columns.contains(&mouse.column)
+                        })
+                {
+                    self.model_click(click);
+                    return true;
+                }
                 if (down || right)
                     && let Some((_, _, opens)) = (self.opens_at.iter()).find(|(row, columns, _)| {
                         mouse.row == *row && columns.contains(&mouse.column)
@@ -12655,7 +12637,6 @@ impl App {
             && watch.background.is_none()
             && watch.usage.is_none()
             && watch.audit.is_none()
-            && watch.ps.is_none()
             && watch.commons.is_none()
             && watch.memory.is_none()
             && watch.sky.is_none()
@@ -12740,6 +12721,7 @@ impl App {
                         background::Key::Stay => {}
                         background::Key::Close => self.close_pane(true),
                         background::Key::Open(bot) => self.enter_agent(&bot),
+                        background::Key::Stop { bot, handle } => self.stop_process(bot, handle),
                     },
                 }
                 return true;
@@ -12836,44 +12818,6 @@ impl App {
                 }
                 return true;
             }
-            // `/ps` takes its own keys: a pick, its stop, whose.
-            if self.pane_keys
-                && pane.is_card()
-                && let Some(view) = self.watch.as_mut().and_then(|w| w.ps.as_mut())
-            {
-                // A key the pane takes keeps the command a stop was asked
-                // for running, as any other key does.
-                let scrolls = matches!(
-                    key.code,
-                    KeyCode::Tab
-                        | KeyCode::PageUp
-                        | KeyCode::PageDown
-                        | KeyCode::Char(' ')
-                        | KeyCode::Home
-                        | KeyCode::End
-                );
-                if scrolls || switches(key) || (copy && pane.screen.selected().is_some()) {
-                    view.keep();
-                }
-                match key.code {
-                    _ if switches(key) || key.code == KeyCode::Tab => self.pane_keys = false,
-                    _ if copy && let Some(text) = pane.screen.selected() => {
-                        pane.screen.unselect();
-                        self.copied(&text);
-                    }
-                    KeyCode::PageUp => pane.screen.page(true),
-                    KeyCode::PageDown | KeyCode::Char(' ') => pane.screen.page(false),
-                    KeyCode::Home => pane.screen.hold(usize::MAX),
-                    KeyCode::End => pane.screen.latest(),
-                    _ => match view.key(*key) {
-                        ps::Key::Stay => {}
-                        ps::Key::Close => self.close_pane(true),
-                        ps::Key::Open(bot) => self.enter_agent(&bot),
-                        ps::Key::Stop { bot, handle } => self.stop_process(bot, handle),
-                    },
-                }
-                return true;
-            }
             // `/audit` takes its own keys: the filters, whose, a pick.
             if self.pane_keys
                 && pane.is_card()
@@ -12966,7 +12910,6 @@ impl App {
                             && watch.background.is_none()
                             && watch.usage.is_none()
                             && watch.audit.is_none()
-                            && watch.ps.is_none()
                             && watch.commons.is_none()
                             && watch.memory.is_none()
                             && watch.sky.is_none() =>
@@ -12980,7 +12923,6 @@ impl App {
                             && watch.background.is_none()
                             && watch.usage.is_none()
                             && watch.audit.is_none()
-                            && watch.ps.is_none()
                             && watch.commons.is_none()
                             && watch.memory.is_none()
                             && watch.sky.is_none()
@@ -13510,8 +13452,6 @@ impl App {
                         view.pick_at(at);
                     } else if let Some(view) = &mut watch.commons {
                         view.pick_at(at);
-                    } else if let Some(view) = &mut watch.ps {
-                        view.pick_at(at);
                     } else if let Some(view) = &mut watch.audit {
                         view.pick_at(at);
                     } else {
@@ -13561,6 +13501,14 @@ impl App {
     fn follow(&mut self, link: &str) {
         if let Some(what) = link.strip_prefix(screen::BUTTON) {
             self.act(what);
+            return;
+        }
+        // A page a reply drew opens in the browser, to be used there.
+        if transcript::browser_page(link) {
+            self.notice = Some(match open(link) {
+                Ok(()) => "opened in your browser".to_owned(),
+                Err(error) => error,
+            });
             return;
         }
         if link.starts_with("file://") {
@@ -13639,9 +13587,6 @@ impl App {
         let Some(watch) = &mut self.watch else {
             return;
         };
-        if let Some(view) = &mut watch.ps {
-            view.keep();
-        }
         if let Some(view) = &mut watch.background {
             view.keep();
         }
@@ -14011,15 +13956,6 @@ impl App {
                                 self.notice = Some("applies when idle".into());
                             }
                         }
-                        // Another client may have moved the bot to a
-                        // provider that serves fewer tiers since the list
-                        // opened: its last row, rather than one gone.
-                        Choice::Speed => {
-                            let rows = self.speed_rows();
-                            if let Some((speed, _)) = rows.get(at.min(rows.len() - 1)) {
-                                self.pace_at(speed).await;
-                            }
-                        }
                     }
                 }
                 list::Act::Close => self.choosing = None,
@@ -14047,11 +13983,8 @@ impl App {
                 self.repaint = true;
             }
             // A new default for project colors, or a new pin, takes now.
-            if self.colors_set != settings.project_colors || self.pinned != settings.project_color {
-                if self.colors_set != settings.project_colors {
-                    self.colors = settings.project_colors;
-                }
-                self.colors_set = settings.project_colors;
+            if self.colors != settings.project_colors || self.pinned != settings.project_color {
+                self.colors = settings.project_colors;
                 self.pinned = settings.project_color;
                 self.palette = None;
                 self.repaint = true;
@@ -14094,11 +14027,23 @@ impl App {
             }
             return;
         }
-        if let Some(picker) = &mut self.picker {
+        if self.picker.is_some() {
+            // The speeds the picked model serves: Tab moves ← and → to
+            // them only where there is more than one.
+            let speeds = (self.picker.as_ref())
+                .and_then(models::Picker::chosen)
+                .map(|(model, _)| self.speeds_of(&model))
+                .unwrap_or_default();
+            let Some(picker) = &mut self.picker else {
+                return;
+            };
             match event {
                 Event::Key(key) if key.kind != KeyEventKind::Release => match key.code {
                     KeyCode::Up => picker.up(),
                     KeyCode::Down => picker.down(),
+                    KeyCode::Tab => picker.on_speed = !picker.on_speed && speeds.len() > 1,
+                    KeyCode::Left if picker.on_speed => picker.step_speed(&speeds, -1),
+                    KeyCode::Right if picker.on_speed => picker.step_speed(&speeds, 1),
                     KeyCode::Left => picker.less(),
                     KeyCode::Right => picker.more(),
                     KeyCode::Backspace => {
@@ -14113,12 +14058,38 @@ impl App {
                     KeyCode::Esc => self.picker = None,
                     KeyCode::Enter => {
                         if let Some(chosen) = picker.chosen() {
+                            // A speed the picked model does not serve is
+                            // standard.
+                            let speed = Some(picker.speed)
+                                .filter(|speed| speeds.contains(speed))
+                                .unwrap_or("standard");
                             self.picker = None;
-                            self.switch = Some(chosen);
-                            self.configure().await;
-                            if self.switch.is_some() {
-                                self.notice = Some("applies when idle".into());
+                            let now = (self.pace).unwrap_or(
+                                self.speed.as_deref().map_or("standard", |now| {
+                                    SPEEDS.into_iter().find(|s| *s == now).unwrap_or("standard")
+                                }),
+                            );
+                            if speed != now {
+                                self.pace = Some(speed);
                             }
+                            let model = (self.switch.as_ref().map(|(m, e)| (m.clone(), e.clone())))
+                                .unwrap_or((self.model.clone(), self.effort.clone()));
+                            if chosen != model {
+                                self.switch = Some(chosen);
+                            }
+                            let faster = self.pace.filter(|speed| *speed != "standard");
+                            self.notice = match self.configure().await {
+                                true => faster.map(|speed| {
+                                    format!(
+                                        "{speed} from the next call, at a higher price per token"
+                                    )
+                                }),
+                                false if self.switch.is_some() || self.pace.is_some() => {
+                                    Some("applies when idle".into())
+                                }
+                                // Refused: the notice already says why.
+                                false => self.notice.take(),
+                            };
                         }
                     }
                     _ => {}
@@ -14127,6 +14098,7 @@ impl App {
                 Event::Resize(width, _) => self.width = width as usize,
                 _ => {}
             }
+            self.fit_speed();
             return;
         }
         let menu = self.menu();
@@ -14562,16 +14534,7 @@ impl App {
             self.toggle_margin();
             return;
         }
-        if prompt == "/ps" {
-            self.input.clear();
-            if self.options.side.is_some() {
-                self.notice = Some("/ps is for the agent itself, not a side chat".into());
-            } else {
-                self.ps().await;
-            }
-            return;
-        }
-        if matches!(prompt.as_str(), "/status" | "/agents") {
+        if prompt == "/status" {
             self.input.clear();
             // The side chat already holds the screen /status would take.
             if self.options.side.is_some() {
@@ -14586,7 +14549,7 @@ impl App {
             self.memory_view();
             return;
         }
-        if matches!(prompt.as_str(), "/commons" | "/forum") {
+        if prompt == "/commons" {
             self.input.clear();
             self.commons();
             return;
@@ -14614,7 +14577,7 @@ impl App {
             }
             return;
         }
-        if matches!(prompt.as_str(), "/background" | "/automations" | "/lookout") {
+        if prompt == "/background" {
             self.input.clear();
             if self.options.side.is_some() {
                 self.notice = Some("/background is for the agent itself, not a side chat".into());
@@ -14638,43 +14601,12 @@ impl App {
             self.open_pane(pane);
             return;
         }
-        if prompt == "/open" {
-            self.input.clear();
-            let page = transcript::PAGE.lock().ok().and_then(|page| page.clone());
-            self.notice = Some(match page {
-                Some(page) => match open(&page.to_string_lossy()) {
-                    Ok(()) => "opened in your browser".to_owned(),
-                    Err(error) => error,
-                },
-                None => "no HTML page in this conversation yet".into(),
-            });
-            return;
-        }
-        if matches!(prompt.as_str(), "/config" | "/settings") {
+        if prompt == "/config" {
             self.input.clear();
             match config::View::open() {
                 Ok(view) => self.config = Some(view),
                 Err(error) => self.notice = Some(error),
             }
-            return;
-        }
-        if prompt == "/fast" {
-            self.input.clear();
-            let rows = self.speed_rows();
-            if rows.len() < 2 {
-                self.notice = Some(format!(
-                    "{} runs at standard speed only",
-                    models::label(&self.model)
-                ));
-                return;
-            }
-            // On the pick still waiting for the turn to end, if there is one.
-            let now = (self.pace).unwrap_or(self.speed_shown().unwrap_or("standard"));
-            let at = rows.iter().position(|(speed, _)| *speed == now);
-            let rows = (self.speed_rows().into_iter())
-                .map(|(speed, about)| (speed.to_owned(), about.to_owned()))
-                .collect();
-            self.choosing = Some((Choice::Speed, list::Picker::new(rows, at.unwrap_or(0))));
             return;
         }
         if prompt == "/model" {
@@ -14687,36 +14619,6 @@ impl App {
             });
             self.listing = Some(receive);
             self.notice = Some("listing models…".into());
-            return;
-        }
-        if prompt == "/instructions" {
-            self.input.clear();
-            if self.project.is_none() {
-                self.notice = Some("only a folder's lead takes its folder's instructions".into());
-                return;
-            }
-            let chosen = project::chosen(&self.options.store, &self.bot);
-            match project::instructions(std::path::Path::new(&self.workspace), chosen.as_deref()) {
-                Ok(composed) => {
-                    self.instruct = Some(composed.text);
-                    if self.configure().await {
-                        self.notice = Some("the lead has its folder's instructions".into());
-                    } else if self.instruct.is_some() {
-                        self.notice = Some("applies when idle".into());
-                    }
-                    // What it goes without is said over either, and told.
-                    if let Some(said) = project::warnings_notice(&composed.left_out, true) {
-                        self.notice = Some(said);
-                        if let Err(error) =
-                            project::tell_warnings(&self.client, &self.bot, &composed.left_out)
-                                .await
-                        {
-                            self.notice = Some(format!("the lead's instructions: {error}"));
-                        }
-                    }
-                }
-                Err(error) => self.notice = Some(format!("the lead's instructions: {error}")),
-            }
             return;
         }
         if prompt == "/resume" {
@@ -14822,24 +14724,6 @@ impl App {
             });
             return;
         }
-        if prompt == "/sound" {
-            self.input.clear();
-            let mut settings = settings::Settings::load();
-            settings.chime = !self.sounds.chime;
-            self.notice = Some(match settings.save() {
-                Ok(()) => {
-                    self.sounds.chime = settings.chime;
-                    if settings.chime {
-                        "chime on"
-                    } else {
-                        "chime off"
-                    }
-                    .to_owned()
-                }
-                Err(error) => error,
-            });
-            return;
-        }
         if prompt == "/verbose" {
             self.input.clear();
             let mut settings = settings::Settings::load();
@@ -14857,24 +14741,6 @@ impl App {
                     .to_owned()
                 }
                 Err(error) => error,
-            });
-            return;
-        }
-        if prompt == "/colors" {
-            self.input.clear();
-            self.colors = !self.colors;
-            self.palette = None;
-            // What is already drawn is drawn again with colors or without,
-            // once no turn runs.
-            self.repaint = true;
-            let followed = self.palette().len();
-            self.notice = Some(match (self.colors, followed) {
-                (false, _) => "project colors off".to_owned(),
-                (true, 0) => {
-                    "project colors on: this agent follows no other project's lead".to_owned()
-                }
-                (true, 1) => "project colors on, for the 1 project followed".to_owned(),
-                (true, n) => format!("project colors on, for the {n} projects followed"),
             });
             return;
         }
@@ -16563,7 +16429,6 @@ impl App {
         let listing = watch.background.is_none()
             && watch.usage.is_none()
             && watch.audit.is_none()
-            && watch.ps.is_none()
             && watch.commons.is_none()
             && watch.memory.is_none()
             && watch.sky.is_none();
@@ -17042,6 +16907,7 @@ impl App {
         }
         let mut composer_at = None;
         let mut opens_at = Vec::new();
+        let mut model_at = Vec::new();
         // The reply's open line, wrapped as it will be written: it grows
         // here row by row until its newline writes it into the history.
         let mut open_rows = self.open_rows(width.min(measure()));
@@ -17180,29 +17046,6 @@ impl App {
                         pane.screen.show_row(0, 0);
                     }
                 } else if watch.picked != Some(at) {
-                    watch.picked = Some(at);
-                    pane.screen.keep_in_view(at, 2);
-                }
-            } else if let Some(view) = &watch.ps {
-                let now_ms = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_millis() as i64;
-                let lines: Vec<Line<'static>> = view
-                    .card(width, now_ms)
-                    .into_iter()
-                    .map(|line| {
-                        let mut spans = vec![Span::raw(" ")];
-                        spans.extend(line.spans);
-                        Line::from(spans).style(line.style)
-                    })
-                    .collect();
-                let marks = row_marks(&lines, &view.starts());
-                pane.set_card_marked(lines, marks, &view.keys());
-                pane.foot = view.footer();
-                if let Some(at) = view.picked_row()
-                    && watch.picked != Some(at)
-                {
                     watch.picked = Some(at);
                     pane.screen.keep_in_view(at, 2);
                 }
@@ -17449,35 +17292,6 @@ impl App {
                 frame.render_widget(Paragraph::new(keys), footer);
                 return;
             }
-            if let Some((Choice::Speed, list)) = &self.choosing {
-                let now = self.speed_shown().unwrap_or("standard");
-                let rows = self.speed_rows();
-                let items: Vec<list::Item> = (list.shown().iter())
-                    .filter_map(|&(at, ref found)| {
-                        let (speed, about) = rows.get(at)?;
-                        Some(
-                            list::Item::new(*speed, *about)
-                                .current(*speed == now)
-                                .found(found),
-                        )
-                    })
-                    .collect();
-                over(
-                    frame,
-                    list::lines(&items, list.at(), width, composer.y as usize),
-                    composer,
-                );
-                let (line, cursor) = list.line("speed for this agent");
-                frame.render_widget(Paragraph::new(line), composer);
-                frame.set_cursor_position((composer.x + cursor, composer.y));
-                let keys = hint::Keys::new().pick().enter(hint::Enter::Choose);
-                let keys = Line::from(hint::under(
-                    &keys.esc(hint::Esc::Close),
-                    footer.width.into(),
-                ));
-                frame.render_widget(Paragraph::new(keys), footer);
-                return;
-            }
             if let Some(confirm) = &self.confirming {
                 let (question, verb) = match confirm {
                     Confirm::Compact => {
@@ -17663,13 +17477,51 @@ impl App {
                     composer.x + 2 + picker.filter.width() as u16,
                     composer.y,
                 ));
+                // The row ← and → move is bold; Tab moves them to the
+                // other, where the picked model serves more than one speed.
+                let speeds = (picker.chosen())
+                    .map(|(model, _)| self.speeds_of(&model))
+                    .unwrap_or_default();
+                let on_speed = picker.on_speed && speeds.len() > 1;
+                let value = |shown: String, on: bool| match on {
+                    true => Span::raw(format!("‹ {shown} ›")).bold(),
+                    false => Span::raw(shown),
+                };
                 let mut keys = vec![
                     Span::raw("  effort ").dim(),
-                    Span::raw(format!("‹ {effort} ›")).bold(),
+                    value(effort.to_owned(), !on_speed),
                 ];
-                let pick = (hint::Keys::new().pick().enter(hint::Enter::Choose))
-                    .key("←→", "effort")
-                    .esc(hint::Esc::Close);
+                if speeds.len() > 1 {
+                    let speed = Some(picker.speed)
+                        .filter(|speed| speeds.contains(speed))
+                        .unwrap_or("standard");
+                    keys.push(Span::raw(" · speed ").dim());
+                    keys.push(value(speed.to_owned(), on_speed));
+                }
+                // A click on a name or value moves ← and → to it; on `‹`
+                // or `›`, steps it. The arrows go first, to be found first.
+                let mut x = footer.x;
+                let mut names = Vec::new();
+                for (pair, click) in keys
+                    .chunks(2)
+                    .zip([models::Click::Effort, models::Click::Speed])
+                {
+                    let start = x;
+                    x += pair.iter().map(|span| span.width() as u16).sum::<u16>();
+                    names.push((footer.y, start..x, click));
+                    if (click == models::Click::Speed) == on_speed {
+                        let shown = pair[1].width() as u16;
+                        model_at.push((footer.y, x - shown..x - shown + 1, models::Click::Less));
+                        model_at.push((footer.y, x - 1..x, models::Click::More));
+                    }
+                }
+                model_at.extend(names);
+                let mut pick = (hint::Keys::new().pick().enter(hint::Enter::Choose))
+                    .key("←→", if on_speed { "speed" } else { "effort" });
+                if speeds.len() > 1 {
+                    pick = pick.key("tab", if on_speed { "effort" } else { "speed" });
+                }
+                let pick = pick.esc(hint::Esc::Close);
                 let room =
                     usize::from(footer.width).saturating_sub(Line::from(keys.clone()).width());
                 keys.extend(hint::under(&pick, room));
@@ -17754,6 +17606,7 @@ impl App {
         let linked = self.links_written.changed(linked, drawn.buffer);
         self.composer_at = composer_at;
         self.opens_at = opens_at;
+        self.model_at = model_at;
         // Over themselves, the cursor kept where the frame left it.
         if !linked.is_empty() {
             execute!(
@@ -21753,20 +21606,52 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn colors_toggle_in_the_window_and_draw_again() {
+    async fn the_menu_lists_resume_only_while_paused_and_zen_says_it_ends_it() {
         let mut app = app(zen_daemon().await);
-        app.input.set("/colors");
-        app.submit().await;
-        assert!(app.colors && app.repaint);
+        app.input.set("/");
+        let listed = |app: &App| -> Vec<(&str, &str)> {
+            (app.menu().iter())
+                .map(|(name, about, _)| (*name, *about))
+                .collect()
+        };
+        let all = listed(&app);
+        assert_eq!(all.len(), 25);
         assert_eq!(
-            app.notice.as_deref(),
-            Some("project colors on: this agent follows no other project's lead")
+            all[0],
+            ("/side", "Start a side chat with a copy of this agent")
         );
-        app.repaint = false;
-        app.input.set("/colors");
-        app.submit().await;
-        assert!(!app.colors && app.repaint);
-        assert_eq!(app.notice.as_deref(), Some("project colors off"));
+        assert!(all.iter().all(|(name, _)| *name != "/resume"));
+        assert!(all.contains(&("/zen", "Talk about one thing and keep the rest for later")));
+        app.paused = Some(json!({"reason": "lunch"}));
+        assert!(listed(&app).contains(&("/resume", "Let the agents go on")));
+        app.zen = Some("the rounding".into());
+        assert!(listed(&app).contains(&("/zen", ZEN_ENDS)));
+    }
+
+    #[tokio::test]
+    async fn a_retired_command_is_answered_and_never_sent() {
+        let mut app = app(zen_daemon().await);
+        for word in [
+            "/sound",
+            "/colors",
+            "/open",
+            "/instructions",
+            "/fast",
+            "/ps",
+            "/agents",
+            "/automations",
+            "/lookout",
+            "/forum",
+            "/settings",
+        ] {
+            assert!(COMMANDS.iter().all(|(name, _)| *name != word), "{word}");
+            app.input.set(word);
+            app.submit().await;
+            let said = format!("no command {word} · / lists them");
+            assert_eq!(app.notice.as_deref(), Some(said.as_str()));
+            // It stays to be fixed: nothing is sent.
+            assert_eq!(app.input.trim(), word);
+        }
     }
 
     #[tokio::test]
@@ -24548,35 +24433,49 @@ mod tests {
         let _ = std::fs::remove_dir_all(workspace);
     }
 
+    /// `/model` typed, and its picker open once the listing is in.
+    async fn model_picker(app: &mut App) {
+        app.input.set("/model");
+        app.submit().await;
+        for _ in 0..400 {
+            app.listed();
+            if app.picker.is_some() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        panic!("the picker opens: {:?}", app.notice);
+    }
+
     #[tokio::test]
-    async fn fast_lists_the_speeds_its_model_serves_and_picks_one() {
+    async fn model_steps_through_the_speeds_its_model_serves_and_picks_one() {
         let asked = Arc::new(std::sync::Mutex::new(Vec::new()));
         let seen = asked.clone();
         let providers = json!({"anthropic": {"speeds": {"claude-opus-5-5": ["fast"]}},
             "bedrock": {"speeds": {"us.openai.gpt-6.1-sol": ["ultrafast"]}},
             "openai": {"speeds": {"gpt-6.1-sol": ["fast", "ultrafast"]}}});
-        let client = daemon_serving(providers, move |request| {
-            seen.lock().unwrap().push(request.clone());
-            json!({"bot": "b", "changed": ["speed"]})
+        let client = daemon_serving(providers, move |request| match request["op"].as_str() {
+            Some("provider_models") => json!({"providers": {}}),
+            _ => {
+                seen.lock().unwrap().push(request.clone());
+                json!({"bot": "b", "changed": ["speed"]})
+            }
         })
         .await;
         let mut app = app(client);
         let key = |code: KeyCode| Event::Key(event::KeyEvent::new(code, KeyModifiers::NONE));
+        let row = |app: &App| app.picker.as_ref().map(|p| (p.speed, p.on_speed));
         app.model = "anthropic/claude-opus-5-5".into();
-        app.input.set("/fast");
-        app.submit().await;
-        // Standard and the one tier Anthropic serves, standard in effect.
-        assert!(matches!(&app.choosing, Some((Choice::Speed, list)) if list.chosen() == Some(0)));
-        assert_eq!(
-            app.speed_rows(),
-            [
-                ("standard", "the model's own speed and price"),
-                ("fast", "faster, at a higher price per token")
-            ]
-        );
-        app.key(key(KeyCode::Down)).await;
+        assert_eq!(app.speeds_of(&app.model), ["standard", "fast"]);
+        model_picker(&mut app).await;
+        // ← and → move effort until Tab moves them to speed.
+        assert_eq!(row(&app), Some(("standard", false)));
+        app.key(key(KeyCode::Tab)).await;
+        app.key(key(KeyCode::Right)).await;
+        app.key(key(KeyCode::Right)).await;
+        assert_eq!(row(&app), Some(("fast", true)));
         app.key(key(KeyCode::Enter)).await;
-        assert!(app.choosing.is_none());
+        assert!(app.picker.is_none());
         assert_eq!(
             app.notice.as_deref(),
             Some("fast from the next call, at a higher price per token")
@@ -24584,39 +24483,34 @@ mod tests {
         assert_eq!(app.speed.as_deref(), Some("fast"));
         let footer = app.footer_line(200).to_string();
         assert!(footer.contains("Opus 5.5 fast"), "{footer}");
-        // It opens again on what is in effect.
-        app.input.set("/fast");
-        app.submit().await;
-        assert!(matches!(&app.choosing, Some((Choice::Speed, list)) if list.chosen() == Some(1)));
-        // Enter on it changes nothing; Esc closes the list.
+        // It opens again on what is in effect; Enter on it changes nothing.
+        model_picker(&mut app).await;
+        assert_eq!(row(&app), Some(("fast", false)));
         app.key(key(KeyCode::Enter)).await;
         assert_eq!(asked.lock().unwrap().len(), 1);
-        app.input.set("/fast");
-        app.submit().await;
-        app.key(key(KeyCode::Up)).await;
+        model_picker(&mut app).await;
+        app.key(key(KeyCode::Tab)).await;
+        app.key(key(KeyCode::Left)).await;
         app.key(key(KeyCode::Enter)).await;
-        assert_eq!(
-            app.notice.as_deref(),
-            Some("standard speed from the next call")
-        );
         assert_eq!(app.speed, None);
         let speeds: Vec<_> = (asked.lock().unwrap().iter())
             .map(|sent| sent["settings"]["speed"].clone())
             .collect();
         assert_eq!(speeds, [json!("fast"), json!("standard")]);
-        // Nothing to pick where the model runs at standard alone, though
-        // another on its provider serves a faster tier.
+        // No speed row where the model runs at standard alone, though
+        // another on its provider serves a faster tier: Tab does nothing.
         app.model = "bedrock/us.xai.grok-4.7".into();
-        app.input.set("/fast");
-        app.submit().await;
-        assert!(app.choosing.is_none());
-        let notice = app.notice.clone().unwrap();
-        assert!(notice.ends_with("runs at standard speed only"), "{notice}");
+        model_picker(&mut app).await;
+        app.key(key(KeyCode::Tab)).await;
+        assert_eq!(row(&app), Some(("standard", false)));
+        app.key(key(KeyCode::Esc)).await;
         app.model = "openai/gpt-6.1-sol".into();
-        app.input.set("/fast");
-        app.submit().await;
-        assert_eq!(app.speed_rows().len(), 3);
-        app.key(key(KeyCode::Up)).await;
+        assert_eq!(app.speeds_of(&app.model).len(), 3);
+        model_picker(&mut app).await;
+        app.key(key(KeyCode::Tab)).await;
+        for _ in 0..3 {
+            app.key(key(KeyCode::Right)).await;
+        }
         app.key(key(KeyCode::Enter)).await;
         assert_eq!(app.speed.as_deref(), Some("ultrafast"));
         // On a model that does not serve it, the footer shows none: its
@@ -24627,15 +24521,63 @@ mod tests {
         app.model = "openai/gpt-6.1-sol".into();
         let footer = app.footer_line(200).to_string();
         assert!(footer.contains("ultrafast"), "{footer}");
-        // Moved meanwhile to a model serving fewer tiers, the list
-        // takes its last row rather than one that is gone.
-        app.input.set("/fast");
-        app.submit().await;
-        assert!(matches!(&app.choosing, Some((Choice::Speed, list)) if list.chosen() == Some(2)));
+    }
+
+    #[tokio::test]
+    async fn model_speed_follows_the_picked_model_and_a_click_moves_or_steps_it() {
+        let providers = json!({"anthropic": {"family": "anthropic",
+            "speeds": {"claude-opus-5-5": ["fast"]}}});
+        let client = daemon_serving(providers, move |request| match request["op"].as_str() {
+            Some("provider_models") => json!({"providers": {"anthropic": {"family": "anthropic",
+                "models": [{"id": "claude-opus-5-5"}, {"id": "claude-sonnet-5-5"}]}}}),
+            _ => json!({"bot": "b", "changed": ["speed"]}),
+        })
+        .await;
+        let mut app = app(client);
+        let key = |code: KeyCode| Event::Key(event::KeyEvent::new(code, KeyModifiers::NONE));
+        let row = |app: &App| app.picker.as_ref().map(|p| (p.speed, p.on_speed));
         app.model = "anthropic/claude-opus-5-5".into();
-        app.key(key(KeyCode::Enter)).await;
-        assert!(app.choosing.is_none());
-        assert_eq!(app.speed.as_deref(), Some("fast"));
+        model_picker(&mut app).await;
+        app.key(key(KeyCode::Tab)).await;
+        app.key(key(KeyCode::Right)).await;
+        assert_eq!(row(&app), Some(("fast", true)));
+        // A model that serves standard alone shows it, ← and → back on
+        // effort; moving back does not bring the old pick with it.
+        app.key(key(KeyCode::Down)).await;
+        assert_eq!(row(&app), Some(("standard", false)));
+        app.key(key(KeyCode::Up)).await;
+        assert_eq!(row(&app), Some(("standard", false)));
+        // A click on speed moves ← and → to it, one on `›` steps it, and
+        // one on effort moves them back.
+        use ratatui::crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+        app.model_at = vec![
+            (9, 14..15, models::Click::Less),
+            (9, 19..20, models::Click::More),
+            (9, 2..20, models::Click::Effort),
+            (9, 20..34, models::Click::Speed),
+        ];
+        let click = |column| {
+            Event::Mouse(MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column,
+                row: 9,
+                modifiers: KeyModifiers::NONE,
+            })
+        };
+        app.key(click(25)).await;
+        assert_eq!(row(&app), Some(("standard", true)));
+        app.key(click(19)).await;
+        assert_eq!(row(&app), Some(("fast", true)));
+        app.key(click(14)).await;
+        assert_eq!(row(&app), Some(("standard", true)));
+        app.key(click(5)).await;
+        assert_eq!(row(&app), Some(("standard", false)));
+        let effort = |app: &App| {
+            app.picker
+                .as_ref()
+                .and_then(|p| p.effort().map(str::to_owned))
+        };
+        assert_eq!(effort(&app), None);
     }
 
     #[tokio::test]
@@ -25989,7 +25931,7 @@ mod tests {
         for (typed, said) in [
             ("/stauts", "no command /stauts · / lists them"),
             ("/status foo", "/status takes nothing after it"),
-            ("/agents now", "/agents takes nothing after it"),
+            ("/copy now", "/copy takes nothing after it"),
         ] {
             app.input.set(typed);
             app.submit().await;
@@ -28198,7 +28140,6 @@ mod tests {
             background: None,
             usage: None,
             audit: None,
-            ps: None,
             commons: None,
             memory: None,
             sky: None,
@@ -28658,7 +28599,6 @@ mod tests {
             background: None,
             usage: None,
             audit: None,
-            ps: None,
             commons: None,
             memory: None,
             sky: None,
@@ -28752,7 +28692,6 @@ mod tests {
             background: None,
             usage: None,
             audit: None,
-            ps: None,
             commons: None,
             memory: None,
             sky: None,
@@ -29006,12 +28945,14 @@ mod tests {
                 .collect::<Vec<_>>()
         };
         app.input.set("/co");
-        assert_eq!(first(&app), ["/compact", "/commons", "/context", "/config"]);
+        assert_eq!(first(&app), ["/copy", "/compact", "/context", "/commons"]);
         let keys = |app: &App| menu_keys(&app.menu(), app.pick, &app.input).map(|k| k.text());
         assert_eq!(
             keys(&app),
             Some("↑↓ pick · enter run · tab complete · esc close".to_owned())
         );
+        app.input.set("/com");
+        assert_eq!(first(&app)[0], "/compact");
         // Enter on part of its name picks /compact as any other command,
         // and it asks first; any key but Enter keeps the conversation.
         app.key(enter()).await;
@@ -29587,26 +29528,39 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_stop_asked_in_ps_is_kept_when_the_pane_closes_or_steps() {
-        let mut app = app(daemon_answering(|_| {
-            json!({"processes": [{"handle": "proc:4", "bot": "calc.lead", "turn": 2,
-                "call_id": "c1", "kind": "background", "command": "cargo build",
-                "started_ms": 1_000, "pid": null}]})
-        })
-        .await);
+    async fn a_stop_asked_in_background_is_kept_when_the_pane_closes_or_steps() {
+        let mut app = app(daemon_answering(|_| json!({})).await);
         let asked = |app: &mut App| {
-            let view = app.watch.as_mut().and_then(|w| w.ps.as_mut()).unwrap();
+            let view = app
+                .watch
+                .as_mut()
+                .and_then(|w| w.background.as_mut())
+                .unwrap();
+            // The command's row, after the items.
+            for _ in 0..64 {
+                if view.keys().contains("x stop") {
+                    break;
+                }
+                view.key(event::KeyEvent::from(KeyCode::Down));
+            }
             view.key(event::KeyEvent::from(KeyCode::Char('x')));
             assert_eq!(view.keys(), "enter stop · esc cancel");
         };
         let keys = |app: &App| {
             app.watch
                 .as_ref()
-                .and_then(|w| w.ps.as_ref())
+                .and_then(|w| w.background.as_ref())
                 .unwrap()
                 .keys()
         };
-        app.ps().await;
+        app.background();
+        app.watch
+            .as_mut()
+            .and_then(|w| w.background.as_mut())
+            .unwrap()
+            .commands_loaded(Ok(json!({"processes": [{"handle": "proc:4",
+                "bot": "calc.lead", "kind": "background", "command": "cargo build",
+                "started_ms": 1_000, "pid": null}]})));
         // Put aside and opened again with Ctrl+]: nothing armed.
         asked(&mut app);
         app.close_pane(true);
