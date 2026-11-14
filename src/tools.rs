@@ -1601,10 +1601,10 @@ enum Escaped {
 
 /// The escaped PEM block at `begin`, as JSON holds a key: its header's
 /// five dashes, an escaped line end right after them (`\n` or `\r\n`,
-/// escaped once or more), a body of base64, spaces and escapes (and an
-/// encrypted key's headers), then its END marker, all on the line.
-/// A header with no END after it on its line, or anything else between,
-/// is a pattern or a quote, not a key.
+/// escaped once or more), a body that stays inside its string (no quote
+/// that is not escaped), then its END marker, all on the line. A header
+/// with no END after it on its line, or a string's end between, is a
+/// pattern or a quote, not a key.
 fn pem_escaped(text: &str, begin: usize, last: bool) -> Escaped {
     const BEGIN: &str = "-----BEGIN ";
     const END: &str = "-----END ";
@@ -1644,10 +1644,15 @@ fn pem_escaped(text: &str, begin: usize, last: bool) -> Escaped {
         _ => return Escaped::No,
     };
     let header = dashes + escaped;
+    // Backslashes just read: a quote after an even run of them ends the
+    // string, so what follows is code, not the key.
+    let mut run = 0;
     for (i, &b) in text.as_bytes()[header..].iter().enumerate() {
         if i > PEM_LINE {
             return Escaped::No;
         }
+        let after = run;
+        run = if b == b'\\' { run + 1 } else { 0 };
         if b == b'-' {
             let tail = &text[header + i..];
             if tail.len() < END.len() && END.starts_with(tail) {
@@ -1665,7 +1670,8 @@ fn pem_escaped(text: &str, begin: usize, last: bool) -> Escaped {
             }
             continue;
         }
-        if !(b.is_ascii_alphanumeric() || b"+/= \t\\:,".contains(&b)) {
+        // An armored key's headers may hold any text; its line is one.
+        if b == b'\n' || b == b'\r' || (b == b'"' && after % 2 == 0) {
             return Escaped::No;
         }
     }
@@ -5558,6 +5564,10 @@ mod tests {
             (
                 r#"{"body": "{\"key\": \"-----BEGIN RSA PRIVATE KEY-----\\nProc-Type: 4,ENCRYPTED\\nDEK-Info: AES-128-CBC,00\\n\\nMIIE\\n-----END RSA PRIVATE KEY-----\\n\"}"}"#,
                 r#"{"body": "{\"key\": \"-----BEGIN RSA PRIVATE KEY-----\\n[REDACTED]\\n-----END RSA PRIVATE KEY-----\\n\"}"}"#,
+            ),
+            (
+                r#"{"value": "-----BEGIN PGP PRIVATE KEY BLOCK-----\nComment: Fixture (no identity) <x@y> it's \"quoted\"\n\nlQOYBGfake\n=AbCd\n-----END PGP PRIVATE KEY BLOCK-----\n"}"#,
+                r#"{"value": "-----BEGIN PGP PRIVATE KEY BLOCK-----\n[REDACTED]\n-----END PGP PRIVATE KEY BLOCK-----\n"}"#,
             ),
         ] {
             assert_eq!(redact(key), hidden);
