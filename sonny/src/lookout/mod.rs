@@ -376,8 +376,8 @@ async fn reply_text(client: &Client, seen: &Seen) -> Option<String> {
 }
 
 /// Tell `to` that `bot`'s turn its message started or joined ended
-/// without being carried out (`error`): a note it reads in its next model
-/// call, without starting a turn, as a trigger's failure is told. Its
+/// without being carried out (`error`): a steer, read in its next model
+/// call or waking it when idle, as a trigger's failure is told. Its
 /// request id names the turn and who is told, so it is told once.
 async fn tell_bounced(
     client: &Client,
@@ -389,8 +389,7 @@ async fn tell_bounced(
     // Bounded whatever the names' lengths, as request ids are.
     let request_id = format!("bounce.{turn}.{}", digest(&format!("{bot}\n{turn}\n{to}")));
     let mut submit = json!({"bot": to, "request_id": request_id,
-        "prompt": prompt, "delivery": "attach", "origin": BOUNCE_ORIGIN,
-        "wait_ms": crate::trigger::attach_wait()});
+        "prompt": prompt, "delivery": "steer", "origin": BOUNCE_ORIGIN});
     if let Some(id) = to_id {
         submit["bot_id"] = json!(id);
     }

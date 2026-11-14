@@ -5202,19 +5202,17 @@ async fn submit(
     started: bool,
     ask: Option<&Asked>,
 ) -> Value {
-    let id = asking["bot_id"].as_i64().unwrap_or_default();
     // A repeating trigger's fire that finds its agent busy waits behind its
     // work, as anacron runs a missed job once: one fire of the trigger
     // waits at a time, so a frequent one does not pile up. A one-off, a
     // fire asked for and a new agent's first message always go.
     let repeating = trigger.at.is_none() && !started && !ask.is_some_and(|a| a.kind.sends());
     let request = asking["request_id"].as_str().unwrap_or_default();
-    // Nothing to tell: the turn already waiting reads what this fire is for.
+    // The turn already waiting reads what this fire is for.
     if repeating && waiting_fire(client, trigger, bot, request).await {
         return json!({"outcome": "skipped", "detail": "bot_busy: an earlier fire waits behind its work"});
     }
-    let submitted = client.request("submit", asking.clone()).await;
-    let outcome = match submitted {
+    match client.request("submit", asking).await {
         Ok(turn) => {
             let mut sent = json!({"outcome": "sent", "turn": turn["message"],
                 "handle": format!("{bot}/{}", turn["message"])});
@@ -5240,35 +5238,13 @@ async fn submit(
             json!({"outcome": "gone", "detail": error.to_string()})
         }
         Err(error) => json!({"outcome": "failed", "detail": error.to_string()}),
-    };
-    if matches!(outcome["outcome"].as_str(), Some("skipped" | "failed")) {
-        missed(client, trigger, (bot, id), &outcome).await;
     }
-    outcome
 }
 
-/// A fire that sent nothing tells the agent its answer goes to, else the
-/// agent it messages, without starting a turn: it reads it in its next
-/// model call, also the one it is busy with, instead of hearing nothing.
-async fn missed(client: &Client, trigger: &Trigger, (bot, id): (&str, i64), outcome: &Value) {
-    let to = match &trigger.reply_to {
-        Some((to, to_id)) => (to.as_str(), *to_id),
-        None => (bot, id),
-    };
-    let detail = outcome["detail"].as_str().unwrap_or("no reason given");
-    let prompt = format!(
-        "[automation {} · {} · {} not sent to {bot}: {detail}]",
-        trigger.name,
-        stamp(now()),
-        trigger.when
-    );
-    // Telling is a courtesy: what came of the fire is its row's either way.
-    let _ = note(client, trigger, to, &prompt).await;
-}
-
-/// `prompt` for `to` as a trigger's note: attached to its next model call,
-/// starting no turn, under a request id of its own that no fire takes for
-/// one of its own (`fire_generation`).
+/// `prompt` for `to` as a trigger's note: a steer, so an agent at work
+/// reads it in its next model call and an idle one wakes to it, under a
+/// request id of its own that no fire takes for one of its own
+/// (`fire_generation`).
 async fn note(
     client: &Client,
     trigger: &Trigger,
@@ -5276,7 +5252,7 @@ async fn note(
     prompt: &str,
 ) -> agent_client::Result<()> {
     let request = format!(
-        "{}missed.{to_id}.{}.{}.{}",
+        "{}note.{to_id}.{}.{}.{}",
         sent_by(trigger),
         now(),
         std::process::id(),
@@ -5286,7 +5262,7 @@ async fn note(
         .request(
             "submit",
             json!({"bot": to, "bot_id": to_id, "request_id": request, "prompt": prompt,
-                "delivery": "attach", "origin": ORIGIN, "wait_ms": attach_wait()}),
+                "delivery": "steer", "origin": ORIGIN}),
         )
         .await
         .map(drop)
@@ -5359,31 +5335,22 @@ fn tell_gate(trigger: &Trigger, kept: &Kept, news: &GateNews) -> bool {
     matches!(told, Ok(Ok(())))
 }
 
-/// How long a trigger's note waits for a call before it goes as a steer:
-/// the person's `attach_wait`, a day unless config.toml says otherwise.
-pub fn attach_wait() -> Option<u64> {
-    agent_client::config::load()
-        .unwrap_or_default()
-        .attach_wait()
-}
-
 /// The generation of the trigger whose fire sent a turn with `request_id`:
-/// a fire's own, not the answer it passes on (`reply.`), a missed fire's
-/// note (`missed.`), nor one whose answer goes to `--reply-to` (`.to.`),
+/// a fire's own, not the answer it passes on (`reply.`), a trigger's note
+/// (`note.`), nor one whose answer goes to `--reply-to` (`.to.`),
 /// which that answer tells of.
 pub fn fire_generation(request_id: &str) -> Option<&str> {
     let (generation, rest) = request_id.strip_prefix("trigger_")?.split_once('_')?;
     let own = !rest.contains(".to.")
-        && !["reply.", "missed.", "failed.", "shadow."]
+        && !["reply.", "note.", "failed.", "shadow."]
             .iter()
             .any(|note| rest.starts_with(note));
     own.then_some(generation)
 }
 
 /// A fire's turn on `bot` that failed (`error`), told to the agent that
-/// added the trigger to start `bot`, else to `bot` itself, as a fire that
-/// sent nothing is told: the note it reads in its next model call, without
-/// starting a turn. The trigger's row, which the daemon at `store_id`
+/// added the trigger to start `bot`, else to `bot` itself, as a steer: read
+/// in its next model call, or waking it when idle. The trigger's row, which the daemon at `store_id`
 /// keeps, names it. Its request id is the turn's own, so it is told once.
 pub async fn tell_failed(
     client: &Client,
@@ -5402,7 +5369,7 @@ pub async fn tell_failed(
     );
     let mut submit = json!({"bot": to,
         "request_id": format!("trigger_{generation}_failed.{bot}.{turn}"),
-        "prompt": prompt, "delivery": "attach", "origin": ORIGIN, "wait_ms": attach_wait()});
+        "prompt": prompt, "delivery": "steer", "origin": ORIGIN});
     // By its id too, as every delivery of a trigger's: a name used again
     // is not who it was for.
     if let Some(id) = to_id {
@@ -6200,7 +6167,8 @@ pub(crate) mod tests {
         let submit = asked.lock().unwrap()[0].clone();
         assert_eq!(submit["bot"], "calc.lead");
         assert_eq!(submit["bot_id"], 5);
-        assert_eq!(submit["delivery"], "attach");
+        assert_eq!(submit["delivery"], "steer");
+        assert_eq!(submit.get("wait_ms"), None);
         assert_eq!(submit["origin"], "automation");
         assert_eq!(submit["request_id"], "trigger_1-2_failed.calc.lead.4");
         let prompt = submit["prompt"].as_str().unwrap();
@@ -6410,7 +6378,7 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn a_gates_note_is_attached_and_starts_no_fire_of_its_own() {
+    async fn a_gates_note_is_a_steer_and_starts_no_fire_of_its_own() {
         let asked = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let seen = asked.clone();
         let client = crate::tests::daemon_answering(move |request| {
@@ -6432,10 +6400,11 @@ pub(crate) mod tests {
             (&submit["bot"], &submit["bot_id"]),
             (&json!("p.lead"), &json!(3))
         );
-        assert_eq!(submit["delivery"], "attach");
+        assert_eq!(submit["delivery"], "steer");
+        assert_eq!(submit.get("wait_ms"), None);
         assert_eq!(submit["origin"], "automation");
         let request = submit["request_id"].as_str().unwrap();
-        assert!(request.starts_with("trigger_test-1_missed.3."), "{request}");
+        assert!(request.starts_with("trigger_test-1_note.3."), "{request}");
         assert_eq!(fire_generation(request), None);
     }
 
@@ -6485,7 +6454,7 @@ pub(crate) mod tests {
         // Not the fire's own: its answer passed on, notes, `--reply-to`'s.
         for id in [
             "trigger_123-456_reply.9.4",
-            "trigger_123-456_missed.7.1.2.3",
+            "trigger_123-456_note.7.1.2.3",
             "trigger_123-456_failed.calc.lead.4",
             "trigger_123-456_7.1700.42.0.to.9",
             "tui-123",
@@ -7123,9 +7092,12 @@ pub(crate) mod tests {
         let (seen, noted) = (turns.clone(), notes.clone());
         let client = crate::tests::daemon_answering(move |request| {
             let mut turns = seen.lock().unwrap();
-            match (request["op"].as_str(), request["delivery"].as_str()) {
+            let note = request["request_id"]
+                .as_str()
+                .is_some_and(|id| id.contains("_note."));
+            match (request["op"].as_str(), note) {
                 (Some("messages"), _) => json!({"messages": *turns}),
-                (Some("submit"), Some("attach")) => {
+                (Some("submit"), true) => {
                     noted.lock().unwrap().push(request["prompt"].clone());
                     json!({"message": 1, "turn": 1})
                 }
