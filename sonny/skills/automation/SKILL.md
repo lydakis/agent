@@ -151,18 +151,17 @@ with and the daemon's socket, not the daemon's environment or anything it
 loaded, so keep the source's read-only token in a file both `quiet` and the
 job read, such as `token` in the job folder with mode 600.
 
-The job posts to the lead (step 8) from its shell. A request id takes only
-letters, digits, `.`, `_` and `-`, so KEY is the post's key with every other
-character turned into `_`, for example `brief_2026-01-05_07_30_-0500`:
+The job posts to the lead (step 8) with its send_message tool: `to` LEAD,
+`delivery` `queue`, `request_id` KEY and the text as `message`. A request id
+takes only letters, digits, `.`, `_` and `-`, so KEY is the post's key with
+every other character turned into `_`, for example
+`brief_2026-01-05_07_30_-0500`.
 
-```
-"$AGENT_BIN" run --bot LEAD --detach --delivery queue --request-id KEY -- TEXT
-```
-
-The turn handle it prints is the confirmation. The daemon keeps the key,
+The handle it returns is the confirmation. The daemon keeps the key,
 and a post records the job's turn that sent it, so sending the same key and
 text again starts nothing new: within that turn it answers `duplicate:
-true`, and from a later run `idempotency_conflict` with `field` `from`. That
+true`, and from a later run it fails with `idempotency_conflict`, saying
+`from` differs. That
 is step 2's lookup for this destination: a run that may have posted sends
 its planned text again under its key, and either answer means the first
 post went out. A conflict on any other field means the text differs from

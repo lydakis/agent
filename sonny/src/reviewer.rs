@@ -513,6 +513,11 @@ async fn round(shared: Arc<Shared>, bot: String, turn: i64, calls: Vec<Value>) {
     let mut usage = Usage::default();
     let mut spent = Spent::default();
     let mut attempts = 0;
+    // What a rule refuses needs no judge: a round of only those is
+    // answered at once.
+    let forbidden: Vec<Option<Verdict>> = (calls.iter())
+        .map(|call| escalated_agent(call).then(policy::escalated_agent))
+        .collect();
     let verdicts: Vec<Verdict> = if shared.tripped.lock().unwrap().contains(&key) {
         // The turn kept going after it was told to stop: end it now.
         interrupt(&shared, &bot, turn).await;
@@ -528,6 +533,8 @@ async fn round(shared: Arc<Shared>, bot: String, turn: i64, calls: Vec<Value>) {
             }
         });
         vec![stop; calls.len()]
+    } else if forbidden.iter().all(Option::is_some) {
+        forbidden.iter().flatten().cloned().collect()
     } else if left == 0 {
         vec![policy::timed_out(); calls.len()]
     } else {
@@ -552,6 +559,9 @@ async fn round(shared: Arc<Shared>, bot: String, turn: i64, calls: Vec<Value>) {
             }
         }
     };
+    let verdicts: Vec<Verdict> = (verdicts.into_iter().zip(forbidden))
+        .map(|(judged, rule)| rule.unwrap_or(judged))
+        .collect();
     let judge_ms = started.elapsed().as_millis() as u64;
     let mut answered = Vec::with_capacity(calls.len());
     for (call, verdict) in calls.iter().zip(&verdicts) {
@@ -608,7 +618,8 @@ fn logged_reply(redactor: &Redactor, reply: &str) -> String {
 /// toward the breaker, as in Codex. A round the review never assessed is
 /// no verdict: it goes to the person, as a doubt does, the call waiting as
 /// it is. Where the gate `lapses` nobody can be asked: a doubt is denied,
-/// and an unassessed call is denied with what the agent is told of it.
+/// and an unassessed call is denied with what the agent is told of it. A
+/// call a rule forbids is denied, unassessed, wherever it is.
 fn decide(verdict: &Verdict, lapses: bool) -> (&'static str, Option<String>, bool) {
     match verdict {
         Verdict::Allow => ("allow", None, false),
@@ -617,6 +628,7 @@ fn decide(verdict: &Verdict, lapses: bool) -> (&'static str, Option<String>, boo
         Verdict::Doubt(reason) => ("ask", Some(reason.clone()), false),
         Verdict::Unreviewed(reason) if lapses => ("deny", Some(reason.clone()), true),
         Verdict::Unreviewed(reason) => ("ask", Some(policy::handed_over(reason)), false),
+        Verdict::Forbidden(reason) => ("deny", Some(reason.clone()), true),
     }
 }
 
@@ -883,6 +895,15 @@ fn reaches_home(
         }
         _ => false,
     }
+}
+
+/// Whether a call asks out of its sandbox only to run `agent` commands that
+/// do the same inside it ([`crate::calls::agent_inside`]).
+fn escalated_agent(call: &Value) -> bool {
+    let arguments = &call["arguments"];
+    call["name"] == "shell"
+        && arguments["sandbox_permissions"] == "require_escalated"
+        && (arguments["command"].as_str()).is_some_and(crate::calls::agent_inside)
 }
 
 /// Whether a planned call may start a daemon outside its sandbox: a
@@ -1829,6 +1850,35 @@ mod tests {
             true
         ));
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn an_escalated_agent_command_that_works_inside_is_refused_unjudged() {
+        let call = |command: &str, escalated: bool| {
+            let mut arguments = json!({"command": command});
+            if escalated {
+                arguments["sandbox_permissions"] = json!("require_escalated");
+            }
+            json!({"name": "shell", "arguments": arguments})
+        };
+        let send = r#""$AGENT_BIN" run --bot shop.lead --detach -- done"#;
+        assert!(escalated_agent(&call(send, true)));
+        // In the sandbox it runs; a new agent or another store is the
+        // judge's, then the person's.
+        assert!(!escalated_agent(&call(send, false)));
+        assert!(!escalated_agent(&call(
+            r#""$AGENT_BIN" run --new --bot shop.x -- go"#,
+            true
+        )));
+        assert!(!escalated_agent(&call(
+            "agent start --store /tmp/side.sqlite",
+            true
+        )));
+        // Denied with why, and not counted toward the breaker.
+        let (decision, reason, unassessed) = decide(&policy::escalated_agent(), false);
+        assert_eq!((decision, unassessed), ("deny", true));
+        assert!(reason.unwrap().contains("without escalating"));
+        assert_eq!(decide(&policy::escalated_agent(), true).0, "deny");
     }
 
     #[test]

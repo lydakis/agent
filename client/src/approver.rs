@@ -48,13 +48,32 @@ pub const ATTEMPTS: u32 = 3;
 /// the turn ends: the approver's own deadline, plus margin.
 pub const AUTO_EXPIRE_MS: u64 = DEADLINE_MS + 15_000;
 /// Tools the approval modes never gate: they touch only the bot's own
-/// store records, or, for web search, ask its provider as its model does
-/// (Codex never gates search, and a provider-hosted one can't be).
-pub const UNGATED: [&str; 4] = ["history", "wait", "echo", "web_search"];
+/// store records, do what the `agent` in its sandboxed shell may do
+/// ungated, as itself (send a message, list agents, pull the cord), or,
+/// for web search, ask its provider as its model does (Codex never gates
+/// search or its agent tools, and a provider-hosted search can't be).
+pub const UNGATED: [&str; 7] = [
+    "history",
+    "wait",
+    "echo",
+    "web_search",
+    "send_message",
+    "list_agents",
+    "pause_agents",
+];
 /// Tools `auto` also leaves to run unjudged. A read's result goes to the
 /// model provider, so reading a key sends it off the machine, but judging
 /// every read cost a round each for what is nearly always allowed.
-pub const AUTO_UNGATED: [&str; 5] = ["history", "wait", "echo", "web_search", "read"];
+pub const AUTO_UNGATED: [&str; 8] = [
+    "history",
+    "wait",
+    "echo",
+    "web_search",
+    "read",
+    "send_message",
+    "list_agents",
+    "pause_agents",
+];
 /// The breaker, as Codex sets it: denials in a row, or among the turn's
 /// last `WINDOW` judged calls.
 pub const IN_ROW: u64 = 3;
@@ -251,6 +270,10 @@ pub enum Verdict {
     /// it, where one can be asked, as Codex asks the person when a review's
     /// input is too large; otherwise it is denied with this reason.
     Doubt(String),
+    /// Refused by a fixed rule before any review, with why: as a Codex
+    /// command rule forbids one with its justification. Never judged, so it
+    /// never counts toward the breaker, and no person is asked.
+    Forbidden(String),
 }
 
 /// A judge's reply as assessments by call id: the whole reply is the
@@ -356,6 +379,18 @@ pub fn starts_daemon(verdict: Verdict) -> Verdict {
         )),
         denied => denied,
     }
+}
+
+/// A call escalated out of its sandbox only to run `agent` commands that
+/// do the same inside it, on the agent's own daemon: refused at once, so a
+/// habit never waits on a review or a person.
+pub fn escalated_agent() -> Verdict {
+    Verdict::Forbidden(
+        "`agent` commands reach your own daemon from inside the sandbox, as you: run this again \
+         without escalating. The send_message, list_agents and pause_agents tools do the same \
+         without a command."
+            .to_owned(),
+    )
 }
 
 /// Whether a command's text runs `agent` in a way that may start a daemon

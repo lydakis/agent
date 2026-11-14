@@ -588,7 +588,7 @@ person sent the quoting prompt: an agent could otherwise quote an old
 `run --instructions` and `--instructions-file` set a new bot's instructions,
 with the CLI's built-in text as the default; the daemon has none. `run
 --tools LIST` chooses a new bot's tools from those the daemon registers,
-default `shell,write_stdin,read,write,wait,history` with the file editor its model
+default `shell,write_stdin,read,write,wait,history,send_message,list_agents,pause_agents` with the file editor its model
 family is trained on: `apply_patch` for a Responses model, else `edit`, and
 `web_search` where the provider offers it and `web_fetch` for any, unless
 `~/.agent/config.toml` sets `web_search = "disabled"` (or names the model in

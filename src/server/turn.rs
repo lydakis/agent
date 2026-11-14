@@ -25,7 +25,8 @@ use agent_runtime::{
         listed_command, unserved,
     },
     tools::{
-        Cord, Files, Outcome, POLL_YIELD_MS, Place, Prepared, ReadSource, Registry, Spill, Stopper,
+        Agents, Cord, Files, Outcome, POLL_YIELD_MS, Place, Prepared, ReadSource, Registry, Spill,
+        Stopper,
     },
 };
 use bytes::Bytes;
@@ -4841,6 +4842,12 @@ impl Turn {
                     Ok(outcome) => outcome,
                     Err(error) => failure(error),
                 },
+                Ok(Prepared::Agents(asked)) => {
+                    match self.agents(&call.call_id, record.bot_id, asked).await {
+                        Ok(outcome) => outcome,
+                        Err(error) => failure(error),
+                    }
+                }
                 Ok(Prepared::History {
                     bot,
                     turn: wanted,
@@ -5722,6 +5729,160 @@ impl Turn {
 
     /// A page of the audit trail for the bot to read, redacted as its
     /// other reads of history are.
+    /// What the bot asked of the daemon with its own tools, made as the
+    /// bot on a session of its own ([`Registry::request`]), so the bot's
+    /// own socket's limits hold, and its answer as the call's result.
+    async fn agents(&self, call_id: &str, bot_id: i64, asked: Agents) -> Result<Outcome> {
+        let request = |request: Value| self.registry.request(bot_id, request);
+        let answer = match asked {
+            Agents::Send {
+                to,
+                message,
+                delivery,
+                interrupt,
+                quotes,
+                request_id,
+            } => {
+                let mut delivery = delivery;
+                // The turn to stop, of a bot this one made, read before the
+                // message goes; it is stopped only once the message is in
+                // line, so a retried call, which sends nothing new, stops
+                // nothing either.
+                let mut running = None;
+                if interrupt {
+                    let target = request(json!({"op":"inspect","bot":to})).await?;
+                    let made = target["bot_id"].as_i64() == Some(bot_id)
+                        || target["created_by_id"].as_i64() == Some(bot_id);
+                    if !made {
+                        return Err(Error::with(
+                            "not_permitted",
+                            format!(
+                                "{to} was not made by this bot, so this bot may not interrupt it"
+                            ),
+                        ));
+                    }
+                    running = target["running_turn"].as_i64();
+                    // Its own turn, after the one stopped.
+                    delivery = "queue";
+                }
+                // The same call made again, after a restart, sends nothing
+                // new: its id is the call's own unless the bot named one,
+                // as a digest of the whole call id, so two calls never share it.
+                let request_id = request_id.unwrap_or_else(|| {
+                    let digest =
+                        aws_lc_rs::digest::digest(&aws_lc_rs::digest::SHA256, call_id.as_bytes());
+                    let call: String = digest.as_ref()[..16]
+                        .iter()
+                        .map(|b| format!("{b:02x}"))
+                        .collect();
+                    format!("tool-{}-{call}", self.turn)
+                });
+                let sent = request(json!({"op":"submit","bot":to,"request_id":request_id,
+                    "prompt":message,"delivery":delivery,
+                    "from":{"bot":self.bot,"turn":self.turn},
+                    "quotes":(!quotes.is_empty()).then_some(quotes)}))
+                .await?;
+                let mut interrupted = Value::Null;
+                if let Some(turn) = running
+                    && sent["duplicate"] != true
+                {
+                    // A turn that ended meanwhile answers how it ended.
+                    request(json!({"op":"interrupt","bot":to,"turn":turn})).await?;
+                    interrupted = json!(turn);
+                }
+                let mut answer = json!({"status":sent["status"]});
+                if let Some(message) = sent["message"].as_i64() {
+                    answer["handle"] = json!(format!("{to}/{message}"));
+                }
+                if sent["duplicate"] == true {
+                    answer["duplicate"] = json!(true);
+                }
+                if !interrupted.is_null() {
+                    answer["interrupted_turn"] = interrupted;
+                }
+                answer
+            }
+            Agents::List {
+                name,
+                running,
+                approvals: false,
+                after,
+                limit,
+            } => {
+                let name = name.or_else(|| self.project_agents());
+                let page = request(json!({"op":"bots","name":name,"active":running,
+                    "limit":limit,"after":after.as_str()}))
+                .await?;
+                let bots: Vec<Value> = (page["bots"].as_array().into_iter().flatten())
+                    .map(|bot| {
+                        let mut row = json!({"name":bot["name"],"status":bot["status"]});
+                        for field in [
+                            "running_turn",
+                            "waiting_on",
+                            "last",
+                            "workspace",
+                            "created_by",
+                        ] {
+                            if !bot[field].is_null() {
+                                row[field] = bot[field].clone();
+                            }
+                        }
+                        row["model"] = json!(format!(
+                            "{}/{}",
+                            bot["provider"].as_str().unwrap_or_default(),
+                            bot["model"].as_str().unwrap_or_default()
+                        ));
+                        row
+                    })
+                    .collect();
+                json!({"bots":bots,"next_after":page["next_after"]})
+            }
+            Agents::List {
+                name,
+                approvals: true,
+                after,
+                limit,
+                ..
+            } => {
+                let name = name.or_else(|| self.project_agents());
+                let page = request(json!({"op":"approvals","after":after.as_i64().unwrap_or(0),
+                    "limit":limit}))
+                .await?;
+                let calls: Vec<Value> = (page["approvals"].as_array().into_iter().flatten())
+                    .filter(|call| {
+                        name.as_deref().is_none_or(|pattern| {
+                            glob(pattern, call["bot"].as_str().unwrap_or_default())
+                        })
+                    })
+                    .map(|call| {
+                        // Redacted whole, before the cut, so a cut through
+                        // a secret cannot keep part of it.
+                        let arguments = self.registry.redact_text(match &call["arguments"] {
+                            Value::String(text) => text.clone(),
+                            other => other.to_string(),
+                        });
+                        let mut start: String = arguments.chars().take(300).collect();
+                        if start.len() < arguments.len() {
+                            start.push('…');
+                        }
+                        json!({"bot":call["bot"],"turn":call["turn"],"tool":call["name"],
+                            "arguments":start,"waiting_on":call["gates"]})
+                    })
+                    .collect();
+                json!({"approvals":calls,"next_after":page["next_after"]})
+            }
+            Agents::Pause { reason } => request(json!({"op":"pause","reason":reason})).await?,
+        };
+        Ok(Outcome::text(self.registry.redact_text(answer.to_string())))
+    }
+
+    /// This bot's project's agents, as a name pattern: those named as it
+    /// is up to the first dot, or every agent for a name with none.
+    fn project_agents(&self) -> Option<String> {
+        let (project, _) = self.bot.split_once('.')?;
+        Some(format!("{project}.*"))
+    }
+
     async fn history_audit(
         &self,
         call_id: &str,
@@ -6402,6 +6563,7 @@ impl Lifts {
             }
             Ok(
                 Prepared::Wait { .. }
+                | Prepared::Agents(_)
                 | Prepared::History { .. }
                 | Prepared::HistoryAudit(_)
                 | Prepared::HistorySearch { .. }
@@ -7756,6 +7918,36 @@ fn failure(error: Error) -> Outcome {
     }
 }
 
+/// Whether `name` matches `pattern`, as the store's bot listing matches
+/// names: `*` any run of characters, `?` any one, case kept.
+fn glob(pattern: &str, name: &str) -> bool {
+    let (pattern, name): (Vec<char>, Vec<char>) =
+        (pattern.chars().collect(), name.chars().collect());
+    let (mut p, mut n, mut star, mut from) = (0, 0, None, 0);
+    while n < name.len() {
+        match pattern.get(p) {
+            Some('*') => {
+                star = Some(p);
+                from = n;
+                p += 1;
+            }
+            Some(&c) if c == '?' || c == name[n] => {
+                p += 1;
+                n += 1;
+            }
+            _ => match star {
+                Some(at) => {
+                    p = at + 1;
+                    from += 1;
+                    n = from;
+                }
+                None => return false,
+            },
+        }
+    }
+    pattern[p..].iter().all(|&c| c == '*')
+}
+
 /// `settings` with five minutes for an hour where any of the `models` a
 /// request may go to must keep five minutes, as a longer marker may not
 /// follow a shorter one. A model on a provider unknown here or of another
@@ -7816,6 +8008,26 @@ fn priced_at(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn approvals_match_names_as_the_bot_listing_does() {
+        for (pattern, name) in [
+            ("shop.*", "shop.fix"),
+            ("*.lead", "web.lead"),
+            ("s?op.*", "shop.x"),
+            ("*", "a"),
+        ] {
+            assert!(super::glob(pattern, name), "{pattern} {name}");
+        }
+        for (pattern, name) in [
+            ("shop.*", "Shop.fix"),
+            ("shop.lead", "Shop.lead"),
+            ("*.lead", "web.lead2"),
+            ("?", ""),
+        ] {
+            assert!(!super::glob(pattern, name), "{pattern} {name}");
+        }
+    }
+
     #[test]
     fn a_lifted_results_parts_are_only_ever_its_pictures() {
         use agent_runtime::codec::Part;

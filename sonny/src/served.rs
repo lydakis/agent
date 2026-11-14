@@ -167,9 +167,8 @@ fn start() -> Value {
                     "description": "Run the folder's .agents/setup in the copy first: true for a task \
                         that will change files, false for one that only reads."},
                 "model": {"type": "string", "minLength": 1,
-                    "description": "PROVIDER/MODEL, one of the models \"$AGENT_BIN\" models lists with \
-                        the person's notes on them, when the work suits another model than yours; \
-                        without one, the project's threads_model, else yours."},
+                    "description": format!("PROVIDER/MODEL, when the work suits another model than yours; \
+                        without one, the project's threads_model, else yours.{}", noted_models())},
                 "effort": {"type": "string", "minLength": 1,
                     "description": "The task's effort level, when the work calls for one."},
                 "reason": {"type": "string", "minLength": 1,
@@ -184,6 +183,32 @@ fn start() -> Value {
         // A setup script may build for minutes.
         "expire_ms": 20 * 60 * 1000
     })
+}
+
+/// The most of the person's model notes the start tool carries.
+const NOTED_BYTES: usize = 2048;
+
+/// The models the person wrote a note on in `~/.agent/models`, each with
+/// its note, for the start tool's model parameter; none, the command that
+/// lists every model. Only their own lines: discovery's catalog notes what
+/// the providers report, not what the person thinks of a model.
+fn noted_models() -> String {
+    let listed = agent_client::models::path()
+        .and_then(|path| agent_client::models::mine(&path).ok())
+        .unwrap_or_default();
+    let mut said = String::new();
+    for model in &listed {
+        let Some(note) = &model.note else { continue };
+        let line = format!("\n- {}: {note}", model.id);
+        if said.len() + line.len() > NOTED_BYTES {
+            break;
+        }
+        said.push_str(&line);
+    }
+    match said.is_empty() {
+        true => " \"$AGENT_BIN\" models lists the models there are.".to_owned(),
+        false => format!(" The person's notes on their models:{said}"),
+    }
 }
 
 /// Open the task `name` just started in a tab of its own, as its starter

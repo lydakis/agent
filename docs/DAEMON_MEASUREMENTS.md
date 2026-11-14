@@ -9679,3 +9679,81 @@ same. Its one warning is the footprint's RSS after a turn each, the
 high-water mark of 1,000 concurrent turns that redact no block: head's
 four runs were 46.1 to 68.2 MiB and base's 54.2 to 60.4 MiB, so the
 ranges overlap, and head's lowest run is below every base run.
+
+## Agent tools: send_message, list_agents and pause_agents at 5, 700 and 5,000 bots (protocol 76, schema 100)
+
+2026-11-14, a 4-core x86_64 Linux cloud host, release builds of main
+`a5312f0` (base) against the agent tools branch with that main merged in.
+Binaries by SHA-256:
+
+- Base: `3932ff7dc523b365755e66e6895cf704057209cff10bf6f1f38d4bd6fb962ffc`.
+- Head: `bd2ee0ce7e54d6334dd3c4b31c36988f90ac31ae88cb155bce5e342a3dc0b742`.
+
+`bench.agent_tools_scale` drives the daemon over its socket, as an agent's
+`agent` command reaches it, with 5, 700 or 5,000 stored bots named `p.*`.
+Each call is one turn of a new bot that makes that one call and gets one
+more model round for the answer, so no call's history carries another's
+answer. Cases go round by round, 21 rounds, two alternating runs per side.
+Times are from the submit to the turn's end, with the synthetic model's
+answers sent without Nagle's delay (otherwise a call that follows the last
+one closely waits about 40 ms on the model's connection, which hid every
+difference here). A message case waits for the turn it starts on `p.b1`
+to end before the next case.
+
+Medians in ms, two runs each. A command runs in the shell's sandbox, so
+it pays for a process:
+
+| Call | 5 bots | 700 bots | 5,000 bots | Answer at 5,000 |
+| --- | --- | --- | --- | --- |
+| `send_message` (queue) | 11.7, 12.6 | 12.0, 12.1 | 12.2, 12.1 | 40 B |
+| `agent run --detach` (shell) | 14.7, 15.4 | 15.8, 16.0 | 16.1, 15.9 | 259 B |
+| `list_agents` `p.*`, first 50 | 9.6, 10.7 | 19.0, 18.6 | 20.5, 18.8 | 6,034 B |
+| `agent ls --name 'p.*' --limit 50` (shell) | 19.3, 21.1 | 62.2, 70.5 | 73.6, 68.9 | 30,520 B |
+| `list_agents`, 256 from the middle | 8.5, 8.6 | 61.5, 63.1 | 67.3, 62.8 | 30,214 B |
+| `list_agents`, last page (60) | 9.4, 10.1 | 21.7, 20.4 | 21.2, 21.8 | 7,043 B |
+| `list_agents` `*.lead` (1 of 5,000) | 8.2, 8.5 | 8.6, 9.5 | 9.8, 9.2 | 145 B |
+| `agent ls --name '*.lead'` (shell) | 14.1, 15.1 | 14.8, 16.3 | 15.9, 15.2 | 677 B |
+| `list_agents` running (none) | 8.1, 7.7 | 7.8, 8.4 | 9.1, 7.8 | 29 B |
+| `agent ls --active` (shell) | 12.5, 12.2 | 13.1, 13.9 | 13.2, 12.2 | 75 B |
+| `list_agents` approvals (none) | 8.0, 8.0 | 7.8, 7.9 | 8.4, 8.0 | 34 B |
+| `agent approvals` (shell) | 11.9, 12.3 | 12.8, 13.1 | 12.1, 12.0 | 75 B |
+| `pause_agents`, submit to `paused` | 4.4, 4.9 | 5.5, 5.2 | 5.3, 4.7 | |
+| `agent pause` (shell), submit to `paused` | 7.4, 8.9 | 9.5, 9.3 | 9.0, 8.4 | |
+
+Resume to the paused turn's end is 6.0 to 7.2 ms for both at every count.
+
+What grows is the answer, not the count of stored bots: a page costs by
+its rows, the same at 700 and at 5,000 (the last page, 60 rows, 21 ms at
+both), and a filter that matches one bot of 5,000 costs what it does at
+5. Most of a large page's time is the next model round reading it: the
+tool's row is about 120 bytes against the command's 600 (it keeps only
+the fields its description names), so a page of 50 is 6 KB
+where `agent ls --limit 50` is 30 KB. Paging all 5,000 at 256 a page is
+20 calls of about 30 KB each. Every tool call is faster than the command
+it replaces at every count.
+
+The commands themselves did not change. The same command cases, with the
+same three tools (`echo,shell,wait`) on both sides, two alternating runs:
+
+| Command | 5 bots, base | 5 bots, head | 5,000 bots, base | 5,000 bots, head |
+| --- | --- | --- | --- | --- |
+| `agent run --detach` | 18.6, 18.4 | 18.9, 18.2 | 26.1, 24.8 | 23.0, 23.0 |
+| `agent ls --limit 50` | 21.3, 22.4 | 23.0, 23.2 | 70.0, 67.5 | 68.4, 69.4 |
+| `agent ls '*.lead'` | 17.5, 16.6 | 18.3, 17.8 | 23.5, 25.0 | 25.7, 24.6 |
+| `agent ls --active` | 17.9, 17.5 | 17.8, 17.0 | 22.6, 24.7 | 23.9, 22.6 |
+| `agent approvals` | 15.8, 15.2 | 16.7, 15.5 | 22.7, 21.7 | 22.2, 20.4 |
+| `agent pause`, to `paused` | 13.0, 12.9 | 12.3, 13.0 | 17.6, 17.6 | 17.3, 17.2 |
+
+(These ran with one caller for every call, before the bench gave each call
+its own, so they are higher than the table above; base and head ran alike.)
+
+The cost a bot pays for having the tools: the three schemas add 2,798
+bytes to each model request's `tools` (3,940 to 6,738 for
+`echo,shell,wait` and the three), the same at every count, and cached
+with the rest of the prefix where the provider caches. The bots that have `wait` and
+`history` get them (schema 100); a bot made with its own tool list does
+not.
+
+The PR's first table (54 ms against 58 ms) is replaced by this one: that
+bench ran the daemon on stdio only, so the commands failed at once for
+want of a socket, and every call waited out the 40 ms above.
