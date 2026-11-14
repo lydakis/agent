@@ -18,6 +18,13 @@ updates:
     groups:
       cargo-minor-and-patch:
         update-types: [minor, patch]
+    ignore:
+      # Only the vendored crossterm uses parking_lot directly, and it stays
+      # on what crossterm 0.29 was published with (vendor/crossterm/README.md).
+      # Other crates keep 0.12, so 0.13 would add a second copy, not replace
+      # one. parking_lot moves when crossterm does.
+      - dependency-name: parking_lot
+        versions: [">= 0.13"]
     commit-message:
       prefix: "deps"
   - package-ecosystem: github-actions

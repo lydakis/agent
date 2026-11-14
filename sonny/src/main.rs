@@ -10247,6 +10247,10 @@ impl App {
             }
             "accepted" => {
                 self.staged.retain(|(staged, _)| Some(*staged) != turn);
+                // What waited in line is running now.
+                if self.notice.as_deref() == Some("queued") {
+                    self.notice = None;
+                }
                 self.end_live(Words::Reply);
                 self.live_item = None;
                 self.ahead.clear();
@@ -10335,6 +10339,10 @@ impl App {
             // An attached note whose wait ran out goes as a steer: the
             // sender's, nothing the person put in line.
             "queued" if data["lapsed"] == true => {}
+            // A steer behind the running turn joins it at its next call,
+            // the person's own marked `↪` where it waits: only a message
+            // waiting for a turn of its own says so, until one starts.
+            "queued" if data["status"] == "queued" && data["delivery"] == "steer" => {}
             "queued" => self.notice = Some("queued".to_owned()),
             // Nothing until a call takes it in: it asks nothing of the
             // person, so nothing says it waits.
@@ -22404,6 +22412,62 @@ mod tests {
         ))
         .await;
         assert_eq!(app.notice, None, "nothing the person queued");
+    }
+
+    #[tokio::test]
+    async fn a_steer_into_the_running_turn_says_nothing_on_its_line() {
+        let client = daemon_with(json!([])).await;
+        let mut app = app(client);
+        app.daemon(turn_event("accepted", 1, json!({}))).await;
+        // A task's update, a lookout note, the person's own Enter: each
+        // joins the turn at its next call, and the turn takes it in.
+        app.daemon(turn_event(
+            "queued",
+            2,
+            json!({"status": "queued", "delivery": "steer", "from": "b.task"}),
+        ))
+        .await;
+        app.daemon(turn_event(
+            "steered",
+            1,
+            json!({"message": 2, "node": null}),
+        ))
+        .await;
+        assert_eq!(app.notice, None, "nothing waits for a turn of its own");
+        assert!(!app.status_line().to_string().contains("queued"));
+        // A turn of its own after this one says it waits, until it starts.
+        app.daemon(turn_event(
+            "queued",
+            3,
+            json!({"status": "queued", "delivery": "queue", "origin": "automation"}),
+        ))
+        .await;
+        assert!(app.status_line().to_string().ends_with(" · queued"));
+        app.daemon(turn_event(
+            "turn_finished",
+            1,
+            json!({"status": "completed"}),
+        ))
+        .await;
+        app.daemon(turn_event("accepted", 3, json!({}))).await;
+        assert!(!app.status_line().to_string().contains("queued"));
+        // At rest, a message waiting for a slot says so too, and its
+        // turn's start lets it go.
+        app.daemon(turn_event(
+            "turn_finished",
+            3,
+            json!({"status": "completed"}),
+        ))
+        .await;
+        app.daemon(turn_event(
+            "queued",
+            4,
+            json!({"status": "ready", "delivery": "steer"}),
+        ))
+        .await;
+        assert_eq!(app.notice.as_deref(), Some("queued"));
+        app.daemon(turn_event("accepted", 4, json!({}))).await;
+        assert_eq!(app.notice, None);
     }
 
     #[tokio::test]
