@@ -6708,6 +6708,11 @@ impl App {
                 for text in program.copied() {
                     term::copy(&text);
                 }
+                // It had nothing left to do with Esc, or Tab with nothing
+                // typed: the conversation has the keys again.
+                if program.left() {
+                    self.pane_keys = false;
+                }
             }
             self.pane_switched();
             self.side_closed();
@@ -14164,6 +14169,11 @@ impl App {
                     // Tab sends it to run once the running turn ends, as
                     // Codex queues; Enter steers.
                     KeyCode::Tab if self.running.is_some() => self.submit_as(true).await,
+                    // Drawn beside another conversation, Tab with nothing
+                    // typed gives that one the keys back.
+                    KeyCode::Tab if self.options.embedded && self.input.is_empty() => {
+                        embed::give_back()
+                    }
                     KeyCode::Esc if self.react_to.is_some() => self.react_to = None,
                     // `/new`'s first message: back to its last list, the
                     // words kept for when it comes back.
@@ -14196,6 +14206,15 @@ impl App {
                                 .client
                                 .request("interrupt", json!({"bot": self.bot, "turn": turn}))
                                 .await;
+                        } else if self.options.embedded {
+                            // What was typed is cleared; with nothing left
+                            // to do here, the conversation it is drawn
+                            // beside has the keys again, and its next Esc
+                            // closes this.
+                            match self.input.is_empty() {
+                                true => embed::give_back(),
+                                false => self.discard(),
+                            }
                         } else if self.options.side.is_some() {
                             // Back to the agent; the copy goes once idle.
                             if self.input.is_empty() {
@@ -14205,6 +14224,14 @@ impl App {
                             }
                         } else if !self.asks.is_empty() {
                             self.chatting = !self.chatting;
+                        } else if self
+                            .pane
+                            .as_ref()
+                            .is_some_and(|pane| pane.program.is_some())
+                        {
+                            // The agent beside gave the keys back: this
+                            // Esc closes it.
+                            self.close_pane(false);
                         }
                     }
                     _ => {}
@@ -17679,8 +17706,10 @@ impl App {
                 Some(_) => vec![Span::raw(format!("Steer {name}")).dim()],
                 None => vec![Span::raw(format!("Message {name}")).dim()],
             };
+            // Muted while the pane has the keys: typing goes there.
             let lead = match answering {
                 Some(_) => Span::raw("? ").bold().fg(Color::Yellow),
+                None if self.pane_keys => Span::raw("› ").dim(),
                 None => Span::raw("› ").bold(),
             };
             let mut spans = vec![lead];
@@ -17742,6 +17771,7 @@ impl App {
                 let lead = match part.start {
                     0 if shell => Span::raw("› ").bold().fg(Color::Magenta),
                     0 if answering.is_some() => Span::raw("? ").bold().fg(Color::Yellow),
+                    0 if self.pane_keys => Span::raw("› ").dim(),
                     0 => Span::raw("› ").bold(),
                     _ => Span::raw("  "),
                 };
@@ -25545,6 +25575,27 @@ mod tests {
             card.iter().any(|row| row.contains("turns 1 to 3")),
             "{card:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn drawn_beside_another_esc_and_tab_give_the_keys_back() {
+        use std::sync::atomic::Ordering;
+        let mut app = app(daemon_answering(|_| json!({})).await);
+        app.options.embedded = true;
+        let press = |code| Event::Key(event::KeyEvent::new(code, KeyModifiers::NONE));
+        let gave = || embed::GAVE_BACK.load(Ordering::Relaxed);
+        let before = gave();
+        // Esc first clears what was typed; with nothing left, it gives
+        // the keys back, as Tab with nothing typed does.
+        app.input.set("half a thought");
+        app.key(press(KeyCode::Esc)).await;
+        assert!(app.input.is_empty() && !app.quit);
+        assert_eq!(gave(), before);
+        app.key(press(KeyCode::Esc)).await;
+        assert_eq!(gave(), before + 1);
+        app.key(press(KeyCode::Tab)).await;
+        assert_eq!(gave(), before + 2);
+        assert!(!app.quit);
     }
 
     #[tokio::test]
