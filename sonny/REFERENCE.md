@@ -115,7 +115,7 @@ ships, the roles of a lead (`lead`, one that extends it, and the project's
 own, marked `•`) before the rest, each with its description. Then, for an
 agent that is not a lead, where it works: a worktree of its own (first in a
 git repository), this folder beside the lead, or an empty folder; a project
-whose tasks all work in its folder (`threads_in = "project"`) asks nothing.
+whose tasks all work in its folder (`task_in = "project"`) asks nothing.
 Then the first message, written in the composer under what it will start;
 Enter starts the agent with it and the window becomes that agent's. A lead
 stays in this folder, as every lead does, named NAME or after the message's
@@ -294,7 +294,7 @@ and a project file names it for its lead:
 | What | `~/.agent/config.toml` | `.agents/project.toml` |
 | --- | --- | --- |
 | The profile a lead runs as | `[sonny] lead_profile` | `profile` |
-| The profile every other agent is told | `[sonny] task_profile` | `threads_profile` |
+| The profile every other agent is told | `[sonny] task_profile` | `task_profile` |
 
 Sonny ships one such profile, `superlead` ([agents/superlead.md](agents/superlead.md)),
 written to `~/.agents/agents` beside the others and used by no lead
@@ -324,12 +324,12 @@ at its model's own effort (`AGENT_EFFORT` when its model is
 | What | `~/.agent/config.toml` | `.agents/project.toml` |
 | --- | --- | --- |
 | A new lead's effort | `[sonny] lead_effort` | `effort` |
-| Each new task's model | (the lead's) | `threads_model` |
-| Each new task's effort | `[sonny] task_effort` | `threads_effort` |
-| Each new task's speed (`standard`, `fast` or `ultrafast`) | `[sonny] task_speed` | `threads_speed` |
+| Each new task's model | (the lead's) | `task_model` |
+| Each new task's effort | `[sonny] task_effort` | `task_effort` |
+| Each new task's speed (`standard`, `fast` or `ultrafast`) | `[sonny] task_speed` | `task_speed` |
 | The reviewer's model, for agents in Auto ([REVIEWER.md](REVIEWER.md)) | `[reviewer] model`, `effort` | |
 | How long a call in Auto waits for the reviewer's verdict before it goes to you | `[reviewer] timeout_ms` (90000 by default, as Codex's; 0 for as long as it takes) | |
-| What `/side`'s copy may do | `[sonny] side_chat` (`fork`, the default, or `answer`) | |
+| What `/side`'s copy may do | `[sonny] side_chat` (`work`, the default, or `answer`) | |
 | The chime, and what the conversation shows | `[sonny] chime` (true or false), `view` (`words`, the default, `steps` or `verbose`) | |
 | The widest the conversation is written | `[sonny] text_width` (100 by default, at least 40, 0 for the window's whole width) | |
 | A guess at your next message | `[sonny] suggest` (true, the default, or false) | |
@@ -341,7 +341,7 @@ at its model's own effort (`AGENT_EFFORT` when its model is
 | Margin notes of your own, filled as their blanks change | `[sonny.notes.NAME] markdown`, `live`, `title` | |
 | Where a click on an agent's name goes | `[sonny] agent_opens` (`tab`, the default, or `beside`) | |
 | Which tasks open in a tab | `[sonny] task_tabs` (`asked`, the default, or `every`) | |
-| Task windows a lead keeps open | `[sonny] task_windows` (32 by default, 0 for no limit) | |
+| Task tabs a lead keeps open | `[sonny] most_task_tabs` (32 by default, 0 for no limit) | |
 | The daemon started with the machine | `[sonny] start_at_boot` (true or false, the default) | |
 | News from outside for the lookout | `[sonny.sources.NAME] command`, `every` | |
 
@@ -354,7 +354,7 @@ lead's effort after it is made.
 ## Terminal layout
 
 A lead moved to another
-folder (`--workspace`) comes back with the next message Sonny sends it from
+folder (`agent run --workspace`) comes back with the next message Sonny sends it from
 its own, history and all. When Sonny runs in a Rex block (`rex` found as
 `$REX`, on the PATH, or in the Mac app), a Herdr pane (`herdr` found as
 `$HERDR` or on the PATH) or a cmux tab (`cmux` found as the tab's own CLI,
@@ -366,7 +366,7 @@ same way. A task the lead (or one of its tasks) starts gets a window there
 without taking focus, its block (pane, cmux tab) labelled with the task's
 name, when someone asks for one: its starter, which asks when it judges you
 will want to watch it or talk to it (`start_task`'s `tab`, within
-`task_windows` as any task's window), an agent that shows it, you, from `/status` or a click on its name, or the task itself
+`most_task_tabs` as any task's tab), an agent that shows it, you, from `/status` or a click on its name, or the task itself
 coming to need you. The others, such as reviewers and a lead's own helpers,
 work without one; `/status` and the footer count them. With `[sonny]
 task_tabs = "every"`, each task gets its window as a turn of its starts. In Rex, each window reports OSC 7501 status, so Rex
@@ -418,25 +418,25 @@ task is marked done. With `task_tabs = "every"`, a task's window
 closes once its work is taken: its turn completed and the lead (or the task
 that started it) waited on it. One that failed, was interrupted or waits on you stays
 open, and a task given more work opens again; ask the lead to show one, or
-run `sonny --agent NAME`. A lead keeps `[sonny] task_windows` of its tasks'
-windows open, 32 by default (0 for no limit), as VS Code's editor limit
-keeps editors: past it, a new one closes the window you used least
-recently, as each window's own Sonny saw you focus, type or click there
-(marked in `~/.agent/sonny/used/`). Only the lead's own tasks' windows
+run `sonny --agent NAME`. A lead keeps `[sonny] most_task_tabs` of its tasks'
+tabs open, 32 by default (0 for no limit), as VS Code's editor limit
+keeps editors: past it, a new one closes the tab you used least
+recently, as each tab's own Sonny saw you focus, type or click there
+(marked in `~/.agent/sonny/used/`). Only the lead's own tasks' tabs
 count and close, as another lead of the folder keeps its own; tasks shown
-together in one window count once and close together. One that
+together in one tab count once and close together. One that
 needs you (an approval, or a question open in it) or failed is never
 closed for room, as the
-lead heard or as that window's own Sonny last said (kept in
+lead heard or as that tab's own Sonny last said (kept in
 `~/.agent/sonny/held/`, so it holds across either one starting again);
-with no other, the limit is passed. A window you have not looked at yet is
+with no other, the limit is passed. A tab you have not looked at yet is
 not one you used least recently, so it is not closed for room either: while
-only such windows could make room, a new task's window does not open (the
-status row says so) and waits for you, as one closed for room does. A window closed for room stays closed while its
+only such tabs could make room, a new task's tab does not open (the
+status row says so) and waits for you, as one closed for room does. A tab closed for room stays closed while its
 task works on, and `/status` (or its name) opens it again, also after the
 lead starts again (kept in `~/.agent/sonny/aside/`); its `/status` row
-says `window set aside for room`. A task set aside that comes to need you
-opens its window again on its own, as what needs you keeps its window. `--rex-host HOST` puts the session on another Rex
+says `tab set aside for room`. A task set aside that comes to need you
+opens its tab again on its own, as what needs you keeps its tab. `--rex-host HOST` puts the session on another Rex
 server; `--no-layout` turns the layout off. Sonny writes a skill for each
 multiplexer the machine has to `~/.agents/skills` (`rex-windows`,
 `herdr-panes` and `cmux-tabs`, from `skills/`). Each sends the agent to
@@ -842,8 +842,8 @@ has something on it, or is off the screen, no time shows.
   names the speed after the effort. A pick made while a turn runs shows in the footer and applies
   when the lead is idle; one that another client overtakes is dropped.
   The tasks an agent starts on its own model run at its speed, as its
-  helpers do at theirs, unless `threads_speed` or `[sonny] task_speed`
-  names one; a task whose provider does not serve that speed starts at
+  helpers do at theirs, unless the project file's `task_speed` or
+  `[sonny] task_speed` names one; a task whose provider does not serve that speed starts at
   standard, and the start says so.
 
   ![/model: the speed row picked with Tab, fast beside the effort](../docs/sonny/model-speed.png)

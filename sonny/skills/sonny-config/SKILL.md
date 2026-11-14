@@ -145,9 +145,9 @@ A key `table.key` goes under `[table]`; a bare key goes at the top.
 | --- | --- | --- |
 | `model` | the lead's model | `model` |
 | `effort` | a new lead's effort | `sonny.lead_effort` |
-| `threads_model` | each new task's model | the lead's |
-| `threads_effort` | each new task's effort | `sonny.task_effort` |
-| `threads_speed` | each new task's speed: `standard`, `fast` or `ultrafast` | `sonny.task_speed` |
+| `task_model` | each new task's model | the lead's |
+| `task_effort` | each new task's effort | `sonny.task_effort` |
+| `task_speed` | each new task's speed: `standard`, `fast` or `ultrafast` | `sonny.task_speed` |
 | `profile` | the profile the lead runs as | `sonny.lead_profile` |
-| `threads_profile` | the profile every other agent is told | `sonny.task_profile` |
+| `task_profile` | the profile every other agent is told | `sonny.task_profile` |
 | `subfolders = "project"` | folders below open this project's lead | |

@@ -169,7 +169,7 @@ fn start() -> Value {
                 "model": {"type": "string", "minLength": 1,
                     "description": "PROVIDER/MODEL, one of the models \"$AGENT_BIN\" models lists with \
                         the person's notes on them, when the work suits another model than yours; \
-                        without one, the project's threads_model, else yours."},
+                        without one, the project's task_model, else yours."},
                 "effort": {"type": "string", "minLength": 1,
                     "description": "The task's effort level, when the work calls for one."},
                 "reason": {"type": "string", "minLength": 1,
@@ -247,11 +247,11 @@ fn project() -> Value {
                 "model": {"type": "string", "minLength": 1,
                     "description": "The lead's PROVIDER/MODEL, as the person picked; else yours."},
                 "effort": {"type": "string", "minLength": 1, "description": "The lead's effort level."},
-                "threads_model": {"type": "string", "minLength": 1,
+                "task_model": {"type": "string", "minLength": 1,
                     "description": "PROVIDER/MODEL for the project's tasks, when the person picked one."},
-                "threads_effort": {"type": "string", "minLength": 1,
+                "task_effort": {"type": "string", "minLength": 1,
                     "description": "The tasks' effort level."},
-                "threads_in": {"type": "string", "enum": ["worktree", "project"],
+                "task_in": {"type": "string", "enum": ["worktree", "project"],
                     "description": "project when the person wants every task to work in the project's \
                         folder itself."}
             },

@@ -172,9 +172,9 @@ pub const SETTINGS: &[Setting] = &[
         group: "Agents",
         name: "side chat",
         label: "/side's copy can do anything its agent can, or only answers",
-        about: "/side's copy is a fork that can do anything its agent can, or answers calling no tool",
-        values: &["fork", "answer"],
-        default: "fork",
+        about: "/side's copy can do anything its agent can, with its tools, in its folder, under its approvals; or answers from what its agent knows, calling no tool",
+        values: &["work", "answer"],
+        default: "work",
     },
     Setting {
         key: "sonny.ask_wait_minutes",
@@ -312,7 +312,7 @@ pub const SETTINGS: &[Setting] = &[
         default: "asked",
     },
     Setting {
-        key: "sonny.task_windows",
+        key: "sonny.most_task_tabs",
         group: "Tabs",
         name: "most task tabs",
         label: "the most task tabs a lead keeps open; 0 for no limit",
@@ -448,13 +448,18 @@ pub const QUIET_GONE: &str = "quiet-gone";
 pub const CHECKS_GONE: &str = "checks-gone";
 /// The migration that makes `[sonny] steps` and `verbose` one `view`.
 pub const VIEW_ONE: &str = "view-one";
+/// The migration that renames `[sonny] task_windows` `most_task_tabs`,
+/// and `side_chat = "fork"` `"work"`, so the file says the Rulebook's
+/// words (0.10.0).
+pub const TAB_WORDS: &str = "tab-words";
 
 /// At start, once each, before the config is read: a line depth the
 /// person set for Sonny moved to the daemon, which bounds it now; the
 /// reviewer's model and effort under the reviewer's name; quiet mode,
 /// gone, leaving no key the config would refuse, no file and no skill; and
 /// the reply check's and done check's keys, gone with the checks; and the
-/// two switches for what the conversation shows, one `view`.
+/// two switches for what the conversation shows, one `view`; and the
+/// words its keys and values say, the Rulebook's.
 pub fn at_start() {
     let (Some(home), Some(path)) = (
         std::env::var_os("HOME").map(PathBuf::from),
@@ -478,6 +483,7 @@ pub fn at_start() {
     });
     crate::upgrade::once(&migrated, CHECKS_GONE, || rewrite(&path, checks_gone));
     crate::upgrade::once(&migrated, VIEW_ONE, || rewrite(&path, view_one));
+    crate::upgrade::once(&migrated, TAB_WORDS, || rewrite(&path, tab_words));
 }
 
 /// The config at `path` as `change` rewrites it, each other line as the
@@ -666,6 +672,71 @@ fn view_one(text: &str) -> Result<Option<String>, ()> {
     }
     match new.parse::<toml::Table>() {
         Ok(parsed) if added && parsed == expected => Ok(Some(new)),
+        _ => Err(()),
+    }
+}
+
+/// `text` as [`rewrite`] writes it for [`TAB_WORDS`]: none when `[sonny]`
+/// sets neither `task_windows` nor `side_chat = "fork"`. The key is
+/// renamed and the value said again, on their own lines, each comment
+/// kept. What is written must parse to the config with only those
+/// changed, so a `most_task_tabs` set already, or a line the rewrite
+/// does not find, is an error.
+fn tab_words(text: &str) -> Result<Option<String>, ()> {
+    use toml::Value;
+    let old: toml::Table = text.parse().map_err(drop)?;
+    let Some(sonny) = old.get("sonny").and_then(Value::as_table) else {
+        return Ok(None);
+    };
+    let fork = sonny.get("side_chat").and_then(Value::as_str) == Some("fork");
+    if !fork && !sonny.contains_key("task_windows") {
+        return Ok(None);
+    }
+    let mut expected = old.clone();
+    let Some(Value::Table(sonny)) = expected.get_mut("sonny") else {
+        return Err(());
+    };
+    if let Some(most) = sonny.remove("task_windows")
+        && sonny.insert("most_task_tabs".into(), most).is_some()
+    {
+        return Err(());
+    }
+    if fork {
+        sonny.insert("side_chat".into(), Value::String("work".into()));
+    }
+    let mut table = String::new();
+    let mut new = String::new();
+    for raw in text.split_inclusive('\n') {
+        let trimmed = raw.trim_start();
+        let indent = &raw[..raw.len() - trimmed.len()];
+        // A heading, `[sonny]`, a comment after it or not.
+        if let Some(heading) = trimmed
+            .strip_prefix('[')
+            .filter(|rest| !rest.starts_with('['))
+            && let Some((name, _)) = heading.split_once(']')
+        {
+            table = name.trim().to_owned();
+        }
+        let line = match (table == "sonny", trimmed.split_once('=')) {
+            (true, Some((key, rest))) if key.trim() == "task_windows" => {
+                format!("{indent}most_task_tabs ={rest}")
+            }
+            (true, Some((key, rest))) if key.trim() == "side_chat" => {
+                let value = rest.trim_start();
+                match value
+                    .strip_prefix("\"fork\"")
+                    .or(value.strip_prefix("'fork'"))
+                {
+                    Some(after) => format!("{indent}side_chat = \"work\"{after}"),
+                    None => raw.to_owned(),
+                }
+            }
+            _ => raw.to_owned(),
+        };
+        new.push_str(&line);
+    }
+    match new.parse::<toml::Table>() {
+        Ok(parsed) if parsed == expected => Ok(Some(new)),
         _ => Err(()),
     }
 }
@@ -1435,6 +1506,43 @@ mod tests {
             agent_client::config::read(&path).unwrap().sonny.view,
             agent_client::config::View::Steps
         );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn task_windows_and_a_fork_side_chat_take_the_rulebooks_words_once() {
+        assert_eq!(
+            tab_words(
+                "# mine\n[sonny] # me\n  task_windows = 8 # few\nside_chat = \"fork\" # all\n"
+            ),
+            Ok(Some(
+                "# mine\n[sonny] # me\n  most_task_tabs = 8 # few\nside_chat = \"work\" # all\n"
+                    .into()
+            ))
+        );
+        // Another table's keys of the same names are not Sonny's.
+        assert_eq!(
+            tab_words("[sonny]\nside_chat = \"answer\"\n[daemon]\ndepth = 2\n"),
+            Ok(None)
+        );
+        // A key set under both names, or one lines can't rename, stays.
+        assert_eq!(
+            tab_words("[sonny]\ntask_windows = 8\nmost_task_tabs = 4\n"),
+            Err(())
+        );
+        assert_eq!(tab_words("sonny.task_windows = 8\n"), Err(()));
+        // What it writes, the reader takes.
+        let dir =
+            std::env::temp_dir().join(format!("sonny-config-tab-words-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        std::fs::write(&path, "[sonny]\ntask_windows = 8\nside_chat = 'fork'\n").unwrap();
+        assert!(agent_client::config::read(&path).is_err());
+        assert!(rewrite(&path, tab_words));
+        let sonny = agent_client::config::read(&path).unwrap().sonny;
+        assert_eq!(sonny.most_task_tabs, 8);
+        assert_eq!(sonny.side_chat, agent_client::config::SideChat::Work);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
