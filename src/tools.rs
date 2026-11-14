@@ -2610,18 +2610,23 @@ impl Registry {
                 limit,
             } => {
                 let file = resolve(workspace, &path);
-                readable(sandbox.clone(), &file, &path).await?;
+                // What a sandboxed bot may not read, checked on the file
+                // opened, as the daemon reads it outside the sandbox.
+                let hidden = sandbox
+                    .as_ref()
+                    .map_or(&[][..], |policy| &policy.unreadable);
                 // A picture goes to the model as one, after a line on it.
                 // Its header says so; the file is read only in its turn.
-                if picture::kind(&files::read_head(&file, picture::HEAD).await?).is_some()
-                    && let Some((image, line)) = picture::read_apart(read_bounded(&file)).await?
+                if picture::kind(&files::read_head(&file, picture::HEAD, hidden).await?).is_some()
+                    && let Some((image, line)) =
+                        picture::read_apart(read_bounded(&file, hidden)).await?
                 {
                     return Ok(Outcome {
                         parts: vec![crate::codec::Part::Image(image)],
                         ..Outcome::text(format!("{path}: {line}"))
                     });
                 }
-                let bytes = read_bounded(&file).await?;
+                let bytes = read_bounded(&file, hidden).await?;
                 if let Some(kind) = binary(&bytes) {
                     return fail_with(
                         "file_not_text",
@@ -2654,7 +2659,10 @@ impl Registry {
                 for path in patch.removed() {
                     removable(sandbox.clone(), &resolve(workspace, path), path).await?;
                 }
-                let staged = patch.stage(workspace).await?;
+                let hidden = sandbox
+                    .as_ref()
+                    .map_or(&[][..], |policy| &policy.unreadable);
+                let staged = patch.stage(workspace, hidden).await?;
                 // A process slot only while the sandbox's helper writes.
                 let _held = crate::sandbox::hold_for(sandbox.as_deref()).await;
                 let _slot = match staged.writes() {
@@ -2671,7 +2679,10 @@ impl Registry {
             } => {
                 let target = resolve(workspace, &path);
                 writable(sandbox.clone(), &target, &path).await?;
-                let bytes = read_bounded(&target).await?;
+                let hidden = sandbox
+                    .as_ref()
+                    .map_or(&[][..], |policy| &policy.unreadable);
+                let bytes = read_bounded(&target, hidden).await?;
                 let text = String::from_utf8(bytes).map_err(|_| Error::new("file_not_utf8"))?;
                 let count = text.matches(&old).count();
                 if count == 0 {
@@ -3535,26 +3546,6 @@ fn resolve(workspace: &Path, path: &str) -> PathBuf {
 /// filesystem, so it runs off the runtime thread.
 async fn writable(sandbox: Option<Arc<Policy>>, target: &Path, path: &str) -> Result<()> {
     allowed(sandbox, target, path, Policy::can_write).await
-}
-
-/// Whether a sandboxed bot may read `target`, as its commands may: all
-/// but what the daemon keeps unreadable. The daemon reads for the `read`
-/// tool outside the sandbox, so it asks the sandbox's rule itself.
-async fn readable(sandbox: Option<Arc<Policy>>, target: &Path, path: &str) -> Result<()> {
-    let Some(policy) = sandbox.filter(|policy| !policy.unreadable.is_empty()) else {
-        return Ok(());
-    };
-    let target = target.to_owned();
-    let readable = tokio::task::spawn_blocking(move || policy.can_read(&target))
-        .await
-        .unwrap_or(false);
-    match readable {
-        false => fail_with(
-            "read_denied",
-            format!("{path} is kept unreadable in this bot's sandbox"),
-        ),
-        true => Ok(()),
-    }
 }
 
 /// [`writable`], for removing `target` itself rather than writing through it.

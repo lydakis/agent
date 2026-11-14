@@ -730,14 +730,15 @@ async fn a_sandboxed_command_writes_only_its_roots() {
         std::fs::create_dir_all(folder).unwrap();
     }
     std::fs::write(dir.join("store"), "db").unwrap();
-    // Keys it may not read: one outside its roots, one in its own folder.
-    let (keys, env) = (base.join("keys"), dir.join("env"));
+    // Keys it may not read: one outside its roots, one in its own folder,
+    // and one there that isn't yet.
+    let (keys, env, later) = (base.join("keys"), dir.join("env"), dir.join("later"));
     std::fs::write(&keys, "KEY=outside").unwrap();
     std::fs::write(&env, "KEY=inside").unwrap();
     let daemon = Daemon {
         store: Some(dir.join("store")),
         helper: Some(env!("CARGO_BIN_EXE_agent").into()),
-        unreadable: vec![keys.clone(), env.clone()],
+        unreadable: vec![keys.clone(), env.clone(), later.clone()],
         ..protecting()
     };
     let writable = [
@@ -909,6 +910,7 @@ async fn a_sandboxed_command_writes_only_its_roots() {
         "echo x > env".into(),
         "mv env moved".into(),
         "ln env linked".into(),
+        "echo KEY=made > later && cat later".into(),
     ] {
         let output = run(command.clone()).await;
         assert_ne!(output["exit_code"], 0, "{command}: {output}");
@@ -917,6 +919,7 @@ async fn a_sandboxed_command_writes_only_its_roots() {
     }
     assert_eq!(std::fs::read_to_string(&env).unwrap(), "KEY=inside");
     assert!(!dir.join("moved").exists() && !dir.join("linked").exists());
+    assert!(!later.is_file());
     std::os::unix::fs::symlink(&keys, dir.join("to-keys")).unwrap();
     for path in [keys.to_str().unwrap(), "env", "to-keys"] {
         let read = tools

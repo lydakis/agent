@@ -6,10 +6,19 @@ use crate::{
     sandbox::{Policy, WRITE},
 };
 use serde_json::Value;
-use std::{io::ErrorKind, path::Path, process::Stdio, sync::Arc};
+use std::{
+    io::ErrorKind,
+    path::{Path, PathBuf},
+    process::Stdio,
+    sync::Arc,
+};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-async fn open_regular(path: &Path, write: bool) -> Result<tokio::fs::File> {
+/// Open `path`, a regular file, refused when what was opened is, or is
+/// under, one of `hidden`: the paths a sandboxed bot may not read
+/// ([`Policy::unreadable`]). The file opened is checked, not the path, so a
+/// link swapped between a check and the open can't reach one.
+async fn open_regular(path: &Path, write: bool, hidden: &[PathBuf]) -> Result<tokio::fs::File> {
     let open_error = |error: std::io::Error| {
         if write {
             Error::with("io_error", format!("{}: {error}", path.display()))
@@ -32,14 +41,54 @@ async fn open_regular(path: &Path, write: bool) -> Result<tokio::fs::File> {
     #[cfg(unix)]
     options.custom_flags(libc::O_NONBLOCK | libc::O_NOCTTY);
     let file = options.open(path).await.map_err(open_error)?;
+    if !hidden.is_empty()
+        && opened(&file).is_none_or(|opened| hidden.iter().any(|hidden| opened.starts_with(hidden)))
+    {
+        return Err(Error::with(
+            "read_denied",
+            format!(
+                "{} is kept unreadable in this bot's sandbox",
+                path.display()
+            ),
+        ));
+    }
     if !file.metadata().await?.is_file() {
         return fail("file_not_regular");
     }
     Ok(file)
 }
 
-pub(super) async fn read_bounded(path: &Path) -> Result<Vec<u8>> {
-    let file = open_regular(path, false).await?;
+/// The path the kernel holds for an open file: where it is, whatever
+/// links led to it or were swapped since. `None` where the system can't
+/// say, which a caller with paths to keep refuses.
+#[cfg(target_os = "linux")]
+fn opened(file: &tokio::fs::File) -> Option<PathBuf> {
+    use std::os::fd::AsRawFd;
+    std::fs::read_link(format!("/proc/self/fd/{}", file.as_raw_fd())).ok()
+}
+
+#[cfg(target_os = "macos")]
+fn opened(file: &tokio::fs::File) -> Option<PathBuf> {
+    use std::os::{fd::AsRawFd, unix::ffi::OsStrExt};
+    let mut path = [0u8; libc::PATH_MAX as usize];
+    // SAFETY: F_GETPATH writes at most MAXPATHLEN (PATH_MAX) bytes,
+    // NUL-terminated, into the buffer.
+    if unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETPATH, path.as_mut_ptr()) } == -1 {
+        return None;
+    }
+    let end = path.iter().position(|byte| *byte == 0)?;
+    Some(PathBuf::from(std::ffi::OsStr::from_bytes(&path[..end])))
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn opened(_: &tokio::fs::File) -> Option<PathBuf> {
+    None
+}
+
+/// A file's bytes, up to the tools' limit; `hidden` as [`open_regular`]
+/// takes it.
+pub(super) async fn read_bounded(path: &Path, hidden: &[PathBuf]) -> Result<Vec<u8>> {
+    let file = open_regular(path, false, hidden).await?;
     let mut bytes = Vec::new();
     file.take(FILE_BYTES as u64 + 1)
         .read_to_end(&mut bytes)
@@ -51,9 +100,9 @@ pub(super) async fn read_bounded(path: &Path) -> Result<Vec<u8>> {
 }
 
 /// The first `count` bytes of a file, or fewer when it is shorter.
-pub(super) async fn read_head(path: &Path, count: u64) -> Result<Vec<u8>> {
+pub(super) async fn read_head(path: &Path, count: u64, hidden: &[PathBuf]) -> Result<Vec<u8>> {
     let mut bytes = Vec::new();
-    (open_regular(path, false).await?)
+    (open_regular(path, false, hidden).await?)
         .take(count)
         .read_to_end(&mut bytes)
         .await?;
@@ -72,7 +121,7 @@ pub(super) async fn write(path: &Path, content: &[u8], sandbox: Option<Arc<Polic
     if let Some(parent) = path.parent() {
         tokio::fs::create_dir_all(parent).await?;
     }
-    let mut file = open_regular(path, true).await?;
+    let mut file = open_regular(path, true, &[]).await?;
     file.set_len(0).await?;
     file.write_all(content).await?;
     // Tokio buffers writes in its blocking pool. Await their completion before

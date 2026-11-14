@@ -764,8 +764,10 @@ fn root(path: &Path, daemon: &Daemon, others: &[known::Known]) -> Result<Root> {
         read_only.extend(store_files(store).filter(|file| file.exists()));
     }
     // A walled folder too: renamed, or a socket made in it, it would let
-    // one out past its rule.
+    // one out past its rule. And what it may not read: missing, it can't
+    // be made, so no command makes the file the person's keys then go in.
     for kept in (daemon.protected_paths.iter())
+        .chain(&daemon.unreadable)
         .chain(&daemon.walled)
         .chain(locks())
         .chain(copies())
