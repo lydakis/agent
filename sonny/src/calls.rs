@@ -32,33 +32,38 @@ pub fn attempted(verb: &str) -> String {
         "Added" => "add",
         "Answered" => "answer",
         "Asked" => "ask",
+        "Called" => "call",
         "Checked" => "check",
         "Cleaned" => "clean",
         "Cleared" => "clear",
         "Discarded" => "discard",
-        "Ran" => "run",
+        "Edited" => "edit",
         "Followed" => "follow",
         "Forked" => "fork",
         "Indexed" => "index",
         "Interrupted" => "interrupt",
+        "Killed" => "kill",
         "Left" => "leave",
         "Listed" => "list",
+        "Loaded" => "load",
         "Looked" => "look",
+        "Marked" => "mark",
         "Moved" => "move",
+        "Noted" => "note",
         "Opened" => "open",
         "Pruned" => "prune",
         "Queued" => "queue",
+        "Ran" => "run",
         "Read" => "read",
         "Removed" => "remove",
-        "Resolved" => "resolve",
         "Saved" => "save",
-        "Scheduled" => "schedule",
         "Started" => "start",
         "Steered" => "steer",
         "Typed" => "type",
         "Unfollowed" => "unfollow",
         "Updated" => "update",
         "Waited" => "wait",
+        "Wrote" => "write",
         _ => return format!("Failed: {}", verb.to_lowercase()),
     };
     match rest {
@@ -336,10 +341,11 @@ fn automation(words: &[String], output: &str, failed: bool) -> Option<Said> {
     };
     match verb.as_str() {
         "add" => {
-            said.verb = "Scheduled".into();
+            said.verb = "Added the automation".into();
+            // `--bot`, as before 0.10.0, in history.
             let name = args
                 .value(&["--name"])
-                .or(args.value(&["--bot", "--start"]));
+                .or(args.value(&["--agent", "--bot", "--start"]));
             let when = [
                 ("--every", "every"),
                 ("--cron", "cron"),
@@ -849,13 +855,15 @@ pub fn declared(name: &str, arguments: &Value, failed: bool) -> Option<Said> {
                     let add = &arguments["add"];
                     let name = (add["name"].as_str())
                         .or(add["start"]["name"].as_str())
+                        .or(add["agent"].as_str())
+                        // `bot`, as before 0.10.0, in history.
                         .or(add["bot"].as_str())
                         .map(|name| name.trim().to_owned());
                     let when = ["every", "cron", "at", "in"]
                         .into_iter()
                         .find_map(|key| Some(format!("{key} {}", add[key].as_str()?.trim())));
                     let what = [name, when].into_iter().flatten().collect::<Vec<_>>();
-                    let mut said = said("Scheduled", &what.join(" · "));
+                    let mut said = said("Added the automation", &what.join(" · "));
                     if let Some(message) = add["message"].as_str() {
                         said.under
                             .push(Line::from(first_line(message)).italic().dim());
@@ -892,10 +900,10 @@ pub fn declared(name: &str, arguments: &Value, failed: bool) -> Option<Said> {
             Some(said)
         }
         crate::resolved::TOOL => Some(Said {
-            verb: "Resolved".into(),
+            verb: "Marked".into(),
             what: match arguments["task"].as_str().map(str::trim) {
-                Some(task) if !task.is_empty() => task.to_owned(),
-                _ => "this task".into(),
+                Some(task) if !task.is_empty() => format!("{task} done"),
+                _ => "this task done".into(),
             },
             under: Vec::new(),
             failed,
@@ -948,7 +956,7 @@ pub fn plan(items: &[String]) -> Said {
     }
     for item in items {
         let (mark, text) = match item.split_at_checked(3) {
-            Some(("[x]", text)) => ("✔", text),
+            Some(("[x]", text)) => ("✓", text),
             Some(("[>]", text)) => ("→", text),
             Some(("[ ]", text)) => ("□", text),
             // A step the bot sent without its mark is still a step.
@@ -956,8 +964,8 @@ pub fn plan(items: &[String]) -> Said {
         };
         let text = text.trim().to_owned();
         said.under.push(match mark {
-            "✔" => Line::from(vec![
-                Span::raw("✔ ").fg(Color::Green),
+            "✓" => Line::from(vec![
+                Span::raw("✓ ").fg(Color::Green),
                 Span::raw(text).dim(),
             ]),
             "→" => Line::from(vec![
@@ -1257,7 +1265,7 @@ Keep the rest.'"#,
             r#"~/.agent/automation add --bot shop.lead --cron '0 9 * * 1' -- Brief me"#,
             r#"{"error":"automations_unsupported","detail":"needs macOS"}"#,
         );
-        assert_eq!(refused.verb, "Scheduled");
+        assert_eq!(refused.verb, "Added the automation");
         assert_eq!(refused.what, "shop.lead · cron 0 9 * * 1");
         assert!(refused.failed);
         let under: Vec<String> = refused.under.iter().map(text).collect();
@@ -1293,7 +1301,7 @@ Keep the rest.'"#,
         let steps = serde_json::json!({"steps": ["[x] Read", "[>] Fix", "[ ] Test", "Ship"]});
         let said = declared("plan", &steps, false).unwrap();
         let lines: Vec<String> = said.under.iter().map(text).collect();
-        assert_eq!(lines, ["✔ Read", "→ Fix", "□ Test", "□ Ship"]);
+        assert_eq!(lines, ["✓ Read", "→ Fix", "□ Test", "□ Ship"]);
         let cleared = declared("plan", &serde_json::json!({"steps": []}), false).unwrap();
         assert_eq!(cleared.verb, "Cleared the plan");
     }

@@ -332,6 +332,7 @@ fn parse_completion_with_usage(
                             call_id: custom.call_id,
                             arguments: serde_json::json!({"input":custom.input}).to_string(),
                             custom: true,
+                            links: Default::default(),
                         }
                     }
                 };
@@ -469,6 +470,7 @@ mod tests {
                 call_id: "c1".into(),
                 arguments: json!({"input":"*** Begin Patch\n*** End Patch"}).to_string(),
                 custom: true,
+                links: Default::default(),
             }]
         );
         // Stored as the provider sent it, so it replays unchanged.

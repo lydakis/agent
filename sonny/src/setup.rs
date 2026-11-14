@@ -5,7 +5,7 @@
 //! provider anywhere it asks for one before it starts the daemon, as
 //! Codex and Claude Code ask for a sign-in before their first turn.
 //! The answers are kept as Codex keeps them: settings in a commented
-//! `~/.agent/config.toml`, and keys in `~/.agent/env`, which Sonny applies
+//! `~/.agent/config.toml`, and keys in `~/.agent/keys/env`, which Sonny applies
 //! to the daemon and everything else it starts, so no shell profile needs
 //! them.
 use crate::picker::{self, Picked, Row};
@@ -137,7 +137,7 @@ struct Found {
     /// Codex is signed in with ChatGPT here, so the person has a plan.
     codex_chatgpt: bool,
     aws: Vec<Profile>,
-    /// The key variables set, in the shell or `~/.agent/env`.
+    /// The key variables set, in the shell or `~/.agent/keys/env`.
     keys: Vec<&'static str>,
     /// The config's `provider`, which setup offers to keep.
     current: Option<String>,
@@ -505,7 +505,7 @@ usage: sonny setup [--provider chatgpt|anthropic|openai|openrouter|bedrock]
                    [--import-mcp [codex,claude,opencode,kiro]] [--browser-signed-in] [--json]
 With no flags, asks in a terminal. With flags, sets what they name and asks
 nothing, for scripts and agents: --key-stdin reads the provider's key from
-stdin into ~/.agent/env; --import-mcp brings the MCP servers of those agents
+stdin into ~/.agent/keys/env; --import-mcp brings the MCP servers of those agents
 (all, when it names none) but those from files in this folder;
 --browser-signed-in names the Default Chrome profile in agent-browser's own
 settings when they name none and Chrome has it; --json prints what this machine has and what
@@ -608,7 +608,7 @@ pub async fn flags(args: &[String], socket: &Path) -> Result<(), String> {
                     kept.push((var, key.to_owned()));
                 } else if !found.keys.contains(var) {
                     return Err(format!(
-                        "{var} is not set: set it in ~/.agent/env, or pass the key on stdin with --key-stdin"
+                        "{var} is not set: set it in ~/.agent/keys/env, or pass the key on stdin with --key-stdin"
                     ));
                 }
             }
@@ -774,7 +774,7 @@ pub async fn model(client: &Client) -> Result<String, String> {
         println!("Welcome to Sonny. A question or two and it's set up.\n");
     }
     let model = loop {
-        print!("{DIM}Listing your providers' models...{RESET}");
+        print!("{DIM}listing models…{RESET}");
         let _ = std::io::stdout().flush();
         let listing = client
             .request("provider_models", json!({}))
@@ -806,7 +806,7 @@ pub async fn model(client: &Client) -> Result<String, String> {
             .iter()
             .enumerate()
             .map(|(index, model)| {
-                let row = Row::new(&model.id, model.detail());
+                let row = Row::new(model.label(), model.detail());
                 match (index == marked && current.is_some(), index) {
                     (true, _) => row.badge("current"),
                     (_, 0) => row.badge("recommended"),
@@ -868,7 +868,7 @@ fn backup() -> Result<bool, String> {
     }
     crate::skills::note_offered("backup");
     println!(
-        "\nBack up memory, skills, profiles and config.toml to a private git repository,\nso a new machine starts where this one left off. Keys in ~/.agent/env, logins\nand chat history stay on this machine."
+        "\nBack up memory, skills, profiles and config.toml to a private git repository,\nso a new machine starts where this one left off. Keys in ~/.agent/keys/env, logins\nand chat history stay on this machine."
     );
     let url = line("Repository URL, or Enter to skip (`sonny setup backup` later): ")?;
     if url.is_empty() {
@@ -979,12 +979,12 @@ fn hint(provider: &str, error: &str) -> Option<String> {
         let profile = agent_client::env_file::var("AWS_PROFILE");
         return Some(match profile {
             Some(profile) => format!("Sign in with `aws sso login --profile {profile}`."),
-            None => "Sign in with `aws sso login`, or set AWS_PROFILE in ~/.agent/env.".into(),
+            None => "Sign in with `aws sso login`, or set AWS_PROFILE in ~/.agent/keys/env.".into(),
         });
     }
     match error {
         "provider_http_401" | "provider_http_403" => Some(format!(
-            "The {provider} key was refused; set a new one in ~/.agent/env or run `sonny setup`."
+            "The {provider} key was refused; set a new one in ~/.agent/keys/env or run `sonny setup`."
         )),
         _ if error.starts_with("provider_login") => {
             Some("Sign in again with `sonny agent login chatgpt`.".into())
@@ -1027,7 +1027,7 @@ fn summary(model: &str, file: &Path, brought: &[String], backed: bool) {
     }
     println!("  Settings    {file}");
     for missing in missing_tools() {
-        println!("  {ACCENT}Missing{RESET}     {missing}");
+        println!("  {NEEDS_YOU}Missing{RESET}     {missing}");
     }
     println!("{DIM}Run `sonny setup` to choose again.{RESET}\n");
     *JUST_SET.lock().unwrap_or_else(|e| e.into_inner()) = Some(format!(
@@ -1153,7 +1153,7 @@ pub async fn again(store: &Path, socket: &Path) -> Result<(), String> {
 #[derive(PartialEq)]
 struct Reached {
     provider: Option<String>,
-    /// `~/.agent/env`, whole.
+    /// `~/.agent/keys/env`, whole.
     env: Vec<u8>,
     /// The ChatGPT sign-in, whole.
     login: Vec<u8>,
@@ -1174,7 +1174,7 @@ fn reached() -> Result<Reached, String> {
 /// The first lines of a new `~/.agent/config.toml`, saying what each
 /// setting does; setup writes its own values below them.
 const TEMPLATE: &str = "\
-# Sonny's and the agent daemon's settings. Keys go in ~/.agent/env.
+# Sonny's and the agent daemon's settings. Keys go in ~/.agent/keys/env.
 # `sonny setup` asks for the provider and model again.
 #
 # model = \"PROVIDER/MODEL\"  the model a new agent runs; /model changes a lead's
@@ -1192,6 +1192,9 @@ const TEMPLATE: &str = "\
 # [reviewer]
 # model = \"PROVIDER/MODEL\"  who reviews calls in auto mode; unset, the agent's model
 # effort = \"low\"
+#
+# [sandbox]
+# unreadable = [\"~/.aws\"]  folders no sandboxed command reads; ~/.agent/keys always
 #
 # [sonny.mcp_servers.NAME]   an MCP server; `sonny mcp add` writes one
 ";
@@ -1251,7 +1254,7 @@ fn save_quietly(
     Ok(suggested)
 }
 
-const ACCENT: &str = "\x1b[38;2;255;190;60m";
+const NEEDS_YOU: &str = "\x1b[33m";
 const BOLD: &str = "\x1b[1m";
 const DIM: &str = "\x1b[2m";
 const RESET: &str = "\x1b[0m";
@@ -1266,13 +1269,20 @@ struct Listed {
 }
 
 impl Listed {
+    /// Its name as people say it, as `/model` leads with; its id when the
+    /// provider gave none.
+    fn label(&self) -> &str {
+        self.name.as_deref().unwrap_or(&self.id)
+    }
+
+    /// After the name: its id, when the name is not it, and its context.
     fn detail(&self) -> String {
         let context = self.context.map(|tokens| match tokens {
             t if t >= 1_000_000 && t % 1_000_000 == 0 => format!("{}M context", t / 1_000_000),
             t if t >= 1_000_000 => format!("{:.1}M context", t as f64 / 1_000_000.0),
             t => format!("{}K context", t / 1_000),
         });
-        [self.name.clone(), context]
+        [self.name.as_ref().map(|_| self.id.clone()), context]
             .into_iter()
             .flatten()
             .collect::<Vec<_>>()
@@ -1438,7 +1448,10 @@ mod tests {
         }});
         let (models, refused) = listed(&listing);
         assert_eq!(models[0].id, "anthropic/claude-a");
-        assert_eq!(models[0].detail(), "Claude A · 200K context");
+        // Led by the name, as /model is; the id after it.
+        assert_eq!(models[0].label(), "Claude A");
+        assert_eq!(models[0].detail(), "anthropic/claude-a · 200K context");
+        assert_eq!(models[1].label(), "anthropic/claude-b");
         assert_eq!(models[1].detail(), "");
         assert_eq!(refused, vec![("openai".into(), "provider_http_401".into())]);
         assert!(hint("openai", "provider_http_401").is_some());

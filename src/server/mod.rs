@@ -1103,6 +1103,8 @@ pub struct Configuration {
     /// Folders whose Unix sockets no sandboxed command reaches, made if
     /// missing, private to the daemon's user.
     pub walled: Vec<PathBuf>,
+    /// Paths no sandboxed command or `read` reads, as Codex's `deny_read`.
+    pub unreadable: Vec<PathBuf>,
     /// System folders every Linux sandbox shows from the person's copy.
     pub own_copies: Vec<PathBuf>,
     /// The context windows the person set, by model path.
@@ -2058,6 +2060,20 @@ pub async fn run(config: Configuration) -> Result<()> {
     let protected_paths = (config.protected_paths.iter())
         .map(|path| real_or_named(path))
         .collect::<Result<Vec<_>>>()?;
+    // Made now, as a walled folder is, so each is known by its real path
+    // from the start, a link anywhere above it resolved: the `read` tool
+    // matches the real path of what it opened.
+    let unreadable = (config.unreadable.iter())
+        .map(|folder| -> Result<PathBuf> {
+            use std::os::unix::fs::DirBuilderExt;
+            let folder = std::path::absolute(folder)?;
+            std::fs::DirBuilder::new()
+                .recursive(true)
+                .mode(0o700)
+                .create(&folder)?;
+            Ok(std::fs::canonicalize(&folder)?)
+        })
+        .collect::<Result<Vec<_>>>()?;
     // Made now, so a sandbox started before a socket is in one hides it all
     // the same, and no other user's sockets are in it.
     let walled = (config.walled.iter())
@@ -2098,22 +2114,23 @@ pub async fn run(config: Configuration) -> Result<()> {
         // missing one by the real path of the folder it would be made in.
         protected_paths,
         walled,
+        unreadable,
         owned: config.own_copies.clone(),
         known: agent_client::config::daemons(),
     };
     // Listed with the person's other daemons, so each keeps this one's
     // store and socket out of its sandboxes as this one keeps theirs. One
     // that cannot list itself, as one inside a sandbox cannot write
-    // `~/.agent`, runs all the same: it can do nothing its sandbox doesn't.
+    // `~/.agent`, doesn't start: no other daemon's sandbox would keep it.
     if let (Some(folder), Some(store)) = (&daemon.known, &daemon.store) {
         let known = agent_runtime::sandbox::known::Known {
             store: store.clone(),
             socket: daemon.socket.clone(),
         };
         if let Err(error) = agent_runtime::sandbox::known::record(folder, &known) {
-            eprintln!(
-                "agent: not listed in {}, so other daemons' sandboxes don't keep this one's store and socket: {error}",
-                folder.display()
+            return fail_with(
+                "daemon_not_listed",
+                format!("{}: {error}", folder.display()),
             );
         }
     }
@@ -7290,6 +7307,7 @@ mod tests {
                     name: "wait".into(),
                     call_id: "wait-1".into(),
                     arguments: r#"{"handles":["proc:1"]}"#.into(),
+                    links: Default::default(),
                 };
                 let item = serde_json::to_vec(&json!({"type":"function_call","name":call.name,
                 "call_id":call.call_id,"arguments":call.arguments}))?
@@ -8596,6 +8614,7 @@ mod tests {
                     name: "wait".into(),
                     call_id: "wait-1".into(),
                     arguments: json!({"handles":[parked]}).to_string(),
+                    links: Default::default(),
                 };
                 let item = serde_json::to_vec(&json!({"type":"function_call","name":call.name,
                 "call_id":call.call_id,"arguments":call.arguments}))?
@@ -9818,6 +9837,7 @@ mod tests {
                     name: "wait".into(),
                     call_id: "wait-1".into(),
                     arguments: r#"{"handles":["proc:1"]}"#.into(),
+                    links: Default::default(),
                 };
                 let item = serde_json::to_vec(&json!({"type":"function_call","name":call.name,
                 "call_id":call.call_id,"arguments":call.arguments}))?
@@ -9891,6 +9911,7 @@ mod tests {
                     name: "shell".into(),
                     call_id: "shell-1".into(),
                     arguments: r#"{"command":"true"}"#.into(),
+                    links: Default::default(),
                 };
                 let item = serde_json::to_vec(&json!({"type":"function_call","name":call.name,
                 "call_id":call.call_id,"arguments":call.arguments}))?
@@ -10067,6 +10088,7 @@ mod tests {
                         name: "shell".into(),
                         call_id: "shell-1".into(),
                         arguments: r#"{"command":"true"}"#.into(),
+                        links: Default::default(),
                     };
                     let item = serde_json::to_vec(&json!({"type":"function_call",
                         "name":call.name,"call_id":call.call_id,"arguments":call.arguments}))?
@@ -10126,6 +10148,7 @@ mod tests {
                     name: "shell".into(),
                     call_id: "shell-2".into(),
                     arguments: r#"{"command":"true"}"#.into(),
+                    links: Default::default(),
                 };
                 db.suspend_load(ann, "shell-2", &[call], now_ms(), None, None)
                     .map(|_| ())

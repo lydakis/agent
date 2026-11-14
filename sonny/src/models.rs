@@ -1,5 +1,5 @@
-//! `/model`: the lead's model and effort, picked from what its provider
-//! family lists. A bot changes model only within its family, since its
+//! `/model`: the lead's model, effort and speed, picked from what its
+//! provider family lists. A bot changes model only within its family, since its
 //! history is in that family's shape.
 use serde_json::Value;
 
@@ -12,8 +12,26 @@ pub struct Picker {
     /// No effort first: the provider's default.
     efforts: Vec<Option<String>>,
     effort: usize,
+    /// The speed picked: `standard`, or a faster tier where the picked
+    /// model serves it.
+    pub speed: &'static str,
+    /// Tab moved ← and → from effort to speed.
+    pub on_speed: bool,
     /// Why a provider of the family listed nothing.
     pub refused: Vec<String>,
+}
+
+/// A spot on `/model`'s footer a click acts on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Click {
+    /// Effort's name or value: ← and → move to it.
+    Effort,
+    /// Speed's name or value: ← and → move to it.
+    Speed,
+    /// The `‹` on the value ← and → are on.
+    Less,
+    /// The `›` on the value ← and → are on.
+    More,
 }
 
 impl Picker {
@@ -96,6 +114,8 @@ impl Picker {
             pick,
             efforts,
             effort,
+            speed: "standard",
+            on_speed: false,
             refused,
         }
     }
@@ -152,6 +172,38 @@ impl Picker {
 
     pub fn more(&mut self) {
         self.effort = (self.effort + 1).min(self.efforts.len() - 1);
+    }
+
+    /// Steps the speed by `by` among `speeds`, those the picked model
+    /// serves.
+    pub fn step_speed(&mut self, speeds: &[&'static str], by: isize) {
+        let at = speeds.iter().position(|s| *s == self.speed).unwrap_or(0);
+        let at = (at as isize + by).clamp(0, speeds.len() as isize - 1);
+        self.speed = speeds[at as usize];
+    }
+
+    /// Keeps the speed to `speeds`, those the picked model serves: a speed
+    /// it lacks is standard, and with standard alone ← and → are effort's.
+    pub fn fit(&mut self, speeds: &[&'static str]) {
+        if !speeds.contains(&self.speed) {
+            self.speed = "standard";
+        }
+        if speeds.len() < 2 {
+            self.on_speed = false;
+        }
+    }
+
+    /// What a click on the footer's `click` does: moves ← and → to the
+    /// value, or steps the one they are on.
+    pub fn click(&mut self, click: Click, speeds: &[&'static str]) {
+        match click {
+            Click::Effort => self.on_speed = false,
+            Click::Speed => self.on_speed = speeds.len() > 1,
+            Click::Less if self.on_speed => self.step_speed(speeds, -1),
+            Click::More if self.on_speed => self.step_speed(speeds, 1),
+            Click::Less => self.less(),
+            Click::More => self.more(),
+        }
     }
 
     pub fn effort(&self) -> Option<&str> {

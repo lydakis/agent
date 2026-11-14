@@ -232,6 +232,23 @@ impl Patch {
         })
     }
 
+    /// Every path the patch writes, as written in it: each added and
+    /// updated file, and the destination of each move.
+    pub fn written(&self) -> impl Iterator<Item = &str> {
+        self.changes.iter().filter_map(|change| match change {
+            Change::Add { path, .. }
+            | Change::Update {
+                path,
+                move_to: None,
+                ..
+            } => Some(path.as_str()),
+            Change::Update {
+                move_to: Some(to), ..
+            } => Some(to.as_str()),
+            Change::Delete { .. } => None,
+        })
+    }
+
     /// Every path the patch writes or removes, as written in it: each
     /// added, updated and deleted file, and both ends of a move. Nothing
     /// is touched before a caller has seen them all.
@@ -248,12 +265,16 @@ impl Patch {
     /// Apply the patch under `workspace`: [`stage`](Self::stage), then
     /// [`commit`](Staged::commit).
     pub async fn apply(&self, workspace: &Path, sandbox: Option<Arc<Policy>>) -> Result<String> {
-        self.stage(workspace).await?.commit(sandbox).await
+        let hidden = sandbox
+            .as_ref()
+            .map_or(&[][..], |policy| &policy.unreadable);
+        self.stage(workspace, hidden).await?.commit(sandbox).await
     }
 
     /// Read and check every file the patch changes, and compute what each
-    /// becomes, writing nothing.
-    pub async fn stage(&self, workspace: &Path) -> Result<Staged> {
+    /// becomes, writing nothing; a file opened at or under `hidden` is
+    /// refused, as the `read` tool refuses it.
+    pub async fn stage(&self, workspace: &Path, hidden: &[std::path::PathBuf]) -> Result<Staged> {
         let mut writes = Vec::new();
         let mut staged = 0;
         let mut summary = String::from("Success. Updated the following files:\n");
@@ -282,7 +303,7 @@ impl Patch {
                     chunks,
                 } => {
                     let source = workspace.join(path);
-                    let bytes = files::read_bounded(&source).await?;
+                    let bytes = files::read_bounded(&source, hidden).await?;
                     let text = String::from_utf8(bytes)
                         .map_err(|_| Error::with("file_not_utf8", path.clone()))?;
                     // Matching can take a while on a long file: off the

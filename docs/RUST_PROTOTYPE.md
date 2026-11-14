@@ -3273,6 +3273,25 @@ every sandbox and, when missing, from being made there. The CLI passes
 writable folder that is a symlink refuses the call with
 `sandbox_unavailable`.
 
+Nor read the keys the daemon was started with, which a command that read
+them could send anywhere the network reaches: `serve --unreadable FOLDER`,
+which repeats, keeps a folder, made private (mode 700) at start if
+missing and known by its real path, and what is in it from
+every sandboxed command's reads, writes, links and renames, as Codex's
+`deny_read` does, and has the `read` tool refuse it for a sandboxed bot
+with `read_denied`, since the daemon answers that tool outside the
+sandbox. Seatbelt denies the folder and what is under it after every
+allow; bubblewrap shows it as an empty folder no one may open (`--perms
+000`), over every other mount, so a read fails rather than reading
+nothing, and binds each folder between a writable root and it on itself,
+so no command renames one and takes the folder out from under its mask.
+One inside another is closed with it. A folder, not a file: a file saved whole is renamed over, which
+takes a bubblewrap mount on it down for the commands already running, and
+is staged beside itself first. One missing as a command starts is made
+first, private (mode 700), so its mask has a place to go and none made
+while the command runs is open to it. The CLI passes `~/.agent/keys`,
+which holds `env`, the keys it gives every daemon it starts.
+
 Nor reach a program a client runs for bots outside the sandbox, which does
 what it is asked as the person: `serve --wall FOLDER`, which repeats, keeps
 every sandboxed command from the Unix sockets in FOLDER, the network on or

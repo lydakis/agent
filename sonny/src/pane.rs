@@ -98,6 +98,9 @@ pub struct Pane {
     margin: bool,
     /// The margin is under it, which its title's arrow goes back to.
     pub over: bool,
+    /// The view in it shows a page of its own, which its title's arrow
+    /// goes back from first.
+    pub page: bool,
     /// It has the window to itself, the conversation a key away, as a
     /// window too narrow for both shows one at a time.
     pub alone: bool,
@@ -218,6 +221,7 @@ impl Pane {
             marks: Vec::new(),
             margin: false,
             over: false,
+            page: false,
             alone: false,
             switch_at: None,
             focused: false,
@@ -321,7 +325,7 @@ impl Pane {
     /// Whether back goes somewhere: to what was shown before, or to the
     /// margin under it.
     pub fn goes_back(&self) -> bool {
-        self.over || !self.back.is_empty()
+        self.over || self.page || !self.back.is_empty()
     }
 
     /// Whether the title shows ‹ and ›: while either goes somewhere.
@@ -350,6 +354,7 @@ impl Pane {
             marks: Vec::new(),
             margin: false,
             over: false,
+            page: false,
             alone: false,
             switch_at: None,
             focused: false,
@@ -384,6 +389,7 @@ impl Pane {
             marks: Vec::new(),
             margin: false,
             over: false,
+            page: false,
             alone: false,
             switch_at: None,
             focused: false,
@@ -611,9 +617,11 @@ impl Pane {
         // what is open the first step back, while either goes somewhere.
         let mut head = vec![Span::raw(" ")];
         if self.arrows() {
-            let arrow = |text, there: bool| match there {
-                true => Span::raw(text),
-                false => Span::raw(text).dark_gray(),
+            // One that goes nowhere is faint, as structure that is not text.
+            let arrow = |text, there: bool| match (there, crate::look::faint()) {
+                (true, _) => Span::raw(text),
+                (false, Some(faint)) => Span::raw(text).fg(faint),
+                (false, None) => Span::raw(text).dim(),
             };
             head.push(arrow("‹", self.goes_back()));
             head.push(Span::raw(" "));
@@ -782,19 +790,18 @@ fn hint_at(keys: &str, said: &str) -> Option<(u16, u16)> {
 
 /// `keys`, padded as the title holds them, in at most `room` columns. "← back"
 /// goes first, since the ‹ beside the name already says it; then the pairs
-/// before the last, from the one before it, so esc, which every view names
-/// last, stays while anything does.
+/// go as every key line's do ([`crate::hint::fit`]): from the right, `esc`
+/// staying, then `enter`.
 fn fit_keys(keys: &str, room: usize) -> String {
-    let mut pairs: Vec<&str> = keys.trim().split(" · ").collect();
-    let said = |pairs: &[&str]| format!("  {} ", pairs.join(" · "));
-    while said(&pairs).width() > room && pairs.len() > 1 {
-        let at = match pairs.iter().position(|pair| *pair == "← back") {
-            Some(at) if at + 1 < pairs.len() => at,
-            _ => pairs.len() - 2,
-        };
-        pairs.remove(at);
+    let said = |keys: &str| format!("  {keys} ");
+    let mut keys = keys.trim().to_owned();
+    if said(&keys).width() > room && keys.contains(" · ") {
+        keys = (keys.split(" · "))
+            .filter(|pair| *pair != "← back")
+            .collect::<Vec<_>>()
+            .join(" · ");
     }
-    said(&pairs)
+    said(&crate::hint::fit(&keys, room.saturating_sub(3)))
 }
 
 /// The path and line a `file://` address names, its `%XX` escapes read.

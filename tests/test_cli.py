@@ -230,6 +230,34 @@ class SocketAndCliTests(ModelFixture):
             statuses = db.execute('SELECT status FROM turns').fetchall()
         self.assertEqual(statuses, [('paced',)] * 4)
 
+    def test_turns_a_stop_cut_mid_command_all_go_on_at_the_next_start(self):
+        # An upgrade replaced the daemon while turns ran commands: each is
+        # parked by the stop, and the next start continues every one of
+        # them at once, its cut command answered as cut.
+        command = lambda line: 'calls:' + json.dumps([['shell', {'command': line, 'timeout_ms': 120000}]])
+        sleeping = lambda: subprocess.run(['pgrep', '-f', '^sleep 68$'], capture_output=True, text=True).stdout.split()
+        bots = [f'Cut{n}' for n in range(4)]
+        for bot in bots:
+            self.agent('run', *self.common, '--new', '--bot', bot, '--detach', command('sleep 68'))
+        for _ in bots:
+            self.model.requests.get(timeout=5)
+        deadline = time.monotonic() + 10
+        while len(sleeping()) != len(bots):
+            self.assertLess(time.monotonic() - deadline, 0, 'the commands did not start')
+            time.sleep(.05)
+        # Past the time a call waits live before its turn parks on it.
+        time.sleep(3)
+        replaced = json.loads(self.agent('start', '--replace', *self.common[:4]).stdout)
+        self.assertEqual(replaced['event'], 'ready')
+        deadline = time.monotonic() + 20
+        while True:
+            with closing(sqlite3.connect(self.store)) as db:
+                statuses = db.execute('SELECT status, waiting FROM turns ORDER BY id').fetchall()
+            if all(status == 'completed' for status, _ in statuses):
+                break
+            self.assertLess(time.monotonic() - deadline, 0, statuses)
+            time.sleep(.1)
+
     def test_shutdown_grace_lets_the_running_turn_finish(self):
         self.model.release_headers = threading.Event()
         self.model.all_streaming = self.model.release_headers
@@ -290,7 +318,7 @@ class SocketAndCliTests(ModelFixture):
         self.assertIn('takes no positional arguments', extra.stderr)
 
     def test_start_replace_switches_the_running_daemon_to_this_agent(self):
-        # `sonny update` switches to a new build that kept the protocol:
+        # `sonny upgrade` switches to a new build that kept the protocol:
         # `start --replace` stops the running daemon at once and starts this
         # agent's own on the same store, which keeps every bot. From inside a
         # bot's turn it keeps the daemon and says so; with none running, it
@@ -1899,8 +1927,8 @@ class CliTests(ModelFixture):
         # reach it however it is started: their providers count, an empty
         # value unsets one, and names starting AGENT_ are passed over.
         home = self.path/'home'
-        (home/'.agent').mkdir(parents=True)
-        env_file = home/'.agent'/'env'
+        (home/'.agent'/'keys').mkdir(parents=True)
+        env_file = home/'.agent'/'keys'/'env'
         env_file.write_text('OPENAI_API_KEY=from-file\nEXTRA_SETTING=from-file\nUNSET_ME=\n'
                             'ANTHROPIC_API_KEY=\n'
                             'export AGENT_SOCKET=/nowhere\nagent_store=/nowhere\n')
@@ -1928,6 +1956,43 @@ class CliTests(ModelFixture):
         listed = subprocess.run([str(self.binary), 'ls', '--store', str(store)], env=env,
                                 capture_output=True, text=True, timeout=10, cwd=self.path)
         self.assertEqual(listed.returncode, 0, listed.stderr)
+
+    @unittest.skipUnless(shutil.which('bwrap') or sys.platform == 'darwin', 'sandboxes need bubblewrap')
+    def test_the_folders_the_config_lists_as_unreadable_are_closed_to_sandboxed_commands(self):
+        # None by default: a sandboxed command reads what the person keeps
+        # at home, as an agent using their session cookies does.
+        home = self.path/'home'
+        jar = home/'cookies'/'jar'
+        jar.parent.mkdir(parents=True)
+        jar.write_text('SESSION=secret\n')
+        env = {**clean_env(), 'HOME': str(home)}
+        run = lambda *args: subprocess.run([str(self.binary), *args], env=env, capture_output=True,
+                                           text=True, timeout=20, cwd=self.path)
+        read = ['sandbox', '--', '/bin/cat', str(jar)]
+        self.assertEqual(run(*read).stdout, 'SESSION=secret\n')
+        # Listed, it is closed, and one not there yet is made, private.
+        config = home/'.agent'/'config.toml'
+        config.parent.mkdir(exist_ok=True)
+        config.write_text('[sandbox]\nunreadable = ["~/cookies", "~/later/keys"]\n')
+        hidden = run(*read)
+        self.assertNotEqual(hidden.returncode, 0)
+        self.assertNotIn('SESSION', hidden.stdout)
+        self.assertEqual((home/'later'/'keys').stat().st_mode & 0o777, 0o700)
+        # A daemon the CLI starts hides them too, beside the keys.
+        store = self.path/'listed.db'
+        started = run('start', '--store', str(store), '--provider', 'openai=responses,http://127.0.0.1:9/v1')
+        self.addCleanup(run, 'shutdown', '--store', str(store))
+        self.assertEqual(started.returncode, 0, started.stderr)
+        cmdline = Path(f'/proc/{json.loads(started.stdout)["pid"]}/cmdline')
+        if cmdline.exists():
+            args = cmdline.read_text().split('\0')
+            self.assertEqual([args[i + 1] for i, arg in enumerate(args) if arg == '--unreadable'],
+                             [str(home/'.agent'/'keys'), str(home/'cookies'), str(home/'later'/'keys')])
+        # A folder named from neither / nor ~/ is refused by name.
+        config.write_text('[sandbox]\nunreadable = ["cookies"]\n')
+        refused = run(*read)
+        self.assertEqual(refused.returncode, 125, refused.stderr)
+        self.assertIn('sandbox.unreadable', refused.stderr)
 
     def test_explicit_store_overrides_inherited_socket(self):
         client = SocketClient(self.binary, self.path/'first.db', self.url, 'echo')

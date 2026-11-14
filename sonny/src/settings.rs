@@ -8,12 +8,9 @@ pub struct Settings {
     /// Whether finished and waiting work rings; off by default.
     /// Notifications show either way.
     pub chime: bool,
-    /// Whether the agent's steps between what is said are drawn, or only
-    /// the person's words and the agent's (the default).
-    pub steps: bool,
-    /// Whether every tool call is drawn, or only the bot's words and the
-    /// calls that move the work on (the clean view, the default).
-    pub verbose: bool,
+    /// What the conversation shows: words (the default), steps, or every
+    /// tool call.
+    pub view: agent_client::config::View,
     /// The widest the conversation is written; 0 for the window's whole
     /// width.
     pub text_width: u64,
@@ -26,7 +23,7 @@ pub struct Settings {
     /// The most lines a margin note runs to.
     pub margin_note_lines: u64,
     /// Experimental: whether a window that follows other leads opens with
-    /// project colors on; `/colors` toggles them there.
+    /// project colors on.
     pub project_colors: bool,
     /// The color each project pins, by project.
     pub project_color: std::collections::BTreeMap<String, String>,
@@ -62,8 +59,7 @@ impl Settings {
     fn from(sonny: agent_client::config::Sonny) -> Self {
         Settings {
             chime: sonny.chime,
-            steps: sonny.steps,
-            verbose: sonny.verbose,
+            view: sonny.view,
             text_width: sonny.text_width,
             margin_opens: sonny.margin_opens,
             agent_opens: sonny.agent_opens,
@@ -85,27 +81,6 @@ impl Settings {
             sources: (sonny.sources.into_iter().map(|source| source.name)).collect(),
         }
     }
-
-    /// The chime and the view into the config, where one changed: its
-    /// default as no line at all.
-    pub fn save(&self) -> Result<(), String> {
-        let was = Self::load();
-        let defaults = Settings::default();
-        let mut pairs = Vec::new();
-        for (key, now, then, default) in [
-            ("sonny.chime", self.chime, was.chime, defaults.chime),
-            ("sonny.verbose", self.verbose, was.verbose, defaults.verbose),
-        ] {
-            if now != then {
-                pairs.push((key, (now != default).then(|| now.into())));
-            }
-        }
-        if pairs.is_empty() {
-            return Ok(());
-        }
-        let config = agent_client::config::path().ok_or("HOME is not set")?;
-        agent_client::config::write(&config, &pairs)
-    }
 }
 
 #[cfg(test)]
@@ -119,10 +94,11 @@ mod tests {
         assert!(!Settings::default().chime);
         let loud = agent_client::config::Sonny {
             chime: true,
-            verbose: true,
+            view: agent_client::config::View::Verbose,
             ..sonny()
         };
         let settings = Settings::from(loud);
-        assert!(settings.chime && settings.verbose);
+        assert!(settings.chime);
+        assert_eq!(settings.view, agent_client::config::View::Verbose);
     }
 }

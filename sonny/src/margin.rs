@@ -134,7 +134,7 @@ pub fn tool() -> Value {
                 "markdown": {"type": "string", "maxLength": NOTE_BYTES,
                     "description": "The note, as Markdown."},
                 "live": {"type": "boolean",
-                    "description": "true: markdown has Jinja blanks Sonny keeps filled: source('name').latest/.topics, file('path'), tasks(), task('name'), now(), |ago, |time, |fromjson."},
+                    "description": format!("true: markdown has Jinja blanks Sonny keeps filled. {}", crate::template::BLANKS)},
                 "file": {"type": "string", "minLength": 1,
                     "description": "Or a file to show, absolute or from your folder."},
                 "from": {"type": "string", "pattern": "^[A-Za-z0-9._-]{1,128}/[a-z0-9][a-z0-9-]{0,39}$",
@@ -302,9 +302,9 @@ fn shown_as_template(arguments: &Value) -> bool {
 
 /// What a call posting live `template` is answered, filled from `data` as the
 /// tool host has it: refused when it does not read as a template, names a
-/// source the person has not set up, or fills to more lines than a note
-/// holds; else what it shows now, or why it does not fill yet, as a blank
-/// that names a task the window fills.
+/// source the person has not set up, does not fill now, or fills to more
+/// lines than a note holds; else what it shows now, or why it does not
+/// fill yet, as a blank that names a task the window fills.
 fn filled(template: &str, data: &crate::template::Data) -> Result<String, (&'static str, String)> {
     // Whole or not at all: a template cut short would read as another.
     if template.len() > NOTE_BYTES {
@@ -1452,7 +1452,7 @@ impl Margin {
         match self.reads.get_mut(path) {
             Some(read) if modified.is_some() && read.modified == modified => read.looked = now,
             _ => {
-                let text = read(path);
+                let text = read(path, &[]);
                 let read = Read {
                     modified,
                     looked: now,
@@ -1485,8 +1485,9 @@ fn leads() -> (Line<'static>, Line<'static>) {
     (Line::from(BODY), Line::from(BODY))
 }
 
-/// The file at `path`, as much of it as a note shows.
-pub fn read(path: &Path) -> Result<String, String> {
+/// The file at `path`, as much of it as a note shows, refused when what
+/// was opened is in one of `hidden` ([`agent_client::hidden::holds`]).
+pub fn read(path: &Path, hidden: &[PathBuf]) -> Result<String, String> {
     use std::io::Read;
     let mut bytes = Vec::new();
     // A pipe or a device could hold the window up: only files are read.
@@ -1494,8 +1495,15 @@ pub fn read(path: &Path) -> Result<String, String> {
         Ok(meta) if !meta.is_file() => return Err(format!("{}: not a file", path.display())),
         _ => {}
     }
-    std::fs::File::open(path)
-        .and_then(|f| f.take(NOTE_BYTES as u64 * 4).read_to_end(&mut bytes))
+    let file = std::fs::File::open(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    if agent_client::hidden::holds(hidden, &file) {
+        return Err(format!(
+            "read_denied: {} is kept unreadable from agents",
+            path.display()
+        ));
+    }
+    file.take(NOTE_BYTES as u64 * 4)
+        .read_to_end(&mut bytes)
         .map_err(|e| format!("{}: {e}", path.display()))?;
     match String::from_utf8(bytes) {
         Ok(text) if !text.contains('\0') => Ok(text),
@@ -1519,20 +1527,26 @@ fn cut(text: &str, most: usize) -> &str {
 }
 
 /// A note's first row: its title, `live` while the running turn changes
-/// it, and its buttons on the right; and where those buttons are.
+/// it, the agent it is about as a blue name that opens it, and its buttons
+/// on the right; and where those buttons are.
 fn head(note: &Note, width: usize, live: bool) -> (Line<'static>, crate::screen::Buttons) {
-    let right = match note.opens {
-        Some(_) => "↗  ↩  ↑  ×",
-        None => "↩  ↑  ×",
-    };
+    let right = "↩  ↑  ×";
     let tail = match live {
         true => " live",
         false => "",
     };
-    let room = width.saturating_sub(right.width() + tail.width() + 4);
+    // The agent by its name in the project, as its row in `/status` reads,
+    // cut to at most half the row the buttons leave, so they always fit.
+    let most = width.saturating_sub(right.width() + tail.width() + 6) / 2;
+    let agent = (note.opens.as_deref())
+        .map(|bot| bot.split_once('.').map_or(bot, |(_, name)| name))
+        .map(|name| crate::transcript::cut(name, most))
+        .filter(|name| name.width() > 1);
+    let named = agent.as_ref().map_or(0, |name| name.width() + 2);
+    let room = width.saturating_sub(named + right.width() + tail.width() + 4);
     let title = crate::transcript::cut(&note.title, room);
     let used = 3 + title.width() + tail.width();
-    let gap = width.saturating_sub(used + right.width()).max(1);
+    let gap = width.saturating_sub(used + named + right.width()).max(1);
     let opens = (used + gap) as u16;
     let mut spans = vec![
         Span::raw(" ✎ ").dim(),
@@ -1543,14 +1557,15 @@ fn head(note: &Note, width: usize, live: bool) -> (Line<'static>, crate::screen:
     let id = &note.id;
     let mut buttons = Vec::new();
     // The agent it is about opens beside the conversation, as a click on
-    // that agent's row does.
-    if let Some(agent) = &note.opens {
-        spans.extend([Span::raw("↗").fg(Color::Cyan), Span::raw("  ")]);
-        buttons.push((opens, opens + 1, format!("{BUTTON}task/{agent}")));
+    // that agent's row or any blue name does.
+    if let (Some(name), Some(bot)) = (agent, &note.opens) {
+        let end = opens + name.width() as u16;
+        spans.extend([Span::raw(name).fg(Color::Blue), Span::raw("  ")]);
+        buttons.push((opens, end, format!("{BUTTON}task/{bot}")));
     }
     // ↩ answers it, quoted where the person writes, as a message's own
     // mark does.
-    let reply = opens + 3 * u16::from(note.opens.is_some());
+    let reply = opens + named as u16;
     let up = reply + 3;
     spans.extend([
         Span::raw(crate::screen::REPLY).dim(),
@@ -1816,7 +1831,7 @@ mod tests {
         later(&mut margin);
         let rows = drawn(&mut margin, &dir);
         assert!(
-            rows.contains("PR is open") && rows.contains("⟨line 1: not JSON"),
+            rows.contains("PR is open") && rows.contains("⟨line 1, `fromjson`: not JSON"),
             "{rows}"
         );
         std::fs::remove_dir_all(&dir).unwrap();
@@ -2500,12 +2515,29 @@ mod tests {
             (lines[1].to_string(), buttons.unwrap())
         };
         let (head, opened) = buttons(&mut margin);
-        assert!(head.ends_with("↗  ↩  ↑  ×"), "{head}");
+        // The agent's name, blue, opens it: `↗` is the main view's alone.
+        assert!(head.ends_with("wire  ↩  ↑  ×"), "{head}");
+        assert!(!head.contains('↗'), "{head}");
         let cols: Vec<char> = head.chars().collect();
-        assert_eq!(cols[opened[0].0 as usize], '↗');
+        assert_eq!(
+            cols[opened[0].0 as usize..opened[0].1 as usize],
+            ['w', 'i', 'r', 'e']
+        );
         assert_eq!(opened[0].2, format!("{BUTTON}task/shop.wire"));
         assert_eq!(cols[opened[2].0 as usize], '↑');
         assert_eq!(cols[opened[3].0 as usize], '×');
+        // A long name is cut so the buttons still fit, each over its own.
+        let long = Note {
+            opens: Some("shop.a-very-long-agent-name-indeed".into()),
+            ..margin.notes()[0].clone()
+        };
+        let (line, cut) = super::head(&long, 30, false);
+        let row = line.to_string();
+        assert!(row.ends_with("↩  ↑  ×") && row.width() <= 30, "{row}");
+        let cols: Vec<char> = row.chars().collect();
+        assert_eq!(cols[cut[2].0 as usize], '↑');
+        assert_eq!(cols[cut[3].0 as usize], '×');
+        assert_eq!(cols[cut[4].0 as usize], '↩');
         // Kept as it was when unsaid, and kept across a read again.
         margin.apply(
             "c2",
@@ -2586,7 +2618,7 @@ mod tests {
         let text: Vec<String> = lines.iter().map(|l| l.to_string()).collect();
         assert!(text.iter().any(|l| l.contains("```html")), "{text:?}");
         assert!(text.iter().any(|l| l.contains("<b>x</b>")), "{text:?}");
-        assert!(read(&dir).unwrap_err().ends_with("not a file"));
+        assert!(read(&dir, &[]).unwrap_err().ends_with("not a file"));
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

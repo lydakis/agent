@@ -579,6 +579,18 @@ class DaemonTests(ModelFixture):
         # The folder the daemon was given keeps the mode its maker gave it.
         self.assertEqual(mode(self.path), given)
 
+    def test_a_daemon_that_cannot_list_itself_refuses_to_start(self):
+        # As one started inside a sandbox, which can't write ~/.agent: no
+        # other daemon's sandbox would keep its store and socket.
+        home = self.path/'home'
+        (home/'.agent').mkdir(parents=True)
+        (home/'.agent/run').write_text('not a folder')
+        result = subprocess.run([str(self.binary), *serve_args(self.path/'unlisted.db', self.url)],
+                                env={**clean_env(), 'HOME': str(home)}, capture_output=True, text=True, timeout=10)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('daemon_not_listed', result.stderr)
+        self.assertIn(str(home/'.agent/run/daemons'), result.stderr)
+
     def test_socket_collision_preserves_live_owner_and_regular_files(self):
         client = SocketClient(self.binary, self.path/'first.db', self.url, 'echo')
         self.addCleanup(client.close)

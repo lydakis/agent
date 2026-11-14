@@ -3,8 +3,9 @@
 //! as chat harnesses stamp each message they pass a model, every agent
 //! Sonny makes has the daemon end each message's line with the local time
 //! it was sent (`trailer`), after the words, so what the model read before
-//! stays cached; Sonny draws the words without it. The window's own times
-//! are read here too.
+//! stays cached; Sonny draws the words without it. Older Sonnys put the
+//! time in the words themselves, and the window draws those without it
+//! too. The window's own times are read here as well.
 
 pub use agent_client::clock::when;
 use agent_client::clock::{DAYS, MONTHS, local};
@@ -16,6 +17,60 @@ pub fn trailer(config: &agent_client::config::Config) -> Vec<String> {
         Some(trailer) => trailer.clone(),
         None => vec!["sender".into(), "time".into()],
     }
+}
+
+/// The line older Sonnys put after the words they sent, stored with them:
+/// `[Sent Sat 31 Oct 2026 16:12, UTC-04:00.]`.
+const OPEN: &str = "\n\n[Sent ";
+const CLOSE: &str = ".]";
+
+/// A stored message's words without the `[Sent …]` line an older Sonny
+/// put after them, so weeks of history draw as they did. Drawing only:
+/// the stored words, and what the model reads, stay as they are. Deleted
+/// in 0.12.0 (`upgrade::MIGRATIONS`, "sent-stamp"); older history then
+/// shows the line again.
+pub fn unstamped(text: &str) -> &str {
+    let Some(at) = text.rfind(OPEN) else {
+        return text;
+    };
+    let line = &text[at + OPEN.len()..];
+    let read = |line: &str| match line.split_once(". ") {
+        Some((time, clause)) => names_a_time(time) && was_away_or_back(&format!("{clause}.")),
+        None => names_a_time(line),
+    };
+    match line.strip_suffix(CLOSE).is_some_and(read) {
+        true => &text[..at],
+        false => text,
+    }
+}
+
+/// Whether `text` is a sentence Sonny once put after the time while quiet
+/// mode was (gone in 0.9.1).
+fn was_away_or_back(text: &str) -> bool {
+    (text.starts_with("The person is away since ")
+        || text.starts_with("The person is back; they were away since "))
+        && text.ends_with('.')
+        && !text.contains('\n')
+}
+
+/// Whether `line` is what `when` writes: `Sat 31 Oct 2026 16:12, UTC-04:00`.
+fn names_a_time(line: &str) -> bool {
+    let Some((at, zone)) = line.split_once(", UTC") else {
+        return false;
+    };
+    let words: Vec<&str> = at.split(' ').collect();
+    let digits = |s: &str, n: usize| s.len() == n && s.bytes().all(|b| b.is_ascii_digit());
+    let zone = zone.as_bytes();
+    matches!(words[..], [day, date, month, year, time]
+        if DAYS.contains(&day)
+            && (digits(date, 1) || digits(date, 2))
+            && MONTHS.contains(&month)
+            && digits(year, 4)
+            && time.split_once(':').is_some_and(|(h, m)| digits(h, 2) && digits(m, 2)))
+        && zone.len() == 6
+        && matches!(zone[0], b'+' | b'-')
+        && zone[3] == b':'
+        && [1, 2, 4, 5].iter().all(|&i| zone[i].is_ascii_digit())
 }
 
 fn epoch_now() -> i64 {
@@ -98,6 +153,33 @@ fn locale_time_format() -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_stamp_an_older_sonny_stored_is_drawn_as_the_words() {
+        let sent = format!("fix the build{OPEN}{}{CLOSE}", when(1_793_473_920));
+        assert_eq!(unstamped(&sent), "fix the build");
+        // Only the last one goes.
+        let twice = format!("{sent}{OPEN}{}{CLOSE}", when(0));
+        assert_eq!(unstamped(&twice), sent);
+        let away = "look at the build\n\n[Sent Sat 7 Nov 2026 16:12, UTC-04:00. The person is away since Fri 6 Nov 19:40; their hours are Mon-Fri 09:00-19:00.]";
+        assert_eq!(unstamped(away), "look at the build");
+        let back = "morning\n\n[Sent Sat 7 Nov 2026 16:12, UTC-04:00. The person is back; they were away since Fri 6 Nov 19:40.]";
+        assert_eq!(unstamped(back), "morning");
+    }
+
+    #[test]
+    fn words_that_only_look_like_a_stamp_stay() {
+        for text in [
+            "plain",
+            "see\n\n[Sent by the person.]",
+            "see\n\n[Sent Sat 31 Oct 2026 16:12, UTC-04:00. Then I left.]",
+            "see\n\n[Sent Sat 31 Oct 2026 16:12, UTC-04:00.] and more",
+            "see\n\n[Sent Sat 31 Oct 2026 16:12.]",
+            "see\n\n[Sent Someday 31 Oct 2026 16:12, UTC-04:00.]",
+        ] {
+            assert_eq!(unstamped(text), text);
+        }
+    }
 
     fn at(year: i32, month: i32, day: i32, weekday: i32, hour: i32, minute: i32) -> libc::tm {
         // SAFETY: a zeroed tm is a valid tm; the fields read are set.

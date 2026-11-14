@@ -335,7 +335,29 @@ AUTOMATION = [
      'plant': 'A4 the lead removes it'},
 ]
 
-DAYS = {'full': STEPS, 'small': SMALL, 'burst': BURST, 'automation': AUTOMATION}
+# Something that changes against something that doesn't: whether the lead
+# shows the first with Sonny's `live` tool, a block the window keeps
+# filled, and answers the second in words.
+LIVE = [
+    {'say': "Subscribe to my ci source so you hear about builds.",
+     'events': [
+         ('ci', 'ci', 'build #4101 passed on main in 4m12s'),
+         ('ci', 'ci', 'build #4102 failed on feature/cart in 3m40s: tests/test_session.py::test_expired'),
+     ]},
+    {'say': "What time is it?",
+     'plant': 'V1 the time, which keeps changing: shown with the live tool (calls count)'},
+    {'say': "What's the latest CI build? Keep it in front of me while we work, I want to see when it changes.",
+     'plant': "V2 a source's latest: shown with the live tool, filled from source('ci') (calls count)",
+     'events': [('ci', 'ci', 'build #4103 passed on main in 5m02s')]},
+    {'say': "How long is a session meant to last, going by the code? Just the answer.",
+     'plant': 'N1 a fact that stays put: answered in words, no live block (calls count)'},
+    {'say': "Put the session timeout from shop/session.py up here and keep it current while I edit the file.",
+     'plant': 'V3 a file that will change: shown with the live tool, filled from file() (calls count)'},
+    {'say': "What's 17 times 23?",
+     'plant': 'N2 arithmetic: answered in words, no live block (calls count)'},
+]
+
+DAYS = {'full': STEPS, 'small': SMALL, 'burst': BURST, 'automation': AUTOMATION, 'live': LIVE}
 DAY, DAY_NAME = STEPS, ''  # the day a run plays, set by --day
 
 SOURCE = r'''import json, sys

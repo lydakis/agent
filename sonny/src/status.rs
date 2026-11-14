@@ -168,24 +168,55 @@ pub fn pull_requests(text: &str) -> Vec<String> {
     found
 }
 
-/// The mark an agent at rest reads with: open, as it may be given work,
-/// where one marked done reads `✓`.
-pub const IDLE_MARK: &str = "○";
+/// A turn the daemon's stop parked, which its next start goes on with.
+pub const PARKED: &str = "parked by a restart";
+/// A turn the pull cord parked until work resumes.
+pub const PAUSED: &str = "paused";
+/// How long a turn's wait for its pool goes unsaid: past it, the state
+/// says when it is tried again.
+const PACED_SAID_MS: u64 = 5 * 60_000;
 
-/// The mark and colour a state reads with.
-pub fn mark(state: &str) -> Span<'static> {
-    match state {
-        "working" => Span::raw("● ").fg(Color::Cyan),
-        "needs you" => Span::raw("? ").fg(Color::Yellow).bold(),
-        crate::started::IDLE | "completed" => Span::raw("○ ").fg(Color::Green),
-        crate::started::DONE => Span::raw("✓ ").dim(),
-        crate::started::QUIET => Span::raw("✓ ").dim(),
-        "failed" => Span::raw("✗ ").fg(Color::Red),
-        s if s.starts_with("waiting") || s == "queued" || s == "rate limited" => {
-            Span::raw("◌ ").dim()
-        }
-        _ => Span::raw("· ").dim(),
+/// A paced turn's state, as what it waits on says (`waiting_on`), at
+/// `now` in milliseconds: parked by a stop or the pause, or rate limited,
+/// with the time it is tried again once that is more than five minutes off.
+pub fn paced(on: &serde_json::Value, now: u64) -> String {
+    if on["stopped"] == true {
+        return PARKED.into();
     }
+    if on["paused"] == true {
+        return PAUSED.into();
+    }
+    match on["resume_at_ms"].as_u64() {
+        Some(at) if at > now + PACED_SAID_MS => format!(
+            "rate limited until {}",
+            crate::asks::clock((at / 1000) as i64, (now / 1000) as i64)
+        ),
+        _ => "rate limited".into(),
+    }
+}
+
+/// A state's mark, alone, in its hue: the one table every surface that
+/// shows a state draws from. Muted unless it needs you, failed or works.
+pub fn sign(state: &str) -> Span<'static> {
+    match state {
+        "needs you" => Span::raw("?").fg(Color::Yellow).bold(),
+        _ if state.starts_with(HELD) => Span::raw("?").fg(Color::Yellow).bold(),
+        "failed" => Span::raw("✗").fg(Color::Red),
+        "working" => Span::raw("●").fg(Color::Cyan),
+        _ if state.starts_with("waiting") => Span::raw("◌").dim(),
+        _ if state.starts_with("rate limited") => Span::raw("◌").dim(),
+        "queued" | "starting" | PARKED | PAUSED => Span::raw("◌").dim(),
+        crate::started::IDLE | crate::started::QUIET | "completed" => Span::raw("○").dim(),
+        crate::started::INTERRUPTED | "removed" => Span::raw("■").dim(),
+        crate::started::DONE => Span::raw("✓").dim(),
+        _ => Span::raw("·").dim(),
+    }
+}
+
+/// A state's mark and the space after it, as rows lead with it.
+pub fn mark(state: &str) -> Span<'static> {
+    let sign = sign(state);
+    Span::styled(format!("{} ", sign.content), sign.style)
 }
 
 /// A reply's first line of prose: fenced blocks and headings skipped,
@@ -565,7 +596,7 @@ pub fn held_cause(code: &str, detail: Option<&str>) -> (String, String) {
         ),
         "provider_http_401" => (
             "API key refused",
-            "fix the key in ~/.agent/env and restart the daemon".to_owned(),
+            "fix the key in ~/.agent/keys/env and restart the daemon".to_owned(),
         ),
         "provider_http_403" => (
             "access refused",
@@ -762,6 +793,35 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_paced_turn_says_what_holds_it() {
+        use serde_json::json;
+        let now = 1_800_000_000_000;
+        assert_eq!(
+            paced(&json!({"resume_at_ms": null, "stopped": true}), now),
+            PARKED
+        );
+        assert_eq!(
+            paced(&json!({"resume_at_ms": null, "paused": true}), now),
+            PAUSED
+        );
+        assert_eq!(
+            paced(&json!({"resume_at_ms": now + 30_000}), now),
+            "rate limited"
+        );
+        let later = now + 2 * 3_600_000;
+        assert_eq!(
+            paced(&json!({"resume_at_ms": later}), now),
+            format!(
+                "rate limited until {}",
+                crate::asks::clock((later / 1000) as i64, (now / 1000) as i64)
+            )
+        );
+        for state in [PARKED, PAUSED, "rate limited until 14:05"] {
+            assert_eq!(mark(state).content, "◌ ", "{state}");
+        }
+    }
+
+    #[test]
     fn the_latest_step_reads_as_prose() {
         assert_eq!(
             plain_line("```mermaid\nflowchart LR\n```\n## Done\n- Added `x` on **line 2**"),
@@ -896,8 +956,39 @@ mod tests {
         assert_eq!(group("failed", false, true, false), Group::NeedsYou);
         // A pull request shows on the row, not as a group of its own.
         assert_eq!(group("idle", false, false, false), Group::Idle);
-        assert_eq!(group("stopped", false, false, false), Group::Idle);
+        assert_eq!(group("interrupted", false, false, false), Group::Idle);
+        assert_eq!(group("no reply", false, false, false), Group::Idle);
         assert_eq!(group("failed", false, true, true), Group::Done);
+    }
+
+    #[test]
+    fn every_state_has_one_mark_and_only_three_have_a_hue() {
+        let yellow = Some(Color::Yellow);
+        for (state, drawn, hue) in [
+            ("needs you", "?", yellow),
+            ("held: sign in to ChatGPT", "?", yellow),
+            ("failed", "✗", Some(Color::Red)),
+            ("working", "●", Some(Color::Cyan)),
+            ("waiting on fix, docs", "◌", None),
+            ("waiting on its reviewer", "◌", None),
+            ("queued", "◌", None),
+            ("rate limited", "◌", None),
+            ("starting", "◌", None),
+            ("idle", "○", None),
+            ("no reply", "○", None),
+            ("interrupted", "■", None),
+            ("done", "✓", None),
+        ] {
+            let sign = sign(state);
+            assert_eq!((&*sign.content, sign.style.fg), (drawn, hue), "{state}");
+            // Muted is the quiet weight; the three with a hue are not.
+            let dim = sign
+                .style
+                .add_modifier
+                .contains(ratatui::style::Modifier::DIM);
+            assert_eq!(dim, hue.is_none(), "{state}");
+            assert_eq!(mark(state).content, format!("{drawn} "));
+        }
     }
 
     #[test]

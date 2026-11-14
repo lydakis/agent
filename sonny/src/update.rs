@@ -1,11 +1,11 @@
-//! `sonny update`: Sonny and its daemon on the latest release, from one
+//! `sonny upgrade`: Sonny and its daemon on the latest release, from one
 //! command the person runs, as `codex update` and `claude update` update
 //! theirs. It tells how Sonny was installed from where its program is, as
 //! Codex does: Homebrew's Cellar (`brew upgrade` of the `sonny` and `agent`
 //! formulas, or `brew reinstall` of `sonny-nightly`), or the release
 //! tarball install.sh unpacks under `PREFIX/opt` (fetched, checked and
 //! linked as install.sh does). Sonny built by hand is left to how it was
-//! built. One update runs at a time, under a lock, as Claude Code's.
+//! built. One upgrade runs at a time, under a lock, as Claude Code's.
 //!
 //! Then the new Sonny does the rest, run in place of the old one: the
 //! daemon running now is replaced by the new build's (`agent start
@@ -17,11 +17,11 @@
 //! ([`installed_since`]). A line says each step, and the last the version.
 use std::path::{Path, PathBuf};
 
-pub const USAGE: &str = "usage: sonny update [--download] [--store PATH] [--socket PATH]\n\
-     Updates Sonny and its daemon to the latest release, as it was installed (Homebrew, or the\n\
+pub const USAGE: &str = "usage: sonny upgrade [--download] [--store PATH] [--socket PATH]\n\
+     Upgrades Sonny and its daemon to the latest release, as it was installed (Homebrew, or the\n\
      release tarball install.sh unpacks), then replaces the running daemon with the new one (its\n\
      running turns continue on it) and has open windows reopen on it. --download only fetches\n\
-     and checks the release tarball, switching nothing; a later sonny update switches to it.";
+     and checks the release tarball, switching nothing; a later sonny upgrade switches to it.";
 
 /// Unlisted: how the Sonny that installed a release has it do the rest,
 /// naming the version it updated from. Kept as it is across releases: an
@@ -116,7 +116,7 @@ fn parse_version(version: &str) -> Option<(u64, u64, u64)> {
     parts.next().is_none().then_some((major, minor, patch))
 }
 
-/// `sonny update ARGS`.
+/// `sonny upgrade ARGS`.
 pub fn cli(args: &[String]) -> Result<(), String> {
     let (mut store, mut socket, mut download, mut installed) = (None, None, false, None);
     let mut passed = Vec::new();
@@ -147,7 +147,7 @@ pub fn cli(args: &[String]) -> Result<(), String> {
     // agent's own too: the person runs it, from a terminal of their own.
     if std::env::var_os("AGENT_BOT_ID").is_some() {
         return Err(
-            "sonny update replaces the daemon this agent's turn runs on; run it in a terminal of your own"
+            "sonny upgrade replaces the daemon this agent's turn runs on; run it in a terminal of your own"
                 .into(),
         );
     }
@@ -183,7 +183,7 @@ pub fn cli(args: &[String]) -> Result<(), String> {
         },
         Install::Other => {
             println!(
-                "Could not tell how Sonny at {} was installed; update it the way you installed it",
+                "Could not tell how Sonny at {} was installed; upgrade it the way you installed it",
                 crate::tilde(&real.to_string_lossy())
             );
             return finish(Last::AsBuilt, &store, &socket);
@@ -202,7 +202,7 @@ pub fn cli(args: &[String]) -> Result<(), String> {
     }
     use std::os::unix::process::CommandExt;
     let error = std::process::Command::new(&new)
-        .arg("update")
+        .arg("upgrade")
         .args([INSTALLED, VERSION])
         .args(&passed)
         .exec();
@@ -242,7 +242,7 @@ fn run(program: &Path, args: &[&str]) -> Result<(), String> {
 /// upgrade` when either is behind. Some path when one was installed.
 fn brew(prefix: &Path) -> Result<Option<PathBuf>, String> {
     let brew = brew_at(prefix);
-    println!("Checking for updates...");
+    println!("Checking for a new release...");
     // The tap is a repository of its own, which only an update reads again:
     // a release made since the last one is not seen without it.
     run(&brew, &["update", "--quiet"])?;
@@ -281,7 +281,7 @@ fn brew(prefix: &Path) -> Result<Option<PathBuf>, String> {
 /// this Sonny was built from.
 fn nightly(prefix: &Path) -> Result<Option<PathBuf>, String> {
     let brew = brew_at(prefix);
-    println!("Checking for updates...");
+    println!("Checking for a new release...");
     let main = std::process::Command::new("git")
         .args(["ls-remote", REPO, "refs/heads/main"])
         .current_dir("/")
@@ -322,14 +322,14 @@ enum Fetched {
 /// `PREFIX/bin/sonny` linked to it. Earlier versions stay, as install.sh
 /// leaves them. One a `--download` unpacked already is not fetched again.
 fn tarball(prefix: &Path, arch: &str, download: bool) -> Result<Fetched, String> {
-    println!("Checking for updates...");
+    println!("Checking for a new release...");
     let latest = latest_release()?;
     match is_newer(&latest, VERSION) {
         Some(true) => println!("New version available: {latest} (current: {VERSION})"),
         Some(false) if latest == VERSION => return Ok(Fetched::Current),
         _ => {
             println!(
-                "You're running {VERSION}, which is not older than the latest release's {latest}. Skipping update."
+                "You're running {VERSION}, which is not older than the latest release's {latest}. Skipping the upgrade."
             );
             return Ok(Fetched::Current);
         }
@@ -347,7 +347,7 @@ fn tarball(prefix: &Path, arch: &str, download: bool) -> Result<Fetched, String>
         println!("Unpacked to {}", crate::tilde(&unpacked.to_string_lossy()));
     }
     if download {
-        println!("Downloaded {latest} without switching to it; sonny update switches");
+        println!("Downloaded {latest} without switching to it; sonny upgrade switches");
         return Ok(Fetched::Downloaded);
     }
     let link = |path: &Path, target: &str| -> Result<(), String> {
@@ -381,7 +381,7 @@ fn latest_release() -> Result<String, String> {
         .arg(format!("{REPO}/releases/latest"))
         .stdin(std::process::Stdio::null())
         .output()
-        .map_err(|e| format!("Failed to check for updates: curl: {e}"))?;
+        .map_err(|e| format!("Failed to check for a new release: curl: {e}"))?;
     let url = String::from_utf8_lossy(&out.stdout);
     let version = url.rsplit_once("/v").map(|(_, version)| version.trim());
     match version {
@@ -389,7 +389,7 @@ fn latest_release() -> Result<String, String> {
             Ok(version.to_owned())
         }
         _ => Err(format!(
-            "Failed to check for updates: no release found at {REPO}/releases/latest ({})",
+            "Failed to check for a new release: no release found at {REPO}/releases/latest ({})",
             String::from_utf8_lossy(&out.stderr).trim()
         )),
     }
@@ -502,7 +502,7 @@ enum Last<'a> {
     From(&'a str),
     /// Nothing newer was found.
     Current,
-    /// Not installed by anything `sonny update` knows: as it was built.
+    /// Not installed by anything `sonny upgrade` knows: as it was built.
     AsBuilt,
 }
 
@@ -533,11 +533,22 @@ fn finish(last: Last, store: &Path, socket: &Path) -> Result<(), String> {
             "Open Sonny windows reopen on {VERSION} as they reconnect, keeping what you typed"
         );
     }
+    // Sonny's new text set beside the person's edits, which a lead is told
+    // of when a window next opens: said here too, by name.
+    if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
+        for (word, name, theirs, staged) in crate::skills::staged(&home) {
+            println!(
+                "Your {name} {word} ({}) is kept; Sonny's new text waits at {}",
+                crate::tilde(&theirs.to_string_lossy()),
+                crate::tilde(&staged.to_string_lossy())
+            );
+        }
+    }
     match last {
         Last::From(from) if from != VERSION => {
-            println!("Successfully updated from {from} to version {VERSION}")
+            println!("Successfully upgraded from {from} to version {VERSION}")
         }
-        Last::From(_) => println!("Successfully updated to the newest build of {VERSION}"),
+        Last::From(_) => println!("Successfully upgraded to the newest build of {VERSION}"),
         Last::AsBuilt => println!("Sonny is on version {VERSION}, as built"),
         _ => println!("Sonny is up to date ({VERSION})"),
     }
@@ -559,7 +570,7 @@ async fn switch_daemon(store: &Path, socket: &Path, installed: bool) -> Result<b
         }
         Err(error) if crate::newer_daemon(&error) => {
             return Err(
-                "the daemon running now is newer than this Sonny; update the Sonny that started it"
+                "the daemon running now is newer than this Sonny; upgrade the Sonny that started it"
                     .into(),
             );
         }
@@ -634,7 +645,7 @@ impl Lock {
                 pid => format!(" (pid {pid})"),
             };
             return Err(format!(
-                "Another sonny update{holder} is running. Please try again in a moment."
+                "Another sonny upgrade{holder} is running. Please try again in a moment."
             ));
         }
         let _ = file.set_len(0);
@@ -665,7 +676,7 @@ fn identity(path: &Path) -> Option<(u64, u64)> {
 }
 
 /// Another Sonny installed where this one runs from since this window
-/// started (`sonny update`, `brew upgrade`, install.sh, a rebuild): its
+/// started (`sonny upgrade`, `brew upgrade`, install.sh, a rebuild): its
 /// program, by the path that outlives a release, which the window
 /// reopens on as it reconnects, rather than run the older one on.
 pub fn installed_since() -> Option<PathBuf> {

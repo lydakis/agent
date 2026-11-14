@@ -2,14 +2,14 @@
 //! profiles) and `~/.agent/config.toml`, copied into a git repository,
 //! `~/agent-home`, and pushed every ten minutes by Sonny's scheduler,
 //! so a machine that dies takes at most that much with it. Keys
-//! (`~/.agent/env`), logins and the daemon's store stay out. The triggers
+//! (`~/.agent/keys/env`), logins and the daemon's store stay out. The triggers
 //! go as a list to read, `triggers.json`: each is tied to an agent of the
 //! store, so after a restore each folder's lead sets up again those the
 //! person asked for.
 //!
 //! `sonny setup backup URL` sets it up, and restores a home the repository
-//! already holds, which is how a new machine starts; `sonny home sync` is
-//! what the scheduler runs, and `sonny home status` says how the last one went.
+//! already holds, which is how a new machine starts; `sonny backup sync`
+//! is what the scheduler runs, and `sonny backup status` says how the last one went.
 //!
 //! Memory is copied without its own `.git`: a commit inside
 //! `~/.agents/memory` would make `memory changed` find nothing and skip the
@@ -37,7 +37,7 @@ const AUTOMATIONS: &str = "automations.json";
 /// copy has no other, and removed by the next sync, which writes the list
 /// under its new name. It goes with upgrade migration `automations-folder`.
 const TRIGGERS: &str = "triggers.json";
-pub const USAGE: &str = "usage: home sync | home status\n       setup backup [URL]";
+pub const USAGE: &str = "usage: backup sync | backup status\n       setup backup [URL]";
 
 /// Where the home, its copy and what its syncs did live.
 pub struct Places {
@@ -62,7 +62,7 @@ impl Places {
     }
 }
 
-/// `sonny home ARGS`: one JSON value on stdout, or a typed error on stderr.
+/// `sonny backup ARGS`: one JSON value on stdout, or a typed error on stderr.
 pub fn cli(args: &[String]) -> i32 {
     let done = Places::home().and_then(|places| match args {
         [verb] if verb == "sync" => sync(&places, None),
@@ -147,7 +147,7 @@ pub fn set_up(places: &Places, url: Option<&str>) -> Result<(), String> {
                 return Err("usage: setup backup URL".into());
             }
             println!(
-                "Back up memory, skills, profiles and config.toml to a private git repository.\nKeys in ~/.agent/env, logins and chat history stay on this machine.\n"
+                "Back up memory, skills, profiles and config.toml to a private git repository.\nKeys in ~/.agent/keys/env, logins and chat history stay on this machine.\n"
             );
             crate::setup::line(
                 "Repository URL (an empty private repository, or one this set up before): ",
@@ -453,7 +453,7 @@ fn sync_once(places: &Places, env: Option<&[(OsString, OsString)]>) -> Result<Va
         match secret_in(&text) {
             Some(key) => {
                 skipped = Some(format!(
-                    "{key} holds a literal secret; move it to ~/.agent/env"
+                    "{key} holds a literal secret; move it to ~/.agent/keys/env"
                 ));
             }
             None if !same(&places.config, &repo.join("config.toml")) => {

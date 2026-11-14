@@ -66,7 +66,16 @@ keeps it read-only where it exists; a client passes `.git`, `.agents` and
 keeps PATH, by its absolute path, read-only in every sandbox and from being
 made there; the CLI passes `~/.agent/rules`, where Sonny reads the
 [command rules](RUST_PROTOTYPE.md#command-rules) it gives its bots, so no
-bot writes its own. `serve --wall FOLDER` keeps every sandboxed command,
+bot writes its own. `serve --unreadable FOLDER` keeps FOLDER and what is in
+it from every sandboxed command's reads, writes, links and renames, as
+Codex's `deny_read`, and the `read` tool refuses it for a sandboxed bot
+(`read_denied`); it is made private (mode 700) if missing. The CLI passes
+`~/.agent/keys`, which holds `env`, the keys it starts the daemon with,
+and each folder `~/.agent/config.toml` lists as `[sandbox] unreadable`,
+from `/` or `~/` (`unreadable = ["~/.aws"]`). That list is empty by default,
+so an agent may use what the person keeps at home, a browser's session
+cookies or a cloud CLI's sign-in, until they list it; a running daemon keeps
+the folders it started with. `serve --wall FOLDER` keeps every sandboxed command,
 the network on or not, from connecting to the Unix sockets in FOLDER,
 which it makes private (mode 700) if missing; the CLI passes
 `~/.agent/run`, where clients such as Sonny keep the sockets of programs
@@ -88,8 +97,9 @@ sandboxed command's reach, the network on or not. So a second daemon on
 the machine is no way out of the first one's sandbox, nor the first out of
 the second's. An entry stays while its store does, so an idle store is kept
 too. A daemon that cannot write the list, as one started inside a sandbox
-cannot, runs all the same and says so in its log; it can do nothing its
-sandbox does not allow. A command that was already running when a new
+cannot, refuses to start with `daemon_not_listed`, naming the folder and
+the error: no other daemon's sandbox would keep its store and socket. A
+command that was already running when a new
 daemon listed itself keeps the sandbox it started with.
 
 One daemon per person is the shape everything else assumes. A second one,
@@ -491,7 +501,7 @@ to start a new one, or on a socket that is not the store's own. Sonny
 starts the daemon this way, so opening it after an upgrade replaces the old
 daemon, and it says so first. `start --replace` replaces the daemon running
 now the same way whatever its version, so an upgrade that kept the protocol
-still runs the new build (`sonny update` runs it): it fails with
+still runs the new build (`sonny upgrade` runs it): it fails with
 `daemon_kept`, saying why, from inside a bot's turn, with `--no-spawn`, or with
 no provider to start a new one; a newer daemon is left running and refused
 with `daemon_protocol_mismatch`; with none running, it starts one as `start`
@@ -519,7 +529,7 @@ separated by whitespace), else `provider` in `~/.agent/config.toml` (the
 same), else the providers whose key variable is set; a
 running daemon is not checked against either. With none of them, starting
 fails with `provider_required`.
-A daemon `agent` starts gets the `KEY=VALUE` lines of `~/.agent/env` over
+A daemon `agent` starts gets the `KEY=VALUE` lines of `~/.agent/keys/env` over
 `agent`'s own environment (an empty value unsets the name), so it has the
 same keys whoever starts it: Sonny, an automation's check, a script or cron.
 The file is read only then, never for a command a running daemon answers.
