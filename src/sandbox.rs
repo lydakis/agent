@@ -1075,6 +1075,9 @@ mod linux {
         }
         // A walled folder is out of sight, as Codex hides its app-server's
         // sockets: a socket in it is a program's that acts as the person.
+        // Always mounted over, so no command runs without it; one removed
+        // since the daemon made it is made again first ([`hold`]), and one
+        // that could not be fails the command, closed.
         for folder in &policy.walled {
             args.extend([
                 "--perms".into(),
@@ -1674,23 +1677,38 @@ pub struct Hold(
 
 /// Hold `policy`'s placeholders while its command runs, once any of them
 /// being removed is gone. Off the runtime thread: it opens and locks files.
+/// On Linux it also makes again, private as the daemon made it at start,
+/// each walled folder something removed since: bubblewrap mounts over every
+/// one and has no mount point to make on a read-only root, and a command
+/// left without the wall would reach the sockets of one made again while it
+/// runs. One that cannot be made is left to fail its command, closed.
 pub async fn hold(policy: &Policy) -> Hold {
-    let paths: Vec<PathBuf> = match cfg!(target_os = "linux") {
-        true => policy
-            .roots
-            .iter()
-            .flat_map(|root| root.missing.iter().cloned())
-            .collect(),
-        false => Vec::new(),
+    let (paths, walled): (Vec<PathBuf>, Vec<PathBuf>) = match cfg!(target_os = "linux") {
+        true => (
+            policy
+                .roots
+                .iter()
+                .flat_map(|root| root.missing.iter().cloned())
+                .collect(),
+            policy.walled.clone(),
+        ),
+        false => (Vec::new(), Vec::new()),
     };
     let left = policy
         .roots
         .iter()
         .flat_map(|root| root.left.iter().cloned())
         .collect();
-    let held = match paths.is_empty() {
+    let held = match paths.is_empty() && walled.is_empty() {
         true => Vec::new(),
         false => tokio::task::spawn_blocking(move || {
+            use std::os::unix::fs::DirBuilderExt;
+            for folder in walled.iter().filter(|folder| !folder.is_dir()) {
+                let _ = std::fs::DirBuilder::new()
+                    .recursive(true)
+                    .mode(0o700)
+                    .create(folder);
+            }
             paths.iter().filter_map(|path| Held::take(path)).collect()
         })
         .await
@@ -2679,6 +2697,41 @@ mod tests {
                     "--remount-ro",
                     &run.to_string_lossy()
                 ]));
+        }
+        // A wall another program removed is made again, private, and
+        // hidden all the same: bubblewrap could not make its mount point on
+        // the read-only root, and a command without the wall would reach
+        // the sockets of one made again while it runs.
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let policy = Policy::new(
+                Some(Mode::WorkspaceWrite),
+                Some(&base),
+                &[],
+                true,
+                &Daemon {
+                    walled: vec![run.clone()],
+                    ..protecting()
+                },
+            )
+            .unwrap()
+            .unwrap();
+            let hidden = |policy: &Policy| {
+                linux::args(policy, false)
+                    .windows(2)
+                    .any(|w| w == ["--tmpfs", &run.to_string_lossy()])
+            };
+            std::fs::remove_dir(&run).unwrap();
+            assert!(hidden(&policy));
+            tokio::runtime::Builder::new_current_thread()
+                .build()
+                .unwrap()
+                .block_on(hold(&policy))
+                .release();
+            let made = std::fs::metadata(&run).unwrap();
+            assert!(made.is_dir());
+            assert_eq!(made.permissions().mode() & 0o777, 0o700);
         }
         // A root inside the wall is refused: its sockets could be renamed
         // out to a folder the rule doesn't name.
