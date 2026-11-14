@@ -17473,14 +17473,17 @@ impl App {
                     .collect();
                 let room = composer.y as usize;
                 let mut rows = list::lines(&items, at, width, room);
-                // Why the list is short, in the rows it leaves.
+                // Why the list is short, in the rows it leaves: muted
+                // beside models to pick, in ink when it is the whole answer.
+                let alone = items.is_empty();
                 for refused in (picker.refused.iter())
                     .take((list::ROWS + 1).min(room).saturating_sub(rows.len()))
                 {
+                    let why = Span::raw(refused.clone());
                     rows.push(Line::from(vec![
                         Span::raw("    "),
                         Span::raw("✗ ").fg(Color::Red),
-                        Span::raw(refused.clone()).dim(),
+                        if alone { why } else { why.dim() },
                     ]));
                 }
                 over(frame, rows, composer);
