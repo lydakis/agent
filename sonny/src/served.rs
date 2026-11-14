@@ -277,7 +277,8 @@ fn follows() -> Value {
             posting in a thread follows it as commons.THREAD, and removing that leaves it. A filter keeps \
             only the events it matches. \
             Add steer yourself for what you own; a filter or a digest only when the person asks for one: \
-            what a filter leaves out you never hear, and a digest makes you late. Add or remove one by name; \
+            what a filter leaves out you never hear, and a digest makes you late. Add or remove one by name, \
+            such as {\"name\": \"leads\", \"bots\": [\"web.lead\", \"api.lead\"], \"sources\": [\"mail\"]}; \
             with neither, it lists them all, with the sources there are and their events' recent fields.",
         "parameters": {
             "type": "object",
