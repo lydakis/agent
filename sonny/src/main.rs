@@ -905,34 +905,34 @@ fn reads_file(store: &std::path::Path, lead: &str) -> std::path::PathBuf {
 }
 
 /// The folder of [`reads_file`]s beside `store`.
-fn reads_dir(store: &std::path::Path) -> std::path::PathBuf {
+pub(crate) fn reads_dir(store: &std::path::Path) -> std::path::PathBuf {
     let mut dir = store.as_os_str().to_owned();
     dir.push(".status-reads");
     std::path::PathBuf::from(dir)
 }
 
 /// Every agent's question as some window or the sky last read it beside
-/// `store`, by this build from the daemon `identity` names: each with the
-/// turn it ended, the newest where two kept one. The sky reads again only
-/// the agents that ran since.
+/// `store`, read as this build reads one ([`seen_stamp`]) from the daemon
+/// `identity` names: each with the turn it ended, the newest where two
+/// kept one. The sky reads again only the agents that ran since.
 pub(crate) fn kept_seen(
     store: &std::path::Path,
     identity: Option<&str>,
 ) -> HashMap<String, (i64, Seen)> {
     #[derive(serde::Deserialize)]
     struct Kept {
-        build: String,
+        reads: String,
         seen: HashMap<String, (i64, Seen)>,
     }
     let store = agent_client::socket::canonical_store(store).unwrap_or_else(|_| store.into());
-    let build = reads_build(identity);
+    let stamp = seen_stamp(identity);
     let mut seen: HashMap<String, (i64, Seen)> = HashMap::new();
     let files = std::fs::read_dir(reads_dir(&store)).into_iter().flatten();
     for file in files.flatten() {
         let Some(kept) = std::fs::read(file.path())
             .ok()
             .and_then(|bytes| serde_json::from_slice::<Kept>(&bytes).ok())
-            .filter(|kept| kept.build == build)
+            .filter(|kept| kept.reads == stamp)
         else {
             continue;
         };
@@ -977,6 +977,15 @@ fn reads_build(identity: Option<&str>) -> String {
     )
 }
 
+/// What a question read is kept under: how this build reads one
+/// ([`needs::READS`]), and the daemon's store it was read from. A new
+/// build that reads questions as the last one did takes what that one
+/// read, so the first sky after an upgrade reads only the agents that ran
+/// since; [`reads_build`] keeps `/status`'s other reads per build.
+pub(crate) fn seen_stamp(identity: Option<&str>) -> String {
+    format!("{:016x} {}", needs::READS, identity.unwrap_or(""))
+}
+
 /// Take what an earlier window kept of each agent's history, where this
 /// one has nothing newer: the same head is the same history, and an ended
 /// turn's question is the same question, so a window opened later reads
@@ -991,21 +1000,25 @@ fn take_reads(
     #[derive(serde::Deserialize)]
     struct Kept {
         build: String,
+        reads: String,
         latest: HashMap<String, (Value, Latest)>,
         seen: HashMap<String, (i64, Seen)>,
     }
     let Some(kept) = std::fs::read(reads_file(store, lead))
         .ok()
         .and_then(|bytes| serde_json::from_slice::<Kept>(&bytes).ok())
-        .filter(|kept| kept.build == reads_build(identity))
     else {
         return;
     };
-    for (name, read) in kept.latest {
-        status_read.entry(name).or_insert(read);
+    if kept.build == reads_build(identity) {
+        for (name, read) in kept.latest {
+            status_read.entry(name).or_insert(read);
+        }
     }
-    for (name, seen) in kept.seen {
-        asks_seen.entry(name).or_insert(seen);
+    if kept.reads == seen_stamp(identity) {
+        for (name, seen) in kept.seen {
+            asks_seen.entry(name).or_insert(seen);
+        }
     }
 }
 
@@ -1035,29 +1048,33 @@ fn write_reads(
     #[derive(serde::Serialize)]
     struct Kept<'a> {
         build: String,
+        reads: String,
         latest: &'a HashMap<String, (Value, Latest)>,
         seen: HashMap<&'a String, &'a (i64, Seen)>,
     }
     let kept = Kept {
         build: reads_build(identity),
+        reads: seen_stamp(identity),
         latest: status_read,
         seen,
     };
     if let Ok(bytes) = serde_json::to_vec(&kept) {
-        // History excerpts: only the person reads them, as with the store.
-        use std::os::unix::fs::PermissionsExt;
-        let file = reads_file(store, lead);
-        if let Some(dir) = file.parent()
-            && std::fs::create_dir_all(dir)
-                .and_then(|()| {
-                    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
-                })
-                .is_err()
-        {
-            return;
-        }
-        let _ = agent_client::files::replace_mode(&file, &bytes, 0o600);
+        keep_beside(&reads_file(store, lead), &bytes);
     }
+}
+
+/// Write `bytes` to `file` among the reads kept beside a store, whole.
+/// History excerpts: only the person reads them, as with the store.
+pub(crate) fn keep_beside(file: &std::path::Path, bytes: &[u8]) {
+    use std::os::unix::fs::PermissionsExt;
+    if let Some(dir) = file.parent()
+        && std::fs::create_dir_all(dir)
+            .and_then(|()| std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)))
+            .is_err()
+    {
+        return;
+    }
+    let _ = agent_client::files::replace_mode(file, bytes, 0o600);
 }
 
 /// `bot`'s latest step, question and pull request; none when a read
@@ -19829,12 +19846,19 @@ mod tests {
             |path: &std::path::Path| std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode(&kept), 0o600);
         assert_eq!(mode(kept.parent().unwrap()), 0o700);
-        // What another build kept is read again.
+        // Another build reads each agent's latest items again, and its
+        // question only when it reads questions otherwise.
         let mut file: Value = serde_json::from_slice(&std::fs::read(&kept).unwrap()).unwrap();
         file["build"] = json!("another");
         std::fs::write(&kept, file.to_string()).unwrap();
         open().await;
-        assert_eq!(histories.load(Ordering::SeqCst), 10);
+        assert_eq!(histories.load(Ordering::SeqCst), 8);
+        let mut file: Value = serde_json::from_slice(&std::fs::read(&kept).unwrap()).unwrap();
+        file["build"] = json!("another");
+        file["reads"] = json!("read otherwise");
+        std::fs::write(&kept, file.to_string()).unwrap();
+        open().await;
+        assert_eq!(histories.load(Ordering::SeqCst), 12);
         std::fs::remove_dir_all(home).unwrap();
     }
 

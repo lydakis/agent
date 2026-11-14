@@ -198,6 +198,47 @@ const MODEL_HUES: [Color; 8] = [
 /// of them, and what was read of it before, to go on from.
 type Scan = (String, Option<i64>, Option<crate::needs::Seen>);
 
+/// An agent as [`Talked`] names it: by name, and by id, as a name used
+/// again is someone else.
+type Named = (String, Option<i64>);
+
+/// Who told whom in the past a sky read, kept beside the store so the next
+/// sky reads only the past since: the pairs [`TALKS`] keeps, newest last,
+/// and those of the hour with when the daemon wrote them. Every past turn
+/// of every agent the store ever held is otherwise read on each open.
+#[derive(Clone, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+struct Talked {
+    /// What it means ([`TALKED`]) and the daemon's store it was read from.
+    stamp: String,
+    /// The last event of the past read.
+    cursor: i64,
+    talks: Vec<(Named, Named)>,
+    said: Vec<(i64, Named, Named)>,
+}
+
+/// Bumped when what [`Talked`] keeps comes to mean something else.
+const TALKED: u32 = 1;
+
+impl Talked {
+    fn stamp(identity: Option<&str>) -> String {
+        format!("{TALKED} {}", identity.unwrap_or(""))
+    }
+
+    /// Its file, beside the reads kept of the store at `store`.
+    fn file(store: &std::path::Path) -> PathBuf {
+        let store = agent_client::socket::canonical_store(store).unwrap_or_else(|_| store.into());
+        crate::reads_dir(&store).join(".sky-talked.json")
+    }
+
+    /// What the sky before kept of the daemon `identity` names.
+    fn kept(store: &std::path::Path, identity: Option<&str>) -> Option<Talked> {
+        let bytes = std::fs::read(Talked::file(store)).ok()?;
+        serde_json::from_slice::<Talked>(&bytes)
+            .ok()
+            .filter(|talked| talked.stamp == Talked::stamp(identity))
+    }
+}
+
 /// What the follow brings the view.
 enum Feed {
     /// Every agent there is now: who is listed is here, who isn't is gone.
@@ -214,6 +255,12 @@ enum Feed {
     /// What windows and skies before read of each agent's questions, as
     /// of the turn it last ended, and the daemon they were read from.
     Kept(Option<String>, HashMap<String, (i64, crate::needs::Seen)>),
+    /// Who told whom in the past the sky before read: only the past since
+    /// is read.
+    Talked(Talked),
+    /// The past is read through this cursor: what it said of who told whom
+    /// is kept for the next sky.
+    Through(i64),
     Live(Value),
     /// An agent's model, read again after it was configured.
     Model(String, String),
@@ -1133,10 +1180,22 @@ impl View {
                         agent.gone = !listed.contains(agent.name.as_str());
                     }
                     for bot in &bots {
-                        self.seat(bot);
+                        // Its last turn's end says whether it failed, as
+                        // that turn's event would: the past kept is not
+                        // read again.
+                        if let Some(at) = self.seat(bot)
+                            && bot["running_turn"].is_null()
+                            && let last = &bot["last"]
+                            && last.is_object()
+                        {
+                            self.agents[at].failed =
+                                last["status"] == "failed" && last["error"] != "empty_completion";
+                        }
                     }
                 }
                 Feed::Past(event) => self.event(&event, now, false),
+                Feed::Talked(talked) => self.talked(talked, now),
+                Feed::Through(cursor) => self.keep_talked(cursor, now),
                 // What the daemon lists, in place of what each agent held;
                 // and each agent has its questions read, as asked before
                 // the sky opened.
@@ -2462,6 +2521,65 @@ impl View {
         match data["origin"].is_string() || data["person"].is_string() {
             true => End::Rim(at),
             false => End::Person,
+        }
+    }
+
+    /// The agent `named`, when it is still here.
+    fn named(&self, (name, id): &Named) -> Option<usize> {
+        (self.agent(name))
+            .filter(|&at| id.is_none() || self.agents[at].id.is_none_or(|known| Some(known) == *id))
+    }
+
+    fn naming(&self, at: usize) -> Named {
+        (self.agents[at].name.clone(), self.agents[at].id)
+    }
+
+    /// Who told whom in the past the sky before read, as reading it again
+    /// would say: the past since goes on from it.
+    fn talked(&mut self, talked: Talked, now: Instant) {
+        for (by, at) in &talked.talks {
+            if let (Some(by), Some(at)) = (self.named(by), self.named(at)) {
+                self.talks.retain(|pair| *pair != (by, at));
+                self.talks.push_back((by, at));
+            }
+        }
+        while self.talks.len() > TALKS {
+            self.talks.pop_front();
+        }
+        let clock = wall_ms();
+        for (written, by, at) in &talked.said {
+            if let (Some(by), Some(at)) = (self.named(by), self.named(at))
+                && let Some(when) =
+                    now.checked_sub(Duration::from_millis(clock.saturating_sub(*written).max(0) as u64))
+                && now.duration_since(when) <= HOUR
+            {
+                self.hear(when, by, at);
+            }
+        }
+    }
+
+    /// Keep who told whom in the past, read through `cursor`, for the next
+    /// sky of the same daemon.
+    fn keep_talked(&self, cursor: i64, now: Instant) {
+        let Some(identity) = &self.kept_from else {
+            return;
+        };
+        let clock = wall_ms();
+        let talked = Talked {
+            stamp: Talked::stamp(identity.as_deref()),
+            cursor,
+            talks: (self.talks.iter())
+                .map(|&(by, at)| (self.naming(by), self.naming(at)))
+                .collect(),
+            said: (self.said.iter())
+                .map(|&(when, by, at)| {
+                    let ago = now.duration_since(when).as_millis() as i64;
+                    (clock - ago, self.naming(by), self.naming(at))
+                })
+                .collect(),
+        };
+        if let Ok(bytes) = serde_json::to_vec(&talked) {
+            crate::keep_beside(&Talked::file(&self.resolved), &bytes);
         }
     }
 
@@ -5055,9 +5173,11 @@ async fn follow(socket: PathBuf, store: PathBuf, send: mpsc::UnboundedSender<Fee
     {
         return;
     }
-    // What was read before, so only the agents that ran since are read.
+    // What was read before, so only the agents that ran since are read,
+    // and only the past since.
     let identity = client.identity().map(str::to_owned);
     let kept = crate::kept_seen(&store, identity.as_deref());
+    let talked = Talked::kept(&store, identity.as_deref());
     if send.send(Feed::Kept(identity, kept)).is_err() {
         return;
     }
@@ -5082,22 +5202,33 @@ async fn follow(socket: PathBuf, store: PathBuf, send: mpsc::UnboundedSender<Fee
     if !roll(&client, &send).await {
         return;
     }
+    // Who told whom, from what the sky before kept, once those agents are
+    // seated.
+    let after = talked.as_ref().map_or(0, |talked| talked.cursor);
+    if let Some(talked) = talked
+        && send.send(Feed::Talked(talked)).is_err()
+    {
+        return;
+    }
     if let Err(error) = client
-        .request("follow", json!({"bot": "*", "after": 0, "kinds": PAST}))
+        .request("follow", json!({"bot": "*", "after": after, "kinds": PAST}))
         .await
     {
         let _ = send.send(Feed::Down(error.to_string()));
         return;
     }
-    let mut cursor = 0;
+    let mut cursor = after;
     while let Some(event) = events.recv().await {
         if event["event"] == "follow_live" {
-            cursor = event["cursor"].as_i64().unwrap_or(0);
+            cursor = event["cursor"].as_i64().unwrap_or(after);
             break;
         }
         if send.send(Feed::Past(event)).is_err() {
             return;
         }
+    }
+    if send.send(Feed::Through(cursor)).is_err() {
+        return;
     }
     // What waits for the person now; the live replay from the past's end
     // brings what changed since.
@@ -7703,6 +7834,11 @@ mod tests {
                     out.push(json!({"id": id, "result": {"approvals": []}}));
                 } else {
                     follows += 1;
+                    // The past since the sky before read it, from where
+                    // that one ended.
+                    if follows == 1 {
+                        assert_eq!(asked["after"], 5);
+                    }
                     if follows == 2 {
                         // The old follow, still live until it is replaced.
                         out.push(started.clone());
@@ -7718,14 +7854,23 @@ mod tests {
                 }
             }
         });
+        let store = dir.join("state.sqlite");
+        let kept = Talked {
+            stamp: Talked::stamp(None),
+            cursor: 5,
+            ..Talked::default()
+        };
+        crate::keep_beside(&Talked::file(&store), &serde_json::to_vec(&kept).unwrap());
         let (send, mut feed) = mpsc::unbounded_channel();
-        tokio::spawn(follow(socket, dir.join("state.sqlite"), send));
+        tokio::spawn(follow(socket, store, send));
         let mut seen = Vec::new();
         while let Some(item) = feed.recv().await {
             seen.push(match item {
                 Feed::Live(event) => event["cursor"].to_string(),
                 Feed::Roll(_) => "roll".into(),
                 Feed::Ready => "ready".into(),
+                Feed::Talked(talked) => format!("talked {}", talked.cursor),
+                Feed::Through(cursor) => format!("through {cursor}"),
                 Feed::Past(_)
                 | Feed::Held(_)
                 | Feed::Scans(_)
@@ -7740,9 +7885,90 @@ mod tests {
                 }
             });
         }
-        // Made, then started, once each in the store's order; then the roll
-        // again, then caught up.
-        assert_eq!(seen, ["roll", "11", "12", "roll", "ready"]);
+        // Who told whom as the sky before kept it, and the past read since
+        // through where it ends; then made, then started, once each in the
+        // store's order; then the roll again, then caught up.
+        assert_eq!(
+            seen,
+            ["roll", "talked 5", "through 10", "11", "12", "roll", "ready"]
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn who_told_whom_is_kept_for_the_next_sky_which_reads_only_the_past_since() {
+        let dir = std::env::temp_dir().join(format!("sky-talked-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = dir.join("state.sqlite");
+        let roll = |b: i64| {
+            Feed::Roll(vec![
+                json!({"name": "a", "bot_id": 1}),
+                json!({"name": "b", "bot_id": b}),
+                json!({"name": "c", "bot_id": 3}),
+            ])
+        };
+        let told = |cursor: i64, by: &str, to: &str, ago: i64| {
+            Feed::Past(json!({"cursor": cursor, "bot": to, "turn": cursor, "event": "accepted",
+                "written_ms": wall_ms() - ago, "data": {"from": {"bot": by}}}))
+        };
+        let (mut first, send) = view();
+        first.resolved = store.clone();
+        send.send(Feed::Kept(None, HashMap::new())).unwrap();
+        send.send(roll(2)).unwrap();
+        // One of the hour, one long before.
+        send.send(told(7, "a", "b", 60_000)).unwrap();
+        send.send(told(8, "b", "c", 86_400_000)).unwrap();
+        send.send(Feed::Through(8)).unwrap();
+        first.drain();
+        let kept = Talked::kept(&store, None).unwrap();
+        assert_eq!(kept.cursor, 8);
+        assert_eq!(kept.talks.len(), 2);
+        assert_eq!(kept.said.len(), 1);
+        // The next sky takes them as reading the past again would have.
+        let (mut next, send) = view();
+        next.resolved = store.clone();
+        send.send(Feed::Kept(None, HashMap::new())).unwrap();
+        send.send(roll(2)).unwrap();
+        send.send(Feed::Talked(kept.clone())).unwrap();
+        next.drain();
+        assert_eq!(next.talks, first.talks);
+        assert_eq!(next.pairs, first.pairs);
+        assert_eq!(next.said.len(), 1);
+        // Another daemon's store keeps none of it.
+        assert!(Talked::kept(&store, Some("another store")).is_none());
+        // A name used again is someone else: no pair names it.
+        let (mut renamed, send) = view();
+        send.send(roll(9)).unwrap();
+        send.send(Feed::Talked(kept)).unwrap();
+        renamed.drain();
+        assert!(renamed.talks.is_empty());
+        assert!(renamed.said.is_empty());
+        // Only the person reads it.
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(Talked::file(&store)).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn the_listing_says_whether_an_agent_failed_as_its_last_turn_ended() {
+        let (mut view, send) = view();
+        send.send(Feed::Roll(vec![
+            json!({"name": "failed", "last": {"turn": 3, "status": "failed", "error": "provider"}}),
+            json!({"name": "said_nothing",
+                "last": {"turn": 3, "status": "failed", "error": "empty_completion"}}),
+            json!({"name": "done", "last": {"turn": 3, "status": "completed"}}),
+            json!({"name": "again", "running_turn": 4,
+                "last": {"turn": 3, "status": "failed", "error": "provider"}}),
+        ]))
+        .unwrap();
+        view.drain();
+        let failed: Vec<&str> = (view.agents.iter())
+            .filter(|agent| agent.failed)
+            .map(|agent| agent.name.as_str())
+            .collect();
+        assert_eq!(failed, ["failed"]);
     }
 
     #[tokio::test]
