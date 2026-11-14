@@ -2326,12 +2326,21 @@ pub fn asked(name: &str, arguments: &Value, workspace: &str) -> Asked {
         }
         ("remove_task", ..) => {
             let task = text("task").or(text("name")).unwrap_or("a task");
-            words(
-                format!("Remove the task {task}?"),
-                format!("removing {task}"),
-                format!("remove {task}"),
-                Vec::new(),
-            )
+            // Discard drops work the task never saved: the question says so.
+            match arguments["discard"] == true {
+                true => words(
+                    format!("Remove the task {task} and drop its unsaved work?"),
+                    format!("removing {task} and dropping its unsaved work"),
+                    format!("remove {task} and drop its unsaved work"),
+                    vec!["What it did not commit or push is lost.".into()],
+                ),
+                false => words(
+                    format!("Remove the task {task}?"),
+                    format!("removing {task}"),
+                    format!("remove {task}"),
+                    Vec::new(),
+                ),
+            }
         }
         ("new_project", ..) => {
             let folder = text("folder")
@@ -2380,12 +2389,20 @@ pub fn asked(name: &str, arguments: &Value, workspace: &str) -> Asked {
             "run a script".into(),
             text("input").map(lines).unwrap_or_default(),
         ),
-        ("workflow", ..) => words(
-            "Run a workflow that starts agents?".into(),
-            "running a workflow".into(),
-            "run a workflow".into(),
-            fields(arguments),
-        ),
+        ("workflow", ..) => match text("stop") {
+            Some(run) => words(
+                format!("Stop the workflow run {run}?"),
+                format!("stopping the workflow run {run}"),
+                format!("stop the workflow run {run}"),
+                Vec::new(),
+            ),
+            None => words(
+                "Run a workflow that starts agents?".into(),
+                "running a workflow".into(),
+                "run a workflow".into(),
+                fields(arguments),
+            ),
+        },
         ("browser" | "desktop", ..) => {
             let action = text("action").unwrap_or("an action");
             words(
@@ -5139,6 +5156,25 @@ mod real_calls {
         );
         // A tool Sonny has no words for: its name, its fields as lines,
         // never JSON.
+        // Discard drops work, and the question says so; a plain removal
+        // does not.
+        assert_eq!(
+            words("remove_task", json!({"task": "readme"})).0,
+            "Remove the task readme?"
+        );
+        let (question, doing, _, detail) =
+            words("remove_task", json!({"task": "readme", "discard": true}));
+        assert_eq!(
+            question,
+            "Remove the task readme and drop its unsaved work?"
+        );
+        assert_eq!(doing, "removing readme and dropping its unsaved work");
+        assert_eq!(detail, ["What it did not commit or push is lost."]);
+        // A workflow's stop names the run it stops, never a new run.
+        let (question, doing, _, detail) = words("workflow", json!({"stop": "wf_1"}));
+        assert_eq!(question, "Stop the workflow run wf_1?");
+        assert_eq!(doing, "stopping the workflow run wf_1");
+        assert!(detail.is_empty());
         let (question, _, _, detail) = words("linear.save_issue", json!({"title": "Fix it"}));
         assert_eq!(question, "Let it use linear.save_issue?");
         assert_eq!(detail, ["title: Fix it"]);
