@@ -1899,8 +1899,8 @@ class CliTests(ModelFixture):
         # reach it however it is started: their providers count, an empty
         # value unsets one, and names starting AGENT_ are passed over.
         home = self.path/'home'
-        (home/'.agent').mkdir(parents=True)
-        env_file = home/'.agent'/'env'
+        (home/'.agent'/'keys').mkdir(parents=True)
+        env_file = home/'.agent'/'keys'/'env'
         env_file.write_text('OPENAI_API_KEY=from-file\nEXTRA_SETTING=from-file\nUNSET_ME=\n'
                             'ANTHROPIC_API_KEY=\n'
                             'export AGENT_SOCKET=/nowhere\nagent_store=/nowhere\n')
