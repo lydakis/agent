@@ -14,10 +14,14 @@ for any source; what a source knows, it puts in its events' fields.
 It is a Sonny feature and a client of the daemon like any other: it
 submits one note at a time to the follower, which decides itself what
 matters. Nothing judges the news. Every note goes as a steer, joining
-the running turn at its next round or starting one, as soon as the one
-before it landed, with everything waiting then that no digest holds. It
-never holds news for the follower to rest, so one kept busy still hears
-it. Neither the daemon nor the `agent` CLI knows of it.
+the running turn at its next round or starting one, with everything
+waiting then that no digest holds. A follower's notes are one group, as
+Prometheus Alertmanager groups alerts, with `group_wait` 0 and
+`group_interval` 2 seconds: an event goes at once when no note went in
+the last 2 seconds, and what comes within 2 seconds of a note goes
+together once they pass, so a burst from many agents is a note every 2
+seconds, not one each. A steer waits for none of it. It never holds news
+for the follower to rest, so one kept busy still hears it. Neither the daemon nor the `agent` CLI knows of it.
 
 The lookout knows no leads. Sonny has each lead follow its tasks when it
 opens the lead's project, and that follow is what makes a lead hear

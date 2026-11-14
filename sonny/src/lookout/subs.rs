@@ -1384,10 +1384,11 @@ const FLIGHT_MS: u128 = 100;
 
 /// About how many notes these events would be, as the lookout sends
 /// them: a note goes as soon as an event is ready and the note before
-/// landed, at once for a steer, carrying what is ready by then, as many
-/// as a note holds; each event no sooner than a digest after the note
-/// before on its clock. What a note had no room for, or a digest still
-/// holds, waits for a later one.
+/// landed, and no sooner than its group interval after it but for a
+/// steer, carrying
+/// what is ready by then, as many as a note holds; each event no sooner
+/// than a digest after the note before on its clock. What a note had no
+/// room for, or a digest still holds, waits for a later one.
 fn notes(times: &[Timed]) -> usize {
     use std::collections::HashMap;
     fn ready(last: &HashMap<&str, u128>, e: &Timed) -> u128 {
@@ -1400,10 +1401,15 @@ fn notes(times: &[Timed]) -> usize {
     fn send<'a>(
         waiting: &mut Vec<Timed<'a>>,
         last: &mut HashMap<&'a str, u128>,
-        free: &mut u128,
+        free: &mut (u128, u128),
         before: Option<u128>,
     ) -> usize {
-        let goes = |last: &HashMap<&str, u128>, free: u128, e: &Timed| ready(last, e).max(free);
+        // `free`: when the note before landed, and when its group interval
+        // ends.
+        let goes = |last: &HashMap<&str, u128>, (landed, ends): (u128, u128), e: &Timed| {
+            let at = ready(last, e).max(landed);
+            if e.steer { at } else { at.max(ends) }
+        };
         let mut notes = 0;
         while !waiting.is_empty() {
             let Some(went) = (waiting.iter()).map(|e| goes(last, *free, e)).min() else {
@@ -1428,13 +1434,13 @@ fn notes(times: &[Timed]) -> usize {
             }
             carried.extend(held);
             *waiting = carried;
-            *free = went + FLIGHT_MS;
+            *free = (went + FLIGHT_MS, went + super::GROUP_INTERVAL.as_millis());
         }
         notes
     }
     let mut last: HashMap<&str, u128> = HashMap::new();
     let mut waiting: Vec<Timed> = Vec::new();
-    let (mut free, mut notes) = (0, 0);
+    let (mut free, mut notes) = ((0, 0), 0);
     for e in times {
         notes += send(&mut waiting, &mut last, &mut free, Some(e.at));
         waiting.push(*e);
@@ -1855,8 +1861,8 @@ mod tests {
             clock,
             bytes: 100,
         };
-        // As they come: each note goes once the last landed, with all
-        // that came meanwhile.
+        // As they come: the first at once, what comes in the group
+        // interval after it together.
         assert_eq!(
             notes(&[
                 t(0, false, 0, "a"),
@@ -1866,6 +1872,9 @@ mod tests {
             ]),
             3
         );
+        // A stream is a note a group interval.
+        let stream: Vec<_> = (0..100).map(|i| t(i * 100, false, 0, "a")).collect();
+        assert_eq!(notes(&stream), 6);
         // A digest: the first at once, the rest gathered at its end.
         let digested = [
             t(s(0), false, hour, "a"),

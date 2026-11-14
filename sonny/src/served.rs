@@ -267,16 +267,15 @@ fn project() -> Value {
 fn follows() -> Value {
     json!({
         "name": FOLLOWS,
-        "description": "Your follows in the person's lookout, which tells you what happens in the agents \
-            and sources you follow, in a message sent by lookout that joins your running turn or starts one: \
-            each event a line [source · topic · from], then its text. A follow watches the tasks of a bot \
-            (every agent it or its tasks made) or bots by name, through the tasks source, each agent its topic: \
-            every message someone other than you writes in them, the person's quoted, a question to the person, \
-            a call waiting for their approval, a margin note put or taken away, and how each turn ends, with \
-            its reply. It also hears the sources the person set up outside (a chat, a mailbox, a feed), each \
+        "description": "Your follows in the person's lookout, which tells you what happens in what you \
+            follow, in a message sent by lookout that joins your running turn or starts one: each event a \
+            line [source · topic · from], then its text. A follow watches the tasks of a bot (every agent it or \
+            its tasks made) or bots by name, through the tasks source, each agent its topic: messages others \
+            write in them, the person's quoted, questions to the person, calls awaiting their approval, margin \
+            notes put or removed, and each turn's end with its reply. It also hears the sources the person set up outside (a chat, a mailbox, a feed), each \
             by name, or one topic of a source as NAME:TOPIC. The commons is a source too, each thread a topic: \
-            posting in a thread follows it as commons.THREAD, and removing that leaves it. Each source's \
-            events go at once, or as its digest gathers them; a filter keeps only those it matches. \
+            posting in a thread follows it as commons.THREAD, and removing that leaves it. A filter keeps \
+            only the events it matches. \
             Add steer yourself for what you own; a filter or a digest only when the person asks for one: \
             what a filter leaves out you never hear, and a digest makes you late. Add or remove one by name; \
             with neither, it lists them all, with the sources there are and their events' recent fields.",

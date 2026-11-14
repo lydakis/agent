@@ -33,6 +33,16 @@ const WAKE_GAP: Duration = Duration::from_secs(120);
 /// How often the lookout looks at what waits: a note goes as soon as the
 /// last one landed, and what came meanwhile goes in the next.
 pub(crate) const TICK: Duration = Duration::from_secs(1);
+/// Each subscriber's notes are one group, as Prometheus Alertmanager
+/// groups alerts, with `group_wait` 0 and this `group_interval`: an
+/// event goes at once when no note went for this long, and what comes
+/// within it after a note goes together once it passes, so many agents
+/// at once are a note every so often, not one each. A steer waits for
+/// none of it.
+pub(crate) const GROUP_INTERVAL: Duration = Duration::from_secs(2);
+/// How often a lookout with events waiting looks whether its group
+/// interval ended.
+const NUDGE: Duration = Duration::from_millis(200);
 /// How often subscription files are read again.
 pub(crate) const REREAD: Duration = Duration::from_secs(15);
 /// How long the daemon may be unreachable before the lookout exits: a
@@ -1003,6 +1013,10 @@ impl Service {
         }
         // What waits is looked at often; subscription files less often.
         let mut tick = tokio::time::interval(TICK);
+        // What waits out a group interval goes soon after it ends, not a tick
+        // later.
+        let mut nudge = tokio::time::interval(NUDGE);
+        nudge.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let mut reread: Option<Instant> = None;
         loop {
             // The lookouts whose news may have changed: those an event
@@ -1201,6 +1215,12 @@ impl Service {
                         self.reread();
                     }
                     touched = Some(vec![lead]);
+                }
+                _ = nudge.tick() => {
+                    touched = Some((self.lookouts.iter())
+                        .filter(|(_, lookout)| !lookout.heard.is_empty())
+                        .map(|(name, _)| name.clone())
+                        .collect());
                 }
                 _ = tick.tick() => {
                     let now = Instant::now();
@@ -2128,6 +2148,9 @@ struct Lookout {
     resend: Vec<sources::Heard>,
     /// The note on its way, and its key, until the daemon answers.
     sending: Option<(Vec<sources::Heard>, Vec<String>)>,
+    /// When the last note went, in epoch ms: the next waits
+    /// `GROUP_INTERVAL` after.
+    sent_ms: u128,
     /// The subscriptions with a digest of their own whose news that note
     /// tells: none tells more till it lands.
     sourced_subs: Vec<String>,
@@ -2172,6 +2195,7 @@ impl Lookout {
             dirty: false,
             resend: Vec::new(),
             sending: None,
+            sent_ms: 0,
             sourced_subs: Vec::new(),
             log: None,
         }
@@ -2666,8 +2690,14 @@ impl Lookout {
         let (mut ready, held): (Vec<_>, Vec<_>) = std::mem::take(&mut self.heard)
             .into_iter()
             .partition(|heard| self.ready(heard, now) && !self.blocked(heard));
-        if ready.is_empty() {
-            self.heard = held;
+        // What is ready goes at once, unless a note went less than
+        // `GROUP_INTERVAL` ago: then it gathers till then, or till
+        // something steers.
+        let grouping = epoch_ms() < self.sent_ms + GROUP_INTERVAL.as_millis();
+        if ready.is_empty() || (grouping && !ready.iter().any(|heard| heard.event.steer)) {
+            ready.extend(held);
+            ready.sort_by_key(|heard| (heard.event.at_ms, heard.event.seq));
+            self.heard = ready;
             return;
         }
         // A bounded note, always at least one event: the rest wait for the
@@ -2726,6 +2756,7 @@ impl Lookout {
         self.sourced_subs = subs;
         self.charged = self.charges(sent.iter().flat_map(|heard| &heard.subs));
         self.sending = Some((sent, key));
+        self.sent_ms = epoch_ms();
         self.keep();
         let (client, woken) = (client.clone(), woken.clone());
         let (lead, id) = (self.lead.clone(), self.id);
@@ -2747,6 +2778,8 @@ impl Lookout {
             // Words it could not quote, gone with their task or too long,
             // are named by their turns instead, and the note goes again.
             Err(code) if code.starts_with("quote_") => {
+                // Nothing reached the subscriber: it goes again at once.
+                self.sent_ms = 0;
                 self.sourced(false);
                 let mut back: Vec<sources::Heard> = sent;
                 for heard in &mut back {
@@ -2861,6 +2894,7 @@ impl Lookout {
     /// The connection dropped: the answer under way is lost with it, so
     /// what its note carried waits again, as when one is refused.
     fn reconnected(&mut self) {
+        self.sent_ms = 0;
         if let Some((mut sent, _)) = self.sending.take() {
             self.sourced(false);
             sent.append(&mut self.heard);
@@ -4774,6 +4808,49 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn an_event_goes_at_once_and_what_follows_it_closely_goes_together() {
+        let (client, mut got) = submits().await;
+        let mut lookout = lookout();
+        lookout.live = true;
+        lookout.subs.push(hears("chat"));
+        let (woken, mut woke) = tokio::sync::mpsc::channel(4);
+        let answer = |lookout: &mut Lookout, woke: &mut tokio::sync::mpsc::Receiver<_>| {
+            let (_, _, answer) = woke.try_recv().unwrap();
+            lookout.answered(answer);
+        };
+        // None went lately: the first goes as it comes.
+        lookout.heard_from(&slack("one", false));
+        lookout.wake(&client, &woken);
+        assert_eq!(got.recv().await.unwrap()["prompt"], "[slack · ana]\none");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        answer(&mut lookout, &mut woke);
+        // What comes within the group interval waits for it to end, together.
+        lookout.heard_from(&slack("two", false));
+        lookout.heard_from(&slack("three", false));
+        lookout.wake(&client, &woken);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(got.try_recv().is_err());
+        // A steer waits for none, and takes along what waits.
+        lookout.heard_from(&slack("down", true));
+        lookout.wake(&client, &woken);
+        let prompt = got.recv().await.unwrap()["prompt"].clone();
+        assert_eq!(
+            prompt,
+            "[slack · ana]\ntwo\n[slack · ana]\nthree\n[slack · ana]\ndown"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        answer(&mut lookout, &mut woke);
+        lookout.heard_from(&slack("four", false));
+        lookout.wake(&client, &woken);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(got.try_recv().is_err());
+        // Once the group interval has passed it goes.
+        lookout.sent_ms -= GROUP_INTERVAL.as_millis();
+        lookout.wake(&client, &woken);
+        assert_eq!(got.recv().await.unwrap()["prompt"], "[slack · ana]\nfour");
+    }
+
+    #[tokio::test]
     async fn a_digest_tells_its_source_at_most_once_a_while() {
         let (client, mut got) = submits().await;
         let mut lookout = lookout();
@@ -4890,6 +4967,8 @@ mod tests {
 
     /// `wake_sources`, and what the daemon answered it, if it sent.
     async fn wake(lookout: &mut Lookout, client: &Arc<Client>) {
+        // As if the group interval since the last note had passed.
+        lookout.sent_ms = 0;
         let (woken, mut woke) = tokio::sync::mpsc::channel(4);
         lookout.wake(client, &woken);
         drop(woken);
