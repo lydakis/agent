@@ -643,7 +643,11 @@ as one.
   `agent` client command that does the same inside: a message to an agent
   there is (`run --bot` with no `--new` or `--fork`), `ls`, `turns`,
   `wait`, `inspect`, `models` without `--discover`, `usage`, `audit`,
-  `stats`, or a `fork --allow ''`. The reason says to run it again without
+  `stats`, or a `fork --allow ''`, with only the flags known to change
+  nothing the sandbox decides (no `--workspace`, `--model`, `--image`,
+  `--store` or `--socket`), piped only into `head`, `tail` or `jq`, with no
+  redirection to a file and no command run inside it (`$(...)`, a
+  backquote). The reason says to run it again without
   escalating, and that the `send_message`, `list_agents` and `pause_agents`
   tools do the same. Like a Codex command rule with `decision = "forbidden"`
   and its `justification`, it is unassessed, so it never counts toward the

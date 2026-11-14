@@ -580,9 +580,10 @@ const STATUSES: &[&str] = &[
 /// Whether a command line only runs `agent` commands that do the same in
 /// the agent's sandbox as out of it, on its own daemon, as itself: a
 /// message to an agent there is, a list, turns read, a wait, a look-up,
-/// models, usage, audit, stats, or a fork that may write nothing. Another
-/// store, a new agent, models discovered into the home or anything else
-/// on the line is not.
+/// models, usage, audit, stats, or a fork that may write nothing, with no
+/// flag but those known to change nothing the sandbox decides. Another
+/// store or socket, a new agent, a move, models discovered into the home
+/// or anything else on the line is not.
 pub fn agent_inside(command: &str) -> bool {
     let parts = crate::shell::parts(command);
     !parts.is_empty()
@@ -610,41 +611,87 @@ pub fn agent_inside(command: &str) -> bool {
             let Some((program, words)) = simple.words.split_first() else {
                 return false;
             };
-            if !matches!(program.as_str(), "$AGENT_BIN" | "${AGENT_BIN}" | "agent")
-                || (words.iter()).any(|w| {
-                    ["--store", "--socket"].iter().any(|flag| {
-                        w == flag || w.strip_prefix(flag).is_some_and(|r| r.starts_with('='))
-                    })
-                })
-            {
+            if !matches!(program.as_str(), "$AGENT_BIN" | "${AGENT_BIN}" | "agent") {
                 return false;
             }
+            // Only the flags named here, each known to change nothing the
+            // sandbox decides: a flag that moves a bot, sets its model or
+            // tools, reads a file or names another daemon is not.
             let mut words = words;
             while let Some(first) = words.first().filter(|w| w.starts_with("--")) {
-                let skip = match SWITCHES.contains(&first.as_str()) || first.contains('=') {
-                    true => 1,
-                    false => 2,
-                };
-                let Some(rest) = words.get(skip..) else {
+                if !matches!(first.as_str(), "--pretty" | "--no-spawn") {
                     return false;
-                };
-                words = rest;
+                }
+                words = &words[1..];
             }
             let Some((verb, rest)) = words.split_first() else {
                 return false;
             };
             let args = Args::new(rest);
+            let only = |valued: &[&str], switches: &[&str], positional: bool| {
+                let mut words = args.words.iter();
+                while let Some(word) = words.next() {
+                    let Some(flag) = word.strip_prefix("--") else {
+                        if !positional {
+                            return false;
+                        }
+                        continue;
+                    };
+                    let (name, inline) = match flag.split_once('=') {
+                        Some((name, _)) => (name, true),
+                        None => (flag, false),
+                    };
+                    if valued.contains(&name) {
+                        if !inline && words.next().is_none() {
+                            return false;
+                        }
+                    } else if inline
+                        || !(switches.contains(&name) || ["pretty", "no-spawn"].contains(&name))
+                    {
+                        return false;
+                    }
+                }
+                true
+            };
             match verb.as_str() {
                 "run" => {
                     args.value(&["--bot"]).is_some()
-                        && !args.has("--new")
-                        && args.value(&["--fork"]).is_none()
+                        && only(
+                            &[
+                                "bot",
+                                "bot-id",
+                                "delivery",
+                                "quote",
+                                "request-id",
+                                "attach-wait",
+                            ],
+                            &["detach"],
+                            true,
+                        )
                 }
-                "fork" => args.value(&["--allow"]) == Some(""),
-                "models" => !args.has("--discover"),
-                "ls" | "turns" | "history" | "wait" | "inspect" | "usage" | "audit" | "stats" => {
-                    true
+                "fork" => {
+                    args.value(&["--allow"]) == Some("")
+                        && only(
+                            &["source", "bot", "checkpoint", "allow", "request-id"],
+                            &[],
+                            true,
+                        )
                 }
+                "models" => only(&[], &[], false),
+                "ls" => only(&["name", "created-by", "limit"], &["active"], false),
+                "turns" | "messages" => only(&["bot", "after", "limit"], &["newest"], false),
+                "wait" => only(&["bot", "bot-id", "timeout"], &["any"], true),
+                "inspect" => only(&["bot", "bot-id"], &[], false),
+                "usage" => only(&["name", "since", "bucket", "limit"], &[], false),
+                "audit" => only(
+                    &[
+                        "bot", "turn", "kind", "place", "approved", "access", "outcome", "tool",
+                        "since", "before", "limit",
+                    ],
+                    &[],
+                    false,
+                ),
+                "stats" => only(&[], &[], false),
                 _ => false,
             }
         })
@@ -1462,6 +1509,13 @@ Keep the rest.'"#,
             r#""$AGENT_BIN" run --bot shop.y --fork shop.fix -- go"#,
             r#""$AGENT_BIN" --store /tmp/s ls"#,
             r#""$AGENT_BIN" --socket /tmp/other.sock ls"#,
+            r#""$AGENT_BIN" run --bot shop.fix --workspace /outside --detach -- test"#,
+            r#""$AGENT_BIN" run --bot shop.fix --model openai/x -- go"#,
+            r#""$AGENT_BIN" run --bot shop.fix --image ~/secret.png -- look"#,
+            r#""$AGENT_BIN" audit trim --before 9"#,
+            r#""$AGENT_BIN" fork --bot shop.fix --allow '' --workspace /outside -- go"#,
+            r#""$AGENT_BIN" --unknown ls"#,
+            r#""$AGENT_BIN" ls --name=x --active=1"#,
             r#""$AGENT_BIN" ls --socket=/tmp/other.sock"#,
             r#"AGENT_SOCKET=/tmp/other.sock "$AGENT_BIN" ls"#,
             r#"AGENT_STORE=/tmp/s "$AGENT_BIN" ls"#,
