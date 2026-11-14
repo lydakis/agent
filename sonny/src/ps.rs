@@ -234,7 +234,13 @@ impl View {
             true => "a this project",
             false => "a every agent",
         };
-        format!("↑↓ pick · enter open · x stop · {scope} · esc close")
+        use crate::hint::{Enter, Esc, Keys};
+        let (key, does) = scope.split_once(' ').unwrap_or((scope, ""));
+        (Keys::new().pick().enter(Enter::Open))
+            .key("x", "stop")
+            .key(key, does)
+            .esc(Esc::Close)
+            .text()
     }
 }
 

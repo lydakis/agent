@@ -813,14 +813,20 @@ impl View {
     /// The keys the picked setting takes.
     pub fn keys(&self) -> Line<'static> {
         let file = crate::tilde(&self.path.display().to_string());
+        use crate::hint::{Enter, Esc, Keys};
         let keys = match (&self.typing, SETTINGS[self.pick].values.is_empty()) {
-            (Some(_), _) => "  enter save, empty for the default · esc cancel",
-            (None, true) => "  ↑↓ pick · enter type · ⌫ default · esc close",
-            (None, false) => "  ↑↓ pick · ←→ change · ⌫ default · esc close",
+            (Some(_), _) => Keys::new().enter(Enter::Save).esc(Esc::Cancel),
+            (None, true) => (Keys::new().pick().enter(Enter::Choose))
+                .key("⌫", "default")
+                .esc(Esc::Close),
+            (None, false) => (Keys::new().pick().key("←→", "change"))
+                .key("⌫", "default")
+                .esc(Esc::Close),
         };
-        let mut spans = crate::hint::spans(keys);
-        if self.typing.is_none() {
-            spans.push(Span::raw(format!("  {file}")).dim());
+        let mut spans = crate::hint::spans(&format!("  {keys}"));
+        match self.typing {
+            Some(_) => spans.push(Span::raw("  empty for the default").dim()),
+            None => spans.push(Span::raw(format!("  {file}")).dim()),
         }
         Line::from(spans)
     }
