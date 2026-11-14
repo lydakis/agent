@@ -927,15 +927,14 @@ fn unfinished_char(bytes: &[u8]) -> usize {
 }
 
 /// `redact_blocks` as a stream: what it may still replace is held, and a
-/// secret block's body is dropped as it comes, up to its end.
+/// secret block's body is dropped as it comes, line by line.
 #[derive(Default)]
 struct BlockStream {
     /// Read and not yet told: from a block's start, or the end of the
     /// text that may begin one.
     held: String,
-    /// Inside a secret block's body, dropped: its last bytes, which may
-    /// begin its end's marker.
-    body: Option<String>,
+    /// Inside a secret block's body.
+    body: Option<PemBody>,
 }
 
 /// The most of a block's header held back for its end: far past any
@@ -949,43 +948,27 @@ impl BlockStream {
 
     fn feed(&mut self, text: &str, blocks: &[String], last: bool) -> String {
         const BEGIN: &str = "-----BEGIN ";
-        const END: &str = "-----END ";
         let mut out = String::with_capacity(text.len());
-        let text = std::mem::take(&mut self.held) + text;
-        let bytes = text.as_bytes();
+        let mut text = std::mem::take(&mut self.held) + text;
         // Read on from `at`: nothing before it is moved again.
         let mut at = 0;
         loop {
-            if let Some(tail) = &mut self.body {
-                // The end's marker, maybe begun in the last text's end.
-                let mut probe = tail.as_bytes().to_vec();
-                probe.extend_from_slice(&bytes[at..(at + END.len() - 1).min(bytes.len())]);
-                let across = (probe.windows(END.len()))
-                    .position(|w| w == END.as_bytes())
-                    .map(|p| at + p + END.len() - tail.len());
-                let end = across.or_else(|| text[at..].find(END).map(|n| at + n + END.len()));
-                match end {
-                    Some(end) => {
-                        // As `redact_blocks` goes on: past the end's marker.
-                        out.push_str(REDACTED);
-                        out.push('\n');
-                        out.push_str(END);
+            if let Some(body) = &mut self.body {
+                // A line held from the last text begins this one.
+                let line = std::mem::take(&mut body.line);
+                if !line.is_empty() {
+                    text = line + &text[at..];
+                    at = 0;
+                }
+                match body.take(&text[at..], last) {
+                    Some((len, told)) => {
+                        out.push_str(told);
                         self.body = None;
-                        at = end;
+                        at += len;
                         continue;
                     }
-                    None if last => {
-                        // A key cut off by its stream's end is still a key.
-                        out.push_str(REDACTED);
-                        self.body = None;
-                    }
-                    None => {
-                        tail.push_str(&text[at..]);
-                        let keep = floor_char(tail, tail.len().saturating_sub(END.len() - 1));
-                        tail.drain(..keep);
-                    }
+                    None => return out,
                 }
-                return out;
             }
             let Some(begin) = text[at..].find(BEGIN).map(|n| at + n) else {
                 // The end may begin a block's marker.
@@ -1003,15 +986,19 @@ impl BlockStream {
             };
             out.push_str(&text[at..begin]);
             at = begin;
-            let Some(dashes) = text[at + BEGIN.len()..]
-                .find("-----")
-                .map(|n| BEGIN.len() + n + 5)
-            else {
-                if last {
-                    // No header ends: `redact_blocks` stops here.
-                    out.push_str(&text[at..]);
-                    return out;
-                }
+            let from = at + BEGIN.len();
+            let line_ends = text[from..].contains('\n');
+            let closed = match text[from..].find('\n') {
+                Some(n) => text[from..from + n].contains("-----"),
+                None => text[from..].contains("-----"),
+            };
+            if !closed && (line_ends || last) {
+                // No header line here: read on after its start.
+                out.push_str(BEGIN);
+                at = from;
+                continue;
+            }
+            if !closed {
                 // No header ends after this block's start, nor so after any
                 // later one: past `HEADER_HOLD` they are no key's and are
                 // told as they are; the last such start is held.
@@ -1023,22 +1010,25 @@ impl BlockStream {
                 out.push_str(&text[at..held]);
                 self.held = text[held..].to_owned();
                 return out;
-            };
-            let header = match &bytes[at + dashes..] {
-                [b'\r', b'\n', ..] => dashes + 2,
-                [b'\n', ..] => dashes + 1,
-                [b'\r'] | [] if !last => {
+            }
+            let Some(header) = pem_header(&text, at, last) else {
+                let dashes = from + text[from..].find("-----").unwrap_or(0) + 5;
+                if !last && matches!(&text.as_bytes()[dashes..], [] | [b'\r']) {
                     // The line's end may follow.
                     self.held = text[at..].to_owned();
                     return out;
                 }
-                _ => dashes,
+                out.push_str(BEGIN);
+                at = from;
+                continue;
             };
-            let header = &text[at..at + header];
-            out.push_str(header);
-            at += header.len();
-            if blocks.iter().any(|block| header.contains(block.as_str())) {
-                self.body = Some(String::new());
+            let named = blocks
+                .iter()
+                .any(|block| text[at..header].contains(block.as_str()));
+            out.push_str(&text[at..header]);
+            at = header;
+            if named {
+                self.body = Some(PemBody::default());
             }
         }
     }
@@ -1048,14 +1038,6 @@ impl BlockStream {
 fn ceil_char(text: &str, mut at: usize) -> usize {
     while !text.is_char_boundary(at) {
         at += 1;
-    }
-    at
-}
-
-/// The last char boundary of `text` at or before `at`.
-fn floor_char(text: &str, mut at: usize) -> usize {
-    while !text.is_char_boundary(at) {
-        at -= 1;
     }
     at
 }
@@ -1425,40 +1407,134 @@ fn redact_fields(text: String, fields: &[String]) -> String {
 
 /// Replace the body of each PEM block in `text` whose header names one of
 /// `blocks`.
-fn redact_blocks(mut text: String, blocks: &[String]) -> String {
+fn redact_blocks(text: String, blocks: &[String]) -> String {
     const BEGIN: &str = "-----BEGIN ";
-    const END: &str = "-----END ";
-    let mut from = 0;
-    while let Some(found) = text[from..].find(BEGIN) {
-        let begin = from + found;
-        // The header line ends in five dashes, then LF or CRLF.
-        let Some(dashes) = text[begin + BEGIN.len()..]
-            .find("-----")
-            .map(|n| begin + BEGIN.len() + n + 5)
-        else {
-            break;
-        };
-        let header = match &text.as_bytes()[dashes..] {
-            [b'\r', b'\n', ..] => dashes + 2,
-            [b'\n', ..] => dashes + 1,
-            _ => dashes,
-        };
-        if !blocks
-            .iter()
-            .any(|block| text[begin..header].contains(block.as_str()))
-        {
-            from = header;
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text.as_str();
+    while let Some(begin) = rest.find(BEGIN) {
+        let Some(header) = pem_header(rest, begin, true) else {
+            // No header line here: read on after its start.
+            out.push_str(&rest[..begin + BEGIN.len()]);
+            rest = &rest[begin + BEGIN.len()..];
             continue;
-        }
-        let Some(end) = text[header..].find(END).map(|n| header + n) else {
-            // A key cut off by truncation is still a key.
-            text.replace_range(header.., REDACTED);
-            break;
         };
-        text.replace_range(header..end, &format!("{REDACTED}\n"));
-        from = header + REDACTED.len() + 1 + END.len();
+        out.push_str(&rest[..header]);
+        let named = blocks
+            .iter()
+            .any(|block| rest[begin..header].contains(block.as_str()));
+        rest = &rest[header..];
+        if named {
+            let mut body = PemBody::default();
+            let (len, told) = body.take(rest, true).expect("the text's end ends the body");
+            out.push_str(told);
+            rest = &rest[len..];
+        }
     }
-    text
+    out.push_str(rest);
+    out
+}
+
+/// Where the header line of the PEM block at `begin` ends, past its line's
+/// end: its five dashes close it on the same line, and only a line's end
+/// follows them, or the text's end when it is `last`. `None` when it is no
+/// header, or when more text may still tell.
+fn pem_header(text: &str, begin: usize, last: bool) -> Option<usize> {
+    const BEGIN: &str = "-----BEGIN ";
+    let from = begin + BEGIN.len();
+    let line = text[from..].find('\n').map_or(text.len(), |n| from + n);
+    let dashes = from + text[from..line].find("-----")? + 5;
+    match &text.as_bytes()[dashes..] {
+        [b'\r', b'\n', ..] => Some(dashes + 2),
+        [b'\n', ..] => Some(dashes + 1),
+        [] if last => Some(dashes),
+        _ => None,
+    }
+}
+
+/// The most of one line a key's body is judged on: a line whose first
+/// this many bytes are base64 is a body's line, whatever follows.
+const PEM_LINE: usize = 64 * 1024;
+
+/// Whether `line`, its end's `\r` taken off, is a line of a key's body:
+/// base64, or the RFC 1421 headers of an encrypted key and the empty line
+/// after them.
+fn pem_line(line: &str, after_info: bool) -> bool {
+    let line = line.strip_suffix('\r').unwrap_or(line);
+    let base64 = |b: &u8| b.is_ascii_alphanumeric() || matches!(b, b'+' | b'/' | b'=');
+    (line.is_empty() && after_info)
+        || (line.len() <= PEM_LINE
+            && (line.starts_with("Proc-Type:") || line.starts_with("DEK-Info:")))
+        || (!line.is_empty() && line.as_bytes().iter().take(PEM_LINE).all(base64))
+}
+
+/// A secret block's body, read line by line after its header: the lines
+/// that read as a key's are told as one `[REDACTED]` line, and the first
+/// that does not, an `END` marker or anything else, is told as it is. So a
+/// key cut short hides only itself, and a line that merely looks like a
+/// header hides nothing after it.
+#[derive(Default)]
+struct PemBody {
+    /// Some of its lines were taken.
+    any: bool,
+    /// The last line taken was a `DEK-Info` header.
+    after_info: bool,
+    /// Inside a line too long to hold that reads as a key's: dropped up to
+    /// its end.
+    long: bool,
+    /// The start of a line not yet ended, held to judge it whole.
+    line: String,
+}
+
+impl PemBody {
+    /// Read `text`, which starts a line: how far the body runs, and what it
+    /// is told as, once a line ends it or `last` ends the text; `None`
+    /// when all of `text` was taken and more may follow.
+    fn take(&mut self, text: &str, last: bool) -> Option<(usize, &'static str)> {
+        let told = |any: bool| if any { "[REDACTED]\n" } else { "" };
+        let mut at = 0;
+        loop {
+            let rest = &text[at..];
+            if self.long {
+                match rest.find('\n') {
+                    Some(n) => {
+                        (self.long, self.after_info) = (false, false);
+                        at += n + 1;
+                        continue;
+                    }
+                    None if last => return Some((text.len(), "[REDACTED]")),
+                    None => return None,
+                }
+            }
+            match rest.find('\n') {
+                Some(n) if pem_line(&rest[..n], self.after_info) => {
+                    self.after_info = rest.starts_with("DEK-Info:");
+                    self.any = true;
+                    at += n + 1;
+                }
+                Some(_) => return Some((at, told(self.any))),
+                None if rest.is_empty() => {
+                    return last.then(|| (at, told(self.any)));
+                }
+                None if last => {
+                    return Some(match pem_line(rest, self.after_info) {
+                        true => (text.len(), "[REDACTED]"),
+                        false => (at, told(self.any)),
+                    });
+                }
+                None if rest.len() > PEM_LINE => {
+                    if !pem_line(rest, false) {
+                        return Some((at, told(self.any)));
+                    }
+                    (self.long, self.any) = (true, true);
+                    return None;
+                }
+                None => {
+                    self.line = rest.to_owned();
+                    return None;
+                }
+            }
+        }
+    }
 }
 
 pub enum Prepared {
@@ -5122,6 +5198,44 @@ mod tests {
             redact("-----BEGIN PRIVATE KEY-----\r\nMIIE\r\n-----END PRIVATE KEY-----\r\n"),
             "-----BEGIN PRIVATE KEY-----\r\n[REDACTED]\n-----END PRIVATE KEY-----\r\n"
         );
+        // A header that doesn't end its line is a scanner's pattern, not a
+        // key: every line after it is kept.
+        let scanner = "re = re.compile(\"-----BEGIN RSA PRIVATE KEY-----\")\nfor line in lines:\n    scan(line)\n";
+        assert_eq!(redact(scanner), scanner);
+        let quoted = "keys = ['-----BEGIN PRIVATE KEY-----']\nprint(keys)\n";
+        assert_eq!(redact(quoted), quoted);
+        // With no END, only the key's own lines are hidden: the first line
+        // that can't be in a key's body ends it.
+        assert_eq!(
+            redact(
+                "KEY = \"\"\"\n-----BEGIN PRIVATE KEY-----\nMIIE+/a=\nAAAA\n\"\"\"\nprint(KEY)\n"
+            ),
+            "KEY = \"\"\"\n-----BEGIN PRIVATE KEY-----\n[REDACTED]\n\"\"\"\nprint(KEY)\n"
+        );
+        // A body line past the longest a line is read is still dropped
+        // whole, and the code after it kept.
+        let long = format!(
+            "-----BEGIN PRIVATE KEY-----\n{}\nprint(KEY)\n",
+            "A".repeat(70_000)
+        );
+        assert_eq!(
+            redact(&long),
+            "-----BEGIN PRIVATE KEY-----\n[REDACTED]\nprint(KEY)\n"
+        );
+        let mut redacting = Redacting::new(credentials.clone());
+        let mut out = String::new();
+        for piece in long.as_bytes().chunks(4096) {
+            out.push_str(&redacting.feed(piece));
+        }
+        out.push_str(&redacting.finish());
+        assert_eq!(out, redact(&long));
+        // An encrypted key's headers and their blank line are its body.
+        assert_eq!(
+            redact(
+                "-----BEGIN RSA PRIVATE KEY-----\nProc-Type: 4,ENCRYPTED\nDEK-Info: AES-128-CBC,00\n\nMIIE\n-----END RSA PRIVATE KEY-----\n"
+            ),
+            "-----BEGIN RSA PRIVATE KEY-----\n[REDACTED]\n-----END RSA PRIVATE KEY-----\n"
+        );
     }
     /// A bot keeps at most the process bound's number of background
     /// commands, as Codex keeps a session's processes: starting one past
@@ -5385,7 +5499,7 @@ mod tests {
             &["password".to_owned(), "api_key".to_owned()],
             &["PRIVATE KEY".to_owned()],
         );
-        let parts: [&str; 23] = [
+        let parts: [&str; 30] = [
             "password=",
             "\"api_key\": \"",
             "password: '",
@@ -5409,6 +5523,13 @@ mod tests {
             "Xabc",
             "123",
             "def456",
+            "-----BEGIN PRIVATE KEY-----\")",
+            "-----BEGIN PRIVATE KEY-----",
+            "Proc-Type: 4,ENCRYPTED\n",
+            "DEK-Info: AES\n",
+            "\r",
+            "MIIE+/a=\n",
+            "print(KEY)\n",
         ];
         let mut seed = 0x2545_f491_4f6c_dd1du64;
         let mut next = || {
