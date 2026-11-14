@@ -33,7 +33,7 @@ pub fn welcome(
     let what = match lead {
         true => [
             "This folder's lead. Ask for anything:",
-            "it plans, starts tasks in their own copies,",
+            "it plans, starts tasks in their own folders,",
             "and tells you when they need you.",
         ],
         false => [

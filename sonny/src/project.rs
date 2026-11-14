@@ -45,6 +45,22 @@ const BUDGETS: [(&str, usize); 3] = [
     ("superlead", 3 * 1024),
 ];
 
+/// The project in `dir` (`agent_client::project::read`), its file's
+/// `threads_*` keys renamed `task_*` first, once for the file
+/// (`TASK_KEYS`, recorded in `~/.agent/sonny/migrated` when it renamed
+/// some), so old keys a checkout brings back after are refused by name.
+pub fn read(dir: &Path) -> Result<Value, String> {
+    use agent_client::project::{FILE, TASK_KEYS, rename_task_keys};
+    if let Some(home) = std::env::var_os("HOME") {
+        let record = Path::new(&home).join(".agent/sonny/migrated");
+        let file = dir.join(FILE);
+        crate::upgrade::once_for(&record, TASK_KEYS, &file.to_string_lossy(), || {
+            rename_task_keys(dir)
+        });
+    }
+    agent_client::project::read(dir)
+}
+
 /// [`BUILTINS`] as agents read them: without the commons while it is off.
 pub fn builtins() -> [(&'static str, std::borrow::Cow<'static, str>); 3] {
     BUILTINS.map(|(name, text)| (name, crate::commons::role(text)))
@@ -89,10 +105,10 @@ pub fn lead_profile(info: &Value) -> Result<String, String> {
 }
 
 /// The name of the profile every agent but a lead is told after the rest:
-/// the project file's `threads_profile`, else the config's
+/// the project file's `task_profile`, else the config's
 /// `[sonny] task_profile`, else `task`.
 pub fn task_profile(info: &Value) -> Result<String, String> {
-    named(info, "threads_profile", |sonny| sonny.task_profile, "task")
+    named(info, "task_profile", |sonny| sonny.task_profile, "task")
 }
 
 fn named(
@@ -344,7 +360,7 @@ pub struct Lead {
 /// The folder's own name reduced to name characters, the name of a
 /// project with no file.
 fn default_name(dir: &Path) -> Result<String, String> {
-    let info = agent_client::project::read(dir)?;
+    let info = read(dir)?;
     Ok(info["name"].as_str().unwrap_or("project").to_owned())
 }
 
@@ -362,7 +378,7 @@ pub fn chosen(store: &Path, bot: &str) -> Option<String> {
 fn role(dir: &Path, chosen: Option<&str>) -> Result<agent_client::policy::Profile, String> {
     match chosen {
         Some(name) => profile(dir, name),
-        None => profile(dir, &lead_profile(&agent_client::project::read(dir)?)?),
+        None => profile(dir, &lead_profile(&read(dir)?)?),
     }
 }
 
@@ -379,7 +395,7 @@ fn role_or_shipped(
         Err(error) if chosen.is_some() => return Err(error),
         Err(error) => error,
     };
-    let name = (agent_client::project::read(dir).ok())
+    let name = (read(dir).ok())
         .and_then(|info| lead_profile(&info).ok())
         .filter(|name| shipped(name).is_some())
         .unwrap_or_else(|| "lead".into());
@@ -406,7 +422,7 @@ fn compose(dir: &Path, chosen: Option<&str>) -> Result<Composed, String> {
     let role = role_or_shipped(dir, chosen, &mut left_out)?;
     let mut composed = folder(dir, &role)?;
     left_out.append(&mut composed.left_out);
-    let info = agent_client::project::read(dir)?;
+    let info = read(dir)?;
     let rule = agent_client::project::rule(&info);
     composed.text = format!("{}\n\n{rule}", composed.text);
     composed.left_out = left_out;
@@ -457,7 +473,7 @@ pub fn plain(dir: &Path) -> Result<String, String> {
     let memory = agent_client::policy::memory_indexes(dir).map_err(|e| e.to_string())?;
     let composed = agent_client::policy::instructions(dir, None, &memory)
         .map_err(|e| format!("{}: {e}", e.code()))?;
-    as_task(dir, &agent_client::project::read(dir)?, &composed.text)
+    as_task(dir, &read(dir)?, &composed.text)
 }
 
 /// The folder's instructions for a lead, when they are not the ones it
@@ -570,7 +586,7 @@ pub fn keep_model(dir: &Path, model: &str, effort: Option<&str>) -> Result<(), S
             format!("{}: {error}", path.display())
         })?;
     // Read back as the app reads it, so a bad edit is said, not kept quiet.
-    agent_client::project::read(dir).map(|_| ())
+    self::read(dir).map(|_| ())
 }
 
 /// `text` with its top-level `model` and `effort` set (or `effort`
@@ -872,7 +888,7 @@ fn claimed(folder: &Path, home: Option<&Path>) -> Result<Option<PathBuf>, String
             break;
         }
         if at.join(file).is_file() {
-            let info = agent_client::project::read(at)?;
+            let info = read(at)?;
             return Ok((info["subfolders"] == "project").then(|| at.to_owned()));
         }
     }
@@ -939,7 +955,7 @@ async fn create(
     // What it was made without is said where it opens, as each window
     // reviews its instructions.
     let role = role_or_shipped(dir, chosen, &mut Vec::new())?;
-    let info = agent_client::project::read(dir)?;
+    let info = read(dir)?;
     // A project file that names a model keeps it; otherwise asked for,
     // the role's, AGENT_MODEL's, the config's `model`, then the newest
     // agent's, so a bare `sonny` needs no flag. With none, the person picks
@@ -1015,7 +1031,7 @@ async fn make(
     let gate = crate::approvals::gate(mode, &crate::approvals::gateable(&tools, &declare));
     // Writing its own state folder, by the name it is made under.
     let lead = (bot.map(str::to_owned)).or_else(|| {
-        let info = agent_client::project::read(dir).ok()?;
+        let info = read(dir).ok()?;
         info["coordinator"].as_str().map(str::to_owned)
     });
     let state = lead.as_deref().and_then(crate::state::folder);
@@ -1110,17 +1126,17 @@ fn picks(arguments: &Value) -> Result<(PathBuf, agent_client::project::Picks), S
         effort: text("effort"),
         ..Default::default()
     };
-    let (threads_model, threads_effort) = (text("threads_model"), text("threads_effort"));
-    let threads_in = text("threads_in");
-    let in_project = match threads_in.as_deref() {
+    let (task_model, task_effort) = (text("task_model"), text("task_effort"));
+    let task_in = text("task_in");
+    let in_project = match task_in.as_deref() {
         None | Some("worktree") => false,
         Some("project") => true,
-        Some(other) => return Err(format!("project_invalid: threads_in {other:?}")),
+        Some(other) => return Err(format!("project_invalid: task_in {other:?}")),
     };
-    if threads_model.is_some() || threads_effort.is_some() || threads_in.is_some() {
-        picks.threads = Some(agent_client::project::ThreadPicks {
-            model: threads_model,
-            effort: threads_effort,
+    if task_model.is_some() || task_effort.is_some() || task_in.is_some() {
+        picks.tasks = Some(agent_client::project::TaskPicks {
+            model: task_model,
+            effort: task_effort,
             in_project,
         });
     }
@@ -1236,7 +1252,7 @@ mod tests {
     #[test]
     fn a_new_project_reads_its_picks_and_refuses_others() {
         let picked = |arguments: Value| picks(&arguments);
-        for bad in [json!({}), json!({"folder": "/", "threads_in": "elsewhere"})] {
+        for bad in [json!({}), json!({"folder": "/", "task_in": "elsewhere"})] {
             assert!(
                 picked(bad.clone())
                     .unwrap_err()
@@ -1250,16 +1266,16 @@ mod tests {
                 .starts_with("project_invalid: ")
         );
         let (_, picks) =
-            picked(json!({"folder": "/", "model": "a/b", "threads_in": "project"})).unwrap();
+            picked(json!({"folder": "/", "model": "a/b", "task_in": "project"})).unwrap();
         assert_eq!(picks.model.as_deref(), Some("a/b"));
         assert!(
             picks
-                .threads
+                .tasks
                 .is_some_and(|t| t.in_project && t.model.is_none())
         );
         // Tasks may take an effort of their own on the lead's model.
-        let (_, picks) = picked(json!({"folder": "/", "threads_effort": "xhigh"})).unwrap();
-        assert!(picks.threads.is_some_and(|t| t.model.is_none()
+        let (_, picks) = picked(json!({"folder": "/", "task_effort": "xhigh"})).unwrap();
+        assert!(picks.tasks.is_some_and(|t| t.model.is_none()
             && t.effort.as_deref() == Some("xhigh")
             && !t.in_project));
     }
@@ -1496,10 +1512,10 @@ mod tests {
     #[test]
     fn the_project_file_keeps_its_other_lines_when_the_model_moves() {
         let file =
-            "# mine\nname = \"shop\"\nmodel = \"openai/a\"   # pinned\nthreads_in = \"project\"\n";
+            "# mine\nname = \"shop\"\nmodel = \"openai/a\"   # pinned\ntask_in = \"project\"\n";
         assert_eq!(
             with_model(file, "anthropic/b", Some("high")),
-            "# mine\nname = \"shop\"\nmodel = \"anthropic/b\"\neffort = \"high\"\nthreads_in = \"project\"\n"
+            "# mine\nname = \"shop\"\nmodel = \"anthropic/b\"\neffort = \"high\"\ntask_in = \"project\"\n"
         );
         let file = "name = \"shop\"\neffort = \"low\"\nmodel = \"openai/a\"\n";
         assert_eq!(

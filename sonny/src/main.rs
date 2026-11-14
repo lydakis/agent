@@ -370,7 +370,7 @@ struct Options {
 
 fn usage() -> String {
     "usage: sonny [--store PATH] [--socket PATH] [--model PROVIDER/MODEL] [--no-layout] [--rex-host HOST] [--no-sound]\n\
-     \x20      [--agent NAME [--new [--workspace DIR]] | --lead NAME | --new-lead [NAME]]\n\
+     \x20      [--agent NAME [--new [--folder DIR]] | --lead NAME | --new-lead [NAME]]\n\
      With no --agent, the folder's lead you last wrote to, its first made with --model the\n\
      first time; --lead opens another of the folder's leads, --new-lead makes one. Its\n\
      tasks open beside it in Rex, Herdr or cmux, each in a git worktree of its own. Type /status\n\
@@ -458,7 +458,7 @@ async fn show(
 }
 
 /// A tab for `bot`, a task `caller` just started asking for one: placed
-/// as a task's window is, within `[sonny] task_windows`, closing the
+/// as a task's window is, within `[sonny] most_task_tabs`, closing the
 /// lead's least recently used task tabs for room, never one the person has
 /// not looked at yet nor one that holds its place. What to tell `caller`
 /// beside the start, if anything.
@@ -489,7 +489,7 @@ async fn task_tab(caller: &str, bot: &str) -> Result<String, String> {
         .unwrap_or_else(|| format!("{project}.lead"));
     let lineage = lineage_of(&bots, &lead, lead == format!("{project}.lead"));
     let mut room = room_for(&project, &lineage, &HashMap::new(), Arc::new(used::held));
-    room.most = agent_client::config::load().map_or(0, |c| c.sonny.task_windows as usize);
+    room.most = agent_client::config::load().map_or(0, |c| c.sonny.most_task_tabs as usize);
     let command = [
         me.to_string_lossy().into_owned(),
         "--socket".into(),
@@ -813,7 +813,7 @@ async fn read_status(
             }
             Some((tab, None)) => format!("tab {tab}"),
             // Its window waits for room, until a click on the row.
-            None if (view.aside)(name) => "window set aside for room".into(),
+            None if (view.aside)(name) => "tab set aside for room".into(),
             None => String::new(),
         };
         // This window's turns run on its own model, when it has one.
@@ -2040,7 +2040,7 @@ fn parse() -> Result<Options, String> {
             "--agent" => bot = Some(value()?),
             "--new" => new = true,
             "--model" => model = Some(value()?),
-            "--workspace" => workspace = Some(value()?),
+            "--folder" => workspace = Some(value()?),
             "--no-layout" => layout = false,
             "--rex-host" => rex_host = Some(value()?),
             "--no-sound" => sound = false,
@@ -2091,7 +2091,7 @@ fn reopen(bot: &str) -> Vec<String> {
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--new" | "--reopened" => {}
-            "--workspace" | "--lead" | "--agent" | "--window-place" | "--send-file"
+            "--folder" | "--lead" | "--agent" | "--window-place" | "--send-file"
             | "--draft-file" => {
                 args.next();
             }
@@ -2977,7 +2977,7 @@ async fn create(client: &Client, options: &Options, bot: &str) -> Result<(), Str
     let memory = agent_client::policy::memory_indexes(&workspace).map_err(|e| e.to_string())?;
     let composed =
         agent_client::policy::instructions(&workspace, None, &memory).map_err(|e| e.to_string())?;
-    let info = agent_client::project::read(&workspace)?;
+    let info = crate::project::read(&workspace)?;
     let instructions = project::as_task(&workspace, &info, &composed.text)?;
     let mut asked = json!({"bot": bot, "workspace": workspace, "model": model,
         "instructions": instructions, "request_id": unique("tui-create")});
@@ -4832,11 +4832,11 @@ struct Fleet {
     began: HashMap<String, std::time::SystemTime>,
     /// When the person last used a task's window ([`used::when`]).
     used_when: fn(&str) -> Option<std::time::SystemTime>,
-    /// `[sonny] task_windows` and `task_tabs`, read as the file changes.
+    /// `[sonny] most_task_tabs` and `task_tabs`, read as the file changes.
     windows: Arc<std::sync::Mutex<TaskWindows>>,
 }
 
-/// `[sonny] task_windows` and `task_tabs` as the config file last said
+/// `[sonny] most_task_tabs` and `task_tabs` as the config file last said
 /// them, read again only once the file changed, so that a change in
 /// `/config` from any window holds from the next task window on.
 #[derive(Default)]
@@ -4869,7 +4869,7 @@ impl TaskWindows {
             let sonny = agent_client::config::load()
                 .map(|c| c.sonny)
                 .unwrap_or_default();
-            self.most = sonny.task_windows as usize;
+            self.most = sonny.most_task_tabs as usize;
             self.tabs = sonny.task_tabs;
         }
     }
@@ -4882,7 +4882,7 @@ fn made_room(closed: &[String], project: &str, most: usize) -> String {
         .map(|bot| bot.strip_prefix(&tasks).unwrap_or(bot))
         .collect();
     format!(
-        "closed {}'s window for room ({most} task windows at most, in /config); /status opens it again",
+        "closed {}'s tab for room ({most} task tabs at most, in /config); /status opens it again",
         names.join(", ")
     )
 }
@@ -4892,7 +4892,7 @@ fn made_room(closed: &[String], project: &str, most: usize) -> String {
 fn no_room(bot: &str, project: &str, most: usize) -> String {
     let name = bot.strip_prefix(&format!("{project}.")).unwrap_or(bot);
     format!(
-        "{name} opened no window: {most} task windows at most (in /config) and you have not looked at those open yet; /status opens it"
+        "{name} opened no tab: {most} task tabs at most (in /config) and you have not looked at those open yet; /status opens it"
     )
 }
 
@@ -4932,7 +4932,7 @@ fn seat_profile(
     match lead {
         // One `/new` made in a role of its own runs as that.
         true => project::chosen(store, bot).or_else(|| {
-            agent_client::project::read(folder)
+            crate::project::read(folder)
                 .ok()
                 .and_then(|info| project::lead_profile(&info).ok())
         }),
@@ -16140,7 +16140,7 @@ impl App {
             return;
         }
         let dir = std::path::Path::new(&self.workspace);
-        let default = (agent_client::project::read(dir))
+        let default = (crate::project::read(dir))
             .and_then(|info| project::lead_profile(&info))
             .unwrap_or_else(|_| "lead".to_owned());
         match new::profiles(dir, &default) {
@@ -27560,8 +27560,8 @@ mod tests {
                 .map(|row| row.place.clone())
                 .unwrap()
         };
-        assert_eq!(place(&rows, "calc.b"), "window set aside for room");
-        assert_ne!(place(&rows, "calc.a"), "window set aside for room");
+        assert_eq!(place(&rows, "calc.b"), "tab set aside for room");
+        assert_ne!(place(&rows, "calc.a"), "tab set aside for room");
         // A call of its held for the person: what needs them keeps its
         // window, so it opens, past the limit, and the new one stays.
         let fleet = app.fleet.as_mut().unwrap();
