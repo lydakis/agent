@@ -26,6 +26,8 @@ pub struct Setting {
 const EFFORTS: &[&str] = &["low", "medium", "high", "xhigh", "max"];
 /// A switch, written as TOML's own true or false.
 const SWITCH: &[&str] = &["true", "false"];
+/// What `trailer` lists, each written as a TOML list of its words.
+const TRAILERS: &[&str] = &["sender, time", "sender", "time", "none"];
 
 /// Whether a setting takes a whole number, typed: its default is one.
 fn number(setting: &Setting) -> bool {
@@ -76,10 +78,10 @@ pub const SETTINGS: &[Setting] = &[
         default: "live",
     },
     Setting {
-        key: "senders",
-        about: "whether a new agent's model reads a line naming who sent it each message",
-        values: &["shown", "hidden"],
-        default: "shown",
+        key: "trailer",
+        about: "what an agent's model reads after each message: who sent it, when it was sent",
+        values: TRAILERS,
+        default: "sender, time",
     },
     Setting {
         key: "reviewer.model",
@@ -605,6 +607,12 @@ impl View {
                 value.and_then(|v| match v {
                     toml::Value::Boolean(on) => Some(on.to_string()),
                     toml::Value::Integer(n) => Some(n.to_string()),
+                    toml::Value::Array(list) if list.is_empty() => Some("none".into()),
+                    toml::Value::Array(list) => Some(
+                        (list.iter().filter_map(toml::Value::as_str))
+                            .collect::<Vec<_>>()
+                            .join(", "),
+                    ),
                     v => v.as_str().map(str::to_owned),
                 })
             })
@@ -616,6 +624,11 @@ impl View {
     fn write(&mut self, value: Option<String>) {
         let setting = &SETTINGS[self.pick];
         let value = value.map(|value| match (setting.values == SWITCH, number(setting)) {
+            _ if setting.values == TRAILERS => toml::Value::Array(
+                (value.split(", ").filter(|part| *part != "none"))
+                    .map(|part| toml::Value::String(part.to_owned()))
+                    .collect(),
+            ),
             (true, _) => toml::Value::Boolean(value == "true"),
             (_, true) => value
                 .parse()
