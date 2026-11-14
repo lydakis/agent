@@ -523,6 +523,16 @@ class TriggerFireTests(ModelFixture):
         self.assertEqual(taken['last']['outcome'], 'sent', taken)
         self.assertEqual(taken['run']['running']['bot'], 'p.review-5', taken)
         self.assertEqual(len(self.turns('p.review-4')), 1, 'an agent it did not make is not messaged')
+        # A run kept by a handle the daemon no longer reads is over, as
+        # gone: the fire goes on to the next run, not failing every time.
+        self.settle('p.review-5')
+        kept = json.loads(last.read_text())
+        kept['run']['running']['handle'] = 'turn:p.review-5/1'
+        last.write_text(json.dumps(kept))
+        moved = fire('g2')
+        self.assertEqual(moved['last']['outcome'], 'sent', moved)
+        self.assertEqual(moved['run']['running']['bot'], 'p.review-6', moved)
+        self.assertEqual(moved['run']['failed']['ended']['status'], 'gone', moved)
 
     def test_an_agent_made_in_full_access_starts_ungated(self):
         # `[sonny] default_permissions = "full"`: no sandbox and no one
@@ -685,9 +695,9 @@ class TriggerFireTests(ModelFixture):
         failed = self.fire('p.task', 'x', extra=['--if', 'true', '--dir', str(gone)])
         self.assertEqual(failed['last']['outcome'], 'failed', failed)
         self.assertIn('--if', failed['last']['detail'])
-        # No turn ran; the agent has one note, attached to its next turn.
+        # The fire sent nothing; the agent hears one note, a steer that wakes it.
         notes = [m for m in self.messages('p.task') if m['message'] > 1]
-        self.assertEqual([m['status'] for m in notes], ['attached'], notes)
+        self.assertEqual([(m['delivery'], m['origin']) for m in notes], [('steer', 'automation')], notes)
         self.assertIn('its --if could not check', notes[0]['prompt_preview'])
         self.assertTrue(failed['checked']['told'], failed)
         # Told once: the next failure adds nothing; working again is one more note.
@@ -711,7 +721,7 @@ class TriggerFireTests(ModelFixture):
         self.assertIn('127', failed['last']['detail'])
         self.assertIn('no-such-gate-here', failed['last']['detail'])
         notes = [m for m in self.messages('p.task') if m['message'] > 1]
-        self.assertEqual([m['status'] for m in notes], ['attached'], notes)
+        self.assertEqual([m['delivery'] for m in notes], ['steer'], notes)
         self.assertIn('its --if could not check', notes[0]['prompt_preview'])
 
     def test_a_gate_waits_out_a_pause_before_it_runs(self):

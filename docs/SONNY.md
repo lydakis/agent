@@ -42,9 +42,9 @@ has it: `last.turn_status`, and `last.turn_error` when it did not complete,
 so an agent sees the failure the person sees in `/background`. It does not
 have to look: when a turn a fire sent fails (not one whose model said
 nothing), the lookout tells the agent that added a `start` automation, else
-the agent the fire messaged, with a note it reads in its next model call,
-as a fire that sent nothing is told (`[automation NAME · TIME · turn N it sent
-BOT failed: WHY]`). A fire with `reply_to` passes the failure on with its
+the agent the fire messaged, with a steer: read in its next model call, or
+waking it when idle (`[automation NAME · TIME · turn N it sent BOT failed:
+WHY]`). A fire with `reply_to` passes the failure on with its
 answer instead.
 It waits for a verdict wherever the agent's other calls do (`/permissions`),
 since an automation runs as the person and its `if` command outside any
@@ -304,10 +304,7 @@ after it is that entry's next year: it sends nothing and ends as `missed`.
 What the fire did (`sent` with the turn and any `reply`, `skipped`, `gone`,
 `missed` or `failed` with why), with the messages sent so far, the agent it
 started and the commit it saw, is kept in `~/.agent/automations/NAME.json`,
-which `ls` and `show` return. A fire the daemon took no turn for (`skipped`,
-or `failed` once the daemon answered) also tells the reply agent, else the
-agent it messages, with `delivery: attach`: one line naming the automation and
-why, which that agent reads in its next model call without a turn starting. Automations are local to this machine. Only
+which `ls` and `show` return. Automations are local to this machine. Only
 the scheduler runs a fire, so no two of one automation ever run at once.
 
 An automation's state is two things: its definition and its state file. Every
@@ -903,12 +900,22 @@ stops at once, its running turns park and
 continue on the new one, and the new one waits on the store, so nothing
 started meanwhile takes it. Then the companions start on the new Sonny,
 and the scripts in `~/.agent`, every automation and the scheduler's job
-are written again by the path that outlives a release. A line says each
-step; the last is `Successfully updated from OLD to version NEW` (`to the
+are written again by the path that outlives a release. A line names each
+skill or role of Sonny's whose new text waits beside the person's edited
+copy (`Your lead role (~/.agents/agents/lead.md) is kept; Sonny's new text
+waits at ...`), as a lead is told when a window next opens. A line says
+each step; the last is `Successfully updated from OLD to version NEW` (`to the
 newest build of VERSION` for a nightly), or `Sonny is up to date
 (VERSION)`, when the daemon is replaced only if it runs another release.
 
 ![sonny update, from a release tarball install of 0.9.4 to 0.9.5](sonny/sonny-update.png)
+
+![sonny update naming the lead role and plan skill whose new text waits beside the person's edited copies](sonny/sonny-update-kept.png)
+
+An update made by hand (`brew upgrade`, install.sh, or a link moved) is
+finished by `sonny update` or by opening a Sonny window: until one runs,
+the daemon, the scripts in `~/.agent`, automations and the scheduler's job
+stay on the old release. A plain `agent start` replaces only the daemon.
 
 Each open window notes the program it started from. When it loses the
 daemon and the Sonny installed where it runs from is another program

@@ -327,6 +327,7 @@ at its model's own effort (`AGENT_EFFORT` when its model is
 | Each new task's effort | `[sonny] task_effort` | `threads_effort` |
 | Each new task's speed (`standard`, `fast` or `ultrafast`) | `[sonny] task_speed` | `threads_speed` |
 | The reviewer's model, for agents in Auto ([REVIEWER.md](REVIEWER.md)) | `[reviewer] model`, `effort` | |
+| How long a call in Auto waits for the reviewer's verdict before it goes to you | `[reviewer] timeout_ms` (90000 by default, as Codex's; 0 for as long as it takes) | |
 | What `/side`'s copy may do | `[sonny] side_chat` (`fork`, the default, or `answer`) | |
 | The chime, the agent's steps, and every tool call drawn | `[sonny] chime`, `steps`, `verbose` (true or false) | |
 | The widest the conversation is written | `[sonny] text_width` (100 by default, at least 40, 0 for the window's whole width) | |
@@ -1703,10 +1704,10 @@ calc.add, calc.neg and calc.div ▸`), and `/verbose` draws each call as
 ever. Quiet rows
 one after another (calls folded, notes put in the margin, messages
 between agents) sit together, with no blank row between. Words that only
-rode along on a call, an attach note from an automation that found the
-agent busy or from another agent, are no message: once the agent reads
-them they hang right under what that call carried, your message or the
-step it joined, as `📎 From an automation ▸`, and a click opens them the
+rode along on a call, an attach note from another agent, are no message:
+once the agent reads them they hang right under what that call carried,
+your message or the step it joined, as `📎 From calc.add ▸`, and a click
+opens them the
 same way. Nothing says such words are waiting: they ask nothing of you, so
 they turn up only once the agent has read them. None waits more than a
 day (`attach_wait` in `config.toml`): one no call took in by then reaches

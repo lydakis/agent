@@ -35,6 +35,7 @@
 //! [reviewer]
 //! model = "openai/gpt-6-luna"   # the model that reviews calls in auto, `sonny reviewer`
 //! effort = "low"                # the reviewer's effort
+//! timeout_ms = 90000            # how long a round waits for its verdict, every attempt included; 0 for as long as it takes
 //!
 //! [shell_environment_policy]    # what tool shells leave out, as in Codex
 //! ignore_default_excludes = false  # also *KEY*, *SECRET* and *TOKEN*; true, the default, keeps them
@@ -555,6 +556,9 @@ pub struct ReviewerModel {
     /// `provider/model`; unset, the reviewed bot's own model.
     pub model: Option<String>,
     pub effort: Option<String>,
+    /// How long a round may wait for its verdict; unset, 90 s; 0, as long
+    /// as it takes.
+    pub timeout_ms: Option<u64>,
 }
 
 /// What Sonny starts its agents with, and how it shows them.
@@ -1658,7 +1662,7 @@ fn parse(text: &str) -> Result<Config, String> {
             continue;
         }
         let keys: &[&str] = match name.as_str() {
-            "reviewer" => &["model", "effort"],
+            "reviewer" => &["model", "effort", "timeout_ms"],
             "shell_environment_policy" => &["ignore_default_excludes", "exclude"],
             "sonny" => &[
                 "lead_effort",
@@ -1700,6 +1704,14 @@ fn parse(text: &str) -> Result<Config, String> {
             _ => return Err(format!("unknown table [{name}]")),
         };
         for (key, value) in section {
+            if (name.as_str(), key.as_str()) == ("reviewer", "timeout_ms") {
+                config.reviewer.timeout_ms = Some(
+                    (value.as_integer())
+                        .and_then(|n| u64::try_from(n).ok())
+                        .ok_or("reviewer.timeout_ms must be a whole number, 0 or more")?,
+                );
+                continue;
+            }
             if (name.as_str(), key.as_str()) == ("sonny", "mcp_servers") {
                 let servers = value
                     .as_table()
@@ -2739,6 +2751,9 @@ mod tests {
         .unwrap();
         assert_eq!(config.reviewer.model.as_deref(), Some("openai/luna"));
         assert_eq!(config.reviewer.effort, None);
+        assert_eq!(config.reviewer.timeout_ms, None);
+        let timed = parse("[reviewer]\ntimeout_ms = 0\n").unwrap();
+        assert_eq!(timed.reviewer.timeout_ms, Some(0));
         assert_eq!(config.sonny.lead_effort.as_deref(), Some("medium"));
         assert_eq!(config.sonny.task_effort.as_deref(), Some("high"));
         assert_eq!(config.sonny.lead_profile, None);
@@ -3045,6 +3060,10 @@ mod tests {
             ("[web]\nsearch = true", "unknown table [web]"),
             ("[sonny]\neffort = \"low\"", "unknown key sonny.effort"),
             ("[reviewer]\neffort = 3", "reviewer.effort must be a string"),
+            (
+                "[reviewer]\ntimeout_ms = -1",
+                "reviewer.timeout_ms must be a whole number, 0 or more",
+            ),
             (
                 "[reviewer]\nmodel = \"\"",
                 "reviewer.model must not be empty",
