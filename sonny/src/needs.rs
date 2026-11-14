@@ -118,6 +118,33 @@ impl Seen {
     }
 }
 
+/// How this build reads a history for its question: a hash of the files
+/// that read one, so a build that changed none of them takes what the one
+/// before read and kept ([`crate::seen_stamp`]), and one that changed any
+/// reads every agent again. A change elsewhere to what a read finds bumps
+/// [`READ_AS`].
+pub const READS: u64 = {
+    let mut hash = fnv(0xcbf2_9ce4_8422_2325, &READ_AS.to_le_bytes());
+    hash = fnv(hash, include_bytes!("needs.rs"));
+    hash = fnv(hash, include_bytes!("asks.rs"));
+    fnv(hash, include_bytes!("resolved.rs"))
+};
+
+/// Bumped when what a question read finds changes outside the files
+/// [`READS`] hashes.
+const READ_AS: u32 = 1;
+
+/// FNV-1a over `bytes`, going on from `hash`.
+const fn fnv(mut hash: u64, bytes: &[u8]) -> u64 {
+    let mut at = 0;
+    while at < bytes.len() {
+        hash ^= bytes[at] as u64;
+        hash = hash.wrapping_mul(0x0100_0000_01b3);
+        at += 1;
+    }
+    hash
+}
+
 /// How many of an agent's newest nodes are read for its open question.
 const SCANNED: usize = 400;
 

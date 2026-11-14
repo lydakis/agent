@@ -2,6 +2,7 @@
 //! JSONL requests correlated by `id`, notifications forwarded on a channel.
 //! Shared by Sonny and the CLI; nothing here depends on the runtime crate.
 pub mod approver;
+pub mod clock;
 pub mod config;
 pub mod env_file;
 pub mod files;

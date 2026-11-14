@@ -1136,9 +1136,7 @@ async fn make(
     // As in `create`: a config that does not read is said where the lead
     // opens, and the defaults stand until it reads.
     let config = agent_client::config::load().unwrap_or_default();
-    if config.hide_senders {
-        settings.insert("hide_senders".into(), json!(true));
-    }
+    settings.insert("trailer".into(), json!(crate::stamp::trailer(&config)));
     if let Some(ms) = config.hold_ms {
         settings.insert("hold_ms".into(), json!(ms));
     }
