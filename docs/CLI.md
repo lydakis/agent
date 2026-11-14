@@ -242,8 +242,12 @@ tries its held turns at once.
   passing them while continuing an existing named bot is an error.
 - `run --new --approval MODE` chooses whether a
   new bot's tool calls wait for a verdict: `full` runs every allowed call (no
-  gate), `manual` waits for an answer from any client, and `auto` has the
-  approver serving the `auto` tag decide each call. The CLI decides
+  gate), `manual` waits for an answer from any client, `auto` has the
+  approver serving the `auto` tag decide each call, and `never` refuses
+  every call a gate would hold without asking anyone (the daemon's
+  `approval_policy`). A bot made by a gated one keeps its creator's
+  gates whatever the flag, so there `full` is refused (`invalid_gate`) and
+  `never` refuses what those gates would ask about. The CLI decides
   nothing itself: an approver must serve the tag, such as Sonny's
   reviewer model (`sonny reviewer`), which Sonny keeps as the daemon's
   companion. For `auto`, and whenever `run` continues
@@ -316,7 +320,7 @@ tries its held turns at once.
   `--note-turns`, `--compact-at`, `--compact-keep`, `--compact-tokens`, `--keep-turns`,
   `--approval-hold`, `--max-output-tokens`, `--cache-ttl`,
   `--sandbox`, `--writable` (repeatable, made absolute from the current
-  folder), `--network`, `--hide-senders`, `--quiet-background`, `--hold`, `--unix-socket` (repeatable: an
+  folder), `--network`, `--trailer` (`sender`, `time`, both comma-separated, or `""` for no line), `--quiet-background`, `--hold`, `--unix-socket` (repeatable: an
   absolute socket, or folder of them, its commands reach) and `--outputs` (made absolute; a new
   bot gets `outputs` beside the store without it); they are not daemon options,
   and an existing bot keeps its own (see [bot settings](RUST_PROTOTYPE.md#bot-settings)).

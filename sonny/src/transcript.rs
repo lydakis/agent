@@ -1062,10 +1062,27 @@ pub fn wrap_lines(
     first: Line<'static>,
     rest: Line<'static>,
 ) -> Vec<Line<'static>> {
+    wrap_rows(line, width, first, rest, 8)
+}
+
+/// A table cell's text wrapped to its column, however narrow: no row of
+/// it wider than `width`, so the column's borders stay put.
+pub fn wrap_cell(line: Line<'static>, width: usize) -> Vec<Line<'static>> {
+    wrap_rows(line, width, Line::default(), Line::default(), 1)
+}
+
+/// [`wrap_lines`], each row given at least `least` columns past its lead.
+fn wrap_rows(
+    line: Line<'static>,
+    width: usize,
+    first: Line<'static>,
+    rest: Line<'static>,
+    least: usize,
+) -> Vec<Line<'static>> {
     // The room after each row's lead: the rows after the first may have
     // a wider one.
-    let mut room = width.saturating_sub(first.width()).max(8);
-    let rest_room = width.saturating_sub(rest.width()).max(8);
+    let mut room = width.saturating_sub(first.width()).max(least);
+    let rest_room = width.saturating_sub(rest.width()).max(least);
     // A row this line itself was wrapped onto stays one.
     let first = match lead(&line) {
         Some(columns) => Line::from([vec![goes_on(columns, true)], first.spans].concat()),
@@ -1106,12 +1123,15 @@ pub fn wrap_lines(
             // measured a character at a time, which never counts less than
             // the joined sequences (a family emoji) the terminal draws
             // narrower, so no row runs past the edge.
-            if wide > room {
+            // A word that fits but for its trailing spaces is not cut:
+            // they hang past the edge.
+            let hangs = used + word.trim_end().width() <= room;
+            if wide > room && !hangs {
                 wide = (word.chars())
                     .map(|c| unicode_width::UnicodeWidthChar::width(c).unwrap_or(0))
                     .sum();
             }
-            while wide > room {
+            while wide > room && !hangs {
                 let mut cut = 0;
                 let mut cols = 0;
                 for (i, c) in word.char_indices() {

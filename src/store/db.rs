@@ -239,6 +239,18 @@ impl Denials {
         self.window = ((self.window << 1) | u64::from(denied)) & ((1 << DENIAL_WINDOW) - 1);
     }
 }
+/// What the line after a prompt's words may name, as a bot's `trailer`
+/// lists it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Trailer {
+    /// Who wrote the words: an agent, a client, a person.
+    Sender,
+    /// When they were sent, in the daemon's local time.
+    Time,
+}
+/// What a bot names after a prompt's words when it chose nothing.
+pub const TRAILER: [Trailer; 1] = [Trailer::Sender];
 /// What a bot chose at creation about its model context, its history and
 /// its approvals. `None` takes the runtime's default; a fork keeps its
 /// source's. Stored as given, so a bot that chose nothing follows the
@@ -304,10 +316,12 @@ pub struct Settings {
     /// every output in the store.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub outputs: Option<String>,
-    /// Whether a prompt another bot or a named client sent reaches the
-    /// model without the line saying so after its words.
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub hide_senders: bool,
+    /// What the line after each prompt's words names for the model:
+    /// `sender`, who wrote it (an agent's words are never taken for a
+    /// person's), and `time`, when it was sent, in the daemon's local
+    /// time. None is `["sender"]`; an empty list adds no line.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub trailer: Option<Vec<Trailer>>,
     /// How long a turn is held on a cause a person can fix (a refused
     /// sign-in or key, a usage limit, a provider that is down or not set
     /// up) before it fails with it, from when the hold began; 0 fails at
@@ -343,6 +357,23 @@ pub struct Settings {
     /// with a variable that changes what runs.
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub env: std::collections::BTreeMap<String, String>,
+    /// `never`: a call that would wait on one of its gates is refused
+    /// instead, and no one is asked, as under Codex's approval policy
+    /// `never`. Its gates stay, so what they hold back stays held back. A
+    /// bot made by another that never asks never asks either. Unset, its
+    /// gates are asked.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub approval_policy: Option<ApprovalPolicy>,
+}
+/// Why a call that would need approval fails on a bot that never asks.
+pub const NEVER_ASKS: &str =
+    "approval_policy is never: this call would need approval, and no one is asked";
+/// How a bot's gated calls are decided, by Codex's `approval_policy`
+/// names: only `never` changes what its gates do.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ApprovalPolicy {
+    Never,
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize, Serialize)]
 pub enum CacheTtl {
@@ -407,6 +438,10 @@ impl Settings {
     pub fn max_drops(&self) -> usize {
         self.max_drops.unwrap_or(MAX_DROPS)
     }
+    /// Whether a call that would wait on a gate is refused instead.
+    pub fn never_asks(&self) -> bool {
+        self.approval_policy == Some(ApprovalPolicy::Never)
+    }
     pub fn approval_hold_ms(&self) -> u64 {
         self.approval_hold_ms.unwrap_or(2000)
     }
@@ -426,11 +461,14 @@ impl Settings {
     /// creator's sandbox and writable folders unless it names a stricter
     /// sandbox, and reaches the network only if both do. Every child goes
     /// by its creator's command rules and `env`, so none is made to get
-    /// past them.
+    /// past them, and never asks when its creator never asks.
     pub fn under(mut self, creator: &Settings) -> Settings {
         use crate::sandbox::Mode;
         self.rules = creator.rules.clone();
         self.env = creator.env.clone();
+        if creator.never_asks() {
+            self.approval_policy = creator.approval_policy;
+        }
         let sandboxed = |settings: &Settings| {
             matches!(
                 settings.sandbox,
@@ -455,8 +493,47 @@ impl Settings {
         self.network &= creator.network;
         self
     }
+    /// What of these settings, asked for a bot that a bot with
+    /// `creator`'s settings makes, [`Settings::under`] would not keep as
+    /// asked: a sandbox looser than its creator's, said, so the bot is
+    /// refused rather than made otherwise than asked. Those left unasked
+    /// take its creator's, and its `rules` and `env` are its creator's
+    /// whatever it asks, as no client picks them for a bot another makes.
+    pub fn beyond(&self, creator: &Settings) -> Option<String> {
+        let held = self.clone().under(creator);
+        let creator_sandbox = || {
+            creator.sandbox.map_or("none", |mode| match mode {
+                crate::sandbox::Mode::ReadOnly => "read-only",
+                crate::sandbox::Mode::WorkspaceWrite => "workspace-write",
+                crate::sandbox::Mode::DangerFullAccess => "danger-full-access",
+            })
+        };
+        let why = if self.sandbox.is_some() && held.sandbox != self.sandbox {
+            format!(
+                "sandbox: a bot made by another is confined at least as its creator is ({})",
+                creator_sandbox()
+            )
+        } else if self.network && !held.network {
+            "network: a bot made by another reaches the network only if its creator does".into()
+        } else if !self.writable.is_empty() && held.writable != self.writable {
+            format!(
+                "writable: a bot made by another writes only within its creator's sandbox ({})",
+                creator_sandbox()
+            )
+        } else if !self.unix_sockets.is_empty() && held.unix_sockets != self.unix_sockets {
+            "unix_sockets: a bot made by another reaches only the sockets its creator does".into()
+        } else {
+            return None;
+        };
+        Some(why)
+    }
     pub fn cache_hour(&self) -> bool {
         self.cache_ttl == Some(CacheTtl::Hour)
+    }
+    /// What the line after each prompt's words names: its own list, else
+    /// the sender alone.
+    pub fn trailer(&self) -> &[Trailer] {
+        self.trailer.as_deref().unwrap_or(&TRAILER)
     }
     /// The tier faster than standard it chose, if any.
     pub fn speed(&self) -> Option<crate::provider::Speed> {
@@ -587,10 +664,10 @@ impl Settings {
             "speed":self.speed().map_or("standard", crate::provider::Speed::name),
             "sandbox":self.sandbox,"writable":self.writable,"network":self.network,
             "outputs":self.outputs,
-            "hide_senders":self.hide_senders,"quiet_background":self.quiet_background,
+            "trailer":self.trailer(),"quiet_background":self.quiet_background,
             "hold_ms":self.hold_ms(),
             "unix_sockets":self.unix_sockets,
-            "rules":self.rules,"env":self.env})
+            "rules":self.rules,"env":self.env,"approval_policy":self.approval_policy})
     }
     fn stored(&self) -> Result<Option<String>> {
         Ok((*self != Self::default())
@@ -611,7 +688,7 @@ pub fn web(name: &str) -> bool {
     matches!(name, "web_fetch" | "web_search")
 }
 /// Every setting's name, as `create` and `configure` take it.
-pub const SETTINGS: [&str; 23] = [
+pub const SETTINGS: [&str; 24] = [
     "context_bytes",
     "context_items",
     "note_turns",
@@ -627,7 +704,7 @@ pub const SETTINGS: [&str; 23] = [
     "writable",
     "network",
     "outputs",
-    "hide_senders",
+    "trailer",
     "quiet_background",
     "hold_ms",
     "max_rounds",
@@ -635,6 +712,7 @@ pub const SETTINGS: [&str; 23] = [
     "unix_sockets",
     "rules",
     "env",
+    "approval_policy",
 ];
 /// Settings as their stored fields, those at their defaults left out.
 fn settings_map(settings: &Settings) -> Result<serde_json::Map<String, Value>> {
@@ -942,8 +1020,19 @@ impl Bot {
     /// sandbox confines runs without a verdict: only an escape is gated,
     /// as in Codex. A command a rule asks about waits, sandbox or not; one
     /// a rule allows or forbids doesn't. A call whose steps go to the gate
-    /// one by one waits for none as a whole.
+    /// one by one waits for none as a whole. A bot that never asks waits
+    /// for nothing: such a call is [`Bot::unasked`] instead.
     pub fn gated(&self, call: &ToolCall, workspace: &std::path::Path, rules: &Rules) -> bool {
+        !self.settings.never_asks() && self.held(call, workspace, rules)
+    }
+    /// Whether this call would wait for a verdict, but the bot never asks,
+    /// so it is refused: an escape from the sandbox as when no gate holds
+    /// it, any other call for needing approval.
+    pub fn unasked(&self, call: &ToolCall, workspace: &std::path::Path, rules: &Rules) -> bool {
+        self.settings.never_asks() && self.held(call, workspace, rules)
+    }
+    /// Whether one of the bot's gates holds this call back, asked or not.
+    fn held(&self, call: &ToolCall, workspace: &std::path::Path, rules: &Rules) -> bool {
         gated(&self.gates, &call.name)
             && self.may_call(&call.name)
             && !self.declared(&call.name).is_some_and(|tool| tool.steps)
@@ -2694,7 +2783,7 @@ impl Database {
     /// before versioning, stores at versions 1 to 5 and stores from newer
     /// binaries are rejected; an older store from version 6 on is migrated
     /// forward, one version at a time, at open.
-    pub const SCHEMA: i32 = 98;
+    pub const SCHEMA: i32 = 99;
     /// The person's messages a compaction keeps verbatim, newest first:
     /// per-message text, and the total text plus `(ordinal, String)` entry
     /// metadata. Empty entries cost space too, so the retained list cannot
@@ -3517,6 +3606,41 @@ impl Database {
             _ => fail("creator_identity_required"),
         }
     }
+    /// Refuse a bot asked for with no gate, made by a bot that has gates,
+    /// which it would keep: asked for none, it is not given them unasked.
+    /// Only a creation that would make a bot is checked: a name already
+    /// held, or one this keyed request made and deleted since, is for
+    /// [`Database::create`] to answer, so a resend gets what it made.
+    pub fn ungated_under(
+        &self,
+        name: &str,
+        request_id: Option<&str>,
+        creator: Option<&str>,
+        expected: Option<i64>,
+    ) -> Result<()> {
+        let held: Option<i64> = self
+            .conn
+            .prepare_cached(
+                "SELECT 1 FROM bots WHERE name=?1
+                 UNION ALL SELECT 1 FROM deleted_bots WHERE name=?1 AND request_id=?2",
+            )?
+            .query_row(params![name, request_id], |r| r.get(0))
+            .optional()?;
+        if held.is_some() {
+            return Ok(());
+        }
+        let Some((id, _)) = Self::creator(&self.conn, creator, expected)? else {
+            return Ok(());
+        };
+        if Self::creator_gates(&self.conn, Some(id))?.is_empty() {
+            return Ok(());
+        }
+        fail_with(
+            "invalid_gate",
+            "a bot made by another keeps its creator's gates; approval_policy never refuses \
+             what they would ask about instead",
+        )
+    }
     /// The gates of the bot a client creates for, already validated: a bot
     /// cannot create or fork its way out of its own gates.
     fn creator_gates(conn: &Connection, creator: Option<i64>) -> Result<Vec<Gate>> {
@@ -3669,8 +3793,8 @@ impl Database {
     }
     /// Replace the settings `named` with `given`'s, a setting `given`
     /// leaves at its default going back to it, and keep the rest. A bot
-    /// another bot made keeps no weaker a sandbox than its creator's, as
-    /// when it was made. The settings that changed, by name, the sandbox
+    /// another bot made keeps no weaker a sandbox than its creator's, and
+    /// never asks while its creator never asks, as when it was made. The settings that changed, by name, the sandbox
     /// and the folders, network and sockets that go with it as `sandbox`.
     pub fn set_settings(
         &mut self,
@@ -3723,7 +3847,8 @@ impl Database {
                 format!("{key}: a bot made by another goes by its creator's {key}"),
             );
         }
-        let confining = named.iter().any(|key| SANDBOX.contains(&key.as_str()));
+        let confining =
+            (named.iter()).any(|key| SANDBOX.contains(&key.as_str()) || key == "approval_policy");
         if confining && let Some(creator) = bot.created_by_id {
             let creator = self
                 .conn
@@ -4138,7 +4263,12 @@ impl Database {
         let inherited = Self::creator_gates(&tx, created_by_id)?;
         let gates = stored_gates(&merge_gates(inherited.iter().chain(binding.gate), &tools))?;
         let settings = match Self::creator_settings(&tx, created_by_id)? {
-            Some(creator) => binding.settings.clone().under(&creator),
+            Some(creator) => {
+                if let Some(why) = binding.settings.beyond(&creator) {
+                    return fail_with("invalid_setting", why);
+                }
+                binding.settings.clone().under(&creator)
+            }
             None => binding.settings.clone(),
         };
         tx.execute(
@@ -7620,12 +7750,12 @@ impl Database {
                 let (images, (after, quotes)) = self
                     .conn
                     .prepare_cached(
-                        "SELECT images,from_bot,from_turn,origin,person,quotes FROM messages WHERE id=?",
+                        "SELECT images,from_bot,from_turn,origin,person,quotes,sent_ms FROM messages WHERE id=?",
                     )?
                     .query_row([id], |r| {
                         Ok((
                             r.get::<_, Option<String>>(0)?,
-                            after_words(r, 1, bot.settings.hide_senders, &bot.name, id)?,
+                            after_words(r, 1, bot.settings.trailer(), &bot.name, id)?,
                         ))
                     })?;
                 let pictures = images_from(images.as_deref())?;
@@ -8439,6 +8569,26 @@ impl Database {
     /// Start a gated call once its gates allow it, or end it denied: its
     /// row in the audit trail says it ran under its bot's sandbox when
     /// `confined`, and who decided it.
+    /// A call a gate would hold, of a bot that never asks: refused before
+    /// it starts, with no one asked, and audited as denied by nobody, as a
+    /// gate's denial is, so it never reads as a failed run.
+    pub fn refuse_unasked(&mut self, turn: i64, call: &ToolCall) -> Result<()> {
+        let bot = self.active(turn)?;
+        let tx = self.conn.savepoint()?;
+        deny(
+            &tx,
+            &bot,
+            turn,
+            call,
+            "approval_refused",
+            Some(NEVER_ASKS),
+            json!([]),
+            false,
+            "nobody",
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
     pub fn approval_start(
         &mut self,
         turn: i64,
@@ -8468,6 +8618,7 @@ impl Database {
                 &bot,
                 turn,
                 call,
+                "approval_denied",
                 denial.reason.as_deref(),
                 // Every accepted verdict, so replay keeps each approver's.
                 request.approvals(),
@@ -8551,6 +8702,7 @@ impl Database {
                 &bot,
                 turn,
                 call,
+                "approval_denied",
                 Some("not reviewed: no verdict"),
                 lapsed,
                 true,
@@ -9082,6 +9234,37 @@ impl Database {
             tx.commit()?;
             return Ok(Stepped {
                 step: Step::Decided(json!({"call_id":id,"decision":"allow","approvals":[]})),
+                notify: None,
+                wake: false,
+                lifted: None,
+            });
+        }
+        // A bot that never asks has a step a gate would hold refused, with
+        // no one asked.
+        if bot.settings.never_asks() {
+            let tx = self.conn.savepoint()?;
+            audit::insert(
+                &tx,
+                now_ms as i64,
+                bot.bot_id,
+                &bot.name,
+                turn,
+                call_id,
+                Some(step),
+                tool,
+                // Denied, so it ran nowhere.
+                audit::Facts {
+                    place: None,
+                    ..facts
+                },
+                "nobody",
+                "denied",
+                &arguments.to_string(),
+            )?;
+            tx.commit()?;
+            return Ok(Stepped {
+                step: Step::Decided(json!({"call_id":id,"decision":"deny",
+                    "reason":NEVER_ASKS,"approvals":[]})),
                 notify: None,
                 wake: false,
                 lifted: None,
@@ -15024,6 +15207,7 @@ fn deny(
     bot: &Bot,
     turn: i64,
     call: &ToolCall,
+    error: &str,
     reason: Option<&str>,
     approvals: Value,
     expired: bool,
@@ -15031,7 +15215,7 @@ fn deny(
 ) -> Result<()> {
     let call_id = call.call_id.as_str();
     audit_call(tx, bot, turn, call, false, approved, "denied")?;
-    let output = json!({"error":"approval_denied","detail":reason}).to_string();
+    let output = json!({"error":error,"detail":reason}).to_string();
     let item = bot
         .family()?
         .tool_result_item(call_id, call.custom, &output)?;
@@ -15804,7 +15988,7 @@ fn quote_author(quote: &Value) -> String {
 fn after_words(
     r: &rusqlite::Row,
     at: usize,
-    hide: bool,
+    trailer: &[Trailer],
     to: &str,
     message: i64,
 ) -> rusqlite::Result<(Vec<String>, Option<String>)> {
@@ -15813,15 +15997,37 @@ fn after_words(
     let origin: Option<String> = r.get(at + 2)?;
     let person: Option<String> = r.get(at + 3)?;
     let quotes: Option<String> = r.get(at + 4)?;
-    let line = match (bot, turn, origin, person) {
-        (Some(bot), Some(turn), _, _) => format!(
-            "[Message {to}/{message}, written by the agent {bot} in {bot}/{turn}, not by a person.]"
-        ),
-        (_, _, Some(origin), _) => format!("[Message {to}/{message}, sent by {origin}.]"),
-        (_, _, None, Some(person)) => format!("[Message {to}/{message}, written by {person}.]"),
-        _ => format!("[Message {to}/{message}.]"),
-    };
-    let mut parts: Vec<String> = (!hide).then_some(line).into_iter().collect();
+    let sent_ms: Option<i64> = r.get(at + 5)?;
+    let sender = trailer.contains(&Trailer::Sender);
+    let time = sent_ms.filter(|_| trailer.contains(&Trailer::Time));
+    let mut parts = Vec::new();
+    if sender || time.is_some() {
+        use std::fmt::Write as _;
+        // One allocation, as the sender's line alone was.
+        let mut line = String::with_capacity(160);
+        let _ = write!(line, "[Message {to}/{message}");
+        if sender {
+            let _ = match (bot, turn, origin, person) {
+                (Some(bot), Some(turn), _, _) => write!(
+                    line,
+                    ", written by the agent {bot} in {bot}/{turn}, not by a person"
+                ),
+                (_, _, Some(origin), _) => write!(line, ", sent by {origin}"),
+                (_, _, None, Some(person)) => write!(line, ", written by {person}"),
+                _ => Ok(()),
+            };
+        }
+        line.push('.');
+        if let Some(ms) = time {
+            let _ = write!(
+                line,
+                " Sent {}.",
+                agent_client::clock::when(ms.div_euclid(1000))
+            );
+        }
+        line.push(']');
+        parts.push(line);
+    }
     let Some(quotes) = quotes else {
         return Ok((parts, None));
     };
@@ -15830,7 +16036,7 @@ fn after_words(
     };
     let mut quotes: Vec<Value> = serde_json::from_str(&quotes).map_err(bad)?;
     for quote in &mut quotes {
-        if !hide {
+        if sender {
             let what = match quote["reply"] == true {
                 true => "the reply to message",
                 false => "message",
@@ -15917,12 +16123,12 @@ fn start_locked(
 ) -> Result<Option<i64>> {
     let (images, (after, quotes)) = tx
         .prepare_cached(
-            "SELECT images,from_bot,from_turn,origin,person,quotes FROM messages WHERE id=?",
+            "SELECT images,from_bot,from_turn,origin,person,quotes,sent_ms FROM messages WHERE id=?",
         )?
         .query_row([turn], |r| {
             Ok((
                 r.get::<_, Option<String>>(0)?,
-                after_words(r, 1, bot.settings.hide_senders, &bot.name, turn)?,
+                after_words(r, 1, bot.settings.trailer(), &bot.name, turn)?,
             ))
         })?;
     let pictures = images_from(images.as_deref())?;
@@ -17604,6 +17810,24 @@ fn migrate_since_73(conn: &Connection, from: i32) -> Result<()> {
             clock_timed_turns(conn)?;
         }
     }
+    // Schema 99: what the line after a prompt's words names is a list,
+    // `trailer`; a bot that hid its senders names nothing.
+    if from < 99 {
+        conn.execute_batch(
+            "UPDATE bots SET settings=CASE WHEN json_extract(settings,'$.hide_senders')
+                 THEN json_set(json_remove(settings,'$.hide_senders'),'$.trailer',json('[]'))
+                 ELSE json_remove(settings,'$.hide_senders') END
+             WHERE json_type(settings,'$.hide_senders') IS NOT NULL;
+             UPDATE bots SET configure_pending=json_set(json_remove(configure_pending,'$.settings.hide_senders'),
+                 '$.settings.trailer',CASE WHEN json_extract(configure_pending,'$.settings.hide_senders')
+                 THEN json('[]') END)
+             WHERE json_type(configure_pending,'$.settings.hide_senders') IS NOT NULL;
+             UPDATE bots SET creation=CASE WHEN json_extract(creation,'$.request.settings.hide_senders')
+                 THEN json_set(json_remove(creation,'$.request.settings.hide_senders'),'$.request.settings.trailer',json('[]'))
+                 ELSE json_remove(creation,'$.request.settings.hide_senders') END
+             WHERE json_type(creation,'$.request.settings.hide_senders') IS NOT NULL;",
+        )?;
+    }
 
     Ok(())
 }
@@ -18758,7 +18982,7 @@ mod tests {
             writable: vec!["/".into()],
             network: true,
             outputs: Some("/".into()),
-            hide_senders: true,
+            trailer: Some(vec![Trailer::Time]),
             hold_ms: Some(1),
             quiet_background: true,
             max_rounds: Some(1),
@@ -18769,6 +18993,7 @@ mod tests {
                 ..Default::default()
             }),
             env: [("A".to_owned(), "1".to_owned())].into(),
+            approval_policy: Some(ApprovalPolicy::Never),
         };
         let mut names: Vec<String> = settings_map(&all)
             .unwrap()

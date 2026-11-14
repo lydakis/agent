@@ -426,6 +426,59 @@ class ApprovalTests(ModelFixture):
         self.assertFalse(own.exists())
 
     @unittest.skipUnless(shutil.which('bwrap') or sys.platform == 'darwin', 'sandboxes need bubblewrap')
+    def test_a_bot_made_by_another_is_held_tighter_never_looser(self):
+        (ROOT / '.local').mkdir(exist_ok=True)
+        outside = Path(tempfile.mkdtemp(dir=ROOT / '.local'))
+        self.addCleanup(shutil.rmtree, outside)
+        client = self.client('echo,shell,wait', settings={'sandbox': 'workspace-write'})
+        bob = client.request('create', bot='Bob', workspace=str(self.path), approve=['echo', 'shell'],
+                             approver='auto')['result']
+
+        def made(name, by=bob, **fields):
+            return client.request('create', bot=name, workspace=str(self.path), created_by=by['name'],
+                                  created_by_id=by['bot_id'], **fields)
+        # Asked for what its maker doesn't have, it is refused, saying what,
+        # rather than made otherwise than asked.
+        loose = made('Loose', settings={'sandbox': 'danger-full-access'})
+        self.assertEqual(loose['error'], 'invalid_setting', loose)
+        self.assertTrue(loose['detail'].startswith('sandbox:'), loose)
+        online = made('Online', settings={'sandbox': 'workspace-write', 'network': True})
+        self.assertEqual(online['error'], 'invalid_setting', online)
+        ungated = made('Ungated', approve=[])
+        self.assertEqual(ungated['error'], 'invalid_gate', ungated)
+        # A root bot asked for no gate has none.
+        self.assertEqual(client.request('create', bot='Root', workspace=str(self.path),
+                                        approve=[])['result']['gates'], [])
+        # One asked to never ask keeps its maker's gate, and refuses what it
+        # would hold: an escape as under no gate, any other call for needing
+        # approval. Nothing is put to anyone.
+        sealed = made('Sealed', settings={'sandbox': 'workspace-write', 'approval_policy': 'never'})['result']
+        self.assertEqual([gate['tag'] for gate in sealed['gates']], ['auto'])
+        self.assertEqual(sealed['settings']['approval_policy'], 'never')
+        # And so do the bots it makes, asked or not.
+        kid = made('Kid', by=sealed)['result']
+        self.assertEqual(kid['settings']['approval_policy'], 'never')
+        calls = [['shell', {'command': f'touch {outside}/escaped', 'sandbox_permissions': 'require_escalated'}],
+                 ['echo', {'text': 'hi'}],
+                 ['shell', {'command': 'touch inside'}]]
+        turn = client.request('submit', bot='Sealed', request_id='t',
+                              prompt='calls:' + json.dumps(calls))['result']['message']
+        self.assertEqual(client.finished(turn)['data']['status'], 'completed')
+        self.assertEqual(self.events(client, turn, 'approval_requested', bot='Sealed'), [])
+        self.assertEqual(self.tool_output(client, 'shell-1', bot='Sealed')[1]['error'], 'escalation_refused')
+        refused = self.tool_output(client, 'echo-2', bot='Sealed')[1]
+        self.assertEqual(refused['error'], 'approval_refused', refused)
+        self.assertIn('approval_policy is never', refused['detail'])
+        # Audited as denied by nobody, as a gate's denial is, never as a run
+        # that failed.
+        rows = {row['call_id']: row for row in
+                client.request('audit', bot='Sealed')['result']['rows']}
+        self.assertEqual((rows['echo-2']['outcome'], rows['echo-2']['approved']), ('denied', 'nobody'))
+        self.assertEqual(self.tool_output(client, 'shell-3', bot='Sealed')[1]['exit_code'], 0)
+        self.assertEqual(list(outside.iterdir()), [])
+        self.assertTrue((self.path / 'inside').exists())
+
+    @unittest.skipUnless(shutil.which('bwrap') or sys.platform == 'darwin', 'sandboxes need bubblewrap')
     def test_a_sandboxed_bots_commands_run_together_in_its_sandbox(self):
         (ROOT / '.local').mkdir(exist_ok=True)
         outside = Path(tempfile.mkdtemp(dir=ROOT / '.local'))

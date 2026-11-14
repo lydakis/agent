@@ -21,7 +21,7 @@ const COMMANDS: &[Command] = &[
         about: "Send a prompt to a bot, or make one with --new; prints the turn as it runs",
         usage: "run [OPTIONS] [--] PROMPT...",
         flags: "--bot --new --created-by --fork --allow --expires --detach --delivery --attach-wait --turn --model --workspace --effort --turn-budget-tokens --budget-counts --image --quote --agents --profile --request-id --bot-id --pretty --no-spawn",
-        settings: "--tools --instructions --instructions-file --budget-tokens --compaction-instructions --compaction-instructions-file --compaction-model --no-compaction --fallback --approval --approve --context-bytes --context-items --note-turns --compact-at --compact-keep --compact-tokens --max-rounds --max-drops --keep-turns --approval-hold --max-output-tokens --cache-ttl --speed --sandbox --writable --network --hide-senders --quiet-background --hold --unix-socket --outputs",
+        settings: "--tools --instructions --instructions-file --budget-tokens --compaction-instructions --compaction-instructions-file --compaction-model --no-compaction --fallback --approval --approve --context-bytes --context-items --note-turns --compact-at --compact-keep --compact-tokens --max-rounds --max-drops --keep-turns --approval-hold --max-output-tokens --cache-ttl --speed --sandbox --writable --network --trailer --quiet-background --hold --unix-socket --outputs",
         startup: true,
     },
     Command {
@@ -574,9 +574,9 @@ fn print_flags(flags: &str) {
                 "PATH",
                 "Where a new bot's tool outputs cut for the model are written whole, one file per stream; default the outputs folder beside the store",
             ),
-            "--hide-senders" => (
-                "",
-                "A new bot's model reads what other bots and clients send it with no line naming the sender",
+            "--trailer" => (
+                "LIST",
+                "What the line after each message's words names for a new bot's model: sender, time, both comma-separated, or \"\" for no line; default sender",
             ),
             "--quiet-background" => (
                 "",
@@ -604,7 +604,7 @@ fn print_flags(flags: &str) {
             ),
             "--approval" => (
                 "MODE",
-                "A new bot's approval: full, manual, or auto; default AGENT_APPROVAL or full",
+                "A new bot's approval: full, manual, auto, or never (refuse what would need approval, asking no one, also under a gate it keeps from its creator); default AGENT_APPROVAL or full",
             ),
             "--approve" => (
                 "LIST",
@@ -832,7 +832,6 @@ pub fn prepare(args: Vec<String>) -> Result<Option<Vec<String>>> {
                 | "--no-compaction"
                 | "--agents"
                 | "--network"
-                | "--hide-senders"
                 | "--quiet-background"
                 | "--discover"
         ) {
@@ -995,7 +994,7 @@ pub fn prepare(args: Vec<String>) -> Result<Option<Vec<String>>> {
             "--sandbox",
             "--writable",
             "--network",
-            "--hide-senders",
+            "--trailer",
             "--quiet-background",
             "--hold",
             "--unix-socket",
@@ -1011,7 +1010,7 @@ pub fn prepare(args: Vec<String>) -> Result<Option<Vec<String>>> {
     {
         return fail_with(
             "usage",
-            "instructions, budget, approval, sandbox, senders and compaction are creation options; use --new",
+            "instructions, budget, approval, sandbox, trailer and compaction are creation options; use --new",
         );
     }
     Ok(Some(out))

@@ -627,6 +627,7 @@ when it sets either.
 | `max_rounds` (`--max-rounds`) | Model calls each turn may make; the last goes with no tool call allowed, and the turn fails `tool_round_limit` past it. | none |
 | `max_drops` (`--max-drops`) | Replies in a row the model's own output cap may cut short in a turn; each before the last is dropped and the model told, and the last ends the turn `provider_incomplete`. | 3 |
 | `keep_turns` (`--keep-turns`) | After each of its turns finishes, prune the bot to this many turns' records (see [Retention](#retention)). | none |
+| `approval_policy` (`--approval never`) | `never`: a call a gate would hold is refused with `approval_refused` and no one is asked, as Codex's `approval_policy = "never"` refuses what would need approval; the bot keeps its gates, so what they name is what it refuses, and a call its sandbox confines still runs inside it. A bot another made takes its creator's `never`, and it can't be configured away from a bot whose creator never asks (see [tool approval](#tool-approval)). | none (ask) |
 | `approval_hold_ms` (`--approval-hold`) | Milliseconds a gated call waits live for its verdict before its turn parks (see [tool approval](#tool-approval)), and a terminal read waits live for its output before its turn parks. 0 parks at once; at most 3,600,000. | 2,000 |
 | `max_output_tokens` (`--max-output-tokens`) | Generated tokens per model call, including reasoning, summaries included. Anthropic calls use the model's full output limit (read inside Bedrock ids) unless this is set; set, it is sent as `max_tokens`, at least 2,048 so a legacy thinking budget of 1,024 or more fits beside the answer. Bedrock holds input plus this bound against quota from a call's start, on both endpoints (the model's maximum when it is unset), so a bound near real output buys throughput there. | none |
 | `cache_ttl` (`--cache-ttl`) | Anthropic prompt-cache lifetime, `5m` or `1h`, on every cache marker of a request: the instructions', the request's own, and the pinned compaction summary's and note's, since the API refuses a longer lifetime after a shorter one. `1h` bills each write at twice the input rate instead of 1.25 times. Responses providers are unaffected. Bedrock takes `1h` for Claude 4.5 and later and may refuse it for older Claude (its prompt-caching guide, read 2026-10-28), so calls to older Claude there keep five minutes whatever this says, also after `configure` switches a bot to one. A bot whose summarizer or fallback is such a model keeps five minutes on every call, since those calls carry the same pinned blocks. `inspect` reports a lifetime never set as `null`, so a client's own default can tell it from `5m` someone chose. | unset (`5m`) |
@@ -635,7 +636,7 @@ when it sets either.
 | `writable` (`--writable`, repeatable) | Absolute folders a `workspace-write` bot may write besides its own; each must exist and is stored by its real path. At most 64, 32 KiB as JSON. | none |
 | `network` (`--network`) | A `workspace-write` bot's commands may use the network. Off, or in `read-only`, the bot is neither offered nor runs `web_fetch` or `web_search` (see [sandbox](#sandbox)). | off |
 | `hold_ms` (`--hold`) | How long a turn waits on a cause a person can fix (a sign-in, a key, a usage limit, a provider down or not set up) before it fails with it ([held turns](#held-turns)), up to 365 days; 0 fails at once. `hold = "5d"` in `~/.agent/config.toml` sets it on the bots the CLI and Sonny make. | 5 days |
-| `hide_senders` (`--hide-senders`) | Its model reads what other bots and clients send it without the line naming the sender (see [fleet controllers](#fleet-controllers)); `senders = "hidden"` in `~/.agent/config.toml` sets it on the bots the CLI and Sonny make. | off |
+| `trailer` (`--trailer sender,time`) | What the line after each prompt's words names for its model (see [fleet controllers](#fleet-controllers)): `sender`, who wrote it, and `time`, when it was sent, in the daemon's local time; an empty list adds no line. `trailer = [...]` in `~/.agent/config.toml` sets it on the bots the CLI and Sonny make; with none there, Sonny's agents name both. Protocol 75 (`hide_senders` before it). | `["sender"]` |
 | `quiet_background` (`--quiet-background`) | The end of a background command no wait collected is left for a wait, untold (see [deferred tool results](#deferred-tool-results)): for a client that collects results itself. Protocol 46. | off |
 | `outputs` (`--outputs`) | An absolute folder that holds each tool output stream cut for the model whole, one file per stream, in place of the store's copy (see [retained outputs](#retained-outputs)). The daemon makes it, owner-only, and writes there only while the bot's sandbox cannot write it; otherwise the stream stays in the store. `agent run --new` and Sonny name `outputs` beside the store unless told otherwise. | none |
 | `unix_sockets` (`--unix-socket`, repeatable) | Absolute Unix sockets, or folders of them, the only ones a sandboxed bot's commands reach, such as a Docker or SSH agent socket (see [sandbox](#sandbox)). Each is stored by its real path while it exists. At most 64. | none |
@@ -1829,8 +1830,12 @@ the prompt's words and before its pictures, so it does not take another
 agent's words for a person's, in the line that names the message: `[Message
 BOT/N, written by the agent NAME in NAME/TURN, not by a person.]` for
 `from`, `[Message BOT/N, sent by ORIGIN.]` for `origin`, and `[Message
-BOT/N.]` for a person's prompt. `content[0]` stays the words. A bot made
-with `hide_senders` reads the words alone.
+BOT/N.]` for a person's prompt. `content[0]` stays the words. A bot whose
+`trailer` names `time` reads the line with the message's local send time
+after it, `[Message BOT/N, written by PERSON. Sent Sat 14 Nov 2026 03:52,
+UTC-05:00.]` (`[Message BOT/N. Sent ….]` with `time` alone), fixed when the
+turn takes it in, so the cache keeps it; one with an empty `trailer` reads
+the words alone.
 
 A client that speaks for a person other than the daemon's own may name
 them with `person` (a name's characters, else `invalid_person`), exclusive
@@ -1850,7 +1855,7 @@ with their writers. Each quote is a text part after the sender's line,
 behind a line naming it, `[Quoted from message BOT/N, written by a
 person:]` or `[Quoted from the reply to message BOT/N, written by the agent
 BOT:]` (`sent by ORIGIN`, `written by PERSON`, `written by the agent NAME
-in NAME/TURN`); `hide_senders` leaves the lines out too. A message that
+in NAME/TURN`); a `trailer` without `sender` leaves the lines out too. A message that
 does not exist, the reply to one that opened no turn, or a turn that ended without a reply
 (or whose events were pruned before schema 70) is `quote_not_found`; a
 reply of an unfinished turn `quote_unfinished`; more than 64 quotes, those
@@ -3084,7 +3089,13 @@ A bot that a sandboxed bot makes (its `created_by`), or forks, takes the
 creator's sandbox and `writable` folders unless it names a stricter sandbox,
 and reaches the network only if both do, as Codex's subagents inherit their
 parent's sandbox. It takes its creator's [command rules](#command-rules)
-too, always.
+too, always. A `create` that asks for more than that is refused with
+`invalid_setting`, naming the setting, and nothing is made: a looser
+sandbox, the network or a socket its creator doesn't reach, `writable`
+folders under a sandbox that drops them. Nothing asked for is loosened or
+tightened in silence; what is left unasked is its creator's. Its `rules`
+and `env` are its creator's whatever it is made with, as they always were:
+no client picks them for a bot another makes.
 
 On Linux, bubblewrap needs an empty folder on the host to mount a missing
 `.git` read-only over: the daemon makes it, and records it as its own in a
@@ -3252,7 +3263,8 @@ them when they change, as do the bots it makes; configuring `rules` on it
 is `invalid_setting`. So no bot loosens the rules by making another. Once its
 creator is deleted, a bot keeps the rules it had and is given its own from
 then on, as no creator's sandbox holds it either; Sonny gives such an agent
-its rules as it gives a root one.
+the person's rules, but their `allow` rules only as it had them, so none
+lets out of its sandbox a command its creator could not.
 
 A sandbox never lets a bot write the files its rules come from:
 `serve --protect-path PATH`, which repeats, keeps a path read-only in
