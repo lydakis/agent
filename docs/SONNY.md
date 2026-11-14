@@ -910,6 +910,8 @@ newest build of VERSION` for a nightly), or `Sonny is up to date
 
 ![sonny update, from a release tarball install of 0.9.4 to 0.9.5](sonny/sonny-update.png)
 
+![sonny update naming the lead role and plan skill whose new text waits beside the person's edited copies](sonny/sonny-update-kept.png)
+
 An update made by hand (`brew upgrade`, install.sh, or a link moved) is
 finished by `sonny update` or by opening a Sonny window: until one runs,
 the daemon, the scripts in `~/.agent`, automations and the scheduler's job
