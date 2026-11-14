@@ -998,15 +998,17 @@ impl Turn {
         if window.ids.is_empty() {
             return Ok(Strip::default());
         }
-        let prefix = fingerprint(prefix, window.ids[0], provider.url().as_str(), model);
-        let (next, elided) = (window.ids[window.ids.len() - 1] + 1, window.elided);
-        let mut strip = record.thinking;
         if window.family == agent_runtime::codec::Family::Responses {
             // Reasoning goes as it was given until the provider refuses it
             // ([`withhold_thinking`]); what it refused stays out. Its state
-            // is bound to no context, so nothing in front of the window
-            // changes that.
-        } else if record.thinking_prefix != Some(prefix) || elided < record.thinking_elided {
+            // is bound to no context, so nothing is hashed or written here
+            // per call.
+            return Ok(record.thinking);
+        }
+        let prefix = fingerprint(prefix, window.ids[0], provider.url().as_str(), model);
+        let (next, elided) = (window.ids[window.ids.len() - 1] + 1, window.elided);
+        let mut strip = record.thinking;
+        if record.thinking_prefix != Some(prefix) || elided < record.thinking_elided {
             strip = Strip::from(next);
         } else if elided > record.thinking_elided {
             // Ids grow along a lineage, so the window's are ascending.
@@ -4066,9 +4068,10 @@ impl Turn {
                     }
                     // The same body without the thinking was accepted, so
                     // later requests leave it out too.
-                    if let (Body::Window(_), Some(strip), Some(prefix)) =
-                        (body, withheld, record.thinking_prefix)
-                    {
+                    if let (Body::Window(_), Some(strip)) = (body, withheld) {
+                        // A Responses bot keeps no prefix: its reasoning is
+                        // bound to none.
+                        let prefix = record.thinking_prefix.unwrap_or_default();
                         let bot = self.bot.clone();
                         let elided = record.thinking_elided;
                         self.store
@@ -4194,7 +4197,6 @@ impl Turn {
                 retry = json!({"fallback_credit":false});
             } else if let Body::Window(context) = body
                 && withheld.is_none()
-                && record.thinking_prefix.is_some()
                 && let Some(strip) = withhold_thinking(context, &error)
             {
                 withheld = Some(strip);
