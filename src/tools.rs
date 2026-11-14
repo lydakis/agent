@@ -1460,21 +1460,26 @@ fn pem_header(text: &str, begin: usize, last: bool) -> Option<usize> {
 /// this many bytes are base64 is a body's line, whatever follows.
 const PEM_LINE: usize = 64 * 1024;
 
-/// Whether `line`, its end's `\r` taken off, is a line of a key's body:
-/// base64, or the RFC 1421 headers of an encrypted key and the empty line
-/// after them.
-fn pem_line(line: &str, after_info: bool) -> bool {
+/// `line` as a key's body is judged: its end's `\r` taken off, and the
+/// number the read tool puts before each line it shows.
+fn pem_text(line: &str) -> &str {
     let line = line.strip_suffix('\r').unwrap_or(line);
-    // The number the read tool puts before each line it shows.
     let numbered = line.trim_start_matches(' ');
     let digits = numbered.len()
         - numbered
             .trim_start_matches(|c: char| c.is_ascii_digit())
             .len();
-    let line = match numbered[digits..].strip_prefix('\t') {
+    match numbered[digits..].strip_prefix('\t') {
         Some(rest) if digits > 0 => rest,
         _ => line,
-    };
+    }
+}
+
+/// Whether `line`, its end's `\r` taken off, is a line of a key's body:
+/// base64, or the RFC 1421 headers of an encrypted key and the empty line
+/// after them.
+fn pem_line(line: &str, after_info: bool) -> bool {
+    let line = pem_text(line);
     let base64 = |b: &u8| b.is_ascii_alphanumeric() || matches!(b, b'+' | b'/' | b'=');
     (line.is_empty() && after_info)
         || (line.len() <= PEM_LINE
@@ -1522,7 +1527,7 @@ impl PemBody {
             }
             match rest.find('\n') {
                 Some(n) if pem_line(&rest[..n], self.after_info) => {
-                    self.after_info = rest.starts_with("DEK-Info:");
+                    self.after_info = pem_text(&rest[..n]).starts_with("DEK-Info:");
                     self.any = true;
                     at += n + 1;
                 }
@@ -5249,6 +5254,12 @@ mod tests {
         assert_eq!(
             redact(numbered),
             "     1\t-----BEGIN PRIVATE KEY-----\n[REDACTED]\n     4\t-----END PRIVATE KEY-----\n"
+        );
+        // An encrypted key's too.
+        let numbered = "     1\t-----BEGIN RSA PRIVATE KEY-----\n     2\tProc-Type: 4,ENCRYPTED\n     3\tDEK-Info: AES-128-CBC,00\n     4\t\n     5\tMIIE\n     6\t-----END RSA PRIVATE KEY-----\n";
+        assert_eq!(
+            redact(numbered),
+            "     1\t-----BEGIN RSA PRIVATE KEY-----\n[REDACTED]\n     6\t-----END RSA PRIVATE KEY-----\n"
         );
         // Many starts on one long line read it once, whole or in pieces.
         let starts = "-----BEGIN ".repeat(40_000) + "\nend\n";
