@@ -10728,6 +10728,20 @@ impl Database {
     }
     /// The workspace and model reference a running turn must use.
     pub fn context(&self, turn: i64) -> Result<TurnContext> {
+        let bot = self.active(turn)?;
+        self.context_for(turn, &bot)
+    }
+    /// The running bot and its turn's overrides, from one worker snapshot.
+    /// Reuse the bot read here rather than inspecting it again for context.
+    pub fn running_context(&self, name: &str, turn: i64) -> Result<(Bot, TurnContext)> {
+        let bot = self.inspect(name)?;
+        if bot.running_turn != Some(turn) {
+            return fail("stale_turn");
+        }
+        let context = self.context_for(turn, &bot)?;
+        Ok((bot, context))
+    }
+    fn context_for(&self, turn: i64, bot: &Bot) -> Result<TurnContext> {
         // Workspace, model, rounds, view sent, effort, cap, what it spent,
         // what the cap counts, and the schema its reply follows.
         type Row = (
@@ -10753,12 +10767,14 @@ impl Database {
             counts,
             output_schema,
             drops,
-        ): Row = self.conn.query_row(
-            "SELECT workspace,model,model_rounds,view_sent,reasoning,budget_tokens,
+        ): Row = self
+            .conn
+            .prepare_cached(
+                "SELECT workspace,model,model_rounds,view_sent,reasoning,budget_tokens,
                         input_tokens+output_tokens,work,budget_counts,output_schema,drops
-               FROM turns WHERE id=?",
-            [turn],
-            |r| {
+               FROM turns WHERE id=?1 AND bot=?2",
+            )?
+            .query_row(params![turn, bot.name], |r| {
                 Ok((
                     r.get(0)?,
                     r.get(1)?,
@@ -10774,9 +10790,7 @@ impl Database {
                     r.get(9)?,
                     r.get::<_, u32>(10)? as usize,
                 ))
-            },
-        )?;
-        let bot = self.active(turn)?;
+            })?;
         let spent_now = bot.spent();
         let default = format!("{}/{}", bot.provider, bot.model);
         // A turn that started stored its prompt node then; steers absorbed
@@ -10806,10 +10820,10 @@ impl Database {
             drops,
             view_sent,
             workspace: workspace
-                .or(bot.workspace)
+                .or_else(|| bot.workspace.clone())
                 .ok_or(Error::new("workspace_required"))?,
             model: model.unwrap_or(default),
-            effort: reasoning.or(bot.effort),
+            effort: reasoning.or_else(|| bot.effort.clone()),
             // Every token the turn counts counts toward the bot's too, so
             // the cap is where the bot's count will stand once the turn
             // spent it.
@@ -10822,9 +10836,9 @@ impl Database {
             }),
             previous_call,
             output_schema,
-            created_by: bot.created_by,
+            created_by: bot.created_by.clone(),
             created_by_id: bot.created_by_id,
-            bot: bot.name,
+            bot: bot.name.clone(),
             bot_id: bot.bot_id,
         })
     }
@@ -14192,7 +14206,10 @@ impl Database {
     /// A page of a bot's messages between `after` and `before`, as `turns`
     /// pages its runs: each as sent, with where it stands (in line, taken
     /// in by `turn`, withdrawn or failed), its words previewed, when it was
-    /// sent and taken in, and the effort it ran at or asked for.
+    /// sent and taken in, and the effort it ran at or asked for. With
+    /// `waiting`, only those still in line (`queued` or `ready`), read
+    /// through the line's own indexes rather than every message the bot
+    /// was sent.
     pub fn messages(
         &self,
         name: &str,
@@ -14200,6 +14217,7 @@ impl Database {
         before: Option<i64>,
         limit: usize,
         newest: bool,
+        waiting: bool,
     ) -> Result<Value> {
         self.inspect(name)?;
         if after < 0 || before.is_some_and(|b| b < 1) || !(1..=256).contains(&limit) {
@@ -14209,6 +14227,13 @@ impl Database {
             );
         }
         let order = if newest { "DESC" } else { "ASC" };
+        let line = match waiting {
+            true => {
+                "AND m.id IN (SELECT id FROM messages WHERE bot=?1 AND status='queued'
+                    UNION ALL SELECT id FROM messages WHERE bot=?1 AND status='ready')"
+            }
+            false => "",
+        };
         let mut statement = self.conn.prepare_cached(&format!(
             "SELECT {TURN_VIEW},{PREVIEW},m.delivery,m.node,m.sent_ms,m.taken_ms,
                     m.from_bot,m.from_turn,m.origin,m.person,
@@ -14217,7 +14242,7 @@ impl Database {
                             ELSE r.bot_reasoning END) END,
                     COALESCE(r.workspace,m.workspace)
              FROM {MESSAGE_FROM} LEFT JOIN turns r ON r.id=m.turn {PREVIEW_NODE}
-             WHERE m.bot=?1 AND m.id>?2 AND m.id<?3 ORDER BY m.id {order} LIMIT ?4"
+             WHERE m.bot=?1 AND m.id>?2 AND m.id<?3 {line} ORDER BY m.id {order} LIMIT ?4"
         ))?;
         let before = before.unwrap_or(i64::MAX);
         let mut rows = statement.query(params![name, after, before, (limit + 1) as i64])?;

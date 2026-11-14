@@ -30,6 +30,14 @@ Fixed-work resource and latency measurements. A time-based soak that completes
 more turns is not here, because its work changes with its speed; it is under
 [operational behavior](#operational-behavior).
 
+- **Turn-start metadata in one storage job.** Rechecked against main
+  `3c73fcdf` after 0.9.5, with Rust 1.100.0: 32 submissions use 96 store
+  jobs instead of 128, and 1,000 turn starts issue zero separate `inspect`
+  jobs instead of 1,000. This is a deterministic work reduction; CPU and
+  latency do not improve conclusively. The four native screens pass with
+  no warnings, along with 718 Rust tests and 12 process checks, including
+  fork/resume and the restart job budget. macOS arm64, 2026-11-13.
+  [Record](DAEMON_MEASUREMENTS.md#metadata-read-rescreen-on-095-main).
 - **Group commit, fixed work.** 192 bots, 4,608 primary turns, the same
   requests and retries in both builds, full flushing in both. The build that
   batches turn completions, which also carried the retention-publication

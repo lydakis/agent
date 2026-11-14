@@ -1875,7 +1875,7 @@ question is open in it, its own or one pinned from below. Next to the model the 
 that isn't its seat's own (`lead` for a lead, `task` for a task). The left
 of the footer says what you talk to and where (the permissions mark, the
 model as pickers name it, its effort, the folder and its branch), and the
-right what wants you (needs you, failed, working, at rest, `✎`, the
+right what wants you (needs you, failed, working, at rest, the
 context). Its counts of the agents are the ones `/status` heads its
 groups with, marks and numbers only: `? 2  ✗ 1  ● 3  ○ 13` needs you,
 failed, working, and at rest; what is done asks nothing of you, and `/status`
@@ -1977,8 +1977,8 @@ after Esc closed it, under whatever is open over it, as VS Code's
 `reveal` shows a task's output; `[sonny] margin_opens = "unless-closed"`
 leaves it closed after Esc until `/margin`, and `"never"` opens it only
 with `/margin`. It never closes by itself: emptied, or opened to look at
-with nothing in it, it stays until Esc. In a narrower window the footer counts the notes
-(`✎ 3`), and Tab with nothing typed shows the margin. Where the margin
+with nothing in it, it stays until Esc. In a narrower window Tab with nothing typed shows
+the margin. Where the margin
 cannot show, because the window is narrower or it is closed, each note is
 drawn in the conversation where it was put instead of its marker, up to
 40 rows with the rest a click away, and it goes back beside the

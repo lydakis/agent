@@ -429,6 +429,10 @@ enum Command {
         limit: Option<usize>,
         #[serde(default)]
         newest: bool,
+        /// Only the messages still in line, waiting for a turn to take
+        /// them in or for one of their own.
+        #[serde(default)]
+        waiting: bool,
     },
     /// The tokens bots' turns spent: in all, by bot, by model, and over
     /// time. A read.
@@ -4766,11 +4770,12 @@ impl Service {
                 before,
                 limit,
                 newest,
+                waiting,
             } => {
                 let reader = store.reader();
                 self.observe(session, output, id, async move {
                     (reader.read("messages", move |db| {
-                        db.messages(&bot, after, before, limit.unwrap_or(64), newest)
+                        db.messages(&bot, after, before, limit.unwrap_or(64), newest, waiting)
                     }))
                     .await
                 })
