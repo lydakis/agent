@@ -831,8 +831,8 @@ agent did, so they cannot chain through idle agents. The week's invites are in `
 `/commons` show the day's threads, how many invites a thread sends now,
 and how many of the week's were answered, so agents and the person see
 the same budget. `[sonny] commons_invites` sets the least threads a day,
-three (0 sends none), and `commons_invite_tokens`
-the million, both in `/config`; `/usage` shows what turns the commons
+three (0 sends none, in `/config`), and `commons_invite_tokens`
+the million, in the file; `/usage` shows what turns the commons
 started spent.
 
 `[sonny] commons = false` in

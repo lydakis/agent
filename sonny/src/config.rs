@@ -15,13 +15,32 @@ use unicode_width::UnicodeWidthStr;
 pub struct Setting {
     /// As the file names it: `table.key`, or the bare key.
     pub key: &'static str,
-    /// What it sets, and when that is read.
+    /// The group `/config` lists it under, as [`GROUPS`] names them; none
+    /// for one that only tunes, which stays in the file and the reference.
+    pub group: &'static str,
+    /// What `/config` calls it, in plain words.
+    pub name: &'static str,
+    /// What it does, in one line `/config` shows: at most the Rulebook's
+    /// `label-max`, 70 characters.
+    pub label: &'static str,
+    /// What it sets and when that is read, whole, for the reference.
     pub about: &'static str,
     /// The values it takes, or none for one that takes a name.
     pub values: &'static [&'static str],
     /// What an unset key is.
     pub default: &'static str,
 }
+
+/// `/config`'s groups, in the order it lists them.
+pub const GROUPS: &[&str] = &[
+    "Models",
+    "Agents",
+    "View",
+    "Margin",
+    "Tabs",
+    "Commons and sky",
+    "This machine",
+];
 
 const EFFORTS: &[&str] = &["low", "medium", "high", "xhigh", "max"];
 /// A switch, written as TOML's own true or false.
@@ -41,275 +60,382 @@ fn span(setting: &Setting) -> bool {
         && agent_client::config::span(setting.key, setting.default).is_ok()
 }
 
-/// The rows `/config` takes with room for all: the blank one, a heading
-/// for each table, and the settings.
+/// The rows `/config` takes: the blank one and a list's rows.
 pub fn height() -> usize {
-    let mut tables: Vec<&str> = SETTINGS
-        .iter()
-        .map(|s| s.key.rsplit_once('.').map_or("", |(table, _)| table))
-        .collect();
-    tables.dedup();
-    1 + tables.len() + SETTINGS.len()
+    1 + crate::list::ROWS
 }
 
-/// A key without its table, which its heading names.
-fn short(key: &str) -> &str {
-    key.rsplit_once('.').map_or(key, |(_, key)| key)
-}
-
-/// Every key `agent_client::config` reads.
+/// Every key `agent_client::config` reads: those `/config` lists in its
+/// groups' order, then those that only tune.
 pub const SETTINGS: &[Setting] = &[
     Setting {
         key: "model",
+        group: "Models",
+        name: "model",
+        label: "the model a new agent runs when none is named",
         about: "a new agent's model, when none is named (provider/model)",
         values: &[],
         default: "none",
     },
     Setting {
         key: "provider",
+        group: "Models",
+        name: "provider",
+        label: "the providers the daemon serves; read when it starts",
         about: "the daemon's providers, as AGENT_PROVIDER takes them; read when it starts",
         values: &[],
         default: "AGENT_PROVIDER",
     },
     Setting {
-        key: "web_search",
-        about: "whether new agents search and fetch the web where their provider offers it",
-        values: &["live", "disabled"],
-        default: "live",
-    },
-    Setting {
-        key: "trailer",
-        about: "what an agent's model reads after each message: who sent it, when it was sent",
-        values: TRAILERS,
-        default: "sender, time",
-    },
-    Setting {
-        key: "reviewer.model",
-        about: "the model that reviews calls in Auto (provider/model)",
-        values: &[],
-        default: "the agent's own model",
-    },
-    Setting {
-        key: "reviewer.effort",
-        about: "the reviewer's effort",
-        values: EFFORTS,
-        default: "the model's own",
-    },
-    Setting {
-        key: "reviewer.timeout_ms",
-        about: "how long a call in Auto waits for the reviewer's verdict, every attempt included, before it goes to you; 0 waits as long as it takes",
-        values: &[],
-        default: "90000",
-    },
-    Setting {
         key: "sonny.lead_effort",
+        group: "Models",
+        name: "lead effort",
+        label: "how hard a new lead thinks",
         about: "a new lead's effort",
         values: EFFORTS,
         default: "the model's own",
     },
     Setting {
         key: "sonny.task_effort",
+        group: "Models",
+        name: "task effort",
+        label: "how hard each new task thinks",
         about: "each new task's effort",
         values: EFFORTS,
         default: "its lead's",
     },
     Setting {
         key: "sonny.task_speed",
-        about: "each new task's speed, where its model serves it",
+        group: "Models",
+        name: "task speed",
+        label: "each new task's speed, where its model serves one",
+        about: "each new task's speed, where its model serves it; unset, its starter's when on the same model",
         values: &agent_client::config::SPEEDS,
-        default: "its starter's on the same model",
+        default: "its starter's",
+    },
+    Setting {
+        key: "reviewer.model",
+        group: "Models",
+        name: "reviewer model",
+        label: "the model that reviews calls in Auto",
+        about: "the model that reviews calls in Auto (provider/model); unset, the agent's own model",
+        values: &[],
+        default: "the agent's own",
+    },
+    Setting {
+        key: "reviewer.effort",
+        group: "Models",
+        name: "reviewer effort",
+        label: "how hard the reviewer thinks",
+        about: "the reviewer's effort",
+        values: EFFORTS,
+        default: "the model's own",
+    },
+    Setting {
+        key: "reviewer.timeout_ms",
+        group: "Models",
+        name: "reviewer wait",
+        label: "how long a call in Auto waits for the reviewer before it asks you",
+        about: "how long a call in Auto waits for the reviewer's verdict, every attempt included, before it goes to you; 0 waits as long as it takes",
+        values: &[],
+        default: "90000",
+    },
+    Setting {
+        key: "sonny.default_permissions",
+        group: "Agents",
+        name: "permissions",
+        label: "the /permissions row a new lead starts in",
+        about: "the /permissions row a new lead starts in; a [sonny.permissions] row of your own is typed into the file",
+        values: &["auto", "ask", "read-only", "full"],
+        default: "auto",
     },
     Setting {
         key: "sonny.lead_profile",
+        group: "Agents",
+        name: "lead profile",
+        label: "the profile a new lead runs as",
         about: "the profile a new lead runs as",
         values: &[],
         default: "lead",
     },
     Setting {
         key: "sonny.task_profile",
+        group: "Agents",
+        name: "task profile",
+        label: "the profile every other agent Sonny starts runs as",
         about: "the profile every other agent Sonny starts is told",
         values: &[],
         default: "task",
     },
     Setting {
         key: "sonny.side_chat",
+        group: "Agents",
+        name: "side chat",
+        label: "/side's copy can do anything its agent can, or only answers",
         about: "/side's copy is a fork that can do anything its agent can, or answers calling no tool",
         values: &["fork", "answer"],
         default: "fork",
     },
     Setting {
-        key: "sonny.chime",
-        about: "whether finished and waiting work rings; notifications show either way",
-        values: SWITCH,
-        default: "false",
+        key: "sonny.ask_wait_minutes",
+        group: "Agents",
+        name: "ask wait",
+        label: "minutes a question waits before its agent goes on; 0 waits for you",
+        about: "minutes an unanswered question waits before its agent goes on with what it recommended, where it said it could, or is reminded; 0 waits for you always",
+        values: &[],
+        default: "60",
     },
     Setting {
-        key: "sonny.steps",
-        about: "the agent's steps between what is said (calls, news in, messages between agents, how long a turn took), or only your words and the agent's",
-        values: SWITCH,
-        default: "false",
+        key: "web_search",
+        group: "Agents",
+        name: "web search",
+        label: "whether new agents search and fetch the web",
+        about: "whether new agents search and fetch the web where their provider offers it",
+        values: &["live", "disabled"],
+        default: "live",
     },
     Setting {
-        key: "sonny.verbose",
-        about: "every tool call drawn, or the clean view: replies, tasks, questions and the plan",
-        values: SWITCH,
-        default: "false",
+        key: "trailer",
+        group: "Agents",
+        name: "senders",
+        label: "what an agent reads after each message: who sent it, and when",
+        about: "what an agent's model reads after each message: who sent it, when it was sent",
+        values: TRAILERS,
+        default: "sender, time",
     },
     Setting {
-        key: "sonny.project_colors",
-        about: "experimental: in a window that follows other leads, a reply about one followed project wears its color",
-        values: SWITCH,
-        default: "false",
+        key: "daemon.depth",
+        group: "Agents",
+        name: "depth",
+        label: "how many generations of agents a line may have; 0 for no end",
+        about: "how many generations below the agent that starts a line (a lead, or an agent you made) a new agent may be: 2 lets a lead's tasks start their own, which start none; 0 for no end; read when the daemon starts",
+        values: &[],
+        default: "2",
+    },
+    Setting {
+        key: "sonny.view",
+        group: "View",
+        name: "view",
+        label: "what the conversation shows: words, steps, or every tool call",
+        about: "what the conversation shows: `words`, only your words and the agent's, its questions and what failed; `steps`, the agent's steps between too (calls, news in, messages between agents, how long a turn took); `verbose`, every tool call. `/verbose` shows every tool call in one window until it is typed again",
+        values: &["words", "steps", "verbose"],
+        default: "words",
     },
     Setting {
         key: "sonny.text_width",
+        group: "View",
+        name: "text width",
+        label: "the widest the conversation is written, in columns; 0 for all",
         about: "the widest the conversation is written, in columns, however wide the window, the pane beside it taking the rest; 0 for the window's whole width, shared half and half with an open pane",
         values: &[],
         default: "100",
     },
     Setting {
-        key: "sonny.margin_opens",
-        about: "when a note the agent puts up or changes opens the margin: always, unless you closed it with Esc, or never",
-        values: &["always", "unless-closed", "never"],
-        default: "always",
-    },
-    Setting {
-        key: "sonny.margin_notes",
-        about: "the most notes a margin holds; past it the agent's new note is refused, and it is told why",
-        values: &[],
-        default: "6",
-    },
-    Setting {
-        key: "sonny.margin_note_lines",
-        about: "the most lines a margin note's text runs to; a longer one is refused, and the agent told to show a file instead",
-        values: &[],
-        default: "12",
-    },
-    Setting {
-        key: "sonny.agent_opens",
-        about: "where a click on an agent's name takes you: its tab in Rex, Herdr or cmux, or a look beside the conversation; a right click, the other",
-        values: &["tab", "beside"],
-        default: "tab",
+        key: "sonny.project_colors",
+        group: "View",
+        name: "project colors",
+        label: "experimental: a followed project's replies wear its color",
+        about: "experimental: in a window that follows other leads, a reply about one followed project wears its color",
+        values: SWITCH,
+        default: "false",
     },
     Setting {
         key: "sonny.suggest",
+        group: "View",
+        name: "suggest",
+        label: "after your turn, guess your next message for Tab to take",
         about: "after a turn you started, a copy of the agent guesses your next message for Tab to take; one small call",
         values: SWITCH,
         default: "true",
     },
     Setting {
         key: "sonny.suggest_ideas",
+        group: "View",
+        name: "suggest ideas",
+        label: "when the next message isn't clear, the guess may offer an idea",
         about: "when your next message isn't obvious, that guess may offer an idea for the work or a tip for a Sonny command or key instead, labeled; no extra call",
         values: SWITCH,
         default: "true",
     },
     Setting {
-        key: "sonny.start_at_boot",
-        about: "the daemon starts when this machine does (at login on a Mac), so a box's agents keep working after a restart",
+        key: "sonny.chime",
+        group: "View",
+        name: "chime",
+        label: "ring when work finishes or waits; notifications show either way",
+        about: "whether finished and waiting work rings; notifications show either way",
         values: SWITCH,
         default: "false",
     },
     Setting {
-        key: "sonny.commons",
-        about: "whether agents have the commons: its tool, its skill and the roles' lines about it; read when Sonny starts",
-        values: SWITCH,
-        default: "true",
+        key: "sonny.margin_opens",
+        group: "Margin",
+        name: "opens",
+        label: "when a note the agent puts up opens the margin",
+        about: "when a note the agent puts up or changes opens the margin: always, unless you closed it with Esc, or never",
+        values: &["always", "unless-closed", "never"],
+        default: "always",
     },
     Setting {
-        key: "sonny.commons_invites",
-        about: "least commons threads a day that send invites, the square root of the week's agents if more, 0 for none; each answered thread adds one, up to as many again",
+        key: "sonny.margin_notes",
+        group: "Margin",
+        name: "notes",
+        label: "the most notes a margin holds",
+        about: "the most notes a margin holds; past it the agent's new note is refused, and it is told why",
         values: &[],
-        default: "3",
+        default: "6",
     },
     Setting {
-        key: "sonny.commons_invite_tokens",
-        about: "the tokens of work an invite pays for: the budget of the one turn it starts, a golden ticket's twice that; later replies reach the agent through its follow",
+        key: "sonny.margin_note_lines",
+        group: "Margin",
+        name: "note lines",
+        label: "the most lines a margin note runs to",
+        about: "the most lines a margin note's text runs to; a longer one is refused, and the agent told to show a file instead",
         values: &[],
-        default: "1000000",
+        default: "12",
     },
     Setting {
-        key: "sonny.ask_wait_minutes",
-        about: "minutes an unanswered question waits before its agent goes on with what it recommended, where it said it could, or is reminded; 0 waits for you always",
-        values: &[],
-        default: "60",
-    },
-    Setting {
-        key: "sonny.default_permissions",
-        about: "the /permissions row a new lead starts in; a [sonny.permissions] row of your own is typed into the file",
-        values: &["auto", "ask", "read-only", "full"],
-        default: "auto",
+        key: "sonny.agent_opens",
+        group: "Tabs",
+        name: "agent opens",
+        label: "where a click on an agent's name takes you: its tab, or beside",
+        about: "where a click on an agent's name takes you: its tab in Rex, Herdr or cmux, or a look beside the conversation; a right click, the other",
+        values: &["tab", "beside"],
+        default: "tab",
     },
     Setting {
         key: "sonny.task_tabs",
+        group: "Tabs",
+        name: "task tabs",
+        label: "which tasks open a tab of their own: those asked for, or every one",
         about: "which tasks open in a tab of their own in Rex, Herdr or cmux: those an agent asks a tab for, shows you, or you open, and any that comes to need you; or every task as its turn starts",
         values: &["asked", "every"],
         default: "asked",
     },
     Setting {
         key: "sonny.task_windows",
-        about: "task windows a lead keeps open in its multiplexer: past it, a new one closes the one you used least recently, never one you have not looked at yet, that needs you, failed or runs something it asked for (with only unseen ones to close, the new one waits for /status); 0 for no limit",
+        group: "Tabs",
+        name: "most task tabs",
+        label: "the most task tabs a lead keeps open; 0 for no limit",
+        about: "task tabs a lead keeps open in its multiplexer: past it, a new one closes the one you used least recently, never one you have not looked at yet, that needs you, failed or runs something it asked for (with only unseen ones to close, the new one waits for /status); 0 for no limit",
         values: &[],
         default: "32",
     },
     Setting {
+        key: "sonny.commons",
+        group: "Commons and sky",
+        name: "commons",
+        label: "whether agents have the commons; read when Sonny starts",
+        about: "whether agents have the commons: its tool, its skill and the roles' lines about it; read when Sonny starts",
+        values: SWITCH,
+        default: "true",
+    },
+    Setting {
+        key: "sonny.commons_invites",
+        group: "Commons and sky",
+        name: "commons invites",
+        label: "the fewest commons threads a day that send invites; 0 for none",
+        about: "least commons threads a day that send invites, the square root of the week's agents if more, 0 for none; each answered thread adds one, up to as many again",
+        values: &[],
+        default: "3",
+    },
+    Setting {
+        key: "sonny.sources.commons.digest",
+        group: "Commons and sky",
+        name: "commons digest",
+        label: "how often at most an agent hears of new posts in its threads",
+        about: "how often at most an agent hears of new posts in the commons threads it posted in, as 30s, 15m or 1h; 0 for as they come. The commons is a source, so steer sets what cuts in, as for yours",
+        values: &[],
+        default: "15m",
+    },
+    Setting {
         key: "sonny.sky_haikus",
+        group: "Commons and sky",
+        name: "sky haikus",
+        label: "a haiku from the sky's busiest agent each time the title passes",
         about: "a haiku from the agent the sky finds busiest, written by a copy of it that calls no tool each time the title passes",
         values: SWITCH,
         default: "true",
     },
     Setting {
+        key: "sonny.start_at_boot",
+        group: "This machine",
+        name: "start at boot",
+        label: "start the daemon when this machine starts, at login on a Mac",
+        about: "the daemon starts when this machine does (at login on a Mac), so a box's agents keep working after a restart",
+        values: SWITCH,
+        default: "false",
+    },
+    Setting {
         key: "sonny.sky_haiku_daily",
+        group: "",
+        name: "sky haiku daily",
+        label: "",
         about: "the most haikus a day; 0 for no limit, the title's hold keeping them a hold apart",
         values: &[],
         default: "0",
     },
     Setting {
         key: "sonny.sky_haiku_keep",
+        group: "",
+        name: "sky haiku keep",
+        label: "",
         about: "the hours haikus are kept, for a replay to show the one up at its time; 0 keeps them all",
         values: &[],
         default: "24",
     },
     Setting {
         key: "sonny.sky_haiku_window",
+        group: "",
+        name: "sky haiku window",
+        label: "",
         about: "the minutes of messages and tool calls that make an agent the sky's busiest",
         values: &[],
         default: "10",
     },
     Setting {
         key: "sonny.sky_haiku_margin",
+        group: "",
+        name: "sky haiku margin",
+        label: "",
         about: "how much busier, in percent, an agent must be than the busiest to take the title, so it does not flicker",
         values: &[],
         default: "50",
     },
     Setting {
         key: "sonny.sky_haiku_hold",
+        group: "",
+        name: "sky haiku hold",
+        label: "",
         about: "the minutes the busiest keeps the title before another can take it",
         values: &[],
         default: "10",
     },
     Setting {
+        key: "sonny.commons_invite_tokens",
+        group: "",
+        name: "commons invite tokens",
+        label: "",
+        about: "the tokens of work an invite pays for: the budget of the one turn it starts, a golden ticket's twice that; later replies reach the agent through its follow",
+        values: &[],
+        default: "1000000",
+    },
+    Setting {
         key: "sonny.tool_processes",
+        group: "",
+        name: "tool processes",
+        label: "",
         about: "processes Sonny runs for agents' tool calls at once in all, each agent at most half; 0 for four times the CPUs",
         values: &[],
         default: "0",
     },
     Setting {
         key: "sonny.lookout_waiting",
+        group: "",
+        name: "lookout waiting",
+        label: "",
         about: "events from your sources that wait for one agent while it is busy: past it, newer ones are not kept, and the agent's next note says how many, from where and when; 0 for no limit",
         values: &[],
         default: "1024",
-    },
-    Setting {
-        key: "sonny.sources.commons.digest",
-        about: "how often at most an agent hears of new posts in the commons threads it posted in, as 30s, 15m or 1h; 0 for as they come. The commons is a source, so steer sets what cuts in, as for yours",
-        values: &[],
-        default: "15m",
-    },
-    Setting {
-        key: "daemon.depth",
-        about: "how many generations below the agent that starts a line (a lead, or an agent you made) a new agent may be: 2 lets a lead's tasks start their own, which start none; 0 for no end; read when the daemon starts",
-        values: &[],
-        default: "2",
     },
 ];
 
@@ -320,12 +446,15 @@ pub const REVIEWER: &str = "judge-reviewer";
 /// The migration that takes quiet mode's keys, files and skill away.
 pub const QUIET_GONE: &str = "quiet-gone";
 pub const CHECKS_GONE: &str = "checks-gone";
+/// The migration that makes `[sonny] steps` and `verbose` one `view`.
+pub const VIEW_ONE: &str = "view-one";
 
 /// At start, once each, before the config is read: a line depth the
 /// person set for Sonny moved to the daemon, which bounds it now; the
 /// reviewer's model and effort under the reviewer's name; quiet mode,
 /// gone, leaving no key the config would refuse, no file and no skill; and
-/// the reply check's and done check's keys, gone with the checks.
+/// the reply check's and done check's keys, gone with the checks; and the
+/// two switches for what the conversation shows, one `view`.
 pub fn at_start() {
     let (Some(home), Some(path)) = (
         std::env::var_os("HOME").map(PathBuf::from),
@@ -348,6 +477,7 @@ pub fn at_start() {
         rewrite(&path, quiet_gone)
     });
     crate::upgrade::once(&migrated, CHECKS_GONE, || rewrite(&path, checks_gone));
+    crate::upgrade::once(&migrated, VIEW_ONE, || rewrite(&path, view_one));
 }
 
 /// The config at `path` as `change` rewrites it, each other line as the
@@ -484,6 +614,62 @@ fn checks_gone(text: &str) -> Result<Option<String>, ()> {
     sonny_keys_gone(text, &["needs_check", "task_done_check"])
 }
 
+/// `text` as [`rewrite`] writes it for [`VIEW_ONE`]: none when `[sonny]`
+/// sets neither `steps` nor `verbose`. Their lines go, and the view they
+/// showed is written under `[sonny]`'s heading: `verbose` on is every tool
+/// call, `steps` on the steps, and neither the words, the default, so no
+/// line. A `view` the file sets already stays as set.
+fn view_one(text: &str) -> Result<Option<String>, ()> {
+    let old: toml::Table = text.parse().map_err(drop)?;
+    let Some(sonny) = old.get("sonny").and_then(toml::Value::as_table) else {
+        return Ok(None);
+    };
+    // A switch set to anything but true or false is left for the person
+    // to see: its meaning can't be carried over.
+    if ["steps", "verbose"]
+        .iter()
+        .any(|key| sonny.get(*key).is_some_and(|value| !value.is_bool()))
+    {
+        return Err(());
+    }
+    let on = |key: &str| sonny.get(key).and_then(toml::Value::as_bool) == Some(true);
+    let view = match (on("verbose"), on("steps")) {
+        _ if sonny.contains_key("view") => None,
+        (true, _) => Some("verbose"),
+        (_, true) => Some("steps"),
+        _ => None,
+    };
+    let Some(gone) = sonny_keys_gone(text, &["steps", "verbose"])? else {
+        return Ok(None);
+    };
+    let Some(view) = view else {
+        return Ok(Some(gone));
+    };
+    let mut expected: toml::Table = gone.parse().map_err(drop)?;
+    if let Some(toml::Value::Table(sonny)) = expected.get_mut("sonny") {
+        sonny.insert("view".into(), toml::Value::String(view.into()));
+    }
+    let mut new = String::new();
+    let mut added = false;
+    for raw in gone.split_inclusive('\n') {
+        new.push_str(raw);
+        let heading = raw.trim().strip_prefix("[sonny]");
+        if !added
+            && heading.is_some_and(|rest| rest.is_empty() || rest.trim_start().starts_with('#'))
+        {
+            if !raw.ends_with('\n') {
+                new.push('\n');
+            }
+            new.push_str(&format!("view = \"{view}\"\n"));
+            added = true;
+        }
+    }
+    match new.parse::<toml::Table>() {
+        Ok(parsed) if added && parsed == expected => Ok(Some(new)),
+        _ => Err(()),
+    }
+}
+
 /// `text` without the `[sonny]` keys `gone`: none when it sets none of
 /// them. Their lines go, a list run over several lines whole, and every
 /// other line stays as written. What is written must parse to the config
@@ -551,14 +737,18 @@ pub fn skill() -> String {
                     .collect::<Vec<_>>()
                     .join(", "),
             };
+            let listed = match setting.group {
+                "" => "the file only".to_owned(),
+                group => format!("{group}: {}", setting.name),
+            };
             format!(
-                "| `{}` | {} | {values} | {} |",
+                "| `{}` | {} | {values} | {} | {listed} |",
                 setting.key, setting.about, setting.default
             )
         })
         .collect();
     let table = format!(
-        "| Key | What it sets | Values | Unset |\n| --- | --- | --- | --- |\n{}",
+        "| Key | What it sets | Values | Unset | In `/config` |\n| --- | --- | --- | --- | --- |\n{}",
         rows.join("\n")
     );
     include_str!("../skills/sonny-config/SKILL.md")
@@ -572,11 +762,25 @@ pub enum Key {
     Close,
 }
 
+/// The settings `/config` lists, by their place in [`SETTINGS`], in its
+/// groups' order.
+fn listed() -> Vec<usize> {
+    (GROUPS.iter())
+        .flat_map(|group| (SETTINGS.iter().enumerate()).filter(move |(_, s)| s.group == *group))
+        .map(|(at, _)| at)
+        .collect()
+}
+
+/// `/config`: a list like any other, its settings under their groups'
+/// names, typing narrowing it to the settings it finds.
 pub struct View {
     path: PathBuf,
     /// Each setting's value in the file, `None` for its default.
     values: Vec<Option<String>>,
-    pick: usize,
+    /// The settings listed, by their place in [`SETTINGS`].
+    listed: Vec<usize>,
+    /// The listed settings' names and labels, narrowed and picked.
+    picker: crate::list::Picker,
     /// The name being typed for the picked setting.
     typing: Option<String>,
     /// What the last change came to: saved, or why not.
@@ -588,15 +792,31 @@ impl View {
     /// every other reader refuses it.
     pub fn open() -> Result<Self, String> {
         let path = agent_client::config::path().ok_or("HOME is not set")?;
-        let mut view = View {
-            path,
-            values: Vec::new(),
-            pick: 0,
-            typing: None,
-            said: None,
-        };
+        let mut view = Self::at(path);
         view.values = view.read()?;
         Ok(view)
+    }
+
+    /// The view of the file at `path`, not yet read.
+    fn at(path: PathBuf) -> Self {
+        let listed = listed();
+        let rows = (listed.iter())
+            .map(|&at| (SETTINGS[at].name.to_owned(), SETTINGS[at].label.to_owned()))
+            .collect();
+        View {
+            path,
+            values: vec![None; SETTINGS.len()],
+            listed,
+            picker: crate::list::Picker::new(rows, 0),
+            typing: None,
+            said: None,
+        }
+    }
+
+    /// The setting picked, by its place in [`SETTINGS`]; none when typing
+    /// finds none.
+    fn picked(&self) -> Option<usize> {
+        self.picker.chosen().map(|at| self.listed[at])
     }
 
     fn read(&self) -> Result<Vec<Option<String>>, String> {
@@ -625,10 +845,10 @@ impl View {
             .collect())
     }
 
-    /// Writes the picked setting's `value`, `None` for its default, and
-    /// reads the file again.
-    fn write(&mut self, value: Option<String>) {
-        let setting = &SETTINGS[self.pick];
+    /// Writes setting `at`'s `value`, `None` for its default, and reads
+    /// the file again.
+    fn write(&mut self, at: usize, value: Option<String>) {
+        let setting = &SETTINGS[at];
         let value = value.map(|value| match (setting.values == SWITCH, number(setting)) {
             _ if setting.values == TRAILERS => toml::Value::Array(
                 (value.split(", ").filter(|part| *part != "none"))
@@ -647,8 +867,8 @@ impl View {
             Ok(values) => {
                 self.values = values;
                 let said = match &value {
-                    Some(value) => format!("{} = {value}", setting.key),
-                    None => format!("{} is its default again", setting.key),
+                    Some(value) => format!("{} = {value}", setting.name),
+                    None => format!("{} is its default again", setting.name),
                 };
                 // The setting is the job: it is set up or taken away now.
                 match setting.key {
@@ -666,7 +886,10 @@ impl View {
     /// The next of the picked setting's values, `by` steps on, through
     /// its default and round again.
     fn step(&mut self, by: isize) {
-        let setting = &SETTINGS[self.pick];
+        let Some(at) = self.picked() else {
+            return;
+        };
+        let setting = &SETTINGS[at];
         if setting.values.is_empty() {
             return;
         }
@@ -676,14 +899,14 @@ impl View {
             .copied()
             .filter(|value| *value != setting.default)
             .collect();
-        let now = match &self.values[self.pick] {
+        let now = match &self.values[at] {
             None => 0,
             Some(value) => (values.iter())
                 .position(|v| v == value)
                 .map_or(0, |at| at as isize + 1),
         };
         let next = (now + by).rem_euclid(values.len() as isize + 1) as usize;
-        self.write(next.checked_sub(1).map(|at| values[at].to_owned()));
+        self.write(at, next.checked_sub(1).map(|at| values[at].to_owned()));
     }
 
     pub fn event(&mut self, event: &Event) -> Key {
@@ -691,19 +914,16 @@ impl View {
             && let Some(typed) = &mut self.typing
         {
             typed.push_str(text.lines().next().unwrap_or_default());
-        }
-        let Event::Key(key) = event else {
-            return Key::Stay;
-        };
-        if key.kind == KeyEventKind::Release {
             return Key::Stay;
         }
-        if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
-            return Key::Close;
-        }
-        let named = SETTINGS[self.pick].values.is_empty();
-        if let Some(typed) = &mut self.typing {
+        if let Event::Key(key) = event
+            && key.kind != KeyEventKind::Release
+            && let Some(typed) = &mut self.typing
+        {
             match key.code {
+                KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    return Key::Close;
+                }
                 KeyCode::Char(c) => typed.push(c),
                 KeyCode::Backspace => {
                     typed.pop();
@@ -712,97 +932,137 @@ impl View {
                 KeyCode::Enter => {
                     let typed = self.typing.take().unwrap_or_default();
                     let typed = typed.trim();
-                    self.write((!typed.is_empty()).then(|| typed.to_owned()));
+                    if let Some(at) = self.picked() {
+                        self.write(at, (!typed.is_empty()).then(|| typed.to_owned()));
+                    }
                 }
                 _ => {}
             }
             return Key::Stay;
         }
+        let Event::Key(key) = event else {
+            if let Event::Paste(_) = event {
+                self.said = None;
+                self.picker.event(event);
+            }
+            return Key::Stay;
+        };
+        if key.kind == KeyEventKind::Release {
+            return Key::Stay;
+        }
         self.said = None;
+        let picked = self.picked();
+        let named = picked.is_some_and(|at| SETTINGS[at].values.is_empty());
+        let set = picked.is_some_and(|at| self.values[at].is_some());
         match key.code {
-            KeyCode::Esc => return Key::Close,
-            KeyCode::Up => self.pick = self.pick.saturating_sub(1),
-            KeyCode::Down => self.pick = (self.pick + 1).min(SETTINGS.len() - 1),
             KeyCode::Left => self.step(-1),
             KeyCode::Right => self.step(1),
             KeyCode::Enter if named => {
-                self.typing = Some(self.values[self.pick].clone().unwrap_or_default())
+                self.typing = picked.map(|at| self.values[at].clone().unwrap_or_default())
             }
             KeyCode::Enter => self.step(1),
-            KeyCode::Backspace | KeyCode::Delete if self.values[self.pick].is_some() => {
-                self.write(None)
+            // With nothing typed to take back, the picked value goes back
+            // to its default.
+            KeyCode::Backspace if self.picker.filter().is_empty() && set => {
+                if let Some(at) = picked {
+                    self.write(at, None);
+                }
             }
-            // Typing a name starts it afresh.
-            KeyCode::Char(c) if named => self.typing = Some(c.to_string()),
-            _ => {}
+            KeyCode::Delete if set => {
+                if let Some(at) = picked {
+                    self.write(at, None);
+                }
+            }
+            _ => {
+                if self.picker.event(event) == crate::list::Act::Close {
+                    return Key::Close;
+                }
+            }
         }
         Key::Stay
     }
 
-    /// Every setting under its table's name, each with its value, under a
-    /// blank row: up to `room` rows, around the pick. A value set in the
-    /// file reads plain and a default muted, so what was changed stands
-    /// out.
-    pub fn rows(&self, room: usize) -> Vec<Line<'static>> {
-        let wide = SETTINGS
-            .iter()
-            .map(|s| short(s.key).len())
+    /// The listed settings `width` wide under a blank row, at most a
+    /// list's rows and only `room` in all, the pick among them: under
+    /// their groups' bold names with nothing typed, best first once typing
+    /// narrows them. Each is its name, its value, and what it does, muted;
+    /// a value set in the file is in ink and a default muted, so what was
+    /// changed stands out.
+    pub fn rows(&self, width: usize, room: usize) -> Vec<Line<'static>> {
+        let shown = self.picker.shown();
+        let pick = self.picker.at();
+        let wide = (self.listed.iter())
+            .map(|&at| SETTINGS[at].name.width())
             .max()
             .unwrap_or(0);
-        let mut out = vec![Line::default()];
+        let value = |at: usize| match &self.values[at] {
+            Some(value) => value.clone(),
+            None => SETTINGS[at].default.to_owned(),
+        };
+        // Values past this many columns are cut, so the labels line up.
+        const VALUE_MAX: usize = 16;
+        let values_wide = (shown.iter())
+            .map(|(row, _)| value(self.listed[*row]).width().min(VALUE_MAX))
+            .max()
+            .unwrap_or(0);
+        let mut lines = Vec::new();
         let mut picked = 0;
-        let mut table = "";
-        for (i, (setting, value)) in SETTINGS.iter().zip(&self.values).enumerate() {
-            let (this, _) = setting.key.rsplit_once('.').unwrap_or(("", setting.key));
-            if this != table || i == 0 {
-                table = this;
-                let name = match this {
-                    "" => "agent".to_owned(),
-                    this => format!("[{this}]"),
-                };
-                out.push(Line::from(format!("    {name}")).dim().bold());
+        let mut group = "";
+        let grouped = self.picker.filter().is_empty();
+        for (i, (row, found)) in shown.iter().enumerate() {
+            let at = self.listed[*row];
+            let setting = &SETTINGS[at];
+            if grouped && setting.group != group {
+                group = setting.group;
+                lines.push(Line::from(format!("  {group}")).bold());
             }
-            if i == self.pick {
-                picked = out.len();
+            let typed = (i == pick).then_some(self.typing.as_ref()).flatten();
+            let shown = match typed {
+                Some(typed) => typed.clone(),
+                None => crate::transcript::cut(&value(at), VALUE_MAX),
+            };
+            let pad = " ".repeat(wide.saturating_sub(setting.name.width()));
+            let gap = " ".repeat(values_wide.saturating_sub(shown.width()) + 2);
+            let room = width.saturating_sub(crate::list::INDENT + wide + 2 + values_wide + 2 + 1);
+            let mut spans = vec![Span::raw(" ".repeat(crate::list::INDENT))];
+            for (at, c) in setting.name.chars().enumerate() {
+                let c = Span::raw(c.to_string());
+                spans.push(if found.contains(&at) { c.bold() } else { c });
             }
-            out.push(self.row(i, setting, value, wide));
+            spans.push(Span::raw(format!("{pad}  ")));
+            spans.push(match self.values[at].is_some() || typed.is_some() {
+                true => Span::raw(shown),
+                false => Span::raw(shown).dim(),
+            });
+            spans.push(Span::raw(gap));
+            spans.push(Span::raw(crate::transcript::cut(setting.label, room)).dim());
+            let mut line = Line::from(spans);
+            if i == pick {
+                picked = lines.len();
+                crate::list::pick(&mut line);
+            }
+            lines.push(line);
         }
-        let shown = out.len().min(room.max(1));
-        let first = (picked + 1).saturating_sub(shown);
-        out.into_iter().skip(first).take(shown).collect()
+        let shown = lines
+            .len()
+            .min(crate::list::ROWS)
+            .min(room.saturating_sub(1));
+        let first = (picked + 1)
+            .saturating_sub(shown)
+            .min(lines.len().saturating_sub(shown));
+        // The group's name over its first row, where there is room.
+        let first = match first.checked_sub(1) {
+            Some(above) if picked < first + shown - 1 && lines[above].spans.len() == 1 => above,
+            _ => first,
+        };
+        let mut out = vec![Line::default()];
+        out.extend(lines.into_iter().skip(first).take(shown));
+        out
     }
 
-    /// The setting `i`'s row, its key `wide` wide.
-    fn row(
-        &self,
-        i: usize,
-        setting: &Setting,
-        value: &Option<String>,
-        wide: usize,
-    ) -> Line<'static> {
-        let key = format!("{:<wide$}", short(setting.key));
-        let value = match value {
-            Some(value) => Span::raw(format!("  {value}")),
-            None => Span::raw(format!("  {}", setting.default)).dim(),
-        };
-        if i != self.pick {
-            return Line::from(vec![Span::raw(format!("      {key}")), value]);
-        }
-        let value = match &self.typing {
-            Some(typed) => Span::raw(format!("  {typed}")),
-            None => value,
-        };
-        Line::from(vec![
-            Span::raw("      "),
-            Span::raw(key).reversed(),
-            value.reversed(),
-            Span::raw(" ").reversed(),
-        ])
-    }
-
-    /// The composer's line: what the picked setting sets, what the last
-    /// change came to, or the name being typed; and where the cursor goes
-    /// when one is.
+    /// The composer's line: the name being typed, what the last change
+    /// came to, or what is typed to find a setting; and where the cursor
+    /// goes when one is.
     pub fn line(&self) -> (Line<'static>, Option<u16>) {
         if let Some(typed) = &self.typing {
             let line = Line::from(vec![Span::raw("› ").bold(), Span::raw(typed.clone())]);
@@ -811,7 +1071,10 @@ impl View {
         let what = match &self.said {
             Some(Ok(saved)) => Span::raw(format!("saved {saved}")).fg(Color::Green),
             Some(Err(error)) => Span::raw(format!("✗ {error}")),
-            None => Span::raw(SETTINGS[self.pick].about).dim(),
+            None => {
+                let (line, cursor) = self.picker.line("find a setting");
+                return (line, Some(cursor));
+            }
         };
         (Line::from(vec![Span::raw("› ").bold(), what]), None)
     }
@@ -820,15 +1083,19 @@ impl View {
     pub fn keys(&self) -> Line<'static> {
         let file = crate::tilde(&self.path.display().to_string());
         use crate::hint::{Enter, Esc, Keys};
-        let keys = match (&self.typing, SETTINGS[self.pick].values.is_empty()) {
+        let picked = self.picked();
+        let named = picked.is_some_and(|at| SETTINGS[at].values.is_empty());
+        let mut keys = match (&self.typing, named) {
             (Some(_), _) => Keys::new().enter(Enter::Save).esc(Esc::Cancel),
-            (None, true) => (Keys::new().pick().enter(Enter::Choose))
-                .key("⌫", "default")
-                .esc(Esc::Close),
-            (None, false) => (Keys::new().pick().key("←→", "change"))
-                .key("⌫", "default")
-                .esc(Esc::Close),
+            (None, true) => Keys::new().pick().enter(Enter::Choose),
+            (None, false) => Keys::new().pick().key("←→", "change"),
         };
+        if self.typing.is_none() {
+            if picked.is_some_and(|at| self.values[at].is_some()) {
+                keys = keys.key("⌫", "default");
+            }
+            keys = keys.esc(Esc::Close);
+        }
         let mut spans = crate::hint::spans(&format!("  {keys}"));
         match self.typing {
             Some(_) => spans.push(Span::raw("  empty for the default").dim()),
@@ -858,7 +1125,9 @@ mod tests {
         assert!(skill.contains("| `sonny.margin_opens` |"));
         assert!(skill.contains("`always`, `unless-closed`, `never` | always |"));
         assert!(skill.contains("| `sonny.commons_invites` |"));
-        assert!(skill.contains("| a whole number | 3 |"));
+        assert!(skill.contains("| a whole number | 3 | Commons and sky: commons invites |"));
+        assert!(skill.contains("| `sonny.tool_processes` |"));
+        assert!(skill.contains("| 0 | the file only |"));
     }
     use ratatui::crossterm::event::KeyEvent;
 
@@ -955,20 +1224,22 @@ mod tests {
         assert_eq!(checks_gone("sonny.needs_check = false\n"), Err(()));
     }
 
+    /// The longest a setting's label runs, as the Rulebook's `label-max`.
+    const LABEL_MAX: usize = 70;
+
+    /// Narrows `view` to the setting named `name`, as typing it does.
+    fn find(view: &mut View, name: &str) {
+        view.picker.narrow(name.to_owned());
+        assert_eq!(view.picked().map(|at| SETTINGS[at].name), Some(name));
+    }
+
     #[test]
     fn every_key_the_file_takes_is_listed() {
         // A key or value the reader does not take would be refused.
         let dir = std::env::temp_dir().join(format!("sonny-config-keys-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
-        let mut view = View {
-            path: dir.join("config.toml"),
-            values: vec![None; SETTINGS.len()],
-            pick: 0,
-            typing: None,
-            said: None,
-        };
+        let mut view = View::at(dir.join("config.toml"));
         for (at, setting) in SETTINGS.iter().enumerate() {
-            view.pick = at;
             let named = match (number(setting), span(setting)) {
                 // Wide enough for a text width.
                 (true, _) => "70",
@@ -976,10 +1247,194 @@ mod tests {
                 _ => "a/b",
             };
             let value = setting.values.last().copied().unwrap_or(named);
-            view.write(Some(value.to_owned()));
+            view.write(at, Some(value.to_owned()));
             assert!(matches!(view.said, Some(Ok(_))), "{:?}", view.said);
             assert_eq!(view.values[at].as_deref(), Some(value));
         }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn config_lists_the_groups_with_one_line_labels_and_keeps_tuning_in_the_file() {
+        // Every group has settings, and every setting a person changes is
+        // in one, under a plain name and a label of one short line.
+        for group in GROUPS {
+            assert!(SETTINGS.iter().any(|s| s.group == *group), "{group}");
+        }
+        for setting in SETTINGS {
+            assert!(
+                setting.group.is_empty() || GROUPS.contains(&setting.group),
+                "{}",
+                setting.key
+            );
+            if !setting.group.is_empty() {
+                assert!(
+                    !setting.label.is_empty()
+                        && setting.label.chars().count() <= LABEL_MAX
+                        && !setting.label.contains('\n'),
+                    "{}: {}",
+                    setting.key,
+                    setting.label
+                );
+                assert!(!setting.name.contains(['_', '.']), "{}", setting.name);
+            }
+        }
+        assert_eq!(listed().len(), 33);
+        // What only tunes stays in the file, and in the reference.
+        for key in [
+            "sonny.sky_haiku_daily",
+            "sonny.sky_haiku_keep",
+            "sonny.sky_haiku_window",
+            "sonny.sky_haiku_margin",
+            "sonny.sky_haiku_hold",
+            "sonny.commons_invite_tokens",
+            "sonny.tool_processes",
+            "sonny.lookout_waiting",
+        ] {
+            let at = SETTINGS.iter().position(|s| s.key == key).unwrap();
+            assert!(!listed().contains(&at), "{key}");
+            assert!(skill().contains(&format!("| `{key}` |")), "{key}");
+        }
+    }
+
+    #[test]
+    fn config_is_a_list_of_eight_rows_under_bold_group_names_that_typing_narrows() {
+        let mut view = View::at(PathBuf::from("/nowhere/config.toml"));
+        view.values[0] = Some("openai/gpt".into());
+        let text =
+            |lines: &[Line]| -> Vec<String> { lines.iter().map(|l| l.to_string()).collect() };
+        let rows = view.rows(100, 40);
+        assert_eq!(rows.len(), 1 + crate::list::ROWS, "{:?}", text(&rows));
+        assert_eq!(rows[0].to_string(), "");
+        assert_eq!(rows[1].to_string(), "  Models");
+        assert!(
+            rows[1]
+                .style
+                .add_modifier
+                .contains(ratatui::style::Modifier::BOLD)
+        );
+        // The pick reversed; a value set in ink, a default muted.
+        let model = rows[2].to_string();
+        assert!(
+            model.starts_with("    model  ") && model.contains("openai/gpt"),
+            "{model}"
+        );
+        assert!(rows[2].spans.iter().skip(1).all(|s| {
+            s.style
+                .add_modifier
+                .contains(ratatui::style::Modifier::REVERSED)
+        }));
+        let provider = &rows[3];
+        let default = provider
+            .spans
+            .iter()
+            .find(|s| s.content == "AGENT_PROVIDER")
+            .unwrap();
+        assert!(
+            default
+                .style
+                .add_modifier
+                .contains(ratatui::style::Modifier::DIM)
+        );
+        assert!(
+            rows.iter().all(|row| row.width() <= 100),
+            "{:?}",
+            text(&rows)
+        );
+        // Down past the eighth row scrolls, the pick in view.
+        for _ in 0..9 {
+            press(&mut view, KeyCode::Down);
+        }
+        let rows = view.rows(100, 40);
+        assert_eq!(rows.len(), 1 + crate::list::ROWS);
+        assert!(
+            text(&rows)
+                .iter()
+                .any(|row| row.trim_start().starts_with("lead profile")),
+            "{:?}",
+            text(&rows)
+        );
+        // Up from the first wraps to the last.
+        let mut view = View::at(PathBuf::from("/nowhere/config.toml"));
+        press(&mut view, KeyCode::Up);
+        assert_eq!(
+            view.picked().map(|at| SETTINGS[at].name),
+            Some("start at boot")
+        );
+        // Typing narrows, best first, without group names.
+        let mut view = View::at(PathBuf::from("/nowhere/config.toml"));
+        for c in "view".chars() {
+            press(&mut view, KeyCode::Char(c));
+        }
+        assert_eq!(view.picked().map(|at| SETTINGS[at].key), Some("sonny.view"));
+        let rows = text(&view.rows(100, 40));
+        assert!(rows[1].starts_with("    view "), "{rows:?}");
+        assert!(
+            rows.iter().all(|row| !row.starts_with("  View")),
+            "{rows:?}"
+        );
+        assert_eq!(view.line().0.to_string(), "› view");
+        // Backspace takes a letter back; Esc closes.
+        press(&mut view, KeyCode::Backspace);
+        assert_eq!(view.picker.filter(), "vie");
+        assert!(matches!(
+            view.event(&Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))),
+            Key::Close
+        ));
+        // Nothing typed, the composer asks.
+        let view = View::at(PathBuf::from("/nowhere/config.toml"));
+        assert_eq!(view.line().0.to_string(), "› find a setting");
+        assert_eq!(
+            view.keys().to_string(),
+            "  ↑↓ pick · enter choose · esc close  /nowhere/config.toml"
+        );
+    }
+
+    #[test]
+    fn steps_and_verbose_become_one_view_once() {
+        // Verbose on is every tool call, whatever steps says.
+        assert_eq!(
+            view_one("# mine\n[sonny] # me\nchime = true\nsteps = true\nverbose = true\n"),
+            Ok(Some(
+                "# mine\n[sonny] # me\nview = \"verbose\"\nchime = true\n".into()
+            ))
+        );
+        assert_eq!(
+            view_one("[sonny]\nsteps = true\nverbose = false\n[daemon]\ndepth = 2\n"),
+            Ok(Some(
+                "[sonny]\nview = \"steps\"\n[daemon]\ndepth = 2\n".into()
+            ))
+        );
+        // Neither on is the words, the default: no line.
+        assert_eq!(
+            view_one("[sonny]\nsteps = false\nchime = true\n"),
+            Ok(Some("[sonny]\nchime = true\n".into()))
+        );
+        // A view set already stays as set.
+        assert_eq!(
+            view_one("[sonny]\nview = \"words\"\nverbose = true\n"),
+            Ok(Some("[sonny]\nview = \"words\"\n".into()))
+        );
+        // Nothing to rewrite, and lines that can't be rewritten.
+        assert_eq!(view_one("[sonny]\nchime = true\n"), Ok(None));
+        assert_eq!(view_one("[daemon]\ndepth = 2\n"), Ok(None));
+        assert_eq!(view_one("sonny.verbose = true\n"), Err(()));
+        // A switch that is not true or false is left as written.
+        assert_eq!(view_one("[sonny]\nsteps = \"true\"\n"), Err(()));
+        assert_eq!(view_one("[sonny]\nsteps = true\nverbose = 1\n"), Err(()));
+        // What it writes, the reader takes.
+        let dir =
+            std::env::temp_dir().join(format!("sonny-config-view-one-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        std::fs::write(&path, "[sonny]\nsteps = true\n").unwrap();
+        assert!(agent_client::config::read(&path).is_err());
+        assert!(rewrite(&path, view_one));
+        assert_eq!(
+            agent_client::config::read(&path).unwrap().sonny.view,
+            agent_client::config::View::Steps
+        );
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -990,17 +1445,9 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("config.toml");
         std::fs::write(&path, "[sonny]\ntext_width = 120\n").unwrap();
-        let mut view = View {
-            path: path.clone(),
-            values: Vec::new(),
-            pick: 0,
-            typing: None,
-            said: None,
-        };
+        let mut view = View::at(path.clone());
         view.values = view.read().unwrap();
-        view.pick = (SETTINGS.iter())
-            .position(|s| s.key == "sonny.text_width")
-            .unwrap();
+        find(&mut view, "text width");
         press(&mut view, KeyCode::Enter);
         for _ in 0..3 {
             press(&mut view, KeyCode::Backspace);
@@ -1013,7 +1460,8 @@ mod tests {
             "{:?}",
             view.said
         );
-        assert_eq!(view.values[view.pick].as_deref(), Some("120"));
+        let at = view.picked().unwrap();
+        assert_eq!(view.values[at].as_deref(), Some("120"));
         assert_eq!(
             std::fs::read_to_string(&path).unwrap(),
             "[sonny]\ntext_width = 120\n"
@@ -1028,69 +1476,79 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("config.toml");
         std::fs::write(&path, "# mine\n[sonny]\nlead_effort = \"low\"\n").unwrap();
-        let mut view = View {
-            path: path.clone(),
-            values: Vec::new(),
-            pick: 0,
-            typing: None,
-            said: None,
-        };
+        let mut view = View::at(path.clone());
         view.values = view.read().unwrap();
-        // Each row by its key, wherever the list puts it.
-        let at = |key: &str| SETTINGS.iter().position(|s| s.key == key).unwrap();
-        let model = at("model");
-        let reviewer_effort = at("reviewer.effort");
-        let lead_effort = at("sonny.lead_effort");
-        let task_effort = at("sonny.task_effort");
-        let task_speed = at("sonny.task_speed");
-        let side_chat = at("sonny.side_chat");
-        let chime = at("sonny.chime");
-        assert_eq!(view.values[lead_effort].as_deref(), Some("low"));
+        let value = |view: &View| view.values[view.picked().unwrap()].clone();
+        find(&mut view, "lead effort");
+        assert_eq!(value(&view).as_deref(), Some("low"));
         // The side chat: one that answers, then its default again either way.
-        view.pick = side_chat;
+        find(&mut view, "side chat");
         press(&mut view, KeyCode::Right);
-        assert_eq!(view.values[side_chat].as_deref(), Some("answer"));
+        assert_eq!(value(&view).as_deref(), Some("answer"));
+        assert!(matches!(&view.said, Some(Ok(said)) if said == "side chat = \"answer\""));
         press(&mut view, KeyCode::Right);
-        assert_eq!(view.values[side_chat], None);
+        assert_eq!(value(&view), None);
         press(&mut view, KeyCode::Left);
-        assert_eq!(view.values[side_chat].as_deref(), Some("answer"));
-        // A task's speed steps through the tiers, taken back to its starter's.
-        view.pick = task_speed;
+        assert_eq!(value(&view).as_deref(), Some("answer"));
+        // A task's speed steps through the tiers, taken back to its starter's
+        // with Delete, as Backspace takes back a letter typed.
+        find(&mut view, "task speed");
         press(&mut view, KeyCode::Right);
-        assert_eq!(view.values[task_speed].as_deref(), Some("standard"));
-        press(&mut view, KeyCode::Backspace);
-        assert_eq!(view.values[task_speed], None);
+        assert_eq!(value(&view).as_deref(), Some("standard"));
+        press(&mut view, KeyCode::Delete);
+        assert_eq!(value(&view), None);
         // Efforts step through every level.
-        view.pick = reviewer_effort;
+        find(&mut view, "reviewer effort");
         press(&mut view, KeyCode::Left);
-        assert_eq!(view.values[reviewer_effort].as_deref(), Some("max"));
+        assert_eq!(value(&view).as_deref(), Some("max"));
         press(&mut view, KeyCode::Enter);
-        assert_eq!(view.values[reviewer_effort], None);
-        // A model is typed whole, and an empty one is the default.
-        view.pick = model;
+        assert_eq!(value(&view), None);
+        // The view steps through its three.
+        find(&mut view, "view");
+        press(&mut view, KeyCode::Right);
+        assert_eq!(value(&view).as_deref(), Some("steps"));
+        press(&mut view, KeyCode::Right);
+        assert_eq!(value(&view).as_deref(), Some("verbose"));
+        assert_eq!(
+            agent_client::config::read(&path).unwrap().sonny.view,
+            agent_client::config::View::Verbose
+        );
+        press(&mut view, KeyCode::Right);
+        assert_eq!(value(&view), None);
+        // A model is typed whole after Enter, and an empty one is the default.
+        let mut view = View::at(path.clone());
+        view.values = view.read().unwrap();
+        assert_eq!(view.picked().map(|at| SETTINGS[at].key), Some("model"));
+        press(&mut view, KeyCode::Enter);
         for c in "a/b".chars() {
             press(&mut view, KeyCode::Char(c));
         }
-        assert_eq!(view.values[model], None);
+        assert_eq!(view.values[0], None);
+        assert_eq!(view.line().0.to_string(), "› a/b");
         press(&mut view, KeyCode::Enter);
-        assert_eq!(view.values[model].as_deref(), Some("a/b"));
+        assert_eq!(view.values[0].as_deref(), Some("a/b"));
         press(&mut view, KeyCode::Enter);
         for _ in 0..3 {
             press(&mut view, KeyCode::Backspace);
         }
         press(&mut view, KeyCode::Enter);
-        assert_eq!(view.values[model], None);
-        // The lead's effort back to its default.
-        view.pick = lead_effort;
+        assert_eq!(view.values[0], None);
+        // The lead's effort back to its default with Backspace, nothing typed.
+        press(&mut view, KeyCode::Down);
+        press(&mut view, KeyCode::Down);
+        assert_eq!(
+            view.picked().map(|at| SETTINGS[at].name),
+            Some("lead effort")
+        );
         press(&mut view, KeyCode::Backspace);
         assert_eq!(
             std::fs::read_to_string(&path).unwrap(),
             "# mine\n[sonny]\nside_chat = \"answer\"\n"
         );
         // A switch is written as TOML's own.
-        view.pick = chime;
+        find(&mut view, "chime");
         press(&mut view, KeyCode::Right);
-        assert_eq!(view.values[chime].as_deref(), Some("true"));
+        assert_eq!(value(&view).as_deref(), Some("true"));
         assert!(agent_client::config::read(&path).unwrap().sonny.chime);
         assert!(
             std::fs::read_to_string(&path)
@@ -1098,10 +1556,9 @@ mod tests {
                 .ends_with("chime = true\n")
         );
         press(&mut view, KeyCode::Right);
-        assert_eq!(view.values[chime], None);
+        assert_eq!(value(&view), None);
         // A value the reader refuses is said, and the file kept.
-        view.pick = task_effort;
-        view.typing = None;
+        find(&mut view, "task effort");
         std::fs::write(&path, "[sonny]\nbogus = \"x\"\n").unwrap();
         press(&mut view, KeyCode::Right);
         assert!(matches!(&view.said, Some(Err(e)) if e.contains("unknown key sonny.bogus")));

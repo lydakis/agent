@@ -49,8 +49,7 @@
 //! task_profile = "worker"       # what every other agent is told, not task
 //! side_chat = "answer"          # calls no tool; "fork", the default, may do anything its agent may
 //! chime = true                  # rings when work ends or waits; quiet by default
-//! steps = true                  # the agent's steps between what is said; words only by default
-//! verbose = true                # every tool call drawn, not the clean view
+//! view = "steps"               # "words", the default: your words and the agent's; "steps" adds what it did between; "verbose" every tool call
 //! text_width = 0                # the widest the conversation is written, 100 by default; 0 the window's whole width
 //! margin_opens = "never"         # "always", the default, or "unless-closed"
 //! margin_notes = 8              # the most notes a margin holds, 6 by default; past it a new one is refused
@@ -588,13 +587,8 @@ pub struct Sonny {
     /// Whether finished and waiting work rings; off by default.
     /// Notifications show either way.
     pub chime: bool,
-    /// Whether the conversation shows the agent's steps between what is
-    /// said (calls, news in, messages between agents, how long a turn
-    /// took), or only the person's words and the agent's (the default).
-    pub steps: bool,
-    /// Whether every tool call is drawn, or only the bot's words and the
-    /// calls that move the work on (the clean view, the default).
-    pub verbose: bool,
+    /// What the conversation shows: words, steps or every call.
+    pub view: View,
     /// The widest the conversation is written, in columns, however wide
     /// the window: 0 for the window's whole width. At least
     /// [`TEXT_WIDTH_LEAST`] otherwise.
@@ -895,8 +889,7 @@ impl Default for Sonny {
             tool_processes: 0,
             lookout_waiting: 1024,
             chime: false,
-            steps: false,
-            verbose: false,
+            view: View::default(),
             text_width: TEXT_WIDTH,
             start_at_boot: false,
             margin_opens: MarginOpens::default(),
@@ -912,6 +905,18 @@ impl Default for Sonny {
             project_color: BTreeMap::new(),
         }
     }
+}
+
+/// What a window's conversation shows: `"words"`, the default, the
+/// person's words and the agent's; `"steps"`, also what the agent did
+/// between them (calls, news in, messages between agents, how long a turn
+/// took); or `"verbose"`, every tool call.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum View {
+    #[default]
+    Words,
+    Steps,
+    Verbose,
 }
 
 /// What the copy `/side` talks to may do: `"fork"`, the default, anything
@@ -1672,8 +1677,7 @@ fn parse(text: &str) -> Result<Config, String> {
                 "task_profile",
                 "side_chat",
                 "chime",
-                "steps",
-                "verbose",
+                "view",
                 "text_width",
                 "margin_opens",
                 "margin_notes",
@@ -1785,8 +1789,6 @@ fn parse(text: &str) -> Result<Config, String> {
                 "suggest" => Some(&mut config.sonny.suggest),
                 "suggest_ideas" => Some(&mut config.sonny.suggest_ideas),
                 "commons" => Some(&mut config.sonny.commons),
-                "steps" => Some(&mut config.sonny.steps),
-                "verbose" => Some(&mut config.sonny.verbose),
                 "start_at_boot" => Some(&mut config.sonny.start_at_boot),
                 "sky_haikus" => Some(&mut config.sonny.sky_haikus),
                 "project_colors" => Some(&mut config.sonny.project_colors),
@@ -1876,6 +1878,19 @@ fn parse(text: &str) -> Result<Config, String> {
                 continue;
             }
             let value = string(&format!("{name}.{key}"), value)?;
+            if key == "view" {
+                config.sonny.view = match value.as_str() {
+                    "words" => View::Words,
+                    "steps" => View::Steps,
+                    "verbose" => View::Verbose,
+                    other => {
+                        return Err(format!(
+                            "sonny.view is words, steps or verbose, not {other}"
+                        ));
+                    }
+                };
+                continue;
+            }
             if key == "side_chat" {
                 config.sonny.side_chat = match value.as_str() {
                     "answer" => SideChat::Answer,
@@ -2895,9 +2910,18 @@ mod tests {
         assert!(parse("[sonny]\ntask_tabs = \"all\"").is_err());
         let closed = parse("[sonny]\nmargin_opens = \"unless-closed\"").unwrap();
         assert_eq!(closed.sonny.margin_opens, MarginOpens::UnlessClosed);
-        assert!(!config.sonny.chime && !config.sonny.verbose);
-        let loud = parse("[sonny]\nchime = true\nverbose = true").unwrap();
-        assert!(loud.sonny.chime && loud.sonny.verbose);
+        assert!(!config.sonny.chime);
+        assert_eq!(config.sonny.view, View::Words);
+        let loud = parse("[sonny]\nchime = true\nview = \"verbose\"").unwrap();
+        assert!(loud.sonny.chime);
+        assert_eq!(loud.sonny.view, View::Verbose);
+        assert_eq!(
+            parse("[sonny]\nview = \"steps\"").unwrap().sonny.view,
+            View::Steps
+        );
+        assert!(parse("[sonny]\nview = \"all\"").is_err());
+        // Two switches for three views went: the file is rewritten once.
+        assert!(parse("[sonny]\nverbose = true").is_err());
         assert_eq!(
             parse("trailer = [\"sender\", \"time\"]").unwrap().trailer,
             Some(vec!["sender".to_owned(), "time".to_owned()])
