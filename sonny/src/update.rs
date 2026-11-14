@@ -533,6 +533,17 @@ fn finish(last: Last, store: &Path, socket: &Path) -> Result<(), String> {
             "Open Sonny windows reopen on {VERSION} as they reconnect, keeping what you typed"
         );
     }
+    // Sonny's new text set beside the person's edits, which a lead is told
+    // of when a window next opens: said here too, by name.
+    if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
+        for (word, name, theirs, staged) in crate::skills::staged(&home) {
+            println!(
+                "Your {name} {word} ({}) is kept; Sonny's new text waits at {}",
+                crate::tilde(&theirs.to_string_lossy()),
+                crate::tilde(&staged.to_string_lossy())
+            );
+        }
+    }
     match last {
         Last::From(from) if from != VERSION => {
             println!("Successfully updated from {from} to version {VERSION}")
