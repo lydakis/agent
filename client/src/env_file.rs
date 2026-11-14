@@ -1,19 +1,28 @@
-//! `~/.agent/env`: provider keys kept out of shell profiles, as `KEY=VALUE`
-//! lines readable only by their owner. The `agent` CLI adds them over the
-//! environment of a daemon it starts, and only then, so every starter
-//! (Sonny, an automation's check, a script, cron) gives the daemon the same
-//! keys; the daemon never reads the file, and it starts with the file
-//! `--unreadable`, so no sandboxed command, nor the `read` tool for a
-//! sandboxed bot, reads it either. As Codex keeps `~/.codex/.env` from setting `CODEX_` names,
-//! names starting `AGENT_` (any case) are passed over: they are Agent's own
-//! settings, and providers live in `~/.agent/config.toml`.
+//! `~/.agent/keys/env`: provider keys kept out of shell profiles, as
+//! `KEY=VALUE` lines readable only by their owner. The `agent` CLI adds them
+//! over the environment of a daemon it starts, and only then, so every
+//! starter (Sonny, an automation's check, a script, cron) gives the daemon
+//! the same keys; the daemon never reads the file, and it starts with its
+//! folder, `~/.agent/keys`, `--unreadable`, so no sandboxed command, nor the
+//! `read` tool for a sandboxed bot, reads it either. A folder, not the file:
+//! the file is saved whole through a file staged beside it, which a command
+//! would read as well, and a rename over a file takes its Linux mask down.
+//! As Codex keeps `~/.codex/.env` from setting `CODEX_` names, names starting
+//! `AGENT_` (any case) are passed over: they are Agent's own settings, and
+//! providers live in `~/.agent/config.toml`.
 use std::path::{Path, PathBuf};
 
 /// Keys, not documents: bounds the read that starts every daemon.
 pub const MAX: u64 = 64 * 1024;
 
+/// `~/.agent/keys`, the folder the keys file is in and staged in, which
+/// no sandboxed command reads.
+pub fn folder() -> Option<PathBuf> {
+    std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".agent/keys"))
+}
+
 pub fn path() -> Option<PathBuf> {
-    std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".agent/env"))
+    folder().map(|folder| folder.join("env"))
 }
 
 /// `KEY=VALUE` lines, `export` optional, `#` comments, and values optionally
@@ -163,8 +172,8 @@ pub fn set(path: &Path, pairs: &[(&str, &str)]) -> Result<(), String> {
         |error: std::io::Error| format!("env_file_unwritable: {}: {error}", path.display());
     if let Some(parent) = path.parent() {
         use std::os::unix::fs::DirBuilderExt;
-        // `~/.agent` is its owner's alone when a client makes it, as when
-        // the daemon does; one that exists keeps its mode.
+        // `~/.agent/keys` is its owner's alone when a client makes it, as
+        // when the daemon does; one that exists keeps its mode.
         std::fs::DirBuilder::new()
             .recursive(true)
             .mode(0o700)

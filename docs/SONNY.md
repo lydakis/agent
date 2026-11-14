@@ -290,7 +290,7 @@ rewritten to the lineage when Sonny next opens on that store. When it fires, Son
 runs with `--trigger-fire` and those arguments. It connects to
 the daemon, and when none answers and the store is known, starts one for it
 on that socket as Sonny does, with the `agent` Sonny finds and the login shell's environment,
-and `agent` adds `~/.agent/env` as for every daemon it starts. A fire submits with `delivery: queue`, so a working bot gets
+and `agent` adds `~/.agent/keys/env` as for every daemon it starts. A fire submits with `delivery: queue`, so a working bot gets
 it after its turn and never has it cut in. A repeating automation first
 looks for one of its own fires still waiting behind the bot's work: if one
 is, it skips that fire (`bot_busy`) rather than let fires pile up, as
@@ -1078,7 +1078,7 @@ names so an entry can be copied across:
 ```toml
 [sonny.mcp_servers.linear]
 url = "https://mcp.linear.app/mcp"
-bearer_token_env_var = "LINEAR_TOKEN"      # from the environment or ~/.agent/env
+bearer_token_env_var = "LINEAR_TOKEN"      # from the environment or ~/.agent/keys/env
 description = "Issues and projects in Linear"
 
 [sonny.mcp_servers.playwright]
@@ -1115,7 +1115,7 @@ folder's, and `--json` only prints what it found. First-run setup offers the
 same. A name Sonny has already, or that an agent earlier in that list has,
 is skipped, and the other agents' files are left as they were. A secret
 written into a server's entry (an `env` value named like a key or token, or
-a literal `Authorization: Bearer`) goes to `~/.agent/env`, which stdio
+a literal `Authorization: Bearer`) goes to `~/.agent/keys/env`, which stdio
 servers are started with and `bearer_token_env_var` names, never to
 `config.toml`; a value that only names a variable (`${VAR}`, `{env:VAR}`)
 is left to the environment, and the import says when that variable is not

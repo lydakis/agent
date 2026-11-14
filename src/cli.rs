@@ -501,8 +501,8 @@ fn print_flags(flags: &str) {
                 "Keep every sandboxed command, the network on or not, from connecting to the Unix sockets in FOLDER, made private (mode 700) if missing; a wall for sockets, not a way to hide files: on Linux the folder shows empty to a sandboxed command, on macOS its files stay readable, and the read tool, which the daemon answers outside any sandbox, reads them on both; repeatable",
             ),
             "--unreadable" => (
-                "PATH",
-                "Keep every sandboxed command from reading, writing, linking to or renaming PATH, by its absolute path, and the read tool from reading it for a sandboxed bot, as Codex's deny_read; clients pass ~/.agent/env; repeatable",
+                "FOLDER",
+                "Keep every sandboxed command from reading, writing, linking to or renaming FOLDER or what is in it, by its absolute path, and the read tool from reading them for a sandboxed bot, as Codex's deny_read; made private (mode 700) if missing; clients pass ~/.agent/keys; repeatable",
             ),
             "--own-copy" => (
                 "FOLDER",

@@ -109,8 +109,9 @@ pub struct Policy {
     /// copy of it, bound read-only in its place: `(copy, place)`.
     #[serde(default)]
     pub owned: Vec<(PathBuf, PathBuf)>,
-    /// What its commands may not read, nor write, link to or rename, and
-    /// the `read` tool doesn't read for it ([`Daemon::unreadable`]).
+    /// The folders its commands may not read, nor write, link to or
+    /// rename, and the `read` tool doesn't read for it
+    /// ([`Daemon::unreadable`]).
     pub unreadable: Vec<PathBuf>,
 }
 
@@ -574,13 +575,14 @@ pub struct Daemon {
     /// overflow user's. Each is shown from a read-only copy the person
     /// owns (`--own-copy`). The client starting the daemon names them.
     pub owned: Vec<PathBuf>,
-    /// Paths no sandboxed command reads, nor writes, links to or renames,
-    /// and the `read` tool doesn't read for a sandboxed bot
-    /// (`--unreadable`), as Codex's `deny_read`: the person's keys, which a
-    /// command that read them could send anywhere the network reaches. The
-    /// client starting the daemon names them. Each by its real path once
-    /// it exists; a missing one by the real path of the folder it would be
-    /// made in.
+    /// Folders no sandboxed command reads, nor writes, links to or renames,
+    /// nor anything in them, and the `read` tool doesn't read for a
+    /// sandboxed bot (`--unreadable`), as Codex's `deny_read`: the person's
+    /// keys, which a command that read them could send anywhere the
+    /// network reaches. The client starting the daemon names them. Each by
+    /// its real path once it exists; a missing one by the real path of the
+    /// folder it would be made in. Folders, not files: a file replaced by
+    /// a rename, as one is saved whole, would take its Linux mask with it.
     pub unreadable: Vec<PathBuf>,
     /// Where the person's daemons list themselves ([`known`]), whose
     /// stores and sockets every root and policy keeps out of reach as it
@@ -763,15 +765,11 @@ fn root(path: &Path, daemon: &Daemon, others: &[known::Known]) -> Result<Root> {
         hold_journals(store);
         read_only.extend(store_files(store).filter(|file| file.exists()));
     }
-    // What it may not read, missing, can't be made, so no command makes
-    // the file the person's keys then go in. One there is masked as each
-    // command starts, and skipped if gone by then, as Codex skips a
-    // missing deny_read path: no bind here that a removal would break.
+    // A folder it may not read is masked as each command starts, made
+    // first if it is gone ([`hold`]), so none is ever open to a command.
     for kept in (daemon.unreadable.iter()).filter(|kept| kept.starts_with(path)) {
-        match std::fs::symlink_metadata(kept) {
-            Ok(found) if found.file_type().is_symlink() => return linked(kept),
-            Ok(_) => {}
-            Err(_) => missing.push(kept.clone()),
+        if std::fs::symlink_metadata(kept).is_ok_and(|found| found.file_type().is_symlink()) {
+            return linked(kept);
         }
     }
     // A walled folder too: renamed, or a socket made in it, it would let
@@ -1125,10 +1123,18 @@ mod linux {
                 path(folder),
             ]);
         }
+        // The person's copies of the system's folders whose files a
+        // program checks the owner of, over the folders themselves.
+        for (copy, place) in &policy.owned {
+            args.extend(["--ro-bind".into(), path(copy), path(place)]);
+        }
         // A folder it may not read, out of sight, as Codex hides its
-        // deny_read folders: empty and closed. Its files are hidden in
-        // `command`, which holds what they are shown from.
-        for hidden in (policy.unreadable.iter()).filter(|hidden| hidden.is_dir()) {
+        // deny_read folders: empty and closed, over every other mount, so
+        // nothing shown later opens it again. [`super::hold`] made it if it
+        // was gone. What changes in it, the keys file replaced by a rename
+        // among them, stays behind the mask, which a rename over a file
+        // would take down.
+        for hidden in &policy.unreadable {
             args.extend([
                 "--perms".into(),
                 "000".into(),
@@ -1137,11 +1143,6 @@ mod linux {
                 "--remount-ro".into(),
                 path(hidden),
             ]);
-        }
-        // The person's copies of the system's folders whose files a
-        // program checks the owner of, over the folders themselves.
-        for (copy, place) in &policy.owned {
-            args.extend(["--ro-bind".into(), path(copy), path(place)]);
         }
         args.extend(["--unshare-user", "--unshare-pid", "--unshare-ipc"].map(String::from));
         if !policy.network {
@@ -1166,20 +1167,6 @@ mod linux {
             .arg("--seccomp")
             .arg(filter.as_raw_fd().to_string());
         let mut kept = vec![filter];
-        // A file it may not read, as Codex hides its deny_read files: an
-        // empty one in its place that no one may open, over every other
-        // mount, so a read is refused, not answered empty. Each that is
-        // there now; one missing is left so, as it can't be made where the
-        // sandbox doesn't write, and the CLI's `~/.agent/env` is in the
-        // agent's home, which no sandbox writes.
-        for hidden in (policy.unreadable.iter()).filter(|hidden| hidden.is_file()) {
-            let empty = std::os::fd::OwnedFd::from(std::fs::File::open("/dev/null")?);
-            command
-                .args(["--perms", "000", "--ro-bind-data"])
-                .arg(empty.as_raw_fd().to_string())
-                .arg(hidden);
-            kept.push(empty);
-        }
         if let Some(handing) = (policy.capability.as_deref().map(handing).transpose()?).flatten() {
             command.env(
                 agent_client::socket::HANDED,
@@ -1740,7 +1727,11 @@ pub struct Hold(
 );
 
 /// Hold `policy`'s placeholders while its command runs, once any of them
-/// being removed is gone. Off the runtime thread: it opens and locks files.
+/// being removed is gone, and make each folder it may not read that is
+/// gone, its owner's alone, as the daemon makes its own: on Linux it is
+/// masked where it is, and a folder made while the command ran would be
+/// open to it. One that can't be made stops a Linux command, its mask
+/// having nowhere to go. Off the runtime thread: it opens and locks files.
 pub async fn hold(policy: &Policy) -> Hold {
     let paths: Vec<PathBuf> = match cfg!(target_os = "linux") {
         true => policy
@@ -1750,14 +1741,22 @@ pub async fn hold(policy: &Policy) -> Hold {
             .collect(),
         false => Vec::new(),
     };
+    let hidden = policy.unreadable.clone();
     let left = policy
         .roots
         .iter()
         .flat_map(|root| root.left.iter().cloned())
         .collect();
-    let held = match paths.is_empty() {
+    let held = match paths.is_empty() && hidden.is_empty() {
         true => Vec::new(),
         false => tokio::task::spawn_blocking(move || {
+            use std::os::unix::fs::DirBuilderExt;
+            for folder in &hidden {
+                let _ = std::fs::DirBuilder::new()
+                    .recursive(true)
+                    .mode(0o700)
+                    .create(folder);
+            }
             paths.iter().filter_map(|path| Held::take(path)).collect()
         })
         .await
@@ -2215,30 +2214,36 @@ mod tests {
     }
 
     /// What the daemon keeps unreadable no command reads, writes, links to
-    /// or renames, in its roots or out of them, by any link to it; the rest
-    /// of what it may read and write is as it was.
+    /// or renames, in its roots or out of them, by any link to it, nor
+    /// anything in it; the rest of what it may read and write is as it was.
     #[test]
-    fn an_unreadable_path_is_closed_to_every_command() {
+    fn an_unreadable_folder_is_closed_to_every_command() {
         let base = std::env::temp_dir().join(format!("agent-sandbox-hide-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&base);
         std::fs::create_dir_all(base.join("work/keys")).unwrap();
-        std::fs::create_dir_all(base.join("home")).unwrap();
-        std::fs::write(base.join("home/env"), "KEY=x").unwrap();
+        std::fs::create_dir_all(base.join("home/keys")).unwrap();
+        std::fs::write(base.join("home/keys/env"), "KEY=x").unwrap();
         let base = std::fs::canonicalize(&base).unwrap();
-        let (work, env, keys) = (
+        let (work, home, keys) = (
             base.join("work"),
-            base.join("home/env"),
+            base.join("home/keys"),
             base.join("work/keys"),
         );
-        std::os::unix::fs::symlink(&env, work.join("env")).unwrap();
+        std::os::unix::fs::symlink(&home, work.join("linked")).unwrap();
         let daemon = Daemon {
-            unreadable: vec![env.clone(), keys.clone()],
+            unreadable: vec![home.clone(), keys.clone()],
             ..protecting()
         };
         let policy = Policy::new(Some(Mode::WorkspaceWrite), Some(&work), &[], true, &daemon)
             .unwrap()
             .unwrap();
-        for hidden in [&env, &work.join("env"), &keys, &keys.join("id")] {
+        for hidden in [
+            &home,
+            &home.join("env"),
+            &work.join("linked/env"),
+            &keys,
+            &keys.join("id"),
+        ] {
             assert!(!policy.can_read(hidden), "{}", hidden.display());
             assert!(!policy.can_write(hidden), "{}", hidden.display());
         }
@@ -2246,7 +2251,7 @@ mod tests {
         assert!(policy.can_read(&base.join("home")) && policy.can_read(&work.join("notes")));
         assert!(policy.can_write(&work.join("notes")));
         let (profile, params) = seatbelt(&policy);
-        for hidden in [&env, &keys] {
+        for hidden in [&home, &keys] {
             let (key, _) = params.iter().find(|(_, path)| path == hidden).unwrap();
             for operation in ["file-read*", "file-write*", "file-link"] {
                 let rule = format!("(deny {operation} (subpath (param \"{key}\")))");
@@ -2258,12 +2263,18 @@ mod tests {
         assert!(profile.rfind("(deny file-read*").unwrap() > allow);
         #[cfg(target_os = "linux")]
         {
+            // Closed over every other mount, the person's copies too.
+            let mut policy = policy.clone();
+            policy.owned = vec![(base.join("copy"), keys.clone())];
             let args = linux::args(&policy, false);
-            let keys = keys.to_string_lossy();
-            assert!(
-                args.windows(4)
-                    .any(|w| w[0] == "000" && w[1] == "--tmpfs" && w[2] == keys)
-            );
+            for hidden in [&home, &keys] {
+                let hidden = hidden.to_string_lossy();
+                let mask = args
+                    .windows(4)
+                    .position(|w| w[0] == "000" && w[1] == "--tmpfs" && w[2] == hidden)
+                    .unwrap();
+                assert!(!args[mask..].iter().any(|arg| arg == "--ro-bind"));
+            }
         }
         std::fs::remove_dir_all(&base).unwrap();
     }

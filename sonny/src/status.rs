@@ -565,7 +565,7 @@ pub fn held_cause(code: &str, detail: Option<&str>) -> (String, String) {
         ),
         "provider_http_401" => (
             "API key refused",
-            "fix the key in ~/.agent/env and restart the daemon".to_owned(),
+            "fix the key in ~/.agent/keys/env and restart the daemon".to_owned(),
         ),
         "provider_http_403" => (
             "access refused",

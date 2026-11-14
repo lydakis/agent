@@ -153,7 +153,7 @@ explains how Auto decides.
 ## Configuration
 
 Settings live in `~/.agent/config.toml`; credentials live in
-`~/.agent/env`, readable only by you. Project settings live in
+`~/.agent/keys/env`, readable only by you. Project settings live in
 `.agents/project.toml`. Use `/config` to inspect defaults and change settings.
 
 ### Roles for leads and tasks

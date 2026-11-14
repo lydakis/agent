@@ -105,7 +105,7 @@ vulnerability, whether or not the code's own documentation agrees.
   macOS, with the mode names, writable folders and profiles ported from
   Codex ([sandbox](docs/RUST_PROTOTYPE.md#sandbox)). Reads stay open in
   every mode: a confined command can read any file the person can,
-  `~/.agent/env` and the store included, and its model provider sees what
+  `~/.agent/keys/env` and the store included, and its model provider sees what
   it reads.
 - A sandboxed bot never runs unconfined for want of a sandbox: creating one
   fails with `sandbox_unavailable` when bubblewrap or `sandbox-exec` is
@@ -191,7 +191,7 @@ vulnerability, whether or not the code's own documentation agrees.
 
 ### Credentials and secrets
 
-- Provider keys come from the environment or `~/.agent/env`, which Sonny
+- Provider keys come from the environment or `~/.agent/keys/env`, which Sonny
   writes `0600` and refuses to read when group or others can. Nothing
   writes a key into a shell profile or into `config.toml`.
 - The ChatGPT sign-in keeps its tokens in `~/.agent/chatgpt.json`,
@@ -211,8 +211,8 @@ vulnerability, whether or not the code's own documentation agrees.
   `ignore_default_excludes = false`, and `exclude` names more. The
   daemon's companions (Sonny's reviewer, lookout and tool host) inherit
   its environment whole, provider keys included.
-- A secret found while importing an MCP server goes to `~/.agent/env`,
-  never to `config.toml`. Sonny's home backup leaves `~/.agent/env`,
+- A secret found while importing an MCP server goes to `~/.agent/keys/env`,
+  never to `config.toml`. Sonny's home backup leaves `~/.agent/keys/env`,
   logins, the store and any `config.toml` that holds a secret off the
   remote repository.
 - The daemon never logs a credential's value, and this repository holds
@@ -287,7 +287,7 @@ approval gate as a call that leaves the sandbox would; `memory` and
   `watch` list names, so its command and those files must be ones no
   agent can write: keep them outside every agent's folders.
 - **MCP servers** run as the person outside every sandbox, started from
-  `~/.agent/config.toml` with `~/.agent/env` in their environment. An
+  `~/.agent/config.toml` with `~/.agent/keys/env` in their environment. An
   agent reaches them only through `exec`, a QuickJS script with no files,
   network or timers, and each call a script makes is checked on its own by
   the server's `approval_mode`; the default asks only for a tool the

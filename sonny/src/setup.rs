@@ -5,7 +5,7 @@
 //! provider anywhere it asks for one before it starts the daemon, as
 //! Codex and Claude Code ask for a sign-in before their first turn.
 //! The answers are kept as Codex keeps them: settings in a commented
-//! `~/.agent/config.toml`, and keys in `~/.agent/env`, which Sonny applies
+//! `~/.agent/config.toml`, and keys in `~/.agent/keys/env`, which Sonny applies
 //! to the daemon and everything else it starts, so no shell profile needs
 //! them.
 use crate::picker::{self, Picked, Row};
@@ -137,7 +137,7 @@ struct Found {
     /// Codex is signed in with ChatGPT here, so the person has a plan.
     codex_chatgpt: bool,
     aws: Vec<Profile>,
-    /// The key variables set, in the shell or `~/.agent/env`.
+    /// The key variables set, in the shell or `~/.agent/keys/env`.
     keys: Vec<&'static str>,
     /// The config's `provider`, which setup offers to keep.
     current: Option<String>,
@@ -505,7 +505,7 @@ usage: sonny setup [--provider chatgpt|anthropic|openai|openrouter|bedrock]
                    [--import-mcp [codex,claude,opencode,kiro]] [--browser-signed-in] [--json]
 With no flags, asks in a terminal. With flags, sets what they name and asks
 nothing, for scripts and agents: --key-stdin reads the provider's key from
-stdin into ~/.agent/env; --import-mcp brings the MCP servers of those agents
+stdin into ~/.agent/keys/env; --import-mcp brings the MCP servers of those agents
 (all, when it names none) but those from files in this folder;
 --browser-signed-in names the Default Chrome profile in agent-browser's own
 settings when they name none and Chrome has it; --json prints what this machine has and what
@@ -608,7 +608,7 @@ pub async fn flags(args: &[String], socket: &Path) -> Result<(), String> {
                     kept.push((var, key.to_owned()));
                 } else if !found.keys.contains(var) {
                     return Err(format!(
-                        "{var} is not set: set it in ~/.agent/env, or pass the key on stdin with --key-stdin"
+                        "{var} is not set: set it in ~/.agent/keys/env, or pass the key on stdin with --key-stdin"
                     ));
                 }
             }
@@ -868,7 +868,7 @@ fn backup() -> Result<bool, String> {
     }
     crate::skills::note_offered("backup");
     println!(
-        "\nBack up memory, skills, profiles and config.toml to a private git repository,\nso a new machine starts where this one left off. Keys in ~/.agent/env, logins\nand chat history stay on this machine."
+        "\nBack up memory, skills, profiles and config.toml to a private git repository,\nso a new machine starts where this one left off. Keys in ~/.agent/keys/env, logins\nand chat history stay on this machine."
     );
     let url = line("Repository URL, or Enter to skip (`sonny setup backup` later): ")?;
     if url.is_empty() {
@@ -979,12 +979,12 @@ fn hint(provider: &str, error: &str) -> Option<String> {
         let profile = agent_client::env_file::var("AWS_PROFILE");
         return Some(match profile {
             Some(profile) => format!("Sign in with `aws sso login --profile {profile}`."),
-            None => "Sign in with `aws sso login`, or set AWS_PROFILE in ~/.agent/env.".into(),
+            None => "Sign in with `aws sso login`, or set AWS_PROFILE in ~/.agent/keys/env.".into(),
         });
     }
     match error {
         "provider_http_401" | "provider_http_403" => Some(format!(
-            "The {provider} key was refused; set a new one in ~/.agent/env or run `sonny setup`."
+            "The {provider} key was refused; set a new one in ~/.agent/keys/env or run `sonny setup`."
         )),
         _ if error.starts_with("provider_login") => {
             Some("Sign in again with `sonny agent login chatgpt`.".into())
@@ -1153,7 +1153,7 @@ pub async fn again(store: &Path, socket: &Path) -> Result<(), String> {
 #[derive(PartialEq)]
 struct Reached {
     provider: Option<String>,
-    /// `~/.agent/env`, whole.
+    /// `~/.agent/keys/env`, whole.
     env: Vec<u8>,
     /// The ChatGPT sign-in, whole.
     login: Vec<u8>,
@@ -1174,7 +1174,7 @@ fn reached() -> Result<Reached, String> {
 /// The first lines of a new `~/.agent/config.toml`, saying what each
 /// setting does; setup writes its own values below them.
 const TEMPLATE: &str = "\
-# Sonny's and the agent daemon's settings. Keys go in ~/.agent/env.
+# Sonny's and the agent daemon's settings. Keys go in ~/.agent/keys/env.
 # `sonny setup` asks for the provider and model again.
 #
 # model = \"PROVIDER/MODEL\"  the model a new agent runs; /model changes a lead's

@@ -259,13 +259,13 @@ fn sandboxed(args: &[String]) -> Result<i32> {
             .into_iter()
             .collect(),
         // And hides the keys a daemon this CLI starts hides from its bots.
-        unreadable: agent_client::env_file::path()
-            .and_then(|env| {
-                std::fs::canonicalize(&env).ok().or_else(|| {
+        unreadable: agent_client::env_file::folder()
+            .and_then(|keys| {
+                std::fs::canonicalize(&keys).ok().or_else(|| {
                     Some(
-                        std::fs::canonicalize(env.parent()?)
+                        std::fs::canonicalize(keys.parent()?)
                             .ok()?
-                            .join(env.file_name()?),
+                            .join(keys.file_name()?),
                     )
                 })
             })

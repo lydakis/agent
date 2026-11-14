@@ -1,6 +1,6 @@
 //! `~/.agent/config.toml`: the person's settings, kept for every client
 //! and the CLI, as Codex keeps its own. Provider keys stay in
-//! `~/.agent/env`. A missing file is the defaults; any key the file does
+//! `~/.agent/keys/env`. A missing file is the defaults; any key the file does
 //! not know is a mistake, refused by name, not ignored.
 //!
 //! ```toml
