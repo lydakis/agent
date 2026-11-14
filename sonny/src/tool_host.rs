@@ -405,11 +405,14 @@ fn configured(record: &Value, given: &Given<'_>) -> Option<serde_json::Map<Strin
     // person's, without what they let run outside the sandbox.
     let shadow =
         (record["name"].as_str()).is_some_and(|name| crate::trigger::shadow_source(name).is_some());
-    let rules = match shadow {
-        true => json!(crate::trigger::shadow_rules(given.rules)),
-        false => json!(given.rules),
-    };
+    // One whose maker is gone goes by the person's rules too, but is let
+    // out of its sandbox by none it didn't have from its maker.
     let creator = record["created_by_id"].as_i64();
+    let rules = match (shadow, creator) {
+        (true, _) => json!(crate::trigger::shadow_rules(given.rules)),
+        (false, Some(_)) => json!(orphan_rules(given.rules, &record["settings"]["rules"])),
+        (false, None) => json!(given.rules),
+    };
     let own = creator.is_none_or(|creator| !given.live.contains(&creator));
     if own && record["settings"]["rules"] != rules {
         settings.insert("rules".into(), rules);
@@ -418,6 +421,35 @@ fn configured(record: &Value, given: &Given<'_>) -> Option<serde_json::Map<Strin
         fields.insert("settings".into(), Value::Object(settings));
     }
     (!fields.is_empty()).then_some(fields)
+}
+
+/// The command rules of an agent another agent made, once that maker is
+/// gone: the person's, `given`, with only the `allow` rules it `had`
+/// already, as its maker's, by their words, and only the program paths
+/// it had pinned. So it never runs outside its sandbox what its maker
+/// could not, while the rules that ask or refuse, and any `allow` or path
+/// the person takes back, still reach it.
+fn orphan_rules(
+    given: Option<&agent_client::rules::Policy>,
+    had: &Value,
+) -> Option<agent_client::rules::Policy> {
+    use agent_client::rules::{Decision, Policy};
+    let had: Policy = serde_json::from_value(had.clone()).unwrap_or_default();
+    let mut rules = given?.clone();
+    rules.prefix_rules.retain(|rule| {
+        rule.decision != Decision::Allow
+            || (had.prefix_rules.iter())
+                .any(|old| old.decision == Decision::Allow && old.pattern == rule.pattern)
+    });
+    // A path pinned since lets the name's `allow` rules out by it, so only
+    // the paths it had stay; a name left with none is unpinned, where its
+    // rules may still ask or refuse but never allow.
+    rules.host_executables.retain(|name, paths| {
+        let old = had.host_executables.get(name);
+        paths.retain(|path| old.is_some_and(|old| old.contains(path)));
+        !paths.is_empty()
+    });
+    Some(rules).filter(|rules| *rules != Policy::default())
 }
 
 /// `record` with the `configure` the daemon keeps for its turn's end laid
@@ -580,6 +612,53 @@ mod tests {
             configured(&agent(Value::Null, json!(8)), &ruled).map(Value::Object),
             Some(json!({"settings": {"rules": policy}}))
         );
+        // The person's `allow` rules reach it only if its maker had them:
+        // the rules that ask or refuse it takes, the ones that let a
+        // command out of its sandbox only as it had them already.
+        let allowing: agent_client::rules::Policy = serde_json::from_value(json!({
+            "prefix_rules": [
+                {"pattern": ["git", "push"], "decision": "prompt", "source": "default.rules:1"},
+                {"pattern": ["cargo", "test"], "decision": "allow", "source": "default.rules:2"}
+            ]
+        }))
+        .unwrap();
+        let allowed = Given {
+            rules: Some(&allowing),
+            ..ruled
+        };
+        assert_eq!(
+            configured(&agent(Value::Null, json!(8)), &allowed).map(Value::Object),
+            Some(json!({"settings": {"rules": policy}}))
+        );
+        assert_eq!(
+            configured(&agent(json!(allowing), json!(8)), &allowed),
+            None
+        );
+        // A root agent is the person's own, and takes them all.
+        assert_eq!(
+            configured(&agent(Value::Null, Value::Null), &allowed).map(Value::Object),
+            Some(json!({"settings": {"rules": allowing}}))
+        );
+        // A program path the person pins since lets none of its maker's
+        // `allow` rules out by it; one it had pinned still does.
+        let pinning: agent_client::rules::Policy = serde_json::from_value(json!({
+            "prefix_rules": [{"pattern": ["cargo", "test"], "decision": "allow"}],
+            "host_executables": {"cargo": ["/opt/bin/cargo", "/usr/bin/cargo"]}
+        }))
+        .unwrap();
+        let pinned = Given {
+            rules: Some(&pinning),
+            ..ruled
+        };
+        let had = json!({
+            "prefix_rules": [{"pattern": ["cargo", "test"], "decision": "allow"}],
+            "host_executables": {"cargo": ["/usr/bin/cargo"]}
+        });
+        assert_eq!(configured(&agent(had, json!(8)), &pinned), None);
+        let unpinned = json!({
+            "prefix_rules": [{"pattern": ["cargo", "test"], "decision": "allow"}]
+        });
+        assert_eq!(configured(&agent(unpinned, json!(8)), &pinned), None);
     }
 
     #[test]

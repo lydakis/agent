@@ -3050,7 +3050,7 @@ pub(crate) fn made(
     let tools: Vec<String> = tools.into_iter().map(String::from).collect();
     let tools = approvals::gateable(&tools, &declare);
     if let Value::Object(fields) = asked {
-        fields.extend(approvals::create_gate(mode, &tools));
+        fields.extend(approvals::gate(mode, &tools));
     }
     Ok(())
 }
@@ -16110,6 +16110,7 @@ impl App {
             // Named even when every task runs as it, so its model and
             // tools apply; its words are told once.
             profile: Some(profile.name.clone()),
+            permissions: None,
             setup: false,
             model: None,
             effort: None,
@@ -16119,6 +16120,7 @@ impl App {
             builds_on: None,
             env,
             made_by: Some(self.bot.clone()),
+            providers: Value::Null,
         };
         let (here, project, starter) = (dir.to_owned(), project.to_owned(), self.bot.clone());
         tokio::task::spawn_blocking(move || {
