@@ -763,11 +763,20 @@ fn root(path: &Path, daemon: &Daemon, others: &[known::Known]) -> Result<Root> {
         hold_journals(store);
         read_only.extend(store_files(store).filter(|file| file.exists()));
     }
+    // What it may not read, missing, can't be made, so no command makes
+    // the file the person's keys then go in. One there is masked as each
+    // command starts, and skipped if gone by then, as Codex skips a
+    // missing deny_read path: no bind here that a removal would break.
+    for kept in (daemon.unreadable.iter()).filter(|kept| kept.starts_with(path)) {
+        match std::fs::symlink_metadata(kept) {
+            Ok(found) if found.file_type().is_symlink() => return linked(kept),
+            Ok(_) => {}
+            Err(_) => missing.push(kept.clone()),
+        }
+    }
     // A walled folder too: renamed, or a socket made in it, it would let
-    // one out past its rule. And what it may not read: missing, it can't
-    // be made, so no command makes the file the person's keys then go in.
+    // one out past its rule.
     for kept in (daemon.protected_paths.iter())
-        .chain(&daemon.unreadable)
         .chain(&daemon.walled)
         .chain(locks())
         .chain(copies())

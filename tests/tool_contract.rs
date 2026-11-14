@@ -920,6 +920,12 @@ async fn a_sandboxed_command_writes_only_its_roots() {
     assert_eq!(std::fs::read_to_string(&env).unwrap(), "KEY=inside");
     assert!(!dir.join("moved").exists() && !dir.join("linked").exists());
     assert!(!later.is_file());
+    // One gone since the sandbox was built is skipped, as Codex skips a
+    // missing deny_read path: commands still run.
+    std::fs::remove_file(&env).unwrap();
+    let output = run("echo ran".into()).await;
+    assert_eq!(output["exit_code"], 0, "{output}");
+    std::fs::write(&env, "KEY=inside").unwrap();
     std::os::unix::fs::symlink(&keys, dir.join("to-keys")).unwrap();
     for path in [keys.to_str().unwrap(), "env", "to-keys"] {
         let read = tools
