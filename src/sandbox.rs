@@ -474,23 +474,10 @@ pub fn escapes(
     let writable = writable_paths(mode, root, writable);
     // A patch escapes when any file it changes would.
     any_written(tool, &arguments, |path, removed| {
-        let joined = folder.join(path);
-        let named = lexical(&joined);
-        // A path whose links [`learn`] did not read is judged as spelled.
-        // Links are followed in the path as given: a `..` after one leaves
-        // where it leads, as the kernel reads it.
-        let target = (links.0.as_deref().filter(|_| judgeable(path)))
-            .and_then(|links| {
-                let link = |path: &Path| links.get(path).cloned();
-                judged(
-                    &joined,
-                    |dir| changeable(mode, &writable, dir),
-                    link,
-                    removed,
-                )
-            })
-            .unwrap_or_else(|| named.clone());
-        outside(mode, &writable, &named, &target)
+        let named = lexical(&folder.join(path));
+        // A path [`learn`] did not follow is judged as spelled.
+        let target = links.target(path, removed).unwrap_or(&named);
+        outside(mode, &writable, &named, target)
     })
 }
 
@@ -517,35 +504,33 @@ fn any_written(
     }
 }
 
-/// The links a write, edit or patch call's paths pass, each by where it
-/// is: what it names, or `None` for a path that is no link (or can't be
-/// read). Read once by [`learn`], off the runtime thread, and carried with
-/// the call, so every judgment of it reads no file and agrees; unread
-/// (`Links::default()`), the call's paths are judged as spelled. Kept with
-/// a call that parks, so it resumes judged as it was announced. Calls are
-/// equal whatever was read for them.
+/// Where a write, edit or patch call's paths lead, each with the links
+/// in it followed whose folders the bot can't change ([`judged`]), by the
+/// path as the call gives it and whether the call removes it. Read once
+/// by [`learn`], off the runtime thread, and carried with the call, so
+/// every judgment of it reads no file, looks up one entry per path, and
+/// agrees; a path not in it (unread, or a link that couldn't be told) is
+/// judged as spelled. Kept with a call that parks, so it resumes judged
+/// as it was announced. One entry per path the call names, so it is no
+/// bigger than the call. Calls are equal whatever was read for them.
 #[derive(Clone, Debug, Default)]
-pub struct Links(Option<std::sync::Arc<std::collections::HashMap<PathBuf, Option<PathBuf>>>>);
+pub struct Links(Option<std::sync::Arc<std::collections::HashMap<(String, bool), PathBuf>>>);
 
-/// [`Links`] as kept: each path and what it links to. A reading with a
-/// path that isn't UTF-8 is kept as unread, so it is read again.
-type KeptLinks = Option<Vec<(String, Option<String>)>>;
+/// [`Links`] as kept: each path, whether it is removed, and where it
+/// leads. One that leads to a path that isn't UTF-8 is left out, so it is
+/// judged as spelled.
+type KeptLinks = Option<Vec<(String, bool, String)>>;
 
 impl serde::Serialize for Links {
     fn serialize<S: serde::Serializer>(
         &self,
         serializer: S,
     ) -> std::result::Result<S::Ok, S::Error> {
-        let name = |path: &Path| path.to_str().map(str::to_owned);
-        let kept: KeptLinks = self.0.as_deref().and_then(|links| {
+        let kept: KeptLinks = self.0.as_deref().map(|links| {
             links
                 .iter()
-                .map(|(path, to)| {
-                    let to = match to {
-                        Some(to) => Some(name(to)?),
-                        None => None,
-                    };
-                    Some((name(path)?, to))
+                .filter_map(|((path, removed), to)| {
+                    Some((path.clone(), *removed, to.to_str()?.to_owned()))
                 })
                 .collect()
         });
@@ -562,7 +547,7 @@ impl<'de> serde::Deserialize<'de> for Links {
             std::sync::Arc::new(
                 links
                     .into_iter()
-                    .map(|(path, to)| (PathBuf::from(path), to.map(PathBuf::from)))
+                    .map(|(path, removed, to)| ((path, removed), PathBuf::from(to)))
                     .collect(),
             )
         })))
@@ -587,10 +572,17 @@ impl Links {
     pub fn unread(&self) -> bool {
         self.0.is_none()
     }
+
+    /// Where `path`, as the call gives it, leads, if [`learn`] read it.
+    fn target(&self, path: &str, removed: bool) -> Option<&PathBuf> {
+        self.0.as_deref()?.get(&(path.to_owned(), removed))
+    }
 }
 
-/// Read the links [`escapes`] follows in a call's paths, `tool` with
-/// `arguments`, of a bot in `mode`. Blocks: run it off the runtime thread.
+/// Read where a call's paths lead, `tool` with `arguments`, for a bot in
+/// `mode`: each link followed in the path as given, so a `..` after one
+/// leaves where it leads, as the kernel reads it. Blocks: run it off the
+/// runtime thread.
 pub fn learn(
     mode: Mode,
     root: Option<&Path>,
@@ -603,14 +595,15 @@ pub fn learn(
     let mut links = std::collections::HashMap::new();
     if let Ok(arguments) = serde_json::from_str::<serde_json::Value>(arguments) {
         any_written(tool, &arguments, |path, removed| {
-            if judgeable(path) {
-                let read = |path: &Path| Some(read_link(&mut links, path));
-                judged(
-                    &folder.join(path),
-                    |dir| changeable(mode, &writable, dir),
-                    read,
-                    removed,
-                );
+            let read = |path: &Path| Some(read_link(path));
+            let target = judgeable(path)
+                .then(|| {
+                    let changeable = |dir: &Path| changeable(mode, &writable, dir);
+                    judged(&folder.join(path), changeable, read, removed)
+                })
+                .flatten();
+            if let Some(target) = target {
+                links.insert((path.to_owned(), removed), target);
             }
             false
         });
@@ -618,20 +611,13 @@ pub fn learn(
     Links(Some(std::sync::Arc::new(links)))
 }
 
-/// The link at `path`, read from the file system once into `links`.
-fn read_link(
-    links: &mut std::collections::HashMap<PathBuf, Option<PathBuf>>,
-    path: &Path,
-) -> Option<PathBuf> {
-    if let Some(read) = links.get(path) {
-        return read.clone();
-    }
-    let found = std::fs::symlink_metadata(path)
+/// What the link at `path` names; `None` when it is no link or can't be
+/// read.
+fn read_link(path: &Path) -> Option<PathBuf> {
+    std::fs::symlink_metadata(path)
         .is_ok_and(|meta| meta.file_type().is_symlink())
         .then(|| std::fs::read_link(path).ok())
-        .flatten();
-    links.insert(path.to_owned(), found.clone());
-    found
+        .flatten()
 }
 
 /// Whether a write's path is one whose links are followed: one a write
@@ -2644,17 +2630,10 @@ mod tests {
         // path unjudged, so it is taken as spelled.
         let unread = real.join("fixed/me/project/a.txt");
         assert_eq!(judged(&unread, fixed, |_| None, false), None);
-        let mut links = std::collections::HashMap::new();
-        let mut followed = |path: &Path, removed| {
+        let followed = |path: &Path, removed| {
             // The test's folders are in the temporary folder, which every
             // bot writes: judged as if its links were in a fixed folder.
-            judged(
-                path,
-                fixed,
-                |path| Some(read_link(&mut links, path)),
-                removed,
-            )
-            .unwrap()
+            judged(path, fixed, |path| Some(read_link(path)), removed).unwrap()
         };
         assert_eq!(followed(&unread, false), project.join("a.txt"));
         // A `..` after a followed link reads from where it led.
@@ -2687,23 +2666,21 @@ mod tests {
                 Path::new("/"),
             )
         };
-        let link = |links: &Links| {
-            links
-                .0
-                .as_ref()
-                .and_then(|links| links.get(&real.join("fixed/me")).cloned())
-        };
+        let given = unread.to_str().unwrap();
+        let link = |links: &Links| links.target(given, false).cloned();
         let first = learn();
         assert!(first.read() && !Links::default().read());
-        assert_eq!(link(&first), Some(Some(home.clone())));
+        assert_eq!(link(&first), Some(project.join("a.txt")));
+        // One entry per path the call names, whatever it passed.
+        assert_eq!(first.0.as_deref().map(|links| links.len()), Some(1));
         // Kept with a parked call, it comes back as read.
         let kept: Links = serde_json::from_str(&serde_json::to_string(&first).unwrap()).unwrap();
-        assert_eq!(link(&kept), Some(Some(home.clone())));
+        assert_eq!(link(&kept), Some(project.join("a.txt")));
         assert!(serde_json::from_str::<Links>("null").unwrap().unread());
         std::fs::remove_file(real.join("fixed/me")).unwrap();
         std::os::unix::fs::symlink(real.join("fixed"), real.join("fixed/me")).unwrap();
-        assert_eq!(link(&first), Some(Some(home.clone())));
-        assert_eq!(link(&learn()), Some(Some(real.join("fixed"))));
+        assert_eq!(link(&first), Some(project.join("a.txt")));
+        assert_eq!(link(&learn()), Some(real.join("fixed/project/a.txt")));
         // A path no tool takes is never read.
         assert!(judgeable(&"a".repeat(4096)));
         assert!(!judgeable(&"a".repeat(4097)));
