@@ -28522,6 +28522,7 @@ mod tests {
             audit: None,
             ps: None,
             commons: None,
+            memory: None,
             sky: None,
             picked: None,
             pick: Some(0),
