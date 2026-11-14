@@ -17545,11 +17545,6 @@ impl App {
             let forms = footer::count(status::IDLE_MARK, Color::Green, counts.idle, true);
             items.push(Item::new(Slot::Idle, forms).opens("status"));
         }
-        let notes = self.margin.notes().len();
-        if notes > 0 {
-            let forms = vec![vec![Span::raw(format!("✎ {notes}")).dim()], Vec::new()];
-            items.push(Item::new(Slot::Notes, forms));
-        }
         // How full the next round is, as what is left of its window: no
         // hue while there is room, then yellow, then red, and it never
         // goes once half is used.
