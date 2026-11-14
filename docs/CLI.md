@@ -72,8 +72,8 @@ which it makes private (mode 700) if missing; the CLI passes
 `~/.agent/run`, where clients such as Sonny keep the sockets of programs
 they run for bots outside the sandbox. It is a wall for sockets, not a
 way to hide files. On Linux the folder shows empty to a sandboxed command,
-since bubblewrap mounts an empty read-only folder over it (none while the
-folder is gone), but on macOS
+since bubblewrap mounts an empty read-only folder over it (made again
+first if something removed it), but on macOS
 Seatbelt only refuses connections to its sockets and hard links into it,
 so its files stay readable; and the `read` tool, which the daemon answers
 itself outside any sandbox, reads them on both. What a sandbox closes and

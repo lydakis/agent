@@ -3268,9 +3268,9 @@ off and whatever its `unix_sockets` name, as Codex hides its app-server's
 sockets. The daemon makes the folder, private to its user, as it starts,
 so a sandbox started before a socket is in it hides it all the same.
 Seatbelt denies connecting to it and hard links into it; bubblewrap hides
-it under an empty read-only folder. One removed after the daemon started
-holds no socket, so bubblewrap skips it rather than fail every command on
-a mount point it cannot make, as Codex skips a missing `deny_read` path.
+it under an empty read-only folder. One removed after the daemon started is
+made again, private, before the next command, so bubblewrap has its mount
+point and no command runs without the wall.
 It stays read-only in every root. The
 CLI passes `~/.agent/run`, where Sonny's agent-desktop host and
 agent-browser sessions listen.

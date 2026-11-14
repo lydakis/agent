@@ -1075,11 +1075,19 @@ mod linux {
         }
         // A walled folder is out of sight, as Codex hides its app-server's
         // sockets: a socket in it is a program's that acts as the person.
-        // One missing now holds no socket, and has no mount point for
-        // bubblewrap to make on a read-only root: skipped, as Codex skips a
-        // `deny_read` path that does not exist. One inside a root has its
-        // placeholder there already, which keeps the bot from making it.
-        for folder in policy.walled.iter().filter(|folder| folder.is_dir()) {
+        // One removed since the daemon made it is made again first, private
+        // as at start: bubblewrap has no mount point to make on a read-only
+        // root, and a command left without the wall would reach the sockets
+        // of one made again while it runs. One that cannot be made fails
+        // the command, closed, as before.
+        for folder in &policy.walled {
+            if !folder.is_dir() {
+                use std::os::unix::fs::DirBuilderExt;
+                let _ = std::fs::DirBuilder::new()
+                    .recursive(true)
+                    .mode(0o700)
+                    .create(folder);
+            }
             args.extend([
                 "--perms".into(),
                 "555".into(),
@@ -2684,11 +2692,13 @@ mod tests {
                     &run.to_string_lossy()
                 ]));
         }
-        // A wall another program removed holds no socket, and bubblewrap
-        // could not make its mount point on the read-only root: skipped,
-        // so every command still starts. Back, it is hidden again.
+        // A wall another program removed is made again, private, and
+        // hidden all the same: bubblewrap could not make its mount point on
+        // the read-only root, and a command without the wall would reach
+        // the sockets of one made again while it runs.
         #[cfg(target_os = "linux")]
         {
+            use std::os::unix::fs::PermissionsExt;
             let policy = Policy::new(
                 Some(Mode::WorkspaceWrite),
                 Some(&base),
@@ -2707,9 +2717,10 @@ mod tests {
                     .any(|w| w == ["--tmpfs", &run.to_string_lossy()])
             };
             std::fs::remove_dir(&run).unwrap();
-            assert!(!hidden(&policy));
-            std::fs::create_dir(&run).unwrap();
             assert!(hidden(&policy));
+            let made = std::fs::metadata(&run).unwrap();
+            assert!(made.is_dir());
+            assert_eq!(made.permissions().mode() & 0o777, 0o700);
         }
         // A root inside the wall is refused: its sockets could be renamed
         // out to a folder the rule doesn't name.
