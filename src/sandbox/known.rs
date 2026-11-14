@@ -8,8 +8,7 @@
 //! the entry stays while the store does, so an idle store is kept too;
 //! entries whose store is gone are dropped by the next daemon to list
 //! itself. A daemon that cannot write the folder, as one started inside a
-//! sandbox cannot, is not listed: it can do nothing its sandbox does not
-//! allow already.
+//! sandbox cannot, refuses to start.
 
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};

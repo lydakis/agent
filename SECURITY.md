@@ -91,9 +91,9 @@ vulnerability, whether or not the code's own documentation agrees.
   no sandbox writes), and every sandbox keeps every listed daemon as it
   keeps its own: the store and SQLite's files beside it read-only, the
   socket and its bots' sockets out of reach whatever the network setting.
-  A daemon started inside a sandbox can't list itself and can do nothing
-  that sandbox doesn't already allow. A command already running when a
-  new daemon lists itself keeps the sandbox it started with.
+  A daemon that can't list itself, as one started inside a sandbox can't,
+  refuses to start (`daemon_not_listed`). A command already running when
+  a new daemon lists itself keeps the sandbox it started with.
 - The daemon collects and sends no usage analytics. Its outbound
   connections are to the model providers a bot's model names, the ChatGPT
   sign-in, and the pages `web_fetch` is asked for.
