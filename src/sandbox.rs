@@ -451,9 +451,10 @@ pub fn confinable(tool: &str) -> bool {
 /// command that asks to escalate, or a write, edit or patch of a path
 /// outside every folder the bot may write. `root` is the bot's folder and `folder`
 /// the turn's, against which a relative path is read. Decided from the call
-/// and the folders' names alone, never from the files as they are now, so
-/// the round that announces a call and the run that starts it agree; a
-/// confined write is still checked against the real path when it runs.
+/// and the folders' names, with only the links the bot can't change
+/// followed (see [`judged`]), so the round that announces a call and the
+/// run that starts it agree; a confined write is still checked against the
+/// real path when it runs.
 pub fn escapes(
     mode: Mode,
     root: Option<&Path>,
@@ -555,15 +556,69 @@ fn outside(
     folder: &Path,
     path: &str,
 ) -> bool {
-    let target = lexical(&folder.join(path));
-    let inside = |dir: &Path| target.starts_with(dir);
+    let writable = writable_paths(mode, root, writable);
+    let changeable = |dir: &Path| {
+        writable.iter().any(|root| dir.starts_with(root))
+            || (mode == Mode::WorkspaceWrite
+                && temporary().iter().any(|(named, _)| dir.starts_with(named)))
+    };
+    let named = lexical(&folder.join(path));
+    let target = judged(&named, changeable);
+    // Inside as spelled or as followed: a folder may be given by a link.
+    let inside = |dir: &Path| named.starts_with(dir) || target.starts_with(dir);
     let temporary = temporary()
         .iter()
         .any(|(named, real)| mode == Mode::WorkspaceWrite && (inside(named) || inside(real)));
-    !(temporary
-        || writable_paths(mode, root, writable)
-            .iter()
-            .any(|dir| inside(dir)))
+    !(temporary || writable.iter().any(|dir| inside(dir)))
+}
+
+/// `path` with each link in it followed whose folder the bot can't
+/// write (`changeable` false), as a home or system folder reached through
+/// a link: such a link stays as it is between the round that judges a
+/// call and the run that starts it. A link in a folder the bot writes is
+/// left as spelled, as Codex substitutes no mutable link's target. Each
+/// target is read by name, as the path itself is.
+fn judged(path: &Path, changeable: impl Fn(&Path) -> bool) -> PathBuf {
+    // As many links as Linux follows in one path.
+    const LINKS: usize = 40;
+    let mut out = PathBuf::new();
+    let mut rest: Vec<_> = path
+        .components()
+        .rev()
+        .map(|part| part.as_os_str().to_owned())
+        .collect();
+    let mut followed = 0;
+    while let Some(part) = rest.pop() {
+        // A `..` or `.` in a target is read by name, as in the path.
+        if part == "." {
+            continue;
+        }
+        if part == ".." {
+            out.pop();
+            continue;
+        }
+        let next = out.join(&part);
+        let link = followed < LINKS
+            && !out.as_os_str().is_empty()
+            && !changeable(&out)
+            && std::fs::symlink_metadata(&next).is_ok_and(|meta| meta.file_type().is_symlink());
+        let target = link.then(|| std::fs::read_link(&next).ok()).flatten();
+        let Some(target) = target else {
+            out = next;
+            continue;
+        };
+        followed += 1;
+        // The target's parts are read on from where the link was, or
+        // from the top when it names a whole path.
+        if target.is_absolute() {
+            out = PathBuf::from("/");
+        }
+        rest.extend(target.components().rev().filter_map(|part| match part {
+            Component::RootDir | Component::Prefix(_) => None,
+            part => Some(part.as_os_str().to_owned()),
+        }));
+    }
+    out
 }
 
 /// `path` with `.` dropped and `..` taken back, by name alone.
@@ -2408,6 +2463,50 @@ mod tests {
             "apply_patch",
             serde_json::json!({"input":"not a patch"})
         ));
+        // A link the bot can't change is followed: a home reached through
+        // one is the folder it names. One in a folder the bot writes is
+        // not, so a write through it is judged by its spelling.
+        let base = std::env::temp_dir().join(format!("agent-escapes-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let real = std::fs::canonicalize(std::env::temp_dir())
+            .unwrap()
+            .join(format!("agent-escapes-{}", std::process::id()));
+        let home = real.join("home/person");
+        let project = home.join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::create_dir_all(real.join("fixed")).unwrap();
+        std::os::unix::fs::symlink(&home, real.join("fixed/me")).unwrap();
+        std::os::unix::fs::symlink("../../../fixed", project.join("out")).unwrap();
+        let judged_escapes = |path: &Path| {
+            outside(
+                Mode::WorkspaceWrite,
+                Some(&project),
+                &[],
+                Path::new("/"),
+                path.to_str().unwrap(),
+            )
+        };
+        let followed = |path: &Path| {
+            // The test's folders are in the temporary folder, which every
+            // bot writes: judged as if its links were in a fixed folder.
+            judged(path, |dir| dir.starts_with(&project))
+        };
+        assert_eq!(
+            followed(&real.join("fixed/me/project/a.txt")),
+            project.join("a.txt")
+        );
+        // A `..` after a followed link reads from where it led.
+        assert_eq!(
+            followed(&real.join("fixed/me/../person/project/b")),
+            project.join("b")
+        );
+        // Through a link in the project, as spelled.
+        assert_eq!(
+            followed(&project.join("out/me/x")),
+            project.join("out/me/x")
+        );
+        assert!(!judged_escapes(&project.join("c.txt")));
+        let _ = std::fs::remove_dir_all(&base);
         // Read-only writes nowhere, so every write asks.
         assert!(super::escapes(
             Mode::ReadOnly,
