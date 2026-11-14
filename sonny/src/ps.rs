@@ -200,6 +200,14 @@ impl View {
     }
 
     /// The row at `at` picked, as a click picks it.
+    /// The command a stop was asked for keeps running: a key went
+    /// elsewhere.
+    pub fn keep(&mut self) {
+        if self.stopping.take().is_some() {
+            self.said = Some("not stopped".into());
+        }
+    }
+
     /// A click picks a row, and takes back a stop that was asked: only
     /// Enter stops.
     pub fn pick_at(&mut self, at: usize) {
@@ -419,6 +427,14 @@ mod tests {
             press(&mut view, KeyCode::Esc),
             Key::Stay,
             "esc cancels, not closes"
+        );
+        // A key the pane takes (a page, Tab) takes the stop back.
+        assert_eq!(press(&mut view, KeyCode::Char('x')), Key::Stay);
+        view.keep();
+        assert_eq!(view.footer().unwrap().to_string(), "not stopped");
+        assert_eq!(
+            press(&mut view, KeyCode::Enter),
+            Key::Open("shop.fix".into())
         );
         // A click on a row takes the stop back: the Enter it brings opens.
         assert_eq!(press(&mut view, KeyCode::Char('x')), Key::Stay);
