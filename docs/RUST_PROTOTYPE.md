@@ -2826,7 +2826,7 @@ as who pulled the cord. A message's `request_id` is the call's own unless
 the model names one, so a call made again after a restart sends nothing
 new. `list_agents` lists the caller's project's bots by default (its name up
 to the first dot, then `*`), and with `approvals` the calls waiting on a
-gate instead. A store from before schema 99 gives the three to every bot
+gate instead. A store from before schema 100 gives the three to every bot
 that has `wait` and `history`; the approval modes never gate them.
 
 `shell` runs a noninteractive command with `/bin/bash -c` (`/bin/sh` where

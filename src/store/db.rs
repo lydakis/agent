@@ -2713,7 +2713,7 @@ impl Database {
     /// before versioning, stores at versions 1 to 5 and stores from newer
     /// binaries are rejected; an older store from version 6 on is migrated
     /// forward, one version at a time, at open.
-    pub const SCHEMA: i32 = 99;
+    pub const SCHEMA: i32 = 100;
     /// The person's messages a compaction keeps verbatim, newest first:
     /// per-message text, and the total text plus `(ordinal, String)` entry
     /// metadata. Empty entries cost space too, so the retained list cannot
@@ -17664,10 +17664,10 @@ fn migrate_since_73(conn: &Connection, from: i32) -> Result<()> {
         )?;
     }
 
-    // Schema 99: an agent sends messages, lists agents and pulls the cord
+    // Schema 100: an agent sends messages, lists agents and pulls the cord
     // with tools of its own, which every new bot has beside wait and
     // history; a bot that has those two takes them too.
-    if from < 99 {
+    if from < 100 {
         conn.execute(
             "UPDATE bots SET tools=tools||',send_message,list_agents,pause_agents'
              WHERE ','||tools||',' LIKE '%,wait,%' AND ','||tools||',' LIKE '%,history,%'
