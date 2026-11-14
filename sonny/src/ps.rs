@@ -134,7 +134,7 @@ impl View {
         // Any key but a second x lets a stop asked for go.
         let stopping = self.stopping.take();
         match key.code {
-            KeyCode::Esc | KeyCode::Char('q') => Key::Close,
+            KeyCode::Esc => Key::Close,
             KeyCode::Enter => match self.picked() {
                 Some(row) => Key::Open(word(row, "bot")),
                 None => Key::Close,
@@ -169,6 +169,22 @@ impl View {
                 Key::Stay
             }
             _ => Key::Stay,
+        }
+    }
+
+    /// The row of the card each row starts on, in their order: one line
+    /// each under the heading.
+    pub fn starts(&self) -> Vec<usize> {
+        match self.error {
+            Some(_) => Vec::new(),
+            None => (0..self.rows.len()).map(|at| at + 2).collect(),
+        }
+    }
+
+    /// The row at `at` picked, as a click picks it.
+    pub fn pick_at(&mut self, at: usize) {
+        if at < self.rows.len() {
+            self.pick = Some(at);
         }
     }
 

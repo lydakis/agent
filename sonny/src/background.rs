@@ -574,6 +574,8 @@ pub struct View {
 pub enum Key {
     Stay,
     Close,
+    /// The agent the picked row is for, to go to.
+    Open(String),
 }
 
 impl View {
@@ -643,7 +645,16 @@ impl View {
         self.notice = None;
         match key.code {
             KeyCode::Esc if confirm.is_some() => {}
-            KeyCode::Esc | KeyCode::Char('q') | KeyCode::Enter => return Key::Close,
+            KeyCode::Esc => return Key::Close,
+            // Enter goes to the agent the row is for: the one an
+            // automation wakes, the subscriber.
+            KeyCode::Enter => {
+                if let Some(item) = self.items.get(self.selected)
+                    && !item.bot.is_empty()
+                {
+                    return Key::Open(item.bot.clone());
+                }
+            }
             KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 return Key::Close;
             }
@@ -725,7 +736,24 @@ impl View {
     }
 
     /// The card, and the row the picked item starts on.
+    #[cfg(test)]
     pub fn card(&self, width: usize) -> (Vec<Line<'static>>, usize) {
+        let (out, at, _) = self.card_rows(width);
+        (out, at)
+    }
+
+    /// The item at `at` picked, as a click picks it.
+    pub fn pick_at(&mut self, at: usize) {
+        if at < self.items.len() {
+            self.selected = at;
+            self.confirm = None;
+        }
+    }
+
+    /// [`View::card`], and the row each item starts on, by its place
+    /// among the items.
+    pub fn card_rows(&self, width: usize) -> (Vec<Line<'static>>, usize, Vec<usize>) {
+        let mut starts = vec![0; self.items.len()];
         let mut out =
             vec![Line::from(format!("{} · in the background", self.scope.project)).bold()];
         if !self.lookout.is_empty() {
@@ -743,7 +771,7 @@ impl View {
                 )
                 .dim(),
             );
-            return (out, 0);
+            return (out, 0, Vec::new());
         }
         // What failed first, whatever it is; then the rest by kind.
         let section = |item: &Item| match (&item.failed, item.kind) {
@@ -769,10 +797,11 @@ impl View {
                 if index == self.selected {
                     at = out.len();
                 }
+                starts[index] = out.len();
                 out.extend(self.item_lines(item, index == self.selected, width));
             }
         }
-        (out, at)
+        (out, at, starts)
     }
 
     fn item_lines(&self, item: &Item, picked: bool, width: usize) -> Vec<Line<'static>> {
@@ -874,6 +903,13 @@ impl View {
         let mut keys = Keys::new();
         if self.items.len() > 1 {
             keys = keys.pick();
+        }
+        if self
+            .items
+            .get(self.selected)
+            .is_some_and(|item| !item.bot.is_empty())
+        {
+            keys = keys.enter(crate::hint::Enter::Open);
         }
         match self.items.get(self.selected) {
             Some(item) if item.kind == Kind::Trigger => {
@@ -1396,6 +1432,9 @@ mod tests {
         assert_eq!(lines[5], "    sent 2");
         assert_eq!(lines[6], "    └ Read preferences.md");
         assert_eq!(lines[8], "Follows · 1");
+        // Enter goes to the agent the automation wakes; it closes nothing.
+        let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+        assert_eq!(view.key(enter), Key::Open("calc.lead".into()));
         assert_eq!(lines[9], "  ◎ tasks for lead");
         let press = |view: &mut View, code| view.key(KeyEvent::new(code, KeyModifiers::NONE));
         // Ctrl+D is not d.

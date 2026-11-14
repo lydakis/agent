@@ -2979,6 +2979,11 @@ impl View {
         shown
     }
 
+    /// The agent whose star is picked, which Enter goes to.
+    pub fn picked(&self) -> Option<&str> {
+        self.pick.as_deref()
+    }
+
     /// Put the agent asked for in the middle, or the person again.
     pub fn centre_on(&mut self, name: Option<String>) {
         if self.centre != name {
@@ -3009,8 +3014,8 @@ impl View {
         self.centre_on(name);
     }
 
-    /// A key the sky takes: the arrows pick a star, Enter centres on it,
-    /// `?` the legend, `z` zen, `m` the models' colours. Esc lets go of the
+    /// A key the sky takes: the arrows pick a star, `c` centers on it,
+    /// `?` the legend, `z` zen, `m` the models' colors. Esc lets go of the
     /// pick, then of the centre; false when there was nothing to let go
     /// of, or the key isn't the sky's.
     pub fn press(&mut self, code: ratatui::crossterm::event::KeyCode) -> bool {
@@ -3061,7 +3066,9 @@ impl View {
             KeyCode::Down => self.step((0.0, 1.0)),
             KeyCode::Left => self.step((-1.0, 0.0)),
             KeyCode::Right => self.step((1.0, 0.0)),
-            KeyCode::Enter => match self.pick.take() {
+            // `c` centers on the star picked; Enter is the window's, which
+            // goes to its agent.
+            KeyCode::Char('c') => match self.pick.take() {
                 Some(pick) => self.centre_on(Some(pick)),
                 None => return false,
             },
@@ -5014,7 +5021,7 @@ const OPENING: Duration = Duration::from_millis(4);
 /// How long `sonny sky` waits before following a daemon that went again.
 const RETRY: Duration = Duration::from_secs(3);
 /// What the keys do in `sonny sky`.
-const KEYS: &str = "↑↓←→ pick · m models · r replay · z zen · ? legend · q quit";
+const KEYS: &str = "↑↓←→ pick · c center · m models · r replay · z zen · ? legend · esc close";
 /// A replay's keys, in the title's place.
 pub const REPLAY_KEYS: &str = "space pause · ←→ step · [ ] speed · esc back";
 
@@ -5085,8 +5092,12 @@ pub fn watch(
                     // dark, drawn with on the next frame.
                     event::Event::Reply(reply) => crate::term::heard(&reply),
                     event::Event::Key(key) if key.kind != event::KeyEventKind::Release => {
-                        // Esc lets go of the pick and the centre before it leaves.
-                        if !view.press(key.code) && quits(&key) {
+                        // Ctrl+C leaves at once, never taken for `c`; Esc
+                        // lets go of the pick and the center before it
+                        // leaves. Other keys with Ctrl are the terminal's.
+                        let ctrl = key.modifiers.contains(event::KeyModifiers::CONTROL);
+                        if (ctrl && quits(&key)) || (!ctrl && !view.press(key.code) && quits(&key))
+                        {
                             return Ok(());
                         }
                     }
@@ -5115,12 +5126,12 @@ pub fn watch(
     drawn
 }
 
-/// q, Esc and Ctrl+C leave `sonny sky`, Esc once nothing is picked or
-/// centred.
+/// Esc and Ctrl+C leave `sonny sky`, Esc once nothing is picked or
+/// centered; `q` does nothing, as in every pane.
 fn quits(key: &ratatui::crossterm::event::KeyEvent) -> bool {
     use ratatui::crossterm::event::{KeyCode, KeyModifiers};
     match key.code {
-        KeyCode::Char('q') | KeyCode::Esc => true,
+        KeyCode::Esc => true,
         KeyCode::Char('c') => key.modifiers.contains(KeyModifiers::CONTROL),
         _ => false,
     }
@@ -5136,7 +5147,7 @@ impl ratatui::widgets::Widget for &mut View {
         let width = area.width as usize;
         let mut head = vec![Span::raw(" "), Span::raw("sky").bold()];
         let mut keys = match self.replay {
-            Some(_) => format!("{REPLAY_KEYS} · q quit"),
+            Some(_) => REPLAY_KEYS.to_owned(),
             None => KEYS.to_owned(),
         };
         // A narrow terminal keeps the last keys, quitting among them.
@@ -6001,16 +6012,16 @@ mod tests {
                 .trim_end()
                 .to_owned()
         };
-        assert!(row(0).starts_with(" sky") && row(0).ends_with("q quit"));
+        assert!(row(0).starts_with(" sky") && row(0).ends_with("esc close"));
         assert!((2..29).any(|y| row(y).contains("shop lead")));
         assert_eq!(
             row(29),
             " 1 agent · ● 1 working · 0 messages in the last minute"
         );
-        // q, Esc and Ctrl+C leave it; other keys do not.
+        // Esc and Ctrl+C leave it; q and other keys do not.
         use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
         let key = |code, mods| quits(&KeyEvent::new(code, mods));
-        assert!(key(KeyCode::Char('q'), KeyModifiers::NONE));
+        assert!(!key(KeyCode::Char('q'), KeyModifiers::NONE));
         assert!(key(KeyCode::Esc, KeyModifiers::NONE));
         assert!(key(KeyCode::Char('c'), KeyModifiers::CONTROL));
         assert!(!key(KeyCode::Char('c'), KeyModifiers::NONE));
@@ -6195,11 +6206,14 @@ mod tests {
         assert!(view.press(KeyCode::Esc));
         assert!(view.centred().is_none());
         assert!(!view.press(KeyCode::Esc));
-        // An arrow picks a star; Enter centres on it.
+        // An arrow picks a star; `c` centers on it. Enter is no key of
+        // the sky's: the window goes to the picked star's agent.
         view.card(120, 40);
         assert!(view.press(KeyCode::Right));
         let picked = view.pick.clone().expect("a star picked");
-        assert!(view.press(KeyCode::Enter));
+        assert!(!view.press(KeyCode::Enter));
+        assert_eq!(view.picked(), Some(picked.as_str()));
+        assert!(view.press(KeyCode::Char('c')));
         assert_eq!(view.centre.as_deref(), Some(picked.as_str()));
         assert!(view.pick.is_none());
         // `m` colours each agent by its model where it stands, the

@@ -124,7 +124,7 @@ impl View {
         }
         let step = |at: &mut usize, values: usize| *at = (*at + 1) % (values + 1);
         match key.code {
-            KeyCode::Esc | KeyCode::Char('q') => return Key::Close,
+            KeyCode::Esc => return Key::Close,
             KeyCode::Enter => {
                 return match self.pick.and_then(|at| self.rows.get(at)) {
                     Some(row) => Key::Open(row["bot"].as_str().unwrap_or_default().to_owned()),
@@ -149,6 +149,22 @@ impl View {
         self.at = None;
         self.pick = None;
         Key::Stay
+    }
+
+    /// The row of the card each row starts on, in their order: one line
+    /// each under the heading.
+    pub fn starts(&self) -> Vec<usize> {
+        match self.error {
+            Some(_) => Vec::new(),
+            None => (0..self.rows.len()).map(|at| at + 2).collect(),
+        }
+    }
+
+    /// The row at `at` picked, as a click picks it.
+    pub fn pick_at(&mut self, at: usize) {
+        if at < self.rows.len() {
+            self.pick = Some(at);
+        }
     }
 
     /// The row of the card the picked call is on, to keep it in view.
