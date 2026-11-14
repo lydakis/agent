@@ -1695,8 +1695,18 @@ fn pem_escaped(text: &str, begin: usize, last: bool) -> Escaped {
                     end: header + i,
                 };
             }
-            if tail.starts_with("-----") {
-                return Escaped::No;
+            // Another block's BEGIN at an escaped line's start ends this
+            // one; one inside a line, such as an armored key's `Comment:`,
+            // is that line's text.
+            let at = header + i;
+            let bytes = text.as_bytes();
+            if matches!(bytes[at - 1], b'n' | b'r') && bytes[at - 2] == b'\\' {
+                if tail.len() < BEGIN.len() && BEGIN.starts_with(tail) {
+                    return more;
+                }
+                if tail.starts_with(BEGIN) {
+                    return Escaped::No;
+                }
             }
             continue;
         }
@@ -5598,6 +5608,10 @@ mod tests {
             (
                 "{\"value\": \"-----BEGIN PRIVATE KEY-----  \t\\nMIIE\\n-----END PRIVATE KEY-----\\n\"}",
                 "{\"value\": \"-----BEGIN PRIVATE KEY-----  \t\\n[REDACTED]\\n-----END PRIVATE KEY-----\\n\"}",
+            ),
+            (
+                r#""-----BEGIN PGP PRIVATE KEY BLOCK-----\nComment: example -----BEGIN CERTIFICATE-----\n\nlQOYBGfake\n-----END PGP PRIVATE KEY BLOCK-----\n""#,
+                r#""-----BEGIN PGP PRIVATE KEY BLOCK-----\n[REDACTED]\n-----END PGP PRIVATE KEY BLOCK-----\n""#,
             ),
             (
                 r#"{"value": "-----BEGIN PGP PRIVATE KEY BLOCK-----\nComment: Fixture (no identity) <x@y> it's \"quoted\"\n\nlQOYBGfake\n=AbCd\n-----END PGP PRIVATE KEY BLOCK-----\n"}"#,
