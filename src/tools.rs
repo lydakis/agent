@@ -1013,7 +1013,11 @@ impl BlockStream {
             }
             let Some(header) = pem_header(&text, at, last) else {
                 let dashes = dash.unwrap_or(from) + 5;
-                if !last && matches!(&text.as_bytes()[dashes..], [] | [b'\r']) {
+                let after = &text.as_bytes()[dashes..];
+                if !last
+                    && after.len() <= PEM_SPACES + 1
+                    && after.iter().all(|b| b" \t\r".contains(b))
+                {
                     // The line's end may follow.
                     self.held = text[at..].to_owned();
                     return out;
@@ -1447,7 +1451,14 @@ fn pem_header(text: &str, begin: usize, last: bool) -> Option<usize> {
     if text[from..dashes].contains('\n') {
         return None;
     }
+    // Spaces or tabs may follow, as a key's reader allows, up to a bound
+    // a stream holds them to; nothing else.
     let dashes = dashes + 5;
+    let spaces = text[dashes..].len() - text[dashes..].trim_start_matches([' ', '\t']).len();
+    if spaces > PEM_SPACES {
+        return None;
+    }
+    let dashes = dashes + spaces;
     match &text.as_bytes()[dashes..] {
         [b'\r', b'\n', ..] => Some(dashes + 2),
         [b'\n', ..] => Some(dashes + 1),
@@ -1455,6 +1466,9 @@ fn pem_header(text: &str, begin: usize, last: bool) -> Option<usize> {
         _ => None,
     }
 }
+
+/// The most spaces or tabs a key's header may end with.
+const PEM_SPACES: usize = 1024;
 
 /// The most of one line a key's body is judged on: a line whose first
 /// this many bytes are base64 is a body's line, whatever follows.
@@ -1475,16 +1489,16 @@ fn pem_text(line: &str) -> &str {
     }
 }
 
-/// Whether `line`, its end's `\r` taken off, is a line of a key's body:
-/// base64, or the RFC 1421 headers of an encrypted key and the empty line
-/// after them.
-fn pem_line(line: &str, after_info: bool) -> bool {
-    let line = pem_text(line);
+/// Whether `line`, its end's `\r` and the spaces or tabs around it taken
+/// off, is a line of a key's body: base64, the RFC 1421 headers of an
+/// encrypted key, or empty, as a key's reader takes them.
+fn pem_line(line: &str) -> bool {
+    let line = pem_text(line).trim_matches([' ', '\t']);
     let base64 = |b: &u8| b.is_ascii_alphanumeric() || matches!(b, b'+' | b'/' | b'=');
-    (line.is_empty() && after_info)
+    line.is_empty()
         || (line.len() <= PEM_LINE
             && (line.starts_with("Proc-Type:") || line.starts_with("DEK-Info:")))
-        || (!line.is_empty() && line.as_bytes().iter().take(PEM_LINE).all(base64))
+        || line.as_bytes().iter().take(PEM_LINE).all(base64)
 }
 
 /// A secret block's body, read line by line after its header: the lines
@@ -1496,8 +1510,6 @@ fn pem_line(line: &str, after_info: bool) -> bool {
 struct PemBody {
     /// Some of its lines were taken.
     any: bool,
-    /// The last line taken was a `DEK-Info` header.
-    after_info: bool,
     /// Inside a line too long to hold that reads as a key's: dropped up to
     /// its end.
     long: bool,
@@ -1517,7 +1529,7 @@ impl PemBody {
             if self.long {
                 match rest.find('\n') {
                     Some(n) => {
-                        (self.long, self.after_info) = (false, false);
+                        self.long = false;
                         at += n + 1;
                         continue;
                     }
@@ -1526,8 +1538,7 @@ impl PemBody {
                 }
             }
             match rest.find('\n') {
-                Some(n) if pem_line(&rest[..n], self.after_info) => {
-                    self.after_info = pem_text(&rest[..n]).starts_with("DEK-Info:");
+                Some(n) if pem_line(&rest[..n]) => {
                     self.any = true;
                     at += n + 1;
                 }
@@ -1536,13 +1547,13 @@ impl PemBody {
                     return last.then(|| (at, told(self.any)));
                 }
                 None if last => {
-                    return Some(match pem_line(rest, self.after_info) {
+                    return Some(match pem_line(rest) {
                         true => (text.len(), "[REDACTED]"),
                         false => (at, told(self.any)),
                     });
                 }
                 None if rest.len() > PEM_LINE => {
-                    if !pem_line(rest, false) {
+                    if !pem_line(rest) {
                         return Some((at, told(self.any)));
                     }
                     (self.long, self.any) = (true, true);
@@ -5261,6 +5272,14 @@ mod tests {
             redact(numbered),
             "     1\t-----BEGIN RSA PRIVATE KEY-----\n[REDACTED]\n     6\t-----END RSA PRIVATE KEY-----\n"
         );
+        // Spaces after the header, a blank line after it, and indented
+        // body lines, as a key's reader takes them.
+        assert_eq!(
+            redact(
+                "-----BEGIN PRIVATE KEY-----   \n\n  MIIE\n\tAAAA \n-----END PRIVATE KEY-----\n"
+            ),
+            "-----BEGIN PRIVATE KEY-----   \n[REDACTED]\n-----END PRIVATE KEY-----\n"
+        );
         // Many starts on one long line read it once, whole or in pieces.
         let starts = "-----BEGIN ".repeat(40_000) + "\nend\n";
         let began = std::time::Instant::now();
@@ -5543,7 +5562,7 @@ mod tests {
             &["password".to_owned(), "api_key".to_owned()],
             &["PRIVATE KEY".to_owned()],
         );
-        let parts: [&str; 30] = [
+        let parts: [&str; 32] = [
             "password=",
             "\"api_key\": \"",
             "password: '",
@@ -5574,6 +5593,8 @@ mod tests {
             "\r",
             "MIIE+/a=\n",
             "print(KEY)\n",
+            "   ",
+            "\t",
         ];
         let mut seed = 0x2545_f491_4f6c_dd1du64;
         let mut next = || {
