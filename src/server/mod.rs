@@ -7373,6 +7373,7 @@ mod tests {
                     name: "wait".into(),
                     call_id: "wait-1".into(),
                     arguments: r#"{"handles":["proc:1"]}"#.into(),
+                    links: Default::default(),
                 };
                 let item = serde_json::to_vec(&json!({"type":"function_call","name":call.name,
                 "call_id":call.call_id,"arguments":call.arguments}))?
@@ -8679,6 +8680,7 @@ mod tests {
                     name: "wait".into(),
                     call_id: "wait-1".into(),
                     arguments: json!({"handles":[parked]}).to_string(),
+                    links: Default::default(),
                 };
                 let item = serde_json::to_vec(&json!({"type":"function_call","name":call.name,
                 "call_id":call.call_id,"arguments":call.arguments}))?
@@ -9901,6 +9903,7 @@ mod tests {
                     name: "wait".into(),
                     call_id: "wait-1".into(),
                     arguments: r#"{"handles":["proc:1"]}"#.into(),
+                    links: Default::default(),
                 };
                 let item = serde_json::to_vec(&json!({"type":"function_call","name":call.name,
                 "call_id":call.call_id,"arguments":call.arguments}))?
@@ -9974,6 +9977,7 @@ mod tests {
                     name: "shell".into(),
                     call_id: "shell-1".into(),
                     arguments: r#"{"command":"true"}"#.into(),
+                    links: Default::default(),
                 };
                 let item = serde_json::to_vec(&json!({"type":"function_call","name":call.name,
                 "call_id":call.call_id,"arguments":call.arguments}))?
@@ -10150,6 +10154,7 @@ mod tests {
                         name: "shell".into(),
                         call_id: "shell-1".into(),
                         arguments: r#"{"command":"true"}"#.into(),
+                        links: Default::default(),
                     };
                     let item = serde_json::to_vec(&json!({"type":"function_call",
                         "name":call.name,"call_id":call.call_id,"arguments":call.arguments}))?
@@ -10209,6 +10214,7 @@ mod tests {
                     name: "shell".into(),
                     call_id: "shell-2".into(),
                     arguments: r#"{"command":"true"}"#.into(),
+                    links: Default::default(),
                 };
                 db.suspend_load(ann, "shell-2", &[call], now_ms(), None, None)
                     .map(|_| ())

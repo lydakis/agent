@@ -58,7 +58,6 @@ pub fn attempted(verb: &str) -> String {
         "Read" => "read",
         "Removed" => "remove",
         "Saved" => "save",
-        "Scheduled" => "schedule",
         "Started" => "start",
         "Steered" => "steer",
         "Typed" => "type",
@@ -343,10 +342,11 @@ fn automation(words: &[String], output: &str, failed: bool) -> Option<Said> {
     };
     match verb.as_str() {
         "add" => {
-            said.verb = "Scheduled".into();
+            said.verb = "Added the automation".into();
+            // `--bot`, as before 0.10.0, in history.
             let name = args
                 .value(&["--name"])
-                .or(args.value(&["--bot", "--start"]));
+                .or(args.value(&["--agent", "--bot", "--start"]));
             let when = [
                 ("--every", "every"),
                 ("--cron", "cron"),
@@ -1147,13 +1147,15 @@ pub fn declared(name: &str, arguments: &Value, failed: bool) -> Option<Said> {
                     let add = &arguments["add"];
                     let name = (add["name"].as_str())
                         .or(add["start"]["name"].as_str())
+                        .or(add["agent"].as_str())
+                        // `bot`, as before 0.10.0, in history.
                         .or(add["bot"].as_str())
                         .map(|name| name.trim().to_owned());
                     let when = ["every", "cron", "at", "in"]
                         .into_iter()
                         .find_map(|key| Some(format!("{key} {}", add[key].as_str()?.trim())));
                     let what = [name, when].into_iter().flatten().collect::<Vec<_>>();
-                    let mut said = said("Scheduled", &what.join(" · "));
+                    let mut said = said("Added the automation", &what.join(" · "));
                     if let Some(message) = add["message"].as_str() {
                         said.under
                             .push(Line::from(first_line(message)).italic().dim());
@@ -1823,7 +1825,7 @@ Keep the rest.'"#,
             r#"~/.agent/automation add --bot shop.lead --cron '0 9 * * 1' -- Brief me"#,
             r#"{"error":"automations_unsupported","detail":"needs macOS"}"#,
         );
-        assert_eq!(refused.verb, "Scheduled");
+        assert_eq!(refused.verb, "Added the automation");
         assert_eq!(refused.what, "shop.lead · cron 0 9 * * 1");
         assert!(refused.failed);
         let under: Vec<String> = refused.under.iter().map(text).collect();

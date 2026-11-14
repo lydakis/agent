@@ -33,7 +33,7 @@ pub fn welcome(
     let what = match lead {
         true => [
             "This folder's lead. Ask for anything:",
-            "it plans, starts tasks in their own copies,",
+            "it plans, starts tasks in their own folders,",
             "and tells you when they need you.",
         ],
         false => [
@@ -292,7 +292,7 @@ fn hints(accent: Style) -> Line<'static> {
         Span::styled("/model", accent),
         " switch model  ".dim(),
         Span::styled("/status", accent),
-        " tasks".dim(),
+        " agents".dim(),
     ])
 }
 

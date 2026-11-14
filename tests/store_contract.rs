@@ -433,6 +433,7 @@ fn unfinished_tools_are_answered_truthfully_without_disabling_the_bot() {
                 name: "write".into(),
                 call_id: id.into(),
                 arguments: r#"{"path":"file","content":"hello"}"#.into(),
+                links: Default::default(),
             });
             let items = match family {
                 Family::Responses => calls.iter().map(|call| json!({"type":"function_call","call_id":call.call_id,"name":call.name,"arguments":call.arguments})).collect::<Vec<_>>(),
@@ -543,6 +544,7 @@ fn restart_repairs_unanswered_tools_once_including_previously_blocked_bots() {
                 name: "write".into(),
                 call_id: "c1".into(),
                 arguments: "{}".into(),
+                links: Default::default(),
             };
             // Keep a completed call in the same turn. A pruned migration
             // must repair only the unanswered suffix, not duplicate results.
@@ -638,6 +640,7 @@ fn tool_results_and_cursor_events_commit_together() {
         name: "echo".into(),
         call_id: "c1".into(),
         arguments: "{}".into(),
+        links: Default::default(),
     };
     db.append(turn, vec![], std::slice::from_ref(&call), None)
         .unwrap();
@@ -696,6 +699,7 @@ fn shell_call(item_id: &str, call_id: &str, command: &str) -> (Bytes, ToolCall) 
         name: "shell".into(),
         call_id: call_id.into(),
         arguments,
+        links: Default::default(),
     };
     (serde_json::to_vec(&item).unwrap().into(), call)
 }
@@ -1006,6 +1010,7 @@ fn a_sandboxed_bot_waits_for_a_verdict_only_on_an_escape() {
             call_id: id.into(),
             arguments,
             custom: false,
+            links: Default::default(),
         };
         (Bytes::from(serde_json::to_vec(&item).unwrap()), call)
     };
@@ -1143,6 +1148,7 @@ fn a_bot_that_never_asks_announces_nothing_its_gates_hold() {
             call_id: id.into(),
             arguments,
             custom: false,
+            links: Default::default(),
         };
         (Bytes::from(serde_json::to_vec(&item).unwrap()), call)
     };
@@ -1337,6 +1343,7 @@ fn lapsing_round(db: &mut Database, calls: &[(&str, &str)]) -> (i64, Vec<ToolCal
                 name: name.into(),
                 call_id: call_id.into(),
                 arguments,
+                links: Default::default(),
             };
             (serde_json::to_vec(&item).unwrap().into(), call)
         })
@@ -1382,6 +1389,7 @@ fn a_turn_parks_on_the_load_gate_before_its_command_and_wakes_to_run_it() {
             name: "shell".into(),
             call_id: call_id.into(),
             arguments: json!({"command":"true"}).to_string(),
+            links: Default::default(),
         })
         .collect();
     let items = round
@@ -1687,6 +1695,7 @@ fn a_long_field_hides_no_other_in_a_listing() {
         name: "shell".into(),
         call_id: "s1".into(),
         arguments,
+        links: Default::default(),
     };
     db.append(
         turn,
@@ -3877,6 +3886,7 @@ fn schema_78_counts_a_call_left_unanswered_before_the_upgrade_as_taken() {
                 call_id: format!("c{n}"),
                 arguments: "{}".into(),
                 custom: false,
+                links: Default::default(),
             })
             .collect();
         db.append(turn, vec![], &calls, None).unwrap();
@@ -4730,6 +4740,7 @@ fn a_prompts_read_names_the_files_its_left_out_calls_wrote() {
             name: name.into(),
             call_id: id.into(),
             arguments,
+            links: Default::default(),
         };
         (Bytes::from(serde_json::to_vec(&item).unwrap()), call)
     };
@@ -5728,6 +5739,7 @@ fn a_call_is_taken_once_and_a_second_take_is_refused_so_it_never_runs_twice() {
             call_id: format!("c{n}"),
             arguments: "{}".into(),
             custom: false,
+            links: Default::default(),
         })
         .collect();
     db.append(turn, vec![], &calls, None).unwrap();
@@ -5823,6 +5835,7 @@ fn waiting_calls_page_past_held_answers_and_an_answer_out_of_time_is_refused() {
             call_id: format!("c{n}"),
             arguments: "{}".into(),
             custom: false,
+            links: Default::default(),
         })
         .collect();
     db.append(turn, vec![], &calls, None).unwrap();
@@ -5898,6 +5911,7 @@ fn a_parked_answer_s_pictures_are_stored_once_its_result_is() {
         call_id: "c1".into(),
         arguments: "{}".into(),
         custom: false,
+        links: Default::default(),
     };
     db.append(turn, vec![], std::slice::from_ref(&call), None)
         .unwrap();
@@ -6074,6 +6088,7 @@ fn artifacts_are_scoped_to_the_owning_bot_and_lineage_checks_use_depth() {
         name: "shell".into(),
         call_id: "c1".into(),
         arguments: "{}".into(),
+        links: Default::default(),
     };
     db.append(turn, vec![], std::slice::from_ref(&call), None)
         .unwrap();
@@ -8099,6 +8114,7 @@ fn forks_start_at_any_answered_message_and_default_to_the_head() {
         name: "echo".into(),
         call_id: "c1".into(),
         arguments: "{}".into(),
+        links: Default::default(),
     };
     let call_item: Bytes = serde_json::to_vec(&json!({"type":"function_call","name":"echo",
         "call_id":"c1","arguments":"{}"}))
@@ -8225,6 +8241,7 @@ fn call(call_id: &str) -> (Bytes, ToolCall) {
         name: "echo".into(),
         call_id: call_id.into(),
         arguments: "{}".into(),
+        links: Default::default(),
     };
     (item, call)
 }
@@ -8666,6 +8683,7 @@ fn forks_preserve_reasoning_pairs_and_require_every_parallel_result() {
             name: "echo".into(),
             call_id: id.into(),
             arguments: "{}".into(),
+            links: Default::default(),
         })
         .collect();
     let mut items = vec![reasoning.clone()];
@@ -8792,6 +8810,7 @@ fn anthropic_forks_check_the_whole_tool_batch_after_a_checkpoint() {
             name: "echo".into(),
             call_id: id.into(),
             arguments: "{}".into(),
+            links: Default::default(),
         })
         .collect();
     let blocks: Vec<Value> = calls
@@ -10245,6 +10264,7 @@ fn ready_turns_wait_for_a_slot_and_survive_interrupted_predecessors() {
         name: "echo".into(),
         call_id: "call-1".into(),
         arguments: "{}".into(),
+        links: Default::default(),
     };
     db.append(first.turn, vec![assistant("calling")], &[call], None)
         .unwrap();
@@ -10365,6 +10385,7 @@ fn retention_preserves_unfinished_turns_and_their_completed_prefix() {
         name: "echo".into(),
         call_id: "live".into(),
         arguments: "{}".into(),
+        links: Default::default(),
     };
     db.append(first.turn, vec![], std::slice::from_ref(&call), None)
         .unwrap();
@@ -11991,6 +12012,7 @@ fn a_halt_says_a_call_it_cut_off_has_an_unknown_outcome_and_one_it_never_started
             name: "write".into(),
             call_id: id.into(),
             arguments: r#"{"path":"file","content":"hello"}"#.into(),
+            links: Default::default(),
         });
         let items = calls
             .iter()
@@ -13979,6 +14001,7 @@ fn exchange(db: &mut Database, turn: i64, call_id: &str, output: &str) -> (i64, 
         name: "shell".into(),
         call_id: call_id.into(),
         arguments: "{}".into(),
+        links: Default::default(),
     };
     let item = json!({"type":"function_call","call_id":call_id,"name":"shell","arguments":"{}"});
     let entries = db
@@ -14113,6 +14136,7 @@ fn pictures_count_at_their_weight_and_go_whole() {
         call_id: "c1".into(),
         arguments: "{}".into(),
         custom: false,
+        links: Default::default(),
     };
     let item = json!({"type":"function_call","call_id":"c1","name":"read","arguments":"{}"});
     db.append(
@@ -14349,6 +14373,7 @@ fn a_current_turn_over_budget_fits_once_its_answered_results_are_elided() {
                 name: "shell".into(),
                 call_id: format!("c{n}"),
                 arguments: "{}".into(),
+                links: Default::default(),
             };
             let item = match family {
                 Family::Responses => {
@@ -14560,6 +14585,7 @@ fn a_result_s_text_parts_elide_together() {
         name: "shell".into(),
         call_id: "c0".into(),
         arguments: "{}".into(),
+        links: Default::default(),
     };
     let item = json!({"type":"function_call","call_id":"c0","name":"shell","arguments":"{}"});
     db.append(
@@ -14609,6 +14635,7 @@ fn a_custom_tool_s_pictures_are_read_without_their_bytes() {
         name: "shot".into(),
         call_id: "c0".into(),
         arguments: "page".into(),
+        links: Default::default(),
     };
     let item = json!({"type":"custom_tool_call","call_id":"c0","name":"shot","input":"page"});
     db.append(
@@ -15980,6 +16007,7 @@ fn a_fork_narrows_what_it_may_call_and_never_widens() {
         call_id: "c".into(),
         arguments: r#"{"command":"true"}"#.into(),
         custom: false,
+        links: Default::default(),
     };
     let folder = std::path::Path::new("/synthetic");
     assert!(
@@ -16034,6 +16062,7 @@ fn a_fork_narrows_what_it_may_call_and_never_widens() {
         name: "read".into(),
         call_id: "r2".into(),
         arguments: arguments.clone(),
+        links: Default::default(),
     };
     let item = json!({"type":"function_call","id":"fc_3","call_id":"r2","name":"read","arguments":arguments});
     let entries = db
@@ -18016,6 +18045,7 @@ fn a_waiting_step_ended_in_a_group_that_fails_is_told_of_once_one_commits() {
         call_id: "c1".into(),
         arguments: "{}".into(),
         custom: false,
+        links: Default::default(),
     };
     db.append(turn, vec![], std::slice::from_ref(&call), None)
         .unwrap();
@@ -19420,6 +19450,7 @@ fn read_call(call_id: &str) -> ToolCall {
         name: "read".into(),
         call_id: call_id.into(),
         arguments: json!({"path":"/synthetic/a"}).to_string(),
+        links: Default::default(),
     }
 }
 
@@ -19578,6 +19609,7 @@ fn stepping_turn_under(db: &mut Database, gated: bool, settings: Settings) -> (i
         call_id: "c1".into(),
         arguments: "{}".into(),
         custom: false,
+        links: Default::default(),
     };
     db.append(turn, vec![], std::slice::from_ref(&call), None)
         .unwrap();
@@ -20994,6 +21026,7 @@ fn a_lifted_answered_call_takes_its_answer_or_is_stopped_and_outlives_a_restart(
                 call_id: format!("c{n}"),
                 arguments: "{}".into(),
                 custom: false,
+                links: Default::default(),
             })
             .collect();
         db.append(turn, vec![], &calls, None).unwrap();
@@ -21106,6 +21139,7 @@ fn a_lifted_answered_call_keeps_its_time_steps_listing_and_audit_row() {
         call_id: "c1".into(),
         arguments: "{}".into(),
         custom: false,
+        links: Default::default(),
     };
     db.append(turn, vec![], std::slice::from_ref(&call), None)
         .unwrap();

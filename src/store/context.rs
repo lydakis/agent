@@ -310,6 +310,19 @@ pub fn without_thinking(item: &[u8]) -> Option<Vec<u8>> {
     Some(out)
 }
 
+/// Whether `item` is a Responses reasoning item, which a request leaves
+/// out whole when it withholds thinking.
+pub(crate) fn reasoning(item: &[u8]) -> bool {
+    #[derive(serde::Deserialize)]
+    struct Item<'a> {
+        #[serde(rename = "type", borrow)]
+        kind: Option<&'a str>,
+    }
+    // Most items are not; a substring search skips parsing them.
+    std::str::from_utf8(item).is_ok_and(|text| text.contains("\"reasoning\""))
+        && serde_json::from_slice::<Item<'_>>(item).is_ok_and(|item| item.kind == Some("reasoning"))
+}
+
 /// Bytes a request saves when it sends an item without thinking, recorded
 /// when the item is stored. A left-out item also takes its comma separator.
 pub fn thinking_bytes(item: &[u8]) -> usize {

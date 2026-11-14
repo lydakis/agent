@@ -45,6 +45,22 @@ const BUDGETS: [(&str, usize); 3] = [
     ("superlead", 3 * 1024),
 ];
 
+/// The project in `dir` (`agent_client::project::read`), its file's
+/// `threads_*` keys renamed `task_*` first, once for the file
+/// (`TASK_KEYS`, recorded in `~/.agent/sonny/migrated` when it renamed
+/// some), so old keys a checkout brings back after are refused by name.
+pub fn read(dir: &Path) -> Result<Value, String> {
+    use agent_client::project::{FILE, TASK_KEYS, rename_task_keys};
+    if let Some(home) = std::env::var_os("HOME") {
+        let record = Path::new(&home).join(".agent/sonny/migrated");
+        let file = dir.join(FILE);
+        crate::upgrade::once_for(&record, TASK_KEYS, &file.to_string_lossy(), || {
+            rename_task_keys(dir)
+        });
+    }
+    agent_client::project::read(dir)
+}
+
 /// [`BUILTINS`] as agents read them: without the commons while it is off.
 pub fn builtins() -> [(&'static str, std::borrow::Cow<'static, str>); 3] {
     BUILTINS.map(|(name, text)| (name, crate::commons::role(text)))
@@ -89,10 +105,10 @@ pub fn lead_profile(info: &Value) -> Result<String, String> {
 }
 
 /// The name of the profile every agent but a lead is told after the rest:
-/// the project file's `threads_profile`, else the config's
+/// the project file's `task_profile`, else the config's
 /// `[sonny] task_profile`, else `task`.
 pub fn task_profile(info: &Value) -> Result<String, String> {
-    named(info, "threads_profile", |sonny| sonny.task_profile, "task")
+    named(info, "task_profile", |sonny| sonny.task_profile, "task")
 }
 
 fn named(
@@ -344,7 +360,7 @@ pub struct Lead {
 /// The folder's own name reduced to name characters, the name of a
 /// project with no file.
 fn default_name(dir: &Path) -> Result<String, String> {
-    let info = agent_client::project::read(dir)?;
+    let info = read(dir)?;
     Ok(info["name"].as_str().unwrap_or("project").to_owned())
 }
 
@@ -362,7 +378,7 @@ pub fn chosen(store: &Path, bot: &str) -> Option<String> {
 fn role(dir: &Path, chosen: Option<&str>) -> Result<agent_client::policy::Profile, String> {
     match chosen {
         Some(name) => profile(dir, name),
-        None => profile(dir, &lead_profile(&agent_client::project::read(dir)?)?),
+        None => profile(dir, &lead_profile(&read(dir)?)?),
     }
 }
 
@@ -379,7 +395,7 @@ fn role_or_shipped(
         Err(error) if chosen.is_some() => return Err(error),
         Err(error) => error,
     };
-    let name = (agent_client::project::read(dir).ok())
+    let name = (read(dir).ok())
         .and_then(|info| lead_profile(&info).ok())
         .filter(|name| shipped(name).is_some())
         .unwrap_or_else(|| "lead".into());
@@ -390,31 +406,23 @@ fn role_or_shipped(
     Ok(role)
 }
 
-/// A lead's instructions as Sonny composes them for `dir` now: its role,
-/// the folder's rules, skills and memory, then the project's task rule.
-/// Rex is the rex-windows skill's to
-/// explain, so they read the same in any client.
-pub fn instructions(dir: &Path, chosen: Option<&str>) -> Result<Composed, String> {
-    compose(dir, chosen)
-}
-
 /// A lead's instructions as composed now, and what was left out of them.
 pub struct Composed {
     pub text: String,
-    /// The names of the skills they list.
-    skills: Vec<String>,
     /// Each file (or the role) that could not be used, and why: the
     /// lead opens without it, and it and the person are told.
     pub left_out: Vec<String>,
 }
 
-/// The instructions for a lead in the role `chosen` or its project's.
+/// A lead's instructions as Sonny composes them for `dir` now, in the
+/// role `chosen` or its project's: its role, the folder's rules, skills
+/// and memory, then the project's task rule.
 fn compose(dir: &Path, chosen: Option<&str>) -> Result<Composed, String> {
     let mut left_out = Vec::new();
     let role = role_or_shipped(dir, chosen, &mut left_out)?;
     let mut composed = folder(dir, &role)?;
     left_out.append(&mut composed.left_out);
-    let info = agent_client::project::read(dir)?;
+    let info = read(dir)?;
     let rule = agent_client::project::rule(&info);
     composed.text = format!("{}\n\n{rule}", composed.text);
     composed.left_out = left_out;
@@ -430,11 +438,6 @@ fn folder(dir: &Path, role: &agent_client::policy::Profile) -> Result<Composed, 
     let memory = memory(dir)?;
     let composed = agent_client::policy::instructions_leaving_out(dir, Some(role), &memory)
         .map_err(|e| e.to_string())?;
-    let skills = composed
-        .skills
-        .into_iter()
-        .map(|skill| skill.name)
-        .collect();
     // Paths under the home folder as `~`, so a narrow window shows what
     // is missing; the lead's shell reads them the same.
     let home = std::env::var("HOME").unwrap_or_default();
@@ -450,7 +453,6 @@ fn folder(dir: &Path, role: &agent_client::policy::Profile) -> Result<Composed, 
         .collect();
     Ok(Composed {
         text: composed.text,
-        skills,
         left_out,
     })
 }
@@ -471,74 +473,20 @@ pub fn plain(dir: &Path) -> Result<String, String> {
     let memory = agent_client::policy::memory_indexes(dir).map_err(|e| e.to_string())?;
     let composed = agent_client::policy::instructions(dir, None, &memory)
         .map_err(|e| format!("{}: {e}", e.code()))?;
-    as_task(dir, &agent_client::project::read(dir)?, &composed.text)
+    as_task(dir, &read(dir)?, &composed.text)
 }
 
-/// What attaching does with a lead's instructions.
-#[derive(Debug, PartialEq)]
-pub enum Instructions {
-    /// They are what the folder composes today.
-    Current,
-    /// A client composed what they hold, and the folder has changed since:
-    /// these replace them.
-    Stale(String),
-    /// They were set some other way, or before Sonny saw this lead, and
-    /// are kept until the person asks for the folder's. `missing` names
-    /// the folder's skills they do not list, such as the layout skill
-    /// Sonny installed after they were set.
-    Kept { missing: Vec<String> },
-}
-
-impl Instructions {
-    /// What Sonny tells the person about instructions it keeps: the
-    /// command first, so a narrow pane still shows what to do.
-    pub fn kept_notice(missing: &[String]) -> String {
-        let why = "its instructions were set outside its folder's files";
-        match missing {
-            [] => "the lead's instructions were set outside its folder's files; \
-                   /instructions takes the folder's"
-                .into(),
-            [skill] => format!("/instructions gives the lead the {skill} skill: {why}"),
-            skills => format!(
-                "/instructions gives the lead the {} skills: {why}",
-                skills.join(", ")
-            ),
-        }
-    }
-}
-
-/// Whether a lead's instructions may follow the folder: only when Sonny
-/// wrote what they hold (or saw a client compose it), so instructions the
-/// person set some other way are never overwritten.
-/// With what was left out of the folder's instructions, which the lead
-/// goes without whichever it is.
+/// The folder's instructions for a lead, when they are not the ones it
+/// `held` last: a lead takes its folder's as its window opens and at each
+/// idle point after. With what was left out of them, which the lead goes
+/// without either way.
 pub fn review(
     dir: &Path,
-    bot: &Value,
-    lead: &str,
-    new: bool,
+    held: &str,
     chosen: Option<&str>,
-) -> Result<(Instructions, Vec<String>), String> {
-    let Composed {
-        text: composed,
-        skills,
-        left_out,
-    } = compose(dir, chosen)?;
-    let current = bot["instructions"].as_str().unwrap_or_default();
-    let reviewed = if current == composed {
-        wrote(lead, current);
-        Instructions::Current
-    } else if new || written(lead).is_some_and(|key| key == fingerprint(current)) {
-        Instructions::Stale(composed)
-    } else {
-        // The composed text lists each skill as "- NAME: summary (path)".
-        let missing = skills
-            .into_iter()
-            .filter(|name| !current.contains(&format!("- {name}:")))
-            .collect();
-        Instructions::Kept { missing }
-    };
-    Ok((reviewed, left_out))
+) -> Result<(Option<String>, Vec<String>), String> {
+    let Composed { text, left_out } = compose(dir, chosen)?;
+    Ok(((text != held).then_some(text), left_out))
 }
 
 /// Where a note of what a lead opened without comes from.
@@ -591,48 +539,6 @@ pub fn warnings_notice(warnings: &[String], told: bool) -> Option<String> {
     }
 }
 
-/// What names a lead across daemons: bot ids count from one in each
-/// store, so the daemon's socket is part of the name.
-pub fn lead(socket: &Path, bot: &Value) -> String {
-    let socket = std::fs::canonicalize(socket).unwrap_or_else(|_| socket.to_owned());
-    let id = bot["bot_id"].as_i64().unwrap_or_default();
-    format!("{}-{id}", fingerprint(&socket.to_string_lossy()))
-}
-
-/// Where Sonny keeps a fingerprint of the instructions it last saw `lead`
-/// take from its folder: one file a lead, so two Sonnys never write over
-/// each other's.
-fn written_path(lead: &str) -> Option<PathBuf> {
-    std::env::var_os("HOME").map(|home| {
-        PathBuf::from(home)
-            .join(".agent/sonny/instructions")
-            .join(lead)
-    })
-}
-
-fn written(lead: &str) -> Option<String> {
-    let text = std::fs::read_to_string(written_path(lead)?).ok()?;
-    Some(text.trim().to_owned())
-}
-
-/// Note that `lead` now holds `text`, composed from its folder.
-pub fn wrote(lead: &str, text: &str) {
-    let Some(path) = written_path(lead) else {
-        return;
-    };
-    let key = fingerprint(text);
-    if written(lead).as_deref() == Some(key.as_str()) {
-        return;
-    }
-    if let Some(dir) = path.parent() {
-        let _ = std::fs::create_dir_all(dir);
-    }
-    let temp = path.with_extension(format!("{}.tmp", std::process::id()));
-    if std::fs::write(&temp, format!("{key}\n")).is_ok() {
-        let _ = std::fs::rename(&temp, &path);
-    }
-}
-
 /// FNV-1a, as hex: stable across runs and builds.
 pub fn fingerprint(text: &str) -> String {
     let hash = text.bytes().fold(0xcbf2_9ce4_8422_2325u64, |hash, byte| {
@@ -680,7 +586,7 @@ pub fn keep_model(dir: &Path, model: &str, effort: Option<&str>) -> Result<(), S
             format!("{}: {error}", path.display())
         })?;
     // Read back as the app reads it, so a bad edit is said, not kept quiet.
-    agent_client::project::read(dir).map(|_| ())
+    self::read(dir).map(|_| ())
 }
 
 /// `text` with its top-level `model` and `effort` set (or `effort`
@@ -982,7 +888,7 @@ fn claimed(folder: &Path, home: Option<&Path>) -> Result<Option<PathBuf>, String
             break;
         }
         if at.join(file).is_file() {
-            let info = agent_client::project::read(at)?;
+            let info = read(at)?;
             return Ok((info["subfolders"] == "project").then(|| at.to_owned()));
         }
     }
@@ -1049,7 +955,7 @@ async fn create(
     // What it was made without is said where it opens, as each window
     // reviews its instructions.
     let role = role_or_shipped(dir, chosen, &mut Vec::new())?;
-    let info = agent_client::project::read(dir)?;
+    let info = read(dir)?;
     // A project file that names a model keeps it; otherwise asked for,
     // the role's, AGENT_MODEL's, the config's `model`, then the newest
     // agent's, so a bare `sonny` needs no flag. With none, the person picks
@@ -1125,7 +1031,7 @@ async fn make(
     let gate = crate::approvals::gate(mode, &crate::approvals::gateable(&tools, &declare));
     // Writing its own state folder, by the name it is made under.
     let lead = (bot.map(str::to_owned)).or_else(|| {
-        let info = agent_client::project::read(dir).ok()?;
+        let info = read(dir).ok()?;
         info["coordinator"].as_str().map(str::to_owned)
     });
     let state = lead.as_deref().and_then(crate::state::folder);
@@ -1157,7 +1063,7 @@ async fn make(
 
 /// A `new_project` call of `caller`'s: the project Sonny makes for a
 /// folder, on the caller's daemon (`created: false` when it was there
-/// already), its lead opened in a home of its own.
+/// already), its lead opened in a workspace of its own.
 pub async fn add(caller: &str, arguments: &Value) -> Result<Value, String> {
     let (dir, mut picks) = picks(arguments)?;
     let config = agent_client::config::load()?;
@@ -1174,13 +1080,6 @@ pub async fn add(caller: &str, arguments: &Value) -> Result<Value, String> {
         .map_err(|e| format!("{}: {}", e.code, e.detail.unwrap_or_default()))?;
     let mut made = make(&client, &dir, &role(&dir, None)?, &picks, None).await;
     if let Ok(made) = &mut made {
-        // Composed from its folder, so the lead follows the folder's
-        // changes as one Sonny opened there does, when it opens.
-        if made["created"] == true
-            && let Some(text) = made["record"]["instructions"].as_str()
-        {
-            wrote(&lead(&socket, &made["record"]), text);
-        }
         open_new_lead(&client, &socket, caller, made).await;
         made.as_object_mut().map(|m| m.remove("record"));
     }
@@ -1188,7 +1087,7 @@ pub async fn add(caller: &str, arguments: &Value) -> Result<Value, String> {
     made
 }
 
-/// A lead made for another agent opens in a home of its own, a Herdr or
+/// A lead made for another agent opens in a workspace of its own, a Herdr or
 /// cmux workspace or a Rex session beside the caller's, as the person would
 /// otherwise ask; `opened_in` says where, or `not_opened` why not.
 async fn open_new_lead(client: &Client, socket: &Path, caller: &str, made: &mut Value) {
@@ -1227,17 +1126,17 @@ fn picks(arguments: &Value) -> Result<(PathBuf, agent_client::project::Picks), S
         effort: text("effort"),
         ..Default::default()
     };
-    let (threads_model, threads_effort) = (text("threads_model"), text("threads_effort"));
-    let threads_in = text("threads_in");
-    let in_project = match threads_in.as_deref() {
+    let (task_model, task_effort) = (text("task_model"), text("task_effort"));
+    let task_in = text("task_in");
+    let in_project = match task_in.as_deref() {
         None | Some("worktree") => false,
         Some("project") => true,
-        Some(other) => return Err(format!("project_invalid: threads_in {other:?}")),
+        Some(other) => return Err(format!("project_invalid: task_in {other:?}")),
     };
-    if threads_model.is_some() || threads_effort.is_some() || threads_in.is_some() {
-        picks.threads = Some(agent_client::project::ThreadPicks {
-            model: threads_model,
-            effort: threads_effort,
+    if task_model.is_some() || task_effort.is_some() || task_in.is_some() {
+        picks.tasks = Some(agent_client::project::TaskPicks {
+            model: task_model,
+            effort: task_effort,
             in_project,
         });
     }
@@ -1353,7 +1252,7 @@ mod tests {
     #[test]
     fn a_new_project_reads_its_picks_and_refuses_others() {
         let picked = |arguments: Value| picks(&arguments);
-        for bad in [json!({}), json!({"folder": "/", "threads_in": "elsewhere"})] {
+        for bad in [json!({}), json!({"folder": "/", "task_in": "elsewhere"})] {
             assert!(
                 picked(bad.clone())
                     .unwrap_err()
@@ -1367,16 +1266,16 @@ mod tests {
                 .starts_with("project_invalid: ")
         );
         let (_, picks) =
-            picked(json!({"folder": "/", "model": "a/b", "threads_in": "project"})).unwrap();
+            picked(json!({"folder": "/", "model": "a/b", "task_in": "project"})).unwrap();
         assert_eq!(picks.model.as_deref(), Some("a/b"));
         assert!(
             picks
-                .threads
+                .tasks
                 .is_some_and(|t| t.in_project && t.model.is_none())
         );
         // Tasks may take an effort of their own on the lead's model.
-        let (_, picks) = picked(json!({"folder": "/", "threads_effort": "xhigh"})).unwrap();
-        assert!(picks.threads.is_some_and(|t| t.model.is_none()
+        let (_, picks) = picked(json!({"folder": "/", "task_effort": "xhigh"})).unwrap();
+        assert!(picks.tasks.is_some_and(|t| t.model.is_none()
             && t.effort.as_deref() == Some("xhigh")
             && !t.in_project));
     }
@@ -1416,7 +1315,7 @@ mod tests {
         let (base, coordination) = base.split_once(skill).unwrap();
         assert!(lead.body.starts_with(base));
         assert!(lead.body.ends_with(coordination));
-        let text = instructions(&dir, None).unwrap().text;
+        let text = compose(&dir, None).unwrap().text;
         assert!(text.contains("# Role: my-lead\n\n"), "{text}");
         // A variant of the lead is no role to start a peer in.
         assert!(!text.contains("- my-lead:"));
@@ -1430,12 +1329,7 @@ mod tests {
         assert!(lead.body.starts_with(base));
         assert!(lead.body.contains("you lead their leads"));
         assert!(lead.body.ends_with(coordination));
-        assert!(
-            !instructions(&dir, None)
-                .unwrap()
-                .text
-                .contains("- superlead:")
-        );
+        assert!(!compose(&dir, None).unwrap().text.contains("- superlead:"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1447,7 +1341,7 @@ mod tests {
         let dir = dir.canonicalize().unwrap();
         // A skill copied as a link to where it no longer is.
         std::os::unix::fs::symlink("/nowhere/review", dir.join(".agents/skills/review")).unwrap();
-        let composed = instructions(&dir, None).unwrap();
+        let composed = compose(&dir, None).unwrap();
         assert_eq!(
             composed.left_out,
             [format!(
@@ -1460,12 +1354,12 @@ mod tests {
         std::fs::create_dir_all(dir.join(".agents/agents")).unwrap();
         std::os::unix::fs::symlink("gone.md", dir.join(".agents/agents/lead.md")).unwrap();
         assert!(role(&dir, None).is_err());
-        let composed = instructions(&dir, None).unwrap();
+        let composed = compose(&dir, None).unwrap();
         assert!(composed.left_out[0].starts_with("the lead's role: instructions_unreadable: "));
         assert!(composed.left_out[0].ends_with("it runs as Sonny's own lead role"));
         assert!(composed.text.contains("# Role: lead\n\n"));
         // One picked by name is the person's to fix.
-        assert!(instructions(&dir, Some("lead")).is_err());
+        assert!(compose(&dir, Some("lead")).is_err());
         // The window says the first, and how many more.
         assert_eq!(
             warnings_notice(&["a".into(), "b".into(), "c".into()], true).as_deref(),
@@ -1599,8 +1493,8 @@ mod tests {
     }
 
     #[test]
-    fn kept_instructions_name_the_skills_they_miss() {
-        let dir = std::env::temp_dir().join(format!("sonny-kept-{}", std::process::id()));
+    fn a_lead_takes_its_folder_s_instructions_only_when_they_changed() {
+        let dir = std::env::temp_dir().join(format!("sonny-review-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join(".agents/skills/deploy")).unwrap();
         std::fs::write(
@@ -1608,39 +1502,20 @@ mod tests {
             "# Deploy\n\nShip it.",
         )
         .unwrap();
-        let lead = format!("kept-test-{}", std::process::id());
-        let missing = |instructions: &str| {
-            let bot = serde_json::json!({ "instructions": instructions });
-            match review(&dir, &bot, &lead, false, None).unwrap().0 {
-                Instructions::Kept { missing } => missing,
-                other => panic!("kept, not {other:?}"),
-            }
-        };
-        assert!(missing("set by hand").contains(&"deploy".to_owned()));
-        assert!(!missing("set by hand\n- deploy: Deploy (x)").contains(&"deploy".to_owned()));
-        assert!(
-            Instructions::kept_notice(&["herdr-panes".into()])
-                .starts_with("/instructions gives the lead the herdr-panes skill:")
-        );
+        let (taken, _) = review(&dir, "set by hand", None).unwrap();
+        let taken = taken.expect("the folder's, over what was set by hand");
+        assert!(taken.contains("- deploy:"));
+        assert_eq!(review(&dir, &taken, None).unwrap().0, None);
         let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn leads_of_two_daemons_with_one_id_have_two_names() {
-        let bot = serde_json::json!({"bot_id": 1});
-        let one = lead(Path::new("/tmp/one/state.sqlite.sock"), &bot);
-        let two = lead(Path::new("/tmp/two/state.sqlite.sock"), &bot);
-        assert_ne!(one, two);
-        assert!(one.ends_with("-1"));
     }
 
     #[test]
     fn the_project_file_keeps_its_other_lines_when_the_model_moves() {
         let file =
-            "# mine\nname = \"shop\"\nmodel = \"openai/a\"   # pinned\nthreads_in = \"project\"\n";
+            "# mine\nname = \"shop\"\nmodel = \"openai/a\"   # pinned\ntask_in = \"project\"\n";
         assert_eq!(
             with_model(file, "anthropic/b", Some("high")),
-            "# mine\nname = \"shop\"\nmodel = \"anthropic/b\"\neffort = \"high\"\nthreads_in = \"project\"\n"
+            "# mine\nname = \"shop\"\nmodel = \"anthropic/b\"\neffort = \"high\"\ntask_in = \"project\"\n"
         );
         let file = "name = \"shop\"\neffort = \"low\"\nmodel = \"openai/a\"\n";
         assert_eq!(

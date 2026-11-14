@@ -1,7 +1,11 @@
 //! A list picked with the arrow keys, drawn in place under the lines
-//! before it, as Codex and Claude Code ask their first-run questions:
-//! Enter takes the marked row, typing narrows the rows as every list
-//! does ([`crate::fuzzy`]), Esc or Ctrl+C cancels. Once picked, the list folds into one line naming the pick.
+//! before it, as Codex and Claude Code ask their first-run questions, in
+//! the look and words of the window's lists ([`crate::list`]): rows
+//! `list::INDENT` in, the pick reversed from its name to a column past its
+//! last word, the rest muted after the name. Enter takes the picked row,
+//! typing narrows the rows as every list does ([`crate::fuzzy`]), Esc or
+//! Ctrl+C cancels. Once picked, the list folds into one line naming the
+//! pick.
 use ratatui::crossterm::{
     event::{self, Event, KeyCode, KeyEventKind, KeyModifiers},
     terminal::{disable_raw_mode, enable_raw_mode},
@@ -11,9 +15,9 @@ use std::io::Write;
 #[derive(Clone)]
 pub struct Row {
     pub label: String,
-    /// Dimmed after the label.
+    /// Muted after the label.
     pub detail: String,
-    /// A word in the accent colour after the detail, as `found`.
+    /// A word after the detail, as `found`, muted as it is.
     pub badge: Option<String>,
 }
 
@@ -44,9 +48,9 @@ pub enum Picked {
 /// row scrolls the rest into view.
 const SHOWN: usize = 10;
 
-const ACCENT: &str = "\x1b[38;2;255;190;60m";
 const BOLD: &str = "\x1b[1m";
 const DIM: &str = "\x1b[2m";
+const REVERSED: &str = "\x1b[7m";
 const RESET: &str = "\x1b[0m";
 
 /// Asks `title` over `rows` with `marked` first marked. With `typed`,
@@ -81,7 +85,7 @@ pub fn pick(title: &str, rows: &[Row], marked: usize, typed: bool) -> Result<Pic
             Picked::Row(index) => rows[*index].label.as_str(),
             Picked::Typed(text) => text.as_str(),
         };
-        println!("{BOLD}{title}{RESET} {ACCENT}{answer}{RESET}");
+        println!("{BOLD}{title}{RESET} {answer}");
     }
     let _ = std::io::stdout().flush();
     picked
@@ -141,7 +145,7 @@ pub fn pick_many(title: &str, rows: &[Row], mut ticked: Vec<bool>) -> Result<Vec
             true => "none".to_owned(),
             false => names.join(", "),
         };
-        println!("{BOLD}{title}{RESET} {ACCENT}{answer}{RESET}");
+        println!("{BOLD}{title}{RESET} {answer}");
     }
     let _ = std::io::stdout().flush();
     picked
@@ -270,29 +274,9 @@ fn draw(title: &str, rows: &[Row], list: &mut List, hint: Hint, drawn: usize) ->
         .map(|&index| rows[index].label.chars().count())
         .max()
         .unwrap_or(0)
-        .min(columns.saturating_sub(3));
+        .min(columns.saturating_sub(crate::list::INDENT + 1));
     for (place, &index) in shown.iter().enumerate().skip(list.top).take(fit) {
-        let row = &rows[index];
-        let label = clip(&row.label, width);
-        let pad = " ".repeat(width - label.chars().count());
-        // What fits after the marker and the label, the last column
-        // left free: the badge, then as much of the detail as is room.
-        let mut room = columns.saturating_sub(3 + width);
-        let badge = match row.badge.as_deref() {
-            Some(badge) if badge.chars().count() + 2 <= room => {
-                room -= badge.chars().count() + 2;
-                format!("  {ACCENT}{badge}{RESET}")
-            }
-            _ => String::new(),
-        };
-        let detail = match room > 2 && !row.detail.is_empty() {
-            true => format!("  {DIM}{}{RESET}", clip(&row.detail, room - 2)),
-            false => String::new(),
-        };
-        lines.push(match place == list.marked {
-            true => format!("{ACCENT}›{RESET} {BOLD}{label}{RESET}{pad}{detail}{badge}"),
-            false => format!("  {label}{pad}{detail}{badge}"),
-        });
+        lines.push(row_line(&rows[index], width, columns, place == list.marked));
     }
     let hidden = shown.len().saturating_sub(list.top + fit);
     let more = match hidden {
@@ -301,13 +285,13 @@ fn draw(title: &str, rows: &[Row], list: &mut List, hint: Hint, drawn: usize) ->
     };
     let hint = match (hint, shown.is_empty()) {
         (Hint::Tick, _) => {
-            format!("{more}↑↓ pick · enter choose · space tick · a all · esc cancel")
+            format!("{more}↑↓ pick · space tick · a all · enter choose · esc close")
         }
         (Hint::Pick { typed: true }, true) => {
-            "nothing listed matches · enter choose what you typed".to_owned()
+            "nothing listed matches · enter choose what you typed · esc close".to_owned()
         }
-        (Hint::Pick { .. }, true) => "nothing matches · ⌫ widen".to_owned(),
-        (Hint::Pick { .. }, false) => format!("{more}↑↓ pick · enter choose · type to narrow"),
+        (Hint::Pick { .. }, true) => "nothing matches · ⌫ widen · esc close".to_owned(),
+        (Hint::Pick { .. }, false) => format!("{more}↑↓ pick · enter choose · esc close"),
     };
     lines.push(format!(
         "{DIM}{}{RESET}",
@@ -318,6 +302,34 @@ fn draw(title: &str, rows: &[Row], list: &mut List, hint: Hint, drawn: usize) ->
     print!("{out}");
     let _ = std::io::stdout().flush();
     lines.len()
+}
+
+/// One row, `width` its label's column, `columns` the terminal's: the
+/// label `list::INDENT` in, then its detail and badge, muted; picked, the
+/// band reversed from the label to a column past its last word, in the
+/// text's own weight, as the window's lists draw their pick.
+fn row_line(row: &Row, width: usize, columns: usize, picked: bool) -> String {
+    let indent = " ".repeat(crate::list::INDENT);
+    let label = clip(&row.label, width);
+    let pad = " ".repeat(width - label.chars().count());
+    // What fits after the indent and the label, the last column left
+    // free: the badge, then as much of the detail as is room.
+    let mut room = columns.saturating_sub(crate::list::INDENT + 1 + width);
+    let badge = match row.badge.as_deref() {
+        Some(badge) if badge.chars().count() + 2 <= room => {
+            room -= badge.chars().count() + 2;
+            format!("  {badge}")
+        }
+        _ => String::new(),
+    };
+    let detail = match room > 2 && !row.detail.is_empty() {
+        true => format!("  {}", clip(&row.detail, room - 2)),
+        false => String::new(),
+    };
+    match picked {
+        true => format!("{indent}{REVERSED}{label}{pad}{detail}{badge} {RESET}"),
+        false => format!("{indent}{label}{pad}{DIM}{detail}{badge}{RESET}"),
+    }
 }
 
 /// `text` in at most `room` characters, cut with an ellipsis.
@@ -342,6 +354,26 @@ mod tests {
             Row::new("anthropic/claude-b", "Claude Haiku"),
             Row::new("openai/gpt-x", ""),
         ]
+    }
+
+    #[test]
+    fn a_row_is_drawn_as_the_windows_lists_draw_theirs() {
+        let row = Row::new("Claude Opus", "anthropic/claude-a").badge("recommended");
+        // In by the list's indent, the rest muted; no truecolor, no `›`.
+        assert_eq!(
+            row_line(&row, 12, 80, false),
+            "    Claude Opus \x1b[2m  anthropic/claude-a  recommended\x1b[0m"
+        );
+        // Picked: reversed from the name to a column past its last word.
+        assert_eq!(
+            row_line(&row, 12, 80, true),
+            "    \x1b[7mClaude Opus   anthropic/claude-a  recommended \x1b[0m"
+        );
+        // A narrow terminal drops the badge, then cuts the detail.
+        assert_eq!(
+            row_line(&row, 12, 28, false),
+            "    Claude Opus \x1b[2m  anthropi\u{2026}\x1b[0m"
+        );
     }
 
     #[test]

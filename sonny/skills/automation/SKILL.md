@@ -16,13 +16,13 @@ Give the job its own agent and folder, created with `--agents` so it reads
 the folder's rules and skills. Make the folder in your state folder,
 `"$SONNY_STATE"/jobs/NAME`: you, your tasks and the agents you make write
 it in every permissions row, and it outlives them. Then add an automation for it with the
-automations tool: `add` with `bot` NAME, `cron` 'MIN HOUR DAY MONTH WEEKDAY'
+automations tool: `add` with `agent` NAME, `cron` 'MIN HOUR DAY MONTH WEEKDAY'
 and `message` MESSAGE. Automations need the system's scheduler to keep the time:
 launchd on macOS, systemd's user manager on Linux. Without one `add` is
 refused with `automations_unsupported`, so say so rather than presenting a job
 as set up. Without the automations tool, outside
 Sonny, `"$HOME/.agent/automation" add` takes the same fields as flags
-(`--bot NAME --cron '...' -- MESSAGE`).
+(`--agent NAME --cron '...' -- MESSAGE`).
 
 MESSAGE names the folder and says to read and follow this file by its
 path, so every run follows the current text even if the agent's skill
@@ -122,7 +122,7 @@ the lead sets it up and handles what it reports. Its `preferences.md` names
 the lead as the destination and, when the person wants one, a destination
 for urgent items, such as a direct message to the person.
 
-Run it often and gate each run: `add` with `bot` NAME, `every` `10m`,
+Run it often and gate each run: `add` with `agent` NAME, `every` `10m`,
 `if` `cd "$SONNY_STATE"/jobs/NAME && ! ./quiet` and `message` MESSAGE. The
 `if` command runs in your own folder, hence the `cd`, and as your own
 commands do: in your sandbox, with your variables.

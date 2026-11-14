@@ -35,6 +35,7 @@
 //! [reviewer]
 //! model = "openai/gpt-6-luna"   # the model that reviews calls in auto, `sonny reviewer`
 //! effort = "low"                # the reviewer's effort
+//! timeout_ms = 90000            # how long a round waits for its verdict, every attempt included; 0 for as long as it takes
 //!
 //! [shell_environment_policy]    # what tool shells leave out, as in Codex
 //! ignore_default_excludes = false  # also *KEY*, *SECRET* and *TOKEN*; true, the default, keeps them
@@ -46,10 +47,9 @@
 //! task_speed = "fast"          # each new task's speed where its model serves it; else its starter's on the same model
 //! lead_profile = "my-lead"      # the role a new lead starts in, not lead
 //! task_profile = "worker"       # what every other agent is told, not task
-//! side_chat = "answer"          # calls no tool; "fork", the default, may do anything its agent may
+//! side_chat = "answer"          # calls no tool; "work", the default, may do anything its agent may
 //! chime = true                  # rings when work ends or waits; quiet by default
-//! steps = true                  # the agent's steps between what is said; words only by default
-//! verbose = true                # every tool call drawn, not the clean view
+//! view = "steps"               # "words", the default: your words and the agent's; "steps" adds what it did between; "verbose" every tool call
 //! text_width = 0                # the widest the conversation is written, 100 by default; 0 the window's whole width
 //! margin_opens = "never"         # "always", the default, or "unless-closed"
 //! margin_notes = 8              # the most notes a margin holds, 6 by default; past it a new one is refused
@@ -62,7 +62,7 @@
 //! commons_invite_tokens = 1000000  # the budget of the turn an invite starts, in tokens of work
 //! ask_wait_minutes = 60         # how long an unanswered ask waits to go ahead or remind; 0 never
 //! task_tabs = "every"         # which tasks open in a tab: "asked", the default, those an agent or you asked for; "every", each as its turn starts
-//! task_windows = 64            # task windows a lead keeps open, 32 by default; past it the least recently used closes, never one not looked at yet; 0 no limit
+//! most_task_tabs = 64          # task tabs a lead keeps open, 32 by default; past it the least recently used closes, never one not looked at yet; 0 no limit
 //! sky_haikus = false            # no haikus from the sky's busiest agent, on by default
 //! sky_haiku_daily = 8           # haikus a day at most; 0, the default, no limit but the title's hold
 //! sky_haiku_keep = 168          # hours haikus are kept for replays, 24 by default; 0 keeps all
@@ -555,6 +555,9 @@ pub struct ReviewerModel {
     /// `provider/model`; unset, the reviewed bot's own model.
     pub model: Option<String>,
     pub effort: Option<String>,
+    /// How long a round may wait for its verdict; unset, 90 s; 0, as long
+    /// as it takes.
+    pub timeout_ms: Option<u64>,
 }
 
 /// What Sonny starts its agents with, and how it shows them.
@@ -584,13 +587,8 @@ pub struct Sonny {
     /// Whether finished and waiting work rings; off by default.
     /// Notifications show either way.
     pub chime: bool,
-    /// Whether the conversation shows the agent's steps between what is
-    /// said (calls, news in, messages between agents, how long a turn
-    /// took), or only the person's words and the agent's (the default).
-    pub steps: bool,
-    /// Whether every tool call is drawn, or only the bot's words and the
-    /// calls that move the work on (the clean view, the default).
-    pub verbose: bool,
+    /// What the conversation shows: words, steps or every call.
+    pub view: View,
     /// The widest the conversation is written, in columns, however wide
     /// the window: 0 for the window's whole width. At least
     /// [`TEXT_WIDTH_LEAST`] otherwise.
@@ -635,11 +633,11 @@ pub struct Sonny {
     pub ask_wait_minutes: u64,
     /// Which tasks open in a tab of their own in the lead's multiplexer.
     pub task_tabs: TaskTabs,
-    /// How many of its tasks' windows a lead keeps open in its
-    /// multiplexer: past it, a new one closes the window the person used
+    /// How many of its tasks' tabs a lead keeps open in its
+    /// multiplexer: past it, a new one closes the tab the person used
     /// least recently, never one they have not looked at yet; 0 for no
     /// limit.
-    pub task_windows: u64,
+    pub most_task_tabs: u64,
     /// Whether the sky's busiest agent writes a haiku each time the title
     /// passes.
     pub sky_haikus: bool,
@@ -881,7 +879,7 @@ impl Default for Sonny {
             commons_source: commons_source(),
             ask_wait_minutes: 60,
             task_tabs: TaskTabs::default(),
-            task_windows: 32,
+            most_task_tabs: 32,
             sky_haikus: true,
             sky_haiku_daily: 0,
             sky_haiku_keep: 24,
@@ -891,8 +889,7 @@ impl Default for Sonny {
             tool_processes: 0,
             lookout_waiting: 1024,
             chime: false,
-            steps: false,
-            verbose: false,
+            view: View::default(),
             text_width: TEXT_WIDTH,
             start_at_boot: false,
             margin_opens: MarginOpens::default(),
@@ -910,14 +907,26 @@ impl Default for Sonny {
     }
 }
 
-/// What the copy `/side` talks to may do: `"fork"`, the default, anything
+/// What a window's conversation shows: `"words"`, the default, the
+/// person's words and the agent's; `"steps"`, also what the agent did
+/// between them (calls, news in, messages between agents, how long a turn
+/// took); or `"verbose"`, every tool call.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum View {
+    #[default]
+    Words,
+    Steps,
+    Verbose,
+}
+
+/// What the copy `/side` talks to may do: `"work"`, the default, anything
 /// its agent may, with its tools, in its folder, under its approvals; or
 /// `"answer"`, from what its agent knows, calling no tool.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum SideChat {
     Answer,
     #[default]
-    Fork,
+    Work,
 }
 
 /// When a note opens the margin beside the conversation, as VS Code's
@@ -1658,7 +1667,7 @@ fn parse(text: &str) -> Result<Config, String> {
             continue;
         }
         let keys: &[&str] = match name.as_str() {
-            "reviewer" => &["model", "effort"],
+            "reviewer" => &["model", "effort", "timeout_ms"],
             "shell_environment_policy" => &["ignore_default_excludes", "exclude"],
             "sonny" => &[
                 "lead_effort",
@@ -1668,8 +1677,7 @@ fn parse(text: &str) -> Result<Config, String> {
                 "task_profile",
                 "side_chat",
                 "chime",
-                "steps",
-                "verbose",
+                "view",
                 "text_width",
                 "margin_opens",
                 "margin_notes",
@@ -1683,7 +1691,7 @@ fn parse(text: &str) -> Result<Config, String> {
                 "commons_invite_tokens",
                 "ask_wait_minutes",
                 "task_tabs",
-                "task_windows",
+                "most_task_tabs",
                 "sky_haikus",
                 "sky_haiku_daily",
                 "sky_haiku_keep",
@@ -1700,6 +1708,14 @@ fn parse(text: &str) -> Result<Config, String> {
             _ => return Err(format!("unknown table [{name}]")),
         };
         for (key, value) in section {
+            if (name.as_str(), key.as_str()) == ("reviewer", "timeout_ms") {
+                config.reviewer.timeout_ms = Some(
+                    (value.as_integer())
+                        .and_then(|n| u64::try_from(n).ok())
+                        .ok_or("reviewer.timeout_ms must be a whole number, 0 or more")?,
+                );
+                continue;
+            }
             if (name.as_str(), key.as_str()) == ("sonny", "mcp_servers") {
                 let servers = value
                     .as_table()
@@ -1773,8 +1789,6 @@ fn parse(text: &str) -> Result<Config, String> {
                 "suggest" => Some(&mut config.sonny.suggest),
                 "suggest_ideas" => Some(&mut config.sonny.suggest_ideas),
                 "commons" => Some(&mut config.sonny.commons),
-                "steps" => Some(&mut config.sonny.steps),
-                "verbose" => Some(&mut config.sonny.verbose),
                 "start_at_boot" => Some(&mut config.sonny.start_at_boot),
                 "sky_haikus" => Some(&mut config.sonny.sky_haikus),
                 "project_colors" => Some(&mut config.sonny.project_colors),
@@ -1797,7 +1811,7 @@ fn parse(text: &str) -> Result<Config, String> {
                 "commons_invites" => Some(&mut config.sonny.commons_invites),
                 "commons_invite_tokens" => Some(&mut config.sonny.commons_invite_tokens),
                 "ask_wait_minutes" => Some(&mut config.sonny.ask_wait_minutes),
-                "task_windows" => Some(&mut config.sonny.task_windows),
+                "most_task_tabs" => Some(&mut config.sonny.most_task_tabs),
                 "sky_haiku_daily" => Some(&mut config.sonny.sky_haiku_daily),
                 "sky_haiku_keep" => Some(&mut config.sonny.sky_haiku_keep),
                 "sky_haiku_window" => Some(&mut config.sonny.sky_haiku_window),
@@ -1864,11 +1878,24 @@ fn parse(text: &str) -> Result<Config, String> {
                 continue;
             }
             let value = string(&format!("{name}.{key}"), value)?;
+            if key == "view" {
+                config.sonny.view = match value.as_str() {
+                    "words" => View::Words,
+                    "steps" => View::Steps,
+                    "verbose" => View::Verbose,
+                    other => {
+                        return Err(format!(
+                            "sonny.view is words, steps or verbose, not {other}"
+                        ));
+                    }
+                };
+                continue;
+            }
             if key == "side_chat" {
                 config.sonny.side_chat = match value.as_str() {
                     "answer" => SideChat::Answer,
-                    "fork" => SideChat::Fork,
-                    other => return Err(format!("sonny.side_chat is answer or fork, not {other}")),
+                    "work" => SideChat::Work,
+                    other => return Err(format!("sonny.side_chat is answer or work, not {other}")),
                 };
                 continue;
             }
@@ -2739,6 +2766,9 @@ mod tests {
         .unwrap();
         assert_eq!(config.reviewer.model.as_deref(), Some("openai/luna"));
         assert_eq!(config.reviewer.effort, None);
+        assert_eq!(config.reviewer.timeout_ms, None);
+        let timed = parse("[reviewer]\ntimeout_ms = 0\n").unwrap();
+        assert_eq!(timed.reviewer.timeout_ms, Some(0));
         assert_eq!(config.sonny.lead_effort.as_deref(), Some("medium"));
         assert_eq!(config.sonny.task_effort.as_deref(), Some("high"));
         assert_eq!(config.sonny.lead_profile, None);
@@ -2864,7 +2894,7 @@ mod tests {
             assert!(parse(bad).is_err(), "{bad}");
         }
         assert_eq!(config.trailer, None);
-        assert_eq!(config.sonny.side_chat, SideChat::Fork);
+        assert_eq!(config.sonny.side_chat, SideChat::Work);
         let answer = parse("[sonny]\nside_chat = \"answer\"").unwrap();
         assert_eq!(answer.sonny.side_chat, SideChat::Answer);
         assert_eq!(config.sonny.margin_opens, MarginOpens::Always);
@@ -2880,9 +2910,18 @@ mod tests {
         assert!(parse("[sonny]\ntask_tabs = \"all\"").is_err());
         let closed = parse("[sonny]\nmargin_opens = \"unless-closed\"").unwrap();
         assert_eq!(closed.sonny.margin_opens, MarginOpens::UnlessClosed);
-        assert!(!config.sonny.chime && !config.sonny.verbose);
-        let loud = parse("[sonny]\nchime = true\nverbose = true").unwrap();
-        assert!(loud.sonny.chime && loud.sonny.verbose);
+        assert!(!config.sonny.chime);
+        assert_eq!(config.sonny.view, View::Words);
+        let loud = parse("[sonny]\nchime = true\nview = \"verbose\"").unwrap();
+        assert!(loud.sonny.chime);
+        assert_eq!(loud.sonny.view, View::Verbose);
+        assert_eq!(
+            parse("[sonny]\nview = \"steps\"").unwrap().sonny.view,
+            View::Steps
+        );
+        assert!(parse("[sonny]\nview = \"all\"").is_err());
+        // Two switches for three views went: the file is rewritten once.
+        assert!(parse("[sonny]\nverbose = true").is_err());
         assert_eq!(
             parse("trailer = [\"sender\", \"time\"]").unwrap().trailer,
             Some(vec!["sender".to_owned(), "time".to_owned()])
@@ -3034,7 +3073,7 @@ mod tests {
             ),
             (
                 "[sonny]\nside_chat = \"all\"",
-                "sonny.side_chat is answer or fork, not all",
+                "sonny.side_chat is answer or work, not all",
             ),
             (
                 "[sonny]\nmargin_opens = \"sometimes\"",
@@ -3045,6 +3084,10 @@ mod tests {
             ("[web]\nsearch = true", "unknown table [web]"),
             ("[sonny]\neffort = \"low\"", "unknown key sonny.effort"),
             ("[reviewer]\neffort = 3", "reviewer.effort must be a string"),
+            (
+                "[reviewer]\ntimeout_ms = -1",
+                "reviewer.timeout_ms must be a whole number, 0 or more",
+            ),
             (
                 "[reviewer]\nmodel = \"\"",
                 "reviewer.model must not be empty",
@@ -3481,7 +3524,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(
             &file,
-            "# mine\nmodel = \"a/b\"\n\n[reviewer]\neffort = \"low\"\n\n[sonny]\nlead_effort = \"low\" # cheap\nside_chat = \"fork\"\n",
+            "# mine\nmodel = \"a/b\"\n\n[reviewer]\neffort = \"low\"\n\n[sonny]\nlead_effort = \"low\" # cheap\nside_chat = \"work\"\n",
         )
         .unwrap();
         write(
@@ -3497,7 +3540,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             std::fs::read_to_string(&file).unwrap(),
-            "# mine\n\n[sonny]\nside_chat = \"fork\"\ntask_effort = \"high\"\nchime = false\n"
+            "# mine\n\n[sonny]\nside_chat = \"work\"\ntask_effort = \"high\"\nchime = false\n"
         );
         // A key the lines cannot find is refused, the file kept.
         for text in ["sonny.chime = false\n", "sonny = { chime = false }\n"] {

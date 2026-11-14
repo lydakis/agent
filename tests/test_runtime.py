@@ -110,6 +110,17 @@ class Model(http.server.BaseHTTPRequestHandler):
                 self.wfile.write(body)
                 self.wfile.flush()
                 return
+            refused = getattr(self.server, 'refused_reasoning', None)
+            if refused and any(i.get('type') == 'reasoning' and i.get('encrypted_content') == refused
+                               for i in request.get('input', [])):
+                # A provider that can no longer read a reasoning item's state.
+                body = b'{"error":{"message":"invalid encrypted view"}}'
+                self.send_response(400)
+                self.send_header('Content-Length', str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+                self.wfile.flush()
+                return
             if is_summary(request) and getattr(self.server, 'compaction_refusals', 0):
                 self.server.compaction_refusals -= 1
                 body = b'{"error":{"message":"synthetic compaction rate limit"}}'
@@ -3012,6 +3023,50 @@ class RuntimeTests(ModelFixture):
             '[shell_environment_policy]\nignore_default_excludes = false\nexclude = ["aws_*"]\n')
         # A daemon started after takes the defaults and the listed names.
         self.assertEqual(seen('Ann'), 'unset:unset:unset:kept')
+
+    def test_a_400_on_replayed_reasoning_resends_without_it_and_later_turns_leave_it_out(self):
+        client = self.client()
+        client.request('create', bot='Bob', workspace=str(self.path))
+        reasoning = {'type': 'reasoning', 'id': 'rs_old', 'summary': [], 'encrypted_content': 'old-state'}
+        turn = lambda n, text: client.finished(client.request(
+            'submit', bot='Bob', request_id=str(n), prompt=text)['result']['message'])['data']
+        self.model.history_reasoning = reasoning
+        self.assertEqual(turn(0, 'first')['status'], 'completed')
+        self.model.history_reasoning = None
+        self.assertEqual(turn(1, 'second')['status'], 'completed')
+        sent = [self.model.requests.get(timeout=1) for _ in range(2)]
+        self.assertIn(reasoning, sent[1]['input'])
+        # The provider can no longer read it: the request goes once more
+        # without the reasoning, and the turn says so.
+        self.model.refused_reasoning = 'old-state'
+        self.assertEqual(turn(2, 'third')['status'], 'completed')
+        refused, resent = (self.model.requests.get(timeout=1) for _ in range(2))
+        self.assertIn(reasoning, refused['input'])
+        self.assertNotIn('reasoning', [i.get('type') for i in resent['input']])
+        self.assertIn('reply:second', json.dumps(resent['input']))
+        self.assertTrue(any(m.get('event') == 'retry' and m['data'].get('thinking_withheld') for m in client.saved))
+        # Later turns, after a restart too, leave it out without asking.
+        client.close()
+        client = self.client()
+        self.assertEqual(turn(3, 'fourth')['status'], 'completed')
+        later = self.model.requests.get(timeout=1)
+        self.assertNotIn('reasoning', [i.get('type') for i in later['input']])
+        self.assertTrue(self.model.requests.empty())
+        # Its summary leaves it out too, and its request is as long as said.
+        # Another model summarizes, so the summary is a request of its own
+        # over the span rather than a copy of the bot's call.
+        self.model.models = ('synthetic-model', 'synthetic-small')
+        client.request('configure', bot='Bob', compaction_instructions='Summarize.',
+                       compaction_model='openai/synthetic-small')
+        self.assertFalse(client.request('compact', bot='Bob')['result']['duplicate'])
+        self.assertNotIn('compaction', turn(4, 'fifth'))
+        self.assertIsNotNone(client.request('inspect', bot='Bob')['result']['compaction'])
+        sent = []
+        while not self.model.requests.empty():
+            sent.append(self.model.requests.get(timeout=1))
+        self.assertTrue(any(is_summary(request) for request in sent))
+        for request in sent:
+            self.assertNotIn('reasoning', [i.get('type') for i in request['input']])
 
     def test_history_pages_recover_an_omitted_long_message(self):
         client = self.client(tools='echo,history', settings={'context_items': 6})

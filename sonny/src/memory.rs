@@ -431,7 +431,9 @@ impl View {
 
     /// The fact a removal waits on is kept: a key went elsewhere.
     pub fn keep(&mut self) {
-        self.confirm = None;
+        if self.confirm.take().is_some() {
+            self.notice = Some("not removed".into());
+        }
     }
 
     /// How many pages are open over the list.
@@ -448,10 +450,14 @@ impl View {
     /// among the links there before scrolling.
     pub fn key(&mut self, key: KeyEvent, in_view: std::ops::Range<usize>) -> Key {
         self.changed += 1;
-        let confirm = self.confirm.take();
-        // Any key but `enter` lets a removal go, and says so.
-        self.notice =
-            (confirm.is_some() && key.code != KeyCode::Enter).then(|| "not removed".to_owned());
+        let asked = self.confirm.take();
+        let modified = (key.modifiers)
+            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER);
+        // Any key but `enter`, with no modifier, lets a removal go, and
+        // says so.
+        let pending = asked.is_some();
+        let confirm = asked.filter(|_| key.code == KeyCode::Enter && !modified);
+        self.notice = (pending && confirm.is_none()).then(|| "not removed".to_owned());
         let code = match key.code {
             KeyCode::Char('k') => KeyCode::Up,
             KeyCode::Char('j') => KeyCode::Down,
@@ -468,12 +474,14 @@ impl View {
                 if key.modifiers.intersects(
                     KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER,
                 ) => {}
-            KeyCode::Esc if confirm.is_some() => {}
+            KeyCode::Esc if pending => {}
             KeyCode::Esc => return Key::Close,
             KeyCode::Enter if confirm.is_some() => {
                 let (scope, name) = confirm.unwrap_or_default();
                 self.read(Some((scope, name)));
             }
+            // A modified Enter kept the removal asked for: nothing else.
+            KeyCode::Enter if pending => {}
             _ if self.on_page() => return self.page_key(code, in_view),
             KeyCode::Up => self.selected = self.selected.saturating_sub(1),
             KeyCode::Down => {
@@ -903,9 +911,8 @@ impl View {
     pub fn footer(&self) -> Option<Line<'static>> {
         if let Some((_, name)) = &self.confirm {
             return Some(Line::from(vec![
-                Span::raw("Remove "),
-                Span::raw(name.clone()).bold(),
-                Span::raw("? It can't be undone."),
+                Span::raw(format!("Remove {name}?")).bold(),
+                Span::raw(" It can't be undone.").dim(),
             ]));
         }
         self.notice
@@ -1573,6 +1580,12 @@ mod tests {
         // Esc cancels, says so, and keeps the view open.
         assert_eq!(view.key(key(KeyCode::Esc), 0..0), Key::Stay);
         assert_eq!(view.footer().unwrap().to_string(), "not removed");
+        // Enter with a modifier keeps it too, and does nothing else.
+        view.key(key(KeyCode::Char('x')), 0..0);
+        let held = KeyEvent::new(KeyCode::Enter, KeyModifiers::CONTROL);
+        assert_eq!(view.key(held, 0..0), Key::Stay);
+        assert_eq!(view.footer().unwrap().to_string(), "not removed");
+        assert_eq!(view.confirm, None);
         view.key(key(KeyCode::Char('x')), 0..0);
         view.key(key(KeyCode::Enter), 0..0);
         settle(&mut view);

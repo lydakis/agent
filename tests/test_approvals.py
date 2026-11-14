@@ -1548,6 +1548,55 @@ class AutoApproverTests(ModelFixture):
         self.assertEqual(state['persons_words'], [{'text': 'answer coworkers yourself'}])
         self.assertNotIn('persons_words_cut', state)
 
+    def test_a_round_has_the_configured_time_and_a_hung_check_says_where_it_was(self):
+        release = threading.Event()
+        self.addCleanup(release.set)
+
+        def reply(request, user):
+            if request['model'] != 'judge-model':
+                return None
+            release.wait(timeout=30)
+            round = json.loads(user)
+            return verdicts(round, lambda id: assessed(risky(round, id)))
+        self.model.reply_for = reply
+        self.model.models = ('synthetic-model', 'judge-model')
+        daemon = self.daemon(tools='echo,shell,wait,read')
+        home = self.path / 'home'
+        (home / '.agent').mkdir(parents=True)
+        (home / '.agent/config.toml').write_text('[reviewer]\ntimeout_ms = 3000\n')
+        _, lines = self.approver(daemon, env={'HOME': str(home)}, judge='openai/judge-model')
+        began = time.monotonic()
+        turn = daemon.request('submit', bot='Bob', request_id='a', prompt='shell:printf hung')['result']['message']
+        failed = lines.get(timeout=15)
+        self.assertLess(time.monotonic() - began, 10)
+        # Logged before its fork goes: the reviewer's turn still running.
+        self.assertEqual((failed['event'], failed['detail']), ('review_failed', 'the check timed out'))
+        hung = failed['hung']
+        self.assertEqual(hung['status'], 'running')
+        self.assertGreaterEqual(hung['submitted_ms_ago'], 0)
+        self.assertIn('model_rounds', hung)
+        release.set()
+        daemon.request('interrupt', bot='Bob', turn=turn)
+
+    def test_a_round_with_no_time_limit_waits_for_its_verdict(self):
+        def reply(request, user):
+            if request['model'] != 'judge-model':
+                return None
+            round = json.loads(user)
+            return verdicts(round, lambda id: assessed(risky(round, id)))
+        self.model.reply_for = reply
+        self.model.models = ('synthetic-model', 'judge-model')
+        daemon = self.daemon(tools='echo,shell,wait,read')
+        home = self.path / 'home'
+        (home / '.agent').mkdir(parents=True)
+        (home / '.agent/config.toml').write_text('[reviewer]\ntimeout_ms = 0\n')
+        _, lines = self.approver(daemon, env={'HOME': str(home)}, judge='openai/judge-model')
+        turn = daemon.request('submit', bot='Bob', request_id='a', prompt='shell:printf safe')['result']['message']
+        # Each wait stays within the day the daemon allows, so no wait is refused.
+        judged = lines.get(timeout=15)
+        self.assertEqual(judged['event'], 'reviewed', judged)
+        self.assertEqual(daemon.finished(turn)['data']['status'], 'completed')
+
     def test_a_model_the_daemon_serves_judges(self):
         asked = queue.Queue()
         parsed = [True]
@@ -1644,7 +1693,8 @@ class AutoApproverTests(ModelFixture):
         events = [lines.get(timeout=5) for _ in range(3)]
         # The reply it could not read is kept, redacted, to be read later.
         self.assertIn({'event': 'review_failed', 'bot': 'Bob', 'turn': vague,
-                       'detail': "the reviewer's answer was not the JSON asked for", 'reply': 'They look fine to me.'}, events)
+                       'detail': "the reviewer's answer was not the JSON asked for", 'reply': 'They look fine to me.',
+                       'hung': None}, events)
         # Each round's fork expires if the approver stops, and goes once it
         # is answered; the base stays.
         base = bots['.reviewer.auto']['bot_id']

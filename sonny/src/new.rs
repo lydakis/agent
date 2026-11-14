@@ -66,14 +66,14 @@ impl Place {
 /// repository, where it comes first; only this folder in a project whose
 /// tasks all work in it.
 pub fn places(dir: &Path) -> Vec<Place> {
-    let info = agent_client::project::read(dir).unwrap_or_default();
+    let info = crate::project::read(dir).unwrap_or_default();
     places_for(&info, agent_client::policy::checkout(dir).is_some())
 }
 
 /// The places for a folder whose project file reads `info`, in a git
 /// checkout or not.
 fn places_for(info: &serde_json::Value, in_git: bool) -> Vec<Place> {
-    if info["threads_in"] == "project" {
+    if info["task_in"] == "project" {
         return vec![Place::Here];
     }
     match in_git {
@@ -452,7 +452,7 @@ mod tests {
         let dir = temp("places");
         std::fs::write(
             dir.join(agent_client::project::FILE),
-            "name = \"p\"\nthreads_in = \"project\"\n",
+            "name = \"p\"\ntask_in = \"project\"\n",
         )
         .unwrap();
         assert_eq!(places(&dir), [Place::Here]);

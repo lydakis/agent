@@ -710,7 +710,7 @@ pub fn run() -> i32 {
             && let (Some(home), Some(me)) = (&home, &me)
             && crate::home::due(home, crate::home::now_ms())
         {
-            syncing = run_own(me, &["home", "sync", "--job"]);
+            syncing = run_own(me, &["backup", "sync", "--job"]);
         }
         let now_folder = modified(&places.jobs);
         let mut fired = false;
