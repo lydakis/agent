@@ -34,16 +34,29 @@ async fn open_regular(path: &Path, write: bool, hidden: &[PathBuf]) -> Result<to
         Err(error) if write && error.kind() == ErrorKind::NotFound => {}
         Err(error) => return Err(open_error(error)),
     }
-    let mut options = tokio::fs::OpenOptions::new();
+    let mut options = std::fs::OpenOptions::new();
     options.read(!write).write(write).create(write);
     // A FIFO substituted after metadata must not block even during open.
     // O_NONBLOCK does not change regular-file I/O. Never truncate before fstat.
     #[cfg(unix)]
-    options.custom_flags(libc::O_NONBLOCK | libc::O_NOCTTY);
-    let file = options.open(path).await.map_err(open_error)?;
-    if !hidden.is_empty()
-        && opened(&file).is_none_or(|opened| hidden.iter().any(|hidden| opened.starts_with(hidden)))
     {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NONBLOCK | libc::O_NOCTTY);
+    }
+    // Opened, and where it is looked up, in one job on the blocking pool,
+    // as Tokio's own open would be: the lookup is filesystem work too.
+    let (target, hidden) = (path.to_owned(), hidden.to_vec());
+    let (file, denied) = tokio::task::spawn_blocking(move || {
+        let file = options.open(&target)?;
+        let denied = !hidden.is_empty()
+            && opened(&file)
+                .is_none_or(|opened| hidden.iter().any(|hidden| opened.starts_with(hidden)));
+        Ok::<_, std::io::Error>((file, denied))
+    })
+    .await
+    .map_err(|_| Error::new("io_error"))?
+    .map_err(open_error)?;
+    if denied {
         return Err(Error::with(
             "read_denied",
             format!(
@@ -52,6 +65,7 @@ async fn open_regular(path: &Path, write: bool, hidden: &[PathBuf]) -> Result<to
             ),
         ));
     }
+    let file = tokio::fs::File::from_std(file);
     if !file.metadata().await?.is_file() {
         return fail("file_not_regular");
     }
@@ -62,14 +76,13 @@ async fn open_regular(path: &Path, write: bool, hidden: &[PathBuf]) -> Result<to
 /// links led to it or were swapped since. `None` where the system can't
 /// say, which a caller with paths to keep refuses.
 #[cfg(target_os = "linux")]
-fn opened(file: &tokio::fs::File) -> Option<PathBuf> {
-    use std::os::fd::AsRawFd;
+fn opened(file: &impl std::os::fd::AsRawFd) -> Option<PathBuf> {
     std::fs::read_link(format!("/proc/self/fd/{}", file.as_raw_fd())).ok()
 }
 
 #[cfg(target_os = "macos")]
-fn opened(file: &tokio::fs::File) -> Option<PathBuf> {
-    use std::os::{fd::AsRawFd, unix::ffi::OsStrExt};
+fn opened(file: &impl std::os::fd::AsRawFd) -> Option<PathBuf> {
+    use std::os::unix::ffi::OsStrExt;
     let mut path = [0u8; libc::PATH_MAX as usize];
     // SAFETY: F_GETPATH writes at most MAXPATHLEN (PATH_MAX) bytes,
     // NUL-terminated, into the buffer.
@@ -81,7 +94,7 @@ fn opened(file: &tokio::fs::File) -> Option<PathBuf> {
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-fn opened(_: &tokio::fs::File) -> Option<PathBuf> {
+fn opened(_: &impl std::os::fd::AsRawFd) -> Option<PathBuf> {
     None
 }
 
