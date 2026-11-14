@@ -6024,7 +6024,8 @@ impl Database {
     }
     /// Encoded items for a batch of window ids, in order, comma-separated.
     /// Items joined by commas; those `strip` names go without their
-    /// thinking blocks, and one that held only thinking is left out.
+    /// thinking blocks, and one that held only thinking is left out, as is
+    /// a Responses reasoning item.
     pub fn items_by_ids(
         &self,
         ids: &[i64],
@@ -6054,6 +6055,9 @@ impl Database {
             }
             statement.query_row([id], |r| {
                 let item = r.get_ref(0)?.as_blob()?;
+                if strip.strips(*id) && super::context::reasoning(item) {
+                    return Ok(());
+                }
                 let item = match (strip.strips(*id) && r.get::<_, i64>(1)? > 0)
                     .then(|| super::without_thinking(item))
                     .flatten()
@@ -6198,6 +6202,28 @@ impl Database {
             .query_row([name], |r| r.get(0))
             .optional()?
             .flatten())
+    }
+    /// Bytes a Responses request saves for each of `ids` that `strip`
+    /// names and that is a reasoning item, left out whole with its
+    /// separator; 0 for the rest.
+    pub fn reasoning_of(&self, ids: &[i64], strip: Strip) -> Result<Vec<u32>> {
+        let mut statement = self
+            .conn
+            .prepare_cached("SELECT item FROM nodes WHERE id=?")?;
+        ids.iter()
+            .map(|id| {
+                if !strip.strips(*id) {
+                    return Ok(0);
+                }
+                Ok(statement.query_row([id], |r| {
+                    let item = r.get_ref(0)?.as_blob()?;
+                    Ok(match super::context::reasoning(item) {
+                        true => (item.len() + 1).min(u32::MAX as usize) as u32,
+                        false => 0,
+                    })
+                })?)
+            })
+            .collect()
     }
     /// Bytes each node loses without its thinking blocks.
     pub fn thinking_of(&self, ids: &[i64]) -> Result<Vec<u32>> {

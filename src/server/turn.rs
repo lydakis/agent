@@ -922,15 +922,17 @@ impl Turn {
         Ok(context)
     }
 
-    /// The window's items, those `strip` names without thinking.
-    fn items(&self, context: &Context, strip: Strip) -> Items {
+    /// The window's items, those `strip` names without thinking: what
+    /// each loses is `reasoning` when given, as [`Self::reasoning`] reads
+    /// it, or else the window's own count.
+    fn items(&self, context: &Context, strip: Strip, reasoning: Option<&[u32]>) -> Items {
         match &context.window {
             Some(w) => self.window_items(
                 context.prefix.bytes.clone(),
                 Span {
                     ids: &w.ids,
                     sizes: &w.sizes,
-                    thinking: &w.thinking,
+                    thinking: reasoning.unwrap_or(&w.thinking),
                     pictured: &w.pictured,
                     elided: w.elided,
                 },
@@ -938,6 +940,25 @@ impl Turn {
             ),
             None => self.window_items(context.prefix.bytes.clone(), Span::EMPTY, Strip::default()),
         }
+    }
+
+    /// What each of a Responses window's items loses when `strip` leaves
+    /// its reasoning out: a reasoning item goes whole, and which items are
+    /// reasoning is read from the store, since the window counts only
+    /// Anthropic thinking. Read only for a bot whose reasoning a provider
+    /// refused; `None` otherwise.
+    async fn reasoning(&self, context: &Context, strip: Strip) -> Result<Option<Vec<u32>>> {
+        let Some(window) = context.window.as_ref().filter(|w| {
+            w.family == agent_runtime::codec::Family::Responses && strip != Strip::default()
+        }) else {
+            return Ok(None);
+        };
+        let ids = window.ids.clone();
+        let sizes = self
+            .store
+            .read("reasoning_of", move |db| db.reasoning_of(&ids, strip))
+            .await?;
+        Ok(Some(sizes))
     }
 
     /// Anthropic thinking replay. Each thinking block is bound to the exact
@@ -974,13 +995,18 @@ impl Turn {
         window: &Window,
         (provider, model): (&Provider, &str),
     ) -> Result<Strip> {
-        if window.family != agent_runtime::codec::Family::Anthropic || window.ids.is_empty() {
+        if window.ids.is_empty() {
             return Ok(Strip::default());
         }
         let prefix = fingerprint(prefix, window.ids[0], provider.url().as_str(), model);
         let (next, elided) = (window.ids[window.ids.len() - 1] + 1, window.elided);
         let mut strip = record.thinking;
-        if record.thinking_prefix != Some(prefix) || elided < record.thinking_elided {
+        if window.family == agent_runtime::codec::Family::Responses {
+            // Reasoning goes as it was given until the provider refuses it
+            // ([`withhold_thinking`]); what it refused stays out. Its state
+            // is bound to no context, so nothing in front of the window
+            // changes that.
+        } else if record.thinking_prefix != Some(prefix) || elided < record.thinking_elided {
             strip = Strip::from(next);
         } else if elided > record.thinking_elided {
             // Ids grow along a lineage, so the window's are ascending.
@@ -3458,9 +3484,7 @@ impl Turn {
             }
             // A call that withheld its replayed thinking recorded that on
             // the bot; the context keeps what it sent.
-            if context.window.as_ref().is_some_and(|w| {
-                w.family == agent_runtime::codec::Family::Anthropic && !w.ids.is_empty()
-            }) {
+            if context.window.as_ref().is_some_and(|w| !w.ids.is_empty()) {
                 context.thinking = record.thinking;
             }
             let mut response = match called {
@@ -3923,7 +3947,11 @@ impl Turn {
                 self.withheld(turn, Limit::Rounds).await?;
             }
             let items = match body {
-                Body::Window(context) => self.items(context, withheld.unwrap_or(context.thinking)),
+                Body::Window(context) => {
+                    let strip = withheld.unwrap_or(context.thinking);
+                    let reasoning = self.reasoning(context, strip).await?;
+                    self.items(context, strip, reasoning.as_deref())
+                }
                 Body::Copied(copy) => self.copied_items(copy),
                 Body::Span(plan, stripped) => self.span_items(plan, stripped).await?,
             };
@@ -6735,17 +6763,24 @@ async fn learn_links(
 /// when the failure is a 400. A 400 is final for its body, and a replayed
 /// block the provider cannot verify or decrypt is documented to fail with
 /// one: no published error type names it, and the message is not matched.
-/// The call sends the body once more without that thinking, and the bot
-/// keeps it out only once a request without it is accepted. Server errors
-/// are retried with the body unchanged.
+/// The same holds for a Responses reasoning item's encrypted content, and
+/// such an item goes whole or not at all: one sent without it names an
+/// item the provider never kept. The call sends the body once more without
+/// that thinking, and the bot keeps it out only once a request without it
+/// is accepted. Server errors are retried with the body unchanged.
 fn withhold_thinking(context: &Context, error: &Error) -> Option<Strip> {
     let window = context.window.as_ref()?;
-    let replayed = window.family == agent_runtime::codec::Family::Anthropic
-        && window
+    let replayed = match window.family {
+        agent_runtime::codec::Family::Anthropic => window
             .ids
             .iter()
             .zip(&window.thinking)
-            .any(|(id, bytes)| *bytes > 0 && !context.thinking.strips(*id));
+            .any(|(id, bytes)| *bytes > 0 && !context.thinking.strips(*id)),
+        // Which items are reasoning is known only once read.
+        agent_runtime::codec::Family::Responses => {
+            window.ids.iter().any(|id| !context.thinking.strips(*id))
+        }
+    };
     (replayed && error.code == "provider_http_400")
         .then(|| Strip::from(window.ids[window.ids.len() - 1] + 1))
 }
