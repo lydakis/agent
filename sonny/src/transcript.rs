@@ -2589,6 +2589,23 @@ fn drawn(
         {
             *bullet = Span::raw("■ ").dim();
         }
+        // Whatever the tool's own rows show (a write's line count, an
+        // edit's diff), the cut is said under them.
+        let said = |row: &Line| {
+            row.spans
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect::<String>()
+        };
+        let first = cut.split(':').next().unwrap_or(cut);
+        if !rows.is_empty() && !rows.iter().any(|row| said(row).contains(first)) {
+            rows.extend(wrap(
+                Line::from(cut),
+                width,
+                Span::raw("  └ ").dim(),
+                Span::raw("    "),
+            ));
+        }
         return rows;
     }
     // A call that failed is `✗` and what it tried, never a red bullet.
@@ -4467,6 +4484,26 @@ mod tests {
                 "  └ a restart came before it ran"
             ]
         );
+        // A tool whose rows show something else still says it was cut.
+        for (name, arguments) in [
+            (
+                "write",
+                serde_json::json!({"path": "/a.txt", "content": "x\ny\n"}),
+            ),
+            (
+                "apply_patch",
+                serde_json::json!({"input": "*** Begin Patch\n*** Add File: a.txt\n+x\n*** End Patch"}),
+            ),
+        ] {
+            let output = serde_json::json!({"error": "daemon_paused", "detail": "the daemon stopped this call before its result was recorded"}).to_string();
+            let rows = text(&tool(name, &arguments, Some(&output), true, "/", 80));
+            assert!(rows[0].starts_with("■ "), "{rows:?}");
+            assert!(
+                rows.iter()
+                    .any(|row| row.contains("cut by the pause: it may have run")),
+                "{name}: {rows:?}"
+            );
+        }
     }
 
     #[test]
