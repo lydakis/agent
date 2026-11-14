@@ -134,7 +134,7 @@ pub fn tool() -> Value {
                 "markdown": {"type": "string", "maxLength": NOTE_BYTES,
                     "description": "The note, as Markdown."},
                 "live": {"type": "boolean",
-                    "description": "true: markdown has Jinja blanks Sonny keeps filled: source('name').latest/.topics, file('path'), tasks(), task('name'), now(), |ago, |time, |fromjson."},
+                    "description": format!("true: markdown has Jinja blanks Sonny keeps filled. {}", crate::template::BLANKS)},
                 "file": {"type": "string", "minLength": 1,
                     "description": "Or a file to show, absolute or from your folder."},
                 "from": {"type": "string", "pattern": "^[A-Za-z0-9._-]{1,128}/[a-z0-9][a-z0-9-]{0,39}$",
@@ -302,9 +302,9 @@ fn shown_as_template(arguments: &Value) -> bool {
 
 /// What a call posting live `template` is answered, filled from `data` as the
 /// tool host has it: refused when it does not read as a template, names a
-/// source the person has not set up, or fills to more lines than a note
-/// holds; else what it shows now, or why it does not fill yet, as a blank
-/// that names a task the window fills.
+/// source the person has not set up, does not fill now, or fills to more
+/// lines than a note holds; else what it shows now, or why it does not
+/// fill yet, as a blank that names a task the window fills.
 fn filled(template: &str, data: &crate::template::Data) -> Result<String, (&'static str, String)> {
     // Whole or not at all: a template cut short would read as another.
     if template.len() > NOTE_BYTES {
@@ -1831,7 +1831,7 @@ mod tests {
         later(&mut margin);
         let rows = drawn(&mut margin, &dir);
         assert!(
-            rows.contains("PR is open") && rows.contains("⟨line 1: not JSON"),
+            rows.contains("PR is open") && rows.contains("⟨line 1, `fromjson`: not JSON"),
             "{rows}"
         );
         std::fs::remove_dir_all(&dir).unwrap();

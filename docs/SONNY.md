@@ -86,7 +86,8 @@ reads with the daemon's file tools and read-only MCP tools, not commands.
 **Live messages.** With `--live`, the message is a template, as a live
 memory fact's text is, filled as each run starts: `source('NAME')` (what
 one of your sources printed, its `.latest`, `.events` and each topic's
-newest in `.topics`), `file('PATH')` from the folder the automation was
+newest in `.topics`; `source('NAME:TOPIC')` for one topic alone),
+`file('PATH')` and `modified('PATH')` from the folder the automation was
 added in, `now()`, and `| ago` and `| time`. So a run starts with the data
 in its prompt instead of spending its first calls fetching it. `add` refuses
 (`live_template`, as every live template is) a message that does not read as a template, names a

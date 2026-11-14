@@ -2007,18 +2007,24 @@ the agent and nothing more in its history: `source('ci').latest.text`
 and `.events` (what one of your sources printed lately, newest first;
 `.topics`, each topic's newest event however old, such as each pull
 request's last word, which the lookout keeps for 200 topics; `.up` and
-`.down_since` while the lookout says it is down),
-`file('state.json')` (a file in its folder, `| fromjson` making JSON
-fields of it; one in a folder kept from agents, `~/.agent/keys` and the
-config's `[sandbox] unreadable`, is refused with `read_denied`, whatever
-link or path leads there), `tasks()` and `task('NAME')` (where its tasks stand, as
-`/status` reads them), `now()`, and `| ago` and `| time` for a time in
-seconds. A blank never runs a command or reaches the network, so an agent
+`.down_since` while the lookout says it is down; `source('ci:TOPIC')`
+reads that topic's events alone, as a subscription to `NAME:TOPIC`
+hears them), `file('state.json')` (a file in its folder, `| fromjson`
+making JSON fields of it; one in a folder kept from agents, `~/.agent/keys`
+and the config's `[sandbox] unreadable`, is refused with `read_denied`,
+whatever link or path leads there), `modified('state.json')` (when it
+last changed, none while it is not there), `tasks()` and `task('NAME')`
+(where its tasks stand, as `/status` reads them), `now()`, and `| ago`
+and `| time` for a time in seconds; Jinja's own filters, such as
+`selectattr`, `sort` and `tojson`, work as well. A blank never runs a command or reaches the network, so an agent
 that wants something no source covers writes it to a file from its own
 commands. The tool host fills the template once as it is posted and
 answers what it shows; a template that does not read as one, names a
-source you have not set up, or fills to more lines than a note holds is
-refused (`live_template`, `margin_note_too_long`). The window then
+source you have not set up, does not fill now (a file not written yet,
+a field a source's events lack), or fills to more lines than a note holds
+is refused (`live_template`, `margin_note_too_long`), so a broken note
+never reaches the margin. A template's error names its line and quotes
+the blank that failed (``line 1, `file('pr.json')`: ...``). The window then
 watches only what the last fill read, once a second (a source's log, a
 file, the tasks as the footer counts them, the minute for a clock), and a
 fill that fails later keeps what it showed with why under it. Under its
