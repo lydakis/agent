@@ -1770,7 +1770,8 @@ while you have scrolled back leave the view still, and PgDn or Enter
 takes you back to the latest. Copying needs no key held:
 a drag selects and copies when you let go, a double click takes a word and
 a triple click its line, Ctrl+C copies a selection instead of
-interrupting, and Esc clears it. The copy is the text as written: a line
+interrupting, and Esc clears it. With the keys in the pane and nothing
+selected, Ctrl+C closes the pane; it quits Sonny only from the composer. The copy is the text as written: a line
 wrapped over rows comes back as one line, without the bullets and indents
 Sonny drew around it. A click on a web link opens it in the browser, and
 a click on a file opens it in a pane beside the conversation: code in
@@ -1845,6 +1846,14 @@ conversation.
 ![/co with /compact marked, then /compact asking: compact the lead's conversation? It can't be undone · enter compact · esc cancel](../docs/sonny/slash-compact-confirm.png)
 
 ![/co after /commons was run: /commons ranks first; /cms finds /commons with c, m and s in bold](../docs/sonny/slash-ranked-fuzzy.png)
+
+A slash word that names no command is answered, not sent: `/stauts`
+says `no command /stauts · / lists them` and stays in the composer to be
+fixed. So does a command given words it doesn't take (`/status foo`). A
+message that only starts with a slash word, such as a path
+(`/etc/hosts is wrong`), goes to the agent as written.
+
+![/stauts answered with no command /stauts · / lists them, the typo kept in the composer](../docs/sonny/slash-no-command.png)
 
 ### Margin and footer
 
