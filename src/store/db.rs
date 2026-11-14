@@ -1567,6 +1567,10 @@ pub struct Waiting {
     /// the call is tried again at `deadline_ms`, with a fresh retry budget.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub blocked: Option<Blocked>,
+    /// Parked on a failed call's backoff, not a closed pool or a hold: the
+    /// error the call failed with, tried again at `deadline_ms`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retrying: Option<String>,
     /// When the run of holds this call is in began, kept across the
     /// ordinary retries between them, so the next hold waits longer still.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2371,11 +2375,11 @@ const TURN_VIEW: &str = "m.id,m.bot,b.id,m.request_id,COALESCE(t.status,m.status
     json_extract(t.waiting,'$.deadline_ms'),json_extract(t.waiting,'$.answer'),
     json_extract(t.waiting,'$.halt'),json_extract(t.waiting,'$.load'),
     json_extract(t.waiting,'$.blocked'),m.held,m.due_ms,COALESCE(t.work,0),t.limited,m.turn,
-    t.error";
+    t.error,json_extract(t.waiting,'$.retrying')";
 /// Where `TURN_VIEW` reads: the message, its bot, and the turn it opened.
 const MESSAGE_FROM: &str = "messages m JOIN bots b ON b.name=m.bot LEFT JOIN turns t ON t.id=m.id";
 /// Columns `TURN_VIEW` takes, for queries that select more after it.
-const TURN_VIEW_COLUMNS: usize = 28;
+const TURN_VIEW_COLUMNS: usize = 29;
 /// A message's words, from `messages m` joined by `MESSAGE_NODE`: kept on
 /// the message, or once 4 KiB or more were taken in, read from its node.
 const MESSAGE_TEXT: &str = "CASE WHEN n.id IS NULL THEN m.text
@@ -2444,9 +2448,10 @@ fn turn_view(r: &rusqlite::Row) -> rusqlite::Result<Value> {
         "paced" => match r.get::<_, Option<String>>(19)?.as_deref() {
             Some("pause") => json!({"resume_at_ms":null,"paused":true}),
             Some("shutdown") => json!({"resume_at_ms":null,"stopped":true}),
-            _ => match blocked(r.get(21)?) {
-                Some(blocked) => json!({"resume_at_ms":deadline_ms,"blocked":blocked}),
-                None => json!({"resume_at_ms":deadline_ms}),
+            _ => match (blocked(r.get(21)?), r.get::<_, Option<String>>(28)?) {
+                (Some(blocked), _) => json!({"resume_at_ms":deadline_ms,"blocked":blocked}),
+                (None, Some(error)) => json!({"resume_at_ms":deadline_ms,"retrying":error}),
+                (None, None) => json!({"resume_at_ms":deadline_ms}),
             },
         },
         // Refused at its start for a cause a person can fix: it keeps its
@@ -8855,6 +8860,7 @@ impl Database {
             fallback: None,
             halt: None,
             blocked: None,
+            retrying: None,
             held_since_ms: None,
             poll: false,
             load: false,
@@ -8919,6 +8925,7 @@ impl Database {
             fallback: None,
             halt: None,
             blocked: None,
+            retrying: None,
             held_since_ms: None,
             poll: false,
             load: true,
@@ -9075,6 +9082,7 @@ impl Database {
             fallback: None,
             halt: None,
             blocked: None,
+            retrying: None,
             held_since_ms: None,
             poll: false,
             load: false,
@@ -11608,6 +11616,7 @@ impl Database {
             fallback: None,
             halt: None,
             blocked: None,
+            retrying: None,
             held_since_ms: None,
             poll,
             load: false,
@@ -11628,8 +11637,10 @@ impl Database {
         Ok(entry(cursor, &bot.name, Some(turn), "turn_waiting", data))
     }
     /// Park a running turn at its model-call boundary until `resume_at_ms`,
-    /// because its provider's pool is closed by a rate limit. It holds no
-    /// task and no slot until then; retries stay in the turn row.
+    /// because its provider's pool is closed by a rate limit, a cause a
+    /// person can fix holds it (`blocked`), or a failed call backs off
+    /// (`retrying`, its error). It holds no task and no slot until then;
+    /// retries stay in the turn row.
     #[allow(clippy::too_many_arguments)]
     pub fn suspend_paced(
         &mut self,
@@ -11646,6 +11657,7 @@ impl Database {
         summary_retry_ms: Option<u64>,
         fallback: Option<ParkedFallback>,
         blocked: Option<Blocked>,
+        retrying: Option<String>,
         held_since_ms: Option<u64>,
     ) -> Result<Value> {
         let bot = self.active(turn)?;
@@ -11655,6 +11667,8 @@ impl Database {
         let mut data = json!({"resume_at_ms":resume_at_ms});
         if let Some(blocked) = &blocked {
             data["blocked"] = json!(blocked);
+        } else if let Some(error) = &retrying {
+            data["retrying"] = json!(error);
         }
         let waiting = Waiting {
             turn,
@@ -11676,6 +11690,7 @@ impl Database {
             fallback,
             halt: None,
             held_since_ms: blocked.as_ref().map(|b| b.since_ms).or(held_since_ms),
+            retrying: retrying.filter(|_| blocked.is_none()),
             blocked,
             poll: false,
             load: false,
@@ -11767,6 +11782,7 @@ impl Database {
             fallback: None,
             halt: Some(stop),
             blocked: None,
+            retrying: None,
             held_since_ms: None,
             poll: false,
             load: false,
@@ -18223,7 +18239,7 @@ fn migrate_bot_status(conn: &Connection) -> Result<()> {
             json_extract(t.waiting,'$.handles'),json_extract(t.waiting,'$.any'),
             json_extract(t.waiting,'$.deadline_ms'),json_extract(t.waiting,'$.answer'),
             json_extract(t.waiting,'$.halt'),json_extract(t.waiting,'$.load'),
-            json_extract(t.waiting,'$.blocked'),t.held,t.due_ms,0,NULL,t.id,NULL
+            json_extract(t.waiting,'$.blocked'),t.held,t.due_ms,0,NULL,t.id,NULL,NULL
          FROM turns t JOIN bots b ON b.name=t.bot WHERE t.id=?",
     )?;
     let mut update = conn.prepare("UPDATE bots SET waiting_on=? WHERE name=?")?;

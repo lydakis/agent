@@ -3519,6 +3519,7 @@ fn a_turn_held_on_its_call_says_so_and_is_woken_to_try_again() {
             None,
             Some(blocked),
             None,
+            None,
         )
         .unwrap();
     assert_eq!(entry["event"], "turn_paced");
@@ -3570,11 +3571,20 @@ fn an_ordinary_retry_between_holds_keeps_when_they_began() {
             None,
             None,
             None,
+            Some("provider_stream_failed".into()),
             Some(5),
         )
         .unwrap();
-    // A retry the provider asked for, not a hold: nothing says held.
+    // A retry the provider asked for, not a hold: nothing says held, and
+    // it says what it backs off from, so no one reads a dropped
+    // connection as a rate limit.
     assert!(entry["data"].get("blocked").is_none());
+    assert_eq!(entry["data"]["retrying"], "provider_stream_failed");
+    let view = db.turn_view("Bob", turn).unwrap();
+    assert_eq!(
+        view["waiting_on"],
+        serde_json::json!({"resume_at_ms":99,"retrying":"provider_stream_failed"})
+    );
     assert!(held_rows(&db).is_empty());
     let waiting = db.waiting_turns().unwrap();
     assert_eq!(
@@ -20019,6 +20029,7 @@ fn paced(db: &mut Database, turn: i64) {
         None,
         None,
         Some(blocked),
+        None,
         None,
     )
     .unwrap();

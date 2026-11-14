@@ -11124,7 +11124,9 @@ impl App {
                         );
                         format!("Held: {what}")
                     } else {
-                        "Rate limited".into()
+                        // A failed call's backoff says what failed: a
+                        // dropped connection is not a rate limit.
+                        crate::task::capitalized(&status::waits_out(data))
                     };
                 }
             }
@@ -17475,7 +17477,11 @@ impl App {
                 for refused in (picker.refused.iter())
                     .take((list::ROWS + 1).min(room).saturating_sub(rows.len()))
                 {
-                    rows.push(Line::from(format!("    {refused}")).dim());
+                    rows.push(Line::from(vec![
+                        Span::raw("    "),
+                        Span::raw("✗ ").fg(Color::Red),
+                        Span::raw(refused.clone()),
+                    ]));
                 }
                 over(frame, rows, composer);
                 let effort = picker.effort().unwrap_or("default");
@@ -26161,6 +26167,25 @@ mod tests {
             }
         })
         .await
+    }
+
+    #[tokio::test]
+    async fn a_dropped_connection_backing_off_never_reads_as_a_rate_limit() {
+        let client = daemon_answering(|_| json!({})).await;
+        let mut app = app(client);
+        app.daemon(turn_event("accepted", 1, json!({}))).await;
+        let paced = |data: Value| turn_event("turn_paced", 1, data);
+        app.daemon(paced(
+            json!({"resume_at_ms": 9, "retrying": "provider_stream_failed"}),
+        ))
+        .await;
+        assert_eq!(
+            app.running.as_ref().unwrap().phase,
+            "Retrying: provider unreachable"
+        );
+        // A pool a rate limit closed says so.
+        app.daemon(paced(json!({"resume_at_ms": 9}))).await;
+        assert_eq!(app.running.as_ref().unwrap().phase, "Rate limited");
     }
 
     #[tokio::test]

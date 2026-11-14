@@ -21,6 +21,20 @@ pub struct Picker {
     pub refused: Vec<String>,
 }
 
+/// Why a provider listed no models, in the person's words, from the
+/// daemon's code: what the provider answered, never the code itself.
+pub fn why_unlisted(error: &str) -> String {
+    match error {
+        "provider_http_401" | "provider_http_403" => "its key was refused".to_owned(),
+        _ if error.starts_with("provider_login") => "sign in again".to_owned(),
+        _ if error.starts_with("provider_aws_credentials") => "AWS sign-in needed".to_owned(),
+        _ => match error.strip_prefix("provider_http_") {
+            Some(status) => format!("it answered HTTP {status}"),
+            None => "it could not be reached".to_owned(),
+        },
+    }
+}
+
 /// A spot on `/model`'s footer a click acts on.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Click {
@@ -73,7 +87,7 @@ impl Picker {
         for name in names {
             let answer = &listing["providers"][name];
             if let Some(error) = answer["error"].as_str() {
-                refused.push(format!("{name}: {error}"));
+                refused.push(format!("{name} listed no models: {}", why_unlisted(error)));
             }
             for model in answer["models"].as_array().into_iter().flatten() {
                 if let Some(id) = model["id"].as_str() {
@@ -442,7 +456,12 @@ mod tests {
             None,
         );
         assert_eq!(picker.shown(), ["anthropic/claude-opus-5-5"]);
-        assert_eq!(picker.refused, ["anthropic: unauthorized"]);
+        assert_eq!(
+            picker.refused,
+            ["anthropic listed no models: it could not be reached"]
+        );
+        assert_eq!(why_unlisted("provider_http_501"), "it answered HTTP 501");
+        assert_eq!(why_unlisted("provider_http_401"), "its key was refused");
         assert_eq!(picker.effort(), None);
         picker.less();
         assert_eq!(picker.effort(), None);

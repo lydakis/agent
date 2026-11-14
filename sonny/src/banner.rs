@@ -22,7 +22,7 @@ pub fn welcome(
 ) -> (Vec<Line<'static>>, Option<usize>) {
     let version = env!("CARGO_PKG_VERSION");
     let accent = Style::new().fg(Color::Cyan);
-    let art = pixels(&PORTRAIT, &PORTRAIT_COLORS);
+    let art = pixels(&PORTRAIT, &PORTRAIT_COLORS, crate::term::light());
     let words = vec![
         Line::from(vec![
             "Welcome to Sonny".bold(),
@@ -224,7 +224,7 @@ fn gesture(n: u64) -> &'static [(Look, Duration)] {
     GESTURES[0].1
 }
 
-/// A pixel's colour.
+/// A pixel's color.
 type Rgb = (u8, u8, u8);
 
 /// The eyes' pixels for `look`, as (upper, lower) on each of
@@ -277,10 +277,10 @@ pub fn draw_eyes(buf: &mut Buffer, x: u16, y: u16, look: Look) {
     let Some(pixels) = eye_pixels(look) else {
         return;
     };
-    let rgb = |(r, g, b): (u8, u8, u8)| Color::Rgb(r, g, b);
+    let light = crate::term::light();
     for (column, (upper, lower)) in EYE_COLUMNS.into_iter().zip(pixels) {
         if let Some(cell) = buf.cell_mut((x + 2 + column, y)) {
-            cell.set_fg(rgb(upper)).set_bg(rgb(lower));
+            cell.set_fg(ink(upper, light)).set_bg(ink(lower, light));
         }
     }
 }
@@ -296,15 +296,29 @@ fn hints(accent: Style) -> Line<'static> {
     ])
 }
 
+/// How much a light background darkens the portrait: Sonny is white, and
+/// as drawn for a dark page his body would melt into a light one.
+const ON_LIGHT: f32 = 0.7;
+
+/// A portrait color as drawn: as painted on a dark background, darkened
+/// by [`ON_LIGHT`] on a light one, every shade kept in proportion.
+fn ink((r, g, b): Rgb, light: bool) -> Color {
+    let dim = |c: u8| match light {
+        true => (f32::from(c) * ON_LIGHT).round() as u8,
+        false => c,
+    };
+    Color::Rgb(dim(r), dim(g), dim(b))
+}
+
 /// Rows of `art`, two pixel rows to a line: the upper pixel as the half
-/// block's colour and the lower as its background.
-fn pixels(art: &[&str], colors: &[(u8, u8, u8)]) -> Vec<Line<'static>> {
+/// block's color and the lower as its background, darkened on a `light`
+/// background.
+fn pixels(art: &[&str], colors: &[Rgb], light: bool) -> Vec<Line<'static>> {
     let color = |row: Option<&&str>, x: usize| {
         let key = row?.as_bytes().get(x)?;
         let index =
             (*key as char).to_digit(36)? as usize + if key.is_ascii_uppercase() { 26 } else { 0 };
-        let (r, g, b) = *colors.get(index)?;
-        Some(Color::Rgb(r, g, b))
+        Some(ink(*colors.get(index)?, light))
     };
     let width = art.first().map_or(0, |row| row.len());
     (0..art.len())
@@ -449,7 +463,7 @@ mod tests {
                 assert!(index < PORTRAIT_COLORS.len(), "{key}");
             }
         }
-        let lines = pixels(&PORTRAIT, &PORTRAIT_COLORS);
+        let lines = pixels(&PORTRAIT, &PORTRAIT_COLORS, false);
         assert_eq!(lines.len(), PORTRAIT.len().div_ceil(2));
         assert!(lines.iter().all(|line| line.width() == width));
         // Open eyes are the portrait's own pixels.
@@ -473,7 +487,7 @@ mod tests {
     #[test]
     fn the_eyes_are_where_the_portrait_has_them() {
         // Both eye rows are drawn on every column a lid covers, so a
-        // blink changes colours only, never a cell's symbol.
+        // blink changes colors only, never a cell's symbol.
         for column in EYE_COLUMNS {
             for row in [EYES, EYES + 1] {
                 assert_ne!(PORTRAIT[row].as_bytes()[column as usize], b'.');
@@ -490,6 +504,22 @@ mod tests {
             task[2].to_string(),
             "A task of this folder's lead. Steer it here:"
         );
+    }
+
+    #[test]
+    fn on_a_light_background_the_white_body_still_stands_out() {
+        let white = (255, 255, 255);
+        let palest = PORTRAIT_COLORS
+            .into_iter()
+            .map(|rgb| match ink(rgb, true) {
+                Color::Rgb(r, g, b) => crate::look::contrast((r, g, b), white),
+                _ => unreachable!(),
+            })
+            .fold(f32::MAX, f32::min);
+        assert!(palest >= 2.0, "{palest}");
+        // On a dark background the colors are the portrait's own.
+        assert_eq!(ink((241, 241, 241), false), Color::Rgb(241, 241, 241));
+        assert_eq!(ink((241, 241, 241), true), Color::Rgb(169, 169, 169));
     }
 
     #[test]

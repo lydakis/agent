@@ -177,8 +177,9 @@ pub const PAUSED: &str = "paused";
 const PACED_SAID_MS: u64 = 5 * 60_000;
 
 /// A paced turn's state, as what it waits on says (`waiting_on`), at
-/// `now` in milliseconds: parked by a stop or the pause, or rate limited,
-/// with the time it is tried again once that is more than five minutes off.
+/// `now` in milliseconds: parked by a stop or the pause, or waiting out a
+/// rate limit or a failed call's backoff, with the time it is tried again
+/// once that is more than five minutes off.
 pub fn paced(on: &serde_json::Value, now: u64) -> String {
     if on["stopped"] == true {
         return PARKED.into();
@@ -186,14 +187,32 @@ pub fn paced(on: &serde_json::Value, now: u64) -> String {
     if on["paused"] == true {
         return PAUSED.into();
     }
+    let what = waits_out(on);
     match on["resume_at_ms"].as_u64() {
         Some(at) if at > now + PACED_SAID_MS => format!(
-            "rate limited until {}",
+            "{what} until {}",
             crate::asks::clock((at / 1000) as i64, (now / 1000) as i64)
         ),
-        _ => "rate limited".into(),
+        _ => what,
     }
 }
+
+/// What a paced turn waits out (`waiting_on`): a failed call's backoff
+/// says what failed, so a dropped connection never reads as a rate limit;
+/// else its provider's pool, closed by a rate limit.
+pub fn waits_out(on: &serde_json::Value) -> String {
+    match on["retrying"].as_str() {
+        Some("provider_overloaded" | "provider_http_529") => {
+            format!("{RETRYING}provider overloaded")
+        }
+        Some(code) => format!("{RETRYING}{}", held_cause(code, None).0),
+        None => "rate limited".into(),
+    }
+}
+
+/// A paced turn's state while it backs off from a failed call, before
+/// what failed.
+pub const RETRYING: &str = "retrying: ";
 
 /// A state's mark, alone, in its hue: the one table every surface that
 /// shows a state draws from. Muted unless it needs you, failed or works.
@@ -204,7 +223,9 @@ pub fn sign(state: &str) -> Span<'static> {
         "failed" => Span::raw("✗").fg(Color::Red),
         "working" => Span::raw("●").fg(Color::Cyan),
         _ if state.starts_with("waiting") => Span::raw("◌").dim(),
-        _ if state.starts_with("rate limited") => Span::raw("◌").dim(),
+        _ if state.starts_with("rate limited") || state.starts_with(RETRYING) => {
+            Span::raw("◌").dim()
+        }
         "queued" | "starting" | PARKED | PAUSED => Span::raw("◌").dim(),
         crate::started::IDLE | crate::started::QUIET | "completed" => Span::raw("○").dim(),
         crate::started::INTERRUPTED | "removed" => Span::raw("■").dim(),
@@ -816,7 +837,30 @@ mod tests {
                 crate::asks::clock((later / 1000) as i64, (now / 1000) as i64)
             )
         );
-        for state in [PARKED, PAUSED, "rate limited until 14:05"] {
+        // A dropped connection's backoff says so, not a rate limit.
+        assert_eq!(
+            paced(
+                &json!({"resume_at_ms": now + 4_000, "retrying": "provider_stream_failed"}),
+                now
+            ),
+            "retrying: provider unreachable"
+        );
+        assert_eq!(
+            paced(
+                &json!({"resume_at_ms": later, "retrying": "provider_http_529"}),
+                now
+            ),
+            format!(
+                "retrying: provider overloaded until {}",
+                crate::asks::clock((later / 1000) as i64, (now / 1000) as i64)
+            )
+        );
+        for state in [
+            PARKED,
+            PAUSED,
+            "rate limited until 14:05",
+            "retrying: provider unreachable",
+        ] {
             assert_eq!(mark(state).content, "◌ ", "{state}");
         }
     }
@@ -973,6 +1017,7 @@ mod tests {
             ("waiting on its reviewer", "◌", None),
             ("queued", "◌", None),
             ("rate limited", "◌", None),
+            ("retrying: provider unreachable", "◌", None),
             ("starting", "◌", None),
             ("idle", "○", None),
             ("no reply", "○", None),
