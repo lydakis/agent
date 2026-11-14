@@ -1533,7 +1533,7 @@ impl View {
                     KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER,
                 ) => {}
             KeyCode::Esc | KeyCode::Backspace | KeyCode::Left if opened => self.open = None,
-            KeyCode::Esc | KeyCode::Char('q') => return Key::Close,
+            KeyCode::Esc => return Key::Close,
             KeyCode::Up | KeyCode::Char('k') if !opened => {
                 self.selected = self.selected.saturating_sub(1);
             }
@@ -1562,26 +1562,38 @@ impl View {
     }
 
     /// The card, and the row the picked thread starts on.
+    #[cfg(test)]
     pub fn card(&self, width: usize) -> (Vec<Line<'static>>, usize) {
+        let (out, at, _) = self.card_rows(width);
+        (out, at)
+    }
+
+    /// [`View::card`], and the row each thread listed starts on, by its
+    /// place in the list; none while a thread is open.
+    pub fn card_rows(&self, width: usize) -> (Vec<Line<'static>>, usize, Vec<usize>) {
         match &self.open {
-            Some((_, read)) => (self.thread_lines(read, width), 0),
+            Some((_, read)) => (self.thread_lines(read, width), 0, Vec::new()),
             None => self.list_lines(width),
         }
     }
 
-    fn list_lines(&self, width: usize) -> (Vec<Line<'static>>, usize) {
+    /// The thread at `at` picked, as a click picks it.
+    pub fn pick_at(&mut self, at: usize) {
+        if self.open.is_none() && at < self.threads.len() {
+            self.selected = at;
+        }
+    }
+
+    fn list_lines(&self, width: usize) -> (Vec<Line<'static>>, usize, Vec<usize>) {
         let count = self.threads.len();
         // Numbers, read as numbers: a listing short of one says 0, never null.
         let invites = |key: &str| self.invites[key].as_u64().unwrap_or(0);
-        // The pane's title names it: its first row counts what it holds.
+        // Whose it is, every project's agents sharing here, then what it holds.
         let mut out = vec![Line::from(vec![
+            Span::raw("every project").bold(),
             Span::raw(format!(
-                "{count} thread{}",
-                if count == 1 { "" } else { "s" }
-            ))
-            .bold(),
-            Span::raw(format!(
-                " · {} of {} invited today, {} invites each · {} of {} answered this week · {} golden ticket{}",
+                " · {count} thread{} · {} of {} invited today, {} invites each · {} of {} answered this week · {} golden ticket{}",
+                if count == 1 { "" } else { "s" },
                 invites("today"),
                 invites("a_day"),
                 invites("reach"),
@@ -1592,23 +1604,24 @@ impl View {
             ))
             .dim(),
         ])];
-        out.push(Line::from("What the agents in every project share with each other.").dim());
         if self.threads.is_empty() {
             out.push(Line::default());
-            out.push(Line::from("No thread yet.").dim());
+            out.push(Line::from("No thread yet."));
             out.push(
                 Line::from("Agents start one with their commons tool when they have something to share or ask.")
                     .dim(),
             );
-            return (out, 0);
+            return (out, 0, Vec::new());
         }
         let mut at = 0;
+        let mut starts = Vec::new();
         for (index, thread) in self.threads.iter().enumerate() {
             let picked = index == self.selected;
             out.push(Line::default());
             if picked {
                 at = out.len();
             }
+            starts.push(out.len());
             let text = |key: &str| thread[key].as_str().unwrap_or_default().to_owned();
             // A picked title is reversed on every row it wraps to, each a
             // cell past its last word, which the wrap leaves room for so
@@ -1651,7 +1664,7 @@ impl View {
                 Span::raw("  "),
             ));
         }
-        (out, at)
+        (out, at, starts)
     }
 
     fn thread_lines(&self, read: &Value, width: usize) -> Vec<Line<'static>> {

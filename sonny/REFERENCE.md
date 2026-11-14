@@ -1017,13 +1017,17 @@ has something on it, or is off the screen, no time shows.
   nothing, and says what went wrong under it),
   **Working** (a turn running, queued, rate limited, starting, waiting on
   other tasks, or `waiting on its reviewer` while the reviewer weighs a
-  call), **Idle** (its turn ended with nothing open, `idle`; ended without
-  words, `no reply`; or you ended it, `interrupted`; a pull request its
-  last reply linked shows on its row), and **Done** (marked done). One
-  table gives every state its mark, for the footer, `/status`, the tasks
-  a lead started and `/switch` alike: `?` needs you or held, `✗` failed,
-  `●` working, `◌` waiting, queued, rate limited or starting, `○` idle or
-  no reply, `■` interrupted, `✓` done; all but the first three muted.
+  call; a turn its pool holds more than five minutes says until when,
+  `rate limited until 14:05`, one a stop parked says `parked by a
+  restart`, which the next start goes on with, and one the pull cord
+  parked says `paused`), **Idle** (its turn ended with nothing open,
+  `idle`; ended without words, `no reply`; or you ended it,
+  `interrupted`; a pull request its last reply linked shows on its row),
+  and **Done** (marked done). One table gives every state its mark, for
+  the footer, `/status`, the tasks a lead started and `/switch` alike:
+  `?` needs you or held, `✗` failed, `●` working, `◌` waiting, queued,
+  rate limited, parked, paused or starting, `○` idle or no reply, `■`
+  interrupted, `✓` done; all but the first three muted.
   Each agent is one line: its mark, name, state and time; one
   that needs you says what for under it, one that failed why. That is all it shows as it opens; `m` shows more and hides it
   again: at each row's right edge, dim, the rest of what it tracks: what it follows (a source with an
@@ -1032,11 +1036,13 @@ has something on it, or is off the screen, no time shows.
   request link its last reply holds, its background work
   and its window, and under the picked agent its model and profile, and
   its latest step. Idle and Done fold to their headings (`Idle · 5 ▸`,
-  `Done · 3 ▸`). A click on either, or `i` and `d`
-  with the keys in the pane, opens them, and the same folds them again.
+  `Done · 3 ▸`), each heading a row the keys pick: a click on it, `→` or
+  Enter opens it, and `←` folds it again, as does `←` on an agent in it.
+  `/status` opens with its first row picked.
   The helpers a task started fold under it (`▸ 2 helpers, 1 working`),
   a helper that needs you or failed listed in its group too; a click on that
-  line, or → on the picked task, opens them, and ← folds them. As threads in a claude.ai project are
+  line, or → on the picked task, opens them, and ← folds them. `x` stops a
+  picked workflow. As threads in a claude.ai project are
   resolved, a task marks itself done with the `mark_done` tool once
   nothing is left to do in it, such as when its pull request merged or
   you dropped the work, and the lead can mark any of its tasks done the
@@ -1060,20 +1066,24 @@ has something on it, or is off the screen, no time shows.
   its project's default. An agent with
   automations or follows of its own shows `↻ 2 automations` there too. A click on an agent's name goes
   to it as a click on a task in a roster does (below), and so does
-  Enter on the agent ↑ and ↓ pick (`›`). This window's own agent is a
+  Enter on the agent ↑ and ↓ pick (reversed, as every view draws its pick). This window's own agent is a
   row like any other: picking it closes `/status`, back to the
   conversation. ‹ in its title,
   or Ctrl+[ from the conversation, goes back to `/status`. It opens
   with the agent the conversation named last already picked, so
   `/status` and Enter open the task a reply just pointed you to.
 
-  ![/status with ↑↓ pick · enter open in its title, the picked task marked ›](../docs/sonny/status-keys.png)
+  ![/status with ↑↓ pick · enter open in its title, the picked task reversed](../docs/sonny/status-keys.png)
 
   ![/status with Idle open and the lead picked, its row shown reversed](../docs/sonny/status-lead-picked.png)
 
   ![/status naming each agent's profile beside its model: superlead, task, reviewer](../docs/sonny/status-profile.png)
 
   ![A task opened from /status in the pane, its ‹ going back to /status](../docs/sonny/status-opens-agent.png)
+
+  ![/status with backup paused by the pull cord and migrate rate limited until 11:40, its pool closed for two hours](../docs/sonny/status-paced-reasons.png)
+
+  ![A task whose command a restart cut: a muted ■ before Ran ./deploy.sh, and under it cut by a restart: it may have run, and was not run again](../docs/sonny/call-cut-by-restart.png)
 
   Under its heading, `/status` says only what is broken around the
   agents, each with a red `✗`: a companion of the daemon that keeps
@@ -1093,8 +1103,8 @@ has something on it, or is off the screen, no time shows.
   no one typing: the automations that wake them, with
   when each runs, its message and what its last run did, and the
   lookout's follows, with how many checks each asked for in the last
-  day. `↑`/`↓` picks one, `r` runs an automation now, and `d` pressed twice
-  removes it; the follow Sonny keeps for a lead's tasks stays. What runs
+  day. `↑`/`↓` picks one, Enter (or a click) goes to the agent it wakes,
+  `r` runs an automation now, and `d` pressed twice removes it; the follow Sonny keeps for a lead's tasks stays. What runs
   there while healthy asks nothing of you, so the footer leaves it out.
   What failed is listed first, with a red `✗` and the error: an automation
   whose run failed (one that ended on it stays listed until `d` removes
@@ -1117,8 +1127,8 @@ has something on it, or is off the screen, no time shows.
   stacked bars over time (output, input read fresh, and input read from the
   provider's cache), by agent and by model: each model by its name, its
   provider in a muted column beside it, and one model's ids from one
-  provider (two Bedrock regions', say) on one row. `d`, `w` and `m` show the last
-  day, week or month, `a` every agent in the store, by project, and `c`
+  provider (two Bedrock regions', say) on one row. `←` and `→` show the last
+  day, week or month, `a` every project's agents, by project, and `c`
   hides the cached reads, so what the provider charges most for stands out.
   Under the models, Speed says how fast each answered its calls: output
   tokens a second from send to answer, and the time to its first output, on
@@ -1269,7 +1279,7 @@ has something on it, or is off the screen, no time shows.
   `NO_COLOR` honoured, and `sonny sky --center NAME` starts on an agent
   (its name, label or project) and `sonny sky --replay [WHEN]` plays the
   past back from WHEN (`2h`, `30m` or `1d` ago, or a time such as `02:10`;
-  an hour ago when not said); `q` leaves it, and a daemon that goes is
+  an hour ago when not said); Esc leaves it, and a daemon that goes is
   followed again once it is back.
 
   ![/sky in the pane](../docs/sonny/sky.gif)
@@ -1875,6 +1885,37 @@ footer was. Each narrows as you type, found by its name or what it is,
 and Backspace back to nothing picks the row it opened on; a question an
 agent asks keeps its options as they are, since their order is its
 recommendation.
+
+Every view in the pane takes the keys one way, as a file browser's list
+does. `↑` `↓` move the pick, and `h` `j` `k` `l` are the arrows there;
+a view with rows opens with its first row picked, and a page of text (a
+file, a commons thread, the margin) picks among the links in view, as
+Lynx does, scrolling where none is left that way. `→` opens what the
+picked row holds and `←` folds it; with nothing to fold, `←` steps the
+pane back a page, and it never moves the keys. Enter goes to the picked
+row's agent, where a click on its blue name goes (on this window's own
+agent it closes the view), and otherwise does the row's one thing: it
+never closes a view for any other reason. A click on a row picks it and
+presses Enter. Esc closes the view; an agent shown beside first does
+what Esc does there (clears what is typed, stops its turn), then gives
+the keys back, and the next Esc closes it. Tab with nothing typed moves
+the keys between the conversation and the pane, both ways, the agent
+beside included; while the pane has them the composer's `›` is muted,
+and a key the view does not name does nothing (`q` included), never
+typed into the composer.
+
+Every view is laid out the same way, too. Its title row is the command
+that opens it (`mcp`, not "MCP servers") and the keys it takes. Under it
+the head says whose view it is, bold: the project (`shop`), `every
+project` when `a` widens it, or one agent as you say it (`shop lead`),
+then muted facts after ` · `. What is broken comes next, as a red `✗` and
+plain words; then sections, a bold name and a muted count; then rows,
+the pick reversed from the row's first word to one column past its last.
+An empty view says so in one sentence, then one muted line on how it
+fills; a view still reading says `reading…`, and one that could not says
+`✗ could not read …: why`. A list cut short ends `… N more`. An agent
+shown beside opens no pane of its own: asked for a view or the margin, it
+says views open in the main window, where Ctrl+G moves it.
 
 ![? with nothing typed: every key beside the conversation](../docs/sonny/shortcuts.png)
 

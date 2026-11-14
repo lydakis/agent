@@ -168,6 +168,33 @@ pub fn pull_requests(text: &str) -> Vec<String> {
     found
 }
 
+/// A turn the daemon's stop parked, which its next start goes on with.
+pub const PARKED: &str = "parked by a restart";
+/// A turn the pull cord parked until work resumes.
+pub const PAUSED: &str = "paused";
+/// How long a turn's wait for its pool goes unsaid: past it, the state
+/// says when it is tried again.
+const PACED_SAID_MS: u64 = 5 * 60_000;
+
+/// A paced turn's state, as what it waits on says (`waiting_on`), at
+/// `now` in milliseconds: parked by a stop or the pause, or rate limited,
+/// with the time it is tried again once that is more than five minutes off.
+pub fn paced(on: &serde_json::Value, now: u64) -> String {
+    if on["stopped"] == true {
+        return PARKED.into();
+    }
+    if on["paused"] == true {
+        return PAUSED.into();
+    }
+    match on["resume_at_ms"].as_u64() {
+        Some(at) if at > now + PACED_SAID_MS => format!(
+            "rate limited until {}",
+            crate::asks::clock((at / 1000) as i64, (now / 1000) as i64)
+        ),
+        _ => "rate limited".into(),
+    }
+}
+
 /// A state's mark, alone, in its hue: the one table every surface that
 /// shows a state draws from. Muted unless it needs you, failed or works.
 pub fn sign(state: &str) -> Span<'static> {
@@ -177,7 +204,8 @@ pub fn sign(state: &str) -> Span<'static> {
         "failed" => Span::raw("✗").fg(Color::Red),
         "working" => Span::raw("●").fg(Color::Cyan),
         _ if state.starts_with("waiting") => Span::raw("◌").dim(),
-        "queued" | "rate limited" | "starting" => Span::raw("◌").dim(),
+        _ if state.starts_with("rate limited") => Span::raw("◌").dim(),
+        "queued" | "starting" | PARKED | PAUSED => Span::raw("◌").dim(),
         crate::started::IDLE | crate::started::QUIET | "completed" => Span::raw("○").dim(),
         crate::started::INTERRUPTED | "removed" => Span::raw("■").dim(),
         crate::started::DONE => Span::raw("✓").dim(),
@@ -763,6 +791,35 @@ fn row_lines(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_paced_turn_says_what_holds_it() {
+        use serde_json::json;
+        let now = 1_800_000_000_000;
+        assert_eq!(
+            paced(&json!({"resume_at_ms": null, "stopped": true}), now),
+            PARKED
+        );
+        assert_eq!(
+            paced(&json!({"resume_at_ms": null, "paused": true}), now),
+            PAUSED
+        );
+        assert_eq!(
+            paced(&json!({"resume_at_ms": now + 30_000}), now),
+            "rate limited"
+        );
+        let later = now + 2 * 3_600_000;
+        assert_eq!(
+            paced(&json!({"resume_at_ms": later}), now),
+            format!(
+                "rate limited until {}",
+                crate::asks::clock((later / 1000) as i64, (now / 1000) as i64)
+            )
+        );
+        for state in [PARKED, PAUSED, "rate limited until 14:05"] {
+            assert_eq!(mark(state).content, "◌ ", "{state}");
+        }
+    }
 
     #[test]
     fn the_latest_step_reads_as_prose() {

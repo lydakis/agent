@@ -10,7 +10,7 @@
 use crate::background::Scope;
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::{
-    style::{Color, Style, Stylize},
+    style::{Color, Stylize},
     text::{Line, Span},
 };
 use serde_json::{Value, json};
@@ -134,7 +134,7 @@ impl View {
         // Any key but a second x lets a stop asked for go.
         let stopping = self.stopping.take();
         match key.code {
-            KeyCode::Esc | KeyCode::Char('q') => Key::Close,
+            KeyCode::Esc => Key::Close,
             KeyCode::Enter => match self.picked() {
                 Some(row) => Key::Open(word(row, "bot")),
                 None => Key::Close,
@@ -172,6 +172,22 @@ impl View {
         }
     }
 
+    /// The row of the card each row starts on, in their order: one line
+    /// each under the heading.
+    pub fn starts(&self) -> Vec<usize> {
+        match self.error {
+            Some(_) => Vec::new(),
+            None => (0..self.rows.len()).map(|at| at + 2).collect(),
+        }
+    }
+
+    /// The row at `at` picked, as a click picks it.
+    pub fn pick_at(&mut self, at: usize) {
+        if at < self.rows.len() {
+            self.pick = Some(at);
+        }
+    }
+
     /// The row of the card the picked command is on, to keep it in view.
     pub fn picked_row(&self) -> Option<usize> {
         self.pick.map(|at| at + 2)
@@ -180,8 +196,8 @@ impl View {
     /// The card at `width`, as of `now_ms`.
     pub fn card(&self, width: usize, now_ms: i64) -> Vec<Line<'static>> {
         let whose = match self.all {
-            true => "every agent".to_owned(),
-            false => format!("{}'s agents", self.scope.project),
+            true => "every project".to_owned(),
+            false => self.scope.project.clone(),
         };
         let mut head = vec![Span::raw(whose).bold()];
         if !self.rows.is_empty() {
@@ -191,7 +207,7 @@ impl View {
         if let Some(error) = &self.error {
             out.push(Line::from(vec![
                 Span::raw("✗ ").fg(Color::Red),
-                Span::raw(format!("couldn't read what runs: {error}")),
+                Span::raw(format!("could not read what runs: {error}")),
             ]));
             return out;
         }
@@ -201,9 +217,9 @@ impl View {
         }
         if self.rows.is_empty() {
             out.push(Line::from("Nothing the agents started is running."));
-            if !self.all {
-                out.push(Line::from("a shows every agent's").dim());
-            }
+            out.push(
+                Line::from("A command an agent leaves running shows here until it ends.").dim(),
+            );
         }
         let names: Vec<String> = (self.rows.iter())
             .map(|row| self.name(row["bot"].as_str().unwrap_or("?")))
@@ -232,7 +248,7 @@ impl View {
     pub fn keys(&self) -> String {
         let scope = match self.all {
             true => "a this project",
-            false => "a every agent",
+            false => "a every project",
         };
         use crate::hint::{Enter, Esc, Keys};
         let (key, does) = scope.split_once(' ').unwrap_or((scope, ""));
@@ -279,10 +295,10 @@ fn line(
     while name.width() > name_width {
         name.pop();
     }
-    let lead = format!(
-        "{} {ran:>4} {name:<name_width$} ",
-        if picked { "›" } else { " " }
-    );
+    // The pad before the age is its own span, so the pick reverses from
+    // the row's first word.
+    let pad = " ".repeat(1 + 4usize.saturating_sub(ran.width()));
+    let lead = format!("{ran} {name:<name_width$} ");
     let facts = match row["pid"].as_i64() {
         Some(pid) => format!("{kind:<8} pid {pid} "),
         None => format!("{kind:<8} "),
@@ -293,19 +309,20 @@ fn line(
         .chars()
         .map(|c| if c.is_control() { ' ' } else { c })
         .collect();
-    let room = width.saturating_sub(lead.width() + facts.width() + 1);
+    let room = width.saturating_sub(pad.width() + lead.width() + facts.width() + 1);
     while command.width() > room {
         command.pop();
     }
-    let style = match picked {
-        true => Style::new().bold(),
-        false => Style::new(),
-    };
-    Line::from(vec![
-        Span::styled(lead, style),
+    let mut line = Line::from(vec![
+        Span::raw(pad),
+        Span::raw(lead),
         Span::raw(facts).dim(),
-        Span::styled(command, style),
-    ])
+        Span::raw(command),
+    ]);
+    if picked {
+        crate::list::pick(&mut line);
+    }
+    line
 }
 
 #[cfg(test)]
