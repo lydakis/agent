@@ -2,8 +2,9 @@
 //! lines readable only by their owner. The `agent` CLI adds them over the
 //! environment of a daemon it starts, and only then, so every starter
 //! (Sonny, an automation's check, a script, cron) gives the daemon the same
-//! keys; a command the daemon answers never reads the file, and the daemon
-//! never does. As Codex keeps `~/.codex/.env` from setting `CODEX_` names,
+//! keys; the daemon never reads the file, and it starts with the file
+//! `--unreadable`, so no sandboxed command, nor the `read` tool for a
+//! sandboxed bot, reads it either. As Codex keeps `~/.codex/.env` from setting `CODEX_` names,
 //! names starting `AGENT_` (any case) are passed over: they are Agent's own
 //! settings, and providers live in `~/.agent/config.toml`.
 use std::path::{Path, PathBuf};

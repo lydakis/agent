@@ -261,7 +261,7 @@ const COMMANDS: &[Command] = &[
         name: "serve",
         about: "Run the daemon in the foreground; other commands start it for you",
         usage: "serve --store PATH --provider SPEC... [OPTIONS]",
-        flags: "--shell-exclude --redact-field --redact-block --protect --protect-existing --protect-path --wall --own-copy --context-window --speeds --fallbacks --models --provider-config --await-owner",
+        flags: "--shell-exclude --redact-field --redact-block --protect --protect-existing --protect-path --wall --unreadable --own-copy --context-window --speeds --fallbacks --models --provider-config --await-owner",
         settings: "",
         startup: true,
     },
@@ -499,6 +499,10 @@ fn print_flags(flags: &str) {
             "--wall" => (
                 "FOLDER",
                 "Keep every sandboxed command, the network on or not, from connecting to the Unix sockets in FOLDER, made private (mode 700) if missing; a wall for sockets, not a way to hide files: on Linux the folder shows empty to a sandboxed command, on macOS its files stay readable, and the read tool, which the daemon answers outside any sandbox, reads them on both; repeatable",
+            ),
+            "--unreadable" => (
+                "PATH",
+                "Keep every sandboxed command from reading, writing, linking to or renaming PATH, by its absolute path, and the read tool from reading it for a sandboxed bot, as Codex's deny_read; clients pass ~/.agent/env; repeatable",
             ),
             "--own-copy" => (
                 "FOLDER",
@@ -802,6 +806,7 @@ pub fn prepare(args: Vec<String>) -> Result<Option<Vec<String>>> {
                     | "--protect-existing"
                     | "--protect-path"
                     | "--wall"
+                    | "--unreadable"
                     | "--own-copy"
                     | "--context-window"
                     | "--speeds"

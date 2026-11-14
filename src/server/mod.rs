@@ -1099,6 +1099,8 @@ pub struct Configuration {
     /// Folders whose Unix sockets no sandboxed command reaches, made if
     /// missing, private to the daemon's user.
     pub walled: Vec<PathBuf>,
+    /// Paths no sandboxed command or `read` reads, as Codex's `deny_read`.
+    pub unreadable: Vec<PathBuf>,
     /// System folders every Linux sandbox shows from the person's copy.
     pub own_copies: Vec<PathBuf>,
     /// The context windows the person set, by model path.
@@ -2054,6 +2056,9 @@ pub async fn run(config: Configuration) -> Result<()> {
     let protected_paths = (config.protected_paths.iter())
         .map(|path| real_or_named(path))
         .collect::<Result<Vec<_>>>()?;
+    let unreadable = (config.unreadable.iter())
+        .map(|path| real_or_named(path))
+        .collect::<Result<Vec<_>>>()?;
     // Made now, so a sandbox started before a socket is in one hides it all
     // the same, and no other user's sockets are in it.
     let walled = (config.walled.iter())
@@ -2094,6 +2099,7 @@ pub async fn run(config: Configuration) -> Result<()> {
         // missing one by the real path of the folder it would be made in.
         protected_paths,
         walled,
+        unreadable,
         owned: config.own_copies.clone(),
         known: agent_client::config::daemons(),
     };

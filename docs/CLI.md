@@ -66,7 +66,11 @@ keeps it read-only where it exists; a client passes `.git`, `.agents` and
 keeps PATH, by its absolute path, read-only in every sandbox and from being
 made there; the CLI passes `~/.agent/rules`, where Sonny reads the
 [command rules](RUST_PROTOTYPE.md#command-rules) it gives its bots, so no
-bot writes its own. `serve --wall FOLDER` keeps every sandboxed command,
+bot writes its own. `serve --unreadable PATH` keeps PATH from every
+sandboxed command's reads, writes, links and renames, as Codex's
+`deny_read`, and the `read` tool refuses it for a sandboxed bot
+(`read_denied`); the CLI passes `~/.agent/env`, the keys it starts the
+daemon with. `serve --wall FOLDER` keeps every sandboxed command,
 the network on or not, from connecting to the Unix sockets in FOLDER,
 which it makes private (mode 700) if missing; the CLI passes
 `~/.agent/run`, where clients such as Sonny keep the sockets of programs

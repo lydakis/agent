@@ -2610,6 +2610,7 @@ impl Registry {
                 limit,
             } => {
                 let file = resolve(workspace, &path);
+                readable(sandbox.clone(), &file, &path).await?;
                 // A picture goes to the model as one, after a line on it.
                 // Its header says so; the file is read only in its turn.
                 if picture::kind(&files::read_head(&file, picture::HEAD).await?).is_some()
@@ -3534,6 +3535,26 @@ fn resolve(workspace: &Path, path: &str) -> PathBuf {
 /// filesystem, so it runs off the runtime thread.
 async fn writable(sandbox: Option<Arc<Policy>>, target: &Path, path: &str) -> Result<()> {
     allowed(sandbox, target, path, Policy::can_write).await
+}
+
+/// Whether a sandboxed bot may read `target`, as its commands may: all
+/// but what the daemon keeps unreadable. The daemon reads for the `read`
+/// tool outside the sandbox, so it asks the sandbox's rule itself.
+async fn readable(sandbox: Option<Arc<Policy>>, target: &Path, path: &str) -> Result<()> {
+    let Some(policy) = sandbox.filter(|policy| !policy.unreadable.is_empty()) else {
+        return Ok(());
+    };
+    let target = target.to_owned();
+    let readable = tokio::task::spawn_blocking(move || policy.can_read(&target))
+        .await
+        .unwrap_or(false);
+    match readable {
+        false => fail_with(
+            "read_denied",
+            format!("{path} is kept unreadable in this bot's sandbox"),
+        ),
+        true => Ok(()),
+    }
 }
 
 /// [`writable`], for removing `target` itself rather than writing through it.

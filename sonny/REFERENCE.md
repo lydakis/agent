@@ -957,8 +957,10 @@ has something on it, or is off the screen, no time shows.
   any other daemon's socket or its agents' sockets, or those of the
   programs Sonny runs for agents outside the sandbox (`~/.agent/run`).
   A call to run outside the sandbox that may start a daemon waits for
-  you, never the reviewer alone. It leaves open reads of anything
-  you can read, as Codex's `workspace-write` does, your SSH keys, cloud
+  you, never the reviewer alone. Nor can it read `~/.agent/env`, the keys
+  the daemon runs with, which no agent's command needs (the `read` tool
+  refuses it too). It leaves open reads of anything
+  else you can read, as Codex's `workspace-write` does, your SSH keys, cloud
   credentials and other projects included; the network, in every row but
   Read only; and, while the network is on, every other Unix socket that a
   program signed in as you listens on, such as ssh-agent, MCPX and

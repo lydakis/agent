@@ -5,7 +5,8 @@
 //! (Apache-2.0; see NOTICE), and kept in step with them.
 //!
 //! A bot with a sandbox writes only its roots: its folder, the folders its
-//! client named, and the temporary directories. Reading stays open. Inside
+//! client named, and the temporary directories. Reading stays open but for
+//! the paths the daemon keeps unreadable, as Codex's `deny_read`. Inside
 //! each root, what git, agent configuration and AWS profiles run or trust
 //! stays read-only, and so does the daemon's own store. Network is off
 //! unless the bot's client turned it on.
@@ -108,6 +109,9 @@ pub struct Policy {
     /// copy of it, bound read-only in its place: `(copy, place)`.
     #[serde(default)]
     pub owned: Vec<(PathBuf, PathBuf)>,
+    /// What its commands may not read, nor write, link to or rename, and
+    /// the `read` tool doesn't read for it ([`Daemon::unreadable`]).
+    pub unreadable: Vec<PathBuf>,
 }
 
 impl Policy {
@@ -173,6 +177,7 @@ impl Policy {
             walled: daemon.walled.clone(),
             owned: owned(&daemon.owned),
             daemons,
+            unreadable: daemon.unreadable.clone(),
         }))
     }
 
@@ -191,6 +196,20 @@ impl Policy {
         real(path).is_some_and(|path| self.writes(&path))
     }
 
+    /// Whether a command in this sandbox may read `path`, an absolute path:
+    /// all but what is kept unreadable and what is under it, by the real
+    /// path a read follows links to.
+    pub fn can_read(&self, path: &Path) -> bool {
+        real(path).is_some_and(|path| !self.hides(&path))
+    }
+
+    /// Whether `path`, a real path, is kept unreadable, or is under what is.
+    fn hides(&self, path: &Path) -> bool {
+        self.unreadable
+            .iter()
+            .any(|hidden| path.starts_with(hidden))
+    }
+
     /// Whether a command in this sandbox may remove `path`, an absolute
     /// path: the name itself in the folder that holds it, so a link is
     /// judged where it lies, as removing it would remove it there, not by
@@ -202,22 +221,24 @@ impl Policy {
         real(folder).is_some_and(|folder| self.writes(&folder.join(name)))
     }
 
-    /// Whether the deepest root that holds `path`, a real path, lets it be
-    /// written.
+    /// Whether `path`, a real path, is not kept unreadable and the deepest
+    /// root that holds it lets it be written.
     fn writes(&self, path: &Path) -> bool {
-        self.roots
-            .iter()
-            .rev()
-            .find(|root| path.starts_with(&root.path))
-            .is_some_and(|root| {
-                !root
-                    .read_only
-                    .iter()
-                    .chain(&root.missing)
-                    .chain(&root.left)
-                    .chain(&root.others)
-                    .any(|kept| path.starts_with(kept))
-            })
+        !self.hides(path)
+            && self
+                .roots
+                .iter()
+                .rev()
+                .find(|root| path.starts_with(&root.path))
+                .is_some_and(|root| {
+                    !root
+                        .read_only
+                        .iter()
+                        .chain(&root.missing)
+                        .chain(&root.left)
+                        .chain(&root.others)
+                        .any(|kept| path.starts_with(kept))
+                })
     }
 }
 
@@ -553,6 +574,14 @@ pub struct Daemon {
     /// overflow user's. Each is shown from a read-only copy the person
     /// owns (`--own-copy`). The client starting the daemon names them.
     pub owned: Vec<PathBuf>,
+    /// Paths no sandboxed command reads, nor writes, links to or renames,
+    /// and the `read` tool doesn't read for a sandboxed bot
+    /// (`--unreadable`), as Codex's `deny_read`: the person's keys, which a
+    /// command that read them could send anywhere the network reaches. The
+    /// client starting the daemon names them. Each by its real path once
+    /// it exists; a missing one by the real path of the folder it would be
+    /// made in.
+    pub unreadable: Vec<PathBuf>,
     /// Where the person's daemons list themselves ([`known`]), whose
     /// stores and sockets every root and policy keeps out of reach as it
     /// does this daemon's own.
@@ -1085,6 +1114,19 @@ mod linux {
                 path(folder),
             ]);
         }
+        // A folder it may not read, out of sight, as Codex hides its
+        // deny_read folders: empty and closed. Its files are hidden in
+        // `command`, which holds what they are shown from.
+        for hidden in (policy.unreadable.iter()).filter(|hidden| hidden.is_dir()) {
+            args.extend([
+                "--perms".into(),
+                "000".into(),
+                "--tmpfs".into(),
+                path(hidden),
+                "--remount-ro".into(),
+                path(hidden),
+            ]);
+        }
         // The person's copies of the system's folders whose files a
         // program checks the owner of, over the folders themselves.
         for (copy, place) in &policy.owned {
@@ -1113,6 +1155,20 @@ mod linux {
             .arg("--seccomp")
             .arg(filter.as_raw_fd().to_string());
         let mut kept = vec![filter];
+        // A file it may not read, as Codex hides its deny_read files: an
+        // empty one in its place that no one may open, over every other
+        // mount, so a read is refused, not answered empty. Each that is
+        // there now; one missing is left so, as it can't be made where the
+        // sandbox doesn't write, and the CLI's `~/.agent/env` is in the
+        // agent's home, which no sandbox writes.
+        for hidden in (policy.unreadable.iter()).filter(|hidden| hidden.is_file()) {
+            let empty = std::os::fd::OwnedFd::from(std::fs::File::open("/dev/null")?);
+            command
+                .args(["--perms", "000", "--ro-bind-data"])
+                .arg(empty.as_raw_fd().to_string())
+                .arg(hidden);
+            kept.push(empty);
+        }
         if let Some(handing) = (policy.capability.as_deref().map(handing).transpose()?).flatten() {
             command.env(
                 agent_client::socket::HANDED,
@@ -1869,6 +1925,7 @@ pub fn seatbelt(policy: &Policy) -> (String, Vec<(String, PathBuf)>) {
         .chain(&policy.socket)
         .chain(&policy.walled)
         .chain(&policy.daemons)
+        .chain(&policy.unreadable)
         .flat_map(|kept| kept.ancestors().skip(1))
         .filter(|folder| {
             policy
@@ -1960,6 +2017,17 @@ pub fn seatbelt(policy: &Policy) -> (String, Vec<(String, PathBuf)>) {
         sections.push(format!(
             "(allow system-socket (socket-domain AF_UNIX))\n\
              (allow network-outbound (remote unix-socket (subpath (param \"{key}\"))))"
+        ));
+    }
+    // Never what it may not read, nor written, made or linked to under
+    // another name, as Codex denies its deny_read paths: after every allow,
+    // so the deny wins.
+    for hidden in &policy.unreadable {
+        let key = param(hidden);
+        sections.push(format!(
+            "(deny file-read* (subpath (param \"{key}\")))\n\
+             (deny file-write* (subpath (param \"{key}\")))\n\
+             (deny file-link (subpath (param \"{key}\")))"
         ));
     }
     sections.push(SEATBELT_PREFERENCES.to_owned());
@@ -2133,6 +2201,60 @@ mod tests {
         assert!(!policy.can_write(&home.join("env")));
         assert!(policy.can_write(&zen.join("key")));
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// What the daemon keeps unreadable no command reads, writes, links to
+    /// or renames, in its roots or out of them, by any link to it; the rest
+    /// of what it may read and write is as it was.
+    #[test]
+    fn an_unreadable_path_is_closed_to_every_command() {
+        let base = std::env::temp_dir().join(format!("agent-sandbox-hide-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(base.join("work/keys")).unwrap();
+        std::fs::create_dir_all(base.join("home")).unwrap();
+        std::fs::write(base.join("home/env"), "KEY=x").unwrap();
+        let base = std::fs::canonicalize(&base).unwrap();
+        let (work, env, keys) = (
+            base.join("work"),
+            base.join("home/env"),
+            base.join("work/keys"),
+        );
+        std::os::unix::fs::symlink(&env, work.join("env")).unwrap();
+        let daemon = Daemon {
+            unreadable: vec![env.clone(), keys.clone()],
+            ..protecting()
+        };
+        let policy = Policy::new(Some(Mode::WorkspaceWrite), Some(&work), &[], true, &daemon)
+            .unwrap()
+            .unwrap();
+        for hidden in [&env, &work.join("env"), &keys, &keys.join("id")] {
+            assert!(!policy.can_read(hidden), "{}", hidden.display());
+            assert!(!policy.can_write(hidden), "{}", hidden.display());
+        }
+        assert!(!policy.can_remove(&keys));
+        assert!(policy.can_read(&base.join("home")) && policy.can_read(&work.join("notes")));
+        assert!(policy.can_write(&work.join("notes")));
+        let (profile, params) = seatbelt(&policy);
+        for hidden in [&env, &keys] {
+            let (key, _) = params.iter().find(|(_, path)| path == hidden).unwrap();
+            for operation in ["file-read*", "file-write*", "file-link"] {
+                let rule = format!("(deny {operation} (subpath (param \"{key}\")))");
+                assert!(profile.contains(&rule), "{rule}");
+            }
+        }
+        // After the allow it overrides.
+        let allow = profile.find("(allow file-read*)").unwrap();
+        assert!(profile.rfind("(deny file-read*").unwrap() > allow);
+        #[cfg(target_os = "linux")]
+        {
+            let args = linux::args(&policy, false);
+            let keys = keys.to_string_lossy();
+            assert!(
+                args.windows(4)
+                    .any(|w| w[0] == "000" && w[1] == "--tmpfs" && w[2] == keys)
+            );
+        }
+        std::fs::remove_dir_all(&base).unwrap();
     }
 
     #[test]
@@ -2733,6 +2855,7 @@ mod tests {
             walled: Vec::new(),
             owned: Vec::new(),
             daemons: Vec::new(),
+            unreadable: Vec::new(),
         };
         let (profile, params) = seatbelt(&policy);
         let size = profile.len()

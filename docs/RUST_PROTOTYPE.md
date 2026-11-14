@@ -3259,6 +3259,19 @@ every sandbox and, when missing, from being made there. The CLI passes
 writable folder that is a symlink refuses the call with
 `sandbox_unavailable`.
 
+Nor read the keys the daemon was started with, which a command that read
+them could send anywhere the network reaches: `serve --unreadable PATH`,
+which repeats, keeps a path, by its real path, from every sandboxed
+command's reads, writes, links and renames, as Codex's `deny_read` does,
+and has the `read` tool refuse it for a sandboxed bot with `read_denied`,
+since the daemon answers that tool outside the sandbox. Seatbelt denies the
+path and what is under it after every allow; bubblewrap shows a folder as
+an empty one no one may open and a file as an empty one no one may open
+(`--perms 000`), so a read fails rather than reading nothing. A path
+missing when a command starts stays missing for it where it may not be
+made. The CLI passes `~/.agent/env`, the keys it gives every daemon it
+starts; the agent's home, which holds it, is read-only in every sandbox.
+
 Nor reach a program a client runs for bots outside the sandbox, which does
 what it is asked as the person: `serve --wall FOLDER`, which repeats, keeps
 every sandboxed command from the Unix sockets in FOLDER, the network on or

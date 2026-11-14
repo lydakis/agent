@@ -1272,6 +1272,11 @@ fn spawn_daemon(
     if let Some(home) = agent_client::config::home() {
         command.arg("--protect-path").arg(home);
     }
+    // The keys this CLI gives the daemon, which no bot's command reads:
+    // one that could would send them anywhere the network reaches.
+    if let Some(env) = agent_client::env_file::path() {
+        command.arg("--unreadable").arg(env);
+    }
     // Where clients keep the sockets of the programs they run for bots
     // outside the sandbox, which do as they are asked as the person.
     if let Some(run) = agent_client::config::run() {

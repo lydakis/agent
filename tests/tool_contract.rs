@@ -730,9 +730,14 @@ async fn a_sandboxed_command_writes_only_its_roots() {
         std::fs::create_dir_all(folder).unwrap();
     }
     std::fs::write(dir.join("store"), "db").unwrap();
+    // Keys it may not read: one outside its roots, one in its own folder.
+    let (keys, env) = (base.join("keys"), dir.join("env"));
+    std::fs::write(&keys, "KEY=outside").unwrap();
+    std::fs::write(&env, "KEY=inside").unwrap();
     let daemon = Daemon {
         store: Some(dir.join("store")),
         helper: Some(env!("CARGO_BIN_EXE_agent").into()),
+        unreadable: vec![keys.clone(), env.clone()],
         ..protecting()
     };
     let writable = [
@@ -750,7 +755,7 @@ async fn a_sandboxed_command_writes_only_its_roots() {
         .unwrap()
         .unwrap(),
     );
-    let tools = Registry::new("shell,write,edit,apply_patch").unwrap();
+    let tools = Registry::new("shell,read,write,edit,apply_patch").unwrap();
     let run = |command: String| {
         let tools = tools.clone();
         let (dir, policy) = (dir.clone(), policy.clone());
@@ -895,6 +900,46 @@ async fn a_sandboxed_command_writes_only_its_roots() {
         .unwrap_err();
     assert_eq!(error.code, "write_denied");
     assert!(hook.symlink_metadata().is_ok());
+    // What the daemon keeps unreadable no command reads, writes, renames or
+    // links to another name, and neither does the read tool, by its path
+    // or through a link.
+    for command in [
+        format!("cat {}", keys.display()),
+        "cat env".into(),
+        "echo x > env".into(),
+        "mv env moved".into(),
+        "ln env linked".into(),
+    ] {
+        let output = run(command.clone()).await;
+        assert_ne!(output["exit_code"], 0, "{command}: {output}");
+        let said = format!("{}{}", output["stdout"], output["stderr"]);
+        assert!(!said.contains("KEY="), "{command}: {output}");
+    }
+    assert_eq!(std::fs::read_to_string(&env).unwrap(), "KEY=inside");
+    assert!(!dir.join("moved").exists() && !dir.join("linked").exists());
+    std::os::unix::fs::symlink(&keys, dir.join("to-keys")).unwrap();
+    for path in [keys.to_str().unwrap(), "env", "to-keys"] {
+        let read = tools
+            .prepare("read", &json!({ "path": path }).to_string())
+            .unwrap();
+        let error = tools
+            .execute(read, &dir, &[], Some(policy.clone()))
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, "read_denied", "{path}");
+    }
+    let error = tools
+        .execute(write("env"), &dir, &[], Some(policy.clone()))
+        .await
+        .unwrap_err();
+    assert_eq!(error.code, "write_denied");
+    let read = tools
+        .prepare("read", &json!({"path":"notes/b.md"}).to_string())
+        .unwrap();
+    tools
+        .execute(read, &dir, &[], Some(policy.clone()))
+        .await
+        .unwrap();
     std::fs::remove_dir_all(base).unwrap();
 }
 
@@ -1536,6 +1581,7 @@ async fn a_terminal_takes_typed_input_and_reports_its_end() {
         walled: Vec::new(),
         owned: Vec::new(),
         daemons: Vec::new(),
+        unreadable: Vec::new(),
     });
     let error = tools
         .write_stdin(1, 3, "x\n", None, false, Some(confined))
