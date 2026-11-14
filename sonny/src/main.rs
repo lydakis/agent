@@ -16090,9 +16090,20 @@ impl App {
                 break;
             }
         }
+        // What waits on the person, as `/status` says it: a call on their
+        // approval, read now, or a question this window follows.
+        let held: std::collections::HashSet<String> = (needs::listing(&self.client, None).await)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|held| held.bot)
+            .collect();
+        let fleet = self.fleet.as_ref();
+        let waits =
+            |bot: &str| held.contains(bot) || fleet.is_some_and(|fleet| fleet.needs.waits(bot));
         let beside = self.beside();
         let mut picker = switch::Picker::new(
             &bots,
+            waits,
             &self.bot,
             self.project.as_deref(),
             &self.workspace,
@@ -25257,7 +25268,7 @@ mod tests {
             if asked["op"] == "submit" {
                 seen.lock()
                     .unwrap()
-                    .push(stamp::unstamped(asked["prompt"].as_str().unwrap()).to_owned());
+                    .push(asked["prompt"].as_str().unwrap().to_owned());
             }
             json!({"message": 2, "turn": 2})
         })

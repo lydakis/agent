@@ -1522,15 +1522,19 @@ fn cut(text: &str, most: usize) -> &str {
 /// it, the agent it is about as a blue name that opens it, and its buttons
 /// on the right; and where those buttons are.
 fn head(note: &Note, width: usize, live: bool) -> (Line<'static>, crate::screen::Buttons) {
-    // The agent by its name in the project, as its row in `/status` reads.
-    let agent =
-        (note.opens.as_deref()).map(|bot| bot.split_once('.').map_or(bot, |(_, name)| name));
-    let named = agent.map_or(0, |name| name.width() + 2);
     let right = "↩  ↑  ×";
     let tail = match live {
         true => " live",
         false => "",
     };
+    // The agent by its name in the project, as its row in `/status` reads,
+    // cut to at most half the row the buttons leave, so they always fit.
+    let most = width.saturating_sub(right.width() + tail.width() + 6) / 2;
+    let agent = (note.opens.as_deref())
+        .map(|bot| bot.split_once('.').map_or(bot, |(_, name)| name))
+        .map(|name| crate::transcript::cut(name, most))
+        .filter(|name| name.width() > 1);
+    let named = agent.as_ref().map_or(0, |name| name.width() + 2);
     let room = width.saturating_sub(named + right.width() + tail.width() + 4);
     let title = crate::transcript::cut(&note.title, room);
     let used = 3 + title.width() + tail.width();
@@ -1547,8 +1551,8 @@ fn head(note: &Note, width: usize, live: bool) -> (Line<'static>, crate::screen:
     // The agent it is about opens beside the conversation, as a click on
     // that agent's row or any blue name does.
     if let (Some(name), Some(bot)) = (agent, &note.opens) {
-        spans.extend([Span::raw(name.to_owned()).fg(Color::Blue), Span::raw("  ")]);
         let end = opens + name.width() as u16;
+        spans.extend([Span::raw(name).fg(Color::Blue), Span::raw("  ")]);
         buttons.push((opens, end, format!("{BUTTON}task/{bot}")));
     }
     // ↩ answers it, quoted where the person writes, as a message's own
@@ -2514,6 +2518,18 @@ mod tests {
         assert_eq!(opened[0].2, format!("{BUTTON}task/shop.wire"));
         assert_eq!(cols[opened[2].0 as usize], '↑');
         assert_eq!(cols[opened[3].0 as usize], '×');
+        // A long name is cut so the buttons still fit, each over its own.
+        let long = Note {
+            opens: Some("shop.a-very-long-agent-name-indeed".into()),
+            ..margin.notes()[0].clone()
+        };
+        let (line, cut) = super::head(&long, 30, false);
+        let row = line.to_string();
+        assert!(row.ends_with("↩  ↑  ×") && row.width() <= 30, "{row}");
+        let cols: Vec<char> = row.chars().collect();
+        assert_eq!(cols[cut[2].0 as usize], '↑');
+        assert_eq!(cols[cut[3].0 as usize], '×');
+        assert_eq!(cols[cut[4].0 as usize], '↩');
         // Kept as it was when unsaid, and kept across a read again.
         margin.apply(
             "c2",
