@@ -275,6 +275,13 @@ pub const MIGRATIONS: &[Migration] = &[
         id: crate::approvals::NESTED_GONE,
         retire: "0.11.0",
     },
+    // Messages older Sonnys stored with a `[Sent …]` line after the words
+    // draw without it (`stamp::unstamped`), now that the daemon's line
+    // carries the time (0.10.0).
+    Migration {
+        id: "sent-stamp",
+        retire: "0.12.0",
+    },
 ];
 
 /// `run` once for each `record`: a file of the ids done, a line each,

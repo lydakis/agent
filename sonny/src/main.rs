@@ -10163,7 +10163,7 @@ impl App {
         let asked = json!({"bot": self.bot, "turn": message, "bytes": PROMPT_READ_BYTES});
         let read = self.client.request("prompts", asked).await.ok()?;
         let text = read["prompts"][0]["text"].as_str()?;
-        Some(text.to_owned())
+        Some(stamp::unstamped(text).to_owned())
     }
 
     /// The folder the agent works in, where its pictures' paths start:
@@ -18240,11 +18240,13 @@ fn quiet_message(text: &str) -> bool {
 }
 
 /// A message item's text: a prompt's own words, without the line the
-/// daemon adds after them naming who sent it and when.
+/// daemon adds after them naming who sent it and when, or the `[Sent …]`
+/// line an older Sonny stored with them.
 fn text(item: &Value) -> String {
     match (&item["role"], &item["content"]) {
         (role, Value::Array(parts)) if role == "user" => (parts.iter())
             .find_map(|part| part["text"].as_str())
+            .map(stamp::unstamped)
             .unwrap_or_default()
             .to_owned(),
         (_, content) => joined(content),
@@ -18653,6 +18655,10 @@ mod tests {
             {"type": "input_text", "text": "ship it"},
             {"type": "input_text", "text": "[Message lead/4. Sent Sat 31 Oct 2026 16:12, UTC-04:00.]"}]});
         assert_eq!(text(&item), "ship it");
+        let stored = json!({"type": "message", "role": "user", "content": [
+            {"type": "input_text", "text": "ship it\n\n[Sent Sat 31 Oct 2026 16:12, UTC-04:00.]"},
+            {"type": "input_text", "text": "[Message lead/4, written by george.]"}]});
+        assert_eq!(text(&stored), "ship it");
     }
 
     /// The words a submit carried.
