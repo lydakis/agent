@@ -4570,6 +4570,12 @@ impl Turn {
                     sandbox = policy;
                     prepared
                 }),
+                // A sandboxed bot's read, which the daemon does outside any
+                // sandbox, keeps out of the folders no sandboxed bot reads.
+                Ok(prepared @ Prepared::Read { .. }) if record.sandboxed() => {
+                    sandbox = Some(Arc::new(Policy::reads(self.registry.daemon())));
+                    Ok(prepared)
+                }
                 other => other,
             };
             let declared = record.declared(&call.name);
@@ -5012,8 +5018,14 @@ impl Turn {
             true => self.sandbox(record, workspace).await,
             false => Ok(None),
         };
+        // Its reads, done in the daemon, keep out of what no sandboxed bot
+        // reads, the batch's command sandbox or none.
+        let reads = record
+            .sandboxed()
+            .then(|| Arc::new(Policy::reads(self.registry.daemon())));
         let runs = batch.into_iter().map(|(call, prepared)| {
             let sandbox = match (&prepared, &sandbox) {
+                (Prepared::Read { .. }, _) if reads.is_some() => Ok(reads.clone()),
                 _ if allowed(&call) => Ok(None),
                 (Prepared::Shell { .. }, Err(error)) => Err(error.clone()),
                 (_, sandbox) => Ok(sandbox.clone().unwrap_or_default()),

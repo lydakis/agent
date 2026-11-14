@@ -206,6 +206,26 @@ impl Policy {
 
     /// This policy, its commands also reaching the Unix sockets at or under
     /// `paths`, absolute paths its settings name.
+    /// What a sandboxed bot's `read` keeps to when no command sandbox is
+    /// built for it, as the daemon reads for it outside any: `daemon`'s
+    /// folders no sandboxed bot reads, and nothing else. A command run in it
+    /// would write nothing and reach no network.
+    pub fn reads(daemon: &Daemon) -> Policy {
+        Policy {
+            roots: Vec::new(),
+            network: false,
+            socket: None,
+            capability: None,
+            listening: None,
+            helper: None,
+            sockets: Vec::new(),
+            walled: Vec::new(),
+            daemons: Vec::new(),
+            owned: Vec::new(),
+            unreadable: daemon.unreadable.clone(),
+        }
+    }
+
     pub fn with_sockets(mut self, paths: &[String]) -> Policy {
         self.sockets.extend(paths.iter().map(PathBuf::from));
         self
