@@ -9427,3 +9427,90 @@ Ignored captures in this worktree's `.local/bench/`:
 The parent checkout's `.local/bench/reader-pool-20261113/` preserves binaries,
 the rejected two-reader binary, the runtime patch, and test/build/benchmark
 logs.
+
+
+## Reader ceiling rescreen on 0.9.5 main
+
+2026-11-13, same M1 Max/macOS host as the earlier reader screen. Base is
+main `3c73fcdf86e402e23ccf697c6df44706e9018faf` (0.9.5); candidate source
+is the rebased reader patch `7f5dfcfd`. Both use pinned Rust 1.100.0 and
+the same symbolized release profile. SHA-256:
+
+- Main: `9377db521ef740755f3dfd38fb3f675a4eb5bb484ce74923b5f92373f7299a0e`.
+- Readers: `d05b64a4f61ebc9e4815b70f8341dfdd6731870ac359a5e35faf2830896bcd9d`.
+
+The four model-free workloads above were repeated with each binary's actual
+default (ten readers on main, four on head), with an excluded warmup and
+five measured repetitions per side, reversing side order: 48 runs. Prompt
+sizes, growing histories, 20 x 256-byte output chunks, request-history
+validation, readiness-to-last-turn CPU and latency boundaries are as in
+the preceding record. Values below are medians (observed min..max).
+
+| Case | Measure | Main | Readers |
+| --- | --- | ---: | ---: |
+| small | CPU, ms/turn | 1.208 (1.195..1.273) | 1.123 (1.072..1.181) |
+| small | turn p99, ms | 49.787 (48.921..97.316) | 53.215 (43.629..54.087) |
+| small | last-turn RSS, MiB | 30.312 (29.125..31.297) | 28.125 (27.422..28.344) |
+| medium | CPU, ms/turn | 2.273 (2.154..2.336) | 2.081 (2.021..2.199) |
+| medium | turn p99, ms | 111.739 (101.061..122.188) | 100.090 (91.200..121.711) |
+| medium | last-turn RSS, MiB | 33.875 (32.844..34.234) | 31.438 (30.906..32.812) |
+| large | CPU, ms/turn | 5.811 (5.378..6.076) | 5.298 (5.185..6.007) |
+| large | turn p99, ms | 305.460 (237.649..329.070) | 287.897 (261.068..862.101) |
+| large | last-turn RSS, MiB | 42.922 (40.797..46.484) | 43.203 (40.266..47.984) |
+| wide | CPU, ms/turn | 1.877 (1.852..1.933) | 1.884 (1.842..1.970) |
+| wide | turn p99, ms | 327.001 (294.907..374.975) | 329.891 (307.090..1161.467) |
+| wide | last-turn RSS, MiB | 37.719 (36.953..38.172) | 37.000 (35.812..37.219) |
+
+CPU medians fall 7.0%, 8.5% and 8.8% in the three 32-bot workloads; the
+128-bot workload is flat (+0.4%). Only the small case's CPU ranges do not
+overlap. Small/medium RSS medians fall about 7%, with nonoverlapping
+ranges; large and wide RSS are mixed. Latency ranges overlap in every
+case, including a 6.9% higher small-case p99 median. These are bounded
+resource improvements, not a general speedup or an optimum for every host.
+
+The mixed observation/search/replay trace was also rerun, base/head then
+head/base, with actual defaults. First-burst short-read p95 is 23.23/18.22
+ms on main versus 14.65/16.71 on head; second-burst is 19.30/20.12 versus
+18.01/11.95. Observer work is time-dependent, so this is an interference
+screen rather than an equal-work CPU comparison.
+
+### Required screens and lifecycle confirmation
+
+All four native screens ran sequentially in base/head then head/base order,
+with admission/completion at five repeats, footprint at two (1,000 bots),
+and lifecycle at one (32 bots, socket echo, five tool schemas). Warmups are
+excluded. `bench.perf_gate` passes with unchanged store work and no warnings.
+
+| Bench | Measure | Base | Head | Change |
+| --- | --- | ---: | ---: | ---: |
+| admission | lone submit CPU, ms | 28.91 | 29.993 | +3.7% |
+| admission | burst submit p99, ms | 2.327 | 2.356 | +1.3% |
+| completion | release to terminal p99, ms | 5.415 | 5.245 | -3.2% |
+| footprint | idle RSS, MiB | 13.227 | 13.164 | -0.5% |
+| footprint | per idle bot, KiB | 2.584 | 2.592 | +0.3% |
+| footprint | RSS after a turn each, MiB | 36.594 | 36.492 | -0.3% |
+| footprint | CPU per turn, ms | 0.508 | 0.506 | -0.4% |
+| lifecycle | CPU, s | 0.401 | 0.446 | +11.3% |
+| lifecycle | p95 turn, ms | 624.451 | 629.288 | +0.8% |
+| lifecycle | peak RSS, MiB | 27.008 | 27.734 | +2.7% |
+
+The initial lifecycle screen nevertheless showed 11.3% more CPU in both
+head samples. This is below the gate's warning threshold but called for
+confirmation before publication. One predefined follow-up ran base/head/
+head/base, three measured repeats per invocation (six samples per side,
+plus excluded warmups), with no code changes. It did not reproduce the
+rise: CPU medians are 0.424 s on both sides (-0.1%); turn p95 is 611.895
+versus 618.221 ms (+1.0%), and peak RSS 27.414 versus 27.242 MiB (-0.6%).
+Both the initial screen and confirmation remain in the record. No general
+lifecycle CPU improvement is established.
+
+All 718 Rust tests, strict Clippy, formatting and 30 release-process checks
+passed, including daemon sessions/replay, slow clients, kill/restart/resume,
+historical forks, durable parks and compaction. No sync setting, write path,
+queue order or per-bot state changes. Explicit reader counts remain available.
+
+Ignored captures in this worktree: `.local/bench/publish-reader-default-20261113/`,
+`publish-reader-mixed-20261113/`, `publish-screen-20261113/` and
+`publish-reader-lifecycle-confirm-20261113/`. The parent checkout's
+`.local/bench/publish-20261113/` keeps binaries, hashes, scripts and logs.
+No paid providers or release artifacts were used.
