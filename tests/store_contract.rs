@@ -98,6 +98,47 @@ fn result(output: &str) -> Outcome {
 }
 
 #[test]
+fn running_context_keeps_bot_defaults_apart_from_turn_overrides() {
+    let mut db = db();
+    let mut defaults = binding();
+    defaults.effort = Some("low");
+    db.create("Bob", Some("/synthetic/bob"), defaults).unwrap();
+    let options = TurnOptions {
+        model: Some("openai/other-model".into()),
+        effort: Some("high".into()),
+        budget_tokens: Some(1234),
+        output_schema: Some(r#"{"type":"object"}"#.into()),
+        ..TurnOptions::default()
+    };
+    let turn = db
+        .begin("Bob", "r1", "first", true, &options, allow_provider)
+        .unwrap()
+        .turn;
+    let (bot, context) = db.running_context("Bob", turn).unwrap();
+    assert_eq!(bot.name, context.bot);
+    assert_eq!(bot.bot_id, context.bot_id);
+    assert_eq!(bot.running_turn, Some(turn));
+    assert_eq!(bot.model, "synthetic-model");
+    assert_eq!(bot.effort.as_deref(), Some("low"));
+    assert_eq!(context.model, "openai/other-model");
+    assert_eq!(context.effort.as_deref(), Some("high"));
+    assert_eq!(context.workspace, "/synthetic/bob");
+    assert_eq!(context.budget.unwrap().tokens, 1234);
+    assert_eq!(context.output_schema, options.output_schema);
+    db.create("Other", Some("/synthetic/other"), binding())
+        .unwrap();
+    assert_eq!(
+        db.running_context("Other", turn).err().unwrap().code,
+        "stale_turn"
+    );
+    db.finish(turn, None).unwrap();
+    assert_eq!(
+        db.running_context("Bob", turn).err().unwrap().code,
+        "stale_turn"
+    );
+}
+
+#[test]
 fn historical_fork_and_exact_resume_preserve_independent_lineage() {
     let mut db = db();
     assert!(db.inspect("missing").is_err());
