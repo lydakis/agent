@@ -4492,8 +4492,15 @@ impl Turn {
             }
             // An escape from a sandbox runs unconfined only once a gate
             // allowed it.
-            let approved = record.gated(&call, workspace, &self.ruled());
-            let ruling = record.ruling(&call, &self.ruled());
+            let ruled = self.ruled();
+            let approved = record.gated(&call, workspace, &ruled);
+            let ruling = record.ruling(&call, &ruled);
+            // A call a gate would hold back, of a bot that never asks, is
+            // refused with no one asked, as Codex refuses one under
+            // `never`; an escape its sandbox holds is refused below, as one
+            // no gate holds.
+            let unasked = record.unasked(&call, workspace, &ruled)
+                && !(record.sandboxed() && agent_runtime::sandbox::confinable(&call.name));
             // A call its sandbox confines runs in it; one that can't be
             // confined fails rather than run unconfined. An escape no gate
             // approved is refused, as Codex refuses one under a policy that
@@ -4507,6 +4514,15 @@ impl Turn {
             // Where its row in the audit trail says it ran: a sandbox holds
             // writes only, so a sandboxed bot's read is within it.
             let in_sandbox = confined || (record.sandboxed() && call.name == "read");
+            if unasked {
+                let refused = call.clone();
+                self.store
+                    .op("refuse_unasked", move |db| {
+                        db.refuse_unasked(turn, &refused)
+                    })
+                    .await?;
+                continue;
+            }
             if approved {
                 match self
                     .approve(
@@ -4943,6 +4959,7 @@ impl Turn {
         let ruled = self.ruled();
         if !matches!(call.name.as_str(), "shell" | "read")
             || record.gated(call, workspace, &ruled)
+            || record.unasked(call, workspace, &ruled)
             || !matches!(
                 record.ruling(call, &ruled),
                 Ok(Ruling::None | Ruling::Allow)
@@ -5354,6 +5371,7 @@ impl Turn {
         let ruled = self.ruled();
         let ruling = record.ruling(call, &ruled);
         !record.gated(call, workspace, &ruled)
+            && !record.unasked(call, workspace, &ruled)
             && matches!(ruling, Ok(Ruling::None | Ruling::Allow))
             && !(record.sandboxed()
                 && ruling != Ok(Ruling::Allow)

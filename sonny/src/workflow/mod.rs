@@ -146,8 +146,10 @@ struct Plan {
     workspace: PathBuf,
     model: String,
     effort: Option<String>,
-    /// The caller's permissions row, whose sandbox its workers get.
+    /// The caller's permissions row, whose sandbox its workers get, held
+    /// to the caller's own settings as it was when the run started.
     mode: String,
+    held: Value,
     state: Option<String>,
     args: Value,
     budget: Option<u64>,
@@ -336,6 +338,7 @@ pub async fn call(
             .unwrap_or_else(crate::approvals::default)
             .to_owned(),
         state: crate::state::of(&record, &bot),
+        held: json!({"settings": record["settings"]}),
         args: arguments.get("args").cloned().unwrap_or(Value::Null),
         budget,
         meta: script.meta.clone(),
@@ -1260,9 +1263,11 @@ impl Attempt {
                 .map(str::to_owned)
                 .collect()
             });
-            // Confined as the caller's row confines it, in its own folder; the
-            // rest of its settings, rules and environment, its maker's.
+            // Confined as the caller's row confines it, in its own folder, no
+            // more than the caller is; the rest of its settings, rules and
+            // environment, its maker's.
             let mut settings = crate::approvals::sandbox(&plan.mode, &dir, plan.state.as_deref());
+            crate::approvals::within(&mut settings, &plan.held);
             if let Some(ttl) = agent_client::policy::cache_ttl(&model) {
                 settings.insert("cache_ttl".into(), json!(ttl));
             }
@@ -1980,7 +1985,7 @@ mod tests {
         let next = dir.join("next");
         let plan: Plan = serde_json::from_value(json!({"id": "next", "caller": "shop.lead",
             "caller_id": 1, "turn": 1, "project": "shop", "roles": "/", "workspace": "/",
-            "model": "openai/m", "effort": null, "mode": "auto", "state": null, "args": null,
+            "model": "openai/m", "effort": null, "mode": "auto", "held": null, "state": null, "args": null,
             "budget": null, "meta": {}, "resumed_from": "x", "started_ms": 0,
             "max_agents": 1000, "at_once": 4}))
         .unwrap();
@@ -2031,7 +2036,7 @@ mod tests {
     fn the_caller_hears_how_it_ended_with_where_the_rest_is() {
         let plan: Plan = serde_json::from_value(json!({"id": "r1", "caller": "shop.lead",
             "caller_id": 1, "turn": 1, "project": "shop", "roles": "/", "workspace": "/",
-            "model": "openai/m", "effort": null, "mode": "auto", "state": null, "args": null,
+            "model": "openai/m", "effort": null, "mode": "auto", "held": null, "state": null, "args": null,
             "budget": null, "meta": {"name": "audit"}, "resumed_from": "r0", "started_ms": 0,
             "max_agents": 1000, "at_once": 4}))
         .unwrap();

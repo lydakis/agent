@@ -313,6 +313,7 @@ pub fn plant(store: &Path, id: &str, caller: &str, name: &str, journal: &[Value]
         model: String::new(),
         effort: None,
         mode: String::new(),
+        held: Value::Null,
         state: None,
         args: Value::Null,
         budget: None,
