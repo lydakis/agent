@@ -2056,8 +2056,19 @@ pub async fn run(config: Configuration) -> Result<()> {
     let protected_paths = (config.protected_paths.iter())
         .map(|path| real_or_named(path))
         .collect::<Result<Vec<_>>>()?;
+    // Made now, as a walled folder is, so each is known by its real path
+    // from the start, a link anywhere above it resolved: the `read` tool
+    // matches the real path of what it opened.
     let unreadable = (config.unreadable.iter())
-        .map(|path| real_or_named(path))
+        .map(|folder| -> Result<PathBuf> {
+            use std::os::unix::fs::DirBuilderExt;
+            let folder = std::path::absolute(folder)?;
+            std::fs::DirBuilder::new()
+                .recursive(true)
+                .mode(0o700)
+                .create(&folder)?;
+            Ok(std::fs::canonicalize(&folder)?)
+        })
         .collect::<Result<Vec<_>>>()?;
     // Made now, so a sandbox started before a socket is in one hides it all
     // the same, and no other user's sockets are in it.

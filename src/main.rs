@@ -259,15 +259,16 @@ fn sandboxed(args: &[String]) -> Result<i32> {
             .into_iter()
             .collect(),
         // And hides the keys a daemon this CLI starts hides from its bots.
+        // Made first, as the daemon makes it, to be known by its real path.
         unreadable: agent_client::env_file::folder()
             .and_then(|keys| {
-                std::fs::canonicalize(&keys).ok().or_else(|| {
-                    Some(
-                        std::fs::canonicalize(keys.parent()?)
-                            .ok()?
-                            .join(keys.file_name()?),
-                    )
-                })
+                use std::os::unix::fs::DirBuilderExt;
+                std::fs::DirBuilder::new()
+                    .recursive(true)
+                    .mode(0o700)
+                    .create(&keys)
+                    .ok()?;
+                std::fs::canonicalize(&keys).ok()
             })
             .into_iter()
             .collect(),

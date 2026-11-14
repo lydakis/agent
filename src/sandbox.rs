@@ -178,7 +178,19 @@ impl Policy {
             walled: daemon.walled.clone(),
             owned: owned(&daemon.owned),
             daemons,
-            unreadable: daemon.unreadable.clone(),
+            // One under another is masked with it: a mask under one
+            // already closed would have nowhere to go.
+            unreadable: (daemon.unreadable.iter())
+                .filter(|hidden| {
+                    !(daemon.unreadable.iter())
+                        .any(|other| other != *hidden && hidden.starts_with(other))
+                })
+                .fold(Vec::new(), |mut kept, hidden| {
+                    if !kept.contains(hidden) {
+                        kept.push(hidden.clone());
+                    }
+                    kept
+                }),
         }))
     }
 
@@ -1049,6 +1061,21 @@ mod linux {
         args.extend(["--ro-bind", "/", "/", "--dev", "/dev"].map(String::from));
         for root in &policy.roots {
             args.extend(["--bind".into(), path(&root.path), path(&root.path)]);
+            // Each folder between the root and a folder it may not read,
+            // bound on itself so no command renames it: moved, it would
+            // take the folder out from under its mask and its name, as
+            // Seatbelt anchors them. First, under what is kept read-only.
+            let mut anchored: Vec<&Path> = (policy.unreadable.iter())
+                .filter(|hidden| hidden.starts_with(&root.path))
+                .flat_map(|hidden| hidden.ancestors().skip(1))
+                .filter(|folder| folder.starts_with(&root.path) && *folder != root.path)
+                .collect();
+            anchored.sort();
+            anchored.dedup();
+            anchored.sort_by_key(|folder| depth(folder));
+            for folder in anchored {
+                args.extend(["--bind".into(), path(folder), path(folder)]);
+            }
             let mut kept: Vec<&PathBuf> = root.read_only.iter().collect();
             kept.sort_by_key(|path| depth(path));
             for kept in kept {

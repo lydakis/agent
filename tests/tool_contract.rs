@@ -731,16 +731,28 @@ async fn a_sandboxed_command_writes_only_its_roots() {
     }
     std::fs::write(dir.join("store"), "db").unwrap();
     // Folders of keys it may not read: one outside its roots, one in its
-    // own folder, and one there that isn't yet.
+    // own folder, one deeper there, and one there that isn't yet; one
+    // inside another is closed with it.
     let (keys, env, later) = (base.join("keys"), dir.join("env"), dir.join("later"));
-    for (folder, key) in [(&keys, "KEY=outside"), (&env, "KEY=inside")] {
+    let deep = dir.join("deep/keys");
+    for (folder, key) in [
+        (&keys, "KEY=outside"),
+        (&env, "KEY=inside"),
+        (&deep, "KEY=deep"),
+    ] {
         std::fs::create_dir_all(folder).unwrap();
         std::fs::write(folder.join("env"), key).unwrap();
     }
     let daemon = Daemon {
         store: Some(dir.join("store")),
         helper: Some(env!("CARGO_BIN_EXE_agent").into()),
-        unreadable: vec![keys.clone(), env.clone(), later.clone()],
+        unreadable: vec![
+            keys.join("inner"),
+            keys.clone(),
+            env.clone(),
+            later.clone(),
+            deep.clone(),
+        ],
         ..protecting()
     };
     let writable = [
@@ -914,6 +926,8 @@ async fn a_sandboxed_command_writes_only_its_roots() {
         "echo x > env/env".into(),
         "mv env moved".into(),
         "mv env/env moved".into(),
+        "mv deep moved".into(),
+        "cat deep/keys/env".into(),
         "ln env/env linked".into(),
         "echo KEY=made > later/env && cat later/env".into(),
     ] {
@@ -927,6 +941,7 @@ async fn a_sandboxed_command_writes_only_its_roots() {
         "KEY=inside"
     );
     assert!(!dir.join("moved").exists() && !dir.join("linked").exists());
+    assert!(deep.join("env").is_file());
     assert!(later.is_dir() && std::fs::read_dir(&later).unwrap().next().is_none());
     // The keys file saved whole while a command runs, staged beside it and
     // renamed over it, stays out of the command's reach.
