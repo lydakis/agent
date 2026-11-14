@@ -4699,7 +4699,12 @@ impl Service {
                 let answer = store
                     .queue("create", move |db| {
                         if ungated {
-                            db.ungated_under(created_by.as_deref(), created_by_id)?;
+                            db.ungated_under(
+                                &bot,
+                                request_id.as_deref(),
+                                created_by.as_deref(),
+                                created_by_id,
+                            )?;
                         }
                         let (created, event) = db.create(
                             &bot,

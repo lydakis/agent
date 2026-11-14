@@ -1061,6 +1061,54 @@ fn a_sandboxed_bot_waits_for_a_verdict_only_on_an_escape() {
 /// each call they would hold is refused instead, an escape as under no
 /// gate, as under Codex's approval policy `never`.
 #[test]
+fn a_bot_asked_for_with_no_gate_under_a_gated_creator_is_refused_once_made_never() {
+    let mut db = db();
+    let tools = ["shell".to_owned()];
+    let gate = Gate {
+        tag: "auto".into(),
+        tools: tools.to_vec(),
+        expire_ms: None,
+    };
+    let (ann, _) = db
+        .create(
+            "Ann",
+            Some("/synthetic"),
+            Binding {
+                tools: &tools,
+                gate: Some(&gate),
+                ..binding()
+            },
+        )
+        .unwrap();
+    let (cy, _) = db
+        .create(
+            "Cy",
+            Some("/synthetic"),
+            Binding {
+                request_id: Some("make-cy"),
+                ..binding()
+            },
+        )
+        .unwrap();
+    let under = |db: &Database, name: &str, key: Option<&str>| {
+        db.ungated_under(name, key, Some(&ann.name), Some(ann.bot_id))
+    };
+    // Asked for by a gated creator: refused, saying it would keep them.
+    assert_eq!(under(&db, "Kid", None).unwrap_err().code, "invalid_gate");
+    // An ungated creator may make one.
+    db.ungated_under("Kid", None, Some(&cy.name), Some(cy.bot_id))
+        .unwrap();
+    // A name already held, or one this keyed request made and deleted
+    // since, is the creation's to answer, so a resend gets what it made
+    // whatever its creator has become since.
+    under(&db, "Cy", None).unwrap();
+    db.delete_bot("Cy").unwrap();
+    under(&db, "Cy", Some("make-cy")).unwrap();
+    // A name a deletion freed is free for any other creation.
+    assert_eq!(under(&db, "Cy", None).unwrap_err().code, "invalid_gate");
+}
+
+#[test]
 fn a_bot_that_never_asks_announces_nothing_its_gates_hold() {
     let mut db = db();
     let tools = ["shell".to_owned(), "write".to_owned(), "echo".to_owned()];

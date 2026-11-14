@@ -353,7 +353,7 @@ pub struct Settings {
 }
 /// Why a call that would need approval fails on a bot that never asks.
 pub const NEVER_ASKS: &str =
-    "approval_policy is never: this call would need approval, and no one is asked; do without it";
+    "approval_policy is never: this call would need approval, and no one is asked";
 /// How a bot's gated calls are decided, by Codex's `approval_policy`
 /// names: only `never` changes what its gates do.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize, Serialize)]
@@ -3589,7 +3589,27 @@ impl Database {
     }
     /// Refuse a bot asked for with no gate, made by a bot that has gates,
     /// which it would keep: asked for none, it is not given them unasked.
-    pub fn ungated_under(&self, creator: Option<&str>, expected: Option<i64>) -> Result<()> {
+    /// Only a creation that would make a bot is checked: a name already
+    /// held, or one this keyed request made and deleted since, is for
+    /// [`Database::create`] to answer, so a resend gets what it made.
+    pub fn ungated_under(
+        &self,
+        name: &str,
+        request_id: Option<&str>,
+        creator: Option<&str>,
+        expected: Option<i64>,
+    ) -> Result<()> {
+        let held: Option<i64> = self
+            .conn
+            .prepare_cached(
+                "SELECT 1 FROM bots WHERE name=?1
+                 UNION ALL SELECT 1 FROM deleted_bots WHERE name=?1 AND request_id=?2",
+            )?
+            .query_row(params![name, request_id], |r| r.get(0))
+            .optional()?;
+        if held.is_some() {
+            return Ok(());
+        }
         let Some((id, _)) = Self::creator(&self.conn, creator, expected)? else {
             return Ok(());
         };

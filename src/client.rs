@@ -1543,11 +1543,25 @@ fn author() -> Result<Value> {
     }
 }
 
-/// Whether a bot record has a gate the `auto` approver answers.
+/// The tools a bot record declares that one of its gates holds back.
+fn held_declared(bot: &Value) -> Vec<&str> {
+    let gated = |name: &str| {
+        (bot["gates"].as_array().into_iter().flatten())
+            .any(|gate| (gate["tools"].as_array().into_iter().flatten()).any(|tool| tool == name))
+    };
+    (bot["declared"].as_array().into_iter().flatten())
+        .filter_map(|tool| tool["name"].as_str())
+        .filter(|name| gated(name))
+        .collect()
+}
+
+/// Whether a bot record has a gate the `auto` approver answers: none for
+/// a bot that never asks, whatever gates it keeps.
 fn answered_by_auto(bot: &Value) -> bool {
-    bot["gates"]
-        .as_array()
-        .is_some_and(|gates| gates.iter().any(|gate| gate["tag"] == "auto"))
+    bot["settings"]["approval_policy"] != "never"
+        && bot["gates"]
+            .as_array()
+            .is_some_and(|gates| gates.iter().any(|gate| gate["tag"] == "auto"))
 }
 
 /// An `auto` bot needs an approver serving `auto`, such as the one Sonny
@@ -2132,7 +2146,24 @@ fn run(options: &Options) -> Result<i32> {
             "compaction_instructions":options.compaction_instructions,
             "compaction_model":options.compaction_model,"fallback":fallback,
             "settings":settings,"request_id":request_id});
-        if let Value::Object(gate) = requested_gate(options, &tools)? {
+        if let Value::Object(mut gate) = requested_gate(options, &tools)? {
+            // The tools its creator declared, which it inherits, held by
+            // its own gate too where its creator's gates hold them, so a
+            // gate it asks for beside its creator's reaches them as well.
+            if options.approve.is_none()
+                && gate.contains_key("approver")
+                && let Some(by) = &created_by
+            {
+                let maker =
+                    connection.request("inspect", json!({"bot": by, "bot_id": created_by_id}))?;
+                if let Some(Value::Array(approve)) = gate.get_mut("approve") {
+                    for name in held_declared(&maker) {
+                        if !approve.iter().any(|have| have == name) {
+                            approve.push(json!(name));
+                        }
+                    }
+                }
+            }
             // An approver first, so a gate nobody serves leaves no bot behind.
             if gate.get("approver").is_some_and(|tag| tag == "auto") {
                 require_approver(&mut connection)?;
@@ -3983,6 +4014,25 @@ fn preview(output: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_made_bot_s_own_gate_holds_the_tools_it_inherits_as_its_creator_s_do() {
+        let maker = json!({"gates": [{"tag": "auto", "tools": ["shell", "start_task"]}],
+            "declared": [{"name": "start_task"}, {"name": "memory"}]});
+        assert_eq!(held_declared(&maker), ["start_task"]);
+        assert!(held_declared(&json!({"declared": [{"name": "start_task"}]})).is_empty());
+    }
+
+    #[test]
+    fn a_bot_that_never_asks_needs_no_approver() {
+        let auto = json!([{"tag": "auto", "tools": ["shell"]}]);
+        assert!(answered_by_auto(&json!({"gates": auto, "settings": {}})));
+        assert!(!answered_by_auto(&json!({"gates": auto,
+            "settings": {"approval_policy": "never"}})));
+        assert!(!answered_by_auto(
+            &json!({"gates": [{"tag": "manual", "tools": ["shell"]}]})
+        ));
+    }
 
     #[test]
     fn a_daemon_that_says_it_starts_is_waited_for_past_the_first_deadline() {
