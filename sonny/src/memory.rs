@@ -741,26 +741,48 @@ impl View {
         if let Some(project) = scope.as_ref().filter(|_| self.every) {
             about.insert(0, project.clone());
         }
-        let mut spans = vec![Span::raw(format!("{} · from ", about.join(" · "))).dim()];
-        let mut buttons = Vec::new();
+        // Where it came from shares the row when there is room, else takes
+        // the next, never split.
+        let about = about.join(" · ");
+        let mut from = vec![Span::raw("from ").dim()];
+        let mut agent_at = None;
         match crate::calls::handle_parts(&peeked.source) {
             Some((agent, number)) => {
-                let from = Line::from(spans.clone()).width() as u16 + 1;
-                buttons.push((
-                    from,
-                    from + agent.width() as u16,
-                    format!("{}{agent}", crate::links::AGENT),
-                ));
-                spans.push(Span::raw(agent.to_owned()).fg(Color::Blue));
-                spans.push(Span::raw(format!("/{number}")).dim());
+                agent_at = Some((5, agent.width(), agent.to_owned()));
+                from.push(Span::raw(agent.to_owned()).fg(Color::Blue));
+                from.push(Span::raw(format!("/{number}")).dim());
             }
-            None => spans.push(Span::raw(peeked.source.clone()).dim()),
+            None => from.push(Span::raw(peeked.source.clone()).dim()),
         }
-        let about = crate::transcript::wrap(Line::from(spans), width, Span::raw(""), Span::raw(""));
-        if !buttons.is_empty() {
+        let shared = about.width() + 3 + Line::from(from.clone()).width() < width;
+        let mut offset = 0;
+        match shared {
+            true => {
+                offset = about.width() + 3;
+                from.insert(0, Span::raw(format!("{about} · ")).dim());
+            }
+            false => out.extend(crate::transcript::wrap(
+                Line::from(about).dim(),
+                width,
+                Span::raw(""),
+                Span::raw(""),
+            )),
+        }
+        if let Some((at, wide, agent)) = agent_at {
+            let start = (offset + at + 1) as u16;
+            let buttons = vec![(
+                start,
+                start + wide as u16,
+                format!("{}{agent}", crate::links::AGENT),
+            )];
             marks.push((out.len(), crate::screen::Mark::Buttons(buttons)));
         }
-        out.extend(about);
+        out.extend(crate::transcript::wrap(
+            Line::from(from),
+            width,
+            Span::raw(""),
+            Span::raw(""),
+        ));
         out.push(Line::default());
         // A live fact as it fills now; one that does not fill says why
         // over its template.
@@ -901,18 +923,23 @@ fn flags(fact: &Listed) -> Vec<String> {
 }
 
 /// A lasting fact's row: its name, its type and flags muted, and at the
-/// right edge when it was last verified; what it is under it.
+/// right edge when it was last verified; what it is under it. Where the
+/// row has no room for its flags, they take a muted row of their own.
 fn fact_row(fact: &Listed, width: usize) -> (Line<'static>, Vec<Line<'static>>) {
-    let first = edge(
-        vec![
-            Span::raw("  "),
-            Span::raw(fact.name.clone()).bold(),
-            Span::raw(format!(" {}", flags(fact).join(" · "))).dim(),
-        ],
-        format!("verified {}", day(&fact.verified)),
-        width,
-    );
-    (first, described(&fact.description, width))
+    let flags = flags(fact).join(" · ");
+    let verified = format!("verified {}", day(&fact.verified));
+    let name = || vec![Span::raw("  "), Span::raw(fact.name.clone()).bold()];
+    let mut left = name();
+    left.push(Span::raw(format!(" {flags}")).dim());
+    if fits(&left, &verified, width) {
+        return (
+            edge(left, verified, width),
+            described(&fact.description, width),
+        );
+    }
+    let mut rest = vec![Line::from(format!("    {flags}")).dim()];
+    rest.extend(described(&fact.description, width));
+    (edge(name(), verified, width), rest)
 }
 
 /// A row's description, under its name, in at most two rows.
@@ -923,9 +950,15 @@ fn described(description: &str, width: usize) -> Vec<Line<'static>> {
     crate::transcript::capped(
         Line::from(description.to_owned()),
         width,
-        Span::raw("  "),
+        Span::raw("    "),
         2,
     )
+}
+
+/// Whether `left` and `right` share a row `width` wide, a cell kept clear
+/// at the edge, as the pick's band takes one.
+fn fits(left: &[Span<'static>], right: &str, width: usize) -> bool {
+    Line::from(left.to_vec()).width() + 2 + right.width() < width
 }
 
 /// `left`, and `right` muted at the edge of a row `width` wide; after it,
@@ -935,10 +968,9 @@ fn edge(mut left: Vec<Span<'static>>, right: String, width: usize) -> Line<'stat
         return Line::from(left);
     }
     let used = Line::from(left.clone()).width();
-    // A cell kept clear at the edge, as the pick's band takes one.
-    let room = width.saturating_sub(1);
-    match used + 2 + right.width() <= room {
+    match fits(&left, &right, width) {
         true => {
+            let room = width - 1;
             left.push(Span::raw(" ".repeat(room - used - right.width())));
             left.push(Span::raw(right).dim());
         }
@@ -1176,13 +1208,19 @@ mod tests {
                 .iter()
                 .any(|l| l.starts_with("  rounding-fix") && l.ends_with("now"))
         );
-        assert!(lines.contains(&"  what rounding-fix says".to_owned()));
+        assert!(lines.contains(&"    what rounding-fix says".to_owned()));
         assert!(lines.contains(&"  This project · 1".to_owned()));
         let row = lines
             .iter()
             .find(|l| l.starts_with("  release-signing"))
             .unwrap();
         assert!(row.contains(" project · confirmed 2") && row.contains("verified "));
+        // Too narrow for its flags, a row gives them a row of their own.
+        let narrow = text(&view.card(36).0);
+        let row = (narrow.iter()).position(|l| l.starts_with("  release-signing"));
+        let row = row.unwrap();
+        assert!(narrow[row].contains("verified "));
+        assert_eq!(narrow[row + 1], "    project · confirmed 2");
         // The person's facts start folded.
         assert!(lines.contains(&"  About you · 1 ▸".to_owned()));
         assert!(!lines.iter().any(|l| l.contains("short-replies")));
@@ -1321,6 +1359,13 @@ mod tests {
         // The agent's name opens it.
         assert!(marks.iter().any(|(row, mark)| *row == 1
             && matches!(mark, crate::screen::Mark::Buttons(b) if b[0].2 == "sonny:agent/tally.lead")));
+        // Too narrow for both, where it came from takes its own row, whole,
+        // and the agent's name opens it from there.
+        let (lines, _, marks) = view.card(30);
+        let shown = text(&lines);
+        assert_eq!(shown[2], "from tally.lead/4");
+        assert!(marks.iter().any(|(row, mark)| *row == 2
+            && matches!(mark, crate::screen::Mark::Buttons(b) if b[0].0 == 6 && b[0].1 == 16)));
         // Two links, each a whole name.
         let page = view.pages.last().unwrap();
         let names: Vec<&str> = page.links.iter().map(|l| l.4.as_str()).collect();
