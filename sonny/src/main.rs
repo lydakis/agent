@@ -57,6 +57,7 @@ mod margin;
 mod math;
 mod mcp;
 mod mcp_import;
+mod memory;
 mod mermaid;
 mod models;
 mod mux;
@@ -3848,7 +3849,7 @@ fn unknown_command(prompt: &str) -> Option<String> {
 /// `/agents` and `/ps` also open `/status`, `/automations` and `/lookout`
 /// open `/background`, `/forum` opens `/commons`, and `/settings` opens
 /// `/config`, unlisted.
-const COMMANDS: [(&str, &str); 31] = [
+const COMMANDS: [(&str, &str); 32] = [
     ("/side", "Start a side chat with a copy of this agent"),
     ("/model", "Pick the model and effort"),
     (
@@ -3873,6 +3874,10 @@ const COMMANDS: [(&str, &str); 31] = [
     (
         "/new",
         "Start an agent here: a lead or a task, in the profile you pick",
+    ),
+    (
+        "/memory",
+        "Show what agents remember about you and this project",
     ),
     (
         "/zen",
@@ -4054,6 +4059,8 @@ struct Watch {
     ps: Option<ps::View>,
     /// `/commons` holds it instead.
     commons: Option<commons::View>,
+    /// `/memory` holds it instead.
+    memory: Option<memory::View>,
     /// `/sky` holds it instead.
     sky: Option<sky::View>,
     /// The row of the picked item (`/background`'s, `/commons`'s or
@@ -11303,6 +11310,7 @@ impl App {
             audit: None,
             ps: None,
             commons: None,
+            memory: None,
             sky: None,
             picked: None,
             pick: None,
@@ -11347,6 +11355,7 @@ impl App {
             audit: None,
             ps: None,
             commons: None,
+            memory: None,
             sky: None,
             picked: None,
             pick: None,
@@ -11416,6 +11425,7 @@ impl App {
             audit: None,
             ps: None,
             commons: None,
+            memory: None,
             sky: None,
             picked: None,
             pick: None,
@@ -11443,6 +11453,7 @@ impl App {
             audit: Some(view),
             ps: None,
             commons: None,
+            memory: None,
             sky: None,
             picked: None,
             pick: None,
@@ -11476,6 +11487,7 @@ impl App {
             audit: None,
             ps: Some(view),
             commons: None,
+            memory: None,
             sky: None,
             picked: None,
             pick: None,
@@ -11528,6 +11540,49 @@ impl App {
         });
     }
 
+    /// What agents saved to memory about the person and this project:
+    /// `/memory` in the pane, as `/commons` is, until Esc. Read off the
+    /// screen thread as it opens, and again only on `a` or a removal.
+    fn memory_view(&mut self) {
+        let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else {
+            self.notice = Some("no HOME, so no memory".into());
+            return;
+        };
+        // A task in a folder of its own works for its lead's project, as
+        // the memory tool finds it.
+        let here = PathBuf::from(&self.workspace);
+        let folder = task::source_folder(&here).unwrap_or(here);
+        let project = agent_client::policy::project(&folder).ok().flatten();
+        let woken = self.woken.clone();
+        let view = memory::View::open(
+            memory::Places {
+                home,
+                project,
+                folder,
+            },
+            Arc::new(move || woken.notify_one()),
+        );
+        self.watch = Some(Watch {
+            project: self.scope().project,
+            rows: Vec::new(),
+            read: Instant::now(),
+            alerts: Vec::new(),
+            open: Vec::new(),
+            background: None,
+            usage: None,
+            audit: None,
+            ps: None,
+            commons: None,
+            memory: Some(view),
+            sky: None,
+            picked: None,
+            pick: None,
+            helpers: Vec::new(),
+            more: false,
+        });
+        self.open_pane(pane::Pane::card("memory", STATUS_KEYS));
+    }
+
     /// What the agents of every project share: `/commons` in the pane,
     /// as `/status` is, until Esc.
     fn commons(&mut self) {
@@ -11546,6 +11601,7 @@ impl App {
             audit: None,
             ps: None,
             commons: Some(commons::View::open(&home)),
+            memory: None,
             sky: None,
             picked: None,
             pick: None,
@@ -11569,6 +11625,7 @@ impl App {
             audit: None,
             ps: None,
             commons: None,
+            memory: None,
             sky: Some(sky::View::open(self.options.socket.clone(), self.store())),
             picked: None,
             pick: None,
@@ -11603,6 +11660,13 @@ impl App {
             && let Some(view) = &mut watch.background
         {
             view.reload();
+            watch.read = Instant::now();
+            return;
+        }
+        // `/memory` reads when it opens, on `a` and after a removal only.
+        if let Some(watch) = &mut self.watch
+            && watch.memory.is_some()
+        {
             watch.read = Instant::now();
             return;
         }
@@ -12481,6 +12545,7 @@ impl App {
             && watch.audit.is_none()
             && watch.ps.is_none()
             && watch.commons.is_none()
+            && watch.memory.is_none()
         {
             let bots = card_bots(watch, self.width.max(40));
             if !bots.is_empty() {
@@ -12556,6 +12621,48 @@ impl App {
                             self.close_pane(true);
                         }
                     }
+                }
+                return true;
+            }
+            // `/memory` takes its own keys: picking, folding, opening a
+            // fact and its links, removing.
+            if self.pane_keys
+                && pane.is_card()
+                && let Some(view) = self.watch.as_mut().and_then(|w| w.memory.as_mut())
+            {
+                let scrolls = matches!(
+                    key.code,
+                    KeyCode::Tab
+                        | KeyCode::PageUp
+                        | KeyCode::PageDown
+                        | KeyCode::Home
+                        | KeyCode::End
+                );
+                if scrolls || (copy && pane.screen.selected().is_some()) {
+                    view.keep();
+                }
+                let depth = view.depth();
+                match key.code {
+                    _ if switches(key) || key.code == KeyCode::Tab => self.pane_keys = false,
+                    _ if copy && let Some(text) = pane.screen.selected() => {
+                        pane.screen.unselect();
+                        self.copied(&text);
+                    }
+                    KeyCode::PageUp => pane.screen.page(true),
+                    KeyCode::PageDown => pane.screen.page(false),
+                    KeyCode::Home => pane.screen.hold(usize::MAX),
+                    KeyCode::End => pane.screen.latest(),
+                    _ => match view.key(*key, pane.screen.in_view()) {
+                        memory::Key::Close => self.close_pane(true),
+                        memory::Key::Scroll(up) => pane.screen.scroll(if up { 1 } else { -1 }),
+                        // A page opened or left is scrolled to anew.
+                        memory::Key::Stay if view.depth() != depth => {
+                            if let Some(watch) = &mut self.watch {
+                                watch.picked = None;
+                            }
+                        }
+                        memory::Key::Stay => {}
+                    },
                 }
                 return true;
             }
@@ -12707,6 +12814,7 @@ impl App {
                             && watch.audit.is_none()
                             && watch.ps.is_none()
                             && watch.commons.is_none()
+                            && watch.memory.is_none()
                             && watch.sky.is_none() =>
                     {
                         watch.more = !watch.more
@@ -12720,6 +12828,7 @@ impl App {
                             && watch.audit.is_none()
                             && watch.ps.is_none()
                             && watch.commons.is_none()
+                            && watch.memory.is_none()
                             && watch.sky.is_none()
                             && let Some(bot) = watch.pick.and_then(|pick| {
                                 card_bots(watch, self.width.max(40)).into_iter().nth(pick)
@@ -13037,6 +13146,13 @@ impl App {
                 self.jump = Some((pin, JUMP_PAGES));
             }
             "back" => self.close_pane(true),
+            // A row or a link in `/memory`.
+            "memory" => {
+                if let Some(view) = self.watch.as_mut().and_then(|w| w.memory.as_mut()) {
+                    view.click(id);
+                    self.pane_keys = true;
+                }
+            }
             // A folding group's heading in `/status`: opened or folded.
             "group" => {
                 if let Some(watch) = &mut self.watch {
@@ -14152,6 +14268,11 @@ impl App {
             } else {
                 self.status().await;
             }
+            return;
+        }
+        if prompt == "/memory" {
+            self.input.clear();
+            self.memory_view();
             return;
         }
         if matches!(prompt.as_str(), "/commons" | "/forum") {
@@ -16120,6 +16241,7 @@ impl App {
             && watch.audit.is_none()
             && watch.ps.is_none()
             && watch.commons.is_none()
+            && watch.memory.is_none()
             && watch.sky.is_none();
         let bots = card_bots(watch, self.width.max(40));
         (open && listing)
@@ -16681,6 +16803,27 @@ impl App {
                 if watch.picked != Some(at) {
                     watch.picked = Some(at);
                     pane.screen.keep_in_view(at, 2);
+                }
+            } else if let Some(view) = &mut watch.memory {
+                view.drain();
+                let (card, at, marks) = view.card(width);
+                let lines: Vec<Line<'static>> = card
+                    .into_iter()
+                    .map(|line| {
+                        let mut spans = vec![Span::raw(" ")];
+                        spans.extend(line.spans);
+                        Line::from(spans).style(line.style)
+                    })
+                    .collect();
+                pane.set_card_marked(lines, marks, &view.keys());
+                pane.foot = view.footer();
+                // A new pick, or a new page, is scrolled to.
+                if watch.picked != Some(at) {
+                    watch.picked = Some(at);
+                    match view.on_page() && at == 0 {
+                        true => pane.screen.show_row(0, 0),
+                        false => pane.screen.keep_in_view(at, 2),
+                    }
                 }
             } else if let Some(view) = &watch.commons {
                 let (card, at) = view.card(width);
@@ -27426,6 +27569,7 @@ mod tests {
             audit: None,
             ps: None,
             commons: None,
+            memory: None,
             sky: None,
             picked: None,
             pick: None,
@@ -27885,6 +28029,7 @@ mod tests {
             audit: None,
             ps: None,
             commons: None,
+            memory: None,
             sky: None,
             picked: None,
             pick: None,
