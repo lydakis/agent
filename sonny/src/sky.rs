@@ -34,6 +34,9 @@ use unicode_width::UnicodeWidthStr;
 
 /// Past turns' events read for who talked to whom.
 const PAST: &[&str] = &["accepted", "steered", "turn_finished"];
+
+/// How often a first sky keeps what it has read so far while it reads on.
+const KEEP_EVERY: Duration = Duration::from_secs(2);
 /// Live events: who is made, who talks, works, calls and posts.
 const LIVE: &[&str] = &[
     "created",
@@ -515,9 +518,18 @@ pub struct View {
     /// The follow said it is ready: who is here, what they did and what
     /// they hold are read.
     ready: bool,
-    /// Whose questions the opening asked for and has not heard back: the
-    /// sky draws once none is left, so nothing pops in after.
+    /// Whose questions the opening asked for and has not heard back, read
+    /// before: the sky draws once none is left, so nothing pops in after.
     unread: HashSet<String>,
+    /// Whose questions the opening asked for that were never read, as on
+    /// a store's first sky: the sky does not wait for them, each `?`
+    /// showing as its read lands, the footer counting what is left
+    /// (George, 11-14).
+    filling: HashSet<String>,
+    /// When what was read was last kept while `filling`: each read is
+    /// kept as it comes, at most every `KEEP_EVERY`, so a sky closed
+    /// halfway leaves the next one less to read.
+    kept_at: Option<Instant>,
     /// Each agent's question as last read, with the turn it had ended
     /// then: one that has run no turn since is not read again. Kept
     /// beside the store, once the follow read what was kept there, for
@@ -982,6 +994,8 @@ impl View {
             live: false,
             ready: false,
             unread: HashSet::new(),
+            filling: HashSet::new(),
+            kept_at: None,
             kept: HashMap::new(),
             kept_from: None,
             kept_changed: false,
@@ -1062,6 +1076,7 @@ impl View {
         self.live = false;
         self.ready = false;
         self.unread.clear();
+        self.filling.clear();
         self.down = None;
         // The new connection's greeting says whether it still hangs.
         self.cord = None;
@@ -1205,6 +1220,10 @@ impl View {
                         by.entry(held.bot.clone()).or_default().push(held);
                     }
                     let mut known = Vec::new();
+                    // What was read before, and agents at work, are read
+                    // first, and the sky waits for them; idle agents never
+                    // read, after, while the sky shows.
+                    let mut never = Vec::new();
                     for agent in &mut self.agents {
                         let held = by.remove(&agent.name).unwrap_or_default();
                         let name = agent.name.clone();
@@ -1234,11 +1253,25 @@ impl View {
                                 ..Default::default()
                             };
                             known.push((name, seen));
-                        } else if let Some(scans) = &self.scans
-                            && let was = self.kept.get(&name).map(|(_, seen)| seen.clone())
-                            && scans.send((name.clone(), None, was)).is_ok()
-                        {
-                            self.unread.insert(name);
+                        } else if let Some(scans) = &self.scans {
+                            match self.kept.get(&name).map(|(_, seen)| seen.clone()) {
+                                // Idle and never read, as every agent on a
+                                // store's first sky: the sky shows without
+                                // it. One at work is waited for, as before.
+                                None if agent.running.is_none() => never.push(name),
+                                was => {
+                                    if scans.send((name.clone(), None, was)).is_ok() {
+                                        self.unread.insert(name);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    if let Some(scans) = &self.scans {
+                        for name in never {
+                            if scans.send((name.clone(), None, None)).is_ok() {
+                                self.filling.insert(name);
+                            }
                         }
                     }
                     for (name, seen) in known {
@@ -1250,6 +1283,7 @@ impl View {
                 // unsure is read again when its turn ends.
                 Feed::Asked(name, Some(seen)) => {
                     self.unread.remove(&name);
+                    self.filling.remove(&name);
                     if let Some(at) = self.agent(&name)
                         && let agent = &self.agents[at]
                         && agent.running.is_none()
@@ -1275,6 +1309,7 @@ impl View {
                 }
                 Feed::Asked(name, None) => {
                     self.unread.remove(&name);
+                    self.filling.remove(&name);
                 }
                 Feed::Live(event) => {
                     self.live = true;
@@ -1310,6 +1345,12 @@ impl View {
             .kept_from
             .as_ref()
             .filter(|_| self.kept_changed && !self.opening())
+            .filter(|_| {
+                self.filling.is_empty()
+                    || self
+                        .kept_at
+                        .is_none_or(|at| now.duration_since(at) >= KEEP_EVERY)
+            })
         {
             let here: HashMap<String, (i64, crate::needs::Seen)> = (self.kept.iter())
                 .filter(|(name, _)| self.agent(name).is_some_and(|at| !self.agents[at].gone))
@@ -1317,6 +1358,7 @@ impl View {
                 .collect();
             crate::keep_sky_seen(&self.resolved, from.as_deref(), &here);
             self.kept_changed = false;
+            self.kept_at = Some(now);
         }
         // The tape let go of what had not played: the replay starts again
         // from what is left, seated as it was then.
@@ -4106,6 +4148,19 @@ impl View {
                 spans.push(Span::raw(mark).fg(color));
                 spans.push(Span::raw(format!(" {n} {word}")).dim());
             }
+        }
+        // A first sky shows before every question is read: how many are
+        // left, until none is.
+        if !self.filling.is_empty() {
+            let n = self.filling.len();
+            spans.push(Span::raw(" · ").dim());
+            spans.push(
+                Span::raw(format!(
+                    "reading what {n} {}",
+                    if n == 1 { "agent asks" } else { "agents ask" }
+                ))
+                .dim(),
+            );
         }
         // Who is in the middle.
         let mut seen = String::new();
@@ -8252,12 +8307,27 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn the_sky_opens_whole_once_who_is_here_and_what_they_ask_are_read() {
+    async fn the_sky_opens_whole_once_who_is_here_and_what_was_read_before_is_read_again() {
         let (mut view, send) = view();
         let (scans, mut asked) = mpsc::unbounded_channel();
         send.send(Feed::Scans(scans)).unwrap();
-        send.send(Feed::Roll(vec![json!({"name": "a"}), json!({"name": "b"})]))
-            .unwrap();
+        // `a` was read before, as of a turn it has ended one since; `b`
+        // never was, as on a store's first sky; nor `c`, which works.
+        let seen = crate::needs::Seen {
+            turn: Some(0),
+            ..Default::default()
+        };
+        send.send(Feed::Kept(
+            None,
+            HashMap::from([("a".to_owned(), (0, seen))]),
+        ))
+        .unwrap();
+        send.send(Feed::Roll(vec![
+            json!({"name": "a", "last": {"turn": 1}}),
+            json!({"name": "b", "last": {"turn": 1}}),
+            json!({"name": "c", "running_turn": 2, "last": {"turn": 1}}),
+        ]))
+        .unwrap();
         send.send(Feed::Past(
             json!({"event": "accepted", "bot": "a", "turn": 1, "data": {}}),
         ))
@@ -8265,8 +8335,9 @@ mod tests {
         view.drain();
         let waiting = text(&view.card(80, 30));
         assert_eq!(waiting.trim(), "Catching up with who is here…");
-        // What they hold is in and their questions are asked for: still one
-        // line, ready or not, until each agent's questions are read.
+        // What they hold is in and their questions are asked for, what was
+        // read before first: still one line, ready or not, until that is
+        // read again.
         send.send(Feed::Held(Vec::new())).unwrap();
         send.send(Feed::Ready).unwrap();
         view.drain();
@@ -8274,8 +8345,7 @@ mod tests {
         while let Ok((name, ..)) = asked.try_recv() {
             sent.push(name);
         }
-        sent.sort();
-        assert_eq!(sent, ["a", "b"]);
+        assert_eq!(sent, ["a", "c", "b"]);
         assert_eq!(
             text(&view.card(80, 30)).trim(),
             "Catching up with who is here…"
@@ -8286,7 +8356,9 @@ mod tests {
             text(&view.card(80, 30)).trim(),
             "Catching up with who is here…"
         );
-        send.send(Feed::Asked("b".into(), None)).unwrap();
+        // The sky shows while what was never read of an idle agent is
+        // read, the footer counting it, until it is in.
+        send.send(Feed::Asked("c".into(), None)).unwrap();
         view.drain();
         let open = text(&view.card(80, 30));
         assert!(!open.contains("Catching up"), "{open}");
@@ -8294,6 +8366,21 @@ mod tests {
             open.contains("you") && open.contains("Quiet. Messages"),
             "{open}"
         );
+        let footer = |view: &View| -> String {
+            view.footer(120)
+                .spans
+                .iter()
+                .map(|s| s.content.as_ref())
+                .collect()
+        };
+        assert!(
+            footer(&view).contains("reading what 1 agent asks"),
+            "{}",
+            footer(&view)
+        );
+        send.send(Feed::Asked("b".into(), None)).unwrap();
+        view.drain();
+        assert!(!footer(&view).contains("reading"), "{}", footer(&view));
         // A fresh follow opens whole again.
         view.pause();
         view.resume();
