@@ -644,14 +644,19 @@ impl View {
 
     pub fn key(&mut self, key: KeyEvent) -> Key {
         self.notice = None;
-        // A removal asked for: only Enter says yes, any other key keeps
-        // the row, and says so.
+        // A removal asked for: only Enter, with no modifier, says yes;
+        // any other key keeps the row, and says so, and Ctrl+C closes too.
         if let Some(asked) = self.confirm.take() {
+            let plain = !key
+                .modifiers
+                .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER);
             match self.items.iter().find(|item| key_of(item) == asked) {
-                Some(item) if key.code == KeyCode::Enter => self.remove(&item.clone()),
+                Some(item) if key.code == KeyCode::Enter && plain => self.remove(&item.clone()),
                 _ => self.notice = Some("not removed".into()),
             }
-            return Key::Stay;
+            let close =
+                key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL);
+            return if close { Key::Close } else { Key::Stay };
         }
         match key.code {
             KeyCode::Esc => return Key::Close,
@@ -1479,6 +1484,19 @@ mod tests {
         assert_eq!(view.notice.as_deref(), Some("not removed"));
         press(&mut view, KeyCode::Char('x'));
         assert_eq!(press(&mut view, KeyCode::Esc), Key::Stay);
+        assert_eq!(view.confirm, None);
+        // Enter with a modifier keeps it too; Ctrl+C keeps it and closes.
+        for modifier in [KeyModifiers::CONTROL, KeyModifiers::ALT] {
+            press(&mut view, KeyCode::Char('x'));
+            let enter = KeyEvent::new(KeyCode::Enter, modifier);
+            assert_eq!(view.key(enter), Key::Stay);
+            assert_eq!(view.confirm, None);
+            assert_eq!(view.items.len(), 2);
+            assert_eq!(view.notice.as_deref(), Some("not removed"));
+        }
+        press(&mut view, KeyCode::Char('x'));
+        let close = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
+        assert_eq!(view.key(close), Key::Close);
         assert_eq!(view.confirm, None);
         press(&mut view, KeyCode::Down);
         assert_eq!(view.card(100).1, 9);
