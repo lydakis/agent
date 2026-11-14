@@ -14,6 +14,9 @@ long as it takes. A check that gives up on a turn still running logs where
 that turn was (`review_failed` with `hung`: its status, rounds, retries,
 time held back, and how long since it last wrote) before its fork is
 removed.
+
+![/config with the reviewer's timeout_ms picked: 90000 unset, and what it sets](../docs/sonny/config-reviewer-timeout.png)
+
 Each round asks a fork of one base bot, `.reviewer.TAG`, whose leading dot
 marks it as one of Sonny's own: no folder's agents share the name, and the
 sky and the agent picker leave it out. Before 0.9.1 these were `[judge]`,
