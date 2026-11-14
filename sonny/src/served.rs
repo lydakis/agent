@@ -647,6 +647,22 @@ async fn called(name: &str, arguments: &Value) -> Answer {
                     ));
                 }
             }
+            // A row asked for gates the task as Sonny gates that row, over
+            // the tools it will have, which the daemon's providers decide.
+            let providers = match text("permissions").is_some() {
+                true => match crate::daemon_paths(None, None) {
+                    Ok((_, socket)) => match Client::connect(&socket).await {
+                        Ok((client, _events)) => {
+                            let providers = client.providers().clone();
+                            client.close().await;
+                            providers
+                        }
+                        Err(_) => Value::Null,
+                    },
+                    Err(_) => Value::Null,
+                },
+                false => Value::Null,
+            };
             let start = crate::task::Start {
                 name: text("name").unwrap_or_default(),
                 brief: text("brief").unwrap_or_default(),
@@ -662,6 +678,7 @@ async fn called(name: &str, arguments: &Value) -> Answer {
                 builds_on: (!line.lead).then(|| caller.clone()),
                 env: Vec::new(),
                 made_by: None,
+                providers,
             };
             let started = crate::task::start(&line.folder, &line.project, &caller, &start)
                 .map_err(|e| ("task_not_started", e))?;

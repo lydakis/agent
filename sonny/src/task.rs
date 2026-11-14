@@ -75,6 +75,9 @@ pub struct Start {
     /// that lead's task while its brief stays the person's words; an
     /// agent's shell starts tasks as its own agent.
     pub made_by: Option<String>,
+    /// The daemon's providers, as its `ready` names them, from which the
+    /// tools a task gets by default are known: null when none were read.
+    pub providers: Value,
 }
 
 /// Start the task `start` asks for in `project`, whose lead's folder is
@@ -420,6 +423,9 @@ pub fn start(here: &Path, project: &str, starter: &str, start: &Start) -> Result
         (Some(row), lead) => {
             if let Some(approval) = crate::approvals::added(row, lead.as_ref()) {
                 flags.extend(["--approval".to_owned(), approval.to_owned()]);
+                let search = (config.web_search, config.web_search_off.as_slice());
+                let list = approved(row, &flags, lead.as_ref(), &start.providers, search);
+                flags.extend(list.into_iter().flatten());
             }
         }
         (None, None) => {}
@@ -657,6 +663,60 @@ struct Picks {
     model: Option<String>,
     effort: Option<String>,
     speed: Option<String>,
+}
+
+/// The `--approve` list for the gate a task in `row` adds to its maker's,
+/// as Sonny gates the row: the tools it will have, its own as the CLI picks
+/// them (`--tools`, else its model's defaults) and the ones it inherits
+/// from `maker` that Sonny gates, but those the row leaves ungated, such
+/// as reads. None when its tools can't be known here, which leaves the
+/// list to the CLI.
+fn approved(
+    row: &crate::approvals::Mode,
+    flags: &[String],
+    maker: Option<&Value>,
+    providers: &Value,
+    (search, off): (agent_client::config::WebSearch, &[String]),
+) -> Option<[String; 2]> {
+    let named = |name: &str| {
+        let at = flags.iter().position(|flag| {
+            flag == name || flag.strip_prefix(name).is_some_and(|r| r.starts_with('='))
+        })?;
+        match flags[at].split_once('=') {
+            Some((_, value)) => Some(value.to_owned()),
+            None => flags.get(at + 1).cloned(),
+        }
+    };
+    let own: Vec<String> = match named("--tools") {
+        Some(tools) => tools
+            .split(',')
+            .filter(|t| !t.is_empty())
+            .map(str::to_owned)
+            .collect(),
+        None if providers.is_object() => {
+            agent_client::default_tools(providers, &named("--model")?, search, off)
+                .into_iter()
+                .map(str::to_owned)
+                .collect()
+        }
+        None => return None,
+    };
+    // Its maker's declarations, those it passes on.
+    let inherited: Vec<Value> = (maker.map(|maker| &maker["declared"]))
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|tool| tool["inherit"] != false && tool["inherit"] != 0)
+        .cloned()
+        .collect();
+    let tools = crate::approvals::gateable(&own, &Value::Array(inherited));
+    let gate = crate::approvals::gate(row.name, &tools);
+    let approve: Vec<&str> = (gate.get("approve").and_then(Value::as_array))
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .collect();
+    (!approve.is_empty()).then(|| ["--approve".to_owned(), approve.join(",")])
 }
 
 /// The run flags with the task's model, effort and speed, unless they
@@ -2082,6 +2142,57 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_tighter_row_gates_the_task_as_sonny_gates_the_row() {
+        use agent_client::config::WebSearch;
+        let row = crate::approvals::find("ask").unwrap();
+        let providers = serde_json::json!({"openai": {"family": "responses", "web_search": false}});
+        let maker = serde_json::json!({"declared": [{"name": "start_task"},
+            {"name": "new_project", "inherit": false}, {"name": "memory"}]});
+        let flags: Vec<String> = ["--model", "openai/m"].map(str::to_owned).to_vec();
+        let off: Vec<String> = Vec::new();
+        let [flag, list] = approved(
+            &row,
+            &flags,
+            Some(&maker),
+            &providers,
+            (WebSearch::Disabled, &off),
+        )
+        .unwrap();
+        assert_eq!(flag, "--approve");
+        let list: Vec<&str> = list.split(',').collect();
+        // Its own tools and the ones it inherits that Sonny gates, not
+        // reads, nor what its maker keeps from it.
+        for tool in ["shell", "write", "apply_patch", "start_task"] {
+            assert!(list.contains(&tool), "{tool} not in {list:?}");
+        }
+        for tool in ["read", "wait", "history", "memory", "new_project"] {
+            assert!(!list.contains(&tool), "{tool} in {list:?}");
+        }
+        // A role's tools are the ones it has.
+        let named: Vec<String> = ["--tools", "read,shell"].map(str::to_owned).to_vec();
+        let [_, list] = approved(
+            &row,
+            &named,
+            None,
+            &Value::Null,
+            (WebSearch::Disabled, &off),
+        )
+        .unwrap();
+        assert_eq!(list, "shell");
+        // Without the daemon's providers its tools aren't known here.
+        assert!(
+            approved(
+                &row,
+                &flags,
+                None,
+                &Value::Null,
+                (WebSearch::Disabled, &off)
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
     fn a_task_at_work_is_left_as_it_is_and_says_how_it_can_be_cleaned_up() {
         let said = busy("fix", 4);
         assert!(said.contains("its turn 4 has not ended"), "{said}");
@@ -2481,6 +2592,7 @@ mod tests {
             builds_on: None,
             env: vec![("AGENT_STORE".into(), store.to_string_lossy().into_owned())],
             made_by: None,
+            providers: Value::Null,
         };
         // The store a window's `--store` names, not the one Sonny's own
         // environment would find.
