@@ -1145,23 +1145,26 @@ has something on it, or is off the screen, no time shows.
 - `/memory` shows, in the pane beside the conversation, what agents saved to
   memory: Work under way, newest first, with how long since each was saved;
   This project's facts; and About you, the facts kept about you in every
-  project, folded at first. Each row has the fact's name, its type and its
-  index flags (`live`, `external`, `confirmed N`, `pushed back N`), its
+  project, folded at first. Each row has the fact's name, its type (left
+  unsaid when it is its section's own: `project` under a project, `user`
+  under About you) and its index flags (`live`, `external`, `confirmed N`, `pushed back N`), its
   description, and `verified DATE` at the right edge. It reads each
   folder's `MEMORY.md`, and a work fact's own file, since an index lists
   work by name and date alone. A live fact's description is filled as a
   starting agent reads it. `a` widens it to every project, one folded
   section each with this one first and open; `a` again narrows it back.
-  ↑↓ pick, → or Enter opens a fact or a folded section, ← folds a section.
+  ↑↓ pick, → or Enter opens a fact or a folded section, or steps into an
+  open one; ← folds it, and a click on a heading opens or folds it.
   An open fact is a page: its text as Markdown, filled now when it is
   live, under one muted line with its type, flags, verified date and
-  `from SOURCE`, where an agent's `NAME/N` opens that agent. Another
-  fact's exact name in the text is a link, as Lynx's are: ↑↓ pick among
-  the links in view and scroll when none is left that way, → or Enter
-  follows one as the next page, and ← walks back. `x` removes the picked
-  fact after `Remove NAME? It can't be undone.`, `enter remove · esc
-  cancel`, through the memory tool's own `remove`, so the index stays
-  right. It reads off the screen thread when it opens, on `a`, and after a
+  `from SOURCE`, where an agent's `NAME/N` is the page's first link and
+  opens that agent. Another fact's exact name in the text is a link, as
+  Lynx's are: ↑↓ pick among the links in view and scroll when none is left
+  that way, → or Enter opens one (a fact as the next page), and ← or the
+  title's ‹ walks back. `x` removes the picked fact after `Remove NAME?
+  It can't be undone.`, `enter remove · esc cancel`, through the memory
+  tool's own `remove`, so the index stays right; any other key says `not
+  removed`. It reads off the screen thread when it opens, on `a`, and after a
   removal, never on a timer. Your reading there is not counted as an
   agent's, so it never keeps a fact from the nightly cleanup's 30-day
   unread check.

@@ -926,8 +926,9 @@ impl View {
         }
         if let Some(page) = self.pages.last() {
             return match page.links.is_empty() {
-                true => "↑↓ scroll · ← back · esc close".into(),
-                false => "↑↓ pick · enter open · ← back · esc close".into(),
+                // The pane's title says `← back` first, beside its `‹`.
+                true => "↑↓ scroll · esc close".into(),
+                false => "↑↓ pick · enter open · esc close".into(),
             };
         }
         let items = self.items();
@@ -1509,7 +1510,7 @@ mod tests {
                 fact("vault-access-old")
             ]
         );
-        assert_eq!(view.keys(), "↑↓ pick · enter open · ← back · esc close");
+        assert_eq!(view.keys(), "↑↓ pick · enter open · esc close");
         // ↓ picks the first link in view, the agent; enter opens it outside
         // the view, as a click on it does.
         let agent = Key::Open("sonny:agent/tally.lead".into());
