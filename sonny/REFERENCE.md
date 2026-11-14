@@ -811,6 +811,14 @@ has something on it, or is off the screen, no time shows.
   daemon's: every agent takes it once the daemon starts again.
 
   ![/config over the composer, side_chat set to fork](../docs/sonny/config.png)
+
+  `trailer` is what an agent's model reads in the daemon's line after
+  each message: `sender, time` by default for Sonny's agents (`[Message
+  site.lead/2. Sent Fri 13 Nov 2026 23:21, UTC-05:00.]`), `sender`,
+  `time` or `none`. Sonny draws the words without the line.
+
+  ![/config with trailer picked: sender, time, Sonny's default](../docs/sonny/config-trailer.png)
+  ![/config after one step: trailer = ["sender"] saved](../docs/sonny/config-trailer-sender.png)
 - `/model` picks the lead's model, from every model its provider family
   lists, each by its name and provider (`Opus 5.5 · bedrock`) with its id
   muted after them, found by either, and its effort (←/→), and writes them to the project's

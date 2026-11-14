@@ -79,7 +79,7 @@ pub const SETTINGS: &[Setting] = &[
     },
     Setting {
         key: "trailer",
-        about: "what the line after each message names for an agent's model: who sent it, when; the agent CLI's agents name the sender alone",
+        about: "what an agent's model reads after each message: who sent it, when it was sent",
         values: TRAILERS,
         default: "sender, time",
     },
