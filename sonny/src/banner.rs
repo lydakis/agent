@@ -292,7 +292,7 @@ fn hints(accent: Style) -> Line<'static> {
         Span::styled("/model", accent),
         " switch model  ".dim(),
         Span::styled("/status", accent),
-        " tasks".dim(),
+        " agents".dim(),
     ])
 }
 
