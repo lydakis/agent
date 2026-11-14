@@ -230,6 +230,34 @@ class SocketAndCliTests(ModelFixture):
             statuses = db.execute('SELECT status FROM turns').fetchall()
         self.assertEqual(statuses, [('paced',)] * 4)
 
+    def test_turns_a_stop_cut_mid_command_all_go_on_at_the_next_start(self):
+        # An upgrade replaced the daemon while turns ran commands: each is
+        # parked by the stop, and the next start continues every one of
+        # them at once, its cut command answered as cut.
+        command = lambda line: 'calls:' + json.dumps([['shell', {'command': line, 'timeout_ms': 120000}]])
+        sleeping = lambda: subprocess.run(['pgrep', '-f', '^sleep 68$'], capture_output=True, text=True).stdout.split()
+        bots = [f'Cut{n}' for n in range(4)]
+        for bot in bots:
+            self.agent('run', *self.common, '--new', '--bot', bot, '--detach', command('sleep 68'))
+        for _ in bots:
+            self.model.requests.get(timeout=5)
+        deadline = time.monotonic() + 10
+        while len(sleeping()) != len(bots):
+            self.assertLess(time.monotonic() - deadline, 0, 'the commands did not start')
+            time.sleep(.05)
+        # Past the time a call waits live before its turn parks on it.
+        time.sleep(3)
+        replaced = json.loads(self.agent('start', '--replace', *self.common[:4]).stdout)
+        self.assertEqual(replaced['event'], 'ready')
+        deadline = time.monotonic() + 20
+        while True:
+            with closing(sqlite3.connect(self.store)) as db:
+                statuses = db.execute('SELECT status, waiting FROM turns ORDER BY id').fetchall()
+            if all(status == 'completed' for status, _ in statuses):
+                break
+            self.assertLess(time.monotonic() - deadline, 0, statuses)
+            time.sleep(.1)
+
     def test_shutdown_grace_lets_the_running_turn_finish(self):
         self.model.release_headers = threading.Event()
         self.model.all_streaming = self.model.release_headers

@@ -717,7 +717,7 @@ async fn read_status(
                     .collect();
                 format!("waiting on {}", on.join(", "))
             }
-            (true, Some("paced")) => "rate limited".into(),
+            (true, Some("paced")) => status::paced(&ran["waiting_on"], now),
             (true, _) => "working".into(),
             (false, Some("completed")) => started::IDLE.into(),
             (false, Some("failed")) if ran["error"] == EMPTY => started::QUIET.into(),
