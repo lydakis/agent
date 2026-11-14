@@ -1017,13 +1017,17 @@ has something on it, or is off the screen, no time shows.
   nothing, and says what went wrong under it),
   **Working** (a turn running, queued, rate limited, starting, waiting on
   other tasks, or `waiting on its reviewer` while the reviewer weighs a
-  call), **Idle** (its turn ended with nothing open, `idle`; ended without
-  words, `no reply`; or you ended it, `interrupted`; a pull request its
-  last reply linked shows on its row), and **Done** (marked done). One
-  table gives every state its mark, for the footer, `/status`, the tasks
-  a lead started and `/switch` alike: `?` needs you or held, `✗` failed,
-  `●` working, `◌` waiting, queued, rate limited or starting, `○` idle or
-  no reply, `■` interrupted, `✓` done; all but the first three muted.
+  call; a turn its pool holds more than five minutes says until when,
+  `rate limited until 14:05`, one a stop parked says `parked by a
+  restart`, which the next start goes on with, and one the pull cord
+  parked says `paused`), **Idle** (its turn ended with nothing open,
+  `idle`; ended without words, `no reply`; or you ended it,
+  `interrupted`; a pull request its last reply linked shows on its row),
+  and **Done** (marked done). One table gives every state its mark, for
+  the footer, `/status`, the tasks a lead started and `/switch` alike:
+  `?` needs you or held, `✗` failed, `●` working, `◌` waiting, queued,
+  rate limited, parked, paused or starting, `○` idle or no reply, `■`
+  interrupted, `✓` done; all but the first three muted.
   Each agent is one line: its mark, name, state and time; one
   that needs you says what for under it, one that failed why. That is all it shows as it opens; `m` shows more and hides it
   again: at each row's right edge, dim, the rest of what it tracks: what it follows (a source with an
@@ -1076,6 +1080,10 @@ has something on it, or is off the screen, no time shows.
   ![/status naming each agent's profile beside its model: superlead, task, reviewer](../docs/sonny/status-profile.png)
 
   ![A task opened from /status in the pane, its ‹ going back to /status](../docs/sonny/status-opens-agent.png)
+
+  ![/status with backup paused by the pull cord and migrate rate limited until 11:40, its pool closed for two hours](../docs/sonny/status-paced-reasons.png)
+
+  ![A task whose command a restart cut: a muted ■ before Ran ./deploy.sh, and under it cut by a restart: it may have run, and was not run again](../docs/sonny/call-cut-by-restart.png)
 
   Under its heading, `/status` says only what is broken around the
   agents, each with a red `✗`: a companion of the daemon that keeps
