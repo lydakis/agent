@@ -779,13 +779,34 @@ pub fn agent_inside(command: &str) -> bool {
         })
 }
 
+/// A command's line, which runs on past a newline escaped by `\\` or inside
+/// quotes, and what follows it (a here-document's text).
+fn command_line(command: &str) -> (&str, &str) {
+    let (mut quote, mut chars) = (None, command.char_indices());
+    while let Some((at, c)) = chars.next() {
+        match (quote, c) {
+            (Some('\''), '\'') => quote = None,
+            (Some('\''), _) => {}
+            (_, '\\') => {
+                chars.next();
+            }
+            (Some(q), c) if c == q => quote = None,
+            (Some(_), _) => {}
+            (None, '\'' | '"') => quote = Some(c),
+            (None, '\n') => return (&command[..at], &command[at + 1..]),
+            _ => {}
+        }
+    }
+    (command, "")
+}
+
 /// Whether a command reaches a file by a redirection, which the sandbox may
 /// not let it read or write: any `<` outside quotes but a here-document or
 /// here-string (`<<`, `<<<`), and any `>` but a copy of one stream to
 /// another (`2>&1`) or a discard (`>/dev/null`). A here-document's text,
-/// after the first line, is the command's input.
+/// after the command's line, is its input.
 fn redirects_elsewhere(command: &str) -> bool {
-    let line = command.lines().next().unwrap_or("");
+    let (line, _) = command_line(command);
     let (mut quote, mut chars) = (None, line.char_indices().peekable());
     while let Some((at, c)) = chars.next() {
         match (quote, c) {
@@ -822,7 +843,7 @@ fn redirects_elsewhere(command: &str) -> bool {
 /// `>(...)` outside quotes; in a here-document's text too, unless its
 /// delimiter is quoted.
 fn substitutes(command: &str) -> bool {
-    let (line, body) = command.split_once('\n').unwrap_or((command, ""));
+    let (line, body) = command_line(command);
     let (mut quote, mut chars) = (None, line.chars().peekable());
     while let Some(c) = chars.next() {
         let next = chars.peek().copied();
@@ -1591,6 +1612,7 @@ Keep the rest.'"#,
             r#""$AGENT_BIN" ls --pretty | jq -r '.name | ascii_upcase' | head -5"#,
             r#""$AGENT_BIN" ls | tail -n +2 | head --lines=3 | jq -rc --arg b x '.[$b]'"#,
             "\"$AGENT_BIN\" run --bot shop.fix --detach - <<<'Done.'",
+            "\"$AGENT_BIN\" run --bot shop.fix --detach \\\n  -- 'Line one\nline two'",
             r#""$AGENT_BIN" run --bot shop.fix --detach -- 'Run $(make test) and say'"#,
             "\"$AGENT_BIN\" run --bot shop.lead --detach - <<'EOF'\nRan $(make) and `ls`.\nEOF",
         ] {
@@ -1631,6 +1653,9 @@ Keep the rest.'"#,
             r#""$AGENT_BIN" ls | jq 'include "x"; .'"#,
             r#""$AGENT_BIN" run --bot shop.fix --detach - < /private/secret.txt"#,
             r#""$AGENT_BIN" ls | jq . < /private/report.json"#,
+            "\"$AGENT_BIN\" ls \\\n> \"$HOME/report.json\"",
+            "\"$AGENT_BIN\" run --bot shop.fix --detach -- \\\n\"$(touch ~/r)\"",
+            "\"$AGENT_BIN\" run --bot shop.fix --detach -- \"Line one\n$(touch ~/r)\"",
             r#""$AGENT_BIN" run --bot shop.lead --detach -- "$(touch "$HOME/report.json"; printf done)""#,
             r#""$AGENT_BIN" run --bot shop.lead --detach -- `touch ~/r; echo done`"#,
             r#""$AGENT_BIN" run --bot shop.lead --detach -- "$(<(cat ~/x))""#,
