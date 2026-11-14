@@ -257,12 +257,6 @@ fn parse(args: &[String]) -> Result<Options> {
                 options.settings.insert("network".to_owned(), json!(true));
                 options.settings_flags.push("--network".to_owned());
             }
-            "--hide-senders" => {
-                options
-                    .settings
-                    .insert("hide_senders".to_owned(), json!(true));
-                options.settings_flags.push("--hide-senders".to_owned());
-            }
             "--quiet-background" => {
                 options
                     .settings
@@ -473,6 +467,18 @@ fn parse(args: &[String]) -> Result<Options> {
                         if !options.settings_flags.iter().any(|f| f == flag) {
                             options.settings_flags.push(flag.to_owned());
                         }
+                    }
+                    "--trailer" => {
+                        let parts: Vec<&str> = value.split(',').filter(|p| !p.is_empty()).collect();
+                        if let Some(part) = parts.iter().find(|p| !matches!(**p, "sender" | "time"))
+                        {
+                            return fail_with(
+                                "usage",
+                                format!("--trailer lists sender and time, not {part}"),
+                            );
+                        }
+                        options.settings.insert("trailer".to_owned(), json!(parts));
+                        options.settings_flags.push(flag.to_owned());
                     }
                     "--outputs" => {
                         let path = std::path::absolute(&value)?;
@@ -2099,8 +2105,8 @@ fn run(options: &Options) -> Result<i32> {
                 .collect(),
         };
         let mut settings = options.settings.clone();
-        if config()?.hide_senders {
-            settings.entry("hide_senders").or_insert(json!(true));
+        if let Some(trailer) = &config()?.trailer {
+            settings.entry("trailer").or_insert(json!(trailer));
         }
         if let Some(ms) = config()?.hold_ms {
             settings.entry("hold_ms").or_insert(json!(ms));

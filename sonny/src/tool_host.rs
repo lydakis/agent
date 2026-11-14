@@ -390,12 +390,9 @@ fn configured(record: &Value, given: &Given<'_>) -> Option<serde_json::Map<Strin
     if !record["fallback"].is_null() {
         fields.insert("fallback".into(), Value::Null);
     }
-    let hidden = record["settings"]["hide_senders"]
-        .as_bool()
-        .unwrap_or(false);
-    if hidden != given.config.hide_senders {
-        let hide = given.config.hide_senders.then_some(true);
-        settings.insert("hide_senders".into(), json!(hide));
+    let trailer = json!(crate::stamp::trailer(given.config));
+    if record["settings"]["trailer"] != trailer {
+        settings.insert("trailer".into(), trailer);
     }
     // As long as the config says, or the daemon's own when it says none.
     let hold = given.config.hold_ms.unwrap_or(agent_client::HOLD_MS);
@@ -457,9 +454,10 @@ mod tests {
     #[test]
     fn an_agent_follows_what_config_gives_its_model() {
         let mut config = agent_client::config::Config::default();
-        let agent = |fallback: Value, hidden: bool| {
+        let (both, sender) = (json!(["sender", "time"]), json!(["sender"]));
+        let agent = |fallback: Value, trailer: &Value| {
             json!({"provider": "anthropic", "model": "claude", "fallback": fallback,
-                "settings": {"hide_senders": hidden},
+                "settings": {"trailer": trailer},
                 "declared": [{"name": "start_task", "answered_by": crate::served::TAG}]})
         };
         fn given(config: &agent_client::config::Config) -> Given<'_> {
@@ -470,47 +468,63 @@ mod tests {
                 live: &NONE,
             }
         }
+        // Sonny's agents name who sent each message and when.
         assert_eq!(
-            configured(&agent(Value::Null, false), &given(&config)),
+            configured(&agent(Value::Null, &both), &given(&config)),
             None
+        );
+        assert_eq!(
+            configured(&agent(Value::Null, &sender), &given(&config)).map(Value::Object),
+            Some(json!({"settings": {"trailer": both}}))
         );
         // The daemon gives the config's fallback, so the agent keeps none.
         config
             .fallbacks
             .insert("anthropic/claude".into(), "anthropic/other".into());
-        config.hide_senders = true;
+        config.trailer = Some(Vec::new());
         assert_eq!(
-            configured(&agent(Value::Null, false), &given(&config)).map(Value::Object),
-            Some(json!({"settings": {"hide_senders": true}}))
+            configured(&agent(Value::Null, &both), &given(&config)).map(Value::Object),
+            Some(json!({"settings": {"trailer": []}}))
         );
-        assert_eq!(configured(&agent(Value::Null, true), &given(&config)), None);
+        assert_eq!(
+            configured(&agent(Value::Null, &json!([])), &given(&config)),
+            None
+        );
         // One an older Sonny copied in goes, whatever the config says.
         assert_eq!(
-            configured(&agent(json!("anthropic/other"), true), &given(&config)).map(Value::Object),
+            configured(
+                &agent(json!("anthropic/other"), &json!([])),
+                &given(&config)
+            )
+            .map(Value::Object),
             Some(json!({"fallback": null}))
         );
         let config = agent_client::config::Config::default();
         assert_eq!(
-            configured(&agent(json!("anthropic/other"), true), &given(&config)).map(Value::Object),
-            Some(json!({"fallback": null, "settings": {"hide_senders": null}}))
+            configured(
+                &agent(json!("anthropic/other"), &json!([])),
+                &given(&config)
+            )
+            .map(Value::Object),
+            Some(json!({"fallback": null, "settings": {"trailer": both}}))
         );
         // A change the daemon keeps for the turn's end counts as made: a
         // file that takes it back asks again, and one that matches it
         // asks nothing.
-        let mut busy = agent(Value::Null, false);
-        busy["configure_pending"] = json!({"settings": {"hide_senders": true}});
+        let mut busy = agent(Value::Null, &both);
+        busy["configure_pending"] = json!({"settings": {"trailer": ["time"]}});
         assert_eq!(
             configured(&busy, &given(&config)).map(Value::Object),
-            Some(json!({"settings": {"hide_senders": null}}))
+            Some(json!({"settings": {"trailer": both}}))
         );
         let mut config = agent_client::config::Config {
-            hide_senders: true,
+            trailer: Some(vec!["time".into()]),
             ..Default::default()
         };
         assert_eq!(configured(&busy, &given(&config)), None);
         // A hold reset kept for the turn's end, and then a hold of its own
         // in the file: the file's goes over the reset.
-        let mut held = agent(Value::Null, true);
+        let mut held = agent(Value::Null, &json!(["time"]));
         held["settings"]["hold_ms"] = json!(agent_client::HOLD_MS);
         held["configure_pending"] = json!({"settings": {"hold_ms": null}});
         config.hold_ms = Some(5);
@@ -520,7 +534,7 @@ mod tests {
         );
         let config = agent_client::config::Config::default();
         // Another client's bot is its own.
-        let mut other = agent(json!("x/y"), true);
+        let mut other = agent(json!("x/y"), &sender);
         other["declared"] = json!([]);
         assert_eq!(configured(&other, &given(&config)), None);
     }
@@ -546,7 +560,7 @@ mod tests {
         };
         let agent = |rules: Value, creator: Value| {
             json!({"provider": "anthropic", "model": "claude", "fallback": null,
-                "settings": {"rules": rules}, "created_by_id": creator,
+                "settings": {"rules": rules, "trailer": ["sender", "time"]}, "created_by_id": creator,
                 "declared": [{"name": "start_task", "answered_by": crate::served::TAG}]})
         };
         assert_eq!(

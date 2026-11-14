@@ -798,14 +798,14 @@ has something on it, or is off the screen, no time shows.
 - `/config` (or `/settings`) lists every key `~/.agent/config.toml` takes,
   with its value or what its default is, over the composer. ↑/↓ picks
   one; ←/→ steps a key with a few values (efforts, `web_search`,
-  `senders`, `side_chat`, `chime`, `steps`, `verbose`, `margin_opens`, `agent_opens`, `suggest`,
+  `trailer`, `side_chat`, `chime`, `steps`, `verbose`, `margin_opens`, `agent_opens`, `suggest`,
   `start_at_boot`) through them
   and its default; Enter types one that takes a name (`model`, `provider`,
   `reviewer.model`, the profiles), empty for its default; ⌫
   takes a key back to its default. Each change is written at once, the
   file's comments and order kept, and a file that does not read is
   refused by name, as every reader refuses it. What the file gives an
-  agent when it is made, `senders` and `hold`, every agent Sonny made
+  agent when it is made, `trailer` and `hold`, every agent Sonny made
   takes within seconds of the file changing, or, at work, once its turn
   ends. `[fallbacks]`, like `[speeds]` and `[context_windows]`, is the
   daemon's: every agent takes it once the daemon starts again.
