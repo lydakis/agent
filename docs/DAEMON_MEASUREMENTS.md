@@ -9255,3 +9255,115 @@ measure is within its run-to-run spread; the call-end path is
 | lifecycle | CPU, s | 0.485 | 0.49 | +1.0% |
 | lifecycle | p95 turn, ms | 573.529 | 577.316 | +0.7% |
 | lifecycle | peak RSS, MiB | 24.502 | 24.596 | +0.4% |
+
+## Turn-startup metadata in one storage job
+
+Measured 2026-11-13 on macOS arm64, M1 Max, external power, Python 3.12.9
+and psutil 7.2.2. Base is main `c5fa7120`; head is that revision plus the
+metadata-read change. Both were built locally with the same locked dependencies,
+release optimization, `CARGO_PROFILE_RELEASE_DEBUG=1` and
+`CARGO_PROFILE_RELEASE_STRIP=none`. Binary SHA-256:
+
+- Base: `771d9634d97c5276c1a9955253fa9b408cfe90fb779fb95bdfdefc846bf7aad6`.
+- Head: `36bd01e57f50ee33bc0259bf6e80e67fa26e1fa194902eedab83a3a4c38f8a80`.
+
+Turn startup formerly awaited an `inspect` job, then a `context` job that
+looked up and inspected the same bot again. It now reads the bot and its
+turn overrides in one `context` job, validates that the turn is still running
+on that bot, and reuses that bot snapshot. The turn-metadata statement is
+cached. This removes one storage job, one duplicate bot inspection and the
+turn-to-bot lookup from each task's startup, including a parked task's restart.
+Tool rounds within the same task already reused this metadata.
+
+The history-window read stays after resumed tools have settled, so it sees
+their newly appended results. SQLite work still runs on the storage worker
+and joins group commit; the runtime thread does no database work. There are
+no new per-bot fields, retained history copies, tasks or timers. The schema,
+sync policy, transcript writes, terminal writes and publication-after-commit
+boundaries are unchanged.
+
+### Required matched screen
+
+The existing four daemon benches ran sequentially in base/head/head/base
+order. Each invocation has its usual excluded warmup. Admission and completion
+use 32 bots and five measured repeats per invocation; footprint uses 1,000
+bots and two; lifecycle uses 32 bots, socket transport, echo mode, all five
+registered tool schemas and one. Lifecycle retains its three turns, 4 KiB
+new input and 500 ms of scripted response streaming. Thus there are ten
+measured admission/completion runs, four footprint runs and two lifecycle
+runs per binary. Provider and observer are outside the measured target.
+
+Medians over measured runs:
+
+| Screen | Measure | Main | Candidate |
+| --- | --- | ---: | ---: |
+| Admission | Store jobs for 32 lone submissions | 128 | 96 |
+| Admission | Store jobs for 32 burst submissions | 128 | 96 |
+| Admission | Lone-submission phase CPU, ms | 27.654 | 26.148 |
+| Admission | Burst reply p99, ms | 2.540 | 2.363 |
+| Completion | Release-to-terminal p99, ms | 5.631 | 5.417 |
+| Footprint | `inspect` jobs over 1,000 turns | 1,000 | 0 |
+| Footprint | CPU per turn, ms | 0.593 | 0.495 |
+| Footprint | Idle RSS, MiB | 13.195 | 13.000 |
+| Footprint | Per idle bot, KiB | 2.432 | 2.472 |
+| Footprint | RSS after turns, MiB | 35.805 | 35.414 |
+| Lifecycle | Observed target CPU, s | 0.363 | 0.373 |
+| Lifecycle | Turn p95, ms | 624.895 | 608.663 |
+| Lifecycle | Sampled peak daemon RSS, MiB | 25.992 | 26.250 |
+
+`bench.perf_gate` passed with no count failures or timing warnings. Every
+lifecycle run, warmups included, reached 32 provider requests in flight and
+passed history/tool-result validation, kill/reopen, exact resume, replay/item
+reads, duplicate submission, historical forks and follower/replay equality,
+with no quality warnings.
+
+The footprint CPU median is 16.5% lower, but its ranges overlap:
+0.535–0.606 ms/turn on main, 0.487–0.549 on head. Lifecycle CPU ranges also
+overlap (0.346–0.381 versus 0.369–0.376 s). Admission has one candidate
+reply-tail outlier: its p99 range is 2.179–26.227 ms versus main's
+2.017–3.693. These small samples do not establish a general latency win.
+
+### Zero intentional provider delay
+
+A separate matched probe repeats the investigation's Responses/SSE workload:
+32 bots, eight turns each, 5 KiB output in twenty frames, zero scripted delay,
+and either 4 or 64 KiB of new input per turn. Both builds use fresh stores.
+One excluded warmup and five measured runs per build and case alternate order.
+Every request's full history and every output byte are validated.
+
+CPU below is target user+system time from ready to the last completed turn,
+divided by 256 turns, excluding provider, observer, startup and shutdown.
+Latency includes local transport, fixture validation/serialization and observer
+delivery. A zero-delay fixture response does not yield, so its peak active
+requests is one despite 32 in-flight target turns; this is not a sustained
+provider-stream capacity test. Values are medians of per-run measurements,
+with their full five-run ranges.
+
+| New input | Measure | Main, median (range) | Candidate, median (range) |
+| --- | --- | ---: | ---: |
+| 4 KiB | CPU/turn, ms | 1.227 (1.143–1.304) | 1.195 (1.107–1.221) |
+| 4 KiB | Turn p50, ms | 33.768 (32.411–38.932) | 33.478 (30.637–34.794) |
+| 4 KiB | Turn p99, ms | 44.071 (41.031–55.175) | 46.762 (43.840–52.650) |
+| 64 KiB | CPU/turn, ms | 2.032 (1.981–2.049) | 2.046 (1.960–2.085) |
+| 64 KiB | Turn p50, ms | 54.577 (52.851–64.215) | 55.778 (52.074–83.034) |
+| 64 KiB | Turn p99, ms | 86.425 (83.584–137.165) | 97.600 (85.955–193.723) |
+
+All ranges overlap. The deterministic saving is one storage job per turn:
+each baseline run counted 256 `inspect` and 256 `context` jobs; each candidate
+counted zero and 256. No broad CPU or latency improvement is established by
+this zero-delay screen, and its higher candidate tail samples remain visible.
+
+Validation: 680 Rust tests, strict package-wide Clippy, formatting and 12
+process-level regressions passed. The added job-budget regression failed on
+main and passed on head, including a restart and historical fork continuation.
+The store regression checks default bot settings against per-turn model,
+effort, budget and schema overrides, plus wrong-owner and stale-turn rejection.
+Existing process tests cover crash recovery, parked waits/rate limits, pause
+across restart, compaction/replay/forks and Anthropic thinking preservation.
+
+Captures in the optimization worktree's ignored `.local/bench/`:
+`metadata-screen-20261113/` (commands and all four screens),
+`metadata-zero-delay-20261113/` (probe results), and the two local scripts
+`run_metadata_screen.py` and `run_metadata_zero_delay.py`. Build/test logs and
+preserved binaries are in the parent checkout's ignored
+`.local/bench/metadata-reads-20261113/`.

@@ -2788,8 +2788,10 @@ impl Turn {
     ) -> Result<Round> {
         accounting.restart(self.side.summary_ms.load(Relaxed));
         let (bot, turn) = (self.bot.clone(), self.turn);
-        let mut record = self.store.op("inspect", move |db| db.inspect(&bot)).await?;
-        let context = self.store.op("context", move |db| db.context(turn)).await?;
+        let (mut record, context) = self
+            .store
+            .op("context", move |db| db.running_context(&bot, turn))
+            .await?;
         // A bot that names no fallback takes the person's for this turn's
         // model, as the daemon was started with.
         if record.fallback.is_none() {

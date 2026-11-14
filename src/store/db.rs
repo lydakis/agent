@@ -10728,6 +10728,20 @@ impl Database {
     }
     /// The workspace and model reference a running turn must use.
     pub fn context(&self, turn: i64) -> Result<TurnContext> {
+        let bot = self.active(turn)?;
+        self.context_for(turn, &bot)
+    }
+    /// The running bot and its turn's overrides, from one worker snapshot.
+    /// Reuse the bot read here rather than inspecting it again for context.
+    pub fn running_context(&self, name: &str, turn: i64) -> Result<(Bot, TurnContext)> {
+        let bot = self.inspect(name)?;
+        if bot.running_turn != Some(turn) {
+            return fail("stale_turn");
+        }
+        let context = self.context_for(turn, &bot)?;
+        Ok((bot, context))
+    }
+    fn context_for(&self, turn: i64, bot: &Bot) -> Result<TurnContext> {
         // Workspace, model, rounds, view sent, effort, cap, what it spent,
         // what the cap counts, and the schema its reply follows.
         type Row = (
@@ -10753,12 +10767,14 @@ impl Database {
             counts,
             output_schema,
             drops,
-        ): Row = self.conn.query_row(
-            "SELECT workspace,model,model_rounds,view_sent,reasoning,budget_tokens,
+        ): Row = self
+            .conn
+            .prepare_cached(
+                "SELECT workspace,model,model_rounds,view_sent,reasoning,budget_tokens,
                         input_tokens+output_tokens,work,budget_counts,output_schema,drops
-               FROM turns WHERE id=?",
-            [turn],
-            |r| {
+               FROM turns WHERE id=?1 AND bot=?2",
+            )?
+            .query_row(params![turn, bot.name], |r| {
                 Ok((
                     r.get(0)?,
                     r.get(1)?,
@@ -10774,9 +10790,7 @@ impl Database {
                     r.get(9)?,
                     r.get::<_, u32>(10)? as usize,
                 ))
-            },
-        )?;
-        let bot = self.active(turn)?;
+            })?;
         let spent_now = bot.spent();
         let default = format!("{}/{}", bot.provider, bot.model);
         // A turn that started stored its prompt node then; steers absorbed
@@ -10806,10 +10820,10 @@ impl Database {
             drops,
             view_sent,
             workspace: workspace
-                .or(bot.workspace)
+                .or_else(|| bot.workspace.clone())
                 .ok_or(Error::new("workspace_required"))?,
             model: model.unwrap_or(default),
-            effort: reasoning.or(bot.effort),
+            effort: reasoning.or_else(|| bot.effort.clone()),
             // Every token the turn counts counts toward the bot's too, so
             // the cap is where the bot's count will stand once the turn
             // spent it.
@@ -10822,9 +10836,9 @@ impl Database {
             }),
             previous_call,
             output_schema,
-            created_by: bot.created_by,
+            created_by: bot.created_by.clone(),
             created_by_id: bot.created_by_id,
-            bot: bot.name,
+            bot: bot.name.clone(),
             bot_id: bot.bot_id,
         })
     }

@@ -30,6 +30,15 @@ Fixed-work resource and latency measurements. A time-based soak that completes
 more turns is not here, because its work changes with its speed; it is under
 [operational behavior](#operational-behavior).
 
+- **Turn-start metadata in one storage job.** Against main `c5fa7120`,
+  combining bot inspection with turn context removes one storage job and
+  avoids reading the bot twice. In the 1,000-bot footprint screen, median
+  CPU per turn fell from 0.593 to 0.495 ms; ranges overlap. Zero-delay
+  32-bot screens at 4 and 64 KiB also overlap, so no general latency or
+  CPU improvement is established. The admission, completion, footprint and
+  32-bot socket lifecycle gate passed without warnings; fork, restart and
+  replay checks passed. macOS arm64, 2026-11-13.
+  [Record](DAEMON_MEASUREMENTS.md#turn-startup-metadata-in-one-storage-job).
 - **Group commit, fixed work.** 192 bots, 4,608 primary turns, the same
   requests and retries in both builds, full flushing in both. The build that
   batches turn completions, which also carried the retention-publication
