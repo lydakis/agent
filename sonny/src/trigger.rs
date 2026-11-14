@@ -4474,17 +4474,27 @@ async fn next_run(
 }
 
 /// How the run whose turn is `handle` ended, waiting while it works: the
-/// daemon's answer, or `gone` when its agent was deleted. A run still
+/// daemon's answer, or `gone` when its agent was deleted or the handle
+/// names no run. A run still
 /// working after the longest wait the daemon takes is skipped, told as a
 /// busy agent's fire is.
 async fn run_ended(client: &Client, handle: &str) -> Result<Value, Value> {
-    let waited = client
+    let waited = match client
         .request(
             "wait",
             json!({"handles": [handle], "timeout_ms": REPLY_WAIT_MS}),
         )
         .await
-        .map_err(|e| json!({"outcome": "failed", "detail": e.to_string()}))?;
+    {
+        Ok(waited) => waited,
+        // A handle that names no run any more, as one kept in a form the
+        // daemon no longer reads: that run is over, as gone, and the fire
+        // goes on, as Kubernetes ends a CronJob's missing Job.
+        Err(e) if matches!(e.code.as_str(), "invalid_handle" | "bot_not_found") => {
+            return Ok(json!({"status": "gone", "error": e.code}));
+        }
+        Err(e) => return Err(json!({"outcome": "failed", "detail": e.to_string()})),
+    };
     let result = &waited["results"][handle];
     if result["pending"] == true {
         return Err(json!({"outcome": "skipped",
