@@ -737,7 +737,7 @@ impl View {
         }
         if listing.more > 0 {
             out.push(Line::default());
-            out.push(Line::from(format!("… {} more projects", listing.more)).dim());
+            out.push(Line::from(format!("… {} more", listing.more)).dim());
         }
         (out, at, marks)
     }

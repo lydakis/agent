@@ -8,7 +8,7 @@
 use crate::background::Scope;
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::{
-    style::{Color, Style, Stylize},
+    style::{Color, Stylize},
     text::{Line, Span},
 };
 use serde_json::{Value, json};
@@ -175,8 +175,8 @@ impl View {
     /// The card at `width`.
     pub fn card(&self, width: usize) -> Vec<Line<'static>> {
         let whose = match self.all {
-            true => "every agent".to_owned(),
-            false => format!("{}'s agents", self.scope.project),
+            true => "every project".to_owned(),
+            false => self.scope.project.clone(),
         };
         let filters: Vec<&str> = [
             picked(&KINDS, self.kind),
@@ -204,7 +204,7 @@ impl View {
         if let Some(error) = &self.error {
             out.push(Line::from(vec![
                 Span::raw("✗ ").fg(Color::Red),
-                Span::raw(format!("couldn't read the audit trail: {error}")),
+                Span::raw(format!("could not read the audit trail: {error}")),
             ]));
             return out;
         }
@@ -217,9 +217,7 @@ impl View {
                 true => "No tool calls yet.",
                 false => "No tool calls match.",
             }));
-            if !self.all {
-                out.push(Line::from("a shows every agent's").dim());
-            }
+            out.push(Line::from("Each tool call an agent makes shows here as it ends.").dim());
             return out;
         }
         let names: Vec<String> = (self.rows.iter())
@@ -244,7 +242,7 @@ impl View {
     pub fn keys(&self) -> String {
         let scope = match self.all {
             true => "a this project",
-            false => "a every agent",
+            false => "a every project",
         };
         let (key, does) = scope.split_once(' ').unwrap_or((scope, ""));
         (crate::hint::Keys::new()
@@ -280,11 +278,8 @@ fn line(row: &Value, name: &str, name_width: usize, width: usize, picked: bool) 
         name.pop();
     }
     let lead = format!(
-        "{} {:02}:{:02}:{:02} {name:<name_width$} ",
-        if picked { "›" } else { " " },
-        at.hour,
-        at.minute,
-        at.second,
+        " {:02}:{:02}:{:02} {name:<name_width$} ",
+        at.hour, at.minute, at.second,
     );
     let facts = format!(
         " {}/{} {} ",
@@ -304,17 +299,20 @@ fn line(row: &Value, name: &str, name_width: usize, width: usize, picked: bool) 
     while preview.width() > room {
         preview.pop();
     }
-    let style = match picked {
-        true => Style::new().bold(),
-        false => Style::new(),
-    };
-    Line::from(vec![
-        Span::styled(lead, style),
-        Span::styled(tool, style),
+    // The pick's column is its own span, so the pick reverses from the
+    // row's first word.
+    let mut line = Line::from(vec![
+        Span::raw(" "),
+        Span::raw(lead[1..].to_owned()),
+        Span::raw(tool),
         Span::raw(facts).dim(),
         Span::raw(outcome).fg(color),
         Span::raw(format!(" {preview}")).dim(),
-    ])
+    ]);
+    if picked {
+        crate::list::pick(&mut line);
+    }
+    line
 }
 
 #[cfg(test)]
@@ -381,10 +379,23 @@ mod tests {
             .map(|line| line.spans.iter().map(|s| s.content.as_ref()).collect())
             .collect();
         assert!(text[2].contains(" fix "), "{text:?}");
+        // The pick is reversed from the row's first word, never a `›`.
         assert!(
-            text[3].starts_with('›') && text[3].contains("lead"),
+            text[3].contains("lead") && !text[3].contains('›'),
             "{text:?}"
         );
+        let reversed = |line: &Line| {
+            (line.spans.iter())
+                .filter(|s| {
+                    s.style
+                        .add_modifier
+                        .contains(ratatui::style::Modifier::REVERSED)
+                })
+                .map(|s| s.content.as_ref())
+                .collect::<String>()
+        };
+        assert!(reversed(&card[3]).starts_with(char::is_numeric), "{text:?}");
+        assert_eq!(reversed(&card[2]), "");
         assert!(text.iter().all(|line| line.width() <= 80), "{text:?}");
     }
 }

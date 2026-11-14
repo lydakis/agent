@@ -309,8 +309,8 @@ impl View {
     /// The card at `width`.
     pub fn card(&self, width: usize) -> Vec<Line<'static>> {
         let whose = match self.all {
-            true => "every agent".to_owned(),
-            false => format!("{}'s agents", self.scope.project),
+            true => "every project".to_owned(),
+            false => self.scope.project.clone(),
         };
         // The pane's title names it: its first row says whose and when.
         let mut out = vec![Line::from(vec![
@@ -321,7 +321,7 @@ impl View {
             out.push(Line::default());
             out.push(Line::from(vec![
                 Span::raw("✗ ").fg(Color::Red),
-                Span::raw(format!("couldn't read usage: {error}")),
+                Span::raw(format!("could not read usage: {error}")),
             ]));
         }
         let Some(read) = &self.read else {
@@ -347,11 +347,8 @@ impl View {
                 read.period.label()
             )));
             out.push(
-                Line::from(match self.all {
-                    true => "a turn counts where it started".to_owned(),
-                    false => "a shows every agent's".to_owned(),
-                })
-                .dim(),
+                Line::from("Each turn an agent takes counts here, in the project it started in.")
+                    .dim(),
             );
             return out;
         }
@@ -734,7 +731,7 @@ impl View {
     pub fn keys(&self) -> String {
         let scope = match self.all {
             true => "a this project",
-            false => "a every agent",
+            false => "a every project",
         };
         let cached = match self.cached {
             true => "c hide cached",
