@@ -13236,6 +13236,7 @@ impl App {
     /// keys stay there, and is put aside for Ctrl+]; the margin itself
     /// stays closed until asked for.
     fn close_pane(&mut self, keep: bool) {
+        self.keep_asked();
         match self.pane.take() {
             Some(open) if open.is_margin() => {
                 self.margin.close(true);
@@ -13581,6 +13582,9 @@ impl App {
     /// thing it showed closes it, and forward with it closed opens again
     /// the one closed last. Whether there was somewhere to go.
     fn step_pane(&mut self, back: bool) -> bool {
+        // What can't be undone and was asked for is kept: leaving or
+        // stepping through the pane is a key that says no.
+        self.keep_asked();
         // A view's own pages go back first, as `←` on them does.
         if back
             && let Some(watch) = &mut self.watch
@@ -13613,6 +13617,24 @@ impl App {
             _ => return false,
         }
         true
+    }
+
+    /// A stop or a removal asked for in the pane's view, kept: only Enter
+    /// in the view itself says yes, so a view put aside, stepped past or
+    /// opened again never comes back armed.
+    fn keep_asked(&mut self) {
+        let Some(watch) = &mut self.watch else {
+            return;
+        };
+        if let Some(view) = &mut watch.ps {
+            view.keep();
+        }
+        if let Some(view) = &mut watch.background {
+            view.keep();
+        }
+        if let Some(view) = &mut watch.memory {
+            view.keep();
+        }
     }
 
     /// The pane back (`back`) or forward to what it showed, as it was left.
@@ -29433,6 +29455,39 @@ mod tests {
         app.toggle_margin();
         assert!(app.pane.as_ref().is_some_and(pane::Pane::is_margin));
         assert!(app.pane_keys && !app.margin.closed());
+    }
+
+    #[tokio::test]
+    async fn a_stop_asked_in_ps_is_kept_when_the_pane_closes_or_steps() {
+        let mut app = app(daemon_answering(|_| {
+            json!({"processes": [{"handle": "proc:4", "bot": "calc.lead", "turn": 2,
+                "call_id": "c1", "kind": "background", "command": "cargo build",
+                "started_ms": 1_000, "pid": null}]})
+        })
+        .await);
+        let asked = |app: &mut App| {
+            let view = app.watch.as_mut().and_then(|w| w.ps.as_mut()).unwrap();
+            view.key(event::KeyEvent::from(KeyCode::Char('x')));
+            assert_eq!(view.keys(), "enter stop · esc cancel");
+        };
+        let keys = |app: &App| {
+            app.watch
+                .as_ref()
+                .and_then(|w| w.ps.as_ref())
+                .unwrap()
+                .keys()
+        };
+        app.ps().await;
+        // Put aside and opened again with Ctrl+]: nothing armed.
+        asked(&mut app);
+        app.close_pane(true);
+        assert!(app.step_pane(false));
+        assert_ne!(keys(&app), "enter stop · esc cancel");
+        // Stepped back past it with Ctrl+[ and forward again: the same.
+        asked(&mut app);
+        assert!(app.step_pane(true));
+        assert!(app.step_pane(false));
+        assert_ne!(keys(&app), "enter stop · esc cancel");
     }
 
     #[tokio::test]
