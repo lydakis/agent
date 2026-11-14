@@ -1083,6 +1083,7 @@ impl Bot {
                         &call.name,
                         &call.arguments,
                         workspace,
+                        (self.bot_id, &call.call_id),
                     )
             }
         }
@@ -1101,10 +1102,18 @@ impl Bot {
         if self.settings.sandbox != Some(Mode::WorkspaceWrite) {
             return None;
         }
-        let calls: Vec<(String, String)> = calls
+        let calls: Vec<(String, String, String)> = calls
             .iter()
             .filter(|call| matches!(call.name.as_str(), "write" | "edit" | "apply_patch"))
-            .map(|call| (call.name.clone(), call.arguments.clone()))
+            .map(|call| {
+                let ToolCall {
+                    call_id,
+                    name,
+                    arguments,
+                    ..
+                } = call;
+                (call_id.clone(), name.clone(), arguments.clone())
+            })
             .collect();
         if calls.is_empty() {
             return None;
@@ -1116,6 +1125,7 @@ impl Bot {
             .to_owned();
         let writable = self.settings.writable.clone();
         let folder = workspace.to_owned();
+        let bot = self.bot_id;
         Some(move || {
             learn(
                 Mode::WorkspaceWrite,
@@ -1123,8 +1133,9 @@ impl Bot {
                 &writable,
                 calls
                     .iter()
-                    .map(|(tool, arguments)| (tool.as_str(), arguments.as_str())),
+                    .map(|(id, tool, arguments)| (id.as_str(), tool.as_str(), arguments.as_str())),
                 &folder,
+                bot,
                 fresh,
             );
         })
