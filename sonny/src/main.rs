@@ -6390,7 +6390,15 @@ impl App {
                 Some(key) = keys.recv() => {
                     keyed = true;
                     heard = Instant::now();
-                    self.key(key).await
+                    self.key(key).await;
+                    // What came while the last frame was drawn is taken
+                    // before the next: a burst of the wheel's notches is
+                    // one frame, not one each the terminal works through
+                    // after the wheel stops.
+                    for _ in 0..keys.len() {
+                        let Ok(key) = keys.try_recv() else { break };
+                        self.key(key).await;
+                    }
                 }
                 _ = tokio::time::sleep(undrawn.map_or(Duration::ZERO, |at| DRAW_EVERY.saturating_sub(at.elapsed()))), if undrawn.is_some() => {}
                 news = async {
