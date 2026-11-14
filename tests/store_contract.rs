@@ -19422,6 +19422,11 @@ fn the_trail_says_who_approved_or_denied_each_gated_call() {
 /// A running turn of Lead, whose declared `run` tool has steps, gated by
 /// `manual` when `gated`.
 fn stepping_turn(db: &mut Database, gated: bool) -> (i64, ToolCall) {
+    stepping_turn_under(db, gated, Settings::default())
+}
+
+/// A stepping turn of Lead under `settings`.
+fn stepping_turn_under(db: &mut Database, gated: bool, settings: Settings) -> (i64, ToolCall) {
     let run = Declared {
         name: "run".into(),
         description: "Run.".into(),
@@ -19446,6 +19451,7 @@ fn stepping_turn(db: &mut Database, gated: bool) -> (i64, ToolCall) {
         Binding {
             declared: Some(std::slice::from_ref(&run)),
             gate: gated.then_some(&gate),
+            settings,
             ..binding()
         },
     )
@@ -19573,6 +19579,39 @@ fn a_tool_hosts_steps_are_kept_with_the_facts_it_declares() {
         .err()
         .unwrap();
     assert_eq!(unknown.code, "no_allowed_step");
+}
+
+#[test]
+fn a_step_a_bot_that_never_asks_would_be_asked_is_refused_and_ran_nowhere() {
+    use agent_runtime::store::{Step, audit::Facts};
+    let mut db = db();
+    let never = Settings {
+        approval_policy: Some(ApprovalPolicy::Never),
+        ..Settings::default()
+    };
+    let (turn, _) = stepping_turn_under(&mut db, true, never);
+    let writes = Facts::given(Some("mcp"), Some("external"), Some("write")).unwrap();
+    let stepped = db
+        .step_announce(
+            "Lead",
+            turn,
+            "c1",
+            "1",
+            "send",
+            json!({"to":"x"}),
+            false,
+            writes,
+            0,
+        )
+        .unwrap();
+    let Step::Decided(decision) = stepped.step else {
+        panic!("a step that never asks is decided at once");
+    };
+    assert_eq!(decision["decision"], "deny");
+    assert_eq!(
+        facts(&trail(&db)[0]),
+        json!(["send", "mcp", null, "nobody", "write", "denied"])
+    );
 }
 
 #[test]

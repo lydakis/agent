@@ -9233,7 +9233,11 @@ impl Database {
                 call_id,
                 Some(step),
                 tool,
-                facts,
+                // Denied, so it ran nowhere.
+                audit::Facts {
+                    place: None,
+                    ..facts
+                },
                 "nobody",
                 "denied",
                 &arguments.to_string(),
