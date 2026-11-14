@@ -3037,9 +3037,7 @@ pub(crate) fn made(
     if let Some(outputs) = outputs() {
         settings.insert("outputs".into(), json!(outputs));
     }
-    if config.hide_senders {
-        settings.insert("hide_senders".into(), json!(true));
-    }
+    settings.insert("trailer".into(), json!(crate::stamp::trailer(&config)));
     if let Some(ms) = config.hold_ms {
         settings.insert("hold_ms".into(), json!(ms));
     }
@@ -10165,7 +10163,7 @@ impl App {
         let asked = json!({"bot": self.bot, "turn": message, "bytes": PROMPT_READ_BYTES});
         let read = self.client.request("prompts", asked).await.ok()?;
         let text = read["prompts"][0]["text"].as_str()?;
-        Some(stamp::unstamped(text).to_owned())
+        Some(text.to_owned())
     }
 
     /// The folder the agent works in, where its pictures' paths start:
@@ -14604,14 +14602,8 @@ impl App {
         // A steer never moves a bot, so a moved lead comes back with the
         // next message that starts a turn.
         let workspace = (!steer).then(|| self.move_to.clone()).flatten();
-        // The person's words carry when they were sent; a record of what
-        // Sonny did for them is read as it is.
-        let sent = match origin {
-            None => stamp::now(&prompt),
-            Some(_) => prompt.clone(),
-        };
         // An answer goes once, whichever window sends it ([`answer_once`]).
-        let submitted = json!({"bot": self.bot, "prompt": sent, "delivery": delivery,
+        let submitted = json!({"bot": self.bot, "prompt": prompt, "delivery": delivery,
             "model": model, "workspace": workspace, "effort": effort, "origin": origin,
             "images": attach::submitted(pictures)});
         let reply = match asks::answer_of(&prompt, origin) {
@@ -14675,7 +14667,7 @@ impl App {
         let Some(task) = ask.task.clone() else {
             return Err("that question is not a task's".into());
         };
-        let submitted = json!({"bot": task.bot, "prompt": stamp::now(prompt),
+        let submitted = json!({"bot": task.bot, "prompt": prompt,
             "delivery": "steer", "images": attach::submitted(pictures)});
         let reply = answer_once(&self.client, &ask.id, submitted).await?;
         self.task_answers.push(TaskAnswer {
@@ -15740,7 +15732,7 @@ impl App {
                 .request(
                     "submit",
                     json!({"bot": name, "bot_id": forked["bot_id"], "request_id": format!("{name}.1"),
-                        "prompt": stamp::now(&question), "delivery": "steer", "model": self.turn_model,
+                        "prompt": question, "delivery": "steer", "model": self.turn_model,
                         "images": attach::submitted(pictures)}),
                 )
                 .await
@@ -18246,13 +18238,11 @@ fn quiet_message(text: &str) -> bool {
 }
 
 /// A message item's text: a prompt's own words, without the line the
-/// daemon adds after them naming who sent it or the time Sonny stamped on
-/// them.
+/// daemon adds after them naming who sent it and when.
 fn text(item: &Value) -> String {
     match (&item["role"], &item["content"]) {
         (role, Value::Array(parts)) if role == "user" => (parts.iter())
             .find_map(|part| part["text"].as_str())
-            .map(stamp::unstamped)
             .unwrap_or_default()
             .to_owned(),
         (_, content) => joined(content),
@@ -18656,17 +18646,16 @@ mod tests {
     }
 
     #[test]
-    fn a_message_is_drawn_without_the_time_it_was_sent() {
-        let sent = stamp::stamped("ship it", 1_793_473_920);
+    fn a_message_is_drawn_without_the_daemon_s_line_after_it() {
         let item = json!({"type": "message", "role": "user", "content": [
-            {"type": "input_text", "text": sent},
-            {"type": "input_text", "text": "[Sent by lookout.tasks.]"}]});
+            {"type": "input_text", "text": "ship it"},
+            {"type": "input_text", "text": "[Message lead/4. Sent Sat 31 Oct 2026 16:12, UTC-04:00.]"}]});
         assert_eq!(text(&item), "ship it");
     }
 
-    /// The words a submit carried, without the time Sonny stamped on them.
+    /// The words a submit carried.
     fn words_sent(asked: &Value) -> &str {
-        stamp::unstamped(asked["prompt"].as_str().unwrap_or_default())
+        asked["prompt"].as_str().unwrap_or_default()
     }
 
     #[test]
@@ -20628,7 +20617,7 @@ mod tests {
             if asked["op"] == "submit" {
                 seen.lock()
                     .unwrap()
-                    .push(stamp::unstamped(asked["prompt"].as_str().unwrap()).to_owned());
+                    .push(asked["prompt"].as_str().unwrap().to_owned());
             }
             json!({"message": 2, "turn": 2})
         })
@@ -21454,7 +21443,7 @@ mod tests {
         assert!(app.repaint);
         let prompts: Vec<String> = (asked.lock().unwrap().iter())
             .filter(|op| op["op"] == "submit")
-            .map(|op| stamp::unstamped(op["prompt"].as_str().unwrap_or("")).to_owned())
+            .map(|op| op["prompt"].as_str().unwrap_or("").to_owned())
             .collect();
         assert_eq!(prompts, ["/zen the receipts' currency", "/zen off"]);
     }
@@ -22120,7 +22109,7 @@ mod tests {
     #[tokio::test]
     async fn a_window_opened_again_shows_the_steer_still_waiting() {
         // Sent from a window since closed: the turn has not taken it in.
-        let said = stamp::stamped("also check the deploy notes", 1_700_000_000);
+        let said = "also check the deploy notes";
         let client = daemon_answering(move |asked| match asked["op"].as_str() {
             Some("messages") => json!({"messages": [
                 {"message": 4, "status": "queued", "delivery": "steer"},
@@ -26506,7 +26495,7 @@ mod tests {
             if asked["op"] == "submit" {
                 seen.lock()
                     .unwrap()
-                    .push(stamp::unstamped(asked["prompt"].as_str().unwrap()).to_owned());
+                    .push(asked["prompt"].as_str().unwrap().to_owned());
             }
             json!({"message": 2, "turn": 2})
         })
@@ -26725,7 +26714,7 @@ mod tests {
         let to = sent.lock().unwrap().last().cloned().unwrap();
         assert_eq!(to["bot"], "calc.ask");
         // Words typed while it is in focus answer it, once.
-        let prompt = stamp::unstamped(to["prompt"].as_str().unwrap());
+        let prompt = to["prompt"].as_str().unwrap();
         assert_eq!(prompt, "You asked (ask:2/q1): Signed in?\n\ndone");
         assert_eq!(to["request_id"], json!(asks::request_id("ask:2/q1", 0)));
         assert!(app.asks.is_empty());

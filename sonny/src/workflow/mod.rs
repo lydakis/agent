@@ -1269,9 +1269,7 @@ impl Attempt {
             if let Some(outputs) = agent_client::policy::outputs_beside(&self.run.store) {
                 settings.insert("outputs".into(), json!(outputs));
             }
-            if config.hide_senders {
-                settings.insert("hide_senders".into(), json!(true));
-            }
+            settings.insert("trailer".into(), json!(crate::stamp::trailer(&config)));
             if let Some(ms) = config.hold_ms {
                 settings.insert("hold_ms".into(), json!(ms));
             }
