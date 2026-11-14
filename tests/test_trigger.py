@@ -523,6 +523,16 @@ class TriggerFireTests(ModelFixture):
         self.assertEqual(taken['last']['outcome'], 'sent', taken)
         self.assertEqual(taken['run']['running']['bot'], 'p.review-5', taken)
         self.assertEqual(len(self.turns('p.review-4')), 1, 'an agent it did not make is not messaged')
+        # A run kept by a handle the daemon no longer reads is over, as
+        # gone: the fire goes on to the next run, not failing every time.
+        self.settle('p.review-5')
+        kept = json.loads(last.read_text())
+        kept['run']['running']['handle'] = 'turn:p.review-5/1'
+        last.write_text(json.dumps(kept))
+        moved = fire('g2')
+        self.assertEqual(moved['last']['outcome'], 'sent', moved)
+        self.assertEqual(moved['run']['running']['bot'], 'p.review-6', moved)
+        self.assertEqual(moved['run']['failed']['ended']['status'], 'gone', moved)
 
     def test_an_agent_made_in_full_access_starts_ungated(self):
         # `[sonny] default_permissions = "full"`: no sandbox and no one

@@ -3500,6 +3500,15 @@ struct Denial {
     reason: String,
 }
 
+/// What the one confirm over the composer asks before: it can't be undone.
+#[derive(Clone, Debug, PartialEq)]
+enum Confirm {
+    /// `/compact`.
+    Compact,
+    /// `/retry` of this call, written out above for the person to read.
+    Retry(Denial),
+}
+
 /// A call waiting on the person as [`App::show_asked`] wrote it out:
 /// its rows, tagged [`screen::Tag::Request`] with `tag`, and enough to
 /// fold them to one row once it is answered, as Codex keeps only the
@@ -3750,7 +3759,7 @@ fn denied_why(denied: &Denial) -> String {
 /// else as its arguments.
 fn retry_shown(denial: &Denial) -> Vec<Line<'static>> {
     let mut lines = vec![Line::from(
-        Span::raw(format!("Approve one retry of {}?", denial.name)).bold(),
+        Span::raw(format!("{}, as the reviewer denied it:", denial.name)).bold(),
     )];
     let what = match (denial.arguments["command"].as_str(), &denial.arguments) {
         (Some(command), Value::Object(fields)) => {
@@ -4401,8 +4410,9 @@ struct App {
     /// Whether picks are kept in the person's file, as they are once the
     /// screen is up: `/switch` reads the agents they picked from it.
     picks_kept: bool,
-    /// `/compact` asks before it compacts: Enter says yes.
-    confirming: bool,
+    /// What asks once, over the composer, before it can't be undone:
+    /// Enter says yes, any other key no.
+    confirming: Option<Confirm>,
     /// The bot's latest replies, by node, with their first lines: what
     /// `/react` offers, newest last.
     replies: Vec<(i64, String)>,
@@ -4679,9 +4689,6 @@ struct App {
     /// denials as they were when it opened: one that comes or ages out
     /// while it is open moves no row onto another call.
     approving: Option<(Vec<Denial>, list::Picker)>,
-    /// The denied call written out whole for the person to read, which a
-    /// second Enter then approves.
-    approve_shown: Option<String>,
     /// The mode picked, set once no turn runs.
     gating: Option<&'static str>,
     /// The mode picked, still to give the agents the lead made: one busy
@@ -6247,7 +6254,7 @@ impl App {
             reactions: reactions::Reactions::default(),
             picks: fuzzy::Picks::default(),
             picks_kept: false,
-            confirming: false,
+            confirming: None,
             replies: Vec::new(),
             quoting: false,
             reacting: None,
@@ -6366,7 +6373,6 @@ impl App {
             reviewing: std::collections::HashSet::new(),
             denials: Vec::new(),
             approving: None,
-            approve_shown: None,
             gating: approvals::refresh(record),
             spread: None,
             last_reply: String::new(),
@@ -12369,6 +12375,21 @@ impl App {
     }
 
     /// `/compact`, once the person said yes.
+    /// `/retry`'s call confirmed: the person's approval of that exact
+    /// call sent, once, and it leaves the list.
+    async fn retry(&mut self, denied: Denial) {
+        let kept = self.denials.clone();
+        self.denials.retain(|d| d.call_id != denied.call_id);
+        let sent = self.send(approval(&denied), None, false, false, &[]).await;
+        self.notice = Some(match sent {
+            Ok(()) => "approved one retry; the retry is still reviewed".into(),
+            Err(error) => {
+                self.denials = kept;
+                error
+            }
+        });
+    }
+
     async fn compact(&mut self) {
         self.notice = Some(
             match self
@@ -12459,6 +12480,11 @@ impl App {
                 let over_pane = self.pane.as_ref().is_some_and(|p| p.area.contains(at));
                 let down = matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left));
                 if down {
+                    // A press outside the pane takes the keys from it, and
+                    // with them what was asked there.
+                    if !over_pane {
+                        self.keep_asked();
+                    }
                     self.pane_mouse = over_pane;
                     self.pane_keys = over_pane;
                     // The keys go to the pane: the conversation's find ends.
@@ -12692,7 +12718,7 @@ impl App {
                         | KeyCode::Home
                         | KeyCode::End
                 );
-                if scrolls || (copy && pane.screen.selected().is_some()) {
+                if scrolls || switches(key) || (copy && pane.screen.selected().is_some()) {
                     view.keep();
                 }
                 match key.code {
@@ -12727,7 +12753,7 @@ impl App {
                         | KeyCode::Home
                         | KeyCode::End
                 );
-                if scrolls || (copy && pane.screen.selected().is_some()) {
+                if scrolls || switches(key) || (copy && pane.screen.selected().is_some()) {
                     view.keep();
                 }
                 let depth = view.depth();
@@ -12810,6 +12836,20 @@ impl App {
                 && pane.is_card()
                 && let Some(view) = self.watch.as_mut().and_then(|w| w.ps.as_mut())
             {
+                // A key the pane takes keeps the command a stop was asked
+                // for running, as any other key does.
+                let scrolls = matches!(
+                    key.code,
+                    KeyCode::Tab
+                        | KeyCode::PageUp
+                        | KeyCode::PageDown
+                        | KeyCode::Char(' ')
+                        | KeyCode::Home
+                        | KeyCode::End
+                );
+                if scrolls || switches(key) || (copy && pane.screen.selected().is_some()) {
+                    view.keep();
+                }
                 match key.code {
                     _ if switches(key) || key.code == KeyCode::Tab => self.pane_keys = false,
                     _ if copy && let Some(text) = pane.screen.selected() => {
@@ -13204,6 +13244,7 @@ impl App {
     /// keys stay there, and is put aside for Ctrl+]; the margin itself
     /// stays closed until asked for.
     fn close_pane(&mut self, keep: bool) {
+        self.keep_asked();
         match self.pane.take() {
             Some(open) if open.is_margin() => {
                 self.margin.close(true);
@@ -13549,6 +13590,9 @@ impl App {
     /// thing it showed closes it, and forward with it closed opens again
     /// the one closed last. Whether there was somewhere to go.
     fn step_pane(&mut self, back: bool) -> bool {
+        // What can't be undone and was asked for is kept: leaving or
+        // stepping through the pane is a key that says no.
+        self.keep_asked();
         // A view's own pages go back first, as `←` on them does.
         if back
             && let Some(watch) = &mut self.watch
@@ -13581,6 +13625,24 @@ impl App {
             _ => return false,
         }
         true
+    }
+
+    /// A stop or a removal asked for in the pane's view, kept: only Enter
+    /// in the view itself says yes, so a view put aside, stepped past or
+    /// opened again never comes back armed.
+    fn keep_asked(&mut self) {
+        let Some(watch) = &mut self.watch else {
+            return;
+        };
+        if let Some(view) = &mut watch.ps {
+            view.keep();
+        }
+        if let Some(view) = &mut watch.background {
+            view.keep();
+        }
+        if let Some(view) = &mut watch.memory {
+            view.keep();
+        }
     }
 
     /// The pane back (`back`) or forward to what it showed, as it was left.
@@ -13746,6 +13808,12 @@ impl App {
             term::heard(reply);
             return;
         }
+        // A stop or a removal asked for in the pane lives only while the
+        // keys stay there: whatever took them away (a click, Ctrl+\, a
+        // paste) said no, so the view never waits armed for their return.
+        if !self.pane_keys {
+            self.keep_asked();
+        }
         // A key, a click, a paste or the window coming to the front: the
         // person is here, not in another terminal's Sonny.
         if let Some(marker) = &mut self.marker
@@ -13878,54 +13946,39 @@ impl App {
                     let Some(denied) = denials.get(at).cloned() else {
                         return;
                     };
-                    // The person approves only what they have read:
-                    // the whole call first, then a second Enter.
-                    if self.approve_shown.as_deref() != Some(denied.call_id.as_str()) {
-                        let lines = retry_shown(&denied);
-                        // Past what the screen keeps, the start would
-                        // scroll away unread.
-                        if lines.len() > RETRY_ROWS {
-                            self.notice = Some(format!(
-                                "{} lines is too long to read here: say in a message what to retry",
-                                lines.len() - 1
-                            ));
-                            return;
-                        }
-                        self.approve_shown = Some(denied.call_id.clone());
-                        self.commit(lines);
-                        self.notice = Some("enter again to approve this exact call".into());
+                    // The person approves only what they have read: the
+                    // whole call written out, then the one confirm.
+                    let lines = retry_shown(&denied);
+                    // Past what the screen keeps, the start would
+                    // scroll away unread.
+                    if lines.len() > RETRY_ROWS {
+                        self.notice = Some(format!(
+                            "{} lines is too long to read here: say in a message what to retry",
+                            lines.len() - 1
+                        ));
                         return;
                     }
                     self.approving = None;
-                    self.approve_shown = None;
-                    let kept = self.denials.clone();
-                    self.denials.retain(|d| d.call_id != denied.call_id);
-                    let sent = self.send(approval(&denied), None, false, false, &[]).await;
-                    self.notice = Some(match sent {
-                        Ok(()) => "approved one retry; the retry is still reviewed".into(),
-                        Err(error) => {
-                            self.denials = kept;
-                            error
-                        }
-                    });
+                    self.commit(lines);
+                    self.confirming = Some(Confirm::Retry(denied));
                 }
-                list::Act::Close => {
-                    self.approving = None;
-                    self.approve_shown = None;
-                }
+                list::Act::Close => self.approving = None,
                 list::Act::Stay | list::Act::Other => {}
             }
             return;
         }
-        if self.confirming {
+        if self.confirming.is_some() {
             if let Event::Key(key) = &event
                 && key.kind != KeyEventKind::Release
+                && let Some(confirm) = self.confirming.take()
             {
-                // Only Enter says yes; anything else keeps the conversation.
-                self.confirming = false;
-                match key.code {
-                    KeyCode::Enter => self.compact().await,
-                    _ => self.notice = Some("not compacted".into()),
+                // Only Enter says yes; any other key says no, and so does
+                // the notice.
+                match (key.code, confirm) {
+                    (KeyCode::Enter, Confirm::Compact) => self.compact().await,
+                    (KeyCode::Enter, Confirm::Retry(denied)) => self.retry(denied).await,
+                    (_, Confirm::Compact) => self.notice = Some("not compacted".into()),
+                    (_, Confirm::Retry(_)) => self.notice = Some("not allowed".into()),
                 }
             }
             return;
@@ -14683,7 +14736,7 @@ impl App {
         // `destructiveHint` does: Enter compacts, Esc keeps the conversation.
         if prompt == "/compact" {
             self.input.clear();
-            self.confirming = true;
+            self.confirming = Some(Confirm::Compact);
             return;
         }
         if prompt == "/react" || prompt == "/reply" {
@@ -16011,7 +16064,7 @@ impl App {
     /// and nothing open over it.
     fn suggested(&self) -> Option<&suggest::Guess> {
         let open = self.listing_open()
-            || self.confirming
+            || self.confirming.is_some()
             || self.choosing.is_some()
             || self.approving.is_some()
             || self.reacting.is_some()
@@ -17132,7 +17185,7 @@ impl App {
                     .collect();
                 let marks = row_marks(&lines, &view.starts());
                 pane.set_card_marked(lines, marks, &view.keys());
-                pane.foot = None;
+                pane.foot = view.footer();
                 if let Some(at) = view.picked_row()
                     && watch.picked != Some(at)
                 {
@@ -17411,19 +17464,27 @@ impl App {
                 frame.render_widget(Paragraph::new(keys), footer);
                 return;
             }
-            if self.confirming {
-                let name = match &self.project {
-                    Some(project) => lead_title(project, &self.bot),
-                    None => self.bot.clone(),
+            if let Some(confirm) = &self.confirming {
+                let (question, verb) = match confirm {
+                    Confirm::Compact => {
+                        let name = match &self.project {
+                            Some(project) => lead_title(project, &self.bot),
+                            None => self.bot.clone(),
+                        };
+                        (format!("Compact {name}'s conversation?"), "compact")
+                    }
+                    Confirm::Retry(denied) => {
+                        (format!("Allow one retry of {}?", denied.name), "allow")
+                    }
                 };
                 // The question first, as a decision card's is; why it asks muted.
                 let line = Line::from(vec![
                     Span::raw("› ").bold(),
-                    Span::raw(format!("Compact {name}'s conversation?")).bold(),
+                    Span::raw(question).bold(),
                     Span::raw(" It can't be undone.").dim(),
                 ]);
                 frame.render_widget(Paragraph::new(line), composer);
-                let keys = hint::Keys::new().enter(hint::Enter::Confirm("compact"));
+                let keys = hint::Keys::new().enter(hint::Enter::Confirm(verb));
                 let keys = Line::from(hint::under(
                     &keys.esc(hint::Esc::Cancel),
                     footer.width.into(),
@@ -17836,7 +17897,7 @@ impl App {
         // A shell command is marked as one while it is typed.
         let shell = self.input.starts_with('!');
         let selected = self.input.selection();
-        let keep = match self.confirming
+        let keep = match self.confirming.is_some()
             || self.choosing.is_some()
             || self.approving.is_some()
             || self.listing_open()
@@ -22279,23 +22340,29 @@ mod tests {
         };
         app.denials.insert(0, other.clone());
         let enter = || Event::Key(event::KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
-        // The first Enter writes the whole call out; nothing is sent yet.
+        // Picked, the whole call is written out and the one confirm
+        // asks; nothing is sent yet. Any key but Enter says no.
         app.key(enter()).await;
-        assert_eq!(
-            app.approving.as_ref().and_then(|(_, list)| list.chosen()),
-            Some(0)
-        );
+        assert!(app.approving.is_none());
+        assert!(matches!(app.confirming, Some(Confirm::Retry(_))));
         assert!(sent.lock().unwrap().is_empty());
         let rows: Vec<String> = app.pending.iter().map(|l| l.to_string()).collect();
         assert!(
             rows.ends_with(&[
-                "Approve one retry of shell?".to_owned(),
+                "shell, as the reviewer denied it:".to_owned(),
                 "  git push --force origin main".to_owned()
             ]),
             "{rows:?}"
         );
+        app.key(Event::Key(KeyCode::Char('y').into())).await;
+        assert!(app.confirming.is_none() && sent.lock().unwrap().is_empty());
+        assert_eq!(app.notice.as_deref(), Some("not allowed"));
+        app.input.set("/retry");
+        app.submit().await;
         app.key(enter()).await;
-        assert!(app.approving.is_none());
+        assert!(matches!(&app.confirming, Some(Confirm::Retry(d)) if d.call_id != "c0"));
+        app.key(enter()).await;
+        assert!(app.confirming.is_none());
         assert_eq!(app.denials, [other]);
         app.denials.clear();
         let prompt = sent.lock().unwrap()[0].as_str().unwrap().to_owned();
@@ -22350,7 +22417,7 @@ mod tests {
             reason: String::new(),
         };
         let shown: Vec<String> = retry_shown(&write).iter().map(|l| l.to_string()).collect();
-        assert_eq!(shown[0], "Approve one retry of write?");
+        assert_eq!(shown[0], "write, as the reviewer denied it:");
         assert!(
             shown
                 .iter()
@@ -28901,13 +28968,13 @@ mod tests {
         // Enter on part of its name picks /compact as any other command,
         // and it asks first; any key but Enter keeps the conversation.
         app.key(enter()).await;
-        assert!(app.confirming && app.input.is_empty());
+        assert!(app.confirming.is_some() && app.input.is_empty());
         app.key(Event::Key(event::KeyEvent::new(
             KeyCode::Char('x'),
             KeyModifiers::NONE,
         )))
         .await;
-        assert!(!app.confirming && !compacted());
+        assert!(app.confirming.is_none() && !compacted());
         assert_eq!(app.notice.as_deref(), Some("not compacted"));
         assert!(app.input.is_empty(), "the key that said no is not typed");
         // Typed whole, it asks too; Enter compacts.
@@ -28917,9 +28984,9 @@ mod tests {
             Some("↑↓ pick · enter run · esc close".to_owned())
         );
         app.key(enter()).await;
-        assert!(app.confirming && !compacted());
+        assert!(app.confirming.is_some() && !compacted());
         app.key(enter()).await;
-        assert!(!app.confirming && compacted());
+        assert!(app.confirming.is_none() && compacted());
         // Any other command runs on part of its name, and what was run
         // more ranks first among the names that start the same.
         for _ in 0..3 {
@@ -29470,6 +29537,49 @@ mod tests {
         app.toggle_margin();
         assert!(app.pane.as_ref().is_some_and(pane::Pane::is_margin));
         assert!(app.pane_keys && !app.margin.closed());
+    }
+
+    #[tokio::test]
+    async fn a_stop_asked_in_ps_is_kept_when_the_pane_closes_or_steps() {
+        let mut app = app(daemon_answering(|_| {
+            json!({"processes": [{"handle": "proc:4", "bot": "calc.lead", "turn": 2,
+                "call_id": "c1", "kind": "background", "command": "cargo build",
+                "started_ms": 1_000, "pid": null}]})
+        })
+        .await);
+        let asked = |app: &mut App| {
+            let view = app.watch.as_mut().and_then(|w| w.ps.as_mut()).unwrap();
+            view.key(event::KeyEvent::from(KeyCode::Char('x')));
+            assert_eq!(view.keys(), "enter stop · esc cancel");
+        };
+        let keys = |app: &App| {
+            app.watch
+                .as_ref()
+                .and_then(|w| w.ps.as_ref())
+                .unwrap()
+                .keys()
+        };
+        app.ps().await;
+        // Put aside and opened again with Ctrl+]: nothing armed.
+        asked(&mut app);
+        app.close_pane(true);
+        assert!(app.step_pane(false));
+        assert_ne!(keys(&app), "enter stop · esc cancel");
+        // Stepped back past it with Ctrl+[ and forward again: the same.
+        asked(&mut app);
+        assert!(app.step_pane(true));
+        assert!(app.step_pane(false));
+        assert_ne!(keys(&app), "enter stop · esc cancel");
+        // The keys taken from the pane, by a click on the composer or
+        // Ctrl+\, and given back: the same.
+        asked(&mut app);
+        app.pane_keys = false;
+        app.key(Event::Key(event::KeyEvent::new(
+            KeyCode::Char('\\'),
+            KeyModifiers::CONTROL,
+        )))
+        .await;
+        assert_ne!(keys(&app), "enter stop · esc cancel");
     }
 
     #[tokio::test]

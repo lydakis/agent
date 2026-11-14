@@ -103,10 +103,9 @@ impl View {
             Ok(page) => {
                 self.error = None;
                 self.rows = page["rows"].as_array().cloned().unwrap_or_default();
-                self.pick = self
-                    .pick
-                    .filter(|_| !self.rows.is_empty())
-                    .map(|at| at.min(self.rows.len() - 1));
+                // With rows, one is always picked: the first to start.
+                self.pick = (!self.rows.is_empty())
+                    .then(|| self.pick.unwrap_or(0).min(self.rows.len() - 1));
             }
             Err(error) => self.error = Some(error),
         }

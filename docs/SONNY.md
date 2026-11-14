@@ -1231,13 +1231,14 @@ place and who approved, Enter to open a row's agent.
 detached service and call waiting on its approval, by agent and oldest first, with its
 agent, how long it has run, a detached one's pid and the start of its
 command, read from the daemon's `processes` every two seconds while it is
-open. `a` shows every agent's, Enter opens a row's agent, and `x` twice
-stops the picked one with all it started (`stop_process`), beside the
-window.
+open. `a` shows every project's, Enter opens a row's agent, and `x`
+asks once to stop the picked one with all it started, naming its
+command; Enter stops it (`stop_process`), beside the window, and any
+other key leaves it running.
 
 ![/ps in a project folder: its lead's detached docs server, with its pid, and a background test watcher](sonny/ps-folder.png)
 
-![/ps after a: every agent's commands, another project's worker first; x once on the docs server asks for a second x to stop it and all it started](sonny/ps-every-agent.png)
+![/ps: x asks once to stop the docs server and all it started, then any key but Enter leaves it running](sonny/one-confirm.png)
 
 ## Links
 

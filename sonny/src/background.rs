@@ -637,14 +637,28 @@ impl View {
 
     /// The item a removal was asked for is kept: a key went elsewhere.
     pub fn keep(&mut self) {
-        self.confirm = None;
+        if self.confirm.take().is_some() {
+            self.notice = Some("not removed".into());
+        }
     }
 
     pub fn key(&mut self, key: KeyEvent) -> Key {
-        let confirm = self.confirm.take();
         self.notice = None;
+        // A removal asked for: only Enter, with no modifier, says yes;
+        // any other key keeps the row, and says so, and Ctrl+C closes too.
+        if let Some(asked) = self.confirm.take() {
+            let plain = !key
+                .modifiers
+                .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER);
+            match self.items.iter().find(|item| key_of(item) == asked) {
+                Some(item) if key.code == KeyCode::Enter && plain => self.remove(&item.clone()),
+                _ => self.notice = Some("not removed".into()),
+            }
+            let close =
+                key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL);
+            return if close { Key::Close } else { Key::Stay };
+        }
         match key.code {
-            KeyCode::Esc if confirm.is_some() => {}
             KeyCode::Esc => return Key::Close,
             // Enter goes to the agent the row is for: the one an
             // automation wakes, the subscriber.
@@ -669,7 +683,7 @@ impl View {
                 self.selected = (self.selected + 1).min(self.items.len().saturating_sub(1));
             }
             KeyCode::Char('r') => self.fire(),
-            KeyCode::Char('d') | KeyCode::Delete => {
+            KeyCode::Char('x') | KeyCode::Delete => {
                 let Some(item) = self.items.get(self.selected).cloned() else {
                     return Key::Stay;
                 };
@@ -687,8 +701,6 @@ impl View {
                         "it goes once the cleanup is scheduled: `~/.agent/memory schedule --model PROVIDER/MODEL`"
                             .into(),
                     );
-                } else if confirm == Some(key_of(&item)) {
-                    self.remove(&item);
                 } else {
                     self.confirm = Some(key_of(&item));
                 }
@@ -744,9 +756,10 @@ impl View {
 
     /// The item at `at` picked, as a click picks it.
     pub fn pick_at(&mut self, at: usize) {
+        // Any click takes back a removal that was asked: only Enter removes.
+        self.confirm = None;
         if at < self.items.len() {
             self.selected = at;
-            self.confirm = None;
         }
     }
 
@@ -882,9 +895,8 @@ impl View {
     pub fn footer(&self) -> Option<Line<'static>> {
         if let Some((_, _, name)) = &self.confirm {
             return Some(Line::from(vec![
-                Span::raw("Remove "),
-                Span::raw(name.clone()).bold(),
-                Span::raw("? It can't be undone.").dim(),
+                Span::raw(format!("Remove {name}?")).bold(),
+                Span::raw(" It can't be undone.").dim(),
             ]));
         }
         self.notice
@@ -897,7 +909,9 @@ impl View {
     pub fn keys(&self) -> String {
         use crate::hint::{Esc, Keys};
         if self.confirm.is_some() {
-            return Keys::new().key("d", "remove").esc(Esc::Cancel).text();
+            return (Keys::new().enter(crate::hint::Enter::Confirm("remove")))
+                .esc(Esc::Cancel)
+                .text();
         }
         let mut keys = Keys::new();
         if self.items.len() > 1 {
@@ -912,10 +926,10 @@ impl View {
         }
         match self.items.get(self.selected) {
             Some(item) if item.kind == Kind::Trigger => {
-                keys = keys.key("r", "run now").key("d", "remove")
+                keys = keys.key("r", "run now").key("x", "remove")
             }
             Some(item) if !item.own && !matches!(item.kind, Kind::Server | Kind::Setup) => {
-                keys = keys.key("d", "remove")
+                keys = keys.key("x", "remove")
             }
             _ => {}
         }
@@ -1386,13 +1400,13 @@ mod tests {
         assert_eq!(view.keys(), "↑↓ pick · esc close");
         assert_eq!(view.footer(), None);
         let press = |view: &mut View, code| view.key(KeyEvent::new(code, KeyModifiers::NONE));
-        press(&mut view, KeyCode::Char('d'));
+        press(&mut view, KeyCode::Char('x'));
         assert_eq!(view.confirm, None);
         assert!(view.notice.as_deref().unwrap().contains("reads again"));
     }
 
     #[test]
-    fn the_card_lists_triggers_then_subscriptions_and_d_asks_twice() {
+    fn the_card_lists_triggers_then_subscriptions_and_x_asks_once() {
         let dir = std::env::temp_dir().join(format!("background-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
@@ -1436,18 +1450,24 @@ mod tests {
         assert_eq!(view.key(enter), Key::Open("calc.lead".into()));
         assert_eq!(lines[9], "  ◎ tasks for lead");
         let press = |view: &mut View, code| view.key(KeyEvent::new(code, KeyModifiers::NONE));
-        // Ctrl+D is not d.
-        view.key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL));
+        // Ctrl+X is not x.
+        view.key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL));
         assert_eq!(view.confirm, None);
-        assert_eq!(press(&mut view, KeyCode::Char('d')), Key::Stay);
+        assert_eq!(press(&mut view, KeyCode::Char('x')), Key::Stay);
         assert_eq!(
             view.confirm,
             Some((Kind::Trigger, "calc.lead".into(), "nightly".into()))
         );
+        // It asks once, in words that name it; only Enter says yes.
+        assert_eq!(
+            view.footer().unwrap().to_string(),
+            "Remove nightly? It can't be undone."
+        );
+        assert_eq!(view.keys(), "enter remove · esc cancel");
         // A key the pane took instead keeps it.
         view.keep();
         assert_eq!(view.confirm, None);
-        assert_eq!(press(&mut view, KeyCode::Char('d')), Key::Stay);
+        assert_eq!(press(&mut view, KeyCode::Char('x')), Key::Stay);
         assert!(view.confirm.is_some());
         // A reload that no longer finds it there forgets it.
         view.reload();
@@ -1456,13 +1476,31 @@ mod tests {
             item(Kind::Trigger, "nightly", &["calc.lead"], false),
             item(Kind::Subscription, "tasks", &["calc.lead"], true),
         ];
-        press(&mut view, KeyCode::Char('d'));
-        // Any other key keeps it; esc then only cancels.
+        press(&mut view, KeyCode::Char('x'));
+        // Any other key keeps it, x again included, and says so; esc then
+        // only cancels.
+        assert_eq!(press(&mut view, KeyCode::Char('x')), Key::Stay);
+        assert_eq!(view.confirm, None);
+        assert_eq!(view.notice.as_deref(), Some("not removed"));
+        press(&mut view, KeyCode::Char('x'));
         assert_eq!(press(&mut view, KeyCode::Esc), Key::Stay);
+        assert_eq!(view.confirm, None);
+        // Enter with a modifier keeps it too; Ctrl+C keeps it and closes.
+        for modifier in [KeyModifiers::CONTROL, KeyModifiers::ALT] {
+            press(&mut view, KeyCode::Char('x'));
+            let enter = KeyEvent::new(KeyCode::Enter, modifier);
+            assert_eq!(view.key(enter), Key::Stay);
+            assert_eq!(view.confirm, None);
+            assert_eq!(view.items.len(), 2);
+            assert_eq!(view.notice.as_deref(), Some("not removed"));
+        }
+        press(&mut view, KeyCode::Char('x'));
+        let close = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
+        assert_eq!(view.key(close), Key::Close);
         assert_eq!(view.confirm, None);
         press(&mut view, KeyCode::Down);
         assert_eq!(view.card(100).1, 9);
-        press(&mut view, KeyCode::Char('d'));
+        press(&mut view, KeyCode::Char('x'));
         assert_eq!(view.confirm, None);
         assert!(view.notice.as_deref().unwrap().starts_with("Sonny keeps"));
         assert_eq!(press(&mut view, KeyCode::Esc), Key::Close);
