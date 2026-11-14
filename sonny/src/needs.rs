@@ -93,6 +93,9 @@ pub struct Seen {
     pub ask: Option<crate::asks::Ask>,
     pub itself: bool,
     pub turn: Option<i64>,
+    /// The newest node read, from which a later read goes on
+    /// ([`scan_since`]).
+    pub through: Option<i64>,
 }
 
 impl Seen {
@@ -186,7 +189,81 @@ pub async fn scan(client: &Client, bot: &str, last: Option<i64>) -> Option<Seen>
         ask: crate::asks::open(&items),
         itself: resolved_itself(&turn, bot),
         turn: last,
+        through: nodes.iter().copied().max(),
     })
+}
+
+/// [`scan`], going on from what was read before (`was`): only the nodes
+/// written since are read, and while none of them asks, closes or answers
+/// a question, nor is the person's own words, the question is the one
+/// read before and the newest turn says whether it resolved it. Anything
+/// else, or more nodes than one scan reads, is read whole again.
+pub async fn scan_since(client: &Client, bot: &str, last: Option<i64>, was: &Seen) -> Option<Seen> {
+    let Some(through) = was.through else {
+        return scan(client, bot, last).await;
+    };
+    let page = client
+        .request(
+            "history_nodes",
+            json!({"bot": bot, "limit": SCANNED, "min_node": through + 1}),
+        )
+        .await
+        .ok()?;
+    if !page["next_from"].is_null() {
+        return scan(client, bot, last).await;
+    }
+    let listed = page["nodes"].as_array().cloned().unwrap_or_default();
+    let nodes: Vec<i64> = listed.iter().filter_map(|n| n["node"].as_i64()).collect();
+    let newest = listed.iter().filter_map(|n| n["turn"].as_i64()).max();
+    let last = last.or(newest).or(was.turn);
+    // The turn that says whether it resolved its question: read before, or
+    // whole among the nodes since.
+    let in_last: HashSet<i64> = (listed.iter())
+        .filter(|n| last.is_some() && n["turn"].as_i64() == last)
+        .filter_map(|n| n["node"].as_i64())
+        .collect();
+    if in_last.is_empty() && last != was.turn {
+        return scan(client, bot, last).await;
+    }
+    let (read, short) = items(client, bot, &nodes).await;
+    if short {
+        return None;
+    }
+    let mut turn = Vec::new();
+    // The call that asked what was open, whose output, should it come
+    // late, may say it failed.
+    let open = (was.ask.as_ref()).and_then(|ask| ask.id.rsplit_once('/').map(|(_, call)| call));
+    for (node, item) in read {
+        let of_open = item["type"] == "function_call_output"
+            && open.is_some_and(|call| item["call_id"] == call);
+        if moves_on(&item) || answers(&item) || asks(&item) || of_open {
+            return scan(client, bot, last).await;
+        }
+        if in_last.contains(&node) {
+            turn.push(item);
+        }
+    }
+    Some(Seen {
+        ask: was.ask.clone(),
+        itself: match in_last.is_empty() {
+            true => was.itself,
+            false => resolved_itself(&turn, bot),
+        },
+        turn: last,
+        through: nodes.iter().copied().max().or(Some(through)),
+    })
+}
+
+/// Whether `item` answers a question: the person's pick.
+fn answers(item: &Value) -> bool {
+    item["role"] == "user"
+        && crate::asks::answer_of(&crate::text(item), item["from"].as_str()).is_some()
+}
+
+/// Whether `item` asks a question or closes one.
+fn asks(item: &Value) -> bool {
+    item["type"] == "function_call"
+        && (item["name"] == crate::asks::TOOL || item["name"] == crate::asks::CLOSE)
 }
 
 /// Whether `item` is the person's own words, past which their questions

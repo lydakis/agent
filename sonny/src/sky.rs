@@ -194,6 +194,10 @@ const MODEL_HUES: [Color; 8] = [
     Color::LightMagenta,
 ];
 
+/// An agent whose questions are to be read: the turn that ended unsure
+/// of them, and what was read of it before, to go on from.
+type Scan = (String, Option<i64>, Option<crate::needs::Seen>);
+
 /// What the follow brings the view.
 enum Feed {
     /// Every agent there is now: who is listed is here, who isn't is gone.
@@ -204,9 +208,12 @@ enum Feed {
     Held(Vec<crate::needs::Held>),
     /// Where to ask for an agent's questions to be read, with the turn
     /// that ended unsure of them.
-    Scans(mpsc::UnboundedSender<(String, Option<i64>)>),
+    Scans(mpsc::UnboundedSender<Scan>),
     /// An agent's history read for its questions: none when it could not be.
     Asked(String, Option<Box<crate::needs::Seen>>),
+    /// What windows and skies before read of each agent's questions, as
+    /// of the turn it last ended, and the daemon they were read from.
+    Kept(Option<String>, HashMap<String, (i64, crate::needs::Seen)>),
     Live(Value),
     /// An agent's model, read again after it was configured.
     Model(String, String),
@@ -310,6 +317,8 @@ struct Agent {
     made_by_id: Option<i64>,
     /// The turn it runs, when it runs one.
     running: Option<i64>,
+    /// The last turn it ended.
+    ended: Option<i64>,
     /// When it was last lit.
     lit: Option<Instant>,
     twinkle: Option<(Instant, Color, Work)>,
@@ -462,9 +471,16 @@ pub struct View {
     /// Whose questions the opening asked for and has not heard back: the
     /// sky draws once none is left, so nothing pops in after.
     unread: HashSet<String>,
+    /// Each agent's question as last read, with the turn it had ended
+    /// then: one that has run no turn since is not read again. Kept
+    /// beside the store, once the follow read what was kept there, for
+    /// the daemon it names, when it changed.
+    kept: HashMap<String, (i64, crate::needs::Seen)>,
+    kept_from: Option<Option<String>>,
+    kept_changed: bool,
     paused: bool,
     /// Where the follow reads agents' questions, once it says.
-    scans: Option<mpsc::UnboundedSender<(String, Option<i64>)>>,
+    scans: Option<mpsc::UnboundedSender<Scan>>,
     /// What each mark, colour and shape means, and the counts, in the
     /// chat log's place.
     pub legend: bool,
@@ -865,7 +881,7 @@ impl Drop for View {
 impl View {
     pub fn open(socket: PathBuf, store: PathBuf) -> Self {
         let (send, feed) = mpsc::unbounded_channel();
-        let task = tokio::spawn(follow(socket.clone(), send));
+        let task = tokio::spawn(follow(socket.clone(), store.clone(), send));
         let mut view = Self::with(socket, feed, task);
         view.resolved = store;
         view
@@ -919,6 +935,9 @@ impl View {
             live: false,
             ready: false,
             unread: HashSet::new(),
+            kept: HashMap::new(),
+            kept_from: None,
+            kept_changed: false,
             paused: false,
             scans: None,
             legend: false,
@@ -988,7 +1007,7 @@ impl View {
                 replay.ready = false;
                 tokio::spawn(tape(self.socket.clone(), replay.from, send))
             }
-            None => tokio::spawn(follow(self.socket.clone(), send)),
+            None => tokio::spawn(follow(self.socket.clone(), self.resolved.clone(), send)),
         };
         // Read afresh: agents removed meanwhile go, and who talked to whom
         // is read again from the turns kept.
@@ -1126,16 +1145,30 @@ impl View {
                     for held in calls {
                         by.entry(held.bot.clone()).or_default().push(held);
                     }
+                    let mut known = Vec::new();
                     for agent in &mut self.agents {
                         let held = by.remove(&agent.name).unwrap_or_default();
                         let name = agent.name.clone();
                         agent.waits.held(held, |bot| bot == name);
-                        if !agent.gone
-                            && let Some(scans) = &self.scans
-                            && scans.send((name.clone(), None)).is_ok()
+                        if agent.gone {
+                            continue;
+                        }
+                        // The same ended turn is the same question: one
+                        // that ran none since is not read again.
+                        let kept = (self.kept.get(&name)).filter(|(turn, _)| {
+                            agent.running.is_none() && agent.ended == Some(*turn)
+                        });
+                        if let Some((_, seen)) = kept {
+                            known.push((name, seen.clone()));
+                        } else if let Some(scans) = &self.scans
+                            && let was = self.kept.get(&name).map(|(_, seen)| seen.clone())
+                            && scans.send((name.clone(), None, was)).is_ok()
                         {
                             self.unread.insert(name);
                         }
+                    }
+                    for (name, seen) in known {
+                        self.answered(&name, seen);
                     }
                 }
                 Feed::Scans(scans) => self.scans = Some(scans),
@@ -1144,11 +1177,26 @@ impl View {
                 Feed::Asked(name, Some(seen)) => {
                     self.unread.remove(&name);
                     if let Some(at) = self.agent(&name)
-                        && !self.agents[at].waits.unsure(&name)
+                        && let agent = &self.agents[at]
+                        && agent.running.is_none()
+                        && let Some(turn) = seen.turn.filter(|turn| agent.ended == Some(*turn))
                     {
-                        let running = self.agents[at].running.is_some();
-                        let ask = (*seen).open(&self.resolved, &name, running);
-                        self.agents[at].waits.asked(&name, ask);
+                        self.kept.insert(name.clone(), (turn, (*seen).clone()));
+                        self.kept_changed = true;
+                    }
+                    self.answered(&name, *seen);
+                }
+                Feed::Kept(from, kept) => {
+                    // Another daemon's store numbers its agents' turns
+                    // anew: what was read from the one before is no use.
+                    if self.kept_from.as_ref().is_some_and(|was| *was != from) {
+                        self.kept.clear();
+                    }
+                    self.kept_from = Some(from);
+                    for (name, read) in kept {
+                        if self.kept.get(&name).is_none_or(|(turn, _)| *turn < read.0) {
+                            self.kept.insert(name, read);
+                        }
                     }
                 }
                 Feed::Asked(name, None) => {
@@ -1159,9 +1207,10 @@ impl View {
                     self.event(&event, now, true);
                     // A turn that ended unsure of its questions is read.
                     if let Some(at) = event["bot"].as_str().and_then(|bot| self.agent(bot)) {
-                        for due in self.agents[at].waits.due() {
+                        for (name, turn) in self.agents[at].waits.due() {
+                            let was = self.kept.get(&name).map(|(_, seen)| seen.clone());
                             if let Some(scans) = &self.scans {
-                                let _ = scans.send(due);
+                                let _ = scans.send((name, turn, was));
                             }
                         }
                     }
@@ -1180,6 +1229,20 @@ impl View {
                 Feed::Ready => (self.live, self.ready) = (true, true),
                 Feed::Down(why) => self.down = Some(why),
             }
+        }
+        // What the opening read, kept for the next sky once it is all in,
+        // and whatever is read again after.
+        if let Some(from) = self
+            .kept_from
+            .as_ref()
+            .filter(|_| self.kept_changed && !self.opening())
+        {
+            let here: HashMap<String, (i64, crate::needs::Seen)> = (self.kept.iter())
+                .filter(|(name, _)| self.agent(name).is_some_and(|at| !self.agents[at].gone))
+                .map(|(name, read)| (name.clone(), read.clone()))
+                .collect();
+            crate::keep_sky_seen(&self.resolved, from.as_deref(), &here);
+            self.kept_changed = false;
         }
         // The tape let go of what had not played: the replay starts again
         // from what is left, seated as it was then.
@@ -1822,6 +1885,7 @@ impl View {
             .map(str::to_owned);
         agent.made_by_id = bot["created_by_id"].as_i64();
         agent.running = bot["running_turn"].as_i64();
+        agent.ended = bot["last"]["turn"].as_i64();
         agent.set_model(bot["model"].as_str().unwrap_or_default());
         Some(at)
     }
@@ -2103,6 +2167,7 @@ impl View {
             {
                 let agent = &mut self.agents[at];
                 agent.running = None;
+                agent.ended = Some(turn);
                 // Its last turn's end, past or live, says whether it failed;
                 // one that ended with nothing to say ended as it should.
                 agent.failed = data["status"] == "failed" && data["error"] != "empty_completion";
@@ -2920,6 +2985,18 @@ impl View {
     /// they have.
     fn opening(&self) -> bool {
         self.replay.is_none() && self.down.is_none() && (!self.ready || !self.unread.is_empty())
+    }
+
+    /// `name`'s question as its history says, unless an event since left
+    /// it unsure: that is read again once its turn ends.
+    fn answered(&mut self, name: &str, seen: crate::needs::Seen) {
+        if let Some(at) = self.agent(name)
+            && !self.agents[at].waits.unsure(name)
+        {
+            let running = self.agents[at].running.is_some();
+            let ask = seen.open(&self.resolved, name, running);
+            self.agents[at].waits.asked(name, ask);
+        }
     }
 
     /// The sky `cols` wide and `rows` high, what happened under it.
@@ -4797,6 +4874,8 @@ impl Sky {
 
 /// How often `sonny sky` draws: smooth enough for a spark's flight.
 const FRAME: Duration = Duration::from_millis(60);
+/// How often the sky looks for what it read while it opens.
+const OPENING: Duration = Duration::from_millis(4);
 
 /// How long `sonny sky` waits before following a daemon that went again.
 const RETRY: Duration = Duration::from_secs(3);
@@ -4861,7 +4940,10 @@ pub fn watch(
                         crate::look::Look::now().finish(frame.buffer_mut());
                     })
                     .map_err(|e| e.to_string())?;
-                if !event::poll(FRAME).map_err(|e| e.to_string())? {
+                // Opening, the reads are taken as they land, not a frame
+                // late each: the sky shows the moment they are all in.
+                let wait = if view.opening() { OPENING } else { FRAME };
+                if !event::poll(wait).map_err(|e| e.to_string())? {
                     continue;
                 }
                 match event::read().map_err(|e| e.to_string())? {
@@ -4959,7 +5041,7 @@ impl ratatui::widgets::Widget for &mut View {
 
 /// The view's own connection: every agent, then who talked to whom in the
 /// turns kept, then live. A daemon gone ends it, saying so.
-async fn follow(socket: PathBuf, send: mpsc::UnboundedSender<Feed>) {
+async fn follow(socket: PathBuf, store: PathBuf, send: mpsc::UnboundedSender<Feed>) {
     let (client, mut events) = match Client::connect(&socket).await {
         Ok(connected) => connected,
         Err(error) => {
@@ -4973,21 +5055,19 @@ async fn follow(socket: PathBuf, send: mpsc::UnboundedSender<Feed>) {
     {
         return;
     }
-    // Agents' questions are read beside the follow, one at a time, as the
-    // view asks: it ends with the view's asking.
-    let (scans, mut asked) = mpsc::unbounded_channel::<(String, Option<i64>)>();
+    // What was read before, so only the agents that ran since are read.
+    let identity = client.identity().map(str::to_owned);
+    let kept = crate::kept_seen(&store, identity.as_deref());
+    if send.send(Feed::Kept(identity, kept)).is_err() {
+        return;
+    }
+    // Agents' questions are read beside the follow, as the view asks: it
+    // ends with the view's asking.
+    let (scans, asked) = mpsc::unbounded_channel::<Scan>();
     if send.send(Feed::Scans(scans)).is_err() {
         return;
     }
-    let (reader, told) = (client.clone(), send.clone());
-    tokio::spawn(async move {
-        while let Some((bot, turn)) = asked.recv().await {
-            let seen = crate::needs::scan(&reader, &bot, turn).await;
-            if told.send(Feed::Asked(bot, seen.map(Box::new))).is_err() {
-                return;
-            }
-        }
-    });
+    tokio::spawn(scan_all(socket.clone(), asked, send.clone()));
     // A cord already pulled when the sky opens hangs, without its drop;
     // `paused` and `resumed` notices tell of what comes after.
     if !client.paused().is_null()
@@ -5090,6 +5170,37 @@ async fn follow(socket: PathBuf, send: mpsc::UnboundedSender<Feed>) {
         }
     }
     let _ = send.send(Feed::Down("the daemon closed the connection".into()));
+}
+
+/// Read each agent's history the view asks for, one at a time and in
+/// the order asked, on a connection of the reads' own: the daemon's
+/// readers stay with the agents at work, and the follow's past, which
+/// fills its connection while it is read, holds up no answer (an answer
+/// with no room closes a connection). One read before goes on from where
+/// it ended. A connection that cannot be made reads nothing: each agent
+/// is told unread.
+async fn scan_all(
+    socket: PathBuf,
+    mut asked: mpsc::UnboundedReceiver<Scan>,
+    told: mpsc::UnboundedSender<Feed>,
+) {
+    // Its events, unread, kept for as long as the connection is.
+    let connected = Client::connect(&socket).await.ok();
+    while let Some((bot, turn, was)) = asked.recv().await {
+        let Some((client, _)) = &connected else {
+            if told.send(Feed::Asked(bot, None)).is_err() {
+                return;
+            }
+            continue;
+        };
+        let seen = match &was {
+            Some(was) => crate::needs::scan_since(client, &bot, turn, was).await,
+            None => crate::needs::scan(client, &bot, turn).await,
+        };
+        if told.send(Feed::Asked(bot, seen.map(Box::new))).is_err() {
+            return;
+        }
+    }
 }
 
 /// A configured agent's model, read again when it changed: the event says
@@ -7608,9 +7719,9 @@ mod tests {
             }
         });
         let (send, mut feed) = mpsc::unbounded_channel();
-        follow(socket, send).await;
+        tokio::spawn(follow(socket, dir.join("state.sqlite"), send));
         let mut seen = Vec::new();
-        while let Ok(item) = feed.try_recv() {
+        while let Some(item) = feed.recv().await {
             seen.push(match item {
                 Feed::Live(event) => event["cursor"].to_string(),
                 Feed::Roll(_) => "roll".into(),
@@ -7619,6 +7730,7 @@ mod tests {
                 | Feed::Held(_)
                 | Feed::Scans(_)
                 | Feed::Asked(..)
+                | Feed::Kept(..)
                 | Feed::Down(_)
                 | Feed::Model(..)
                 | Feed::Tape(_)
@@ -7723,7 +7835,7 @@ mod tests {
         send.send(Feed::Ready).unwrap();
         view.drain();
         let mut sent = Vec::new();
-        while let Ok((name, _)) = asked.try_recv() {
+        while let Ok((name, ..)) = asked.try_recv() {
             sent.push(name);
         }
         sent.sort();
@@ -7753,6 +7865,180 @@ mod tests {
             text(&view.card(80, 30)).trim(),
             "Catching up with who is here…"
         );
+    }
+
+    #[tokio::test]
+    async fn an_agent_that_ran_no_turn_since_its_question_was_read_is_not_read_again() {
+        let dir = std::env::temp_dir().join(format!("sky-kept-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = dir.join("state.sqlite");
+        let (mut view, send) = view();
+        view.resolved = store.clone();
+        let (scans, mut asked) = mpsc::unbounded_channel();
+        send.send(Feed::Scans(scans)).unwrap();
+        let read = |turn| {
+            let seen = crate::needs::Seen {
+                turn: Some(turn),
+                ..Default::default()
+            };
+            (turn, seen)
+        };
+        let kept = HashMap::from([
+            ("idle".to_owned(), read(5)),
+            ("ran".to_owned(), read(3)),
+            ("busy".to_owned(), read(7)),
+        ]);
+        send.send(Feed::Kept(None, kept)).unwrap();
+        send.send(Feed::Roll(vec![
+            json!({"name": "idle", "last": {"turn": 5}}),
+            json!({"name": "ran", "last": {"turn": 4}}),
+            json!({"name": "busy", "running_turn": 8, "last": {"turn": 7}}),
+            json!({"name": "new"}),
+        ]))
+        .unwrap();
+        send.send(Feed::Held(Vec::new())).unwrap();
+        send.send(Feed::Ready).unwrap();
+        view.drain();
+        // Only the agents that ran since, run now, or were never read.
+        let mut sent = Vec::new();
+        while let Ok((name, ..)) = asked.try_recv() {
+            sent.push(name);
+        }
+        sent.sort();
+        assert_eq!(sent, ["busy", "new", "ran"]);
+        assert!(view.opening());
+        send.send(Feed::Asked("ran".into(), Some(Box::new(read(4).1))))
+            .unwrap();
+        send.send(Feed::Asked("new".into(), Some(Box::default())))
+            .unwrap();
+        send.send(Feed::Asked("busy".into(), Some(Box::new(read(8).1))))
+            .unwrap();
+        view.drain();
+        assert!(!view.opening());
+        // Kept as of the turn each ended: not a running turn's read, nor
+        // one with no turn.
+        let kept = crate::kept_seen(&store, None);
+        let turns: BTreeMap<&str, i64> = (kept.iter())
+            .map(|(name, (turn, _))| (name.as_str(), *turn))
+            .collect();
+        assert_eq!(
+            turns,
+            BTreeMap::from([("busy", 7), ("idle", 5), ("ran", 4)])
+        );
+        // Another build reads none of it.
+        assert!(crate::kept_seen(&store, Some("another daemon")).is_empty());
+        // Followed again on another daemon's store, nothing read from the
+        // one before is taken.
+        send.send(Feed::Kept(Some("another store".into()), HashMap::new()))
+            .unwrap();
+        view.drain();
+        assert!(view.kept.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn agents_are_read_one_at_a_time_going_on_from_the_last_read() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        let dir = std::env::temp_dir().join(format!("sky-scans-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let socket = dir.join("agent.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        let asked = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let heard_ops = asked.clone();
+        // Since node 10, `b` only worked and `c` heard from the person.
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let (read, mut write) = stream.into_split();
+            let ready = json!({"event": "ready", "protocol": agent_client::PROTOCOL});
+            write
+                .write_all(format!("{ready}\n").as_bytes())
+                .await
+                .unwrap();
+            let mut lines = BufReader::new(read).lines();
+            while let Ok(Some(line)) = lines.next_line().await {
+                let asked: Value = serde_json::from_str(&line).unwrap();
+                let (bot, op) = (
+                    asked["bot"].as_str().unwrap_or(""),
+                    asked["op"].as_str().unwrap_or(""),
+                );
+                heard_ops
+                    .lock()
+                    .unwrap()
+                    .push(format!("{op} {bot} {}", asked["min_node"]));
+                let result = match op {
+                    "history_nodes" if asked["min_node"].is_i64() => {
+                        json!({"nodes": [{"node": 12, "turn": 3}, {"node": 11, "turn": 3}]})
+                    }
+                    "history_nodes" => json!({"nodes": [{"node": 4, "turn": 1}]}),
+                    _ => {
+                        let first = match bot {
+                            "c" => json!({"type": "message", "role": "user",
+                                "content": [{"type": "input_text", "text": "never mind that"}]}),
+                            _ => json!({"type": "message", "role": "user",
+                                "content": [{"type": "input_text", "text": "go on"}]}),
+                        };
+                        let mut items = vec![json!({"node": 12, "item": {"type": "message",
+                            "role": "assistant", "content": [{"type": "output_text", "text": "done"}]}})];
+                        match bot {
+                            "b" => items.push(json!({"node": 11, "item": first,
+                                "from": {"bot": "lead", "turn": 1}})),
+                            _ => items.push(json!({"node": 11, "item": first})),
+                        }
+                        json!({"items": items})
+                    }
+                };
+                let answer = json!({"id": asked["id"], "result": result});
+                if write
+                    .write_all(format!("{answer}\n").as_bytes())
+                    .await
+                    .is_err()
+                {
+                    return;
+                }
+            }
+        });
+        let (ask, scans) = mpsc::unbounded_channel();
+        let (told, mut heard) = mpsc::unbounded_channel();
+        let was = crate::needs::Seen {
+            itself: true,
+            turn: Some(2),
+            through: Some(10),
+            ..Default::default()
+        };
+        ask.send(("a".to_owned(), None, None)).unwrap();
+        ask.send(("b".to_owned(), None, Some(was.clone()))).unwrap();
+        ask.send(("c".to_owned(), None, Some(was))).unwrap();
+        drop(ask);
+        tokio::spawn(scan_all(socket.clone(), scans, told));
+        let mut seen = HashMap::new();
+        while let Some(feed) = heard.recv().await {
+            if let Feed::Asked(bot, Some(read)) = feed {
+                seen.insert(bot, *read);
+            }
+        }
+        // `b` goes on from node 10: its newest turn did not resolve it.
+        assert_eq!(seen["b"].turn, Some(3));
+        assert_eq!(seen["b"].through, Some(12));
+        assert!(!seen["b"].itself);
+        // `c`'s person moved on: read whole again.
+        assert_eq!(seen["c"].through, Some(4));
+        let ops = asked.lock().unwrap();
+        assert_eq!(
+            *ops,
+            [
+                "history_nodes a null",
+                "history_items a null",
+                "history_nodes b 11",
+                "history_items b null",
+                "history_nodes c 11",
+                "history_items c null",
+                "history_nodes c null",
+                "history_items c null",
+            ]
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]
@@ -7898,6 +8184,7 @@ mod tests {
             ),
             itself: false,
             turn: Some(turn),
+            through: None,
         };
         // Its lead resolved the cart past the turn that asked; the login
         // still asks, as does the cart once a later turn reopens it.
