@@ -1022,6 +1022,31 @@ impl BlockStream {
                     self.held = text[at..].to_owned();
                     return out;
                 }
+                match pem_escaped(&text, at, last) {
+                    Escaped::More => {
+                        self.held = text[at..].to_owned();
+                        return out;
+                    }
+                    Escaped::Key {
+                        escape,
+                        header,
+                        end,
+                    } => {
+                        let named = blocks
+                            .iter()
+                            .any(|block| text[at..header].contains(block.as_str()));
+                        out.push_str(&text[at..header]);
+                        if named {
+                            out.push_str(REDACTED);
+                            out.push_str(&text[escape..header]);
+                            at = end;
+                        } else {
+                            at = header;
+                        }
+                        continue;
+                    }
+                    Escaped::No => {}
+                }
                 out.push_str(BEGIN);
                 at = from;
                 continue;
@@ -1417,6 +1442,25 @@ fn redact_blocks(text: String, blocks: &[String]) -> String {
     let mut rest = text.as_str();
     while let Some(begin) = rest.find(BEGIN) {
         let Some(header) = pem_header(rest, begin, true) else {
+            if let Escaped::Key {
+                escape,
+                header,
+                end,
+            } = pem_escaped(rest, begin, true)
+            {
+                out.push_str(&rest[..header]);
+                let named = blocks
+                    .iter()
+                    .any(|block| rest[begin..header].contains(block.as_str()));
+                if named {
+                    out.push_str(REDACTED);
+                    out.push_str(&rest[escape..header]);
+                    rest = &rest[end..];
+                } else {
+                    rest = &rest[header..];
+                }
+                continue;
+            }
             // No header line here: read on after its start.
             out.push_str(&rest[..begin + BEGIN.len()]);
             rest = &rest[begin + BEGIN.len()..];
@@ -1469,6 +1513,91 @@ fn pem_header(text: &str, begin: usize, last: bool) -> Option<usize> {
 
 /// The most spaces or tabs a key's header may end with.
 const PEM_SPACES: usize = 1024;
+
+/// A key's block as a JSON string holds it, all on one line.
+enum Escaped {
+    /// Its header runs to `header`, the escaped line end that closes it
+    /// from `escape`; its body to `end`, where its END marker starts.
+    Key {
+        escape: usize,
+        header: usize,
+        end: usize,
+    },
+    /// No such block.
+    No,
+    /// More text may still tell.
+    More,
+}
+
+/// The escaped PEM block at `begin`, as JSON holds a key: its header's
+/// five dashes, an escaped line end right after them (`\n` or `\r\n`,
+/// escaped once or more), a body of base64, spaces and escapes (and an
+/// encrypted key's headers), then its END marker, all on the line.
+/// A header with no END after it on its line, or anything else between,
+/// is a pattern or a quote, not a key.
+fn pem_escaped(text: &str, begin: usize, last: bool) -> Escaped {
+    const BEGIN: &str = "-----BEGIN ";
+    const END: &str = "-----END ";
+    let more = match last {
+        true => Escaped::No,
+        false => Escaped::More,
+    };
+    let from = begin + BEGIN.len();
+    let Some(dashes) = text[from..].find("-----").map(|n| from + n + 5) else {
+        return Escaped::No;
+    };
+    if text[from..dashes].contains('\n') {
+        return Escaped::No;
+    }
+    let bytes = &text.as_bytes()[dashes..];
+    let slashes = bytes.iter().take_while(|&&b| b == b'\\').count();
+    let escaped = match (slashes, bytes.get(slashes)) {
+        (0, Some(_)) => return Escaped::No,
+        (_, None) => return more,
+        (_, Some(b'n')) => slashes + 1,
+        (_, Some(b'r')) => {
+            // `\r\n`, the `\n` escaped as the `\r` is.
+            let after = &bytes[slashes + 1..];
+            let n = slashes + 1;
+            let ends = |b: &u8, i: usize| if i < slashes { *b == b'\\' } else { *b == b'n' };
+            if after.len() < n && after.iter().enumerate().all(|(i, b)| ends(b, i)) {
+                return more;
+            }
+            match after.len() >= n && after[..n].iter().enumerate().all(|(i, b)| ends(b, i)) {
+                true => slashes + 1 + n,
+                false => slashes + 1,
+            }
+        }
+        _ => return Escaped::No,
+    };
+    let header = dashes + escaped;
+    for (i, &b) in text.as_bytes()[header..].iter().enumerate() {
+        if i > PEM_LINE {
+            return Escaped::No;
+        }
+        if b == b'-' {
+            let tail = &text[header + i..];
+            if tail.len() < END.len() && END.starts_with(tail) {
+                return more;
+            }
+            if tail.starts_with(END) && i > 0 {
+                return Escaped::Key {
+                    escape: dashes,
+                    header,
+                    end: header + i,
+                };
+            }
+            if tail.starts_with("-----") {
+                return Escaped::No;
+            }
+            continue;
+        }
+        if !(b.is_ascii_alphanumeric() || b"+/= \t\\:,".contains(&b)) {
+            return Escaped::No;
+        }
+    }
+    more
+}
 
 /// The most of one line a key's body is judged on: a line whose first
 /// this many bytes are base64 is a body's line, whatever follows.
@@ -5337,6 +5466,42 @@ mod tests {
             ),
             "-----BEGIN RSA PRIVATE KEY-----\n[REDACTED]\n-----END RSA PRIVATE KEY-----\n"
         );
+        // A key as JSON holds it, its line ends escaped, under any name or
+        // none, and escaped again inside another string.
+        for (key, hidden) in [
+            (
+                r#"{"value": "-----BEGIN PRIVATE KEY-----\nMIIEvQIB+/a=\nAAAA\n-----END PRIVATE KEY-----\n", "n": 1}"#,
+                r#"{"value": "-----BEGIN PRIVATE KEY-----\n[REDACTED]\n-----END PRIVATE KEY-----\n", "n": 1}"#,
+            ),
+            (
+                r#""-----BEGIN OPENSSH PRIVATE KEY-----\r\nb3BlbnNzaC1rZXk\r\n-----END OPENSSH PRIVATE KEY-----""#,
+                r#""-----BEGIN OPENSSH PRIVATE KEY-----\r\n[REDACTED]\r\n-----END OPENSSH PRIVATE KEY-----""#,
+            ),
+            (
+                r#"{"body": "{\"key\": \"-----BEGIN RSA PRIVATE KEY-----\\nProc-Type: 4,ENCRYPTED\\nDEK-Info: AES-128-CBC,00\\n\\nMIIE\\n-----END RSA PRIVATE KEY-----\\n\"}"}"#,
+                r#"{"body": "{\"key\": \"-----BEGIN RSA PRIVATE KEY-----\\n[REDACTED]\\n-----END RSA PRIVATE KEY-----\\n\"}"}"#,
+            ),
+        ] {
+            assert_eq!(redact(key), hidden);
+            for size in 1..=key.len() {
+                let mut redacting = Redacting::new(credentials.clone());
+                let mut out = String::new();
+                for piece in key.as_bytes().chunks(size) {
+                    out.push_str(&redacting.feed(piece));
+                }
+                out.push_str(&redacting.finish());
+                assert_eq!(out, hidden, "in pieces of {size}");
+            }
+        }
+        // An escaped header with no END on its line, or code between it
+        // and one, is a pattern: kept.
+        for kept in [
+            r#"re.compile("-----BEGIN PRIVATE KEY-----\n")"#,
+            r#"a = "-----BEGIN PRIVATE KEY-----\n"; b = "-----END PRIVATE KEY-----""#,
+            "\"-----BEGIN PRIVATE KEY-----\\nMIIE\n-----END PRIVATE KEY-----\"",
+        ] {
+            assert_eq!(redact(kept), kept);
+        }
     }
     /// A bot keeps at most the process bound's number of background
     /// commands, as Codex keeps a session's processes: starting one past
@@ -5600,7 +5765,7 @@ mod tests {
             &["password".to_owned(), "api_key".to_owned()],
             &["PRIVATE KEY".to_owned()],
         );
-        let parts: [&str; 32] = [
+        let parts: [&str; 35] = [
             "password=",
             "\"api_key\": \"",
             "password: '",
@@ -5633,6 +5798,9 @@ mod tests {
             "print(KEY)\n",
             "   ",
             "\t",
+            "\"-----BEGIN PRIVATE KEY-----\\n",
+            "MIIE+/a=\\r\\n",
+            "-----END PRIVATE KEY-----\\n\"",
         ];
         let mut seed = 0x2545_f491_4f6c_dd1du64;
         let mut next = || {
