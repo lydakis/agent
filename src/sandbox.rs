@@ -474,13 +474,16 @@ pub fn escapes(
     let writable = writable_paths(mode, root, writable);
     // A patch escapes when any file it changes would.
     any_written(tool, &arguments, |path, removed| {
-        let named = lexical(&folder.join(path));
+        let joined = folder.join(path);
+        let named = lexical(&joined);
         // A path whose links [`learn`] did not read is judged as spelled.
+        // Links are followed in the path as given: a `..` after one leaves
+        // where it leads, as the kernel reads it.
         let target = (links.0.as_deref().filter(|_| judgeable(path)))
             .and_then(|links| {
                 let link = |path: &Path| links.get(path).cloned();
                 judged(
-                    &named,
+                    &joined,
                     |dir| changeable(mode, &writable, dir),
                     link,
                     removed,
@@ -518,10 +521,53 @@ fn any_written(
 /// is: what it names, or `None` for a path that is no link (or can't be
 /// read). Read once by [`learn`], off the runtime thread, and carried with
 /// the call, so every judgment of it reads no file and agrees; unread
-/// (`Links::default()`), the call's paths are judged as spelled. Calls are
+/// (`Links::default()`), the call's paths are judged as spelled. Kept with
+/// a call that parks, so it resumes judged as it was announced. Calls are
 /// equal whatever was read for them.
 #[derive(Clone, Debug, Default)]
 pub struct Links(Option<std::sync::Arc<std::collections::HashMap<PathBuf, Option<PathBuf>>>>);
+
+/// [`Links`] as kept: each path and what it links to. A reading with a
+/// path that isn't UTF-8 is kept as unread, so it is read again.
+type KeptLinks = Option<Vec<(String, Option<String>)>>;
+
+impl serde::Serialize for Links {
+    fn serialize<S: serde::Serializer>(
+        &self,
+        serializer: S,
+    ) -> std::result::Result<S::Ok, S::Error> {
+        let name = |path: &Path| path.to_str().map(str::to_owned);
+        let kept: KeptLinks = self.0.as_deref().and_then(|links| {
+            links
+                .iter()
+                .map(|(path, to)| {
+                    let to = match to {
+                        Some(to) => Some(name(to)?),
+                        None => None,
+                    };
+                    Some((name(path)?, to))
+                })
+                .collect()
+        });
+        kept.serialize(serializer)
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for Links {
+    fn deserialize<D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> std::result::Result<Self, D::Error> {
+        let kept = <KeptLinks as serde::Deserialize>::deserialize(deserializer)?;
+        Ok(Links(kept.map(|links| {
+            std::sync::Arc::new(
+                links
+                    .into_iter()
+                    .map(|(path, to)| (PathBuf::from(path), to.map(PathBuf::from)))
+                    .collect(),
+            )
+        })))
+    }
+}
 
 impl PartialEq for Links {
     fn eq(&self, _: &Self) -> bool {
@@ -535,6 +581,11 @@ impl Links {
     /// Whether [`learn`] read them.
     pub fn read(&self) -> bool {
         self.0.is_some()
+    }
+
+    /// Whether [`learn`] has not read them: nothing to keep.
+    pub fn unread(&self) -> bool {
+        self.0.is_none()
     }
 }
 
@@ -553,10 +604,9 @@ pub fn learn(
     if let Ok(arguments) = serde_json::from_str::<serde_json::Value>(arguments) {
         any_written(tool, &arguments, |path, removed| {
             if judgeable(path) {
-                let named = lexical(&folder.join(path));
                 let read = |path: &Path| Some(read_link(&mut links, path));
                 judged(
-                    &named,
+                    &folder.join(path),
                     |dir| changeable(mode, &writable, dir),
                     read,
                     removed,
@@ -2646,6 +2696,10 @@ mod tests {
         let first = learn();
         assert!(first.read() && !Links::default().read());
         assert_eq!(link(&first), Some(Some(home.clone())));
+        // Kept with a parked call, it comes back as read.
+        let kept: Links = serde_json::from_str(&serde_json::to_string(&first).unwrap()).unwrap();
+        assert_eq!(link(&kept), Some(Some(home.clone())));
+        assert!(serde_json::from_str::<Links>("null").unwrap().unread());
         std::fs::remove_file(real.join("fixed/me")).unwrap();
         std::os::unix::fs::symlink(real.join("fixed"), real.join("fixed/me")).unwrap();
         assert_eq!(link(&first), Some(Some(home.clone())));

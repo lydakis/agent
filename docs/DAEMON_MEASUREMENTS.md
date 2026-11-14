@@ -9597,3 +9597,55 @@ only for a sandboxed bot with hidden folders, and one `is_dir` stat per
 hidden folder inside the `spawn_blocking` that `sandbox::hold` already runs
 before each command. Nothing new runs on the runtime thread. No paid
 providers were used.
+
+## Links followed in a write's path (#1003)
+
+2026-11-14, Linux 6.18 cloud VM, 4 CPUs, Python 3 and the bench venv.
+Base is main `f12b4ff`; head is this pull request at `ac5130d`. The later
+review round only changes which spelling of a path its links are read
+from and keeps what was read with a call that parks, so nothing it adds
+runs on these screens. Both are local release builds (`--bin agent`) with
+the same locked dependencies. Binary SHA-256:
+
+- Base: `b43971e30e59a3d8bb8e03df8fa02a6f99c684ccfe20a96f995df6791f2ed965`.
+- Head: `7c538a222d2d54064187ea5d7a5f95d209b715f91386e400d94eb1c00af9617c`.
+
+What the change adds is per call, never per bot: for a bot in
+`workspace-write` mode, each `write`, `edit` or `apply_patch` call has
+the links in its paths read once, in `spawn_blocking`, before the round
+judges it (an `lstat` and, for a link, a `readlink` per path part in a
+folder the bot can't change, at most 40 links per path). What was read
+travels with the call, so judging reads no file on the runtime thread. A
+call that parks keeps it in the turn's stored `waiting` row; a call that
+reads nothing stores nothing. Other modes, other tools and shell calls do
+no new work, and nothing grows with the number of agents: no table, task
+or timer is added. The protocol and schema are unchanged.
+
+### Required matched screen
+
+The four daemon screens ran in base/head order for two rounds, with the
+Perf workflow's settings. Admission and completion use five measured
+repeats, footprint uses two (1,000 bots), and lifecycle uses one (32
+bots, socket echo, five tool schemas). Each invocation has its usual
+excluded warmup. Medians over every measured run:
+
+| Bench | Measure | Base | Head | Change |
+| --- | --- | ---: | ---: | ---: |
+| admission | lone submit CPU, ms | 41.519 | 39.187 | -5.6% |
+| admission | burst submit p99, ms | 4.397 | 5.187 | +18.0% |
+| completion | release to terminal p99, ms | 12.096 | 11.178 | -7.6% |
+| footprint | idle RSS, MiB | 16.379 | 16.346 | -0.2% |
+| footprint | per idle bot, KiB | 1.972 | 1.9 | -3.7% |
+| footprint | RSS after a turn each, MiB | 34.689 | 36.908 | +6.4% |
+| footprint | CPU per turn, ms | 0.927 | 1.059 | +14.2% |
+| lifecycle | CPU, s | 0.625 | 0.65 | +4.0% |
+| lifecycle | p95 turn, ms | 585.281 | 585.215 | -0.0% |
+| lifecycle | peak RSS, MiB | 25.191 | 25.297 | +0.4% |
+
+`bench.perf_gate` reports no count failures and no warnings: store work
+per turn is the same on both sides. The two larger timing moves fall
+inside each other's ranges, on screens that never reach the new code
+(admission runs no tools, footprint's bots aren't in `workspace-write`):
+
+- Admission burst p99: base 4.23 to 7.47 ms, head 4.04 to 7.01 ms.
+- Footprint CPU per turn: base 0.907 to 1.049 ms, head 0.999 to 1.065 ms.

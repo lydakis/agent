@@ -587,8 +587,8 @@ pub struct ToolCall {
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub custom: bool,
     /// The links its paths pass, as the daemon read them before the round
-    /// judged it ([`crate::sandbox::learn`]); never stored.
-    #[serde(skip)]
+    /// judged it ([`crate::sandbox::learn`]); kept with a call that parks.
+    #[serde(default, skip_serializing_if = "crate::sandbox::Links::unread")]
     pub links: crate::sandbox::Links,
 }
 pub type ItemStream = futures_util::stream::BoxStream<'static, std::io::Result<Bytes>>;
