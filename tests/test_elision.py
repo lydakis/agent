@@ -204,7 +204,14 @@ class ElisionTests(ModelFixture):
         client = self.client(tools='shell,read', settings={'context_bytes': 65536})
         client.request('create', bot='Bob', workspace=str(self.path), tools=['shell', 'read'],
                        compaction_instructions='Summarize.')
-        self.model.compaction_refusals = 1
+        # The summary's refusal closes the pool for its Retry-After. The turn
+        # parks only when its next call, after the call beside the summary
+        # and that call's tools, finds the pool closed for longer than a
+        # wait the gate holds; at the default 0.4 s that left 0.15 s for the
+        # call and its tools on a loaded runner, and when it missed, the
+        # call waited in the gate and the turn never parked. Two seconds
+        # leave it 1.75 s.
+        self.model.compaction_refusals, self.model.compaction_retry_after = 1, '2'
         turn = client.request('submit', bot='Bob', request_id='1',
                               prompt='long:1x600,35x40,1x700,2x1')['result']['message']
         # The pause comes after some forty rounds, slower than the default
@@ -214,7 +221,8 @@ class ElisionTests(ModelFixture):
         client = Client(self.binary, self.path / 'state.sqlite', self.url,
                         settings={'context_bytes': 65536}, tools='shell,read')
         self.addCleanup(client.close)
-        ended = client.finished(turn)
+        # It resumes once the pool opens again.
+        ended = client.finished(turn, timeout=30)
         self.assertEqual(ended['data']['status'], 'completed', ended)
         events = client.request('events', bot='Bob', after=0, limit=256)['result']['events']
         moves = [e['data'] for e in events if e['event'] in ('elided', 'compacted')]

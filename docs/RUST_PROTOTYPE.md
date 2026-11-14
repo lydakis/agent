@@ -636,7 +636,7 @@ when it sets either.
 | `writable` (`--writable`, repeatable) | Absolute folders a `workspace-write` bot may write besides its own; each must exist and is stored by its real path. At most 64, 32 KiB as JSON. | none |
 | `network` (`--network`) | A `workspace-write` bot's commands may use the network. Off, or in `read-only`, the bot is neither offered nor runs `web_fetch` or `web_search` (see [sandbox](#sandbox)). | off |
 | `hold_ms` (`--hold`) | How long a turn waits on a cause a person can fix (a sign-in, a key, a usage limit, a provider down or not set up) before it fails with it ([held turns](#held-turns)), up to 365 days; 0 fails at once. `hold = "5d"` in `~/.agent/config.toml` sets it on the bots the CLI and Sonny make. | 5 days |
-| `hide_senders` (`--hide-senders`) | Its model reads what other bots and clients send it without the line naming the sender (see [fleet controllers](#fleet-controllers)); `senders = "hidden"` in `~/.agent/config.toml` sets it on the bots the CLI and Sonny make. | off |
+| `trailer` (`--trailer sender,time`) | What the line after each prompt's words names for its model (see [fleet controllers](#fleet-controllers)): `sender`, who wrote it, and `time`, when it was sent, in the daemon's local time; an empty list adds no line. `trailer = [...]` in `~/.agent/config.toml` sets it on the bots the CLI and Sonny make; with none there, Sonny's agents name both. Protocol 75 (`hide_senders` before it). | `["sender"]` |
 | `quiet_background` (`--quiet-background`) | The end of a background command no wait collected is left for a wait, untold (see [deferred tool results](#deferred-tool-results)): for a client that collects results itself. Protocol 46. | off |
 | `outputs` (`--outputs`) | An absolute folder that holds each tool output stream cut for the model whole, one file per stream, in place of the store's copy (see [retained outputs](#retained-outputs)). The daemon makes it, owner-only, and writes there only while the bot's sandbox cannot write it; otherwise the stream stays in the store. `agent run --new` and Sonny name `outputs` beside the store unless told otherwise. | none |
 | `unix_sockets` (`--unix-socket`, repeatable) | Absolute Unix sockets, or folders of them, the only ones a sandboxed bot's commands reach, such as a Docker or SSH agent socket (see [sandbox](#sandbox)). Each is stored by its real path while it exists. At most 64. | none |
@@ -1830,8 +1830,12 @@ the prompt's words and before its pictures, so it does not take another
 agent's words for a person's, in the line that names the message: `[Message
 BOT/N, written by the agent NAME in NAME/TURN, not by a person.]` for
 `from`, `[Message BOT/N, sent by ORIGIN.]` for `origin`, and `[Message
-BOT/N.]` for a person's prompt. `content[0]` stays the words. A bot made
-with `hide_senders` reads the words alone.
+BOT/N.]` for a person's prompt. `content[0]` stays the words. A bot whose
+`trailer` names `time` reads the line with the message's local send time
+after it, `[Message BOT/N, written by PERSON. Sent Sat 14 Nov 2026 03:52,
+UTC-05:00.]` (`[Message BOT/N. Sent ….]` with `time` alone), fixed when the
+turn takes it in, so the cache keeps it; one with an empty `trailer` reads
+the words alone.
 
 A client that speaks for a person other than the daemon's own may name
 them with `person` (a name's characters, else `invalid_person`), exclusive
@@ -1851,7 +1855,7 @@ with their writers. Each quote is a text part after the sender's line,
 behind a line naming it, `[Quoted from message BOT/N, written by a
 person:]` or `[Quoted from the reply to message BOT/N, written by the agent
 BOT:]` (`sent by ORIGIN`, `written by PERSON`, `written by the agent NAME
-in NAME/TURN`); `hide_senders` leaves the lines out too. A message that
+in NAME/TURN`); a `trailer` without `sender` leaves the lines out too. A message that
 does not exist, the reply to one that opened no turn, or a turn that ended without a reply
 (or whose events were pruned before schema 70) is `quote_not_found`; a
 reply of an unfinished turn `quote_unfinished`; more than 64 quotes, those

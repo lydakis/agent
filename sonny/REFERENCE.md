@@ -798,19 +798,27 @@ has something on it, or is off the screen, no time shows.
 - `/config` (or `/settings`) lists every key `~/.agent/config.toml` takes,
   with its value or what its default is, over the composer. ↑/↓ picks
   one; ←/→ steps a key with a few values (efforts, `web_search`,
-  `senders`, `side_chat`, `chime`, `steps`, `verbose`, `margin_opens`, `agent_opens`, `suggest`,
+  `trailer`, `side_chat`, `chime`, `steps`, `verbose`, `margin_opens`, `agent_opens`, `suggest`,
   `start_at_boot`) through them
   and its default; Enter types one that takes a name (`model`, `provider`,
   `reviewer.model`, the profiles), empty for its default; ⌫
   takes a key back to its default. Each change is written at once, the
   file's comments and order kept, and a file that does not read is
   refused by name, as every reader refuses it. What the file gives an
-  agent when it is made, `senders` and `hold`, every agent Sonny made
+  agent when it is made, `trailer` and `hold`, every agent Sonny made
   takes within seconds of the file changing, or, at work, once its turn
   ends. `[fallbacks]`, like `[speeds]` and `[context_windows]`, is the
   daemon's: every agent takes it once the daemon starts again.
 
   ![/config over the composer, side_chat set to fork](../docs/sonny/config.png)
+
+  `trailer` is what an agent's model reads in the daemon's line after
+  each message: `sender, time` by default for Sonny's agents (`[Message
+  site.lead/2. Sent Fri 13 Nov 2026 23:21, UTC-05:00.]`), `sender`,
+  `time` or `none`. Sonny draws the words without the line.
+
+  ![/config with trailer picked: sender, time, Sonny's default](../docs/sonny/config-trailer.png)
+  ![/config after one step: trailer = ["sender"] saved](../docs/sonny/config-trailer-sender.png)
 - `/model` picks the lead's model, from every model its provider family
   lists, each by its name and provider (`Opus 5.5 · bedrock`) with its id
   muted after them, found by either, and its effort (←/→), and writes them to the project's
@@ -1770,7 +1778,8 @@ while you have scrolled back leave the view still, and PgDn or Enter
 takes you back to the latest. Copying needs no key held:
 a drag selects and copies when you let go, a double click takes a word and
 a triple click its line, Ctrl+C copies a selection instead of
-interrupting, and Esc clears it. The copy is the text as written: a line
+interrupting, and Esc clears it. With the keys in the pane and nothing
+selected, Ctrl+C closes the pane; it quits Sonny only from the composer. The copy is the text as written: a line
 wrapped over rows comes back as one line, without the bullets and indents
 Sonny drew around it. A click on a web link opens it in the browser, and
 a click on a file opens it in a pane beside the conversation: code in
@@ -1845,6 +1854,14 @@ conversation.
 ![/co with /compact marked, then /compact asking: compact the lead's conversation? It can't be undone · enter compact · esc cancel](../docs/sonny/slash-compact-confirm.png)
 
 ![/co after /commons was run: /commons ranks first; /cms finds /commons with c, m and s in bold](../docs/sonny/slash-ranked-fuzzy.png)
+
+A slash word that names no command is answered, not sent: `/stauts`
+says `no command /stauts · / lists them` and stays in the composer to be
+fixed. So does a command given words it doesn't take (`/status foo`). A
+message that only starts with a slash word, such as a path
+(`/etc/hosts is wrong`), goes to the agent as written.
+
+![/stauts answered with no command /stauts · / lists them, the typo kept in the composer](../docs/sonny/slash-no-command.png)
 
 ### Margin and footer
 

@@ -239,6 +239,18 @@ impl Denials {
         self.window = ((self.window << 1) | u64::from(denied)) & ((1 << DENIAL_WINDOW) - 1);
     }
 }
+/// What the line after a prompt's words may name, as a bot's `trailer`
+/// lists it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Trailer {
+    /// Who wrote the words: an agent, a client, a person.
+    Sender,
+    /// When they were sent, in the daemon's local time.
+    Time,
+}
+/// What a bot names after a prompt's words when it chose nothing.
+pub const TRAILER: [Trailer; 1] = [Trailer::Sender];
 /// What a bot chose at creation about its model context, its history and
 /// its approvals. `None` takes the runtime's default; a fork keeps its
 /// source's. Stored as given, so a bot that chose nothing follows the
@@ -304,10 +316,12 @@ pub struct Settings {
     /// every output in the store.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub outputs: Option<String>,
-    /// Whether a prompt another bot or a named client sent reaches the
-    /// model without the line saying so after its words.
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub hide_senders: bool,
+    /// What the line after each prompt's words names for the model:
+    /// `sender`, who wrote it (an agent's words are never taken for a
+    /// person's), and `time`, when it was sent, in the daemon's local
+    /// time. None is `["sender"]`; an empty list adds no line.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub trailer: Option<Vec<Trailer>>,
     /// How long a turn is held on a cause a person can fix (a refused
     /// sign-in or key, a usage limit, a provider that is down or not set
     /// up) before it fails with it, from when the hold began; 0 fails at
@@ -516,6 +530,11 @@ impl Settings {
     pub fn cache_hour(&self) -> bool {
         self.cache_ttl == Some(CacheTtl::Hour)
     }
+    /// What the line after each prompt's words names: its own list, else
+    /// the sender alone.
+    pub fn trailer(&self) -> &[Trailer] {
+        self.trailer.as_deref().unwrap_or(&TRAILER)
+    }
     /// The tier faster than standard it chose, if any.
     pub fn speed(&self) -> Option<crate::provider::Speed> {
         self.speed
@@ -645,7 +664,7 @@ impl Settings {
             "speed":self.speed().map_or("standard", crate::provider::Speed::name),
             "sandbox":self.sandbox,"writable":self.writable,"network":self.network,
             "outputs":self.outputs,
-            "hide_senders":self.hide_senders,"quiet_background":self.quiet_background,
+            "trailer":self.trailer(),"quiet_background":self.quiet_background,
             "hold_ms":self.hold_ms(),
             "unix_sockets":self.unix_sockets,
             "rules":self.rules,"env":self.env,"approval_policy":self.approval_policy})
@@ -685,7 +704,7 @@ pub const SETTINGS: [&str; 24] = [
     "writable",
     "network",
     "outputs",
-    "hide_senders",
+    "trailer",
     "quiet_background",
     "hold_ms",
     "max_rounds",
@@ -2764,7 +2783,7 @@ impl Database {
     /// before versioning, stores at versions 1 to 5 and stores from newer
     /// binaries are rejected; an older store from version 6 on is migrated
     /// forward, one version at a time, at open.
-    pub const SCHEMA: i32 = 98;
+    pub const SCHEMA: i32 = 99;
     /// The person's messages a compaction keeps verbatim, newest first:
     /// per-message text, and the total text plus `(ordinal, String)` entry
     /// metadata. Empty entries cost space too, so the retained list cannot
@@ -7731,12 +7750,12 @@ impl Database {
                 let (images, (after, quotes)) = self
                     .conn
                     .prepare_cached(
-                        "SELECT images,from_bot,from_turn,origin,person,quotes FROM messages WHERE id=?",
+                        "SELECT images,from_bot,from_turn,origin,person,quotes,sent_ms FROM messages WHERE id=?",
                     )?
                     .query_row([id], |r| {
                         Ok((
                             r.get::<_, Option<String>>(0)?,
-                            after_words(r, 1, bot.settings.hide_senders, &bot.name, id)?,
+                            after_words(r, 1, bot.settings.trailer(), &bot.name, id)?,
                         ))
                     })?;
                 let pictures = images_from(images.as_deref())?;
@@ -15969,7 +15988,7 @@ fn quote_author(quote: &Value) -> String {
 fn after_words(
     r: &rusqlite::Row,
     at: usize,
-    hide: bool,
+    trailer: &[Trailer],
     to: &str,
     message: i64,
 ) -> rusqlite::Result<(Vec<String>, Option<String>)> {
@@ -15978,15 +15997,37 @@ fn after_words(
     let origin: Option<String> = r.get(at + 2)?;
     let person: Option<String> = r.get(at + 3)?;
     let quotes: Option<String> = r.get(at + 4)?;
-    let line = match (bot, turn, origin, person) {
-        (Some(bot), Some(turn), _, _) => format!(
-            "[Message {to}/{message}, written by the agent {bot} in {bot}/{turn}, not by a person.]"
-        ),
-        (_, _, Some(origin), _) => format!("[Message {to}/{message}, sent by {origin}.]"),
-        (_, _, None, Some(person)) => format!("[Message {to}/{message}, written by {person}.]"),
-        _ => format!("[Message {to}/{message}.]"),
-    };
-    let mut parts: Vec<String> = (!hide).then_some(line).into_iter().collect();
+    let sent_ms: Option<i64> = r.get(at + 5)?;
+    let sender = trailer.contains(&Trailer::Sender);
+    let time = sent_ms.filter(|_| trailer.contains(&Trailer::Time));
+    let mut parts = Vec::new();
+    if sender || time.is_some() {
+        use std::fmt::Write as _;
+        // One allocation, as the sender's line alone was.
+        let mut line = String::with_capacity(160);
+        let _ = write!(line, "[Message {to}/{message}");
+        if sender {
+            let _ = match (bot, turn, origin, person) {
+                (Some(bot), Some(turn), _, _) => write!(
+                    line,
+                    ", written by the agent {bot} in {bot}/{turn}, not by a person"
+                ),
+                (_, _, Some(origin), _) => write!(line, ", sent by {origin}"),
+                (_, _, None, Some(person)) => write!(line, ", written by {person}"),
+                _ => Ok(()),
+            };
+        }
+        line.push('.');
+        if let Some(ms) = time {
+            let _ = write!(
+                line,
+                " Sent {}.",
+                agent_client::clock::when(ms.div_euclid(1000))
+            );
+        }
+        line.push(']');
+        parts.push(line);
+    }
     let Some(quotes) = quotes else {
         return Ok((parts, None));
     };
@@ -15995,7 +16036,7 @@ fn after_words(
     };
     let mut quotes: Vec<Value> = serde_json::from_str(&quotes).map_err(bad)?;
     for quote in &mut quotes {
-        if !hide {
+        if sender {
             let what = match quote["reply"] == true {
                 true => "the reply to message",
                 false => "message",
@@ -16082,12 +16123,12 @@ fn start_locked(
 ) -> Result<Option<i64>> {
     let (images, (after, quotes)) = tx
         .prepare_cached(
-            "SELECT images,from_bot,from_turn,origin,person,quotes FROM messages WHERE id=?",
+            "SELECT images,from_bot,from_turn,origin,person,quotes,sent_ms FROM messages WHERE id=?",
         )?
         .query_row([turn], |r| {
             Ok((
                 r.get::<_, Option<String>>(0)?,
-                after_words(r, 1, bot.settings.hide_senders, &bot.name, turn)?,
+                after_words(r, 1, bot.settings.trailer(), &bot.name, turn)?,
             ))
         })?;
     let pictures = images_from(images.as_deref())?;
@@ -17769,6 +17810,24 @@ fn migrate_since_73(conn: &Connection, from: i32) -> Result<()> {
             clock_timed_turns(conn)?;
         }
     }
+    // Schema 99: what the line after a prompt's words names is a list,
+    // `trailer`; a bot that hid its senders names nothing.
+    if from < 99 {
+        conn.execute_batch(
+            "UPDATE bots SET settings=CASE WHEN json_extract(settings,'$.hide_senders')
+                 THEN json_set(json_remove(settings,'$.hide_senders'),'$.trailer',json('[]'))
+                 ELSE json_remove(settings,'$.hide_senders') END
+             WHERE json_type(settings,'$.hide_senders') IS NOT NULL;
+             UPDATE bots SET configure_pending=json_set(json_remove(configure_pending,'$.settings.hide_senders'),
+                 '$.settings.trailer',CASE WHEN json_extract(configure_pending,'$.settings.hide_senders')
+                 THEN json('[]') END)
+             WHERE json_type(configure_pending,'$.settings.hide_senders') IS NOT NULL;
+             UPDATE bots SET creation=CASE WHEN json_extract(creation,'$.request.settings.hide_senders')
+                 THEN json_set(json_remove(creation,'$.request.settings.hide_senders'),'$.request.settings.trailer',json('[]'))
+                 ELSE json_remove(creation,'$.request.settings.hide_senders') END
+             WHERE json_type(creation,'$.request.settings.hide_senders') IS NOT NULL;",
+        )?;
+    }
 
     Ok(())
 }
@@ -18923,7 +18982,7 @@ mod tests {
             writable: vec!["/".into()],
             network: true,
             outputs: Some("/".into()),
-            hide_senders: true,
+            trailer: Some(vec![Trailer::Time]),
             hold_ms: Some(1),
             quiet_background: true,
             max_rounds: Some(1),

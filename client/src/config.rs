@@ -8,7 +8,7 @@
 //! provider = "chatgpt"          # the daemon's, with no AGENT_PROVIDER; an edit applies to its next turns
 //! web_search = "disabled"       # "live", the default, lets new agents search and fetch
 //! web_search_off = ["bedrock-openai/xai.*"]  # models a new agent gets no search on, * and ? wildcards
-//! senders = "hidden"            # "shown", the default, labels what agents send
+//! trailer = ["sender", "time"]  # what the line after each message names for a new agent's model; [] none
 //! attach_wait = "1d"            # how long an attached note waits for a call, the default; "0" as long as it takes
 //! hold = "5d"                   # how long a new agent's turn waits on a cause you can fix before it fails, the default; "0" fails at once
 //! prices = "~/sheets/llm.toml"  # the price sheet /usage costs from, ~/.agent/prices.toml by default; see `prices`
@@ -142,10 +142,11 @@ pub struct Config {
     /// offers it, for a model the provider's hosted search refuses (Grok
     /// on Bedrock Mantle). It still fetches pages.
     pub web_search_off: Vec<String>,
-    /// Whether a new agent's model reads what another agent or a client
-    /// sent it with no line naming the sender: `senders = "hidden"`;
-    /// `"shown"`, the default, names it.
-    pub hide_senders: bool,
+    /// `trailer`: what the line after each message's words names for a
+    /// new agent's model, `sender` and `time`, as the bot setting of that
+    /// name; unset leaves each client's own (the CLI the daemon's, the
+    /// sender alone; Sonny both), and an empty list adds no line.
+    pub trailer: Option<Vec<String>>,
     /// `attach_wait`: how long a message sent with delivery attach waits
     /// for a call to take it in before it goes as a steer, in
     /// milliseconds; unset is `ATTACH_WAIT_MS`, and 0 waits as long as it
@@ -1457,12 +1458,21 @@ fn parse(text: &str) -> Result<Config, String> {
             }
             continue;
         }
-        if name == "senders" {
-            config.hide_senders = match string(name, value)?.as_str() {
-                "shown" => false,
-                "hidden" => true,
-                other => return Err(format!("senders is shown or hidden, not {other}")),
-            };
+        if name == "trailer" {
+            let parts = value
+                .as_array()
+                .ok_or("trailer is a list of sender and time")?;
+            let mut trailer = Vec::new();
+            for part in parts {
+                match part.as_str() {
+                    Some(part @ ("sender" | "time")) => trailer.push(part.to_owned()),
+                    Some(other) => {
+                        return Err(format!("trailer lists sender and time, not {other}"));
+                    }
+                    None => return Err("trailer is a list of sender and time".into()),
+                }
+            }
+            config.trailer = Some(trailer);
             continue;
         }
         if name == "hold" {
@@ -2784,7 +2794,7 @@ mod tests {
         ] {
             assert!(parse(bad).is_err(), "{bad}");
         }
-        assert!(!config.hide_senders);
+        assert_eq!(config.trailer, None);
         assert_eq!(config.sonny.side_chat, SideChat::Fork);
         let answer = parse("[sonny]\nside_chat = \"answer\"").unwrap();
         assert_eq!(answer.sonny.side_chat, SideChat::Answer);
@@ -2804,8 +2814,11 @@ mod tests {
         assert!(!config.sonny.chime && !config.sonny.verbose);
         let loud = parse("[sonny]\nchime = true\nverbose = true").unwrap();
         assert!(loud.sonny.chime && loud.sonny.verbose);
-        assert!(parse("senders = \"hidden\"").unwrap().hide_senders);
-        assert!(!parse("senders = \"shown\"").unwrap().hide_senders);
+        assert_eq!(
+            parse("trailer = [\"sender\", \"time\"]").unwrap().trailer,
+            Some(vec!["sender".to_owned(), "time".to_owned()])
+        );
+        assert_eq!(parse("trailer = []").unwrap().trailer, Some(Vec::new()));
         let fallbacks = parse("[fallbacks]\n\"a/big\" = \"a/other\"\n")
             .unwrap()
             .fallbacks;
@@ -2941,7 +2954,11 @@ mod tests {
                 "web_search is live or disabled, not cached",
             ),
             ("web_search = false", "web_search must be a string"),
-            ("senders = \"off\"", "senders is shown or hidden, not off"),
+            (
+                "trailer = [\"who\"]",
+                "trailer lists sender and time, not who",
+            ),
+            ("trailer = \"time\"", "trailer is a list of sender and time"),
             (
                 "[sonny]\nchime = \"no\"",
                 "sonny.chime must be true or false",

@@ -5,7 +5,7 @@ use agent_runtime::{
     store::{
         Answered, ApprovalPolicy, Binding, Blocked, Bot, CacheTtl, CompactionPlan, ContextUsage,
         Counts, Database, Decision, Delivery, Fork, Gate, Gated, Halt, Halted, Lifted, Limit,
-        Planning, ProcessKind, QuoteRef, Settings, Strip, TurnBudget, TurnOptions, Wake,
+        Planning, ProcessKind, QuoteRef, Settings, Strip, Trailer, TurnBudget, TurnOptions, Wake,
     },
     tools::{Declared, Inherit, Outcome},
 };
@@ -3085,11 +3085,11 @@ fn a_quote_names_a_turn_that_has_the_words() {
 }
 
 #[test]
-fn a_bot_that_hides_senders_reads_quoted_words_without_their_lines() {
+fn a_bot_with_no_trailer_reads_quoted_words_without_their_lines() {
     let mut db = db();
     db.create("Bob", Some("/synthetic"), binding()).unwrap();
     let mut quiet = binding();
-    quiet.settings.hide_senders = true;
+    quiet.settings.trailer = Some(Vec::new());
     db.create("Carol", Some("/synthetic"), quiet).unwrap();
     let asked = db
         .begin(
@@ -4172,11 +4172,11 @@ fn schema_68_events_had_no_times() {
 }
 
 #[test]
-fn a_bot_that_hides_senders_reads_only_the_words() {
+fn a_bot_with_no_trailer_reads_only_the_words() {
     let mut db = db();
     db.create("Bob", Some("/synthetic"), binding()).unwrap();
     let mut quiet = binding();
-    quiet.settings.hide_senders = true;
+    quiet.settings.trailer = Some(Vec::new());
     db.create("Carol", Some("/synthetic"), quiet).unwrap();
     let person = db
         .begin(
@@ -4210,8 +4210,70 @@ fn a_bot_that_hides_senders_reads_only_the_words() {
         json!([{"type": "input_text", "text": "delegated work"}])
     );
     assert_eq!(
-        db.inspect("Carol").unwrap().settings.resolved()["hide_senders"],
-        true
+        db.inspect("Carol").unwrap().settings.resolved()["trailer"],
+        json!([])
+    );
+}
+
+#[test]
+fn a_bot_whose_trailer_names_the_time_reads_when_each_message_was_sent() {
+    let mut db = db();
+    db.create("Bob", Some("/synthetic"), binding()).unwrap();
+    let mut timed = binding();
+    timed.settings.trailer = Some(vec![Trailer::Sender, Trailer::Time]);
+    db.create("Carol", Some("/synthetic"), timed).unwrap();
+    let mut clock = binding();
+    clock.settings.trailer = Some(vec![Trailer::Time]);
+    db.create("Dan", Some("/synthetic"), clock).unwrap();
+    let person = db
+        .begin(
+            "Bob",
+            "p1",
+            "work",
+            true,
+            &TurnOptions::default(),
+            allow_provider,
+        )
+        .unwrap()
+        .turn;
+    let from_bob = TurnOptions {
+        from: Some(("Bob".into(), person)),
+        ..TurnOptions::default()
+    };
+    let line = |db: &mut Database, bot: &str, options: &TurnOptions| {
+        let started = db
+            .begin(bot, "b1", "delegated work", true, options, allow_provider)
+            .unwrap();
+        let node = started.entry.unwrap()["data"]["node"].as_i64().unwrap();
+        let item = read_item(db, bot, node).unwrap();
+        assert_eq!(item["content"][0]["text"], "delegated work");
+        item["content"][1]["text"].as_str().unwrap().to_owned()
+    };
+    // Who wrote it, then when, in the daemon's local time.
+    let said = line(&mut db, "Carol", &from_bob);
+    let sent = said
+        .strip_prefix("[Message Carol/")
+        .and_then(|rest| rest.split_once(", written by the agent Bob in Bob/"))
+        .and_then(|(_, rest)| rest.split_once(", not by a person. Sent "))
+        .map(|(_, when)| when)
+        .unwrap_or_else(|| panic!("{said}"));
+    let when = sent.strip_suffix(".]").unwrap_or_else(|| panic!("{said}"));
+    let (day, zone) = when.split_once(", UTC").unwrap_or_else(|| panic!("{said}"));
+    assert_eq!(day.split(' ').count(), 5, "{said}");
+    assert_eq!(zone.len(), 6, "{said}");
+    // The time alone: no sender.
+    let said = line(&mut db, "Dan", &from_bob);
+    assert!(said.starts_with("[Message Dan/"), "{said}");
+    assert!(!said.contains("written by"), "{said}");
+    assert!(said.contains(". Sent ") && said.ends_with(".]"), "{said}");
+    assert_eq!(
+        db.inspect("Dan").unwrap().settings.resolved()["trailer"],
+        json!(["time"])
+    );
+    // The default names the sender alone.
+    assert_eq!(
+        db.inspect("Bob").unwrap().settings.resolved()["trailer"],
+        json!(["sender"])
     );
 }
 
@@ -5337,7 +5399,7 @@ fn a_bot_keeps_its_settings_and_a_fork_copies_them() {
         serde_json::to_value(&bob).unwrap()["settings"],
         json!({"context_bytes":4096,"context_items":4096,"note_turns":48,"compact_at":75,
             "compact_keep":25,"compact_tokens":null,"keep_turns":1,"max_rounds":null,"max_drops":3,"approval_hold_ms":2000,"max_output_tokens":null,
-            "cache_ttl":"1h","speed":"fast","sandbox":null,"writable":[],"network":false,"outputs":null,"hide_senders":false,
+            "cache_ttl":"1h","speed":"fast","sandbox":null,"writable":[],"network":false,"outputs":null,"trailer":["sender"],
             "quiet_background":false,"hold_ms":432000000,"unix_sockets":[],"rules":null,"env":{},
             "approval_policy":null})
     );
@@ -11123,6 +11185,50 @@ fn schema_46_settings_keep_turns_as_prune_names_it() {
         .filter(|event| event["event"] == "turn_finished")
         .count();
     assert_eq!(finished, 1);
+    drop(db);
+    std::fs::remove_file(path).unwrap();
+}
+
+#[test]
+fn schema_98_hidden_senders_become_an_empty_trailer() {
+    let path = std::env::temp_dir().join(format!("agent-schema98-{}.sqlite", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+    let quiet = Settings {
+        trailer: Some(Vec::new()),
+        ..Settings::default()
+    };
+    let made = |settings: &Settings| Binding {
+        settings: settings.clone(),
+        request_id: Some("once"),
+        starts_line: false,
+        ..binding()
+    };
+    {
+        let mut db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
+        db.create("Bob", Some("/synthetic"), made(&quiet)).unwrap();
+        db.create("Carol", Some("/synthetic"), made(&Settings::default()))
+            .unwrap();
+    }
+    // Before 99 a bot hid its senders with `hide_senders`, in its settings,
+    // its creation and a change kept for its turn's end.
+    Connection::open(&path)
+        .unwrap()
+        .execute_batch(
+            "UPDATE bots SET settings='{\"hide_senders\":true}',
+             creation=json_set(json_remove(creation,'$.request.settings.trailer'),'$.request.settings.hide_senders',json('true'))
+             WHERE name='Bob';
+             UPDATE bots SET configure_pending='{\"settings\":{\"hide_senders\":true}}' WHERE name='Carol';
+             PRAGMA user_version=98;",
+        )
+        .unwrap();
+    let mut db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
+    // It names nothing, and a resend of its creation is still the same request.
+    let (again, event) = db.create("Bob", Some("/synthetic"), made(&quiet)).unwrap();
+    assert_eq!((again.settings, event), (quiet, None));
+    assert_eq!(
+        db.inspect("Carol").unwrap().configure_pending,
+        Some(json!({"settings": {"trailer": []}}))
+    );
     drop(db);
     std::fs::remove_file(path).unwrap();
 }

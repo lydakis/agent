@@ -125,11 +125,12 @@ class Client:
             event = {**event, 'data': {**event['data'], 'status': 'taken', 'turn': event['turn']}}
         return event
 
-    def summarized(self, bot, timeout=5):
+    def summarized(self, bot, timeout=5, turn=None):
         """Wait for the summary a turn of `bot` started as it ended to land,
-        installed or not. The message stays among the saved ones."""
+        installed or not: `turn`'s, when it is named. The message stays
+        among the saved ones."""
         def landed(message):
-            if message.get('bot') != bot:
+            if message.get('bot') != bot or turn not in (None, message.get('turn')):
                 return False
             if message.get('event') == 'compaction_failed':
                 # One a request of its own follows is not the end of it.
