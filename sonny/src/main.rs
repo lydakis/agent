@@ -3104,11 +3104,20 @@ fn tilde(path: &str) -> String {
     }
 }
 
+/// A name no other call makes, in this process or another: two calls in
+/// the same millisecond differ by their count. A request id made here is
+/// the daemon's idempotency key, so two requests must never share one.
 fn unique(prefix: &str) -> String {
+    static COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default();
-    format!("{prefix}-{}-{}", now.as_millis(), std::process::id())
+    let count = COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    format!(
+        "{prefix}-{}-{}-{count}",
+        now.as_millis(),
+        std::process::id()
+    )
 }
 
 /// The agent a side chat is a copy of, from the name `/side` gives it,
@@ -18247,6 +18256,14 @@ fn zen_notice(on: bool) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Request ids made in one millisecond, as two reactions sent back to
+    /// back, are still two requests to the daemon.
+    #[test]
+    fn names_made_in_the_same_millisecond_differ() {
+        let names: std::collections::HashSet<_> = (0..1000).map(|_| unique("acp")).collect();
+        assert_eq!(names.len(), 1000);
+    }
 
     #[test]
     fn an_env_file_that_sets_agent_s_own_names_is_told_they_are_not_read() {
