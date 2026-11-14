@@ -741,7 +741,13 @@ impl View {
             true => "c hide cached",
             false => "c show cached",
         };
-        format!("d/w/m period · {scope} · {cached} · esc close")
+        let pair = |said: &'static str| said.split_once(' ').unwrap_or((said, ""));
+        let (scope, cached) = (pair(scope), pair(cached));
+        (crate::hint::Keys::new().key("d/w/m", "period"))
+            .key(scope.0, scope.1)
+            .key(cached.0, cached.1)
+            .esc(crate::hint::Esc::Close)
+            .text()
     }
 }
 

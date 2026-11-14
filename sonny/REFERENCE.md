@@ -1861,7 +1861,12 @@ redraws it by hand, as in a shell.
 With nothing typed, `?` lists every key beside the conversation. Every
 hint on screen is written one way, as Codex writes them: the key, then
 what it does muted, `·` between them (`↑↓ pick · enter open · esc
-close`). Every list over the composer (the slash menu, `/model`,
+close`). Each view names its keys once, and the same few words say what
+`esc` and `enter` do everywhere: `esc` closes, goes back, cancels, or
+leaves a question for your own words; `enter` opens, runs, chooses, goes
+on, saves, or says a confirm's own verb (`enter compact`). A line too
+long for its row drops pairs from the right, keeping `esc`, then
+`enter`. Every list over the composer (the slash menu, `/model`,
 `/switch`, `/new`, `/permissions`, `/fast`, `/retry`, a reply to react to
 or answer, Ctrl+R) is one list: up to 8 rows under a blank one, the pick
 in reverse video, `•` before what is in effect, and its keys where the

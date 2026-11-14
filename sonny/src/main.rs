@@ -3948,12 +3948,14 @@ const SHORTCUTS: [(&str, &str); 21] = [
 
 /// The slash menu's keys, while it is open: Tab completes the pick's name
 /// until it is whole.
-fn menu_keys(menu: &[(&str, &str, Vec<usize>)], pick: usize, typed: &str) -> Option<&'static str> {
+fn menu_keys(menu: &[(&str, &str, Vec<usize>)], pick: usize, typed: &str) -> Option<hint::Keys> {
     let picked = menu.get(pick.min(menu.len().checked_sub(1)?))?.0;
-    Some(match typed == picked {
-        true => "  ↑↓ pick · enter run · esc close",
-        false => "  ↑↓ pick · tab complete · enter run · esc close",
-    })
+    let keys = hint::Keys::new().pick().enter(hint::Enter::Run);
+    let keys = match typed == picked {
+        true => keys,
+        false => keys.key("tab", "complete"),
+    };
+    Some(keys.esc(hint::Esc::Close))
 }
 
 use needs::Seen;
@@ -4134,7 +4136,8 @@ impl Search {
     /// find, then the keys; and the column the cursor goes in.
     fn keys(&self) -> (Line<'static>, u16) {
         let mut keys = vec![Span::raw(SEARCH_LABEL).dim(), Span::raw(self.typed.clone())];
-        keys.extend(hint::spans("  ↑↓ pick · enter edit · esc cancel"));
+        let pick = hint::Keys::new().pick().enter(hint::Enter::Choose);
+        keys.extend(hint::spans(&format!("  {}", pick.esc(hint::Esc::Cancel))));
         let cursor = SEARCH_LABEL.width() + self.typed.width();
         (Line::from(keys), cursor as u16)
     }
@@ -16895,7 +16898,7 @@ impl App {
                         Line::from(spans).style(line.style)
                     })
                     .collect();
-                pane.set_card(lines, view.keys());
+                pane.set_card(lines, &view.keys());
                 pane.foot = view.footer();
                 if view.reading() {
                     // A thread just opened starts at its top, after the
@@ -17099,7 +17102,9 @@ impl App {
                     _ => "  ".to_owned(),
                 };
                 let mut keys = vec![Span::raw(place)];
-                keys.extend(hint::spans("↑ older · ↓ newer · esc stop"));
+                let search =
+                    (hint::Keys::new().key("↑", "older").key("↓", "newer")).esc(hint::Esc::Close);
+                keys.extend(hint::spans(&search.text()));
                 let keys = Line::from(keys);
                 frame.render_widget(Paragraph::new(keys), footer);
                 return;
@@ -17122,17 +17127,20 @@ impl App {
                 let (asked, keys) = match self.quoting {
                     true => (
                         "which reply to answer? type to narrow",
-                        "  ↑↓ pick · enter quote · esc close",
+                        hint::Keys::new().pick().enter(hint::Enter::Choose),
                     ),
                     false => (
                         "which reply to react to? type to narrow",
-                        "  ↑↓ pick · enter react · esc close",
+                        hint::Keys::new().pick().enter(hint::Enter::Choose),
                     ),
                 };
                 let (line, cursor) = list.line(asked);
                 frame.render_widget(Paragraph::new(line), composer);
                 frame.set_cursor_position((composer.x + cursor, composer.y));
-                let keys = Line::from(hint::spans(keys));
+                let keys = Line::from(hint::under(
+                    &keys.esc(hint::Esc::Close),
+                    footer.width.into(),
+                ));
                 frame.render_widget(Paragraph::new(keys), footer);
                 return;
             }
@@ -17185,7 +17193,11 @@ impl App {
                 let (line, cursor) = list.line("speed for this agent");
                 frame.render_widget(Paragraph::new(line), composer);
                 frame.set_cursor_position((composer.x + cursor, composer.y));
-                let keys = Line::from(hint::spans("  ↑↓ pick · enter choose · esc close"));
+                let keys = hint::Keys::new().pick().enter(hint::Enter::Choose);
+                let keys = Line::from(hint::under(
+                    &keys.esc(hint::Esc::Close),
+                    footer.width.into(),
+                ));
                 frame.render_widget(Paragraph::new(keys), footer);
                 return;
             }
@@ -17201,7 +17213,11 @@ impl App {
                     Span::raw(" It can't be undone.").dim(),
                 ]);
                 frame.render_widget(Paragraph::new(line), composer);
-                let keys = Line::from(hint::spans("  enter compact · esc cancel"));
+                let keys = hint::Keys::new().enter(hint::Enter::Confirm("compact"));
+                let keys = Line::from(hint::under(
+                    &keys.esc(hint::Esc::Cancel),
+                    footer.width.into(),
+                ));
                 frame.render_widget(Paragraph::new(keys), footer);
                 return;
             }
@@ -17230,7 +17246,11 @@ impl App {
                 let (line, cursor) = list.line("permissions");
                 frame.render_widget(Paragraph::new(line), composer);
                 frame.set_cursor_position((composer.x + cursor, composer.y));
-                let keys = Line::from(hint::spans("  ↑↓ pick · enter choose · esc close"));
+                let keys = hint::Keys::new().pick().enter(hint::Enter::Choose);
+                let keys = Line::from(hint::under(
+                    &keys.esc(hint::Esc::Close),
+                    footer.width.into(),
+                ));
                 frame.render_widget(Paragraph::new(keys), footer);
                 return;
             }
@@ -17292,7 +17312,7 @@ impl App {
                 let (line, cursor) = list.line(&making.asked());
                 frame.render_widget(Paragraph::new(line), composer);
                 frame.set_cursor_position((composer.x + cursor, composer.y));
-                let keys = Line::from(hint::spans(making.keys()));
+                let keys = Line::from(hint::under(&making.keys(), footer.width.into()));
                 frame.render_widget(Paragraph::new(keys), footer);
                 return;
             }
@@ -17314,8 +17334,9 @@ impl App {
                 let (line, cursor) = agents.line("type to narrow");
                 frame.render_widget(Paragraph::new(line), composer);
                 frame.set_cursor_position((composer.x + cursor, composer.y));
-                let keys = "  ↑↓ pick · enter switch · esc close";
-                frame.render_widget(Paragraph::new(Line::from(hint::spans(keys))), footer);
+                let keys = hint::Keys::new().pick().enter(hint::Enter::Open);
+                let keys = hint::under(&keys.esc(hint::Esc::Close), footer.width.into());
+                frame.render_widget(Paragraph::new(Line::from(keys)), footer);
                 return;
             }
             if let Some(picker) = &self.picker {
@@ -17361,9 +17382,12 @@ impl App {
                     Span::raw("  effort ").dim(),
                     Span::raw(format!("‹ {effort} ›")).bold(),
                 ];
-                keys.extend(hint::spans(
-                    "  ↑↓ pick · ←→ effort · enter switch · esc close",
-                ));
+                let pick = (hint::Keys::new().pick().enter(hint::Enter::Choose))
+                    .key("←→", "effort")
+                    .esc(hint::Esc::Close);
+                let room =
+                    usize::from(footer.width).saturating_sub(Line::from(keys.clone()).width());
+                keys.extend(hint::under(&pick, room));
                 let keys = Line::from(keys);
                 frame.render_widget(Paragraph::new(keys), footer);
                 return;
@@ -17418,7 +17442,10 @@ impl App {
             // The menu's keys while it is open, as every list over the
             // composer has them, saying what Enter does with the pick.
             let (line, opens) = match menu_keys(&menu, self.pick, &self.input) {
-                Some(keys) => (Line::from(hint::spans(keys)), Vec::new()),
+                Some(keys) => (
+                    Line::from(hint::under(&keys, footer.width.into())),
+                    Vec::new(),
+                ),
                 None => self.footer(width.min(measure())),
             };
             frame.render_widget(Paragraph::new(line), footer);
@@ -17554,10 +17581,21 @@ impl App {
                     self.asks.len(),
                     width.saturating_sub(prompt::LEAD),
                 ),
-                _ if self.new_brief() => said("What should it do?", "enter start · esc back"),
-                _ if self.react_to.is_some() => said("An emoji for that reply", "esc cancel"),
+                _ if self.new_brief() => said(
+                    "What should it do?",
+                    &(hint::Keys::new().enter(hint::Enter::Confirm("start")))
+                        .esc(hint::Esc::Back)
+                        .text(),
+                ),
+                _ if self.react_to.is_some() => said(
+                    "An emoji for that reply",
+                    &hint::Keys::new().esc(hint::Esc::Cancel).text(),
+                ),
                 // Answered with its keys, until Esc sets it aside.
-                _ if self.waiting().is_some() => said("An approval waits", "esc type a message"),
+                _ if self.waiting().is_some() => said(
+                    "An approval waits",
+                    &hint::Keys::new().esc(hint::Esc::WriteInstead).text(),
+                ),
                 _ if self.calls_waiting().1 > 0 => said("A message of your own", "enter approval"),
                 _ if !self.asks.is_empty() => said("A message of your own", "esc answer"),
                 Some(_) => vec![Span::raw(format!("Steer {name}")).dim()],
@@ -18203,10 +18241,10 @@ fn group_key(group: status::Group) -> &'static str {
 /// The keys `/status`'s title row names: the picks, then the key of
 /// each group that folds there (`keys`), as it would change it.
 fn status_keys(watch: &Watch, keys: &[&str]) -> String {
-    let mut said = String::from("↑↓ pick · enter open");
+    let mut said = hint::Keys::new().pick().enter(hint::Enter::Open);
     for key in keys {
         if *key == "→" {
-            said.push_str(" · →← helpers");
+            said = said.key("→←", "helpers");
             continue;
         }
         let group = match *key {
@@ -18221,14 +18259,13 @@ fn status_keys(watch: &Watch, keys: &[&str]) -> String {
             status::Group::Idle => "idle",
             _ => "done",
         };
-        said.push_str(&format!(" · {key} {verb} {name}"));
+        said = said.key(*key, format!("{verb} {name}"));
     }
-    said.push_str(match watch.more {
-        true => " · m less",
-        false => " · m more",
-    });
-    said.push_str(" · esc close");
-    said
+    let more = match watch.more {
+        true => "less",
+        false => "more",
+    };
+    said.key("m", more).esc(hint::Esc::Close).text()
 }
 
 /// Codex's sweep: a brighter band moving across the phase every two seconds.
@@ -28271,7 +28308,7 @@ mod tests {
         let (keys, cursor) = app.searching.as_ref().unwrap().keys();
         assert_eq!(
             keys.to_string(),
-            "  find fix  ↑↓ pick · enter edit · esc cancel"
+            "  find fix  ↑↓ pick · enter choose · esc cancel"
         );
         assert_eq!(cursor, 10);
         // Ctrl+R again goes further back, as a shell's does.
@@ -28342,10 +28379,10 @@ mod tests {
         };
         app.input.set("/co");
         assert_eq!(first(&app), ["/compact", "/commons", "/context", "/config"]);
-        let keys = |app: &App| menu_keys(&app.menu(), app.pick, &app.input);
+        let keys = |app: &App| menu_keys(&app.menu(), app.pick, &app.input).map(|k| k.text());
         assert_eq!(
             keys(&app),
-            Some("  ↑↓ pick · tab complete · enter run · esc close")
+            Some("↑↓ pick · enter run · tab complete · esc close".to_owned())
         );
         // Enter on part of its name picks /compact as any other command,
         // and it asks first; any key but Enter keeps the conversation.
@@ -28361,7 +28398,10 @@ mod tests {
         assert!(app.input.is_empty(), "the key that said no is not typed");
         // Typed whole, it asks too; Enter compacts.
         app.input.set("/compact");
-        assert_eq!(keys(&app), Some("  ↑↓ pick · enter run · esc close"));
+        assert_eq!(
+            keys(&app),
+            Some("↑↓ pick · enter run · esc close".to_owned())
+        );
         app.key(enter()).await;
         assert!(app.confirming && !compacted());
         app.key(enter()).await;
@@ -28377,7 +28417,7 @@ mod tests {
         assert_eq!(first(&app)[0], "/copy");
         assert_eq!(
             keys(&app),
-            Some("  ↑↓ pick · tab complete · enter run · esc close")
+            Some("↑↓ pick · enter run · tab complete · esc close".to_owned())
         );
         // Its letters in order find a command.
         app.input.set("/cms");

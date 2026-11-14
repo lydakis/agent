@@ -5001,7 +5001,7 @@ const RETRY: Duration = Duration::from_secs(3);
 /// What the keys do in `sonny sky`.
 const KEYS: &str = "↑↓←→ pick · m models · r replay · z zen · ? legend · q quit";
 /// A replay's keys, in the title's place.
-pub const REPLAY_KEYS: &str = "space pause · ←→ step · [ ] speed · esc live";
+pub const REPLAY_KEYS: &str = "space pause · ←→ step · [ ] speed · esc back";
 
 /// `sonny sky`: the same sky, the whole terminal, on its own, to keep
 /// beside the work as btop is kept: its title and the keys over it, the

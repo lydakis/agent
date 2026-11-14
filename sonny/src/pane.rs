@@ -790,19 +790,18 @@ fn hint_at(keys: &str, said: &str) -> Option<(u16, u16)> {
 
 /// `keys`, padded as the title holds them, in at most `room` columns. "← back"
 /// goes first, since the ‹ beside the name already says it; then the pairs
-/// before the last, from the one before it, so esc, which every view names
-/// last, stays while anything does.
+/// go as every key line's do ([`crate::hint::fit`]): from the right, `esc`
+/// staying, then `enter`.
 fn fit_keys(keys: &str, room: usize) -> String {
-    let mut pairs: Vec<&str> = keys.trim().split(" · ").collect();
-    let said = |pairs: &[&str]| format!("  {} ", pairs.join(" · "));
-    while said(&pairs).width() > room && pairs.len() > 1 {
-        let at = match pairs.iter().position(|pair| *pair == "← back") {
-            Some(at) if at + 1 < pairs.len() => at,
-            _ => pairs.len() - 2,
-        };
-        pairs.remove(at);
+    let said = |keys: &str| format!("  {keys} ");
+    let mut keys = keys.trim().to_owned();
+    if said(&keys).width() > room && keys.contains(" · ") {
+        keys = (keys.split(" · "))
+            .filter(|pair| *pair != "← back")
+            .collect::<Vec<_>>()
+            .join(" · ");
     }
-    said(&pairs)
+    said(&crate::hint::fit(&keys, room.saturating_sub(3)))
 }
 
 /// The path and line a `file://` address names, its `%XX` escapes read.

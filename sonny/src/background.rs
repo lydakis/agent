@@ -867,22 +867,24 @@ impl View {
     /// What the keys do, as the pane's title says it: the picked row's,
     /// or the removal's while it waits to be confirmed.
     pub fn keys(&self) -> String {
+        use crate::hint::{Esc, Keys};
         if self.confirm.is_some() {
-            return "d remove · esc keep".into();
+            return Keys::new().key("d", "remove").esc(Esc::Cancel).text();
         }
-        let mut keys = Vec::new();
+        let mut keys = Keys::new();
         if self.items.len() > 1 {
-            keys.push("↑↓ pick");
+            keys = keys.pick();
         }
         match self.items.get(self.selected) {
-            Some(item) if item.kind == Kind::Trigger => keys.extend(["r run now", "d remove"]),
+            Some(item) if item.kind == Kind::Trigger => {
+                keys = keys.key("r", "run now").key("d", "remove")
+            }
             Some(item) if !item.own && !matches!(item.kind, Kind::Server | Kind::Setup) => {
-                keys.push("d remove")
+                keys = keys.key("d", "remove")
             }
             _ => {}
         }
-        keys.push("esc close");
-        keys.join(" · ")
+        keys.esc(Esc::Close).text()
     }
 }
 
