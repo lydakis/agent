@@ -268,12 +268,12 @@ fn follows() -> Value {
     json!({
         "name": FOLLOWS,
         "description": "Your follows in the person's lookout, which watches agents for you and tells you \
-            what happens in them in a note starting \"Task updates\", since you last heard: every message \
+            what happens in them in a note starting \"Task updates\": every message \
             someone other than you writes in them, the person's quoted and others' by turn handle; questions \
             a task asked the person; turns waiting for an approval or silent for long; and turns that ended, \
             each with what it replied, its lines marked > (a task's own words, not the person's). Turns the \
-            person asked for in a task are listed apart. To read more of a turn, call wait once on its handle \
-            with timeout_ms 0. Each note joins your running turn, or starts one; the person sees neither unless \
+            person asked for in a task are listed apart. Read more of a turn with one wait call on its \
+            handle (timeout_ms 0). Each note joins your running turn, or starts one; the person sees neither unless \
             you reply. A \
             follow watches the tasks of a bot (every agent it or its tasks made) or bots by name. It also hears the \
             sources the person set up outside (a chat, a mailbox, a feed), each by name, in a note starting \
