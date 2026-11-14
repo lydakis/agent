@@ -494,12 +494,17 @@ fn any_written(
 /// Read the links [`escapes`] follows in these calls' paths, so that
 /// judging them reads no file: run off the runtime thread, before any
 /// round judges the calls. Each call is a tool's name and its arguments.
+/// `fresh` reads each link again, as a round that announces its calls
+/// does, so a link changed since an earlier round is seen; otherwise a
+/// link read before is kept, so a round resumed after its announcement
+/// judges as it was announced.
 pub fn learn<'a>(
     mode: Mode,
     root: Option<&Path>,
     writable: &[String],
     calls: impl IntoIterator<Item = (&'a str, &'a str)>,
     folder: &Path,
+    fresh: bool,
 ) {
     let writable = writable_paths(mode, root, writable);
     for (tool, arguments) in calls {
@@ -507,27 +512,43 @@ pub fn learn<'a>(
             continue;
         };
         any_written(tool, &arguments, |path| {
-            let named = lexical(&folder.join(path));
-            judged(&named, |dir| changeable(mode, &writable, dir), read_link);
+            if judgeable(path) {
+                let named = lexical(&folder.join(path));
+                let read = |path: &Path| read_link(path, fresh);
+                judged(&named, |dir| changeable(mode, &writable, dir), read);
+            }
             false
         });
     }
 }
 
-/// What a link found on the way to a write's path names, or `None` for a
-/// path that is no link (or can't be read), as [`learn`] read them off the
-/// runtime thread. Kept as found for the daemon's life: a link in a folder
-/// no bot can change stays put, and the round that announces a call, the
-/// store that records it and the run that starts it must judge it alike.
-/// At most [`KNOWN_KEPT`] paths; a path past those is judged as spelled.
-static KNOWN: std::sync::LazyLock<
-    std::sync::Mutex<std::collections::HashMap<PathBuf, Option<PathBuf>>>,
-> = std::sync::LazyLock::new(Default::default);
+/// Whether a write's path is one whose links are followed: one a write
+/// could name, of up to 4096 bytes (as the tools take) with no NUL byte.
+/// Any other is judged as spelled, and the tool refuses it anyway.
+fn judgeable(path: &str) -> bool {
+    path.len() <= 4096 && !path.contains('\0')
+}
 
-/// Paths [`KNOWN`] keeps, about 10 MB at most.
-const KNOWN_KEPT: usize = 1 << 16;
+/// What each link found on the way to a write's path names, or `None` for
+/// a path that is no link (or can't be read), as [`learn`] read them off
+/// the runtime thread, with the bytes the paths take. The round that
+/// announces a call reads its links again; the store that records it and
+/// the run that starts it judge from what that round read, so all agree.
+/// At most [`KNOWN_BYTES`] of paths; a path past those is judged as
+/// spelled.
+static KNOWN: std::sync::LazyLock<std::sync::Mutex<Known>> =
+    std::sync::LazyLock::new(Default::default);
 
-fn links() -> std::sync::MutexGuard<'static, std::collections::HashMap<PathBuf, Option<PathBuf>>> {
+#[derive(Default)]
+struct Known {
+    links: std::collections::HashMap<PathBuf, Option<PathBuf>>,
+    bytes: usize,
+}
+
+/// The paths [`KNOWN`] keeps, in bytes: tens of thousands of real ones.
+const KNOWN_BYTES: usize = 4 << 20;
+
+fn known() -> std::sync::MutexGuard<'static, Known> {
     KNOWN
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -535,22 +556,35 @@ fn links() -> std::sync::MutexGuard<'static, std::collections::HashMap<PathBuf, 
 
 /// The link at `path` as [`learn`] found it; `None` when not yet read.
 fn known_link(path: &Path) -> Option<Option<PathBuf>> {
-    links().get(path).cloned()
+    known().links.get(path).cloned()
 }
 
-/// The link at `path`, read from the file system and kept for
-/// [`known_link`]. Blocks: only [`learn`] calls it.
-fn read_link(path: &Path) -> Option<Option<PathBuf>> {
-    if let Some(known) = known_link(path) {
+/// The link at `path`, read from the file system (or, unless `fresh`, as
+/// read before) and kept for [`known_link`]. Blocks: only [`learn`] calls
+/// it.
+fn read_link(path: &Path, fresh: bool) -> Option<Option<PathBuf>> {
+    if !fresh && let Some(known) = known_link(path) {
         return Some(known);
     }
     let found = std::fs::symlink_metadata(path)
         .is_ok_and(|meta| meta.file_type().is_symlink())
         .then(|| std::fs::read_link(path).ok())
         .flatten();
-    let mut links = links();
-    if links.len() < KNOWN_KEPT {
-        links.insert(path.to_owned(), found.clone());
+    let size = |link: &Option<PathBuf>| link.as_ref().map_or(0, |to| to.as_os_str().len());
+    let mut known = known();
+    let Known { links, bytes } = &mut *known;
+    match links.get_mut(path) {
+        Some(kept) => {
+            *bytes = *bytes - size(kept) + size(&found);
+            *kept = found.clone();
+        }
+        None => {
+            let more = path.as_os_str().len() + size(&found);
+            if *bytes + more <= KNOWN_BYTES {
+                *bytes += more;
+                links.insert(path.to_owned(), found.clone());
+            }
+        }
     }
     Some(found)
 }
@@ -630,7 +664,9 @@ fn outside(
     let writable = writable_paths(mode, root, writable);
     let named = lexical(&folder.join(path));
     // A path whose links [`learn`] has not read is judged as spelled.
-    let target = judged(&named, |dir| changeable(mode, &writable, dir), known_link)
+    let target = judgeable(path)
+        .then(|| judged(&named, |dir| changeable(mode, &writable, dir), known_link))
+        .flatten()
         .unwrap_or_else(|| named.clone());
     // Inside as spelled or as followed: a folder may be given by a link.
     let inside = |dir: &Path| named.starts_with(dir) || target.starts_with(dir);
@@ -2575,7 +2611,7 @@ mod tests {
         let followed = |path: &Path| {
             // The test's folders are in the temporary folder, which every
             // bot writes: judged as if its links were in a fixed folder.
-            judged(path, fixed, read_link).unwrap()
+            judged(path, fixed, |path| read_link(path, true)).unwrap()
         };
         assert_eq!(
             followed(&real.join("fixed/me/project/a.txt")),
@@ -2597,6 +2633,19 @@ mod tests {
             judged(&unread, fixed, known_link),
             Some(project.join("a.txt"))
         );
+        // A link changed since is seen by the next round that reads again,
+        // and not by one that keeps what was read.
+        std::fs::remove_file(real.join("fixed/me")).unwrap();
+        std::os::unix::fs::symlink(real.join("fixed"), real.join("fixed/me")).unwrap();
+        let kept = judged(&unread, fixed, |path| read_link(path, false));
+        assert_eq!(kept, Some(project.join("a.txt")));
+        let again = judged(&unread, fixed, |path| read_link(path, true));
+        assert_eq!(again, Some(real.join("fixed/project/a.txt")));
+        assert_eq!(judged(&unread, fixed, known_link), again);
+        // A path no tool takes is never read or kept.
+        assert!(judgeable(&"a".repeat(4096)));
+        assert!(!judgeable(&"a".repeat(4097)));
+        assert!(!judgeable("a\0b"));
         let _ = std::fs::remove_dir_all(&base);
         // Read-only writes nowhere, so every write asks.
         assert!(super::escapes(

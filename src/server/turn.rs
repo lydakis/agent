@@ -3545,7 +3545,9 @@ impl Turn {
             record.sent = sent.or(record.sent);
             let name = self.bot.clone();
             let rules = self.rules();
-            learn_links(&record, &calls, &workspace).await;
+            // Read again for each round that announces calls: a link
+            // changed since an earlier round is seen.
+            learn_links(&record, &calls, &workspace, true).await;
             let gated = calls
                 .iter()
                 .any(|call| record.gated(call, &workspace, &rules));
@@ -4442,8 +4444,9 @@ impl Turn {
         summary_retry_ms: Option<u64>,
     ) -> Result<Option<Stop>> {
         let turn = self.turn;
-        // A round resumed after a restart has not read them yet.
-        learn_links(record, &calls, workspace).await;
+        // A round resumed after a restart has not read them yet; one just
+        // announced keeps what it read, so it runs as it was announced.
+        learn_links(record, &calls, workspace, false).await;
         let mut calls = calls.into_iter();
         while let Some(call) = calls.next() {
             // Nor any tool: the calls not yet started are answered as not
@@ -6708,9 +6711,9 @@ fn epoch_ms(at: tokio::time::Instant) -> u64 {
 
 /// Read off the runtime thread the links a sandboxed bot's writes pass
 /// on their way, so that judging the calls reads no file
-/// ([`agent_runtime::sandbox::learn`]).
-async fn learn_links(record: &Bot, calls: &[ToolCall], workspace: &std::path::Path) {
-    if let Some(learn) = record.links_to_learn(calls, workspace) {
+/// ([`agent_runtime::sandbox::learn`]); each again when `fresh`.
+async fn learn_links(record: &Bot, calls: &[ToolCall], workspace: &std::path::Path, fresh: bool) {
+    if let Some(learn) = record.links_to_learn(calls, workspace, fresh) {
         tokio::task::spawn_blocking(learn)
             .await
             .unwrap_or_else(|join| std::panic::resume_unwind(join.into_panic()));

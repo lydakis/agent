@@ -1088,12 +1088,14 @@ impl Bot {
         }
     }
     /// The reads [`crate::sandbox::learn`] makes for these calls, to run
-    /// off the runtime thread before any of them is judged; `None` when the
-    /// bot writes no folder of its own or no call writes a file.
+    /// off the runtime thread before any of them is judged, each link read
+    /// again when `fresh`; `None` when the bot writes no folder of its own
+    /// or no call writes a file.
     pub fn links_to_learn(
         &self,
         calls: &[ToolCall],
         workspace: &std::path::Path,
+        fresh: bool,
     ) -> Option<impl FnOnce() + Send + 'static> {
         use crate::sandbox::{Mode, learn};
         if self.settings.sandbox != Some(Mode::WorkspaceWrite) {
@@ -1123,6 +1125,7 @@ impl Bot {
                     .iter()
                     .map(|(tool, arguments)| (tool.as_str(), arguments.as_str())),
                 &folder,
+                fresh,
             );
         })
     }
