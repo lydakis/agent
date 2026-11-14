@@ -2268,8 +2268,12 @@ fn sky_cli(args: &[String]) -> Result<(), String> {
         }
     }
     let (store, socket) = daemon_paths(store, socket)?;
+    // Two workers, as a window has: on one, the connection's reader, which
+    // reads the past as fast as the daemon sends it, ran ahead of the
+    // follow taking it, and a sky of 400 agents let its connection go
+    // halfway through 40,000 past events and tried again 3 s later.
     let runtime = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(1)
+        .worker_threads(2)
         .enable_all()
         .build()
         .map_err(|e| e.to_string())?;
@@ -2521,10 +2525,7 @@ async fn run() -> Result<(), String> {
     // items instead of replayed events, so the replay is skipped. The bot
     // is read after that, so a turn that ended during the replay is seen
     // as ended.
-    client
-        .request("follow", json!({"bot": name, "after": 0}))
-        .await
-        .map_err(|e| e.to_string())?;
+    follow_bot(&client, &name).await?;
     let caught = caught_up(&mut events).await;
     let bot = client
         .request("inspect", json!({"bot": name}))
@@ -3248,6 +3249,30 @@ fn report_status(state: &str, bot: &str) {
     };
     let _ = write!(stdout, "\x1b]2;{title}\x07");
     let _ = stdout.flush();
+}
+
+/// Follow `bot` from the start of its turn before last: what the window
+/// needs of the replay ([`caught_up`]) is the context its last model round
+/// left, which that turn or the one after it holds, and a pause since the
+/// greeting. Its history is drawn from its items, so the events of every
+/// turn before, as many as the agent ever made, are not read again.
+async fn follow_bot(client: &Client, bot: &str) -> Result<(), String> {
+    let newest = client
+        .request("turns", json!({"bot": bot, "newest": true, "limit": 2}))
+        .await
+        .map_err(|e| e.to_string())?;
+    let since = (newest["turns"].as_array().into_iter().flatten())
+        .filter_map(|turn| turn["started_ms"].as_i64())
+        .min();
+    let follow = match since {
+        Some(since) => json!({"bot": bot, "since_ms": since}),
+        None => json!({"bot": bot, "after": 0}),
+    };
+    client
+        .request("follow", follow)
+        .await
+        .map(|_| ())
+        .map_err(|e| e.to_string())
 }
 
 /// Read past a follow's replay as it arrives, so a long one cannot fill
@@ -7362,10 +7387,7 @@ impl App {
         }
         let lead = async {
             let (client, mut fresh) = connect(&self.options, Asking::Never).await?;
-            client
-                .request("follow", json!({"bot": self.bot, "after": 0}))
-                .await
-                .map_err(|e| e.to_string())?;
+            follow_bot(&client, &self.bot).await?;
             let caught = caught_up(&mut fresh).await;
             // Read after the replay, so a turn that ends meanwhile arrives
             // as an event rather than lost between the two.
@@ -19460,6 +19482,42 @@ mod tests {
         app.status_rows().await.unwrap();
         assert_eq!(histories.load(Ordering::SeqCst), 259);
         assert_eq!(turn_reads.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn a_window_follows_its_agent_from_its_turn_before_last_not_its_first_event() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let follows = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (seen, fresh) = (follows.clone(), Arc::new(AtomicBool::new(false)));
+        let new = fresh.clone();
+        let client =
+            daemon_answering(
+                move |asked| match asked["op"].as_str().unwrap_or_default() {
+                    // Newest first: one running, the one before it ended.
+                    "turns" if new.load(Ordering::SeqCst) => {
+                        json!({"turns": [], "next_before": null})
+                    }
+                    "turns" => {
+                        json!({"turns": [{"turn": 9, "status": "running", "started_ms": 9_000},
+                {"turn": 7, "status": "completed", "started_ms": 7_000}], "next_before": 7})
+                    }
+                    "follow" => {
+                        seen.lock().unwrap().push(asked.clone());
+                        json!({})
+                    }
+                    _ => json!({"error": {"code": "unexpected", "message": asked.to_string()}}),
+                },
+            )
+            .await;
+        follow_bot(&client, "shop.lead").await.unwrap();
+        // An agent that ran no turn yet has no events to skip.
+        fresh.store(true, Ordering::SeqCst);
+        follow_bot(&client, "shop.lead").await.unwrap();
+        let follows = follows.lock().unwrap();
+        assert_eq!(follows[0]["since_ms"], 7_000);
+        assert!(follows[0]["after"].is_null());
+        assert_eq!(follows[1]["after"], 0);
+        assert!(follows[1]["since_ms"].is_null());
     }
 
     #[tokio::test]
