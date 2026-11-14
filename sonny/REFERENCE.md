@@ -825,12 +825,15 @@ has something on it, or is off the screen, no time shows.
   lists, each by its name and provider (`Opus 5.5 · bedrock`) with its id
   muted after them, found by either, its effort and its speed, and writes
   the model and effort to the project's `.agents/project.toml` when the
-  folder has one. ←/→ step the effort; Tab moves them to the speed and
-  back: standard, then each faster tier the picked model serves, `fast`
-  (Claude's fast mode, OpenAI's priority tier) and `ultrafast`, each at a
-  higher price per token. A model served at standard alone, as Bedrock
-  serves Claude, has no speed row. The footer names the speed after the
-  effort. A pick made while a turn runs shows in the footer and applies
+  folder has one. It always opens with ←/→ on the effort; Tab moves them
+  to the speed and back: standard, then each faster tier the picked model
+  serves, `fast` (Claude's fast mode, OpenAI's priority tier) and
+  `ultrafast`, each at a higher price per token. `‹ ›` sit only on the
+  value ←/→ change. A model served at standard alone, as Bedrock serves
+  Claude, has no speed row, and ←/→ go back to the effort; moving to a
+  model that lacks the picked speed shows standard. A click on `effort` or
+  `speed` moves ←/→ there, and a click on `‹` or `›` steps it. The footer
+  names the speed after the effort. A pick made while a turn runs shows in the footer and applies
   when the lead is idle; one that another client overtakes is dropped.
   The tasks an agent starts on its own model run at its speed, as its
   helpers do at theirs, unless `threads_speed` or `[sonny] task_speed`

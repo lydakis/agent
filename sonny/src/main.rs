@@ -4483,6 +4483,8 @@ struct App {
     /// What a click opens around the composer, by row and columns: the
     /// footer's counts, and the agent the composer's guess came from.
     opens_at: Vec<(u16, std::ops::Range<u16>, String)>,
+    /// What a click on `/model`'s footer does, by row and columns.
+    model_at: Vec<(u16, std::ops::Range<u16>, models::Click)>,
     /// The mouse button went down on the composer's text, on what: a
     /// spot, word or line a drag selects from, and where the text was
     /// drawn then, kept while the button is down so a redraw that scrolls
@@ -6264,6 +6266,7 @@ impl App {
             closed: None,
             composer_at: None,
             opens_at: Vec::new(),
+            model_at: Vec::new(),
             composing: None,
             composer_click: None,
             margin: margin::Margin::default(),
@@ -7146,6 +7149,30 @@ impl App {
         (SPEEDS.into_iter())
             .filter(|speed| *speed == "standard" || serves.iter().any(|s| s == speed))
             .collect()
+    }
+
+    /// Keeps `/model`'s speed to what its picked model serves, as the pick
+    /// moves.
+    fn fit_speed(&mut self) {
+        let speeds = (self.picker.as_ref())
+            .and_then(models::Picker::chosen)
+            .map(|(model, _)| self.speeds_of(&model))
+            .unwrap_or_default();
+        if let Some(picker) = &mut self.picker {
+            picker.fit(&speeds);
+        }
+    }
+
+    /// A click on `/model`'s footer: on a value, ← and → move to it; on
+    /// `‹` or `›`, they step it.
+    fn model_click(&mut self, click: models::Click) {
+        let speeds = (self.picker.as_ref())
+            .and_then(models::Picker::chosen)
+            .map(|(model, _)| self.speeds_of(&model))
+            .unwrap_or_default();
+        if let Some(picker) = &mut self.picker {
+            picker.click(click, &speeds);
+        }
     }
 
     /// A call the reviewer denied, as `/retry` lists it.
@@ -12451,6 +12478,16 @@ impl App {
                 // from: what it opens; a right click on the agent, the
                 // other way to it, as on its name anywhere.
                 let right = matches!(mouse.kind, MouseEventKind::Down(MouseButton::Right));
+                if down
+                    && self.picker.is_some()
+                    && let Some(&(_, _, click)) =
+                        (self.model_at.iter()).find(|(row, columns, _)| {
+                            mouse.row == *row && columns.contains(&mouse.column)
+                        })
+                {
+                    self.model_click(click);
+                    return true;
+                }
                 if (down || right)
                     && let Some((_, _, opens)) = (self.opens_at.iter()).find(|(row, columns, _)| {
                         mouse.row == *row && columns.contains(&mouse.column)
@@ -14000,18 +14037,13 @@ impl App {
             let Some(picker) = &mut self.picker else {
                 return;
             };
-            let step = |picker: &mut models::Picker, by: isize| {
-                let at = speeds.iter().position(|s| *s == picker.speed).unwrap_or(0);
-                let at = (at as isize + by).clamp(0, speeds.len() as isize - 1);
-                picker.speed = speeds[at as usize];
-            };
             match event {
                 Event::Key(key) if key.kind != KeyEventKind::Release => match key.code {
                     KeyCode::Up => picker.up(),
                     KeyCode::Down => picker.down(),
                     KeyCode::Tab => picker.on_speed = !picker.on_speed && speeds.len() > 1,
-                    KeyCode::Left if picker.on_speed && speeds.len() > 1 => step(picker, -1),
-                    KeyCode::Right if picker.on_speed && speeds.len() > 1 => step(picker, 1),
+                    KeyCode::Left if picker.on_speed => picker.step_speed(&speeds, -1),
+                    KeyCode::Right if picker.on_speed => picker.step_speed(&speeds, 1),
                     KeyCode::Left => picker.less(),
                     KeyCode::Right => picker.more(),
                     KeyCode::Backspace => {
@@ -14066,6 +14098,7 @@ impl App {
                 Event::Resize(width, _) => self.width = width as usize,
                 _ => {}
             }
+            self.fit_speed();
             return;
         }
         let menu = self.menu();
@@ -16874,6 +16907,7 @@ impl App {
         }
         let mut composer_at = None;
         let mut opens_at = Vec::new();
+        let mut model_at = Vec::new();
         // The reply's open line, wrapped as it will be written: it grows
         // here row by row until its newline writes it into the history.
         let mut open_rows = self.open_rows(width.min(measure()));
@@ -17464,6 +17498,24 @@ impl App {
                     keys.push(Span::raw(" · speed ").dim());
                     keys.push(value(speed.to_owned(), on_speed));
                 }
+                // A click on a name or value moves ← and → to it; on `‹`
+                // or `›`, steps it. The arrows go first, to be found first.
+                let mut x = footer.x;
+                let mut names = Vec::new();
+                for (pair, click) in keys
+                    .chunks(2)
+                    .zip([models::Click::Effort, models::Click::Speed])
+                {
+                    let start = x;
+                    x += pair.iter().map(|span| span.width() as u16).sum::<u16>();
+                    names.push((footer.y, start..x, click));
+                    if (click == models::Click::Speed) == on_speed {
+                        let shown = pair[1].width() as u16;
+                        model_at.push((footer.y, x - shown..x - shown + 1, models::Click::Less));
+                        model_at.push((footer.y, x - 1..x, models::Click::More));
+                    }
+                }
+                model_at.extend(names);
                 let mut pick = (hint::Keys::new().pick().enter(hint::Enter::Choose))
                     .key("←→", if on_speed { "speed" } else { "effort" });
                 if speeds.len() > 1 {
@@ -17554,6 +17606,7 @@ impl App {
         let linked = self.links_written.changed(linked, drawn.buffer);
         self.composer_at = composer_at;
         self.opens_at = opens_at;
+        self.model_at = model_at;
         // Over themselves, the cursor kept where the frame left it.
         if !linked.is_empty() {
             execute!(
@@ -24468,6 +24521,63 @@ mod tests {
         app.model = "openai/gpt-6.1-sol".into();
         let footer = app.footer_line(200).to_string();
         assert!(footer.contains("ultrafast"), "{footer}");
+    }
+
+    #[tokio::test]
+    async fn model_speed_follows_the_picked_model_and_a_click_moves_or_steps_it() {
+        let providers = json!({"anthropic": {"family": "anthropic",
+            "speeds": {"claude-opus-5-5": ["fast"]}}});
+        let client = daemon_serving(providers, move |request| match request["op"].as_str() {
+            Some("provider_models") => json!({"providers": {"anthropic": {"family": "anthropic",
+                "models": [{"id": "claude-opus-5-5"}, {"id": "claude-sonnet-5-5"}]}}}),
+            _ => json!({"bot": "b", "changed": ["speed"]}),
+        })
+        .await;
+        let mut app = app(client);
+        let key = |code: KeyCode| Event::Key(event::KeyEvent::new(code, KeyModifiers::NONE));
+        let row = |app: &App| app.picker.as_ref().map(|p| (p.speed, p.on_speed));
+        app.model = "anthropic/claude-opus-5-5".into();
+        model_picker(&mut app).await;
+        app.key(key(KeyCode::Tab)).await;
+        app.key(key(KeyCode::Right)).await;
+        assert_eq!(row(&app), Some(("fast", true)));
+        // A model that serves standard alone shows it, ← and → back on
+        // effort; moving back does not bring the old pick with it.
+        app.key(key(KeyCode::Down)).await;
+        assert_eq!(row(&app), Some(("standard", false)));
+        app.key(key(KeyCode::Up)).await;
+        assert_eq!(row(&app), Some(("standard", false)));
+        // A click on speed moves ← and → to it, one on `›` steps it, and
+        // one on effort moves them back.
+        use ratatui::crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+        app.model_at = vec![
+            (9, 14..15, models::Click::Less),
+            (9, 19..20, models::Click::More),
+            (9, 2..20, models::Click::Effort),
+            (9, 20..34, models::Click::Speed),
+        ];
+        let click = |column| {
+            Event::Mouse(MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column,
+                row: 9,
+                modifiers: KeyModifiers::NONE,
+            })
+        };
+        app.key(click(25)).await;
+        assert_eq!(row(&app), Some(("standard", true)));
+        app.key(click(19)).await;
+        assert_eq!(row(&app), Some(("fast", true)));
+        app.key(click(14)).await;
+        assert_eq!(row(&app), Some(("standard", true)));
+        app.key(click(5)).await;
+        assert_eq!(row(&app), Some(("standard", false)));
+        let effort = |app: &App| {
+            app.picker
+                .as_ref()
+                .and_then(|p| p.effort().map(str::to_owned))
+        };
+        assert_eq!(effort(&app), None);
     }
 
     #[tokio::test]
