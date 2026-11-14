@@ -2549,8 +2549,9 @@ impl View {
         let clock = wall_ms();
         for (written, by, at) in &talked.said {
             if let (Some(by), Some(at)) = (self.named(by), self.named(at))
-                && let Some(when) =
-                    now.checked_sub(Duration::from_millis(clock.saturating_sub(*written).max(0) as u64))
+                && let Some(when) = now.checked_sub(Duration::from_millis(
+                    clock.saturating_sub(*written).max(0) as u64,
+                ))
                 && now.duration_since(when) <= HOUR
             {
                 self.hear(when, by, at);
@@ -7890,7 +7891,15 @@ mod tests {
         // store's order; then the roll again, then caught up.
         assert_eq!(
             seen,
-            ["roll", "talked 5", "through 10", "11", "12", "roll", "ready"]
+            [
+                "roll",
+                "talked 5",
+                "through 10",
+                "11",
+                "12",
+                "roll",
+                "ready"
+            ]
         );
         std::fs::remove_dir_all(dir).unwrap();
     }
@@ -7909,8 +7918,10 @@ mod tests {
             ])
         };
         let told = |cursor: i64, by: &str, to: &str, ago: i64| {
-            Feed::Past(json!({"cursor": cursor, "bot": to, "turn": cursor, "event": "accepted",
-                "written_ms": wall_ms() - ago, "data": {"from": {"bot": by}}}))
+            Feed::Past(
+                json!({"cursor": cursor, "bot": to, "turn": cursor, "event": "accepted",
+                "written_ms": wall_ms() - ago, "data": {"from": {"bot": by}}}),
+            )
         };
         let (mut first, send) = view();
         first.resolved = store.clone();
@@ -7946,7 +7957,10 @@ mod tests {
         assert!(renamed.said.is_empty());
         // Only the person reads it.
         use std::os::unix::fs::PermissionsExt;
-        let mode = std::fs::metadata(Talked::file(&store)).unwrap().permissions().mode();
+        let mode = std::fs::metadata(Talked::file(&store))
+            .unwrap()
+            .permissions()
+            .mode();
         assert_eq!(mode & 0o777, 0o600);
         std::fs::remove_dir_all(dir).unwrap();
     }
