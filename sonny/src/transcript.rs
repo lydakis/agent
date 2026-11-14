@@ -2366,20 +2366,37 @@ pub fn asked(name: &str, arguments: &Value, workspace: &str) -> Asked {
                     .or_else(|| arguments[key]["name"].as_str())
                     .map(str::to_owned)
             };
-            let (verb, doing, to, of) = match (named("add"), named("remove"), named("run")) {
-                (Some(it), ..) => ("Add", "adding", "add", it),
-                (None, Some(it), _) => ("Remove", "removing", "remove", it),
-                (None, None, Some(it)) => ("Run", "running", "run", it),
-                _ => ("Change", "changing", "change", format!("your {what}s")),
+            // Every change the call makes is named, in the order it is
+            // made: one call can remove one and add another.
+            let mut changes: Vec<([&str; 2], String)> = [
+                ("remove", "removing", "remove"),
+                ("add", "adding", "add"),
+                ("run", "running", "run"),
+            ]
+            .into_iter()
+            .filter_map(|(key, doing, to)| {
+                named(key).map(|it| ([doing, to], format!("the {what} {it}")))
+            })
+            .collect();
+            if changes.is_empty() {
+                changes.push((["changing", "change"], format!("your {what}s")));
+            }
+            // 0 says it as doing, 1 as what to do.
+            let said = |form: usize| {
+                (changes.iter())
+                    .map(|(verb, the)| format!("{} {the}", verb[form]))
+                    .collect::<Vec<_>>()
+                    .join(" and ")
             };
-            let the = match of.starts_with("your ") {
-                true => of.clone(),
-                false => format!("the {what} {of}"),
-            };
+            let to = said(1);
+            let mut question = to.clone();
+            if let Some(first) = question.get_mut(..1) {
+                first.make_ascii_uppercase();
+            }
             words(
-                format!("{verb} {the}?"),
-                format!("{doing} {the}"),
-                format!("{to} {the}"),
+                format!("{question}?"),
+                said(0),
+                to,
                 fields(&arguments["add"]),
             )
         }
@@ -5149,6 +5166,22 @@ mod real_calls {
         assert_eq!(
             words("follows", json!({"remove": "tasks"})).0,
             "Remove the follow tasks?"
+        );
+        // A call that removes one and adds another names both.
+        let (question, doing, to, detail) = words(
+            "follows",
+            json!({"remove": "tasks", "add": {"name": "news", "source": "lookout"}}),
+        );
+        assert_eq!(question, "Remove the follow tasks and add the follow news?");
+        assert_eq!(
+            doing,
+            "removing the follow tasks and adding the follow news"
+        );
+        assert_eq!(to, "remove the follow tasks and add the follow news");
+        assert_eq!(detail, ["name: news", "source: lookout"]);
+        assert_eq!(
+            words("automations", json!({})).0,
+            "Change your automations?"
         );
         assert_eq!(
             words("write", json!({"path": "/w/src/a.rs"})).0,
