@@ -176,7 +176,17 @@ impl Policy {
             helper: daemon.helper.clone(),
             sockets: Vec::new(),
             walled: daemon.walled.clone(),
-            owned: owned(&daemon.owned),
+            // None that holds or is in a folder it may not read: its copy
+            // would show what the folder hides, at a name of its own.
+            owned: owned(
+                &(daemon.owned.iter())
+                    .filter(|place| {
+                        !(daemon.unreadable.iter())
+                            .any(|hidden| hidden.starts_with(place) || place.starts_with(hidden))
+                    })
+                    .cloned()
+                    .collect::<Vec<_>>(),
+            ),
             daemons,
             // One under another is masked with it: a mask under one
             // already closed would have nowhere to go.
@@ -2264,13 +2274,17 @@ mod tests {
             base.join("work/keys"),
         );
         std::os::unix::fs::symlink(&home, work.join("linked")).unwrap();
+        // A folder shown from the person's copy that holds one, or is in
+        // one, isn't copied: the copy would show it at a name of its own.
         let daemon = Daemon {
             unreadable: vec![home.clone(), keys.clone()],
+            owned: vec![base.join("home"), home.join("sub")],
             ..protecting()
         };
         let policy = Policy::new(Some(Mode::WorkspaceWrite), Some(&work), &[], true, &daemon)
             .unwrap()
             .unwrap();
+        assert!(policy.owned.is_empty());
         for hidden in [
             &home,
             &home.join("env"),
