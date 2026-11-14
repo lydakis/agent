@@ -30,6 +30,16 @@ Fixed-work resource and latency measurements. A time-based soak that completes
 more turns is not here, because its work changes with its speed; it is under
 [operational behavior](#operational-behavior).
 
+- **SSE block scanning, buffer reuse and chunk cooperation.** Against main
+  `f8e7c7b3`, two 64-block model-free controls reduce tiny-event CPU about
+  19%, remove the original p50 penalty, and show no established p99 change.
+  The final four-case matrix reduces large-output CPU 19–27%; usual-output
+  CPU overlaps main. A warmed 128-frame allocator probe falls from 256
+  alloc/realloc calls to zero; decoder-only throughput rises 1.6–18x on
+  the tested inputs. Runtime Rust tests, 14 process checks and all four
+  native screens pass, with unchanged storage work and no warnings.
+  macOS arm64, 2026-11-13.
+  [Record](DAEMON_MEASUREMENTS.md#sse-block-scanning-and-reusable-frames).
 - **Group commit, fixed work.** 192 bots, 4,608 primary turns, the same
   requests and retries in both builds, full flushing in both. The build that
   batches turn completions, which also carried the retention-publication

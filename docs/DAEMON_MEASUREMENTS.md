@@ -9255,3 +9255,215 @@ measure is within its run-to-run spread; the call-end path is
 | lifecycle | CPU, s | 0.485 | 0.49 | +1.0% |
 | lifecycle | p95 turn, ms | 573.529 | 577.316 | +0.7% |
 | lifecycle | peak RSS, MiB | 24.502 | 24.596 | +0.4% |
+
+
+## SSE block scanning and reusable frames
+
+Measured locally 2026-11-13 on Apple M1 Max (10 logical CPUs), macOS
+27.2.1, APFS, external power, Rust 1.100.0, Python 3.12.9 and psutil 7.2.2.
+Final base is main `f8e7c7b3e93d2daccbdc0ebe7c51cbcee5453805` (0.9.5).
+Head is that base plus the isolated SSE implementation, built before
+commit. Later changes add tests, comments and documentation only. Neither metadata batching,
+the reader ceiling nor checkpoint scheduling is included. Both binaries use
+the same symbolized release profile. SHA-256:
+
+- Main: `b6240fa7664943a8867a06661ed67dac65b80e2bd09cf5d49b5d5429ca96df0b`.
+- Selected SSE: `f705715e116585efa6e0752fda59163bb2ae88016a64843d8d458531aba0e262`.
+
+The old loop passed each transport byte through the decoder and transferred
+its data Vec out on every frame. The new decoder scans CR/LF with `memchr2`,
+consumes at most one frame per call, and lends its reusable data buffer to
+the parser. `memchr` 2.8.3 was already locked transitively; the patch adds a
+direct dependency, with no new package version. A single-byte append path
+avoids block-search setup for isolated non-delimiter bytes. The line buffer,
+combined pending-line/data bound and protocol rules are retained.
+
+The provider yields once after each transport chunk. That lets other bots
+and the event writer run even when both input and delta callbacks are
+immediately ready. A yield does not add a task, timer, queue, storage job,
+frame list or input-chunk copy. Parser progress and stall-deadline renewal
+retain their boundaries: only content renews the deadline, after publishing.
+Buffers live only for the active provider call, not idle bots. HTTP/SSE
+Responses and Anthropic share this path; WebSocket handling is unchanged.
+
+### Initial latency regression and controlled fix
+
+The initial patch on main `3c73fcdf86e402e23ccf697c6df44706e9018faf` reduced
+usual-output CPU 7.6% and large-output CPU about 30%, but tiny-event p50 rose
+9.7% across five measured runs. A subsequent 16-block control, with two
+identical-main binaries per block, confirmed a paired mean increase of
+11.8% (bootstrap 95% interval 7.4..16.8%). More of the extra time preceded
+the next provider request; draining after the final provider write was
+faster. This suggested scheduling/commit-cohort effects, not slower scanning.
+The precise split between writer wakeups, batching and storage wait is not
+established by these traces.
+
+Per-frame `consume_budget` was tested and rejected: a 16-block four-way
+control did not establish a latency benefit. Yielding after each chunk did.
+Two predefined 64-block runs on final main used 32 bots, four turns each,
+256 output chunks of 16 bytes per turn, a 4 KiB prompt per turn and no model
+delay. Each has one excluded warmup block and rotating three-way order:
+main/original-SSE/chunk-yield, then main/chunk-yield/progress-only-yield.
+All fixtures validate full history, output bytes and completed requests.
+Runs and compilation were sequential; no profiling or competing build ran
+during the timed screens.
+
+Paired means of per-block candidate/main percentage changes; bootstrap
+intervals resample 64 whole blocks 10,000 times with seed 1758. These are
+local repeatability intervals, not guarantees across machines/workloads.
+
+| Selected SSE vs main | Run 1 | 95% interval | Confirmation | 95% interval |
+| --- | ---: | ---: | ---: | ---: |
+| CPU per turn | -18.7% | -20.0..-17.4% | -18.5% | -19.8..-17.3% |
+| turn p50 | -2.2% | -4.1..-0.4% | -1.6% | -3.6..+0.5% |
+| turn p99 | +1.0% | -2.7..+5.1% | -0.2% | -3.5..+2.8% |
+
+Original SSE without a yield still regressed p50 in run 1: +4.4%
+(2.6..6.4%). Adding the yield reduced it 6.1% relative to that version
+(-8.0..-3.8%). The selected version therefore removes the observed median
+penalty while reducing CPU. There is no established p99 improvement; the
+intervals still allow a small tail penalty.
+
+Yielding only on chunks with parser progress was also tested. One 64-block
+run showed a +5.2% p99 penalty against main (2.5..8.1%); the direct
+confirmation did not reproduce that tail difference between variants or
+show a CPU benefit from skipping partial chunks. Its p50 was 2.7% higher
+than the selected version (0.6..5.2%). The simpler every-chunk yield is
+retained. All candidate results remain in the ignored captures.
+
+### Isolated decoder evidence
+
+A separate allocator probe forwards calls to the system allocator. For 128
+fixed-size frames after warmup, the old decoder makes 256 allocation or
+reallocation calls; the new decoder makes zero. This is frame-buffer reuse,
+not a claim that JSON parsing or a whole model call is allocation-free.
+Buffers can grow when a larger frame arrives.
+
+The throughput probe uses the ordinary allocator, without that instrumented
+allocator. Each cell decodes about 32 MiB of identical SSE bytes, with 64
+frames per input corpus, an excluded decoder warmup, fixed work on both
+sides and base/head then head/base order (two measurements per side). It
+checks frame counts and consumes payload lengths. Both native probes use
+Rust -O, thin LTO and one codegen unit. These are component measurements,
+not turn-speedup or provider-capacity claims.
+
+| Payload bytes | Fragment bytes | Main MiB/s | SSE MiB/s | Ratio |
+| ---: | ---: | ---: | ---: | ---: |
+| 64 | 1 | 304.4 | 611.1 | 2.01x |
+| 64 | 64 | 486.6 | 3079.5 | 6.33x |
+| 64 | 4096 | 511.1 | 3881.5 | 7.60x |
+| 64 | 65536 | 509.3 | 3906.5 | 7.67x |
+| 4096 | 1 | 455.2 | 743.8 | 1.63x |
+| 4096 | 64 | 848.4 | 9263.0 | 10.92x |
+| 4096 | 4096 | 948.8 | 17082.4 | 18.00x |
+| 4096 | 65536 | 952.5 | 17501.5 | 18.37x |
+
+The first block-scanning prototype regressed on single-byte fragments
+(about 0.56x the baseline for 4 KiB payloads); the bounded single-byte
+append path fixes that case without retaining the old decoder API. The
+final measured ratios are 1.6–18x on these inputs. Initial results remain
+in `initial-micro-*` captures.
+
+A differential probe compares the pinned old decoder with the candidate on
+10,000 seeded byte streams at five fragment sizes, plus exact-limit and
+oversized frames: all agree. Four durable protocol tests cover every
+fragment size of a Unicode/multiline/CR/LF fixture, lazy single-frame
+consumption, partial EOF versus comments, and combined line/data limits.
+
+### Matched model-free turns
+
+The unchanged decoder above was measured on the initial `3c73fcdf` base;
+those component results do not measure the provider yield. Final full-turn
+results below use the pinned `f8e7c7b3` binaries. Each turn adds a 4 KiB
+prompt. The fixture validates all history and emitted bytes and injects no
+model delay. Each case has an excluded warmup and five measured repetitions
+per binary, reversing order each repetition: 48 runs. CPU is daemon CPU
+from readiness to the final terminal event, excluding launch/shutdown.
+Latency includes transport, fixture and observer work. Configured bot count
+does not establish simultaneous active streams.
+
+| Case | Bots | Turns/bot | Output chunks x bytes |
+| --- | ---: | ---: | ---: |
+| many-events | 32 | 4 | 256 x 16 |
+| usual | 32 | 8 | 20 x 256 |
+| large-deltas | 16 | 4 | 16 x 4,096 |
+| large-frame | 8 | 4 | 1 x 65,536 |
+
+Medians of per-run values, with observed min..max:
+
+| Case | Measure | Main | SSE |
+| --- | --- | ---: | ---: |
+| many-events | CPU, ms/turn | 3.049 (2.768..3.236) | 2.442 (2.219..2.520) |
+| many-events | turn p50, ms | 44.830 (43.206..51.533) | 44.927 (42.140..46.615) |
+| many-events | turn p99, ms | 73.749 (69.299..85.700) | 76.217 (71.011..82.417) |
+| many-events | last-turn RSS, MiB | 28.344 (27.406..29.625) | 28.750 (27.641..29.234) |
+| usual | CPU, ms/turn | 1.191 (1.117..1.208) | 1.158 (1.140..1.179) |
+| usual | turn p50, ms | 23.937 (19.088..26.547) | 20.127 (19.604..24.177) |
+| usual | turn p99, ms | 43.346 (38.623..64.929) | 42.591 (39.583..46.653) |
+| usual | last-turn RSS, MiB | 29.906 (29.062..30.188) | 29.984 (29.562..30.141) |
+| large-deltas | CPU, ms/turn | 2.783 (2.689..2.975) | 2.264 (2.051..2.390) |
+| large-deltas | turn p50, ms | 38.064 (36.501..38.917) | 34.064 (32.761..35.633) |
+| large-deltas | turn p99, ms | 49.386 (48.321..52.541) | 53.451 (44.091..58.736) |
+| large-deltas | last-turn RSS, MiB | 31.688 (31.141..33.656) | 28.297 (27.109..28.719) |
+| large-frame | CPU, ms/turn | 2.816 (2.699..3.000) | 2.062 (1.798..2.178) |
+| large-frame | turn p50, ms | 15.660 (13.249..20.633) | 12.410 (11.489..12.983) |
+| large-frame | turn p99, ms | 37.132 (35.340..39.881) | 35.717 (32.436..47.697) |
+| large-frame | last-turn RSS, MiB | 26.703 (26.266..27.500) | 23.750 (23.547..24.188) |
+
+CPU medians fall 19.9% for tiny events, 18.6% for large deltas and 26.8%
+for large frames, with nonoverlapping observed CPU ranges. Usual-output CPU
+is 2.8% lower with overlapping ranges, so a gain there is not established
+by this final screen. The original 7.6%/30% figures are not the final
+candidate's results. Tiny-event p50 is flat in this shorter matrix; the
+larger controlled runs above constrain the original regression. Latency
+and RSS depend on the workload. No universal latency or cross-engine
+speedup is claimed.
+
+### Required native screen and verification
+
+The four native screens run sequentially in base/head then head/base order:
+admission/completion at five repeats, footprint at two (1,000 bots), and
+lifecycle at one (32 bots, socket echo, five tool schemas), excluding each
+runner's warmup. `bench.perf_gate` passes with unchanged store work per turn,
+no failures and no warnings. Sonny is not changed or screened.
+
+| Bench | Measure | Base | Head | Change |
+| --- | --- | ---: | ---: | ---: |
+| admission | lone submit CPU, ms | 28.407 | 29.09 | +2.4% |
+| admission | burst submit p99, ms | 2.363 | 2.381 | +0.7% |
+| completion | release to terminal p99, ms | 5.614 | 5.395 | -3.9% |
+| footprint | idle RSS, MiB | 13.234 | 13.203 | -0.2% |
+| footprint | per idle bot, KiB | 2.496 | 2.496 | +0.0% |
+| footprint | RSS after a turn each, MiB | 39.984 | 38.125 | -4.7% |
+| footprint | CPU per turn, ms | 0.51 | 0.484 | -5.1% |
+| lifecycle | CPU, s | 0.423 | 0.398 | -6.0% |
+| lifecycle | p95 turn, ms | 614.347 | 620.944 | +1.1% |
+| lifecycle | peak RSS, MiB | 27.25 | 26.523 | -2.7% |
+
+All 719 runtime Rust tests, strict Clippy, formatting and 14 release-process
+checks pass. Process checks include Responses and Anthropic thinking/tools/
+usage, sanitation of HTTP/in-stream errors, keepalive-only stall and retry,
+kill/restart/resume, historical forks, durable parks and compaction. The
+schema, durability settings, publication-after-commit and fork boundaries
+are unchanged. No paid providers or release artifacts are used.
+
+Ignored captures under this worktree's `.local/bench/`:
+
+- `sse-20261113/`: initial reference, differential/allocator/throughput probes,
+  initial and final component results and binaries on `3c73fcdf`.
+- `sse-tiny-triad-retry-20261113/`: original 16-block identical-binary control.
+- `sse-tinyfix-20261113/`: final main/selected binaries, candidate builds,
+  process logs, Rust checks, and `validate.py`/`screen.py`/`finish.py`.
+- `sse-chunk-control-20261113/`, `sse-yield-choice-20261113/`: selected
+  candidate's two 64-block runs, paired summaries and full traces.
+- `sse-tinyfix-streams-20261113/`, `sse-tinyfix-screen-20261113/`: selected
+  candidate's final matrix and required native screens.
+- `sse-tinyfix-control-20261113/`, `sse-final-20261113/` and its adjacent
+  `control`, `streams` and `screen` directories retain rejected candidates.
+
+Completed synthetic SQLite captures were losslessly gzipped and their
+contents verified by SHA-256 before removing the uncompressed copies to
+recover local disk space. Two disk-full build/startup failures were excluded;
+they produced no usable timed candidate results. JSON, logs and immutable
+binary hashes are retained. The only runtime source difference since the
+selected binary was built is its explanatory yield comment.

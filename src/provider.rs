@@ -1624,10 +1624,8 @@ impl Provider {
                     preview.extend_from_slice(&chunk[..chunk.len().min(room)]);
                 }
                 let mut progressed = false;
-                for byte in chunk {
-                    let Some(frame) = decoder.byte(byte)? else {
-                        continue;
-                    };
+                let mut bytes = chunk.as_ref();
+                while let Some(frame) = decoder.next_frame(&mut bytes)? {
                     if unnamed && frames == 0 {
                         // A completed frame rules out the no-frame diagnostic.
                         // Release its bounded preview for the rest of the stream.
@@ -1637,13 +1635,15 @@ impl Provider {
                     if frame == b"[DONE]" {
                         continue;
                     }
-                    match parser.frame(&frame)? {
+                    match parser.frame(frame)? {
                         Frame::Keepalive => continue,
                         Frame::Delta(part) => delta(part).await?,
                         Frame::Quiet => {}
                     }
                     progressed = true;
                 }
+                // Ready chunks must leave room for other bots and the event writer.
+                tokio::task::yield_now().await;
                 // Renewed after publishing, so a slow consumer is not a stall.
                 if progressed {
                     stall

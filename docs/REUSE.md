@@ -93,3 +93,14 @@ measurement. Planned historical-fork/resumption scenarios need engine adapters;
 the current engine matrix exercises neither feature. No paid
 service purchase, global profiler installation, or model API run is part of this
 initial tooling slice.
+
+SSE decoder reuse, 2026-11-13: the decoder directly uses the already-locked
+`memchr` 2.8.3 for CR/LF scanning and reuses one bounded frame buffer. It
+preserves framing, limits and the provider parser boundary. The provider
+yields after each transport chunk so ready input leaves room for other bots
+and event delivery. Against main `f8e7c7b3`, two 64-block model-free controls
+remove the original tiny-event p50 penalty and reduce CPU about 19%; p99
+has no established change. The final matrix retains 19–27% less CPU for
+large output; usual-output CPU overlaps main. Decoder/allocator results
+are component evidence, not cross-engine rankings or full-turn speedup
+claims. See [the record](DAEMON_MEASUREMENTS.md#sse-block-scanning-and-reusable-frames).
