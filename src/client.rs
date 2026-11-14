@@ -3976,28 +3976,39 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("agent-starting-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        let socket = dir.join("s.sock");
-        let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
-        let daemon = std::thread::spawn(move || {
-            let (mut stream, _) = listener.accept().unwrap();
-            for _ in 0..4 {
-                stream
-                    .write_all(b"{\"event\":\"starting\",\"protocol\":1,\"pid\":7}\n")
-                    .unwrap();
-                std::thread::sleep(Duration::from_millis(150));
+        // The daemon's `starting` line is in before the client reads, so
+        // what the first deadline sees is the line, not how soon a thread
+        // is scheduled to write it.
+        let (stream, mut daemon) = std::os::unix::net::UnixStream::pair().unwrap();
+        daemon
+            .write_all(b"{\"event\":\"starting\",\"protocol\":1,\"pid\":7}\n")
+            .unwrap();
+        let (deadline, first) = std::sync::mpsc::channel::<Instant>();
+        let late = std::thread::spawn(move || {
+            // Its ready line comes only once the first deadline has passed:
+            // the `starting` line gave it more time.
+            let first = first.recv().unwrap();
+            while let Some(left) = first.checked_duration_since(Instant::now()) {
+                std::thread::sleep(left + Duration::from_millis(1));
             }
-            stream
+            daemon
                 .write_all(b"{\"event\":\"ready\",\"pid\":7}\n")
                 .unwrap();
-            stream
+            daemon
         });
-        // Its ready line comes well after the first deadline: each
-        // `starting` gives it more time.
-        let connection =
-            Connection::greeted_until(&socket, Instant::now() + Duration::from_millis(200))
-                .unwrap();
-        assert_eq!(connection.ready, json!({"event": "ready", "pid": 7}));
-        drop(daemon.join().unwrap());
+        let mut connection = Connection {
+            writer: stream.try_clone().unwrap(),
+            reader: BufReader::new(stream),
+            next: 0,
+            pending: VecDeque::new(),
+            ready: Value::Null,
+        };
+        let first = Instant::now() + Duration::from_millis(200);
+        deadline.send(first).unwrap();
+        let ready = connection.read_ready(first).unwrap();
+        assert_eq!(ready, json!({"event": "ready", "pid": 7}));
+        assert!(Instant::now() > first);
+        drop(late.join().unwrap());
         // One that says nothing is not waited for past it.
         let listener = std::os::unix::net::UnixListener::bind(dir.join("quiet.sock")).unwrap();
         let quiet = Connection::greeted_until(
