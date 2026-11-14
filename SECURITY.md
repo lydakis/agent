@@ -159,8 +159,10 @@ vulnerability, whether or not the code's own documentation agrees.
   unconfined with the caller's full permissions. That is the daemon's
   default; Sonny's default is a sandbox.
 - Only `shell`, `write`, `edit`, `apply_patch` and `write_stdin` are
-  confined. `read`, `history` and `web_fetch` run in the daemon itself,
-  so `web_fetch` works for a bot whose network is off.
+  confined. `read`, `history` and `web_fetch` run in the daemon itself:
+  a bot whose network is off is neither offered nor runs `web_fetch`
+  (above), and a sandboxed bot's `read` still refuses the folders kept
+  from it (`--unreadable`), alone or in a batch.
 
 ### Approvals
 
@@ -246,7 +248,8 @@ vulnerability, whether or not the code's own documentation agrees.
   redirects, reads at most 4 MiB, and sends no credentials. It does not
   refuse private, loopback or link-local addresses: a bot with
   `web_fetch` can read what the daemon's host can reach on its own
-  networks, with the bot's network on or off. Set
+  networks while its network is on; a bot off the network has no
+  `web_fetch`. Set
   `web_search = "disabled"` to leave it out of new bots.
 - Sonny marks a memory fact or commons post saved in a turn that read
   outside content through web search, `web_fetch`, the browser or an MCP
