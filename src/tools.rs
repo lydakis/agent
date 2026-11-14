@@ -1619,6 +1619,15 @@ fn pem_escaped(text: &str, begin: usize, last: bool) -> Escaped {
     if text[from..dashes].contains('\n') {
         return Escaped::No;
     }
+    // Spaces or tabs may end its header, as a key's reader allows.
+    let spaces = text.as_bytes()[dashes..]
+        .iter()
+        .take_while(|&&b| b == b' ' || b == b'\t')
+        .count();
+    if spaces > PEM_SPACES {
+        return Escaped::No;
+    }
+    let dashes = dashes + spaces;
     let bytes = &text.as_bytes()[dashes..];
     let slashes = bytes.iter().take_while(|&&b| b == b'\\').count();
     if slashes > PEM_ESCAPES {
@@ -5564,6 +5573,10 @@ mod tests {
             (
                 r#"{"body": "{\"key\": \"-----BEGIN RSA PRIVATE KEY-----\\nProc-Type: 4,ENCRYPTED\\nDEK-Info: AES-128-CBC,00\\n\\nMIIE\\n-----END RSA PRIVATE KEY-----\\n\"}"}"#,
                 r#"{"body": "{\"key\": \"-----BEGIN RSA PRIVATE KEY-----\\n[REDACTED]\\n-----END RSA PRIVATE KEY-----\\n\"}"}"#,
+            ),
+            (
+                "{\"value\": \"-----BEGIN PRIVATE KEY-----  \t\\nMIIE\\n-----END PRIVATE KEY-----\\n\"}",
+                "{\"value\": \"-----BEGIN PRIVATE KEY-----  \t\\n[REDACTED]\\n-----END PRIVATE KEY-----\\n\"}",
             ),
             (
                 r#"{"value": "-----BEGIN PGP PRIVATE KEY BLOCK-----\nComment: Fixture (no identity) <x@y> it's \"quoted\"\n\nlQOYBGfake\n=AbCd\n-----END PGP PRIVATE KEY BLOCK-----\n"}"#,
