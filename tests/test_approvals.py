@@ -457,7 +457,7 @@ class ApprovalTests(ModelFixture):
         keys.mkdir()
         (keys / 'env').write_text('OPENAI_API_KEY=sk-kept\n')
         (self.path / 'notes').write_text('plain notes\n')
-        client = self.client('read', extra=('--unreadable', str(keys)),
+        client = self.client('read,wait', extra=('--unreadable', str(keys)),
                              settings={'sandbox': 'workspace-write'})
         client.request('create', bot='Bob', workspace=str(self.path))
         hidden = str(keys / 'env')
@@ -471,6 +471,34 @@ class ApprovalTests(ModelFixture):
                 self.assertEqual(denied['error'], 'read_denied', denied)
                 self.assertNotIn('sk-kept', json.dumps(denied))
         self.assertIn('plain notes', self.read_output(client, 'read-2'))
+        # One lifted while it waits for its verdict, then allowed, too.
+        def respond(request, user):
+            if not user.startswith('lift:'):
+                return None
+            start = max(n for n, i in enumerate(request['input']) if i.get('role') == 'user'
+                        and not i['content'][0]['text'].startswith('steer:'))
+            if any(i.get('type') == 'function_call_output' for i in request['input'][start:]):
+                return 'lifted'
+            return [['read', {'path': user[5:]}]]
+        self.model.respond = respond
+        client.request('create', bot='Gated', workspace=str(self.path), tools=['read', 'wait'],
+                       approve=['read'], approver='manual', settings={'sandbox': 'workspace-write'})
+        turn = client.request('submit', bot='Gated', request_id='l', prompt='lift:' + hidden)['result']['turn']
+        asked = client.receive(lambda m: m.get('event') == 'approval_requested' and m.get('turn') == turn)
+        client.request('submit', bot='Gated', request_id='s', prompt='steer:go on', delivery='steer')
+        self.assertEqual(client.finished(turn)['data']['status'], 'completed')
+        waiting = asked['data']['calls'][0]
+        client.request('answer', bot='Gated', turn=turn, call_id=waiting['call_id'],
+                       request=waiting['request'], decision='allow', by='test')
+        ended = client.receive(lambda m: m.get('event') == 'lifted_ended' and m.get('bot') in (None, 'Gated'))
+        self.assertEqual(ended['data']['outcome'], 'allowed', ended)
+        handle = json.loads(self.read_output(client, waiting['call_id'], bot='Gated'))['handle']
+        prompt = 'calls:' + json.dumps([['wait', {'handles': [handle]}]])
+        turn = client.request('submit', bot='Gated', request_id='w', prompt=prompt, delivery='queue')['result']['message']
+        self.assertEqual(client.finished(turn)['data']['status'], 'completed')
+        lifted = self.read_output(client, 'wait-1', bot='Gated')
+        self.assertIn('read_denied', lifted)
+        self.assertNotIn('sk-kept', lifted)
         # A bot outside any sandbox reads it, as the person would.
         client.request('create', bot='Free', workspace=str(self.path),
                        settings={'sandbox': 'danger-full-access'})

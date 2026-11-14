@@ -6212,6 +6212,11 @@ impl Lifts {
             _ => Ok(prepared),
         });
         let sandbox = match (&prepared, confined) {
+            // A sandboxed bot's read, which the daemon does outside any
+            // sandbox, keeps out of the folders no sandboxed bot reads.
+            (Ok(Prepared::Read { .. }), _) if bot.sandboxed() => {
+                Some(Arc::new(Policy::reads(self.registry.daemon())))
+            }
             (Ok(_), true) => {
                 let (settings, daemon, id, root) = (
                     bot.settings.clone(),
