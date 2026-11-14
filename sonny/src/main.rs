@@ -3808,6 +3808,27 @@ fn hold(unsent: &mut Vec<String>, record: String) {
     }
 }
 
+/// Why `prompt` is not sent, when it reads as a command that none of the
+/// commands took: one slash word that names no command, or a command
+/// given words it doesn't take. A message that only starts with a slash
+/// word, such as a path, is words for the agent.
+fn unknown_command(prompt: &str) -> Option<String> {
+    const UNLISTED: [&str; 5] = ["/agents", "/automations", "/lookout", "/forum", "/settings"];
+    let mut words = prompt.split_whitespace();
+    let word = words.next()?;
+    let name = word.strip_prefix('/')?;
+    if name.is_empty() || !(name.chars()).all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    {
+        return None;
+    }
+    let known = COMMANDS.iter().any(|(command, _)| *command == word) || UNLISTED.contains(&word);
+    match (known, words.next().is_some()) {
+        (true, _) => Some(format!("{word} takes nothing after it")),
+        (false, false) => Some(format!("no command {word} · / lists them")),
+        (false, true) => None,
+    }
+}
+
 /// The slash commands, as the menu lists them: name and what it does.
 /// `/agents` and `/ps` also open `/status`, `/automations` and `/lookout`
 /// open `/background`, `/forum` opens `/commons`, and `/settings` opens
@@ -12648,6 +12669,13 @@ impl App {
                         self.close_pane(true)
                     }
                     KeyCode::Esc => {}
+                    // Ctrl+C copies what is selected here, else closes the
+                    // pane: it quits only from the composer.
+                    _ if copy && let Some(text) = pane.screen.selected() => {
+                        pane.screen.unselect();
+                        self.copied(&text);
+                    }
+                    KeyCode::Char('c') if ctrl => self.close_pane(true),
                     // `/sky`'s own keys: its legend, zen, the models' colours,
                     // a star picked and centred on; Esc lets go of the pick
                     // and the centre before it closes the pane.
@@ -12699,10 +12727,6 @@ impl App {
                         })
                     }
                     _ if switches(key) || key.code == KeyCode::Tab => self.pane_keys = false,
-                    _ if copy && let Some(text) = pane.screen.selected() => {
-                        pane.screen.unselect();
-                        self.copied(&text);
-                    }
                     // The picture or drawing shown, opened bigger outside Sonny.
                     KeyCode::Char('o')
                         if let Some(path) = pane.bigger().map(std::path::Path::to_path_buf) =>
@@ -14443,6 +14467,11 @@ impl App {
             self.input.clear();
             self.pictures.clear();
             self.side(question.trim().to_owned(), &pictures).await;
+            return;
+        }
+        // A slash word no command took is answered, and stays to be fixed.
+        if let Some(why) = unknown_command(&prompt) {
+            self.notice = Some(why);
             return;
         }
         // What is sent while a question is in focus answers it, as the
@@ -25156,6 +25185,82 @@ mod tests {
             card.iter().any(|row| row.contains("turns 1 to 3")),
             "{card:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn ctrl_c_in_the_pane_closes_it_and_quits_only_from_the_composer() {
+        let client = daemon_answering(|request| match request["op"].as_str() {
+            Some("inspect") => json!({"name": "b", "instructions": "", "tools": [],
+                "declared": []}),
+            _ => json!({}),
+        })
+        .await;
+        let mut app = app(client);
+        app.input.set("/context");
+        app.submit().await;
+        assert!(app.pane.is_some());
+        app.pane_keys = true;
+        let ctrl_c = || {
+            Event::Key(event::KeyEvent::new(
+                KeyCode::Char('c'),
+                KeyModifiers::CONTROL,
+            ))
+        };
+        app.key(ctrl_c()).await;
+        assert!(app.pane.is_none() && !app.pane_keys && !app.quit);
+        app.key(ctrl_c()).await;
+        assert!(app.quit);
+    }
+
+    #[tokio::test]
+    async fn a_slash_word_that_names_no_command_is_answered_not_sent() {
+        let sent = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = sent.clone();
+        let client = daemon_answering(move |asked| {
+            if asked["op"] == "submit" {
+                seen.lock()
+                    .unwrap()
+                    .push(stamp::unstamped(asked["prompt"].as_str().unwrap()).to_owned());
+            }
+            json!({"message": 2, "turn": 2})
+        })
+        .await;
+        let mut app = app(client);
+        for (typed, said) in [
+            ("/stauts", "no command /stauts · / lists them"),
+            ("/status foo", "/status takes nothing after it"),
+            ("/agents now", "/agents takes nothing after it"),
+        ] {
+            app.input.set(typed);
+            app.submit().await;
+            assert_eq!(app.notice.as_deref(), Some(said));
+            // Kept, to be fixed and sent again.
+            assert_eq!(&*app.input, typed);
+        }
+        // Words that only start with a slash word, or a path, go as written.
+        for typed in ["/etc/hosts", "/tmp is full", "/ alone"] {
+            app.input.set(typed);
+            app.submit().await;
+        }
+        assert_eq!(
+            *sent.lock().unwrap(),
+            ["/etc/hosts", "/tmp is full", "/ alone"]
+        );
+    }
+
+    #[test]
+    fn unknown_command_reads_only_slash_words() {
+        assert_eq!(
+            unknown_command("/zen-mode").as_deref(),
+            Some("no command /zen-mode · / lists them")
+        );
+        assert_eq!(
+            unknown_command("/model gpt").as_deref(),
+            Some("/model takes nothing after it")
+        );
+        for words in ["hello", "/", "/etc/hosts", "/a.txt", "/x y", "!ls"] {
+            assert_eq!(unknown_command(words), None, "{words}");
+        }
     }
 
     #[tokio::test]
