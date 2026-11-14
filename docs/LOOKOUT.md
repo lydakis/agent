@@ -580,3 +580,7 @@ calc.fix completed · you wrote in calc.docs · ▲ ci`, each task's event in
 a few words and each other source's counted, marked by its icon. A turn it
 started that ends with an empty reply stays there: no line under it and no
 sound. Anything the lead does write shows as any reply.
+
+![A lead's window: the lookout's note folded to one row, ↳ Lookout · calc.fix-avg completed, then the lead's reply](sonny/lookout-note-folded.png)
+
+![The same note opened: its [tasks · calc.fix-avg · calc.fix-avg replied, completed] header and the task's reply under it](sonny/lookout-note-open.png)

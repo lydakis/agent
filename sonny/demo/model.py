@@ -44,6 +44,9 @@ class Model(http.server.BaseHTTPRequestHandler):
         told = '[tasks · ' in str(items[last_user].get('content'))
         if lead and told:
             text = '`fix-avg` is done: it fixed the average and the tests pass.'
+        elif lead and 'Sonny upgraded' in str(items[last_user].get('content')):
+            # Sonny's own notice on a fresh home: nothing to start.
+            text = 'Noted.'
         elif lead and step == 0:
             text = "That needs a fix and a test run, so I'll hand it to a task."
             output = [call('shell', f'l1-{len(items)}', command='"$AGENT_BIN" run --detach --new --bot "${AGENT_BOT%.lead}.fix-avg" '
