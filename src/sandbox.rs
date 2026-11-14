@@ -476,8 +476,14 @@ pub fn escapes(
     any_written(tool, &arguments, |path, removed| {
         let named = lexical(&folder.join(path));
         // A path [`learn`] did not follow is judged as spelled.
-        let target = links.target(path, removed).unwrap_or(&named);
-        outside(mode, &writable, &named, target)
+        let escapes = |removed| {
+            let target = links.target(path, removed).unwrap_or(&named);
+            outside(mode, &writable, &named, target)
+        };
+        // A removal takes the entry, but the tool also checks what it
+        // leads to before running it, so it escapes when either is
+        // outside.
+        escapes(removed) || (removed && escapes(false))
     })
 }
 
@@ -517,8 +523,7 @@ fn any_written(
 pub struct Links(Option<std::sync::Arc<std::collections::HashMap<(String, bool), PathBuf>>>);
 
 /// [`Links`] as kept: each path, whether it is removed, and where it
-/// leads. One that leads to a path that isn't UTF-8 is left out, so it is
-/// judged as spelled.
+/// leads. [`learn`] keeps no target that isn't UTF-8, so none is lost.
 type KeptLinks = Option<Vec<(String, bool, String)>>;
 
 impl serde::Serialize for Links {
@@ -595,15 +600,22 @@ pub fn learn(
     let mut links = std::collections::HashMap::new();
     if let Ok(arguments) = serde_json::from_str::<serde_json::Value>(arguments) {
         any_written(tool, &arguments, |path, removed| {
-            let read = |path: &Path| Some(read_link(path));
-            let target = judgeable(path)
-                .then(|| {
-                    let changeable = |dir: &Path| changeable(mode, &writable, dir);
-                    judged(&folder.join(path), changeable, read, removed)
-                })
-                .flatten();
-            if let Some(target) = target {
-                links.insert((path.to_owned(), removed), target);
+            // A removal is judged as the entry and as what it leads to.
+            let ways: &[bool] = if removed { &[true, false] } else { &[false] };
+            for &removed in ways {
+                let read = |path: &Path| Some(read_link(path));
+                let target = judgeable(path)
+                    .then(|| {
+                        let changeable = |dir: &Path| changeable(mode, &writable, dir);
+                        judged(&folder.join(path), changeable, read, removed)
+                    })
+                    .flatten()
+                    // Kept only as a name a parked call can keep whole, so
+                    // the call is judged the same once it resumes.
+                    .filter(|target| target.to_str().is_some());
+                if let Some(target) = target {
+                    links.insert((path.to_owned(), removed), target);
+                }
             }
             false
         });
@@ -2681,6 +2693,23 @@ mod tests {
         std::os::unix::fs::symlink(real.join("fixed"), real.join("fixed/me")).unwrap();
         assert_eq!(link(&first), Some(project.join("a.txt")));
         assert_eq!(link(&learn()), Some(real.join("fixed/project/a.txt")));
+        // A removal is kept both as the entry and as what it leads to.
+        let gone = real.join("fixed/me");
+        let patch = format!(
+            "*** Begin Patch\n*** Delete File: {}\n*** End Patch",
+            gone.display()
+        );
+        let removal = super::learn(
+            Mode::ReadOnly,
+            None,
+            &[],
+            "apply_patch",
+            &serde_json::json!({ "input": patch }).to_string(),
+            Path::new("/"),
+        );
+        let given = gone.to_str().unwrap();
+        assert_eq!(removal.target(given, true), Some(&gone));
+        assert_eq!(removal.target(given, false), Some(&real.join("fixed")));
         // A path no tool takes is never read.
         assert!(judgeable(&"a".repeat(4096)));
         assert!(!judgeable(&"a".repeat(4097)));
