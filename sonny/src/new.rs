@@ -254,11 +254,13 @@ impl Making {
         }
     }
 
-    /// What Esc does in the open list, for its key line.
-    pub fn keys(&self) -> &'static str {
+    /// The open list's keys: Esc goes back a step, from the first it closes.
+    pub fn keys(&self) -> crate::hint::Keys {
+        use crate::hint::{Enter, Esc, Keys};
+        let keys = Keys::new().pick().enter(Enter::Next);
         match self.step {
-            Step::Profile(_) => "  ↑↓ pick · enter next · esc close",
-            _ => "  ↑↓ pick · enter next · esc back",
+            Step::Profile(_) => keys.esc(Esc::Close),
+            _ => keys.esc(Esc::Back),
         }
     }
 

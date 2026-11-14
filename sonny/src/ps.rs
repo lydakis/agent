@@ -189,7 +189,10 @@ impl View {
         }
         let mut out = vec![Line::from(head), Line::default()];
         if let Some(error) = &self.error {
-            out.push(Line::from(format!("could not read what runs: {error}")).fg(Color::Yellow));
+            out.push(Line::from(vec![
+                Span::raw("✗ ").fg(Color::Red),
+                Span::raw(format!("couldn't read what runs: {error}")),
+            ]));
             return out;
         }
         if self.at.is_none() && self.rows.is_empty() {
@@ -231,7 +234,13 @@ impl View {
             true => "a this project",
             false => "a every agent",
         };
-        format!("↑↓ pick · enter open · x stop · {scope} · esc close")
+        use crate::hint::{Enter, Esc, Keys};
+        let (key, does) = scope.split_once(' ').unwrap_or((scope, ""));
+        (Keys::new().pick().enter(Enter::Open))
+            .key("x", "stop")
+            .key(key, does)
+            .esc(Esc::Close)
+            .text()
     }
 }
 

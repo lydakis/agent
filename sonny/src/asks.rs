@@ -1611,8 +1611,13 @@ pub fn hint(ask: &Ask, at: usize, of: usize, width: usize) -> Vec<Span<'static>>
     if of > 1 {
         keys.push("↑↓ switch".into());
     }
-    keys.push("esc write instead".into());
-    let keys = keys.join(" · ");
+    let keys = (keys.iter())
+        .fold(crate::hint::Keys::new(), |all, pair| {
+            let (key, does) = pair.split_once(' ').unwrap_or((pair, ""));
+            all.key(key, does)
+        })
+        .esc(crate::hint::Esc::WriteInstead)
+        .text();
     // Words answer it too: typed, or for a step of the person's, how it
     // went.
     let words = match ask.options.len() {

@@ -519,6 +519,15 @@ so a change in the data is no memory news. Only Sonny fills: the daemon
 links no template engine, and an agent composed by `agent run --agents`
 reads a live description as it is written.
 
+The person reads memory in `/memory`, in the pane: each folder's index,
+never every fact's file (a `work` fact's file alone, for what it is and
+when it was saved), read off the screen thread when the view opens, on
+`a` and after a removal. A fact opens with
+[`memory::peek`](../client/src/memory.rs), which reads it as `read` does
+but records no read, so the person's browsing never hides a fact no agent
+needs from the cleanup's unread check. Its `x` removes through the tool's
+own `remove`.
+
 Sonny's agents read and save memory with the `memory` tool, which Sonny's
 tool host answers outside the agent's sandbox, so a sandboxed agent still
 saves to `~/.agents/memory`: `read` NAME, `search` WORDS, `save {name, type,
@@ -1075,8 +1084,8 @@ starts a new run with an earlier run's answers, so only calls that changed
 cost model calls. `stop` interrupts a run's workers; it ends as stopped.
 
 `/status` shows each run that has not ended as one row in Working, under
-the agent that started it: its name, current phase and agents running, done
-and failed, and on `m` each phase's counts, its last `log()` line and its
+the agent that started it: its name, current phase and its agents
+working, finished and failed (`Verify · 12 working, 31 finished, 2 failed`), and on `m` each phase's counts, its last `log()` line and its
 output tokens. A window reads only what each journal gained since its last
 look. With a run's row picked, `s` stops it: the window leaves a `stop`
 file in the run's folder, and the host running it stops it within a

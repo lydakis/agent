@@ -907,6 +907,12 @@ impl Screen {
         self.linked = None;
     }
 
+    /// The rows of those shown that the view held when last drawn.
+    pub fn in_view(&self) -> std::ops::Range<usize> {
+        let end = (self.top + self.area.height as usize).min(self.shown.len());
+        self.top.min(end)..end
+    }
+
     /// Back to the newest rows.
     pub fn latest(&mut self) {
         self.back = 0;

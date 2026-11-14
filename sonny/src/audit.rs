@@ -186,9 +186,10 @@ impl View {
         }
         let mut out = vec![Line::from(head), Line::default()];
         if let Some(error) = &self.error {
-            out.push(
-                Line::from(format!("could not read the audit trail: {error}")).fg(Color::Yellow),
-            );
+            out.push(Line::from(vec![
+                Span::raw("✗ ").fg(Color::Red),
+                Span::raw(format!("couldn't read the audit trail: {error}")),
+            ]));
             return out;
         }
         if self.at.is_none() && self.rows.is_empty() {
@@ -229,7 +230,16 @@ impl View {
             true => "a this project",
             false => "a every agent",
         };
-        format!("↑↓ pick · enter open · t kind · p place · w who · {scope} · esc close")
+        let (key, does) = scope.split_once(' ').unwrap_or((scope, ""));
+        (crate::hint::Keys::new()
+            .pick()
+            .enter(crate::hint::Enter::Open))
+        .key("t", "kind")
+        .key("p", "place")
+        .key("w", "who")
+        .key(key, does)
+        .esc(crate::hint::Esc::Close)
+        .text()
     }
 }
 

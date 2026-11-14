@@ -658,6 +658,147 @@ fn count(fields: &std::collections::HashMap<&str, &str>, key: &str) -> Result<u3
     })
 }
 
+/// One fact as its folder's index lists it, read back from the line
+/// [`Fact::line`] writes: what Sonny's `/memory` lists without opening a
+/// fact's file. Work is listed by name and date alone, so its
+/// description is empty here.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct Listed {
+    pub name: String,
+    pub kind: String,
+    pub verified: String,
+    pub description: String,
+    pub external: bool,
+    pub live: bool,
+    pub confirmed: u32,
+    pub pushed_back: u32,
+}
+
+impl From<&Fact> for Listed {
+    fn from(fact: &Fact) -> Self {
+        Self {
+            name: fact.name.clone(),
+            kind: fact.kind.clone(),
+            verified: fact.verified.clone(),
+            description: fact.description.clone(),
+            external: fact.external,
+            live: fact.live,
+            confirmed: fact.confirmed,
+            pushed_back: fact.pushed_back,
+        }
+    }
+}
+
+/// The facts an index lists, in its order; a line that is not one of
+/// [`Fact::line`]'s, such as its heading or a head's closing count, is
+/// skipped.
+pub fn listed(index: &str) -> Vec<Listed> {
+    index.lines().filter_map(listed_line).collect()
+}
+
+fn listed_line(line: &str) -> Option<Listed> {
+    let rest = line.strip_prefix("- ")?;
+    let (name, rest) = rest.split_once(" (")?;
+    // Work ends at its meta; every other line goes on with its description.
+    let (meta, description) = match rest.split_once("): ") {
+        Some((meta, description)) => (meta, description),
+        None => (rest.strip_suffix(')')?, ""),
+    };
+    let mut parts = meta.split(", ");
+    let kind = parts.next()?;
+    let verified = parts.next()?.strip_prefix("verified ")?;
+    if valid_name(name).is_err() || !TYPES.contains(&kind) {
+        return None;
+    }
+    let mut listed = Listed {
+        name: name.to_owned(),
+        kind: kind.to_owned(),
+        verified: verified.to_owned(),
+        description: description.to_owned(),
+        ..Listed::default()
+    };
+    for part in parts {
+        match part {
+            "external" => listed.external = true,
+            "live" => listed.live = true,
+            _ => match part.strip_prefix("confirmed ") {
+                Some(n) => listed.confirmed = n.parse().ok()?,
+                None => listed.pushed_back = part.strip_prefix("pushed back ")?.parse().ok()?,
+            },
+        }
+    }
+    Some(listed)
+}
+
+/// A fact's file as the person reads it in Sonny's `/memory`: as the
+/// memory tool's `read` gives it, but not recorded, since the nightly
+/// cleanup counts only agents' reads.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Peeked {
+    pub listed: Listed,
+    pub source: String,
+    /// The fact's text, under its front matter.
+    pub text: String,
+    /// A live fact's text filled now from `folder`, or why it did not
+    /// fill; nothing for a plain fact, or when no folder was given.
+    pub filled: Option<Result<String, String>>,
+    /// When its file was last written, in ms.
+    pub modified_ms: u64,
+}
+
+/// The fact `name` in `dir`, read and left unrecorded; a live one filled
+/// from `folder` when one is given.
+pub fn peek(dir: &Path, folder: Option<&Path>, name: &str) -> Result<Peeked, String> {
+    let (fact, text, modified_ms) = fact_file(dir, name)?;
+    let body = text
+        .split_once("\n---\n")
+        .map_or("", |(_, body)| body)
+        .trim()
+        .to_owned();
+    let filled = match (FILL.get(), folder) {
+        (Some(fill), Some(folder)) if fact.live => Some(fill.fill(&body, folder).map(cut_filled)),
+        _ => None,
+    };
+    Ok(Peeked {
+        listed: Listed::from(&fact),
+        source: fact.source.clone(),
+        text: body,
+        filled,
+        modified_ms,
+    })
+}
+
+/// The fact `name` in `dir`: what it says, its whole file, and when the
+/// file was last written, in ms.
+fn fact_file(dir: &Path, name: &str) -> Result<(Fact, String, u64), String> {
+    valid_name(name)?;
+    let file = format!("{name}.md");
+    let path = dir.join(&file);
+    let mut text = String::new();
+    let opened = match std::fs::File::open(&path) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Err(format!(
+                "fact_not_found: {name}: no such fact in {}",
+                dir.display()
+            ));
+        }
+        opened => opened.map_err(|e| format!("memory_failed: {}: {e}", path.display()))?,
+    };
+    let modified_ms = (opened.metadata().and_then(|m| m.modified()).ok())
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map_or(0, |d| d.as_millis() as u64);
+    opened
+        .take(LIMIT as u64 + 1)
+        .read_to_string(&mut text)
+        .map_err(|e| format!("memory_failed: {}: {e}", path.display()))?;
+    let invalid = |why: String| format!("memory_invalid: {}: {why}", path.display());
+    if text.len() > LIMIT {
+        return Err(invalid(format!("larger than {LIMIT} bytes")));
+    }
+    let fact = Fact::parse(&file, &text).map_err(invalid)?;
+    Ok((fact, text, modified_ms))
+}
+
 /// A fact's name, which is also its file's. `memory` would be the index's
 /// file on a Mac, whose folders ignore case.
 fn valid_name(name: &str) -> Result<(), String> {
@@ -956,26 +1097,8 @@ fn reads(dir: &Path) -> serde_json::Map<String, Value> {
 /// The fact `name` in `dir`, its whole file, with a live one's text filled
 /// from `folder` as it stands now; the read is recorded.
 fn read(dir: &Path, folder: &Path, name: &str) -> Result<Value, String> {
-    valid_name(name)?;
-    let file = format!("{name}.md");
-    let path = dir.join(&file);
-    let mut text = String::new();
-    match std::fs::File::open(&path) {
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            return Err(format!(
-                "fact_not_found: {name}: no such fact in {}",
-                dir.display()
-            ));
-        }
-        opened => opened
-            .and_then(|f| f.take(LIMIT as u64 + 1).read_to_string(&mut text))
-            .map_err(|e| format!("memory_failed: {}: {e}", path.display()))?,
-    };
-    let invalid = |why: String| format!("memory_invalid: {}: {why}", path.display());
-    if text.len() > LIMIT {
-        return Err(invalid(format!("larger than {LIMIT} bytes")));
-    }
-    let fact = Fact::parse(&file, &text).map_err(invalid)?;
+    let (fact, text, _) = fact_file(dir, name)?;
+    let path = dir.join(format!("{name}.md"));
     // Locked only to record it, so a read of no fact makes no folder.
     let _lock = lock(dir)?;
     let mut all = reads(dir);
@@ -1819,27 +1942,31 @@ pub fn view(root: &Path, project: Option<&str>) -> Value {
     let projects = root.join("projects");
     let (names, more) = match project {
         Some(name) => (vec![name.to_owned()], 0),
-        None => {
-            let mut names: Vec<String> = std::fs::read_dir(&projects)
-                .into_iter()
-                .flatten()
-                .take(MAX_ENTRIES)
-                .flatten()
-                .filter(|e| e.path().is_dir())
-                .filter_map(|e| e.file_name().into_string().ok())
-                .filter(|name| crate::project::valid_name(name))
-                .collect();
-            names.sort();
-            let more = names.len().saturating_sub(MAX_PROJECTS);
-            names.truncate(MAX_PROJECTS);
-            (names, more)
-        }
+        None => self::projects(root),
     };
     let listed: Vec<Value> = names
         .iter()
         .map(|name| scope(projects.join(name), Some(name)))
         .collect();
     json!({"user": scope(root.to_path_buf(), None), "projects": listed, "more": more})
+}
+
+/// The projects with a memory folder under `root`, by name, at most
+/// [`MAX_PROJECTS`] of them, and how many more there are.
+pub fn projects(root: &Path) -> (Vec<String>, usize) {
+    let mut names: Vec<String> = std::fs::read_dir(root.join("projects"))
+        .into_iter()
+        .flatten()
+        .take(MAX_ENTRIES)
+        .flatten()
+        .filter(|e| e.path().is_dir())
+        .filter_map(|e| e.file_name().into_string().ok())
+        .filter(|name| crate::project::valid_name(name))
+        .collect();
+    names.sort();
+    let more = names.len().saturating_sub(MAX_PROJECTS);
+    names.truncate(MAX_PROJECTS);
+    (names, more)
 }
 
 /// What `~/.agent/memory` says it takes.
@@ -1856,6 +1983,54 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir.canonicalize().unwrap()
+    }
+
+    #[test]
+    fn an_index_line_reads_back_as_the_fact_it_lists() {
+        let mut fact = Fact {
+            name: "release-signing".into(),
+            kind: "project".into(),
+            description: "keys live in the vault (not CI): see release-0-8".into(),
+            source: "tally.lead/4".into(),
+            verified: "2026-11-03".into(),
+            external: true,
+            live: true,
+            confirmed: 3,
+            pushed_back: 1,
+        };
+        assert_eq!(listed(&fact.line()), vec![Listed::from(&fact)]);
+        (fact.external, fact.live, fact.confirmed, fact.pushed_back) = (false, false, 0, 0);
+        assert_eq!(listed(&fact.line()), vec![Listed::from(&fact)]);
+        // Work by name and date alone, and what is no fact's line skipped.
+        let index = "# Memory in /m\n\n- release-0-8 (work, verified 2026-11-13)\n- Bad Name (user, verified 2026-11-13): x\n\n3 more facts are in this folder's MEMORY.md\n";
+        let work = listed(index);
+        assert_eq!(work.len(), 1);
+        assert_eq!(
+            (work[0].name.as_str(), work[0].kind.as_str()),
+            ("release-0-8", "work")
+        );
+        assert_eq!(
+            (work[0].verified.as_str(), work[0].description.as_str()),
+            ("2026-11-13", "")
+        );
+    }
+
+    #[test]
+    fn a_peek_gives_the_fact_and_records_no_read() {
+        let root = temp("peek");
+        save_user(&root, "short-replies", "keep replies short", "Short.").unwrap();
+        let peeked = peek(&root, None, "short-replies").unwrap();
+        assert_eq!(peeked.text, "Short.");
+        assert_eq!(peeked.source, "George, 2026-10-10");
+        assert_eq!(peeked.listed.kind, "feedback");
+        assert!(peeked.filled.is_none() && peeked.modified_ms > 0);
+        assert!(!root.join(READS).exists());
+        assert!(
+            peek(&root, None, "gone")
+                .unwrap_err()
+                .starts_with("fact_not_found: ")
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

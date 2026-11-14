@@ -121,6 +121,7 @@ Closing its window leaves the daemon and running turns alive.
 | Change model and effort | `/model` |
 | Change settings | `/config` |
 | Review automations and other background work | `/background` |
+| Read and remove what agents remember | `/memory` |
 | Inspect token usage | `/usage` |
 | List commands or keyboard shortcuts | `/`, or `?` with an empty composer |
 

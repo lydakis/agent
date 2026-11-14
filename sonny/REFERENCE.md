@@ -414,7 +414,7 @@ project whose lead is in no multiplexer gets none, and its agents get no
 layout skill. A tab asked for stays until you or an agent close it, or the
 task is marked done. With `task_tabs = "every"`, a task's window
 closes once its work is taken: its turn completed and the lead (or the task
-that started it) waited on it. One that failed, stopped or waits on you stays
+that started it) waited on it. One that failed, was interrupted or waits on you stays
 open, and a task given more work opens again; ask the lead to show one, or
 run `sonny --agent NAME`. A lead keeps `[sonny] task_windows` of its tasks'
 windows open, 32 by default (0 for no limit), as VS Code's editor limit
@@ -1015,11 +1015,16 @@ has something on it, or is off the screen, no time shows.
   approval, asking you a question, or held on something only you can fix,
   such as a ChatGPT sign-in), **Failed** (its last turn failed; it asks
   nothing, and says what went wrong under it),
-  **Working** (a turn running, queued, rate limited, waiting on other
-  tasks, or `waiting on its reviewer` while the reviewer weighs a call), **Idle**
-  (its turn ended, stopped, or never started, with nothing open; a pull
-  request its last reply linked shows on its row), and **Done** (marked
-  done). Each agent is one line: its mark, name, state and time; one
+  **Working** (a turn running, queued, rate limited, starting, waiting on
+  other tasks, or `waiting on its reviewer` while the reviewer weighs a
+  call), **Idle** (its turn ended with nothing open, `idle`; ended without
+  words, `no reply`; or you ended it, `interrupted`; a pull request its
+  last reply linked shows on its row), and **Done** (marked done). One
+  table gives every state its mark, for the footer, `/status`, the tasks
+  a lead started and `/switch` alike: `?` needs you or held, `✗` failed,
+  `●` working, `◌` waiting, queued, rate limited or starting, `○` idle or
+  no reply, `■` interrupted, `✓` done; all but the first three muted.
+  Each agent is one line: its mark, name, state and time; one
   that needs you says what for under it, one that failed why. That is all it shows as it opens; `m` shows more and hides it
   again: at each row's right edge, dim, the rest of what it tracks: what it follows (a source with an
   `icon` in `[sonny.sources.NAME]` shows as that icon, as it does wherever
@@ -1145,6 +1150,34 @@ has something on it, or is off the screen, no time shows.
   reading there is not counted as an agent's.
 
   ![/commons in the pane](../docs/sonny/commons.png)
+- `/memory` shows, in the pane beside the conversation, what agents saved to
+  memory: Work under way, newest first, with how long since each was saved;
+  This project's facts; and About you, the facts kept about you in every
+  project, folded at first. Each row has the fact's name, its type (left
+  unsaid when it is its section's own: `project` under a project, `user`
+  under About you) and its index flags (`live`, `external`, `confirmed N`, `pushed back N`), its
+  description, and `verified DATE` at the right edge. It reads each
+  folder's `MEMORY.md`, and a work fact's own file, since an index lists
+  work by name and date alone. A live fact's description is filled as a
+  starting agent reads it. `a` widens it to every project, one folded
+  section each with this one first and open; `a` again narrows it back.
+  ↑↓ pick, → or Enter opens a fact or a folded section, or steps into an
+  open one; ← folds it, and a click on a heading opens or folds it.
+  An open fact is a page: its text as Markdown, filled now when it is
+  live, under one muted line with its type, flags, verified date and
+  `from SOURCE`, where an agent's `NAME/N` is the page's first link and
+  opens that agent. Another fact's exact name in the text is a link, as
+  Lynx's are: ↑↓ pick among the links in view and scroll when none is left
+  that way, → or Enter opens one (a fact as the next page), and ← or the
+  title's ‹ walks back. `x` removes the picked fact after `Remove NAME?
+  It can't be undone.`, `enter remove · esc cancel`, through the memory
+  tool's own `remove`, so the index stays right; any other key says `not
+  removed`. It reads off the screen thread when it opens, on `a`, and after a
+  removal, never on a timer. Your reading there is not counted as an
+  agent's, so it never keeps a fact from the nightly cleanup's 30-day
+  unread check.
+
+  ![/memory in the pane](../docs/sonny/memory.png)
 - `/sky` draws every agent the daemon keeps, in the pane: leads on the inner
   ring, the agents each one made fanned out behind it, you in the middle,
   on a circle as 0.7.0 drew it, stretched to fill a wide pane (up to twice
@@ -1658,8 +1691,8 @@ they turn up only once the agent has read them. None waits more than a
 day (`attach_wait` in `config.toml`): one no call took in by then reaches
 the agent as a message of its own. Your reactions and the margin notes you
 close wait for your next word instead, which is what they are about. A turn that ends
-with the model saying nothing (`empty_completion`) ends quietly, not as a
-failure.
+with the model saying nothing (`empty_completion`) reads `no reply`, not
+a failure, and its notification says `fix finished, no reply`.
 
 ![Memory saves folded into one row, and a question whose options are buttons](../docs/sonny/fold-and-ask.png)
 
@@ -1829,7 +1862,12 @@ redraws it by hand, as in a shell.
 With nothing typed, `?` lists every key beside the conversation. Every
 hint on screen is written one way, as Codex writes them: the key, then
 what it does muted, `·` between them (`↑↓ pick · enter open · esc
-close`). Every list over the composer (the slash menu, `/model`,
+close`). Each view names its keys once, and the same few words say what
+`esc` and `enter` do everywhere: `esc` closes, goes back, cancels, or
+leaves a question for your own words; `enter` opens, runs, chooses, goes
+on, saves, or says a confirm's own verb (`enter compact`). A line too
+long for its row drops pairs from the right, keeping `esc`, then
+`enter`. Every list over the composer (the slash menu, `/model`,
 `/switch`, `/new`, `/permissions`, `/fast`, `/retry`, a reply to react to
 or answer, Ctrl+R) is one list: up to 8 rows under a blank one, the pick
 in reverse video, `•` before what is in effect, and its keys where the

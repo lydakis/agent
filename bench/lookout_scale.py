@@ -332,7 +332,10 @@ class Bench:
         path = Path(str(self.store) + '.lookout.jsonl')
         if not path.exists():
             return []
-        return [json.loads(line) for line in path.read_text().splitlines() if line.strip()]
+        # The lookout may be writing its last line as this reads: only
+        # lines it has ended are whole.
+        whole = path.read_text().rpartition('\n')[0]
+        return [json.loads(line) for line in whole.splitlines() if line.strip()]
 
     def start_lookout(self, phase):
         log = open(self.out / f'lookout-{phase}.out', 'w')
