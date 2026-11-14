@@ -1195,7 +1195,11 @@ has something on it, or is off the screen, no time shows.
   on a circle as 0.7.0 drew it, stretched to fill a wide pane (up to twice
   as wide as high). It opens whole: "Catching up with who is here…" until
   every agent, what each did and holds, and what each asks are read, then
-  the sky, its counts and its log at once. Projects keep their places in
+  the sky, its counts and its log at once. An idle agent whose question
+  was never read, as every agent on a store's first sky, does not hold it:
+  the sky shows, the footer says `reading what 182 agents ask`, and each
+  `?` appears as its read lands; what was read is kept as it comes, so a
+  sky closed halfway leaves the next one less. Projects keep their places in
   the order they started,
   each arm as wide as the square root of its size, and the agents that made
   none sit on the outer edge, as a tree's leaves do, so the sky fills to
@@ -1295,6 +1299,8 @@ has something on it, or is off the screen, no time shows.
   ![/sky: a reviewer's no streaking red onto an agent, a hand-off yellow, a schedule's tick flashing as it fires](../docs/sonny/sky-origins.gif)
 
   ![/sky with states and its chat log](../docs/sonny/sky-states.png)
+
+  ![/sky's first open on a store of 5,000 agents, shown while it reads what 182 still ask](../docs/sonny/sky-first-open.png)
 
   ![/sky in zen](../docs/sonny/sky-zen.png)
 
