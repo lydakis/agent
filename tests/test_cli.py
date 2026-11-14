@@ -318,7 +318,7 @@ class SocketAndCliTests(ModelFixture):
         self.assertIn('takes no positional arguments', extra.stderr)
 
     def test_start_replace_switches_the_running_daemon_to_this_agent(self):
-        # `sonny update` switches to a new build that kept the protocol:
+        # `sonny upgrade` switches to a new build that kept the protocol:
         # `start --replace` stops the running daemon at once and starts this
         # agent's own on the same store, which keeps every bot. From inside a
         # bot's turn it keeps the daemon and says so; with none running, it

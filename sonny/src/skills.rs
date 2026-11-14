@@ -290,7 +290,7 @@ fn in_app_bundle(target: &Path) -> bool {
 
 /// This Sonny, by the path that outlives an upgrade: Homebrew's `opt`
 /// link for a Sonny in its Cellar, and the release tarball's
-/// `PREFIX/opt/sonny` link for one install.sh or `sonny update` unpacked,
+/// `PREFIX/opt/sonny` link for one install.sh or `sonny upgrade` unpacked,
 /// which a scheduled fire still finds after the old version is gone.
 pub fn sonny_path() -> Option<PathBuf> {
     let me = crate::named::me().ok()?;

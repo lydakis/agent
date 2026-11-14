@@ -391,7 +391,7 @@ fn usage() -> String {
      tasks; sonny tool-host answers its agents' calls of Sonny's tools. Sonny starts both.\n\
      sonny agent ARGS... runs Sonny's own `agent` with ARGS, whatever `agent` is on PATH.\n\
      sonny setup asks again for the provider and the default model, as the first run does.\n\
-     sonny update [--download] updates Sonny and its daemon to the latest release, as it was\n\
+     sonny upgrade [--download] upgrades Sonny and its daemon to the latest release, as it was\n\
      installed, replaces the running daemon with the new one and has open windows reopen on it.\n\
      sonny acp [--store PATH] [--socket PATH] speaks the Agent Client Protocol on stdio\n\
      for T3 Code: a thread is its folder's lead, and each task opens as a thread of its own."
@@ -1913,7 +1913,7 @@ fn start_daemon(
 }
 
 /// [`start_daemon`], replacing the daemon running now, whatever its
-/// release, as `sonny update` switches to the new one (`agent start
+/// release, as `sonny upgrade` switches to the new one (`agent start
 /// --replace`).
 fn start_daemon_replacing(
     store: &std::path::Path,
@@ -2202,12 +2202,19 @@ fn main() -> std::process::ExitCode {
         Some((verb, rest)) if verb == "sky" => sky_cli(rest),
         Some((verb, rest)) if verb == "status" => status_cli(rest),
         // The person runs this, from a terminal of their own.
-        Some((verb, rest)) if verb == "update" => update::cli(rest),
+        Some((verb, rest)) if verb == "upgrade" => update::cli(rest),
+        // An older Sonny's hand-off after it installed this one, under the
+        // name before 0.10.0 (`upgrade::MIGRATIONS`, "update-hand-off").
+        Some((verb, rest))
+            if verb == "update" && rest.first().is_some_and(|arg| arg == "--installed") =>
+        {
+            update::cli(rest)
+        }
         // An agent's shell runs this, before it opens anything in a terminal.
         Some((verb, rest)) if verb == "where" => where_cli(rest),
         // An agent's shell runs this, for zen it was asked for in words.
         Some((verb, rest)) if verb == "zen" => zen::cli(rest),
-        Some((verb, rest)) if verb == "home" => {
+        Some((verb, rest)) if verb == "backup" => {
             return std::process::ExitCode::from(home::cli(rest) as u8);
         }
         // Unlisted: the job `sonny.start_at_boot` keeps.
@@ -4975,7 +4982,7 @@ fn inner_projects<'a>(names: impl Iterator<Item = &'a str>, project: &str) -> Ve
 enum Kin {
     /// One of its tasks: a window here.
     Task,
-    /// Another project's lead: a home of its own, opened when asked for.
+    /// Another project's lead: a workspace of its own, opened when asked for.
     Lead(String),
     None,
 }

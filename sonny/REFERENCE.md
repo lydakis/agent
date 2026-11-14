@@ -4,7 +4,7 @@ For installation and your first task, start with the [quickstart](README.md).
 This reference covers settings, integrations, controls, and their detailed behavior.
 
 [Installation](#installation) · [Projects](#projects-and-leads) ·
-[Setup](#provider-setup) · [Configuration](#roles-for-leads-and-tasks) ·
+[Setup](#provider-setup) · [Configuration](#profiles-for-leads-and-tasks) ·
 [Terminal layout](#terminal-layout) · [ACP](#acp-clients) ·
 [Keyboard](#writing-messages) · [Commands](#commands) ·
 [Display](#conversation-display)
@@ -31,13 +31,13 @@ latest one into `~/.local`:
 
     curl -fsSL https://raw.githubusercontent.com/lydakis/agent/main/install.sh | sh
 
-`sonny update` updates either install to the latest release, replaces the
+`sonny upgrade` upgrades either install to the latest release, replaces the
 running daemon with the new one (its running turns continue on it) and has
-open windows reopen on it ([docs/SONNY.md](../docs/SONNY.md#updating)).
+open windows reopen on it ([docs/SONNY.md](../docs/SONNY.md#upgrading)).
 
 For main without a version tag, `brew install lydakis/agent/sonny-nightly`
 fetches current main and builds Sonny and its matching daemon together. If
-stable Sonny is installed, run `brew unlink sonny` first. Update with
+stable Sonny is installed, run `brew unlink sonny` first. Upgrade with
 `brew update` and `brew reinstall lydakis/agent/sonny-nightly`: a reinstall
 fetches the latest main commit even when the formula's version is unchanged.
 No `--HEAD` or wait for a scheduled build is needed. `sonny --version` and
@@ -211,7 +211,7 @@ that may be rebuilt or lost: memory, skills and profiles (`~/.agents`) and
 `~/.agent/config.toml` are copied into a clone of URL, a private git
 repository, at `~/agent-home`, committed and pushed every ten minutes by
 Sonny's scheduler, the one background job Sonny keeps
-([docs/SONNY.md](../docs/SONNY.md#the-scheduler)), which runs `sonny home
+([docs/SONNY.md](../docs/SONNY.md#the-scheduler)), which runs `sonny backup
 sync`. Keys in `~/.agent/keys/env`, logins and the daemon's store
 stay out, and so does a `config.toml` that holds a secret itself (an MCP
 server's `http_headers`, or a key named like a token), which the sync names
@@ -220,7 +220,7 @@ out too, since a commit inside `~/.agents/memory` would make the nightly
 cleanup find nothing to do. On a machine that never synced, setup first
 restores what the repository holds, keeping a `config.toml` it replaces as
 `config.toml.before-restore`: a new box is `install.sh`, then `sonny setup
-backup URL`. `sonny home status` says how the last sync went. Pushing uses
+backup URL`. `sonny backup status` says how the last sync went. Pushing uses
 the person's own git credentials, read from the login shell. Sonny names
 no host for the repository. First-run setup offers it last, once, and an
 empty answer skips it; until backup is set up, the first lead after an
@@ -241,7 +241,7 @@ brings back the companions it keeps, the lookout and the tool host among
 them. Turning it off leaves the scheduler for automations, and a running
 daemon running.
 
-## Roles and upgrades
+## Profiles and upgrades
 
 A lead's transcript starts with a welcome, as Claude Code's does: Sonny,
 the robot the client is named for, as a portrait drawn in half blocks,
@@ -274,7 +274,7 @@ for anything that cannot be undone. A folder's own
 `.agents/agents/lead.md` or `task.md` comes first. The task settings from `.agents/project.toml` are composed after
 the lead's role, not kept in the file.
 
-### Roles for leads and tasks
+### Profiles for leads and tasks
 
 A lead runs as the `lead` profile and every other agent is told the `task`
 one, unless set to another. Another kind of lead is a profile of its own,

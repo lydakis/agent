@@ -1063,7 +1063,7 @@ async fn make(
 
 /// A `new_project` call of `caller`'s: the project Sonny makes for a
 /// folder, on the caller's daemon (`created: false` when it was there
-/// already), its lead opened in a home of its own.
+/// already), its lead opened in a workspace of its own.
 pub async fn add(caller: &str, arguments: &Value) -> Result<Value, String> {
     let (dir, mut picks) = picks(arguments)?;
     let config = agent_client::config::load()?;
@@ -1087,7 +1087,7 @@ pub async fn add(caller: &str, arguments: &Value) -> Result<Value, String> {
     made
 }
 
-/// A lead made for another agent opens in a home of its own, a Herdr or
+/// A lead made for another agent opens in a workspace of its own, a Herdr or
 /// cmux workspace or a Rex session beside the caller's, as the person would
 /// otherwise ask; `opened_in` says where, or `not_opened` why not.
 async fn open_new_lead(client: &Client, socket: &Path, caller: &str, made: &mut Value) {
