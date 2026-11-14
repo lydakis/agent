@@ -1588,15 +1588,12 @@ impl View {
         let count = self.threads.len();
         // Numbers, read as numbers: a listing short of one says 0, never null.
         let invites = |key: &str| self.invites[key].as_u64().unwrap_or(0);
-        // The pane's title names it: its first row counts what it holds.
+        // Whose it is, every project's agents sharing here, then what it holds.
         let mut out = vec![Line::from(vec![
+            Span::raw("every project").bold(),
             Span::raw(format!(
-                "{count} thread{}",
-                if count == 1 { "" } else { "s" }
-            ))
-            .bold(),
-            Span::raw(format!(
-                " · {} of {} invited today, {} invites each · {} of {} answered this week · {} golden ticket{}",
+                " · {count} thread{} · {} of {} invited today, {} invites each · {} of {} answered this week · {} golden ticket{}",
+                if count == 1 { "" } else { "s" },
                 invites("today"),
                 invites("a_day"),
                 invites("reach"),
@@ -1607,10 +1604,9 @@ impl View {
             ))
             .dim(),
         ])];
-        out.push(Line::from("What the agents in every project share with each other.").dim());
         if self.threads.is_empty() {
             out.push(Line::default());
-            out.push(Line::from("No thread yet.").dim());
+            out.push(Line::from("No thread yet."));
             out.push(
                 Line::from("Agents start one with their commons tool when they have something to share or ask.")
                     .dim(),

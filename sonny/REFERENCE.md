@@ -1066,14 +1066,14 @@ has something on it, or is off the screen, no time shows.
   its project's default. An agent with
   automations or follows of its own shows `↻ 2 automations` there too. A click on an agent's name goes
   to it as a click on a task in a roster does (below), and so does
-  Enter on the agent ↑ and ↓ pick (`›`). This window's own agent is a
+  Enter on the agent ↑ and ↓ pick (reversed, as every view draws its pick). This window's own agent is a
   row like any other: picking it closes `/status`, back to the
   conversation. ‹ in its title,
   or Ctrl+[ from the conversation, goes back to `/status`. It opens
   with the agent the conversation named last already picked, so
   `/status` and Enter open the task a reply just pointed you to.
 
-  ![/status with ↑↓ pick · enter open in its title, the picked task marked ›](../docs/sonny/status-keys.png)
+  ![/status with ↑↓ pick · enter open in its title, the picked task reversed](../docs/sonny/status-keys.png)
 
   ![/status with Idle open and the lead picked, its row shown reversed](../docs/sonny/status-lead-picked.png)
 
@@ -1128,7 +1128,7 @@ has something on it, or is off the screen, no time shows.
   provider's cache), by agent and by model: each model by its name, its
   provider in a muted column beside it, and one model's ids from one
   provider (two Bedrock regions', say) on one row. `←` and `→` show the last
-  day, week or month, `a` every agent in the store, by project, and `c`
+  day, week or month, `a` every project's agents, by project, and `c`
   hides the cached reads, so what the provider charges most for stands out.
   Under the models, Speed says how fast each answered its calls: output
   tokens a second from send to answer, and the time to its first output, on
@@ -1903,6 +1903,19 @@ the keys between the conversation and the pane, both ways, the agent
 beside included; while the pane has them the composer's `›` is muted,
 and a key the view does not name does nothing (`q` included), never
 typed into the composer.
+
+Every view is laid out the same way, too. Its title row is the command
+that opens it (`mcp`, not "MCP servers") and the keys it takes. Under it
+the head says whose view it is, bold: the project (`shop`), `every
+project` when `a` widens it, or one agent as you say it (`shop lead`),
+then muted facts after ` · `. What is broken comes next, as a red `✗` and
+plain words; then sections, a bold name and a muted count; then rows,
+the pick reversed from the row's first word to one column past its last.
+An empty view says so in one sentence, then one muted line on how it
+fills; a view still reading says `reading…`, and one that could not says
+`✗ could not read …: why`. A list cut short ends `… N more`. An agent
+shown beside opens no pane of its own: asked for a view or the margin, it
+says views open in the main window, where Ctrl+G moves it.
 
 ![? with nothing typed: every key beside the conversation](../docs/sonny/shortcuts.png)
 

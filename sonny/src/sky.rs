@@ -4017,7 +4017,7 @@ impl View {
         }
         if more > 0 {
             let hidden = self.order.len() - kept.len();
-            lines.push(Line::from(format!("  … {hidden} more, quiet")).dim());
+            lines.push(Line::from(format!("  … {hidden} more")).dim());
         }
         lines.push(Line::default());
         (lines, hits)
@@ -8850,7 +8850,10 @@ mod tests {
                 && row.contains("from shop lead")),
             "{shown}"
         );
-        assert!(shown.contains("more, quiet"), "{shown}");
+        assert!(
+            shown.contains(" more") && !shown.contains("quiet"),
+            "{shown}"
+        );
         assert!(rows.len() <= 20, "{shown}");
     }
 
