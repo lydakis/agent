@@ -180,7 +180,7 @@ the lookout with its `follows` tool, and hears each run that
 failed, was stopped or replied words (step 10):
 
 ```json
-{"add": {"name": "NAME", "bots": ["NAME"]}}
+{"add": {"name": "NAME", "agents": ["NAME"]}}
 ```
 
 ## Each run

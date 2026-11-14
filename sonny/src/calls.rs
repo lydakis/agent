@@ -1205,7 +1205,7 @@ Keep the rest.'"#,
         assert_eq!(
             call(
                 "follows",
-                serde_json::json!({"add": {"name": "prs", "bots": ["a"]}})
+                serde_json::json!({"add": {"name": "prs", "agents": ["a"]}})
             ),
             "Followed prs"
         );

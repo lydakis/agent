@@ -5098,7 +5098,7 @@ fn followed_leads(lead: &str, read: impl Fn(&str) -> Vec<lookout::subs::Sub>) ->
     let mut at = vec![lead.to_owned()];
     while let Some(follower) = at.pop() {
         for sub in read(&follower) {
-            for name in sub.tasks_of.iter().chain(&sub.bots) {
+            for name in sub.tasks_of.iter().chain(&sub.agents) {
                 if !name.contains('*') && project::is_lead(name) && seen.insert(name.clone()) {
                     at.push(name.clone());
                 }

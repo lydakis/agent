@@ -282,6 +282,12 @@ pub const MIGRATIONS: &[Migration] = &[
         id: "sent-stamp",
         retire: "0.12.0",
     },
+    // A follow's `bots` become its `agents`, in the Rulebook's words
+    // (0.10.0).
+    Migration {
+        id: crate::lookout::subs::AGENTS,
+        retire: "0.12.0",
+    },
     // `[sonny] steps` and `verbose`, two switches, become one `view`
     // (0.10.0).
     Migration {
