@@ -2121,16 +2121,16 @@ pub async fn run(config: Configuration) -> Result<()> {
     // Listed with the person's other daemons, so each keeps this one's
     // store and socket out of its sandboxes as this one keeps theirs. One
     // that cannot list itself, as one inside a sandbox cannot write
-    // `~/.agent`, runs all the same: it can do nothing its sandbox doesn't.
+    // `~/.agent`, doesn't start: no other daemon's sandbox would keep it.
     if let (Some(folder), Some(store)) = (&daemon.known, &daemon.store) {
         let known = agent_runtime::sandbox::known::Known {
             store: store.clone(),
             socket: daemon.socket.clone(),
         };
         if let Err(error) = agent_runtime::sandbox::known::record(folder, &known) {
-            eprintln!(
-                "agent: not listed in {}, so other daemons' sandboxes don't keep this one's store and socket: {error}",
-                folder.display()
+            return fail_with(
+                "daemon_not_listed",
+                format!("{}: {error}", folder.display()),
             );
         }
     }

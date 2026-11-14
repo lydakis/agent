@@ -979,15 +979,16 @@ fn unfinished_char(bytes: &[u8]) -> usize {
 }
 
 /// `redact_blocks` as a stream: what it may still replace is held, and a
-/// secret block's body is dropped as it comes, up to its end.
+/// secret block's body is dropped as it comes, line by line.
 #[derive(Default)]
 struct BlockStream {
     /// Read and not yet told: from a block's start, or the end of the
     /// text that may begin one.
     held: String,
-    /// Inside a secret block's body, dropped: its last bytes, which may
-    /// begin its end's marker.
-    body: Option<String>,
+    /// Inside a secret block's body.
+    body: Option<PemBody>,
+    /// How far the held key's escaped line was read.
+    scan: LineScan,
 }
 
 /// The most of a block's header held back for its end: far past any
@@ -1001,43 +1002,46 @@ impl BlockStream {
 
     fn feed(&mut self, text: &str, blocks: &[String], last: bool) -> String {
         const BEGIN: &str = "-----BEGIN ";
-        const END: &str = "-----END ";
         let mut out = String::with_capacity(text.len());
-        let text = std::mem::take(&mut self.held) + text;
-        let bytes = text.as_bytes();
+        let mut text = std::mem::take(&mut self.held) + text;
+        let mut scan = std::mem::take(&mut self.scan);
         // Read on from `at`: nothing before it is moved again.
         let mut at = 0;
         loop {
-            if let Some(tail) = &mut self.body {
-                // The end's marker, maybe begun in the last text's end.
-                let mut probe = tail.as_bytes().to_vec();
-                probe.extend_from_slice(&bytes[at..(at + END.len() - 1).min(bytes.len())]);
-                let across = (probe.windows(END.len()))
-                    .position(|w| w == END.as_bytes())
-                    .map(|p| at + p + END.len() - tail.len());
-                let end = across.or_else(|| text[at..].find(END).map(|n| at + n + END.len()));
-                match end {
-                    Some(end) => {
-                        // As `redact_blocks` goes on: past the end's marker.
-                        out.push_str(REDACTED);
-                        out.push('\n');
-                        out.push_str(END);
-                        self.body = None;
-                        at = end;
-                        continue;
-                    }
-                    None if last => {
-                        // A key cut off by its stream's end is still a key.
-                        out.push_str(REDACTED);
-                        self.body = None;
-                    }
-                    None => {
-                        tail.push_str(&text[at..]);
-                        let keep = floor_char(tail, tail.len().saturating_sub(END.len() - 1));
-                        tail.drain(..keep);
+            if let Some(body) = &mut self.body {
+                // A line held from the last text begins this one.
+                let line = std::mem::take(&mut body.line);
+                if !line.is_empty() {
+                    text = line + &text[at..];
+                    at = 0;
+                    scan = LineScan::default();
+                }
+                if body.searching {
+                    let rest = &text[at..];
+                    match pem_end(rest, body.searched, last) {
+                        None => {
+                            body.searched = rest.len();
+                            self.held = rest.to_owned();
+                            return out;
+                        }
+                        Some(Some(end)) => {
+                            out.push_str(if end > 0 { "[REDACTED]\n" } else { "" });
+                            self.body = None;
+                            at += end;
+                            continue;
+                        }
+                        Some(None) => body.searching = false,
                     }
                 }
-                return out;
+                match body.take(&text[at..], last) {
+                    Some((len, told)) => {
+                        out.push_str(told);
+                        self.body = None;
+                        at += len;
+                        continue;
+                    }
+                    None => return out,
+                }
             }
             let Some(begin) = text[at..].find(BEGIN).map(|n| at + n) else {
                 // The end may begin a block's marker.
@@ -1055,15 +1059,19 @@ impl BlockStream {
             };
             out.push_str(&text[at..begin]);
             at = begin;
-            let Some(dashes) = text[at + BEGIN.len()..]
-                .find("-----")
-                .map(|n| BEGIN.len() + n + 5)
-            else {
-                if last {
-                    // No header ends: `redact_blocks` stops here.
-                    out.push_str(&text[at..]);
-                    return out;
-                }
+            let from = at + BEGIN.len();
+            // The closing dashes first, as `pem_header` reads them.
+            let dash = find_dashes(&text[from..]).map(|n| from + n);
+            let closed = dash.is_some_and(|dash| !text[from..dash].contains('\n'));
+            // No dashes after: no later block starts, so this is read once.
+            let line_ends = dash.is_some() || text[from..].contains('\n');
+            if !closed && (line_ends || last) {
+                // No header line here: read on after its start.
+                out.push_str(BEGIN);
+                at = from;
+                continue;
+            }
+            if !closed {
                 // No header ends after this block's start, nor so after any
                 // later one: past `HEADER_HOLD` they are no key's and are
                 // told as they are; the last such start is held.
@@ -1075,24 +1083,92 @@ impl BlockStream {
                 out.push_str(&text[at..held]);
                 self.held = text[held..].to_owned();
                 return out;
-            };
-            let header = match &bytes[at + dashes..] {
-                [b'\r', b'\n', ..] => dashes + 2,
-                [b'\n', ..] => dashes + 1,
-                [b'\r'] | [] if !last => {
+            }
+            let Some(header) = pem_header(&text, at, last) else {
+                let dashes = dash.unwrap_or(from) + 5;
+                let after = &text.as_bytes()[dashes..];
+                if !last
+                    && after.len() <= PEM_SPACES + 1
+                    && after.iter().all(|b| b" \t\r".contains(b))
+                {
                     // The line's end may follow.
                     self.held = text[at..].to_owned();
                     return out;
                 }
-                _ => dashes,
+                match pem_escaped(&text, at, last, &mut scan) {
+                    Escaped::More => {
+                        self.held = text[at..].to_owned();
+                        self.scan = scan.from(at);
+                        return out;
+                    }
+                    Escaped::Key {
+                        escape,
+                        header,
+                        end,
+                    } => {
+                        let named = blocks
+                            .iter()
+                            .any(|block| text[at..header].contains(block.as_str()));
+                        out.push_str(&text[at..header]);
+                        if named {
+                            out.push_str(REDACTED);
+                            out.push_str(&text[escape..header]);
+                            at = end;
+                        } else {
+                            at = header;
+                        }
+                        continue;
+                    }
+                    Escaped::No => {}
+                }
+                out.push_str(BEGIN);
+                at = from;
+                continue;
             };
-            let header = &text[at..at + header];
-            out.push_str(header);
-            at += header.len();
-            if blocks.iter().any(|block| header.contains(block.as_str())) {
-                self.body = Some(String::new());
+            let named = blocks
+                .iter()
+                .any(|block| text[at..header].contains(block.as_str()));
+            out.push_str(&text[at..header]);
+            at = header;
+            if named {
+                self.body = Some(PemBody {
+                    searching: true,
+                    ..PemBody::default()
+                });
             }
         }
+    }
+}
+
+/// Where the first run of five dashes starts in `text`: a byte search for
+/// each dash, with no searcher built per call, as a key's markers are
+/// looked for at every header.
+fn find_dashes(text: &str) -> Option<usize> {
+    let bytes = text.as_bytes();
+    let mut at = 0;
+    loop {
+        let dash = at + text[at..].find('-')?;
+        let run = bytes[dash..]
+            .iter()
+            .take(5)
+            .take_while(|&&b| b == b'-')
+            .count();
+        if run >= 5 {
+            return Some(dash);
+        }
+        at = dash + run;
+    }
+}
+
+/// Where `marker`, five dashes and a word, first starts in `text`.
+fn find_marker(text: &str, marker: &str) -> Option<usize> {
+    let mut at = 0;
+    loop {
+        let dashes = at + find_dashes(&text[at..])?;
+        if text[dashes..].starts_with(marker) {
+            return Some(dashes);
+        }
+        at = dashes + 1;
     }
 }
 
@@ -1100,14 +1176,6 @@ impl BlockStream {
 fn ceil_char(text: &str, mut at: usize) -> usize {
     while !text.is_char_boundary(at) {
         at += 1;
-    }
-    at
-}
-
-/// The last char boundary of `text` at or before `at`.
-fn floor_char(text: &str, mut at: usize) -> usize {
-    while !text.is_char_boundary(at) {
-        at -= 1;
     }
     at
 }
@@ -1477,40 +1545,466 @@ fn redact_fields(text: String, fields: &[String]) -> String {
 
 /// Replace the body of each PEM block in `text` whose header names one of
 /// `blocks`.
-fn redact_blocks(mut text: String, blocks: &[String]) -> String {
+fn redact_blocks(text: String, blocks: &[String]) -> String {
+    const BEGIN: &str = "-----BEGIN ";
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text.as_str();
+    let mut scan = LineScan::default();
+    while let Some(begin) = rest.find(BEGIN) {
+        let Some(header) = pem_header(rest, begin, true) else {
+            // Read in the whole text, so its line's scan is kept.
+            let base = text.len() - rest.len();
+            if let Escaped::Key {
+                escape,
+                header,
+                end,
+            } = pem_escaped(&text, base + begin, true, &mut scan)
+            {
+                let (escape, header, end) = (escape - base, header - base, end - base);
+                out.push_str(&rest[..header]);
+                let named = blocks
+                    .iter()
+                    .any(|block| rest[begin..header].contains(block.as_str()));
+                if named {
+                    out.push_str(REDACTED);
+                    out.push_str(&rest[escape..header]);
+                    rest = &rest[end..];
+                } else {
+                    rest = &rest[header..];
+                }
+                continue;
+            }
+            // No header line here: read on after its start.
+            out.push_str(&rest[..begin + BEGIN.len()]);
+            rest = &rest[begin + BEGIN.len()..];
+            continue;
+        };
+        out.push_str(&rest[..header]);
+        let named = blocks
+            .iter()
+            .any(|block| rest[begin..header].contains(block.as_str()));
+        rest = &rest[header..];
+        if named {
+            if let Some(Some(end)) = pem_end(rest, 0, true) {
+                out.push_str(if end > 0 { "[REDACTED]\n" } else { "" });
+                rest = &rest[end..];
+                continue;
+            }
+            let mut body = PemBody::default();
+            let (len, told) = body.take(rest, true).expect("the text's end ends the body");
+            out.push_str(told);
+            rest = &rest[len..];
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+/// Where the header line of the PEM block at `begin` ends, past its line's
+/// end: its five dashes close it on the same line, and only a line's end
+/// follows them, or the text's end when it is `last`. `None` when it is no
+/// header, or when more text may still tell.
+fn pem_header(text: &str, begin: usize, last: bool) -> Option<usize> {
+    const BEGIN: &str = "-----BEGIN ";
+    let from = begin + BEGIN.len();
+    // The closing dashes first: the next are at the latest the next
+    // block's, so no text is read twice however many starts a line holds.
+    let dashes = from + find_dashes(&text[from..])?;
+    if text[from..dashes].contains('\n') {
+        return None;
+    }
+    // Spaces or tabs may follow, as a key's reader allows, up to a bound
+    // a stream holds them to; nothing else.
+    let dashes = dashes + 5;
+    let spaces = text[dashes..].len() - text[dashes..].trim_start_matches([' ', '\t']).len();
+    if spaces > PEM_SPACES {
+        return None;
+    }
+    let dashes = dashes + spaces;
+    match &text.as_bytes()[dashes..] {
+        [b'\r', b'\n', ..] => Some(dashes + 2),
+        [b'\n', ..] => Some(dashes + 1),
+        [] if last => Some(dashes),
+        _ => None,
+    }
+}
+
+/// The most spaces or tabs a key's header may end with.
+const PEM_SPACES: usize = 1024;
+
+/// The most of a secret block's body looked through for its END marker:
+/// far past any key's, armored PGP keys with their subkeys among them.
+const BODY_HOLD: usize = 256 * 1024;
+
+/// Where the line of a secret block's END marker starts in `body`, the
+/// text after its header, when one starts within [`BODY_HOLD`] and before
+/// any other block's BEGIN: the whole block is hidden through it, whatever
+/// its lines hold, as a key's reader takes them. `Some(None)` when none
+/// does, `None` when more text may still tell. `from` is how much of
+/// `body` was looked through before. Each search stops at the next BEGIN,
+/// so many headers read their text once.
+fn pem_end(body: &str, from: usize, last: bool) -> Option<Option<usize>> {
+    const END: &str = "-----END ";
+    const BEGIN: &str = "-----BEGIN ";
+    let window = body.floor_char_boundary(BODY_HOLD + END.len() - 1);
+    let mut at = ceil_char(body, from.saturating_sub(BEGIN.len()).min(window));
+    // Where the line read now starts, and what its text before the
+    // marker read so far holds, kept as the search moves on so no text is
+    // read twice: a marker starts its line after at most spaces or what a
+    // search or the read tool puts before each line (a path or a number
+    // ending in `:`, `-` or a tab, with no space inside it).
+    let mut line = body[..at].rfind('\n').map_or(0, |n| n + 1);
+    let (mut scan, mut word, mut gap) = (line, false, false);
+    while let Some(n) = find_dashes(&body[at..window]) {
+        let dashes = at + n;
+        if let Some(n) = body[at..dashes].rfind('\n') {
+            line = at + n + 1;
+            (scan, word, gap) = (line, false, false);
+        }
+        let tail = &body[dashes..];
+        let (end, begin) = (tail.starts_with(END), tail.starts_with(BEGIN));
+        if end || begin {
+            for &b in &body.as_bytes()[scan..dashes] {
+                match b {
+                    b' ' => gap |= word,
+                    _ => word = true,
+                }
+            }
+            scan = dashes;
+            // One inside text, such as an armored key's `Comment:`, is
+            // that text.
+            let starts = !gap && (!word || body[line..dashes].ends_with([':', '-', '\t']));
+            if end {
+                // Hidden to that line's start when only such a prefix is
+                // before it, so that shows.
+                return Some(Some(if starts { line } else { dashes }));
+            }
+            if starts {
+                return Some(None);
+            }
+        }
+        if !last && (END.starts_with(tail) || BEGIN.starts_with(tail)) {
+            return None;
+        }
+        at = dashes + 1;
+    }
+    match last || window < body.len() || body.len() >= BODY_HOLD + END.len() - 1 {
+        true => Some(None),
+        false => None,
+    }
+}
+
+/// The most backslashes a key's escaped line end is read with: JSON
+/// inside JSON, and deeper, far past any real one.
+const PEM_ESCAPES: usize = 16;
+
+/// A key's block as a JSON string holds it, all on one line.
+enum Escaped {
+    /// Its header runs to `header`, the escaped line end that closes it
+    /// from `escape`; its body to `end`, where its END marker starts.
+    Key {
+        escape: usize,
+        header: usize,
+        end: usize,
+    },
+    /// No such block.
+    No,
+    /// More text may still tell.
+    More,
+}
+
+/// The escaped PEM block at `begin`, as JSON holds a key: its header's
+/// five dashes, an escaped line end right after them (`\n` or `\r\n`,
+/// escaped once or more), a body that stays inside its string (no quote
+/// that is not escaped), then its END marker, all on the line. A header
+/// with no END after it on its line, or a string's end between, is a
+/// pattern or a quote, not a key.
+fn pem_escaped(text: &str, begin: usize, last: bool, scan: &mut LineScan) -> Escaped {
     const BEGIN: &str = "-----BEGIN ";
     const END: &str = "-----END ";
-    let mut from = 0;
-    while let Some(found) = text[from..].find(BEGIN) {
-        let begin = from + found;
-        // The header line ends in five dashes, then LF or CRLF.
-        let Some(dashes) = text[begin + BEGIN.len()..]
-            .find("-----")
-            .map(|n| begin + BEGIN.len() + n + 5)
-        else {
-            break;
-        };
-        let header = match &text.as_bytes()[dashes..] {
-            [b'\r', b'\n', ..] => dashes + 2,
-            [b'\n', ..] => dashes + 1,
-            _ => dashes,
-        };
-        if !blocks
-            .iter()
-            .any(|block| text[begin..header].contains(block.as_str()))
-        {
-            from = header;
-            continue;
-        }
-        let Some(end) = text[header..].find(END).map(|n| header + n) else {
-            // A key cut off by truncation is still a key.
-            text.replace_range(header.., REDACTED);
-            break;
-        };
-        text.replace_range(header..end, &format!("{REDACTED}\n"));
-        from = header + REDACTED.len() + 1 + END.len();
+    let more = match last {
+        true => Escaped::No,
+        false => Escaped::More,
+    };
+    let from = begin + BEGIN.len();
+    let Some(dashes) = find_dashes(&text[from..]).map(|n| from + n + 5) else {
+        return Escaped::No;
+    };
+    if text[from..dashes].contains('\n') {
+        return Escaped::No;
     }
-    text
+    // Spaces or tabs may end its header, as a key's reader allows.
+    let spaces = text.as_bytes()[dashes..]
+        .iter()
+        .take_while(|&&b| b == b' ' || b == b'\t')
+        .count();
+    if spaces > PEM_SPACES {
+        return Escaped::No;
+    }
+    let dashes = dashes + spaces;
+    let bytes = &text.as_bytes()[dashes..];
+    let slashes = bytes.iter().take_while(|&&b| b == b'\\').count();
+    if slashes > PEM_ESCAPES {
+        return Escaped::No;
+    }
+    let escaped = match (slashes, bytes.get(slashes)) {
+        (0, Some(_)) => return Escaped::No,
+        (_, None) => return more,
+        (_, Some(b'n')) => slashes + 1,
+        (_, Some(b'r')) => {
+            // `\r\n`, the `\n` escaped as the `\r` is.
+            let after = &bytes[slashes + 1..];
+            let n = slashes + 1;
+            let ends = |b: &u8, i: usize| if i < slashes { *b == b'\\' } else { *b == b'n' };
+            if after.len() < n && after.iter().enumerate().all(|(i, b)| ends(b, i)) {
+                return more;
+            }
+            match after.len() >= n && after[..n].iter().enumerate().all(|(i, b)| ends(b, i)) {
+                true => slashes + 1 + n,
+                false => slashes + 1,
+            }
+        }
+        _ => return Escaped::No,
+    };
+    let header = dashes + escaped;
+    // Its line, read to at most a line's worth with room for an END that
+    // starts at its end, up to the first thing that ends it: its END, a
+    // line's end (code, not a key), a quote after an even run of
+    // backslashes (the string's end, so what follows is code), or another
+    // block's BEGIN at an escaped line's start. One inside a line, such as
+    // an armored key's `Comment:`, is that line's text.
+    let limit = text.floor_char_boundary(header + PEM_LINE + END.len());
+    let bytes = text.as_bytes();
+    // A search goes on a marker's length before where the last stopped,
+    // at a char's start.
+    let floor = |a: usize| text.floor_char_boundary(a);
+    let find_end = |a: usize, b: usize| find_marker(&text[floor(a)..b], END).map(|n| floor(a) + n);
+    let end = match scan.end.get(header, limit, END.len() - 1, find_end) {
+        Some(end) if end == header => scan.end.get(header + 1, limit, END.len() - 1, find_end),
+        end => end,
+    };
+    // Only what comes before its END is looked for.
+    let to = end.unwrap_or(limit);
+    let newline = scan
+        .newline
+        .get(header, to, 0, |a, b| text[a..b].find('\n').map(|n| a + n));
+    let carriage = scan
+        .carriage
+        .get(header, to, 0, |a, b| text[a..b].find('\r').map(|n| a + n));
+    let quote = scan.quote.get(header, to, 0, |a, b| {
+        text[a..b]
+            .match_indices('"')
+            .map(|(q, _)| a + q)
+            .find(|&q| {
+                let run = bytes[..q].iter().rev().take_while(|&&b| b == b'\\');
+                run.count() % 2 == 0
+            })
+    });
+    let begins = scan.begin.get(header, to, BEGIN.len() - 1, |a, b| {
+        let mut at = floor(a);
+        while let Some(p) = find_marker(&text[at..b], BEGIN).map(|n| at + n) {
+            if matches!(bytes[p - 1], b'n' | b'r') && bytes[p - 2] == b'\\' {
+                return Some(p);
+            }
+            at = p + 1;
+        }
+        None
+    });
+    let stopped = [newline, carriage, quote, begins]
+        .iter()
+        .any(Option::is_some);
+    match end {
+        _ if stopped => Escaped::No,
+        Some(end) if end - header > PEM_LINE => Escaped::No,
+        Some(end) => Escaped::Key {
+            escape: dashes,
+            header,
+            end,
+        },
+        None if text.len() >= header + PEM_LINE + END.len() => Escaped::No,
+        None => more,
+    }
+}
+
+/// Where the next of each thing that ends an escaped key's line is, as far
+/// as it was looked for: kept from one header to the next of a text, and
+/// while a stream holds a key's line, so however many headers a line holds
+/// it is read once.
+#[derive(Default)]
+struct LineScan {
+    end: Next,
+    begin: Next,
+    quote: Next,
+    newline: Next,
+    carriage: Next,
+}
+
+impl LineScan {
+    /// The same, for the text from `at` on.
+    fn from(self, at: usize) -> Self {
+        // One found before `at`, for an earlier header, is looked for again.
+        let next = |next: Next| match next.found {
+            Some(found) if found < at => Next::default(),
+            found => Next {
+                from: next.from.saturating_sub(at),
+                upto: next.upto.saturating_sub(at),
+                found: found.map(|found| found - at),
+            },
+        };
+        Self {
+            end: next(self.end),
+            begin: next(self.begin),
+            quote: next(self.quote),
+            newline: next(self.newline),
+            carriage: next(self.carriage),
+        }
+    }
+}
+
+/// The first of something at or after `from`, as far as `upto`.
+#[derive(Default, Clone, Copy)]
+struct Next {
+    from: usize,
+    upto: usize,
+    found: Option<usize>,
+}
+
+impl Next {
+    /// The first at or after `at` and before `limit`: `find` looks between
+    /// two places, and a search goes on from where the last stopped, less
+    /// `back` for a marker cut there.
+    fn get(
+        &mut self,
+        at: usize,
+        limit: usize,
+        back: usize,
+        find: impl Fn(usize, usize) -> Option<usize>,
+    ) -> Option<usize> {
+        let known = self.from <= at && self.found.is_none_or(|found| found >= at);
+        if !known {
+            *self = Next {
+                from: at,
+                upto: limit,
+                found: find(at, limit),
+            };
+        } else if self.found.is_none() && self.upto < limit {
+            self.found = find(self.upto.saturating_sub(back).max(at), limit);
+            self.upto = limit;
+        }
+        self.found.filter(|&found| found < limit)
+    }
+}
+
+/// The most of one line a key's body is judged on: a line whose first
+/// this many bytes are base64 is a body's line, whatever follows.
+const PEM_LINE: usize = 64 * 1024;
+
+/// `line` as a key's body is judged: its end's `\r` taken off, and the
+/// number the read tool puts before each line it shows.
+fn pem_text(line: &str) -> &str {
+    let line = line.strip_suffix('\r').unwrap_or(line);
+    let numbered = line.trim_start_matches(' ');
+    let digits = numbered.len()
+        - numbered
+            .trim_start_matches(|c: char| c.is_ascii_digit())
+            .len();
+    match numbered[digits..].strip_prefix('\t') {
+        Some(rest) if digits > 0 => rest,
+        _ => line,
+    }
+}
+
+/// Whether `line`, its end's `\r` and the spaces or tabs around it taken
+/// off, is a line of a key's body: base64 with any spaces or tabs, the RFC
+/// 1421 headers of an encrypted key, or empty, as a key's reader takes
+/// them. What a search or a listing puts before each line it shows (a
+/// path, a number, `:`, `-` or a tab between them) is not read: base64
+/// holds none of those, so a body's line is what follows the last of
+/// them. A marker's dashes are never a body's.
+fn pem_line(line: &str) -> bool {
+    let line = pem_text(line).trim_matches([' ', '\t']);
+    let head = &line[..line.floor_char_boundary(PEM_LINE)];
+    if find_dashes(head).is_some() {
+        return false;
+    }
+    if line.len() <= PEM_LINE && (head.contains("Proc-Type:") || head.contains("DEK-Info:")) {
+        return true;
+    }
+    let body = head.rsplit([':', '-', '\t']).next().unwrap_or("");
+    let base64 = |b: &u8| b.is_ascii_alphanumeric() || matches!(b, b'+' | b'/' | b'=' | b' ');
+    body.as_bytes().iter().all(base64)
+}
+
+/// A secret block's body with no END marker within [`BODY_HOLD`] of its
+/// header, read line by line after its header: the lines
+/// that read as a key's are told as one `[REDACTED]` line, and the first
+/// that does not, an `END` marker or anything else, is told as it is. So a
+/// key cut short hides only itself, and a line that merely looks like a
+/// header hides nothing after it.
+#[derive(Default)]
+struct PemBody {
+    /// Still looking for its END marker ([`pem_end`]), all of it held.
+    searching: bool,
+    /// How much of the held body was looked through for its END.
+    searched: usize,
+    /// Some of its lines were taken.
+    any: bool,
+    /// Inside a line too long to hold that reads as a key's: dropped up to
+    /// its end.
+    long: bool,
+    /// The start of a line not yet ended, held to judge it whole.
+    line: String,
+}
+
+impl PemBody {
+    /// Read `text`, which starts a line: how far the body runs, and what it
+    /// is told as, once a line ends it or `last` ends the text; `None`
+    /// when all of `text` was taken and more may follow.
+    fn take(&mut self, text: &str, last: bool) -> Option<(usize, &'static str)> {
+        let told = |any: bool| if any { "[REDACTED]\n" } else { "" };
+        let mut at = 0;
+        loop {
+            let rest = &text[at..];
+            if self.long {
+                match rest.find('\n') {
+                    Some(n) => {
+                        self.long = false;
+                        at += n + 1;
+                        continue;
+                    }
+                    None if last => return Some((text.len(), "[REDACTED]")),
+                    None => return None,
+                }
+            }
+            match rest.find('\n') {
+                Some(n) if pem_line(&rest[..n]) => {
+                    self.any = true;
+                    at += n + 1;
+                }
+                Some(_) => return Some((at, told(self.any))),
+                None if rest.is_empty() => {
+                    return last.then(|| (at, told(self.any)));
+                }
+                None if last => {
+                    return Some(match pem_line(rest) {
+                        true => (text.len(), "[REDACTED]"),
+                        false => (at, told(self.any)),
+                    });
+                }
+                None if rest.len() > PEM_LINE => {
+                    if !pem_line(rest) {
+                        return Some((at, told(self.any)));
+                    }
+                    (self.long, self.any) = (true, true);
+                    return None;
+                }
+                None => {
+                    self.line = rest.to_owned();
+                    return None;
+                }
+            }
+        }
+    }
 }
 
 /// What an agent asks of the daemon with its own tools: what its shell's
@@ -5344,6 +5838,273 @@ mod tests {
             redact("-----BEGIN PRIVATE KEY-----\r\nMIIE\r\n-----END PRIVATE KEY-----\r\n"),
             "-----BEGIN PRIVATE KEY-----\r\n[REDACTED]\n-----END PRIVATE KEY-----\r\n"
         );
+        // A header that doesn't end its line is a scanner's pattern, not a
+        // key: every line after it is kept.
+        let scanner = "re = re.compile(\"-----BEGIN RSA PRIVATE KEY-----\")\nfor line in lines:\n    scan(line)\n";
+        assert_eq!(redact(scanner), scanner);
+        let quoted = "keys = ['-----BEGIN PRIVATE KEY-----']\nprint(keys)\n";
+        assert_eq!(redact(quoted), quoted);
+        // With no END, only the key's own lines are hidden: the first line
+        // that can't be in a key's body ends it.
+        assert_eq!(
+            redact(
+                "KEY = \"\"\"\n-----BEGIN PRIVATE KEY-----\nMIIE+/a=\nAAAA\n\"\"\"\nprint(KEY)\n"
+            ),
+            "KEY = \"\"\"\n-----BEGIN PRIVATE KEY-----\n[REDACTED]\n\"\"\"\nprint(KEY)\n"
+        );
+        // A body line past the longest a line is read is still dropped
+        // whole, and the code after it kept.
+        let long = format!(
+            "-----BEGIN PRIVATE KEY-----\n{}\nprint(KEY)\n",
+            "A".repeat(70_000)
+        );
+        assert_eq!(
+            redact(&long),
+            "-----BEGIN PRIVATE KEY-----\n[REDACTED]\nprint(KEY)\n"
+        );
+        let mut redacting = Redacting::new(credentials.clone());
+        let mut out = String::new();
+        for piece in long.as_bytes().chunks(4096) {
+            out.push_str(&redacting.feed(piece));
+        }
+        out.push_str(&redacting.finish());
+        assert_eq!(out, redact(&long));
+        // As the read tool shows it, each line numbered.
+        let numbered = "     1\t-----BEGIN PRIVATE KEY-----\n     2\tMIIE+/a=\n     3\tAAAA\n     4\t-----END PRIVATE KEY-----\n";
+        assert_eq!(
+            redact(numbered),
+            "     1\t-----BEGIN PRIVATE KEY-----\n[REDACTED]\n     4\t-----END PRIVATE KEY-----\n"
+        );
+        // An encrypted key's too.
+        let numbered = "     1\t-----BEGIN RSA PRIVATE KEY-----\n     2\tProc-Type: 4,ENCRYPTED\n     3\tDEK-Info: AES-128-CBC,00\n     4\t\n     5\tMIIE\n     6\t-----END RSA PRIVATE KEY-----\n";
+        assert_eq!(
+            redact(numbered),
+            "     1\t-----BEGIN RSA PRIVATE KEY-----\n[REDACTED]\n     6\t-----END RSA PRIVATE KEY-----\n"
+        );
+        // Spaces after the header, a blank line after it, and indented
+        // body lines, as a key's reader takes them.
+        assert_eq!(
+            redact(
+                "-----BEGIN PRIVATE KEY-----   \n\n  MIIE\n\tAAAA \nMIIEvQIB ADAN\tBgkq\n-----END PRIVATE KEY-----\n"
+            ),
+            "-----BEGIN PRIVATE KEY-----   \n[REDACTED]\n-----END PRIVATE KEY-----\n"
+        );
+        // A search's numbers and paths before each line, as `rg -n` and
+        // `grep -n -A` print them: the body is still hidden to its END,
+        // and the line after it shows.
+        for (head, sep) in [("", ":"), ("keys/id.pem:", ":"), ("keys/id.pem-", "-")] {
+            let prefix = |n: usize| format!("{head}{n}{sep}");
+            let end = "after";
+            let text = format!(
+                "{}-----BEGIN OPENSSH PRIVATE KEY-----\n{}b3BlbnNzaC1rZXktdjEAAAAA\n{}QyNTUxOQAAACA=\n\
+                 {}-----END OPENSSH PRIVATE KEY-----\n{}{end}\n",
+                prefix(1),
+                prefix(2),
+                prefix(3),
+                prefix(4),
+                prefix(5)
+            );
+            let hidden = redact(&text);
+            assert!(
+                !hidden.contains("b3Blbn") && !hidden.contains("QyNTUx"),
+                "{hidden}"
+            );
+            assert!(
+                hidden.ends_with(&format!(
+                    "[REDACTED]\n{}-----END OPENSSH PRIVATE KEY-----\n{}{end}\n",
+                    prefix(4),
+                    prefix(5)
+                )),
+                "{hidden}"
+            );
+        }
+        // A long run of dashes is read once.
+        let run = format!(
+            "{}\n-----BEGIN PRIVATE KEY-----\nMIIE\n{}",
+            "-".repeat(1 << 20),
+            "-".repeat(1 << 20)
+        );
+        let began = std::time::Instant::now();
+        let mut redacting = Redacting::new(credentials.clone());
+        let mut out = String::new();
+        for piece in run.as_bytes().chunks(8192) {
+            out.push_str(&redacting.feed(piece));
+        }
+        out.push_str(&redacting.finish());
+        assert_eq!(out, redact(&run));
+        assert!(began.elapsed() < std::time::Duration::from_secs(5));
+        // Many starts on one long line read it once, whole or in pieces.
+        let starts = "-----BEGIN ".repeat(40_000) + "\nend\n";
+        let began = std::time::Instant::now();
+        assert_eq!(redact(&starts), starts);
+        let mut redacting = Redacting::new(credentials.clone());
+        let mut out = String::new();
+        for piece in starts.as_bytes().chunks(8192) {
+            out.push_str(&redacting.feed(piece));
+        }
+        out.push_str(&redacting.finish());
+        assert_eq!(out, starts);
+        assert!(began.elapsed() < std::time::Duration::from_secs(5));
+        // An encrypted key's headers and their blank line are its body.
+        assert_eq!(
+            redact(
+                "-----BEGIN RSA PRIVATE KEY-----\nProc-Type: 4,ENCRYPTED\nDEK-Info: AES-128-CBC,00\n\nMIIE\n-----END RSA PRIVATE KEY-----\n"
+            ),
+            "-----BEGIN RSA PRIVATE KEY-----\n[REDACTED]\n-----END RSA PRIVATE KEY-----\n"
+        );
+        // A key as JSON holds it, its line ends escaped, under any name or
+        // none, and escaped again inside another string.
+        for (key, hidden) in [
+            (
+                r#"{"value": "-----BEGIN PRIVATE KEY-----\nMIIEvQIB+/a=\nAAAA\n-----END PRIVATE KEY-----\n", "n": 1}"#,
+                r#"{"value": "-----BEGIN PRIVATE KEY-----\n[REDACTED]\n-----END PRIVATE KEY-----\n", "n": 1}"#,
+            ),
+            (
+                r#""-----BEGIN OPENSSH PRIVATE KEY-----\r\nb3BlbnNzaC1rZXk\r\n-----END OPENSSH PRIVATE KEY-----""#,
+                r#""-----BEGIN OPENSSH PRIVATE KEY-----\r\n[REDACTED]\r\n-----END OPENSSH PRIVATE KEY-----""#,
+            ),
+            (
+                r#"{"body": "{\"key\": \"-----BEGIN RSA PRIVATE KEY-----\\nProc-Type: 4,ENCRYPTED\\nDEK-Info: AES-128-CBC,00\\n\\nMIIE\\n-----END RSA PRIVATE KEY-----\\n\"}"}"#,
+                r#"{"body": "{\"key\": \"-----BEGIN RSA PRIVATE KEY-----\\n[REDACTED]\\n-----END RSA PRIVATE KEY-----\\n\"}"}"#,
+            ),
+            (
+                "{\"value\": \"-----BEGIN PRIVATE KEY-----  \t\\nMIIE\\n-----END PRIVATE KEY-----\\n\"}",
+                "{\"value\": \"-----BEGIN PRIVATE KEY-----  \t\\n[REDACTED]\\n-----END PRIVATE KEY-----\\n\"}",
+            ),
+            (
+                r#""-----BEGIN PGP PRIVATE KEY BLOCK-----\nComment: example -----BEGIN CERTIFICATE-----\n\nlQOYBGfake\n-----END PGP PRIVATE KEY BLOCK-----\n""#,
+                r#""-----BEGIN PGP PRIVATE KEY BLOCK-----\n[REDACTED]\n-----END PGP PRIVATE KEY BLOCK-----\n""#,
+            ),
+            (
+                r#"{"value": "-----BEGIN PGP PRIVATE KEY BLOCK-----\nComment: Fixture (no identity) <x@y> it's \"quoted\"\n\nlQOYBGfake\n=AbCd\n-----END PGP PRIVATE KEY BLOCK-----\n"}"#,
+                r#"{"value": "-----BEGIN PGP PRIVATE KEY BLOCK-----\n[REDACTED]\n-----END PGP PRIVATE KEY BLOCK-----\n"}"#,
+            ),
+        ] {
+            assert_eq!(redact(key), hidden);
+            for size in 1..=key.len() {
+                let mut redacting = Redacting::new(credentials.clone());
+                let mut out = String::new();
+                for piece in key.as_bytes().chunks(size) {
+                    out.push_str(&redacting.feed(piece));
+                }
+                out.push_str(&redacting.finish());
+                assert_eq!(out, hidden, "in pieces of {size}");
+            }
+        }
+        // A whole block is hidden through its END, whatever its lines
+        // hold: an armored key's headers among them.
+        let armored = "-----BEGIN PGP PRIVATE KEY BLOCK-----\nComment: A fixture (no identity) <x@y>\n\nlQOYBGfake\n=AbCd\n-----END PGP PRIVATE KEY BLOCK-----\nafter\n";
+        let hidden = "-----BEGIN PGP PRIVATE KEY BLOCK-----\n[REDACTED]\n-----END PGP PRIVATE KEY BLOCK-----\nafter\n";
+        assert_eq!(redact(armored), hidden);
+        for size in 1..=armored.len() {
+            let mut redacting = Redacting::new(credentials.clone());
+            let mut out = String::new();
+            for piece in armored.as_bytes().chunks(size) {
+                out.push_str(&redacting.feed(piece));
+            }
+            out.push_str(&redacting.finish());
+            assert_eq!(out, hidden, "in pieces of {size}");
+        }
+        // A BEGIN inside an armored key's `Comment:` is that comment's
+        // text: the key is still hidden through its own END.
+        let commented = "-----BEGIN PGP PRIVATE KEY BLOCK-----\nComment: example -----BEGIN CERTIFICATE-----\n\nlQOYBGfake\n-----END PGP PRIVATE KEY BLOCK-----\nafter\n";
+        let hidden = "-----BEGIN PGP PRIVATE KEY BLOCK-----\n[REDACTED]\n-----END PGP PRIVATE KEY BLOCK-----\nafter\n";
+        assert_eq!(redact(commented), hidden);
+        for size in 1..=commented.len() {
+            let mut redacting = Redacting::new(credentials.clone());
+            let mut out = String::new();
+            for piece in commented.as_bytes().chunks(size) {
+                out.push_str(&redacting.feed(piece));
+            }
+            out.push_str(&redacting.finish());
+            assert_eq!(out, hidden, "in pieces of {size}");
+        }
+        // A long body line of dashes and BEGINs inside it is read once.
+        let dashed = format!(
+            "-----BEGIN PRIVATE KEY-----\n{}\n-----END PRIVATE KEY-----\n",
+            "a -----x a -----BEGIN x ".repeat(8_000)
+        );
+        let began = std::time::Instant::now();
+        assert_eq!(
+            redact(&dashed),
+            "-----BEGIN PRIVATE KEY-----\n[REDACTED]\n-----END PRIVATE KEY-----\n"
+        );
+        let mut redacting = Redacting::new(credentials.clone());
+        let mut out = String::new();
+        for piece in dashed.as_bytes().chunks(8192) {
+            out.push_str(&redacting.feed(piece));
+        }
+        out.push_str(&redacting.finish());
+        assert_eq!(out, redact(&dashed));
+        assert!(began.elapsed() < std::time::Duration::from_secs(2));
+        // A body line run into its END is hidden with it.
+        assert_eq!(
+            redact("-----BEGIN PRIVATE KEY-----\nMIIE\nAAAA-----END PRIVATE KEY-----\n"),
+            "-----BEGIN PRIVATE KEY-----\n[REDACTED]\n-----END PRIVATE KEY-----\n"
+        );
+        // A header then a run of backslashes is read once, and held no
+        // longer than an escape is.
+        let slashes = format!("-----BEGIN PRIVATE KEY-----{}", "\\".repeat(4 << 20));
+        let began = std::time::Instant::now();
+        let mut redacting = Redacting::new(credentials.clone());
+        let mut out = String::new();
+        for piece in slashes.as_bytes().chunks(8192) {
+            out.push_str(&redacting.feed(piece));
+        }
+        out.push_str(&redacting.finish());
+        assert_eq!(out, slashes);
+        assert!(began.elapsed() < std::time::Duration::from_secs(5));
+        // Many headers with no END read their text once, whole or in
+        // pieces: each looks for its END only up to the next BEGIN.
+        let headers = "-----BEGIN PRIVATE KEY-----\nprint(1)\n".repeat(40_000);
+        let began = std::time::Instant::now();
+        let whole = redact(&headers);
+        let mut redacting = Redacting::new(credentials.clone());
+        let mut out = String::new();
+        for piece in headers.as_bytes().chunks(8192) {
+            out.push_str(&redacting.feed(piece));
+        }
+        out.push_str(&redacting.finish());
+        assert_eq!(out, whole);
+        assert_eq!(whole, headers);
+        assert!(began.elapsed() < std::time::Duration::from_secs(5));
+        // Many escaped headers on one line read it once, whole or in
+        // pieces, whatever is between them.
+        let began = std::time::Instant::now();
+        for between in ["", " x ", "MIIE"] {
+            let header = format!("-----BEGIN PRIVATE KEY-----\\n{between}");
+            let ended = format!("\"{}-----END PRIVATE KEY-----\"", header.repeat(5_000));
+            assert!(!redact(&ended).contains(" x -----END"));
+            for line in [
+                format!("\"{}\"\n", header.repeat(5_000)),
+                header.repeat(5_000),
+                ended,
+            ] {
+                let whole = redact(&line);
+                if !line.contains("-----END") {
+                    assert_eq!(whole, line);
+                }
+                for size in [512, 8192] {
+                    let mut redacting = Redacting::new(credentials.clone());
+                    let mut out = String::new();
+                    for piece in line.as_bytes().chunks(size) {
+                        out.push_str(&redacting.feed(piece));
+                    }
+                    out.push_str(&redacting.finish());
+                    assert_eq!(out, whole);
+                }
+            }
+        }
+        assert!(began.elapsed() < std::time::Duration::from_secs(5));
+        // An escaped header with no END on its line, or code between it
+        // and one, is a pattern: kept.
+        for kept in [
+            r#"re.compile("-----BEGIN PRIVATE KEY-----\n")"#,
+            r#"a = "-----BEGIN PRIVATE KEY-----\n"; b = "-----END PRIVATE KEY-----""#,
+            "\"-----BEGIN PRIVATE KEY-----\\nMIIE\n-----END PRIVATE KEY-----\"",
+        ] {
+            assert_eq!(redact(kept), kept);
+        }
     }
     /// A bot keeps at most the process bound's number of background
     /// commands, as Codex keeps a session's processes: starting one past
@@ -5607,7 +6368,7 @@ mod tests {
             &["password".to_owned(), "api_key".to_owned()],
             &["PRIVATE KEY".to_owned()],
         );
-        let parts: [&str; 23] = [
+        let parts: [&str; 35] = [
             "password=",
             "\"api_key\": \"",
             "password: '",
@@ -5631,6 +6392,18 @@ mod tests {
             "Xabc",
             "123",
             "def456",
+            "-----BEGIN PRIVATE KEY-----\")",
+            "-----BEGIN PRIVATE KEY-----",
+            "Proc-Type: 4,ENCRYPTED\n",
+            "DEK-Info: AES\n",
+            "\r",
+            "MIIE+/a=\n",
+            "print(KEY)\n",
+            "   ",
+            "\t",
+            "\"-----BEGIN PRIVATE KEY-----\\n",
+            "MIIE+/a=\\r\\n",
+            "-----END PRIVATE KEY-----\\n\"",
         ];
         let mut seed = 0x2545_f491_4f6c_dd1du64;
         let mut next = || {

@@ -519,6 +519,15 @@ so a change in the data is no memory news. Only Sonny fills: the daemon
 links no template engine, and an agent composed by `agent run --agents`
 reads a live description as it is written.
 
+The person reads memory in `/memory`, in the pane: each folder's index,
+never every fact's file (a `work` fact's file alone, for what it is and
+when it was saved), read off the screen thread when the view opens, on
+`a` and after a removal. A fact opens with
+[`memory::peek`](../client/src/memory.rs), which reads it as `read` does
+but records no read, so the person's browsing never hides a fact no agent
+needs from the cleanup's unread check. Its `x` removes through the tool's
+own `remove`.
+
 Sonny's agents read and save memory with the `memory` tool, which Sonny's
 tool host answers outside the agent's sandbox, so a sandboxed agent still
 saves to `~/.agents/memory`: `read` NAME, `search` WORDS, `save {name, type,

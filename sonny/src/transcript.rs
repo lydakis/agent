@@ -2581,6 +2581,37 @@ fn drawn(
     width: usize,
     clean: bool,
 ) -> Vec<Line<'static>> {
+    // A call a restart or the pause cut off is said as cut, under what it
+    // tried, rather than as its result: one cut while it ran is
+    // interrupted, a muted `■`, and one cut before it ran couldn't run.
+    if let Some((cut, ran)) = halted(output) {
+        let mut rows = drawn(name, arguments, Some(cut), !ran, workspace, width, clean);
+        let first = rows.first_mut().map(|row| row.spans.iter_mut());
+        if ran
+            && let Some(bullet) =
+                first.and_then(|mut spans| spans.find(|span| span.content == "• "))
+        {
+            *bullet = Span::raw("■ ").dim();
+        }
+        // Whatever the tool's own rows show (a write's line count, an
+        // edit's diff), the cut is said under them.
+        let said = |row: &Line| {
+            row.spans
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect::<String>()
+        };
+        let first = cut.split(':').next().unwrap_or(cut);
+        if !rows.is_empty() && !rows.iter().any(|row| said(row).contains(first)) {
+            rows.extend(wrap(
+                Line::from(cut),
+                width,
+                Span::raw("  └ ").dim(),
+                Span::raw("    "),
+            ));
+        }
+        return rows;
+    }
     // A call that failed is `✗` and what it tried, never a red bullet.
     let bullet = if failed {
         Span::raw("✗ ").fg(Color::Red)
@@ -2902,6 +2933,26 @@ fn assignment(part: &str) -> bool {
             })
         })
     })
+}
+
+/// What a call the daemon's stop or the pause cut off is said as: cut
+/// while it ran, so it may have had effects, or stopped before it ran.
+fn halted(output: Option<&str>) -> Option<(&'static str, bool)> {
+    let output = output?;
+    if !output.starts_with('{') || !output.contains("\"daemon_") {
+        return None;
+    }
+    let error: Value = serde_json::from_str(output).ok()?;
+    let detail = error["detail"].as_str().unwrap_or("");
+    let ran = detail.contains("stopped this call before its result was recorded");
+    let cut = match (error["error"].as_str()?, ran) {
+        ("daemon_shutdown", true) => "cut by a restart: it may have run, and was not run again",
+        ("daemon_shutdown", false) => "a restart came before it ran",
+        ("daemon_paused", true) => "cut by the pause: it may have run, and was not run again",
+        ("daemon_paused", false) => "the pause came before it ran",
+        _ => return None,
+    };
+    Some((cut, ran))
 }
 
 /// The first line of a failed call's `{"error","detail"}` output: its
@@ -4405,6 +4456,61 @@ mod tests {
                 "    … +6 lines"
             ]
         );
+    }
+
+    #[test]
+    fn a_call_a_restart_cut_says_so_under_what_it_tried() {
+        let cut = |detail: &str| {
+            let output =
+                serde_json::json!({"error": "daemon_shutdown", "detail": detail}).to_string();
+            let rows = tool(
+                "shell",
+                &serde_json::json!({"command":"sleep 600"}),
+                Some(&output),
+                true,
+                "/",
+                80,
+            );
+            text(&rows)
+        };
+        assert_eq!(
+            cut(
+                "the daemon stopped this call before its result was recorded, so it may have had effects; nothing has run it again. The daemon has since started again and this turn goes on"
+            ),
+            [
+                "■ Ran sleep 600",
+                "  └ cut by a restart: it may have run, and was not run again"
+            ]
+        );
+        assert_eq!(
+            cut(
+                "the daemon stopped before this call ran, so it did not run. The daemon has since started again and this turn goes on"
+            ),
+            [
+                "✗ Couldn't run sleep 600",
+                "  └ a restart came before it ran"
+            ]
+        );
+        // A tool whose rows show something else still says it was cut.
+        for (name, arguments) in [
+            (
+                "write",
+                serde_json::json!({"path": "/a.txt", "content": "x\ny\n"}),
+            ),
+            (
+                "apply_patch",
+                serde_json::json!({"input": "*** Begin Patch\n*** Add File: a.txt\n+x\n*** End Patch"}),
+            ),
+        ] {
+            let output = serde_json::json!({"error": "daemon_paused", "detail": "the daemon stopped this call before its result was recorded"}).to_string();
+            let rows = text(&tool(name, &arguments, Some(&output), true, "/", 80));
+            assert!(rows[0].starts_with("■ "), "{rows:?}");
+            assert!(
+                rows.iter()
+                    .any(|row| row.contains("cut by the pause: it may have run")),
+                "{name}: {rows:?}"
+            );
+        }
     }
 
     #[test]

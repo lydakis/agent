@@ -34,6 +34,8 @@ pub struct Embedded {
     size: (u16, u16),
     copied: Arc<Mutex<Vec<String>>>,
     opened: Arc<Mutex<Option<String>>>,
+    /// The program gave the keys back since last asked ([`give_back`]).
+    left: Arc<AtomicBool>,
     /// The program asked for color-scheme reports (mode 2031).
     follows: Arc<AtomicBool>,
     /// The light or dark and the colors the program was last told of.
@@ -77,6 +79,8 @@ impl Embedded {
         let opened = Arc::new(Mutex::new(None));
         let (screen, replies, copies) = (parser.clone(), writer.clone(), copied.clone());
         let opens = opened.clone();
+        let left = Arc::new(AtomicBool::new(false));
+        let leaves = left.clone();
         let follows = Arc::new(AtomicBool::new(false));
         let following = follows.clone();
         std::thread::spawn(move || {
@@ -104,6 +108,7 @@ impl Embedded {
                             crate::term::theme(),
                         )),
                         Piece::Follows(on) => following.store(on, Ordering::Relaxed),
+                        Piece::Leaves => leaves.store(true, Ordering::Relaxed),
                         Piece::Copied(payload) => {
                             if let Some(text) = copy_text(payload)
                                 && let Ok(mut copies) = copies.lock()
@@ -142,6 +147,7 @@ impl Embedded {
             size: (rows, cols),
             copied,
             opened,
+            left,
             follows,
             told: (crate::term::light(), crate::term::theme()),
         })
@@ -165,6 +171,12 @@ impl Embedded {
     /// place since last asked ([`open_here`]), if it asked.
     pub fn opened(&self) -> Option<String> {
         self.opened.lock().ok().and_then(|mut opened| opened.take())
+    }
+
+    /// Whether the program, an agent's Sonny, gave the keys back since
+    /// last asked ([`give_back`]).
+    pub fn left(&self) -> bool {
+        self.left.swap(false, Ordering::Relaxed)
     }
 
     /// What the program copied since last asked, oldest first.
@@ -379,6 +391,8 @@ enum Piece<'a> {
     Copied(&'a [u8]),
     /// [`OPEN`]'s agent: the one the program asks to show in its place.
     Opens(&'a [u8]),
+    /// [`LEAVE`]: the program gives the keys back.
+    Leaves,
 }
 
 /// Where OSC 52, a copy to the clipboard, starts.
@@ -391,6 +405,28 @@ const MOST_COPIED: usize = 8 << 20;
 const OPEN: &[u8] = b"\x1b]7700;open=";
 /// The longest agent name an [`OPEN`] carries.
 const MOST_OPENED: usize = 256;
+
+/// Sonny's own too: the keys given back to the Sonny this one is drawn
+/// in, which no terminal reads.
+const LEAVE: &[u8] = b"\x1b]7700;keys\x1b\\";
+
+/// Gives the keys back to the Sonny this one is drawn in, as `esc` with
+/// nothing left to do here and `tab` with nothing typed do: its
+/// conversation has them again. A terminal ignores it.
+pub fn give_back() {
+    #[cfg(test)]
+    GAVE_BACK.fetch_add(1, Ordering::Relaxed);
+    #[cfg(not(test))]
+    {
+        let mut stdout = std::io::stdout();
+        let _ = stdout.write_all(LEAVE);
+        let _ = stdout.flush();
+    }
+}
+
+/// How often a test's Sonny gave the keys back.
+#[cfg(test)]
+pub static GAVE_BACK: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 /// Asks the Sonny this one is drawn in to show `bot` in its place, as
 /// a click on an agent's name opens it there; a terminal ignores it.
@@ -444,7 +480,7 @@ fn pieces(bytes: &[u8]) -> (Vec<Piece<'_>>, &[u8]) {
     let starts = || {
         (ASKS.iter().map(|(seq, _)| *seq))
             .chain(FOLLOWS.iter().map(|(seq, _)| *seq))
-            .chain([COPY, OPEN])
+            .chain([COPY, OPEN, LEAVE])
     };
     let longest = starts().map(<[u8]>::len).max().unwrap_or(0);
     let held = (bytes.len().saturating_sub(longest - 1)..bytes.len())
@@ -475,6 +511,15 @@ fn pieces(bytes: &[u8]) -> (Vec<Piece<'_>>, &[u8]) {
             }
             out.push(Piece::Follows(*on));
             at += seq.len();
+            from = at;
+            continue;
+        }
+        if bytes[at..].starts_with(LEAVE) {
+            if from < at {
+                out.push(Piece::Output(&bytes[from..at]));
+            }
+            out.push(Piece::Leaves);
+            at += LEAVE.len();
             from = at;
             continue;
         }
@@ -742,6 +787,20 @@ mod tests {
         };
         assert_eq!(opened, "shop.fix");
         assert_eq!(program.opened(), None);
+    }
+
+    #[test]
+    fn a_program_gives_the_keys_back() {
+        let (pieces, rest) = pieces(b"a\x1b]7700;keysb\x1b]7700;keys\x1b\\c\x1b]77");
+        assert!(matches!(
+            pieces[..],
+            [
+                Piece::Output(b"a\x1b]7700;keysb"),
+                Piece::Leaves,
+                Piece::Output(b"c")
+            ]
+        ));
+        assert_eq!(rest, b"\x1b]77");
     }
 
     #[test]

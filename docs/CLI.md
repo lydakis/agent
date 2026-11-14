@@ -70,7 +70,12 @@ bot writes its own. `serve --unreadable FOLDER` keeps FOLDER and what is in
 it from every sandboxed command's reads, writes, links and renames, as
 Codex's `deny_read`, and the `read` tool refuses it for a sandboxed bot
 (`read_denied`); it is made private (mode 700) if missing. The CLI passes
-`~/.agent/keys`, which holds `env`, the keys it starts the daemon with. `serve --wall FOLDER` keeps every sandboxed command,
+`~/.agent/keys`, which holds `env`, the keys it starts the daemon with,
+and each folder `~/.agent/config.toml` lists as `[sandbox] unreadable`,
+from `/` or `~/` (`unreadable = ["~/.aws"]`). That list is empty by default,
+so an agent may use what the person keeps at home, a browser's session
+cookies or a cloud CLI's sign-in, until they list it; a running daemon keeps
+the folders it started with. `serve --wall FOLDER` keeps every sandboxed command,
 the network on or not, from connecting to the Unix sockets in FOLDER,
 which it makes private (mode 700) if missing; the CLI passes
 `~/.agent/run`, where clients such as Sonny keep the sockets of programs
@@ -92,8 +97,9 @@ sandboxed command's reach, the network on or not. So a second daemon on
 the machine is no way out of the first one's sandbox, nor the first out of
 the second's. An entry stays while its store does, so an idle store is kept
 too. A daemon that cannot write the list, as one started inside a sandbox
-cannot, runs all the same and says so in its log; it can do nothing its
-sandbox does not allow. A command that was already running when a new
+cannot, refuses to start with `daemon_not_listed`, naming the folder and
+the error: no other daemon's sandbox would keep its store and socket. A
+command that was already running when a new
 daemon listed itself keeps the sandbox it started with.
 
 One daemon per person is the shape everything else assumes. A second one,

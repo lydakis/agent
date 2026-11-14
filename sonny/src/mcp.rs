@@ -624,13 +624,37 @@ fn shown() -> Result<Vec<Shown>, String> {
 pub fn card() -> Vec<ratatui::text::Line<'static>> {
     use ratatui::style::Stylize;
     use ratatui::text::{Line, Span};
+    // Commands in code's hue, as a reply draws them.
+    let code = |text: &'static str| Span::raw(text).fg(ratatui::style::Color::Cyan);
+    // The person's servers, which every project's agents call.
+    let mut lines = vec![Line::from(vec![
+        Span::raw(" "),
+        Span::raw("every project").bold(),
+    ])];
     let servers = match shown() {
         Ok(servers) => servers,
-        Err(error) => return vec![Line::from(format!(" {error}"))],
+        Err(error) => {
+            lines.push(Line::default());
+            lines.push(Line::from(vec![
+                Span::raw("✗ ").red(),
+                Span::raw(format!("could not read MCP servers: {error}")),
+            ]));
+            return lines;
+        }
     };
-    let mut lines = Vec::new();
+    if !servers.is_empty() {
+        let n = servers.len();
+        let count = format!(" · {n} server{}", if n == 1 { "" } else { "s" });
+        lines[0].spans.push(Span::raw(count).dim());
+    }
+    lines.push(Line::default());
     if servers.is_empty() {
-        lines.push(Line::from(" No MCP servers.").dim());
+        lines.push(Line::from(" No MCP servers."));
+        lines.push(Line::from(vec![
+            Span::raw(" Add one with ").dim(),
+            code("sonny mcp add"),
+            Span::raw("; agents call it through exec.").dim(),
+        ]));
     }
     for server in servers {
         lines.push(Line::from(vec![
@@ -649,18 +673,6 @@ pub fn card() -> Vec<ratatui::text::Line<'static>> {
         }
         lines.push(Line::default());
     }
-    // Commands in code's hue, as a reply draws them.
-    let code = |text: &'static str| Span::raw(text).fg(ratatui::style::Color::Cyan);
-    lines.push(Line::from(" Agents call these through exec.").dim());
-    lines.push(Line::from(vec![
-        Span::raw(" Add or remove one with ").dim(),
-        code("sonny mcp add"),
-        Span::raw(" or ").dim(),
-        code("sonny mcp remove"),
-        Span::raw("; ").dim(),
-        code("sonny mcp list"),
-        Span::raw(" starts each.").dim(),
-    ]));
     lines
 }
 

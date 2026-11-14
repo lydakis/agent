@@ -2461,6 +2461,8 @@ mod tests {
         test.tools
             .insert("fail".into(), agent_client::config::ApprovalMode::Approve);
         hub.configure(&servers).await;
+        // Started first, so its start does not spend the script's 300 ms.
+        hub.tools("test").await.unwrap();
         let (client, mut steps) = gate(&dir, Duration::from_millis(600), None).await;
         let asker = Steps::new(client, "shop.lead".into(), 7, "c1".into());
         let answering = asker.run.clone();
@@ -2872,10 +2874,15 @@ text(ALL_TOOLS.map(t => t.name).join(","));"#,
     async fn a_script_ends_on_its_time_its_memory_or_its_turn() {
         let dir = scratch("limits");
         let hub = hub(&dir).await;
+        // A script's time counts from its call, so starting the test server
+        // and waiting for a place, behind the suite's other scripts, would
+        // spend it before the script starts. The server is started first,
+        // and the time leaves room for a place.
+        hub.tools("test").await.unwrap();
         let spun = ran(
             &hub,
             &dir,
-            "// @exec: {\"timeout_ms\": 200}\ntext('x'); while (true) {}",
+            "// @exec: {\"timeout_ms\": 1000}\ntext('x'); while (true) {}",
         )
         .await;
         assert!(

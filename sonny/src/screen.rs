@@ -237,6 +237,9 @@ pub struct Screen {
     /// drawn when they were found.
     links: Vec<(u16, u16, u16, String)>,
     linked: Option<(usize, usize, usize, Rect)>,
+    /// The link picked from the keys, as Lynx picks one: its row among
+    /// those shown, the column it starts at, and its address.
+    link_pick: Option<(usize, u16, String)>,
     /// What Ctrl+F looks for, and where it is.
     finding: Option<Finding>,
     /// Counts each change to the rows shown, so what was found in them is
@@ -851,6 +854,41 @@ impl Screen {
         self.rows.push(row);
     }
 
+    /// The next link in view down the page, or up it, picked, as Lynx
+    /// moves among a page's links; false when none is left that way in
+    /// view, for the view to scroll instead. Buttons count as links where
+    /// `buttons` says, as the margin's notes' do.
+    pub fn pick_link(&mut self, down: bool, buttons: bool) -> bool {
+        let (top, y0) = (self.top, self.area.y);
+        let mut links: Vec<(usize, u16, String)> = (self.links.iter())
+            .filter(|(.., url)| buttons || !url.starts_with(BUTTON))
+            .map(|(y, from, _, url)| (top + usize::from(y - y0), *from, url.clone()))
+            .collect();
+        links.sort();
+        let here = self.link_pick.as_ref().map(|(row, from, _)| (*row, *from));
+        let next = match (here, down) {
+            (Some(here), true) => links.into_iter().find(|(r, f, _)| (*r, *f) > here),
+            (Some(here), false) => links.into_iter().rev().find(|(r, f, _)| (*r, *f) < here),
+            (None, true) => links.into_iter().next(),
+            (None, false) => links.into_iter().next_back(),
+        };
+        match next {
+            Some(link) => {
+                self.link_pick = Some(link);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// The address of the link picked from the keys, while it is in view.
+    pub fn picked_link(&self) -> Option<&str> {
+        let (row, _, url) = self.link_pick.as_ref()?;
+        (self.top..self.top + self.drawn)
+            .contains(row)
+            .then_some(url.as_str())
+    }
+
     /// Its lines replaced by `lines`, the view kept as far down from the
     /// first row as it was, with `marks` as [`Screen::push_marked`] puts them.
     pub fn replace_marked(&mut self, lines: Vec<Line<'static>>, marks: Vec<(usize, Mark)>) {
@@ -905,6 +943,12 @@ impl Screen {
             self.selection = None;
         }
         self.linked = None;
+    }
+
+    /// The rows of those shown that the view held when last drawn.
+    pub fn in_view(&self) -> std::ops::Range<usize> {
+        let end = (self.top + self.area.height as usize).min(self.shown.len());
+        self.top.min(end)..end
     }
 
     /// Back to the newest rows.
@@ -1309,6 +1353,9 @@ impl Screen {
             self.relaid = 0;
             self.selection = None;
             self.linked = None;
+            // Laid again, the rows a picked link was on are gone: it is
+            // picked again from the keys, never followed from where it was.
+            self.link_pick = None;
             self.laid += 1;
         }
         let before = self.shown.len();
@@ -1730,6 +1777,17 @@ impl Screen {
         if self.linked != Some((top, bottom, self.width, area)) {
             self.linked = Some((top, bottom, self.width, area));
             self.links = self.find_links(drawn, &file);
+        }
+        // The link picked from the keys, reversed as a list's pick is.
+        if let Some((row, from, _)) = &self.link_pick
+            && (top..bottom).contains(row)
+            && let Some((y, _, to, _)) = (self.links.iter())
+                .find(|(y, f, ..)| top + usize::from(y - area.y) == *row && f == from)
+        {
+            for x in *from..(*to).min(area.right()) {
+                let cell = &mut buf[(x, *y)];
+                cell.set_style(cell.style().add_modifier(Modifier::REVERSED));
+            }
         }
         for (y, from, to, url) in &self.links {
             // An agent's name in the agents' color, as a button is drawn:
@@ -2554,6 +2612,40 @@ impl Written {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_keys_pick_a_pages_links_in_view_as_lynx_does() {
+        let mut screen = Screen::default();
+        screen.push_linked(Line::from("a file"), "file:///a".into());
+        screen.push(vec![Line::from("plain words")]);
+        screen.push_linked(Line::from("a page"), "https://b.example".into());
+        screen.push_linked(Line::from("a button"), format!("{BUTTON}close/n1"));
+        let area = Rect::new(0, 0, 20, 5);
+        let mut buf = Buffer::empty(area);
+        screen.render(area, &mut buf, |_| None);
+        assert_eq!(screen.picked_link(), None);
+        assert!(screen.pick_link(true, false));
+        assert_eq!(screen.picked_link(), Some("file:///a"));
+        assert!(screen.pick_link(true, false));
+        assert_eq!(screen.picked_link(), Some("https://b.example"));
+        // None left down the page: the view scrolls instead. A button is
+        // a link where buttons count, as in the margin.
+        assert!(!screen.pick_link(true, false));
+        assert!(screen.pick_link(true, true));
+        assert_eq!(screen.picked_link(), Some(&*format!("{BUTTON}close/n1")));
+        assert!(screen.pick_link(false, false));
+        assert_eq!(screen.picked_link(), Some("https://b.example"));
+        // The pick is drawn reversed.
+        let mut buf = Buffer::empty(area);
+        screen.render(area, &mut buf, |_| None);
+        assert!(buf[(0, 2)].modifier.contains(Modifier::REVERSED));
+        assert!(!buf[(0, 0)].modifier.contains(Modifier::REVERSED));
+        // Laid at another width, nothing is picked: Enter follows no link
+        // from where the rows were.
+        let narrow = Rect::new(0, 0, 4, 5);
+        screen.render(narrow, &mut Buffer::empty(narrow), |_| None);
+        assert_eq!(screen.picked_link(), None);
+    }
 
     #[test]
     fn a_link_is_written_again_only_when_it_or_what_is_under_it_changed() {

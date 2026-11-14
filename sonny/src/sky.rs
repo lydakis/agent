@@ -1219,6 +1219,21 @@ impl View {
                         });
                         if let Some((_, seen)) = kept {
                             known.push((name, seen.clone()));
+                        } else if agent.running.is_none()
+                            && crate::resolved::holds(
+                                crate::resolved::read(&self.resolved, &name),
+                                agent.ended,
+                                false,
+                            )
+                        {
+                            // Marked done since its last turn, by itself or
+                            // its lead: no question of its is open, whatever
+                            // its history holds, so it is not read.
+                            let seen = crate::needs::Seen {
+                                turn: agent.ended,
+                                ..Default::default()
+                            };
+                            known.push((name, seen));
                         } else if let Some(scans) = &self.scans
                             && let was = self.kept.get(&name).map(|(_, seen)| seen.clone())
                             && scans.send((name.clone(), None, was)).is_ok()
@@ -2964,6 +2979,11 @@ impl View {
         shown
     }
 
+    /// The agent whose star is picked, which Enter goes to.
+    pub fn picked(&self) -> Option<&str> {
+        self.pick.as_deref()
+    }
+
     /// Put the agent asked for in the middle, or the person again.
     pub fn centre_on(&mut self, name: Option<String>) {
         if self.centre != name {
@@ -2994,8 +3014,8 @@ impl View {
         self.centre_on(name);
     }
 
-    /// A key the sky takes: the arrows pick a star, Enter centres on it,
-    /// `?` the legend, `z` zen, `m` the models' colours. Esc lets go of the
+    /// A key the sky takes: the arrows pick a star, `c` centers on it,
+    /// `?` the legend, `z` zen, `m` the models' colors. Esc lets go of the
     /// pick, then of the centre; false when there was nothing to let go
     /// of, or the key isn't the sky's.
     pub fn press(&mut self, code: ratatui::crossterm::event::KeyCode) -> bool {
@@ -3046,7 +3066,9 @@ impl View {
             KeyCode::Down => self.step((0.0, 1.0)),
             KeyCode::Left => self.step((-1.0, 0.0)),
             KeyCode::Right => self.step((1.0, 0.0)),
-            KeyCode::Enter => match self.pick.take() {
+            // `c` centers on the star picked; Enter is the window's, which
+            // goes to its agent.
+            KeyCode::Char('c') => match self.pick.take() {
                 Some(pick) => self.centre_on(Some(pick)),
                 None => return false,
             },
@@ -3995,7 +4017,7 @@ impl View {
         }
         if more > 0 {
             let hidden = self.order.len() - kept.len();
-            lines.push(Line::from(format!("  … {hidden} more, quiet")).dim());
+            lines.push(Line::from(format!("  … {hidden} more")).dim());
         }
         lines.push(Line::default());
         (lines, hits)
@@ -4999,9 +5021,9 @@ const OPENING: Duration = Duration::from_millis(4);
 /// How long `sonny sky` waits before following a daemon that went again.
 const RETRY: Duration = Duration::from_secs(3);
 /// What the keys do in `sonny sky`.
-const KEYS: &str = "↑↓←→ pick · m models · r replay · z zen · ? legend · q quit";
+const KEYS: &str = "↑↓←→ pick · c center · m models · r replay · z zen · ? legend · esc close";
 /// A replay's keys, in the title's place.
-pub const REPLAY_KEYS: &str = "space pause · ←→ step · [ ] speed · esc live";
+pub const REPLAY_KEYS: &str = "space pause · ←→ step · [ ] speed · esc back";
 
 /// `sonny sky`: the same sky, the whole terminal, on its own, to keep
 /// beside the work as btop is kept: its title and the keys over it, the
@@ -5070,8 +5092,12 @@ pub fn watch(
                     // dark, drawn with on the next frame.
                     event::Event::Reply(reply) => crate::term::heard(&reply),
                     event::Event::Key(key) if key.kind != event::KeyEventKind::Release => {
-                        // Esc lets go of the pick and the centre before it leaves.
-                        if !view.press(key.code) && quits(&key) {
+                        // Ctrl+C leaves at once, never taken for `c`; Esc
+                        // lets go of the pick and the center before it
+                        // leaves. Other keys with Ctrl are the terminal's.
+                        let ctrl = key.modifiers.contains(event::KeyModifiers::CONTROL);
+                        if (ctrl && quits(&key)) || (!ctrl && !view.press(key.code) && quits(&key))
+                        {
                             return Ok(());
                         }
                     }
@@ -5100,12 +5126,12 @@ pub fn watch(
     drawn
 }
 
-/// q, Esc and Ctrl+C leave `sonny sky`, Esc once nothing is picked or
-/// centred.
+/// Esc and Ctrl+C leave `sonny sky`, Esc once nothing is picked or
+/// centered; `q` does nothing, as in every pane.
 fn quits(key: &ratatui::crossterm::event::KeyEvent) -> bool {
     use ratatui::crossterm::event::{KeyCode, KeyModifiers};
     match key.code {
-        KeyCode::Char('q') | KeyCode::Esc => true,
+        KeyCode::Esc => true,
         KeyCode::Char('c') => key.modifiers.contains(KeyModifiers::CONTROL),
         _ => false,
     }
@@ -5121,7 +5147,7 @@ impl ratatui::widgets::Widget for &mut View {
         let width = area.width as usize;
         let mut head = vec![Span::raw(" "), Span::raw("sky").bold()];
         let mut keys = match self.replay {
-            Some(_) => format!("{REPLAY_KEYS} · q quit"),
+            Some(_) => REPLAY_KEYS.to_owned(),
             None => KEYS.to_owned(),
         };
         // A narrow terminal keeps the last keys, quitting among them.
@@ -5161,7 +5187,7 @@ impl ratatui::widgets::Widget for &mut View {
 /// The view's own connection: every agent, then who talked to whom in the
 /// turns kept, then live. A daemon gone ends it, saying so.
 async fn follow(socket: PathBuf, store: PathBuf, send: mpsc::UnboundedSender<Feed>) {
-    let (client, mut events) = match Client::connect(&socket).await {
+    let (mut client, mut events) = match Client::connect(&socket).await {
         Ok(connected) => connected,
         Err(error) => {
             let _ = send.send(Feed::Down(error.to_string()));
@@ -5211,22 +5237,63 @@ async fn follow(socket: PathBuf, store: PathBuf, send: mpsc::UnboundedSender<Fee
     {
         return;
     }
-    if let Err(error) = client
-        .request("follow", json!({"bot": "*", "after": after, "kinds": PAST}))
-        .await
-    {
-        let _ = send.send(Feed::Down(error.to_string()));
-        return;
-    }
+    // The past may be long: a sky that falls behind reading it reads on,
+    // on a new connection, from the last event it took, rather than start
+    // over; one that takes nothing new since says so.
     let mut cursor = after;
-    while let Some(event) = events.recv().await {
-        if event["event"] == "follow_live" {
-            cursor = event["cursor"].as_i64().unwrap_or(after);
-            break;
-        }
-        if send.send(Feed::Past(event)).is_err() {
+    let mut resumed = None;
+    loop {
+        if let Err(error) = client
+            .request(
+                "follow",
+                json!({"bot": "*", "after": cursor, "kinds": PAST}),
+            )
+            .await
+        {
+            let _ = send.send(Feed::Down(error.to_string()));
             return;
         }
+        let mut fell = false;
+        let mut live = false;
+        while let Some(event) = events.recv().await {
+            match event["event"].as_str() {
+                Some("follow_live") => {
+                    cursor = event["cursor"].as_i64().unwrap_or(cursor);
+                    live = true;
+                    break;
+                }
+                Some("lagged" | "follow_lagged") => {
+                    fell = true;
+                    break;
+                }
+                _ => {}
+            }
+            if let Some(at) = event["cursor"].as_i64() {
+                cursor = cursor.max(at);
+            }
+            if send.send(Feed::Past(event)).is_err() {
+                return;
+            }
+        }
+        if live {
+            break;
+        }
+        if !fell {
+            let _ = send.send(Feed::Down("the daemon closed the connection".into()));
+            return;
+        }
+        if resumed == Some(cursor) {
+            let _ = send.send(Feed::Down("fell behind the daemon".into()));
+            return;
+        }
+        resumed = Some(cursor);
+        (client, events) = match Client::connect(&socket).await {
+            Ok(connected) => connected,
+            Err(error) => {
+                let _ = send.send(Feed::Down(error.to_string()));
+                return;
+            }
+        };
     }
     if send.send(Feed::Through(cursor)).is_err() {
         return;
@@ -5945,16 +6012,16 @@ mod tests {
                 .trim_end()
                 .to_owned()
         };
-        assert!(row(0).starts_with(" sky") && row(0).ends_with("q quit"));
+        assert!(row(0).starts_with(" sky") && row(0).ends_with("esc close"));
         assert!((2..29).any(|y| row(y).contains("shop lead")));
         assert_eq!(
             row(29),
             " 1 agent · ● 1 working · 0 messages in the last minute"
         );
-        // q, Esc and Ctrl+C leave it; other keys do not.
+        // Esc and Ctrl+C leave it; q and other keys do not.
         use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
         let key = |code, mods| quits(&KeyEvent::new(code, mods));
-        assert!(key(KeyCode::Char('q'), KeyModifiers::NONE));
+        assert!(!key(KeyCode::Char('q'), KeyModifiers::NONE));
         assert!(key(KeyCode::Esc, KeyModifiers::NONE));
         assert!(key(KeyCode::Char('c'), KeyModifiers::CONTROL));
         assert!(!key(KeyCode::Char('c'), KeyModifiers::NONE));
@@ -6139,11 +6206,14 @@ mod tests {
         assert!(view.press(KeyCode::Esc));
         assert!(view.centred().is_none());
         assert!(!view.press(KeyCode::Esc));
-        // An arrow picks a star; Enter centres on it.
+        // An arrow picks a star; `c` centers on it. Enter is no key of
+        // the sky's: the window goes to the picked star's agent.
         view.card(120, 40);
         assert!(view.press(KeyCode::Right));
         let picked = view.pick.clone().expect("a star picked");
-        assert!(view.press(KeyCode::Enter));
+        assert!(!view.press(KeyCode::Enter));
+        assert_eq!(view.picked(), Some(picked.as_str()));
+        assert!(view.press(KeyCode::Char('c')));
         assert_eq!(view.centre.as_deref(), Some(picked.as_str()));
         assert!(view.pick.is_none());
         // `m` colours each agent by its model where it stands, the
@@ -7905,6 +7975,99 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_sky_behind_on_the_past_reads_on_from_the_last_event_it_took() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        let dir = std::env::temp_dir().join(format!("sky-behind-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let socket = dir.join("agent.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        tokio::spawn(async move {
+            let mut pasts = 0;
+            loop {
+                let Ok((stream, _)) = listener.accept().await else {
+                    return;
+                };
+                let (read, mut write) = stream.into_split();
+                let mut out = vec![json!({"event": "ready", "protocol": agent_client::PROTOCOL})];
+                let mut lines = BufReader::new(read).lines();
+                let mut rolls = 0;
+                loop {
+                    for line in out.drain(..) {
+                        write
+                            .write_all(format!("{line}\n").as_bytes())
+                            .await
+                            .unwrap();
+                    }
+                    let Ok(Some(line)) = lines.next_line().await else {
+                        break;
+                    };
+                    let asked: Value = serde_json::from_str(&line).unwrap();
+                    let id = asked["id"].clone();
+                    if asked["op"] == "bots" {
+                        rolls += 1;
+                        out.push(json!({"id": id, "result": {"bots": [{"name": "a"}]}}));
+                    } else if asked["op"] == "approvals" {
+                        out.push(json!({"id": id, "result": {"approvals": []}}));
+                    } else if asked["kinds"] == json!(PAST) {
+                        pasts += 1;
+                        out.push(json!({"id": id, "result": {}}));
+                        if pasts == 1 {
+                            // Two events taken, then the sky falls behind
+                            // and this connection is let go.
+                            assert_eq!(asked["after"], 0);
+                            out.push(json!({"cursor": 6, "bot": "a", "turn": 1, "event": "accepted", "data": {}}));
+                            out.push(json!({"cursor": 7, "bot": "a", "turn": 1, "event": "turn_finished", "data": {}}));
+                            out.push(json!({"event": "follow_lagged", "durable": false}));
+                            for line in out.drain(..) {
+                                write
+                                    .write_all(format!("{line}\n").as_bytes())
+                                    .await
+                                    .unwrap();
+                            }
+                            break;
+                        }
+                        // Read on from the last event taken, not from the
+                        // start.
+                        assert_eq!(asked["after"], 7);
+                        out.push(json!({"cursor": 9, "bot": "a", "turn": 2, "event": "accepted", "data": {}}));
+                        out.push(json!({"event": "follow_live", "cursor": 9}));
+                    } else {
+                        out.push(json!({"id": id, "result": {}}));
+                        out.push(json!({"event": "follow_live", "cursor": 9}));
+                    }
+                    if rolls == 2 {
+                        for line in out.drain(..) {
+                            write
+                                .write_all(format!("{line}\n").as_bytes())
+                                .await
+                                .unwrap();
+                        }
+                        return;
+                    }
+                }
+            }
+        });
+        let (send, mut feed) = mpsc::unbounded_channel();
+        tokio::spawn(follow(socket, dir.join("state.sqlite"), send));
+        let mut seen = Vec::new();
+        while let Some(item) = feed.recv().await {
+            match item {
+                Feed::Past(event) => seen.push(event["cursor"].to_string()),
+                Feed::Through(cursor) => seen.push(format!("through {cursor}")),
+                Feed::Down(why) => seen.push(format!("down {why}")),
+                Feed::Ready => {
+                    seen.push("ready".into());
+                    break;
+                }
+                _ => {}
+            }
+        }
+        assert_eq!(seen, ["6", "7", "9", "through 9", "ready"]);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
     async fn who_told_whom_is_kept_for_the_next_sky_which_reads_only_the_past_since() {
         let dir = std::env::temp_dir().join(format!("sky-talked-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -7962,6 +8125,39 @@ mod tests {
             .permissions()
             .mode();
         assert_eq!(mode & 0o777, 0o600);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn an_agent_marked_done_since_its_last_turn_is_not_read_for_its_question() {
+        let dir = std::env::temp_dir().join(format!("sky-done-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = dir.join("state.sqlite");
+        crate::resolved::keep(&store, "done", 5, "c1").unwrap();
+        crate::resolved::keep(&store, "reopened", 5, "c2").unwrap();
+        crate::resolved::keep(&store, "busy", 5, "c3").unwrap();
+        let (mut view, send) = view();
+        view.resolved = store.clone();
+        let (scans, mut asked) = mpsc::unbounded_channel();
+        send.send(Feed::Scans(scans)).unwrap();
+        send.send(Feed::Roll(vec![
+            json!({"name": "done", "last": {"turn": 5}}),
+            json!({"name": "reopened", "last": {"turn": 6}}),
+            json!({"name": "busy", "running_turn": 6, "last": {"turn": 5}}),
+            json!({"name": "open"}),
+        ]))
+        .unwrap();
+        send.send(Feed::Held(Vec::new())).unwrap();
+        send.send(Feed::Ready).unwrap();
+        view.drain();
+        let mut sent = Vec::new();
+        while let Ok((name, ..)) = asked.try_recv() {
+            sent.push(name);
+        }
+        sent.sort();
+        // Only what a later turn reopened, what runs, and what is unmarked.
+        assert_eq!(sent, ["busy", "open", "reopened"]);
         std::fs::remove_dir_all(dir).unwrap();
     }
 
@@ -8654,7 +8850,10 @@ mod tests {
                 && row.contains("from shop lead")),
             "{shown}"
         );
-        assert!(shown.contains("more, quiet"), "{shown}");
+        assert!(
+            shown.contains(" more") && !shown.contains("quiet"),
+            "{shown}"
+        );
         assert!(rows.len() <= 20, "{shown}");
     }
 

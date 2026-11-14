@@ -257,10 +257,9 @@ impl View {
             };
         }
         let period = match key.code {
-            KeyCode::Esc | KeyCode::Char('q') | KeyCode::Enter => return Key::Close,
-            KeyCode::Char('d') => Period::Day,
-            KeyCode::Char('w') => Period::Week,
-            KeyCode::Char('m') => Period::Month,
+            KeyCode::Esc => return Key::Close,
+            // Its one value, the period, takes ← and →: it has no rows to
+            // open, and a letter means one thing in every pane.
             KeyCode::Left | KeyCode::Char('h') => match self.period {
                 Period::Month => Period::Week,
                 _ => Period::Day,
@@ -310,8 +309,8 @@ impl View {
     /// The card at `width`.
     pub fn card(&self, width: usize) -> Vec<Line<'static>> {
         let whose = match self.all {
-            true => "every agent".to_owned(),
-            false => format!("{}'s agents", self.scope.project),
+            true => "every project".to_owned(),
+            false => self.scope.project.clone(),
         };
         // The pane's title names it: its first row says whose and when.
         let mut out = vec![Line::from(vec![
@@ -322,7 +321,7 @@ impl View {
             out.push(Line::default());
             out.push(Line::from(vec![
                 Span::raw("✗ ").fg(Color::Red),
-                Span::raw(format!("couldn't read usage: {error}")),
+                Span::raw(format!("could not read usage: {error}")),
             ]));
         }
         let Some(read) = &self.read else {
@@ -348,11 +347,8 @@ impl View {
                 read.period.label()
             )));
             out.push(
-                Line::from(match self.all {
-                    true => "a turn counts where it started".to_owned(),
-                    false => "a shows every agent's".to_owned(),
-                })
-                .dim(),
+                Line::from("Each turn an agent takes counts here, in the project it started in.")
+                    .dim(),
             );
             return out;
         }
@@ -735,13 +731,19 @@ impl View {
     pub fn keys(&self) -> String {
         let scope = match self.all {
             true => "a this project",
-            false => "a every agent",
+            false => "a every project",
         };
         let cached = match self.cached {
             true => "c hide cached",
             false => "c show cached",
         };
-        format!("d/w/m period · {scope} · {cached} · esc close")
+        let pair = |said: &'static str| said.split_once(' ').unwrap_or((said, ""));
+        let (scope, cached) = (pair(scope), pair(cached));
+        (crate::hint::Keys::new().key("←→", "period"))
+            .key(scope.0, scope.1)
+            .key(cached.0, cached.1)
+            .esc(crate::hint::Esc::Close)
+            .text()
     }
 }
 
@@ -1360,9 +1362,12 @@ mod tests {
         view.key(KeyEvent::from(KeyCode::Char('a')));
         assert!(view.due());
         assert!(view.query(now).0.get("name").is_none());
-        view.key(KeyEvent::from(KeyCode::Char('m')));
+        view.key(KeyEvent::from(KeyCode::Right));
+        view.key(KeyEvent::from(KeyCode::Right));
         let (query, window) = view.query(now);
         assert_eq!((query["bucket_ms"].as_i64(), window.2), (Some(DAY), 30));
+        // Enter opens nothing here and never closes it; Esc does.
+        assert_eq!(view.key(KeyEvent::from(KeyCode::Enter)), Key::Stay);
         assert_eq!(view.key(KeyEvent::from(KeyCode::Esc)), Key::Close);
     }
 

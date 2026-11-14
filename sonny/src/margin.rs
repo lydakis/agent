@@ -1452,7 +1452,7 @@ impl Margin {
         match self.reads.get_mut(path) {
             Some(read) if modified.is_some() && read.modified == modified => read.looked = now,
             _ => {
-                let text = read(path);
+                let text = read(path, &[]);
                 let read = Read {
                     modified,
                     looked: now,
@@ -1485,8 +1485,9 @@ fn leads() -> (Line<'static>, Line<'static>) {
     (Line::from(BODY), Line::from(BODY))
 }
 
-/// The file at `path`, as much of it as a note shows.
-pub fn read(path: &Path) -> Result<String, String> {
+/// The file at `path`, as much of it as a note shows, refused when what
+/// was opened is in one of `hidden` ([`agent_client::hidden::holds`]).
+pub fn read(path: &Path, hidden: &[PathBuf]) -> Result<String, String> {
     use std::io::Read;
     let mut bytes = Vec::new();
     // A pipe or a device could hold the window up: only files are read.
@@ -1494,8 +1495,15 @@ pub fn read(path: &Path) -> Result<String, String> {
         Ok(meta) if !meta.is_file() => return Err(format!("{}: not a file", path.display())),
         _ => {}
     }
-    std::fs::File::open(path)
-        .and_then(|f| f.take(NOTE_BYTES as u64 * 4).read_to_end(&mut bytes))
+    let file = std::fs::File::open(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    if agent_client::hidden::holds(hidden, &file) {
+        return Err(format!(
+            "read_denied: {} is kept unreadable from agents",
+            path.display()
+        ));
+    }
+    file.take(NOTE_BYTES as u64 * 4)
+        .read_to_end(&mut bytes)
         .map_err(|e| format!("{}: {e}", path.display()))?;
     match String::from_utf8(bytes) {
         Ok(text) if !text.contains('\0') => Ok(text),
@@ -2610,7 +2618,7 @@ mod tests {
         let text: Vec<String> = lines.iter().map(|l| l.to_string()).collect();
         assert!(text.iter().any(|l| l.contains("```html")), "{text:?}");
         assert!(text.iter().any(|l| l.contains("<b>x</b>")), "{text:?}");
-        assert!(read(&dir).unwrap_err().ends_with("not a file"));
+        assert!(read(&dir, &[]).unwrap_err().ends_with("not a file"));
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
