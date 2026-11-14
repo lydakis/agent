@@ -1036,52 +1036,61 @@ mod tests {
             said: None,
         };
         view.values = view.read().unwrap();
-        assert_eq!(view.values[6].as_deref(), Some("low"));
+        // Each row by its key, wherever the list puts it.
+        let at = |key: &str| SETTINGS.iter().position(|s| s.key == key).unwrap();
+        let model = at("model");
+        let reviewer_effort = at("reviewer.effort");
+        let lead_effort = at("sonny.lead_effort");
+        let task_effort = at("sonny.task_effort");
+        let task_speed = at("sonny.task_speed");
+        let side_chat = at("sonny.side_chat");
+        let chime = at("sonny.chime");
+        assert_eq!(view.values[lead_effort].as_deref(), Some("low"));
         // The side chat: one that answers, then its default again either way.
-        view.pick = 11;
+        view.pick = side_chat;
         press(&mut view, KeyCode::Right);
-        assert_eq!(view.values[11].as_deref(), Some("answer"));
+        assert_eq!(view.values[side_chat].as_deref(), Some("answer"));
         press(&mut view, KeyCode::Right);
-        assert_eq!(view.values[11], None);
+        assert_eq!(view.values[side_chat], None);
         press(&mut view, KeyCode::Left);
-        assert_eq!(view.values[11].as_deref(), Some("answer"));
+        assert_eq!(view.values[side_chat].as_deref(), Some("answer"));
         // A task's speed steps through the tiers, taken back to its starter's.
-        view.pick = 8;
+        view.pick = task_speed;
         press(&mut view, KeyCode::Right);
-        assert_eq!(view.values[8].as_deref(), Some("standard"));
+        assert_eq!(view.values[task_speed].as_deref(), Some("standard"));
         press(&mut view, KeyCode::Backspace);
-        assert_eq!(view.values[8], None);
+        assert_eq!(view.values[task_speed], None);
         // Efforts step through every level.
-        view.pick = 5;
+        view.pick = reviewer_effort;
         press(&mut view, KeyCode::Left);
-        assert_eq!(view.values[5].as_deref(), Some("max"));
+        assert_eq!(view.values[reviewer_effort].as_deref(), Some("max"));
         press(&mut view, KeyCode::Enter);
-        assert_eq!(view.values[5], None);
+        assert_eq!(view.values[reviewer_effort], None);
         // A model is typed whole, and an empty one is the default.
-        view.pick = 0;
+        view.pick = model;
         for c in "a/b".chars() {
             press(&mut view, KeyCode::Char(c));
         }
-        assert_eq!(view.values[0], None);
+        assert_eq!(view.values[model], None);
         press(&mut view, KeyCode::Enter);
-        assert_eq!(view.values[0].as_deref(), Some("a/b"));
+        assert_eq!(view.values[model].as_deref(), Some("a/b"));
         press(&mut view, KeyCode::Enter);
         for _ in 0..3 {
             press(&mut view, KeyCode::Backspace);
         }
         press(&mut view, KeyCode::Enter);
-        assert_eq!(view.values[0], None);
+        assert_eq!(view.values[model], None);
         // The lead's effort back to its default.
-        view.pick = 6;
+        view.pick = lead_effort;
         press(&mut view, KeyCode::Backspace);
         assert_eq!(
             std::fs::read_to_string(&path).unwrap(),
             "# mine\n[sonny]\nside_chat = \"answer\"\n"
         );
         // A switch is written as TOML's own.
-        view.pick = 12;
+        view.pick = chime;
         press(&mut view, KeyCode::Right);
-        assert_eq!(view.values[12].as_deref(), Some("true"));
+        assert_eq!(view.values[chime].as_deref(), Some("true"));
         assert!(agent_client::config::read(&path).unwrap().sonny.chime);
         assert!(
             std::fs::read_to_string(&path)
@@ -1089,9 +1098,9 @@ mod tests {
                 .ends_with("chime = true\n")
         );
         press(&mut view, KeyCode::Right);
-        assert_eq!(view.values[12], None);
+        assert_eq!(view.values[chime], None);
         // A value the reader refuses is said, and the file kept.
-        view.pick = 7;
+        view.pick = task_effort;
         view.typing = None;
         std::fs::write(&path, "[sonny]\nbogus = \"x\"\n").unwrap();
         press(&mut view, KeyCode::Right);
