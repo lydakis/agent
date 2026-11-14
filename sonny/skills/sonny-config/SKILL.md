@@ -17,7 +17,7 @@ each setting is; what to set is the person's call.
   stay. A setting is read when its time comes (a new agent, a new turn);
   one marked "read when it starts" waits for the daemon or Sonny to start
   again (`sonny agent shutdown` stops the daemon; Sonny starts it).
-- `~/.agent/env`: provider keys only, one `NAME=value` a line, readable by
+- `~/.agent/keys/env`: provider keys only, one `NAME=value` a line, readable by
   the person alone. `sonny setup --provider NAME --key-stdin` puts a key
   there; never write one anywhere else (see the sonny-setup skill).
 - `.agents/project.toml` in a project's folder: that project's own picks,

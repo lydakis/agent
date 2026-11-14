@@ -53,7 +53,7 @@ impl Step {
 /// What this Sonny's upgrade asks agents to do. A new one is a file in
 /// `sonny/upgrades` and a row here, named in its feature's history.
 pub const STEPS: &[Step] = &[
-    // A reviewer model set as `AGENT_JUDGE` in ~/.agent/env, unread since
+    // A reviewer model set as `AGENT_JUDGE` in ~/.agent/keys/env, unread since
     // 0.8.0, moves to `[reviewer] model` (0.9.0).
     Step {
         id: "judge-env",
@@ -129,7 +129,7 @@ fn names_old_handle(text: &str) -> bool {
     })
 }
 
-/// Whether `~/.agent/env` sets no `AGENT_JUDGE`, the reviewer's model
+/// Whether `~/.agent/keys/env` sets no `AGENT_JUDGE`, the reviewer's model
 /// before 0.8.0, which is `[reviewer] model` now.
 fn judge_env_done() -> bool {
     agent_client::env_file::path().is_none_or(|file| no_judge_in(&file))

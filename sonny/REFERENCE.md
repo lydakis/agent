@@ -147,7 +147,7 @@ skills and memory of the folder are the same for all of them.
 
 ## Provider setup
 
-`~/.agent/env` (`KEY=VALUE` lines, readable only by you) holds the provider
+`~/.agent/keys/env` (`KEY=VALUE` lines, readable only by you) holds the provider
 keys, and `AWS_PROFILE` for Bedrock, which `agent` applies over your shell's
 to every daemon it starts, whoever starts it; it does not set Agent's own
 names, so an `AGENT_` name there (`AGENT_PROVIDER` among them) is passed
@@ -211,7 +211,7 @@ that may be rebuilt or lost: memory, skills and profiles (`~/.agents`) and
 repository, at `~/agent-home`, committed and pushed every ten minutes by
 Sonny's scheduler, the one background job Sonny keeps
 ([docs/SONNY.md](../docs/SONNY.md#the-scheduler)), which runs `sonny home
-sync`. Keys in `~/.agent/env`, logins and the daemon's store
+sync`. Keys in `~/.agent/keys/env`, logins and the daemon's store
 stay out, and so does a `config.toml` that holds a secret itself (an MCP
 server's `http_headers`, or a key named like a token), which the sync names
 and leaves behind while memory still goes. Memory's own git history stays
@@ -965,8 +965,10 @@ has something on it, or is off the screen, no time shows.
   any other daemon's socket or its agents' sockets, or those of the
   programs Sonny runs for agents outside the sandbox (`~/.agent/run`).
   A call to run outside the sandbox that may start a daemon waits for
-  you, never the reviewer alone. It leaves open reads of anything
-  you can read, as Codex's `workspace-write` does, your SSH keys, cloud
+  you, never the reviewer alone. Nor can it read `~/.agent/keys`, the folder
+  of the keys the daemon runs with, which no agent's command needs (the `read` tool
+  refuses it too). It leaves open reads of anything
+  else you can read, as Codex's `workspace-write` does, your SSH keys, cloud
   credentials and other projects included; the network, in every row but
   Read only; and, while the network is on, every other Unix socket that a
   program signed in as you listens on, such as ssh-agent, MCPX and

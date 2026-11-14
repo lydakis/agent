@@ -407,7 +407,7 @@ async fn connect(config: &McpServer) -> Result<Live, String> {
     let (client, group, stderr) = match (&config.command, &config.url) {
         (Some(command), _) => {
             let mut process = tokio::process::Command::new(command);
-            // Under the server's own env, ~/.agent/env as it is now, where
+            // Under the server's own env, ~/.agent/keys/env as it is now, where
             // `sonny mcp import` puts the secrets other agents' files held.
             let kept = agent_client::env_file::path()
                 .and_then(|file| agent_client::env_file::read(&file).ok())

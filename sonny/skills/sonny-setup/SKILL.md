@@ -6,7 +6,7 @@ description: Set up or change how Sonny and its agent daemon reach a model, brin
 # Setting up Sonny
 
 Sonny keeps its settings in `~/.agent/config.toml` (the provider, the
-default model, efforts, MCP servers) and keys in `~/.agent/env`, one
+default model, efforts, MCP servers) and keys in `~/.agent/keys/env`, one
 `NAME=value` a line, which only the person can read; Sonny applies it to
 the daemon and everything it starts. `sonny setup` with flags changes both
 and asks nothing; with none, it asks the person in a terminal.
@@ -32,7 +32,7 @@ Ask the person which way they want when more than one is ready. Then:
 - ChatGPT plan: `sonny agent login chatgpt` signs in through the browser,
   then `sonny setup --provider chatgpt`.
 - A key: `sonny setup --provider anthropic` (or `openai`, `openrouter`)
-  uses the key set in the shell or `~/.agent/env`. A new key goes in on
+  uses the key set in the shell or `~/.agent/keys/env`. A new key goes in on
   stdin, never as an argument: the person runs
   `sonny setup --provider openai --key-stdin` and pastes it. Never read a
   key out of another agent's files, or write one anywhere else.
@@ -53,7 +53,7 @@ it starts. `sonny agent models` lists them now.
 `sonny mcp import --json` shows what other agents have.
 `sonny setup --import-mcp` brings them all, or
 `--import-mcp codex,claude` those agents' alone; a secret in one moves to
-`~/.agent/env`. Servers from files in the folder are left out: the person
+`~/.agent/keys/env`. Servers from files in the folder are left out: the person
 ticks those in `sonny mcp import` if they trust them. `sonny mcp list`
 starts each and says which work.
 

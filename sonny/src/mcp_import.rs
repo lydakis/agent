@@ -4,7 +4,7 @@
 //! `.mcp.json`, OpenCode's `opencode.json` and Kiro's `.kiro/settings/mcp.json`,
 //! each in the user's home and in the folder Sonny runs in. A secret
 //! written into one of those files (a key in a server's environment, a
-//! bearer token) goes to `~/.agent/env`, never into `config.toml`, and the
+//! bearer token) goes to `~/.agent/keys/env`, never into `config.toml`, and the
 //! server names it there. Nothing in the other agents' files changes.
 use crate::picker::{self, Row};
 use serde_json::Value;
@@ -19,7 +19,7 @@ pub struct Found {
     pub from: &'static str,
     /// Its keys under Sonny's names.
     pub keys: toml::Table,
-    /// Secrets for `~/.agent/env`, by variable.
+    /// Secrets for `~/.agent/keys/env`, by variable.
     pub secrets: Vec<(String, String)>,
     /// Variables it reads from the environment it is started in.
     pub needs: Vec<String>,
@@ -189,7 +189,7 @@ fn codex(name: &str, server: &toml::Value) -> Option<Raw> {
             }
             "env_vars" => {
                 // Passed through from Codex's environment: Sonny's servers
-                // inherit the tool host's, which ~/.agent/env sets.
+                // inherit the tool host's, which ~/.agent/keys/env sets.
                 for var in value
                     .as_array()
                     .into_iter()
@@ -471,7 +471,7 @@ fn translate(from: &'static str, raw: Raw) -> Found {
             .insert("disabled_tools".into(), raw.disabled_tools.into());
     }
     // A server's environment: a value naming its own variable is
-    // inherited, a secret goes to ~/.agent/env under its own name (which
+    // inherited, a secret goes to ~/.agent/keys/env under its own name (which
     // the server is started with), and the rest stays.
     let mut env = found
         .keys
@@ -481,9 +481,9 @@ fn translate(from: &'static str, raw: Raw) -> Found {
     for (key, value) in raw.env {
         match named(&value) {
             Some(var) if var == key => found.needs.push(key),
-            Some(var) => found
-                .notes
-                .push(format!("{key} came from {var}; set {key} in ~/.agent/env")),
+            Some(var) => found.notes.push(format!(
+                "{key} came from {var}; set {key} in ~/.agent/keys/env"
+            )),
             None if secret(&key) => found.secrets.push((key, value)),
             None => {
                 env.insert(key, value.into());
@@ -537,7 +537,7 @@ fn translate(from: &'static str, raw: Raw) -> Found {
 }
 
 /// Each secret of `chosen` that the environment children get (`kept`, the
-/// shell's with `~/.agent/env` over it) or a server before it already holds
+/// shell's with `~/.agent/keys/env` over it) or a server before it already holds
 /// with another value stays in its server's `env` instead, since one
 /// variable can hold only one; a URL server's token takes a free name.
 fn settle(chosen: &mut [Found], kept: &[(String, String)]) {
@@ -572,7 +572,7 @@ fn settle(chosen: &mut [Found], kept: &[(String, String)]) {
             Some(held) if held != value => {
                 env.insert(var.clone(), value.clone().into());
                 found.notes.push(format!(
-                    "{var} stays in config.toml: ~/.agent/env holds another {var}"
+                    "{var} stays in config.toml: ~/.agent/keys/env holds another {var}"
                 ));
                 false
             }
@@ -587,7 +587,7 @@ fn settle(chosen: &mut [Found], kept: &[(String, String)]) {
     }
 }
 
-/// Writes `chosen` to Sonny's config and their secrets to `~/.agent/env`.
+/// Writes `chosen` to Sonny's config and their secrets to `~/.agent/keys/env`.
 pub fn bring(mut chosen: Vec<Found>) -> Result<Vec<Found>, String> {
     let config = agent_client::config::path().ok_or("set HOME")?;
     let env = agent_client::env_file::path().ok_or("set HOME")?;
@@ -638,7 +638,7 @@ fn row(found: &Found) -> Row {
     let secrets = match found.secrets.len() {
         0 => String::new(),
         n => format!(
-            " · {n} secret{} to ~/.agent/env",
+            " · {n} secret{} to ~/.agent/keys/env",
             if n == 1 { "" } else { "s" }
         ),
     };
@@ -721,7 +721,7 @@ pub fn offer_from(all: bool, agents: &[&str], say: &dyn Fn(&str)) -> Result<Vec<
     for server in &brought {
         let unset = (server.needs.iter())
             .filter(|var| agent_client::env_file::var(var).is_none())
-            .map(|var| format!("set {var} in ~/.agent/env; it is not set"));
+            .map(|var| format!("set {var} in ~/.agent/keys/env; it is not set"));
         for note in server.notes.iter().cloned().chain(unset) {
             say(&format!("  {}: {note}", server.name));
         }

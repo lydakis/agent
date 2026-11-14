@@ -1618,7 +1618,7 @@ fn installed_agent(me: &std::path::Path) -> Vec<PathBuf> {
 /// `sonny agent ARGS...`: the `agent` Sonny itself starts, run with
 /// ARGS in place of this process, so the person reaches it whatever else
 /// is called `agent` on their PATH. It gives a daemon it starts the keys
-/// in ~/.agent/env, as for every other starter.
+/// in ~/.agent/keys/env, as for every other starter.
 fn pass_to_agent(args: &[String]) -> Result<(), String> {
     let bin = agent_bin_or_missing()?;
     let mut command = std::process::Command::new(&bin);
@@ -1626,7 +1626,7 @@ fn pass_to_agent(args: &[String]) -> Result<(), String> {
     Err(format!("{}: {error}", bin.display()))
 }
 
-/// What to tell the person when `~/.agent/env` sets one of Agent's own
+/// What to tell the person when `~/.agent/keys/env` sets one of Agent's own
 /// names, which it never gives a daemon (`agent_client::env_file::refused`):
 /// providers are set by `provider` in `~/.agent/config.toml` (a shell's own
 /// `AGENT_PROVIDER` still wins, for scripts).
@@ -1953,7 +1953,7 @@ fn start_daemon_with(
     if let Some(runtime) = std::env::var_os("XDG_RUNTIME_DIR").filter(|_| scoped) {
         command.env("XDG_RUNTIME_DIR", runtime);
     }
-    // The CLI gives the daemon the keys in ~/.agent/env itself.
+    // The CLI gives the daemon the keys in ~/.agent/keys/env itself.
     command.env("AGENT_BIN", &bin).env_remove(named::PROGRAM);
     command.arg("start");
     if replace {
