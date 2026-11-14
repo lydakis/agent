@@ -1083,39 +1083,27 @@ impl Bot {
                         &call.name,
                         &call.arguments,
                         workspace,
-                        (self.bot_id, &call.call_id),
+                        &call.links,
                     )
             }
         }
     }
     /// The reads [`crate::sandbox::learn`] makes for these calls, to run
-    /// off the runtime thread before any of them is judged, each link read
-    /// again when `fresh`; `None` when the bot writes no folder of its own
-    /// or no call writes a file.
+    /// off the runtime thread before any of them is judged: each write,
+    /// edit or patch not read yet, or every one when `fresh`. `None` when
+    /// the bot writes no folder of its own or no call needs reading.
     pub fn links_to_learn(
         &self,
         calls: &[ToolCall],
         workspace: &std::path::Path,
         fresh: bool,
-    ) -> Option<impl FnOnce() + Send + 'static> {
+    ) -> Option<impl FnOnce(&mut [ToolCall]) + Send + 'static> {
         use crate::sandbox::{Mode, learn};
-        if self.settings.sandbox != Some(Mode::WorkspaceWrite) {
-            return None;
-        }
-        let calls: Vec<(String, String, String)> = calls
-            .iter()
-            .filter(|call| matches!(call.name.as_str(), "write" | "edit" | "apply_patch"))
-            .map(|call| {
-                let ToolCall {
-                    call_id,
-                    name,
-                    arguments,
-                    ..
-                } = call;
-                (call_id.clone(), name.clone(), arguments.clone())
-            })
-            .collect();
-        if calls.is_empty() {
+        let wanted = move |call: &ToolCall| {
+            matches!(call.name.as_str(), "write" | "edit" | "apply_patch")
+                && (fresh || !call.links.read())
+        };
+        if self.settings.sandbox != Some(Mode::WorkspaceWrite) || !calls.iter().any(wanted) {
             return None;
         }
         let root = self
@@ -1125,19 +1113,17 @@ impl Bot {
             .to_owned();
         let writable = self.settings.writable.clone();
         let folder = workspace.to_owned();
-        let bot = self.bot_id;
-        Some(move || {
-            learn(
-                Mode::WorkspaceWrite,
-                Some(&root),
-                &writable,
-                calls
-                    .iter()
-                    .map(|(id, tool, arguments)| (id.as_str(), tool.as_str(), arguments.as_str())),
-                &folder,
-                bot,
-                fresh,
-            );
+        Some(move |calls: &mut [ToolCall]| {
+            for call in calls.iter_mut().filter(|call| wanted(call)) {
+                call.links = learn(
+                    Mode::WorkspaceWrite,
+                    Some(&root),
+                    &writable,
+                    &call.name,
+                    &call.arguments,
+                    &folder,
+                );
+            }
         })
     }
     /// The tools this bot may call: its allowed list, else its tools.
@@ -19147,6 +19133,7 @@ mod tests {
             call_id: "c".into(),
             arguments: json!({"input":input}).to_string(),
             custom: true,
+            links: Default::default(),
         };
         let data = started(&call);
         assert_eq!(data["arguments_truncated"], true);
@@ -19189,6 +19176,7 @@ mod tests {
                 call_id: "c".into(),
                 arguments: arguments.to_string(),
                 custom: false,
+                links: Default::default(),
             };
             let data = started(&call);
             assert_eq!(data["arguments_truncated"], true, "{name}");

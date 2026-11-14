@@ -452,10 +452,10 @@ pub fn confinable(tool: &str) -> bool {
 /// outside every folder the bot may write. `root` is the bot's folder and `folder`
 /// the turn's, against which a relative path is read. Decided from the call
 /// and the folders' names, with only the links the bot can't change
-/// followed as [`learn`] read them for this call (`call`: the bot's id and
-/// the call's), so the round that announces a call, the store that records
-/// it and the run that starts it agree; a confined write is still checked
-/// against the real path when it runs.
+/// followed as [`learn`] read them for this call (`links`, carried with
+/// it), so the round that announces a call, the store that records it and
+/// the run that starts it agree; a confined write is still checked against
+/// the real path when it runs.
 pub fn escapes(
     mode: Mode,
     root: Option<&Path>,
@@ -463,7 +463,7 @@ pub fn escapes(
     tool: &str,
     arguments: &str,
     folder: &Path,
-    call: (i64, &str),
+    links: &Links,
 ) -> bool {
     let Ok(arguments) = serde_json::from_str::<serde_json::Value>(arguments) else {
         return false;
@@ -472,15 +472,13 @@ pub fn escapes(
         return arguments["sandbox_permissions"] == "require_escalated";
     }
     let writable = writable_paths(mode, root, writable);
-    let known = known();
-    let links = known.calls.get(&(call.0, call.1.to_owned()));
     // A patch escapes when any file it changes would.
     any_written(tool, &arguments, |path, removed| {
         let named = lexical(&folder.join(path));
         // A path whose links [`learn`] did not read is judged as spelled.
-        let target = (links.filter(|_| judgeable(path)))
+        let target = (links.0.as_deref().filter(|_| judgeable(path)))
             .and_then(|links| {
-                let link = |path: &Path| links.links.get(path).cloned();
+                let link = |path: &Path| links.get(path).cloned();
                 judged(
                     &named,
                     |dir| changeable(mode, &writable, dir),
@@ -516,36 +514,47 @@ fn any_written(
     }
 }
 
-/// Read off the runtime thread the links [`escapes`] follows in these
-/// calls' paths, and keep them for each call, so that judging it reads no
-/// file. Each call is its id, its tool's name and its arguments, of the
-/// bot whose id is `bot`. `fresh` reads them again, as a round that
-/// announces its calls does; otherwise a call read before keeps what was
-/// read, so a round resumed after its announcement judges as announced.
-#[allow(clippy::too_many_arguments)]
-pub fn learn<'a>(
+/// The links a write, edit or patch call's paths pass, each by where it
+/// is: what it names, or `None` for a path that is no link (or can't be
+/// read). Read once by [`learn`], off the runtime thread, and carried with
+/// the call, so every judgment of it reads no file and agrees; unread
+/// (`Links::default()`), the call's paths are judged as spelled. Calls are
+/// equal whatever was read for them.
+#[derive(Clone, Debug, Default)]
+pub struct Links(Option<std::sync::Arc<std::collections::HashMap<PathBuf, Option<PathBuf>>>>);
+
+impl PartialEq for Links {
+    fn eq(&self, _: &Self) -> bool {
+        true
+    }
+}
+
+impl Eq for Links {}
+
+impl Links {
+    /// Whether [`learn`] read them.
+    pub fn read(&self) -> bool {
+        self.0.is_some()
+    }
+}
+
+/// Read the links [`escapes`] follows in a call's paths, `tool` with
+/// `arguments`, of a bot in `mode`. Blocks: run it off the runtime thread.
+pub fn learn(
     mode: Mode,
     root: Option<&Path>,
     writable: &[String],
-    calls: impl IntoIterator<Item = (&'a str, &'a str, &'a str)>,
+    tool: &str,
+    arguments: &str,
     folder: &Path,
-    bot: i64,
-    fresh: bool,
-) {
+) -> Links {
     let writable = writable_paths(mode, root, writable);
-    for (id, tool, arguments) in calls {
-        let key = (bot, id.to_owned());
-        if !fresh && known().calls.contains_key(&key) {
-            continue;
-        }
-        let Ok(arguments) = serde_json::from_str::<serde_json::Value>(arguments) else {
-            continue;
-        };
-        let mut links = Links::default();
+    let mut links = std::collections::HashMap::new();
+    if let Ok(arguments) = serde_json::from_str::<serde_json::Value>(arguments) {
         any_written(tool, &arguments, |path, removed| {
             if judgeable(path) {
                 let named = lexical(&folder.join(path));
-                let read = |path: &Path| Some(links.read(path));
+                let read = |path: &Path| Some(read_link(&mut links, path));
                 judged(
                     &named,
                     |dir| changeable(mode, &writable, dir),
@@ -555,8 +564,24 @@ pub fn learn<'a>(
             }
             false
         });
-        known().keep(key, links);
     }
+    Links(Some(std::sync::Arc::new(links)))
+}
+
+/// The link at `path`, read from the file system once into `links`.
+fn read_link(
+    links: &mut std::collections::HashMap<PathBuf, Option<PathBuf>>,
+    path: &Path,
+) -> Option<PathBuf> {
+    if let Some(read) = links.get(path) {
+        return read.clone();
+    }
+    let found = std::fs::symlink_metadata(path)
+        .is_ok_and(|meta| meta.file_type().is_symlink())
+        .then(|| std::fs::read_link(path).ok())
+        .flatten();
+    links.insert(path.to_owned(), found.clone());
+    found
 }
 
 /// Whether a write's path is one whose links are followed: one a write
@@ -564,86 +589,6 @@ pub fn learn<'a>(
 /// Any other is judged as spelled, and the tool refuses it anyway.
 fn judgeable(path: &str) -> bool {
     path.len() <= 4096 && !path.contains('\0')
-}
-
-/// What [`learn`] read for each call, by the bot's id and the call's,
-/// oldest first out once they take more than [`KNOWN_BYTES`]. A call whose
-/// links are no longer kept is judged as spelled.
-static KNOWN: std::sync::LazyLock<std::sync::Mutex<Known>> =
-    std::sync::LazyLock::new(Default::default);
-
-/// The bytes of paths [`KNOWN`] keeps: the links of tens of thousands of
-/// calls.
-const KNOWN_BYTES: usize = 4 << 20;
-
-#[derive(Default)]
-struct Known {
-    calls: std::collections::HashMap<(i64, String), Links>,
-    /// Each call as kept, oldest first, with the count it was kept at.
-    order: std::collections::VecDeque<(u64, (i64, String))>,
-    kept: u64,
-    bytes: usize,
-}
-
-impl Known {
-    /// Keep `links` for the call `key`, in place of what was kept for it.
-    fn keep(&mut self, key: (i64, String), mut links: Links) {
-        if let Some(old) = self.calls.remove(&key) {
-            self.bytes -= old.bytes;
-        }
-        // One call's links over a sixteenth of the room aren't kept: it
-        // is judged as spelled, every time alike.
-        if links.bytes > KNOWN_BYTES / 16 {
-            return;
-        }
-        self.kept += 1;
-        links.kept = self.kept;
-        self.bytes += links.bytes;
-        self.order.push_back((self.kept, key.clone()));
-        self.calls.insert(key, links);
-        while self.bytes > KNOWN_BYTES {
-            let Some((kept, key)) = self.order.pop_front() else {
-                break;
-            };
-            if self.calls.get(&key).is_some_and(|links| links.kept == kept)
-                && let Some(gone) = self.calls.remove(&key)
-            {
-                self.bytes -= gone.bytes;
-            }
-        }
-    }
-}
-
-fn known() -> std::sync::MutexGuard<'static, Known> {
-    KNOWN
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-}
-
-/// The links one call's paths pass: what each names, or `None` for a path
-/// that is no link (or can't be read).
-#[derive(Default)]
-struct Links {
-    links: std::collections::HashMap<PathBuf, Option<PathBuf>>,
-    bytes: usize,
-    kept: u64,
-}
-
-impl Links {
-    /// The link at `path`, read from the file system once. Blocks: only
-    /// [`learn`] calls it.
-    fn read(&mut self, path: &Path) -> Option<PathBuf> {
-        if let Some(read) = self.links.get(path) {
-            return read.clone();
-        }
-        let found = std::fs::symlink_metadata(path)
-            .is_ok_and(|meta| meta.file_type().is_symlink())
-            .then(|| std::fs::read_link(path).ok())
-            .flatten();
-        self.bytes += path.as_os_str().len() + found.as_ref().map_or(0, |to| to.as_os_str().len());
-        self.links.insert(path.to_owned(), found.clone());
-        found
-    }
 }
 
 /// The words of each command in a plain script, as bash reads them; `None`
@@ -2589,7 +2534,7 @@ mod tests {
                 tool,
                 &arguments.to_string(),
                 Path::new("/work/project/sub"),
-                (0, "call"),
+                &Links::default(),
             )
         };
         assert!(!escapes("shell", serde_json::json!({"command":"make"})));
@@ -2649,11 +2594,17 @@ mod tests {
         // path unjudged, so it is taken as spelled.
         let unread = real.join("fixed/me/project/a.txt");
         assert_eq!(judged(&unread, fixed, |_| None, false), None);
-        let mut links = Links::default();
+        let mut links = std::collections::HashMap::new();
         let mut followed = |path: &Path, removed| {
             // The test's folders are in the temporary folder, which every
             // bot writes: judged as if its links were in a fixed folder.
-            judged(path, fixed, |path| Some(links.read(path)), removed).unwrap()
+            judged(
+                path,
+                fixed,
+                |path| Some(read_link(&mut links, path)),
+                removed,
+            )
+            .unwrap()
         };
         assert_eq!(followed(&unread, false), project.join("a.txt"));
         // A `..` after a followed link reads from where it led.
@@ -2672,49 +2623,37 @@ mod tests {
             real.join("fixed/me")
         );
         assert_eq!(followed(&real.join("fixed/me"), false), home);
-        // Each call keeps what was read for it: another call reading a link
-        // changed since changes nothing a call already announced judges by.
-        let call = |id: &str| (-1, id.to_owned());
+        // What was read goes with the call: a link changed since changes
+        // nothing a call already read judges by, and a call read later
+        // sees the change.
         let arguments = serde_json::json!({"path": unread, "content": ""}).to_string();
-        let learn = |id: &str, fresh| {
+        let learn = || {
             super::learn(
                 Mode::ReadOnly,
                 None,
                 &[],
-                [(id, "write", arguments.as_str())],
+                "write",
+                &arguments,
                 Path::new("/"),
-                -1,
-                fresh,
             )
         };
-        let kept = |id: &str| {
-            known()
-                .calls
-                .get(&call(id))
-                .and_then(|links| links.links.get(&real.join("fixed/me")).cloned())
+        let link = |links: &Links| {
+            links
+                .0
+                .as_ref()
+                .and_then(|links| links.get(&real.join("fixed/me")).cloned())
         };
-        learn("a", true);
-        assert_eq!(kept("a"), Some(Some(home.clone())));
+        let first = learn();
+        assert!(first.read() && !Links::default().read());
+        assert_eq!(link(&first), Some(Some(home.clone())));
         std::fs::remove_file(real.join("fixed/me")).unwrap();
         std::os::unix::fs::symlink(real.join("fixed"), real.join("fixed/me")).unwrap();
-        learn("b", true);
-        assert_eq!(kept("b"), Some(Some(real.join("fixed"))));
-        // A round resumed keeps what it read; one announced reads again.
-        learn("a", false);
-        assert_eq!(kept("a"), Some(Some(home.clone())));
-        learn("a", true);
-        assert_eq!(kept("a"), Some(Some(real.join("fixed"))));
-        // A path no tool takes is never read or kept.
+        assert_eq!(link(&first), Some(Some(home.clone())));
+        assert_eq!(link(&learn()), Some(Some(real.join("fixed"))));
+        // A path no tool takes is never read.
         assert!(judgeable(&"a".repeat(4096)));
         assert!(!judgeable(&"a".repeat(4097)));
         assert!(!judgeable("a\0b"));
-        // Nor is one call's reading past a sixteenth of the room.
-        let big = Links {
-            bytes: KNOWN_BYTES / 16 + 1,
-            ..Links::default()
-        };
-        known().keep(call("big"), big);
-        assert!(!known().calls.contains_key(&call("big")));
         let _ = std::fs::remove_dir_all(&base);
         // Read-only writes nowhere, so every write asks.
         assert!(super::escapes(
@@ -2724,7 +2663,7 @@ mod tests {
             "write",
             r#"{"path":"a.txt","content":""}"#,
             root,
-            (0, "call")
+            &Links::default()
         ));
     }
 

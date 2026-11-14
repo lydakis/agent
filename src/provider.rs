@@ -586,6 +586,10 @@ pub struct ToolCall {
     /// `custom_tool_call_output`.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub custom: bool,
+    /// The links its paths pass, as the daemon read them before the round
+    /// judged it ([`crate::sandbox::learn`]); never stored.
+    #[serde(skip)]
+    pub links: crate::sandbox::Links,
 }
 pub type ItemStream = futures_util::stream::BoxStream<'static, std::io::Result<Bytes>>;
 /// The conversation items of a request: pre-encoded, comma-separated items

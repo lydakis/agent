@@ -3463,7 +3463,7 @@ impl Turn {
             }) {
                 context.thinking = record.thinking;
             }
-            let response = match called {
+            let mut response = match called {
                 Ok(Some(response)) => {
                     drops = 0;
                     response
@@ -3530,6 +3530,9 @@ impl Turn {
                 bytes: items.iter().map(Bytes::len).sum(),
                 items: items.len(),
             };
+            // Read for each round that announces calls, so a link changed
+            // since an earlier round is seen; the calls carry it from here.
+            learn_links(&record, &mut response.calls, &workspace, true).await;
             let calls: Vec<ToolCall> = response.calls.clone();
             let usage = response.usage.clone();
             // What the view cost in tokens, for the token threshold. One
@@ -3545,9 +3548,6 @@ impl Turn {
             record.sent = sent.or(record.sent);
             let name = self.bot.clone();
             let rules = self.rules();
-            // Read again for each round that announces calls: a link
-            // changed since an earlier round is seen.
-            learn_links(&record, &calls, &workspace, true).await;
             let gated = calls
                 .iter()
                 .any(|call| record.gated(call, &workspace, &rules));
@@ -4446,7 +4446,8 @@ impl Turn {
         let turn = self.turn;
         // A round resumed after a restart has not read them yet; one just
         // announced keeps what it read, so it runs as it was announced.
-        learn_links(record, &calls, workspace, false).await;
+        let mut calls = calls;
+        learn_links(record, &mut calls, workspace, false).await;
         let mut calls = calls.into_iter();
         while let Some(call) = calls.next() {
             // Nor any tool: the calls not yet started are answered as not
@@ -6710,13 +6711,23 @@ fn epoch_ms(at: tokio::time::Instant) -> u64 {
 }
 
 /// Read off the runtime thread the links a sandboxed bot's writes pass
-/// on their way, so that judging the calls reads no file
-/// ([`agent_runtime::sandbox::learn`]); each again when `fresh`.
-async fn learn_links(record: &Bot, calls: &[ToolCall], workspace: &std::path::Path, fresh: bool) {
+/// on their way, into each call, so that judging the calls reads no file
+/// ([`agent_runtime::sandbox::learn`]); each again when `fresh`. The calls
+/// move to the blocking thread and back, never copied.
+async fn learn_links(
+    record: &Bot,
+    calls: &mut Vec<ToolCall>,
+    workspace: &std::path::Path,
+    fresh: bool,
+) {
     if let Some(learn) = record.links_to_learn(calls, workspace, fresh) {
-        tokio::task::spawn_blocking(learn)
-            .await
-            .unwrap_or_else(|join| std::panic::resume_unwind(join.into_panic()));
+        let mut taken = std::mem::take(calls);
+        *calls = tokio::task::spawn_blocking(move || {
+            learn(&mut taken);
+            taken
+        })
+        .await
+        .unwrap_or_else(|join| std::panic::resume_unwind(join.into_panic()));
     }
 }
 
@@ -8402,6 +8413,7 @@ mod tests {
             name: name.into(),
             call_id: id.into(),
             arguments: arguments.to_string(),
+            links: Default::default(),
         })
         .collect();
         let round = calls.clone();
@@ -8522,6 +8534,7 @@ mod tests {
             name: "shell".into(),
             call_id: "shell-2".into(),
             arguments: json!({"command": "rm -rf x"}).to_string(),
+            links: Default::default(),
         };
         assert!(task.load_holds(&record, &calls[1], &dir));
         assert!(!task.load_holds(&record, &forbidden, &dir));
