@@ -587,7 +587,8 @@ pub fn agent_inside(command: &str) -> bool {
     let parts = crate::shell::parts(command);
     !parts.is_empty()
         && parts.iter().all(|part| {
-            let Some(simple) = crate::shell::simple(part).filter(|_| !writes_elsewhere(part))
+            let Some(simple) = crate::shell::simple(part)
+                .filter(|_| !writes_elsewhere(part) && !substitutes(part))
             else {
                 return false;
             };
@@ -672,6 +673,39 @@ fn writes_elsewhere(command: &str) -> bool {
         }
     }
     false
+}
+
+/// Whether a command runs another inside it, whose own reach is not
+/// known: `$(...)` or a backquote outside single quotes, or `<(...)` and
+/// `>(...)` outside quotes; in a here-document's text too, unless its
+/// delimiter is quoted.
+fn substitutes(command: &str) -> bool {
+    let (line, body) = command.split_once('\n').unwrap_or((command, ""));
+    let (mut quote, mut chars) = (None, line.chars().peekable());
+    while let Some(c) = chars.next() {
+        let next = chars.peek().copied();
+        match (quote, c) {
+            (Some('\''), '\'') => quote = None,
+            (Some('\''), _) => {}
+            (_, '`') => return true,
+            (_, '$') if next == Some('(') => return true,
+            (Some('"'), '"') => quote = None,
+            (Some(_), '\\') | (None, '\\') => {
+                chars.next();
+            }
+            (Some(_), _) => {}
+            (None, '\'' | '"') => quote = Some(c),
+            (None, '<' | '>') if next == Some('(') => return true,
+            _ => {}
+        }
+    }
+    let expands = line.split_once("<<").is_some_and(|(_, rest)| {
+        !rest
+            .trim_start_matches('-')
+            .trim_start()
+            .starts_with(['\'', '"', '\\'])
+    });
+    expands && (body.contains("$(") || body.contains('`'))
 }
 
 /// The bot and number a `BOT/N` handle names.
@@ -1413,6 +1447,8 @@ Keep the rest.'"#,
             r#""$AGENT_BIN" ls --name 'a>b' 2>&1"#,
             r#""$AGENT_BIN" ls 2>/dev/null"#,
             r#""$AGENT_BIN" ls --pretty | jq -r '.name | ascii_upcase' | head -5"#,
+            r#""$AGENT_BIN" run --bot shop.fix --detach -- 'Run $(make test) and say'"#,
+            "\"$AGENT_BIN\" run --bot shop.lead --detach - <<'EOF'\nRan $(make) and `ls`.\nEOF",
         ] {
             assert!(agent_inside(inside), "{inside}");
         }
@@ -1432,6 +1468,11 @@ Keep the rest.'"#,
             r#""$AGENT_BIN" turns --bot shop.fix >> /tmp/out 2>&1"#,
             r#""$AGENT_BIN" ls | head | tee "$HOME/report.json""#,
             r#""$AGENT_BIN" ls | jq . | sh"#,
+            r#""$AGENT_BIN" run --bot shop.lead --detach -- "$(touch "$HOME/report.json"; printf done)""#,
+            r#""$AGENT_BIN" run --bot shop.lead --detach -- `touch ~/r; echo done`"#,
+            r#""$AGENT_BIN" run --bot shop.lead --detach -- "$(<(cat ~/x))""#,
+            r#""$AGENT_BIN" ls --name "$(cat ~/.name)""#,
+            "\"$AGENT_BIN\" run --bot shop.lead --detach - <<EOF\nRan $(touch ~/r).\nEOF",
             "",
         ] {
             assert!(!agent_inside(outside), "{outside}");
