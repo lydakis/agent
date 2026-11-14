@@ -308,7 +308,7 @@ class DeliveryTests(ModelFixture):
     def test_steer_joins_the_running_turn_at_its_next_round_boundary(self):
         client = self.client('echo,shell')
         client.request('create', bot='Bob', workspace=str(self.path))
-        first = client.request('submit', bot='Bob', request_id='1', prompt='shell:sleep .4')['result']['message']
+        first = client.request('submit', bot='Bob', request_id='1', prompt='shell:sleep 1')['result']['message']
         client.receive(lambda m: m.get('event') == 'tool_started' and m.get('turn') == first)
         steer = client.request('submit', bot='Bob', request_id='s', prompt='from-steer', delivery='steer')['result']
         self.assertEqual(steer['status'], 'queued')
@@ -328,6 +328,11 @@ class DeliveryTests(ModelFixture):
         self.assertEqual(tail[1]['content'][0]['text'], 'from-steer')
         self.assertEqual(poll(client, 'Bob', first)['result']['text'], 'reply:from-steer')
         self.assertIn('steered', [e['event'] for e in self.events(client, 'Bob') if e['turn'] == first])
+        # The steer moved the command, still running, to the background; its
+        # end is told in a turn of its own, after which the bot is idle.
+        self.assertEqual(json.loads(tail[0]['output'])['background'], True)
+        told = client.receive(lambda m: m.get('event') == 'accepted' and m['data'].get('origin') == 'background')
+        self.assertEqual(client.finished(told['turn'])['data']['status'], 'completed')
         # On an idle bot a steer is an ordinary turn.
         idle = client.request('submit', bot='Bob', request_id='s2', prompt='alone', delivery='steer')['result']
         self.assertEqual(idle['status'], 'running')
