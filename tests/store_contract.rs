@@ -98,6 +98,47 @@ fn result(output: &str) -> Outcome {
 }
 
 #[test]
+fn running_context_keeps_bot_defaults_apart_from_turn_overrides() {
+    let mut db = db();
+    let mut defaults = binding();
+    defaults.effort = Some("low");
+    db.create("Bob", Some("/synthetic/bob"), defaults).unwrap();
+    let options = TurnOptions {
+        model: Some("openai/other-model".into()),
+        effort: Some("high".into()),
+        budget_tokens: Some(1234),
+        output_schema: Some(r#"{"type":"object"}"#.into()),
+        ..TurnOptions::default()
+    };
+    let turn = db
+        .begin("Bob", "r1", "first", true, &options, allow_provider)
+        .unwrap()
+        .turn;
+    let (bot, context) = db.running_context("Bob", turn).unwrap();
+    assert_eq!(bot.name, context.bot);
+    assert_eq!(bot.bot_id, context.bot_id);
+    assert_eq!(bot.running_turn, Some(turn));
+    assert_eq!(bot.model, "synthetic-model");
+    assert_eq!(bot.effort.as_deref(), Some("low"));
+    assert_eq!(context.model, "openai/other-model");
+    assert_eq!(context.effort.as_deref(), Some("high"));
+    assert_eq!(context.workspace, "/synthetic/bob");
+    assert_eq!(context.budget.unwrap().tokens, 1234);
+    assert_eq!(context.output_schema, options.output_schema);
+    db.create("Other", Some("/synthetic/other"), binding())
+        .unwrap();
+    assert_eq!(
+        db.running_context("Other", turn).err().unwrap().code,
+        "stale_turn"
+    );
+    db.finish(turn, None).unwrap();
+    assert_eq!(
+        db.running_context("Bob", turn).err().unwrap().code,
+        "stale_turn"
+    );
+}
+
+#[test]
 fn historical_fork_and_exact_resume_preserve_independent_lineage() {
     let mut db = db();
     assert!(db.inspect("missing").is_err());
@@ -4049,7 +4090,7 @@ fn prompts_name_who_wrote_each_and_what_the_turn_ran() {
     // The steer named no folder, so it records the one its turn ran in,
     // which a later move does not rewrite.
     let row = |db: &Database, id: i64| {
-        let messages = db.messages("Carol", 0, None, 10, false).unwrap();
+        let messages = db.messages("Carol", 0, None, 10, false, false).unwrap();
         let ran = (messages["messages"].as_array().unwrap().iter())
             .find(|m| m["message"] == id)
             .unwrap()["turn"]
@@ -4647,7 +4688,7 @@ fn schema_39_records_the_folder_each_earlier_turn_ran_in() {
         .unwrap();
     let mut db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
     // The steer ran with the folder and model of the turn it joined.
-    let messages = db.messages("Dan", 0, None, 10, false).unwrap();
+    let messages = db.messages("Dan", 0, None, 10, false, false).unwrap();
     let joined = (messages["messages"].as_array().unwrap().iter())
         .find(|m| m["message"] == steer)
         .unwrap()["turn"]
@@ -4817,7 +4858,7 @@ fn schema_41_turns_ran_at_their_bots_effort() {
         "medium"
     );
     assert_eq!(
-        db.messages("Bob", 0, None, 10, false).unwrap()["messages"][1]["effort"],
+        db.messages("Bob", 0, None, 10, false, false).unwrap()["messages"][1]["effort"],
         "medium"
     );
     drop(db);
@@ -5015,7 +5056,7 @@ fn schema_42_backfills_absorbed_effort_or_rolls_back_when_history_is_missing() {
             assert!(!conn.query_row("SELECT EXISTS(SELECT 1 FROM pragma_table_info('turns') WHERE name='inherited_reasoning')", [], |r| r.get::<_, bool>(0)).unwrap());
         } else {
             let db = opened.unwrap();
-            let listed = db.messages("Bob", 0, None, 10, false).unwrap();
+            let listed = db.messages("Bob", 0, None, 10, false, false).unwrap();
             let levels: Vec<_> = listed["messages"]
                 .as_array()
                 .unwrap()
@@ -5990,7 +6031,7 @@ fn a_turn_runs_at_its_own_effort_or_its_bots() {
         )
         .unwrap();
     assert_eq!(plain.entry.unwrap()["data"]["effort"], "high");
-    let listed = db.messages("Bob", 0, None, 10, false).unwrap();
+    let listed = db.messages("Bob", 0, None, 10, false, false).unwrap();
     let levels: Vec<&Value> = listed["messages"]
         .as_array()
         .unwrap()
@@ -6060,7 +6101,7 @@ fn absorbed_effort_does_not_change_the_submitted_request() {
             // Both the inline and shared-prompt paths report the effective effort,
             // but retries still compare the original omission or explicit level.
             assert_eq!(
-                db.messages("Bob", 0, None, 10, false).unwrap()["messages"][1]["effort"],
+                db.messages("Bob", 0, None, 10, false, false).unwrap()["messages"][1]["effort"],
                 "low"
             );
             let retry = db
@@ -9327,7 +9368,8 @@ fn pruning_takes_the_events_of_messages_that_ended_in_line() {
     // Each message keeps its row: history stays.
     for message in &ended {
         assert_eq!(
-            db.messages("Bob", message - 1, None, 1, false).unwrap()["messages"][0]["message"],
+            db.messages("Bob", message - 1, None, 1, false, false)
+                .unwrap()["messages"][0]["message"],
             *message
         );
     }
@@ -18731,7 +18773,7 @@ fn messages_that_joined_a_declined_request_go_back_in_line_as_sent() {
     // The person's and the agent's messages are in line again, as sent,
     // each its own message, in the order they came; neither the note nor
     // the fact goes again.
-    let listed: Vec<Value> = db.messages("Carol", turn, None, 8, false).unwrap()["messages"]
+    let listed: Vec<Value> = db.messages("Carol", turn, None, 8, false, false).unwrap()["messages"]
         .as_array()
         .unwrap()
         .iter()
@@ -18754,10 +18796,26 @@ fn messages_that_joined_a_declined_request_go_back_in_line_as_sent() {
             ])
         ]
     );
+    // Only those in line, read from the whole history: what a window
+    // opening on the bot shows waiting.
+    let ids = |page: Value| -> Vec<Value> {
+        (page["messages"].as_array().unwrap().iter())
+            .map(|m| m["message"].clone())
+            .collect()
+    };
+    let waiting = ids(db.messages("Carol", 0, None, 8, false, true).unwrap());
+    assert_eq!(
+        waiting,
+        [listed[0]["message"].clone(), listed[1]["message"].clone()]
+    );
+    let newest = ids(db.messages("Carol", 0, None, 1, true, true).unwrap());
+    assert_eq!(newest, [listed[1]["message"].clone()]);
     let first = listed[0]["message"].as_i64().unwrap();
     let second = listed[1]["message"].as_i64().unwrap();
     let (accepted, _) = db.start(first, allow_provider).unwrap();
     assert_eq!(accepted["data"]["person"], "pat");
+    let waiting = ids(db.messages("Carol", 0, None, 8, false, true).unwrap());
+    assert_eq!(waiting, [json!(second)], "the first is out of line");
     // In the declined turn the model is told each went again; the note
     // and the fact are left out as before. The next turn opens on the
     // person's words, with who wrote them and the picture.
@@ -18850,7 +18908,7 @@ fn a_message_sent_again_runs_where_it_joined_and_daemon_notes_stay_notes() {
     .unwrap();
     let refused = Error::new("provider_refusal").facts(json!({"category":"cyber"}));
     db.finish(turn, Some(&refused)).unwrap();
-    let again: Vec<Value> = (db.messages("Dan", turn, None, 8, false).unwrap()["messages"]
+    let again: Vec<Value> = (db.messages("Dan", turn, None, 8, false, false).unwrap()["messages"]
         .as_array())
     .unwrap()
     .iter()
@@ -18915,7 +18973,7 @@ fn a_message_sent_again_keeps_who_sent_it_and_what_it_quoted() {
     db.delete_bot("Bob").unwrap();
     let refused = Error::new("provider_refusal").facts(json!({"category":"cyber"}));
     db.finish(turn, Some(&refused)).unwrap();
-    let again = (db.messages("Carol", turn, None, 8, false).unwrap()["messages"].as_array())
+    let again = (db.messages("Carol", turn, None, 8, false, false).unwrap()["messages"].as_array())
         .unwrap()
         .iter()
         .find(|t| t["status"] == "ready")
@@ -20380,7 +20438,7 @@ fn a_lifted_call_waits_on_past_its_turn_and_its_verdict_runs_or_ends_it() {
         db.process_result(p2).unwrap(),
         Some(("finished".into(), Some(result.clone())))
     );
-    let told = db.messages("Bob", 0, None, 16, false).unwrap();
+    let told = db.messages("Bob", 0, None, 16, false, false).unwrap();
     let prompts: Vec<&str> = (told["messages"].as_array().unwrap().iter())
         .filter_map(|t| t["prompt_preview"].as_str())
         .collect();
@@ -20415,7 +20473,7 @@ fn a_lifted_call_waits_on_past_its_turn_and_its_verdict_runs_or_ends_it() {
     // Its bot at rest is told it ended with its tool's own fields, as its
     // turn would have read them.
     db.tell_finished("Bob").unwrap();
-    let told = db.messages("Bob", 0, None, 16, false).unwrap();
+    let told = db.messages("Bob", 0, None, 16, false, false).unwrap();
     let prompts: Vec<&str> = (told["messages"].as_array().unwrap().iter())
         .filter_map(|t| t["prompt_preview"].as_str())
         .collect();
@@ -20893,7 +20951,7 @@ fn retention_keeps_the_ending_of_the_message_it_ends() {
         .turn;
     converse(&mut db, "Bob", 2);
     let status = |db: &Database| -> Value {
-        db.messages("Bob", 0, None, 16, false).unwrap()["messages"]
+        db.messages("Bob", 0, None, 16, false, false).unwrap()["messages"]
             .as_array()
             .unwrap()
             .iter()

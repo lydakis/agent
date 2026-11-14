@@ -199,6 +199,9 @@ fn tick_draws(moving: bool, lively: bool, drawn: Option<Duration>) -> bool {
 }
 /// How much history is shown on attach.
 const HISTORY_ITEMS: u64 = 200;
+/// The most of a waiting message's words read to stage it: all the
+/// daemon gives one `prompts` read, past what a staged row shows unfolded.
+const PROMPT_READ_BYTES: usize = 256 * 1024;
 /// How much older history is drawn at a time as the view nears its top:
 /// a page drawn while the wheel turns, so small enough not to stall it.
 const OLDER_ITEMS: u64 = 50;
@@ -898,9 +901,68 @@ async fn read_status(
 /// window, beside the store: one file a lead, as each lead's card reads its
 /// own agents, so leads sharing a store never undo each other's.
 fn reads_file(store: &std::path::Path, lead: &str) -> std::path::PathBuf {
+    reads_dir(store).join(format!("{lead}.json"))
+}
+
+/// The folder of [`reads_file`]s beside `store`.
+fn reads_dir(store: &std::path::Path) -> std::path::PathBuf {
     let mut dir = store.as_os_str().to_owned();
     dir.push(".status-reads");
-    std::path::PathBuf::from(dir).join(format!("{lead}.json"))
+    std::path::PathBuf::from(dir)
+}
+
+/// Every agent's question as some window or the sky last read it beside
+/// `store`, by this build from the daemon `identity` names: each with the
+/// turn it ended, the newest where two kept one. The sky reads again only
+/// the agents that ran since.
+pub(crate) fn kept_seen(
+    store: &std::path::Path,
+    identity: Option<&str>,
+) -> HashMap<String, (i64, Seen)> {
+    #[derive(serde::Deserialize)]
+    struct Kept {
+        build: String,
+        seen: HashMap<String, (i64, Seen)>,
+    }
+    let store = agent_client::socket::canonical_store(store).unwrap_or_else(|_| store.into());
+    let build = reads_build(identity);
+    let mut seen: HashMap<String, (i64, Seen)> = HashMap::new();
+    let files = std::fs::read_dir(reads_dir(&store)).into_iter().flatten();
+    for file in files.flatten() {
+        let Some(kept) = std::fs::read(file.path())
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<Kept>(&bytes).ok())
+            .filter(|kept| kept.build == build)
+        else {
+            continue;
+        };
+        for (name, read) in kept.seen {
+            match seen.get(&name) {
+                Some((turn, _)) if *turn >= read.0 => {}
+                _ => {
+                    seen.insert(name, read);
+                }
+            }
+        }
+    }
+    seen
+}
+
+/// Keep what the sky read of every agent's question for the next one,
+/// beside the leads' own (a leading dot, as no lead is named).
+pub(crate) fn keep_sky_seen(
+    store: &std::path::Path,
+    identity: Option<&str>,
+    seen: &HashMap<String, (i64, Seen)>,
+) {
+    let store = agent_client::socket::canonical_store(store).unwrap_or_else(|_| store.into());
+    write_reads(
+        &store,
+        ".sky",
+        identity,
+        &HashMap::new(),
+        seen.iter().collect(),
+    );
 }
 
 /// The build that kept them, which another may read a history otherwise,
@@ -959,6 +1021,17 @@ fn keep_reads(
     let seen: HashMap<&String, &(i64, Seen)> = (asks_seen.iter())
         .filter(|(name, _)| status_read.contains_key(*name))
         .collect();
+    write_reads(store, lead, identity, status_read, seen);
+}
+
+/// [`keep_reads`]'s file for `lead`, written whole.
+fn write_reads(
+    store: &std::path::Path,
+    lead: &str,
+    identity: Option<&str>,
+    status_read: &HashMap<String, (Value, Latest)>,
+    seen: HashMap<&String, &(i64, Seen)>,
+) {
     #[derive(serde::Serialize)]
     struct Kept<'a> {
         build: String,
@@ -2198,8 +2271,12 @@ fn sky_cli(args: &[String]) -> Result<(), String> {
         }
     }
     let (store, socket) = daemon_paths(store, socket)?;
+    // Two workers, as a window has: on one, the connection's reader, which
+    // reads the past as fast as the daemon sends it, ran ahead of the
+    // follow taking it, and a sky of 400 agents let its connection go
+    // halfway through 40,000 past events and tried again 3 s later.
     let runtime = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(1)
+        .worker_threads(2)
         .enable_all()
         .build()
         .map_err(|e| e.to_string())?;
@@ -2451,10 +2528,7 @@ async fn run() -> Result<(), String> {
     // items instead of replayed events, so the replay is skipped. The bot
     // is read after that, so a turn that ended during the replay is seen
     // as ended.
-    client
-        .request("follow", json!({"bot": name, "after": 0}))
-        .await
-        .map_err(|e| e.to_string())?;
+    follow_bot(&client, &name).await?;
     let caught = caught_up(&mut events).await;
     let bot = client
         .request("inspect", json!({"bot": name}))
@@ -2860,6 +2934,16 @@ fn used(event: &Event) -> bool {
     }
 }
 
+/// A notch of the wheel.
+fn is_wheel(event: &Event) -> bool {
+    use ratatui::crossterm::event::MouseEventKind;
+    matches!(
+        event,
+        Event::Mouse(mouse)
+            if matches!(mouse.kind, MouseEventKind::ScrollUp | MouseEventKind::ScrollDown)
+    )
+}
+
 /// A new bot in the folder, with the instructions its folder gives it.
 async fn create(client: &Client, options: &Options, bot: &str) -> Result<(), String> {
     let model = options
@@ -3091,11 +3175,20 @@ fn tilde(path: &str) -> String {
     }
 }
 
+/// A name no other call makes, in this process or another: two calls in
+/// the same millisecond differ by their count. A request id made here is
+/// the daemon's idempotency key, so two requests must never share one.
 fn unique(prefix: &str) -> String {
+    static COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default();
-    format!("{prefix}-{}-{}", now.as_millis(), std::process::id())
+    let count = COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    format!(
+        "{prefix}-{}-{}-{count}",
+        now.as_millis(),
+        std::process::id()
+    )
 }
 
 /// The agent a side chat is a copy of, from the name `/side` gives it,
@@ -3178,6 +3271,30 @@ fn report_status(state: &str, bot: &str) {
     };
     let _ = write!(stdout, "\x1b]2;{title}\x07");
     let _ = stdout.flush();
+}
+
+/// Follow `bot` from the start of its turn before last: what the window
+/// needs of the replay ([`caught_up`]) is the context its last model round
+/// left, which that turn or the one after it holds, and a pause since the
+/// greeting. Its history is drawn from its items, so the events of every
+/// turn before, as many as the agent ever made, are not read again.
+async fn follow_bot(client: &Client, bot: &str) -> Result<(), String> {
+    let newest = client
+        .request("turns", json!({"bot": bot, "newest": true, "limit": 2}))
+        .await
+        .map_err(|e| e.to_string())?;
+    let since = (newest["turns"].as_array().into_iter().flatten())
+        .filter_map(|turn| turn["started_ms"].as_i64())
+        .min();
+    let follow = match since {
+        Some(since) => json!({"bot": bot, "since_ms": since}),
+        None => json!({"bot": bot, "after": 0}),
+    };
+    client
+        .request("follow", follow)
+        .await
+        .map(|_| ())
+        .map_err(|e| e.to_string())
 }
 
 /// Read past a follow's replay as it arrives, so a long one cannot fill
@@ -6221,6 +6338,8 @@ impl App {
         self.margin = margin::Margin::load(self.reactions_key.as_deref());
         self.picked = reactions::Picked::load(self.reactions_key.as_deref());
         self.history().await;
+        // What was sent and still waits, wherever it was sent from.
+        self.restage().await;
         // A turn already running: its clock, and any call it waits on.
         if let Some(turn) = self.running.as_ref().map(|r| r.turn) {
             if let Ok(page) = self
@@ -6334,6 +6453,9 @@ impl App {
         // and once a second for what else time changes, so an idle window
         // builds a frame a second, not ten.
         let mut changed = true;
+        // An event taken while gathering a burst of the wheel's notches
+        // that was not one, handled first next time round.
+        let mut held: Option<Event> = None;
         loop {
             let due = drawn.is_none_or(|at| at.elapsed() >= DRAW_EVERY);
             let wanted = keyed || changed || self.quit;
@@ -6378,6 +6500,14 @@ impl App {
             let every = tick_every(self.moving(), heard.elapsed());
             let lively = every == LIVELY_TICK;
             let next_tick = ticked + every;
+            // The event the last burst of the wheel's notches stopped at,
+            // before any newer.
+            if let Some(key) = held.take() {
+                keyed = true;
+                heard = Instant::now();
+                self.key(key).await;
+                continue;
+            }
             tokio::select! {
                 event = events.recv(), if !self.down => {
                     changed = true;
@@ -6390,7 +6520,11 @@ impl App {
                 Some(key) = keys.recv() => {
                     keyed = true;
                     heard = Instant::now();
-                    self.key(key).await
+                    let (wheel, chat) = (is_wheel(&key), self.over_chat(&key));
+                    self.key(key).await;
+                    if wheel {
+                        held = self.wheel_burst(&mut keys, chat).await;
+                    }
                 }
                 _ = tokio::time::sleep(undrawn.map_or(Duration::ZERO, |at| DRAW_EVERY.saturating_sub(at.elapsed()))), if undrawn.is_some() => {}
                 news = async {
@@ -6591,6 +6725,42 @@ impl App {
                 self.repaint = false;
                 self.repaint(terminal).await?;
             }
+        }
+    }
+
+    /// After a notch of the wheel, the notches that came while the last
+    /// frame was drawn, taken before the next: a burst is one frame, not
+    /// one each that a slower terminal works through after the wheel
+    /// stops. Only notches: the first event that is not one is given back,
+    /// to be taken after the frame, as a key may answer what the frame
+    /// shows. The burst stops once the window is quitting, and over the
+    /// conversation (`chat`) near its first row drawn while older pages
+    /// remain, so they are drawn before the rest of it.
+    async fn wheel_burst(
+        &mut self,
+        keys: &mut tokio::sync::mpsc::UnboundedReceiver<Event>,
+        chat: bool,
+    ) -> Option<Event> {
+        for _ in 0..keys.len() {
+            if self.quit || (chat && self.older.is_some() && self.screen.near_top()) {
+                break;
+            }
+            let Ok(key) = keys.try_recv() else { break };
+            if !is_wheel(&key) {
+                return Some(key);
+            }
+            self.key(key).await;
+        }
+        None
+    }
+
+    /// Whether `event` is over the conversation rather than the pane (the
+    /// margin, a preview, a side chat).
+    fn over_chat(&self, event: &Event) -> bool {
+        match event {
+            Event::Mouse(mouse) => !(self.pane.as_ref())
+                .is_some_and(|p| p.area.contains((mouse.column, mouse.row).into())),
+            _ => true,
         }
     }
 
@@ -7292,10 +7462,7 @@ impl App {
         }
         let lead = async {
             let (client, mut fresh) = connect(&self.options, Asking::Never).await?;
-            client
-                .request("follow", json!({"bot": self.bot, "after": 0}))
-                .await
-                .map_err(|e| e.to_string())?;
+            follow_bot(&client, &self.bot).await?;
             let caught = caught_up(&mut fresh).await;
             // Read after the replay, so a turn that ends meanwhile arrives
             // as an event rather than lost between the two.
@@ -7333,7 +7500,7 @@ impl App {
             self.compacted = caught.compacted.clone().or(self.compacted.take());
             self.history_after(self.seen_node.max(self.options.side.unwrap_or(0)))
                 .await;
-            self.unstage_landed().await;
+            self.restage().await;
             let now = record["running_turn"].as_i64();
             // A turn that ended while away ends here as its event would have.
             if let Some(turn) = self.running.as_ref().map(|r| r.turn)
@@ -9876,37 +10043,91 @@ impl App {
         unpaired
     }
 
-    /// Drop the staged prompts that landed while Sonny was away, whose
-    /// `accepted` or `steered` it missed: those no longer waiting in line.
-    async fn unstage_landed(&mut self) {
-        let ids = self.staged.iter().map(|(message, _)| *message);
-        let (Some(first), Some(last)) = (ids.clone().min(), ids.max()) else {
-            return;
-        };
-        // Every message from the first staged to the last, a page at a
-        // time: other clients may have sent many between them.
-        let mut waiting: Vec<i64> = Vec::new();
-        let mut after = first - 1;
+    /// What waits in the bot's line, staged as this window's own sends
+    /// are, each marked with what it waits for: the person's words not
+    /// yet taken in, whichever window or client sent them, and whatever
+    /// this window staged that still waits. A window knows only the sends
+    /// it saw, so one opened again (Sonny restarted, `/switch` there and
+    /// back) or reconnected reads the line; a staged prompt that landed
+    /// meanwhile goes. Unread, the staged stay as they are.
+    async fn restage(&mut self) {
+        let mut waiting: Vec<Value> = Vec::new();
+        let mut after = 0;
         loop {
-            let asked = json!({"bot": self.bot, "after": after, "before": last + 1, "limit": 256});
+            let asked = json!({"bot": self.bot, "after": after, "limit": 256, "waiting": true});
             let Ok(page) = self.client.request("messages", asked).await else {
-                // Unread, they stay as they are.
                 return;
             };
-            waiting.extend(
-                page["messages"]
-                    .as_array()
-                    .into_iter()
-                    .flatten()
-                    .filter(|row| matches!(row["status"].as_str(), Some("queued" | "ready")))
-                    .filter_map(|row| row["message"].as_i64()),
-            );
+            waiting.extend(page["messages"].as_array().into_iter().flatten().cloned());
             match page["next_after"].as_i64() {
                 Some(next) => after = next,
                 None => break,
             }
         }
-        self.staged.retain(|(turn, _)| waiting.contains(turn));
+        let mut staged = Vec::new();
+        for row in &waiting {
+            let Some(message) = row["message"].as_i64() else {
+                continue;
+            };
+            let kept = self.staged.iter().find(|(sent, _)| *sent == message);
+            let prompt = match kept {
+                Some((_, prompt)) => prompt.clone(),
+                None if needs::from_person(row) => match self.prompt_of(message).await {
+                    Some(prompt) => prompt,
+                    None => continue,
+                },
+                None => continue,
+            };
+            staged.push((message, prompt));
+            self.waits_as(message, row["delivery"].as_str());
+        }
+        self.staged = staged;
+        let staged = &self.staged;
+        let waiting = |sent: &i64| staged.iter().any(|(turn, _)| turn == sent);
+        self.queued.retain(waiting);
+        self.steering.retain(waiting);
+    }
+
+    /// The person's words in line that another window or client sent,
+    /// staged here as they are there, from the `queued` event that says
+    /// they wait: this window's own were staged as it sent them.
+    async fn stage_sent_elsewhere(&mut self, event: &Value) {
+        let data = &event["data"];
+        let Some(message) = event["message"].as_i64() else {
+            return;
+        };
+        if data["lapsed"] == true
+            || !needs::from_person(data)
+            || self.staged.iter().any(|(sent, _)| *sent == message)
+        {
+            return;
+        }
+        if let Some(prompt) = self.prompt_of(message).await {
+            self.staged.push((message, prompt));
+            self.waits_as(message, data["delivery"].as_str());
+        }
+    }
+
+    /// A staged message marked with what it waits for, by how it was
+    /// sent: a queued one the turn's end, a steer the call under way.
+    fn waits_as(&mut self, message: i64, delivery: Option<&str>) {
+        let marks = match delivery {
+            Some("queue") => &mut self.queued,
+            Some("steer") => &mut self.steering,
+            _ => return,
+        };
+        if !marks.contains(&message) {
+            marks.push(message);
+        }
+    }
+
+    /// A message's words as the person wrote them, read whole from the
+    /// store: what its staged row shows.
+    async fn prompt_of(&self, message: i64) -> Option<String> {
+        let asked = json!({"bot": self.bot, "turn": message, "bytes": PROMPT_READ_BYTES});
+        let read = self.client.request("prompts", asked).await.ok()?;
+        let text = read["prompts"][0]["text"].as_str()?;
+        Some(stamp::unstamped(text).to_owned())
     }
 
     /// The folder the agent works in, where its pictures' paths start:
@@ -10188,6 +10409,12 @@ impl App {
         let drawn = data["node"]
             .as_i64()
             .is_some_and(|node| node <= self.seen_node);
+        // A message taken in is out of line, its node drawn or not: one
+        // staged from a `queued` event heard after history drew it too.
+        if kind == "steered" {
+            self.staged
+                .retain(|(staged, _)| Some(*staged) != data["message"].as_i64());
+        }
         if drawn && matches!(kind, "steered" | "message" | "tool_completed") {
             return;
         }
@@ -10206,6 +10433,9 @@ impl App {
                 "tool_started" | "text_delta" | "message" => running.acted = true,
                 _ => {}
             }
+        }
+        if kind == "queued" {
+            self.stage_sent_elsewhere(&event).await;
         }
         match kind {
             // Changed by this or another client: the footer and the
@@ -10247,6 +10477,10 @@ impl App {
             }
             "accepted" => {
                 self.staged.retain(|(staged, _)| Some(*staged) != turn);
+                // What waited in line is running now.
+                if self.notice.as_deref() == Some("queued") {
+                    self.notice = None;
+                }
                 self.end_live(Words::Reply);
                 self.live_item = None;
                 self.ahead.clear();
@@ -10305,8 +10539,6 @@ impl App {
                 }
             }
             "steered" => {
-                self.staged
-                    .retain(|(staged, _)| Some(*staged) != data["message"].as_i64());
                 // A reaction was drawn when it was sent.
                 if let Some(node) = data["node"].as_i64()
                     && let Some(item) = self.items(&[node]).await.first()
@@ -10335,6 +10567,10 @@ impl App {
             // An attached note whose wait ran out goes as a steer: the
             // sender's, nothing the person put in line.
             "queued" if data["lapsed"] == true => {}
+            // A steer behind the running turn joins it at its next call,
+            // the person's own marked `↪` where it waits: only a message
+            // waiting for a turn of its own says so, until one starts.
+            "queued" if data["status"] == "queued" && data["delivery"] == "steer" => {}
             "queued" => self.notice = Some("queued".to_owned()),
             // Nothing until a call takes it in: it asks nothing of the
             // person, so nothing says it waits.
@@ -17537,11 +17773,6 @@ impl App {
             let forms = footer::count(status::IDLE_MARK, Color::Green, counts.idle, true);
             items.push(Item::new(Slot::Idle, forms).opens("status"));
         }
-        let notes = self.margin.notes().len();
-        if notes > 0 {
-            let forms = vec![vec![Span::raw(format!("✎ {notes}")).dim()], Vec::new()];
-            items.push(Item::new(Slot::Notes, forms));
-        }
         // How full the next round is, as what is left of its window: no
         // hue while there is room, then yellow, then red, and it never
         // goes once half is used.
@@ -18117,6 +18348,14 @@ fn zen_notice(on: bool) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Request ids made in one millisecond, as two reactions sent back to
+    /// back, are still two requests to the daemon.
+    #[test]
+    fn names_made_in_the_same_millisecond_differ() {
+        let names: std::collections::HashSet<_> = (0..1000).map(|_| unique("acp")).collect();
+        assert_eq!(names.len(), 1000);
+    }
 
     #[test]
     fn an_env_file_that_sets_agent_s_own_names_is_told_they_are_not_read() {
@@ -18703,6 +18942,76 @@ mod tests {
         assert_eq!(at("old/gpt", None), ["high"]);
         assert!(at("openai/gpt", Some("xhigh")).is_empty());
         assert!(at("nowhere/x", None).is_empty());
+    }
+
+    /// A window on 400 rows, drawn 10 high, and the wheel's notch.
+    async fn wheel_app() -> (App, Event) {
+        let client = daemon_answering(|_| json!({})).await;
+        let mut app = app(client);
+        app.screen
+            .push((0..400).map(|i| Line::from(format!("row {i}"))).collect());
+        let area = Rect::new(0, 0, 80, 10);
+        app.screen
+            .render(area, &mut ratatui::buffer::Buffer::empty(area), |_| None);
+        let notch = Event::Mouse(event::MouseEvent {
+            kind: event::MouseEventKind::ScrollUp,
+            column: 1,
+            row: 1,
+            modifiers: KeyModifiers::NONE,
+        });
+        (app, notch)
+    }
+
+    #[tokio::test]
+    async fn a_burst_of_the_wheel_is_taken_before_the_frame_and_a_key_after_it() {
+        let (mut app, notch) = wheel_app().await;
+        let (tx, mut keys) = tokio::sync::mpsc::unbounded_channel();
+        let key = Event::Key(event::KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE));
+        for event in [
+            notch.clone(),
+            notch.clone(),
+            notch.clone(),
+            key,
+            notch.clone(),
+        ] {
+            tx.send(event).unwrap();
+        }
+        app.key(notch).await;
+        let back = app.screen.back();
+        let held = app.wheel_burst(&mut keys, true).await;
+        // The three notches waiting, then the key held for after the frame.
+        assert_eq!(app.screen.back(), back * 4);
+        assert!(matches!(held, Some(Event::Key(_))));
+        assert!(app.input.is_empty(), "the key waits for the frame");
+        assert_eq!(keys.len(), 1, "what came after the key waits too");
+    }
+
+    #[tokio::test]
+    async fn a_burst_stops_once_the_window_quits() {
+        let (mut app, notch) = wheel_app().await;
+        let (tx, mut keys) = tokio::sync::mpsc::unbounded_channel();
+        tx.send(notch.clone()).unwrap();
+        app.quit = true;
+        assert!(app.wheel_burst(&mut keys, true).await.is_none());
+        assert_eq!(keys.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_burst_waits_for_older_pages_near_the_first_row_but_not_over_the_pane() {
+        let (mut app, notch) = wheel_app().await;
+        let (tx, mut keys) = tokio::sync::mpsc::unbounded_channel();
+        tx.send(notch.clone()).unwrap();
+        app.older = Some(1);
+        app.screen.scroll(isize::MAX);
+        assert!(app.screen.near_top());
+        app.wheel_burst(&mut keys, true).await;
+        assert_eq!(keys.len(), 1, "older pages are drawn first");
+        app.wheel_burst(&mut keys, false).await;
+        assert_eq!(keys.len(), 0, "the pane's notches do not wait on them");
+        app.older = None;
+        tx.send(notch).unwrap();
+        app.wheel_burst(&mut keys, true).await;
+        assert_eq!(keys.len(), 0, "no older pages, nothing to wait for");
     }
 
     #[tokio::test]
@@ -19390,6 +19699,42 @@ mod tests {
         app.status_rows().await.unwrap();
         assert_eq!(histories.load(Ordering::SeqCst), 259);
         assert_eq!(turn_reads.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn a_window_follows_its_agent_from_its_turn_before_last_not_its_first_event() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let follows = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (seen, fresh) = (follows.clone(), Arc::new(AtomicBool::new(false)));
+        let new = fresh.clone();
+        let client =
+            daemon_answering(
+                move |asked| match asked["op"].as_str().unwrap_or_default() {
+                    // Newest first: one running, the one before it ended.
+                    "turns" if new.load(Ordering::SeqCst) => {
+                        json!({"turns": [], "next_before": null})
+                    }
+                    "turns" => {
+                        json!({"turns": [{"turn": 9, "status": "running", "started_ms": 9_000},
+                {"turn": 7, "status": "completed", "started_ms": 7_000}], "next_before": 7})
+                    }
+                    "follow" => {
+                        seen.lock().unwrap().push(asked.clone());
+                        json!({})
+                    }
+                    _ => json!({"error": {"code": "unexpected", "message": asked.to_string()}}),
+                },
+            )
+            .await;
+        follow_bot(&client, "shop.lead").await.unwrap();
+        // An agent that ran no turn yet has no events to skip.
+        fresh.store(true, Ordering::SeqCst);
+        follow_bot(&client, "shop.lead").await.unwrap();
+        let follows = follows.lock().unwrap();
+        assert_eq!(follows[0]["since_ms"], 7_000);
+        assert!(follows[0]["after"].is_null());
+        assert_eq!(follows[1]["after"], 0);
+        assert!(follows[1]["since_ms"].is_null());
     }
 
     #[tokio::test]
@@ -21690,21 +22035,20 @@ mod tests {
 
     #[tokio::test]
     async fn on_reconnecting_only_prompts_still_waiting_stay_staged() {
-        // Two pages, from the first staged turn on.
-        let client =
-            daemon_answering(
-                |asked| match (asked["op"].as_str(), asked["after"].as_i64()) {
-                    (Some("messages"), Some(4)) => json!({"messages": [
-                {"message": 5, "status": "taken"},
-                {"message": 6, "status": "running"},
-            ], "next_after": 6}),
-                    (Some("messages"), Some(6)) => json!({"messages": [
-                {"message": 7, "status": "queued"},
-            ], "next_after": null}),
-                    _ => json!({}),
-                },
-            )
-            .await;
+        // Two pages of what waits in line, nothing else.
+        let client = daemon_answering(|asked| {
+            assert_eq!(asked["waiting"], true);
+            match (asked["op"].as_str(), asked["after"].as_i64()) {
+                (Some("messages"), Some(0)) => json!({"messages": [
+                    {"message": 7, "status": "queued", "delivery": "queue"},
+                ], "next_after": 7}),
+                (Some("messages"), Some(7)) => json!({"messages": [
+                    {"message": 9, "status": "queued", "delivery": "steer", "origin": "lookout"},
+                ], "next_after": null}),
+                _ => json!({}),
+            }
+        })
+        .await;
         let mut app = app(client);
         app.staged = vec![
             (5, "a".into()),
@@ -21712,8 +22056,107 @@ mod tests {
             (7, "c".into()),
             (8, "d".into()),
         ];
-        app.unstage_landed().await;
+        app.queued = vec![7, 8];
+        app.restage().await;
+        // Its words as this window kept them; a note the lookout sent is
+        // not the person's, so it is not staged.
         assert_eq!(app.staged, [(7, "c".to_owned())]);
+        assert_eq!(app.queued, [7]);
+    }
+
+    #[tokio::test]
+    async fn a_window_opened_again_shows_the_steer_still_waiting() {
+        // Sent from a window since closed: the turn has not taken it in.
+        let said = stamp::stamped("also check the deploy notes", 1_700_000_000);
+        let client = daemon_answering(move |asked| match asked["op"].as_str() {
+            Some("messages") => json!({"messages": [
+                {"message": 4, "status": "queued", "delivery": "steer"},
+                {"message": 5, "status": "queued", "delivery": "steer", "from": {"bot": "b.task", "turn": 2}},
+                {"message": 6, "status": "queued", "delivery": "queue"},
+            ], "next_after": null}),
+            Some("prompts") => match asked["turn"].as_i64() {
+                Some(4) => json!({"prompts": [{"message": 4, "text": said}]}),
+                Some(6) => json!({"prompts": [{"message": 6, "text": "then the release"}]}),
+                turn => panic!("read {turn:?}, which is not the person's"),
+            },
+            _ => json!({}),
+        })
+        .await;
+        let mut app = app(client);
+        app.daemon(turn_event("accepted", 3, json!({}))).await;
+        app.restage().await;
+        assert_eq!(
+            app.staged,
+            [
+                (4, "also check the deploy notes".to_owned()),
+                (6, "then the release".to_owned())
+            ]
+        );
+        let rows: Vec<String> = app.staged_rows(80).iter().map(|l| l.to_string()).collect();
+        assert_eq!(
+            rows,
+            [
+                "",
+                "›↪ also check the deploy notes",
+                "",
+                "›⋯ then the release",
+                ""
+            ]
+        );
+        // Taken in, it lands and is staged no more.
+        app.daemon(turn_event("steered", 3, json!({"message": 4})))
+            .await;
+        assert_eq!(app.staged, [(6, "then the release".to_owned())]);
+    }
+
+    #[tokio::test]
+    async fn a_steer_sent_from_another_window_is_staged_here_too() {
+        let client = daemon_answering(|asked| match asked["op"].as_str() {
+            Some("prompts") => {
+                json!({"prompts": [{"message": asked["turn"], "text": "look at the logs"}]})
+            }
+            _ => json!({}),
+        })
+        .await;
+        let mut app = app(client);
+        app.daemon(turn_event("accepted", 1, json!({}))).await;
+        let queued = |message: i64, data: Value| json!({"event": "queued", "bot": "b", "turn": null, "message": message, "data": data});
+        app.daemon(queued(2, json!({"status": "queued", "delivery": "steer"})))
+            .await;
+        // A task's update, an automation's message and a lapsed note are
+        // not the person's words: nothing stages them.
+        app.daemon(queued(
+            3,
+            json!({"status": "queued", "delivery": "steer", "from": {"bot": "b.task", "turn": 1}}),
+        ))
+        .await;
+        app.daemon(queued(
+            4,
+            json!({"status": "queued", "delivery": "queue", "origin": "automation"}),
+        ))
+        .await;
+        app.daemon(queued(
+            5,
+            json!({"status": "queued", "delivery": "steer", "lapsed": true}),
+        ))
+        .await;
+        // Heard again, it is staged once.
+        app.daemon(queued(2, json!({"status": "queued", "delivery": "steer"})))
+            .await;
+        assert_eq!(app.staged, [(2, "look at the logs".to_owned())]);
+        assert_eq!(app.steering, [2]);
+        app.daemon(turn_event("steered", 1, json!({"message": 2})))
+            .await;
+        assert!(app.staged.is_empty());
+        // Taken in before this window read history, which drew it: its
+        // `queued` and `steered` heard after still leave nothing staged.
+        app.seen_node = 20;
+        app.daemon(queued(6, json!({"status": "queued", "delivery": "steer"})))
+            .await;
+        assert_eq!(app.staged.len(), 1);
+        app.daemon(turn_event("steered", 1, json!({"message": 6, "node": 12})))
+            .await;
+        assert!(app.staged.is_empty());
     }
 
     #[tokio::test]
@@ -22409,6 +22852,62 @@ mod tests {
         ))
         .await;
         assert_eq!(app.notice, None, "nothing the person queued");
+    }
+
+    #[tokio::test]
+    async fn a_steer_into_the_running_turn_says_nothing_on_its_line() {
+        let client = daemon_with(json!([])).await;
+        let mut app = app(client);
+        app.daemon(turn_event("accepted", 1, json!({}))).await;
+        // A task's update, a lookout note, the person's own Enter: each
+        // joins the turn at its next call, and the turn takes it in.
+        app.daemon(turn_event(
+            "queued",
+            2,
+            json!({"status": "queued", "delivery": "steer", "from": "b.task"}),
+        ))
+        .await;
+        app.daemon(turn_event(
+            "steered",
+            1,
+            json!({"message": 2, "node": null}),
+        ))
+        .await;
+        assert_eq!(app.notice, None, "nothing waits for a turn of its own");
+        assert!(!app.status_line().to_string().contains("queued"));
+        // A turn of its own after this one says it waits, until it starts.
+        app.daemon(turn_event(
+            "queued",
+            3,
+            json!({"status": "queued", "delivery": "queue", "origin": "automation"}),
+        ))
+        .await;
+        assert!(app.status_line().to_string().ends_with(" · queued"));
+        app.daemon(turn_event(
+            "turn_finished",
+            1,
+            json!({"status": "completed"}),
+        ))
+        .await;
+        app.daemon(turn_event("accepted", 3, json!({}))).await;
+        assert!(!app.status_line().to_string().contains("queued"));
+        // At rest, a message waiting for a slot says so too, and its
+        // turn's start lets it go.
+        app.daemon(turn_event(
+            "turn_finished",
+            3,
+            json!({"status": "completed"}),
+        ))
+        .await;
+        app.daemon(turn_event(
+            "queued",
+            4,
+            json!({"status": "ready", "delivery": "steer"}),
+        ))
+        .await;
+        assert_eq!(app.notice.as_deref(), Some("queued"));
+        app.daemon(turn_event("accepted", 4, json!({}))).await;
+        assert_eq!(app.notice, None);
     }
 
     #[tokio::test]

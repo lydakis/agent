@@ -3183,8 +3183,13 @@ class RuntimeTests(ModelFixture):
                            tools=['echo', 'shell', 'write_stdin', 'wait'])
 
         def submit(bot, request_id, name, arguments):
+            # A turn's end and its park commit before its task lets go of the
+            # one slot, so a turn sent just after waits in line for it rather
+            # than being refused.
             prompt = 'calls:' + json.dumps([[name, arguments]])
-            return client.request('submit', bot=bot, request_id=request_id, prompt=prompt)['result']['message']
+            sent = client.request('submit', bot=bot, request_id=request_id, prompt=prompt, delivery='queue')
+            self.assertIn('result', sent, sent)
+            return sent['result']['message']
 
         def result(bot, turn):
             self.assertEqual(client.finished(turn)['data']['status'], 'completed')

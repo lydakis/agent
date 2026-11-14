@@ -163,8 +163,12 @@ async fn a_service_whose_name_is_not_utf8_keeps_its_place() {
         .unwrap();
     std::os::unix::fs::symlink(sleep, &name).unwrap();
     let service = launch(&tools, &dir, &format!("'{}' 30", name.display())).await;
-    let comm = std::fs::read(format!("/proc/{service}/comm")).unwrap();
-    assert!(std::str::from_utf8(&comm).is_err(), "{comm:?}");
+    // The shell forks the service before it execs the symlink, and the
+    // fork goes by the shell's name until then.
+    until("the service exec'd under a name that is not UTF-8", || {
+        std::str::from_utf8(&std::fs::read(format!("/proc/{service}/comm")).unwrap()).is_err()
+    })
+    .await;
     tokio::time::sleep(Duration::from_millis(1500)).await;
     assert_eq!(
         refused(&tools, &dir).await.as_deref(),

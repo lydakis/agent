@@ -32,7 +32,6 @@ pub enum Slot {
     Working,
     /// The agents at rest: the first to go.
     Idle,
-    Notes,
     /// The context while under half of it is used: good to know.
     RoomyContext,
     /// The context once half of it is used: it never goes.
@@ -47,14 +46,13 @@ impl Slot {
 
 /// The order things give way: each step takes that item to its next
 /// form, and a step for an item absent or at its last form is passed.
-const LADDER: [Slot; 13] = [
+const LADDER: [Slot; 12] = [
     Slot::Idle,
     Slot::Folded,
     Slot::Access,
     Slot::Place,
     Slot::RoomyContext,
     Slot::Place,
-    Slot::Notes,
     Slot::LowContext,
     Slot::Place,
     Slot::Profile,
@@ -267,7 +265,6 @@ mod tests {
             Item::new(Slot::Failed, count("✗", Color::Red, 1, false)).opens("background"),
             Item::new(Slot::Working, count("●", Color::Cyan, 2, true)).opens("status"),
             Item::new(Slot::Idle, count("○", Color::Green, 4, true)).opens("status"),
-            word(Slot::Notes, &["✎ 2", ""]),
             Item::new(
                 Slot::LowContext,
                 vec![
@@ -288,11 +285,11 @@ mod tests {
         // The counts are their marks and numbers alone, at every width.
         assert_eq!(
             rows[0].trim(),
-            "⏵⏵ full access · GPT 6.1 Sol high · ~/Developer/agent on main  ? 1  ✗ 1  ● 2  ○ 4  ✎ 2  37% left"
+            "⏵⏵ full access · GPT 6.1 Sol high · ~/Developer/agent on main       ? 1  ✗ 1  ● 2  ○ 4  37% left"
         );
         assert_eq!(
             rows[1].trim(),
-            "⏵⏵ GPT 6.1 Sol high · ~/D/agent on main         ? 1  ✗ 1  ● 2  ✎ 2  37% left"
+            "⏵⏵ GPT 6.1 Sol high · ~/Developer/agent on main      ? 1  ✗ 1  ● 2  37% left"
         );
         assert_eq!(
             rows[2].trim(),
@@ -325,7 +322,6 @@ mod tests {
                     "",
                 ],
             ),
-            word(Slot::Notes, &["✎ 2", ""]),
             word(Slot::LowContext, &["37% left", "37%"]),
         ];
         let line = row(items, 100);
@@ -333,7 +329,7 @@ mod tests {
             line.starts_with("  ⏵⏵ full access · GPT 6.1 Sol high · ~/Developer/agent on main  "),
             "{line}"
         );
-        assert!(line.ends_with("  ✎ 2  37% left  "), "{line}");
+        assert!(line.ends_with("  37% left  "), "{line}");
     }
 
     #[test]
