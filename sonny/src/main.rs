@@ -11338,14 +11338,15 @@ impl App {
             helpers: Vec::new(),
             more: false,
         });
-        // Picked already, the agent named last in what shows: Enter opens
-        // the one the conversation just pointed to.
-        if let Some(named) = self.screen.last_agent()
-            && let Some(watch) = &mut self.watch
-        {
-            watch.pick = card_bots(watch, self.width.max(40))
-                .iter()
-                .position(|bot| *bot == named);
+        // The first row picked, or the agent named last in what shows:
+        // Enter opens the one the conversation just pointed to.
+        let named = self.screen.last_agent();
+        if let Some(watch) = &mut self.watch {
+            let picks = card_picks(watch, self.width.max(40));
+            watch.pick = (named.and_then(|named| {
+                (picks.iter()).position(|picked| *picked == Picked::Agent(named.clone()))
+            }))
+            .or((!picks.is_empty()).then_some(0));
         }
         self.open_pane(pane::Pane::card("status", PICK_KEYS));
     }
@@ -12605,12 +12606,13 @@ impl App {
             && watch.ps.is_none()
             && watch.commons.is_none()
             && watch.memory.is_none()
+            && watch.sky.is_none()
         {
-            let bots = card_bots(watch, self.width.max(40));
-            if !bots.is_empty() {
-                let last = bots.len() - 1;
+            let picks = card_picks(watch, self.width.max(40));
+            if !picks.is_empty() {
+                let last = picks.len() - 1;
                 // A pick the list no longer has (resolved agents hidden) is
-                // no pick: Enter opens only the agent marked `›`.
+                // no pick: Enter opens only the row marked `›`.
                 let pick = watch.pick.filter(|pick| *pick <= last);
                 let pick = match (key.code, pick) {
                     (KeyCode::Up, Some(at)) => Some(at.saturating_sub(1)),
@@ -12619,16 +12621,23 @@ impl App {
                     (KeyCode::Down, None) => Some(0),
                     (_, pick) => pick,
                 };
-                if key.code == KeyCode::Enter {
-                    if let Some(at) = pick {
-                        let bot = bots[at].clone();
-                        self.open_picked(&bot);
+                let picked = pick.and_then(|at| picks.get(at).cloned());
+                match (key.code, picked) {
+                    // Enter goes to the picked agent; on a heading it
+                    // does the heading's one thing, opening or folding.
+                    (KeyCode::Enter, Some(Picked::Agent(bot))) => self.open_picked(&bot),
+                    (KeyCode::Enter, Some(Picked::Group(group))) => {
+                        if let Some(watch) = &mut self.watch {
+                            watch.toggle(group);
+                        }
                     }
-                } else if let Some(watch) = &mut self.watch {
-                    watch.pick = pick;
-                    // → shows the picked task's helpers under it, ← folds them.
-                    if let (KeyCode::Right | KeyCode::Left, Some(at)) = (key.code, pick) {
-                        watch.helpers_of(&bots[at], Some(key.code == KeyCode::Right));
+                    (KeyCode::Left | KeyCode::Right, Some(picked)) => {
+                        self.status_fold(picked, key.code == KeyCode::Right);
+                    }
+                    _ => {
+                        if let Some(watch) = &mut self.watch {
+                            watch.pick = pick;
+                        }
                     }
                 }
                 return true;
@@ -12877,7 +12886,7 @@ impl App {
                         watch.more = !watch.more
                     }
                     // `/status` stops the workflow picked.
-                    KeyCode::Char('s')
+                    KeyCode::Char('x')
                         if pane.is_card()
                             && let Some(watch) = &self.watch
                             && watch.background.is_none()
@@ -12887,8 +12896,8 @@ impl App {
                             && watch.commons.is_none()
                             && watch.memory.is_none()
                             && watch.sky.is_none()
-                            && let Some(bot) = watch.pick.and_then(|pick| {
-                                card_bots(watch, self.width.max(40)).into_iter().nth(pick)
+                            && let Some(Picked::Agent(bot)) = watch.pick.and_then(|pick| {
+                                card_picks(watch, self.width.max(40)).into_iter().nth(pick)
                             })
                             && let (_, Some(run)) = workflow::view::split(&bot) =>
                     {
@@ -12896,16 +12905,6 @@ impl App {
                             Ok(()) => format!("stopping workflow run {run}"),
                             Err(error) => error,
                         });
-                    }
-                    // `/status` opens or folds its idle and done tasks.
-                    KeyCode::Char(key @ ('i' | 'd'))
-                        if pane.is_card()
-                            && let Some(watch) = &mut self.watch =>
-                    {
-                        watch.toggle(match key {
-                            'i' => status::Group::Idle,
-                            _ => status::Group::Done,
-                        })
                     }
                     _ if switches(key) || key.code == KeyCode::Tab => self.pane_keys = false,
                     // The picture or drawing shown, opened bigger outside Sonny.
@@ -13057,6 +13056,47 @@ impl App {
         let mut pane = pane::Pane::card("shortcuts", "esc close");
         pane.set_card(lines, "esc close");
         self.open_pane(pane);
+    }
+
+    /// `→` (`open`) or `←` on `/status`'s picked row, as a file browser's
+    /// list does: → opens a folded heading or a task's helpers; ← folds
+    /// what the row opened, else the group it is in, picking its heading,
+    /// else steps the pane back, and at the first page does nothing.
+    fn status_fold(&mut self, picked: Picked, open: bool) {
+        let width = self.width.max(40);
+        let Some(watch) = &mut self.watch else {
+            return;
+        };
+        match picked {
+            Picked::Group(group) => {
+                if watch.open.contains(&group) != open {
+                    watch.toggle(group);
+                } else if !open && self.pane.as_ref().is_some_and(pane::Pane::goes_back) {
+                    self.step_pane(true);
+                }
+            }
+            Picked::Agent(bot) if open => watch.helpers_of(&bot, Some(true)),
+            Picked::Agent(bot) if watch.helpers.contains(&bot) => {
+                watch.helpers_of(&bot, Some(false))
+            }
+            Picked::Agent(bot) => {
+                let group = (watch.rows.iter())
+                    .find(|row| row.bot == bot)
+                    .map(|row| row.group)
+                    .filter(|group| watch.open.contains(group));
+                match group {
+                    Some(group) => {
+                        watch.toggle(group);
+                        watch.pick = (card_picks(watch, width).iter())
+                            .position(|picked| *picked == Picked::Group(group));
+                    }
+                    None if self.pane.as_ref().is_some_and(pane::Pane::goes_back) => {
+                        self.step_pane(true);
+                    }
+                    None => {}
+                }
+            }
+        }
     }
 
     /// `enter` on a row of `bot`'s: the view closes and the agent opens
@@ -13225,10 +13265,7 @@ impl App {
             // A folding group's heading in `/status`: opened or folded.
             "group" => {
                 if let Some(watch) = &mut self.watch {
-                    watch.toggle(match id {
-                        "i" => status::Group::Idle,
-                        _ => status::Group::Done,
-                    });
+                    watch.toggle(group_of(id));
                 }
             }
             // A task's helpers in `/status`: shown under it, or folded.
@@ -16334,10 +16371,14 @@ impl App {
             && watch.commons.is_none()
             && watch.memory.is_none()
             && watch.sky.is_none();
-        let bots = card_bots(watch, self.width.max(40));
+        let picks = card_picks(watch, self.width.max(40));
         (open && listing)
-            .then(|| watch.pick.and_then(|at| bots.get(at).cloned()))
+            .then(|| watch.pick.and_then(|at| picks.get(at).cloned()))
             .flatten()
+            .and_then(|picked| match picked {
+                Picked::Agent(bot) => Some(bot),
+                Picked::Group(_) => None,
+            })
             .filter(|bot| *bot != self.bot)
     }
 
@@ -16999,7 +17040,7 @@ impl App {
                 pane.set_card(lines, &view.keys());
                 pane.foot = None;
             } else {
-                let (mut lines, fold_keys, marks) = watch_card(watch, width);
+                let (mut lines, folding, marks) = watch_card(watch, width);
                 let mut picked = None;
                 // The agent picked from the keys is drawn as the picker
                 // draws its pick, reversed.
@@ -17009,13 +17050,16 @@ impl App {
                     list::pick(line);
                     picked = Some(row);
                 }
-                let mut keys = status_keys(watch, &fold_keys);
+                let mut keys = status_keys(watch, folding);
                 // A workflow's row picked can be stopped.
                 if let Some((_, screen::Mark::Link(link))) =
                     watch.pick.and_then(|pick| marks.get(pick))
                     && link.contains(workflow::view::MARK)
                 {
-                    keys.push_str(" · s stop workflow");
+                    keys = hint::fit(
+                        &keys.replace(" · esc close", " · x stop workflow · esc close"),
+                        usize::MAX,
+                    );
                 }
                 pane.set_card_marked(lines, marks, &keys);
                 // Scrolled to once, as a new pick, so the page keys still
@@ -18147,31 +18191,26 @@ const SKY_REPLAY_KEYS: &str = sky::REPLAY_KEYS;
 const PICK_KEYS: &str = "↑↓ pick · enter open · esc close";
 
 /// The agents `/status` lists, in its order: what its keys pick from.
-fn card_bots(watch: &Watch, width: usize) -> Vec<String> {
+fn card_picks(watch: &Watch, width: usize) -> Vec<Picked> {
     (watch_card(watch, width).2)
         .into_iter()
-        .filter_map(|(_, mark)| match mark {
-            screen::Mark::Link(link) => link
-                .strip_prefix(&format!("{}task/", screen::BUTTON))
-                .map(str::to_owned),
+        .map_while(|(_, mark)| match mark {
+            screen::Mark::Link(link) => Picked::from_link(&link),
             _ => None,
         })
         .collect()
 }
 
 /// `/status`'s card at `width`, each line after a space, its times
-/// running turns counted on from when its rows were read; the keys of the
-/// groups in it that fold; and the line each agent starts on, which a
-/// click opens in the pane (this window's own closes `/status`), then
-/// each folding group's heading, which a click opens or folds.
+/// running turns counted on from when its rows were read; whether a row
+/// in it folds; and the rows the keys pick, in the order drawn: each
+/// agent, which a click opens in the pane (this window's own closes
+/// `/status`), and each folding group's heading, which a click opens or
+/// folds.
 fn watch_card(
     watch: &Watch,
     width: usize,
-) -> (
-    Vec<Line<'static>>,
-    Vec<&'static str>,
-    Vec<(usize, screen::Mark)>,
-) {
+) -> (Vec<Line<'static>>, bool, Vec<(usize, screen::Mark)>) {
     let since = watch.read.elapsed().as_secs();
     let rows: Vec<status::Row> = watch
         .rows
@@ -18195,8 +18234,15 @@ fn watch_card(
         &watch.helpers,
     );
     let picked = (watch.pick)
-        .and_then(|at| listed.named.get(at))
-        .map(|(_, bot)| bot.clone());
+        .and_then(|at| {
+            picks_in_order(&listed.named, &listed.folds)
+                .into_iter()
+                .nth(at)
+        })
+        .and_then(|(_, picked)| match picked {
+            Picked::Agent(bot) => Some(bot),
+            Picked::Group(_) => None,
+        });
     let status::Card {
         lines: mut card,
         named,
@@ -18227,27 +18273,13 @@ fn watch_card(
     let added = above.len();
     card.splice(1..1, above);
     let below = |at: usize| at + if at >= 1 { added } else { 0 };
-    // The agents first, in their order, which the keys pick by; then the
-    // headings that open and fold their groups.
-    let mut marks: Vec<(usize, screen::Mark)> = (named.into_iter())
-        .map(|(at, bot)| (below(at), bot))
-        .map(|(at, bot)| {
-            (
-                at,
-                screen::Mark::Link(format!("{}task/{bot}", screen::BUTTON)),
-            )
-        })
+    // The rows the keys pick first, in the order they are drawn: each
+    // agent, and each heading that opens and folds its group.
+    let folding = !folds.is_empty() || !helpers.is_empty();
+    let mut marks: Vec<(usize, screen::Mark)> = (picks_in_order(&named, &folds).into_iter())
+        .map(|(at, picked)| (below(at), screen::Mark::Link(picked.link())))
         .collect();
-    let mut fold_keys: Vec<&str> = folds.iter().map(|(_, group)| group_key(*group)).collect();
-    fold_keys.dedup();
-    if !helpers.is_empty() {
-        fold_keys.push("→");
-    }
     marks.extend(opening);
-    marks.extend(folds.into_iter().map(|(at, group)| {
-        let link = format!("{}group/{}", screen::BUTTON, group_key(group));
-        (below(at), screen::Mark::Link(link))
-    }));
     marks.extend(helpers.into_iter().map(|(at, bot)| {
         let link = format!("{}helpers/{bot}", screen::BUTTON);
         (below(at), screen::Mark::Link(link))
@@ -18260,40 +18292,73 @@ fn watch_card(
             Line::from(spans).style(line.style)
         })
         .collect();
-    (lines, fold_keys, marks)
+    (lines, folding, marks)
 }
 
-/// The key that opens or folds `group` in `/status`, and its name in a
-/// button: `i` idle, `d` done.
-fn group_key(group: status::Group) -> &'static str {
-    match group {
-        status::Group::Idle => "i",
-        _ => "d",
+/// A row `/status`'s keys pick: an agent, or the heading of a group that
+/// folds.
+#[derive(Clone, Debug, PartialEq)]
+enum Picked {
+    Agent(String),
+    Group(status::Group),
+}
+
+impl Picked {
+    /// The button a click on its row presses.
+    fn link(&self) -> String {
+        match self {
+            Picked::Agent(bot) => format!("{}task/{bot}", screen::BUTTON),
+            Picked::Group(group) => format!("{}group/{}", screen::BUTTON, group_id(*group)),
+        }
+    }
+
+    /// The row a button names, if it is one the keys pick.
+    fn from_link(link: &str) -> Option<Self> {
+        let button = link.strip_prefix(screen::BUTTON)?;
+        if let Some(bot) = button.strip_prefix("task/") {
+            return Some(Picked::Agent(bot.to_owned()));
+        }
+        button
+            .strip_prefix("group/")
+            .map(|id| Picked::Group(group_of(id)))
     }
 }
 
-/// The keys `/status`'s title row names: the picks, then the key of
-/// each group that folds there (`keys`), as it would change it.
-fn status_keys(watch: &Watch, keys: &[&str]) -> String {
+/// The agents and the folding groups' headings of a card, by the row
+/// each is drawn on, in that order.
+fn picks_in_order(
+    named: &[(usize, String)],
+    folds: &[(usize, status::Group)],
+) -> Vec<(usize, Picked)> {
+    let mut picks: Vec<(usize, Picked)> = (named.iter())
+        .map(|(at, bot)| (*at, Picked::Agent(bot.clone())))
+        .chain(folds.iter().map(|(at, group)| (*at, Picked::Group(*group))))
+        .collect();
+    picks.sort_by_key(|(at, _)| *at);
+    picks
+}
+
+/// A folding group's name in its heading's button.
+fn group_id(group: status::Group) -> &'static str {
+    match group {
+        status::Group::Idle => "idle",
+        _ => "done",
+    }
+}
+
+fn group_of(id: &str) -> status::Group {
+    match id {
+        "idle" => status::Group::Idle,
+        _ => status::Group::Done,
+    }
+}
+
+/// The keys `/status`'s title row names: the picks, → and ← where a row
+/// folds (`folding`), more or less.
+fn status_keys(watch: &Watch, folding: bool) -> String {
     let mut said = hint::Keys::new().pick().enter(hint::Enter::Open);
-    for key in keys {
-        if *key == "→" {
-            said = said.key("→←", "helpers");
-            continue;
-        }
-        let group = match *key {
-            "i" => status::Group::Idle,
-            _ => status::Group::Done,
-        };
-        let verb = match watch.open.contains(&group) {
-            true => "fold",
-            false => "show",
-        };
-        let name = match group {
-            status::Group::Idle => "idle",
-            _ => "done",
-        };
-        said = said.key(*key, format!("{verb} {name}"));
+    if folding {
+        said = said.key("→←", "fold");
     }
     let more = match watch.more {
         true => "less",
@@ -28235,10 +28300,81 @@ mod tests {
         }
         app.key(key(KeyCode::Down)).await;
         assert_eq!(pick(&app), Some(0));
-        assert_eq!(card_bots(app.watch.as_ref().unwrap(), 80)[0], "calc.lead");
+        assert_eq!(
+            card_picks(app.watch.as_ref().unwrap(), 80)[0],
+            Picked::Agent("calc.lead".into())
+        );
         assert!(app.beside().is_none(), "never this window's own agent");
         app.key(key(KeyCode::Enter)).await;
         assert!(app.pane.is_none(), "closed, as Esc closes it");
+    }
+
+    #[tokio::test]
+    async fn status_folds_its_groups_from_the_keys_as_a_file_browser_does() {
+        let mut app = app(daemon_answering(|_| json!({})).await);
+        let row = |name: &str, group| status::Row {
+            name: name.into(),
+            bot: format!("calc.{name}"),
+            state: "idle".into(),
+            group,
+            ..Default::default()
+        };
+        app.open_pane(pane::Pane::card("status", PICK_KEYS));
+        app.watch = Some(Watch {
+            project: "calc".into(),
+            rows: vec![
+                row("add", status::Group::Working),
+                row("neg", status::Group::Idle),
+            ],
+            read: Instant::now(),
+            alerts: Vec::new(),
+            open: Vec::new(),
+            background: None,
+            usage: None,
+            audit: None,
+            ps: None,
+            commons: None,
+            sky: None,
+            picked: None,
+            pick: Some(0),
+            helpers: Vec::new(),
+            more: false,
+        });
+        let key = |code| Event::Key(event::KeyEvent::new(code, KeyModifiers::NONE));
+        let picks = |app: &App| card_picks(app.watch.as_ref().unwrap(), 80);
+        let picked = |app: &App| picks(app)[app.watch.as_ref().unwrap().pick.unwrap()].clone();
+        let idle = Picked::Group(status::Group::Idle);
+        // The folded heading is a row of its own, after the working agent.
+        assert_eq!(
+            picks(&app),
+            [Picked::Agent("calc.add".into()), idle.clone()]
+        );
+        app.key(key(KeyCode::Char('j'))).await;
+        assert_eq!(picked(&app), idle);
+        // → opens it, its agent listed under it; ← on that agent folds the
+        // group it is in and picks its heading; Enter opens it again.
+        app.key(key(KeyCode::Right)).await;
+        assert!(picks(&app).contains(&Picked::Agent("calc.neg".into())));
+        app.key(key(KeyCode::Down)).await;
+        assert_eq!(picked(&app), Picked::Agent("calc.neg".into()));
+        app.key(key(KeyCode::Left)).await;
+        assert_eq!(picked(&app), idle);
+        assert_eq!(picks(&app).len(), 2);
+        app.key(key(KeyCode::Enter)).await;
+        assert_eq!(picks(&app).len(), 3);
+        // `i` and `d` are no keys of its: the pane keeps them.
+        app.key(key(KeyCode::Char('i'))).await;
+        assert_eq!(picks(&app).len(), 3);
+        assert!(app.input.is_empty() && app.pane_keys);
+        // ← on the open heading folds it; again, at the first page, nothing.
+        app.key(key(KeyCode::Left)).await;
+        app.key(key(KeyCode::Left)).await;
+        assert_eq!(picks(&app).len(), 2);
+        assert!(app.pane.is_some() && app.pane_keys);
+        assert_eq!(
+            status_keys(app.watch.as_ref().unwrap(), true),
+            "↑↓ pick · enter open · →← fold · m more · esc close"
+        );
     }
 
     #[tokio::test]
