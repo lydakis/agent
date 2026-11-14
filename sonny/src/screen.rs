@@ -1353,6 +1353,9 @@ impl Screen {
             self.relaid = 0;
             self.selection = None;
             self.linked = None;
+            // Laid again, the rows a picked link was on are gone: it is
+            // picked again from the keys, never followed from where it was.
+            self.link_pick = None;
             self.laid += 1;
         }
         let before = self.shown.len();
@@ -2637,6 +2640,11 @@ mod tests {
         screen.render(area, &mut buf, |_| None);
         assert!(buf[(0, 2)].modifier.contains(Modifier::REVERSED));
         assert!(!buf[(0, 0)].modifier.contains(Modifier::REVERSED));
+        // Laid at another width, nothing is picked: Enter follows no link
+        // from where the rows were.
+        let narrow = Rect::new(0, 0, 4, 5);
+        screen.render(narrow, &mut Buffer::empty(narrow), |_| None);
+        assert_eq!(screen.picked_link(), None);
     }
 
     #[test]
