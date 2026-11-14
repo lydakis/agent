@@ -666,7 +666,7 @@ mod tests {
 
     #[test]
     fn the_persons_own_models_leave_out_the_catalog() {
-        let dir = temp("mine");
+        let dir = temp("own");
         let list = dir.join("models");
         std::fs::write(
             &list,
