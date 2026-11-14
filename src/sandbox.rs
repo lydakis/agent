@@ -468,20 +468,91 @@ pub fn escapes(
     };
     match tool {
         "shell" => arguments["sandbox_permissions"] == "require_escalated",
-        "write" | "edit" => arguments["path"]
-            .as_str()
-            .is_some_and(|path| outside(mode, root, writable, folder, path)),
         // A patch escapes when any file it changes would.
+        _ => any_written(tool, &arguments, |path| {
+            outside(mode, root, writable, folder, path)
+        }),
+    }
+}
+
+/// Whether `test` holds for any path a write, edit or patch call writes.
+fn any_written(
+    tool: &str,
+    arguments: &serde_json::Value,
+    mut test: impl FnMut(&str) -> bool,
+) -> bool {
+    match tool {
+        "write" | "edit" => arguments["path"].as_str().is_some_and(test),
         "apply_patch" => arguments["input"]
             .as_str()
             .and_then(|input| crate::tools::Patch::parse(input).ok())
-            .is_some_and(|patch| {
-                patch
-                    .paths()
-                    .any(|path| outside(mode, root, writable, folder, path))
-            }),
+            .is_some_and(|patch| patch.paths().any(&mut test)),
         _ => false,
     }
+}
+
+/// Read the links [`escapes`] follows in these calls' paths, so that
+/// judging them reads no file: run off the runtime thread, before any
+/// round judges the calls. Each call is a tool's name and its arguments.
+pub fn learn<'a>(
+    mode: Mode,
+    root: Option<&Path>,
+    writable: &[String],
+    calls: impl IntoIterator<Item = (&'a str, &'a str)>,
+    folder: &Path,
+) {
+    let writable = writable_paths(mode, root, writable);
+    for (tool, arguments) in calls {
+        let Ok(arguments) = serde_json::from_str::<serde_json::Value>(arguments) else {
+            continue;
+        };
+        any_written(tool, &arguments, |path| {
+            let named = lexical(&folder.join(path));
+            judged(&named, |dir| changeable(mode, &writable, dir), read_link);
+            false
+        });
+    }
+}
+
+/// What a link found on the way to a write's path names, or `None` for a
+/// path that is no link (or can't be read), as [`learn`] read them off the
+/// runtime thread. Kept as found for the daemon's life: a link in a folder
+/// no bot can change stays put, and the round that announces a call, the
+/// store that records it and the run that starts it must judge it alike.
+/// At most [`KNOWN_KEPT`] paths; a path past those is judged as spelled.
+static KNOWN: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<PathBuf, Option<PathBuf>>>,
+> = std::sync::LazyLock::new(Default::default);
+
+/// Paths [`KNOWN`] keeps, about 10 MB at most.
+const KNOWN_KEPT: usize = 1 << 16;
+
+fn links() -> std::sync::MutexGuard<'static, std::collections::HashMap<PathBuf, Option<PathBuf>>> {
+    KNOWN
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// The link at `path` as [`learn`] found it; `None` when not yet read.
+fn known_link(path: &Path) -> Option<Option<PathBuf>> {
+    links().get(path).cloned()
+}
+
+/// The link at `path`, read from the file system and kept for
+/// [`known_link`]. Blocks: only [`learn`] calls it.
+fn read_link(path: &Path) -> Option<Option<PathBuf>> {
+    if let Some(known) = known_link(path) {
+        return Some(known);
+    }
+    let found = std::fs::symlink_metadata(path)
+        .is_ok_and(|meta| meta.file_type().is_symlink())
+        .then(|| std::fs::read_link(path).ok())
+        .flatten();
+    let mut links = links();
+    if links.len() < KNOWN_KEPT {
+        links.insert(path.to_owned(), found.clone());
+    }
+    Some(found)
 }
 
 /// The words of each command in a plain script, as bash reads them; `None`
@@ -557,13 +628,10 @@ fn outside(
     path: &str,
 ) -> bool {
     let writable = writable_paths(mode, root, writable);
-    let changeable = |dir: &Path| {
-        writable.iter().any(|root| dir.starts_with(root))
-            || (mode == Mode::WorkspaceWrite
-                && temporary().iter().any(|(named, _)| dir.starts_with(named)))
-    };
     let named = lexical(&folder.join(path));
-    let target = judged(&named, changeable);
+    // A path whose links [`learn`] has not read is judged as spelled.
+    let target = judged(&named, |dir| changeable(mode, &writable, dir), known_link)
+        .unwrap_or_else(|| named.clone());
     // Inside as spelled or as followed: a folder may be given by a link.
     let inside = |dir: &Path| named.starts_with(dir) || target.starts_with(dir);
     let temporary = temporary()
@@ -572,13 +640,26 @@ fn outside(
     !(temporary || writable.iter().any(|dir| inside(dir)))
 }
 
+/// Whether a bot that writes `writable` may change what is in `dir`.
+fn changeable(mode: Mode, writable: &[PathBuf], dir: &Path) -> bool {
+    writable.iter().any(|root| dir.starts_with(root))
+        || (mode == Mode::WorkspaceWrite
+            && temporary().iter().any(|(named, _)| dir.starts_with(named)))
+}
+
 /// `path` with each link in it followed whose folder the bot can't
 /// write (`changeable` false), as a home or system folder reached through
 /// a link: such a link stays as it is between the round that judges a
 /// call and the run that starts it. A link in a folder the bot writes is
 /// left as spelled, as Codex substitutes no mutable link's target. Each
-/// target is read by name, as the path itself is.
-fn judged(path: &Path, changeable: impl Fn(&Path) -> bool) -> PathBuf {
+/// target is read by name, as the path itself is. `link` says what a path
+/// links to, `Some(None)` for no link; `None` when it can't say, and then
+/// so does this.
+fn judged(
+    path: &Path,
+    changeable: impl Fn(&Path) -> bool,
+    mut link: impl FnMut(&Path) -> Option<Option<PathBuf>>,
+) -> Option<PathBuf> {
     // As many links as Linux follows in one path.
     const LINKS: usize = 40;
     let mut out = PathBuf::new();
@@ -598,11 +679,11 @@ fn judged(path: &Path, changeable: impl Fn(&Path) -> bool) -> PathBuf {
             continue;
         }
         let next = out.join(&part);
-        let link = followed < LINKS
-            && !out.as_os_str().is_empty()
-            && !changeable(&out)
-            && std::fs::symlink_metadata(&next).is_ok_and(|meta| meta.file_type().is_symlink());
-        let target = link.then(|| std::fs::read_link(&next).ok()).flatten();
+        let followable = followed < LINKS && !out.as_os_str().is_empty() && !changeable(&out);
+        let target = match followable {
+            true => link(&next)?,
+            false => None,
+        };
         let Some(target) = target else {
             out = next;
             continue;
@@ -618,7 +699,7 @@ fn judged(path: &Path, changeable: impl Fn(&Path) -> bool) -> PathBuf {
             part => Some(part.as_os_str().to_owned()),
         }));
     }
-    out
+    Some(out)
 }
 
 /// `path` with `.` dropped and `..` taken back, by name alone.
@@ -2486,10 +2567,15 @@ mod tests {
                 path.to_str().unwrap(),
             )
         };
+        let fixed = |dir: &Path| dir.starts_with(&project);
+        // Judging reads no file: a link not yet learned leaves the path
+        // unjudged, so it is taken as spelled.
+        let unread = real.join("fixed/me/project/a.txt");
+        assert_eq!(judged(&unread, fixed, known_link), None);
         let followed = |path: &Path| {
             // The test's folders are in the temporary folder, which every
             // bot writes: judged as if its links were in a fixed folder.
-            judged(path, |dir| dir.starts_with(&project))
+            judged(path, fixed, read_link).unwrap()
         };
         assert_eq!(
             followed(&real.join("fixed/me/project/a.txt")),
@@ -2506,6 +2592,11 @@ mod tests {
             project.join("out/me/x")
         );
         assert!(!judged_escapes(&project.join("c.txt")));
+        // Once read, judging finds the links kept.
+        assert_eq!(
+            judged(&unread, fixed, known_link),
+            Some(project.join("a.txt"))
+        );
         let _ = std::fs::remove_dir_all(&base);
         // Read-only writes nowhere, so every write asks.
         assert!(super::escapes(

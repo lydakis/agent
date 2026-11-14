@@ -1087,6 +1087,45 @@ impl Bot {
             }
         }
     }
+    /// The reads [`crate::sandbox::learn`] makes for these calls, to run
+    /// off the runtime thread before any of them is judged; `None` when the
+    /// bot writes no folder of its own or no call writes a file.
+    pub fn links_to_learn(
+        &self,
+        calls: &[ToolCall],
+        workspace: &std::path::Path,
+    ) -> Option<impl FnOnce() + Send + 'static> {
+        use crate::sandbox::{Mode, learn};
+        if self.settings.sandbox != Some(Mode::WorkspaceWrite) {
+            return None;
+        }
+        let calls: Vec<(String, String)> = calls
+            .iter()
+            .filter(|call| matches!(call.name.as_str(), "write" | "edit" | "apply_patch"))
+            .map(|call| (call.name.clone(), call.arguments.clone()))
+            .collect();
+        if calls.is_empty() {
+            return None;
+        }
+        let root = self
+            .workspace
+            .as_deref()
+            .map_or(workspace, std::path::Path::new)
+            .to_owned();
+        let writable = self.settings.writable.clone();
+        let folder = workspace.to_owned();
+        Some(move || {
+            learn(
+                Mode::WorkspaceWrite,
+                Some(&root),
+                &writable,
+                calls
+                    .iter()
+                    .map(|(tool, arguments)| (tool.as_str(), arguments.as_str())),
+                &folder,
+            );
+        })
+    }
     /// The tools this bot may call: its allowed list, else its tools.
     pub fn callable(&self) -> &[String] {
         self.allowed.as_deref().unwrap_or(&self.tools)
