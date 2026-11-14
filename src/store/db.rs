@@ -6024,15 +6024,25 @@ impl Database {
     }
     /// Encoded items for a batch of window ids, in order, comma-separated.
     /// Items joined by commas; those `strip` names go without their
-    /// thinking blocks, and one that held only thinking is left out, as is
-    /// a Responses reasoning item.
+    /// thinking blocks, and one that held only thinking is left out.
     pub fn items_by_ids(
         &self,
         ids: &[i64],
         strip: impl Into<Strip>,
         elided: i64,
     ) -> Result<Vec<u8>> {
-        let strip = strip.into();
+        self.items_sent(ids, strip.into(), false, elided)
+    }
+    /// [`Self::items_by_ids`], and with `reasoning` a Responses reasoning
+    /// item `strip` names left out whole too, as [`Self::reasoning_of`]
+    /// counts it.
+    pub fn items_sent(
+        &self,
+        ids: &[i64],
+        strip: Strip,
+        reasoning: bool,
+        elided: i64,
+    ) -> Result<Vec<u8>> {
         let mut statement = self
             .conn
             .prepare_cached("SELECT item,thinking FROM nodes WHERE id=?")?;
@@ -6055,7 +6065,7 @@ impl Database {
             }
             statement.query_row([id], |r| {
                 let item = r.get_ref(0)?.as_blob()?;
-                if strip.strips(*id) && super::context::reasoning(item) {
+                if reasoning && strip.strips(*id) && super::context::reasoning(item) {
                     return Ok(());
                 }
                 let item = match (strip.strips(*id) && r.get::<_, i64>(1)? > 0)

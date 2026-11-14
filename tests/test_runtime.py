@@ -3052,6 +3052,21 @@ class RuntimeTests(ModelFixture):
         later = self.model.requests.get(timeout=1)
         self.assertNotIn('reasoning', [i.get('type') for i in later['input']])
         self.assertTrue(self.model.requests.empty())
+        # Its summary leaves it out too, and its request is as long as said.
+        # Another model summarizes, so the summary is a request of its own
+        # over the span rather than a copy of the bot's call.
+        self.model.models = ('synthetic-model', 'synthetic-small')
+        client.request('configure', bot='Bob', compaction_instructions='Summarize.',
+                       compaction_model='openai/synthetic-small')
+        self.assertFalse(client.request('compact', bot='Bob')['result']['duplicate'])
+        self.assertNotIn('compaction', turn(4, 'fifth'))
+        self.assertIsNotNone(client.request('inspect', bot='Bob')['result']['compaction'])
+        sent = []
+        while not self.model.requests.empty():
+            sent.append(self.model.requests.get(timeout=1))
+        self.assertTrue(any(is_summary(request) for request in sent))
+        for request in sent:
+            self.assertNotIn('reasoning', [i.get('type') for i in request['input']])
 
     def test_history_pages_recover_an_omitted_long_message(self):
         client = self.client(tools='echo,history', settings={'context_items': 6})

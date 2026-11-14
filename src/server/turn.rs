@@ -92,6 +92,9 @@ struct Span<'a> {
     thinking: &'a [u32],
     pictured: &'a [i32],
     elided: i64,
+    /// Whether a Responses reasoning item the strip names goes whole, as
+    /// `thinking` then counts it ([`Turn::reasoning`]).
+    reasoning: bool,
 }
 impl Span<'_> {
     const EMPTY: Span<'static> = Span {
@@ -100,6 +103,7 @@ impl Span<'_> {
         thinking: &[],
         pictured: &[],
         elided: 0,
+        reasoning: false,
     };
 }
 
@@ -154,6 +158,7 @@ fn item_chunks(
     store: Store,
     chunks: Arc<[Vec<i64>]>,
     strip: Strip,
+    reasoning: bool,
     elided: i64,
 ) -> impl futures_util::Stream<Item = std::io::Result<Bytes>> + Send + 'static {
     let mut started = false;
@@ -163,7 +168,7 @@ fn item_chunks(
             async move {
                 store
                     .read("items_by_ids", move |db| {
-                        db.items_by_ids(&chunks[index], strip, elided)
+                        db.items_sent(&chunks[index], strip, reasoning, elided)
                     })
                     .await
                     .map_err(|error| std::io::Error::other(error.code))
@@ -935,6 +940,7 @@ impl Turn {
                     thinking: reasoning.unwrap_or(&w.thinking),
                     pictured: &w.pictured,
                     elided: w.elided,
+                    reasoning: reasoning.is_some(),
                 },
                 strip,
             ),
@@ -947,8 +953,8 @@ impl Turn {
     /// reasoning is read from the store, since the window counts only
     /// Anthropic thinking. Read only for a bot whose reasoning a provider
     /// refused; `None` otherwise.
-    async fn reasoning(&self, context: &Context, strip: Strip) -> Result<Option<Vec<u32>>> {
-        let Some(window) = context.window.as_ref().filter(|w| {
+    async fn reasoning(&self, window: Option<&Window>, strip: Strip) -> Result<Option<Vec<u32>>> {
+        let Some(window) = window.filter(|w| {
             w.family == agent_runtime::codec::Family::Responses && strip != Strip::default()
         }) else {
             return Ok(None);
@@ -1050,15 +1056,17 @@ impl Turn {
         self.framed_items(prefix, span, strip, Bytes::new())
     }
 
-    /// A copy of the bot's call with the compaction request after it.
-    fn copied_items(&self, copy: Copied<'_>) -> Items {
+    /// A copy of the bot's call with the compaction request after it;
+    /// `reasoning` as for [`Self::items`].
+    fn copied_items(&self, copy: Copied<'_>, reasoning: Option<&[u32]>) -> Items {
         let (window, len) = (copy.window, copy.len);
         let span = Span {
             ids: &window.ids[..len],
             sizes: &window.sizes[..len],
-            thinking: &window.thinking[..len],
+            thinking: &reasoning.unwrap_or(&window.thinking)[..len],
             pictured: &window.pictured[..len],
             elided: window.elided,
+            reasoning: reasoning.is_some(),
         };
         self.framed_items(
             copy.prefix.clone(),
@@ -1077,6 +1085,7 @@ impl Turn {
             thinking,
             pictured,
             elided,
+            reasoning,
         } = span;
         let stripped: usize = ids
             .iter()
@@ -1097,6 +1106,7 @@ impl Turn {
                 store.clone(),
                 chunks.clone(),
                 strip,
+                reasoning,
                 elided,
             ));
             if tail.is_empty() {
@@ -2768,10 +2778,28 @@ impl Turn {
         stripped: usize,
     ) -> Result<Items> {
         let bot = self.bot.clone();
-        let family = self
+        let (family, refused) = self
             .store
-            .op("inspect", move |db| db.inspect(&bot)?.family())
+            .op("inspect", move |db| {
+                let record = db.inspect(&bot)?;
+                Ok((record.family()?, record.thinking))
+            })
             .await?;
+        // A Responses bot's reasoning a provider refused stays out of its
+        // summary too, each item counted whole: read only for such a bot.
+        let (strip, reasoning) = match family {
+            agent_runtime::codec::Family::Responses if refused != Strip::default() => {
+                let ids = plan.ids.clone();
+                let sizes = self
+                    .store
+                    .read("reasoning_of", move |db| db.reasoning_of(&ids, refused))
+                    .await?;
+                let bytes: usize = sizes.iter().map(|&bytes| bytes as usize).sum();
+                (refused, Some(bytes))
+            }
+            _ => (Strip::from(i64::MAX), None),
+        };
+        let stripped = stripped + reasoning.unwrap_or(0);
         let (head, tail) = agent_runtime::store::CompactionPlan::frame(
             family,
             plan.previous_summary.as_deref(),
@@ -2800,7 +2828,8 @@ impl Turn {
                     .chain(item_chunks(
                         store.clone(),
                         chunks.clone(),
-                        Strip::from(i64::MAX),
+                        strip,
+                        reasoning.is_some(),
                         elided,
                     ))
                     .chain(stream::iter([Ok(tail.clone())]))
@@ -3948,13 +3977,22 @@ impl Turn {
                 accounting.limit = Some(Limit::Rounds);
                 self.withheld(turn, Limit::Rounds).await?;
             }
-            let items = match body {
+            // What a refused Responses bot's reasoning takes, read once
+            // for the body and its chained tail alike.
+            let (strip, reasoning) = match body {
                 Body::Window(context) => {
                     let strip = withheld.unwrap_or(context.thinking);
-                    let reasoning = self.reasoning(context, strip).await?;
-                    self.items(context, strip, reasoning.as_deref())
+                    (strip, self.reasoning(context.window.as_ref(), strip).await?)
                 }
-                Body::Copied(copy) => self.copied_items(copy),
+                Body::Copied(copy) => {
+                    let reasoning = self.reasoning(Some(copy.window), copy.thinking).await?;
+                    (copy.thinking, reasoning)
+                }
+                Body::Span(..) => (Strip::default(), None),
+            };
+            let items = match body {
+                Body::Window(context) => self.items(context, strip, reasoning.as_deref()),
+                Body::Copied(copy) => self.copied_items(copy, reasoning.as_deref()),
                 Body::Span(plan, stripped) => self.span_items(plan, stripped).await?,
             };
             accounting.begin(attempt > 0);
@@ -3998,7 +4036,8 @@ impl Turn {
                         items,
                         // A summary beside the turn's call keeps off the
                         // bot's connection, which that call holds.
-                        chain: (!accounting.beside).then(|| self.chain(body)),
+                        chain: (!accounting.beside)
+                            .then(|| self.chain(body, strip, reasoning.as_deref())),
                         // A summary of its own goes off the turn's route; a
                         // copy follows it to the server that holds its cache.
                         route: (!matches!(body, Body::Span(..))).then_some(&accounting.route),
@@ -4337,7 +4376,14 @@ impl Turn {
 
     /// Where this request sits in the bot's history, for a provider that can
     /// continue from the bot's previous response. A span has no window.
-    fn chain<'a>(&'a self, body: Body<'a>) -> Chain<'a> {
+    /// Its tail strips as the body does: `strip`, and `reasoning` as for
+    /// [`Self::items`].
+    fn chain<'a>(
+        &'a self,
+        body: Body<'a>,
+        strip: Strip,
+        reasoning: Option<&'a [u32]>,
+    ) -> Chain<'a> {
         match body {
             Body::Window(Context {
                 window: Some(window),
@@ -4350,11 +4396,17 @@ impl Turn {
                     let span = Span {
                         ids: &window.ids[skip..],
                         sizes: &window.sizes[skip..],
-                        thinking: &window.thinking[skip..],
+                        thinking: &reasoning.unwrap_or(&window.thinking)[skip..],
                         pictured: &window.pictured[skip..],
                         elided: window.elided,
+                        reasoning: reasoning.is_some(),
                     };
-                    self.window_items(Bytes::new(), span, *thinking)
+                    let strip = if reasoning.is_some() {
+                        strip
+                    } else {
+                        *thinking
+                    };
+                    self.window_items(Bytes::new(), span, strip)
                 }),
             },
             _ => Chain {
