@@ -12765,8 +12765,21 @@ impl App {
                         pane.screen.unselect();
                         self.copied(&text);
                     }
-                    KeyCode::Up if reading => pane.screen.scroll(1),
-                    KeyCode::Down if reading => pane.screen.scroll(-1),
+                    // A thread read is a page: ↑↓ pick its links, as Lynx
+                    // does, and scroll where none is left that way.
+                    KeyCode::Up if reading && !pane.screen.pick_link(false, pane.is_margin()) => {
+                        pane.screen.scroll(1)
+                    }
+                    KeyCode::Down if reading && !pane.screen.pick_link(true, pane.is_margin()) => {
+                        pane.screen.scroll(-1)
+                    }
+                    KeyCode::Up | KeyCode::Down if reading => {}
+                    KeyCode::Enter | KeyCode::Right
+                        if reading && let Some(url) = pane.screen.picked_link() =>
+                    {
+                        let url = url.to_owned();
+                        self.follow(&url);
+                    }
                     KeyCode::PageUp => pane.screen.page(true),
                     KeyCode::PageDown => pane.screen.page(false),
                     KeyCode::Char(' ') if reading => pane.screen.page(false),
@@ -12937,14 +12950,34 @@ impl App {
                     {
                         self.open_bigger(&path)
                     }
+                    // The link picked in a page of text opens, as a click
+                    // on it does.
+                    KeyCode::Enter | KeyCode::Right
+                        if !pane.is_card()
+                            && let Some(url) = pane.screen.picked_link() =>
+                    {
+                        let url = url.to_owned();
+                        self.follow(&url);
+                    }
                     // Back and forward through what the pane has shown.
                     // Back to the margin from the first thing over it, as ‹ goes.
                     KeyCode::Left | KeyCode::Backspace if pane.goes_back() => {
                         self.step_pane(true);
                     }
                     KeyCode::Right if pane.can_go(false) => self.go(false),
-                    KeyCode::Up => pane.screen.scroll(1),
-                    KeyCode::Down => pane.screen.scroll(-1),
+                    // A page of text: ↑↓ pick its links in view, as Lynx
+                    // does, and scroll where none is left that way.
+                    KeyCode::Up
+                        if pane.is_card() || !pane.screen.pick_link(false, pane.is_margin()) =>
+                    {
+                        pane.screen.scroll(1)
+                    }
+                    KeyCode::Down
+                        if pane.is_card() || !pane.screen.pick_link(true, pane.is_margin()) =>
+                    {
+                        pane.screen.scroll(-1)
+                    }
+                    KeyCode::Up | KeyCode::Down => {}
                     KeyCode::PageUp => pane.screen.page(true),
                     KeyCode::PageDown | KeyCode::Char(' ') => pane.screen.page(false),
                     KeyCode::Home => pane.screen.hold(usize::MAX),
