@@ -9602,9 +9602,9 @@ providers were used.
 
 2026-11-14, Linux 6.18 cloud VM, 4 CPUs, Python 3 and the bench venv.
 Base is main `f12b4ff`; head is this pull request at `ac5130d`. The later
-review round only changes which spelling of a path its links are read
-from and keeps what was read with a call that parks, so nothing it adds
-runs on these screens. Both are local release builds (`--bin agent`) with
+review rounds read links from the path as given, keep what was read with
+a call that parks, and keep one entry per path instead of every link on
+the way, which makes judging cheaper; none of it runs on these screens. Both are local release builds (`--bin agent`) with
 the same locked dependencies. Binary SHA-256:
 
 - Base: `b43971e30e59a3d8bb8e03df8fa02a6f99c684ccfe20a96f995df6791f2ed965`.
@@ -9614,10 +9614,11 @@ What the change adds is per call, never per bot: for a bot in
 `workspace-write` mode, each `write`, `edit` or `apply_patch` call has
 the links in its paths read once, in `spawn_blocking`, before the round
 judges it (an `lstat` and, for a link, a `readlink` per path part in a
-folder the bot can't change, at most 40 links per path). What was read
-travels with the call, so judging reads no file on the runtime thread. A
-call that parks keeps it in the turn's stored `waiting` row; a call that
-reads nothing stores nothing. Other modes, other tools and shell calls do
+folder the bot can't change, at most 40 links per path). Where each path
+leads travels with the call, one entry per path it names, so judging is
+one lookup per path and reads no file on the runtime thread. A call that
+parks keeps it in the turn's stored `waiting` row; a call that reads
+nothing stores nothing. Other modes, other tools and shell calls do
 no new work, and nothing grows with the number of agents: no table, task
 or timer is added. The protocol and schema are unchanged.
 
