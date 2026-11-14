@@ -96,6 +96,12 @@ pub const SETTINGS: &[Setting] = &[
         default: "the model's own",
     },
     Setting {
+        key: "reviewer.timeout_ms",
+        about: "how long a call in Auto waits for the reviewer's verdict, every attempt included, before it goes to you; 0 waits as long as it takes",
+        values: &[],
+        default: "90000",
+    },
+    Setting {
         key: "sonny.lead_effort",
         about: "a new lead's effort",
         values: EFFORTS,

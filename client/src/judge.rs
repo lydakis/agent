@@ -241,6 +241,10 @@ pub struct Failed {
     /// Where the reviewer's turn spent its time, when it ended: none for one
     /// that never started or was still running when the check gave up.
     pub timing: Option<Timing>,
+    /// Where a turn still running when the check gave up was, read before
+    /// its fork is removed: its status, rounds, retries and time held back,
+    /// when it started, and how long since it last wrote anything.
+    pub hung: Option<Value>,
 }
 
 fn failed(why: impl Into<String>) -> Failed {
@@ -248,6 +252,7 @@ fn failed(why: impl Into<String>) -> Failed {
         why: why.into(),
         reply: None,
         timing: None,
+        hung: None,
     }
 }
 
@@ -497,7 +502,11 @@ pub async fn turn_with(
     };
     let outcome = &waited["results"][handle];
     if outcome["pending"] == true {
-        return (Err(failed("the check timed out")), Some(turn));
+        let failed = Failed {
+            hung: Some(hung(client, name, turn, submitted_ms).await),
+            ..failed("the check timed out")
+        };
+        return (Err(failed), Some(turn));
     }
     let usage = usage(client, name, turn, submitted_ms).await;
     if outcome["status"] != "completed" {
@@ -524,11 +533,36 @@ pub async fn turn_with(
                 why,
                 reply: Some(text.to_owned()),
                 timing: usage.timing,
+                hung: None,
             };
             return (Err(failed), None);
         }
     };
     (Ok((answers, usage)), None)
+}
+
+/// Where `bot`'s turn `turn`, sent at `submitted_ms` and still running,
+/// is: what its row says, and how long since it last wrote, from its
+/// history's newest entry. What can't be read is left out.
+async fn hung(client: &Client, bot: &str, turn: i64, submitted_ms: i64) -> Value {
+    let now = epoch_ms();
+    let read = client
+        .request("turns", json!({"bot": bot, "after": turn - 1, "limit": 1}))
+        .await
+        .unwrap_or_default();
+    let row = &read["turns"][0];
+    let mut state = json!({"status": row["status"], "model_rounds": row["model_rounds"],
+        "retries": row["retries"], "paced_ms": row["paced_ms"],
+        "submitted_ms_ago": now - submitted_ms});
+    if let Some(started) = row["started_ms"].as_i64() {
+        state["started_ms_ago"] = json!(now - started);
+    }
+    if let Some(last) = (entries(client, bot, turn).await)
+        .and_then(|entries| entries.iter().map(|(at, _)| *at).max())
+    {
+        state["entries_ms_ago"] = json!(now - last);
+    }
+    state
 }
 
 /// The tokens and time of `bot`'s ended turn `turn`, sent at `submitted_ms`.

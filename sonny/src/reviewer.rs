@@ -39,6 +39,9 @@ pub struct Settings {
     pub effort: Option<String>,
     /// The environment note the reviewer always sees.
     pub note: Option<String>,
+    /// `[reviewer] timeout_ms`: how long a round may wait for its verdict,
+    /// every attempt included; unset, Codex's 90 s; 0, as long as it takes.
+    pub timeout_ms: Option<u64>,
 }
 
 /// The lease a tag is served under, renewed well inside it.
@@ -130,6 +133,7 @@ pub fn run(args: &[String]) -> std::result::Result<(), String> {
         caller: env("AGENT_MODEL"),
         effort: effort.or(config.reviewer.effort),
         note,
+        timeout_ms: config.reviewer.timeout_ms,
     };
     main(settings).map(drop).map_err(|error| {
         serde_json::json!({"error": error.code, "detail": error.detail}).to_string()
@@ -199,6 +203,7 @@ enum Judged {
         why: String,
         reply: Option<String>,
         timing: Option<judge::Timing>,
+        hung: Option<Value>,
     },
 }
 
@@ -211,7 +216,8 @@ const VERDICT: judge::Reply = judge::Reply {
 
 struct Judge {
     base: judge::Base,
-    /// How long a round may wait for its verdict, from its announcement.
+    /// How long a round may wait for its verdict, from its announcement;
+    /// 0 for as long as it takes.
     deadline_ms: u64,
 }
 
@@ -236,7 +242,17 @@ impl Judge {
                 answers: Value::Object(answers),
                 usage,
             },
-            Err(Failed { why, reply, timing }) => Judged::Failed { why, reply, timing },
+            Err(Failed {
+                why,
+                reply,
+                timing,
+                hung,
+            }) => Judged::Failed {
+                why,
+                reply,
+                timing,
+                hung,
+            },
         }
     }
 }
@@ -318,7 +334,7 @@ async fn serve(settings: Settings) -> Result<i32> {
         client,
         judge: Judge {
             base,
-            deadline_ms: policy::DEADLINE_MS,
+            deadline_ms: settings.timeout_ms.unwrap_or(policy::DEADLINE_MS),
         },
         tag: tag.clone(),
         lease,
@@ -498,7 +514,11 @@ async fn round(shared: Arc<Shared>, bot: String, turn: i64, calls: Vec<Value>) {
         .filter_map(|call| call["announced_ms"].as_i64())
         .min()
         .unwrap_or_else(epoch_ms);
-    let left = (announced + shared.judge.deadline_ms as i64 - epoch_ms()).max(0) as u64;
+    // No deadline is a year's: no round waits that long.
+    let left = match shared.judge.deadline_ms {
+        0 => 365 * 24 * 3600 * 1000,
+        ms => (announced + ms as i64 - epoch_ms()).max(0) as u64,
+    };
     let deadline = started + Duration::from_millis(left);
     let counts = &calls[0]["denials"][&shared.tag];
     let (in_row, recent) = (
@@ -703,12 +723,17 @@ async fn judge(
         )
         .await
     {
-        Judged::Failed { why, reply, timing } => {
+        Judged::Failed {
+            why,
+            reply,
+            timing,
+            hung,
+        } => {
             spent.judged(timing.as_ref());
             let reply = reply.map(|reply| logged_reply(&shared.redactor, &reply));
             report(
                 json!({"event":"review_failed","bot":bot,"turn":turn,"detail":why,
-                "reply":reply}),
+                "reply":reply,"hung":hung}),
             );
             Err(Unreviewed::Failed(why))
         }
