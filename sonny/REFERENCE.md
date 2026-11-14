@@ -1043,7 +1043,7 @@ has something on it, or is off the screen, no time shows.
   that needs you says what for under it, one that failed why. That is all it shows as it opens; `m` shows more and hides it
   again: at each row's right edge, dim, the rest of what it tracks: what it follows (a source with an
   `icon` in `[sonny.sources.NAME]` shows as that icon, as it does wherever
-  Sonny names that source: `/background` and the "From your sources" row), a pull or merge
+  Sonny names that source: `/background` and the lookout's row), a pull or merge
   request link its last reply holds, its background work
   and its window, and under the picked agent its model and profile, and
   its latest step. Idle and Done fold to their headings (`Idle · 5 ▸`,
@@ -1230,8 +1230,8 @@ has something on it, or is off the screen, no time shows.
   allow, whose call runs. What comes in from no agent flies in from the
   edge only when it is from outside: news from its sources, another
   person, a schedule (whose tick flashes as it fires), a reply's note
-  from the commons, task updates, a message that came back; the chat log
-  names each so (`its sources → inbox`, `task updates → shop lead`). A commons invite flies from whoever started the
+  from the commons, the lookout's notes, a message that came back; the chat log
+  names each so (`the lookout → shop lead`). A commons invite flies from whoever started the
   thread, and a margin note you closed from you. It is a
   calm window to keep open and watch: dim lines join who made whom, and
   every pair that has ever talked keeps a dim curve, the last 96 pairs, past
@@ -1467,7 +1467,7 @@ has something on it, or is off the screen, no time shows.
   answered the same way when it opens. A yellow `?` starts it and a muted
   bar runs down its left side, however narrow the window gets later,
   setting it apart from the replies around it with or without color. A task
-  asks the same way: its lead hears the question in its task updates
+  asks the same way: its lead hears the question from the lookout
   (`shop.wire asks you`), the task's row reads `needs you`, and a click on
   it opens the task in the pane, where an option's click answers the task
   itself.
@@ -1492,7 +1492,7 @@ has something on it, or is off the screen, no time shows.
 
   ![Where each question stands: one answered, one withdrawn with why, one set aside, and the composer answering an open one in words](../docs/sonny/question-states-dark.png)
 
-  ![A task's question: the lead's task updates say shop.wire asks you, and wire, opened from the margin's ↗, shows the decision in the pane](../docs/sonny/ask-from-task.png)
+  ![A task's question: the lead's lookout note says shop.wire asks you, and wire, opened from the margin's ↗, shows the decision in the pane](../docs/sonny/ask-from-task.png)
 - `/copy` puts the last reply on the clipboard; `/verbose`
   switches between the clean view and every tool call; `/quit`
   leaves the agents working. An HTML page a reply shows has its file's
@@ -1637,11 +1637,12 @@ their approvals, even with its network on.
 skills and MCP.
 Sonny starts its lookout, `sonny lookout`, when it opens a project: one
 for the daemon, watching for every bot that follows others, and Sonny
-has each lead follow its tasks. As soon as news settles, it tells the
-lead every message someone else wrote in its tasks and how each turn
-ended, in one "Task updates" note, by the handles its wait tool reads them
-with, as a steer: the note joins the lead's running turn, or starts one,
-and the lead decides what matters. A turn a note started that ends with
+has each lead follow its tasks. As things happen, it tells the lead every
+message someone else wrote in its tasks, each turn's end with the task's
+reply, a question or approval waiting on you, and a margin note, in one
+note at a time beside what the sources it follows said, each event under
+a `[source · topic · from]` line, as a steer: the note joins the lead's
+running turn, or starts one, and the lead decides what matters. A turn a note started that ends with
 nothing to say stays folded under the note, with no sound. Any agent can
 follow more with its `follows` tool (other agents' tasks, bots
 by name, sources outside such as a chat you poll, questions of its own),
@@ -1707,7 +1708,7 @@ updates one row with what happened in them, and a click opens the whole
 message. Everything between two things said (your message, the agent's
 words, a question, a failure, a task started) is one such row: what came
 in counted and who from, then in a few words what the agent did about it
-and where its plan stands (`↳ 3 task updates · calc.neg · sent 2 to
+and where its plan stands (`↳ 3 lookout notes · calc.neg · sent 2 to
 calc.neg, saved a memory, plan 1/3 ▸`). It grows in place as the agent
 works, and a click opens it to each one's own row in the order they came,
 a click on one of those opening it in turn. A coordinating agent can work
@@ -1732,13 +1733,13 @@ a failure, and its notification says `fix finished, no reply`.
 
 ![Memory saves folded into one row, and a question whose options are buttons](../docs/sonny/fold-and-ask.png)
 
-![A message from calc.neg, the task updates and a steer, each one row](../docs/sonny/agent-calls-folded.png)
+![A message from calc.neg, the lookout's note and a steer, each one row](../docs/sonny/agent-calls-folded.png)
 
 ![The steer opened to what it told calc.neg](../docs/sonny/agent-call-opened.png)
 
 ![A commons reply that rode along hanging as a 📎 row under the person's message, and an automation's under the step its call joined](../docs/sonny/attached-notes.png)
 
-![Three task updates in a row gathered into one row that names the tasks](../docs/sonny/task-updates-gathered.png)
+![Three lookout notes in a row gathered into one row that names the tasks](../docs/sonny/task-updates-gathered.png)
 
 ![A lead that hands checks to two tasks: one ↳ row between each thing it says, naming the updates that came in and what it did about them](../docs/sonny/one-row-per-gap.png)
 
@@ -1769,7 +1770,7 @@ and Ctrl+] shows it again.
 
 An agent's name anywhere in the conversation goes to that agent, as a
 click on a task does, the way a GitHub `@name` links to its account: in a reply ("tally.halves
-has a question for you"), in a row of task updates, in a message from
+has a question for you"), in a lookout note's row, in a message from
 another agent, and in the pane's own text. Only a name the daemon knows
 is one, so it is drawn in the agents' blue, and a word that only looks
 like one stays plain. In a row a click opens, such as `↳ From calc.neg

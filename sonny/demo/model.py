@@ -39,13 +39,10 @@ class Model(http.server.BaseHTTPRequestHandler):
         step = sum(item.get('type') == 'function_call_output' for item in items[last_user:])
         text, output = '', []
         lead = '# Role: lead' in request.get('instructions', '')
-        told = str(items[last_user].get('content')).find('Task updates: ') != -1
-        if lead and told and step == 0:
-            # Sonny telling the lead a task ended: it reads the reply by its handle.
-            handle = re.search(r'- [\w.-]+: ([\w.-]+/\d+)', str(items[last_user].get('content'))).group(1)
-            text = 'A task finished; reading what it did.'
-            output = [call('wait', f'w0-{len(items)}', handles=[handle], timeout_ms=0)]
-        elif lead and told:
+        # The lookout's note: each event under a `[source · topic · from]`
+        # line, a task's reply with its end.
+        told = '[tasks · ' in str(items[last_user].get('content'))
+        if lead and told:
             text = '`fix-avg` is done: it fixed the average and the tests pass.'
         elif lead and step == 0:
             text = "That needs a fix and a test run, so I'll hand it to a task."

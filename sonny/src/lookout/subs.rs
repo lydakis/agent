@@ -154,16 +154,6 @@ impl Sub {
         out
     }
 
-    /// Whether it says more than what it watches: a filter, a digest,
-    /// what steers, or how many notes it lasts, which counts what it
-    /// heard. One that says none costs the lookout nothing more.
-    pub fn rules(&self) -> bool {
-        self.filter.is_some()
-            || self.digest.is_some()
-            || self.steer.is_some()
-            || self.runs.is_some()
-    }
-
     /// When it ends, in seconds since the epoch; none when it lasts.
     pub fn ends_at(&self) -> Option<i64> {
         crate::trigger::moment(self.until.as_deref()?).ok()
@@ -1324,8 +1314,9 @@ fn preview(store: &Path, subscriber: &str, sub: &Sub) -> Value {
         let heard = super::sources::Heard {
             event: (*event).clone(),
             subs: vec![sub.name.clone()],
+            order: 0,
         };
-        let bytes = super::sources::line(&heard).len();
+        let bytes = super::sources::bytes(&heard);
         let window = digest.map_or(0, |d| d.as_millis());
         times.push(Timed {
             at: event.at_ms,
@@ -1387,13 +1378,16 @@ struct Timed<'a> {
     bytes: usize,
 }
 
+/// About how long a note takes to land, while what comes waits for the
+/// next, in ms.
+const FLIGHT_MS: u128 = 100;
+
 /// About how many notes these events would be, as the lookout sends
-/// them: a note goes once what came since the note before settles, and
-/// an event is ready, or at once for a steer,
-/// carrying what is ready by then, steers first, as many as a note holds;
-/// each event no sooner than a digest after the note before on its
-/// clock. What a note had no room for, or a digest still holds, waits for
-/// a later one, which goes no sooner than the note before.
+/// them: a note goes as soon as an event is ready and the note before
+/// landed, at once for a steer, carrying what is ready by then, as many
+/// as a note holds; each event no sooner than a digest after the note
+/// before on its clock. What a note had no room for, or a digest still
+/// holds, waits for a later one.
 fn notes(times: &[Timed]) -> usize {
     use std::collections::HashMap;
     fn ready(last: &HashMap<&str, u128>, e: &Timed) -> u128 {
@@ -1409,20 +1403,10 @@ fn notes(times: &[Timed]) -> usize {
         free: &mut u128,
         before: Option<u128>,
     ) -> usize {
-        let settle = super::SETTLE.as_millis();
-        // What waits settles from when the first of it came since the note
-        // before, as the lookout's `heard_since`; a steer waits for none.
-        let goes = |last: &HashMap<&str, u128>, free: u128, settled: u128, e: &Timed| {
-            let at = ready(last, e).max(free);
-            if e.steer { at } else { at.max(settled) }
-        };
+        let goes = |last: &HashMap<&str, u128>, free: u128, e: &Timed| ready(last, e).max(free);
         let mut notes = 0;
-        while let Some(since) = (waiting.iter()).map(|e| e.at.max(*free)).min() {
-            let settled = since + settle;
-            let Some(went) = (waiting.iter())
-                .map(|e| goes(last, *free, settled, e))
-                .min()
-            else {
+        while !waiting.is_empty() {
+            let Some(went) = (waiting.iter()).map(|e| goes(last, *free, e)).min() else {
                 break;
             };
             if before.is_some_and(|at| went >= at) {
@@ -1431,9 +1415,8 @@ fn notes(times: &[Timed]) -> usize {
             notes += 1;
             let (mut carried, held): (Vec<_>, Vec<_>) =
                 waiting.drain(..).partition(|e| ready(last, e) <= went);
-            carried.sort_by_key(|e| !e.steer);
             let mut bytes = 0;
-            let take = (carried.iter().take(super::NOTE_ITEMS))
+            let take = (carried.iter())
                 .take_while(|e| {
                     bytes += e.bytes + 1;
                     bytes <= super::sources::NOTE_BYTES
@@ -1445,7 +1428,7 @@ fn notes(times: &[Timed]) -> usize {
             }
             carried.extend(held);
             *waiting = carried;
-            *free = went;
+            *free = went + FLIGHT_MS;
         }
         notes
     }
@@ -1710,7 +1693,6 @@ mod tests {
         assert_eq!(added["follows"][0]["runs"], 1);
         let sub = &read(&store, "shop.lead")[0];
         assert_eq!(Sub::from_json(&sub.to_json()).as_ref(), Some(sub));
-        assert!(sub.rules());
         assert!(!sub.over(now) && sub.over(now + 3600));
         assert!(sub.describe().contains(&soon), "{}", sub.describe());
         // Its notes count under when it was added, which the bot never
@@ -1873,14 +1855,16 @@ mod tests {
             clock,
             bytes: 100,
         };
-        // As they come: a spell within the settle is one note.
+        // As they come: each note goes once the last landed, with all
+        // that came meanwhile.
         assert_eq!(
             notes(&[
-                t(s(0), false, 0, "a"),
-                t(s(1), false, 0, "a"),
+                t(0, false, 0, "a"),
+                t(50, false, 0, "a"),
+                t(60, false, 0, "a"),
                 t(s(10), false, 0, "a")
             ]),
-            2
+            3
         );
         // A digest: the first at once, the rest gathered at its end.
         let digested = [
@@ -1903,14 +1887,14 @@ mod tests {
         ];
         // A steer goes at once, alone: what its digest holds waits on.
         assert_eq!(notes(&steered), 3);
-        // What settled while its digest held it goes once the digest ends.
+        // What its digest held goes once the digest ends.
         let late = [
             t(s(0), false, hour, "a"),
             t(s(60), false, hour, "a"),
             t(s(3603), true, hour, "a"),
         ];
         assert_eq!(notes(&late), 3);
-        // Steers wait for no settle: each goes as it comes.
+        // Steers apart: each goes as it comes.
         assert_eq!(
             notes(&[
                 t(0, true, 0, "a"),
@@ -1919,9 +1903,12 @@ mod tests {
             ]),
             3
         );
-        // A note holds so many events, and so many bytes.
+        // A note holds so many bytes: the rest go in the next.
         let burst = vec![t(0, false, 0, "a"); 2000];
-        assert_eq!(notes(&burst), 2000 / super::super::NOTE_ITEMS);
+        assert_eq!(
+            notes(&burst),
+            2000usize.div_ceil(super::super::sources::NOTE_BYTES / 101)
+        );
         let big = Timed {
             bytes: super::super::sources::NOTE_BYTES / 2,
             ..t(0, false, 0, "a")

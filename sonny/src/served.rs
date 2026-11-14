@@ -267,15 +267,16 @@ fn project() -> Value {
 fn follows() -> Value {
     json!({
         "name": FOLLOWS,
-        "description": "Your follows in the person's lookout, which watches agents for you and tells you \
-            what happens in them in a note starting \"Task updates\": every message someone other than you \
-            writes in them, the person's quoted, and how each turn ends, by the handle your wait tool reads. \
-            Each note joins your running turn, or starts one. A \
-            follow watches the tasks of a bot (every agent it or its tasks made) or bots by name. It also hears the \
-            sources the person set up outside (a chat, a mailbox, a feed), each by name, in a note starting \
-            \"From your sources\": every event, at once when the source says it steers, or one topic of a \
-            source as NAME:TOPIC, or only those its filter matches. The commons is a source too, each thread \
-            a topic: posting in a thread follows it as commons.THREAD, and removing that leaves it. \
+        "description": "Your follows in the person's lookout, which tells you what happens in the agents \
+            and sources you follow, in a message sent by lookout that joins your running turn or starts one: \
+            each event a line [source · topic · from], then its text. A follow watches the tasks of a bot \
+            (every agent it or its tasks made) or bots by name, through the tasks source, each agent its topic: \
+            every message someone other than you writes in them, the person's quoted, a question to the person, \
+            a call waiting for their approval, a margin note put or taken away, and how each turn ends, with \
+            its reply. It also hears the sources the person set up outside (a chat, a mailbox, a feed), each \
+            by name, or one topic of a source as NAME:TOPIC. The commons is a source too, each thread a topic: \
+            posting in a thread follows it as commons.THREAD, and removing that leaves it. Each source's \
+            events go at once, or as its digest gathers them; a filter keeps only those it matches. \
             Add steer yourself for what you own; a filter or a digest only when the person asks for one: \
             what a filter leaves out you never hear, and a digest makes you late. Add or remove one by name; \
             with neither, it lists them all, with the sources there are and their events' recent fields.",
@@ -295,11 +296,11 @@ fn follows() -> Value {
                             "description": "Sources it hears, by name, or NAME:TOPIC for one topic of it."},
                         "filter": {"type": "object",
                             "description": "Only the events this matches are heard, its sources' and its bots' \
-                                alike. A bot's events have type (message.written, turn.ended, approval.waiting, \
-                                ask.posted, turn.silent, note.changed), bot, maker, by (you, person, an agent's \
-                                name, automation), turn, status (completed, failed, stopped, interrupted), done, \
-                                theirs (the person asked for the turn themselves), text (the person's \
-                                words), question, options and id (a margin note's). An event pattern as \
+                                alike. A task's event has type (wrote, turn.ended, question, approval, \
+                                margin), bot, maker, from, turn, text, status (completed, failed, \
+                                stopped, interrupted), done, asked_by (you, the person, an agent's name, \
+                                automation), options, command, call, id and removed (a margin note's). \
+                                An event pattern as \
                                 AWS EventBridge writes one. Each field maps to a list of values, \
                                 any of which will do, or to a pattern for an object field; every field \
                                 must match, and a field that is a list matches when any item does. A value is a \
@@ -310,8 +311,8 @@ fn follows() -> Value {
                                 As {\"paths\": [{\"prefix\": \"src/billing/\"}], \"author\": [{\"anything-but\": \"me\"}]}."},
                         "digest": {"type": "string", "pattern": "^(0|[0-9]+[smh])$",
                             "description": "Tell what it hears at most once this long, as 15m or 1h, in place of \
-                                its sources' own digest. The person's words, a question to them and an approval only they can give \
-                                never wait."},
+                                its sources' own digest. What steers never waits: the person's words in a task, a question \
+                                to them, an approval only they can give, and what steer matches."},
                         "steer": {"type": "object",
                             "description": "What it hears that this matches, a pattern as filter's, goes at once, \
                                 past any digest, as the person's words do. As \

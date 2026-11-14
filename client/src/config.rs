@@ -846,6 +846,10 @@ pub const TEXT_WIDTH_LEAST: u64 = 40;
 /// The name of the source Sonny's lookout makes of the commons.
 pub const COMMONS_SOURCE: &str = "commons";
 
+/// The name of the lookout's own source of what happens in the tasks a
+/// subscriber watches: no source in the settings takes it.
+pub const TASKS_SOURCE: &str = "tasks";
+
 /// A span of time as a count and `s`, `m` or `h`, as `30s`, `5m` or `1h`,
 /// in seconds; `0` alone is none. `key` names it in the error.
 pub fn span(key: &str, text: &str) -> Result<u64, String> {
@@ -1064,7 +1068,7 @@ pub struct Source {
     pub watch: Vec<String>,
     /// One character cell that marks it wherever Sonny names it: on the
     /// `/status` row of each agent that follows it, its follows in
-    /// `/background`, and the "From your sources" row.
+    /// `/background`, and the lookout's row.
     pub icon: Option<String>,
     /// A field of its events whose values subscriptions' filters name,
     /// as `id` or `meta.repo`: the lookout writes those values to a file
@@ -2085,6 +2089,12 @@ fn sources(value: &toml::Value) -> Result<(Vec<Source>, Source), String> {
         {
             return Err(format!(
                 "sonny.sources.{name}: a source's name is 1 to 64 of A-Z a-z 0-9 _ -"
+            ));
+        }
+        if name == TASKS_SOURCE {
+            return Err(format!(
+                "sonny.sources.{name}: the lookout's own source of what happens in tasks has this \
+                 name; name yours another way"
             ));
         }
         let fields =

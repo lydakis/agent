@@ -316,7 +316,7 @@ class Bench:
             if getattr(self.args, 'rules', False):
                 # Every event built and matched, none held or dropped: the
                 # rules' own cost, with the notes going as they would.
-                tasks['filter'] = {'type': [{'anything-but': 'note.changed'}]}
+                tasks['filter'] = {'type': [{'anything-but': 'margin'}]}
                 tasks['steer'] = {'status': ['never']}
             (folder / f'p{p}.lead.json').write_text(json.dumps({'subscriptions': [tasks]}))
         # One finished turn each lead's messages to its tasks come from: what
@@ -465,6 +465,8 @@ class Bench:
             request_id = note.get('request_id') or f"lookout-{fnv(','.join(note['woke']))}"
             begun = started.get((note['lead'], request_id))
             for key in note['woke']:
+                # The one pipe keys a task's event under its source.
+                key = key.removeprefix('tasks/')
                 task, _, rest = key.partition('/')
                 turn = rest.partition('/')[0]
                 if turn.isdigit():

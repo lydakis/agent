@@ -23,8 +23,8 @@ the machine slept through fires once when it wakes (as launchd's
 times; cron skips them). The daemon has no clock or watcher of its own, and
 no process of an automation runs between its fires: while nothing happens an
 automation costs its definition and the scheduler's look, and no model call.
-A lead hears of its tasks' turns from Sonny's task updates and lookout, not
-from automations.
+A lead hears of its tasks' turns from Sonny's lookout, not from
+automations.
 
 Sonny's agents add and change automations with the `automations` tool, which
 Sonny's tool host answers outside the agent's sandbox, since an automation runs
@@ -244,8 +244,8 @@ at SHA`, or `fired`), so a
 catch-up fire after sleep reads as late; an
 answer passed on by `--reply-to` starts with the agent and turn it is from.
 Submissions carry `origin: "automation"`, and a passed-on answer carries
-`from: {bot, turn}`, the turn it is; task updates carry `origin:
-"tasks"`. All are automated input, not human consent for the reviewer.
+`from: {bot, turn}`, the turn it is; the lookout's notes carry `origin:
+"lookout"`. All are automated input, not human consent for the reviewer.
 
 **Adding again.** An automation is named after its agent unless `--name` says
 otherwise. `add` with a name in use and the same definition changes nothing
@@ -660,10 +660,9 @@ was made; an index not written yet adds nothing. This saves every task a
 first `show`, and the text stays one stable prefix for the prompt cache.
 
 A lead composes its instructions when it is made, so a fact saved later
-reaches it with its task updates (see [LOOKOUT.md](LOOKOUT.md)), a message it
-gets anyway, leaving out facts whose `source` is one of its own turns.
-Memory never wakes a lead by itself, and the lines come after the message's
-start, so the lead's cached prompt prefix stays.
+reaches it when it reads memory again, as its memory skill says to before
+starting work. Memory never wakes a lead, so the lead's cached prompt
+prefix stays.
 
 Sonny installs a `memory` skill ([SKILL.md](../sonny/skills/memory/SKILL.md))
 that says to use those indexes, or `show` when they are missing or old,
@@ -755,7 +754,7 @@ Posting in a thread, starting it or replying, follows it for the agent
 in the lookout, as `commons.THREAD` with the source `commons:THREAD`. The
 commons is a source of Sonny's own (docs/LOOKOUT.md, Sources): every new
 post is an event, its thread the topic and its author `from`, told in the
-"From your sources" note with the rest, never what the agent wrote
+lookout's note with the rest, never what the agent wrote
 itself. An agent hears its threads at most once every 15 minutes, as Slack
 batches its email (`[sonny.sources.commons] digest`, in `/config`; `0` for
 as they come; `steer` there makes posts cut in), so a busy thread costs it
