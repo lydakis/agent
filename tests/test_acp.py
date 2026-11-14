@@ -300,7 +300,9 @@ class AcpTests(ModelFixture):
         turns = self.daemon.request('turns', bot='calc.lead')['result']['turns']
         self.assertEqual([t['status'] for t in turns], ['completed'])
         sent = self.daemon.request('messages', bot='calc.lead')['result']['messages']
-        # The opener reads as its turn; the steer as taken into it.
+        # The opener reads as its turn; the steer as taken into it. The
+        # lookout's note of the task's end may join the turn too, at once.
+        sent = [m for m in sent if m.get('origin') != 'lookout']
         self.assertEqual([(m['status'], m['turn']) for m in sent],
                          [('completed', turns[0]['turn']), ('taken', turns[0]['turn'])])
         # T3 Code would not take the task as a child: it opens as a thread of
@@ -890,7 +892,10 @@ class AcpTests(ModelFixture):
         self.assertRegex(answer, r'^You asked \(ask:\d+/script-0\): Which database\?\n\nPostgres$')
         thread.send({'id': cache['id'], 'result': {'action': 'accept', 'content': {'pick': '1'}}})
         self.assertIn('Which cache?\n\nNone', until_answered('calc.fix', 2)[-1])
-        self.assertEqual(self.daemon.request('turns', bot='calc.lead')['result']['turns'], [])
+        # The answers went to the task: the lead's turns, if any, are the
+        # lookout's notes of the questions.
+        self.assertEqual([t['request_id'] for t in self.daemon.request('turns', bot='calc.lead')['result']['turns']
+                          if not t['request_id'].startswith('lookout-')], [])
         # Asked live.
         self.model.call_script.append(asked('Which queue?', 'None', 'SQS'))
         ran('calc.fix', 'script')

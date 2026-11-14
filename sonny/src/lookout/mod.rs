@@ -180,6 +180,19 @@ struct Sent {
     turn: i64,
     status: String,
     error: String,
+    /// Who asked for the turn, as its start named them: the sender's
+    /// filters hear its end with the asker the end's event carries.
+    asker: Option<Asked>,
+}
+
+/// Who a message that started a turn came from: a bot, the origin it
+/// went with, and whether a lookout note sent it, whose turn's end is no
+/// event.
+#[derive(Clone)]
+struct Asked {
+    from: Option<String>,
+    origin: Option<String>,
+    note: bool,
 }
 
 /// A bounce: the agent and turn that did not carry a message out, and who
@@ -643,6 +656,7 @@ async fn serve(settings: Settings) -> Result<(), String> {
         saved: None,
         fires: HashMap::new(),
         senders: HashMap::new(),
+        askers: HashMap::new(),
         resume: marks(&settings.store).0,
         replayed: None,
         replay: marks(&settings.store).1,
@@ -782,6 +796,8 @@ struct Service {
     /// The agents whose messages started or joined each turn, by bot and
     /// turn, for whom a turn that fails is a note (`bounced`).
     senders: HashMap<(String, i64), Vec<Sender>>,
+    /// Who asked for each turn whose senders wait on its end.
+    askers: HashMap<(String, i64), Asked>,
     /// Failed fires' turns whose note is under way, by agent and turn: held
     /// so a restart or a reconnect before the daemon takes the note replays
     /// the turn and tells it again, not never.
@@ -1386,14 +1402,26 @@ impl Service {
                     && let Some(message) = event["message"].as_i64()
                 {
                     self.senders.remove(&(bot.to_owned(), message));
+                    self.askers.remove(&(bot.to_owned(), message));
+                }
+                // Bounded: turns whose end was never seen are let go.
+                if self.senders.len() >= FIRES || self.askers.len() >= FIRES {
+                    self.senders.clear();
+                    self.askers.clear();
+                }
+                // The message that starts a turn names who asked for it.
+                if kind != "steered" {
+                    let text = |value: &Value| value.as_str().map(str::to_owned);
+                    let note =
+                        (data["request_id"].as_str()).is_some_and(|id| id.starts_with("lookout-"));
+                    let origin = text(&data["origin"]).or(text(&data["person"]));
+                    let from = text(&data["from"]["bot"]);
+                    let asked = Asked { from, origin, note };
+                    self.askers.insert((bot.to_owned(), turn), asked);
                 }
                 let Some(from) = data["from"]["bot"].as_str().filter(|from| *from != bot) else {
                     return Vec::new();
                 };
-                // Bounded: turns whose end was never seen are let go.
-                if self.senders.len() >= FIRES {
-                    self.senders.clear();
-                }
                 let senders = self.senders.entry((bot.to_owned(), turn)).or_default();
                 if !senders.iter().any(|(known, _)| known == from) {
                     senders.push((from.to_owned(), data["from"]["bot_id"].as_i64()));
@@ -1401,6 +1429,7 @@ impl Service {
                 Vec::new()
             }
             Some("turn_finished" | "message_ended") => {
+                let asker = self.askers.remove(&(bot.to_owned(), turn));
                 let Some(senders) = self.senders.remove(&(bot.to_owned(), turn)) else {
                     return Vec::new();
                 };
@@ -1420,6 +1449,7 @@ impl Service {
                         turn,
                         status: status.to_owned(),
                         error: error.to_owned(),
+                        asker: asker.clone(),
                     })
                     .collect()
             }
@@ -1434,8 +1464,7 @@ impl Service {
     fn unheard(&self, sent: Vec<Sent>) -> Vec<(String, Option<i64>, String, i64, String)> {
         let hears = |sent: &Sent| {
             (self.watchers.get(&sent.bot)).is_some_and(|names| names.contains(&sent.from))
-                && (self.lookouts.get(&sent.from))
-                    .is_none_or(|lookout| lookout.hears_end(&sent.bot, sent.turn, &sent.status))
+                && (self.lookouts.get(&sent.from)).is_none_or(|lookout| lookout.hears_end(sent))
         };
         (sent.into_iter())
             .filter(|sent| !hears(sent))
@@ -2533,14 +2562,21 @@ impl Lookout {
             .collect()
     }
 
-    /// Whether the end of `bot`'s turn, which the subscriber asked for,
-    /// reaches it, as its subscriptions' filters hear that end.
-    fn hears_end(&self, bot: &str, turn: i64, status: &str) -> bool {
-        if !self.watched.contains(bot) {
+    /// Whether the end of a turn the subscriber sent a message into
+    /// reaches it, as its subscriptions' filters hear that end, asked for
+    /// by whom its start named. A turn a lookout note started ends with
+    /// no event, and one whose start was not seen names no asker.
+    fn hears_end(&self, sent: &Sent) -> bool {
+        let bot = sent.bot.as_str();
+        if !self.watched.contains(bot) || sent.asker.as_ref().is_some_and(|asked| asked.note) {
             return false;
         }
-        let fields = json!({"type": "turn.ended", "bot": bot, "from": bot, "turn": turn,
-            "status": status, "asked_by": "you", "done": false});
+        let mut fields = json!({"type": "turn.ended", "bot": bot, "from": bot, "turn": sent.turn,
+            "status": sent.status, "done": false});
+        if let Some(asked) = &sent.asker {
+            let by = activity::by(&self.lead, asked.from.as_deref(), asked.origin.as_deref());
+            fields["asked_by"] = json!(by);
+        }
         (self.subs.iter()).any(|sub| {
             self.sub_watches(sub, bot)
                 && (sub.filter.as_ref()).is_none_or(|filter| pattern::matches(filter, &fields))
@@ -2687,36 +2723,43 @@ impl Lookout {
             let prompt = sources::note(&sent, self.heard.len(), unkept.as_deref());
             return self.send_note(client, woken, sent, prompt);
         }
-        let (mut ready, held): (Vec<_>, Vec<_>) = std::mem::take(&mut self.heard)
-            .into_iter()
-            .partition(|heard| self.ready(heard, now) && !self.blocked(heard));
         // What is ready goes at once, unless a note went less than
         // `GROUP_INTERVAL` ago: then it gathers till then, or till
         // something steers.
         let grouping = epoch_ms() < self.sent_ms + GROUP_INTERVAL.as_millis();
-        if ready.is_empty() || (grouping && !ready.iter().any(|heard| heard.event.steer)) {
-            ready.extend(held);
-            ready.sort_by_key(|heard| (heard.event.at_ms, heard.event.seq));
-            self.heard = ready;
+        let goes = |heard: &sources::Heard| self.ready(heard, now) && !self.blocked(heard);
+        let any = match grouping {
+            true => self
+                .heard
+                .iter()
+                .any(|heard| heard.event.steer && goes(heard)),
+            false => self.heard.iter().any(goes),
+        };
+        if !any {
             return;
         }
+        // What waits keeps its place: a task's events stay in the order
+        // they happened, however their reads finished.
+        let (mut ready, held): (Vec<_>, Vec<_>) = std::mem::take(&mut self.heard)
+            .into_iter()
+            .enumerate()
+            .partition(|(_, heard)| self.ready(heard, now) && !self.blocked(heard));
         // A bounded note, always at least one event: the rest wait for the
         // next.
         let (mut bytes, mut quotes) = (0, 0);
         let take = (ready.iter())
-            .take_while(|heard| {
+            .take_while(|(_, heard)| {
                 bytes += sources::bytes(heard);
                 quotes += usize::from(heard.event.quote.is_some());
                 bytes <= sources::NOTE_BYTES && quotes <= sources::NOTE_QUOTES
             })
             .count()
             .max(1);
-        let sent: Vec<sources::Heard> = ready.drain(..take).collect();
-        // What waits keeps the order it came in.
+        let sent: Vec<sources::Heard> = ready.drain(..take).map(|(_, heard)| heard).collect();
         let mut rest = ready;
         rest.extend(held);
-        rest.sort_by_key(|heard| (heard.event.at_ms, heard.event.seq));
-        self.heard = rest;
+        rest.sort_unstable_by_key(|(place, _)| *place);
+        self.heard = rest.into_iter().map(|(_, heard)| heard).collect();
         // What did not fit is told with it, and again if it is refused.
         self.unkept_sent = std::mem::take(&mut self.unkept);
         let unkept = self.unkept_sent.line(self.waiting, epoch_ms() as u64);
@@ -3684,6 +3727,7 @@ mod tests {
             rewriting: HashSet::new(),
             fires: HashMap::new(),
             senders: HashMap::new(),
+            askers: HashMap::new(),
         }
     }
 
@@ -3753,8 +3797,9 @@ mod tests {
         assert_eq!(service.lookouts["calc.fix"].subs, [own]);
     }
 
-    #[test]
-    fn a_task_s_events_are_told_in_the_order_they_happened_though_read_out_of_it() {
+    #[tokio::test]
+    async fn a_task_s_events_are_told_in_the_order_they_happened_though_read_out_of_it() {
+        let (client, mut got) = submits().await;
         let mut lookout = seated();
         let from = json!({"from": {"bot": "calc.docs"}, "node": 4});
         lookout.event(&at(ev("calc.fix", 5, "queued", from), 10), None);
@@ -3780,6 +3825,23 @@ mod tests {
             .collect();
         assert_eq!(froms, ["calc.docs", "calc.fix replied, completed"]);
         assert!(!lookout.blocked(&lookout.heard[1]));
+        // Waiting out a group interval keeps that order, and so does the
+        // note once it goes.
+        let (woken, _woke) = tokio::sync::mpsc::channel(4);
+        lookout.sent_ms = epoch_ms();
+        lookout.wake(&client, &woken);
+        let froms: Vec<&str> = (lookout.heard.iter())
+            .map(|heard| heard.event.from.as_deref().unwrap())
+            .collect();
+        assert_eq!(froms, ["calc.docs", "calc.fix replied, completed"]);
+        lookout.sent_ms = 0;
+        lookout.wake(&client, &woken);
+        let prompt = got.recv().await.unwrap()["prompt"].clone();
+        assert_eq!(
+            prompt,
+            "[tasks · calc.fix · calc.docs]\nlook at this\n\
+             [tasks · calc.fix · calc.fix replied, completed]\ndone"
+        );
     }
 
     #[test]
@@ -3802,10 +3864,37 @@ mod tests {
             .map(|heard| heard.event.from.as_deref().unwrap())
             .collect();
         assert_eq!(told, ["calc.fix replied, failed"]);
-        // A turn it asked for itself ends for it as the filter hears it.
-        assert!(lookout.hears_end("calc.fix", 7, "failed"));
-        assert!(!lookout.hears_end("calc.fix", 7, "completed"));
-        assert!(!lookout.hears_end("calc.other", 7, "failed"));
+        // A turn it sent a message into ends for it as the filter hears
+        // it, asked for by whom the turn's start named.
+        let asked = |from: Option<&str>| Asked {
+            from: from.map(str::to_owned),
+            origin: None,
+            note: false,
+        };
+        let sent = |bot: &str, status: &str, asker: Option<Asked>| Sent {
+            from: "calc.lead".into(),
+            id: None,
+            bot: bot.into(),
+            turn: 7,
+            status: status.into(),
+            error: status.into(),
+            asker,
+        };
+        let you = Some(asked(Some("calc.lead")));
+        assert!(lookout.hears_end(&sent("calc.fix", "failed", you.clone())));
+        assert!(!lookout.hears_end(&sent("calc.fix", "completed", you.clone())));
+        assert!(!lookout.hears_end(&sent("calc.other", "failed", you.clone())));
+        // Asked for by the person, its end does not pass a filter for the
+        // subscriber's own turns: the message bounces.
+        lookout.subs[0].filter = Some(json!({"type": ["turn.ended"], "asked_by": ["you"]}));
+        assert!(lookout.hears_end(&sent("calc.fix", "failed", you)));
+        assert!(!lookout.hears_end(&sent("calc.fix", "failed", Some(asked(None)))));
+        // Nor does a turn a lookout note started, which ends with no event.
+        let note = Asked {
+            note: true,
+            ..asked(Some("calc.lead"))
+        };
+        assert!(!lookout.hears_end(&sent("calc.fix", "failed", Some(note))));
     }
 
     #[test]
