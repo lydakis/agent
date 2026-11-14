@@ -1005,7 +1005,7 @@ impl BlockStream {
             at = begin;
             let from = at + BEGIN.len();
             // The closing dashes first, as `pem_header` reads them.
-            let dash = text[from..].find("-----").map(|n| from + n);
+            let dash = find_dashes(&text[from..]).map(|n| from + n);
             let closed = dash.is_some_and(|dash| !text[from..dash].contains('\n'));
             // No dashes after: no later block starts, so this is read once.
             let line_ends = dash.is_some() || text[from..].contains('\n');
@@ -1080,6 +1080,38 @@ impl BlockStream {
                 });
             }
         }
+    }
+}
+
+/// Where the first run of five dashes starts in `text`: a byte search for
+/// each dash, with no searcher built per call, as a key's markers are
+/// looked for at every header.
+fn find_dashes(text: &str) -> Option<usize> {
+    let bytes = text.as_bytes();
+    let mut at = 0;
+    loop {
+        let dash = at + text[at..].find('-')?;
+        let run = bytes[dash..]
+            .iter()
+            .take(5)
+            .take_while(|&&b| b == b'-')
+            .count();
+        if run >= 5 {
+            return Some(dash);
+        }
+        at = dash + run;
+    }
+}
+
+/// Where `marker`, five dashes and a word, first starts in `text`.
+fn find_marker(text: &str, marker: &str) -> Option<usize> {
+    let mut at = 0;
+    loop {
+        let dashes = at + find_dashes(&text[at..])?;
+        if text[dashes..].starts_with(marker) {
+            return Some(dashes);
+        }
+        at = dashes + 1;
     }
 }
 
@@ -1516,7 +1548,7 @@ fn pem_header(text: &str, begin: usize, last: bool) -> Option<usize> {
     let from = begin + BEGIN.len();
     // The closing dashes first: the next are at the latest the next
     // block's, so no text is read twice however many starts a line holds.
-    let dashes = from + text[from..].find("-----")?;
+    let dashes = from + find_dashes(&text[from..])?;
     if text[from..dashes].contains('\n') {
         return None;
     }
@@ -1562,7 +1594,7 @@ fn pem_end(body: &str, from: usize, last: bool) -> Option<Option<usize>> {
     // ending in `:`, `-` or a tab, with no space inside it).
     let mut line = body[..at].rfind('\n').map_or(0, |n| n + 1);
     let (mut scan, mut word, mut gap) = (line, false, false);
-    while let Some(n) = body[at..window].find("-----") {
+    while let Some(n) = find_dashes(&body[at..window]) {
         let dashes = at + n;
         if let Some(n) = body[at..dashes].rfind('\n') {
             line = at + n + 1;
@@ -1634,7 +1666,7 @@ fn pem_escaped(text: &str, begin: usize, last: bool) -> Escaped {
         false => Escaped::More,
     };
     let from = begin + BEGIN.len();
-    let Some(dashes) = text[from..].find("-----").map(|n| from + n + 5) else {
+    let Some(dashes) = find_dashes(&text[from..]).map(|n| from + n + 5) else {
         return Escaped::No;
     };
     if text[from..dashes].contains('\n') {
@@ -1674,48 +1706,60 @@ fn pem_escaped(text: &str, begin: usize, last: bool) -> Escaped {
         _ => return Escaped::No,
     };
     let header = dashes + escaped;
-    // Backslashes just read: a quote after an even run of them ends the
-    // string, so what follows is code, not the key.
-    let mut run = 0;
-    for (i, &b) in text.as_bytes()[header..].iter().enumerate() {
-        if i > PEM_LINE {
-            return Escaped::No;
-        }
-        let after = run;
-        run = if b == b'\\' { run + 1 } else { 0 };
-        if b == b'-' {
-            let tail = &text[header + i..];
-            if tail.len() < END.len() && END.starts_with(tail) {
-                return more;
-            }
-            if tail.starts_with(END) && i > 0 {
-                return Escaped::Key {
-                    escape: dashes,
-                    header,
-                    end: header + i,
-                };
-            }
-            // Another block's BEGIN at an escaped line's start ends this
-            // one; one inside a line, such as an armored key's `Comment:`,
-            // is that line's text.
-            let at = header + i;
-            let bytes = text.as_bytes();
-            if matches!(bytes[at - 1], b'n' | b'r') && bytes[at - 2] == b'\\' {
-                if tail.len() < BEGIN.len() && BEGIN.starts_with(tail) {
-                    return more;
-                }
-                if tail.starts_with(BEGIN) {
-                    return Escaped::No;
-                }
-            }
-            continue;
-        }
-        // An armored key's headers may hold any text; its line is one.
-        if b == b'\n' || b == b'\r' || (b == b'"' && after % 2 == 0) {
-            return Escaped::No;
-        }
+    let bytes = text.as_bytes();
+    // Its line, read to at most a line's worth with room for an END that
+    // starts at its end: a line's end is code, not a key.
+    let region = &text[header..text.floor_char_boundary(header + PEM_LINE + END.len())];
+    let mut line = region;
+    if let Some(n) = line.find('\n') {
+        line = &line[..n];
     }
-    more
+    if let Some(n) = line.find('\r') {
+        line = &line[..n];
+    }
+    let ended = line.len() < region.len() || text.len() >= header + PEM_LINE + END.len();
+    let end = match find_marker(line, END) {
+        Some(0) => find_marker(&line[1..], END).map(|n| n + 1),
+        end => end,
+    };
+    if end.is_some_and(|n| n > PEM_LINE) {
+        return Escaped::No;
+    }
+    let upto = end.unwrap_or(line.len());
+    // A quote after an even run of backslashes ends the string, so what
+    // follows is code, not the key.
+    let quoted = line[..upto].match_indices('"').any(|(q, _)| {
+        let run = line.as_bytes()[..q]
+            .iter()
+            .rev()
+            .take_while(|&&b| b == b'\\');
+        run.count() % 2 == 0
+    });
+    // Another block's BEGIN at an escaped line's start ends this one; one
+    // inside a line, such as an armored key's `Comment:`, is that line's
+    // text.
+    let mut begins = false;
+    let mut at = 0;
+    while let Some(p) = find_marker(&line[at..], BEGIN).map(|n| at + n) {
+        if p >= upto {
+            break;
+        }
+        if matches!(bytes[header + p - 1], b'n' | b'r') && bytes[header + p - 2] == b'\\' {
+            begins = true;
+            break;
+        }
+        at = p + 1;
+    }
+    match end {
+        _ if quoted || begins => Escaped::No,
+        Some(end) => Escaped::Key {
+            escape: dashes,
+            header,
+            end: header + end,
+        },
+        None if ended => Escaped::No,
+        None => more,
+    }
 }
 
 /// The most of one line a key's body is judged on: a line whose first
@@ -1747,7 +1791,7 @@ fn pem_text(line: &str) -> &str {
 fn pem_line(line: &str) -> bool {
     let line = pem_text(line).trim_matches([' ', '\t']);
     let head = &line[..line.floor_char_boundary(PEM_LINE)];
-    if head.contains("-----") {
+    if find_dashes(head).is_some() {
         return false;
     }
     if line.len() <= PEM_LINE && (head.contains("Proc-Type:") || head.contains("DEK-Info:")) {
@@ -5571,6 +5615,21 @@ mod tests {
                 "{hidden}"
             );
         }
+        // A long run of dashes is read once.
+        let run = format!(
+            "{}\n-----BEGIN PRIVATE KEY-----\nMIIE\n{}",
+            "-".repeat(1 << 20),
+            "-".repeat(1 << 20)
+        );
+        let began = std::time::Instant::now();
+        let mut redacting = Redacting::new(credentials.clone());
+        let mut out = String::new();
+        for piece in run.as_bytes().chunks(8192) {
+            out.push_str(&redacting.feed(piece));
+        }
+        out.push_str(&redacting.finish());
+        assert_eq!(out, redact(&run));
+        assert!(began.elapsed() < std::time::Duration::from_secs(5));
         // Many starts on one long line read it once, whole or in pieces.
         let starts = "-----BEGIN ".repeat(40_000) + "\nend\n";
         let began = std::time::Instant::now();
