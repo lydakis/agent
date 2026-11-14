@@ -2990,7 +2990,15 @@ impl Lookout {
     /// file should hold it: none waiting, no file.
     fn kept(&self) -> Option<(PathBuf, Option<Vec<u8>>)> {
         let path = self.held.clone()?;
-        let json = |heard: &sources::Heard| heard.event.to_json();
+        // A task's event keeps its place in the daemon's stream, so one
+        // read again after a restart is still told before it.
+        let json = |heard: &sources::Heard| {
+            let mut kept = heard.event.to_json();
+            if heard.order > 0 {
+                kept["order"] = json!(heard.order);
+            }
+            kept
+        };
         let sending: Vec<Value> = match &self.sending {
             Some((sent, ..)) => sent.iter().map(json).collect(),
             None => self.resend.iter().map(json).collect(),
@@ -3098,11 +3106,12 @@ impl Lookout {
             );
         let heard = |key: &str| -> Vec<sources::Heard> {
             (kept[key].as_array().into_iter().flatten())
-                .filter_map(sources::Event::from_json)
-                .map(|event| sources::Heard {
-                    event,
-                    subs: Vec::new(),
-                    order: 0,
+                .filter_map(|kept| {
+                    Some(sources::Heard {
+                        event: sources::Event::from_json(kept)?,
+                        subs: Vec::new(),
+                        order: kept["order"].as_i64().unwrap_or(0),
+                    })
                 })
                 .collect()
         };
@@ -3842,6 +3851,47 @@ mod tests {
             "[tasks · calc.fix · calc.docs]\nlook at this\n\
              [tasks · calc.fix · calc.fix replied, completed]\ndone"
         );
+    }
+
+    #[test]
+    fn a_task_s_event_kept_on_disk_keeps_its_place_for_one_read_again() {
+        let dir = std::env::temp_dir().join(format!("sonny-order-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("calc.lead.json");
+        let mut lookout = seated();
+        lookout.restore(path.clone());
+        let from = json!({"from": {"bot": "calc.docs"}, "node": 4});
+        lookout.event(&at(ev("calc.fix", 5, "queued", from), 10), None);
+        let finished = json!({"status": "completed"});
+        lookout.event(&at(ev("calc.fix", 4, "turn_finished", finished), 11), None);
+        let mut due = std::mem::take(&mut lookout.due);
+        let later = due.pop().unwrap();
+        let earlier = due.pop().unwrap();
+        let started = Instant::now();
+        for pending in [&earlier, &later] {
+            (lookout.reading).push((started, pending.task.clone(), pending.order));
+        }
+        // The later read ends and is kept; the lookout stops before the
+        // earlier one does.
+        lookout.read(started, &later, says("done")(&later));
+        lookout.flush();
+        held::written();
+        let mut again = seated();
+        again.restore(path.clone());
+        assert_eq!(again.heard.len(), 1);
+        assert_eq!(again.heard[0].order, later.order);
+        // Read again from the stream, the earlier one holds it back while
+        // under way, and is told before it.
+        again
+            .reading
+            .push((started, earlier.task.clone(), earlier.order));
+        assert!(again.blocked(&again.heard[0]));
+        again.read(started, &earlier, says("look at this")(&earlier));
+        let froms: Vec<&str> = (again.heard.iter())
+            .map(|heard| heard.event.from.as_deref().unwrap())
+            .collect();
+        assert_eq!(froms, ["calc.docs", "calc.fix replied, completed"]);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
