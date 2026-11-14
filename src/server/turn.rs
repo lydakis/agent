@@ -4514,6 +4514,15 @@ impl Turn {
             // Where its row in the audit trail says it ran: a sandbox holds
             // writes only, so a sandboxed bot's read is within it.
             let in_sandbox = confined || (record.sandboxed() && call.name == "read");
+            if unasked {
+                let refused = call.clone();
+                self.store
+                    .op("refuse_unasked", move |db| {
+                        db.refuse_unasked(turn, &refused)
+                    })
+                    .await?;
+                continue;
+            }
             if approved {
                 match self
                     .approve(
@@ -4562,10 +4571,6 @@ impl Turn {
                     Err(Error::with("command_needs_approval", why.as_str()))
                 }
                 Err(error) => Err(error.clone()),
-                Ok(_) if unasked => Err(Error::with(
-                    "approval_refused",
-                    agent_runtime::store::NEVER_ASKS,
-                )),
                 Ok(_) => Ok(prepared),
             });
             let mut sandbox = None;

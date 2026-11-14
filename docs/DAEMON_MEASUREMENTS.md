@@ -9412,3 +9412,68 @@ The capture is this worktree's ignored `.local/bench/publish-screen-20261113/`.
 The parent checkout's `.local/bench/publish-20261113/` keeps binary hashes,
 compiler/test/process logs, gate output and the sequential screen runner.
 No paid providers or release artifacts were used.
+
+## A bot that never asks, and made bots held to their maker (#983)
+
+2026-11-14, Linux 6.18 cloud VM, 4 CPUs, Python 3 and the bench venv.
+Base is main `9556455`; head is this pull request with the second review
+round applied. Both are local release builds with the same locked
+dependencies. Binary SHA-256:
+
+- Base: `42af1d65ffd82d5e5b1e58f2d2cfa63dffaedb5b07c88a873f3e90360d2bd9a3`.
+- Head: `2c89990d3857991aac6524a289b23c75743e9e01d6bff1e24fd4275466bb97d0`.
+
+On the tool-execution path, each call adds one comparison
+(`approval_policy` is `never`), which short-circuits for every bot that
+doesn't set it. A bot that sets it gets a refused call as one storage job,
+the same job a gate's denial uses. On `create`, the made-bot checks
+(`Settings::beyond`, and a name lookup for a create asking for no gate)
+read only the creator's row the store already reads. There are no new
+per-bot fields beyond the one setting, and no new tasks or timers. The
+schema, sync policy and publication-after-commit boundaries are unchanged.
+
+### Required matched screen
+
+The four daemon screens ran in base/head/head/base order, with the Perf
+workflow's settings. Admission and completion use five measured repeats,
+footprint uses two (1,000 bots), and lifecycle uses one (32 bots, socket
+echo, five tool schemas). Each invocation has its usual excluded warmup.
+Footprint and lifecycle then ran three more times on each side, in
+head/base/base/head/head/base order, because the first two lifecycle runs
+on this shared VM were 0.37 to 0.47 s. The table gives the medians over
+every measured run.
+
+| Bench | Measure | Base | Head | Change |
+| --- | --- | ---: | ---: | ---: |
+| admission | lone submit CPU, ms | 25.984 | 25.428 | -2.1% |
+| admission | burst submit p99, ms | 3.477 | 3.340 | -3.9% |
+| completion | release to terminal p99, ms | 8.473 | 9.281 | +9.5% |
+| footprint | idle RSS, MiB | 16.43 | 16.586 | +1.0% |
+| footprint | per idle bot, KiB | 2.096 | 2.074 | -1.0% |
+| footprint | RSS after a turn each, MiB | 34.096 | 32.846 | -3.7% |
+| footprint | CPU per turn, ms | 0.699 | 0.733 | +4.9% |
+| lifecycle | CPU, s | 0.42 | 0.42 | +0.0% |
+| lifecycle | p95 turn, ms | 575.052 | 575.298 | +0.0% |
+| lifecycle | peak RSS, MiB | 24.797 | 25.363 | +2.3% |
+
+`bench.perf_gate` reports no count failures and no warnings: store work
+per turn is the same. The timing moves fall inside each other's ranges:
+
+- Footprint CPU per turn: base 0.595 to 0.743 ms, head 0.672 to 0.741 ms.
+- Lifecycle CPU: base 0.40 to 0.44 s, head 0.39 to 0.44 s.
+
+### Approval overhead at 1 and 400 bots
+
+`bench.approval_overhead`, on the same binaries before the review round,
+in alternating runs. The low end is 1 bot × 200 turns × 3 rounds; the high
+end is 400 bots × 8 turns × 5 rounds. Arms are `ungated`, and `held` (one
+gated `shell` call per turn, allowed within the hold).
+
+| Scale | Arm | CPU ms/turn, base → head | p50 ms | Store B/turn | Jobs/turn |
+| --- | --- | --- | --- | --- | --- |
+| 1 | ungated | 4.80 → 4.65 | 7.8 → 8.2 | 4772 → 4772 | 31.52 → 31.52 |
+| 1 | held | 5.40 → 5.00 | 9.1 → 8.7 | 5120 → 5120 | 33.52 → 33.52 |
+| 400 | ungated | 1.488 → 1.497 | 498 → 504 | 3269 → 3268 | 11.333 → 11.336 |
+| 400 | held | 2.141 → 2.197 | 770 → 767 | 3596 → 3594 | 13.266 → 13.267 |
+
+Ranges overlap at 400 held: base 2.11 to 2.25, head 2.14 to 2.29.

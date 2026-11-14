@@ -464,6 +464,11 @@ class ApprovalTests(ModelFixture):
         refused = self.tool_output(client, 'echo-2', bot='Sealed')[1]
         self.assertEqual(refused['error'], 'approval_refused', refused)
         self.assertIn('approval_policy is never', refused['detail'])
+        # Audited as denied by nobody, as a gate's denial is, never as a run
+        # that failed.
+        rows = {row['call_id']: row for row in
+                client.request('audit', bot='Sealed')['result']['rows']}
+        self.assertEqual((rows['echo-2']['outcome'], rows['echo-2']['approved']), ('denied', 'nobody'))
         self.assertEqual(self.tool_output(client, 'shell-3', bot='Sealed')[1]['exit_code'], 0)
         self.assertEqual(list(outside.iterdir()), [])
         self.assertTrue((self.path / 'inside').exists())

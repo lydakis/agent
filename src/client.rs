@@ -1543,13 +1543,18 @@ fn author() -> Result<Value> {
     }
 }
 
-/// The tools a bot record declares that one of its gates holds back.
+/// The tools a bot record declares, and passes to the bots it makes, that
+/// one of its gates holds back.
 fn held_declared(bot: &Value) -> Vec<&str> {
     let gated = |name: &str| {
         (bot["gates"].as_array().into_iter().flatten())
             .any(|gate| (gate["tools"].as_array().into_iter().flatten()).any(|tool| tool == name))
     };
+    // `false`, or no generations left, is kept from the bots it makes.
+    let passed =
+        |tool: &&Value| !matches!(&tool["inherit"], Value::Bool(false)) && tool["inherit"] != 0;
     (bot["declared"].as_array().into_iter().flatten())
+        .filter(passed)
         .filter_map(|tool| tool["name"].as_str())
         .filter(|name| gated(name))
         .collect()
@@ -4020,6 +4025,11 @@ mod tests {
         let maker = json!({"gates": [{"tag": "auto", "tools": ["shell", "start_task"]}],
             "declared": [{"name": "start_task"}, {"name": "memory"}]});
         assert_eq!(held_declared(&maker), ["start_task"]);
+        // One it keeps from the bots it makes is none of theirs to gate.
+        let kept = json!({"gates": [{"tag": "auto", "tools": ["new_project", "start_task"]}],
+            "declared": [{"name": "new_project", "inherit": false},
+                {"name": "start_task", "inherit": 2}]});
+        assert_eq!(held_declared(&kept), ["start_task"]);
         assert!(held_declared(&json!({"declared": [{"name": "start_task"}]})).is_empty());
     }
 

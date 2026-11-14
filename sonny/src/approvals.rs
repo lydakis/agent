@@ -191,14 +191,20 @@ pub fn looser(row: &Mode, maker: &Value) -> Option<String> {
         Some("workspace-write") => 1,
         _ => 2,
     };
-    let (mine, network, reached) = match &row.sandbox {
-        Sandbox::Full => (None, true, Vec::new()),
-        Sandbox::ReadOnly => (Some("read-only"), false, Vec::new()),
+    let (mine, network, reached, own) = match &row.sandbox {
+        Sandbox::Full => (None, true, Vec::new(), Vec::new()),
+        Sandbox::ReadOnly => (Some("read-only"), false, Vec::new(), Vec::new()),
         Sandbox::Workspace {
             network,
             unix_sockets,
+            writable,
             ..
-        } => (Some("workspace-write"), *network, sockets(unix_sockets)),
+        } => (
+            Some("workspace-write"),
+            *network,
+            sockets(unix_sockets),
+            real(writable),
+        ),
     };
     let name = row.name;
     if rank(mine) > rank(theirs) {
@@ -217,6 +223,22 @@ pub fn looser(row: &Mode, maker: &Value) -> Option<String> {
             return Some(format!(
                 "{name} reaches the socket {socket}, which you don't"
             ));
+        }
+        // A folder of the row's own, beside the agent's folder and its
+        // repository, that is neither in the maker's folder nor one it
+        // writes.
+        let mut writes: Vec<std::path::PathBuf> = list(settings, "writable")
+            .iter()
+            .map(std::path::PathBuf::from)
+            .collect();
+        writes.extend(maker["workspace"].as_str().map(std::path::PathBuf::from));
+        let outside = |folder: &&String| {
+            !writes
+                .iter()
+                .any(|root| std::path::Path::new(folder.as_str()).starts_with(root))
+        };
+        if let Some(folder) = own.iter().find(outside) {
+            return Some(format!("{name} writes {folder}, which you don't"));
         }
     }
     let Some(yours) = reviewer(maker) else {
@@ -1677,6 +1699,29 @@ mod tests {
         let why = looser(&row("ask"), &never).unwrap();
         assert!(why.contains("nothing that needs approval runs"), "{why}");
         assert_eq!(looser(&sealed_row, &never), None);
+        // A row of the person's own that writes a folder its maker doesn't.
+        let elsewhere = std::env::temp_dir().join(format!("sonny-looser-{}", std::process::id()));
+        std::fs::create_dir_all(elsewhere.join("inner")).unwrap();
+        let elsewhere = std::fs::canonicalize(&elsewhere).unwrap();
+        let wider = Mode {
+            name: "wider",
+            sandbox: Sandbox::Workspace {
+                network: true,
+                git: true,
+                writable: vec![elsewhere.join("inner").display().to_string()],
+                unix_sockets: Vec::new(),
+            },
+            ..row("auto")
+        };
+        let why = looser(&wider, &auto).unwrap();
+        assert!(why.contains("which you don't"), "{why}");
+        let mut writing = auto.clone();
+        writing["settings"]["writable"] = json!([elsewhere]);
+        assert_eq!(looser(&wider, &writing), None);
+        let mut inside = auto.clone();
+        inside["workspace"] = json!(elsewhere);
+        assert_eq!(looser(&wider, &inside), None);
+        std::fs::remove_dir_all(&elsewhere).unwrap();
         let asking = maker(json!([shell("manual")]), working.clone());
         assert!(looser(&row("auto"), &asking).is_some());
         assert_eq!(looser(&row("ask"), &asking), None);

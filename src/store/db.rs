@@ -8550,6 +8550,26 @@ impl Database {
     /// Start a gated call once its gates allow it, or end it denied: its
     /// row in the audit trail says it ran under its bot's sandbox when
     /// `confined`, and who decided it.
+    /// A call a gate would hold, of a bot that never asks: refused before
+    /// it starts, with no one asked, and audited as denied by nobody, as a
+    /// gate's denial is, so it never reads as a failed run.
+    pub fn refuse_unasked(&mut self, turn: i64, call: &ToolCall) -> Result<()> {
+        let bot = self.active(turn)?;
+        let tx = self.conn.savepoint()?;
+        deny(
+            &tx,
+            &bot,
+            turn,
+            call,
+            "approval_refused",
+            Some(NEVER_ASKS),
+            json!([]),
+            false,
+            "nobody",
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
     pub fn approval_start(
         &mut self,
         turn: i64,
@@ -8579,6 +8599,7 @@ impl Database {
                 &bot,
                 turn,
                 call,
+                "approval_denied",
                 denial.reason.as_deref(),
                 // Every accepted verdict, so replay keeps each approver's.
                 request.approvals(),
@@ -8662,6 +8683,7 @@ impl Database {
                 &bot,
                 turn,
                 call,
+                "approval_denied",
                 Some("not reviewed: no verdict"),
                 lapsed,
                 true,
@@ -15162,6 +15184,7 @@ fn deny(
     bot: &Bot,
     turn: i64,
     call: &ToolCall,
+    error: &str,
     reason: Option<&str>,
     approvals: Value,
     expired: bool,
@@ -15169,7 +15192,7 @@ fn deny(
 ) -> Result<()> {
     let call_id = call.call_id.as_str();
     audit_call(tx, bot, turn, call, false, approved, "denied")?;
-    let output = json!({"error":"approval_denied","detail":reason}).to_string();
+    let output = json!({"error":error,"detail":reason}).to_string();
     let item = bot
         .family()?
         .tool_result_item(call_id, call.custom, &output)?;
