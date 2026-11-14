@@ -611,9 +611,11 @@ impl Pane {
         // what is open the first step back, while either goes somewhere.
         let mut head = vec![Span::raw(" ")];
         if self.arrows() {
-            let arrow = |text, there: bool| match there {
-                true => Span::raw(text),
-                false => Span::raw(text).dark_gray(),
+            // One that goes nowhere is faint, as structure that is not text.
+            let arrow = |text, there: bool| match (there, crate::look::faint()) {
+                (true, _) => Span::raw(text),
+                (false, Some(faint)) => Span::raw(text).fg(faint),
+                (false, None) => Span::raw(text).dim(),
             };
             head.push(arrow("‹", self.goes_back()));
             head.push(Span::raw(" "));

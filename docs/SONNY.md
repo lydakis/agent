@@ -1075,8 +1075,8 @@ starts a new run with an earlier run's answers, so only calls that changed
 cost model calls. `stop` interrupts a run's workers; it ends as stopped.
 
 `/status` shows each run that has not ended as one row in Working, under
-the agent that started it: its name, current phase and agents running, done
-and failed, and on `m` each phase's counts, its last `log()` line and its
+the agent that started it: its name, current phase and its agents
+working, finished and failed (`Verify · 12 working, 31 finished, 2 failed`), and on `m` each phase's counts, its last `log()` line and its
 output tokens. A window reads only what each journal gained since its last
 look. With a run's row picked, `s` stops it: the window leaves a `stop`
 file in the run's folder, and the host running it stops it within a
