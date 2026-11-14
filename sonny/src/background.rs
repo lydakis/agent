@@ -362,10 +362,10 @@ fn trigger_item(row: &Value, bots: Vec<String>) -> Item {
             .unwrap_or_default();
         let detail = match last["detail"].as_str() {
             Some(detail) if outcome == "failed" => {
-                failed = Some(first_line(detail));
+                failed = Some(detail_line(detail));
                 String::new()
             }
-            Some(detail) if outcome != "sent" => format!(": {}", first_line(detail)),
+            Some(detail) if outcome != "sent" => format!(": {}", detail_line(detail)),
             _ => String::new(),
         };
         facts.push(format!("last {outcome}{ago}{detail}"));
@@ -377,7 +377,7 @@ fn trigger_item(row: &Value, bots: Vec<String>) -> Item {
             Some(_) => {
                 facts.push("its turn failed".into());
                 failed = Some(match last["turn_error"].as_str() {
-                    Some(error) if !error.is_empty() => first_line(error),
+                    Some(error) if !error.is_empty() => detail_line(error),
                     _ => "its turn failed".into(),
                 });
             }
@@ -389,7 +389,7 @@ fn trigger_item(row: &Value, bots: Vec<String>) -> Item {
         if last["reply"]["outcome"] == "failed" && failed.is_none() {
             facts.push("its answer was not passed on".into());
             failed = Some(match last["reply"]["detail"].as_str() {
-                Some(detail) if !detail.is_empty() => first_line(detail),
+                Some(detail) if !detail.is_empty() => detail_line(detail),
                 _ => "its answer was not passed on".into(),
             });
         }
@@ -407,7 +407,7 @@ fn trigger_item(row: &Value, bots: Vec<String>) -> Item {
         Some("failed") => {
             facts.push(format!("could not check since{}", checked_ago("since_ms")));
             failed = Some(match checked["detail"].as_str() {
-                Some(detail) if !detail.is_empty() => first_line(detail),
+                Some(detail) if !detail.is_empty() => detail_line(detail),
                 _ => "could not check".into(),
             });
             // One break, however many checks it failed and whatever each
@@ -1113,6 +1113,15 @@ fn ago(seconds: u64) -> String {
     }
 }
 
+/// What a run came to, on one line, a daemon's error code at its start
+/// in the Rulebook's words: the daemon keeps `bot` inside itself.
+fn detail_line(detail: &str) -> String {
+    let codes = [("bot_busy", "busy"), ("bot_not_found", "agent not found")];
+    let worded = (codes.iter())
+        .find_map(|(code, words)| Some(format!("{words}{}", detail.strip_prefix(code)?)));
+    first_line(worded.as_deref().unwrap_or(detail))
+}
+
 fn first_line(text: &str) -> String {
     let line = text.lines().next().unwrap_or("");
     let mut cut: String = line.chars().take(80).collect();
@@ -1236,7 +1245,7 @@ mod tests {
         let item = trigger_item(&row, vec!["calc.lead".into()]);
         assert_eq!(item.what, "Read the inbox…");
         assert_eq!(item.facts, ["sent 4 of 10", "last failed 3h ago"]);
-        assert_eq!(item.failed.as_deref(), Some("bot_busy: it works"));
+        assert_eq!(item.failed.as_deref(), Some("busy: it works"));
         assert_eq!(item.reply_to.as_deref(), Some("calc.lead"));
         // A later fire that failed the same way, sending no turn, is news.
         let mut later = row.clone();
@@ -1425,7 +1434,7 @@ mod tests {
         lost["last"]["reply"] = json!({"outcome": "failed", "detail": "bot_not_found: calc.lead"});
         trigger::with_turn(&mut lost, &turns);
         let lost = trigger_item(&lost, vec!["memory-cleanup".into()]);
-        assert_eq!(lost.failed.as_deref(), Some("bot_not_found: calc.lead"));
+        assert_eq!(lost.failed.as_deref(), Some("agent not found: calc.lead"));
         assert_eq!(lost.facts[2], "its answer was not passed on");
         // Not asked yet: the window asks the daemon for it.
         let running = ended("h4");

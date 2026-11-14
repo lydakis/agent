@@ -5494,7 +5494,9 @@ fn slim(mut event: Value) -> Value {
             .and_then(|text| serde_json::from_str::<Value>(text).ok())
             .and_then(|call| {
                 let add = call.get("add")?.as_object()?;
-                let keys = ["name", "bot", "every", "in", "at", "cron", "file", "commit"];
+                let keys = [
+                    "name", "agent", "bot", "every", "in", "at", "cron", "file", "commit",
+                ];
                 let mut kept: serde_json::Map<String, Value> = (add.iter())
                     .filter(|(key, _)| keys.contains(&key.as_str()))
                     .map(|(key, value)| (key.clone(), value.clone()))
@@ -5520,7 +5522,8 @@ fn booking(arguments: &Value, by: &str) -> Option<Booking> {
     let call = serde_json::from_str::<Value>(arguments.as_str()?).ok()?;
     let add = call.get("add")?.as_object()?;
     let text = |key: &str| add.get(key).and_then(Value::as_str);
-    let bot = (text("bot"))
+    // `bot`, as before 0.10.0, in history.
+    let bot = (text("agent").or_else(|| text("bot")))
         .or_else(|| add.get("start")?.get("name")?.as_str())
         .unwrap_or(by)
         .to_owned();
@@ -6530,7 +6533,7 @@ mod tests {
         };
         send.send(add(
             "c1",
-            json!({"bot": "shop.login", "every": "30m", "name": "login-ci", "message": "check CI"}),
+            json!({"agent": "shop.login", "every": "30m", "name": "login-ci", "message": "check CI"}),
         ))
         .unwrap();
         // One the tool refuses is told of not at all.
@@ -6649,7 +6652,7 @@ mod tests {
 
     #[test]
     fn a_schedule_s_call_keeps_whom_and_how_often_on_the_tape_not_its_message() {
-        let arguments = json!({"add": {"bot": "b", "every": "1h", "message": "secret",
+        let arguments = json!({"add": {"agent": "b", "every": "1h", "message": "secret",
             "if": "test -f x", "start": {"name": "n", "model": "m"}}})
         .to_string();
         let call = json!({"event": "tool_started", "bot": "a", "written_ms": 1,
@@ -6658,7 +6661,7 @@ mod tests {
         let kept: Value = serde_json::from_str(&kept).unwrap();
         assert_eq!(
             kept,
-            json!({"add": {"bot": "b", "every": "1h", "start": {"name": "n"}}})
+            json!({"add": {"agent": "b", "every": "1h", "start": {"name": "n"}}})
         );
         let booked = booking(&json!(kept.to_string()), "a").unwrap();
         assert_eq!(
@@ -6669,6 +6672,9 @@ mod tests {
             ),
             ("b", "every 1h", "b")
         );
+        // `bot`, as a call before 0.10.0 named it, in history.
+        let old = booking(&json!(r#"{"add":{"bot":"b","every":"1h"}}"#), "a").unwrap();
+        assert_eq!(old.bot, "b");
         // For itself when it names no other; cut short, nothing.
         let own = booking(&json!(r#"{"add":{"file":"/x","message":"m"}}"#), "a").unwrap();
         assert_eq!((own.bot.as_str(), own.when.as_str()), ("a", "file"));

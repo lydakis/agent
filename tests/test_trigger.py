@@ -789,7 +789,7 @@ class TriggerFireTests(ModelFixture):
 
         doorbell = self.home / '.agent/automations/.ring'
         self.assertTrue(self.until(doorbell.exists, 30), 'the scheduler did not open its doorbell')
-        automation('add', '--bot', 'p.task', '--name', 'gated', '--every', '30m', '--if', 'true', '--', 'look')
+        automation('add', '--agent', 'p.task', '--name', 'gated', '--every', '30m', '--if', 'true', '--', 'look')
         written = json.loads(job(self.home, 'gated').read_text())
         self.assertEqual(written['environment']['AGENT_BIN'], str(self.binary))
         (row,) = automation('ls')['automations']
@@ -955,7 +955,7 @@ class TriggerFireTests(ModelFixture):
             return result
 
         # A one-off: the scheduler fires it at its minute, the bot gets the message, and it ends itself.
-        trigger('add', '--bot', 'p.task', '--name', name, '--in', '1m', '--', 'the scheduler says hi')
+        trigger('add', '--agent', 'p.task', '--name', name, '--in', '1m', '--', 'the scheduler says hi')
         self.assertTrue(job(self.home, name).exists())
         self.assertTrue(self.until(lambda: len(self.turns('p.task')) == 2, 150), 'the scheduler did not fire it')
         self.assertTrue(self.until(lambda: not job(self.home, name).exists(), 30), 'it did not end itself')
@@ -963,10 +963,10 @@ class TriggerFireTests(ModelFixture):
         self.assertEqual([(r['name'], r['ended'], r['last']['outcome']) for r in ended], [(name, True, 'sent')])
         # A file trigger: a write to the file fires it; the same add again is that trigger.
         watched = self.path / 'notes.md'
-        trigger('add', '--bot', 'p.task', '--name', name, '--file', str(watched), '--', 'notes changed')
-        self.assertTrue(json.loads(trigger('add', '--bot', 'p.task', '--name', name, '--file', str(watched),
+        trigger('add', '--agent', 'p.task', '--name', name, '--file', str(watched), '--', 'notes changed')
+        self.assertTrue(json.loads(trigger('add', '--agent', 'p.task', '--name', name, '--file', str(watched),
                                            '--', 'notes changed').stdout)['duplicate'])
-        other = trigger('add', '--bot', 'p.task', '--name', name, '--every', '1h', '--', 'b', ok=False)
+        other = trigger('add', '--agent', 'p.task', '--name', name, '--every', '1h', '--', 'b', ok=False)
         self.assertEqual(json.loads(other.stderr)['field'], 'when')
         watched.write_text('synthetic\n')
         self.assertTrue(self.until(lambda: len(self.turns('p.task')) == 3, 60), 'it did not fire on the write')
@@ -979,8 +979,8 @@ class TriggerFireTests(ModelFixture):
         self.assertEqual(fired['handle'], f"p.task/{self.turns('p.task')[-1]['turn']}")
         self.assertTrue(self.turns('p.task')[-1]['prompt_preview'].startswith(f'[automation {name} · '))
         # A trigger that recurs leaves the scheduler as it was: nothing for the system to tell anyone about.
-        trigger('add', '--bot', 'p.task', '--name', 'p.next', '--every', '30m', '--', 'look')
-        trigger('add', '--bot', 'p.task', '--name', 'p.next', '--every', '30m', '--replace', '--', 'look again')
+        trigger('add', '--agent', 'p.task', '--name', 'p.next', '--every', '30m', '--', 'look')
+        trigger('add', '--agent', 'p.task', '--name', 'p.next', '--every', '30m', '--replace', '--', 'look again')
         self.assertIn('look again', job(self.home, 'p.next').read_text())
         trigger('rm', name)
         trigger('rm', 'p.next')
@@ -1012,7 +1012,7 @@ class TriggerFireTests(ModelFixture):
             except OSError:
                 return False
         self.assertTrue(self.until(listening, 30), 'the scheduler did not open its doorbell')
-        added = subprocess.run([str(SONNY), 'automation', 'add', '--bot', 'p.task', '--name', 'ztest-gone',
+        added = subprocess.run([str(SONNY), 'automation', 'add', '--agent', 'p.task', '--name', 'ztest-gone',
                                 '--every', '30m', '--', 'nobody home'], env=env, capture_output=True, text=True,
                                timeout=120)
         self.assertEqual(added.returncode, 0, added.stderr)
@@ -1069,13 +1069,13 @@ class TriggerFireTests(ModelFixture):
             return result
 
         # The first trigger sets the job up; the system runs the scheduler, which fires it.
-        trigger('add', '--bot', 'p.task', '--name', 'ztest', '--in', '1m', '--', 'the system says hi')
+        trigger('add', '--agent', 'p.task', '--name', 'ztest', '--in', '1m', '--', 'the system says hi')
         self.assertTrue(job_file.exists())
         written = job_file.stat().st_mtime_ns
         self.assertTrue(self.until(running, 30), 'the system did not run the scheduler')
         # Every trigger after, and every replace, leaves the job as it was.
         for message in ('look', 'look again', 'and again'):
-            trigger('add', '--bot', 'p.task', '--name', 'p.next', '--every', '30m', '--replace', '--', message)
+            trigger('add', '--agent', 'p.task', '--name', 'p.next', '--every', '30m', '--replace', '--', message)
         self.assertEqual(job_file.stat().st_mtime_ns, written)
         self.assertTrue(self.until(lambda: len(self.turns('p.task')) == 2, 150), 'the scheduler did not fire it')
         trigger('rm', 'p.next')

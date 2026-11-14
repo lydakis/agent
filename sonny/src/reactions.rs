@@ -245,14 +245,14 @@ pub fn tool() -> Value {
             replaces an answer: when the person asked something, answer in words. When a reaction is all \
             their message needs, react and end your turn without words. `remove` takes off a reaction you \
             added, such as one that said you were looking into it, once you have answered. React only to \
-            the person, never to another agent's messages. With `bot`, it reacts to the person's newest \
+            the person, never to another agent's messages. With `agent`, it reacts to the person's newest \
             message in that agent instead, such as what they wrote in one of your tasks that you picked up.",
         "parameters": {
             "type": "object",
             "properties": {
                 "emoji": {"type": "string", "description": "One emoji, such as 👍."},
                 "remove": {"type": "boolean", "description": "Take this reaction off instead."},
-                "bot": {"type": "string", "minLength": 1,
+                "agent": {"type": "string", "minLength": 1,
                     "description": "Another agent, to react to the person's newest message there."}
             },
             "required": ["emoji"],
@@ -271,7 +271,7 @@ pub fn call(arguments: &Value) -> Option<(String, bool)> {
 /// The other agent a `react` call names, whose person's message it is for
 /// rather than the caller's own.
 pub fn target(arguments: &Value) -> Option<&str> {
-    arguments["bot"]
+    arguments["agent"]
         .as_str()
         .map(str::trim)
         .filter(|bot| !bot.is_empty())
@@ -584,7 +584,7 @@ mod tests {
             answer(&client, store, "calc.lead", &own).await,
             Ok("Done.".into())
         );
-        let outside = json!({"emoji": "👀", "bot": "ws.fix"});
+        let outside = json!({"emoji": "👀", "agent": "ws.fix"});
         let refused = answer(&client, store, "calc.lead", &outside).await;
         assert_eq!(refused.map_err(|e| e.0), Err("react_refused"));
     }
@@ -648,10 +648,10 @@ mod tests {
         assert!(picked.on(12).is_empty());
         let target = |arguments: Value| target(&arguments).map(str::to_owned);
         assert_eq!(
-            target(json!({"emoji": "👀", "bot": "calc.tui"})).as_deref(),
+            target(json!({"emoji": "👀", "agent": "calc.tui"})).as_deref(),
             Some("calc.tui")
         );
-        assert_eq!(target(json!({"emoji": "👀", "bot": " "})), None);
+        assert_eq!(target(json!({"emoji": "👀", "agent": " "})), None);
         assert_eq!(target(json!({"emoji": "👀"})), None);
         let _ = std::fs::remove_dir_all(&dir);
     }

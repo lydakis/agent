@@ -2803,7 +2803,7 @@ async fn run() -> Result<(), String> {
         }
         return Err(format!("could not open {other}: {error}"));
     }
-    // Sonny was updated while this window was open: it goes on as the new
+    // Sonny was upgraded while this window was open: it goes on as the new
     // Sonny, in this same terminal, on the same agent, with what was typed.
     if let (Ok(()), Some(program)) = (&result, app.reopen_on.take()) {
         use std::os::unix::process::CommandExt;
@@ -3719,13 +3719,14 @@ const HISTORY_NODES: usize = 400;
 /// The most denials `/retry` offers.
 const DENIALS: usize = 8;
 
-/// What the person sends to approve one retry of a denied call: their own
-/// words, so the judge reads the consent, as Codex words it.
+/// What the person sends to allow one retry of a denied call: their own
+/// words, so the reviewer reads the consent, as Codex words it, in the
+/// Rulebook's word for it.
 fn approval(denial: &Denial) -> String {
     format!(
-        "I approve one retry of the action the reviewer denied: {} {}\n\n\
-         Treat this as approval to perform that exact action in the same context in which it \
-         was originally requested. Do not assume this also authorizes similar operations with \
+        "I allow one retry of the action the reviewer denied: {} {}\n\n\
+         Treat this as permission to perform that exact action in the same context in which it \
+         was originally requested. Do not assume this also allows similar operations with \
          different payloads.",
         denial.name, denial.arguments
     )
@@ -6441,7 +6442,7 @@ impl App {
         }
         if self.options.reopened {
             self.notice = Some(format!(
-                "Sonny was updated; this window reopened on {}",
+                "Sonny was upgraded; this window reopened on {}",
                 env!("CARGO_PKG_VERSION")
             ));
         }
@@ -7544,7 +7545,7 @@ impl App {
     /// what happened meanwhile: the bot's new items, and a turn that ended
     /// or began. Tried again every two seconds until it works.
     async fn reattach(&mut self, events: &mut Events) {
-        // Sonny was updated while this window was open: the daemon it lost
+        // Sonny was upgraded while this window was open: the daemon it lost
         // is likely the old one, and what this window would start again is
         // its own older build. It reopens on the new one, in place.
         if let Some(program) = update::installed_since() {
@@ -12361,7 +12362,7 @@ impl App {
         self.denials.retain(|d| d.call_id != denied.call_id);
         let sent = self.send(approval(&denied), None, false, false, &[]).await;
         self.notice = Some(match sent {
-            Ok(()) => "approved one retry; the retry is still reviewed".into(),
+            Ok(()) => "allowed one retry; the retry is still reviewed".into(),
             Err(error) => {
                 self.denials = kept;
                 error
@@ -17290,11 +17291,11 @@ impl App {
                     list::lines(&items, list.at(), width, composer.y as usize),
                     composer,
                 );
-                let (line, cursor) = list.line("reviewer denials: approve one retry");
+                let (line, cursor) = list.line("reviewer denials: allow one retry");
                 frame.render_widget(Paragraph::new(line), composer);
                 frame.set_cursor_position((composer.x + cursor, composer.y));
                 let keys = Line::from(hint::spans(
-                    "  ↑↓ pick · enter read, again approve one retry · esc close",
+                    "  ↑↓ pick · enter read, again allow one retry · esc close",
                 ));
                 frame.render_widget(Paragraph::new(keys), footer);
                 return;
@@ -19162,7 +19163,10 @@ mod tests {
             (2, call("ran", "shell", "{}")),
             (3, result("ran")),
             (4, call("here", "react", r#"{"emoji":"👍"}"#)),
-            (5, call("there", "react", r#"{"emoji":"👍","bot":"other"}"#)),
+            (
+                5,
+                call("there", "react", r#"{"emoji":"👍","agent":"other"}"#),
+            ),
             (6, result("here")),
             (6, result("there")),
         ];
@@ -22279,9 +22283,9 @@ mod tests {
         app.denials.clear();
         let prompt = sent.lock().unwrap()[0].as_str().unwrap().to_owned();
         assert!(prompt.starts_with(
-            "I approve one retry of the action the reviewer denied: shell {\"command\":\"git push --force origin main\"}"
+            "I allow one retry of the action the reviewer denied: shell {\"command\":\"git push --force origin main\"}"
         ));
-        assert!(prompt.contains("Do not assume this also authorizes similar operations"));
+        assert!(prompt.contains("Do not assume this also allows similar operations"));
         // Nothing left to approve.
         app.input.set("/retry");
         app.submit().await;

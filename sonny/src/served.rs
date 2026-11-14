@@ -132,9 +132,9 @@ fn start() -> Value {
             task a git worktree of its lead's repository on the branch agent/NAME, from the last commit (a task's \
             own helper, from the last commit on that task's branch), so uncommitted changes are not in it; outside git, the task works in this folder itself, shared with you and \
             its other tasks. With own_folder, it gets an empty folder of its own instead, where it makes what it \
-            changes, such as a workspace made with this folder's tooling, as the brief says how, and reads this \
+            changes, such as a checkout made with this folder's tooling, as the brief says how, and reads this \
             folder where it is. With setup, the folder's .agents/setup runs in the task's folder first. The task starts there with this folder's rules, skills and \
-            memory, in the role named, and the brief as its first message. Paths in this folder that the brief \
+            memory, as the profile named, and the brief as its first message. Paths in this folder that the brief \
             names are turned into the task's own. The result is the task's turn handle; its work comes back on \
             its branch, here already as it commits.",
         "parameters": {
@@ -146,8 +146,8 @@ fn start() -> Value {
                 "brief": {"type": "string", "minLength": 1,
                     "description": "Everything the task needs, since it never sees your conversation."},
                 "profile": {"type": "string", "minLength": 1,
-                    "description": "A role listed under Profiles that fits the task; without one, it \
-                        starts in no role."},
+                    "description": "A profile listed under Profiles that fits the task; without one, it \
+                        starts with none."},
                 "permissions": {"type": "string", "minLength": 1,
                     "description": "One of the person's /permissions rows to hold the task tighter \
                         than you, such as one that refuses what would need approval; one looser \
@@ -158,7 +158,7 @@ fn start() -> Value {
                         then gets a worktree of that repository and works at that folder in it."},
                 "own_folder": {"type": "boolean",
                     "description": "An empty folder of the task's own instead of a worktree or this folder: \
-                        for work that makes its own copy of what it changes, such as a workspace on another \
+                        for work that makes its own copy of what it changes, such as a checkout of another \
                         branch made with this folder's tooling, or that must not touch this folder."},
                 "tab": {"type": "boolean",
                     "description": "A tab of its own, for a task the person will want to watch or talk to, \
@@ -364,7 +364,7 @@ fn automations() -> Value {
                             "description": "Runs when this file is written."},
                         "commit": {"type": "string", "minLength": 1,
                             "description": "Runs when this repository gets a new commit."},
-                        "bot": {"type": "string", "minLength": 1,
+                        "agent": {"type": "string", "minLength": 1,
                             "description": "The agent it messages; you when neither this nor start is given."},
                         "start": {
                             "type": "object",
@@ -375,7 +375,7 @@ fn automations() -> Value {
                             },
                             "required": ["name", "model"],
                             "additionalProperties": false,
-                            "description": "An agent the first run makes, in your folder as a task is made, \
+                            "description": "An agent the first run starts, in your folder as a task is started, \
                                 and later runs message."
                         },
                         "reply_to": {"type": "string", "minLength": 1,

@@ -53,7 +53,7 @@ sandbox. For people, scripts and other harnesses, Sonny writes
 `sonny automation`:
 
 ```sh
-~/.agent/automation add [--name NAME] [WHEN] [--bot NAME | --start NAME --model PROVIDER/MODEL [--effort LEVEL]] [--reply-to BOT] [--if CMD] [--runs N] [--until 'YYYY-MM-DD HH:MM'] [--turn-budget-tokens N [--budget-counts work]] [--shadow] [--live] -- MESSAGE
+~/.agent/automation add [--name NAME] [WHEN] [--agent NAME | --start NAME --model PROVIDER/MODEL [--effort LEVEL]] [--reply-to AGENT] [--if CMD] [--runs N] [--until 'YYYY-MM-DD HH:MM'] [--turn-budget-tokens N [--budget-counts work]] [--shadow] [--live] -- MESSAGE
   WHEN: --every 30m | --in 45m | --at 'YYYY-MM-DD HH:MM' | --cron 'MIN HOUR DAY MONTH WEEKDAY' | --file PATH | --commit REPO
 ~/.agent/automation ls [--after NAME]
 ~/.agent/automation show NAME
@@ -141,8 +141,8 @@ WHEN, only `run` runs it (its `when` reads `on demand`); `run` while a fire stil
 fire once it is done.
 
 **Whom.** `add` defaults to the agent whose shell runs it (`AGENT_BOT`,
-which must still match `AGENT_BOT_ID`); `--bot` names another. Either is
-pinned by its id: a bot deleted since, or a new bot under its name, is not
+which must still match `AGENT_BOT_ID`); `--agent` names another. Either is
+pinned by its id: an agent deleted since, or a new agent under its name, is not
 reached (`bot_not_found`), and the automation ends. `--start NAME --model
 PROVIDER/MODEL [--effort LEVEL]` names an agent that does not exist yet:
 the first fire makes it as Sonny makes an agent (the daemon's `create`,
@@ -923,7 +923,7 @@ daemon and the Sonny installed where it runs from is another program
 on that one in place, in the same terminal, with its own arguments, on the
 same agent, and with what was typed in its composer back in it unsent,
 pasted pictures and all, as `/new` hands its first message on in a file; the reopened window says
-`Sonny was updated; this window reopened on VERSION`. A window that meets
+`Sonny was upgraded; this window reopened on VERSION`. A window that meets
 a newer daemon with no newer Sonny installed here still says `Sonny was
 upgraded; reopen this window` and starts nothing.
 
