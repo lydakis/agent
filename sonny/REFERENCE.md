@@ -2013,7 +2013,7 @@ hears them), `file('state.json')` (a file in its folder, `| fromjson`
 making JSON fields of it; one in a folder kept from agents, `~/.agent/keys`
 and the config's `[sandbox] unreadable`, is refused with `read_denied`,
 whatever link or path leads there), `modified('state.json')` (when it
-last changed, none while it is not there), `tasks()` and `task('NAME')`
+last changed, none while it is not there, refused as `file()` is), `tasks()` and `task('NAME')`
 (where its tasks stand, as `/status` reads them), `now()`, and `| ago`
 and `| time` for a time in seconds; Jinja's own filters, such as
 `selectattr`, `sort` and `tojson`, work as well. A blank never runs a command or reaches the network, so an agent

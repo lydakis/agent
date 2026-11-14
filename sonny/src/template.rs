@@ -460,18 +460,16 @@ fn blanks(env: &mut Environment<'static>, data: &Data, reads: &Arc<Mutex<Reads>>
         crate::margin::read(&path, hidden).map_err(failed)
     });
     let (r, d) = (reads.clone(), data.clone());
-    env.add_function("modified", move |path: String| -> Value {
+    let kept = Arc::new(std::sync::OnceLock::new());
+    env.add_function("modified", move |path: String| -> Result<Value, Error> {
         let path = d.folder.join(path.trim());
         let stamp = stamp(&path);
         read(&r, &|reads| {
             reads.files.insert(path.clone());
             reads.seen.insert(path.clone(), stamp);
         });
-        let since = |at: SystemTime| at.duration_since(SystemTime::UNIX_EPOCH).ok();
-        match stamp.1.and_then(since) {
-            Some(at) => Value::from(at.as_secs() as i64),
-            None => Value::from(()),
-        }
+        let hidden = kept.get_or_init(hidden).as_ref().map_err(failed)?;
+        modified(&path, hidden).map_err(failed)
     });
     let (r, d) = (reads.clone(), data.clone());
     env.add_function("tasks", move || {
@@ -537,6 +535,39 @@ fn hidden() -> Result<Vec<PathBuf>, String> {
     Ok((agent_client::hidden::folders(&config).into_iter())
         .map(|folder| std::fs::canonicalize(&folder).unwrap_or(folder))
         .collect())
+}
+
+/// When the file at `path` last changed, in seconds, none while it is not
+/// there; refused, as `file()` is, when what was opened is in one of
+/// `hidden`, so a blank can't tell when a key changed either.
+fn modified(path: &Path, hidden: &[PathBuf]) -> Result<Value, String> {
+    use std::os::unix::fs::OpenOptionsExt;
+    // A pipe opened without O_NONBLOCK would hold the window up.
+    let Ok(file) = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK)
+        .open(path)
+    else {
+        return Ok(Value::from(()));
+    };
+    if agent_client::hidden::holds(hidden, &file) {
+        return Err(format!(
+            "read_denied: {} is kept unreadable from agents",
+            path.display()
+        ));
+    }
+    let since = |at: SystemTime| at.duration_since(SystemTime::UNIX_EPOCH).ok();
+    Ok(
+        match file
+            .metadata()
+            .and_then(|meta| meta.modified())
+            .ok()
+            .and_then(since)
+        {
+            Some(at) => Value::from(at.as_secs() as i64),
+            None => Value::from(()),
+        },
+    )
 }
 
 fn failed(why: impl Into<String>) -> Error {
@@ -830,6 +861,30 @@ mod tests {
         );
         std::fs::write(dir.join("gone.json"), "{}").unwrap();
         assert!(changed(&reads), "a file written since shows");
+    }
+
+    #[test]
+    fn modified_refuses_a_file_in_a_kept_folder_by_where_it_leads() {
+        let dir = tempfile_dir("modified-kept");
+        let keys = dir.join("keys");
+        std::fs::create_dir_all(&keys).unwrap();
+        std::fs::write(keys.join("env"), "KEY=x").unwrap();
+        std::fs::write(dir.join("plain"), "x").unwrap();
+        let link = dir.join("link");
+        let _ = std::fs::remove_file(&link);
+        std::os::unix::fs::symlink(keys.join("env"), &link).unwrap();
+        let hidden = [std::fs::canonicalize(&keys).unwrap()];
+        for path in [keys.join("env"), link] {
+            let refused = modified(&path, &hidden).unwrap_err();
+            assert!(refused.starts_with("read_denied: "), "{refused}");
+        }
+        assert!(
+            modified(&dir.join("plain"), &hidden)
+                .unwrap()
+                .as_i64()
+                .is_some()
+        );
+        assert!(modified(&dir.join("gone"), &hidden).unwrap().is_none());
     }
 
     #[test]
