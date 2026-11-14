@@ -611,7 +611,11 @@ pub fn agent_inside(command: &str) -> bool {
                 return false;
             };
             if !matches!(program.as_str(), "$AGENT_BIN" | "${AGENT_BIN}" | "agent")
-                || (words.iter()).any(|w| w == "--store" || w.starts_with("--store="))
+                || (words.iter()).any(|w| {
+                    ["--store", "--socket"].iter().any(|flag| {
+                        w == flag || w.strip_prefix(flag).is_some_and(|r| r.starts_with('='))
+                    })
+                })
             {
                 return false;
             }
@@ -1457,6 +1461,9 @@ Keep the rest.'"#,
             r#""$AGENT_BIN" run -- go"#,
             r#""$AGENT_BIN" run --bot shop.y --fork shop.fix -- go"#,
             r#""$AGENT_BIN" --store /tmp/s ls"#,
+            r#""$AGENT_BIN" --socket /tmp/other.sock ls"#,
+            r#""$AGENT_BIN" ls --socket=/tmp/other.sock"#,
+            r#"AGENT_SOCKET=/tmp/other.sock "$AGENT_BIN" ls"#,
             r#"AGENT_STORE=/tmp/s "$AGENT_BIN" ls"#,
             r#""$AGENT_BIN" start"#,
             r#""$AGENT_BIN" answer --bot shop.fix --turn 3 --allow"#,

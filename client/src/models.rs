@@ -76,9 +76,14 @@ pub fn read(path: &Path) -> Result<Vec<Model>, Error> {
 /// The models the person lists at `path`, in their order, less those
 /// they hide: their own lines only, none of the catalog's.
 pub fn mine(path: &Path) -> Result<Vec<Model>, Error> {
-    let listed = lines_at(path)?.into_iter();
+    let lines = lines_at(path)?;
+    let hidden: std::collections::HashSet<String> = (lines.iter())
+        .filter(|(hide, _)| *hide)
+        .map(|(_, model)| model.id.clone())
+        .collect();
+    let listed = lines.into_iter();
     Ok(listed
-        .filter_map(|(hide, model)| (!hide).then_some(model))
+        .filter_map(|(hide, model)| (!hide && !hidden.contains(&model.id)).then_some(model))
         .collect())
 }
 
@@ -663,7 +668,11 @@ mod tests {
     fn the_persons_own_models_leave_out_the_catalog() {
         let dir = temp("mine");
         let list = dir.join("models");
-        std::fs::write(&list, "openai/a  # fast\n-openai/b\nopenai/c\n").unwrap();
+        std::fs::write(
+            &list,
+            "openai/a  # fast\n-openai/b\nopenai/c\nopenai/e  # for reviews\n-openai/e\n",
+        )
+        .unwrap();
         std::fs::write(
             super::discovered(&list),
             "openai/b  # B\nopenai/d  # D, 200k tokens\n",
@@ -677,6 +686,7 @@ mod tests {
             ids(&super::read(&list).unwrap()),
             ["openai/a", "openai/c", "openai/d"]
         );
+        // A model they hide is left out wherever its line is.
         // No list of the person's is no models, whatever the catalog holds.
         std::fs::remove_file(&list).unwrap();
         assert!(super::mine(&list).unwrap().is_empty());
