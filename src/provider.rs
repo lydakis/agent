@@ -702,6 +702,78 @@ pub struct Chain<'a> {
     pub tail: Box<dyn FnOnce(usize) -> Items + Send + 'a>,
 }
 
+/// Read a streamed body into `parser`, publishing each delta, until it ends.
+/// `frames` counts the frames it held; while it named no content type
+/// (`unnamed`) and held none, `preview` keeps its first bytes.
+async fn read_body<E, F, Fut>(
+    stream: impl Stream<Item = std::result::Result<Bytes, E>>,
+    stall_timeout: Duration,
+    parser: &mut Parser,
+    delta: &mut F,
+    unnamed: bool,
+    frames: &mut usize,
+    preview: &mut Vec<u8>,
+) -> Result<()>
+where
+    F: FnMut(Delta) -> Fut,
+    Fut: Future<Output = Result<()>>,
+{
+    let mut stream = std::pin::pin!(stream);
+    let mut decoder = Decoder::default();
+    let mut total = 0usize;
+    // Only a content frame renews the stall deadline. The client's read
+    // timeout restarts on any byte, so pings alone never trip it.
+    let stall = tokio::time::sleep(stall_timeout);
+    tokio::pin!(stall);
+    loop {
+        let chunk = tokio::select! {
+            chunk = stream.next() => chunk,
+            () = &mut stall => return fail("provider_stream_stalled"),
+        };
+        let Some(chunk) = chunk else { break };
+        let chunk = chunk.map_err(|_| Error::new("provider_stream_failed"))?;
+        total += chunk.len();
+        if total > MAX_RESPONSE {
+            return fail("provider_response_limit");
+        }
+        if unnamed && *frames == 0 && preview.len() < 4096 {
+            let room = 4096 - preview.len();
+            preview.extend_from_slice(&chunk[..chunk.len().min(room)]);
+        }
+        let mut progressed = false;
+        for byte in chunk {
+            let Some(frame) = decoder.byte(byte)? else {
+                continue;
+            };
+            if unnamed && *frames == 0 {
+                // A completed frame rules out the no-frame diagnostic.
+                // Release its bounded preview for the rest of the stream.
+                *preview = Vec::new();
+            }
+            *frames += 1;
+            if frame == b"[DONE]" {
+                continue;
+            }
+            match parser.frame(&frame)? {
+                Frame::Keepalive => continue,
+                Frame::Delta(part) => delta(part).await?,
+                Frame::Quiet => {}
+            }
+            progressed = true;
+        }
+        // Renewed after publishing, so a slow consumer is not a stall.
+        if progressed {
+            stall
+                .as_mut()
+                .reset(tokio::time::Instant::now() + stall_timeout);
+        }
+    }
+    if !decoder.is_empty() {
+        return fail("truncated_sse_frame");
+    }
+    Ok(())
+}
+
 enum Parser {
     Responses(responses::State),
     Anthropic(anthropic::State),
@@ -1591,8 +1663,6 @@ impl Provider {
                 request_id.as_ref(),
             ));
         }
-        let mut stream = response.bytes_stream();
-        let mut decoder = Decoder::default();
         let mut parser = match self.family {
             Family::Responses => Parser::Responses(responses::State::default()),
             Family::Anthropic => {
@@ -1602,60 +1672,15 @@ impl Provider {
         let unnamed = content_type.is_none();
         let mut frames = 0usize;
         let mut preview = Vec::new();
-        let result = async {
-            let mut total = 0usize;
-            // Only a content frame renews the stall deadline. The client's
-            // read timeout restarts on any byte, so pings alone never trip it.
-            let stall = tokio::time::sleep(self.stall_timeout);
-            tokio::pin!(stall);
-            loop {
-                let chunk = tokio::select! {
-                    chunk = stream.next() => chunk,
-                    () = &mut stall => return fail("provider_stream_stalled"),
-                };
-                let Some(chunk) = chunk else { break };
-                let chunk = chunk.map_err(|_| Error::new("provider_stream_failed"))?;
-                total += chunk.len();
-                if total > MAX_RESPONSE {
-                    return fail("provider_response_limit");
-                }
-                if unnamed && frames == 0 && preview.len() < 4096 {
-                    let room = 4096 - preview.len();
-                    preview.extend_from_slice(&chunk[..chunk.len().min(room)]);
-                }
-                let mut progressed = false;
-                for byte in chunk {
-                    let Some(frame) = decoder.byte(byte)? else {
-                        continue;
-                    };
-                    if unnamed && frames == 0 {
-                        // A completed frame rules out the no-frame diagnostic.
-                        // Release its bounded preview for the rest of the stream.
-                        preview = Vec::new();
-                    }
-                    frames += 1;
-                    if frame == b"[DONE]" {
-                        continue;
-                    }
-                    match parser.frame(&frame)? {
-                        Frame::Keepalive => continue,
-                        Frame::Delta(part) => delta(part).await?,
-                        Frame::Quiet => {}
-                    }
-                    progressed = true;
-                }
-                // Renewed after publishing, so a slow consumer is not a stall.
-                if progressed {
-                    stall
-                        .as_mut()
-                        .reset(tokio::time::Instant::now() + self.stall_timeout);
-                }
-            }
-            if !decoder.is_empty() {
-                return fail("truncated_sse_frame");
-            }
-            Ok(())
-        }
+        let result = read_body(
+            response.bytes_stream(),
+            self.stall_timeout,
+            &mut parser,
+            &mut delta,
+            unnamed,
+            &mut frames,
+            &mut preview,
+        )
         .await;
         // A success that named no content type and carried no SSE frame was
         // not a stream: say so, with the short message it held, instead of
@@ -3458,8 +3483,37 @@ mod tests {
         assert_eq!(Transport::new(0, 0).unwrap().connections(), 1);
     }
 
-    /// Serve one SSE response: text deltas `gap` apart with a ping and a
-    /// comment keepalive between them, then only keepalives, forever.
+    /// An SSE body: text deltas `gap` apart with a ping and a comment
+    /// keepalive between them, then only keepalives, forever.
+    fn pings(deltas: usize, gap: Duration) -> impl Stream<Item = Bytes> {
+        fn frame(data: &str) -> String {
+            format!("data: {data}\n\n")
+        }
+        stream::unfold(0usize, move |step| async move {
+            let mut out = String::new();
+            if step == 0 {
+                out += &frame(r#"{"type":"message_start","message":{"usage":{"input_tokens":1}}}"#);
+                out += &frame(
+                    r#"{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}"#,
+                );
+            } else {
+                // A ping a quarter of the way to the next delta.
+                let wait = if step % 2 == 1 { gap / 4 } else { gap * 3 / 4 };
+                tokio::time::sleep(wait).await;
+            }
+            let n = step / 2;
+            if step % 2 == 0 && n < deltas {
+                out += &frame(&format!(
+                    r#"{{"type":"content_block_delta","index":0,"delta":{{"type":"text_delta","text":"{n}"}}}}"#
+                ));
+            }
+            out += &frame(r#"{"type":"ping"}"#);
+            out += ": keepalive\n\n";
+            Some((Bytes::from(out), step + 1))
+        })
+    }
+
+    /// Serve `pings` as one SSE response.
     async fn pinging(deltas: usize, gap: Duration) -> String {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -3474,41 +3528,63 @@ mod tests {
                 let n = socket.read(&mut buffer).await.unwrap();
                 request.extend_from_slice(&buffer[..n]);
             }
-            let frame = |data: &str| format!("data: {data}\n\n");
-            let mut out = String::from(
-                "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\nconnection: close\r\n\r\n",
-            );
-            out += &frame(r#"{"type":"message_start","message":{"usage":{"input_tokens":1}}}"#);
-            out += &frame(
-                r#"{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}"#,
-            );
-            let keepalive = frame(r#"{"type":"ping"}"#) + ": keepalive\n\n";
-            for n in 0.. {
-                if n < deltas {
-                    out += &frame(&format!(
-                        r#"{{"type":"content_block_delta","index":0,"delta":{{"type":"text_delta","text":"{n}"}}}}"#
-                    ));
-                }
-                out += &keepalive;
-                if socket.write_all(out.as_bytes()).await.is_err() {
+            let head =
+                "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\nconnection: close\r\n\r\n";
+            if socket.write_all(head.as_bytes()).await.is_err() {
+                return;
+            }
+            let mut body = std::pin::pin!(pings(deltas, gap));
+            while let Some(chunk) = body.next().await {
+                if socket.write_all(&chunk).await.is_err() {
                     return;
                 }
-                out.clear();
-                tokio::time::sleep(gap / 4).await;
-                if socket.write_all(keepalive.as_bytes()).await.is_err() {
-                    return;
-                }
-                tokio::time::sleep(gap * 3 / 4).await;
             }
         });
         url
     }
 
-    #[tokio::test]
+    /// On the runtime's own clock, which moves only when every task waits,
+    /// so where the stall falls is exact however loaded the machine is.
+    #[tokio::test(start_paused = true)]
     async fn a_stream_that_only_pings_stalls_after_its_last_content() {
         let gap = Duration::from_millis(100);
         let bound = Duration::from_millis(300);
-        let url = pinging(6, gap).await;
+        let body = pings(6, gap).map(Ok::<_, std::convert::Infallible>);
+        let mut parser = Parser::Anthropic(anthropic::State::new(false));
+        let mut text = String::new();
+        let mut delta = |delta| {
+            if let Delta::Text(_, part) = delta {
+                text.push_str(&part);
+            }
+            async { Ok(()) }
+        };
+        let (mut frames, mut preview) = (0, Vec::new());
+        let started = tokio::time::Instant::now();
+        let error = read_body(
+            body,
+            bound,
+            &mut parser,
+            &mut delta,
+            false,
+            &mut frames,
+            &mut preview,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.code, "provider_stream_stalled");
+        // Content kept the stream alive past the bound; pings did not.
+        assert_eq!(text, "012345");
+        let stalled = started.elapsed();
+        assert!(stalled >= gap * 5 + bound, "{stalled:?}");
+        assert!(stalled < gap * 5 + bound + gap / 4, "{stalled:?}");
+    }
+
+    /// Over HTTP, keepalives arrive well inside the bound, so only the
+    /// guard can end this call; the client's read timeout never fires.
+    #[tokio::test]
+    async fn a_provider_that_only_pings_is_ended_by_the_stall_guard() {
+        let bound = Duration::from_millis(300);
+        let url = pinging(1, Duration::from_millis(100)).await;
         let provider = Provider::new(Transport::new(0, 1).unwrap(), Family::Anthropic, &url, None)
             .unwrap()
             .with_stall_timeout(bound)
@@ -3540,16 +3616,13 @@ mod tests {
                 async { Ok(()) }
             },
         );
-        // Keepalives arrive well inside the bound, so only the guard can end
-        // this call; the client's read timeout never fires.
         let error = tokio::time::timeout(Duration::from_secs(10), call)
             .await
             .expect("the stall guard ends a stream that only pings")
             .unwrap_err();
         assert_eq!(error.code, "provider_stream_stalled");
-        // Content kept the stream alive past the bound; pings did not.
-        assert_eq!(text, "012345");
-        assert!(started.elapsed() >= gap * 5 + bound);
+        assert_eq!(text, "0");
+        assert!(started.elapsed() >= bound);
         assert!(
             Provider::new(Transport::new(0, 1).unwrap(), Family::Anthropic, &url, None)
                 .unwrap()
