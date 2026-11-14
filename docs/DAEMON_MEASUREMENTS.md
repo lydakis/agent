@@ -8341,7 +8341,7 @@ in both directions (lone submit CPU read +12% on a change that added
 nothing to a submit in the screen before this one). The benches run at
 standard, which is what nearly every call is.
 
-## Daemon start after upgrades, keys from `~/.agent/keys/env`, open-file limit
+## Daemon start after upgrades, keys from `~/.agent/env`, open-file limit
 
 No turn, store or socket path changes: the store and socket locks wait only
 in a daemon started with `--await-owner` (a replacement), the env file is
