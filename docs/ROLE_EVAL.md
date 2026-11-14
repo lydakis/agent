@@ -94,6 +94,28 @@ Its output sits under `.local/role-eval/<model>/small/`. Score:
 
 and note the step's `took` in timeline.json, the seconds it kept agents busy.
 
+## The live day
+
+`--day live` asks whether a fresh lead shows what keeps changing with
+Sonny's `live` tool, a block the window keeps filled, and answers what
+stays put in words. It subscribes the lead to `ci`, then asks the time,
+the latest build (kept in view), how long a session lasts, the session
+timeout kept in view while the person edits the file, and a sum. Its
+output sits under `.local/role-eval/<model>/live/`. Score from the calls
+in the transcript, and read each `live` call's answer in `acp.jsonl`:
+
+| Id | Counts when the lead |
+| --- | --- |
+| V1 | shows the time with a `live` call that fills from `now()` |
+| V2 | shows the latest build with a `live` call that fills from `source('ci')` |
+| V3 | shows the timeout with a `live` call that fills from `file()` |
+| N1 | answers how long a session lasts in words, with no `live` call |
+| N2 | answers the sum in words, with no `live` call |
+
+Also note any `live_template` refusal and whether it wrote a working one
+after, and any reply that repeats what the block will change, such as the
+time in words beside a clock.
+
 ## The burst
 
 `--day burst` (DeepSeek Harness's super-agent case) tells a fresh lead the
