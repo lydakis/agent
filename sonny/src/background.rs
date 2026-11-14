@@ -574,6 +574,8 @@ pub struct View {
 pub enum Key {
     Stay,
     Close,
+    /// The agent the picked row is for, to go to.
+    Open(String),
 }
 
 impl View {
@@ -643,7 +645,16 @@ impl View {
         self.notice = None;
         match key.code {
             KeyCode::Esc if confirm.is_some() => {}
-            KeyCode::Esc | KeyCode::Char('q') | KeyCode::Enter => return Key::Close,
+            KeyCode::Esc => return Key::Close,
+            // Enter goes to the agent the row is for: the one an
+            // automation wakes, the subscriber.
+            KeyCode::Enter => {
+                if let Some(item) = self.items.get(self.selected)
+                    && !item.bot.is_empty()
+                {
+                    return Key::Open(item.bot.clone());
+                }
+            }
             KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 return Key::Close;
             }
@@ -874,6 +885,13 @@ impl View {
         let mut keys = Keys::new();
         if self.items.len() > 1 {
             keys = keys.pick();
+        }
+        if self
+            .items
+            .get(self.selected)
+            .is_some_and(|item| !item.bot.is_empty())
+        {
+            keys = keys.enter(crate::hint::Enter::Open);
         }
         match self.items.get(self.selected) {
             Some(item) if item.kind == Kind::Trigger => {
@@ -1396,6 +1414,9 @@ mod tests {
         assert_eq!(lines[5], "    sent 2");
         assert_eq!(lines[6], "    └ Read preferences.md");
         assert_eq!(lines[8], "Follows · 1");
+        // Enter goes to the agent the automation wakes; it closes nothing.
+        let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+        assert_eq!(view.key(enter), Key::Open("calc.lead".into()));
         assert_eq!(lines[9], "  ◎ tasks for lead");
         let press = |view: &mut View, code| view.key(KeyEvent::new(code, KeyModifiers::NONE));
         // Ctrl+D is not d.

@@ -1533,7 +1533,7 @@ impl View {
                     KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER,
                 ) => {}
             KeyCode::Esc | KeyCode::Backspace | KeyCode::Left if opened => self.open = None,
-            KeyCode::Esc | KeyCode::Char('q') => return Key::Close,
+            KeyCode::Esc => return Key::Close,
             KeyCode::Up | KeyCode::Char('k') if !opened => {
                 self.selected = self.selected.saturating_sub(1);
             }

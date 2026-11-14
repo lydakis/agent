@@ -4999,7 +4999,7 @@ const OPENING: Duration = Duration::from_millis(4);
 /// How long `sonny sky` waits before following a daemon that went again.
 const RETRY: Duration = Duration::from_secs(3);
 /// What the keys do in `sonny sky`.
-const KEYS: &str = "↑↓←→ pick · m models · r replay · z zen · ? legend · q quit";
+const KEYS: &str = "↑↓←→ pick · m models · r replay · z zen · ? legend · esc close";
 /// A replay's keys, in the title's place.
 pub const REPLAY_KEYS: &str = "space pause · ←→ step · [ ] speed · esc back";
 
@@ -5100,12 +5100,12 @@ pub fn watch(
     drawn
 }
 
-/// q, Esc and Ctrl+C leave `sonny sky`, Esc once nothing is picked or
-/// centred.
+/// Esc and Ctrl+C leave `sonny sky`, Esc once nothing is picked or
+/// centered; `q` does nothing, as in every pane.
 fn quits(key: &ratatui::crossterm::event::KeyEvent) -> bool {
     use ratatui::crossterm::event::{KeyCode, KeyModifiers};
     match key.code {
-        KeyCode::Char('q') | KeyCode::Esc => true,
+        KeyCode::Esc => true,
         KeyCode::Char('c') => key.modifiers.contains(KeyModifiers::CONTROL),
         _ => false,
     }
@@ -5121,7 +5121,7 @@ impl ratatui::widgets::Widget for &mut View {
         let width = area.width as usize;
         let mut head = vec![Span::raw(" "), Span::raw("sky").bold()];
         let mut keys = match self.replay {
-            Some(_) => format!("{REPLAY_KEYS} · q quit"),
+            Some(_) => REPLAY_KEYS.to_owned(),
             None => KEYS.to_owned(),
         };
         // A narrow terminal keeps the last keys, quitting among them.
@@ -5945,16 +5945,16 @@ mod tests {
                 .trim_end()
                 .to_owned()
         };
-        assert!(row(0).starts_with(" sky") && row(0).ends_with("q quit"));
+        assert!(row(0).starts_with(" sky") && row(0).ends_with("esc close"));
         assert!((2..29).any(|y| row(y).contains("shop lead")));
         assert_eq!(
             row(29),
             " 1 agent · ● 1 working · 0 messages in the last minute"
         );
-        // q, Esc and Ctrl+C leave it; other keys do not.
+        // Esc and Ctrl+C leave it; q and other keys do not.
         use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
         let key = |code, mods| quits(&KeyEvent::new(code, mods));
-        assert!(key(KeyCode::Char('q'), KeyModifiers::NONE));
+        assert!(!key(KeyCode::Char('q'), KeyModifiers::NONE));
         assert!(key(KeyCode::Esc, KeyModifiers::NONE));
         assert!(key(KeyCode::Char('c'), KeyModifiers::CONTROL));
         assert!(!key(KeyCode::Char('c'), KeyModifiers::NONE));

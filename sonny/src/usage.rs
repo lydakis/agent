@@ -257,10 +257,9 @@ impl View {
             };
         }
         let period = match key.code {
-            KeyCode::Esc | KeyCode::Char('q') | KeyCode::Enter => return Key::Close,
-            KeyCode::Char('d') => Period::Day,
-            KeyCode::Char('w') => Period::Week,
-            KeyCode::Char('m') => Period::Month,
+            KeyCode::Esc => return Key::Close,
+            // Its one value, the period, takes ← and →: it has no rows to
+            // open, and a letter means one thing in every pane.
             KeyCode::Left | KeyCode::Char('h') => match self.period {
                 Period::Month => Period::Week,
                 _ => Period::Day,
@@ -743,7 +742,7 @@ impl View {
         };
         let pair = |said: &'static str| said.split_once(' ').unwrap_or((said, ""));
         let (scope, cached) = (pair(scope), pair(cached));
-        (crate::hint::Keys::new().key("d/w/m", "period"))
+        (crate::hint::Keys::new().key("←→", "period"))
             .key(scope.0, scope.1)
             .key(cached.0, cached.1)
             .esc(crate::hint::Esc::Close)
@@ -1366,9 +1365,12 @@ mod tests {
         view.key(KeyEvent::from(KeyCode::Char('a')));
         assert!(view.due());
         assert!(view.query(now).0.get("name").is_none());
-        view.key(KeyEvent::from(KeyCode::Char('m')));
+        view.key(KeyEvent::from(KeyCode::Right));
+        view.key(KeyEvent::from(KeyCode::Right));
         let (query, window) = view.query(now);
         assert_eq!((query["bucket_ms"].as_i64(), window.2), (Some(DAY), 30));
+        // Enter opens nothing here and never closes it; Esc does.
+        assert_eq!(view.key(KeyEvent::from(KeyCode::Enter)), Key::Stay);
         assert_eq!(view.key(KeyEvent::from(KeyCode::Esc)), Key::Close);
     }
 

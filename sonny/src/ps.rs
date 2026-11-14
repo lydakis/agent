@@ -134,7 +134,7 @@ impl View {
         // Any key but a second x lets a stop asked for go.
         let stopping = self.stopping.take();
         match key.code {
-            KeyCode::Esc | KeyCode::Char('q') => Key::Close,
+            KeyCode::Esc => Key::Close,
             KeyCode::Enter => match self.picked() {
                 Some(row) => Key::Open(word(row, "bot")),
                 None => Key::Close,

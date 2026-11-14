@@ -3673,6 +3673,24 @@ fn boosts(providers: &Value, model: &str, effort: Option<&str>) -> Vec<String> {
 /// Ctrl+\, which moves the keys between the conversation and the pane:
 /// no terminal or multiplexer takes it, as many take Shift+Tab. Without
 /// the keyboard protocol it arrives as Ctrl+4.
+/// The arrow `h` `j` `k` or `l` is in a pane, as in a file browser's
+/// list: never with Ctrl, Alt or Super.
+fn vim_arrow(key: &KeyEvent) -> Option<KeyCode> {
+    if key
+        .modifiers
+        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER)
+    {
+        return None;
+    }
+    match key.code {
+        KeyCode::Char('h') => Some(KeyCode::Left),
+        KeyCode::Char('j') => Some(KeyCode::Down),
+        KeyCode::Char('k') => Some(KeyCode::Up),
+        KeyCode::Char('l') => Some(KeyCode::Right),
+        _ => None,
+    }
+}
+
 fn switches(key: &KeyEvent) -> bool {
     key.modifiers.contains(KeyModifiers::CONTROL) && matches!(key.code, KeyCode::Char('\\' | '4'))
 }
@@ -12555,6 +12573,19 @@ impl App {
             Some(true) if !program => &esc,
             _ => key,
         };
+        // `h` `j` `k` `l` are the arrows in every pane but a program's,
+        // unlisted.
+        let arrow;
+        let key = match (self.pane_keys && !program && self.finding.is_none())
+            .then(|| vim_arrow(key))
+            .flatten()
+        {
+            Some(code) => {
+                arrow = KeyEvent::new(code, KeyModifiers::NONE);
+                &arrow
+            }
+            None => key,
+        };
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         let copy =
             key.code == KeyCode::Char('c') && (ctrl || key.modifiers.contains(KeyModifiers::SUPER));
@@ -12644,11 +12675,11 @@ impl App {
                     KeyCode::PageDown => pane.screen.page(false),
                     KeyCode::Home => pane.screen.hold(usize::MAX),
                     KeyCode::End => pane.screen.latest(),
-                    _ => {
-                        if view.key(*key) == background::Key::Close {
-                            self.close_pane(true);
-                        }
-                    }
+                    _ => match view.key(*key) {
+                        background::Key::Stay => {}
+                        background::Key::Close => self.close_pane(true),
+                        background::Key::Open(bot) => self.enter_agent(&bot),
+                    },
                 }
                 return true;
             }
@@ -12749,10 +12780,7 @@ impl App {
                     _ => match view.key(*key) {
                         ps::Key::Stay => {}
                         ps::Key::Close => self.close_pane(true),
-                        ps::Key::Open(bot) => {
-                            self.close_pane(true);
-                            self.open_agent(&bot, false);
-                        }
+                        ps::Key::Open(bot) => self.enter_agent(&bot),
                         ps::Key::Stop { bot, handle } => self.stop_process(bot, handle),
                     },
                 }
@@ -12776,10 +12804,7 @@ impl App {
                     _ => match view.key(*key) {
                         audit::Key::Stay => {}
                         audit::Key::Close => self.close_pane(true),
-                        audit::Key::Open(bot) => {
-                            self.close_pane(true);
-                            self.open_agent(&bot, false);
-                        }
+                        audit::Key::Open(bot) => self.enter_agent(&bot),
                     },
                 }
                 return true;
@@ -12901,11 +12926,10 @@ impl App {
                     KeyCode::PageDown | KeyCode::Char(' ') => pane.screen.page(false),
                     KeyCode::Home => pane.screen.hold(usize::MAX),
                     KeyCode::End => pane.screen.latest(),
-                    // Anything else is for the composer, as it was typed.
-                    _ => {
-                        self.pane_keys = false;
-                        return false;
-                    }
+                    // A pane that has the keys keeps them: a key it does
+                    // not list does nothing, and is never typed into the
+                    // composer.
+                    _ => {}
                 }
                 return true;
             }
@@ -13033,6 +13057,16 @@ impl App {
         let mut pane = pane::Pane::card("shortcuts", "esc close");
         pane.set_card(lines, "esc close");
         self.open_pane(pane);
+    }
+
+    /// `enter` on a row of `bot`'s: the view closes and the agent opens
+    /// where a click on its blue name does; on this window's own agent
+    /// the view only closes.
+    fn enter_agent(&mut self, bot: &str) {
+        self.close_pane(true);
+        if bot != self.bot {
+            self.open_agent(bot, false);
+        }
     }
 
     /// `pane` beside the conversation, with the keys; what was selected
@@ -25446,6 +25480,43 @@ mod tests {
             card.iter().any(|row| row.contains("turns 1 to 3")),
             "{card:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn a_pane_with_the_keys_keeps_them_and_q_does_nothing() {
+        let client = daemon_answering(|request| match request["op"].as_str() {
+            Some("inspect") => json!({"name": "b", "instructions": "", "tools": [],
+                "declared": []}),
+            _ => json!({}),
+        })
+        .await;
+        let mut app = app(client);
+        app.input.set("/context");
+        app.submit().await;
+        assert!(app.pane.is_some() && app.pane_keys);
+        let press = |code| Event::Key(event::KeyEvent::new(code, KeyModifiers::NONE));
+        // A key the view does not list is not typed into the composer,
+        // `q` included; ← at the first page and `h` neither move the keys.
+        for code in [
+            KeyCode::Char('q'),
+            KeyCode::Char('x'),
+            KeyCode::Char('/'),
+            KeyCode::Left,
+            KeyCode::Char('h'),
+            KeyCode::Char('j'),
+            KeyCode::Char('k'),
+        ] {
+            app.key(press(code)).await;
+            assert!(app.pane.is_some() && app.pane_keys, "{code:?}");
+            assert!(app.input.is_empty(), "{code:?}");
+        }
+        // Tab with nothing typed moves the keys, both ways; Esc closes.
+        app.key(press(KeyCode::Tab)).await;
+        assert!(app.pane.is_some() && !app.pane_keys);
+        app.key(press(KeyCode::Tab)).await;
+        assert!(app.pane_keys);
+        app.key(press(KeyCode::Esc)).await;
+        assert!(app.pane.is_none());
     }
 
     #[tokio::test]

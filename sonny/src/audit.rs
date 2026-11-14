@@ -124,7 +124,7 @@ impl View {
         }
         let step = |at: &mut usize, values: usize| *at = (*at + 1) % (values + 1);
         match key.code {
-            KeyCode::Esc | KeyCode::Char('q') => return Key::Close,
+            KeyCode::Esc => return Key::Close,
             KeyCode::Enter => {
                 return match self.pick.and_then(|at| self.rows.get(at)) {
                     Some(row) => Key::Open(row["bot"].as_str().unwrap_or_default().to_owned()),
