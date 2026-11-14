@@ -15835,29 +15835,34 @@ fn after_words(
     let sent_ms: Option<i64> = r.get(at + 5)?;
     let sender = trailer.contains(&Trailer::Sender);
     let time = sent_ms.filter(|_| trailer.contains(&Trailer::Time));
-    let mut line = format!("[Message {to}/{message}");
-    if sender {
-        match (bot, turn, origin, person) {
-            (Some(bot), Some(turn), _, _) => line.push_str(&format!(
-                ", written by the agent {bot} in {bot}/{turn}, not by a person"
-            )),
-            (_, _, Some(origin), _) => line.push_str(&format!(", sent by {origin}")),
-            (_, _, None, Some(person)) => line.push_str(&format!(", written by {person}")),
-            _ => {}
+    let mut parts = Vec::new();
+    if sender || time.is_some() {
+        use std::fmt::Write as _;
+        // One allocation, as the sender's line alone was.
+        let mut line = String::with_capacity(160);
+        let _ = write!(line, "[Message {to}/{message}");
+        if sender {
+            let _ = match (bot, turn, origin, person) {
+                (Some(bot), Some(turn), _, _) => write!(
+                    line,
+                    ", written by the agent {bot} in {bot}/{turn}, not by a person"
+                ),
+                (_, _, Some(origin), _) => write!(line, ", sent by {origin}"),
+                (_, _, None, Some(person)) => write!(line, ", written by {person}"),
+                _ => Ok(()),
+            };
         }
+        line.push('.');
+        if let Some(ms) = time {
+            let _ = write!(
+                line,
+                " Sent {}.",
+                agent_client::clock::when(ms.div_euclid(1000))
+            );
+        }
+        line.push(']');
+        parts.push(line);
     }
-    line.push('.');
-    if let Some(ms) = time {
-        line.push_str(&format!(
-            " Sent {}.",
-            agent_client::clock::when(ms.div_euclid(1000))
-        ));
-    }
-    line.push(']');
-    let mut parts: Vec<String> = (sender || time.is_some())
-        .then_some(line)
-        .into_iter()
-        .collect();
     let Some(quotes) = quotes else {
         return Ok((parts, None));
     };
