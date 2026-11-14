@@ -7,7 +7,7 @@ use crate::{Client, Error};
 use serde_json::{Map, Value, json};
 use std::{
     sync::atomic::{AtomicU64, Ordering},
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 /// Whether a judge's name is `provider/model`, a model the daemon may run.
@@ -450,6 +450,9 @@ pub fn is_judge(bot: &Value, instructions: &str) -> bool {
         && (tools.is_empty() || bot["settings"]["sandbox"] == "read-only")
 }
 
+/// The longest the daemon's `wait` takes in one call, a day.
+const WAIT_MAX_MS: u64 = 86_400_000;
+
 /// One turn of a judge's fork `name`, its reply held to `reply`'s schema
 /// and read by its parse, by `deadline`; and the turn if it is still
 /// running.
@@ -486,18 +489,25 @@ pub async fn turn_with(
     else {
         return (Err(failed("the reviewer's turn was not started")), None);
     };
-    let left = deadline.saturating_duration_since(Instant::now());
-    let waited = match client
-        .request(
-            "wait",
-            json!({"handles": [handle], "timeout_ms": left.as_millis() as u64}),
-        )
-        .await
-    {
-        Ok(waited) => waited,
-        Err(error) => {
-            let why = format!("the reviewer could not be waited on: {}", error.code);
-            return (Err(failed(why)), Some(turn));
+    // The daemon waits a day at most a call: a later deadline waits again.
+    let waited = loop {
+        let left = deadline
+            .saturating_duration_since(Instant::now())
+            .min(Duration::from_millis(WAIT_MAX_MS));
+        match client
+            .request(
+                "wait",
+                json!({"handles": [handle], "timeout_ms": left.as_millis() as u64}),
+            )
+            .await
+        {
+            Ok(waited)
+                if waited["results"][handle]["pending"] == true && Instant::now() < deadline => {}
+            Ok(waited) => break waited,
+            Err(error) => {
+                let why = format!("the reviewer could not be waited on: {}", error.code);
+                return (Err(failed(why)), Some(turn));
+            }
         }
     };
     let outcome = &waited["results"][handle];

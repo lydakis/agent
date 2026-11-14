@@ -1578,6 +1578,25 @@ class AutoApproverTests(ModelFixture):
         release.set()
         daemon.request('interrupt', bot='Bob', turn=turn)
 
+    def test_a_round_with_no_time_limit_waits_for_its_verdict(self):
+        def reply(request, user):
+            if request['model'] != 'judge-model':
+                return None
+            round = json.loads(user)
+            return verdicts(round, lambda id: assessed(risky(round, id)))
+        self.model.reply_for = reply
+        self.model.models = ('synthetic-model', 'judge-model')
+        daemon = self.daemon(tools='echo,shell,wait,read')
+        home = self.path / 'home'
+        (home / '.agent').mkdir(parents=True)
+        (home / '.agent/config.toml').write_text('[reviewer]\ntimeout_ms = 0\n')
+        _, lines = self.approver(daemon, env={'HOME': str(home)}, judge='openai/judge-model')
+        turn = daemon.request('submit', bot='Bob', request_id='a', prompt='shell:printf safe')['result']['message']
+        # Each wait stays within the day the daemon allows, so no wait is refused.
+        judged = lines.get(timeout=15)
+        self.assertEqual(judged['event'], 'reviewed', judged)
+        self.assertEqual(daemon.finished(turn)['data']['status'], 'completed')
+
     def test_a_model_the_daemon_serves_judges(self):
         asked = queue.Queue()
         parsed = [True]
