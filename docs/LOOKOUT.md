@@ -118,7 +118,8 @@ schedules.
 The lookout also hands back what a turn never carried out, as mail
 returns a letter it could not deliver. It notes which bots sent each
 message (an `accepted`, `queued` or `steered` event's `from`), and when
-that turn ends failed or interrupted it attaches a note to each sender:
+that turn ends failed or interrupted it steers a note to each sender,
+waking it when idle:
 `[your message to BOT was not carried out: turn N ended CODE]`, timed
 like any message. The sender knows what the message was for, so it decides
 whether to send again, wait, or tell the person; nobody else could. A

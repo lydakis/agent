@@ -1693,10 +1693,10 @@ calc.add, calc.neg and calc.div ▸`), and `/verbose` draws each call as
 ever. Quiet rows
 one after another (calls folded, notes put in the margin, messages
 between agents) sit together, with no blank row between. Words that only
-rode along on a call, an attach note from an automation that found the
-agent busy or from another agent, are no message: once the agent reads
-them they hang right under what that call carried, your message or the
-step it joined, as `📎 From an automation ▸`, and a click opens them the
+rode along on a call, an attach note from another agent, are no message:
+once the agent reads them they hang right under what that call carried,
+your message or the step it joined, as `📎 From calc.add ▸`, and a click
+opens them the
 same way. Nothing says such words are waiting: they ask nothing of you, so
 they turn up only once the agent has read them. None waits more than a
 day (`attach_wait` in `config.toml`): one no call took in by then reaches

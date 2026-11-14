@@ -42,9 +42,9 @@ has it: `last.turn_status`, and `last.turn_error` when it did not complete,
 so an agent sees the failure the person sees in `/background`. It does not
 have to look: when a turn a fire sent fails (not one whose model said
 nothing), the lookout tells the agent that added a `start` automation, else
-the agent the fire messaged, with a note it reads in its next model call,
-as a fire that sent nothing is told (`[automation NAME · TIME · turn N it sent
-BOT failed: WHY]`). A fire with `reply_to` passes the failure on with its
+the agent the fire messaged, with a steer: read in its next model call, or
+waking it when idle (`[automation NAME · TIME · turn N it sent BOT failed:
+WHY]`). A fire with `reply_to` passes the failure on with its
 answer instead.
 It waits for a verdict wherever the agent's other calls do (`/permissions`),
 since an automation runs as the person and its `if` command outside any
@@ -304,10 +304,7 @@ after it is that entry's next year: it sends nothing and ends as `missed`.
 What the fire did (`sent` with the turn and any `reply`, `skipped`, `gone`,
 `missed` or `failed` with why), with the messages sent so far, the agent it
 started and the commit it saw, is kept in `~/.agent/automations/NAME.json`,
-which `ls` and `show` return. A fire the daemon took no turn for (`skipped`,
-or `failed` once the daemon answered) also tells the reply agent, else the
-agent it messages, with `delivery: attach`: one line naming the automation and
-why, which that agent reads in its next model call without a turn starting. Automations are local to this machine. Only
+which `ls` and `show` return. Automations are local to this machine. Only
 the scheduler runs a fire, so no two of one automation ever run at once.
 
 An automation's state is two things: its definition and its state file. Every
