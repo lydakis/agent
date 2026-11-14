@@ -92,6 +92,9 @@ struct Span<'a> {
     thinking: &'a [u32],
     pictured: &'a [i32],
     elided: i64,
+    /// Whether a Responses reasoning item the strip names goes whole, as
+    /// `thinking` then counts it ([`Turn::reasoning`]).
+    reasoning: bool,
 }
 impl Span<'_> {
     const EMPTY: Span<'static> = Span {
@@ -100,6 +103,7 @@ impl Span<'_> {
         thinking: &[],
         pictured: &[],
         elided: 0,
+        reasoning: false,
     };
 }
 
@@ -154,6 +158,7 @@ fn item_chunks(
     store: Store,
     chunks: Arc<[Vec<i64>]>,
     strip: Strip,
+    reasoning: bool,
     elided: i64,
 ) -> impl futures_util::Stream<Item = std::io::Result<Bytes>> + Send + 'static {
     let mut started = false;
@@ -163,7 +168,7 @@ fn item_chunks(
             async move {
                 store
                     .read("items_by_ids", move |db| {
-                        db.items_by_ids(&chunks[index], strip, elided)
+                        db.items_sent(&chunks[index], strip, reasoning, elided)
                     })
                     .await
                     .map_err(|error| std::io::Error::other(error.code))
@@ -922,22 +927,44 @@ impl Turn {
         Ok(context)
     }
 
-    /// The window's items, those `strip` names without thinking.
-    fn items(&self, context: &Context, strip: Strip) -> Items {
+    /// The window's items, those `strip` names without thinking: what
+    /// each loses is `reasoning` when given, as [`Self::reasoning`] reads
+    /// it, or else the window's own count.
+    fn items(&self, context: &Context, strip: Strip, reasoning: Option<&[u32]>) -> Items {
         match &context.window {
             Some(w) => self.window_items(
                 context.prefix.bytes.clone(),
                 Span {
                     ids: &w.ids,
                     sizes: &w.sizes,
-                    thinking: &w.thinking,
+                    thinking: reasoning.unwrap_or(&w.thinking),
                     pictured: &w.pictured,
                     elided: w.elided,
+                    reasoning: reasoning.is_some(),
                 },
                 strip,
             ),
             None => self.window_items(context.prefix.bytes.clone(), Span::EMPTY, Strip::default()),
         }
+    }
+
+    /// What each of a Responses window's items loses when `strip` leaves
+    /// its reasoning out: a reasoning item goes whole, and which items are
+    /// reasoning is read from the store, since the window counts only
+    /// Anthropic thinking. Read only for a bot whose reasoning a provider
+    /// refused; `None` otherwise.
+    async fn reasoning(&self, window: Option<&Window>, strip: Strip) -> Result<Option<Vec<u32>>> {
+        let Some(window) = window.filter(|w| {
+            w.family == agent_runtime::codec::Family::Responses && strip != Strip::default()
+        }) else {
+            return Ok(None);
+        };
+        let ids = window.ids.clone();
+        let sizes = self
+            .store
+            .read("reasoning_of", move |db| db.reasoning_of(&ids, strip))
+            .await?;
+        Ok(Some(sizes))
     }
 
     /// Anthropic thinking replay. Each thinking block is bound to the exact
@@ -974,8 +1001,15 @@ impl Turn {
         window: &Window,
         (provider, model): (&Provider, &str),
     ) -> Result<Strip> {
-        if window.family != agent_runtime::codec::Family::Anthropic || window.ids.is_empty() {
+        if window.ids.is_empty() {
             return Ok(Strip::default());
+        }
+        if window.family == agent_runtime::codec::Family::Responses {
+            // Reasoning goes as it was given until the provider refuses it
+            // ([`withhold_thinking`]); what it refused stays out. Its state
+            // is bound to no context, so nothing is hashed or written here
+            // per call.
+            return Ok(record.thinking);
         }
         let prefix = fingerprint(prefix, window.ids[0], provider.url().as_str(), model);
         let (next, elided) = (window.ids[window.ids.len() - 1] + 1, window.elided);
@@ -1022,15 +1056,17 @@ impl Turn {
         self.framed_items(prefix, span, strip, Bytes::new())
     }
 
-    /// A copy of the bot's call with the compaction request after it.
-    fn copied_items(&self, copy: Copied<'_>) -> Items {
+    /// A copy of the bot's call with the compaction request after it;
+    /// `reasoning` as for [`Self::items`].
+    fn copied_items(&self, copy: Copied<'_>, reasoning: Option<&[u32]>) -> Items {
         let (window, len) = (copy.window, copy.len);
         let span = Span {
             ids: &window.ids[..len],
             sizes: &window.sizes[..len],
-            thinking: &window.thinking[..len],
+            thinking: &reasoning.unwrap_or(&window.thinking)[..len],
             pictured: &window.pictured[..len],
             elided: window.elided,
+            reasoning: reasoning.is_some(),
         };
         self.framed_items(
             copy.prefix.clone(),
@@ -1049,6 +1085,7 @@ impl Turn {
             thinking,
             pictured,
             elided,
+            reasoning,
         } = span;
         let stripped: usize = ids
             .iter()
@@ -1069,6 +1106,7 @@ impl Turn {
                 store.clone(),
                 chunks.clone(),
                 strip,
+                reasoning,
                 elided,
             ));
             if tail.is_empty() {
@@ -2740,10 +2778,28 @@ impl Turn {
         stripped: usize,
     ) -> Result<Items> {
         let bot = self.bot.clone();
-        let family = self
+        let (family, refused) = self
             .store
-            .op("inspect", move |db| db.inspect(&bot)?.family())
+            .op("inspect", move |db| {
+                let record = db.inspect(&bot)?;
+                Ok((record.family()?, record.thinking))
+            })
             .await?;
+        // A Responses bot's reasoning a provider refused stays out of its
+        // summary too, each item counted whole: read only for such a bot.
+        let (strip, reasoning) = match family {
+            agent_runtime::codec::Family::Responses if refused != Strip::default() => {
+                let ids = plan.ids.clone();
+                let sizes = self
+                    .store
+                    .read("reasoning_of", move |db| db.reasoning_of(&ids, refused))
+                    .await?;
+                let bytes: usize = sizes.iter().map(|&bytes| bytes as usize).sum();
+                (refused, Some(bytes))
+            }
+            _ => (Strip::from(i64::MAX), None),
+        };
+        let stripped = stripped + reasoning.unwrap_or(0);
         let (head, tail) = agent_runtime::store::CompactionPlan::frame(
             family,
             plan.previous_summary.as_deref(),
@@ -2772,7 +2828,8 @@ impl Turn {
                     .chain(item_chunks(
                         store.clone(),
                         chunks.clone(),
-                        Strip::from(i64::MAX),
+                        strip,
+                        reasoning.is_some(),
                         elided,
                     ))
                     .chain(stream::iter([Ok(tail.clone())]))
@@ -3458,12 +3515,10 @@ impl Turn {
             }
             // A call that withheld its replayed thinking recorded that on
             // the bot; the context keeps what it sent.
-            if context.window.as_ref().is_some_and(|w| {
-                w.family == agent_runtime::codec::Family::Anthropic && !w.ids.is_empty()
-            }) {
+            if context.window.as_ref().is_some_and(|w| !w.ids.is_empty()) {
                 context.thinking = record.thinking;
             }
-            let response = match called {
+            let mut response = match called {
                 Ok(Some(response)) => {
                     drops = 0;
                     response
@@ -3530,6 +3585,9 @@ impl Turn {
                 bytes: items.iter().map(Bytes::len).sum(),
                 items: items.len(),
             };
+            // Read for each round that announces calls, so a link changed
+            // since an earlier round is seen; the calls carry it from here.
+            learn_links(&record, &mut response.calls, &workspace, true).await;
             let calls: Vec<ToolCall> = response.calls.clone();
             let usage = response.usage.clone();
             // What the view cost in tokens, for the token threshold. One
@@ -3919,9 +3977,22 @@ impl Turn {
                 accounting.limit = Some(Limit::Rounds);
                 self.withheld(turn, Limit::Rounds).await?;
             }
+            // What a refused Responses bot's reasoning takes, read once
+            // for the body and its chained tail alike.
+            let (strip, reasoning) = match body {
+                Body::Window(context) => {
+                    let strip = withheld.unwrap_or(context.thinking);
+                    (strip, self.reasoning(context.window.as_ref(), strip).await?)
+                }
+                Body::Copied(copy) => {
+                    let reasoning = self.reasoning(Some(copy.window), copy.thinking).await?;
+                    (copy.thinking, reasoning)
+                }
+                Body::Span(..) => (Strip::default(), None),
+            };
             let items = match body {
-                Body::Window(context) => self.items(context, withheld.unwrap_or(context.thinking)),
-                Body::Copied(copy) => self.copied_items(copy),
+                Body::Window(context) => self.items(context, strip, reasoning.as_deref()),
+                Body::Copied(copy) => self.copied_items(copy, reasoning.as_deref()),
                 Body::Span(plan, stripped) => self.span_items(plan, stripped).await?,
             };
             accounting.begin(attempt > 0);
@@ -3965,7 +4036,8 @@ impl Turn {
                         items,
                         // A summary beside the turn's call keeps off the
                         // bot's connection, which that call holds.
-                        chain: (!accounting.beside).then(|| self.chain(body)),
+                        chain: (!accounting.beside)
+                            .then(|| self.chain(body, strip, reasoning.as_deref())),
                         // A summary of its own goes off the turn's route; a
                         // copy follows it to the server that holds its cache.
                         route: (!matches!(body, Body::Span(..))).then_some(&accounting.route),
@@ -4035,9 +4107,10 @@ impl Turn {
                     }
                     // The same body without the thinking was accepted, so
                     // later requests leave it out too.
-                    if let (Body::Window(_), Some(strip), Some(prefix)) =
-                        (body, withheld, record.thinking_prefix)
-                    {
+                    if let (Body::Window(_), Some(strip)) = (body, withheld) {
+                        // A Responses bot keeps no prefix: its reasoning is
+                        // bound to none.
+                        let prefix = record.thinking_prefix.unwrap_or_default();
                         let bot = self.bot.clone();
                         let elided = record.thinking_elided;
                         self.store
@@ -4163,7 +4236,6 @@ impl Turn {
                 retry = json!({"fallback_credit":false});
             } else if let Body::Window(context) = body
                 && withheld.is_none()
-                && record.thinking_prefix.is_some()
                 && let Some(strip) = withhold_thinking(context, &error)
             {
                 withheld = Some(strip);
@@ -4304,7 +4376,14 @@ impl Turn {
 
     /// Where this request sits in the bot's history, for a provider that can
     /// continue from the bot's previous response. A span has no window.
-    fn chain<'a>(&'a self, body: Body<'a>) -> Chain<'a> {
+    /// Its tail strips as the body does: `strip`, and `reasoning` as for
+    /// [`Self::items`].
+    fn chain<'a>(
+        &'a self,
+        body: Body<'a>,
+        strip: Strip,
+        reasoning: Option<&'a [u32]>,
+    ) -> Chain<'a> {
         match body {
             Body::Window(Context {
                 window: Some(window),
@@ -4317,11 +4396,17 @@ impl Turn {
                     let span = Span {
                         ids: &window.ids[skip..],
                         sizes: &window.sizes[skip..],
-                        thinking: &window.thinking[skip..],
+                        thinking: &reasoning.unwrap_or(&window.thinking)[skip..],
                         pictured: &window.pictured[skip..],
                         elided: window.elided,
+                        reasoning: reasoning.is_some(),
                     };
-                    self.window_items(Bytes::new(), span, *thinking)
+                    let strip = if reasoning.is_some() {
+                        strip
+                    } else {
+                        *thinking
+                    };
+                    self.window_items(Bytes::new(), span, strip)
                 }),
             },
             _ => Chain {
@@ -4441,6 +4526,10 @@ impl Turn {
         summary_retry_ms: Option<u64>,
     ) -> Result<Option<Stop>> {
         let turn = self.turn;
+        // A round resumed after a restart has not read them yet; one just
+        // announced keeps what it read, so it runs as it was announced.
+        let mut calls = calls;
+        learn_links(record, &mut calls, workspace, false).await;
         let mut calls = calls.into_iter();
         while let Some(call) = calls.next() {
             // Nor any tool: the calls not yet started are answered as not
@@ -6703,21 +6792,49 @@ fn epoch_ms(at: tokio::time::Instant) -> u64 {
     now_ms().saturating_sub(at.elapsed().as_millis() as u64)
 }
 
+/// Read off the runtime thread the links a sandboxed bot's writes pass
+/// on their way, into each call, so that judging the calls reads no file
+/// ([`agent_runtime::sandbox::learn`]); each again when `fresh`. The calls
+/// move to the blocking thread and back, never copied.
+async fn learn_links(
+    record: &Bot,
+    calls: &mut Vec<ToolCall>,
+    workspace: &std::path::Path,
+    fresh: bool,
+) {
+    if let Some(learn) = record.links_to_learn(calls, workspace, fresh) {
+        let mut taken = std::mem::take(calls);
+        *calls = tokio::task::spawn_blocking(move || {
+            learn(&mut taken);
+            taken
+        })
+        .await
+        .unwrap_or_else(|join| std::panic::resume_unwind(join.into_panic()));
+    }
+}
+
 /// The strip that withholds every thinking block a failed request replayed,
 /// when the failure is a 400. A 400 is final for its body, and a replayed
 /// block the provider cannot verify or decrypt is documented to fail with
 /// one: no published error type names it, and the message is not matched.
-/// The call sends the body once more without that thinking, and the bot
-/// keeps it out only once a request without it is accepted. Server errors
-/// are retried with the body unchanged.
+/// The same holds for a Responses reasoning item's encrypted content, and
+/// such an item goes whole or not at all: one sent without it names an
+/// item the provider never kept. The call sends the body once more without
+/// that thinking, and the bot keeps it out only once a request without it
+/// is accepted. Server errors are retried with the body unchanged.
 fn withhold_thinking(context: &Context, error: &Error) -> Option<Strip> {
     let window = context.window.as_ref()?;
-    let replayed = window.family == agent_runtime::codec::Family::Anthropic
-        && window
+    let replayed = match window.family {
+        agent_runtime::codec::Family::Anthropic => window
             .ids
             .iter()
             .zip(&window.thinking)
-            .any(|(id, bytes)| *bytes > 0 && !context.thinking.strips(*id));
+            .any(|(id, bytes)| *bytes > 0 && !context.thinking.strips(*id)),
+        // Which items are reasoning is known only once read.
+        agent_runtime::codec::Family::Responses => {
+            window.ids.iter().any(|id| !context.thinking.strips(*id))
+        }
+    };
     (replayed && error.code == "provider_http_400")
         .then(|| Strip::from(window.ids[window.ids.len() - 1] + 1))
 }
@@ -8385,6 +8502,7 @@ mod tests {
             name: name.into(),
             call_id: id.into(),
             arguments: arguments.to_string(),
+            links: Default::default(),
         })
         .collect();
         let round = calls.clone();
@@ -8505,6 +8623,7 @@ mod tests {
             name: "shell".into(),
             call_id: "shell-2".into(),
             arguments: json!({"command": "rm -rf x"}).to_string(),
+            links: Default::default(),
         };
         assert!(task.load_holds(&record, &calls[1], &dir));
         assert!(!task.load_holds(&record, &forbidden, &dir));

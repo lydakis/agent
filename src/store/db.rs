@@ -1083,9 +1083,48 @@ impl Bot {
                         &call.name,
                         &call.arguments,
                         workspace,
+                        &call.links,
                     )
             }
         }
+    }
+    /// The reads [`crate::sandbox::learn`] makes for these calls, to run
+    /// off the runtime thread before any of them is judged: each write,
+    /// edit or patch not read yet, or every one when `fresh`. `None` when
+    /// the bot writes no folder of its own or no call needs reading.
+    pub fn links_to_learn(
+        &self,
+        calls: &[ToolCall],
+        workspace: &std::path::Path,
+        fresh: bool,
+    ) -> Option<impl FnOnce(&mut [ToolCall]) + Send + 'static> {
+        use crate::sandbox::{Mode, learn};
+        let wanted = move |call: &ToolCall| {
+            matches!(call.name.as_str(), "write" | "edit" | "apply_patch")
+                && (fresh || !call.links.read())
+        };
+        if self.settings.sandbox != Some(Mode::WorkspaceWrite) || !calls.iter().any(wanted) {
+            return None;
+        }
+        let root = self
+            .workspace
+            .as_deref()
+            .map_or(workspace, std::path::Path::new)
+            .to_owned();
+        let writable = self.settings.writable.clone();
+        let folder = workspace.to_owned();
+        Some(move |calls: &mut [ToolCall]| {
+            for call in calls.iter_mut().filter(|call| wanted(call)) {
+                call.links = learn(
+                    Mode::WorkspaceWrite,
+                    Some(&root),
+                    &writable,
+                    &call.name,
+                    &call.arguments,
+                    &folder,
+                );
+            }
+        })
     }
     /// The tools this bot may call: its allowed list, else its tools.
     pub fn callable(&self) -> &[String] {
@@ -5992,7 +6031,18 @@ impl Database {
         strip: impl Into<Strip>,
         elided: i64,
     ) -> Result<Vec<u8>> {
-        let strip = strip.into();
+        self.items_sent(ids, strip.into(), false, elided)
+    }
+    /// [`Self::items_by_ids`], and with `reasoning` a Responses reasoning
+    /// item `strip` names left out whole too, as [`Self::reasoning_of`]
+    /// counts it.
+    pub fn items_sent(
+        &self,
+        ids: &[i64],
+        strip: Strip,
+        reasoning: bool,
+        elided: i64,
+    ) -> Result<Vec<u8>> {
         let mut statement = self
             .conn
             .prepare_cached("SELECT item,thinking FROM nodes WHERE id=?")?;
@@ -6015,6 +6065,9 @@ impl Database {
             }
             statement.query_row([id], |r| {
                 let item = r.get_ref(0)?.as_blob()?;
+                if reasoning && strip.strips(*id) && super::context::reasoning(item) {
+                    return Ok(());
+                }
                 let item = match (strip.strips(*id) && r.get::<_, i64>(1)? > 0)
                     .then(|| super::without_thinking(item))
                     .flatten()
@@ -6159,6 +6212,28 @@ impl Database {
             .query_row([name], |r| r.get(0))
             .optional()?
             .flatten())
+    }
+    /// Bytes a Responses request saves for each of `ids` that `strip`
+    /// names and that is a reasoning item, left out whole with its
+    /// separator; 0 for the rest.
+    pub fn reasoning_of(&self, ids: &[i64], strip: Strip) -> Result<Vec<u32>> {
+        let mut statement = self
+            .conn
+            .prepare_cached("SELECT item FROM nodes WHERE id=?")?;
+        ids.iter()
+            .map(|id| {
+                if !strip.strips(*id) {
+                    return Ok(0);
+                }
+                Ok(statement.query_row([id], |r| {
+                    let item = r.get_ref(0)?.as_blob()?;
+                    Ok(match super::context::reasoning(item) {
+                        true => (item.len() + 1).min(u32::MAX as usize) as u32,
+                        false => 0,
+                    })
+                })?)
+            })
+            .collect()
     }
     /// Bytes each node loses without its thinking blocks.
     pub fn thinking_of(&self, ids: &[i64]) -> Result<Vec<u32>> {
@@ -19094,6 +19169,7 @@ mod tests {
             call_id: "c".into(),
             arguments: json!({"input":input}).to_string(),
             custom: true,
+            links: Default::default(),
         };
         let data = started(&call);
         assert_eq!(data["arguments_truncated"], true);
@@ -19136,6 +19212,7 @@ mod tests {
                 call_id: "c".into(),
                 arguments: arguments.to_string(),
                 custom: false,
+                links: Default::default(),
             };
             let data = started(&call);
             assert_eq!(data["arguments_truncated"], true, "{name}");
