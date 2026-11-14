@@ -1219,6 +1219,21 @@ impl View {
                         });
                         if let Some((_, seen)) = kept {
                             known.push((name, seen.clone()));
+                        } else if agent.running.is_none()
+                            && crate::resolved::holds(
+                                crate::resolved::read(&self.resolved, &name),
+                                agent.ended,
+                                false,
+                            )
+                        {
+                            // Marked done since its last turn, by itself or
+                            // its lead: no question of its is open, whatever
+                            // its history holds, so it is not read.
+                            let seen = crate::needs::Seen {
+                                turn: agent.ended,
+                                ..Default::default()
+                            };
+                            known.push((name, seen));
                         } else if let Some(scans) = &self.scans
                             && let was = self.kept.get(&name).map(|(_, seen)| seen.clone())
                             && scans.send((name.clone(), None, was)).is_ok()
@@ -7962,6 +7977,39 @@ mod tests {
             .permissions()
             .mode();
         assert_eq!(mode & 0o777, 0o600);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn an_agent_marked_done_since_its_last_turn_is_not_read_for_its_question() {
+        let dir = std::env::temp_dir().join(format!("sky-done-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = dir.join("state.sqlite");
+        crate::resolved::keep(&store, "done", 5, "c1").unwrap();
+        crate::resolved::keep(&store, "reopened", 5, "c2").unwrap();
+        crate::resolved::keep(&store, "busy", 5, "c3").unwrap();
+        let (mut view, send) = view();
+        view.resolved = store.clone();
+        let (scans, mut asked) = mpsc::unbounded_channel();
+        send.send(Feed::Scans(scans)).unwrap();
+        send.send(Feed::Roll(vec![
+            json!({"name": "done", "last": {"turn": 5}}),
+            json!({"name": "reopened", "last": {"turn": 6}}),
+            json!({"name": "busy", "running_turn": 6, "last": {"turn": 5}}),
+            json!({"name": "open"}),
+        ]))
+        .unwrap();
+        send.send(Feed::Held(Vec::new())).unwrap();
+        send.send(Feed::Ready).unwrap();
+        view.drain();
+        let mut sent = Vec::new();
+        while let Ok((name, ..)) = asked.try_recv() {
+            sent.push(name);
+        }
+        sent.sort();
+        // Only what a later turn reopened, what runs, and what is unmarked.
+        assert_eq!(sent, ["busy", "open", "reopened"]);
         std::fs::remove_dir_all(dir).unwrap();
     }
 
