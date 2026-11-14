@@ -121,22 +121,16 @@ impl View {
     }
 
     pub fn key(&mut self, key: KeyEvent) -> Key {
-        if key
-            .modifiers
-            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER)
-        {
-            return match key.code {
-                KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => Key::Close,
-                _ => Key::Stay,
-            };
-        }
+        let modified = (key.modifiers)
+            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER);
+        let close = key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL);
         let word = |row: &Value, field: &str| row[field].as_str().unwrap_or_default().to_owned();
         // A stop asked for: only Enter says yes, any other key keeps it
-        // running, and says so.
+        // running, and says so; Ctrl+C closes as well.
         if let Some((handle, _)) = self.stopping.take() {
-            if key.code != KeyCode::Enter {
+            if key.code != KeyCode::Enter || modified {
                 self.said = Some("not stopped".into());
-                return Key::Stay;
+                return if close { Key::Close } else { Key::Stay };
             }
             let bot = (self.rows.iter())
                 .find(|row| row["handle"] == *handle)
@@ -146,6 +140,9 @@ impl View {
                 Some(bot) => Key::Stop { bot, handle },
                 None => Key::Stay,
             };
+        }
+        if modified {
+            return if close { Key::Close } else { Key::Stay };
         }
         match key.code {
             KeyCode::Esc => Key::Close,
@@ -427,6 +424,18 @@ mod tests {
             press(&mut view, KeyCode::Esc),
             Key::Stay,
             "esc cancels, not closes"
+        );
+        // A modified key takes it back too, and Ctrl+C closes as well.
+        assert_eq!(press(&mut view, KeyCode::Char('x')), Key::Stay);
+        let alt = KeyEvent::new(KeyCode::Char('x'), KeyModifiers::ALT);
+        assert_eq!(view.key(alt), Key::Stay);
+        assert_eq!(view.footer().unwrap().to_string(), "not stopped");
+        assert_eq!(press(&mut view, KeyCode::Char('x')), Key::Stay);
+        let ctrl_c = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
+        assert_eq!(view.key(ctrl_c), Key::Close);
+        assert_eq!(
+            press(&mut view, KeyCode::Enter),
+            Key::Open("shop.fix".into())
         );
         // A key the pane takes (a page, Tab) takes the stop back.
         assert_eq!(press(&mut view, KeyCode::Char('x')), Key::Stay);
