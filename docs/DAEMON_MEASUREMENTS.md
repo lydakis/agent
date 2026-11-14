@@ -9367,3 +9367,48 @@ Captures in the optimization worktree's ignored `.local/bench/`:
 `run_metadata_screen.py` and `run_metadata_zero_delay.py`. Build/test logs and
 preserved binaries are in the parent checkout's ignored
 `.local/bench/metadata-reads-20261113/`.
+
+
+## Metadata read rescreen on 0.9.5 main
+
+2026-11-13, same M1 Max/macOS host as the earlier metadata screen, after
+rebasing onto main `3c73fcdf86e402e23ccf697c6df44706e9018faf` (0.9.5).
+The implementation is `95a7fac3`; this rescreen uses main's pinned Rust
+1.100.0 and the same symbolized release profile on both sides. Binaries are
+identified by SHA-256:
+
+- Main: `9377db521ef740755f3dfd38fb3f675a4eb5bb484ce74923b5f92373f7299a0e`.
+- Metadata: `f46a0b53d8fb99957d281150c036b235a36c32f5254a649d31ec72c8f5e16d6b`.
+
+All 718 Rust tests, strict Clippy, formatting and 12 release-process checks
+passed, including the storage-job budget across restart and a historical
+fork. The four native screens ran sequentially in main/head then head/main
+order: admission/completion at five repeats, footprint at two (1,000 bots),
+and lifecycle at one (32 bots, socket echo, five tool schemas), each with
+its runner's excluded warmup. `bench.perf_gate` reports no failures or
+warnings. The change removes one storage job per task startup; these timings
+do not establish a CPU or latency speedup. Store writes, sync settings,
+fork/resume semantics, queue fairness and per-bot live state are unchanged.
+
+| Bench | Measure | Base | Head | Change |
+| --- | --- | ---: | ---: | ---: |
+| admission | burst_submit jobs (count) | 128 | 96 |  |
+| admission | lone_submit jobs (count) | 128 | 96 |  |
+| admission | lone submit CPU, ms | 29.195 | 32.282 | +10.6% |
+| admission | burst submit p99, ms | 2.443 | 2.517 | +3.1% |
+| completion | release to terminal p99, ms | 5.269 | 5.424 | +2.9% |
+| footprint | inspect (count) | 1000 | 0 |  |
+| footprint | idle RSS, MiB | 13.219 | 13.195 | -0.2% |
+| footprint | per idle bot, KiB | 2.568 | 2.472 | -3.7% |
+| footprint | RSS after a turn each, MiB | 38.195 | 37.359 | -2.2% |
+| footprint | CPU per turn, ms | 0.529 | 0.538 | +1.7% |
+| lifecycle | CPU, s | 0.404 | 0.421 | +4.1% |
+| lifecycle | p95 turn, ms | 614.746 | 607.808 | -1.1% |
+| lifecycle | peak RSS, MiB | 26.711 | 26.805 | +0.4% |
+
+The guaranteed gain is the storage work count: 128 to 96 jobs for 32
+submissions, and 1,000 to zero turn-start `inspect` jobs in footprint.
+The capture is this worktree's ignored `.local/bench/publish-screen-20261113/`.
+The parent checkout's `.local/bench/publish-20261113/` keeps binary hashes,
+compiler/test/process logs, gate output and the sequential screen runner.
+No paid providers or release artifacts were used.
