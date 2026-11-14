@@ -13466,6 +13466,14 @@ impl App {
             self.act(what);
             return;
         }
+        // A page a reply drew opens in the browser, to be used there.
+        if transcript::browser_page(link) {
+            self.notice = Some(match open(link) {
+                Ok(()) => "opened in your browser".to_owned(),
+                Err(error) => error,
+            });
+            return;
+        }
         if link.starts_with("file://") {
             match self.preview(link) {
                 // After the file shown, as a browser goes on to a page.

@@ -1002,6 +1002,16 @@ fn page(source: &str, width: usize) -> Vec<Line<'static>> {
     out
 }
 
+/// Whether `link` is an HTML page a ```html fence kept, which a click
+/// opens in the browser, as a page is used, rather than in the pane.
+pub fn browser_page(link: &str) -> bool {
+    let dir = std::env::temp_dir().join("sonny-pages");
+    crate::links::file_url(&dir).is_some_and(|dir| {
+        link.strip_prefix(&dir)
+            .is_some_and(|name| name.starts_with('/') && name.ends_with(".html"))
+    })
+}
+
 /// Where a drawn fence's source is kept for the pane, named by what it
 /// holds, so drawing it again keeps the same file.
 fn kept_path(what: &impl std::hash::Hash, extension: &str) -> Option<std::path::PathBuf> {
@@ -4452,6 +4462,20 @@ mod tests {
                 "• Saved to memory flow",
             ],
         );
+    }
+
+    #[test]
+    fn a_kept_html_page_opens_in_the_browser_and_other_kept_files_in_the_pane() {
+        let dir = std::env::temp_dir().join("sonny-pages");
+        let url = |name: &str| crate::links::file_url(&dir.join(name)).unwrap();
+        assert!(browser_page(&url("1-2.html")));
+        // A drawing's kept source or picture, and a page anywhere else,
+        // show in the pane.
+        assert!(!browser_page(&url("0123.svg")));
+        assert!(!browser_page(&url("0123.png")));
+        assert!(!browser_page("file:///w/site/index.html"));
+        let beside = crate::links::file_url(&std::env::temp_dir().join("sonny-pages2/a.html"));
+        assert!(!browser_page(&beside.unwrap()));
     }
 
     #[test]
