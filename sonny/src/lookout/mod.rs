@@ -935,6 +935,10 @@ impl Service {
             .filter_map(|b| Some((b["name"].as_str()?.to_owned(), b.clone())))
             .collect();
         self.made = Made::of(&self.records);
+        // Files renamed before anything rewrites them: a writer reads a
+        // file as `Sub` and would drop a key not yet renamed.
+        subs::steer_files(&self.store);
+        subs::agents_files(&self.store);
         // Agents that posted in the commons before posting subscribed them
         // are subscribed to its threads, once, from a whole listing.
         if complete
@@ -951,7 +955,6 @@ impl Service {
         if complete {
             crate::approvals::nested_gone(client.clone(), &bots, &self.store);
         }
-        subs::steer_files(&self.store);
         subs::goals_gone(&self.store);
         if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
             crate::commons::woken_gone(&home);
@@ -1629,7 +1632,7 @@ impl Service {
         for (subscriber, subs) in &self.subscribers {
             for sub in subs {
                 // A maker's tasks outlive it: one that watches them stays.
-                let names: Vec<&String> = sub.bots.iter().collect();
+                let names: Vec<&String> = sub.agents.iter().collect();
                 let watched_gone = names.iter().any(|name| *name == gone)
                     && sub.sources.is_empty()
                     && sub.tasks_of.is_empty()
@@ -2125,7 +2128,7 @@ struct Lookout {
     /// For each other bot a subscription names the makers of: it, and every
     /// bot it or one of those made.
     others: HashMap<String, HashSet<String>>,
-    /// Bots a subscription's `bots` glob names, as listed and made since.
+    /// Bots a subscription's `agents` glob names, as listed and made since.
     globbed: HashSet<String>,
     /// The other leads of the lead's folder and every bot they or theirs
     /// made: theirs, which the lead's tasks subscription never names.
@@ -2336,7 +2339,8 @@ impl Lookout {
         };
         // A glob names only what `globbed` holds: no side chat.
         sub.tasks_of.iter().any(made)
-            || (self.globbed.contains(bot) && sub.bots.iter().any(|glob| subs::matches(glob, bot)))
+            || (self.globbed.contains(bot)
+                && sub.agents.iter().any(|glob| subs::matches(glob, bot)))
     }
 
     fn watches(&self, bot: &str) -> bool {
@@ -2377,8 +2381,8 @@ impl Lookout {
         }
         made.grow(&mut theirs);
         self.theirs = theirs;
-        // Only a `bots` glob names bots beyond the lineages.
-        self.globbed = match self.subs.iter().any(|sub| !sub.bots.is_empty()) {
+        // Only an `agents` glob names bots beyond the lineages.
+        self.globbed = match self.subs.iter().any(|sub| !sub.agents.is_empty()) {
             true => (records.iter())
                 .filter(|(name, record)| self.globs(name) && record["expire_ms"].is_null())
                 .map(|(name, _)| name.clone())
@@ -2402,7 +2406,7 @@ impl Lookout {
             && crate::project::lead_project(bot) == crate::project::lead_project(&self.lead)
     }
 
-    /// Whether a subscription's `bots` glob names this bot. The tasks
+    /// Whether a subscription's `agents` glob names this bot. The tasks
     /// subscription Sonny gives a lead never names another lead's: one the
     /// lead asked for may.
     fn globs(&self, bot: &str) -> bool {
@@ -2410,7 +2414,7 @@ impl Lookout {
         bot != self.lead
             && (self.subs.iter()).any(|sub| {
                 !(theirs && sub.name == "tasks")
-                    && sub.bots.iter().any(|glob| subs::matches(glob, bot))
+                    && sub.agents.iter().any(|glob| subs::matches(glob, bot))
             })
     }
 
@@ -3529,7 +3533,7 @@ mod tests {
         subs::Sub {
             name: name.into(),
             tasks_of: tasks_of.iter().map(|b| b.to_string()).collect(),
-            bots: bots.iter().map(|b| b.to_string()).collect(),
+            agents: bots.iter().map(|b| b.to_string()).collect(),
             sources: Vec::new(),
             filter: None,
             digest: None,
@@ -5041,7 +5045,7 @@ mod tests {
         add(
             "shop.fix",
             2,
-            json!({"name": "mine", "bots": ["shop.lead"]}),
+            json!({"name": "mine", "agents": ["shop.lead"]}),
         );
         add(
             "shop.lead",
@@ -5051,13 +5055,17 @@ mod tests {
         add(
             "shop.lead",
             1,
-            json!({"name": "both", "bots": ["shop.fix", "shop.docs"]}),
+            json!({"name": "both", "agents": ["shop.fix", "shop.docs"]}),
         );
-        add("shop.lead", 1, json!({"name": "glob", "bots": ["shop.*"]}));
         add(
             "shop.lead",
             1,
-            json!({"name": "ci", "bots": ["shop.fix"], "sources": ["ci"]}),
+            json!({"name": "glob", "agents": ["shop.*"]}),
+        );
+        add(
+            "shop.lead",
+            1,
+            json!({"name": "ci", "agents": ["shop.fix"], "sources": ["ci"]}),
         );
         let lead = json!({"name": "shop.lead", "bot_id": 1});
         let docs = json!({"name": "shop.docs", "bot_id": 3});
@@ -5086,7 +5094,7 @@ mod tests {
         add(
             "shop.gone",
             4,
-            json!({"name": "old", "bots": ["shop.lead"]}),
+            json!({"name": "old", "agents": ["shop.lead"]}),
         );
         service.subscribers = subs::all(&store).into_iter().collect();
         let after = std::time::SystemTime::now() + Duration::from_secs(5);
@@ -5097,7 +5105,11 @@ mod tests {
         assert!(!service.unheld(after), "nothing more");
         // A file written since the listing is left: a bot made since may
         // have written it.
-        add("shop.new", 5, json!({"name": "new", "bots": ["shop.lead"]}));
+        add(
+            "shop.new",
+            5,
+            json!({"name": "new", "agents": ["shop.lead"]}),
+        );
         service.subscribers = subs::all(&store).into_iter().collect();
         let before = std::time::SystemTime::now() - Duration::from_secs(5);
         assert!(!service.unheld(before));

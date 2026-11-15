@@ -294,15 +294,15 @@ fn follows() -> Value {
         "name": FOLLOWS,
         "description": "Your follows in the person's lookout, which tells you what happens in what you \
             follow, in a message sent by lookout that joins your running turn or starts one: each event a \
-            line [source · topic · from], then its text. A follow watches the tasks of a bot (every agent it or \
-            its tasks made) or bots by name, through the tasks source, each agent its topic: messages others \
+            line [source · topic · from], then its text. A follow watches the tasks of an agent (every agent it or \
+            its tasks made) or agents by name, through the tasks source, each agent its topic: messages others \
             write in them, the person's quoted, questions to the person, calls awaiting their approval, margin \
             notes put or removed, and each turn's end with its reply. It also hears the sources the person set up outside, each \
             by name, or one topic of a source as NAME:TOPIC. The commons is a source too, each thread a topic: \
             posting in a thread follows it as commons.THREAD, and removing that leaves it. \
             Add steer yourself for what you own; a filter or a digest only when the person asks: \
             what a filter leaves out you never hear, and a digest makes you late. Add or remove one by name, \
-            as {\"name\": \"leads\", \"bots\": [\"web.lead\"], \"sources\": [\"mail\"]}; with neither, \
+            as {\"name\": \"leads\", \"agents\": [\"web.lead\"], \"sources\": [\"mail\"]}; with neither, \
             it lists them all, the sources there are and their events' recent fields.",
         "parameters": {
             "type": "object",
@@ -312,14 +312,14 @@ fn follows() -> Value {
                     "properties": {
                         "name": {"type": "string", "pattern": "^[A-Za-z0-9_-][A-Za-z0-9._-]{0,79}$"},
                         "tasks_of": {"type": "array", "items": {"type": "string", "minLength": 1},
-                            "description": "Bots whose tasks it watches."},
-                        "bots": {"type": "array", "items": {"type": "string", "minLength": 1},
-                            "description": "Bots it watches by name, * matching any run of characters; \
+                            "description": "Agents whose tasks it watches."},
+                        "agents": {"type": "array", "items": {"type": "string", "minLength": 1},
+                            "description": "Agents it watches by name, * matching any run of characters; \
                                 another lead counts only where named exactly."},
                         "sources": {"type": "array", "items": {"type": "string", "minLength": 1},
                             "description": "Sources it hears, by name, or NAME:TOPIC for one topic of it."},
                         "filter": {"type": "object",
-                            "description": "Only the events this matches are heard, its sources' and its bots' \
+                            "description": "Only the events this matches are heard, its sources' and its agents' \
                                 alike. A task's event has type (wrote, turn.ended, question, approval, \
                                 margin), bot, maker, from, turn, text, status (completed, failed, \
                                 stopped, interrupted), done, asked_by (you, the person, an agent's name, \

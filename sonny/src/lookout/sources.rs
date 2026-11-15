@@ -2372,7 +2372,7 @@ mod tests {
         let sub = |name: &str, filter: Value| super::super::subs::Sub {
             name: name.into(),
             tasks_of: Vec::new(),
-            bots: Vec::new(),
+            agents: Vec::new(),
             sources: vec!["cr".into()],
             filter: Some(filter),
             digest: None,
@@ -2433,7 +2433,7 @@ mod tests {
         let sub = |sources: &[&str], filter: Option<Value>| super::super::subs::Sub {
             name: "s".into(),
             tasks_of: Vec::new(),
-            bots: Vec::new(),
+            agents: Vec::new(),
             sources: sources.iter().map(|s| (*s).to_owned()).collect(),
             filter,
             digest: None,

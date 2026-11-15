@@ -142,7 +142,7 @@ Sonny opens a project it adds the lead's `tasks` follow, unless the
 lead's file already holds one by that name, which it keeps as it is:
 
 ```
-{"name": "tasks", "tasks_of": ["shop.lead"], "bots": ["shop.*"]}
+{"name": "tasks", "tasks_of": ["shop.lead"], "agents": ["shop.*"]}
 ```
 
 That is the folder's first lead's. Another lead of the folder,
@@ -155,7 +155,7 @@ a follow in the file's shape, and whose `remove` takes a name; each
 call answers with all of them:
 
 ```
-{"add": {"name": "deploys", "bots": ["ops.*"]}}
+{"add": {"name": "deploys", "agents": ["ops.*"]}}
 {"add": {"name": "review", "tasks_of": ["review.lead"]}}
 {}
 {"remove": "deploys"}
@@ -169,7 +169,7 @@ with a narrower `sources` or a filter. A follow is held by the bot that made it,
 its ID: a later task given the same name inherits none of it.
 
 `tasks_of` watches every bot one of them or one of its tasks made,
-`bots` every bot its name matches, `*` matching any run of characters,
+`agents` every agent its name matches, `*` matching any run of characters,
 and `sources` every event of the sources the person set up, by name
 (below). A follow needs one of them, and may have several. A glob
 never names a side chat, nor a bot that deletes itself once idle.
@@ -183,9 +183,9 @@ follow with none of them is heard as it always was, and costs the
 lookout nothing more: no event is built for the bots it watches.
 
 ```
-{"add": {"name": "api", "bots": ["api.lead"],
+{"add": {"name": "api", "agents": ["api.lead"],
          "filter": {"type": ["turn.ended"], "$or": [{"status": ["failed"]}, {"done": [true]}]}}}
-{"add": {"name": "leads", "bots": ["*.lead"], "digest": "1h"}}
+{"add": {"name": "leads", "agents": ["*.lead"], "digest": "1h"}}
 {"add": {"name": "migration", "tasks_of": ["shop.migrate"], "steer": {"status": ["failed"]}}}
 ```
 
@@ -200,7 +200,7 @@ that watched only bots by exact name, every one of them deleted now, and
 no source, ends too. Each end is a line in the lookout's log with why.
 
 ```
-{"add": {"name": "deploy", "bots": ["ops.deploy"], "steer": {"status": ["failed"]}, "runs": 1}}
+{"add": {"name": "deploy", "agents": ["ops.deploy"], "steer": {"status": ["failed"]}, "runs": 1}}
 {"add": {"name": "launch", "sources": ["slack:launch"], "until": "2026-11-08 18:00"}}
 ```
 
