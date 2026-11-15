@@ -465,13 +465,22 @@ class CompactionTests(ModelFixture):
                     client = Client(self.binary, path, self.url)
                     self.addCleanup(client.close)
                 self.assertEqual(client.finished(turn)['data']['status'], 'completed')
+                # The turn ends past the threshold, so it summarizes again
+                # after it reports, with no refusals left. Let that summary
+                # land before counting: it reached the model before the
+                # count or after it, as the runner was loaded.
+                after = client.receive(lambda m: m.get('event') == 'compacted' and m.get('turn') == turn
+                                       and ((m.get('data') or {}).get('request') or {}).get('after_turn'),
+                                       timeout=15)
                 requests = self.requests()
-                self.assertEqual(sum(is_summary(r) for r in requests), 64)
+                # The 64 refused, none when the ordinary call resumed, and
+                # the one after the turn.
+                self.assertEqual(sum(is_summary(r) for r in requests), 65)
                 self.assertEqual(sum(not is_summary(r) for r in requests), 1)
-                # A subsequent head may compact again; the failed attempt does
-                # not permanently disable compaction for this bot.
-                self.run_turn(client, 'Bob', 'later', 'continue')
-                self.assertTrue(any(is_summary(r) for r in self.requests()))
+                # The failed attempt does not disable compaction for this
+                # bot: the one after the turn was installed.
+                self.assertIsNotNone(after)
+                self.assertIsNotNone(client.request('inspect', bot='Bob')['result']['compaction'])
                 client.close()
 
     def run_turn(self, client, bot, request, prompt):
