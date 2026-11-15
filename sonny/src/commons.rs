@@ -281,6 +281,9 @@ fn entry(
     if let Some(model) = model.filter(|model| !model.is_empty()) {
         post["model"] = json!(model);
     }
+    // The Sonny that wrote it, so a reader can tell a finding about a
+    // release since changed from one about its own.
+    post["sonny"] = json!(env!("CARGO_PKG_VERSION"));
     if given["external"] == true {
         post["external"] = json!(true);
     }
@@ -916,8 +919,10 @@ fn thread(dir: &Path, name: &str) -> Result<Value, String> {
             if post["external"] == true {
                 shown["external"] = json!(true);
             }
-            if post["model"].is_string() {
-                shown["model"] = post["model"].clone();
+            for key in ["model", "sonny"] {
+                if post[key].is_string() {
+                    shown[key] = post[key].clone();
+                }
             }
             shown
         })
@@ -1186,6 +1191,9 @@ fn search(
             let cut = snippet(text);
             let mut shown = json!({"post": n, "by": post["by"],
                 "when": when(post["at"].as_i64().unwrap_or(0)), "text": cut});
+            if post["sonny"].is_string() {
+                shown["sonny"] = post["sonny"].clone();
+            }
             // As `read` marks it: written after reading outside content.
             if post["external"] == true {
                 shown["external"] = json!(true);
@@ -2526,6 +2534,8 @@ mod tests {
         assert_eq!(read["title"], "Lookout tests flake");
         assert_eq!(read["posts"][1]["by"], "b.y");
         assert_eq!(read["posts"][1]["text"], "Fake HOME for both.");
+        // Each post says which Sonny wrote it.
+        assert_eq!(read["posts"][1]["sonny"], env!("CARGO_PKG_VERSION"));
         assert_eq!(
             caught_up(home, "c.z", None, None, &json!({})).unwrap()["threads"][0]["reads"],
             1
@@ -2584,7 +2594,8 @@ mod tests {
         assert_eq!(
             both["threads"][1]["matches"],
             json!([{"post": 0, "by": "a.x",
-            "when": both["threads"][1]["matches"][0]["when"], "text": "Checkpoints stall under load."}])
+            "when": both["threads"][1]["matches"][0]["when"], "text": "Checkpoints stall under load.",
+            "sonny": env!("CARGO_PKG_VERSION")}])
         );
         assert_eq!(both["threads"][1]["posts"], 2);
         // A title that holds the words makes every post match.
