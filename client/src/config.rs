@@ -60,6 +60,7 @@
 //! commons = false               # agents go without the commons, on by default
 //! commons_invites = 3           # least threads a day that send invites (more with the square root of the week's agents), 0 none; answers add up to as many again
 //! commons_invite_tokens = 1000000  # the budget of the turn an invite starts, in tokens of work
+//! commons_pointer = false       # a new task's brief names no commons threads sharing its words, on by default
 //! ask_wait_minutes = 60         # how long an unanswered ask waits to go ahead or remind; 0 never
 //! task_tabs = "every"         # which tasks open in a tab: "asked", the default, those an agent or you asked for; "every", each as its turn starts
 //! most_task_tabs = 64          # task tabs a lead keeps open, 32 by default; past it the least recently used closes, never one not looked at yet; 0 no limit
@@ -622,6 +623,9 @@ pub struct Sonny {
     /// The tokens of work an invite pays for: the budget of the turn it
     /// starts.
     pub commons_invite_tokens: u64,
+    /// Whether a new task's brief ends with a line naming the commons
+    /// threads whose titles share its words.
+    pub commons_pointer: bool,
     /// Sonny's own sources, as `[sonny.sources.commons]`, `.memory` and
     /// `.links` set them: each one's `digest`, `steer` and `icon`, as the
     /// person's sources take them; none has a command.
@@ -899,6 +903,7 @@ impl Default for Sonny {
             commons: true,
             commons_invites: 3,
             commons_invite_tokens: 1_000_000,
+            commons_pointer: true,
             own_sources: OWN_SOURCES.iter().map(|name| own_source(name)).collect(),
             ask_wait_minutes: 60,
             task_tabs: TaskTabs::default(),
@@ -1720,6 +1725,7 @@ fn parse(text: &str) -> Result<Config, String> {
                 "commons",
                 "commons_invites",
                 "commons_invite_tokens",
+                "commons_pointer",
                 "ask_wait_minutes",
                 "task_tabs",
                 "most_task_tabs",
@@ -1819,6 +1825,7 @@ fn parse(text: &str) -> Result<Config, String> {
                 "suggest" => Some(&mut config.sonny.suggest),
                 "suggest_ideas" => Some(&mut config.sonny.suggest_ideas),
                 "commons" => Some(&mut config.sonny.commons),
+                "commons_pointer" => Some(&mut config.sonny.commons_pointer),
                 "start_at_boot" => Some(&mut config.sonny.start_at_boot),
                 "sky_haikus" => Some(&mut config.sonny.sky_haikus),
                 "project_colors" => Some(&mut config.sonny.project_colors),

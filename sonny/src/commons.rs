@@ -545,12 +545,8 @@ const SEARCH_PAGES: usize = 4;
 /// What of a title is searched for in agents' turns: its three longest
 /// words of four letters or more.
 fn words(title: &str) -> Vec<String> {
-    let mut words: Vec<String> = (title.split(|c: char| !c.is_alphanumeric()))
-        .filter(|word| word.chars().count() >= 4)
-        .map(str::to_lowercase)
-        .collect();
+    let mut words = match_words(title);
     words.sort_by(|a, b| b.chars().count().cmp(&a.chars().count()).then(a.cmp(b)));
-    words.dedup();
     words.truncate(3);
     words
 }
@@ -1186,6 +1182,133 @@ fn similar(dir: &Path, name: &str, title: &str) -> Vec<Value> {
         .collect()
 }
 
+/// The most threads a brief's pointer names.
+const POINTED: usize = 3;
+/// The fewest title words a thread shares with a brief to be named under it.
+const POINTED_WORDS: usize = 2;
+
+/// Whether a new task's brief names the commons threads it shares words
+/// with, from `[sonny] commons_pointer`, read once: on by default, and
+/// never while the commons is off.
+pub fn pointer_on() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    on() && *ON.get_or_init(|| {
+        agent_client::config::load().map_or(true, |config| config.sonny.commons_pointer)
+    })
+}
+
+/// A title's or brief's words that matching weighs: those of four letters
+/// or more, as invites take a title's, lowercased, each once.
+fn match_words(text: &str) -> Vec<String> {
+    let mut words: Vec<String> = (text.split(|c: char| !c.is_alphanumeric()))
+        .filter(|word| word.chars().count() >= 4)
+        .map(str::to_lowercase)
+        .collect();
+    words.sort();
+    words.dedup();
+    words
+}
+
+/// `brief` with a line under it naming the commons threads whose titles
+/// share at least `POINTED_WORDS` of its words, at most `POINTED`, as
+/// Stack Overflow names related questions: a word few titles hold weighs
+/// more than one many do (BM25's inverse document frequency, as Lucene's
+/// More Like This weighs terms), the best first, then the latest to move.
+/// The brief as it was when no thread shares enough. Only each thread's
+/// first line is read to match, and the named ones whole for their count
+/// of posts, so a start costs one short read a thread: a few milliseconds
+/// at thousands of threads. A fact about the commons, never a request to
+/// read it.
+pub fn pointed(home: &Path, brief: &str) -> String {
+    match pointer(&dir(home), brief) {
+        Some(line) => format!("{brief}\n\n{line}"),
+        None => brief.to_owned(),
+    }
+}
+
+fn pointer(dir: &Path, brief: &str) -> Option<String> {
+    let briefed: std::collections::HashSet<String> = match_words(brief).into_iter().collect();
+    if briefed.len() < POINTED_WORDS {
+        return None;
+    }
+    let mut titles: Vec<(String, PathBuf, Vec<String>)> = Vec::new();
+    for entry in std::fs::read_dir(dir).ok()?.flatten() {
+        let path = entry.path();
+        let Some(name) = (path.file_name().and_then(|n| n.to_str()))
+            .and_then(|n| n.strip_suffix(".jsonl"))
+            .filter(|n| valid_name(n).is_ok())
+            .map(str::to_owned)
+        else {
+            continue;
+        };
+        let Some(first) = first_post(&path) else {
+            continue;
+        };
+        let words = match_words(first["title"].as_str().unwrap_or_default());
+        titles.push((name, path, words));
+    }
+    let threads = titles.len() as f64;
+    let mut held: HashMap<&str, usize> = HashMap::new();
+    for (_, _, words) in &titles {
+        for word in words {
+            *held.entry(word.as_str()).or_default() += 1;
+        }
+    }
+    let weight = |word: &str| {
+        let held = held.get(word).copied().unwrap_or(0) as f64;
+        (1.0 + (threads - held + 0.5) / (held + 0.5)).ln()
+    };
+    let mut found: Vec<(f64, std::time::SystemTime, &str, &Path)> = Vec::new();
+    for (name, path, words) in &titles {
+        let shared: Vec<&String> = words.iter().filter(|w| briefed.contains(*w)).collect();
+        if shared.len() < POINTED_WORDS {
+            continue;
+        }
+        let score = shared.iter().map(|word| weight(word)).sum();
+        let moved =
+            (std::fs::metadata(path).and_then(|m| m.modified())).unwrap_or(std::time::UNIX_EPOCH);
+        found.push((score, moved, name, path));
+    }
+    found.sort_by(|a, b| {
+        (b.0.total_cmp(&a.0))
+            .then_with(|| b.1.cmp(&a.1))
+            .then_with(|| a.2.cmp(b.2))
+    });
+    let lines: Vec<String> = (found.into_iter())
+        .filter_map(|(_, _, name, path)| summary(name, path))
+        .take(POINTED)
+        .map(|thread| {
+            let posts = thread["posts"].as_u64().unwrap_or(1);
+            let since = (now() - thread["at"].as_i64().unwrap_or(0)).max(0);
+            format!(
+                "- {} {} ({posts} post{}, last {})",
+                thread["thread"].as_str().unwrap_or_default(),
+                Value::from(thread["title"].as_str().unwrap_or_default()),
+                if posts == 1 { "" } else { "s" },
+                ago(since),
+            )
+        })
+        .collect();
+    (!lines.is_empty()).then(|| {
+        format!(
+            "[The commons has threads whose titles share words with this brief:\n{}]",
+            lines.join("\n")
+        )
+    })
+}
+
+/// How long ago `seconds` was, in words: `just now`, `5 minutes ago`,
+/// `3 hours ago`, `2 days ago`.
+fn ago(seconds: i64) -> String {
+    let (count, unit) = match seconds {
+        ..60 => return "just now".into(),
+        60..3600 => (seconds / 60, "minute"),
+        3600..86_400 => (seconds / 3600, "hour"),
+        _ => (seconds / 86_400, "day"),
+    };
+    format!("{count} {unit}{} ago", if count == 1 { "" } else { "s" })
+}
+
 /// A thread's first post, which never changes, read alone.
 fn first_post(path: &Path) -> Option<Value> {
     use std::io::{BufRead, Read};
@@ -1665,6 +1788,82 @@ mod tests {
         assert_eq!(look(&home, &cursor), lost);
         assert!(look(&home, &cursor).is_empty());
         let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn a_brief_names_the_threads_whose_titles_share_two_of_its_words() {
+        let home = home("pointer");
+        let post = |by: &str, arguments: Value| call(&home, by, None, None, &arguments).unwrap();
+        let start = |name: &str, title: &str| {
+            post(
+                "a.x",
+                json!({"post": {"name": name, "title": title, "text": "x"}}),
+            )
+        };
+        start("cache", "Sandbox cache misses after upgrade");
+        start("runtime", "Stale runtime after upgrade");
+        start("render", "Wide tables render badly");
+        post(
+            "b.y",
+            json!({"reply": {"thread": "cache", "text": "fixed"}}),
+        );
+        let brief = "Fix the sandbox cache: builds miss it since the upgrade.";
+        let said = pointed(&home, brief);
+        let (kept, line) = said.split_once("\n\n").unwrap();
+        assert_eq!(kept, brief);
+        assert_eq!(
+            line,
+            "[The commons has threads whose titles share words with this brief:\n\
+             - cache \"Sandbox cache misses after upgrade\" (2 posts, last just now)]"
+        );
+        // One shared word, however rare, is no match.
+        assert_eq!(pointed(&home, "Render the page."), "Render the page.");
+        // Nor are words of three letters or fewer.
+        assert_eq!(pointed(&home, "Fix the bad UI."), "Fix the bad UI.");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn a_brief_names_three_threads_at_most_the_rarer_words_first() {
+        let home = home("pointer-rank");
+        let post = |name: &str, title: &str| {
+            call(
+                &home,
+                "a.x",
+                None,
+                None,
+                &json!({"post": {"name": name, "title": title, "text": "x"}}),
+            )
+            .unwrap()
+        };
+        for n in 0..4 {
+            post(&format!("sonny-agent-{n}"), "Sonny agent notes");
+        }
+        post("lookout", "Sonny lookout digest");
+        let said = pointed(&home, "Sonny's agent and lookout digest need a look.");
+        let line = said.split_once("\n\n").unwrap().1;
+        let named: Vec<&str> = (line.lines().skip(1))
+            .map(|l| l.trim_start_matches("- ").split(' ').next().unwrap())
+            .collect();
+        // "lookout" and "digest" are rarer than "agent", so their thread
+        // leads, and three is the most named.
+        assert_eq!(named.len(), 3);
+        assert_eq!(named[0], "lookout");
+        assert!(line.ends_with(']'));
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn an_empty_or_missing_commons_leaves_a_brief_as_written() {
+        let home = home("pointer-empty");
+        assert_eq!(
+            pointed(&home, "Fix the sandbox cache"),
+            "Fix the sandbox cache"
+        );
+        assert_eq!(ago(30), "just now");
+        assert_eq!(ago(60), "1 minute ago");
+        assert_eq!(ago(7200), "2 hours ago");
+        assert_eq!(ago(86_400 * 3), "3 days ago");
     }
 
     #[test]
