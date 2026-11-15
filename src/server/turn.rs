@@ -1455,8 +1455,10 @@ impl Turn {
     /// reply, and whether the view and the reply still fit the input limit.
     /// `None` without compaction instructions, or below the threshold.
     /// As a turn ends on its reply (`post_turn`), the threshold is the soft
-    /// limit where there is one; elsewhere it is the hard one. What the
-    /// summary keeps follows the hard limit either way.
+    /// limit where there is one; elsewhere it is the hard one. The summary
+    /// keeps the same share of whichever was used, so one written at the
+    /// soft limit leaves the view as far under it as one at the hard limit
+    /// leaves it under that.
     fn due(
         &self,
         record: &agent_runtime::store::Bot,
@@ -1471,13 +1473,14 @@ impl Turn {
         let overhead = record.instructions.len() + tools.get().len();
         let budget = self.soft_bytes(record, overhead);
         let hard = budget / 100 * self.settings().compact_at();
-        let at = match post_turn {
+        // The limit this check uses, the soft one as a turn ends.
+        let limit_at = match post_turn {
             true => self
                 .post_turn_bytes(record, overhead)
                 .map_or(hard, |soft| soft.min(hard)),
             false => hard,
-        }
-        .min(limit.bytes - reserve);
+        };
+        let at = limit_at.min(limit.bytes - reserve);
         if !requested
             && pressure.bytes < at
             && pressure.items
@@ -1490,7 +1493,7 @@ impl Turn {
             (1, 1)
         } else {
             (
-                (budget / 100 * self.settings().compact_keep())
+                (limit_at * self.settings().compact_keep() / self.settings().compact_at())
                     .min(
                         limit.bytes.saturating_sub(ahead.bytes) * self.settings().compact_keep()
                             / self.settings().compact_at(),

@@ -4159,7 +4159,9 @@ land after the reply. On 200K, 272K and 1M windows the soft limit is
 pre-turn check does, so a new prompt never waits for a summary the soft
 limit asked for. A bot on bytes alone (`compact_tokens` 0), or before its
 first call, has no token estimate and no soft limit: its turns end on the
-hard one. What a summary keeps verbatim follows the hard limit either way.
+hard one. A summary keeps verbatim the same share (`compact_keep` of
+`compact_at`) of whichever limit it passed, so one written at the soft
+limit leaves the view under it with the same room.
 The `compacted` event's `trigger.at_bytes` is the limit that was passed.
 Below the threshold the turn ends on one comparison; past it, the view is
 read again and the summary planned as at a boundary, copying the turn's

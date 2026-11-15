@@ -537,6 +537,8 @@ class TurnCompactionTests(ModelFixture):
         token, with `overhead` bytes of instructions, each turn four rounds
         of `lines` lines, until it has compacted `compactions` times; each
         summary as long as it is asked for, the least room it can leave.
+        The person reads each reply before writing again, so a summary
+        started as a turn ends lands before the next turn.
         The compacted events, oldest first."""
         self.model.bytes_per_token = per_token
         self.model.compaction_text = lambda request: 's' * asked_bytes(request)
@@ -547,7 +549,11 @@ class TurnCompactionTests(ModelFixture):
         for n in range(400):
             turn = client.request('submit', bot='Lead', request_id=str(n),
                                   prompt=f'long:4x{lines}')['result']['message']
-            self.assertEqual(client.finished(turn, timeout=60)['data']['status'], 'completed')
+            ended = client.finished(turn, timeout=60)
+            self.assertEqual(ended['data']['status'], 'completed')
+            time.sleep(.3)
+            if getattr(self.model, 'summarizing', False):
+                client.summarized('Lead', timeout=30, turn=ended['turn'])
             drain(self.model)
             compacted = [e['data'] for e in all_events(client, 'Lead') if e['event'] == 'compacted']
             if len(compacted) >= compactions:
@@ -573,6 +579,10 @@ class TurnCompactionTests(ModelFixture):
         # about 36 KB, each summary a full 64 KiB.
         compacted = self.drive(200_000, 4, 40_000, 2000)
         self.assert_room(compacted, 200_000)
+        # Past the first, each is written as a turn ends, at the soft
+        # limit, before any turn reaches the hard one.
+        self.assertTrue(all(d['request'].get('after_turn') for d in compacted[1:]), compacted)
+        self.assertLess(compacted[1]['trigger']['at_bytes'], compacted[0]['trigger']['at_bytes'])
 
     def test_a_lead_keeps_room_to_work_across_twenty_compactions_at_1m(self):
         # A byte a token, so the test sends a million bytes, not four.
