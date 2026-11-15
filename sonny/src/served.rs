@@ -144,7 +144,8 @@ fn start() -> Value {
                     "description": "A short name for the task, valid as a git branch name, that no agent of \
                         this project has yet; Sonny puts your project's name and a dot before it."},
                 "brief": {"type": "string", "minLength": 1,
-                    "description": "Everything the task needs, since it never sees your conversation."},
+                    "description": "Everything the task needs, since it never sees your conversation. Its \
+                        first line is the task's title."},
                 "profile": {"type": "string", "minLength": 1,
                     "description": "A profile listed under Profiles that fits the task; without one, it \
                         starts with none."},
