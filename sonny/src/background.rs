@@ -78,6 +78,9 @@ pub struct Item {
     /// question, shown as the question and what happens when, never as
     /// its gate. It goes once the question is answered.
     pub reminder: Option<crate::asks::Reminder>,
+    /// An automation's row as Sonny's scheduler lists it, which its page
+    /// shows; null for anything else.
+    pub row: Value,
 }
 
 /// Every trigger made on the daemon whose store is `store_id` and every
@@ -153,6 +156,7 @@ pub fn read(
                 message: String::new(),
                 sub: Some(sub.clone()),
                 reminder: None,
+                row: Value::Null,
             });
         }
     }
@@ -268,6 +272,24 @@ fn heard(
         .filter(|kept| kept["clear"] != true)
         .filter_map(|kept| lookout::sources::Event::from_json(&kept))
         .find(|event| !event.lookout && hears(event))
+}
+
+/// When each automation made on the daemon whose store is `store_id`
+/// runs next, in seconds, as [`trigger::upcoming`] reads them: read again
+/// once their folder changes or the first of those times comes.
+fn next_runs(store_id: &str) -> HashMap<String, i64> {
+    static KEPT: kept::Slot<HashMap<String, i64>> = kept::Slot::new(None);
+    let Ok(places) = trigger::Places::home() else {
+        return HashMap::new();
+    };
+    kept::read(&KEPT, store_id, vec![places.jobs.clone()], || {
+        let now = (now_ms() / 1000) as i64;
+        let next: HashMap<String, i64> = (trigger::upcoming(&places, store_id, now).into_iter())
+            .filter_map(|run| Some((run.name, run.next?)))
+            .collect();
+        let until = next.values().min().copied();
+        (next, until)
+    })
 }
 
 /// What `subscriber`'s follows told lately, as the lookout last counted
@@ -395,6 +417,7 @@ fn unscheduled(cleanup: Option<(String, i64)>) -> Option<Item> {
         message: String::new(),
         sub: None,
         reminder: None,
+        row: Value::Null,
     })
 }
 
@@ -441,6 +464,7 @@ fn servers(view: &Value) -> Vec<Item> {
                 message: String::new(),
                 sub: None,
                 reminder: None,
+                row: Value::Null,
             });
         }
     }
@@ -592,6 +616,7 @@ fn trigger_item(row: &Value, bots: Vec<String>) -> Item {
         message: text("message"),
         sub: None,
         reminder: crate::asks::reminder(&text("if"), &text("when"), &text("message")),
+        row: row.clone(),
     }
 }
 
@@ -729,6 +754,8 @@ pub struct View {
     tasks: Arc<Vec<Value>>,
     /// What the open follow's page says beyond its settings.
     follow: Follow,
+    /// When the open automation's page says it runs next, in seconds.
+    next_run: Option<i64>,
 }
 
 /// What a follow's page says beyond how it was set, read only while it
@@ -776,6 +803,49 @@ impl Field {
             spans: vec![Span::raw(text)],
             link: None,
         }
+    }
+
+    /// A row of words alone, wider than `room`, as rows that fit, broken
+    /// after a space or a `/`, so a folder breaks between its parts.
+    fn broken(self, room: usize) -> Vec<Field> {
+        let [span] = &self.spans[..] else {
+            return vec![self];
+        };
+        if self.link.is_some() || span.width() <= room || room == 0 {
+            return vec![self];
+        }
+        let style = span.style;
+        let mut rows: Vec<String> = Vec::new();
+        let mut row = String::new();
+        // A part a ` · ` apart stays whole where it fits a row.
+        let mut words: Vec<String> = Vec::new();
+        for part in span.content.split_inclusive(" · ") {
+            if part.trim_end().width() <= room {
+                words.push(part.to_owned());
+                continue;
+            }
+            let mut word = String::new();
+            for c in part.chars() {
+                word.push(c);
+                if c == ' ' || c == '/' {
+                    words.push(std::mem::take(&mut word));
+                }
+            }
+            words.push(word);
+        }
+        for word in words.into_iter().filter(|w| !w.is_empty()) {
+            if !row.is_empty() && row.width() + word.trim_end().width() > room {
+                rows.push(std::mem::take(&mut row).trim_end().to_owned());
+            }
+            row.push_str(&word);
+        }
+        rows.push(row.trim_end().to_owned());
+        (rows.into_iter())
+            .map(|text| Field {
+                spans: vec![Span::styled(text, style)],
+                link: None,
+            })
+            .collect()
     }
 }
 
@@ -901,6 +971,7 @@ impl View {
             page: None,
             tasks: Arc::default(),
             follow: Follow::default(),
+            next_run: None,
         };
         view.reload();
         view
@@ -993,7 +1064,23 @@ impl View {
         self.lookout =
             crate::tool_host::with_status(lookout::status(&self.store, &self.bot), &self.store);
         self.icons = source_icons();
+        self.read_page();
+    }
+
+    /// What the open page says beyond its row, read only while it is open:
+    /// a follow's agents, words and counts, an automation's next run.
+    fn read_page(&mut self) {
         self.follow = self.read_follow();
+        self.next_run = self.read_next_run();
+    }
+
+    /// When the automation whose page is open runs next, as its schedule
+    /// says: none for one that waits on a file or a commit.
+    fn read_next_run(&self) -> Option<i64> {
+        self.page.as_ref().filter(|page| page.handle.is_none())?;
+        let item = (self.items.get(self.selected)).filter(|item| item.kind == Kind::Trigger)?;
+        let next = next_runs(self.store_id.as_deref()?);
+        next.get(&item.name).copied()
     }
 
     /// The tasks as `/status` read them now.
@@ -1182,7 +1269,7 @@ impl View {
             links: Vec::new(),
             done_open: false,
         });
-        self.follow = self.read_follow();
+        self.read_page();
     }
 
     /// Whether a thing is open as a page.
@@ -1544,14 +1631,38 @@ impl View {
             ));
         } else if let Some(item) = self.items.get(self.selected).cloned() {
             out.push(Line::from(item.name.clone()).bold());
-            let what = match item.kind {
-                Kind::Subscription => "follow for ",
-                _ => "automation for ",
-            };
-            about.push(vec![
-                (what.into(), None),
-                (short(&item.bot), Some(item.bot.clone())),
-            ]);
+            let start = &item.row["start"];
+            match item.kind {
+                Kind::Subscription => about.push(vec![
+                    ("follow for ".into(), None),
+                    (short(&item.bot), Some(item.bot.clone())),
+                ]),
+                // One that starts its agent each run has none of its own
+                // to link.
+                _ if start["fresh"] == true => {
+                    about.push(vec![(
+                        format!("starts {} each run", short(&item.bot)),
+                        None,
+                    )]);
+                    let model = start["model"].as_str().unwrap_or_default();
+                    about.push(vec![(crate::models::label(model), None)]);
+                }
+                // One whose agent its first run starts names it in plain
+                // words until it is there.
+                _ => {
+                    let there = start.is_null() || item.row["bot_id"].is_i64();
+                    about.push(vec![
+                        ("automation for ".into(), None),
+                        (short(&item.bot), there.then(|| item.bot.clone())),
+                    ]);
+                }
+            }
+            if let Some(by) = item.row["by"].as_str() {
+                about.push(vec![
+                    ("added by ".into(), None),
+                    (short(by), Some(by.to_owned())),
+                ]);
+            }
             if item.own {
                 about.push(vec![("Sonny's own".into(), None)]);
             }
@@ -1572,6 +1683,7 @@ impl View {
             }
             let fields: Vec<(&str, Vec<Field>)> = match &item.sub {
                 Some(sub) => self.follow_fields(sub, &item.bot, width),
+                None if item.kind == Kind::Trigger => self.automation_fields(&item),
                 None => vec![("when", vec![Field::text(item.when.clone())])],
             };
             // The links in the line under the name come first.
@@ -1584,7 +1696,10 @@ impl View {
             let label = fields.iter().map(|(l, _)| l.width()).max().unwrap_or(0) + 2;
             let hang = " ".repeat(label);
             for (name, rows) in fields {
-                for (n, Field { mut spans, link }) in rows.into_iter().enumerate() {
+                // A value too wide breaks at a space or after a `/`.
+                let rows =
+                    (rows.into_iter()).flat_map(|row| row.broken(width.saturating_sub(label)));
+                for (n, Field { mut spans, link }) in rows.enumerate() {
                     let lead = match n {
                         0 => Span::raw(format!("{name:<label$}")).dim(),
                         _ => Span::raw(hang.clone()),
@@ -1612,9 +1727,9 @@ impl View {
                     body.push(Line::from([vec![lead], spans].concat()));
                 }
             }
-            // What an automation's row says after it, whole. A follow's
-            // page says it all in its fields.
-            if !item.facts.is_empty() && item.sub.is_none() {
+            // What a row says after it, whole, where its page has no field
+            // for it.
+            if !item.facts.is_empty() && item.sub.is_none() && item.kind != Kind::Trigger {
                 body.extend(crate::transcript::wrap(
                     Line::from(item.facts.join(" · ")).dim(),
                     width,
@@ -1843,6 +1958,121 @@ impl View {
         };
         fields.push(("told", vec![Field::text(told)]));
         fields
+    }
+
+    /// An automation's fields on its page: when it runs and when next,
+    /// its check and what that last said, its last run and the agent it
+    /// ran in, what is left of it, and its budget.
+    fn automation_fields(&self, item: &Item) -> Vec<(&'static str, Vec<Field>)> {
+        let row = &item.row;
+        let now = (now_ms() / 1000) as i64;
+        let mut fields = Vec::new();
+        let mut when = vec![Field::text(when_words(
+            row["when"].as_str().unwrap_or(&item.when),
+            self.next_run,
+            now,
+        ))];
+        if row["missed"] == true {
+            when.push(Field::text("missed its time".into()));
+        }
+        fields.push(("when", when));
+        if let Some(gate) = row["if"].as_str() {
+            let mut rows = vec![Field::text(home_path(gate))];
+            let checked = &row["checked"];
+            let ago_of = |key: &str| {
+                let at = checked[key].as_u64().unwrap_or_default();
+                ago(now_ms().saturating_sub(at) / 1000)
+            };
+            match checked["gate"].as_str() {
+                Some("no") => rows.push(Field::text(format!(
+                    "checked {}, nothing new",
+                    ago_of("checked_ms")
+                ))),
+                Some("go") => rows.push(Field::text(format!(
+                    "checked {}, something new",
+                    ago_of("checked_ms")
+                ))),
+                Some("failed") => rows.push(Field::text(format!(
+                    "could not check since {}",
+                    ago_of("since_ms")
+                ))),
+                _ => {}
+            }
+            fields.push(("if", rows));
+        }
+        fields.push(("last", vec![self.last_run(item)]));
+        let mut left = Vec::new();
+        if let Some(runs) = row["runs"].as_u64() {
+            let sent = row["sent"].as_u64().unwrap_or(0);
+            left.push(format!("{} of {runs} runs", runs.saturating_sub(sent)));
+        }
+        if let Some(until) = row["until"].as_str() {
+            let until = trigger::moment(until).map_or_else(|_| until.to_owned(), trigger::date);
+            left.push(format!("until {until}"));
+        }
+        if row["ended"] == true {
+            left = vec!["ended".into()];
+        }
+        if !left.is_empty() {
+            fields.push(("left", vec![Field::text(left.join(" · "))]));
+        }
+        if let Some(tokens) = row["turn_budget_tokens"].as_u64() {
+            let what = match row["budget_counts"].as_str() {
+                Some("work") => " of work",
+                _ => "",
+            };
+            fields.push((
+                "budget",
+                vec![Field::text(format!(
+                    "{} tokens{what} a run",
+                    thousands(tokens)
+                ))],
+            ));
+        }
+        fields
+    }
+
+    /// When an automation last ran and the agent it ran in, a link; how
+    /// it ended only when not well, `working` while its turn runs.
+    fn last_run(&self, item: &Item) -> Field {
+        let row = &item.row;
+        let last = &row["last"];
+        let Some(fired) = last["fired_ms"].as_u64() else {
+            return Field::text("not run yet".into());
+        };
+        // The agent its run went to: a run's own where each starts one.
+        let run = &row["run"];
+        let bot = (["running", "finished", "failed"].iter())
+            .find_map(|key| run[key]["bot"].as_str())
+            .unwrap_or(&item.bot)
+            .to_owned();
+        let ended = match (last["outcome"].as_str(), last["turn_status"].as_str()) {
+            (Some("sent"), None) => Some("working".to_owned()),
+            (Some("sent"), Some("completed")) => None,
+            (Some("sent"), Some("failed")) => Some("its turn failed".into()),
+            (Some("sent"), Some(status)) => Some(status.to_owned()),
+            (Some("failed"), _) => Some("it could not send".into()),
+            (Some(outcome), _) => Some(outcome.to_owned()),
+            (None, _) => None,
+        };
+        let ended = match last["reply"]["outcome"] == "failed" {
+            true => Some("its answer was not passed on".to_owned()),
+            false => ended,
+        };
+        let mut spans = vec![
+            Span::raw(format!(
+                "{} in ",
+                ago(now_ms().saturating_sub(fired) / 1000)
+            )),
+            Span::raw(self.scope.short(&bot)).fg(Color::Blue),
+        ];
+        if let Some(ended) = ended {
+            spans.push(Span::raw(format!(" · {ended}")));
+        }
+        Field {
+            spans,
+            link: Some((1, Target::Agent(bot))),
+        }
     }
 
     /// Every agent `sub` watches now, each a link with its mark and word,
@@ -2184,6 +2414,77 @@ fn said(reminder: &crate::asks::Reminder, now: i64) -> Line<'static> {
 
 /// A pattern as JSON with a space after each `:` and `,`, so a page
 /// wraps it between its parts rather than inside one.
+/// When an automation runs, as set, then when it runs next: `every 1h ·
+/// next 14:00, in 35m`, `a commit lands in ~/tally`, `~/notes.md changes`.
+fn when_words(when: &str, next: Option<i64>, now: i64) -> String {
+    if let Some(path) = when.strip_prefix("file ") {
+        return format!("{} changes", home_path(path));
+    }
+    if let Some(path) = when.strip_prefix("commit ") {
+        return format!("a commit lands in {}", home_path(path));
+    }
+    if when.is_empty() || when == "fire" {
+        return "only when run".into();
+    }
+    match (when.strip_prefix("at "), next) {
+        (Some(_), Some(next)) => format!("once, {}", coming(next, now)),
+        (Some(at), None) => format!(
+            "once, {}",
+            trigger::moment(at).map_or_else(|_| at.to_owned(), trigger::date)
+        ),
+        (None, Some(next)) => format!("{when} · next {}", coming(next, now)),
+        (None, None) => when.to_owned(),
+    }
+}
+
+/// A time to come and how far off: `03:00, in 15h` within a day, else
+/// its date.
+fn coming(at: i64, now: i64) -> String {
+    let left = (at - now).max(0);
+    let time = match left < 86_400 {
+        true => {
+            let local = trigger::local(at);
+            format!("{:02}:{:02}", local.hour, local.minute)
+        }
+        false => trigger::date(at),
+    };
+    let off = match left {
+        0..3600 => format!("{}m", ((left + 59) / 60).max(1)),
+        3600..86_400 => format!("{}h", left / 3600),
+        _ => format!("{}d", left / 86_400),
+    };
+    format!("{time}, in {off}")
+}
+
+/// A path written from `~` where it is under the home folder, as the
+/// footer writes one; a command's paths too.
+fn home_path(text: &str) -> String {
+    match std::env::var("HOME") {
+        Ok(home) if home.len() > 1 => {
+            let home = home.trim_end_matches('/');
+            let text = text.replace(&format!("{home}/"), "~/");
+            match text.strip_suffix(home) {
+                Some(rest) if rest.is_empty() || rest.ends_with(' ') => format!("{rest}~"),
+                _ => text,
+            }
+        }
+        _ => text.to_owned(),
+    }
+}
+
+/// `9000` as `9,000`.
+fn thousands(n: u64) -> String {
+    let digits = n.to_string();
+    let mut out = String::new();
+    for (i, c) in digits.chars().enumerate() {
+        if i > 0 && (digits.len() - i).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(c);
+    }
+    out
+}
+
 /// A pattern in words, as a page says it: `text starts with "main:"`,
 /// each field's values an `or` apart and the fields an `and`. None for one
 /// that nests or has `$or`, which a page shows as written.
@@ -2329,6 +2630,7 @@ mod tests {
             message: "Read preferences.md".into(),
             sub: None,
             reminder: None,
+            row: Value::Null,
         }
     }
 
@@ -2381,6 +2683,7 @@ mod tests {
             page: None,
             tasks: Arc::default(),
             follow: Follow::default(),
+            next_run: None,
         }
     }
 
@@ -2696,6 +2999,133 @@ mod tests {
     }
 
     #[test]
+    fn an_automations_page_says_when_it_runs_next_and_how_its_last_run_went() {
+        let now = now_ms();
+        let row = json!({"name": "nightly", "when": "cron 0 3 * * *", "bot": "calc.lead",
+            "bot_id": 1, "start": null, "by": null, "reply_to": null,
+            "if": "git -C /nowhere/calc log --since=1.day --oneline | grep -q .",
+            "checked": {"gate": "no", "checked_ms": now - 120_000},
+            "runs": 5, "sent": 2, "until": "2026-12-01 09:00", "turn_budget_tokens": 90000,
+            "message": "Run the full test suite on main.\nOtherwise say nothing.",
+            "last": {"outcome": "sent", "fired_ms": now - 9 * 3_600_000, "handle": "h1",
+                "turn_status": "completed"}});
+        let item = Item {
+            row: row.clone(),
+            message: row["message"].as_str().unwrap().into(),
+            ..item(Kind::Trigger, "nightly", &["calc.lead"], false)
+        };
+        let mut view = view_of(std::env::temp_dir(), vec![item]);
+        view.key(
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            0..usize::MAX,
+        );
+        let soon = (now_ms() / 1000) as i64 + 15 * 3600 + 30;
+        view.next_run = Some(soon);
+        let local = trigger::local(soon);
+        let until = trigger::date(trigger::moment("2026-12-01 09:00").unwrap());
+        assert_eq!(
+            page_text(&mut view, 60),
+            [
+                "nightly".to_owned(),
+                "automation for lead".into(),
+                "".into(),
+                format!(
+                    "when    cron 0 3 * * * · next {:02}:{:02}, in 15h",
+                    local.hour, local.minute
+                ),
+                "if      git -C /nowhere/calc log --since=1.day --oneline |".into(),
+                "        grep -q .".into(),
+                "        checked 2m ago, nothing new".into(),
+                "last    9h ago in lead".into(),
+                format!("left    3 of 5 runs · until {until}"),
+                "budget  90,000 tokens a run".into(),
+                "".into(),
+                "Run the full test suite on main.".into(),
+                "Otherwise say nothing.".into(),
+            ]
+        );
+        // The agent it ran in is a link after the one it is for.
+        let links = &view.page.as_ref().unwrap().links;
+        assert_eq!(links[1].3, Target::Agent("calc.lead".into()));
+        assert_eq!((links[1].0, links[1].1, links[1].2), (7, 18, 22));
+        // A folder too wide breaks after a `/`, never inside a name.
+        let narrow = page_text(&mut view, 44);
+        assert_eq!(narrow[4], "if      git -C /nowhere/calc log");
+        assert_eq!(narrow[5], "        --since=1.day --oneline | grep -q .");
+        // A part a ` · ` apart stays whole: a date never breaks.
+        let narrower = page_text(&mut view, 40);
+        let at = narrower.iter().position(|l| l.starts_with("left")).unwrap();
+        assert_eq!(narrower[at], "left    3 of 5 runs ·");
+        assert_eq!(narrower[at + 1], format!("        until {until}"));
+    }
+
+    #[test]
+    fn an_automation_that_starts_its_agent_each_run_names_it_in_words() {
+        let now = now_ms();
+        let row = json!({"name": "pushcheck", "when": "commit /nowhere/calc", "bot": "calc.pushcheck",
+            "bot_id": null, "start": {"model": "demo/scripted", "effort": null, "fresh": true},
+            "by": "calc.lead", "reply_to": "calc.lead", "sent": 1,
+            "message": "Check what was pushed.",
+            "run": {"running": {"n": 1, "bot": "calc.pushcheck-1", "id": 4, "handle": "h"}},
+            "last": {"outcome": "sent", "fired_ms": now - 25_000, "handle": "h"}});
+        let item = Item {
+            row: row.clone(),
+            reply_to: Some("calc.lead".into()),
+            message: "Check what was pushed.".into(),
+            ..item(Kind::Trigger, "pushcheck", &["calc.pushcheck"], false)
+        };
+        let mut view = view_of(std::env::temp_dir(), vec![item]);
+        view.key(
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            0..usize::MAX,
+        );
+        let page = page_text(&mut view, 80);
+        assert_eq!(
+            page[1],
+            "starts pushcheck each run · Scripted · added by lead · answers go to lead"
+        );
+        assert_eq!(page[3], "when  a commit lands in /nowhere/calc");
+        assert_eq!(page[4], "last  25s ago in pushcheck-1 · working");
+        let targets: Vec<Target> = (view.page.as_ref().unwrap().links.iter())
+            .map(|link| link.3.clone())
+            .collect();
+        assert_eq!(
+            targets,
+            [
+                Target::Agent("calc.lead".into()),
+                Target::Agent("calc.lead".into()),
+                Target::Agent("calc.pushcheck-1".into()),
+            ]
+        );
+    }
+
+    #[test]
+    fn when_an_automation_runs_reads_in_words() {
+        let now = 1_000_000;
+        assert_eq!(
+            when_words("file /x/notes.md", None, now),
+            "/x/notes.md changes"
+        );
+        assert_eq!(when_words("fire", None, now), "only when run");
+        assert_eq!(when_words("every 1h", None, now), "every 1h");
+        let soon = trigger::local(now + 35 * 60);
+        assert_eq!(
+            when_words("every 1h", Some(now + 35 * 60), now),
+            format!(
+                "every 1h · next {:02}:{:02}, in 35m",
+                soon.hour, soon.minute
+            )
+        );
+        let far = now + 4 * 86_400 + 60;
+        assert_eq!(
+            when_words("at 2026-11-20 09:00", Some(far), now),
+            format!("once, {}, in 4d", trigger::date(far))
+        );
+        assert_eq!(thousands(1_234_567), "1,234,567");
+        assert_eq!(thousands(900), "900");
+    }
+
+    #[test]
     fn a_follow_of_a_tasks_tasks_lists_them_not_it_and_cuts_a_long_name_to_its_row() {
         let sub = lookout::subs::Sub {
             name: "fix".into(),
@@ -2870,6 +3300,7 @@ mod tests {
             page: None,
             tasks: Arc::default(),
             follow: Follow::default(),
+            next_run: None,
         };
         let rows: Vec<String> = (view.card(100).0.iter())
             .map(|l| l.to_string())
@@ -2949,6 +3380,7 @@ mod tests {
             page: None,
             tasks: Arc::default(),
             follow: Follow::default(),
+            next_run: None,
         };
         let clock = crate::asks::clock(at, now);
         // The pick reaches a column past the last word.
@@ -3289,6 +3721,7 @@ mod tests {
             page: None,
             tasks: Arc::default(),
             follow: Follow::default(),
+            next_run: None,
         };
         let (card, at) = view.card(100);
         let lines: Vec<String> = card.iter().map(|l| l.to_string()).collect();
@@ -3353,6 +3786,7 @@ mod tests {
             page: None,
             tasks: Arc::default(),
             follow: Follow::default(),
+            next_run: None,
         };
         let text = |view: &View| -> Vec<String> {
             view.card(100)
@@ -3387,7 +3821,7 @@ mod tests {
                 "automation for lead",
                 "",
                 "when  every 1d",
-                "      sent 2",
+                "last  not run yet",
                 "",
                 "Read preferences.md",
             ]

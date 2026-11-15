@@ -1131,8 +1131,18 @@ has something on it, or is off the screen, no time shows.
   its agent, how long it has run, a detached one's pid and the start of
   its command, read from the daemon's `processes` every two seconds while
   it is open. `↑`/`↓` picks one, and Enter, `→` or a click opens it as a
-  page, as a fact opens in `/memory`: an automation's whole message, when
-  it runs, its last run and how that ended, and who gets the answers; a
+  page, as a fact opens in `/memory`: an automation's page says, under its
+  name, whom it is for, who added it where Sonny knows, and who gets the
+  answers (one that starts its agent each run says `starts pushcheck each
+  run` and its model; an agent its first run starts is plain words until
+  it is there), then `when` as set and when it runs next (`cron 0 3 * * * ·
+  next 03:00, in 15h`, `a commit lands in ~/tally`), `if` with its check
+  whole and what that last said, `last` with when it last ran and the
+  agent it ran in, a link, saying how it ended only when not well
+  (`working` while its turn runs), `left` (`3 of 5 runs`, `until Tue 1 Dec
+  09:00`), `budget`, and then its whole message; folders are written from
+  `~` and break at a `/`, and its next run is read from its schedule only
+  while the page is open; a
   follow's page says what it does now after how it was set: what it
   watches and every agent that matches now, each a link with its mark and
   state, those not done first and two done or more folded to `3 done`,
@@ -1175,6 +1185,8 @@ has something on it, or is off the screen, no time shows.
   ![/background's pages: enter on an automation, a follow and a command, each with the agent it belongs to as its first link](../docs/sonny/background-pages-60.png)
 
   ![A follow's page: its sources' newest words or down since when, and the lead's tasks follow with the agents it watches, the done folded](../docs/sonny/follow-page-60.png)
+
+  ![An automation's page after a run: when it runs next, its check and what it said, its last run, what is left; and one whose agent its first run starts](../docs/sonny/automation-page-60.png)
 - `/usage` shows, in the pane beside the conversation,
   the tokens the project's agents spent in the last 24 hours, as their
   retained history records them: in all, as
