@@ -857,7 +857,7 @@ fn redirects_elsewhere(command: &str) -> bool {
 /// delimiter is quoted.
 fn substitutes(command: &str) -> bool {
     let (line, body) = command_line(command);
-    let (mut quote, mut chars) = (None, line.chars().peekable());
+    let (mut quote, mut expands, mut chars) = (None, false, line.chars().peekable());
     while let Some(c) = chars.next() {
         let next = chars.peek().copied();
         match (quote, c) {
@@ -872,15 +872,36 @@ fn substitutes(command: &str) -> bool {
             (Some(_), _) => {}
             (None, '\'' | '"') => quote = Some(c),
             (None, '<' | '>') if next == Some('(') => return true,
+            // A here-document's operator, outside quotes: its text
+            // expands unless some of its delimiter is quoted.
+            (None, '<') if next == Some('<') => {
+                chars.next();
+                if chars.next_if_eq(&'<').is_some() {
+                    continue;
+                }
+                chars.next_if_eq(&'-');
+                while chars.next_if(|c| c.is_whitespace()).is_some() {}
+                // The delimiter word, its quotes and escapes included.
+                let (mut quoted, mut inner) = (false, None);
+                while let Some(c) = chars
+                    .next_if(|&c| inner.is_some() || !(c.is_whitespace() || ";&|<>()".contains(c)))
+                {
+                    match (inner, c) {
+                        (Some(q), c) if c == q => inner = None,
+                        (Some(_), _) => {}
+                        (None, '\'' | '"') => (quoted, inner) = (true, Some(c)),
+                        (None, '\\') => {
+                            quoted = true;
+                            chars.next();
+                        }
+                        (None, _) => {}
+                    }
+                }
+                expands |= !quoted;
+            }
             _ => {}
         }
     }
-    let expands = line.split_once("<<").is_some_and(|(_, rest)| {
-        !rest
-            .trim_start_matches('-')
-            .trim_start()
-            .starts_with(['\'', '"', '\\'])
-    });
     expands && (body.contains("$(") || body.contains('`'))
 }
 
@@ -1631,6 +1652,9 @@ Keep the rest.'"#,
             "\"$AGENT_BIN\" run --bot shop.fix --detach \\\n  -- 'Line one\nline two'",
             r#""$AGENT_BIN" run --bot shop.fix --detach -- 'Run $(make test) and say'"#,
             "\"$AGENT_BIN\" run --bot shop.lead --detach - <<'EOF'\nRan $(make) and `ls`.\nEOF",
+            "\"$AGENT_BIN\" run --bot shop.fix --detach -- \"explain <<EOF\" - <<'LIVE'\nRan $(make).\nLIVE",
+            "\"$AGENT_BIN\" run --bot shop.fix --detach - <<\\EOF\nRan $(make).\nEOF",
+            "\"$AGENT_BIN\" run --bot shop.fix --detach - <<-\"E O\"\nRan $(make).\nE O",
         ] {
             assert!(agent_inside(inside), "{inside}");
         }
@@ -1659,6 +1683,8 @@ Keep the rest.'"#,
             r#""$AGENT_BIN" ls > "$HOME/report.json""#,
             r#""$AGENT_BIN" turns --bot shop.fix >> /tmp/out 2>&1"#,
             r#""$AGENT_BIN" ls >&1.txt"#,
+            "\"$AGENT_BIN\" run --bot shop.fix --detach -- \"explain <<'EOF'\" - <<LIVE\n$(touch \"$HOME/r\")\nLIVE",
+            "\"$AGENT_BIN\" run --bot shop.fix --detach - <<'A' <<B\nx\nA\n$(touch r)\nB",
             r#""$AGENT_BIN" ls 2>&1x"#,
             r#""$AGENT_BIN" ls >/dev/null-report"#,
             r#""$AGENT_BIN" ls >/dev/nullx 2>&1"#,
