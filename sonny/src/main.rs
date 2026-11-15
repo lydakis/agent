@@ -4697,6 +4697,9 @@ struct App {
     last_reply: String,
     /// A `!command` of the person's, running.
     shell: Option<user_shell::Running>,
+    /// The question it answers once it ends: a step of the person's that
+    /// was in focus when they ran it.
+    shell_answers: Option<asks::Ask>,
     /// What the person's commands printed, to show once the bot's words
     /// allow.
     shown: Vec<Line<'static>>,
@@ -6381,6 +6384,7 @@ impl App {
             spread: None,
             last_reply: String::new(),
             shell: None,
+            shell_answers: None,
             shown: Vec::new(),
             unsent: Vec::new(),
             ran_here: Vec::new(),
@@ -6852,18 +6856,35 @@ impl App {
     /// The person's command, once it ran: the bot is given it at once, as
     /// a message, so it answers it as Claude Code's does: a turn of its
     /// own, or a steer of the running one. What it printed is shown once
-    /// the bot's words still coming are not cut into.
+    /// the bot's words still coming are not cut into. Run for a step of
+    /// theirs in focus, their answer follows it into the same turn: what
+    /// they ran and how it exited ([`asks::ran`]).
     async fn shell_ran(&mut self) {
         if self.shell.as_ref().is_some_and(|s| s.is_finished()) {
             let ran = self.shell.take().unwrap().ran().await;
+            let answering = self.shell_answers.take();
             self.shown.extend(user_shell::lines(&ran, self.prose()));
             let record = user_shell::record(&ran);
-            // Refused, it is kept, to go with the next message.
+            // Refused, it is kept, to go with the next message, and the
+            // question stays open for that message to answer.
             match self
                 .send(record.clone(), Some(SHELL), false, false, &[])
                 .await
             {
-                Ok(()) => self.ran_here.extend(user_shell::read(&record)),
+                Ok(()) => {
+                    self.ran_here.extend(user_shell::read(&record));
+                    // Still open: answered or written past meanwhile, it
+                    // takes nothing more.
+                    if let Some(ask) =
+                        answering.filter(|ask| self.asks.iter().any(|open| open.key() == ask.key()))
+                    {
+                        let answer = asks::answer(&ask, &asks::ran(&ran));
+                        match self.send(answer.clone(), None, true, false, &[]).await {
+                            Ok(()) => self.close_ask(&ask, &answer),
+                            Err(error) => self.notice = Some(error),
+                        }
+                    }
+                }
                 Err(error) => {
                     self.notice = Some(format!("{error}; it goes with your next message"));
                     hold(&mut self.unsent, record);
@@ -14632,6 +14653,9 @@ impl App {
             } else {
                 match user_shell::start(command, &self.workspace) {
                     Ok(running) => {
+                        // Run while a step of theirs is in focus, it is
+                        // that step.
+                        self.shell_answers = self.runs().cloned();
                         self.shell = Some(running);
                         self.input.clear();
                         self.notice = None;
@@ -15620,6 +15644,12 @@ impl App {
         (!typed.trim().is_empty() && !typed.starts_with(['/', '!']))
             .then(|| self.asking())
             .flatten()
+    }
+
+    /// The question in focus a `!` command run now answers once it ends:
+    /// a step to run here ([`asks::runs_here`]).
+    fn runs(&self) -> Option<&asks::Ask> {
+        self.asking().filter(|ask| asks::runs_here(ask))
     }
 
     /// Where the question in focus is among those open, from 0.
@@ -22718,6 +22748,114 @@ mod tests {
         app.input.set("thanks");
         app.submit().await;
         assert_eq!(words_sent(&sent.lock().unwrap()[2]), "thanks");
+    }
+
+    #[tokio::test]
+    async fn a_command_run_for_a_step_in_focus_answers_it() {
+        let sent = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = sent.clone();
+        let client = daemon_answering(move |asked| {
+            if asked["op"] == "submit" {
+                seen.lock().unwrap().push(asked.clone());
+            }
+            json!({"message": 2, "turn": 2})
+        })
+        .await;
+        let mut app = app(client);
+        app.workspace = std::env::temp_dir().to_string_lossy().into_owned();
+        let step = asks::call(
+            "ask:1/c1",
+            &json!({"question": "Sign in to the registry?", "why": "Publishing needs it.",
+                "command": "npm login", "if_unanswered": "wait"}),
+        )
+        .unwrap();
+        let pick = asks::call(
+            "ask:1/c2",
+            &json!({"question": "Keep the old API?", "options": [
+                {"label": "Keep it", "explanation": "e"},
+                {"label": "Drop it", "explanation": "e"}]}),
+        )
+        .unwrap();
+        // With a question to pick on in focus, a line for the shell answers
+        // nothing, as Codex keeps a question open past one.
+        app.asks = vec![pick.clone()];
+        app.input.set("!ls");
+        assert!(app.answering_over(80).is_none());
+        // With a step to run in focus, it is that step; no row over it
+        // says so.
+        app.asks = vec![step.clone(), pick.clone()];
+        app.input.set("!echo signed in");
+        assert!(app.answering_over(80).is_none());
+        app.submit().await;
+        while app.shell.as_ref().is_some_and(|s| !s.is_finished()) {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        app.shell_ran().await;
+        let sent = sent.lock().unwrap().clone();
+        // What it printed goes as the command's record, never the person's
+        // words; their answer, what ran and how it exited, joins its turn.
+        assert_eq!(sent.len(), 2);
+        assert_eq!(sent[0]["origin"], "shell");
+        assert_eq!(
+            user_shell::read(words_sent(&sent[0])).unwrap().output,
+            "signed in"
+        );
+        assert_eq!(
+            words_sent(&sent[1]),
+            "You asked (ask:1/c1): Sign in to the registry?\n\nRan ! echo signed in · exit 0"
+        );
+        assert_eq!(sent[1]["origin"], Value::Null);
+        assert_eq!(sent[1]["delivery"], "steer");
+        // Answered: out of the composer, its card saying what ran.
+        assert_eq!(app.asks, [pick]);
+        assert_eq!(
+            app.settled.get("ask:1/c1"),
+            Some(&asks::State::Answered(
+                "Ran ! echo signed in · exit 0".into()
+            ))
+        );
+    }
+
+    #[tokio::test]
+    async fn a_command_run_after_esc_or_for_a_tasks_step_answers_nothing() {
+        let sent = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = sent.clone();
+        let client = daemon_answering(move |asked| {
+            if asked["op"] == "submit" {
+                seen.lock().unwrap().push(asked.clone());
+            }
+            json!({"message": 2, "turn": 2})
+        })
+        .await;
+        let mut app = app(client);
+        app.workspace = std::env::temp_dir().to_string_lossy().into_owned();
+        let step = asks::call(
+            "ask:1/c1",
+            &json!({"question": "Sign in?", "why": "w", "command": "npm login"}),
+        )
+        .unwrap();
+        let mut tasks = step.clone();
+        tasks.id = "ask:1/c2".into();
+        tasks.task = Some(asks::Asker {
+            bot: "calc.fix".into(),
+            name: "fix".into(),
+        });
+        // A task's step goes to the task, which would not see what ran
+        // here; after Esc, words and commands are the person's own.
+        for (asks, chatting) in [(vec![tasks], false), (vec![step], true)] {
+            app.asks = asks.clone();
+            app.chatting = chatting;
+            app.input.set("!true");
+            app.submit().await;
+            while app.shell.as_ref().is_some_and(|s| !s.is_finished()) {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            app.shell_ran().await;
+            assert_eq!(app.asks, asks);
+        }
+        let sent = sent.lock().unwrap().clone();
+        assert_eq!(sent.len(), 2);
+        assert!(sent.iter().all(|asked| asked["origin"] == "shell"));
     }
 
     #[tokio::test]

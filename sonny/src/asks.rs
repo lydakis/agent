@@ -697,6 +697,25 @@ fn option<'a>(ask: &'a Ask, typed: &str) -> Option<&'a Choice> {
         .and_then(|at| ask.options.get(at))
 }
 
+/// Whether running a `!` command in this window answers `ask`: a step
+/// only the person can take, the window's agent's own, whose command the
+/// person runs here as Claude Code has them run theirs. A task's goes to
+/// the task, which would not see what ran in its lead's window.
+pub fn runs_here(ask: &Ask) -> bool {
+    ask.command.is_some() && ask.task.is_none()
+}
+
+/// The person's answer to a step of theirs they ran here with `!`, as
+/// [`answer`] frames it: what they ran and how it exited. What it printed
+/// goes on its own just before, as their command's record, never as their
+/// words: it is no consent to anything.
+pub fn ran(ran: &crate::user_shell::Ran) -> String {
+    let mut lines = ran.command.lines();
+    let first = lines.next().unwrap_or_default().trim();
+    let more = if lines.next().is_some() { " …" } else { "" };
+    format!("Ran ! {first}{more} · exit {}", ran.exit)
+}
+
 /// Whether `typed` is an option's number, a pick, rather than words.
 pub fn picks(ask: &Ask, typed: &str) -> bool {
     option(ask, typed).is_some()
@@ -1757,8 +1776,9 @@ pub fn hint(ask: &Ask, at: usize, of: usize, width: usize) -> Vec<Span<'static>>
         .esc(crate::hint::Esc::WriteInstead)
         .text();
     // Words answer it too: typed, or for a step of the person's, how it
-    // went.
+    // went, or the step itself run here.
     let words = match ask.options.len() {
+        0 if runs_here(ask) => " say how it went or ! run it ·",
         0 if ask.command.is_some() => " say how it went ·",
         0 => " type your answer ·",
         _ => " type or",
@@ -2025,6 +2045,44 @@ mod tests {
 
     fn text(spans: &[Span]) -> String {
         spans.iter().map(|span| span.content.as_ref()).collect()
+    }
+
+    #[test]
+    fn a_step_to_run_here_says_a_bang_answers_it_and_how_it_went() {
+        let mut step = call(
+            "ask:1/c1",
+            &json!({"question": "Sign in?", "why": "w", "command": "npm login"}),
+        )
+        .unwrap();
+        assert!(runs_here(&step));
+        assert_eq!(
+            text(&hint(&step, 0, 1, 80)),
+            "Answer “Sign in?”: say how it went or ! run it · esc write instead"
+        );
+        // A task's step is the task's to be told of: run here, it would
+        // not see what ran.
+        step.task = Some(Asker {
+            bot: "calc.fix".into(),
+            name: "fix".into(),
+        });
+        assert!(!runs_here(&step));
+        assert_eq!(
+            text(&hint(&step, 0, 1, 80)),
+            "Answer “Sign in?” from fix: say how it went · esc write instead"
+        );
+        assert!(!runs_here(&call("c1", &keep_api()).unwrap()));
+        // What ran and how it exited, its first line for a long one.
+        let ran = |command: &str, exit| crate::user_shell::Ran {
+            command: command.into(),
+            exit,
+            output: "Logged in".into(),
+            seconds: 1.0,
+        };
+        assert_eq!(super::ran(&ran("npm login", 0)), "Ran ! npm login · exit 0");
+        assert_eq!(
+            super::ran(&ran("cd web\nnpm login", 1)),
+            "Ran ! cd web … · exit 1"
+        );
     }
 
     #[test]
@@ -2697,13 +2755,14 @@ mod tests {
             answer(&ask, "done, signed in"),
             "You asked (ask:4/c9): Sign in to the package registry\n\ndone, signed in"
         );
-        let hint: String = hint(&ask, 0, 1, 80)
+        let hint: String = hint(&ask, 0, 1, 100)
             .iter()
             .map(|s| s.content.as_ref())
             .collect();
         assert_eq!(
             hint,
-            "Answer “Sign in to the package registry”: say how it went · esc write instead"
+            "Answer “Sign in to the package registry”: say how it went or ! run it · esc write \
+             instead"
         );
     }
 
