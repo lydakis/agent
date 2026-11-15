@@ -730,6 +730,13 @@ impl View {
         self.selected = at
             .unwrap_or(self.selected)
             .min(self.rows().saturating_sub(1));
+        // A command's page stays on its command, wherever the items moved
+        // it.
+        if let Some(handle) = self.page.as_ref().and_then(|p| p.handle.as_deref())
+            && let Some(at) = (self.commands.rows.iter()).position(|row| row["handle"] == *handle)
+        {
+            self.selected = self.items.len() + at;
+        }
         // A removal waits only on the row it was asked for, still picked.
         if self.confirm.is_some() && self.items.get(self.selected).map(key_of) != self.confirm {
             self.confirm = None;
@@ -886,6 +893,12 @@ impl View {
     /// Whether a thing is open as a page.
     pub fn on_page(&self) -> bool {
         self.page.is_some()
+    }
+
+    /// Whether a link is picked on the open page: none once the arrows
+    /// scrolled it out of view.
+    pub fn link_picked(&self) -> bool {
+        self.page.as_ref().is_some_and(|page| page.pick.is_some())
     }
 
     /// Back to the list from a page, as `←` there and the title's `‹`
@@ -2204,6 +2217,16 @@ mod tests {
         assert_eq!(view.keys(), "enter open · x stop · esc close");
         // It stays on its command as the commands are read again, and
         // closes once the command ends.
+        view.commands_loaded(Ok(json!({"processes": [
+            {"handle": "proc:9", "bot": "calc.fix", "kind": "detached",
+             "command": "npm run dev\nmore", "started_ms": 1_000, "pid": 4242},
+        ]})));
+        // The items read again, however many there are now, it stays on
+        // its command too.
+        let items = view.items.clone();
+        view.reload();
+        assert_eq!(view.command().unwrap()["handle"], "proc:9");
+        view.items = items;
         view.commands_loaded(Ok(json!({"processes": [
             {"handle": "proc:9", "bot": "calc.fix", "kind": "detached",
              "command": "npm run dev\nmore", "started_ms": 1_000, "pid": 4242},

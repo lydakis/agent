@@ -17042,11 +17042,14 @@ impl App {
                 pane.set_card_marked(lines, marks, &view.keys());
                 pane.foot = view.footer();
                 // A new pick is scrolled to, with the two rows under it; a
-                // page just opened starts at its top.
+                // page just opened starts at its top; a page whose link
+                // scrolled out of view, so none is picked, stays where the
+                // scroll took it.
                 if watch.picked != Some(at) {
-                    match view.on_page() && watch.picked.is_none() {
-                        true => pane.screen.show_row(0, 0),
-                        false => pane.screen.keep_in_view(at, 2),
+                    match (view.on_page(), watch.picked.is_none()) {
+                        (true, true) => pane.screen.show_row(0, 0),
+                        (true, false) if !view.link_picked() => {}
+                        _ => pane.screen.keep_in_view(at, 2),
                     }
                     watch.picked = Some(at);
                 }
