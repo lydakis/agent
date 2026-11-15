@@ -325,6 +325,13 @@ class DaemonStepTests(ModelFixture):
         self.ended(client, turn, 'script-0/1')
         self.assertEqual(client.finished(turn, timeout=10)['data']['status'], 'completed')
 
+    def test_a_step_naming_no_valid_bot_is_refused_before_it_is_held(self):
+        client, turn = self.script()
+        refused = client.request('run_step', bot='x' * 200, turn=turn, call_id='script-0', step='1',
+                                 name='echo', arguments={'text': 'hi'})
+        self.assertEqual(refused['error'], 'invalid_name')
+        self.assertEqual(client.request('stats')['result']['steps']['in_flight'], 0)
+
     def test_an_interrupt_stops_the_step_with_its_call(self):
         client, turn = self.script()
         request = self.ask(client, turn)

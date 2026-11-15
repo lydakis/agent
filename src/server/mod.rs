@@ -5788,6 +5788,8 @@ impl Service {
                 name: tool,
                 arguments,
             } => {
+                // Bounded before the coordinator holds any of it.
+                name("bot", &bot)?;
                 if call_id.is_empty() {
                     return fail_with("invalid_call_id", "call_id may not be empty");
                 }

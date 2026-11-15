@@ -332,7 +332,11 @@ impl Service {
             )
             .facts(json!({"in_flight":wide})));
         }
-        let bytes = ask.arguments.len() + ask.call_id.len() + ask.step.len() + STEP_OVERHEAD;
+        let bytes = ask.arguments.len()
+            + ask.call_id.len()
+            + ask.step.len()
+            + ask.bot.len()
+            + STEP_OVERHEAD;
         if steps.flights.len() >= MAX_STEPS || steps.bytes + bytes > MAX_STEP_BYTES {
             steps.refused += 1;
             return Err(Error::with(
@@ -523,9 +527,9 @@ impl Service {
                         daemon: Some(key),
                     },
                 );
-                if gone {
-                    self.check_steps(vec![approval], true);
-                }
+                // Its verdict may have come before it was registered here,
+                // its notice then passed over: one look at what is stored.
+                self.check_steps(vec![approval], gone);
             }
             Err(error) => {
                 // A call no longer waiting takes no more steps.
