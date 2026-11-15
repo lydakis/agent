@@ -4391,13 +4391,11 @@ mod tests {
         service.cursor = Some(90);
         service.in_flight.insert(("calc.fix".into(), 7), 40);
         service.in_flight.insert(("calc.docs".into(), 9), 60);
-        service.save_cursor();
-        held::written();
+        saved(&mut service);
         assert_eq!(marks(&store), (Some(90), Some(39)));
         // Nothing under way: it starts again where its news ended.
         service.in_flight.clear();
-        service.save_cursor();
-        held::written();
+        saved(&mut service);
         assert_eq!(marks(&store), (Some(90), Some(90)));
         // A failed fire whose note is under way is told again from its
         // start: its end is news and its start names its trigger.
@@ -4407,17 +4405,30 @@ mod tests {
             ended: Some(50),
         };
         service.telling.insert(("calc.fix".into(), 7), telling);
-        service.save_cursor();
-        held::written();
+        saved(&mut service);
         assert_eq!(marks(&store), (Some(49), Some(29)));
         // The daemon took it: nothing holds the stream.
         service.telling.clear();
-        service.save_cursor();
-        held::written();
+        saved(&mut service);
         assert_eq!(marks(&store), (Some(90), Some(90)));
         std::fs::write(cursor_path(&store), "12").unwrap();
         assert_eq!(marks(&store), (Some(12), Some(12)));
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Saves the cursor and waits until it is on disk. Every test shares
+    /// the one writer, so a write another test makes as its folder goes
+    /// can fail in the same batch and hold this one back: it is saved
+    /// again then, as the next save would.
+    fn saved(service: &mut Service) {
+        for _ in 0..20 {
+            service.save_cursor();
+            if held::written() {
+                return;
+            }
+            service.saved = None;
+        }
+        panic!("the cursor never reached the disk");
     }
 
     #[tokio::test]
@@ -4460,8 +4471,7 @@ mod tests {
             .lookouts
             .insert("shop.lead".into(), lead("shop.lead", "shop.fix"));
         first.cursor = Some(90);
-        first.save_cursor();
-        held::written();
+        saved(&mut first);
         // The stream starts again before calc.lead's news; shop.lead's own
         // mark is kept beside it.
         assert_eq!(marks(&store), (Some(49), Some(49)));
@@ -4471,8 +4481,7 @@ mod tests {
         );
         // Nothing waits: no mark of its own past where the stream starts.
         first.lookouts.get_mut("calc.lead").unwrap().due.clear();
-        first.save_cursor();
-        held::written();
+        saved(&mut first);
         assert_eq!(marks(&store), (Some(90), Some(90)));
         assert!(told_marks(&store).is_empty());
         first
@@ -4482,8 +4491,7 @@ mod tests {
             .due
             .push(pending(5));
         first.lookouts.get_mut("calc.lead").unwrap().from = Some(50);
-        first.save_cursor();
-        held::written();
+        saved(&mut first);
 
         // The next lookout, as it starts.
         let mut again = service(store.clone(), &[]);

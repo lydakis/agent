@@ -315,10 +315,12 @@ class ServedToolTests(ModelFixture):
             time.sleep(.05)
         self.host()
         self.assertEqual(self.daemon.finished(turn)['data']['status'], 'completed')
-        # The commons, on unless set off, is a source of Sonny's own.
-        # No lookout runs here, so none has taken them.
+        # The commons (on unless set off), links and memory are sources of
+        # Sonny's own. No lookout runs here, so none has taken them.
         self.assertEqual(json.loads(self.output('calc.lead', turn)),
-                         {'follows': [], 'sources': [{'name': 'commons', 'events': 0}],
+                         {'follows': [], 'sources': [{'name': 'commons', 'events': 0},
+                                                     {'name': 'links', 'events': 0},
+                                                     {'name': 'memory', 'events': 0}],
                           'lookout': {'running': False, 'current': False, 'took_ms': None, 'rereads_every_s': 15}})
 
     def test_an_agent_s_script_calls_an_mcp_server_the_host_keeps_up(self):

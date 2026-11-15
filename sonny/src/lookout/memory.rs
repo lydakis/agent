@@ -8,8 +8,9 @@ use std::path::Path;
 /// What changed in memory since the last look, as lines a source prints:
 /// a fact saved (new, or written again) by the agent that saved it, and a
 /// fact removed. `cursor` is the source's own folder, where each fact's
-/// file and when it was last written are kept; the first look tells none,
-/// so a new store is not told memory's past.
+/// file is kept with when it was last written, its project and its type, so
+/// a removal carries the fields a filter may name; the first look tells
+/// none, so a new store is not told memory's past.
 pub fn news(home: &Path, cursor: &Path) -> News {
     news_in(&home.join(".agents/memory"), cursor)
 }
@@ -22,7 +23,8 @@ fn news_in(root: &Path, cursor: &Path) -> News {
         .and_then(|text| serde_json::from_str::<Value>(&text).ok())
         .and_then(|value| value.as_object().cloned())
         .unwrap_or_default();
-    let view = agent_client::memory::view(root, None);
+    // Every project, not the capped view /background shows.
+    let view = agent_client::memory::view_all(root);
     let scopes =
         std::iter::once(&view["user"]).chain(view["projects"].as_array().into_iter().flatten());
     let mut now = Map::new();
@@ -46,8 +48,11 @@ fn news_in(root: &Path, cursor: &Path) -> News {
             let (Some(file), Some(at)) = (fact["path"].as_str(), fact["modified"].as_u64()) else {
                 continue;
             };
-            now.insert(file.to_owned(), json!(at));
-            if first || had.get(file).and_then(Value::as_u64) == Some(at) {
+            now.insert(
+                file.to_owned(),
+                json!({"at": at, "project": project, "type": fact["type"]}),
+            );
+            if first || had.get(file).map(|was| &was["at"]) == Some(&json!(at)) {
                 continue;
             }
             let by = fact["source"]
@@ -65,10 +70,11 @@ fn news_in(root: &Path, cursor: &Path) -> News {
             }));
         }
     }
-    for (file, at) in &had {
+    for (file, was) in &had {
         if now.contains_key(file) || !read.iter().any(|dir| in_dir(file, dir)) {
             continue;
         }
+        let at = &was["at"];
         let name = Path::new(file)
             .file_stem()
             .map(|s| s.to_string_lossy().into_owned());
@@ -77,6 +83,8 @@ fn news_in(root: &Path, cursor: &Path) -> News {
             "topic": name,
             "from": "removed",
             "text": format!("{file} is gone"),
+            "project": was["project"],
+            "type": was["type"],
             "file": file,
         }));
     }
@@ -159,9 +167,20 @@ mod tests {
                 &json!(file)
             )
         );
+        // A removal carries the project and type a filter may name.
         assert_eq!(
-            (&lines[1]["topic"], &lines[1]["from"]),
-            (&json!("old-ci-notes"), &json!("removed"))
+            (
+                &lines[1]["topic"],
+                &lines[1]["from"],
+                &lines[1]["project"],
+                &lines[1]["type"]
+            ),
+            (
+                &json!("old-ci-notes"),
+                &json!("removed"),
+                &Value::Null,
+                &json!("project")
+            )
         );
         // Until the lookout keeps them, the same news is read again, with
         // the same IDs, so none is told twice.
@@ -172,6 +191,25 @@ mod tests {
         );
         assert!(news.mark_read());
         assert!(news_in(&root, &cursor).lines.is_empty());
+    }
+
+    #[test]
+    fn every_project_is_watched_past_the_hundred_background_shows() {
+        let temp = scratch("many");
+        let (root, cursor) = (temp.join("memory"), temp.join("cursor"));
+        for n in 0..=100 {
+            std::fs::create_dir_all(root.join(format!("projects/p{n:03}"))).unwrap();
+        }
+        assert!(news_in(&root, &cursor).mark_read());
+        save(
+            &root.join("projects/p100"),
+            "late",
+            "p100.lead",
+            "The last project.",
+        );
+        let lines = said(&news_in(&root, &cursor));
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert_eq!(lines[0]["project"], "p100");
     }
 
     #[test]
