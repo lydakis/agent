@@ -9921,3 +9921,71 @@ none runs the changed check; the moves are the runner's. The footprint's
 RSS after a turn is the allocator's high-water mark from 1,000 turns of
 model and history work, which this change does not touch, and stays under
 the gate's 15%.
+
+## A sandbox's placeholders go once it is gone (#1046)
+
+2026-11-15, Linux 6.18 cloud VM, 4 CPUs, Python 3 and the bench venv.
+Base is main `e021f96`; head is this pull request at `8303a77`. Both are
+local release builds (`--bin agent`) with the same locked dependencies.
+Binary SHA-256:
+
+- Base: `4920211ccc6d574a5f1872d4da2b953ae32697593b40e217a24130a60531c8cd`.
+- Head: `7dc20f04e8fb308059b00a525dfcfc03572d318ffda5e13d64cc32bdb80c27d2`.
+
+What the change adds is per sandboxed command, never per bot: one pipe,
+made as the command is, and passed to bubblewrap as `--sync-fd`. The
+command's hold, whose cleanup already runs on a thread of its own after
+the result, reads the pipe to its end before letting go. A hold over
+many sandboxes, as a patch's over its writes, closes each pipe that has
+already ended when the next is added, so it keeps only those still
+running. A holder letting go now makes one more `fcntl`, letting its own
+read lock go first. Unsandboxed commands, other tools and idle bots do no
+new work. No table, task or timer is added, and the protocol and schema
+are unchanged.
+
+### Required matched screen
+
+The four daemon screens ran in base/head order for two rounds, with the
+Perf workflow's settings. Admission and completion use five measured
+repeats, footprint uses two (1,000 bots), and lifecycle uses one (32
+bots, socket echo, five tool schemas). Each invocation has its usual
+excluded warmup. Medians over every measured run:
+
+| Bench | Measure | Base | Head | Change |
+| --- | --- | ---: | ---: | ---: |
+| admission | lone submit CPU, ms | 34.01 | 36.828 | +8.3% |
+| admission | burst submit p99, ms | 4.259 | 4.644 | +9.0% |
+| completion | release to terminal p99, ms | 11.534 | 12.444 | +7.9% |
+| footprint | idle RSS, MiB | 16.596 | 16.512 | -0.5% |
+| footprint | per idle bot, KiB | 1.796 | 1.992 | +10.9% |
+| footprint | RSS after a turn each, MiB | 33.031 | 34.385 | +4.1% |
+| footprint | CPU per turn, ms | 0.836 | 0.941 | +12.7% |
+| lifecycle | CPU, s | 0.6 | 0.585 | -2.5% |
+| lifecycle | p95 turn, ms | 584.983 | 580.607 | -0.7% |
+| lifecycle | peak RSS, MiB | 25.234 | 24.576 | -2.6% |
+
+`bench.perf_gate` reports no count failures and no warnings: store work
+per turn is the same on both sides. None of these screens runs a
+sandboxed command, so none reaches the new code, and every move falls
+inside the other side's range:
+
+- Lone submit CPU: base 29.4 to 37.5 ms, head 32.6 to 41.8 ms.
+- Burst submit p99: base 3.65 to 5.23 ms, head 4.17 to 5.98 ms.
+- Release to terminal p99: base 9.89 to 12.67 ms, head 10.03 to 13.82 ms.
+- Per idle bot: base 1.57 to 1.90 KiB, head 1.88 to 2.03 KiB.
+- CPU per turn: base 0.80 to 0.98 ms, head 0.91 to 1.02 ms.
+
+### The sandboxed command itself
+
+300 alternating runs of bubblewrap with the daemon's namespaces around
+`true`, plain and with `--sync-fd`, timed from the start to the
+command's end and to the pipe's end. Medians:
+
+| Measure | Plain | With `--sync-fd` |
+| --- | ---: | ---: |
+| command's end, ms | 4.54 | 4.49 |
+| sandbox gone, the pipe at its end, ms | | 4.56 |
+
+The hold's cleanup waits 68 µs past the command's end at the median and
+276 µs at p99, on its own thread, after the result has gone out. No
+result waits on it.
