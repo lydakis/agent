@@ -9989,3 +9989,68 @@ command's end and to the pipe's end. Medians:
 The hold's cleanup waits 68 µs past the command's end at the median and
 276 µs at p99, on its own thread, after the result has gone out. No
 result waits on it.
+
+## Declared tool lists stored once, by digest, at 6, 424, 2,000 and 5,000 bots (protocol 77, schema 101)
+
+2026-11-15, a 4-core x86_64 Linux cloud host, release builds of main
+`df69529` (base) and the branch that stores each list of declared tools
+once. Binaries by SHA-256:
+
+- Base: `02e1b1d4012db631bf69aa0f4f52aa4e1b19d2eafe1b066988bfca593dbcd2f0`.
+- Head: `39b0a4878fc242bbe77dce234d1560340ce61946fa57550402934e8408141c3e`.
+
+`bench.tool_lists` speaks the socket protocol alone, with no Sonny in the
+path. Each bot is made with a list of 20 tools, 32,210 bytes as sent, the
+size of Sonny's lead's. The client then configures every bot to the list
+it already holds, as a host does at each start, first by sending the list
+and then (head only) by sending its digest; then it inspects every bot
+and pages the `bots` listing. Times are per bot, from the request sent to
+its answer read, two alternating runs per side.
+
+| Per bot, ms | 6 base | 6 head | 424 base | 424 head | 2,000 base | 2,000 head | 5,000 base | 5,000 head |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| `configure`, same list sent | 1.11, 0.92 | 0.85, 0.78 | 0.99, 0.79 | 0.47, 0.62 | 1.05, 0.94 | 0.63, 0.51 | 1.10, 0.94 | 0.60, 0.65 |
+| `configure`, its digest sent | | 0.52, 0.53 | | 0.22, 0.24 | | 0.40, 0.39 | | 0.28, 0.34 |
+| `configure`, instructions only | 0.99, 0.38 | 0.61, 0.30 | 0.41, 0.26 | 0.22, 0.23 | 0.31, 0.28 | 0.30, 0.31 | 0.32, 0.27 | 0.22, 0.25 |
+| `inspect` (33.8 KB answer) | 1.05, 0.67 | 0.93, 1.03 | 0.85, 0.73 | 0.83, 0.80 | 0.96, 0.80 | 0.87, 0.86 | 0.93, 0.93 | 0.83, 0.72 |
+
+Configuring 5,000 unchanged bots by digest takes 1.42 and 1.68 s, a
+116-byte request each; with the list it took 5.5 and 4.7 s on main. Neither
+side writes anything for an unchanged list: `set_declared` already wrote
+only a list that differs, so the store growth an earlier Sonny-host run
+showed came from its first start replacing a one-tool list, not from
+repeated starts. What a bot's row keeps for its tools goes from 32,191
+bytes to 64 (the digest), and the store keeps the list once
+(`tool_lists`: one row of 32,191 bytes for all 5,000), so at 5,000 bots
+the rows hold 0.3 MB of digests instead of 161 MB of copies. Daemon RSS
+after the run is the same on both sides (23.3 to 24.0 MiB at 5,000).
+`inspect` still answers the whole list, so it costs what it did; a client
+that needs only to know a bot's tools are current reads `declared_digest`
+from the `bots` listing (119 and 101 ms for all 5,000 at 256 a page).
+
+In the daemon, a turn's tool encoding is now keyed by the list's digest
+rather than by serializing the list at each turn's start or resumption,
+and every bot, turn and fork that holds a list shares one parsed copy.
+
+### Required matched screen
+
+The Perf workflow's screen of this change against its base `df69529`
+(GitHub Actions `ubuntu-24.04`, two alternating rounds each, 2026-11-15,
+run 43741741543). Store work per turn is the same on both sides, so the
+gate passes; no CPU, latency or memory measure moved past the 15% the gate
+warns at, except Sonny's lookout CPU at 10 sources × 1 delta (31.25 to
+37.5 ms per 1,000 deltas), a measure this change does not touch and which
+moved the other way at 10 × 10.
+
+| Bench | Measure | Base | Head | Change |
+| --- | --- | ---: | ---: | ---: |
+| admission | lone submit CPU, ms | 34.95 | 35.12 | +0.5% |
+| admission | burst submit p99, ms | 4.309 | 4.436 | +2.9% |
+| completion | release to terminal p99, ms | 11.68 | 11.75 | +0.6% |
+| footprint | idle RSS, MiB | 16.36 | 16.56 | +1.2% |
+| footprint | per idle bot, KiB | 1.954 | 2.002 | +2.5% |
+| footprint | RSS after a turn each, MiB | 39.37 | 41.16 | +4.6% |
+| footprint | CPU per turn, ms | 0.99 | 1.007 | +1.7% |
+| lifecycle | CPU, s | 0.545 | 0.545 | +0.0% |
+| lifecycle | p95 turn, ms | 579.7 | 579.3 | -0.1% |
+| lifecycle | peak RSS, MiB | 25.06 | 24.78 | -1.1% |

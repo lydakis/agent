@@ -5,10 +5,17 @@
 use rusqlite::Connection;
 
 /// Puts a store back in schema 90's shape, where a message and the turn it
-/// opened were one `turns` row: the shape every store before 91 had, so an
+/// opened were one `turns` row and each bot kept its own declared tools: the shape every store before 91 had, so an
 /// older store built from today's is one the migrations really met.
 pub const UNSPLIT: &str = "
     PRAGMA foreign_keys=OFF;
+    DROP INDEX bots_declared;
+    UPDATE bots SET creation=json_set(creation,'$.request.declare',json(COALESCE(
+            (SELECT tools FROM tool_lists WHERE digest=json_extract(creation,'$.request.declare')),'[]')))
+        WHERE json_type(creation,'$.request.declare')='text';
+    UPDATE bots SET declared=(SELECT tools FROM tool_lists WHERE digest=bots.declared)
+        WHERE declared IS NOT NULL;
+    DROP TABLE tool_lists;
     CREATE TABLE turns_whole(id INTEGER PRIMARY KEY, bot TEXT NOT NULL REFERENCES bots(name),
         request_id TEXT NOT NULL, prompt TEXT NOT NULL, status TEXT NOT NULL,
         prompt_node INTEGER REFERENCES nodes(id),

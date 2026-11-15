@@ -2575,6 +2575,34 @@ class RuntimeTests(ModelFixture):
         output = node_item(client, 'Lead', done['data']['node'])['result']['output']
         self.assertEqual(json.loads(output)['error'], 'tool_not_available')
 
+    def test_a_declared_list_is_named_by_its_digest_once_the_daemon_holds_it(self):
+        client = self.client('echo')
+        react = {'name': 'react', 'description': 'React to a message.',
+                 'parameters': {'type': 'object', 'properties': {'emoji': {'type': 'string'}}}}
+        first = client.request('create', bot='Lead', workspace=str(self.path), declare=[react])['result']
+        digest = first['declared_digest']
+        self.assertRegex(digest, '^[0-9a-f]{64}$')
+        # Another bot declares the same tools by digest alone, and is shown them.
+        second = client.request('create', bot='Task', workspace=str(self.path), declare=digest)['result']
+        self.assertEqual((second['declared'], second['declared_digest']), (first['declared'], digest))
+        self.model.call_script = [('react', {'emoji': 'ok'})]
+        turn = client.request('submit', bot='Task', request_id='1', prompt='script')['result']['message']
+        self.assertEqual(client.finished(turn)['data']['status'], 'completed')
+        self.assertEqual([t['name'] for t in self.model.requests.get(timeout=3)['tools']], ['echo', 'react'])
+        # The same list again, by digest or whole, changes nothing.
+        for declare in (digest, [react]):
+            self.assertEqual(client.request('configure', bot='Lead', declare=declare)['result']['changed'], [])
+        # A listing names each bot's list by digest, never the list.
+        listed = {b['name']: b for b in client.request('bots')['result']['bots']}
+        self.assertEqual(listed['Lead']['declared_digest'], digest)
+        self.assertNotIn('declared', listed['Lead'])
+        # A digest the daemon does not hold asks for the list.
+        self.assertEqual(client.request('create', bot='Late', workspace=str(self.path),
+                                        declare='f' * 64)['error'], 'tool_list_unknown')
+        self.assertEqual(client.request('configure', bot='Lead', declare='f' * 64)['error'], 'tool_list_unknown')
+        self.assertEqual(client.request('configure', bot='Lead', declare='not a digest')['error'],
+                         'tool_list_unknown')
+
     def test_a_fork_calls_only_its_allowed_tools_and_keeps_its_sources_request(self):
         client = self.client('echo,shell')
         client.request('create', bot='Both', workspace=str(self.path), tools=['shell', 'echo'])

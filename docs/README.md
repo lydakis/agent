@@ -16,6 +16,7 @@ or the [Sonny quickstart](../sonny/README.md#first-run).
 | Understand permissions | [Sandbox](RUST_PROTOTYPE.md#sandbox), [tool approval](RUST_PROTOTYPE.md#tool-approval), [security policy](../SECURITY.md) |
 | Diagnose a turn waiting on credentials or provider access | [Held turns](RUST_PROTOTYPE.md#held-turns) |
 | Understand persistence and conversation forks | [Durable state and recovery](RUST_PROTOTYPE.md#durable-state-and-recovery) |
+| Follow the plan for code mode and declared tools at fleet scale | [Code mode and the tool path](CODE_MODE.md) |
 
 ## Using Sonny
 

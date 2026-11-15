@@ -5,7 +5,7 @@ use crate::{
     codec::Family,
     fail, fail_with,
     provider::{ToolCall, Usage},
-    tools::{Declared, Outcome},
+    tools::{Declared, Outcome, ToolList},
 };
 use bytes::Bytes;
 use rusqlite::{Connection, OptionalExtension, config::DbConfig, params};
@@ -75,6 +75,31 @@ pub struct Ended {
     /// The code it failed or was interrupted with, if any.
     pub error: Option<String>,
 }
+/// A bot's declared tools as its record shows them: the list, and the
+/// digest a client sends to declare the same list again (`declared` and
+/// `declared_digest`); nothing for none.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Holding(pub ToolList);
+impl std::ops::Deref for Holding {
+    type Target = ToolList;
+    fn deref(&self) -> &ToolList {
+        &self.0
+    }
+}
+impl Serialize for Holding {
+    fn serialize<S: serde::Serializer>(
+        &self,
+        serializer: S,
+    ) -> std::result::Result<S::Ok, S::Error> {
+        use serde::ser::SerializeMap;
+        let mut map = serializer.serialize_map(None)?;
+        if let Some(digest) = self.0.digest() {
+            map.serialize_entry("declared", &self.0)?;
+            map.serialize_entry("declared_digest", digest)?;
+        }
+        map.end()
+    }
+}
 #[derive(Debug, Clone, Serialize)]
 pub struct Bot {
     pub name: String,
@@ -132,8 +157,10 @@ pub struct Bot {
     /// Tools its client declared, shown after `tools` and never run: a
     /// call is recorded with the tool's fixed result. A bot it creates
     /// takes them unless its client declares others; a fork keeps them.
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    pub declared: Vec<Declared>,
+    /// One list, stored once and shared by every bot that holds it; the
+    /// record shows it with its digest.
+    #[serde(flatten)]
+    pub declared: Holding,
     /// The bot whose client created or forked this one, as that client
     /// declared it (the CLI takes it from `AGENT_BOT`). Bots are peers;
     /// this is lineage for people, not authority.
@@ -1259,7 +1286,7 @@ pub struct Binding<'a> {
     pub settings: Settings,
     /// The tools its client declares, already checked; `None` takes its
     /// creator's.
-    pub declared: Option<&'a [Declared]>,
+    pub declared: Option<&'a ToolList>,
     /// The client's idempotency key: a resend with the same key and fields
     /// gets the bot it made.
     pub request_id: Option<&'a str>,
@@ -2620,10 +2647,38 @@ fn stored_gates(gates: &[Gate]) -> Result<Option<String>> {
         .then(|| serde_json::to_string(gates))
         .transpose()?)
 }
-fn stored_declared(declared: &[Declared]) -> Result<Option<String>> {
-    Ok((!declared.is_empty())
-        .then(|| serde_json::to_string(declared))
-        .transpose()?)
+/// The list of declared tools the store keeps under `digest`, as
+/// [`Database::tool_list`] finds it.
+fn tool_list(conn: &Connection, digest: &str) -> Result<ToolList> {
+    ToolList::stored(digest, || {
+        conn.prepare_cached("SELECT tools FROM tool_lists WHERE digest=?")?
+            .query_row([digest], |r| r.get(0))
+            .optional()?
+            .ok_or_else(|| Error::with("tool_list_unknown", digest))
+    })
+}
+/// Keep `list` in the store, once whoever holds it, and give the digest
+/// a bot's row holds for it; `None` for no tools.
+fn keep_list<'a>(conn: &Connection, list: &'a ToolList) -> Result<Option<&'a str>> {
+    let (Some(digest), Some(json)) = (list.digest(), list.json()) else {
+        return Ok(None);
+    };
+    conn.prepare_cached("INSERT OR IGNORE INTO tool_lists(digest,tools) VALUES (?,?)")?
+        .execute([digest, json])?;
+    Ok(Some(digest))
+}
+/// Let go of the list `digest` names once no bot holds it. A waiting
+/// configuration and a creation's record hold the tools or the digest
+/// themselves, not the stored list.
+fn drop_list(conn: &Connection, digest: Option<&str>) -> Result<()> {
+    if let Some(digest) = digest {
+        conn.prepare_cached(
+            "DELETE FROM tool_lists WHERE digest=?1
+              AND NOT EXISTS(SELECT 1 FROM bots WHERE declared=?1)",
+        )?
+        .execute([digest])?;
+    }
+    Ok(())
 }
 fn split_tools(joined: &str) -> Vec<String> {
     joined
@@ -2860,7 +2915,7 @@ impl Database {
     /// before versioning, stores at versions 1 to 5 and stores from newer
     /// binaries are rejected; an older store from version 6 on is migrated
     /// forward, one version at a time, at open.
-    pub const SCHEMA: i32 = 100;
+    pub const SCHEMA: i32 = 101;
     /// The person's messages a compaction keeps verbatim, newest first:
     /// per-message text, and the total text plus `(ordinal, String)` entry
     /// metadata. Empty entries cost space too, so the retained list cannot
@@ -3044,6 +3099,8 @@ impl Database {
             CREATE INDEX IF NOT EXISTS bots_elision ON bots(elision);
             CREATE INDEX IF NOT EXISTS bots_configure_pending ON bots(name)
                 WHERE configure_pending IS NOT NULL;
+            CREATE INDEX IF NOT EXISTS bots_declared ON bots(declared) WHERE declared IS NOT NULL;
+            CREATE TABLE IF NOT EXISTS tool_lists(digest TEXT PRIMARY KEY, tools TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS bot_sequence(singleton INTEGER PRIMARY KEY CHECK(singleton=1),
                 last_id INTEGER NOT NULL CHECK(last_id>=0));
             INSERT OR IGNORE INTO bot_sequence VALUES (1,0);
@@ -3646,17 +3703,26 @@ impl Database {
                     )
                 })?),
             },
-            declared: match r.get::<_, Option<String>>(39)? {
-                None => Vec::new(),
-                Some(text) => serde_json::from_str(&text).map_err(|error| {
-                    rusqlite::Error::FromSqlConversionFailure(
-                        40,
-                        rusqlite::types::Type::Text,
-                        Box::new(error),
-                    )
-                })?,
-            },
+            // Found by its digest once the row is read (`Self::with_tools`).
+            declared: Holding::default(),
         })
+    }
+    /// A bot's row and the digest of its declared tools.
+    fn row_held(r: &rusqlite::Row<'_>) -> rusqlite::Result<(Bot, Option<String>)> {
+        Ok((Self::row(r)?, r.get(39)?))
+    }
+    /// A bot read with its declared tools: the copy in use, or the store's.
+    fn with_tools(&self, (mut bot, digest): (Bot, Option<String>)) -> Result<Bot> {
+        if let Some(digest) = digest {
+            bot.declared = Holding(self.tool_list(&digest)?);
+        }
+        Ok(bot)
+    }
+    /// The list of declared tools `digest` names: the copy in use in this
+    /// process, or the store's, parsed once; `tool_list_unknown` when the
+    /// store holds none, as a list no bot holds any longer.
+    pub fn tool_list(&self, digest: &str) -> Result<ToolList> {
+        tool_list(&self.conn, digest)
     }
     const COLUMNS: &str = "name,head,workspace,status,running_turn,provider,family,model,instructions,reasoning,budget_tokens,tokens_used,tools,input_tokens,cached_input_tokens,id,created_by,created_by_id,compaction,compaction_instructions,compaction_model,cache_bot,thinking_prefix,thinking_floor,fallback,elision,thinking_from,thinking_to,thinking_elided,gates,denials,allowed,closed,settings,expire_ms,expires_at,sent_bytes,sent_tokens,compact_asked,declared,work,work_read,budget_counts,depth,started_ms,waiting_on,last_turn,last_status,last_started_ms,last_finished_ms,last_error,configure_pending";
     /// Validate the caller's captured identity in the same transaction that
@@ -3747,38 +3813,66 @@ impl Database {
     /// The tools the creating bot's client declared, which a bot it
     /// creates takes unless its own client declares others: all but those
     /// declared as the creator's own, each passed on one generation fewer.
-    fn creator_declared(conn: &Connection, creator: Option<i64>) -> Result<Option<String>> {
+    fn creator_declared(conn: &Connection, creator: Option<i64>) -> Result<ToolList> {
         let Some(id) = creator else {
-            return Ok(None);
+            return Ok(ToolList::default());
         };
         let stored: Option<String> =
             conn.query_row("SELECT declared FROM bots WHERE id=?", [id], |r| r.get(0))?;
         let Some(stored) = stored else {
-            return Ok(None);
+            return Ok(ToolList::default());
         };
-        let mut declared: Vec<Declared> = serde_json::from_str(&stored)?;
+        let list = tool_list(conn, &stored)?;
+        // Tools every generation takes pass on as they are: the same list.
+        if list
+            .iter()
+            .all(|tool| tool.inherit == crate::tools::Inherit::All)
+        {
+            return Ok(list);
+        }
+        let mut declared = list.to_vec();
         declared.retain(|tool| tool.inherit.passes());
         for tool in &mut declared {
             tool.inherit = tool.inherit.passed();
         }
-        stored_declared(&declared)
+        ToolList::new(declared)
     }
     /// The bot holding identity `id`, whatever it is named.
     pub fn inspect_id(&self, id: i64) -> Result<Bot> {
-        // Cached: parsing this many columns costs more than the read.
-        self.conn
-            .prepare_cached(&format!("SELECT {} FROM bots WHERE id=?", Self::COLUMNS))?
-            .query_row([id], Self::row)
-            .optional()?
-            .ok_or(Error::new("bot_not_found"))
+        self.with_snapshot(|| {
+            // Cached: parsing this many columns costs more than the read.
+            self.conn
+                .prepare_cached(&format!("SELECT {} FROM bots WHERE id=?", Self::COLUMNS))?
+                .query_row([id], Self::row_held)
+                .optional()?
+                .ok_or(Error::new("bot_not_found"))
+                .and_then(|read| self.with_tools(read))
+        })
     }
     pub fn inspect(&self, name: &str) -> Result<Bot> {
-        // Cached: parsing this many columns costs more than the read.
-        self.conn
-            .prepare_cached(&format!("SELECT {} FROM bots WHERE name=?", Self::COLUMNS))?
-            .query_row([name], Self::row)
-            .optional()?
-            .ok_or(Error::new("bot_not_found"))
+        self.with_snapshot(|| {
+            // Cached: parsing this many columns costs more than the read.
+            self.conn
+                .prepare_cached(&format!("SELECT {} FROM bots WHERE name=?", Self::COLUMNS))?
+                .query_row([name], Self::row_held)
+                .optional()?
+                .ok_or(Error::new("bot_not_found"))
+                .and_then(|read| self.with_tools(read))
+        })
+    }
+    /// Read a bot with its tools. Its list is most often in use already
+    /// and read from memory; when it is read from the store, a configure
+    /// between the two reads may have let it go, so a list not found
+    /// outside a transaction is read again with the bot, in one snapshot.
+    fn with_snapshot(&self, read: impl Fn() -> Result<Bot>) -> Result<Bot> {
+        match read() {
+            Err(error) if error.code == "tool_list_unknown" && self.conn.is_autocommit() => {
+                // Read only; dropping it rolls back.
+                let _snapshot = self.conn.unchecked_transaction()?;
+                read()
+            }
+            other => other,
+        }
     }
     /// Replace a bot's instructions, as its client composes them now; whether
     /// they changed. Its next request sends the new ones, so the provider's
@@ -3802,19 +3896,31 @@ impl Database {
     /// Replace the tools a bot's client declared; whether they changed.
     /// The daemon has checked them. Its next request shows the new set,
     /// so a fork keys its own cache from then on, as for instructions.
+    /// The list is kept once, by its digest, and one no bot holds after
+    /// is let go.
     pub fn set_declared(
         &mut self,
         name: &str,
         bot_id: Option<i64>,
-        declared: &[Declared],
+        declared: &ToolList,
     ) -> Result<bool> {
         let id = self.identity(name, bot_id)?;
-        let stored = stored_declared(declared)?;
-        let changed = self.conn.execute(
-            "UPDATE bots SET declared=?, cache_bot=NULL WHERE id=? AND declared IS NOT ?",
-            params![stored, id, stored],
+        let before: Option<String> = (self
+            .conn
+            .prepare_cached("SELECT declared FROM bots WHERE id=?")?)
+        .query_row([id], |r| r.get(0))?;
+        if before.as_deref() == declared.digest() {
+            return Ok(false);
+        }
+        let tx = self.conn.savepoint()?;
+        let digest = keep_list(&tx, declared)?;
+        tx.execute(
+            "UPDATE bots SET declared=?, cache_bot=NULL WHERE id=?",
+            params![digest, id],
         )?;
-        Ok(changed == 1)
+        drop_list(&tx, before.as_deref())?;
+        tx.commit()?;
+        Ok(true)
     }
     /// Point a bot at another model of its family, and its effort level;
     /// whether either changed. The daemon has checked both. Turns past
@@ -3858,7 +3964,7 @@ impl Database {
         let id = self.identity(name, bot_id)?;
         let bot = self.inspect(name)?;
         if let Some(gate) = &gate {
-            let declared = declared.unwrap_or(&bot.declared);
+            let declared = declared.unwrap_or(&**bot.declared);
             not_in_tools(&gate.tools, &gateable(&bot.tools, declared))?;
         }
         let gates = stored_gates(gate.as_slice())?;
@@ -4159,7 +4265,7 @@ impl Database {
             "SELECT name,head,workspace,status,running_turn,provider,family,model,reasoning,budget_tokens,tokens_used,tools,
                     input_tokens,cached_input_tokens,id,created_by,created_by_id,gates,allowed,expire_ms,expires_at,
                     work,budget_counts,depth,started_ms,waiting_on,last_turn,last_status,
-                    last_started_ms,last_finished_ms,last_error
+                    last_started_ms,last_finished_ms,last_error,declared
              FROM bots WHERE {from}{maker}{running} ORDER BY name LIMIT ?2"
         ))?;
         let mut rows = statement.query(values.as_slice())?;
@@ -4194,6 +4300,11 @@ impl Database {
             if let Some(expire_ms) = r.get::<_, Option<i64>>(19)? {
                 bot["expire_ms"] = json!(expire_ms);
                 bot["expires_at"] = json!(r.get::<_, Option<i64>>(20)?);
+            }
+            // Its declared tools by digest alone: a client that knows the
+            // list needs no `inspect` to see the bot holds it.
+            if let Some(digest) = r.get::<_, Option<String>>(31)? {
+                bot["declared_digest"] = json!(digest);
             }
             let size = crate::output::encoded_len(&bot)? + 1;
             if bots.len() == limit || bytes + size > crate::output::MAX_EVENT / 2 {
@@ -4294,7 +4405,8 @@ impl Database {
             "tools":binding.tools,"created_by":binding.created_by,
             "created_by_id":binding.created_by_id,"compaction_model":binding.compaction_model,
             "fallback":binding.fallback,"gate":binding.gate,"settings":binding.settings,
-            "declare":binding.declared})
+            // By digest, as sent either way; "" for none.
+            "declare":binding.declared.map(|list| list.digest().unwrap_or_default())})
         });
         // Kept only when set, so a resend sent before the field existed
         // still matches.
@@ -4321,19 +4433,13 @@ impl Database {
         };
         Self::within_depth(self.max_depth, name, depth)?;
         let declared = match binding.declared {
-            Some(declared) => stored_declared(declared)?,
+            Some(declared) => declared.clone(),
             None => Self::creator_declared(&tx, created_by_id)?,
         };
         // A gate may hold back the tools the bot is declared, its own or
         // its creator's.
-        let tools = gateable(
-            binding.tools,
-            &declared
-                .as_deref()
-                .map(serde_json::from_str::<Vec<Declared>>)
-                .transpose()?
-                .unwrap_or_default(),
-        );
+        let tools = gateable(binding.tools, &declared);
+        let declared = keep_list(&tx, &declared)?;
         if let Some(gate) = binding.gate {
             not_in_tools(&gate.tools, &tools)?;
         }
@@ -13338,7 +13444,7 @@ impl Database {
                 creation(request_id, request),
                 expire_ms.map(|ms| ms as i64),
                 expire_ms.map(|ms| epoch_ms().saturating_add(ms as i64)),
-                stored_declared(&parent.declared)?,
+                parent.declared.digest(),
                 budget_counts.stored(),
                 depth as i64,
             ],
@@ -13895,7 +14001,12 @@ impl Database {
              SELECT id,name,json_extract(creation,'$.request_id') FROM bots WHERE name=?",
             [name],
         )?;
+        let declared: Option<String> =
+            tx.query_row("SELECT declared FROM bots WHERE name=?", [name], |r| {
+                r.get(0)
+            })?;
         tx.execute("DELETE FROM bots WHERE name=?", [name])?;
+        drop_list(&tx, declared.as_deref())?;
         out["nodes"] = json!(freed);
         out["done"] = json!(true);
         tx.commit()?;
@@ -17965,6 +18076,53 @@ fn migrate_since_73(conn: &Connection, from: i32) -> Result<()> {
         )?;
     }
 
+    // Schema 101: a list of declared tools is stored once, by its digest,
+    // and a bot's row holds the digest; a creation's record names the
+    // list it declared by digest too.
+    if from < 101 {
+        migrate_lists_once(conn)?;
+    }
+
+    Ok(())
+}
+/// 100 -> 101: every bot's declared tools moved to `tool_lists`, one row
+/// a distinct list, and its row left holding the digest; each creation's
+/// record that declared tools names them by digest, `""` for none. One
+/// bot at a time, so memory holds one list however many there are.
+fn migrate_lists_once(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS tool_lists(digest TEXT PRIMARY KEY, tools TEXT NOT NULL);",
+    )?;
+    let invalid = |_| Error::new("store_migration_invalid_declared");
+    let held: Vec<i64> = conn
+        .prepare("SELECT id FROM bots WHERE declared IS NOT NULL")?
+        .query_map([], |r| r.get(0))?
+        .collect::<rusqlite::Result<_>>()?;
+    for id in held {
+        let stored: String =
+            conn.query_row("SELECT declared FROM bots WHERE id=?", [id], |r| r.get(0))?;
+        let tools: Vec<Declared> = serde_json::from_str(&stored).map_err(invalid)?;
+        let list = ToolList::new(tools)?;
+        let digest = keep_list(conn, &list)?;
+        conn.execute("UPDATE bots SET declared=? WHERE id=?", params![digest, id])?;
+    }
+    let declaring: Vec<i64> = conn
+        .prepare("SELECT id FROM bots WHERE json_type(creation,'$.request.declare')='array'")?
+        .query_map([], |r| r.get(0))?
+        .collect::<rusqlite::Result<_>>()?;
+    for id in declaring {
+        let stored: String = conn.query_row(
+            "SELECT json_extract(creation,'$.request.declare') FROM bots WHERE id=?",
+            [id],
+            |r| r.get(0),
+        )?;
+        let tools: Vec<Declared> = serde_json::from_str(&stored).map_err(invalid)?;
+        let list = ToolList::new(tools)?;
+        conn.execute(
+            "UPDATE bots SET creation=json_set(creation,'$.request.declare',?) WHERE id=?",
+            params![list.digest().unwrap_or_default(), id],
+        )?;
+    }
     Ok(())
 }
 /// 97 -> 98: the tool calls and tool time of every turn with timed model
