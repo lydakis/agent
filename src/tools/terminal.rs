@@ -525,6 +525,7 @@ impl Registry {
         }
         let reader = {
             let terminal = terminal.clone();
+            let mut redacting = Redacting::new(self.credentials.clone());
             tokio::spawn(async move {
                 let mut buffer = vec![0u8; 16 * 1024];
                 loop {
@@ -544,9 +545,12 @@ impl Registry {
                     match read {
                         Err(_) => continue,
                         // An end of file, or the far end gone (EIO).
-                        Ok(Ok(0) | Err(_)) => return,
+                        Ok(Ok(0) | Err(_)) => {
+                            terminal.peek.end(&mut redacting);
+                            return;
+                        }
                         Ok(Ok(n)) => {
-                            terminal.peek.push(&buffer[..n]);
+                            terminal.peek.feed(&mut redacting, &buffer[..n]);
                             let dropping = {
                                 let mut state =
                                     terminal.state.lock().unwrap_or_else(|e| e.into_inner());

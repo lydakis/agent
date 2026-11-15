@@ -4272,9 +4272,30 @@ impl Peek {
         ring.folder.clone()
     }
 
-    /// Keep `bytes`, the command's next output: only the newest
-    /// [`PEEK_BYTES`] are kept.
-    pub fn push(&self, bytes: &[u8]) {
+    /// Keep `bytes`, the next output of the stream `redacting` reads,
+    /// redacted as that stream goes before any of it is kept: a secret
+    /// cut across reads is held until it is whole, and a secret block's
+    /// body never reaches the ring, so letting older output go can never
+    /// show part of one. Only the newest [`PEEK_BYTES`] are kept.
+    pub fn feed(&self, redacting: &mut Redacting, bytes: &[u8]) {
+        let text = redacting.feed(bytes);
+        if !text.is_empty() {
+            self.push(text.as_bytes());
+        }
+    }
+
+    /// The stream `redacting` reads ended: keep what it still held,
+    /// redacted.
+    pub fn end(&self, redacting: &mut Redacting) {
+        let fresh = Redacting::new(redacting.credentials.clone());
+        let text = std::mem::replace(redacting, fresh).finish();
+        if !text.is_empty() {
+            self.push(text.as_bytes());
+        }
+    }
+
+    /// Keep `bytes`, already redacted: only the newest [`PEEK_BYTES`].
+    fn push(&self, bytes: &[u8]) {
         let bytes = &bytes[bytes.len().saturating_sub(PEEK_BYTES)..];
         let mut ring = self.0.lock().unwrap_or_else(|e| e.into_inner());
         let over = (ring.bytes.len() + bytes.len()).saturating_sub(PEEK_BYTES);
@@ -4288,9 +4309,9 @@ impl Peek {
 
     /// Its last `count` lines that hold anything, oldest first, as text:
     /// escape sequences and control characters left out, a line a
-    /// carriage return rewrote as it ended, each redacted by
-    /// `credentials`. A line cut where older output was let go is left
-    /// out, so no part of a secret is shown without its whole.
+    /// carriage return rewrote as it ended. What [`Self::feed`] kept is
+    /// redacted already; `credentials` redacts it again for any added
+    /// since. A line cut where older output was let go is left out.
     pub fn lines(&self, count: usize, credentials: &Credentials) -> Vec<String> {
         let (bytes, cut) = {
             let ring = self.0.lock().unwrap_or_else(|e| e.into_inner());
@@ -4805,8 +4826,9 @@ struct Captured {
     waiting: Arc<std::sync::atomic::AtomicUsize>,
     /// The file that holds it, once its writer is done.
     spilled: Option<Spilled>,
-    /// Where its newest output is kept for a client to look at.
-    peek: Option<Peek>,
+    /// Where its newest output is kept for a client to look at, and what
+    /// redacts this stream on its way there.
+    peek: Option<(Peek, Redacting)>,
 }
 
 /// The most a retained stream's file holds: `SPILL_BYTES` of output, each
@@ -4890,7 +4912,7 @@ impl Captured {
         Captured {
             spill: spill.map(|spill| (spill.clone(), stream, registry.credentials.clone())),
             waiting: waiting.clone(),
-            peek: peek.cloned(),
+            peek: peek.map(|peek| (peek.clone(), Redacting::new(registry.credentials.clone()))),
             ..Captured::default()
         }
     }
@@ -5112,19 +5134,19 @@ impl SpillFile {
 async fn capture(pipe: &mut (impl AsyncRead + Unpin), captured: &mut Captured) -> Result<()> {
     let room = KEPT_END.saturating_sub(captured.head.len());
     if room > 0 {
-        match &captured.peek {
+        match &mut captured.peek {
             // Read as it comes, so a client looking sees it at once.
-            Some(peek) => {
-                let peek = peek.clone();
+            Some((peek, redacting)) => {
                 let mut chunk = vec![0; room.min(64 * 1024)];
                 while captured.head.len() < KEPT_END {
                     let room = (KEPT_END - captured.head.len()).min(chunk.len());
                     let read = pipe.read(&mut chunk[..room]).await?;
                     if read == 0 {
+                        peek.end(redacting);
                         return Ok(());
                     }
                     captured.head.extend_from_slice(&chunk[..read]);
-                    peek.push(&chunk[..read]);
+                    peek.feed(redacting, &chunk[..read]);
                 }
             }
             None => {
@@ -5142,10 +5164,13 @@ async fn capture(pipe: &mut (impl AsyncRead + Unpin), captured: &mut Captured) -
     loop {
         let read = pipe.read(&mut chunk).await?;
         if read == 0 {
+            if let Some((peek, redacting)) = &mut captured.peek {
+                peek.end(redacting);
+            }
             return Ok(());
         }
-        if let Some(peek) = &captured.peek {
-            peek.push(&chunk[..read]);
+        if let Some((peek, redacting)) = &mut captured.peek {
+            peek.feed(redacting, &chunk[..read]);
         }
         if captured.spill.is_some() || captured.writer.is_some() {
             captured.spill(&chunk[..read]).await;
@@ -5917,10 +5942,20 @@ mod tests {
     #[test]
     fn a_commands_peek_keeps_its_newest_lines_plain_and_redacted() {
         let credentials = Credentials::default();
-        credentials.redact_also(&["password".to_owned()], &[]);
-        let peek = Peek::default();
-        peek.push(b"\x1b[1mbuilding\x1b[0m\n\x1b]0;title\x07step 1\rstep 2\r\n");
-        peek.push(b"\n\tpassword: fake8fake8fake8\n");
+        credentials.redact_also(&["password".to_owned()], &["PRIVATE KEY".to_owned()]);
+        credentials.set("TOKEN", "sk-fake9fake9fake9fake9");
+        let feed = |pieces: &[&[u8]]| {
+            let peek = Peek::default();
+            let mut redacting = Redacting::new(credentials.clone());
+            for piece in pieces {
+                peek.feed(&mut redacting, piece);
+            }
+            (peek, redacting)
+        };
+        let (peek, _) = feed(&[
+            b"\x1b[1mbuilding\x1b[0m\n\x1b]0;title\x07step 1\rstep 2\r\n",
+            b"\n\tpassword: fake8fake8fake8\n",
+        ]);
         assert_eq!(
             peek.lines(10, &credentials),
             ["building", "step 2", " password: [REDACTED]"]
@@ -5928,10 +5963,32 @@ mod tests {
         assert_eq!(peek.lines(1, &credentials), [" password: [REDACTED]"]);
         // Past the bound, only the newest are kept, and the first line,
         // cut where the older went, is left out.
-        let peek = Peek::default();
-        peek.push(&[b'x'; PEEK_BYTES]);
-        peek.push(b"password: fake8fake8fake8\nlast\n");
+        let (peek, _) = feed(&[&[b'x'; PEEK_BYTES], b"password: fake8fake8fake8\nlast\n"]);
         assert_eq!(peek.lines(10, &credentials), ["last"]);
+        // A secret cut across reads is held until it is whole, never
+        // kept in part, and what is held at the end is kept redacted.
+        let (peek, mut redacting) =
+            feed(&[b"token sk-fake9fa", b"ke9fake9fake9 ok\nnext sk-fake9"]);
+        assert_eq!(
+            peek.lines(10, &credentials),
+            ["token [REDACTED] ok", "next"]
+        );
+        peek.end(&mut redacting);
+        assert_eq!(
+            peek.lines(10, &credentials),
+            ["token [REDACTED] ok", "next sk-fake9"]
+        );
+        // A key's body whose BEGIN went past the bound is never shown:
+        // it was dropped before it was kept.
+        let body = "MIIEvQIBADANBgkqhkiG9w0BAQEFAASC\n".repeat(PEEK_BYTES / 32 + 8);
+        let (peek, _) = feed(&[
+            b"-----BEGIN PRIVATE KEY-----\n",
+            body.as_bytes(),
+            b"-----END PRIVATE KEY-----\nafter\n",
+        ]);
+        let lines = peek.lines(10, &credentials);
+        assert!(!lines.iter().any(|line| line.contains("MIIE")), "{lines:?}");
+        assert_eq!(lines.last().map(String::as_str), Some("after"));
     }
 
     #[tokio::test]
