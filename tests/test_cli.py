@@ -2014,6 +2014,34 @@ class CliTests(ModelFixture):
             self.assertNotIn('pinned', replaced.stdout)
             self.assertEqual(program.read_text(), '#!/bin/sh\necho pinned\n')
 
+    @unittest.skipUnless(shutil.which('bwrap') or sys.platform == 'darwin', 'sandboxes need bubblewrap')
+    def test_a_daemon_started_by_a_name_in_sonny_s_programs_still_writes_for_a_sandboxed_bot(self):
+        # Sonny starts the daemon by a name in its programs folder, kept
+        # from every sandbox: a sandboxed bot's write runs Agent by the
+        # path its starter named, not by that name.
+        home = self.path/'named-home'
+        names = home/'.agent'/'sonny'/'programs'/'names'
+        names.mkdir(parents=True)
+        daemon = names/'sonny-daemon'
+        try:
+            os.link(self.binary, daemon)
+        except OSError:
+            shutil.copy2(self.binary, daemon)
+        work = self.path/'named-work'
+        work.mkdir()
+        store = self.path/'named.db'
+        env = {**clean_env(), 'HOME': str(home), 'AGENT_BIN': str(self.binary)}
+        run = lambda binary, *args: subprocess.run([str(binary), *args], env=env, capture_output=True,
+                                                   text=True, timeout=30, cwd=work)
+        started = run(daemon, 'start', '--store', str(store), '--provider', f'openai=responses,{self.url}')
+        self.addCleanup(run, self.binary, 'shutdown', '--store', str(store))
+        self.assertEqual(started.returncode, 0, started.stderr)
+        wrote = run(self.binary, 'run', '--store', str(store), '--new', '--bot', 'w',
+                    '--model', 'openai/synthetic-model', '--tools', 'write', '--sandbox', 'workspace-write',
+                    'calls:' + json.dumps([['write', {'path': 'out.txt', 'content': 'hi'}]]))
+        self.assertEqual(wrote.returncode, 0, wrote.stderr)
+        self.assertEqual((work/'out.txt').read_text(), 'hi')
+
     def test_explicit_store_overrides_inherited_socket(self):
         client = SocketClient(self.binary, self.path/'first.db', self.url, 'echo')
         self.addCleanup(client.close)

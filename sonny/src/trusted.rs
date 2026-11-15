@@ -337,14 +337,13 @@ mod tests {
             .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
             .collect();
         copied.sort();
-        assert_eq!(
-            copied,
-            [
-                VERSION.to_owned(),
-                format!("tool-helper-{platform}"),
-                format!("tool-{platform}")
-            ]
-        );
+        let mut wanted = [
+            VERSION.to_owned(),
+            format!("tool-helper-{platform}"),
+            format!("tool-{platform}"),
+        ];
+        wanted.sort();
+        assert_eq!(copied, wanted);
         use std::os::unix::fs::PermissionsExt;
         let mode = |path: &Path| std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
         assert_eq!((mode(&programs), mode(&program)), (0o700, 0o700));

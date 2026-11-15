@@ -1630,8 +1630,9 @@ Sonny installs its own, at the versions its tools list the commands of
 checked against the integrity it pins, into
 `~/.agent/sonny/programs/NAME/`: `sonny setup` installs them, and `sonny
 upgrade` brings them to the versions the new Sonny pins (agent-desktop only
-where there is a desktop). The daemon keeps `~/.agent` read-only to every
-sandbox, so no agent can swap a program that runs as you. On macOS, that
+where there is a desktop). The daemon keeps that folder from every
+sandbox, as it keeps `~/.agent/keys`, even one given it by name, so no
+agent can swap a program that runs as you. On macOS, that
 copy is what you grant Accessibility and Screen Recording to. Their
 temporary and socket folder is `~/.agent/run/sonny/`, private, so the
 background host agent-desktop keeps for its commands, and agent-browser's
