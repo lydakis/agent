@@ -1185,7 +1185,12 @@ impl script::Host for Attempt {
                 // counts as running.
                 let _ = run.note(json!({"t": "thrown", "key": key, "phase": asked.phase,
                     "error": error, "at_ms": now_ms()}));
-                done();
+                // With its journal broken the run ends here, its workers
+                // still known, so a turn one still runs is interrupted
+                // and counted.
+                if run.broken.lock().unwrap().is_none() {
+                    done();
+                }
                 Err(error)
             }
             Err(Trouble::Lost) => {
@@ -1419,11 +1424,12 @@ impl Attempt {
         };
         live(Some(SUBMITTED));
         // A submission the journal does not know of could not be stopped
-        // after a restart: none is sent.
+        // after a restart: none is sent. The worker stays known, as one a
+        // replay found submitted may still run from the go before: the
+        // run's end interrupts it and counts what it spent.
         if let Err(why) =
             (self.run).note(json!({"t": "submit", "worker": worker, "at_ms": now_ms()}))
         {
-            live(None);
             return Err(Trouble::Thrown(why));
         }
         let submitted = match self.client.request("submit", submit).await {
