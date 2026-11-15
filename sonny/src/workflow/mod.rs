@@ -163,7 +163,9 @@ struct Plan {
 /// A run going on in this host.
 struct Run {
     plan: Plan,
-    script: script::Script,
+    /// None when it could not be read again: the run is then broken, and
+    /// ends failed through `finish`, its workers interrupted.
+    script: Option<script::Script>,
     dir: PathBuf,
     store: PathBuf,
     socket: PathBuf,
@@ -369,7 +371,7 @@ pub async fn call(
     if let Some(why) = run.broken.lock().unwrap().clone() {
         return Err(refused(why));
     }
-    let name = run.script.name().to_owned();
+    let name = (run.script.as_ref()).map_or(String::new(), |script| script.name().to_owned());
     start(run);
     let reused = match &plan.resumed_from {
         Some(from) => {
@@ -620,8 +622,7 @@ fn journal_of(dir: &Path) -> Result<Journal, String> {
 /// The run kept in `dir`, read to go on.
 fn load(dir: &Path, store: &Path, socket: &Path) -> Result<Arc<Run>, String> {
     let plan = read_plan(dir)?;
-    let source = read_file(&dir.join("script.js"))?;
-    let script = script::read(&source)?;
+    let script = read_file(&dir.join("script.js")).and_then(|source| script::read(&source));
     let Journal {
         answers,
         spent,
@@ -651,6 +652,15 @@ fn load(dir: &Path, store: &Path, socket: &Path) -> Result<Arc<Run>, String> {
     let (journal, broken) = match opened {
         Ok(file) => (Some(file), None),
         Err(e) => (None, Some(unwritable(e))),
+    };
+    // So does a script that no longer reads: the workers its journal
+    // knows of may still run.
+    let (script, broken) = match script {
+        Ok(script) => (Some(script), broken),
+        Err(why) => (
+            None,
+            broken.or(Some(format!("its script could not be read again: {why}"))),
+        ),
     };
     Ok(Arc::new(Run {
         script,
@@ -700,9 +710,10 @@ pub fn resume(store: PathBuf, socket: PathBuf) {
             }
             // Unended, or its ending never written whole: run again. One
             // that cannot be picked up ends failed, saying why: one whose
-            // journal cannot be written is loaded broken and ends through
-            // `finish`, its workers interrupted; this is one whose plan,
-            // script or journal cannot be read, so whose workers are unknown.
+            // journal cannot be written, or whose script no longer reads, is
+            // loaded broken and ends through `finish`, its workers
+            // interrupted; this is one whose plan or journal cannot be read,
+            // so whose workers are unknown.
             None => match load(&path, &store, &socket) {
                 Ok(run) => {
                     let _ = run.note(json!({"t": "replay", "at_ms": now_ms()}));
@@ -765,7 +776,7 @@ async fn stop(client: &Client, caller: &str, id: &str) -> Result<String, String>
     let mut said = format!(
         "Stopping workflow {} (run {id}): {stopped} running agent{} interrupted. You hear back \
          once it has ended, with what finished.",
-        run.script.name(),
+        (run.script.as_ref()).map_or(run.plan.id.as_str(), |script| script.name()),
         if stopped == 1 { "" } else { "s" }
     );
     if let Err(why) = kept {
@@ -1588,9 +1599,12 @@ async fn drive(run: Arc<Run>) {
         for worker in reserved {
             tokio::spawn(Attempt::release_when_ended(Arc::clone(&attempt), worker));
         }
+        let Some(script) = &run.script else {
+            break (script::Ended::Halted, Some(attempt));
+        };
         let ended = script::run(
             Arc::clone(&attempt),
-            &run.script,
+            script,
             run.plan.args.clone(),
             run.plan.budget,
         )
@@ -2213,6 +2227,20 @@ mod tests {
             assert!(why.contains("could not be written"), "{why}");
             std::fs::set_permissions(&journal, std::fs::Permissions::from_mode(0o644)).unwrap();
         }
+        // A script that no longer reads loads broken too, knowing the
+        // workers its journal submitted to, so its end interrupts them.
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&journal)
+            .unwrap()
+            .write_all(b"{\"t\": \"submit\", \"worker\": \"shop.wf-r1-k2\"}\n")
+            .unwrap();
+        std::fs::write(run_dir.join("script.js"), "return 1\n").unwrap();
+        let run = load(&run_dir, &dir, &socket).unwrap();
+        assert!(run.script.is_none() && run.stopping());
+        assert!(run.live.lock().unwrap().contains_key("shop.wf-r1-k2"));
+        let why = run.broken.lock().unwrap().clone().unwrap();
+        assert!(why.contains("its script could not be read again"), "{why}");
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
