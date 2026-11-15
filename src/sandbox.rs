@@ -2040,6 +2040,20 @@ impl Ended {
     }
 }
 
+/// Whether the sandbox `end` tells of is gone: its pipe at its end, as
+/// nothing is ever written to it. Asked without waiting.
+fn gone(end: &std::os::fd::OwnedFd) -> bool {
+    use std::os::fd::AsRawFd;
+    let mut asked = libc::pollfd {
+        fd: end.as_raw_fd(),
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    // SAFETY: one pollfd, valid for the call, which doesn't wait.
+    (unsafe { libc::poll(&mut asked, 1, 0) }) == 1
+        && asked.revents & (libc::POLLIN | libc::POLLHUP) != 0
+}
+
 /// What a running sandbox holds in place; dropping it lets the
 /// placeholders go once no other sandbox holds them, removes what the
 /// command may not leave made, and gives up its share in the bot's socket,
@@ -2111,8 +2125,10 @@ impl Hold {
     /// enough: bubblewrap's init, which holds the placeholders' locks too,
     /// dies only after it, and a placeholder let go while init still holds
     /// it is never removed. The caller drops its copy of the command first,
-    /// with the pipe's write end in it.
+    /// with the pipe's write end in it. One held over many sandboxes, as a
+    /// patch's over its writes, keeps the pipes of only those still running.
     pub fn waits_for(&mut self, ended: Ended) {
+        self.3.retain(|end| !gone(end));
         self.3.extend(ended.0);
     }
 
@@ -3453,6 +3469,21 @@ mod tests {
         hold(&policy).await.release();
         assert!(!git.exists(), "the next holder removes what a crash left");
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// A hold over many sandboxes keeps the pipes of only those still
+    /// running, however many it waited for.
+    #[test]
+    fn a_hold_keeps_only_the_ends_of_sandboxes_still_running() {
+        let mut held = Hold(Vec::new(), Vec::new(), None, Vec::new());
+        let (running, _open) = std::io::pipe().unwrap();
+        held.waits_for(Ended(Some(running.into())));
+        for _ in 0..100 {
+            let (ended, closed) = std::io::pipe().unwrap();
+            drop(closed);
+            held.waits_for(Ended(Some(ended.into())));
+        }
+        assert_eq!(held.3.len(), 2, "the running one and the last one asked");
     }
 
     /// Two holders letting go at the same moment: one of them removes the
