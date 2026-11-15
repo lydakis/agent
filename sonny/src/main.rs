@@ -13407,6 +13407,21 @@ impl App {
                 self.pane_keys = true;
                 self.margin_focus = self.margin.note(id).map(|note| margin::anchor(&note.call));
             }
+            // A note whose fold row has no file to open, whole in the
+            // pane: the text kept of a task's file once the task is gone.
+            "whole" => {
+                let wide = pane::width(self.full_width, kept(self.full_width));
+                let width = card_width(wide);
+                let workspace = std::path::PathBuf::from(&self.workspace);
+                let Some(title) = self.margin.note(id).map(|note| note.title.clone()) else {
+                    return;
+                };
+                if let Some(lines) = self.margin.whole_rows(id, width, &workspace) {
+                    let mut pane = pane::Pane::card(&title, "esc close");
+                    pane.set_card(lines, "esc close");
+                    self.open_pane(pane);
+                }
+            }
             // The conversation back where the note was put.
             "jump" => {
                 let Some(note) = self.margin.note(id) else {

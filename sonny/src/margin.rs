@@ -1440,6 +1440,19 @@ impl Margin {
         Some(fold(whole.rows, whole.unread, most, whole.opens))
     }
 
+    /// The note `id` whole, `width` wide, files read from `workspace`:
+    /// every row it draws, as the pane shows it when its fold row is
+    /// opened with nothing else to open.
+    pub fn whole_rows(
+        &mut self,
+        id: &str,
+        width: usize,
+        workspace: &Path,
+    ) -> Option<Vec<Line<'static>>> {
+        let whole = self.whole(id, width, workspace)?;
+        Some(fold(whole.rows, whole.unread, usize::MAX, None).0)
+    }
+
     /// The note `id`'s rows, every one, `width` wide, files read from
     /// `workspace`.
     fn whole(&mut self, id: &str, width: usize, workspace: &Path) -> Option<Whole> {
@@ -1478,8 +1491,9 @@ impl Margin {
                 let folder = folder.unwrap_or(workspace);
                 let file = Path::new(path);
                 (whole.rows, whole.unread) = text_lines(file, text, folder, width);
-                let there = folder.join(file.file_name().unwrap_or(file.as_os_str()));
-                whole.opens = crate::links::file_url(&there);
+                // The text kept of it, whole in the pane: there whether or
+                // not the task and its folder still are.
+                whole.opens = Some(format!("{BUTTON}whole/{id}"));
             }
             Body::From { bot, id, .. } => {
                 let line = format!("{BODY}{bot}'s note {id}, once it is read");
@@ -3013,12 +3027,18 @@ mod tests {
         let url = crate::links::file_url(&dir.join("log.txt")).unwrap();
         assert!(marks.contains(&(folded, Mark::Link(url))), "{marks:?}");
         let folded = at("… 24 more lines · enter opens it").expect("the task's note's fold");
-        let url = crate::links::file_url(&dir.join("there/flow.txt")).unwrap();
-        assert!(marks.contains(&(folded, Mark::Link(url))), "{marks:?}");
+        let whole = Mark::Link(format!("{BUTTON}whole/flow"));
+        assert!(marks.contains(&(folded, whole.clone())), "{marks:?}");
         // Drawn out in the conversation, the same.
         let (body, opens) = margin.body("log", 60, &dir, 40).unwrap();
         assert_eq!(body.len(), 7);
         assert!(opens.is_some_and(|url| url.ends_with("log.txt")));
+        // The task's note opens the text kept of its file, whole in the
+        // pane, even once the task is gone with its folder.
+        std::fs::remove_dir_all(dir.join("there")).unwrap();
+        let rows = margin.whole_rows("flow", 60, &dir).unwrap();
+        assert_eq!(rows.len(), 30);
+        assert_eq!(rows[29].to_string().trim(), "line 30");
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

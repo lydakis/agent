@@ -2094,8 +2094,9 @@ title. A live note whose last fill failed says why under what it
 follows, where no fold reaches it. A note that shows a file, or a
 task's note, shows its first rows up to the most a note draws, then a
 muted `… N more lines · enter opens it` row; Enter on it, or a click,
-opens the file whole in the pane (a task's note that shows no file opens
-the task). Each note is pinned where the agent first put it: a quiet `✎ title · in the
+opens the file whole in the pane (a task's note opens the text it shows
+of the task's file, whole, even once the task is gone; one that shows no
+file opens the task). Each note is pinned where the agent first put it: a quiet `✎ title · in the
 margin` row there scrolls the margin to it when clicked, and the note's
 `↑` scrolls the conversation back there, drawing older messages again
 when it is further back. Its `×` takes the note away and tells the agent
