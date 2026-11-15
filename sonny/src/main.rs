@@ -14654,8 +14654,8 @@ impl App {
                 match user_shell::start(command, &self.workspace) {
                     Ok(running) => {
                         // Run while a step of theirs is in focus, it is
-                        // that step.
-                        self.shell_answers = self.runs().cloned();
+                        // that step, as the row over the composer said.
+                        self.shell_answers = self.answers(&prompt).cloned();
                         self.shell = Some(running);
                         self.input.clear();
                         self.notice = None;
@@ -15638,18 +15638,15 @@ impl App {
     }
 
     /// The question in focus that sending `typed` answers: any words but
-    /// a command, a line for the shell, or nothing.
+    /// a command, a line for the shell, or nothing; and a line for the
+    /// shell when the question is a step to run here ([`asks::runs_here`]).
     fn answers(&self, typed: &str) -> Option<&asks::Ask> {
         let typed = typed.trim_start();
-        (!typed.trim().is_empty() && !typed.starts_with(['/', '!']))
-            .then(|| self.asking())
-            .flatten()
-    }
-
-    /// The question in focus a `!` command run now answers once it ends:
-    /// a step to run here ([`asks::runs_here`]).
-    fn runs(&self) -> Option<&asks::Ask> {
-        self.asking().filter(|ask| asks::runs_here(ask))
+        let ask = self.asking()?;
+        let words = !typed.trim().is_empty() && !typed.starts_with(['/', '!']);
+        let runs = (typed.strip_prefix('!')).is_some_and(|command| !command.trim().is_empty())
+            && asks::runs_here(ask);
+        (words || runs).then_some(ask)
     }
 
     /// Where the question in focus is among those open, from 0.
@@ -22773,11 +22770,14 @@ mod tests {
         app.asks = vec![pick.clone()];
         app.input.set("!ls");
         assert!(app.answering_over(80).is_none());
-        // With a step to run in focus, it is that step; no row over it
-        // says so.
+        // With a step to run in focus, it is that step, named over it as
+        // typed words are.
         app.asks = vec![step.clone(), pick.clone()];
         app.input.set("!echo signed in");
-        assert!(app.answering_over(80).is_none());
+        assert_eq!(
+            app.answering_over(80).unwrap().to_string(),
+            "  answering “Sign in to the registry?” (1 of 2)"
+        );
         app.submit().await;
         while app.shell.as_ref().is_some_and(|s| !s.is_finished()) {
             tokio::time::sleep(Duration::from_millis(10)).await;
@@ -22838,6 +22838,7 @@ mod tests {
             app.asks = asks.clone();
             app.chatting = chatting;
             app.input.set("!true");
+            assert!(app.answering_over(80).is_none());
             app.submit().await;
             while app.shell.as_ref().is_some_and(|s| !s.is_finished()) {
                 tokio::time::sleep(Duration::from_millis(10)).await;
