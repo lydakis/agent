@@ -1693,7 +1693,7 @@ impl Service {
                 for lookout in self.lookouts.values_mut() {
                     lookout.flush();
                 }
-                held::then(move |written| {
+                held::then(self.store.clone(), move |written| {
                     let _ = kept.send(written);
                 });
             }
@@ -1902,7 +1902,7 @@ impl Service {
         let path = cursor_path(&self.store);
         let partial = path.with_extension(format!("cursor.{}.partial", std::process::id()));
         self.saved = Some(text.clone());
-        held::then(move |written| {
+        held::then(self.store.clone(), move |written| {
             if written {
                 let _ = write_moved(&partial, &path, &text);
             }
@@ -3258,12 +3258,14 @@ mod held {
     use std::sync::{Mutex, OnceLock, mpsc};
 
     /// What is called once the writes handed over before it are done:
-    /// whether every file holds what it was last handed.
+    /// whether every file of its store holds what it was last handed.
     type Then = Box<dyn FnOnce(bool) + Send>;
 
     enum Job {
         Write(PathBuf, Option<Vec<u8>>),
-        Done(Then),
+        /// The store whose files it asks about, by the path each is
+        /// named beside, and what to call.
+        Done(PathBuf, Then),
     }
 
     fn sender() -> &'static Mutex<mpsc::Sender<Job>> {
@@ -3283,7 +3285,7 @@ mod held {
                                 writes.retain(|(had, _)| *had != path);
                                 writes.push((path, body));
                             }
-                            Job::Done(then) => done.push(then),
+                            Job::Done(store, then) => done.push((store, then)),
                         }
                     }
                     for (path, body) in failed.drain() {
@@ -3296,8 +3298,15 @@ mod held {
                             failed.insert(path, body);
                         }
                     }
-                    for then in done {
-                        then(failed.is_empty());
+                    // Another store's write failing is not this one's: one
+                    // process holds one store, but tests hold many at once.
+                    for (store, then) in done {
+                        let store = store.as_os_str().as_encoded_bytes();
+                        then(
+                            !failed
+                                .keys()
+                                .any(|path| path.as_os_str().as_encoded_bytes().starts_with(store)),
+                        );
                     }
                 }
             });
@@ -3328,22 +3337,23 @@ mod held {
     }
 
     /// Calls `then` once every write handed over before it is done, with
-    /// whether each file holds what it was last handed. Never called
-    /// only if the writer is gone, which drops `then`.
-    pub fn then(then: impl FnOnce(bool) + Send + 'static) {
+    /// whether each file of `store`, named beside it, holds what it was
+    /// last handed. Never called only if the writer is gone, which drops
+    /// `then`.
+    pub fn then(store: PathBuf, then: impl FnOnce(bool) + Send + 'static) {
         if let Ok(send) = sender().lock() {
-            let _ = send.send(Job::Done(Box::new(then)));
+            let _ = send.send(Job::Done(store, Box::new(then)));
         }
     }
 
     /// Waits for every write handed over before it.
     #[cfg(test)]
-    pub fn written() -> bool {
+    pub fn written() {
         let (tell, told) = mpsc::channel();
-        then(move |written| {
-            let _ = tell.send(written);
+        then(PathBuf::new(), move |_| {
+            let _ = tell.send(());
         });
-        told.recv().unwrap_or(false)
+        let _ = told.recv();
     }
 }
 
