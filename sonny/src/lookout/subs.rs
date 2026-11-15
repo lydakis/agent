@@ -492,7 +492,7 @@ fn files_renamed(store: &Path, from: &str, to: &str) -> bool {
     let Ok(entries) = std::fs::read_dir(dir(store)) else {
         return true;
     };
-    let _held = match held(store) {
+    let _held = match locked(store) {
         Ok(held) => held,
         Err(_) => return false,
     };
@@ -1019,8 +1019,17 @@ fn plain(name: &str, max: usize) -> bool {
         && (name.bytes()).all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b))
 }
 
-/// The lock every edit holds while it reads and writes.
+/// The lock every edit holds while it reads and writes, taken once the
+/// files are renamed: an edit reads a file as [`Sub`], which drops a key
+/// not yet renamed.
 fn held(store: &Path) -> Result<std::fs::File, String> {
+    steer_files(store);
+    agents_files(store);
+    locked(store)
+}
+
+/// The lock alone, for the renames themselves.
+fn locked(store: &Path) -> Result<std::fs::File, String> {
     use std::os::fd::AsRawFd;
     use std::os::unix::fs::OpenOptionsExt;
     super::make_dir(&dir(store)).map_err(|e| e.to_string())?;
@@ -1666,6 +1675,28 @@ mod tests {
         assert_eq!(now[1].sources, ["ci"]);
         let text = std::fs::read_to_string(&path).unwrap();
         assert!(!text.contains("bots"), "{text}");
+        let _ = std::fs::remove_dir_all(dir(&store));
+        let mut record = store.as_os_str().to_owned();
+        record.push(".migrated");
+        let _ = std::fs::remove_file(record);
+    }
+
+    #[test]
+    fn an_edit_before_the_lookout_starts_keeps_a_follow_s_bots() {
+        let store = std::env::temp_dir().join(format!("sonny-agents-edit-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(dir(&store));
+        std::fs::create_dir_all(dir(&store)).unwrap();
+        let path = file(&store, "shop.lead");
+        let old = json!({"subscriptions": [{"name": "web", "bots": ["web.lead"]}]});
+        std::fs::write(&path, old.to_string()).unwrap();
+        // Sonny subscribes the lead it opens before the lookout renames.
+        assert_eq!(
+            ensure(&store, "shop.lead", Sub::lead("shop.lead", "shop")),
+            Ok(true)
+        );
+        let now = read(&store, "shop.lead");
+        assert_eq!(now.len(), 2);
+        assert_eq!(now[1].agents, ["web.lead"]);
         let _ = std::fs::remove_dir_all(dir(&store));
         let mut record = store.as_os_str().to_owned();
         record.push(".migrated");
