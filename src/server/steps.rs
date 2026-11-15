@@ -91,6 +91,9 @@ pub(super) struct Steps {
     /// The calls of each turn with a step in flight or a capture, so a
     /// turn's end visits only its own.
     by_turn: HashMap<i64, HashSet<Box<str>>>,
+    /// The calls each session has a step in flight for, so its closing
+    /// visits only its own.
+    by_session: HashMap<u64, HashSet<Key>>,
     /// Steps waiting for their decision's store job.
     asking: Queue,
     /// Steps' store jobs under way, at most [`STORE_WINDOW`] decisions.
@@ -220,6 +223,12 @@ impl Steps {
     fn take(&mut self, key: &Key) -> Option<Flight> {
         let flight = self.flights.remove(key)?;
         self.unindex(key);
+        if let Some(keys) = self.by_session.get_mut(&flight.session) {
+            keys.remove(key);
+            if keys.is_empty() {
+                self.by_session.remove(&flight.session);
+            }
+        }
         self.bytes -= flight.bytes;
         if let Some(count) = self.by_bot.get_mut(flight.ask.bot.as_str()) {
             *count -= 1;
@@ -351,6 +360,11 @@ impl Service {
             },
         );
         steps.index(&key);
+        steps
+            .by_session
+            .entry(session)
+            .or_default()
+            .insert(key.clone());
         steps.asking.push(key, serial);
         self.ask_steps();
         Err(Error::new("deferred"))
@@ -449,7 +463,13 @@ impl Service {
             // Taken up in the job that asked, never brought back here.
             Ok(StepOpened::Learn { .. }) | Err(_) => None,
         };
-        if let Some(capture) = capture {
+        // Kept for the call's next steps, unless this one was stopped
+        // while it was decided: a call that ended meanwhile asks no more,
+        // and nothing would let its capture go.
+        let stopped = (self.steps.flights.get(&key)).is_some_and(|flight| flight.stopped.is_some());
+        if let Some(capture) = capture
+            && !stopped
+        {
             self.steps.captured.entry(key.clone()).or_insert(capture);
             self.steps.index(&key);
         }
@@ -833,10 +853,10 @@ impl Service {
     /// A session closed: its steps dropped from the line or stopped, and
     /// told nothing.
     pub(super) fn steps_session_closed(&mut self, session: u64) {
-        let keys: Vec<Key> = (self.steps.flights.iter())
-            .filter(|(_, flight)| flight.session == session)
-            .map(|(key, _)| key.clone())
-            .collect();
+        let Some(keys) = self.steps.by_session.get(&session) else {
+            return;
+        };
+        let keys: Vec<Key> = keys.iter().cloned().collect();
         for key in keys {
             self.stop_step(&key, "its asker left", true);
         }
