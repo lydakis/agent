@@ -10115,3 +10115,107 @@ steps' jobs to a few commits' worth, which more than halved the other
 bots' tail and raised the step rate. Commits of up to 128 jobs raise the
 step rate a further 18%, but they change every store job's latency and
 belong in a change of their own with the store's screens.
+
+### Remeasured after review: a second process, measured memory, and a derived gate
+
+Reviews of the run above asked for three fixes to the bench and one to the
+gate, and this section reports them. The tables above stay as they were
+measured.
+
+- **Other bots run in their own process.** The 32 other bots now run from a
+  forked process with their own socket, so the fleet client's work no
+  longer lands in their times. Their idle p99 reads higher than before (75
+  to 112 ms against 68), because it now includes that process's own
+  scheduling on the same 4 cores.
+- **Memory a waiting step holds is measured, not added up.** With every
+  call waiting, one `sleep 3` shell step holds the only process slot
+  (`--max-processes 1`) and up to 2,000 other calls each line a `true`
+  shell step behind it. The daemon's RSS is read before and after, both
+  after a second's settle and before any other step has run. The 282
+  bytes reported above was the coordinator's own count of the request's
+  bytes, not memory.
+- **The fleet's steps are `echo`.** They measure the coordinator, its
+  lines and the store: what a step costs the daemon apart from the work
+  the tool does. A `shell` step's process is bounded by the process slots
+  as a turn's command is, and the footprint phase above is the only place
+  this bench runs one.
+
+Two rounds of each arm, release build, the same 4-core container,
+2026-11-15. The `32` arm is this change; `128` is the same build with
+commits of up to 128 store jobs (`GROUP_JOBS`), which is not part of this
+change.
+
+| Bots | Arm | Steps a second | Step p50 / p99 | Bots ÷ rate | p99 ÷ (bots ÷ rate) | Other bots' p99, idle / while stepping |
+| ---: | --- | ---: | ---: | ---: | ---: | ---: |
+| 6 | 32 | 605 / 913 | 4 / 15, 3 / 13 ms | 10 / 7 ms | n/a | 77 / 77, 75 / 73 ms |
+| 6 | 128 | 657 / 581 | 4 / 20, 3 / 19 ms | 9 / 10 ms | n/a | 72 / 83, 76 / 82 ms |
+| 400 | 32 | 3,829 / 4,313 | 107 / 133, 77 / 116 ms | 104 / 93 ms | 1.28 / 1.24 | 90 / 125, 88 / 119 ms |
+| 400 | 128 | 8,061 / 7,369 | 44 / 65, 48 / 68 ms | 50 / 54 ms | 1.30 / 1.25 | 79 / 97, 84 / 91 ms |
+| 2,000 | 32 | 4,694 / 5,466 | 365 / 643, 337 / 502 ms | 426 / 366 ms | 1.51 / 1.37 | 89 / 147, 84 / 124 ms |
+| 2,000 | 128 | 7,469 / 6,688 | 231 / 388, 257 / 426 ms | 268 / 299 ms | 1.45 / 1.42 | 98 / 125, 104 / 123 ms |
+| 10,000 | 32 | 6,098 / 6,148 | 1,558 / 1,852, 1,560 / 1,841 ms | 1,640 / 1,627 ms | 1.13 / 1.13 | 94 / 143, 104 / 129 ms |
+| 10,000 | 128 | 8,002 / 7,705 | 1,166 / 1,325, 1,253 / 1,403 ms | 1,250 / 1,298 ms | 1.06 / 1.08 | 112 / 137, 84 / 120 ms |
+
+One step alone stayed at 0.86 to 1.43 ms p50 and 1.8 to 6.1 ms p99 in
+every run of both arms (200 steps a run; the 1.43 and 6.1 ms are single
+runs, each with a sub-millisecond run of the same arm beside it). Every
+run finished every step, none refused, at 2.0 store jobs a step.
+
+| Steps in line | Measured RSS a step | The coordinator's count |
+| ---: | ---: | ---: |
+| 399 (400 bots) | 1,735 to 1,950 bytes | 289 bytes |
+| 1,999 (2,000 bots) | 2,848 to 2,998 bytes | 289 bytes |
+| 2,000 (10,000 bots) | 950 to 1,128 bytes | 289 bytes |
+
+At 10,000 bots the allocator reuses memory the fleet's calls freed on
+the way to waiting, so the lower figure is the one the allocator can
+hide; the 2,000-bot runs, read on a daemon that had freed less, are the
+honest bound. A step in line costs about 3 KB, not 289 bytes: the parsed
+request (a JSON tree, not its text), its key, its flight and its place in
+the line. **The design's gate of the request and under 1 KiB more is
+missed.** Holding the request's text and parsing it when the step starts
+is the follow-up that would meet it.
+
+**What the step p99 is.** A fleet whose every call steps at once waits in
+one FIFO line, so a step waits about one pass of that line: the fleet's
+size over the daemon's step rate. The p99 sits within 1.06 to 1.51 times
+that pass in every run, highest at 2,000 bots, where the line's first
+pass is still filling. The 1 s gate was a number written before any run;
+it is met at 10,000 bots only by a step rate of 10,000 a second. The
+proposal that replaces it:
+
+- **Fairness:** step p99 at most 1.6 times the fleet's size over its step
+  rate, at 400, 2,000 and 10,000 bots. No step starves behind a line it
+  did not join.
+- **Rate:** steps a second at 10,000 bots no lower than main's on the same
+  machine (6,098 to 6,148 here).
+
+**Other bots beside the fleet.** Timed from their own process, the other
+bots' p99 rises 24 to 65% with the `32` arm and 8 to 43% with `128`,
+against the gate's 15%. Neither the bench client nor its interpreter is
+in those times now. The daemon's runtime thread is 32 to 52% busy and its
+store thread 63 to 69%; the other bots' turns are store jobs too, and
+they wait behind the fleet's commits. Commits of up to 128 jobs raise the
+step rate by a quarter at 10,000 bots and up to twice at 400, and leave
+the other bots' tail no worse, but they
+change every store job's latency and are their own change, screened on
+their own.
+
+**The rerouted planner, screened.** Every call, alone or together, now
+goes through `Bot::plan`, the same planner a step uses. The Perf
+workflow's screen finished on the change's earlier head, with that
+planner in place and the same in this slice-2-only head; it passed every
+gate:
+
+| Bench | Measure | main | This change | Change |
+| --- | --- | ---: | ---: | ---: |
+| admission | lone submit CPU, ms | 23.52 | 23.84 | +1.4% |
+| admission | burst submit p99, ms | 2.622 | 2.703 | +3.1% |
+| completion | release to terminal p99, ms | 6.635 | 6.62 | -0.2% |
+| footprint | idle RSS, MiB | 16.49 | 16.84 | +2.2% |
+| footprint | per idle bot, KiB | 1.888 | 1.76 | -6.8% |
+| footprint | RSS after a turn each, MiB | 55.90 | 56.56 | +1.2% |
+| footprint | CPU per turn, ms | 0.671 | 0.672 | +0.2% |
+| lifecycle | CPU, s | 0.315 | 0.33 | +4.8% |
+| lifecycle | p95 turn, ms | 573.6 | 572.5 | -0.2% |
+| lifecycle | peak RSS, MiB | 24.81 | 25.27 | +1.8% |

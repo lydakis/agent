@@ -274,7 +274,10 @@ class StepsFleet(ModelFixture):
                     turns[start + n] = answer['result']['message']
 
             def calling(turn):
-                return any(e['event'] == 'tool_started' for _, e in pipe.events.get(turn, []))
+                events = [e for _, e in pipe.events.get(turn, [])]
+                ended = [e for e in events if e['event'] == 'turn_finished']
+                assert not ended, f'turn {turn} ended before its call: {ended[0]}'
+                return any(e['event'] == 'tool_started' for e in events)
             pipe.wait(lambda: all(calling(t) for t in turns.values()), 600)
             calls_s = time.perf_counter() - submitted
             footprint = self.footprint(pipe, pid, turns, agents)
@@ -386,7 +389,9 @@ class StepsFleet(ModelFixture):
         with every call waiting, then with one step of every call but one
         waiting in line behind that one's command, which holds the only
         process slot. Before any other step ran, so no freed memory the
-        allocator kept counts. Then the command ends and the line drains."""
+        allocator kept counts. Then the command ends and the line drains.
+        At most 2,000 steps line up, so the line drains one process at a
+        time well inside a client call's time."""
         def settled():
             time.sleep(1)
             return rss_kib(pid)
@@ -396,12 +401,13 @@ class StepsFleet(ModelFixture):
         while pipe.request('stats')['result']['steps']['commands'] == 0:
             time.sleep(.01)
         lined = []
-        for start in range(1, agents, 2000):
+        lining = min(agents, 2001)
+        for start in range(1, lining, 2000):
             ids, _ = pipe.send_many([('run_step', dict(bot=f'p.b{b}', turn=turns[b], call_id='script-0', step='f',
                                                        name='shell', arguments={'command': 'true'}))
-                                     for b in range(start, min(agents, start + 2000))])
+                                     for b in range(start, min(lining, start + 2000))])
             lined += ids
-        while pipe.request('stats')['result']['steps']['in_line'] < agents - 1:
+        while pipe.request('stats')['result']['steps']['in_line'] < lining - 1:
             time.sleep(.05)
         steps = pipe.request('stats')['result']['steps']
         waiting = settled()
