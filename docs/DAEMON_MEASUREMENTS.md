@@ -10181,8 +10181,8 @@ one FIFO line, so a step waits about one pass of that line: the fleet's
 size over the daemon's step rate. The p99 sits within 1.06 to 1.51 times
 that pass in every run, highest at 2,000 bots, where the line's first
 pass is still filling. The 1 s gate was a number written before any run;
-it is met at 10,000 bots only by a step rate of 10,000 a second. The
-proposal that replaces it:
+it is met at 10,000 bots only by a step rate of 10,000 a second. What
+replaces it, agreed with George the same day:
 
 - **Fairness:** step p99 at most 1.6 times the fleet's size over its step
   rate, at 400, 2,000 and 10,000 bots. No step starves behind a line it
