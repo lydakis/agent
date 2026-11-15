@@ -10031,3 +10031,26 @@ from the `bots` listing (119 and 101 ms for all 5,000 at 256 a page).
 In the daemon, a turn's tool encoding is now keyed by the list's digest
 rather than by serializing the list at each turn's start or resumption,
 and every bot, turn and fork that holds a list shares one parsed copy.
+
+### Required matched screen
+
+The Perf workflow's screen of this change against its base `df69529`
+(GitHub Actions `ubuntu-24.04`, two alternating rounds each, 2026-11-15,
+run 43741741543). Store work per turn is the same on both sides, so the
+gate passes; no CPU, latency or memory measure moved past the 15% the gate
+warns at, except Sonny's lookout CPU at 10 sources × 1 delta (31.25 to
+37.5 ms per 1,000 deltas), a measure this change does not touch and which
+moved the other way at 10 × 10.
+
+| Bench | Measure | Base | Head | Change |
+| --- | --- | ---: | ---: | ---: |
+| admission | lone submit CPU, ms | 34.95 | 35.12 | +0.5% |
+| admission | burst submit p99, ms | 4.309 | 4.436 | +2.9% |
+| completion | release to terminal p99, ms | 11.68 | 11.75 | +0.6% |
+| footprint | idle RSS, MiB | 16.36 | 16.56 | +1.2% |
+| footprint | per idle bot, KiB | 1.954 | 2.002 | +2.5% |
+| footprint | RSS after a turn each, MiB | 39.37 | 41.16 | +4.6% |
+| footprint | CPU per turn, ms | 0.99 | 1.007 | +1.7% |
+| lifecycle | CPU, s | 0.545 | 0.545 | +0.0% |
+| lifecycle | p95 turn, ms | 579.7 | 579.3 | -0.1% |
+| lifecycle | peak RSS, MiB | 25.06 | 24.78 | -1.1% |
