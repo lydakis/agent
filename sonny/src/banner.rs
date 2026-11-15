@@ -224,7 +224,7 @@ fn gesture(n: u64) -> &'static [(Look, Duration)] {
     GESTURES[0].1
 }
 
-/// A pixel's colour.
+/// A pixel's color.
 type Rgb = (u8, u8, u8);
 
 /// The eyes' pixels for `look`, as (upper, lower) on each of
@@ -297,7 +297,7 @@ fn hints(accent: Style) -> Line<'static> {
 }
 
 /// Rows of `art`, two pixel rows to a line: the upper pixel as the half
-/// block's colour and the lower as its background.
+/// block's color and the lower as its background.
 fn pixels(art: &[&str], colors: &[(u8, u8, u8)]) -> Vec<Line<'static>> {
     let color = |row: Option<&&str>, x: usize| {
         let key = row?.as_bytes().get(x)?;
@@ -473,7 +473,7 @@ mod tests {
     #[test]
     fn the_eyes_are_where_the_portrait_has_them() {
         // Both eye rows are drawn on every column a lid covers, so a
-        // blink changes colours only, never a cell's symbol.
+        // blink changes colors only, never a cell's symbol.
         for column in EYE_COLUMNS {
             for row in [EYES, EYES + 1] {
                 assert_ne!(PORTRAIT[row].as_bytes()[column as usize], b'.');
