@@ -3519,6 +3519,7 @@ fn a_turn_held_on_its_call_says_so_and_is_woken_to_try_again() {
             None,
             Some(blocked),
             None,
+            None,
         )
         .unwrap();
     assert_eq!(entry["event"], "turn_paced");
@@ -3570,11 +3571,20 @@ fn an_ordinary_retry_between_holds_keeps_when_they_began() {
             None,
             None,
             None,
+            Some("provider_stream_failed".into()),
             Some(5),
         )
         .unwrap();
-    // A retry the provider asked for, not a hold: nothing says held.
+    // A retry the provider asked for, not a hold: nothing says held, and
+    // it says what it backs off from, so no one reads a dropped
+    // connection as a rate limit.
     assert!(entry["data"].get("blocked").is_none());
+    assert_eq!(entry["data"]["retrying"], "provider_stream_failed");
+    let view = db.turn_view("Bob", turn).unwrap();
+    assert_eq!(
+        view["waiting_on"],
+        serde_json::json!({"resume_at_ms":99,"retrying":"provider_stream_failed"})
+    );
     assert!(held_rows(&db).is_empty());
     let waiting = db.waiting_turns().unwrap();
     assert_eq!(
@@ -17685,6 +17695,9 @@ fn a_trimmed_row_a_fallback_and_summaries_leave_a_turns_time_as_it_ran() {
     db.append(turn, vec![item], &[shell.clone(), read.clone()], None)
         .unwrap();
     db.tool_start(turn, &shell, false, false).unwrap();
+    // The read's own time is 0.5 s more than what passes here: a slow
+    // runner's time counts too.
+    let since = std::time::Instant::now();
     db.tool_start(turn, &read, false, false).unwrap();
     // The command's row goes while both run; the read started 0.5 s ago.
     let conn = Connection::open(&path).unwrap();
@@ -17696,6 +17709,7 @@ fn a_trimmed_row_a_fallback_and_summaries_leave_a_turns_time_as_it_ran() {
     .unwrap();
     db.tool_finish(turn, "s1", &result("ok")).unwrap();
     db.tool_finish(turn, "r1", &result("ok")).unwrap();
+    let ran = since.elapsed().as_millis() as i64;
     // A fallback's round: 3 tokens from the attempt that failed, 40 from
     // the one that answered, which its time is.
     let attempt = |model: &str, output| ModelTokens {
@@ -17741,7 +17755,7 @@ fn a_trimmed_row_a_fallback_and_summaries_leave_a_turns_time_as_it_ran() {
     let time = &usage["time"];
     // The command counts with no time and leaves the read's whole.
     let tool_ms = time["tool_ms"].as_i64().unwrap();
-    assert!((500..900).contains(&tool_ms), "{time}");
+    assert!((500..=502 + ran).contains(&tool_ms), "{time} in {ran} ms");
     assert_eq!(
         [
             &time["tool_calls"],
@@ -17776,6 +17790,7 @@ fn schema_98_clocks_the_timed_turns_from_the_audit_trail() {
         clocked_turn(&path, &mut db, 0, "1");
         let timed = clocked_turn(&path, &mut db, 2_000, "2");
         let lifted = clocked_turn(&path, &mut db, 2_000, "3");
+        let pruned = clocked_turn(&path, &mut db, 2_000, "4");
         // The third turn's read went to the background, as a lifted call
         // does: its row ended with its process, not in its turn. Its
         // command ran as a terminal does, with a process of its own that
@@ -17793,7 +17808,17 @@ fn schema_98_clocks_the_timed_turns_from_the_audit_trail() {
             [lifted],
         )
         .unwrap();
-        assert!(timed < lifted);
+        // The fourth turn's read was lifted too, but retention has since
+        // removed its turn's events, so only its end, after its turn's,
+        // tells.
+        conn.execute(
+            "UPDATE audit SET ms=ms+60000 WHERE turn=?1 AND call_id='r4'",
+            [pruned],
+        )
+        .unwrap();
+        conn.execute("DELETE FROM events WHERE turn=?1", [pruned])
+            .unwrap();
+        assert!(timed < lifted && lifted < pruned);
     }
     let conn = Connection::open(&path).unwrap();
     conn.execute_batch(
@@ -17810,10 +17835,11 @@ fn schema_98_clocks_the_timed_turns_from_the_audit_trail() {
     let db = Database::initialize(conn).unwrap();
     let usage = db.usage(None, 0, None, 64).unwrap();
     let time = &usage["time"];
-    // Two calls together in the second turn, 1 s; the third turn's command
-    // alone, 1 s, its process notwithstanding; its lifted read left out.
+    // Two calls together in the second turn, 1 s; the third and fourth
+    // turns' commands alone, 1 s each, their processes notwithstanding;
+    // their lifted reads left out.
     let tool_ms = time["tool_ms"].as_i64().unwrap();
-    assert!((2_000..2_400).contains(&tool_ms), "{time}");
+    assert!((3_000..3_600).contains(&tool_ms), "{time}");
     assert_eq!(
         [
             &time["turns"],
@@ -17823,11 +17849,11 @@ fn schema_98_clocks_the_timed_turns_from_the_audit_trail() {
             &time["first_token_ms"]
         ],
         [
-            &json!(2),
             &json!(3),
-            &json!(2),
-            &json!(4_000),
-            &json!(1_000)
+            &json!(4),
+            &json!(3),
+            &json!(6_000),
+            &json!(1_500)
         ]
     );
     drop(db);
@@ -20019,6 +20045,7 @@ fn paced(db: &mut Database, turn: i64) {
         None,
         None,
         Some(blocked),
+        None,
         None,
     )
     .unwrap();

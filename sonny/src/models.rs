@@ -73,7 +73,7 @@ impl Picker {
         for name in names {
             let answer = &listing["providers"][name];
             if let Some(error) = answer["error"].as_str() {
-                refused.push(format!("{name}: {error}"));
+                refused.push(format!("{name}: {}", crate::status::cause(error)));
             }
             for model in answer["models"].as_array().into_iter().flatten() {
                 if let Some(id) = model["id"].as_str() {
@@ -442,6 +442,7 @@ mod tests {
             None,
         );
         assert_eq!(picker.shown(), ["anthropic/claude-opus-5-5"]);
+        // A code the table does not know is said as it is, never guessed.
         assert_eq!(picker.refused, ["anthropic: unauthorized"]);
         assert_eq!(picker.effort(), None);
         picker.less();

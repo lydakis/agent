@@ -325,7 +325,8 @@ fn filled(template: &str, data: &crate::template::Data) -> Result<String, (&'sta
             "margin_note_too_long",
             format!(
                 "the template fills to {} lines and a margin note holds at most {}: \
-                 show less of what it reads, such as the newest few events",
+                 show less of what it reads, such as a source's newest few events or the lines \
+                 of a file that matter",
                 text.lines().count(),
                 most_lines()
             ),
