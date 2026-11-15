@@ -2088,7 +2088,10 @@ The margin draws what waits on you first, then what you follow, then what
 you keep, and never scrolls: in a short window it folds notes until the
 whole margin fits, giving rows to what waits first, then what you follow,
 then what you keep, each folded note keeping its title, and a note cut
-short ends with a muted `… N more lines`. A note that shows a file, or a
+short ends with a muted `… N more lines`. A long plan over the notes
+folds first, to `… N more lines of the plan`, so every note keeps its
+title. A live note whose last fill failed says why under what it
+follows, where no fold reaches it. A note that shows a file, or a
 task's note, shows its first rows up to the most a note draws, then a
 muted `… N more lines · enter opens it` row; Enter on it, or a click,
 opens the file whole in the pane (a task's note that shows no file opens

@@ -244,15 +244,22 @@ pub fn lines(
         }
     }
     if let Some(error) = &filled.error {
-        let said = Line::from(format!("⟨{error}⟩")).dim();
-        out.extend(crate::transcript::wrap(
-            said,
-            width,
-            Span::raw(lead),
-            Span::raw(lead),
-        ));
+        out.extend(said(error, width, lead));
     }
     out
+}
+
+/// Why a fill failed, as [`lines`] draws it last.
+fn said(error: &str, width: usize, lead: &'static str) -> Vec<Line<'static>> {
+    let said = Line::from(format!("⟨{error}⟩")).dim();
+    crate::transcript::wrap(said, width, Span::raw(lead), Span::raw(lead))
+}
+
+/// How many of the rows [`lines`] draws say why the last fill failed,
+/// after what it filled to before.
+pub fn failed_rows(filled: Option<&Filled>, width: usize, lead: &'static str) -> usize {
+    (filled.and_then(|filled| filled.error.as_deref()))
+        .map_or(0, |error| said(error, width, lead).len())
 }
 
 /// How many of the rows [`lines`] draws say what the template follows,

@@ -1403,10 +1403,19 @@ impl Margin {
     /// pictures read from `folder`: what it follows, its text, then why
     /// its last fill failed, when it did; and how many rows say what it
     /// follows, which a note's most rows leave out.
+    /// A live note's rows, and how many of them, first, say what it
+    /// follows and why its last fill failed, which the most a note draws
+    /// leaves out: a note never folds away that it is no longer filled.
     fn filled_lines(&self, key: &str, width: usize, folder: &Path) -> (Vec<Line<'static>>, usize) {
         let filled = self.watch.get(key);
-        let rows = crate::live::lines(filled, width, folder, usize::MAX, BODY);
-        (rows, crate::live::follows_rows(filled, width, BODY))
+        let mut rows = crate::live::lines(filled, width, folder, usize::MAX, BODY);
+        let follows = crate::live::follows_rows(filled, width, BODY);
+        let failed = crate::live::failed_rows(filled, width, BODY);
+        // Why it failed under what it follows, over what it filled to
+        // before, where a fold never reaches it.
+        let said: Vec<_> = rows.drain(rows.len() - failed..).collect();
+        rows.splice(follows..follows, said);
+        (rows, follows + failed)
     }
 
     /// How many times what the margin shows has changed: a note, a file a
@@ -1515,6 +1524,19 @@ impl Margin {
                 );
             }
             return (lines, marks);
+        }
+        // The plan folded to leave a row for every note's title, so what
+        // waits on the person is never behind it.
+        let titles = person.len() + self.kept.notes.len();
+        let room = height.saturating_sub(titles);
+        if lines.len() > room {
+            let keep = room.saturating_sub(1);
+            let more = lines.len() - keep;
+            lines.truncate(keep);
+            marks.retain(|(at, _)| *at < keep);
+            if room > 0 {
+                lines.push(Line::from(format!("{BODY}… {more} more lines of the plan")).dim());
+            }
         }
         // The person's own, over the agent's: theirs to change in their
         // config, so no buttons, and given rows as a note they keep beside
@@ -3156,6 +3178,78 @@ mod tests {
         );
         assert!(
             rows.contains(&"     … 14 more lines".to_owned()),
+            "{rows:#?}"
+        );
+    }
+
+    #[test]
+    fn a_long_plan_folds_to_leave_every_note_its_title() {
+        set_limits(6, 6);
+        let mut margin = margin();
+        let steps: Vec<String> = (1..=12).map(|i| format!("[ ] step {i}")).collect();
+        margin.set_plan(&steps);
+        for (call, id, kind) in [("c1", "review", "waits"), ("c2", "keep", "pinned")] {
+            let post = json!({"id": id, "kind": kind, "title": id, "markdown": "- one"});
+            margin.apply(call, &post, None, None);
+        }
+        let rows = shown(&mut margin, 8, Path::new("/"));
+        assert_eq!(rows.len(), 8, "{rows:#?}");
+        assert!(
+            rows.iter().any(|row| row.starts_with(" ✎ review ")),
+            "{rows:#?}"
+        );
+        assert!(
+            rows.iter().any(|row| row.starts_with(" ✎ keep ")),
+            "{rows:#?}"
+        );
+        assert!(
+            rows.iter()
+                .any(|row| row.contains("more lines of the plan")),
+            "{rows:#?}"
+        );
+        // With room, the plan is whole.
+        let rows = shown(&mut margin, 40, Path::new("/"));
+        assert!(rows.iter().any(|row| row.contains("step 12")), "{rows:#?}");
+        assert!(
+            !rows.iter().any(|row| row.contains("of the plan")),
+            "{rows:#?}"
+        );
+    }
+
+    #[test]
+    fn a_live_note_that_no_longer_fills_says_so_however_far_it_folds() {
+        set_limits(6, 6);
+        let mut margin = margin();
+        let tasks = |n: usize| {
+            Arc::new(
+                (0..n)
+                    .map(|i| json!({"name": format!("t{i}"), "state": "working"}))
+                    .collect(),
+            )
+        };
+        margin.blanks.tasks = tasks(9);
+        // Fills while there are other than eight tasks.
+        let template =
+            "{% for t in tasks() %}- {{ t.name }}\n{% endfor %}{{ 1 // (tasks() | length - 8) }}";
+        let post = json!({"id": "n", "kind": "follows", "live": true, "markdown": template});
+        margin.apply("c1", &post, None, None);
+        let folder = Path::new("/");
+        let rows = shown(&mut margin, usize::MAX, folder);
+        assert!(rows.contains(&"     - t0".to_owned()), "{rows:#?}");
+        assert!(!rows.iter().any(|row| row.contains('⟨')), "{rows:#?}");
+        margin.blanks.tasks = tasks(8);
+        margin.blanks.tasks_read += 1;
+        later(&mut margin);
+        let rows = shown(&mut margin, usize::MAX, folder);
+        // What it filled to before, folded, and why it stopped, kept.
+        let failed = rows
+            .iter()
+            .position(|row| row.contains('⟨'))
+            .unwrap_or_else(|| panic!("{rows:#?}"));
+        let first = rows.iter().position(|row| row == "     - t0").unwrap();
+        assert!(failed < first, "{rows:#?}");
+        assert!(
+            rows.iter().any(|row| row.contains("more lines")),
             "{rows:#?}"
         );
     }
