@@ -98,6 +98,7 @@ pub fn read(
             }
         }
     }
+    let down = down(store);
     for (subscriber, subs) in subscriptions(store) {
         if !ours(&subscriber) {
             continue;
@@ -114,6 +115,19 @@ pub fn read(
                 })
                 .collect();
             sources.dedup();
+            // A source it hears that is down fails it: nothing from that
+            // source reaches its agent until it works again.
+            let (failed, episode) = match sources.iter().find_map(|s| Some((s, down.get(s)?))) {
+                Some((source, down)) => (
+                    Some(format!(
+                        "{source} is down since {}: {}",
+                        since_of(down.since_ms),
+                        down.why.replacen("exit status: ", "exit status ", 1)
+                    )),
+                    Some(format!("{source} down since {}", down.since_ms)),
+                ),
+                None => (None, None),
+            };
             let what = described
                 .strip_prefix(&format!("{} · ", sub.name))
                 .unwrap_or(&described)
@@ -131,10 +145,10 @@ pub fn read(
                 },
                 reply_to: None,
                 own,
-                failed: None,
+                failed,
                 handle: None,
                 fired_ms: None,
-                episode: None,
+                episode,
                 sources,
                 message: String::new(),
                 sub: Some(sub.clone()),
@@ -177,6 +191,30 @@ fn subscriptions(store: &Path) -> Vec<(String, Vec<lookout::subs::Sub>)> {
     kept::read(&KEPT, &key, vec![lookout::subs::dir(store)], || {
         (lookout::subs::all(store), None)
     })
+}
+
+/// Each source the lookout beside `store` last told is down, as
+/// [`lookout::sources::down`] reads them, read again only once their
+/// folder changes.
+fn down(store: &Path) -> HashMap<String, lookout::sources::Down> {
+    static KEPT: kept::Slot<HashMap<String, lookout::sources::Down>> = kept::Slot::new(None);
+    let key = store.to_string_lossy();
+    let dir = lookout::beside(store, ".sources").join(".health");
+    kept::read(&KEPT, &key, vec![dir], || {
+        (lookout::sources::down(store), None)
+    })
+}
+
+/// When something past began, `ms` since the epoch: the time today, else
+/// its date.
+fn since_of(ms: u128) -> String {
+    let at = (ms / 1000) as i64;
+    let now = (now_ms() / 1000) as i64;
+    let (day, today) = (trigger::local(at), trigger::local(now));
+    match (day.year, day.month, day.day) == (today.year, today.month, today.day) {
+        true => format!("{:02}:{:02}", day.hour, day.minute),
+        false => trigger::date(at),
+    }
 }
 
 /// The person's own agents, which no project names, as the one the nightly
@@ -1236,6 +1274,7 @@ impl View {
                     Span::raw(""),
                     Span::raw("  "),
                 ));
+                body.push(Line::default());
             }
             let mut fields: Vec<(&str, String)> = Vec::new();
             match &item.sub {
@@ -1769,6 +1808,67 @@ mod tests {
                 "lasts    3 updates",
             ]
         );
+    }
+
+    #[test]
+    fn a_follow_whose_source_is_down_is_failed_until_it_works_again() {
+        let dir = std::env::temp_dir().join(format!("background-down-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = dir.join("state.sqlite");
+        let follow = |name: &str, sources: &[&str]| lookout::subs::Sub {
+            name: name.into(),
+            tasks_of: Vec::new(),
+            agents: Vec::new(),
+            sources: sources.iter().map(|s| s.to_string()).collect(),
+            filter: None,
+            digest: None,
+            steer: None,
+            owner: None,
+            until: None,
+            runs: None,
+            made: None,
+        };
+        lookout::subs::ensure(&store, "calc.lead", follow("inbox", &["mail", "ci:main"])).unwrap();
+        lookout::subs::ensure(&store, "calc.lead", follow("builds", &["ci"])).unwrap();
+        let health = lookout::sources::health_file(&lookout::beside(&store, ".sources"), "mail");
+        std::fs::create_dir_all(health.parent().unwrap()).unwrap();
+        let since = now_ms() - 60_000;
+        let word = json!({"down": true, "since_ms": since, "at_ms": since + 30_000,
+            "failed": "exit status: 3", "stderr": ["mail-poll: could not sign in"]});
+        std::fs::write(&health, word.to_string()).unwrap();
+        let failed = |items: &[Item]| -> Vec<(String, Option<String>)> {
+            (items.iter())
+                .map(|item| (item.name.clone(), item.failed.clone()))
+                .collect()
+        };
+        let items = read(&store, None, &HashMap::new(), |_| true);
+        let clock = since_of(u128::from(since));
+        assert_eq!(
+            failed(&items),
+            [
+                ("builds".into(), None),
+                (
+                    "inbox".into(),
+                    Some(format!("mail is down since {clock}: exit status 3"))
+                ),
+            ]
+        );
+        // Its failure stays the same one while the source stays down.
+        let keys = failures(&items);
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        assert_eq!(
+            failures(&read(&store, None, &HashMap::new(), |_| true)),
+            keys
+        );
+        // Back, it is a follow like any other.
+        let back = json!({"down": false, "since_ms": since, "at_ms": since + 50_000});
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        std::fs::write(health.with_extension("partial"), back.to_string()).unwrap();
+        std::fs::rename(health.with_extension("partial"), &health).unwrap();
+        let items = read(&store, None, &HashMap::new(), |_| true);
+        assert!(items.iter().all(|item| item.failed.is_none()), "{items:?}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

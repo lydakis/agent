@@ -688,6 +688,29 @@ pub(crate) fn local(epoch: i64) -> Local {
     }
 }
 
+/// `epoch` as a date in local time, as a page writes one:
+/// `Fri 20 Nov 09:00`.
+pub(crate) fn date(epoch: i64) -> String {
+    // SAFETY: localtime_r fills the zeroed struct it is given and nothing else.
+    let tm = unsafe {
+        let mut tm: libc::tm = std::mem::zeroed();
+        libc::localtime_r(&(epoch as libc::time_t), &mut tm);
+        tm
+    };
+    const DAYS: [&str; 7] = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+    const MONTHS: [&str; 12] = [
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    ];
+    format!(
+        "{} {} {} {:02}:{:02}",
+        DAYS[tm.tm_wday.clamp(0, 6) as usize],
+        tm.tm_mday,
+        MONTHS[tm.tm_mon.clamp(0, 11) as usize],
+        tm.tm_hour,
+        tm.tm_min
+    )
+}
+
 /// The time a local wall-clock time names, when it names one.
 pub(crate) fn epoch_of(at: Local) -> Option<i64> {
     mktime(at, -1)
