@@ -10206,6 +10206,9 @@ impl App {
         // the turn's own prompt says who started it, and with project
         // colors whose project its rows are about.
         let colored = !self.palette().is_empty();
+        // The first message of the turn the page starts in, as its prompt
+        // reads, when only the words view's `↳` asked for it.
+        let mut opening: Option<(i64, String)> = None;
         // In words, who started it, for the `↳` over its reply.
         if (self.zen.is_some() || colored || self.words())
             && let Some(&turn) = nodes.first().and_then(|node| turns.get(node))
@@ -10238,17 +10241,20 @@ impl App {
             // about; the steers the page holds say the rest.
             if colored && let Some((text, from)) = prompts.first().map(said) {
                 self.bar_turn(Some((&text, from.as_deref())));
-            } else if let Some((text, from)) = prompts.first().map(said)
-                && transcript::relays(&text, from.as_deref())
-            {
-                let came = transcript::came_names(&text, from.as_deref());
-                self.turn_hints.came = (came.into_iter())
-                    .map(|name| self.hint_name(&name))
-                    .collect();
+            } else if let Some((text, from)) = prompts.first().map(said) {
+                if transcript::relays(&text, from.as_deref()) {
+                    let came = transcript::came_names(&text, from.as_deref());
+                    self.turn_hints.came = (came.into_iter())
+                        .map(|name| self.hint_name(&name))
+                        .collect();
+                }
+                // The page may start at that message itself: it still
+                // begins the turn, and a later one steers it.
+                if !(self.zen.is_some() || colored) {
+                    opening = Some((turn, text));
+                }
             }
-            if self.zen.is_some() || colored {
-                began.insert(turn);
-            }
+            began.insert(turn);
         }
         // A chunk read at a time, what it held let go before the next.
         let mut chunks = nodes.chunks(100);
@@ -10280,8 +10286,13 @@ impl App {
                     }
                     (_, Some("user")) => {
                         let turn = turns.get(&node).copied();
-                        let first = turn.is_none_or(|turn| began.insert(turn));
                         let (said, from) = (text(&item), item["from"].as_str());
+                        let opens = opening.take_if(|(at, text)| {
+                            Some(*at) == turn && !text.is_empty() && said.starts_with(text.as_str())
+                        });
+                        let first = opens.is_some() || turn.is_none_or(|turn| began.insert(turn));
+                        // Only the page's first message can be the turn's.
+                        opening = None;
                         match transcript::relays(&said, from) {
                             false => aside = false,
                             true if first => aside = true,
