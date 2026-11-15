@@ -3372,7 +3372,7 @@ fn epoch_ms() -> u128 {
 /// does, so its reply after them is posted at once: each event's id is
 /// `THREAD/N`, its Nth post from 0.
 fn told_commons(lead: &str, sent: &[sources::Heard]) {
-    let mut upto: Vec<(&str, usize)> = Vec::new();
+    let mut told: Vec<(&str, Vec<usize>)> = Vec::new();
     for heard in sent {
         let event = &heard.event;
         if event.source != agent_client::config::COMMONS_SOURCE {
@@ -3380,23 +3380,23 @@ fn told_commons(lead: &str, sent: &[sources::Heard]) {
         }
         let Some((thread, n)) = (event.id.as_deref())
             .and_then(|id| id.rsplit_once('/'))
-            .and_then(|(thread, n)| Some((thread, n.parse::<usize>().ok()? + 1)))
+            .and_then(|(thread, n)| Some((thread, n.parse::<usize>().ok()?)))
         else {
             continue;
         };
-        match upto.iter_mut().find(|(had, _)| *had == thread) {
-            Some((_, most)) => *most = (*most).max(n),
-            None => upto.push((thread, n)),
+        match told.iter_mut().find(|(had, _)| *had == thread) {
+            Some((_, posts)) => posts.push(n),
+            None => told.push((thread, vec![n])),
         }
     }
-    let Some(home) = (!upto.is_empty())
+    let Some(home) = (!told.is_empty())
         .then(|| std::env::var_os("HOME"))
         .flatten()
     else {
         return;
     };
-    for (thread, n) in upto {
-        crate::commons::told(Path::new(&home), lead, thread, n);
+    for (thread, posts) in told {
+        crate::commons::told(Path::new(&home), lead, thread, &posts);
     }
 }
 
@@ -5613,9 +5613,9 @@ mod tests {
             assert!(first.lines.is_empty());
             assert!(first.mark_read());
             // Each had read the thread, so its reply is posted.
-            crate::commons::told(&crash.home, "b.y", "t", 1);
+            crate::commons::told(&crash.home, "b.y", "t", &[0]);
             post("b.y", json!({"reply": {"thread": "t", "text": "one"}}));
-            crate::commons::told(&crash.home, "c.z", "t", 2);
+            crate::commons::told(&crash.home, "c.z", "t", &[0, 1]);
             post("c.z", json!({"reply": {"thread": "t", "text": "two"}}));
             let child = std::process::Command::new(std::env::current_exe().unwrap())
                 .args([

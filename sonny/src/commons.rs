@@ -823,16 +823,29 @@ fn show(dir: &Path, thread: &str, bot: &str, upto: usize) {
     );
 }
 
-/// The lookout told `bot` of `thread`'s posts up to its `upto`th: what a
-/// note says counts as shown, as a read does.
-pub fn told(home: &Path, bot: &str, thread: &str, upto: usize) {
+/// The lookout told `bot` of `thread`'s posts numbered `told`, from 0:
+/// what a note says counts as shown, as a read does, but only on from
+/// what `bot` was shown already, unbroken, so a post a filter kept from it
+/// stays unshown, and so does every one after it.
+pub fn told(home: &Path, bot: &str, thread: &str, told: &[usize]) {
     let dir = dir(home);
     if valid_name(thread).is_err() || !dir.join(format!("{thread}.jsonl")).exists() {
         return;
     }
-    if let Ok(_lock) = lock(&dir) {
-        show(&dir, thread, bot, upto);
+    let Ok(_lock) = lock(&dir) else {
+        return;
+    };
+    let mut told = told.to_vec();
+    told.sort_unstable();
+    let mut upto = shown(&dir, thread, bot);
+    for n in told {
+        match n.cmp(&upto) {
+            std::cmp::Ordering::Less => {}
+            std::cmp::Ordering::Equal => upto += 1,
+            std::cmp::Ordering::Greater => break,
+        }
     }
+    show(&dir, thread, bot, upto);
 }
 
 fn saw(dir: &Path, thread: &str, bot: &str) -> u64 {
@@ -1838,7 +1851,7 @@ mod tests {
         if let Some(thread) = arguments["reply"]["thread"].as_str()
             && let Ok(posts) = posts(&dir(home).join(format!("{thread}.jsonl")))
         {
-            told(home, by, thread, posts.len());
+            told(home, by, thread, &(0..posts.len()).collect::<Vec<_>>());
         }
         super::call(home, by, id, model, arguments)
     }
@@ -1921,11 +1934,16 @@ mod tests {
         assert_eq!(blind["posted"], false);
         assert_eq!(blind["posts"].as_array().unwrap().len(), 3);
         // What the lookout told counts as shown, as a read does.
-        told(&home, "e.v", "t", 3);
+        told(&home, "e.v", "t", &[0, 1, 2]);
         assert_eq!(send("e.v", reply("Same")).unwrap()["posts"], 4);
         // Shown counts only grow: an older note takes nothing back.
-        told(&home, "e.v", "t", 1);
+        told(&home, "e.v", "t", &[0]);
         assert_eq!(shown(&dir(&home), "t", "e.v"), 4);
+        // A note that skips a post, one a filter kept back, shows none
+        // past it.
+        told(&home, "f.u", "t", &[0, 2, 3]);
+        assert_eq!(shown(&dir(&home), "t", "f.u"), 1);
+        assert_eq!(send("f.u", reply("Late")).unwrap()["posted"], false);
         let _ = std::fs::remove_dir_all(&home);
     }
 
@@ -1938,14 +1956,8 @@ mod tests {
             json!({"post": {"name": "t", "title": "T", "text": "one"}}),
         )
         .unwrap();
-        told(&home, "a.x", "t", 1);
+        // Its own posts count as shown to it.
         for text in ["two", "three"] {
-            told(
-                &home,
-                "a.x",
-                "t",
-                posts(&dir(&home).join("t.jsonl")).unwrap().len(),
-            );
             send("a.x", json!({"reply": {"thread": "t", "text": text}})).unwrap();
         }
         send("b.y", json!({"read": "t", "from": 2})).unwrap();
