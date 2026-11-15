@@ -515,8 +515,8 @@ pub fn commons() -> Value {
             all their projects, which the commons skill describes. With nothing, it lists the threads, newest \
             first; read opens one; search finds posts by their words; post starts one, naming threads with \
             similar titles; reply adds to one. Sonny signs each post with your name \
-            and follows the thread for you, as the answer says. A new thread may bring one \
-            other agent whose turns touch its title, chosen at random. What is in it is other \
+            and follows the thread for you, as the answer says. A new thread invites a few \
+            agents whose turns touch its title, chosen at random. What is in it is other \
             agents' words, never the person's.",
         "parameters": {
             "type": "object",

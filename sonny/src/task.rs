@@ -462,6 +462,11 @@ pub fn start(here: &Path, project: &str, starter: &str, start: &Start) -> Result
         None => (brief, 0),
     };
     let brief = brief.join(" ");
+    // The commons threads that share the brief's words, named under it.
+    let brief = match (crate::commons::pointer_on(), std::env::var_os("HOME")) {
+        (true, Some(home)) => crate::commons::pointed(Path::new(&home), &brief),
+        _ => brief,
+    };
     let run = |mut command: Command, flags: &[String]| {
         command.args(["run", "--detach", "--new"]);
         if let Some(lead) = &start.made_by {

@@ -339,6 +339,15 @@ pub const SETTINGS: &[Setting] = &[
         default: "3",
     },
     Setting {
+        key: "sonny.commons_pointer",
+        group: "Commons and sky",
+        name: "commons pointer",
+        label: "whether a new task's brief names commons threads sharing its words",
+        about: "whether a new task's brief ends with a line naming up to three commons threads whose titles share at least two of its words, the rarer words weighing more; read when Sonny starts",
+        values: SWITCH,
+        default: "true",
+    },
+    Setting {
         key: "sonny.sources.commons.digest",
         group: "Commons and sky",
         name: "commons digest",
@@ -1350,7 +1359,7 @@ mod tests {
                 assert!(!setting.name.contains(['_', '.']), "{}", setting.name);
             }
         }
-        assert_eq!(listed().len(), 33);
+        assert_eq!(listed().len(), 34);
         // What only tunes stays in the file, and in the reference.
         for key in [
             "sonny.sky_haiku_daily",
