@@ -5611,7 +5611,7 @@ mod tests {
                 store: root.join("state.sqlite"),
             };
             let post = |by: &str, arguments: Value| {
-                crate::commons::call(&crash.home, by, None, None, &arguments).unwrap()
+                crate::commons::call(&crash.home, by, None, by, None, &arguments).unwrap()
             };
             post(
                 "calc.lead",

@@ -191,27 +191,25 @@ pub fn dir(home: &Path) -> PathBuf {
 
 /// The commons tool's answer, for `author`, the agent the daemon knows
 /// as `author_id`, writing with `model`.
+///
+/// `reader` is whom `.shown` counts what the answer shows for: the
+/// conversation it reaches, as `who` names it. That is the author but for a
+/// side chat, which signs as its agent and reads on its own.
 pub fn call(
     home: &Path,
     author: &str,
     author_id: Option<i64>,
+    reader: &str,
     model: Option<&str>,
     arguments: &Value,
 ) -> Result<Value, String> {
     let dir = dir(home);
     let from = arguments["from"].as_u64().unwrap_or(0) as usize;
     if let Some(name) = arguments["read"].as_str() {
-        return read(&dir, name, author, &who(author, author_id), from);
+        return read(&dir, name, author, reader, from);
     }
     if let Some(words) = arguments["search"].as_str() {
-        return search(
-            &dir,
-            words,
-            author,
-            &who(author, author_id),
-            from,
-            LIST_BYTES,
-        );
+        return search(&dir, words, author, reader, from, LIST_BYTES);
     }
     if arguments["post"].is_object() {
         let post = &arguments["post"];
@@ -225,13 +223,19 @@ pub fn call(
             name,
             title,
             &entry(author, author_id, model, text, post)?,
+            reader,
         );
     }
     if arguments["reply"].is_object() {
         let reply = &arguments["reply"];
         let thread = reply["thread"].as_str().unwrap_or_default();
         let text = reply["text"].as_str().unwrap_or_default();
-        return add(&dir, thread, &entry(author, author_id, model, text, reply)?);
+        return add(
+            &dir,
+            thread,
+            &entry(author, author_id, model, text, reply)?,
+            reader,
+        );
     }
     list(&dir, from, LIST_BYTES, &mut Summaries::new(), &sent(&dir))
 }
@@ -346,7 +350,7 @@ fn append(path: &Path, post: &Value) -> Result<(), String> {
         .map_err(failed)
 }
 
-fn start(dir: &Path, name: &str, title: &str, post: &Value) -> Result<Value, String> {
+fn start(dir: &Path, name: &str, title: &str, post: &Value, reader: &str) -> Result<Value, String> {
     valid_name(name)?;
     if title.trim().is_empty() || title.contains('\n') || title.chars().count() > 200 {
         return Err(
@@ -364,7 +368,7 @@ fn start(dir: &Path, name: &str, title: &str, post: &Value) -> Result<Value, Str
     first["title"] = json!(title);
     append(&path, &first)?;
     saw(dir, name, post["by"].as_str().unwrap_or_default());
-    show(dir, name, &posted_by(post), 1);
+    show(dir, name, reader, 1);
     let mut started = json!({"thread": name, "posts": 1});
     let similar = similar(dir, name, title);
     if !similar.is_empty() {
@@ -762,7 +766,7 @@ fn invite_submit(bot: &str, thread: &str, note: String, golden: bool) -> Value {
         "origin": ORIGIN, "request_id": format!("commons.invite.{thread}")})
 }
 
-fn add(dir: &Path, name: &str, post: &Value) -> Result<Value, String> {
+fn add(dir: &Path, name: &str, post: &Value, reader: &str) -> Result<Value, String> {
     valid_name(name)?;
     let _lock = lock(dir)?;
     let path = dir.join(format!("{name}.jsonl"));
@@ -773,11 +777,11 @@ fn add(dir: &Path, name: &str, post: &Value) -> Result<Value, String> {
         ));
     }
     let by = post["by"].as_str().unwrap_or_default();
-    let who = posted_by(post);
-    let upto = shown(dir, name, &who);
+    let who = reader;
+    let upto = shown(dir, name, who);
     if upto < earlier.len() {
         let missed = earlier.len() - upto;
-        let mut said = read_locked(dir, name, by, &who, upto)?;
+        let mut said = read_locked(dir, name, by, who, upto)?;
         said["posted"] = json!(false);
         said["missed"] = json!(format!(
             "Not posted: {missed} post{} came that you had not been shown, below. The same reply sent again is posted.",
@@ -787,7 +791,7 @@ fn add(dir: &Path, name: &str, post: &Value) -> Result<Value, String> {
     }
     append(&path, post)?;
     saw(dir, name, by);
-    show(dir, name, &who, earlier.len() + 1);
+    show(dir, name, who, earlier.len() + 1);
     answered(dir, name, by);
     let title = earlier.first().map_or(Value::Null, |p| p["title"].clone());
     Ok(json!({"thread": name, "title": title, "posts": earlier.len() + 1}))
@@ -815,14 +819,6 @@ pub fn who(name: &str, id: Option<i64>) -> String {
         Some(id) => format!("{name}#{id}"),
         None => name.to_owned(),
     }
-}
-
-/// Whom `.shown` counts a post's author as.
-fn posted_by(post: &Value) -> String {
-    who(
-        post["by"].as_str().unwrap_or_default(),
-        post["by_id"].as_i64(),
-    )
 }
 
 /// How many of `thread`'s posts `bot` (as `who` names it) has been shown.
@@ -1887,7 +1883,7 @@ mod tests {
         {
             told(home, by, thread, &(0..posts.len()).collect::<Vec<_>>());
         }
-        super::call(home, by, id, model, arguments)
+        super::call(home, by, id, &who(by, id), model, arguments)
     }
 
     /// A home of its own for one test.
@@ -1932,7 +1928,7 @@ mod tests {
     #[test]
     fn a_reply_after_posts_its_author_missed_waits_once_and_shows_them() {
         let home = home("missed");
-        let send = |by: &str, arguments: Value| super::call(&home, by, None, None, &arguments);
+        let send = |by: &str, arguments: Value| super::call(&home, by, None, by, None, &arguments);
         send(
             "a.x",
             json!({"post": {"name": "t", "title": "T", "text": "Seen it?"}}),
@@ -1985,7 +1981,15 @@ mod tests {
     fn a_new_agent_given_a_gone_one_s_name_starts_shown_nothing() {
         let home = home("missed-id");
         let send = |id: i64, arguments: Value| {
-            super::call(&home, "b.y", Some(id), None, &arguments).unwrap()
+            super::call(
+                &home,
+                "b.y",
+                Some(id),
+                &who("b.y", Some(id)),
+                None,
+                &arguments,
+            )
+            .unwrap()
         };
         send(
             1,
@@ -2001,9 +2005,37 @@ mod tests {
     }
 
     #[test]
+    fn a_side_chat_signs_as_its_agent_but_is_shown_posts_on_its_own() {
+        let home = home("missed-side");
+        // The agent a.x is #1; its side chat a.x-side is #2 and signs as a.x.
+        let (agent, side) = (who("a.x", Some(1)), who("a.x-side", Some(2)));
+        let send = |reader: &str, arguments: Value| {
+            super::call(&home, "a.x", Some(1), reader, None, &arguments).unwrap()
+        };
+        let other = |arguments: Value| caught_up(&home, "b.y", None, None, &arguments).unwrap();
+        send(
+            &agent,
+            json!({"post": {"name": "t", "title": "T", "text": "one"}}),
+        );
+        other(json!({"reply": {"thread": "t", "text": "two"}}));
+        // The agent reads the new post; its side chat has not seen it.
+        send(&agent, json!({"read": "t"}));
+        let reply = json!({"reply": {"thread": "t", "text": "three"}});
+        let held = send(&side, reply.clone());
+        assert_eq!(held["posted"], false);
+        assert_eq!(shown(&dir(&home), "t", &side), 2);
+        assert_eq!(send(&side, reply)["posts"], 3);
+        // Nor does the side chat's read count for the agent.
+        other(json!({"reply": {"thread": "t", "text": "four"}}));
+        send(&side, json!({"read": "t"}));
+        assert_eq!(shown(&dir(&home), "t", &agent), 2);
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
     fn a_later_page_read_alone_leaves_the_posts_before_it_unshown() {
         let home = home("missed-page");
-        let send = |by: &str, arguments: Value| super::call(&home, by, None, None, &arguments);
+        let send = |by: &str, arguments: Value| super::call(&home, by, None, by, None, &arguments);
         send(
             "a.x",
             json!({"post": {"name": "t", "title": "T", "text": "one"}}),

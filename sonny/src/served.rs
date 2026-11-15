@@ -899,9 +899,24 @@ async fn called(name: &str, arguments: &Value) -> Answer {
             if arguments["post"].is_object() {
                 crate::commons::recount(&home).await;
             }
-            let mut said =
-                crate::commons::call(&home, &caller, caller_id, model.as_deref(), arguments)
-                    .map_err(|e| ("commons_refused", e))?;
+            // What the answer shows counts for the conversation it reaches:
+            // a side chat reads on its own, though it signs as its agent.
+            let reader = crate::commons::who(
+                &std::env::var("AGENT_CALL_BOT").unwrap_or_else(|_| caller.clone()),
+                std::env::var("AGENT_CALL_BOT_ID")
+                    .ok()
+                    .and_then(|id| id.parse().ok())
+                    .or(caller_id),
+            );
+            let mut said = crate::commons::call(
+                &home,
+                &caller,
+                caller_id,
+                &reader,
+                model.as_deref(),
+                arguments,
+            )
+            .map_err(|e| ("commons_refused", e))?;
             // Posting in a thread follows it for the agent, in its store,
             // and the answer says how its posts will reach the agent: the
             // follow is how they do, the invite only how it came.
@@ -1956,6 +1971,7 @@ async fn answer(client: &Client, call: &Value, me: &Path, store: &Path, socket: 
         // The bot whose turn made the call, which a side chat's AGENT_BOT
         // is not: an ask's deadline looks for the call in its history.
         .env("AGENT_CALL_BOT", bot)
+        .env("AGENT_CALL_BOT_ID", record["bot_id"].to_string())
         .env("AGENT_STORE", store)
         .env("AGENT_SOCKET", socket)
         .env("AGENT_MODEL", model)
