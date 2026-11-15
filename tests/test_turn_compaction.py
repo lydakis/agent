@@ -249,6 +249,37 @@ class TurnCompactionTests(ModelFixture):
                     self.assertGreater(largest, 40 * 11000)
                 client.close()
 
+    def test_a_turn_past_only_the_soft_limit_compacts_as_it_ends(self):
+        # Four bytes a token: the hard limit, 16K tokens, is about 64 KiB;
+        # the soft one, 20% of a 40,000-token window, about 32 KiB. Four
+        # 11 KiB rounds pass the soft limit and stay under the hard one.
+        self.model.bytes_per_token = 4
+        for percent, expected in ((20, True), (0, False)):
+            with self.subTest(post_turn_compact_percent=percent):
+                bot = f'Bob{percent}'
+                client = self.client(tools='shell', extra=('--context-window', 'openai/*=40000'),
+                                     settings={'compact_tokens': 16384,
+                                               'post_turn_compact_percent': percent})
+                client.request('provider_models')
+                client.request('create', bot=bot, workspace=str(self.path), tools=['shell'],
+                               compaction_instructions='Summarize.')
+                record = client.request('inspect', bot=bot)['result']
+                self.assertEqual(record['settings']['post_turn_compact_percent'], percent)
+                turn = client.request('submit', bot=bot, request_id='1', prompt='long:4')['result']['message']
+                ended = client.finished(turn, timeout=60)
+                self.assertEqual(ended['data']['status'], 'completed', ended)
+                if expected:
+                    landed = client.summarized(bot, timeout=15)
+                    self.assertEqual((landed['event'], landed['turn']), ('compacted', ended['turn']))
+                    # Written after the turn, never inside it.
+                    self.assertTrue(landed['data']['request']['after_turn'])
+                    self.assertLess(landed['data']['trigger']['at_bytes'], 40000)
+                compacted = [e for e in all_events(client, bot) if e['event'] == 'compacted']
+                self.assertEqual(len(compacted), int(expected))
+                self.assertTrue(all(e['data']['request'].get('after_turn') for e in compacted))
+                drain(self.model)
+                client.close()
+
     def test_an_unset_threshold_follows_the_models_listed_window(self):
         # A 40,000-token window compacts at 7,000 tokens, its window less
         # 33,000: about 28 KiB at four bytes a token. The window is the

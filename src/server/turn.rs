@@ -1149,6 +1149,24 @@ impl Turn {
         }
     }
 
+    /// The soft limit in view bytes: the view that, with `overhead`
+    /// (instructions and tools), sends the bot's `post_turn_compact_tokens`,
+    /// estimated from its last call as `soft_bytes` estimates the hard
+    /// one. Checked only as a turn ends on its reply. `None` before a
+    /// first call, for a bot on bytes alone or with the soft limit off.
+    fn post_turn_bytes(
+        &self,
+        record: &agent_runtime::store::Bot,
+        overhead: usize,
+    ) -> Option<usize> {
+        let window = self.window.get().copied().unwrap_or(200_000);
+        let tokens = self.settings().post_turn_compact_tokens(window)?;
+        let (bytes, counted) = record.sent.filter(|(_, counted)| *counted > 0)?;
+        let at = (u128::from(tokens) * u128::from(bytes) / u128::from(counted))
+            .min(self.settings().context_bytes() as u128) as usize;
+        at.checked_sub(overhead).filter(|view| *view > 0)
+    }
+
     /// What started a compaction, for its `compacted` event: the `reason`
     /// (`bytes` or `items` past the threshold, `requested` by a client, or
     /// `overflow`, a view that could not be sent), the model's context
@@ -1296,7 +1314,7 @@ impl Turn {
             tools,
             (context.pressure(), context.prefix_usage()),
             output_bytes,
-            requested,
+            (requested, false),
         )
         else {
             return Ok(Compaction::Skipped);
@@ -1436,19 +1454,30 @@ impl Turn {
     /// threshold in bytes and why it was passed, the room kept for the
     /// reply, and whether the view and the reply still fit the input limit.
     /// `None` without compaction instructions, or below the threshold.
+    /// As a turn ends on its reply (`post_turn`), the threshold is the soft
+    /// limit where there is one; elsewhere it is the hard one. What the
+    /// summary keeps follows the hard limit either way.
     fn due(
         &self,
         record: &agent_runtime::store::Bot,
         tools: &serde_json::value::RawValue,
         (pressure, ahead): (ContextUsage, ContextUsage),
         output_bytes: Option<usize>,
-        requested: bool,
+        (requested, post_turn): (bool, bool),
     ) -> Option<Due> {
         record.compaction_instructions.as_ref()?;
         let limit = self.input_limit();
         let reserve = output_bytes.unwrap_or(0).min(limit.bytes / 4);
-        let budget = self.soft_bytes(record, record.instructions.len() + tools.get().len());
-        let at = (budget / 100 * self.settings().compact_at()).min(limit.bytes - reserve);
+        let overhead = record.instructions.len() + tools.get().len();
+        let budget = self.soft_bytes(record, overhead);
+        let hard = budget / 100 * self.settings().compact_at();
+        let at = match post_turn {
+            true => self
+                .post_turn_bytes(record, overhead)
+                .map_or(hard, |soft| soft.min(hard)),
+            false => hard,
+        }
+        .min(limit.bytes - reserve);
         if !requested
             && pressure.bytes < at
             && pressure.items
@@ -1526,7 +1555,7 @@ impl Turn {
         };
         let ahead = sent.prefix_usage();
         if self
-            .due(record, tools, (grown, ahead), output_bytes, false)
+            .due(record, tools, (grown, ahead), output_bytes, (false, true))
             .is_none()
         {
             return Ok(());
@@ -1555,7 +1584,7 @@ impl Turn {
             tools,
             (now.pressure(), now.prefix_usage()),
             output_bytes,
-            false,
+            (false, true),
         )
         else {
             return Ok(());
@@ -3263,7 +3292,7 @@ impl Turn {
                                 &tools,
                                 (context.pressure(), context.prefix_usage()),
                                 output_bytes,
-                                false,
+                                (false, false),
                             )
                             .is_some_and(|due| !due.fits));
                 if self.settle_ahead(&mut record, wait).await? {
