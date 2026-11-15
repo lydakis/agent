@@ -4286,11 +4286,19 @@ mod tests {
         // bar over the words.
         let (rows, folds) = prompt("> first\n> a\n\n> second\n> b\n\nboth", 80, None);
         let shown = text(&rows);
-        assert_eq!(shown[1..4], ["  ▌ first", "  ▌ a", "  ▌ … quoted, 3 more lines ▸"]);
+        assert_eq!(
+            shown[1..4],
+            ["  ▌ first", "  ▌ a", "  ▌ … quoted, 3 more lines ▸"]
+        );
         assert_eq!(shown[4], "› both");
         assert_eq!(folds.quoted, Some(3));
         assert_eq!(
-            text(&prompt_quoted("> first\n> a\n\n> second\n> b\n\nboth", 80, true, None)),
+            text(&prompt_quoted(
+                "> first\n> a\n\n> second\n> b\n\nboth",
+                80,
+                true,
+                None
+            )),
             ["  ", "  ▌ second", "  ▌ b", "  ▌ quoted, 3 more lines ▾"]
         );
     }

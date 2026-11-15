@@ -18239,7 +18239,8 @@ impl App {
             true => String::new(),
             false => format!("{before}\n\n"),
         };
-        self.input.set(&format!("{before}{}\n\n{typed}", quoted.join("\n")));
+        self.input
+            .set(&format!("{before}{}\n\n{typed}", quoted.join("\n")));
         self.pane_keys = false;
     }
 
