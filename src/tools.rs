@@ -285,6 +285,13 @@ pub struct Declared {
     /// whose nested calls are each approved, as in Codex's code mode.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub steps: bool,
+    /// Whether a gate that names the tool also judges the daemon steps of
+    /// its calls (`run_step`), beside the gates that name each step's own
+    /// tool. Left out, a `shell` step is judged as `shell` and nothing
+    /// more, as a script tool whose gate judges only its client's steps
+    /// wants.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub gate_daemon_steps: bool,
     /// Whether a steer lifts a call still waiting for its answer to the
     /// background once it has waited the grace a foreground command gets,
     /// as it lifts that command: for a tool whose calls may run long, a
@@ -298,6 +305,14 @@ pub struct Declared {
     /// calls' rows there name; none when its client says nothing.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub kind: Option<String>,
+}
+/// A command that asks to leave its sandbox with no gate to let it.
+pub fn escalation_refused() -> Error {
+    Error::with(
+        "escalation_refused",
+        "no approval lets this bot run a command outside its sandbox; \
+             run it without sandbox_permissions",
+    )
 }
 fn declared_result() -> String {
     "ok".into()
@@ -797,6 +812,9 @@ fn binary(bytes: &[u8]) -> Option<&'static str> {
         .contains(&0)
         .then_some("a binary file")
 }
+
+/// A process slot, held while a command or a sandbox's helper runs.
+pub type Slot = tokio::sync::OwnedSemaphorePermit;
 
 /// A background command's admission: a slot taken at once when one was
 /// free, otherwise a counted place in line released when it gets a slot
@@ -2341,9 +2359,10 @@ impl ReadSource {
         {
             return Ok(ReadSource::Result { node });
         }
-        let mut parts = text.splitn(3, '/');
-        if let (Some(turn), Some(call_id), Some(stream)) =
-            (parts.next(), parts.next(), parts.next())
+        // A daemon step's call id is `CALL/STEP`: the stream is the last
+        // part, the turn the first.
+        if let Some((turn, rest)) = text.split_once('/')
+            && let Some((call_id, stream)) = rest.rsplit_once('/')
             && let Ok(turn) = turn.parse::<i64>()
             && turn > 0
             && !call_id.is_empty()
@@ -2805,6 +2824,17 @@ impl Registry {
             0 => cap,
             budget => cap.min(budget / 2).max(1),
         }
+    }
+    /// A process slot now, when one is free, for a caller that keeps its
+    /// own line and hands the slot to the command it starts.
+    pub fn try_slot(&self) -> Option<Slot> {
+        self.slots.clone().try_acquire_owned().ok()
+    }
+    /// A process slot once one is free, waiting in the semaphore's fair
+    /// line beside the turns' own commands; none once it is closed.
+    pub fn slot(&self) -> impl Future<Output = Option<Slot>> + Send + 'static {
+        let slots = self.slots.clone();
+        async move { slots.acquire_owned().await.ok() }
     }
     /// Take a place in line for a background command, or refuse when as many
     /// are already waiting as may run: a counter and a comparison, so a fleet
@@ -3725,6 +3755,34 @@ impl Registry {
         started: tokio::sync::oneshot::Sender<()>,
         spill: Option<Spill>,
     ) -> impl Future<Output = Result<Outcome>> + Send + 'static {
+        self.foreground_holding(
+            command,
+            workspace,
+            timeout_ms,
+            environment,
+            sandbox,
+            place,
+            started,
+            spill,
+            None,
+        )
+    }
+
+    /// [`foreground`](Self::foreground) with a process slot the caller
+    /// took for it, `held`, which then waits for none.
+    #[allow(clippy::too_many_arguments)]
+    pub fn foreground_holding(
+        &self,
+        command: String,
+        workspace: PathBuf,
+        timeout_ms: Option<u64>,
+        environment: Vec<(String, String)>,
+        sandbox: Option<Arc<Policy>>,
+        place: Place,
+        started: tokio::sync::oneshot::Sender<()>,
+        spill: Option<Spill>,
+        held: Option<Slot>,
+    ) -> impl Future<Output = Result<Outcome>> + Send + 'static {
         let registry = self.clone();
         async move {
             let (mut stdout, mut stderr, exit, elapsed) = {
@@ -3732,12 +3790,16 @@ impl Registry {
                 // gone, and taken before the slot, so no slot waits on it.
                 // Both go before the output is redacted, so a result
                 // waiting for that holds no process budget.
-                let mut held = crate::sandbox::hold_for(sandbox.as_deref()).await;
-                let _slot = registry
-                    .slots
-                    .acquire()
-                    .await
-                    .map_err(|_| Error::new("tool_scheduler_closed"))?;
+                let mut hold = crate::sandbox::hold_for(sandbox.as_deref()).await;
+                let _slot = match held {
+                    Some(slot) => slot,
+                    None => registry
+                        .slots
+                        .clone()
+                        .acquire_owned()
+                        .await
+                        .map_err(|_| Error::new("tool_scheduler_closed"))?,
+                };
                 let _place = place.take();
                 let _ = started.send(());
                 shell(
@@ -3747,7 +3809,7 @@ impl Registry {
                     &registry,
                     &environment,
                     sandbox.as_deref(),
-                    held.as_mut(),
+                    hold.as_mut(),
                     spill.as_ref(),
                 )
                 .await?
@@ -4204,9 +4266,9 @@ impl Cord {
 
     /// `run`, not begun when the cord was pulled or the daemon's stop came
     /// before, and ended as either comes, as a background command is.
-    pub async fn until_pulled<F>(mut self, run: F) -> Result<Outcome>
+    pub async fn until_pulled<T, F>(mut self, run: F) -> Result<T>
     where
-        F: Future<Output = Result<Outcome>>,
+        F: Future<Output = Result<T>>,
     {
         self.check()?;
         tokio::select! {
@@ -5674,7 +5736,7 @@ mod tests {
         assert!(!begun.load(std::sync::atomic::Ordering::SeqCst));
         // One decided after the pull runs, and a later pull ends it.
         let after = registry.cord();
-        let running = tokio::spawn(after.until_pulled(std::future::pending()));
+        let running = tokio::spawn(after.until_pulled(std::future::pending::<Result<Outcome>>()));
         tokio::task::yield_now().await;
         registry.end_running();
         let ended = running.await.unwrap().unwrap_err();
@@ -5683,7 +5745,11 @@ mod tests {
     #[tokio::test]
     async fn the_daemons_stop_refuses_a_start_and_ends_a_run() {
         let registry = Registry::new("shell").unwrap();
-        let running = tokio::spawn(registry.cord().until_pulled(std::future::pending()));
+        let running = tokio::spawn(
+            registry
+                .cord()
+                .until_pulled(std::future::pending::<Result<Outcome>>()),
+        );
         tokio::task::yield_now().await;
         registry.end_background();
         let ended = running.await.unwrap().unwrap_err();

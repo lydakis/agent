@@ -4,7 +4,12 @@ Status: design note, third draft, 2026-11-15, approved by George the same
 day to be built whole, in the order under
 [What changes, in order](#what-changes-in-order). Built so far: slice 1,
 tool lists stored once (protocol 77, schema 101; measured in
-[DAEMON_MEASUREMENTS.md](DAEMON_MEASUREMENTS.md#declared-tool-lists-stored-once-by-digest-at-6-424-2000-and-5000-bots-protocol-77-schema-101)).
+[DAEMON_MEASUREMENTS.md](DAEMON_MEASUREMENTS.md#declared-tool-lists-stored-once-by-digest-at-6-424-2000-and-5000-bots-protocol-77-schema-101));
+slice 2, daemon steps for `shell` and `echo` (protocol 78, schema 102;
+measured in
+[DAEMON_MEASUREMENTS.md](DAEMON_MEASUREMENTS.md#daemon-steps-at-1000-and-10000-bots-protocol-78-schema-102),
+where three of its gates are missed, why, and the derived gate proposed
+for the step p99).
 GPT-6 Astra reviewed two
 drafts the same day and approved neither slice as scoped. This draft takes
 the narrower scopes it said it would approve and has not been reviewed
@@ -787,6 +792,15 @@ no Agent-only number exists yet, and says so.
 
 The fleet row is the one that matters. A screen where steps are refused
 or starved can pass every other row.
+
+Slice 2's run missed three of these rows: the step p99 under 1 s (1.84 s
+at 10,000 bots), the other bots' 15% (24 to 65% from their own process),
+and the 1 KiB a step in line (about 3 KB measured). The 1 s figure was
+written before any run. A fleet stepping at once waits in one FIFO line,
+so its p99 is about one pass of that line, the fleet's size over the step
+rate; the proposed replacement is a p99 at most 1.6 times that, with a
+step rate no lower than main's. The numbers and the reasoning are in
+[DAEMON_MEASUREMENTS.md](DAEMON_MEASUREMENTS.md#remeasured-after-review-a-second-process-measured-memory-and-a-derived-gate).
 
 **Sonny's gates,** on Agent, with the bench the numbers above came from:
 

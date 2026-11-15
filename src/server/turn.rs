@@ -299,7 +299,7 @@ impl Lift {
 const LIFT_GRACE: Duration = Duration::from_millis(250);
 /// The most of one round's calls a bot runs at once. Each command also
 /// waits for the daemon's process budget, so this is a bot's share of it.
-const PARALLEL_CALLS: usize = 4;
+pub(super) const PARALLEL_CALLS: usize = 4;
 
 /// A tool's result, or the command a steer moved to the background.
 enum Ran<F, T = Outcome> {
@@ -2952,29 +2952,15 @@ impl Turn {
         self.window
             .get_or_init(|| agent_runtime::provider::context_window(provider, model));
         let workspace = PathBuf::from(&context.workspace);
-        // What this turn's children inherit: the CLI a bot runs to delegate
-        // needs a model for the peer (its own by default) and its effort
-        // level when it has one, the bot's own name
-        // so a created peer records who created it, this turn so a prompt it
-        // submits records whose model wrote it, and its creator so a peer
-        // can address the bot that spawned it. Before them, the variables
-        // its client gave it, its `env` setting.
-        let mut environment: Vec<(String, String)> = (record.settings.env.iter())
-            .map(|(name, value)| (name.clone(), value.clone()))
-            .collect();
-        environment.extend([
-            ("AGENT_MODEL".to_owned(), context.model.clone()),
-            ("AGENT_BOT".to_owned(), context.bot.clone()),
-            ("AGENT_BOT_ID".to_owned(), context.bot_id.to_string()),
-            ("AGENT_TURN".to_owned(), turn.to_string()),
-        ]);
-        if let Some(level) = &record.effort {
-            environment.push(("AGENT_EFFORT".to_owned(), level.clone()));
-        }
-        if let (Some(parent), Some(id)) = (&context.created_by, context.created_by_id) {
-            environment.push(("AGENT_PARENT".to_owned(), parent.clone()));
-            environment.push(("AGENT_PARENT_ID".to_owned(), id.to_string()));
-        }
+        // What this turn's commands and children get.
+        let environment = commands_environment(
+            &record,
+            &context.model,
+            (&context.bot, context.bot_id),
+            turn,
+            record.effort.as_deref(),
+            context.created_by.as_deref().zip(context.created_by_id),
+        );
         let mut resume_window = false;
         // What a summary that parked had copied, for its retry to copy.
         let mut copied = None;
@@ -3035,6 +3021,9 @@ impl Turn {
                         )),
                     };
                     if let Some(outcome) = outcome {
+                        // Answered or out of time while parked: a daemon
+                        // step of it still running or in line is stopped.
+                        self.handles.call_ended(turn, waiting.call_id.clone());
                         let id = waiting.call_id.clone();
                         self.store
                             .op("tool_finish", move |db| db.tool_finish(turn, &id, &outcome))
@@ -4626,31 +4615,19 @@ impl Turn {
                     .await?;
                 continue;
             }
-            // An escape from a sandbox runs unconfined only once a gate
-            // allowed it.
-            let ruled = self.ruled();
-            let approved = record.gated(&call, workspace, &ruled);
-            let ruling = record.ruling(&call, &ruled);
-            // A call a gate would hold back, of a bot that never asks, is
-            // refused with no one asked, as Codex refuses one under
-            // `never`; an escape its sandbox holds is refused below, as one
-            // no gate holds.
-            let unasked = record.unasked(&call, workspace, &ruled)
-                && !(record.sandboxed() && agent_runtime::sandbox::confinable(&call.name));
-            // A call its sandbox confines runs in it; one that can't be
-            // confined fails rather than run unconfined. An escape no gate
-            // approved is refused, as Codex refuses one under a policy that
-            // never asks: a command, or a write or edit held to the sandbox.
-            // A command a rule allows runs unconfined, as in Codex; one a
-            // rule asked about runs where it asked to, once allowed.
-            let confined = record.sandboxed()
-                && agent_runtime::sandbox::confinable(&call.name)
-                && !(approved && !record.confines(&call, workspace))
-                && ruling != Ok(Ruling::Allow);
-            // Where its row in the audit trail says it ran: a sandbox holds
-            // writes only, so a sandboxed bot's read is within it.
-            let in_sandbox = confined || (record.sandboxed() && call.name == "read");
-            if unasked {
+            // One plan decides it, as it decides the same call beside others
+            // or as a daemon step. An escape from a sandbox runs unconfined
+            // only once a gate allowed it. A call a gate would hold back, of
+            // a bot that never asks, is refused with no one asked, as Codex
+            // refuses one under `never`; an escape its sandbox holds is
+            // refused below, as one no gate holds. A call its sandbox
+            // confines runs in it; one that can't be confined fails rather
+            // than run unconfined. A command a rule allows runs unconfined,
+            // as in Codex; one a rule asked about runs where it asked to,
+            // once allowed.
+            let plan = record.plan(&call, workspace, &self.ruled());
+            let (approved, confined, in_sandbox) = (plan.gated, plan.confined(), plan.in_sandbox());
+            if plan.refused_unasked() {
                 let refused = call.clone();
                 self.store
                     .op("refuse_unasked", move |db| {
@@ -4679,7 +4656,7 @@ impl Turn {
                 }
             } else {
                 let started = call.clone();
-                let ruled = matches!(ruling, Ok(Ruling::Allow | Ruling::Forbidden(_)));
+                let ruled = plan.ruled();
                 self.store
                     .op("tool_start", move |db| {
                         db.tool_start(turn, &started, in_sandbox, ruled)
@@ -4701,23 +4678,15 @@ impl Turn {
             // is refused, and one a rule asks about with no gate to ask is
             // refused too, as Codex refuses it under a policy that never
             // asks.
-            let prepared = prepared.and_then(|prepared| match &ruling {
-                Ok(Ruling::Forbidden(why)) => Err(Error::with("command_forbidden", why.as_str())),
-                Ok(Ruling::Prompt(why)) if !approved => {
-                    Err(Error::with("command_needs_approval", why.as_str()))
-                }
-                Err(error) => Err(error.clone()),
-                Ok(_) => Ok(prepared),
+            let prepared = prepared.and_then(|prepared| match plan.ruled_out() {
+                Some(error) => Err(error),
+                None => Ok(prepared),
             });
             let mut sandbox = None;
             let prepared = match prepared {
                 Ok(
                     Prepared::Shell { .. } | Prepared::Detach { .. } | Prepared::Terminal { .. },
-                ) if confined && !record.confines(&call, workspace) => Err(Error::with(
-                    "escalation_refused",
-                    "no approval lets this bot run a command outside its sandbox; \
-                         run it without sandbox_permissions",
-                )),
+                ) if plan.escapes() => Err(agent_runtime::tools::escalation_refused()),
                 Ok(prepared) if confined => self.sandbox(record, workspace).await.map(|policy| {
                     sandbox = policy;
                     prepared
@@ -4733,13 +4702,20 @@ impl Turn {
             let declared = record.declared(&call.name);
             let answered = declared.is_some_and(|tool| tool.answered_by.is_some());
             let lifts = declared.is_some_and(|tool| tool.lift);
+            let steps = declared.is_some_and(|tool| tool.steps);
             // A terminal whose end this result shows its bot.
             let mut seen = None;
             let outcome = match prepared {
                 // A declared tool runs nothing: its meaning is its client's,
                 // and so is its answer, when its client gives one.
                 Ok(Prepared::Declared(_)) if answered => match self
-                    .await_answer(&call.call_id, lifts, &mut calls, route, summary_retry_ms)
+                    .await_answer(
+                        &call.call_id,
+                        (lifts, steps),
+                        &mut calls,
+                        route,
+                        summary_retry_ms,
+                    )
                     .await?
                 {
                     ControlFlow::Continue(Some(outcome)) => outcome,
@@ -5104,18 +5080,14 @@ impl Turn {
         call: &ToolCall,
         workspace: &std::path::Path,
     ) -> Option<Prepared> {
-        let ruled = self.ruled();
         if !matches!(call.name.as_str(), "shell" | "read")
-            || record.gated(call, workspace, &ruled)
-            || record.unasked(call, workspace, &ruled)
-            || !matches!(
-                record.ruling(call, &ruled),
-                Ok(Ruling::None | Ruling::Allow)
-            )
             || record.declared(&call.name).is_some()
             || !record.calls(&call.name)
-            || (call.name == "shell" && record.sandboxed() && !record.confines(call, workspace))
         {
+            return None;
+        }
+        let plan = record.plan(call, workspace, &self.ruled());
+        if !plan.free() || (call.name == "shell" && record.sandboxed() && !plan.confines) {
             return None;
         }
         match self.registry.prepare(&call.name, &call.arguments) {
@@ -5522,14 +5494,9 @@ impl Turn {
         {
             return false;
         }
-        let ruled = self.ruled();
-        let ruling = record.ruling(call, &ruled);
-        !record.gated(call, workspace, &ruled)
-            && !record.unasked(call, workspace, &ruled)
-            && matches!(ruling, Ok(Ruling::None | Ruling::Allow))
-            && !(record.sandboxed()
-                && ruling != Ok(Ruling::Allow)
-                && !record.confines(call, workspace))
+        let plan = record.plan(call, workspace, &self.ruled());
+        plan.free()
+            && !(record.sandboxed() && plan.ruling != Ok(Ruling::Allow) && !plan.confines)
             && matches!(
                 self.registry.prepare(&call.name, &call.arguments),
                 Ok(Prepared::Shell {
@@ -5628,7 +5595,7 @@ impl Turn {
     async fn await_answer(
         &self,
         call_id: &str,
-        lifts: bool,
+        (lifts, steps): (bool, bool),
         calls: &mut std::vec::IntoIter<ToolCall>,
         route: Option<&str>,
         summary_retry_ms: Option<u64>,
@@ -5647,7 +5614,14 @@ impl Turn {
                 .op("answer_take", move |db| db.answer_take(turn, &id, now_ms()))
                 .await?
             {
-                CallAnswer::Given(outcome) => return Ok(ControlFlow::Continue(Some(outcome))),
+                CallAnswer::Given(outcome) => {
+                    // Answered or out of time: a daemon step of it still
+                    // running is stopped.
+                    if steps {
+                        self.handles.call_ended(turn, call_id.to_owned());
+                    }
+                    return Ok(ControlFlow::Continue(Some(outcome)));
+                }
                 CallAnswer::Pending { notify, expires_ms } => (notify, expires_ms),
             };
             // No deadline while a step of the call waits on a gate: it
@@ -6435,8 +6409,18 @@ impl Lifts {
             .await?;
         match (found, stopper) {
             (Lifted::Waiting(at), _) => self.handles.lifted_lapses(process, at),
-            (Lifted::Ended { result, ready }, _) => {
+            (
+                Lifted::Ended {
+                    result,
+                    ready,
+                    call,
+                },
+                _,
+            ) => {
                 self.handles.lifted_lapses(process, None);
+                if let Some((turn, call_id)) = call {
+                    self.handles.call_ended(turn, call_id);
+                }
                 self.handles.process_finished(process, result);
                 if ready {
                     self.handles.turn_ready();
@@ -6486,29 +6470,16 @@ impl Lifts {
             let _ = sender.send(Err(Error::new("workspace_required")));
             return;
         };
-        let mut environment: Vec<(String, String)> = (bot.settings.env.iter())
-            .map(|(name, value)| (name.clone(), value.clone()))
-            .collect();
-        environment.extend([
-            ("AGENT_MODEL".to_owned(), model),
-            ("AGENT_BOT".to_owned(), bot.name.clone()),
-            ("AGENT_BOT_ID".to_owned(), bot.bot_id.to_string()),
-            ("AGENT_TURN".to_owned(), turn.to_string()),
-        ]);
-        if let Some(level) = effort {
-            environment.push(("AGENT_EFFORT".to_owned(), level));
-        }
-        if let (Some(parent), Some(id)) = (&bot.created_by, bot.created_by_id) {
-            environment.push(("AGENT_PARENT".to_owned(), parent.clone()));
-            environment.push(("AGENT_PARENT_ID".to_owned(), id.to_string()));
-        }
+        let environment = commands_environment(
+            &bot,
+            &model,
+            (&bot.name, bot.bot_id),
+            turn,
+            effort.as_deref(),
+            bot.created_by.as_deref().zip(bot.created_by_id),
+        );
         let root = (bot.workspace.as_ref()).map_or_else(|| workspace.clone(), PathBuf::from);
-        let outputs = (bot.settings.outputs.as_ref()).map(|folder| Outputs {
-            folder: PathBuf::from(folder),
-            settings: bot.settings.clone(),
-            root: root.clone(),
-            daemon: self.registry.daemon().clone(),
-        });
+        let outputs = Outputs::of(&bot, root.clone(), self.registry.daemon());
         // As its turn would prepare it, its gates having allowed it: the
         // command rules as its round was announced still refuse a
         // forbidden command.
@@ -6924,8 +6895,15 @@ pub(super) async fn stop_handle(
         .await?;
     let name = format!("proc:{handle}");
     Ok(match stopped {
-        Some(Some(Lifted::Ended { result, ready })) => {
+        Some(Some(Lifted::Ended {
+            result,
+            ready,
+            call,
+        })) => {
             handles.lifted_lapses(handle, None);
+            if let Some((turn, call_id)) = call {
+                handles.call_ended(turn, call_id);
+            }
             handles.process_finished(handle, result.clone());
             if ready {
                 handles.turn_ready();
@@ -7203,7 +7181,7 @@ fn backoff(attempt: u32, seed: u64) -> std::time::Duration {
 /// Where a bot's cut outputs go whole: the outputs folder its settings
 /// name, and what decides whether its sandbox may write there.
 #[derive(Clone)]
-struct Outputs {
+pub(super) struct Outputs {
     folder: PathBuf,
     settings: Settings,
     root: PathBuf,
@@ -7211,13 +7189,28 @@ struct Outputs {
 }
 
 impl Outputs {
+    /// The bot's, when its settings name a folder, its sandbox rooted at
+    /// `root`.
+    pub(super) fn of(
+        bot: &Bot,
+        root: PathBuf,
+        daemon: &agent_runtime::sandbox::Daemon,
+    ) -> Option<Self> {
+        Some(Outputs {
+            folder: PathBuf::from(bot.settings.outputs.as_ref()?),
+            settings: bot.settings.clone(),
+            root,
+            daemon: daemon.clone(),
+        })
+    }
+
     /// Write each retained stream of `outcome` whole to a file of its own,
     /// `TURN-CALL_ID-STREAM`, in place of the store's copy, off the runtime
     /// thread. Only while the bot's sandbox cannot write the folder: a
     /// command that could would put a link there for the daemon to follow.
     /// Files are made new, never through a link, readable by their owner
     /// alone. A stream that cannot be written stays in the store.
-    async fn keep(self, mut outcome: Outcome, turn: i64, call_id: &str) -> Outcome {
+    pub(super) async fn keep(self, mut outcome: Outcome, turn: i64, call_id: &str) -> Outcome {
         if outcome.artifacts.is_empty() {
             return outcome;
         }
@@ -7274,7 +7267,7 @@ impl Outputs {
     /// Where a command's streams go whole as it runs, past the bound, as
     /// `keep` would name their files: only while the bot's sandbox cannot
     /// write the folder, as `keep` checks, there when one passes it.
-    fn spill(self, turn: i64, call_id: &str) -> Spill {
+    pub(super) fn spill(self, turn: i64, call_id: &str) -> Spill {
         Spill {
             folder: self.folder.clone(),
             name: format!("{turn}-{}", file_name(call_id)),
@@ -7369,7 +7362,7 @@ fn write_new(path: &std::path::Path, data: &[u8]) -> std::io::Result<()> {
 /// Name retained streams in the model-facing result so the model can read
 /// them back: `TURN/CALL_ID/STREAM`, and the files that hold any of them
 /// whole, by path.
-fn annotate(mut outcome: Outcome, turn: i64, call_id: &str) -> Outcome {
+pub(super) fn annotate(mut outcome: Outcome, turn: i64, call_id: &str) -> Outcome {
     if outcome.artifacts.is_empty() && outcome.files.is_empty() {
         return outcome;
     }
@@ -8070,6 +8063,40 @@ impl Turn {
     async fn no_terminal(&self, handle: i64, error: Error) -> Result<Error> {
         no_terminal(&self.store, &self.bot, handle, error).await
     }
+}
+
+/// What a turn's commands get in their environment: the variables its
+/// client gave the bot, its `env` setting, then what its children inherit.
+/// The CLI a bot runs to delegate needs a model for the peer (its own by
+/// default) and its effort level when it has one, the bot's own name so a
+/// created peer records who created it, this turn so a prompt it submits
+/// records whose model wrote it, and its creator so a peer can address the
+/// bot that spawned it. A lifted call and a daemon step get the same.
+pub(super) fn commands_environment(
+    record: &Bot,
+    model: &str,
+    (bot, bot_id): (&str, i64),
+    turn: i64,
+    effort: Option<&str>,
+    parent: Option<(&str, i64)>,
+) -> Vec<(String, String)> {
+    let mut environment: Vec<(String, String)> = (record.settings.env.iter())
+        .map(|(name, value)| (name.clone(), value.clone()))
+        .collect();
+    environment.extend([
+        ("AGENT_MODEL".to_owned(), model.to_owned()),
+        ("AGENT_BOT".to_owned(), bot.to_owned()),
+        ("AGENT_BOT_ID".to_owned(), bot_id.to_string()),
+        ("AGENT_TURN".to_owned(), turn.to_string()),
+    ]);
+    if let Some(level) = effort {
+        environment.push(("AGENT_EFFORT".to_owned(), level.to_owned()));
+    }
+    if let Some((parent, id)) = parent {
+        environment.push(("AGENT_PARENT".to_owned(), parent.to_owned()));
+        environment.push(("AGENT_PARENT_ID".to_owned(), id.to_string()));
+    }
+    environment
 }
 
 fn failure(error: Error) -> Outcome {
