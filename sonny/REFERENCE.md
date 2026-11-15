@@ -774,6 +774,8 @@ copy of the quote is its words alone.
 
 ![Two replies quoted into the composer, in the order picked, over the words](../docs/sonny/reply-quoted-several.png)
 
+![Two replies quoted and sent: both fold onto the one bar over the words](../docs/sonny/reply-quote-fold-several.png)
+
 The message under the mouse also says when it was written, muted, at
 its top right edge, the right end of the empty row over it:
 `Sat 7 Nov 09:13`, the
