@@ -15579,6 +15579,7 @@ impl App {
                     self.names.get_mut().learn(task.bot.clone(), true);
                 }
                 self.commit_ask(&ask);
+                self.keep_draft();
                 // Oldest first, as the turns that asked them count, as the
                 // lead's own are: one read late goes where it was asked.
                 let at = (self.asks.iter())
@@ -15622,12 +15623,27 @@ impl App {
 
     /// The question an `ask` call put, open until it is answered or the
     /// conversation goes on past it. One newly asked takes no focus from
-    /// the one being answered, as Codex's questions take none.
+    /// the one being answered, as Codex's questions take none, nor the
+    /// words being typed ([`App::keep_draft`]).
     fn asked(&mut self, id: &str, turn: Option<i64>, arguments: &Value) {
         if let Some(ask) = asks::call(&Self::ask_id(turn, id), arguments)
             && !(self.asks.iter().chain(&self.aside)).any(|open| open.id == ask.id)
         {
+            self.keep_draft();
             self.asks.push(ask);
+        }
+    }
+
+    /// A question about to open: words typed while none was being
+    /// answered stay the person's own, as after Esc, so what was written
+    /// before it was asked never answers it, as Codex keeps its draft
+    /// apart from its questions. The one being answered keeps its focus.
+    fn keep_draft(&mut self) {
+        if self.asking().is_none() && !self.input.trim().is_empty() {
+            self.chatting = true;
+        }
+        if self.focus.is_none() {
+            self.focus = self.asks.first().map(asks::Ask::key);
         }
     }
 
@@ -22848,6 +22864,49 @@ mod tests {
         let sent = sent.lock().unwrap().clone();
         assert_eq!(sent.len(), 2);
         assert!(sent.iter().all(|asked| asked["origin"] == "shell"));
+    }
+
+    #[tokio::test]
+    async fn a_question_asked_while_typing_leaves_the_draft_the_persons_own() {
+        let sent = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = sent.clone();
+        let client = daemon_answering(move |asked| {
+            if asked["op"] == "submit" {
+                seen.lock().unwrap().push(words_sent(asked).to_owned());
+            }
+            json!({"message": 2, "turn": 2})
+        })
+        .await;
+        let mut app = app(client);
+        let question = json!({"question": "Bump it?", "options": [
+            {"label": "Keep it", "explanation": "e"},
+            {"label": "Drop it", "explanation": "e"}]});
+        // Words typed before the question came stay the person's: nothing
+        // names it over them, and sending them answers nothing.
+        app.input.set("also rename the crate");
+        app.asked("c0", Some(1), &question);
+        assert!(app.asking().is_none());
+        assert!(app.answering_over(80).is_none());
+        app.submit().await;
+        // Landing, they went on past it, as words after Esc do.
+        app.answered("also rename the crate", None);
+        assert!(app.asks.is_empty());
+        // With nothing typed, the next one asked is answered as ever.
+        app.asked("c1", Some(3), &question);
+        assert!(app.asking().is_some());
+        // One asked while another is being answered takes neither its
+        // focus nor what is typed for it.
+        app.input.set("not yet");
+        app.asked("c2", Some(3), &json!({"question": "Tag it?"}));
+        assert_eq!(app.asking().unwrap().id, "ask:3/c1");
+        app.submit().await;
+        assert_eq!(
+            *sent.lock().unwrap(),
+            [
+                "also rename the crate",
+                "You asked (ask:3/c1): Bump it?\n\nnot yet"
+            ]
+        );
     }
 
     #[tokio::test]
