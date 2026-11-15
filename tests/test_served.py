@@ -728,12 +728,12 @@ for (let i = 0; ; i++) await agent(`say ${i}`)
         thread = (self.path / '.agents/commons/fake-home.jsonl').read_text().splitlines()
         self.assertEqual([json.loads(line)['by'] for line in thread], ['calc.a', 'shop.b'])
         # The lookout tells calc.a of the reply, and shop.b nothing of its own.
-        note = self.note_for('calc.a', 'Confirmed here too.', starts='From your sources: ')
-        self.assertIn('- commons:fake-home, from "shop.b" (for your commons.fake-home): '
-                      '"reply in fake-home, \\"Live tests want a fake HOME\\": Confirmed here too."', note)
+        note = self.note_for('calc.a', 'Confirmed here too.')
+        self.assertIn('[commons · fake-home · shop.b]\nreply in fake-home, "Live tests want a fake HOME": '
+                      'Confirmed here too.', note)
         for t in self.daemon.request('turns', bot='shop.b')['result']['turns']:
             prompts = self.daemon.request('prompts', bot='shop.b', turn=t['turn'])['result']['prompts']
-            self.assertFalse(prompts and prompts[0]['text'].startswith('From your sources: '), prompts)
+            self.assertFalse(prompts and prompts[0].get('origin') == 'lookout', prompts)
         listed = turn('shop.b', {})
         self.assertEqual([t['thread'] for t in listed['threads']], ['fake-home'])
         # Search finds it by its words, case aside, with the posts that hold them.
@@ -832,13 +832,13 @@ for (let i = 0; ; i++) await agent(`say ${i}`)
         self.assertIn('# Memory of api', lead['instructions'])
         self.assertNotIn('# Memory of ws', lead['instructions'])
 
-    def note_for(self, bot, having, timeout=30, starts='Task updates: '):
+    def note_for(self, bot, having, timeout=30):
         """The first note the lookout gave `bot` that says `having`."""
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
             for turn in self.daemon.request('turns', bot=bot)['result']['turns']:
                 text = self.daemon.request('prompts', bot=bot, turn=turn['turn'])['result']['prompts']
-                if text and text[0]['text'].startswith(starts) and having in text[0]['text']:
+                if text and text[0].get('origin') == 'lookout' and having in text[0]['text']:
                     return text[0]['text']
             time.sleep(.2)
         self.fail(f'{bot} heard nothing saying {having!r}')

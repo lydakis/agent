@@ -7275,10 +7275,10 @@ mod tests {
         let lead = view.index["shop.lead"];
         // A margin note closed: the person's.
         assert_eq!(view.sender(&json!({"origin": "margin"}), lead), End::Person);
-        // Task updates name no task: what they quote is the person's
-        // words, so they come from the edge.
-        let tasks = crate::lookout::TASKS_ORIGIN;
-        let quoting = json!({"origin": tasks, "quotes": [{"bot": "shop.login", "message": 3}]});
+        // A lookout note names no task: what it quotes is the person's
+        // words, so it comes from the edge.
+        let lookout = crate::lookout::ORIGIN;
+        let quoting = json!({"origin": lookout, "quotes": [{"bot": "shop.login", "message": 3}]});
         assert_eq!(view.sender(&quoting, lead), End::Rim(lead));
         // Follows and other people stay outside.
         assert_eq!(
@@ -7795,7 +7795,7 @@ mod tests {
         ))
         .unwrap();
         send.send(Feed::Live(
-            json!({"event": "accepted", "bot": "a", "turn": 2, "data": {"origin": "lookout.sources"}}),
+            json!({"event": "accepted", "bot": "a", "turn": 2, "data": {"origin": "lookout"}}),
         ))
         .unwrap();
         view.drain();
@@ -7804,7 +7804,7 @@ mod tests {
         let shown = text(&view.card(60, 30));
         assert!(shown.contains("a posted to the commons"), "{shown}");
         // Named for what it brings, not the lookout's word for asking.
-        assert!(shown.contains("its sources → a"), "{shown}");
+        assert!(shown.contains("the lookout → a"), "{shown}");
     }
 
     #[tokio::test]
