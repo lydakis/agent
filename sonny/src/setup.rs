@@ -641,6 +641,18 @@ pub async fn flags(args: &[String], socket: &Path) -> Result<(), String> {
         }
         save(&config, Some(("model", model)))?;
     }
+    // A setup by flags installs the browser and desktop programs as the
+    // one that asks does, so agents can use them after either.
+    if provider.is_some() || model.is_some() {
+        let say = |line: &str| match json {
+            true => eprintln!("{line}"),
+            false => println!("{line}"),
+        };
+        for error in crate::trusted::bring_up(&say) {
+            say(&format!("Not installed: {error}"));
+        }
+        crate::skills::install_programs();
+    }
     let brought = match &import {
         Some(agents) => {
             let agents: Vec<&str> = agents.split(',').filter(|a| !a.is_empty()).collect();
