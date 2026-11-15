@@ -199,7 +199,7 @@ sonny  # from your project's folder
 
 First-run setup helps you connect a provider, choose a model, and import MCP
 servers. Sonny also gives agents [memory, skills, and automations](docs/SONNY.md).
-The [lookout](docs/LOOKOUT.md) brings in task updates and news from configured
+The [lookout](docs/LOOKOUT.md) brings in what happens in tasks and news from configured
 sources. `/status` shows the work; `/config` changes settings.
 
 ### When to use Sonny
