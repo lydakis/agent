@@ -5,8 +5,7 @@ day to be built whole, in the order under
 [What changes, in order](#what-changes-in-order). Built so far: slice 1,
 tool lists stored once (protocol 77, schema 101; measured in
 [DAEMON_MEASUREMENTS.md](DAEMON_MEASUREMENTS.md#declared-tool-lists-stored-once-by-digest-at-6-424-2000-and-5000-bots-protocol-77-schema-101));
-slices 2 and 3, daemon steps for `shell`, `echo` and the file tools
-(protocol 78, schema 102;
+slice 2, daemon steps for `shell` and `echo` (protocol 78, schema 102;
 measured in
 [DAEMON_MEASUREMENTS.md](DAEMON_MEASUREMENTS.md#daemon-steps-at-1000-and-10000-bots-protocol-78-schema-102),
 where two of its fleet gates are missed and why).

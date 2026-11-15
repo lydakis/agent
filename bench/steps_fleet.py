@@ -12,6 +12,7 @@ an idle daemon. Synthetic model, no spend; needs a release build.
         python3 -m bench.steps_fleet
 """
 import json
+import multiprocessing
 import os
 import socket
 import statistics
@@ -105,6 +106,48 @@ class Pipe:
         self.socket.close()
 
 
+def side_turns(pipe, stop, name):
+    """Plain turns on other bots, one after another on each, until
+    `stop`: each turn's time from submit to its end."""
+    times = []
+    for round_ in range(SIDE_TURNS):
+        if stop is not None and stop.is_set() and round_ > 0:
+            break
+        ids, sent = pipe.send_many([('submit', dict(bot=f's.b{i}', request_id=f'{name}{round_}-{i}',
+                                                    prompt='hello', delivery='reject'))
+                                    for i in range(SIDE)])
+        turns = []
+        for request in ids:
+            pipe.wait(lambda: request in pipe.replies, 60)
+            turns.append((pipe.take(request)[1])['result']['message'])
+
+        def ended(turn):
+            return any(e['event'] == 'turn_finished' for _, e in pipe.events.get(turn, []))
+        pipe.wait(lambda: all(ended(t) for t in turns), 120)
+        with pipe.lock:
+            for turn in turns:
+                at = next(t for t, e in pipe.events[turn] if e['event'] == 'turn_finished')
+                times.append((at - sent) * 1000)
+                pipe.events.pop(turn, None)
+    return times
+
+
+def side_process(path, go, stop, out):
+    """The other bots' turns, timed from a process of their own, so the
+    fleet's client, parsing thousands of replies a second, does not time
+    them: once on the idle daemon, then from `go` until `stop`."""
+    pipe = Pipe(path)
+    try:
+        bots = [f's.b{i}' for i in range(SIDE)]
+        ids, _ = pipe.send_many([('follow', dict(bot=bot, kinds=['turn_finished'], after=0)) for bot in bots])
+        pipe.wait(lambda: all(i in pipe.replies for i in ids), 120)
+        out.put(('idle', side_turns(pipe, None, 'idle')))
+        go.wait()
+        out.put(('busy', side_turns(pipe, stop, 'busy')))
+    finally:
+        pipe.close()
+
+
 def percentile(values, p):
     if not values:
         return None
@@ -155,43 +198,23 @@ class StepsFleet(ModelFixture):
             print(json.dumps(result), flush=True)
         (Path(__file__).resolve().parent.parent / '.local/steps_fleet.json').write_text(json.dumps(results, indent=1))
 
-    def side_turns(self, pipe, stop, name):
-        """Plain turns on other bots, one after another on each, until
-        `stop`: each turn's time from submit to its end."""
-        times = []
-        for round_ in range(SIDE_TURNS):
-            if stop is not None and stop.is_set() and round_ > 0:
-                break
-            ids, sent = pipe.send_many([('submit', dict(bot=f's.b{i}', request_id=f'{name}{round_}-{i}',
-                                                        prompt='hello', delivery='reject'))
-                                        for i in range(SIDE)])
-            turns = []
-            for request in ids:
-                pipe.wait(lambda: request in pipe.replies, 60)
-                turns.append((pipe.take(request)[1])['result']['message'])
-
-            def ended(turn):
-                return any(e['event'] == 'turn_finished' for _, e in pipe.events.get(turn, []))
-            pipe.wait(lambda: all(ended(t) for t in turns), 120)
-            with pipe.lock:
-                for turn in turns:
-                    at = next(t for t, e in pipe.events[turn] if e['event'] == 'turn_finished')
-                    times.append((at - sent) * 1000)
-                    pipe.events.pop(turn, None)
-        return times
-
     def run_fleet(self, agents):
         store = self.path / f'steps-{agents}.sqlite'
         binary = os.environ.get('BINARY', self.binary)
         self.model.call_script = [('exec', {'code': 'run()'})]
-        daemon = SocketClient(binary, store, self.url, 'echo',
-                              extra=(*PROTECTING, '--max-active', '0'))
-        pipe, side = Pipe(daemon.socket_path), Pipe(daemon.socket_path)
+        # One process slot: the footprint's steps wait in line behind one
+        # command. Echo steps and plain turns take none.
+        daemon = SocketClient(binary, store, self.url, 'echo,shell',
+                              extra=(*PROTECTING, '--max-active', '0', '--max-processes', '1'))
+        pipe = Pipe(daemon.socket_path)
+        forked = multiprocessing.get_context('fork')
+        go, stop, out = forked.Event(), forked.Event(), forked.Queue()
+        sider = None
         try:
             pid = daemon.process.pid
             create = [('create', dict(bot=f'p.b{i}', workspace=str(self.path), declare=[EXEC],
                                       model='openai/synthetic-model', instructions='Test agent.',
-                                      tools=['echo'])) for i in range(agents)]
+                                      tools=['echo', 'shell'])) for i in range(agents)]
             create += [('create', dict(bot=f's.b{i}', workspace=str(self.path), model='openai/synthetic-model',
                                        instructions='Test agent.', tools=['echo'], declare=[EXEC]))
                        for i in range(SIDE)]
@@ -201,18 +224,22 @@ class StepsFleet(ModelFixture):
                 for i in ids:
                     made = pipe.take(i)[1]
                     assert 'result' in made, made
-            # Each session follows its bots for their calls and ends only.
+            # The session follows its bots for their calls and ends only.
             kinds = ['tool_started', 'turn_finished']
-            for session, bots in ((pipe, [f'p.b{i}' for i in range(agents)] + ['s.b0']),
-                                  (side, [f's.b{i}' for i in range(SIDE)])):
-                for start in range(0, len(bots), 500):
-                    ids, _ = session.send_many([('follow', dict(bot=bot, kinds=kinds, after=0))
-                                                for bot in bots[start:start + 500]])
-                    session.wait(lambda: all(i in session.replies for i in ids), 120)
-                    for i in ids:
-                        followed = session.take(i)[1]
-                        assert 'result' in followed, followed
-            idle = self.side_turns(side, None, 'idle')
+            bots = [f'p.b{i}' for i in range(agents)] + ['s.b0']
+            for start in range(0, len(bots), 500):
+                ids, _ = pipe.send_many([('follow', dict(bot=bot, kinds=kinds, after=0))
+                                         for bot in bots[start:start + 500]])
+                pipe.wait(lambda: all(i in pipe.replies for i in ids), 120)
+                for i in ids:
+                    followed = pipe.take(i)[1]
+                    assert 'result' in followed, followed
+            sider = forked.Process(target=side_process, args=(str(daemon.socket_path), go, stop, out))
+            sider.start()
+            kind, idle = out.get(timeout=600)
+            assert kind == 'idle'
+            # The other bots' turns from here on run in their own process,
+            # never at once with the one step alone.
             # One step alone, on one bot whose call waits: what a step costs
             # with nothing else asking.
             pipe.send('submit', bot='s.b0', request_id='alone', prompt='script', delivery='reject')
@@ -250,12 +277,11 @@ class StepsFleet(ModelFixture):
                 return any(e['event'] == 'tool_started' for _, e in pipe.events.get(turn, []))
             pipe.wait(lambda: all(calling(t) for t in turns.values()), 600)
             calls_s = time.perf_counter() - submitted
+            footprint = self.footprint(pipe, pid, turns, agents)
             before = pipe.request('stats')['result']
             ops_before = store_ops(before)
             # Side turns run while the fleet steps.
-            stop, side_times = threading.Event(), []
-            sider = threading.Thread(target=lambda: side_times.extend(self.side_turns(side, stop, 'busy')))
-            sider.start()
+            go.set()
             # Every bot's first step at once, then each bot's next as its
             # last one answers.
             waits, refused, done = [], {}, 0
@@ -323,7 +349,9 @@ class StepsFleet(ModelFixture):
             def finished(turn):
                 return any(e['event'] == 'turn_finished' for _, e in pipe.events.get(turn, []))
             pipe.wait(lambda: all(finished(t) for t in turns.values()), 600)
-            sider.join(timeout=300)
+            kind, side_times = out.get(timeout=300)
+            assert kind == 'busy'
+            sider.join(timeout=60)
             asked = agents * STEPS
             return {
                 'agents': agents, 'steps_each': STEPS, 'steps': len(waits),
@@ -341,11 +369,49 @@ class StepsFleet(ModelFixture):
                 'side_busy_ms_p99': round(percentile(side_times, 99), 2) if side_times else None,
                 'side_busy_turns': len(side_times),
                 'daemon_rss_kib': rss_kib(pid),
+                'footprint': footprint,
             }
         finally:
+            stop.set()
+            go.set()
+            if sider is not None:
+                sider.join(timeout=60)
+                if sider.is_alive():
+                    sider.kill()
             pipe.close()
-            side.close()
             daemon.close()
+
+    def footprint(self, pipe, pid, turns, agents):
+        """What a step waiting in line holds, measured: the daemon's RSS
+        with every call waiting, then with one step of every call but one
+        waiting in line behind that one's command, which holds the only
+        process slot. Before any other step ran, so no freed memory the
+        allocator kept counts. Then the command ends and the line drains."""
+        def settled():
+            time.sleep(1)
+            return rss_kib(pid)
+        before = settled()
+        holder, sent = pipe.send('run_step', bot='p.b0', turn=turns[0], call_id='script-0', step='f',
+                                 name='shell', arguments={'command': 'sleep 3'})
+        while pipe.request('stats')['result']['steps']['commands'] == 0:
+            time.sleep(.01)
+        lined = []
+        for start in range(1, agents, 2000):
+            ids, _ = pipe.send_many([('run_step', dict(bot=f'p.b{b}', turn=turns[b], call_id='script-0', step='f',
+                                                       name='shell', arguments={'command': 'true'}))
+                                     for b in range(start, min(agents, start + 2000))])
+            lined += ids
+        while pipe.request('stats')['result']['steps']['in_line'] < agents - 1:
+            time.sleep(.05)
+        steps = pipe.request('stats')['result']['steps']
+        waiting = settled()
+        pipe.wait(lambda: holder in pipe.replies and all(i in pipe.replies for i in lined), 600)
+        for i in [holder, *lined]:
+            reply = pipe.take(i)[1]
+            assert 'result' in reply, reply
+        return {'rss_kib_calls_waiting': before, 'rss_kib_steps_in_line': waiting,
+                'steps_in_line': steps['in_line'], 'accounted_bytes': steps['bytes'],
+                'measured_bytes_per_step': round((waiting - before) * 1024 / max(1, steps['in_line']))}
 
 
 if __name__ == '__main__':
