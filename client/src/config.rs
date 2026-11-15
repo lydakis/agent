@@ -109,7 +109,9 @@
 //! icon = "▲"                    # one character marking it wherever Sonny names it: /status, /background, news rows
 //! wants = "channel"             # a field of its events: the values follows' filters name are written for the command
 //! [sonny.sources.commons]       # Sonny's own source: the commons threads an agent posted in
-//! digest = "15m"                # the default; 0 at once. Takes digest and steer alone
+//! digest = "15m"                # the default; 0 at once. Takes digest, steer and icon alone
+//! [sonny.sources.memory]        # Sonny's own source: each fact saved or removed; no agent follows it unless it asks
+//! [sonny.sources.links]         # Sonny's own source: each linked machine that comes or goes
 //! [sonny.notes.prs]             # a margin note of your own, over the agent's in every lead's margin
 //! title = "My PRs"              # its name by default
 //! markdown = "{{ source('prs').latest.text }}"  # the note, as Markdown
@@ -573,10 +575,6 @@ pub struct Sonny {
     /// The profile every other agent Sonny starts is told, in place of
     /// `task`.
     pub task_profile: Option<String>,
-    /// What `[sonny] unsandboxed` named before command rules took its
-    /// place: read only so Sonny can move it into them (upgrade migration
-    /// `unsandboxed-rules`, retired with it).
-    pub unsandboxed: Vec<String>,
     /// The `/permissions` row a new lead starts in; unset, `auto`.
     pub default_permissions: Option<String>,
     /// `/permissions` rows of the person's own, by name.
@@ -624,9 +622,10 @@ pub struct Sonny {
     /// The tokens of work an invite pays for: the budget of the turn it
     /// starts.
     pub commons_invite_tokens: u64,
-    /// The commons as a source, `[sonny.sources.commons]`: its `digest`
-    /// and `steer`, as the person's sources take them; it has no command.
-    pub commons_source: Source,
+    /// Sonny's own sources, as `[sonny.sources.commons]`, `.memory` and
+    /// `.links` set them: each one's `digest`, `steer` and `icon`, as the
+    /// person's sources take them; none has a command.
+    pub own_sources: Vec<Source>,
     /// How long an `ask` the person has not answered waits, in minutes,
     /// before its agent goes on with what it recommended, where it said
     /// it could, or is reminded of it; 0 lets every ask wait for them.
@@ -840,6 +839,17 @@ pub const TEXT_WIDTH_LEAST: u64 = 40;
 /// The name of the source Sonny's lookout makes of the commons.
 pub const COMMONS_SOURCE: &str = "commons";
 
+/// The name of the source Sonny's lookout makes of memory: each fact
+/// saved or removed.
+pub const MEMORY_SOURCE: &str = "memory";
+
+/// The name of the source Sonny's lookout makes of the machines linked
+/// here: each one that comes or goes.
+pub const LINKS_SOURCE: &str = "links";
+
+/// The sources Sonny's lookout makes itself, which no command prints.
+pub const OWN_SOURCES: [&str; 3] = [COMMONS_SOURCE, MEMORY_SOURCE, LINKS_SOURCE];
+
 /// The name of the lookout's own source of what happens in the tasks a
 /// subscriber watches: no source in the settings takes it.
 pub const TASKS_SOURCE: &str = "tasks";
@@ -862,6 +872,16 @@ pub fn span(key: &str, text: &str) -> Result<u64, String> {
     count.checked_mul(unit).ok_or_else(bad)
 }
 
+impl Sonny {
+    /// The source of Sonny's own named `name`, as the config sets it.
+    pub fn own_source(&self, name: &str) -> Source {
+        (self.own_sources.iter())
+            .find(|source| source.name == name)
+            .cloned()
+            .unwrap_or_else(|| own_source(name))
+    }
+}
+
 impl Default for Sonny {
     fn default() -> Self {
         Sonny {
@@ -870,7 +890,6 @@ impl Default for Sonny {
             task_speed: None,
             lead_profile: None,
             task_profile: None,
-            unsandboxed: Vec::new(),
             default_permissions: None,
             permissions: BTreeMap::new(),
             mcp_servers: BTreeMap::new(),
@@ -880,7 +899,7 @@ impl Default for Sonny {
             commons: true,
             commons_invites: 3,
             commons_invite_tokens: 1_000_000,
-            commons_source: commons_source(),
+            own_sources: OWN_SOURCES.iter().map(|name| own_source(name)).collect(),
             ask_wait_minutes: 60,
             task_tabs: TaskTabs::default(),
             most_task_tabs: 32,
@@ -1712,7 +1731,6 @@ fn parse(text: &str) -> Result<Config, String> {
                 "sky_haiku_hold",
                 "tool_processes",
                 "lookout_waiting",
-                "unsandboxed",
                 "default_permissions",
                 "browser_confirm",
                 "project_colors",
@@ -1757,7 +1775,7 @@ fn parse(text: &str) -> Result<Config, String> {
                 continue;
             }
             if (name.as_str(), key.as_str()) == ("sonny", "sources") {
-                (config.sonny.sources, config.sonny.commons_source) = sources(value)?;
+                (config.sonny.sources, config.sonny.own_sources) = sources(value)?;
                 continue;
             }
             if (name.as_str(), key.as_str()) == ("sonny", "permissions") {
@@ -1872,18 +1890,6 @@ fn parse(text: &str) -> Result<Config, String> {
                         {
                             Ok(category.to_owned())
                         }
-                        _ => Err(invalid()),
-                    })
-                    .collect::<Result<_, _>>()?;
-                continue;
-            }
-            if (name.as_str(), key.as_str()) == ("sonny", "unsandboxed") {
-                let invalid = || format!("{name}.{key} must be a list of commands");
-                let commands = value.as_array().ok_or_else(invalid)?;
-                config.sonny.unsandboxed = commands
-                    .iter()
-                    .map(|command| match command.as_str() {
-                        Some(command) if !command.trim().is_empty() => Ok(command.to_owned()),
                         _ => Err(invalid()),
                     })
                     .collect::<Result<_, _>>()?;
@@ -2083,14 +2089,15 @@ fn permissions(value: &toml::Value) -> Result<BTreeMap<String, Permissions>, Str
     Ok(rows)
 }
 
-/// The commons as a source, as it is unless the config sets it: how often
-/// it looks is Sonny's.
-fn commons_source() -> Source {
+/// A source of Sonny's own, as it is unless the config sets it: how often
+/// it looks is Sonny's. The commons is heard at most every
+/// [`COMMONS_DIGEST`]; the others as they come.
+fn own_source(name: &str) -> Source {
     Source {
-        name: COMMONS_SOURCE.into(),
+        name: name.into(),
         command: String::new(),
         every: None,
-        digest: Some(COMMONS_DIGEST.into()),
+        digest: (name == COMMONS_SOURCE).then(|| COMMONS_DIGEST.into()),
         steer: None,
         watch: Vec::new(),
         icon: None,
@@ -2099,11 +2106,11 @@ fn commons_source() -> Source {
 }
 
 /// `[sonny.sources.NAME]` tables, each with a `command` and maybe `every`,
-/// and the commons' own, with no command.
-fn sources(value: &toml::Value) -> Result<(Vec<Source>, Source), String> {
+/// and Sonny's own sources, with no command.
+fn sources(value: &toml::Value) -> Result<(Vec<Source>, Vec<Source>), String> {
     let table = (value.as_table()).ok_or("sonny.sources must be a table of sources")?;
     let mut sources = Vec::new();
-    let mut commons = commons_source();
+    let mut owns: Vec<Source> = OWN_SOURCES.iter().map(|name| own_source(name)).collect();
     for (name, source) in table {
         let key = |field: &str| format!("sonny.sources.{name}.{field}");
         if name.is_empty()
@@ -2129,13 +2136,13 @@ fn sources(value: &toml::Value) -> Result<(Vec<Source>, Source), String> {
         let mut watch = Vec::new();
         let mut icon = None;
         let mut wants = None;
-        let own = name == COMMONS_SOURCE;
+        let own = OWN_SOURCES.contains(&name.as_str());
         for (field, value) in fields {
             match field.as_str() {
                 "command" | "every" | "watch" | "wants" if own => {
                     return Err(format!(
-                        "{}: the commons is a source of Sonny's own, which takes digest and steer alone; \
-                         name yours another way",
+                        "{}: {name} is a source of Sonny's own, which takes digest, steer and icon \
+                         alone; name yours another way",
                         key(field)
                     ));
                 }
@@ -2196,10 +2203,10 @@ fn sources(value: &toml::Value) -> Result<(Vec<Source>, Source), String> {
                 _ => return Err(format!("unknown key {}", key(field))),
             }
         }
-        if own {
-            commons.digest = digest.or(commons.digest);
-            commons.steer = steer;
-            commons.icon = icon;
+        if let Some(source) = owns.iter_mut().find(|source| &source.name == name) {
+            source.digest = digest.or(source.digest.take());
+            source.steer = steer;
+            source.icon = icon;
             continue;
         }
         sources.push(Source {
@@ -2213,7 +2220,7 @@ fn sources(value: &toml::Value) -> Result<(Vec<Source>, Source), String> {
             wants,
         });
     }
-    Ok((sources, commons))
+    Ok((sources, owns))
 }
 
 /// The largest price sheet the reader takes.
@@ -2779,7 +2786,7 @@ mod tests {
     fn the_file_sets_what_it_names_and_refuses_the_rest() {
         assert_eq!(parse("").unwrap(), Config::default());
         let config = parse(
-            "# mine\n[reviewer]\nmodel = \"openai/luna\"\n\n[sonny]\nlead_effort = \"medium\"\ntask_effort = \"high\"\nunsandboxed = [\"mcpx\", \"docker compose\"]\n",
+            "# mine\n[reviewer]\nmodel = \"openai/luna\"\n\n[sonny]\nlead_effort = \"medium\"\ntask_effort = \"high\"\n",
         )
         .unwrap();
         assert_eq!(config.reviewer.model.as_deref(), Some("openai/luna"));
@@ -2790,7 +2797,6 @@ mod tests {
         assert_eq!(config.sonny.lead_effort.as_deref(), Some("medium"));
         assert_eq!(config.sonny.task_effort.as_deref(), Some("high"));
         assert_eq!(config.sonny.lead_profile, None);
-        assert_eq!(config.sonny.unsandboxed, ["mcpx", "docker compose"]);
         assert_eq!(config.web_search, WebSearch::Live);
         let roles =
             parse("[sonny]\nlead_profile = \"my-lead\"\ntask_profile = \"worker\"").unwrap();
@@ -3111,12 +3117,8 @@ mod tests {
                 "reviewer.model must not be empty",
             ),
             (
-                "[sonny]\nunsandboxed = \"mcpx\"",
-                "sonny.unsandboxed must be a list of commands",
-            ),
-            (
-                "[sonny]\nunsandboxed = [\" \"]",
-                "sonny.unsandboxed must be a list of commands",
+                "[sonny]\nunsandboxed = [\"mcpx\"]",
+                "unknown key sonny.unsandboxed",
             ),
         ] {
             assert_eq!(parse(text).unwrap_err(), error, "{text}");
@@ -3387,14 +3389,21 @@ mod tests {
         );
         assert_eq!(config.sonny.sources[0].wants, None);
         // The commons is a source of Sonny's own, set as any other.
-        assert_eq!(config.sonny.commons_source.digest.as_deref(), Some("15m"));
+        assert_eq!(
+            config.sonny.own_source(COMMONS_SOURCE).digest.as_deref(),
+            Some("15m")
+        );
+        assert_eq!(config.sonny.own_source(MEMORY_SOURCE).digest, None);
         let commons =
             parse("[sonny.sources.commons]\ndigest = \"0\"\nsteer = { from = [\"ana\"] }\n")
                 .unwrap();
         assert!(commons.sonny.sources.is_empty());
-        assert_eq!(commons.sonny.commons_source.digest.as_deref(), Some("0"));
         assert_eq!(
-            commons.sonny.commons_source.steer,
+            commons.sonny.own_source(COMMONS_SOURCE).digest.as_deref(),
+            Some("0")
+        );
+        assert_eq!(
+            commons.sonny.own_source(COMMONS_SOURCE).steer,
             Some(serde_json::json!({"from": ["ana"]}))
         );
         let named: Vec<(&str, &str, Option<&str>)> = (config.sonny.sources.iter())
@@ -3422,7 +3431,7 @@ mod tests {
             ),
             (
                 "[sonny.sources.commons]\ncommand = \"x\"",
-                "sonny.sources.commons.command: the commons is a source of Sonny's own, which takes digest and steer alone; name yours another way",
+                "sonny.sources.commons.command: commons is a source of Sonny's own, which takes digest, steer and icon alone; name yours another way",
             ),
             (
                 "[sonny.sources.slack]\ncommand = \"x\"\nwatch = \"poll.py\"",
@@ -3434,7 +3443,7 @@ mod tests {
             ),
             (
                 "[sonny.sources.commons]\nwatch = [\"~/x\"]",
-                "sonny.sources.commons.watch: the commons is a source of Sonny's own, which takes digest and steer alone; name yours another way",
+                "sonny.sources.commons.watch: commons is a source of Sonny's own, which takes digest, steer and icon alone; name yours another way",
             ),
             (
                 "[sonny.sources.commons]\ndigest = \"an hour\"",
@@ -3454,7 +3463,7 @@ mod tests {
             ),
             (
                 "[sonny.sources.commons]\nwants = \"topic\"",
-                "sonny.sources.commons.wants: the commons is a source of Sonny's own, which takes digest and steer alone; name yours another way",
+                "sonny.sources.commons.wants: commons is a source of Sonny's own, which takes digest, steer and icon alone; name yours another way",
             ),
             (
                 "[sonny.sources.\"a b\"]\ncommand = \"x\"",

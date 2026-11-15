@@ -4,7 +4,7 @@
 //! seconds. The lookout watches for whoever has a file and knows no leads:
 //! Sonny writes a lead's `tasks` subscription when it opens the lead's
 //! project (`lead`, `ensure`).
-use agent_client::config::COMMONS_SOURCE;
+use agent_client::config::{COMMONS_SOURCE, LINKS_SOURCE, MEMORY_SOURCE};
 use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
 
@@ -268,39 +268,6 @@ impl Sub {
     }
 }
 
-/// The upgrade migration that names what cuts in `steer` (0.8.0): a
-/// source's `urgent` in the person's config and in subscriptions, and
-/// `[sonny] commons_digest`, which becomes the commons source's `digest`.
-pub const STEER: &str = "lookout-steer";
-
-/// At start, once, before the config is read: its `urgent` keys and
-/// `commons_digest` as they are named now.
-pub fn at_start() {
-    let (Some(home), Some(path)) = (
-        std::env::var_os("HOME").map(PathBuf::from),
-        agent_client::config::path(),
-    ) else {
-        return;
-    };
-    // No config, nothing to move: and nothing made, not even a HOME gone.
-    if !path.exists() {
-        return;
-    }
-    crate::upgrade::once(&home.join(".agent/sonny/migrated"), STEER, || {
-        config_steers(&path)
-    });
-}
-
-/// Each subscription file of `store` with `urgent` named `steer`, once
-/// for the store, before the lookout reads them.
-pub fn steer_files(store: &Path) {
-    let mut record = store.as_os_str().to_owned();
-    record.push(".migrated");
-    crate::upgrade::once(Path::new(&record), STEER, || {
-        files_renamed(store, "urgent", "steer")
-    });
-}
-
 /// A follow's agents, named `bots` before 0.10.0, as the Rulebook's words
 /// name them.
 pub const AGENTS: &str = "lookout-agents";
@@ -331,149 +298,6 @@ pub fn goals_gone(store: &Path) {
             Err(e) => e.kind() == std::io::ErrorKind::NotFound,
         },
     );
-}
-
-/// The config at `path` with `urgent` under a source named `steer`, and
-/// `[sonny] commons_digest` moved to `[sonny.sources.commons] digest`,
-/// each line kept as the person wrote it otherwise. Whether it is done:
-/// a config it cannot move cleanly is left as it is, for the config's own
-/// error to name the key, and tried again next time.
-fn config_steers(path: &Path) -> bool {
-    let text = match std::fs::read_to_string(path) {
-        Ok(text) => text,
-        Err(e) => return e.kind() == std::io::ErrorKind::NotFound,
-    };
-    match steers(&text) {
-        Err(()) => false,
-        Ok(None) => true,
-        Ok(Some(moved)) => {
-            use std::os::unix::fs::PermissionsExt;
-            let mode = std::fs::metadata(path).map_or(0o600, |m| m.permissions().mode() & 0o777);
-            agent_client::files::replace_mode(path, moved.as_bytes(), mode).is_ok()
-        }
-    }
-}
-
-/// `text` as [`config_steers`] writes it: none when there is nothing to
-/// move. The keys are found in the parsed config, not its lines, and the
-/// lines written must parse to the config with only those keys moved, so
-/// a string that holds `urgent =` is never touched; a config whose keys
-/// sit where lines can't move them (a dotted key, an inline table) is an
-/// error.
-fn steers(text: &str) -> Result<Option<String>, ()> {
-    let old: toml::Table = text.parse().map_err(drop)?;
-    let Some(expected) = steered(&old) else {
-        return Ok(None);
-    };
-    let new = steer_lines(text).ok_or(())?;
-    match new.parse::<toml::Table>() {
-        Ok(parsed) if parsed == expected => Ok(Some(new)),
-        _ => Err(()),
-    }
-}
-
-/// `config` with each source's `urgent` named `steer` and `[sonny]
-/// commons_digest` as the commons source's `digest`; none when it holds
-/// neither.
-fn steered(config: &toml::Table) -> Option<toml::Table> {
-    use toml::Value;
-    let mut config = config.clone();
-    let Some(Value::Table(sonny)) = config.get_mut("sonny") else {
-        return None;
-    };
-    let mut changed = false;
-    let digest = sonny.remove("commons_digest");
-    if let Some(Value::Table(sources)) = sonny.get_mut("sources") {
-        for (_, source) in sources.iter_mut() {
-            if let Value::Table(source) = source
-                && let Some(value) = source.remove("urgent")
-            {
-                source.insert("steer".into(), value);
-                changed = true;
-            }
-        }
-    }
-    if let Some(digest) = digest {
-        let sources = sonny
-            .entry("sources")
-            .or_insert_with(|| Value::Table(toml::Table::new()));
-        let Value::Table(sources) = sources else {
-            return None;
-        };
-        let commons = sources
-            .entry("commons")
-            .or_insert_with(|| Value::Table(toml::Table::new()));
-        let Value::Table(commons) = commons else {
-            return None;
-        };
-        commons.insert("digest".into(), digest);
-        changed = true;
-    }
-    changed.then_some(config)
-}
-
-/// The lines of `text` with the keys [`steered`] moves moved, outside any
-/// multiline string; none when nothing moved.
-fn steer_lines(text: &str) -> Option<String> {
-    let header = |line: &str| {
-        let line = line.trim();
-        (line.starts_with('[') && !line.starts_with("[["))
-            .then(|| line.trim_matches(['[', ']']).trim().to_owned())
-    };
-    let key = |line: &str| line.split_once('=').map(|(key, _)| key.trim().to_owned());
-    let mut table = String::new();
-    let mut lines: Vec<String> = Vec::new();
-    let mut digest = None;
-    let mut changed = false;
-    let mut quoted = false;
-    for line in text.lines() {
-        // Inside a multiline string, a line is the string's.
-        let opens = line.matches("\"\"\"").count() + line.matches("'''").count();
-        if quoted {
-            quoted = opens % 2 == 0;
-            lines.push(line.to_owned());
-            continue;
-        }
-        quoted = opens % 2 == 1;
-        if let Some(name) = header(line) {
-            table = name;
-        } else if table.starts_with("sonny.sources.") && key(line).as_deref() == Some("urgent") {
-            let at = line.find("urgent").unwrap_or(0);
-            lines.push(format!(
-                "{}steer{}",
-                &line[..at],
-                &line[at + "urgent".len()..]
-            ));
-            changed = true;
-            continue;
-        } else if table == "sonny" && key(line).as_deref() == Some("commons_digest") {
-            digest = line
-                .split_once('=')
-                .map(|(_, value)| value.trim().to_owned());
-            changed = true;
-            continue;
-        }
-        lines.push(line.to_owned());
-    }
-    if let Some(digest) = digest {
-        let commons =
-            (lines.iter()).position(|l| header(l).as_deref() == Some("sonny.sources.commons"));
-        match commons {
-            Some(at) => lines.insert(at + 1, format!("digest = {digest}")),
-            None => {
-                if lines.last().is_some_and(|l| !l.trim().is_empty()) {
-                    lines.push(String::new());
-                }
-                lines.push("[sonny.sources.commons]".into());
-                lines.push(format!("digest = {digest}"));
-            }
-        }
-    }
-    changed.then(|| {
-        let mut moved = lines.join("\n");
-        moved.push('\n');
-        moved
-    })
 }
 
 /// Every subscription file beside `store` with each subscription's `from`
@@ -1013,7 +837,6 @@ fn plain(name: &str, max: usize) -> bool {
 /// files are renamed: an edit reads a file as [`Sub`], which drops a key
 /// not yet renamed.
 fn held(store: &Path) -> Result<std::fs::File, String> {
-    steer_files(store);
     agents_files(store);
     locked(store)
 }
@@ -1497,10 +1320,14 @@ fn preview(store: &Path, subscriber: &str, sub: &Sub) -> Value {
             "{cut} of the events it heard were kept cut, which a filter may misjudge"
         ));
     }
-    // The commons keeps no recent log, as no bot does.
+    // Sonny's own sources keep no recent log, as no bot does.
     let untested: Vec<&str> = [
         (!sub.tasks_of.is_empty() || !sub.agents.is_empty()).then_some("its agents"),
         named.contains(&COMMONS_SOURCE).then_some("the commons"),
+        named.contains(&MEMORY_SOURCE).then_some("memory"),
+        named
+            .contains(&LINKS_SOURCE)
+            .then_some("the linked machines"),
     ]
     .into_iter()
     .flatten()
@@ -1713,34 +1540,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn the_steer_migration_renames_urgent_and_moves_the_commons_digest() {
-        let text = "model = \"m\"\n\n[sonny]\ncommons_digest = \"30m\"\ntheme = \"dark\"\n\n[sonny.sources.github]\ncommand = \"gh\"\nurgent = \"review_requested\" # mine\n";
-        assert_eq!(
-            steers(text).unwrap().unwrap(),
-            "model = \"m\"\n\n[sonny]\ntheme = \"dark\"\n\n[sonny.sources.github]\ncommand = \"gh\"\nsteer = \"review_requested\" # mine\n\n[sonny.sources.commons]\ndigest = \"30m\"\n"
-        );
-        let beside = "[sonny]\ncommons_digest = \"0\"\n[sonny.sources.commons]\nurgent = \"*\"\n";
-        assert_eq!(
-            steers(beside).unwrap().unwrap(),
-            "[sonny]\n[sonny.sources.commons]\ndigest = \"0\"\nsteer = \"*\"\n"
-        );
-        // What another table names `urgent` is its own.
-        assert_eq!(steers("[other]\nurgent = 1\n"), Ok(None));
-        assert_eq!(steers(""), Ok(None));
-        // A command's own words are the command's, in a config already
-        // current or not.
-        let script = "[sonny.sources.ci]\ncommand = \"\"\"\nurgent=1\necho $urgent\n\"\"\"\n";
-        assert_eq!(steers(script), Ok(None));
-        let both = format!("{script}urgent = \"*\"\n");
-        assert_eq!(
-            steers(&both).unwrap().unwrap(),
-            format!("{script}steer = \"*\"\n")
-        );
-        // One the lines can't move is left for the config's own error.
-        assert_eq!(steers("sonny.sources.ci.urgent = \"*\"\n"), Err(()));
-    }
-
-    #[test]
     fn the_goals_folder_goes_once_and_subscriptions_stay() {
         let store = std::env::temp_dir().join(format!("sonny-goals-gone-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(dir(&store));
@@ -1759,21 +1558,6 @@ mod tests {
         assert_eq!(crate::upgrade::lines(Path::new(&record)), [GOALS_GONE]);
         let _ = std::fs::remove_dir_all(dir(&store));
         let _ = std::fs::remove_file(&record);
-    }
-
-    #[test]
-    fn the_steer_migration_renames_urgent_in_each_subscription_file() {
-        let store = std::env::temp_dir().join(format!("sonny-steer-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(dir(&store));
-        std::fs::create_dir_all(dir(&store)).unwrap();
-        let path = dir(&store).join("b.json");
-        let old = json!({"subscriptions": [{"name": "pr", "source": "github:1", "urgent": "*"}]});
-        std::fs::write(&path, old.to_string()).unwrap();
-        assert!(files_renamed(&store, "urgent", "steer"));
-        let now: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
-        assert_eq!(now["subscriptions"][0]["steer"], "*");
-        assert!(now["subscriptions"][0].get("urgent").is_none());
-        let _ = std::fs::remove_dir_all(dir(&store));
     }
 
     #[test]

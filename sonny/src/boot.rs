@@ -8,10 +8,6 @@
 //! companions it keeps.
 use std::path::Path;
 
-/// The job each setting had of its own before the scheduler ran it, which
-/// Sonny's start lets go of.
-pub(crate) const OLD_LABEL: &str = "me.lydakis.agent.boot";
-
 /// Whether the setting is on, as config.toml says now.
 pub fn on() -> bool {
     agent_client::config::path()

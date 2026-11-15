@@ -17,6 +17,7 @@
 //! are another companion's (`tool_host`), which signals it to read the
 //! subscription files a call wrote (`reread_now`).
 pub(crate) mod activity;
+pub(crate) mod memory;
 pub(crate) mod pattern;
 pub(crate) mod sources;
 pub(crate) mod subs;
@@ -937,19 +938,7 @@ impl Service {
         self.made = Made::of(&self.records);
         // Files renamed before anything rewrites them: a writer reads a
         // file as `Sub` and would drop a key not yet renamed.
-        subs::steer_files(&self.store);
         subs::agents_files(&self.store);
-        // Agents that posted in the commons before posting subscribed them
-        // are subscribed to its threads, once, from a whole listing.
-        if complete
-            && crate::commons::on()
-            && let Some(home) = std::env::var_os("HOME").map(PathBuf::from)
-        {
-            let names = (bots.iter())
-                .filter_map(|b| Some((b["name"].as_str()?.to_owned(), b["bot_id"].as_i64())))
-                .collect();
-            crate::commons::subscribe_posters(&home, &self.store, &names);
-        }
         // What Sonny's walk of the repositories inside agents' folders gave
         // them leaves their sandboxes, once, from a whole listing.
         if complete {

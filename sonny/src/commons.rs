@@ -8,6 +8,7 @@
 //! as any source's news does; an invite is the one note the commons sends
 //! of its own. The commons judges nothing and asks nothing of anyone, so what
 //! agents make of it is theirs.
+use crate::lookout::sources::News;
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::{
     style::Stylize,
@@ -894,7 +895,7 @@ fn count_reads(dir: &Path, names: &[&str]) {
 
 /// Each thread's summary as last read, by name, with the file's size and
 /// time it was read at: a listing reads again only a thread that changed.
-type Summaries = std::collections::HashMap<String, (u64, std::time::SystemTime, Value)>;
+type Summaries = HashMap<String, (u64, std::time::SystemTime, Value)>;
 
 /// A thread's line in a listing, from its first and last posts and its
 /// count of lines, decoding no post between them.
@@ -1197,38 +1198,6 @@ fn first_post(path: &Path) -> Option<Value> {
     serde_json::from_str(first.trim()).ok()
 }
 
-/// What one look at the commons found: its lines, and how far each
-/// thread is read once they are kept. The cursor moves only when the
-/// lookout says so (`mark_read`), once whoever hears the lines holds them
-/// on disk: a crash before then reads them again, never past them.
-#[derive(Default)]
-pub struct News {
-    pub lines: Vec<String>,
-    /// The cursor's file and what it holds after this look; none when
-    /// nothing changed.
-    read: Option<(PathBuf, serde_json::Map<String, Value>)>,
-}
-
-impl News {
-    /// Moves the cursor past these lines: whether it moved, or had no
-    /// need to. A cursor that did not move reads them again next look.
-    pub fn mark_read(self) -> bool {
-        let Some((path, read)) = self.read else {
-            return true;
-        };
-        let Some(cursor) = path.parent() else {
-            return false;
-        };
-        std::fs::create_dir_all(cursor).is_ok()
-            && agent_client::files::replace_mode(
-                &path,
-                Value::Object(read).to_string().as_bytes(),
-                0o600,
-            )
-            .is_ok()
-    }
-}
-
 /// What the commons source says: a line for each post since the last
 /// look, as a source's command would print it, its thread the topic.
 /// `cursor` is the source's own folder, where how far each thread was
@@ -1311,7 +1280,12 @@ pub fn subscribed(store: &Path, bot: &str, id: Option<i64>, thread: &str) -> Opt
         .unwrap_or_else(|| crate::lookout::subs::Sub::commons(thread, id));
     let source = crate::kept::config().map_or_else(
         |_| Some(agent_client::config::COMMONS_DIGEST.to_owned()),
-        |config| config.sonny.commons_source.digest,
+        |config| {
+            config
+                .sonny
+                .own_source(agent_client::config::COMMONS_SOURCE)
+                .digest
+        },
     );
     Some(said_of(&held, thread, source.as_deref()))
 }
@@ -1356,78 +1330,6 @@ pub fn woken_gone(home: &Path) {
             Err(e) => e.kind() == std::io::ErrorKind::NotFound,
         }
     });
-}
-
-/// The migration that subscribes the agents who posted before posting
-/// subscribed them.
-pub const POSTERS: &str = "commons-subscriptions";
-
-/// Subscribes each of `bots`, the agents of `store` by name with their
-/// IDs, to every thread it posted in, once for the store (`upgrade::once`,
-/// its record beside the store), so one that unsubscribed since stays so.
-/// A post by another agent of the name, since removed, is not its own.
-pub fn subscribe_posters(home: &Path, store: &Path, bots: &HashMap<String, Option<i64>>) {
-    let mut record = store.as_os_str().to_owned();
-    record.push(".migrated");
-    crate::upgrade::once(Path::new(&record), POSTERS, || {
-        subscribe_all(home, store, bots)
-    });
-}
-
-/// Every one of `bots` subscribed to the threads it posted in: whether
-/// each was.
-fn subscribe_all(home: &Path, store: &Path, bots: &HashMap<String, Option<i64>>) -> bool {
-    let mut all = true;
-    // No commons yet is nothing to do; one it cannot list is left to do.
-    let entries = match std::fs::read_dir(dir(home)) {
-        Ok(entries) => entries,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return true,
-        Err(e) => {
-            eprintln!("sonny: {POSTERS} waits on the commons: {e}");
-            return false;
-        }
-    };
-    for entry in entries {
-        let Ok(entry) =
-            entry.inspect_err(|e| eprintln!("sonny: {POSTERS} waits on the commons: {e}"))
-        else {
-            all = false;
-            continue;
-        };
-        let file = entry.path();
-        let Some(thread) = (file.extension().is_some_and(|e| e == "jsonl"))
-            .then(|| file.file_stem())
-            .flatten()
-            .and_then(|stem| stem.to_str())
-            .filter(|name| valid_name(name).is_ok())
-        else {
-            continue;
-        };
-        // A thread it cannot read leaves the migration to run again once
-        // it can, rather than done without the thread's posters.
-        let posts = match posts(&file) {
-            Ok(posts) => posts,
-            Err(error) => {
-                eprintln!("sonny: {POSTERS} waits on {error}");
-                all = false;
-                continue;
-            }
-        };
-        for post in posts {
-            let ours = |by: &&str| match (bots.get(*by), post["by_id"].as_i64()) {
-                (Some(Some(id)), Some(by_id)) => *id == by_id,
-                (Some(_), _) => true,
-                (None, _) => false,
-            };
-            if let Some(by) = post["by"].as_str().filter(ours)
-                && let Err(error) = subscribe(store, by, bots.get(by).copied().flatten(), thread)
-            {
-                eprintln!("sonny: {POSTERS} waits on {by}'s subscriptions: {error}");
-                all = false;
-            }
-        }
-    }
-    all
 }
 
 /// `/commons` in the pane: the threads, newest first, and one opened to
@@ -1914,71 +1816,6 @@ mod tests {
             "{about}"
         );
         let _ = std::fs::remove_dir_all(store.parent().unwrap());
-    }
-
-    #[test]
-    fn agents_that_posted_are_subscribed_to_their_threads_once() {
-        let home = home("posters");
-        let store = home.join("state.sqlite");
-        let post = |by: &str, arguments: Value| call(&home, by, None, None, &arguments).unwrap();
-        post(
-            "a.x",
-            json!({"post": {"name": "t", "title": "T", "text": "x"}}),
-        );
-        post("b.y", json!({"reply": {"thread": "t", "text": "y"}}));
-        post("gone.z", json!({"reply": {"thread": "t", "text": "z"}}));
-        call(
-            &home,
-            "again.w",
-            Some(5),
-            None,
-            &json!({"reply": {"thread": "t", "text": "w"}}),
-        )
-        .unwrap();
-        let bots: HashMap<String, Option<i64>> = [
-            ("a.x".to_owned(), None),
-            ("b.y".to_owned(), Some(2)),
-            ("again.w".to_owned(), Some(9)),
-        ]
-        .into();
-        subscribe_posters(&home, &store, &bots);
-        let names = |bot: &str| -> Vec<String> {
-            (crate::lookout::subs::read(&store, bot).into_iter())
-                .map(|sub| sub.name)
-                .collect()
-        };
-        assert_eq!(names("a.x"), ["commons.t"]);
-        assert_eq!(names("b.y"), ["commons.t"]);
-        // An agent of another store is not this store's to subscribe.
-        assert!(names("gone.z").is_empty());
-        // Nor one that took the name of an agent since removed.
-        assert!(names("again.w").is_empty());
-        // One that unsubscribed since stays so.
-        crate::lookout::subs::remove(&store, "b.y", "commons.t").unwrap();
-        subscribe_posters(&home, &store, &bots);
-        assert!(names("b.y").is_empty());
-        // A commons it cannot list, or a thread it cannot read, keeps the
-        // migration to do; no commons at all is done.
-        assert!(subscribe_all(&home.join("nowhere"), &store, &bots));
-        let file = home.join("not-a-folder");
-        std::fs::write(&file, "").unwrap();
-        assert!(!subscribe_all(&file, &store, &bots));
-        let other = home.join("other.sqlite");
-        let torn = dir(&home).join("torn.jsonl");
-        std::fs::write(&torn, "{\"by\": \"a.x\", \"text\": \"x\"}\n{torn").unwrap();
-        subscribe_posters(&home, &other, &bots);
-        let mut record = other.as_os_str().to_owned();
-        record.push(".migrated");
-        assert!(!crate::upgrade::lines(Path::new(&record)).contains(&POSTERS.to_owned()));
-        std::fs::write(&torn, "{\"by\": \"a.x\", \"text\": \"x\"}\n").unwrap();
-        subscribe_posters(&home, &other, &bots);
-        assert!(crate::upgrade::lines(Path::new(&record)).contains(&POSTERS.to_owned()));
-        let mut other_names: Vec<String> = (crate::lookout::subs::read(&other, "a.x").into_iter())
-            .map(|sub| sub.name)
-            .collect();
-        other_names.sort();
-        assert_eq!(other_names, ["commons.t", "commons.torn"]);
-        let _ = std::fs::remove_dir_all(&home);
     }
 
     #[test]
