@@ -42,7 +42,7 @@ class LookoutTests(ModelFixture):
         """The subscription Sonny writes for a lead when it opens its project."""
         folder = self.path / 'state.sqlite.lookout'
         folder.mkdir(exist_ok=True)
-        tasks = {'name': 'tasks', 'tasks_of': [lead], 'bots': [f'{project}.*']}
+        tasks = {'name': 'tasks', 'tasks_of': [lead], 'agents': [f'{project}.*']}
         (folder / f'{lead}.json').write_text(json.dumps({'subscriptions': [tasks]}))
 
     def make(self, *bots, declare=None):
@@ -303,7 +303,7 @@ class LookoutTests(ModelFixture):
         self.make('calc.lead', 'calc.fix', 'shop.lead', 'shop.fix')
         self.subscribe('calc.lead', 'calc')
         folder = self.path / 'state.sqlite.lookout'
-        tasks = {'name': 'tasks', 'tasks_of': ['shop.lead'], 'bots': ['shop.*'], 'digest': '1h'}
+        tasks = {'name': 'tasks', 'tasks_of': ['shop.lead'], 'agents': ['shop.*'], 'digest': '1h'}
         (folder / 'shop.lead.json').write_text(json.dumps({'subscriptions': [tasks]}))
         service = self.start()
         time.sleep(1)
@@ -347,14 +347,14 @@ class LookoutTests(ModelFixture):
         self.make('ops.deploy')
         self.start()
         self.host()
-        self.model.call_script = [('follows', {'add': {'name': 'deploys', 'bots': ['ops.*']}})]
+        self.model.call_script = [('follows', {'add': {'name': 'deploys', 'agents': ['ops.*']}})]
         turn = self.daemon.request('submit', bot='reviewer', request_id='s', prompt='script')['result']['message']
         self.assertEqual(self.daemon.finished(turn)['data']['status'], 'completed')
         events = self.daemon.request('events', bot='reviewer', after=0, limit=256)['result']['events']
         done = next(e for e in events if e['event'] == 'tool_completed')
         listed = json.loads(node_item(self.daemon, 'reviewer', done['data']['node'])['result']['output'])
         self.assertEqual(listed['added'], True)
-        self.assertEqual(listed['follows'][0]['bots'], ['ops.*'])
+        self.assertEqual(listed['follows'][0]['agents'], ['ops.*'])
         saved = json.loads((self.path / 'state.sqlite.lookout' / 'reviewer.json').read_text())
         self.assertEqual(saved['subscriptions'], listed['follows'])
         # Heard from the next event on, with no wait for a reread.
@@ -392,14 +392,14 @@ class LookoutTests(ModelFixture):
             return [line for line in map(json.loads, log.read_text().splitlines())
                     if line.get('lead') == 'reviewer' and line.get(key)]
 
-        listed({'add': {'name': 'deploys', 'bots': ['ops.*']}})
+        listed({'add': {'name': 'deploys', 'agents': ['ops.*']}})
         deadline = time.monotonic() + 20
         while not (log.exists() and lines('seated')):
             self.assertLess(time.monotonic(), deadline, 'the subscriber was never seated')
             time.sleep(.1)
         self.assertEqual(lines('reloaded'), [])
         # Its file changed: said once the lookout reads it.
-        listed({'add': {'name': 'reviews', 'bots': ['ops.*']}})
+        listed({'add': {'name': 'reviews', 'agents': ['ops.*']}})
         deadline = time.monotonic() + 30
         while not lines('reloaded'):
             self.assertLess(time.monotonic(), deadline, 'the change was never said')
