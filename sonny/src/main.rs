@@ -12817,7 +12817,7 @@ impl App {
                     KeyCode::Home => pane.screen.hold(usize::MAX),
                     KeyCode::End => pane.screen.latest(),
                     _ => {
-                        let paged = view.on_page();
+                        let paged = view.depth();
                         match view.key(*key, pane.screen.in_view()) {
                             background::Key::Stay => {}
                             background::Key::Close => self.close_pane(true),
@@ -12829,7 +12829,7 @@ impl App {
                         }
                         // A page opened or left is scrolled to anew.
                         if let Some(watch) = &mut self.watch
-                            && (watch.background.as_ref()).is_some_and(|v| v.on_page() != paged)
+                            && (watch.background.as_ref()).is_some_and(|v| v.depth() != paged)
                         {
                             watch.picked = None;
                         }
@@ -13446,13 +13446,40 @@ impl App {
             "back" => self.close_pane(true),
             // A link on a page of `/background`'s.
             "background-page" => {
-                if let Some(view) = self.watch.as_mut().and_then(|w| w.background.as_mut()) {
+                if let Some(watch) = self.watch.as_mut()
+                    && let Some(view) = watch.background.as_mut()
+                {
+                    let depth = view.depth();
                     let leaves = view.click(id);
+                    // A source's page opened over a follow's starts at
+                    // its top.
+                    if view.depth() != depth {
+                        watch.picked = None;
+                    }
                     self.pane_keys = true;
                     if let Some(url) = leaves {
                         self.follow(&url);
                     }
                 }
+            }
+            // A fact a source's page names, by its project and name:
+            // `/memory` open on it.
+            "fact" if self.options.side.is_none() => {
+                let (project, name) = id.rsplit_once('/').unwrap_or(("", id));
+                let project = (!project.is_empty()).then(|| project.to_owned());
+                self.memory_view();
+                if let Some(view) = self.watch.as_mut().and_then(|w| w.memory.as_mut()) {
+                    view.open_named(project, name.to_owned());
+                }
+                self.pane_keys = true;
+            }
+            // A commons thread a source's page names: `/commons` open on it.
+            "thread" if self.options.side.is_none() => {
+                self.commons();
+                if let Some(view) = self.watch.as_mut().and_then(|w| w.commons.as_mut()) {
+                    view.open_thread(id);
+                }
+                self.pane_keys = true;
             }
             // A row or a link in `/memory`.
             "memory" => {

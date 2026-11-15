@@ -275,6 +275,12 @@ impl View {
         });
     }
 
+    /// The fact `name` of `project` (none for the person's) opened as a
+    /// page, as a link elsewhere names it.
+    pub fn open_named(&mut self, project: Option<String>, name: String) {
+        self.open_fact(project, name);
+    }
+
     /// Open the fact `name` of `scope` as the next page, read off the
     /// screen thread.
     fn open_fact(&mut self, scope: Option<String>, name: String) {

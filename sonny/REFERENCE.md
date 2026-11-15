@@ -1152,7 +1152,19 @@ has something on it, or is off the screen, no time shows.
   which Enter lists; each source it hears with the newest thing it said
   on what the follow hears and how long ago, or `✗ down since 11:28`,
   never cut: when any word does not fit beside its name, every word goes
-  under its name on two rows at most, the age on the name's row; its
+  under its name on two rows at most, the age on the name's row; and
+  its name a link to the source's page, which opens over the follow's
+  (`←` goes back to it): `source`, how often it runs and `tells at most
+  every 5m` where it has a digest (one of Sonny's own says `Sonny's own`
+  and has no command); while it is down, since when, why and the last
+  lines its failed run wrote, five at most; its command whole; `said`,
+  the newest word on each topic it named in the last day with its age,
+  under its topic as on a follow's page when one does not fit beside it,
+  or `nothing since 11:27` while it is down, a topic Sonny shows linked
+  there (an agent of the tasks source, a commons thread, a fact); each
+  follow of it and whose, the agent a link, or `no one follows it`; and,
+  muted, `set in ~/.agent/config.toml`, since a source is yours to remove
+  there and `x` removes nothing on its page; its
   filter and steer in words (`where text starts with "main:"`; one that
   nests or has `$or` as written), digest, end as a date and what is left
   of the updates it lasts (`2 of 3 updates left`); and what it told in the
@@ -1188,6 +1200,8 @@ has something on it, or is off the screen, no time shows.
   ![/background's pages: enter on an automation, a follow and a command, each with the agent it belongs to as its first link](../docs/sonny/background-pages-60.png)
 
   ![A follow's page: its sources' newest words or down since when, and the lead's tasks follow with the agents it watches, the done folded](../docs/sonny/follow-page-60.png)
+
+  ![A source's page, opened from a follow's: mail down with why and its last lines, and ci's newest word on each topic and who follows it](../docs/sonny/source-page-60.png)
 
   ![An automation's page after a run: when it runs next, its check and what it said, its last run, what is left; and one whose agent its first run starts](../docs/sonny/automation-page-60.png)
 - `/usage` shows, in the pane beside the conversation,
