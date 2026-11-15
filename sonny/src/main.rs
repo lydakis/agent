@@ -11124,7 +11124,9 @@ impl App {
                         );
                         format!("Held: {what}")
                     } else {
-                        "Rate limited".into()
+                        // A failed call's backoff says what failed: a
+                        // dropped connection is not a rate limit.
+                        crate::task::capitalized(&status::waits_out(data))
                     };
                 }
             }
@@ -17471,11 +17473,18 @@ impl App {
                     .collect();
                 let room = composer.y as usize;
                 let mut rows = list::lines(&items, at, width, room);
-                // Why the list is short, in the rows it leaves.
+                // Why the list is short, in the rows it leaves: muted
+                // beside models to pick, in ink when it is the whole answer.
+                let alone = items.is_empty();
                 for refused in (picker.refused.iter())
                     .take((list::ROWS + 1).min(room).saturating_sub(rows.len()))
                 {
-                    rows.push(Line::from(format!("    {refused}")).dim());
+                    let why = Span::raw(refused.clone());
+                    rows.push(Line::from(vec![
+                        Span::raw("    "),
+                        Span::raw("✗ ").fg(Color::Red),
+                        if alone { why } else { why.dim() },
+                    ]));
                 }
                 over(frame, rows, composer);
                 let effort = picker.effort().unwrap_or("default");
@@ -26161,6 +26170,25 @@ mod tests {
             }
         })
         .await
+    }
+
+    #[tokio::test]
+    async fn a_dropped_connection_backing_off_never_reads_as_a_rate_limit() {
+        let client = daemon_answering(|_| json!({})).await;
+        let mut app = app(client);
+        app.daemon(turn_event("accepted", 1, json!({}))).await;
+        let paced = |data: Value| turn_event("turn_paced", 1, data);
+        app.daemon(paced(
+            json!({"resume_at_ms": 9, "retrying": "provider_stream_failed"}),
+        ))
+        .await;
+        assert_eq!(
+            app.running.as_ref().unwrap().phase,
+            "Retrying: provider unreachable"
+        );
+        // A pool a rate limit closed says so.
+        app.daemon(paced(json!({"resume_at_ms": 9}))).await;
+        assert_eq!(app.running.as_ref().unwrap().phase, "Rate limited");
     }
 
     #[tokio::test]

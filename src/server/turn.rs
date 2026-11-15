@@ -413,6 +413,9 @@ struct Accounting {
     /// when the run of holds it belongs to began, kept across tries.
     blocked: Option<agent_runtime::store::Blocked>,
     held_since: Option<u64>,
+    /// The error a failed call parked on while it backs off, when it
+    /// parked so rather than on a closed pool or a hold.
+    backing_off: Option<String>,
     /// The limit the call goes to without tool calls, if one does.
     limit: Option<Limit>,
     /// The daemon's own clock toward the next call: since when it runs
@@ -436,6 +439,7 @@ impl Accounting {
         self.call_spent_ms = 0;
         self.parked_until = now + blocked.wait_ms(now, hold_ms);
         self.blocked = Some(blocked);
+        self.backing_off = None;
         self.parked_until
     }
     fn totals(&self) -> (u64, u64) {
@@ -640,6 +644,7 @@ impl Turn {
             let copied = accounting.copied.take().filter(|_| compaction);
             let route = accounting.route.get().cloned();
             let blocked = accounting.blocked.take();
+            let retrying = accounting.backing_off.take();
             let held_since = accounting.held_since;
             // Commit the park and its accounting together, outside cancellation.
             self.store
@@ -658,6 +663,7 @@ impl Turn {
                         summary_retry_ms,
                         fallback,
                         blocked,
+                        retrying,
                         held_since,
                     )
                     .map(|_| ())
@@ -4191,6 +4197,7 @@ impl Turn {
                 accounting.call_spent_ms = spent.as_millis() as u64;
                 accounting.parked_until = now_ms() + block.as_millis() as u64;
                 accounting.blocked = None;
+                accounting.backing_off = None;
                 return Ok(None);
             }
             // Whatever the provider billed for a failed attempt is still spent.
@@ -4366,6 +4373,9 @@ impl Turn {
                 accounting.call_fallback = fallback.as_ref().map(Fallback::parked);
                 accounting.parked_until = now_ms() + block.as_millis() as u64;
                 accounting.blocked = None;
+                // A backoff's park says what it backs off from: a dropped
+                // connection is not a rate limit.
+                accounting.backing_off = pool.is_none().then(|| error.code.clone());
                 return Ok(None);
             }
             if !delay.is_zero() {
