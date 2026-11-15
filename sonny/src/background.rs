@@ -779,6 +779,45 @@ impl Field {
     }
 }
 
+/// `text` broken after its words into rows `room` wide, two at most, the
+/// second cut short with an ellipsis where more is left.
+fn two_rows(text: &str, room: usize) -> Vec<String> {
+    let room = room.max(8);
+    let mut rows = vec![String::new()];
+    for word in text.split(' ').filter(|w| !w.is_empty()) {
+        let full = rows.len() == 2;
+        let row = rows.last_mut().expect("a row");
+        let wide = row.width() + usize::from(!row.is_empty()) + word.width();
+        if row.is_empty() || wide <= room {
+            if !row.is_empty() {
+                row.push(' ');
+            }
+            row.push_str(word);
+            continue;
+        }
+        // Past the second row: it is cut where the row ends.
+        if full {
+            *row = crate::transcript::cut(&format!("{row} {word}"), room);
+            return rows;
+        }
+        rows.push(word.to_owned());
+    }
+    // A single word wider than a row is cut too.
+    for row in &mut rows {
+        if row.width() > room {
+            *row = crate::transcript::cut(row, room);
+        }
+    }
+    rows
+}
+
+/// `text` with every control character a space, for one row.
+fn plain(text: &str) -> String {
+    (text.chars())
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect()
+}
+
 /// `spans` cut to `room` columns: the span that crosses it cut short with
 /// an ellipsis, the rest left out.
 fn fit(spans: Vec<Span<'static>>, room: usize) -> Vec<Span<'static>> {
@@ -1706,45 +1745,61 @@ impl View {
             let wide = sub.sources.iter().map(|s| s.width()).max().unwrap_or(0);
             // Past the label, the mark, the name and the space after it.
             let past = FOLLOW_LABEL + 2 + wide + 2;
-            let rows = (sub.sources.iter())
+            // Each source's newest word on one row, and how long ago.
+            let said: Vec<Option<(String, String)>> = (sub.sources.iter())
                 .map(|written| {
-                    let name = written.split_once(':').map_or(written.as_str(), |s| s.0);
-                    let pad = Span::raw(" ".repeat(wide - written.width() + 2));
-                    let named = Span::raw(written.clone());
-                    let spans = match self.follow.down.get(name) {
-                        Some(down) => vec![
-                            Span::raw("✗ ").fg(Color::Red),
-                            named,
-                            pad,
-                            Span::raw(format!("down since {}", since_of(down.since_ms))),
-                        ],
-                        None => {
-                            let mark = match self.icons.get(name) {
-                                Some(icon) => Span::raw(format!("{icon} ")),
-                                None => Span::raw("  "),
-                            };
-                            let said = match self.follow.newest.get(written) {
-                                Some((text, at)) => {
-                                    let secs = (u128::from(now).saturating_sub(*at) / 1000) as u64;
-                                    let age = format!(" · {}", ago(secs));
-                                    let room = width.saturating_sub(past + age.width()).max(8);
-                                    let text: String = (text.lines().next().unwrap_or(""))
-                                        .chars()
-                                        .map(|c| if c.is_control() { ' ' } else { c })
-                                        .collect();
-                                    vec![
-                                        Span::raw(crate::transcript::cut(&text, room)),
-                                        Span::raw(age).dim(),
-                                    ]
-                                }
-                                None => vec![Span::raw("nothing yet").dim()],
-                            };
-                            [vec![mark, named, pad], said].concat()
-                        }
-                    };
-                    Field { spans, link: None }
+                    let (text, at) = self.follow.newest.get(written)?;
+                    let secs = (u128::from(now).saturating_sub(*at) / 1000) as u64;
+                    Some((plain(text.lines().next().unwrap_or_default()), ago(secs)))
                 })
                 .collect();
+            // A word is never cut beside its name: when any does not fit
+            // there, every word goes under its name, two rows at most.
+            let under = (sub.sources.iter().zip(&said)).any(|(written, said)| {
+                let name = lookout::sources::named(written).0;
+                !self.follow.down.contains_key(name)
+                    && said
+                        .as_ref()
+                        .is_some_and(|(text, age)| past + text.width() + 3 + age.width() > width)
+            });
+            let room = width.saturating_sub(FOLLOW_LABEL + 4);
+            let mut rows = Vec::new();
+            for (written, said) in sub.sources.iter().zip(said) {
+                let name = lookout::sources::named(written).0;
+                let pad = Span::raw(" ".repeat(wide - written.width() + 2));
+                let named = Span::raw(written.clone());
+                let mut words = Vec::new();
+                let spans = match self.follow.down.get(name) {
+                    Some(down) => vec![
+                        Span::raw("✗ ").fg(Color::Red),
+                        named,
+                        pad,
+                        Span::raw(format!("down since {}", since_of(down.since_ms))),
+                    ],
+                    None => {
+                        let mark = match self.icons.get(name) {
+                            Some(icon) => Span::raw(format!("{icon} ")),
+                            None => Span::raw("  "),
+                        };
+                        let said = match said {
+                            Some((text, age)) if under => {
+                                words = two_rows(&text, room);
+                                vec![Span::raw(age).dim()]
+                            }
+                            Some((text, age)) => {
+                                vec![Span::raw(text), Span::raw(format!(" · {age}")).dim()]
+                            }
+                            None => vec![Span::raw("nothing yet").dim()],
+                        };
+                        [vec![mark, named, pad], said].concat()
+                    }
+                };
+                rows.push(Field { spans, link: None });
+                rows.extend(words.into_iter().map(|row| Field {
+                    spans: vec![Span::raw(format!("  {row}"))],
+                    link: None,
+                }));
+            }
             fields.push(("sources", rows));
         }
         let pattern = |pattern: &Value| in_words(pattern).unwrap_or_else(|| spaced(pattern));
@@ -1938,15 +1993,54 @@ impl View {
                 Span::raw(INDENT),
             ));
         }
-        if !item.what.is_empty() {
+        // A follow in the words its page uses.
+        let what = match &item.sub {
+            Some(sub) => self.follow_words(sub),
+            None => item.what.clone(),
+        };
+        if !what.is_empty() {
             out.extend(crate::transcript::capped(
-                Line::from(item.what.clone()).dim(),
+                Line::from(what).dim(),
                 width,
                 Span::raw(format!("{INDENT}└ ")).dim(),
                 1,
             ));
         }
         out
+    }
+
+    /// What a follow watches and how it was set, in the words its page
+    /// uses: `tasks of lead, source ci where text starts with "main:",
+    /// until Fri 20 Nov 09:00`.
+    fn follow_words(&self, sub: &lookout::subs::Sub) -> String {
+        let pattern = |pattern: &Value| in_words(pattern).unwrap_or_else(|| spaced(pattern));
+        let mut words: Vec<String> = (sub.tasks_of.iter())
+            .map(|bot| format!("tasks of {}", self.scope.short(bot)))
+            .chain(sub.agents.iter().map(|glob| format!("agents {glob}")))
+            .chain(sub.sources.iter().map(|source| format!("source {source}")))
+            .collect();
+        if let Some(filter) = &sub.filter {
+            let last = words.pop().unwrap_or_default();
+            words.push(
+                format!("{last} where {}", pattern(filter))
+                    .trim_start()
+                    .to_owned(),
+            );
+        }
+        if let Some(digest) = &sub.digest {
+            words.push(format!("at most every {digest}"));
+        }
+        if let Some(steer) = &sub.steer {
+            words.push(format!("steers when {}", pattern(steer)));
+        }
+        if let Some(until) = &sub.until {
+            let until = sub.ends_at().map_or_else(|| until.clone(), trigger::date);
+            words.push(format!("until {until}"));
+        }
+        if let Some(runs) = sub.runs {
+            words.push(format!("for {runs} update{}", plural(runs)));
+        }
+        words.join(", ")
     }
 
     /// A question's reminder's rows: whose question and when, then what
@@ -2410,7 +2504,27 @@ mod tests {
         );
         // At 44 columns the newest word is cut to fit its row.
         let narrow = page_text(&mut view, 44);
-        assert_eq!(narrow[6], "         ⚙ ci:main  main: build 41… · 2m ago");
+        // The list's row says it in the page's words.
+        let card: Vec<String> = (view.card(150).0.iter()).map(|l| l.to_string()).collect();
+        assert!(card.iter().any(|l| l.contains(
+            "└ source mail, source ci:main where text starts with \"main:\" or starts with"
+        )));
+        assert!(
+            view.follow_words(&sub)
+                .ends_with(&format!("at most every 5m, steers when {{\"$or\": [{{\"text\": [{{\"suffix\": \"failed\"}}]}}]}}, until {until}, for 3 updates")),
+        );
+        // At 44 columns the newest word goes under its name, whole.
+        assert_eq!(
+            narrow[5..8],
+            [
+                format!(
+                    "sources  ✗ mail     down since {}",
+                    since_of(u128::from(since))
+                ),
+                "         ⚙ ci:main  2m ago".into(),
+                "           main: build 412 passed".into(),
+            ]
+        );
         // Before any note, it says so.
         std::fs::remove_file(&file).unwrap();
         std::fs::remove_file(&held).unwrap();
@@ -2419,6 +2533,24 @@ mod tests {
         assert!(page.contains(&"lasts    3 updates, none told yet".to_owned()));
         assert!(page.contains(&"told     nothing yet".to_owned()));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_word_too_long_for_its_row_breaks_after_a_word_onto_two_rows_at_most() {
+        assert_eq!(
+            two_rows("main: build 417 passed", 33),
+            ["main: build 417 passed"]
+        );
+        assert_eq!(
+            two_rows(
+                "release: build 417 failed in the integration suite on the arm64 runner after 14 minutes",
+                33
+            ),
+            [
+                "release: build 417 failed in the",
+                "integration suite on the arm64 r…"
+            ]
+        );
     }
 
     #[test]

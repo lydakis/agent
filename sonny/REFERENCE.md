@@ -1137,7 +1137,9 @@ has something on it, or is off the screen, no time shows.
   watches and every agent that matches now, each a link with its mark and
   state, those not done first and two done or more folded to `3 done`,
   which Enter lists; each source it hears with the newest thing it said
-  on what the follow hears and how long ago, or `✗ down since 11:28`; its
+  on what the follow hears and how long ago, or `✗ down since 11:28`,
+  never cut: when any word does not fit beside its name, every word goes
+  under its name on two rows at most, the age on the name's row; its
   filter and steer in words (`where text starts with "main:"`; one that
   nests or has `$or` as written), digest, end as a date and what is left
   of the updates it lasts (`2 of 3 updates left`); and what it told in the
