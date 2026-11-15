@@ -1919,7 +1919,11 @@ redraws it by hand, as in a shell.
 With nothing typed, `?` lists every key beside the conversation. In the
 pane, `?` lists every key the view in it takes, those its title has no
 room for too, one to a row, until the next key (`esc` only hides them);
-the sky keeps `?` for its legend. Every
+the sky keeps `?` for its legend.
+
+![/background at 44 columns: ? lists every key the title has no room for, and a confirm wraps rather than being cut](../docs/sonny/pane-keys-44.png)
+
+Every
 hint on screen is written one way, as Codex writes them: the key, then
 what it does muted, `·` between them (`↑↓ pick · enter open · esc
 close`). Each view names its keys once, and the same few words say what
