@@ -184,9 +184,9 @@ struct Run {
     making: Arc<tokio::sync::RwLock<()>>,
     /// Instructions composed, by folder and profile: once a run.
     told: Mutex<HashMap<(PathBuf, Option<String>), Told>>,
-    /// Its journal, opened to append. A line it cannot take ends the run
-    /// failed, as [`Run::broken`] says.
-    journal: Mutex<std::fs::File>,
+    /// Its journal, opened to append: none when it could not be opened. A
+    /// line it cannot take ends the run failed, as [`Run::broken`] says.
+    journal: Mutex<Option<std::fs::File>>,
     /// Why the journal last refused a line: the run ends failed, saying so,
     /// since what it does next could not be picked up again.
     broken: Mutex<Option<String>>,
@@ -366,6 +366,9 @@ pub async fn call(
     .map_err(|e| refused(e.to_string()))?;
     made.map_err(|e| refused(format!("{}: {e}", dir.display())))?;
     let run = load(&dir, store, socket).map_err(refused)?;
+    if let Some(why) = run.broken.lock().unwrap().clone() {
+        return Err(refused(why));
+    }
     let name = run.script.name().to_owned();
     start(run);
     let reused = match &plan.resumed_from {
@@ -634,16 +637,21 @@ fn load(dir: &Path, store: &Path, socket: &Path) -> Result<Arc<Run>, String> {
         .filter(|bot| !answered.contains(bot))
         .map(|bot| (bot, SUBMITTED))
         .collect();
+    // A journal it can read but not write still loads, broken: a run picked
+    // up again then ends failed through `finish`, which interrupts the
+    // workers it knows of, and a new one is refused (`run`).
     let path = dir.join("events.jsonl");
     let unwritable =
         |e: std::io::Error| format!("its journal {} could not be written: {e}", path.display());
-    let mut journal = std::fs::OpenOptions::new()
-        .append(true)
-        .open(&path)
-        .map_err(unwritable)?;
-    if cut {
-        journal.write_all(b"\n").map_err(unwritable)?;
-    }
+    let opened = std::fs::OpenOptions::new().append(true).open(&path);
+    let opened = opened.and_then(|mut file| match cut {
+        true => file.write_all(b"\n").map(|()| file),
+        false => Ok(file),
+    });
+    let (journal, broken) = match opened {
+        Ok(file) => (Some(file), None),
+        Err(e) => (None, Some(unwritable(e))),
+    };
     Ok(Arc::new(Run {
         script,
         dir: dir.to_owned(),
@@ -663,7 +671,7 @@ fn load(dir: &Path, store: &Path, socket: &Path) -> Result<Arc<Run>, String> {
         making: Arc::default(),
         told: Mutex::default(),
         journal: Mutex::new(journal),
-        broken: Mutex::default(),
+        broken: Mutex::new(broken),
         plan,
     }))
 }
@@ -691,7 +699,10 @@ pub fn resume(store: PathBuf, socket: PathBuf) {
                 }
             }
             // Unended, or its ending never written whole: run again. One
-            // that cannot be picked up ends failed, saying why.
+            // that cannot be picked up ends failed, saying why: one whose
+            // journal cannot be written is loaded broken and ends through
+            // `finish`, its workers interrupted; this is one whose plan,
+            // script or journal cannot be read, so whose workers are unknown.
             None => match load(&path, &store, &socket) {
                 Ok(run) => {
                     let _ = run.note(json!({"t": "replay", "at_ms": now_ms()}));
@@ -772,7 +783,10 @@ impl Run {
     fn note(&self, line: Value) -> Result<(), String> {
         let mut text = line.to_string();
         text.push('\n');
-        let written = self.journal.lock().unwrap().write_all(text.as_bytes());
+        let written = match self.journal.lock().unwrap().as_mut() {
+            Some(file) => file.write_all(text.as_bytes()),
+            None => Err(std::io::Error::other("it is not open")),
+        };
         written.map_err(|e| {
             let why = format!(
                 "its journal {} could not be written: {e}",
@@ -2139,7 +2153,7 @@ mod tests {
         let run = load(&run_dir, &dir, &socket).unwrap();
         assert!(run.note(json!({"t": "phase", "title": "Find"})).is_ok());
         assert!(!run.stopping());
-        *run.journal.lock().unwrap() = std::fs::File::open(&journal).unwrap();
+        *run.journal.lock().unwrap() = Some(std::fs::File::open(&journal).unwrap());
         let why = run
             .note(json!({"t": "phase", "title": "Check"}))
             .unwrap_err();
@@ -2173,6 +2187,25 @@ mod tests {
             said.contains("could not be saved") && said.contains("disk full"),
             "{said}"
         );
+        // A journal it can read but not write loads broken, knowing the
+        // workers it submitted to, so its end interrupts them. (Root writes
+        // past a file's mode.)
+        if unsafe { libc::geteuid() } != 0 {
+            use std::os::unix::fs::PermissionsExt;
+            let mut file = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&journal)
+                .unwrap();
+            file.write_all(b"{\"t\": \"submit\", \"worker\": \"shop.wf-r1-k1\"}\n")
+                .unwrap();
+            std::fs::set_permissions(&journal, std::fs::Permissions::from_mode(0o444)).unwrap();
+            let run = load(&run_dir, &dir, &socket).unwrap();
+            assert!(run.stopping());
+            assert!(run.live.lock().unwrap().contains_key("shop.wf-r1-k1"));
+            let why = run.note(json!({"t": "replay"})).unwrap_err();
+            assert!(why.contains("could not be written"), "{why}");
+            std::fs::set_permissions(&journal, std::fs::Permissions::from_mode(0o644)).unwrap();
+        }
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
