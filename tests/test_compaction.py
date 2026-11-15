@@ -465,13 +465,17 @@ class CompactionTests(ModelFixture):
                     client = Client(self.binary, path, self.url)
                     self.addCleanup(client.close)
                 self.assertEqual(client.finished(turn)['data']['status'], 'completed')
+                # The 64 refused summaries, then the one ordinary call. A
+                # summary for the next head may follow once the turn ends,
+                # before or after this read: it is the later head's.
                 requests = self.requests()
-                self.assertEqual(sum(is_summary(r) for r in requests), 64)
-                self.assertEqual(sum(not is_summary(r) for r in requests), 1)
+                self.assertEqual([i for i, r in enumerate(requests) if not is_summary(r)], [64])
+                later = requests[65:]
                 # A subsequent head may compact again; the failed attempt does
                 # not permanently disable compaction for this bot.
                 self.run_turn(client, 'Bob', 'later', 'continue')
-                self.assertTrue(any(is_summary(r) for r in self.requests()))
+                later += self.requests()
+                self.assertTrue(any(is_summary(r) for r in later))
                 client.close()
 
     def run_turn(self, client, bot, request, prompt):

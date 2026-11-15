@@ -163,7 +163,9 @@ struct Plan {
 /// A run going on in this host.
 struct Run {
     plan: Plan,
-    script: script::Script,
+    /// None when it could not be read again: the run is then broken, and
+    /// ends failed through `finish`, its workers interrupted.
+    script: Option<script::Script>,
     dir: PathBuf,
     store: PathBuf,
     socket: PathBuf,
@@ -184,7 +186,12 @@ struct Run {
     making: Arc<tokio::sync::RwLock<()>>,
     /// Instructions composed, by folder and profile: once a run.
     told: Mutex<HashMap<(PathBuf, Option<String>), Told>>,
+    /// Its journal, opened to append: none when it could not be opened. A
+    /// line it cannot take ends the run failed, as [`Run::broken`] says.
     journal: Mutex<Option<std::fs::File>>,
+    /// Why the journal last refused a line: the run ends failed, saying so,
+    /// since what it does next could not be picked up again.
+    broken: Mutex<Option<String>>,
 }
 
 /// What a worker in a folder is told, and its profile's model and tools.
@@ -361,7 +368,10 @@ pub async fn call(
     .map_err(|e| refused(e.to_string()))?;
     made.map_err(|e| refused(format!("{}: {e}", dir.display())))?;
     let run = load(&dir, store, socket).map_err(refused)?;
-    let name = run.script.name().to_owned();
+    if let Some(why) = run.broken.lock().unwrap().clone() {
+        return Err(refused(why));
+    }
+    let name = (run.script.as_ref()).map_or(String::new(), |script| script.name().to_owned());
     start(run);
     let reused = match &plan.resumed_from {
         Some(from) => {
@@ -522,7 +532,7 @@ fn make(dir: &Path, plan: &Plan, source: &str, from: Option<&Path>) -> std::io::
     std::fs::write(dir.join("script.js"), source)?;
     let mut journal = String::new();
     if let Some(from) = from {
-        for (key, (value, ..)) in answers_of(from) {
+        for (key, (value, ..)) in answers_of(from).map_err(std::io::Error::other)? {
             // A worker that failed then runs again.
             if !value.is_null() {
                 journal.push_str(
@@ -547,8 +557,8 @@ fn read_plan(dir: &Path) -> Result<Plan, String> {
 /// The answers the journal in `dir` records, by call key, each with
 /// whether it came from an earlier run, and the output tokens this run's
 /// own agents spent.
-fn answers_of(dir: &Path) -> HashMap<String, Answer> {
-    journal_of(dir).answers
+fn answers_of(dir: &Path) -> Result<HashMap<String, Answer>, String> {
+    Ok(journal_of(dir)?.answers)
 }
 
 /// A call's recorded value, whether an earlier run gave it, and the
@@ -570,11 +580,16 @@ struct Journal {
     submitted: HashSet<String>,
 }
 
-fn journal_of(dir: &Path) -> Journal {
+/// The journal of the run in `dir`. One that cannot be read is an error,
+/// never an empty journal: a run read from nothing would ask every call
+/// again.
+fn journal_of(dir: &Path) -> Result<Journal, String> {
     let mut journal = Journal::default();
     // Each line is read on its own, from bytes: a line a crash cut short,
     // even inside a character, costs only that line.
-    let bytes = std::fs::read(dir.join("events.jsonl")).unwrap_or_default();
+    let path = dir.join("events.jsonl");
+    let bytes = std::fs::read(&path)
+        .map_err(|e| format!("its journal {} could not be read: {e}", path.display()))?;
     journal.cut = bytes.last().is_some_and(|last| *last != b'\n');
     for line in bytes.split(|byte| *byte == b'\n') {
         let Ok(mut entry) = serde_json::from_slice::<Value>(line) else {
@@ -601,21 +616,20 @@ fn journal_of(dir: &Path) -> Journal {
             (entry["value"].take(), earlier, tokens),
         );
     }
-    journal
+    Ok(journal)
 }
 
 /// The run kept in `dir`, read to go on.
 fn load(dir: &Path, store: &Path, socket: &Path) -> Result<Arc<Run>, String> {
     let plan = read_plan(dir)?;
-    let source = read_file(&dir.join("script.js"))?;
-    let script = script::read(&source)?;
+    let script = read_file(&dir.join("script.js")).and_then(|source| script::read(&source));
     let Journal {
         answers,
         spent,
         cut,
         stopped,
         submitted,
-    } = journal_of(dir);
+    } = journal_of(dir)?;
     // Workers it submitted to and has no answer from may still run: known,
     // so a stop or end interrupts them and a replay takes them up again.
     let worker = |key: &String| format!("{}.{WORKER}{}-{key}", plan.project, plan.id);
@@ -624,14 +638,30 @@ fn load(dir: &Path, store: &Path, socket: &Path) -> Result<Arc<Run>, String> {
         .filter(|bot| !answered.contains(bot))
         .map(|bot| (bot, SUBMITTED))
         .collect();
-    let mut journal = std::fs::OpenOptions::new()
-        .append(true)
-        .create(true)
-        .open(dir.join("events.jsonl"))
-        .ok();
-    if cut && let Some(file) = journal.as_mut() {
-        let _ = file.write_all(b"\n");
-    }
+    // A journal it can read but not write still loads, broken: a run picked
+    // up again then ends failed through `finish`, which interrupts the
+    // workers it knows of, and a new one is refused (`run`).
+    let path = dir.join("events.jsonl");
+    let unwritable =
+        |e: std::io::Error| format!("its journal {} could not be written: {e}", path.display());
+    let opened = std::fs::OpenOptions::new().append(true).open(&path);
+    let opened = opened.and_then(|mut file| match cut {
+        true => file.write_all(b"\n").map(|()| file),
+        false => Ok(file),
+    });
+    let (journal, broken) = match opened {
+        Ok(file) => (Some(file), None),
+        Err(e) => (None, Some(unwritable(e))),
+    };
+    // So does a script that no longer reads: the workers its journal
+    // knows of may still run.
+    let (script, broken) = match script {
+        Ok(script) => (Some(script), broken),
+        Err(why) => (
+            None,
+            broken.or(Some(format!("its script could not be read again: {why}"))),
+        ),
+    };
     Ok(Arc::new(Run {
         script,
         dir: dir.to_owned(),
@@ -651,6 +681,7 @@ fn load(dir: &Path, store: &Path, socket: &Path) -> Result<Arc<Run>, String> {
         making: Arc::default(),
         told: Mutex::default(),
         journal: Mutex::new(journal),
+        broken: Mutex::new(broken),
         plan,
     }))
 }
@@ -677,13 +708,29 @@ pub fn resume(store: PathBuf, socket: PathBuf) {
                     deliver(plan, result, path, socket.clone());
                 }
             }
-            // Unended, or its ending never written whole: run again.
-            None => {
-                if let Ok(run) = load(&path, &store, &socket) {
-                    run.note(json!({"t": "replay", "at_ms": now_ms()}));
+            // Unended, or its ending never written whole: run again. One
+            // that cannot be picked up ends failed, saying why: one whose
+            // journal cannot be written, or whose script no longer reads, is
+            // loaded broken and ends through `finish`, its workers
+            // interrupted; this is one whose plan or journal cannot be read,
+            // so whose workers are unknown.
+            None => match load(&path, &store, &socket) {
+                Ok(run) => {
+                    let _ = run.note(json!({"t": "replay", "at_ms": now_ms()}));
                     start(run);
                 }
-            }
+                Err(why) => {
+                    if let Ok(plan) = read_plan(&path) {
+                        let mut ended = json!({"status": "failed", "result": null,
+                            "error": format!("the run could not be picked up again: {why}"),
+                            "agents": 0, "nulls": 0, "reused": 0, "output_tokens": 0,
+                            "kept": [], "ended_ms": now_ms(), "told": false});
+                        let kept = keep_result(&path, &ended);
+                        unsaved(&mut ended, kept);
+                        deliver(plan, ended, path, socket.clone());
+                    }
+                }
+            },
         }
     }
 }
@@ -720,30 +767,54 @@ async fn stop(client: &Client, caller: &str, id: &str) -> Result<String, String>
         return Err(format!("run {id} is {}'s to stop", run.plan.caller));
     }
     // Kept before it is acknowledged, so a host that goes away before
-    // the run ends still ends it stopped.
-    run.note(json!({"t": "stop", "at_ms": now_ms()}));
+    // the run ends still ends it stopped. A stop the journal refused still
+    // stops it, and the run ends failed, saying why.
+    let kept = run.note(json!({"t": "stop", "at_ms": now_ms()}));
     run.stopping.store(true, Ordering::SeqCst);
     run.halt.notify_waiters();
     let (stopped, _) = run.interrupt(client).await;
-    Ok(format!(
+    let mut said = format!(
         "Stopping workflow {} (run {id}): {stopped} running agent{} interrupted. You hear back \
          once it has ended, with what finished.",
-        run.script.name(),
+        (run.script.as_ref()).map_or(run.plan.id.as_str(), |script| script.name()),
         if stopped == 1 { "" } else { "s" }
-    ))
+    );
+    if let Err(why) = kept {
+        said.push_str(&format!(
+            " The stop was not saved ({why}), so the run ends failed rather than stopped."
+        ));
+    }
+    Ok(said)
 }
 
 impl Run {
-    fn note(&self, line: Value) {
-        if let Some(file) = self.journal.lock().unwrap().as_mut() {
-            let mut text = line.to_string();
-            text.push('\n');
-            let _ = file.write_all(text.as_bytes());
-        }
+    /// Add `line` to the journal. A line it cannot take halts the run,
+    /// which then ends failed, saying why: its steps from here on could
+    /// not be picked up again.
+    fn note(&self, line: Value) -> Result<(), String> {
+        let mut text = line.to_string();
+        text.push('\n');
+        let written = match self.journal.lock().unwrap().as_mut() {
+            Some(file) => file.write_all(text.as_bytes()),
+            None => Err(std::io::Error::other("it is not open")),
+        };
+        written.map_err(|e| {
+            let why = format!(
+                "its journal {} could not be written: {e}",
+                self.dir.join("events.jsonl").display()
+            );
+            self.broken
+                .lock()
+                .unwrap()
+                .get_or_insert_with(|| why.clone());
+            self.halt.notify_waiters();
+            why
+        })
     }
 
+    /// Whether the run is to stop: it was told to, or its journal broke.
     fn stopping(&self) -> bool {
-        self.stopping.load(Ordering::SeqCst)
+        self.stopping.load(Ordering::SeqCst) || self.broken.lock().unwrap().is_some()
     }
 
     /// Interrupt every worker whose turn runs: how many there were, and
@@ -1099,7 +1170,7 @@ impl script::Host for Attempt {
         run.note(
             json!({"t": "asking", "key": key, "label": asked.label, "phase": asked.phase,
             "bot": worker, "at_ms": now_ms()}),
-        );
+        )?;
         let done = || run.live.lock().unwrap().remove(&worker);
         match self.work(&worker, &key, &prompt, &asked).await {
             Ok((value, turn, tokens, error)) => {
@@ -1108,7 +1179,9 @@ impl script::Host for Attempt {
                 if value.is_null() {
                     self.nulls.fetch_add(1, Ordering::SeqCst);
                 }
-                run.note(json!({"t": "agent", "key": key, "label": asked.label,
+                // Unrecorded, the answer is still this go's; the run halts
+                // and ends failed.
+                let _ = run.note(json!({"t": "agent", "key": key, "label": asked.label,
                     "phase": asked.phase, "bot": worker, "turn": turn, "value": value,
                     "output_tokens": tokens, "error": error, "at_ms": now_ms()}));
                 run.answers
@@ -1121,9 +1194,14 @@ impl script::Host for Attempt {
             Err(Trouble::Thrown(error)) => {
                 // Not an answer: a replay asks again. It ends what a window
                 // counts as running.
-                run.note(json!({"t": "thrown", "key": key, "phase": asked.phase,
+                let _ = run.note(json!({"t": "thrown", "key": key, "phase": asked.phase,
                     "error": error, "at_ms": now_ms()}));
-                done();
+                // With its journal broken the run ends here, its workers
+                // still known, so a turn one still runs is interrupted
+                // and counted.
+                if run.broken.lock().unwrap().is_none() {
+                    done();
+                }
                 Err(error)
             }
             Err(Trouble::Lost) => {
@@ -1135,13 +1213,11 @@ impl script::Host for Attempt {
     }
 
     fn phase(&self, title: &str) {
-        self.run
-            .note(json!({"t": "phase", "title": title, "at_ms": now_ms()}));
+        let _ = (self.run).note(json!({"t": "phase", "title": title, "at_ms": now_ms()}));
     }
 
     fn log(&self, text: &str) {
-        self.run
-            .note(json!({"t": "log", "text": text, "at_ms": now_ms()}));
+        let _ = (self.run).note(json!({"t": "log", "text": text, "at_ms": now_ms()}));
     }
 
     /// What this go's calls cost so far, the ones answered from the
@@ -1358,8 +1434,15 @@ impl Attempt {
             }
         };
         live(Some(SUBMITTED));
-        self.run
-            .note(json!({"t": "submit", "worker": worker, "at_ms": now_ms()}));
+        // A submission the journal does not know of could not be stopped
+        // after a restart: none is sent. The worker stays known, as one a
+        // replay found submitted may still run from the go before: the
+        // run's end interrupts it and counts what it spent.
+        if let Err(why) =
+            (self.run).note(json!({"t": "submit", "worker": worker, "at_ms": now_ms()}))
+        {
+            return Err(Trouble::Thrown(why));
+        }
         let submitted = match self.client.request("submit", submit).await {
             Ok(submitted) => submitted,
             Err(error) if lost(&error) => return Err(Trouble::Lost),
@@ -1475,7 +1558,7 @@ async fn drive(run: Arc<Run>) {
             let stop = run.dir.join(view::STOP);
             loop {
                 if !run.stopping() && tokio::fs::try_exists(&stop).await.unwrap_or(false) {
-                    run.note(json!({"t": "stop", "at_ms": now_ms()}));
+                    let _ = run.note(json!({"t": "stop", "at_ms": now_ms()}));
                     run.stopping.store(true, Ordering::SeqCst);
                     run.halt.notify_waiters();
                 }
@@ -1516,16 +1599,19 @@ async fn drive(run: Arc<Run>) {
         for worker in reserved {
             tokio::spawn(Attempt::release_when_ended(Arc::clone(&attempt), worker));
         }
+        let Some(script) = &run.script else {
+            break (script::Ended::Halted, Some(attempt));
+        };
         let ended = script::run(
             Arc::clone(&attempt),
-            &run.script,
+            script,
             run.plan.args.clone(),
             run.plan.budget,
         )
         .await;
         if attempt.lost.load(Ordering::SeqCst) && !run.stopping() {
             client.close().await;
-            run.note(json!({"t": "replay", "at_ms": now_ms()}));
+            let _ = run.note(json!({"t": "replay", "at_ms": now_ms()}));
             tokio::time::sleep(AGAIN).await;
             continue;
         }
@@ -1595,11 +1681,22 @@ async fn finish(run: &Run, ended: script::Ended, attempt: Option<&Attempt>) {
             .ok()
             .map(|(client, _)| client);
     }
-    let (status, result, error) = match ended {
+    let (mut status, result, mut error) = match ended {
         script::Ended::Returned(value) => ("completed", value, None),
         script::Ended::Threw(error) => ("failed", Value::Null, Some(error)),
         script::Ended::Halted => ("stopped", Value::Null, None),
     };
+    // A journal that refused a line, or refuses the end, fails the run
+    // whatever its script did.
+    let ending = json!({"t": "end", "status": status, "error": error, "at_ms": now_ms()});
+    let journaled = run.note(ending);
+    if let Some(why) = run.broken.lock().unwrap().clone().or(journaled.err()) {
+        status = "failed";
+        error = Some(match error {
+            Some(thrown) => format!("{why}\n{thrown}"),
+            None => why,
+        });
+    }
     let count =
         |of: fn(&Attempt) -> &AtomicU64| attempt.map_or(0, |a| of(a).load(Ordering::SeqCst));
     let trees: Vec<String> = run.trees.lock().unwrap().iter().cloned().collect();
@@ -1625,12 +1722,12 @@ async fn finish(run: &Run, ended: script::Ended, attempt: Option<&Attempt>) {
     })
     .await
     .unwrap_or_default();
-    let ended = json!({"status": status, "result": result, "error": error,
+    let mut ended = json!({"status": status, "result": result, "error": error,
         "agents": count(|a| &a.calls), "nulls": count(|a| &a.nulls),
         "reused": count(|a| &a.reused), "output_tokens": run.spent.load(Ordering::SeqCst),
         "kept": kept, "ended_ms": now_ms(), "told": false});
-    run.note(json!({"t": "end", "status": status, "error": error, "at_ms": now_ms()}));
-    let _ = keep_result(&run.dir, &ended);
+    let kept = keep_result(&run.dir, &ended);
+    unsaved(&mut ended, kept);
     deliver(plan.clone(), ended, run.dir.clone(), run.socket.clone());
 }
 
@@ -1640,8 +1737,18 @@ fn deliver(plan: Plan, mut ended: Value, dir: PathBuf, socket: PathBuf) {
     tokio::spawn(async move {
         tell(&plan, &ended, &dir, &socket).await;
         ended["told"] = json!(true);
+        // Unmarked, the caller is told again when the host next starts:
+        // twice, never not at all.
         let _ = keep_result(&dir, &ended);
     });
+}
+
+/// Note in `ended`, for its caller, that it could not be saved: a host
+/// that starts again runs it again.
+fn unsaved(ended: &mut Value, kept: std::io::Result<()>) {
+    if let Err(e) = kept {
+        ended["unsaved"] = json!(e.to_string());
+    }
 }
 
 /// The workflow `reference` names, as the run in `dir` first read it: its
@@ -1757,6 +1864,13 @@ fn told(plan: &Plan, ended: &Value, dir: &Path) -> String {
     said.push_str(&format!(": {counts}; {tokens} output tokens.\n\n"));
     if let Some(error) = ended["error"].as_str() {
         said.push_str(&format!("Error:\n{}\n\n", cut(error, TOLD_BYTES / 2)));
+    }
+    if let Some(why) = ended["unsaved"].as_str() {
+        said.push_str(&format!(
+            "How it ended could not be saved to {} ({why}): when the tool host starts again, \
+             it runs this workflow again from its journal.\n\n",
+            dir.join("result.json").display()
+        ));
     }
     if ended["status"] == "completed" {
         let result = match &ended["result"] {
@@ -1974,7 +2088,7 @@ mod tests {
             cut,
             stopped,
             ..
-        } = journal_of(&dir);
+        } = journal_of(&dir).unwrap();
         assert!(cut && !stopped);
         assert_eq!(spent, 10);
         assert_eq!(answers["k1"], (json!("x"), false, 7));
@@ -1991,7 +2105,7 @@ mod tests {
         .unwrap();
         let source = "export const meta = {name: 'next', description: 'x'}\nreturn 1\n";
         make(&next, &plan, source, Some(&dir)).unwrap();
-        let Journal { answers, spent, .. } = journal_of(&next);
+        let Journal { answers, spent, .. } = journal_of(&next).unwrap();
         assert_eq!(spent, 0);
         assert_eq!(answers.len(), 2);
         assert!(
@@ -2007,8 +2121,8 @@ mod tests {
             .open(dir.join("events.jsonl"))
             .unwrap();
         file.write_all(b"\n{\"t\": \"stop\"}\n").unwrap();
-        assert!(journal_of(&dir).stopped);
-        assert!(!journal_of(&next).stopped);
+        assert!(journal_of(&dir).unwrap().stopped);
+        assert!(!journal_of(&next).unwrap().stopped);
         // Loaded again, a stopped run is stopping, and knows the workers it
         // submitted to that have not answered, to interrupt them.
         let mut file = std::fs::OpenOptions::new()
@@ -2029,6 +2143,104 @@ mod tests {
             *run.live.lock().unwrap(),
             HashMap::from([("shop.wf-next-k9".to_owned(), SUBMITTED)])
         );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_run_whose_journal_fails_ends_failed_saying_why() {
+        let dir = std::env::temp_dir().join(format!("sonny-journal-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let plan: Plan = serde_json::from_value(json!({"id": "r1", "caller": "shop.lead",
+            "caller_id": 1, "turn": 1, "project": "shop", "roles": "/", "workspace": "/",
+            "model": "openai/m", "effort": null, "mode": "auto", "held": null, "state": null,
+            "args": null, "budget": null, "meta": {}, "resumed_from": null, "started_ms": 0,
+            "max_agents": 1000, "at_once": 4}))
+        .unwrap();
+        let source = "export const meta = {name: 'r1', description: 'x'}\nreturn 1\n";
+        let run_dir = dir.join("r1");
+        make(&run_dir, &plan, source, None).unwrap();
+        let socket = dir.join("socket");
+        // A journal that cannot be read is no run to pick up, and no run
+        // to resume from: never an empty one.
+        let journal = run_dir.join("events.jsonl");
+        std::fs::rename(&journal, dir.join("aside")).unwrap();
+        let why = load(&run_dir, &dir, &socket).err().unwrap();
+        assert!(why.contains("could not be read"), "{why}");
+        let error = make(&dir.join("r2"), &plan, source, Some(&run_dir)).unwrap_err();
+        assert!(error.to_string().contains("could not be read"), "{error}");
+        std::fs::rename(dir.join("aside"), &journal).unwrap();
+        // A line it cannot take halts the run, which ends failed saying why.
+        let run = load(&run_dir, &dir, &socket).unwrap();
+        assert!(run.note(json!({"t": "phase", "title": "Find"})).is_ok());
+        assert!(!run.stopping());
+        *run.journal.lock().unwrap() = Some(std::fs::File::open(&journal).unwrap());
+        let why = run
+            .note(json!({"t": "phase", "title": "Check"}))
+            .unwrap_err();
+        assert!(why.contains("could not be written"), "{why}");
+        assert!(run.stopping());
+        finish(&run, script::Ended::Halted, None).await;
+        let ended: Value =
+            serde_json::from_slice(&std::fs::read(run_dir.join("result.json")).unwrap()).unwrap();
+        assert_eq!(ended["status"], "failed");
+        assert_eq!(ended["error"], json!(why));
+        let said = told(&plan, &ended, &run_dir);
+        assert!(
+            said.contains("failed after") && said.contains(&why),
+            "{said}"
+        );
+        // A script that returned all the same fails: its run could not be
+        // picked up again.
+        std::fs::remove_file(run_dir.join("result.json")).unwrap();
+        finish(&run, script::Ended::Returned(json!(1)), None).await;
+        let ended: Value =
+            serde_json::from_slice(&std::fs::read(run_dir.join("result.json")).unwrap()).unwrap();
+        assert_eq!(
+            (&ended["status"], &ended["result"]),
+            (&json!("failed"), &json!(1))
+        );
+        // An ending that cannot be saved is told, with what follows.
+        let mut ended = json!({"status": "completed", "result": 1, "ended_ms": 0, "kept": []});
+        unsaved(&mut ended, Err(std::io::Error::other("disk full")));
+        let said = told(&plan, &ended, &run_dir);
+        assert!(
+            said.contains("could not be saved") && said.contains("disk full"),
+            "{said}"
+        );
+        // A journal it can read but not write loads broken, knowing the
+        // workers it submitted to, so its end interrupts them. (Root writes
+        // past a file's mode.)
+        // SAFETY: geteuid takes nothing and cannot fail.
+        if unsafe { libc::geteuid() } != 0 {
+            use std::os::unix::fs::PermissionsExt;
+            let mut file = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&journal)
+                .unwrap();
+            file.write_all(b"{\"t\": \"submit\", \"worker\": \"shop.wf-r1-k1\"}\n")
+                .unwrap();
+            std::fs::set_permissions(&journal, std::fs::Permissions::from_mode(0o444)).unwrap();
+            let run = load(&run_dir, &dir, &socket).unwrap();
+            assert!(run.stopping());
+            assert!(run.live.lock().unwrap().contains_key("shop.wf-r1-k1"));
+            let why = run.note(json!({"t": "replay"})).unwrap_err();
+            assert!(why.contains("could not be written"), "{why}");
+            std::fs::set_permissions(&journal, std::fs::Permissions::from_mode(0o644)).unwrap();
+        }
+        // A script that no longer reads loads broken too, knowing the
+        // workers its journal submitted to, so its end interrupts them.
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&journal)
+            .unwrap()
+            .write_all(b"{\"t\": \"submit\", \"worker\": \"shop.wf-r1-k2\"}\n")
+            .unwrap();
+        std::fs::write(run_dir.join("script.js"), "return 1\n").unwrap();
+        let run = load(&run_dir, &dir, &socket).unwrap();
+        assert!(run.script.is_none() && run.stopping());
+        assert!(run.live.lock().unwrap().contains_key("shop.wf-r1-k2"));
+        let why = run.broken.lock().unwrap().clone().unwrap();
+        assert!(why.contains("its script could not be read again"), "{why}");
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
