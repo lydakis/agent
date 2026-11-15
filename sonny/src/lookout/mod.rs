@@ -1051,6 +1051,10 @@ impl Service {
             .filter_map(|b| Some((b["name"].as_str()?.to_owned(), b.clone())))
             .collect();
         self.made = Made::of(&self.records);
+        // Files renamed before anything rewrites them: a writer reads a
+        // file as `Sub` and would drop a key not yet renamed.
+        subs::steer_files(&self.store);
+        subs::agents_files(&self.store);
         // Agents that posted in the commons before posting subscribed them
         // are subscribed to its threads, once, from a whole listing.
         if complete
@@ -1067,8 +1071,6 @@ impl Service {
         if complete {
             crate::approvals::nested_gone(client.clone(), &bots, &self.store);
         }
-        subs::steer_files(&self.store);
-        subs::agents_files(&self.store);
         subs::goals_gone(&self.store);
         if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
             crate::commons::woken_gone(&home);
