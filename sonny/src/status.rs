@@ -611,6 +611,7 @@ pub fn cause(code: &str) -> String {
         }
         _ if code.starts_with("provider_aws_credentials") => "AWS sign-in",
         "provider_quota_exhausted" => "usage limit reached",
+        "provider_key_unavailable" => "API key not set",
         "provider_http_401" => "API key refused",
         "provider_http_403" => "access refused",
         "provider_unavailable" => "provider not set up",
@@ -635,12 +636,26 @@ pub fn cause(code: &str) -> String {
 /// right, from the daemon's cause (`code`) and what the provider said
 /// (`detail`).
 pub fn held_cause(code: &str, detail: Option<&str>) -> (String, String) {
+    // The daemon's detail leads with the variable it started without.
+    if code == "provider_key_unavailable"
+        && let Some(key) = detail
+            .and_then(|detail| detail.split_whitespace().next())
+            .filter(|key| key.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'))
+    {
+        return (
+            format!("{key} not set"),
+            format!("set {key} in ~/.agent/keys/env and restart the daemon"),
+        );
+    }
     let fix = match code {
         "provider_login_rejected" | "provider_login_expired" | "provider_login_unavailable" => {
             "run agent login chatgpt; held turns go on at once".to_owned()
         }
         "provider_quota_exhausted" => {
             "they go on when the limit resets, tried again each hour at most".to_owned()
+        }
+        "provider_key_unavailable" => {
+            "set the key in ~/.agent/keys/env and restart the daemon".to_owned()
         }
         "provider_http_401" => "fix the key in ~/.agent/keys/env and restart the daemon".to_owned(),
         "provider_http_403" => "check the account's access, then agent retry".to_owned(),
@@ -829,6 +844,7 @@ mod tests {
     fn one_table_says_every_provider_failure_truly() {
         for (code, said) in [
             ("provider_http_401", "API key refused"),
+            ("provider_key_unavailable", "API key not set"),
             ("provider_http_403", "access refused"),
             ("provider_login_expired", "ChatGPT sign-in"),
             ("provider_aws_credentials_expired", "AWS sign-in"),
@@ -846,6 +862,24 @@ mod tests {
         }
         // A held turn says what the table says.
         assert_eq!(held_cause("provider_http_401", None).0, "API key refused");
+    }
+
+    #[test]
+    fn a_turn_held_on_a_missing_key_names_it_and_where_it_goes() {
+        let detail = "OPENAI_API_KEY (provider openai) was not set when the daemon started; \
+                      it takes its keys from /home/a/.agent/keys/env as it starts";
+        assert_eq!(
+            held_cause("provider_key_unavailable", Some(detail)),
+            (
+                "OPENAI_API_KEY not set".to_owned(),
+                "set OPENAI_API_KEY in ~/.agent/keys/env and restart the daemon".to_owned()
+            )
+        );
+        // A detail with no variable first still says what and how.
+        assert_eq!(
+            held_cause("provider_key_unavailable", Some("openai: unset")).0,
+            "API key not set"
+        );
     }
 
     #[test]

@@ -7120,8 +7120,8 @@ pub fn held_at_start(code: &str) -> bool {
 }
 
 /// Causes a person can fix, which hold the turn until they are: a login
-/// refused or expired, a key or account the provider refuses, a provider
-/// quota spent. The bot's and the turn's own token caps are limits their
+/// refused or expired, a key the daemon started without, a key or account
+/// the provider refuses, a provider quota spent. The bot's and the turn's own token caps are limits their
 /// makers set, and end it.
 fn held(code: &str) -> bool {
     matches!(
@@ -7130,6 +7130,7 @@ fn held(code: &str) -> bool {
             | "provider_login_expired"
             | "provider_login_unavailable"
             | "provider_quota_exhausted"
+            | "provider_key_unavailable"
             | "provider_http_401"
             | "provider_http_403"
     )

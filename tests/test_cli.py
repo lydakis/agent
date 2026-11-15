@@ -2305,6 +2305,25 @@ class ModelListTests(ModelFixture):
         self.assertIn('another one', refused.stderr)
         self.assertFalse(self.catalog.exists())
 
+    def test_a_provider_whose_key_is_not_set_does_not_stop_the_daemon(self):
+        config = self.home / '.agent' / 'config.toml'
+        config.parent.mkdir(exist_ok=True)
+        # As 0.10.0 met it: the config names openai, whose key is in no
+        # environment and not in ~/.agent/keys/env.
+        config.write_text(f'provider = "openai fixture=responses,{self.url}"\n')
+        stats = json.loads(self.agent('stats', *self.store).stdout)
+        self.assertEqual(sorted(stats['providers']), ['fixture', 'openai'])
+        with socket.socket(socket.AF_UNIX) as s:
+            s.connect(str(self.state) + '.sock')
+            ready = json.loads(s.makefile('r').readline())
+        unresolved = ready['providers']['openai']['unresolved']
+        self.assertEqual(unresolved['error'], 'provider_key_unavailable')
+        self.assertTrue(unresolved['detail'].startswith('OPENAI_API_KEY (provider openai)'))
+        self.assertIn(str(self.home / '.agent' / 'keys' / 'env'), unresolved['detail'])
+        self.assertNotIn('unresolved', ready['providers']['fixture'])
+        # The other provider serves.
+        self.agent('run', *self.store, '--model', 'fixture/synthetic-model', '--new', '--bot', 'Bob', 'hello')
+
     def test_an_edit_to_the_config_s_providers_applies_without_a_restart(self):
         config = self.home / '.agent' / 'config.toml'
         config.parent.mkdir(exist_ok=True)

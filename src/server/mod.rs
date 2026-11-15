@@ -1887,19 +1887,20 @@ impl Binder {
             .map_err(|_| Error::new("provider_login_unavailable"))??;
             (None, Some(Arc::new(login)))
         } else {
-            let key = spec
-                .key_env
-                .as_ref()
-                .map(|env| {
-                    std::env::var(env)
-                        .map_err(|_| Error::with("provider_key_unavailable", env.as_str()))
-                })
-                .transpose()?;
+            // Unset or blank is no key, as Codex reads its key variables.
+            let key = (spec.key_env.as_ref())
+                .and_then(|env| std::env::var(env).ok())
+                .filter(|value| !value.trim().is_empty());
             if let (Some(env), Some(value)) = (&spec.key_env, &key) {
                 credentials.set(env, value);
             }
             (key, None)
         };
+        // A key variable the daemon started without leaves this binding
+        // failing its calls, not the daemon: its other providers serve.
+        let unkeyed = (spec.key_env.as_deref())
+            .filter(|_| key.is_none() && login.is_none())
+            .map(|env| key_unset(&spec.name, env));
         // Which provider's URL it is: the URL itself may carry a secret.
         let named = |error: Error| match (error.code.as_str(), &error.detail) {
             ("invalid_provider_url", Some(why)) => {
@@ -1913,6 +1914,10 @@ impl Binder {
             provider = provider.with_login(login)?;
         }
         let mut auth = None;
+        if let Some(error) = unkeyed {
+            auth = Some(json!({"unresolved": {"error": error.code, "detail": error.detail}}));
+            provider = provider.without_key(error);
+        }
         if spec.sigv4 {
             let url = reqwest::Url::parse(&spec.url)
                 .map_err(|_| Error::with("invalid_provider_url", "the base URL does not parse"))?;
@@ -1951,6 +1956,25 @@ impl Binder {
         }
         Ok((provider, binding))
     }
+}
+
+/// Why a provider's calls fail: `env`, the key variable its spec names,
+/// was not set when the daemon started. The daemon takes the environment
+/// it was started with, which the CLI that starts it gives the keys file
+/// over; it never reads the file itself.
+fn key_unset(provider: &str, env: &str) -> Error {
+    let file = agent_client::env_file::path();
+    // The variable leads, so a client names it without the facts a held
+    // turn does not keep.
+    let detail = match &file {
+        Some(file) => format!(
+            "{env} (provider {provider}) was not set when the daemon started; it takes its keys from {} as it starts",
+            file.display()
+        ),
+        None => format!("{env} (provider {provider}) was not set when the daemon started"),
+    };
+    Error::with("provider_key_unavailable", detail)
+        .facts(json!({"provider": provider, "key": env, "keys_file": file}))
 }
 
 pub async fn run(config: Configuration) -> Result<()> {

@@ -129,6 +129,7 @@ impl Provider {
     /// A ChatGPT login refused with 401 is refreshed and tried once more,
     /// as a completion is.
     async fn list_models(&self) -> Result<Vec<Value>> {
+        self.keyed()?;
         let Some(login) = &self.login else {
             return self
                 .fetch_models(None)
