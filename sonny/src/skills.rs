@@ -40,8 +40,7 @@ pub fn install_own() {
     }
     install("sonny-setup", crate::setup::SKILL);
     install("sonny-config", &crate::config::skill());
-    install_browser();
-    install_desktop();
+    install_programs();
     // A job reaches the daemon the way every agent Sonny runs does.
     let automation = include_str!("../skills/automation/SKILL.md");
     install("automation", &agent_client::policy::with_cli(automation));
@@ -85,6 +84,13 @@ pub fn install_own() {
     }) {
         let _ = std::fs::remove_file(&project);
     }
+}
+
+/// agent-browser's and agent-desktop's own skills, as their installed
+/// programs serve them: at each start, and again once setup installs them.
+pub fn install_programs() {
+    install_browser();
+    install_desktop();
 }
 
 /// agent-browser's own skill, as the installed binary serves it, so it

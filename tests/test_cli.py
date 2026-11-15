@@ -1987,12 +1987,32 @@ class CliTests(ModelFixture):
         if cmdline.exists():
             args = cmdline.read_text().split('\0')
             self.assertEqual([args[i + 1] for i, arg in enumerate(args) if arg == '--unreadable'],
-                             [str(home/'.agent'/'keys'), str(home/'cookies'), str(home/'later'/'keys')])
+                             [str(home/'.agent'/'keys'), str(home/'.agent'/'sonny'/'programs'),
+                              str(home/'cookies'), str(home/'later'/'keys')])
         # A folder named from neither / nor ~/ is refused by name.
         config.write_text('[sandbox]\nunreadable = ["cookies"]\n')
         refused = run(*read)
         self.assertEqual(refused.returncode, 125, refused.stderr)
         self.assertIn('sandbox.unreadable', refused.stderr)
+
+    @unittest.skipUnless(shutil.which('bwrap') or sys.platform == 'darwin', 'sandboxes need bubblewrap')
+    def test_sonny_s_programs_are_kept_from_a_sandbox_given_them_by_name(self):
+        # The programs Sonny's tool host runs as the person: a command given
+        # their folder, or Sonny's above it, neither reads nor replaces one.
+        home = self.path/'home'
+        programs = home/'.agent'/'sonny'/'programs'
+        program = programs/'agent-browser'/'agent-browser-linux-x64'
+        program.parent.mkdir(parents=True)
+        program.write_text('#!/bin/sh\necho pinned\n')
+        env = {**clean_env(), 'HOME': str(home)}
+        for given in (programs, programs/'agent-browser', programs.parent):
+            replaced = subprocess.run(
+                [str(self.binary), 'sandbox', '--writable', str(given), '--',
+                 '/bin/sh', '-c', f'cat {program}; echo swapped > {program}'],
+                env=env, capture_output=True, text=True, timeout=20, cwd=self.path)
+            self.assertNotEqual(replaced.returncode, 0, given)
+            self.assertNotIn('pinned', replaced.stdout)
+            self.assertEqual(program.read_text(), '#!/bin/sh\necho pinned\n')
 
     def test_explicit_store_overrides_inherited_socket(self):
         client = SocketClient(self.binary, self.path/'first.db', self.url, 'echo')

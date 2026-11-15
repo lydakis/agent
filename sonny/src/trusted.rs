@@ -79,18 +79,11 @@ fn files(program: &str, origin: &Path) -> Vec<PathBuf> {
     files
 }
 
-/// Sonny's own folder, `name` in `~/.agent/sonny`.
-fn dir(name: &str) -> PathBuf {
-    std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(std::env::temp_dir)
-        .join(".agent/sonny")
-        .join(name)
-}
-
-/// Where the programs are installed, one folder each.
+/// Where the programs are installed, one folder each: a folder the daemon
+/// keeps from every sandbox ([`agent_client::config::programs`]).
 fn programs() -> PathBuf {
-    dir("programs")
+    agent_client::config::programs()
+        .unwrap_or_else(|| std::env::temp_dir().join(".agent/sonny/programs"))
 }
 
 /// The program `name` runs as, in `programs`: its native program for

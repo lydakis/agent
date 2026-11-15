@@ -921,6 +921,8 @@ fn programs() {
     for error in crate::trusted::bring_up(&say) {
         println!("{DIM}Not installed: {error}{RESET}");
     }
+    // Their skills, which the start before setup found nothing to ask for.
+    crate::skills::install_programs();
 }
 
 /// Whether this machine shows a desktop agent-desktop could use: any but
