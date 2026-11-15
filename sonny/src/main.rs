@@ -3943,20 +3943,25 @@ const SHORTCUTS: [(&str, &str); 21] = [
     ("ctrl+l", "draw the screen again"),
 ];
 
-/// Whether Enter runs the menu's pick (`picked`, at `pick`): when what is
-/// `typed` begins its name, or the person picked it. A name the letters
-/// only scatter across, as `/ps` across `/pause`, is not what was meant:
-/// Enter sends what is typed, to be answered.
-fn menu_runs(picked: &str, pick: usize, typed: &str) -> bool {
-    pick > 0 || picked.starts_with(typed)
+/// Whether Enter runs the menu's pick (`picked`): when what is `typed`
+/// begins its name, or the person `moved` to it with the arrows. A name
+/// the letters only scatter across, as `/ps` across `/pause`, is not what
+/// was meant: Enter sends what is typed, to be answered.
+fn menu_runs(picked: &str, moved: bool, typed: &str) -> bool {
+    moved || picked.starts_with(typed)
 }
 
 /// The slash menu's keys, while it is open: Tab completes the pick's name
 /// until it is whole; Enter runs it where [`menu_runs`].
-fn menu_keys(menu: &[(&str, &str, Vec<usize>)], pick: usize, typed: &str) -> Option<hint::Keys> {
+fn menu_keys(
+    menu: &[(&str, &str, Vec<usize>)],
+    pick: usize,
+    moved: bool,
+    typed: &str,
+) -> Option<hint::Keys> {
     let picked = menu.get(pick.min(menu.len().checked_sub(1)?))?.0;
     let keys = hint::Keys::new().pick();
-    let keys = match menu_runs(picked, pick, typed) {
+    let keys = match menu_runs(picked, moved, typed) {
         true => keys.enter(hint::Enter::Run),
         false => keys,
     };
@@ -4634,6 +4639,9 @@ struct App {
     /// What was typed when Enter sent it past the slash menu, which stays
     /// shut over the answer until the words change ([`menu_runs`]).
     menu_shut: Option<String>,
+    /// Whether the slash menu's pick was moved to by the arrows, so Enter
+    /// runs it whatever was typed ([`menu_runs`]).
+    menu_moved: bool,
     /// `/new`, its lists over the composer, then its first message in it.
     making: Option<new::Making>,
     /// The file with the first message for the agent this window becomes,
@@ -6344,6 +6352,7 @@ impl App {
             listing: None,
             agents_asked: None,
             menu_shut: None,
+            menu_moved: false,
             reach: None,
             reaching: None,
             agents: None,
@@ -14200,13 +14209,16 @@ impl App {
             && !menu.is_empty()
         {
             let picked = menu[self.pick.min(menu.len() - 1)].0;
+            let moved = std::mem::take(&mut self.menu_moved);
             match key.code {
                 KeyCode::Up => {
                     self.pick = (self.pick + menu.len() - 1) % menu.len();
+                    self.menu_moved = true;
                     return;
                 }
                 KeyCode::Down => {
                     self.pick = (self.pick + 1) % menu.len();
+                    self.menu_moved = true;
                     return;
                 }
                 KeyCode::Tab => {
@@ -14219,7 +14231,7 @@ impl App {
                         .modifiers
                         .intersects(KeyModifiers::SHIFT | KeyModifiers::ALT) =>
                 {
-                    let runs = menu_runs(picked, self.pick, &self.input);
+                    let runs = menu_runs(picked, moved, &self.input);
                     self.pick = 0;
                     if runs {
                         self.input.set(picked);
@@ -17788,7 +17800,7 @@ impl App {
             // right edge where the band's is.
             // The menu's keys while it is open, as every list over the
             // composer has them, saying what Enter does with the pick.
-            let (line, opens) = match menu_keys(&menu, self.pick, &self.input) {
+            let (line, opens) = match menu_keys(&menu, self.pick, self.menu_moved, &self.input) {
                 Some(keys) => (
                     Line::from(hint::under(&keys, footer.width.into())),
                     Vec::new(),
@@ -26265,18 +26277,30 @@ mod tests {
         assert!(app.menu().is_empty());
         app.input.set("/p");
         assert!(
-            menu_keys(&app.menu(), 0, "/p")
+            menu_keys(&app.menu(), 0, false, "/p")
                 .unwrap()
                 .text()
                 .contains("enter run")
         );
         assert!(
-            !menu_keys(&app.menu(), 0, "/ps")
+            !menu_keys(&app.menu(), 0, false, "/ps")
                 .unwrap()
                 .text()
                 .contains("enter")
         );
-        // Picked by hand, it runs whatever was typed.
+        // Moved to with the arrows, even back to the first row, it runs
+        // whatever was typed.
+        app.input.set("/p");
+        app.key(Event::Key(KeyCode::Char('s').into())).await;
+        app.key(Event::Key(KeyCode::Down.into())).await;
+        app.key(Event::Key(KeyCode::Up.into())).await;
+        assert_eq!(app.menu()[app.pick].0, "/pause");
+        app.key(Event::Key(KeyCode::Enter.into())).await;
+        assert_eq!(
+            app.notice.as_deref(),
+            Some("/pause takes why: /pause REASON")
+        );
+        app.input.set("/p");
         app.key(Event::Key(KeyCode::Char('s').into())).await;
         assert_eq!(&*app.input, "/ps");
         assert!(!app.menu().is_empty());
@@ -29312,7 +29336,9 @@ mod tests {
         };
         app.input.set("/co");
         assert_eq!(first(&app), ["/copy", "/compact", "/context", "/commons"]);
-        let keys = |app: &App| menu_keys(&app.menu(), app.pick, &app.input).map(|k| k.text());
+        let keys = |app: &App| {
+            menu_keys(&app.menu(), app.pick, app.menu_moved, &app.input).map(|k| k.text())
+        };
         assert_eq!(
             keys(&app),
             Some("↑↓ pick · enter run · tab complete · esc close".to_owned())
