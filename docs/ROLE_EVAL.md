@@ -116,6 +116,40 @@ Also note any `live_template` refusal and whether it wrote a working one
 after, and any reply that repeats what the block will change, such as the
 time in words beside a clock.
 
+## The margin screen
+
+`bench/margin_eval.py` asks whether a lead keeps its margin to state. It
+runs twenty single-turn prompts, each to a fresh lead in its own run of
+the shop repository above, with synthetic content only. Ten are bait,
+where the reply is the answer and no margin call is right: explain how the
+package fits together, compare two modules, walk through a file, run the
+tests or a benchmark and report, draw a diagram, design an export, say
+what a fix changed, tabulate the functions, review a file. Ten are true
+cases, where one note is right: a pull request pushed for review later
+(two), CI on a pull request to watch, a task's question that waits on the
+person, a reply and release notes drafted for the person to send, two
+reviews waiting, a mail answer awaited, a file's value kept in view while
+the person edits it, release dates to keep beside them. Each true case
+then sends a follow-up that ends its condition (merged, sent, answered,
+done), after which its note must be gone.
+
+```
+python3 -m bench.margin_eval all --runs 1 --parallel 4 \
+  --bin A=../main/.local/target/release --bin B=../branch/.local/target/release
+python3 -m bench.margin_eval score
+```
+
+Runs sit under `.local/role-eval/<model>/margin/runs/<case>/<arm><n>/`,
+with the role eval's files; each run's root, with its copy of the build,
+is removed once it ends. `score` counts, per arm, from each lead's calls
+in `acp.jsonl`: margin calls on bait, true cases with a note and the
+calls by kind (a build without kinds counts `none`), notes left standing
+after their condition ended, refusals by code, and replies that mention a
+note or the margin. It writes `margin-results.json` and
+`margin-replies.md`, each such reply beside the notes that stood then;
+read those by hand for the last row: replies that cannot be read without
+a note.
+
 ## The burst
 
 `--day burst` (DeepSeek Harness's super-agent case) tells a fresh lead the

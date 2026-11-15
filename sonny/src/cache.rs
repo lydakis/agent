@@ -15,6 +15,11 @@ pub fn drawn(
     width: usize,
     draw: impl FnOnce() -> Result<Drawn, String>,
 ) -> Result<Drawn, String> {
+    // Counted only, as the tool host counts a note's rows: drawn afresh,
+    // with nothing read from or written to a shared folder.
+    if crate::term::measured() {
+        return draw();
+    }
     let path = path(lang, source, width);
     if let Some(drawn) = path.as_ref().and_then(read) {
         return Ok(drawn);
@@ -61,6 +66,43 @@ fn write(path: &PathBuf, drawn: &Drawn) -> std::io::Result<()> {
     bytes.extend_from_slice(&drawn.png);
     // Whole or not at all, should another Sonny read it meanwhile.
     let part = path.with_extension(format!("{}.part", std::process::id()));
-    std::fs::write(&part, bytes)?;
+    write_new(&part, &bytes)?;
     std::fs::rename(part, path)
+}
+
+/// `bytes` written to a file made new at `path`: refused when anything is
+/// there already, a link left in a shared folder included, so a write
+/// never goes on through a link to where it points.
+pub fn write_new(path: &std::path::Path, bytes: impl AsRef<[u8]>) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)?;
+    file.write_all(bytes.as_ref())
+}
+
+#[cfg(test)]
+mod tests {
+    #[cfg(unix)]
+    #[test]
+    fn a_new_file_is_never_written_through_a_link_left_in_its_place() {
+        let dir = std::env::temp_dir().join(format!("sonny-write-new-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let (link, target) = (dir.join("kept.svg"), dir.join("elsewhere"));
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        assert!(super::write_new(&link, "<svg/>").is_err());
+        assert!(!target.exists());
+        // Nor over a file already there; a new one is written whole.
+        std::fs::write(&target, "theirs").unwrap();
+        assert!(super::write_new(&target, "ours").is_err());
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "theirs");
+        super::write_new(&dir.join("new.svg"), "<svg/>").unwrap();
+        assert_eq!(
+            std::fs::read_to_string(dir.join("new.svg")).unwrap(),
+            "<svg/>"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 }

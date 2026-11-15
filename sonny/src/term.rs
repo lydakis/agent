@@ -188,15 +188,39 @@ pub fn heard(reply: &str) {
     }
 }
 
-/// Whether images can be drawn: Kitty graphics answered OK.
+/// Whether images can be drawn: Kitty graphics answered OK, or rows are
+/// being counted ([`measuring`]).
 pub fn graphics() -> bool {
-    PROBE.get().is_some_and(|p| p.graphics)
+    measured() || PROBE.get().is_some_and(|p| p.graphics)
+}
+
+thread_local! {
+    static MEASURING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// `count` run as a terminal that draws pictures lays rows out, its cells
+/// 8×16, whatever this one is or whether there is one: so rows counted by
+/// the tool host, which has no terminal, are the same in every window.
+pub fn measuring<T>(count: impl FnOnce() -> T) -> T {
+    let was = MEASURING.replace(true);
+    let counted = count();
+    MEASURING.set(was);
+    counted
+}
+
+/// Whether rows are being counted, not drawn.
+pub fn measured() -> bool {
+    MEASURING.get()
 }
 
 /// A cell's size in pixels: as the terminal gives it now with the window
 /// size, else as it answered at start (Rex answers 8×16 for a block it has
-/// not laid out yet, and the real size once it has).
+/// not laid out yet, and the real size once it has); 8×16 while rows are
+/// counted.
 pub fn cell() -> (u32, u32) {
+    if measured() {
+        return (8, 16);
+    }
     if let Ok(size) = size()
         && size.columns > 0
         && size.rows > 0
