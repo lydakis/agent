@@ -170,6 +170,35 @@ class DaemonStepTests(ModelFixture):
         # The very bytes the direct call reads: nothing encoded again.
         self.assertEqual(base64.b64decode(data), heavy)
 
+    def test_a_picture_that_fits_only_beside_a_short_request_id_is_kept_for_a_long_one(self):
+        # A picture sized to fit a reply with a short id, not one beside a
+        # request id of 128 control characters (six JSON bytes each): its
+        # step still answers, the picture kept under the step.
+        import struct
+        import zlib
+        from tests.test_images import png
+
+        def chunk(kind, data):
+            return struct.pack('>I', len(data)) + kind + data + struct.pack('>I', zlib.crc32(kind + data))
+        small = png(4, 4)
+        encoded = 1024 * 1024 - 900
+        size = encoded // 4 * 3
+        filler = size - len(small) - 12
+        picture = small[:-12] + chunk(b'tEXt', b'k\x00' + b'x' * (filler - 2)) + small[-12:]
+        self.assertEqual(len(picture), size)
+        (self.path / 'wide.png').write_bytes(picture)
+        client, turn = self.script(tools='echo,read', bot_tools=['read'])
+        request = '\u0001' * 128
+        line = dict(id=request, op='run_step', bot='Lead', turn=turn, call_id='script-0', step='1',
+                    name='read', arguments={'path': 'wide.png'})
+        client.process.stdin.write(json.dumps(line) + '\n')
+        client.process.stdin.flush()
+        replied = self.reply(client, request, timeout=10)
+        self.assertIn('result', replied, replied)
+        ran = replied['result']
+        self.assertIn(f'too large for the reply kept as {turn}/script-0/1/picture-1', ran['output'])
+        self.assertNotIn('parts', ran)
+
     @unittest.skipUnless(shutil.which('bwrap') or sys.platform == 'darwin', 'sandboxes need bubblewrap')
     def test_a_sandboxed_bot_s_file_steps_stay_in_its_sandbox(self):
         client, turn = self.script(tools='echo,shell,read,write,web_fetch',
@@ -419,7 +448,9 @@ class DaemonStepTests(ModelFixture):
             time.sleep(.01)
         # It waits as an entry in the line, not as a started command.
         self.assertEqual(client.request('stats')['result']['steps']['commands'], 0)
-        ran = self.reply(client, request, timeout=10)['result']
+        replied = self.reply(client, request, timeout=10)
+        self.assertIn('result', replied, replied)
+        ran = replied['result']
         self.assertEqual(json.loads(ran['output'])['stdout'], 'ran\n')
         self.assertEqual(client.finished(held)['data']['status'], 'completed')
 

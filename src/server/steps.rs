@@ -732,6 +732,9 @@ impl Service {
     fn close_step(&mut self, key: Key, ran: Result<Outcome>) {
         let flight = self.steps.flights.get(&key).expect("a flight");
         let (turn, id, serial) = (key.0, flight.ask.id(), flight.serial);
+        // The reply's id, as encoded, is part of what its pictures share.
+        let envelope = ENVELOPE
+            + agent_runtime::output::encoded_len(&flight.request).unwrap_or(usize::MAX / 2);
         let capture = self.steps.captured.get(&key).cloned();
         let outputs = capture.as_ref().and_then(|capture| {
             let root = PathBuf::from(
@@ -751,7 +754,21 @@ impl Service {
                     (failure(error), Some(code))
                 }
             };
-            let outcome = parted(outcome, turn, &id);
+            // A picture's base64 is sized, moved and copied off the
+            // runtime thread, as a lifted call's pictures are.
+            let pictured = outcome.parts.iter().any(|part| part.image().is_some());
+            let outcome = if pictured {
+                let id = id.clone();
+                tokio::task::spawn_blocking(move || parted(outcome, turn, &id, envelope))
+                    .await
+                    .map_err(|_| Error::new("step_task_failed"))
+            } else {
+                Ok(outcome)
+            };
+            let outcome = match outcome {
+                Ok(outcome) => outcome,
+                Err(error) => return (key, serial, Done::Closed(Err(error))),
+            };
             let outcome = match outputs {
                 Some(outputs) if !outcome.artifacts.is_empty() => {
                     outputs.keep(outcome, turn, &id).await
@@ -759,12 +776,27 @@ impl Service {
                 _ => outcome,
             };
             let outcome = turn::annotate(outcome, turn, &id);
-            let mut reply = json!({"call_id":id,"output":outcome.output,"failed":outcome.failed});
-            // A picture read goes back as one, in the parts `tool_result`
-            // takes, so the script can hand it on to the model.
-            if !outcome.parts.is_empty() {
-                reply["parts"] = json!(outcome.parts);
-            }
+            let built = |outcome: Outcome, id: String| {
+                let mut reply =
+                    json!({"call_id":id,"output":outcome.output,"failed":outcome.failed});
+                // A picture read goes back as one, in the parts `tool_result`
+                // takes, so the script can hand it on to the model.
+                if !outcome.parts.is_empty() {
+                    reply["parts"] = json!(outcome.parts);
+                }
+                (outcome, id, reply)
+            };
+            let built = if pictured {
+                tokio::task::spawn_blocking(move || built(outcome, id))
+                    .await
+                    .map_err(|_| Error::new("step_task_failed"))
+            } else {
+                Ok(built(outcome, id))
+            };
+            let (outcome, id, reply) = match built {
+                Ok(built) => built,
+                Err(error) => return (key, serial, Done::Closed(Err(error))),
+            };
             let closed = store
                 .op("step_close", move |db| {
                     db.step_close(turn, &id, &outcome, error.as_deref(), handles_now())
@@ -1064,7 +1096,8 @@ async fn run(
     }
 }
 
-/// What a reply carries beside its result: its id and the object around it.
+/// What a reply carries beside its result and its encoded id: the object
+/// around them.
 const ENVELOPE: usize = 256;
 
 /// The streams a step's pictures too large for its reply are kept under.
@@ -1096,13 +1129,13 @@ const PICTURES: [&str; 20] = [
 /// as its own output, its base64 under `CALL/STEP` as `picture-N`, read
 /// with `artifact` as any kept output is, and its output says so. Nothing
 /// is decoded or encoded again: a step reads what the direct call does.
-fn parted(mut outcome: Outcome, turn: i64, id: &str) -> Outcome {
+fn parted(mut outcome: Outcome, turn: i64, id: &str, envelope: usize) -> Outcome {
     if !outcome.parts.iter().any(|part| part.image().is_some()) {
         return outcome;
     }
     let size = |value: &Value| serde_json::to_vec(value).map_or(usize::MAX, |bytes| bytes.len());
     let bare = size(&json!({"call_id":id,"output":outcome.output,"failed":outcome.failed}));
-    let mut room = output::MAX_EVENT.saturating_sub(bare + ENVELOPE);
+    let mut room = output::MAX_EVENT.saturating_sub(bare.saturating_add(envelope));
     let (mut kept, mut lines) = (0, Vec::new());
     outcome.parts = (std::mem::take(&mut outcome.parts).into_iter())
         .filter_map(|part| {
