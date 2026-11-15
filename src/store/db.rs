@@ -11830,6 +11830,13 @@ impl Database {
                 "DELETE FROM answers WHERE turn=? AND process IS NULL",
                 [turn],
             )?;
+            // The ended steps of a call that ended unanswered with its turn,
+            // an interrupted one's; a running step's row goes as it ends.
+            tx.prepare_cached(
+                "DELETE FROM steps WHERE turn=?1 AND ended_ms IS NOT NULL
+                 AND step_of NOT IN (SELECT call_id FROM answers WHERE turn=?1)",
+            )?
+            .execute([turn])?;
         }
         // Interrupted, by cause: a client's interrupt, the daemon shutting
         // down or paused around the turn, a daemon that died with it
@@ -14421,6 +14428,10 @@ impl Database {
                     tx.prepare_cached(&format!("DELETE FROM {table} WHERE turn=?"))?
                         .execute([turn])?;
                 }
+                // A step still running keeps its row until it ends, which
+                // finds its call gone and drops it.
+                tx.prepare_cached("DELETE FROM steps WHERE turn=? AND ended_ms IS NOT NULL")?
+                    .execute([turn])?;
                 events += tx
                     .prepare_cached("DELETE FROM events WHERE turn=?")?
                     .execute([turn])?;
@@ -14649,6 +14660,13 @@ impl Database {
             tx.prepare_cached(
                 "DELETE FROM tools WHERE turn=?1 AND call_id NOT IN
                  (SELECT call_id FROM processes WHERE turn=?1 AND status='running')",
+            )?
+            .execute([turn])?;
+            // A lifted call's steps stay while it waits; a running step's
+            // row goes as it ends.
+            tx.prepare_cached(
+                "DELETE FROM steps WHERE turn=?1 AND ended_ms IS NOT NULL
+                 AND step_of NOT IN (SELECT call_id FROM answers WHERE turn=?1 AND output IS NULL)",
             )?
             .execute([turn])?;
             let last: Option<i64> = tx

@@ -813,6 +813,9 @@ fn binary(bytes: &[u8]) -> Option<&'static str> {
         .then_some("a binary file")
 }
 
+/// A process slot, held while a command or a sandbox's helper runs.
+pub type Slot = tokio::sync::OwnedSemaphorePermit;
+
 /// A background command's admission: a slot taken at once when one was
 /// free, otherwise a counted place in line released when it gets a slot
 /// or is dropped before starting.
@@ -2822,6 +2825,17 @@ impl Registry {
             budget => cap.min(budget / 2).max(1),
         }
     }
+    /// A process slot now, when one is free, for a caller that keeps its
+    /// own line and hands the slot to the command it starts.
+    pub fn try_slot(&self) -> Option<Slot> {
+        self.slots.clone().try_acquire_owned().ok()
+    }
+    /// A process slot once one is free, waiting in the semaphore's fair
+    /// line beside the turns' own commands; none once it is closed.
+    pub fn slot(&self) -> impl Future<Output = Option<Slot>> + Send + 'static {
+        let slots = self.slots.clone();
+        async move { slots.acquire_owned().await.ok() }
+    }
     /// Take a place in line for a background command, or refuse when as many
     /// are already waiting as may run: a counter and a comparison, so a fleet
     /// cannot accumulate an invisible backlog behind the process bound.
@@ -3424,6 +3438,20 @@ impl Registry {
         environment: &[(String, String)],
         sandbox: Option<Arc<Policy>>,
     ) -> Result<Outcome> {
+        self.execute_holding(tool, workspace, environment, sandbox, None)
+            .await
+    }
+
+    /// [`execute`](Self::execute) with a process slot the caller took for
+    /// a confined write, which then waits for none.
+    pub async fn execute_holding(
+        &self,
+        tool: Prepared,
+        workspace: &Path,
+        environment: &[(String, String)],
+        sandbox: Option<Arc<Policy>>,
+        mut slot: Option<Slot>,
+    ) -> Result<Outcome> {
         match tool {
             Prepared::Echo(text) => Ok(Outcome::text(self.redact(text))),
             Prepared::Shell {
@@ -3522,7 +3550,7 @@ impl Registry {
                 let target = resolve(workspace, &path);
                 writable(sandbox.clone(), &target, &path).await?;
                 let mut held = crate::sandbox::hold_for(sandbox.as_deref()).await;
-                let _slot = self.helper_slot(&sandbox).await?;
+                let _slot = self.helper_slot(&sandbox, &mut slot).await?;
                 files::write(&target, content.as_bytes(), sandbox, held.as_mut()).await?;
                 Ok(Outcome::text(format!(
                     "wrote {} bytes to {}",
@@ -3546,7 +3574,7 @@ impl Registry {
                 // A process slot only while the sandbox's helper writes.
                 let mut held = crate::sandbox::hold_for(sandbox.as_deref()).await;
                 let _slot = match staged.writes() {
-                    true => self.helper_slot(&sandbox).await?,
+                    true => self.helper_slot(&sandbox, &mut slot).await?,
                     false => None,
                 };
                 Ok(Outcome::text(staged.commit(sandbox, held.as_mut()).await?))
@@ -3588,7 +3616,7 @@ impl Registry {
                 };
                 debug_assert_eq!(updated.len(), expanded);
                 let mut held = crate::sandbox::hold_for(sandbox.as_deref()).await;
-                let _slot = self.helper_slot(&sandbox).await?;
+                let _slot = self.helper_slot(&sandbox, &mut slot).await?;
                 files::write(&target, updated.as_bytes(), sandbox, held.as_mut()).await?;
                 Ok(Outcome::text(format!(
                     "replaced {count} occurrence{} in {path}",
@@ -3709,18 +3737,24 @@ impl Registry {
     }
 
     /// A process slot for a confined write, which runs as a process of
-    /// its own and so waits its turn as a command does.
+    /// its own and so waits its turn as a command does: `held` when the
+    /// caller took one for it.
     async fn helper_slot(
         &self,
         sandbox: &Option<Arc<Policy>>,
-    ) -> Result<Option<tokio::sync::SemaphorePermit<'_>>> {
+        held: &mut Option<Slot>,
+    ) -> Result<Option<Slot>> {
         match sandbox {
-            Some(_) => Ok(Some(
-                self.slots
-                    .acquire()
-                    .await
-                    .map_err(|_| Error::new("tool_scheduler_closed"))?,
-            )),
+            Some(_) => match held.take() {
+                Some(slot) => Ok(Some(slot)),
+                None => Ok(Some(
+                    self.slots
+                        .clone()
+                        .acquire_owned()
+                        .await
+                        .map_err(|_| Error::new("tool_scheduler_closed"))?,
+                )),
+            },
             None => Ok(None),
         }
     }
@@ -3741,6 +3775,34 @@ impl Registry {
         started: tokio::sync::oneshot::Sender<()>,
         spill: Option<Spill>,
     ) -> impl Future<Output = Result<Outcome>> + Send + 'static {
+        self.foreground_holding(
+            command,
+            workspace,
+            timeout_ms,
+            environment,
+            sandbox,
+            place,
+            started,
+            spill,
+            None,
+        )
+    }
+
+    /// [`foreground`](Self::foreground) with a process slot the caller
+    /// took for it, `held`, which then waits for none.
+    #[allow(clippy::too_many_arguments)]
+    pub fn foreground_holding(
+        &self,
+        command: String,
+        workspace: PathBuf,
+        timeout_ms: Option<u64>,
+        environment: Vec<(String, String)>,
+        sandbox: Option<Arc<Policy>>,
+        place: Place,
+        started: tokio::sync::oneshot::Sender<()>,
+        spill: Option<Spill>,
+        held: Option<Slot>,
+    ) -> impl Future<Output = Result<Outcome>> + Send + 'static {
         let registry = self.clone();
         async move {
             let (mut stdout, mut stderr, exit, elapsed) = {
@@ -3748,12 +3810,16 @@ impl Registry {
                 // gone, and taken before the slot, so no slot waits on it.
                 // Both go before the output is redacted, so a result
                 // waiting for that holds no process budget.
-                let mut held = crate::sandbox::hold_for(sandbox.as_deref()).await;
-                let _slot = registry
-                    .slots
-                    .acquire()
-                    .await
-                    .map_err(|_| Error::new("tool_scheduler_closed"))?;
+                let mut hold = crate::sandbox::hold_for(sandbox.as_deref()).await;
+                let _slot = match held {
+                    Some(slot) => slot,
+                    None => registry
+                        .slots
+                        .clone()
+                        .acquire_owned()
+                        .await
+                        .map_err(|_| Error::new("tool_scheduler_closed"))?,
+                };
                 let _place = place.take();
                 let _ = started.send(());
                 shell(
@@ -3763,7 +3829,7 @@ impl Registry {
                     &registry,
                     &environment,
                     sandbox.as_deref(),
-                    held.as_mut(),
+                    hold.as_mut(),
                     spill.as_ref(),
                 )
                 .await?

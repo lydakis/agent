@@ -5,6 +5,7 @@ import json
 import os
 import queue
 import shutil
+import sqlite3
 import sys
 import time
 import unittest
@@ -37,10 +38,10 @@ class DaemonStepTests(ModelFixture):
         return client.request('run_step', bot='Lead', turn=turn, call_id=call_id, step=step, name=name,
                               arguments={'text': 'hi'} if arguments is None else arguments)
 
-    def ask(self, client, turn, step='1', name='shell', arguments=None):
+    def ask(self, client, turn, step='1', name='shell', arguments=None, bot='Lead'):
         """Send a run_step without waiting for it; its id, to receive the reply by."""
         client.next_id += 1
-        request = dict(id=client.next_id, op='run_step', bot='Lead', turn=turn, call_id='script-0',
+        request = dict(id=client.next_id, op='run_step', bot=bot, turn=turn, call_id='script-0',
                        step=step, name=name, arguments=arguments or {'command': 'sleep 30'})
         client.process.stdin.write(json.dumps(request) + '\n')
         client.process.stdin.flush()
@@ -327,6 +328,71 @@ class DaemonStepTests(ModelFixture):
         self.assertEqual(daemon.request('stats')['result']['steps']['in_flight'], 0)
         self.assertIn('result', daemon.request('tool_result', bot='Lead', turn=turn, call_id='script-0', output='ok'))
         self.assertEqual(daemon.finished(turn)['data']['status'], 'completed')
+
+    def test_a_step_command_waits_in_line_while_a_turn_s_command_holds_the_slot(self):
+        client = self.client('echo,shell', extra=('--max-processes', '1'))
+
+        def respond(request, user):
+            if user != 'hold':
+                return None
+            answered = any(i.get('type') == 'function_call_output' for i in request['input'])
+            return 'held' if answered else [['shell', {'command': 'sleep 2'}]]
+        self.model.respond = respond
+        client.request('create', bot='Other', workspace=str(self.path), tools=['shell'])
+        held = client.request('submit', bot='Other', request_id='h', prompt='hold')['result']['message']
+        deadline = time.monotonic() + 5
+        while client.request('stats')['result']['running_processes'] == 0:
+            self.assertLess(time.monotonic(), deadline, "the turn's command never started")
+            time.sleep(.01)
+        client, turn = self.script(client=client)
+        request = self.ask(client, turn, arguments={'command': 'echo ran'})
+        while client.request('stats')['result']['steps']['in_line'] == 0:
+            self.assertLess(time.monotonic(), deadline, 'the step never lined up')
+            time.sleep(.01)
+        # It waits as an entry in the line, not as a started command.
+        self.assertEqual(client.request('stats')['result']['steps']['commands'], 0)
+        ran = self.reply(client, request, timeout=10)['result']
+        self.assertEqual(json.loads(ran['output'])['stdout'], 'ran\n')
+        self.assertEqual(client.finished(held)['data']['status'], 'completed')
+
+    def test_no_process_bound_lets_every_call_s_command_step_run_at_once(self):
+        client = self.client('echo,shell', extra=('--max-processes', '0'))
+        self.model.call_script = [('exec', {'code': 'run()'})]
+        turns = {}
+        for bot in ('Lead', 'Second'):
+            client.request('create', bot=bot, workspace=str(self.path), declare=[EXEC])
+            turns[bot] = client.request('submit', bot=bot, request_id='t', prompt='script')['result']['message']
+        deadline = time.monotonic() + 5
+        while len(client.request('tool_calls', tag='sonny')['result']['calls']) < 2:
+            self.assertLess(time.monotonic(), deadline)
+            time.sleep(.01)
+        slow = self.ask(client, turns['Lead'], arguments={'command': 'sleep 30'})
+        self.running(client)
+        quick = self.ask(client, turns['Second'], arguments={'command': 'echo quick'}, bot='Second')
+        ran = self.reply(client, quick, timeout=5)['result']
+        self.assertEqual(json.loads(ran['output'])['stdout'], 'quick\n')
+        client.request('interrupt', bot='Lead', turn=turns['Lead'])
+        self.assertEqual(self.reply(client, slow, timeout=10)['error'], 'step_stopped')
+
+    def test_another_bot_s_answer_to_the_call_stops_nothing(self):
+        client, turn = self.script()
+        client.request('create', bot='Other', workspace=str(self.path))
+        request = self.ask(client, turn)
+        self.running(client)
+        wrong = client.request('tool_result', bot='Other', turn=turn, call_id='script-0', output='no')
+        self.assertEqual(wrong['error'], 'turn_not_found')
+        self.assertEqual(client.request('stats')['result']['steps']['commands'], 1)
+        self.assertEqual(self.events(client, turn, 'step_completed'), [])
+        self.answer(client, turn)
+        self.assertEqual(self.reply(client, request, timeout=10)['error'], 'step_stopped')
+
+    def test_an_interrupted_call_s_steps_leave_no_rows(self):
+        client, turn = self.script()
+        self.assertIn('result', self.step(client, turn))
+        client.request('interrupt', bot='Lead', turn=turn)
+        self.assertEqual(client.finished(turn, timeout=10)['data']['status'], 'interrupted')
+        with sqlite3.connect(self.path / 'state.sqlite') as db:
+            self.assertEqual(db.execute('SELECT count(*) FROM steps').fetchone()[0], 0)
 
     def test_a_step_cut_off_by_a_restart_ends_of_unknown_outcome(self):
         client, turn = self.script()

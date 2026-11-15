@@ -5655,7 +5655,7 @@ impl Service {
                 };
                 // A daemon step of the call still running is stopped
                 // first: the answer is recorded once its stop is sent.
-                self.call_ended(turn, &call_id, "the call was answered");
+                self.call_answered(&bot, turn, &call_id);
                 let name = bot.clone();
                 let answered = self
                     .store
