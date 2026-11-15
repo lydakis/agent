@@ -1114,6 +1114,140 @@ fn checked(add: &Value, sources: &[String]) -> Result<Sub, String> {
     Ok(sub)
 }
 
+/// A `follows` call's `read`: what the sources the follow `add` names
+/// say now, adding nothing, as Alertmanager's alerts API reads the
+/// alerts it holds by a route's matchers or a receiver's name. An add
+/// that names nothing but its name reads `subscriber`'s follow of that
+/// name. Each source answers its status as the lookout keeps it
+/// ([`super::sources::status`]): the newest event of each topic it
+/// hears, newest first, as data, and that the source is down while it
+/// is. The tasks source and the commons keep none here, so they are said
+/// to be unread.
+pub fn read_now(
+    store: &Path,
+    subscriber: &str,
+    add: &Value,
+    sources: &[String],
+) -> Result<Value, String> {
+    let names_one = ["sources", "agents", "tasks_of"]
+        .iter()
+        .any(|key| add.get(*key).is_some());
+    let sub = match names_one {
+        true => checked(add, sources)?,
+        false => {
+            let name = add["name"].as_str().unwrap_or_default();
+            (read_whole(store, subscriber)?.into_iter())
+                .find(|sub| sub.name == name)
+                .ok_or_else(|| {
+                    format!("no follow {name:?}: a read names sources, or one of your follows")
+                })?
+        }
+    };
+    let named: Vec<&str> = (sub.sources.iter())
+        .map(|name| super::sources::named(name).0)
+        .collect();
+    let mut unread: Vec<&str> = Vec::new();
+    if !sub.tasks_of.is_empty() || !sub.agents.is_empty() {
+        unread.push("its agents");
+    }
+    let mut listed = Vec::new();
+    // The whole answer fits what a tool's answer shows, its words besides
+    // the topics (`outside`, `more`, `unread`) counted first.
+    let (mut bytes, mut more) = (READ_WORDS, 0);
+    for (n, source) in named.iter().enumerate() {
+        if named[..n].contains(source) {
+            continue;
+        }
+        if *source == COMMONS_SOURCE {
+            unread.push("the commons");
+            continue;
+        }
+        // Only the topics it names, when it names no whole source.
+        let of_it: Vec<Option<&str>> = (sub.sources.iter())
+            .map(|name| super::sources::named(name))
+            .filter(|(name, _)| name == source)
+            .map(|(_, topic)| topic)
+            .collect();
+        let wanted = |topic: Option<&str>| {
+            of_it.contains(&None) || topic.is_some_and(|topic| of_it.contains(&Some(topic)))
+        };
+        let (newest, down) = super::sources::status(store, source, wanted);
+        bytes += source.len() + down.as_ref().map_or(0, |down| down.len() + 16) + 32;
+        let mut topics = Vec::new();
+        for (event, cut) in newest.iter().filter(|(event, _)| sub.hears(event)) {
+            // Past what one answer holds, the rest are counted, not written.
+            if more > 0 {
+                more += 1;
+                continue;
+            }
+            let said = as_read(event, *cut);
+            let size = said.to_string().len() + 1;
+            if bytes + size > crate::served::OUTPUT_BYTES {
+                more += 1;
+                continue;
+            }
+            bytes += size;
+            topics.push(said);
+        }
+        let mut status = json!({"source": source, "topics": topics});
+        if let Some(down) = down {
+            status["down"] = json!(down);
+        }
+        listed.push(status);
+    }
+    let mut answer = json!({"read": listed});
+    if listed
+        .iter()
+        .any(|status| status["topics"].as_array().is_some_and(|t| !t.is_empty()))
+    {
+        answer["outside"] = json!(super::sources::OUTSIDE);
+    }
+    if more > 0 {
+        answer["more"] = json!(format!("{more} topics more than one answer holds"));
+    }
+    if !unread.is_empty() {
+        answer["unread"] = json!(format!(
+            "{}: only what sources printed is kept to read",
+            unread.join(" and ")
+        ));
+    }
+    Ok(answer)
+}
+
+/// What a read's answer says besides its sources and topics, at most.
+const READ_WORDS: usize = 1024;
+
+/// An event as a read gives it: its topic, who wrote it, when, its text,
+/// ID and link, and its other fields, with whether it was kept cut.
+fn as_read(event: &super::sources::Event, cut: bool) -> Value {
+    let mut said = json!({});
+    if let Some(topic) = &event.topic {
+        said["topic"] = json!(topic);
+    }
+    if let Some(from) = &event.from {
+        said["from"] = json!(from);
+    }
+    said["at"] = json!(super::sources::clock(event.at_ms));
+    said["text"] = json!(event.text);
+    if let Some(id) = &event.id {
+        said["id"] = json!(id);
+    }
+    if let Some(url) = event.fields["url"].as_str() {
+        said["url"] = json!(url);
+    }
+    let others: serde_json::Map<String, Value> = (event.fields.as_object().into_iter().flatten())
+        .filter(|(key, _)| !super::sources::OWN.contains(&key.as_str()))
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect();
+    if !others.is_empty() {
+        said["fields"] = Value::Object(others);
+    }
+    if cut {
+        said["cut"] = json!(true);
+    }
+    said
+}
+
 /// A `follows` call's `test`: what the subscription `add` names
 /// would have heard of its sources' last 24 hours, as the lookout keeps
 /// them, and adding nothing. How many events it would hear, how many
@@ -1603,6 +1737,200 @@ mod tests {
         assert_eq!(forget(&store, "shop.lead", Some(1)), Ok(0));
         assert_eq!(read(&store, "shop.lead")[0].name, "theirs");
         let _ = std::fs::remove_dir_all(dir(&store));
+    }
+
+    /// A source's kept log of `events` events in the last minutes, over
+    /// `topics` topics in turn, each a PR with its state, as the lookout
+    /// keeps what a command printed.
+    fn kept_log(store: &Path, source: &str, events: usize, topics: usize) {
+        let sources_dir = super::super::beside(store, ".sources");
+        let file = super::super::sources::recent_file(&sources_dir, source);
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        let now = super::super::epoch_ms() as u64;
+        let lines: String = (0..events)
+            .map(|n| {
+                let topic = (n % topics).to_string();
+                let state = ["open", "green", "red"][n % 3];
+                let text = format!("#{topic} {state}: {}", "x".repeat(1_200));
+                json!({"source": source, "text": text, "topic": topic, "from": "ci",
+                    "id": format!("{source}/{n}"), "at_ms": now - (events - n) as u64, "seq": n,
+                    "fields": {"text": text, "topic": topic, "from": "ci", "state": state,
+                        "url": format!("https://example.com/{topic}")}})
+                .to_string()
+                    + "\n"
+            })
+            .collect();
+        std::fs::write(file, lines).unwrap();
+    }
+
+    #[test]
+    fn a_read_gives_what_sources_say_now_and_follows_nothing() {
+        let store = std::env::temp_dir().join(format!("subs-read-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(dir(&store));
+        let _ = std::fs::remove_dir_all(super::super::beside(&store, ".sources"));
+        kept_log(&store, "prs", 7, 3);
+        let names = ["prs".to_owned(), COMMONS_SOURCE.to_owned()];
+        let read = |mut asked: Value| {
+            asked["name"] = json!(asked["name"].as_str().unwrap_or("r"));
+            read_now(&store, "shop.lead", &asked, &names)
+        };
+        let topics = |said: &Value| -> Vec<String> {
+            (said["read"][0]["topics"].as_array().unwrap().iter())
+                .map(|t| t["topic"].as_str().unwrap().to_owned())
+                .collect()
+        };
+        // Each topic's newest, newest first, as data.
+        let said = read(json!({"sources": ["prs"]})).unwrap();
+        assert_eq!(topics(&said), ["0", "2", "1"], "{said}");
+        let newest = &said["read"][0]["topics"][0];
+        assert!(
+            newest["text"].as_str().unwrap().starts_with("#0 open"),
+            "{newest}"
+        );
+        assert_eq!(newest["from"], "ci");
+        assert_eq!(newest["id"], "prs/6");
+        assert_eq!(newest["url"], "https://example.com/0");
+        assert_eq!(newest["fields"], json!({"state": "open"}));
+        assert!(said["outside"].as_str().is_some());
+        // One topic, or a filter, as a follow names them.
+        assert_eq!(topics(&read(json!({"sources": ["prs:2"]})).unwrap()), ["2"]);
+        let red = read(json!({"sources": ["prs"], "filter": {"state": ["red"]}})).unwrap();
+        assert_eq!(topics(&red), ["2"], "{red}");
+        // A follow of the caller's, by its name alone: what it hears, and
+        // that its agents and the commons keep nothing here.
+        let follow = json!({"name": "mine", "sources": ["prs:1", format!("{COMMONS_SOURCE}:t")],
+            "agents": ["shop.*"]});
+        change(&store, "shop.lead", None, Some(&follow), None, &names).unwrap();
+        let mine = read(json!({"name": "mine"})).unwrap();
+        assert_eq!(topics(&mine), ["1"]);
+        assert_eq!(mine["read"].as_array().unwrap().len(), 1, "{mine}");
+        assert_eq!(
+            mine["unread"],
+            "its agents and the commons: only what sources printed is kept to read"
+        );
+        // An add's whole read the same, adding nothing.
+        assert_eq!(read(follow.clone()).unwrap(), mine);
+        assert_eq!(super::read(&store, "shop.lead").len(), 1);
+        // What it cannot read it says.
+        for (asked, why) in [
+            (json!({"name": "theirs"}), "no follow"),
+            (json!({"sources": ["mail"]}), "no source"),
+        ] {
+            let refused = read(asked.clone()).unwrap_err();
+            assert!(refused.contains(why), "{asked}: {refused}");
+        }
+        // More than a tool's answer shows is counted, and the answer whole
+        // still fits.
+        kept_log(&store, "prs", 300, 300);
+        let all = read(json!({"sources": ["prs"]})).unwrap();
+        let shown = all["read"][0]["topics"].as_array().unwrap().len();
+        assert!(
+            all.to_string().len() <= crate::served::OUTPUT_BYTES,
+            "{}",
+            all.to_string().len()
+        );
+        assert_eq!(
+            all["more"],
+            format!("{} topics more than one answer holds", 300 - shown)
+        );
+        // A source with nothing kept reads empty, and says nothing is outside.
+        let names = ["ci".to_owned()];
+        let empty = read_now(
+            &store,
+            "shop.lead",
+            &json!({"name": "r", "sources": ["ci"]}),
+            &names,
+        )
+        .unwrap();
+        assert_eq!(empty, json!({"read": [{"source": "ci", "topics": []}]}));
+        let _ = std::fs::remove_dir_all(dir(&store));
+        let _ = std::fs::remove_dir_all(super::super::beside(&store, ".sources"));
+    }
+
+    /// What a read costs at fleet scale: a source at its bounds, its topics
+    /// one per agent, read by every agent at once.
+    /// `cargo test -p sonny --release reads_at_scale -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn reads_at_scale() {
+        let threads = std::thread::available_parallelism().map_or(1, |n| n.get());
+        println!("{threads} threads");
+        for agents in [6, 424, 2_000, 5_000] {
+            let store =
+                std::env::temp_dir().join(format!("subs-scale-{}-{agents}", std::process::id()));
+            let _ = std::fs::remove_dir_all(super::super::beside(&store, ".sources"));
+            kept_log(&store, "prs", 2_000, agents);
+            let names = ["prs".to_owned()];
+            let asks = [
+                ("whole", json!({"name": "r", "sources": ["prs"]})),
+                ("topic", json!({"name": "r", "sources": ["prs:3"]})),
+                (
+                    "filter",
+                    json!({"name": "r", "sources": ["prs"], "filter": {"state": ["red"]}}),
+                ),
+            ];
+            for (what, asked) in &asks {
+                let _ = read_now(&store, "a", asked, &names).unwrap();
+                let start = std::time::Instant::now();
+                for _ in 0..20 {
+                    let _ = read_now(&store, "a", asked, &names).unwrap();
+                }
+                let one = start.elapsed() / 20;
+                let size = read_now(&store, "a", asked, &names)
+                    .unwrap()
+                    .to_string()
+                    .len();
+                println!(
+                    "agents {agents:>5} {what:>6}: one read {one:>9.2?}, answer {} KiB",
+                    size / 1024
+                );
+            }
+            // What a `test` of the whole source, there before, costs.
+            let add = json!({"name": "t", "sources": ["prs"]});
+            let start = std::time::Instant::now();
+            for _ in 0..20 {
+                let _ = tried(&store, "a", &add, &names).unwrap();
+            }
+            println!(
+                "agents {agents:>5}   test: one {:>9.2?}",
+                start.elapsed() / 20
+            );
+            // Every agent reads its own topic at once.
+            let start = std::time::Instant::now();
+            let mut each: Vec<std::time::Duration> = std::thread::scope(|scope| {
+                let handles: Vec<_> = (0..threads)
+                    .map(|t| {
+                        let store = &store;
+                        let names = &names;
+                        scope.spawn(move || {
+                            (t..agents)
+                                .step_by(threads)
+                                .map(|agent| {
+                                    let asked =
+                                        json!({"name": "r", "sources": [format!("prs:{agent}")]});
+                                    let at = std::time::Instant::now();
+                                    let _ = read_now(store, "a", &asked, names).unwrap();
+                                    at.elapsed()
+                                })
+                                .collect::<Vec<_>>()
+                        })
+                    })
+                    .collect();
+                handles
+                    .into_iter()
+                    .flat_map(|h| h.join().unwrap())
+                    .collect()
+            });
+            let all = start.elapsed();
+            each.sort();
+            let at = |q: f64| each[((each.len() - 1) as f64 * q) as usize];
+            println!(
+                "agents {agents:>5}   all at once: {all:>9.2?}, each p50 {:>8.2?} p99 {:>8.2?}",
+                at(0.5),
+                at(0.99)
+            );
+            let _ = std::fs::remove_dir_all(super::super::beside(&store, ".sources"));
+        }
     }
 
     #[test]

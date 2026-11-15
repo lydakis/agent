@@ -57,7 +57,7 @@ pub const GATED: [&str; 9] = [
 
 /// The most of what a call printed that its result holds, under the
 /// daemon's bound on an answer.
-const OUTPUT_BYTES: usize = 60 * 1024;
+pub(crate) const OUTPUT_BYTES: usize = 60 * 1024;
 
 /// How often waiting calls are listed with no call started to say so: a
 /// start missed while the daemon restarted is answered by then.
@@ -348,7 +348,8 @@ fn follows() -> Value {
                     "additionalProperties": false
                 },
                 "remove": {"type": "string", "minLength": 1, "description": "The name of one to remove."},
-                "test": {"type": "boolean", "description": "What add would have heard of its sources' last day; adds nothing."}
+                "test": {"type": "boolean", "description": "What add would have heard of its sources' last day; adds nothing."},
+                "read": {"type": "boolean", "description": "What add hears now; adds nothing."}
             },
             "additionalProperties": false
         },
@@ -777,6 +778,19 @@ async fn called(name: &str, arguments: &Value) -> Answer {
             let caller_id = std::env::var("AGENT_BOT_ID")
                 .ok()
                 .and_then(|id| id.parse().ok());
+            if arguments["read"] == true {
+                let (Some(add), None) = (arguments.get("add"), arguments.get("remove")) else {
+                    return Err(("follow_refused", "read reads an add alone".into()));
+                };
+                return crate::lookout::subs::read_now(
+                    &store,
+                    &caller,
+                    add,
+                    &crate::lookout::sources::names(),
+                )
+                .map(|read| read.to_string())
+                .map_err(|e| ("follow_refused", e));
+            }
             if arguments["test"] == true {
                 let Some(add) = arguments.get("add") else {
                     return Err(("follow_refused", "test tries an add".into()));
