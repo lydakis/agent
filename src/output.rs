@@ -26,6 +26,19 @@ pub const MAX_EVENT: usize = 1024 * 1024;
 pub const DETAIL_LIMIT: usize = 4096;
 type Packet = (Vec<u8>, OwnedSemaphorePermit, Option<oneshot::Sender<()>>);
 
+/// What an in-process session was sent, each a JSON line.
+pub struct Lines(mpsc::UnboundedReceiver<Packet>);
+impl Lines {
+    /// The next line, or `None` once the session's output is gone.
+    pub async fn next(&mut self) -> Option<Vec<u8>> {
+        let (bytes, _permit, flushed) = self.0.recv().await?;
+        if let Some(flushed) = flushed {
+            let _ = flushed.send(());
+        }
+        Some(bytes)
+    }
+}
+
 #[derive(Clone)]
 pub struct Output {
     sender: mpsc::UnboundedSender<Packet>,
@@ -85,6 +98,13 @@ impl Output {
             Ok(())
         });
         (output, worker)
+    }
+
+    /// A session read inside the daemon: what it would write, line by
+    /// line, for a client that is part of it, such as a bot's own tools.
+    pub fn in_process() -> (Self, Lines) {
+        let (output, receiver) = Self::channel();
+        (output, Lines(receiver))
     }
 
     /// Drain to an async writer; the session ends when writing fails.
