@@ -833,13 +833,18 @@ impl Field {
             }
             words.push(word);
         }
+        // A row broken at a ` · ` leaves the dot: no row ends in one.
+        let ended = |row: &str| -> String {
+            let row = row.trim_end();
+            row.strip_suffix('·').unwrap_or(row).trim_end().to_owned()
+        };
         for word in words.into_iter().filter(|w| !w.is_empty()) {
-            if !row.is_empty() && row.width() + word.trim_end().width() > room {
-                rows.push(std::mem::take(&mut row).trim_end().to_owned());
+            if !row.is_empty() && row.width() + ended(&word).width() > room {
+                rows.push(ended(&std::mem::take(&mut row)));
             }
             row.push_str(&word);
         }
-        rows.push(row.trim_end().to_owned());
+        rows.push(ended(&row));
         (rows.into_iter())
             .map(|text| Field {
                 spans: vec![Span::styled(text, style)],
@@ -1672,9 +1677,9 @@ impl View {
                     (short(to), Some(to.clone())),
                 ]);
             }
-            if let Some(why) = &item.failed {
+            if let Some(why) = page_alert(&item) {
                 body.extend(crate::transcript::wrap(
-                    Line::from(vec![Span::raw("✗ ").fg(Color::Red), Span::raw(why.clone())]),
+                    Line::from(vec![Span::raw("✗ ").fg(Color::Red), Span::raw(why)]),
                     width,
                     Span::raw(""),
                     Span::raw("  "),
@@ -1967,11 +1972,15 @@ impl View {
         let row = &item.row;
         let now = (now_ms() / 1000) as i64;
         let mut fields = Vec::new();
-        let mut when = vec![Field::text(when_words(
-            row["when"].as_str().unwrap_or(&item.when),
-            self.next_run,
-            now,
-        ))];
+        // A time at or past its end is no run.
+        let until = (row["until"].as_str()).and_then(|until| trigger::moment(until).ok());
+        let when_set = row["when"].as_str().unwrap_or(&item.when);
+        let mut when = vec![Field::text(match (self.next_run, until) {
+            (Some(next), Some(until)) if next >= until => {
+                format!("{when_set} · no run before it ends")
+            }
+            (next, _) => when_words(when_set, next, now),
+        })];
         if row["missed"] == true {
             when.push(Field::text("missed its time".into()));
         }
@@ -1994,13 +2003,15 @@ impl View {
                 ))),
                 Some("failed") => rows.push(Field::text(format!(
                     "could not check since {}",
-                    ago_of("since_ms")
+                    since_of(u128::from(checked["since_ms"].as_u64().unwrap_or_default()))
                 ))),
                 _ => {}
             }
             fields.push(("if", rows));
         }
-        fields.push(("last", vec![self.last_run(item)]));
+        if let Some(last) = self.last_run(item) {
+            fields.push(("last", vec![last]));
+        }
         let mut left = Vec::new();
         if let Some(runs) = row["runs"].as_u64() {
             let sent = row["sent"].as_u64().unwrap_or(0);
@@ -2034,18 +2045,29 @@ impl View {
 
     /// When an automation last ran and the agent it ran in, a link; how
     /// it ended only when not well, `working` while its turn runs.
-    fn last_run(&self, item: &Item) -> Field {
+    fn last_run(&self, item: &Item) -> Option<Field> {
         let row = &item.row;
         let last = &row["last"];
+        let never = || Field::text("not run yet".into());
         let Some(fired) = last["fired_ms"].as_u64() else {
-            return Field::text("not run yet".into());
+            return Some(never());
         };
-        // The agent its run went to: a run's own where each starts one.
+        // A check that could not run sent nothing: no run, and its own
+        // row and the alert say why.
+        if last["gate"] == "failed" {
+            return (row["sent"].as_u64().unwrap_or(0) == 0).then(never);
+        }
+        // The agent its run went to: the run whose turn it sent, where
+        // each run starts its own; none where it sent no turn.
         let run = &row["run"];
-        let bot = (["running", "finished", "failed"].iter())
-            .find_map(|key| run[key]["bot"].as_str())
-            .unwrap_or(&item.bot)
-            .to_owned();
+        let bot = last["handle"].as_str().map(|handle| {
+            (["running", "finished", "failed"].iter())
+                .map(|key| &run[key])
+                .find(|run| run["handle"].as_str() == Some(handle))
+                .and_then(|run| run["bot"].as_str())
+                .unwrap_or(&item.bot)
+                .to_owned()
+        });
         let ended = match (last["outcome"].as_str(), last["turn_status"].as_str()) {
             (Some("sent"), None) => Some("working".to_owned()),
             (Some("sent"), Some("completed")) => None,
@@ -2059,20 +2081,21 @@ impl View {
             true => Some("its answer was not passed on".to_owned()),
             false => ended,
         };
-        let mut spans = vec![
-            Span::raw(format!(
-                "{} in ",
-                ago(now_ms().saturating_sub(fired) / 1000)
-            )),
-            Span::raw(self.scope.short(&bot)).fg(Color::Blue),
-        ];
+        let when = ago(now_ms().saturating_sub(fired) / 1000);
+        let mut spans = match &bot {
+            Some(bot) => vec![
+                Span::raw(format!("{when} in ")),
+                Span::raw(self.scope.short(bot)).fg(Color::Blue),
+            ],
+            None => vec![Span::raw(when)],
+        };
         if let Some(ended) = ended {
             spans.push(Span::raw(format!(" · {ended}")));
         }
-        Field {
+        Some(Field {
             spans,
-            link: Some((1, Target::Agent(bot))),
-        }
+            link: bot.map(|bot| (1, Target::Agent(bot))),
+        })
     }
 
     /// Every agent `sub` watches now, each a link with its mark and word,
@@ -2423,7 +2446,7 @@ fn when_words(when: &str, next: Option<i64>, now: i64) -> String {
     if let Some(path) = when.strip_prefix("commit ") {
         return format!("a commit lands in {}", home_path(path));
     }
-    if when.is_empty() || when == "fire" {
+    if when.is_empty() || when == "fire" || when == trigger::ON_DEMAND {
         return "only when run".into();
     }
     match (when.strip_prefix("at "), next) {
@@ -2448,9 +2471,11 @@ fn coming(at: i64, now: i64) -> String {
         }
         false => trigger::date(at),
     };
+    // Minutes up to the hour, rounded up; from 60 minutes, hours.
+    let minutes = ((left + 59) / 60).max(1);
     let off = match left {
-        0..3600 => format!("{}m", ((left + 59) / 60).max(1)),
-        3600..86_400 => format!("{}h", left / 3600),
+        _ if minutes < 60 => format!("{minutes}m"),
+        0..86_400 => format!("{}h", (left / 3600).max(1)),
         _ => format!("{}d", left / 86_400),
     };
     format!("{time}, in {off}")
@@ -2590,6 +2615,31 @@ fn ago(seconds: u64) -> String {
 
 /// What a run came to, on one line, a daemon's error code at its start
 /// in the Rulebook's words: the daemon keeps `bot` inside itself.
+/// The page's alert: an automation's check in the page's own words, as
+/// its row calls it `if`; anything else as the list says it.
+fn page_alert(item: &Item) -> Option<String> {
+    let row = &item.row;
+    let check = |words: &str, why: &str| {
+        let why = why.strip_prefix("--if: ").unwrap_or(why);
+        let why = why.replace("exit status: ", "exit status ");
+        format!("{words}: {}", first_line(&why))
+    };
+    if item.kind == Kind::Trigger {
+        if let Some(why) = row["if_cannot_run"].as_str() {
+            return Some(check("its check cannot run", why));
+        }
+        let checked = &row["checked"];
+        if checked["gate"] == "failed" {
+            let why = checked["detail"].as_str().filter(|why| !why.is_empty());
+            return Some(match why {
+                Some(why) => check("its check could not run", why),
+                None => "its check could not run".into(),
+            });
+        }
+    }
+    item.failed.clone()
+}
+
 fn detail_line(detail: &str) -> String {
     let codes = [("bot_busy", "busy"), ("bot_not_found", "agent not found")];
     let worded = (codes.iter())
@@ -3055,8 +3105,42 @@ mod tests {
         // A part a ` · ` apart stays whole: a date never breaks.
         let narrower = page_text(&mut view, 40);
         let at = narrower.iter().position(|l| l.starts_with("left")).unwrap();
-        assert_eq!(narrower[at], "left    3 of 5 runs ·");
+        assert_eq!(narrower[at], "left    3 of 5 runs");
         assert_eq!(narrower[at + 1], format!("        until {until}"));
+    }
+
+    #[test]
+    fn a_check_that_could_not_run_is_no_run_and_no_time_past_the_end_is_next() {
+        let now = now_ms();
+        let since = now - 3_000;
+        let row = json!({"name": "watch", "when": "cron 0 3 * * *", "bot": "calc.lead",
+            "bot_id": 1, "if": "exit 7", "sent": 0, "until": "2026-11-15 23:30",
+            "message": "Look.",
+            "checked": {"gate": "failed", "since_ms": since, "detail": "--if: exit status: 7"},
+            "last": {"outcome": "failed", "gate": "failed", "fired_ms": since,
+                "detail": "--if: exit status: 7"}});
+        let item = Item {
+            row: row.clone(),
+            failed: Some("--if: exit status: 7".into()),
+            message: "Look.".into(),
+            ..item(Kind::Trigger, "watch", &["calc.lead"], false)
+        };
+        let mut view = view_of(std::env::temp_dir(), vec![item]);
+        view.key(
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            0..usize::MAX,
+        );
+        view.next_run = trigger::moment("2026-11-16 03:00").ok();
+        let page = page_text(&mut view, 80);
+        let clock = since_of(u128::from(since));
+        assert_eq!(page[3], "✗ its check could not run: exit status 7");
+        assert_eq!(page[5], "when  cron 0 3 * * * · no run before it ends");
+        assert_eq!(page[6], "if    exit 7");
+        assert_eq!(page[7], format!("      could not check since {clock}"));
+        assert_eq!(page[8], "last  not run yet");
+        // Nothing went to the agent: no link to it under `last`.
+        let links = &view.page.as_ref().unwrap().links;
+        assert!(links.iter().all(|link| link.0 != 8), "{links:?}");
     }
 
     #[test]
@@ -3107,6 +3191,13 @@ mod tests {
             "/x/notes.md changes"
         );
         assert_eq!(when_words("fire", None, now), "only when run");
+        assert_eq!(when_words(trigger::ON_DEMAND, None, now), "only when run");
+        // From 60 minutes it is hours.
+        let hour = trigger::local(now + 3590);
+        assert_eq!(
+            when_words("every 1h", Some(now + 3590), now),
+            format!("every 1h · next {:02}:{:02}, in 1h", hour.hour, hour.minute)
+        );
         assert_eq!(when_words("every 1h", None, now), "every 1h");
         let soon = trigger::local(now + 35 * 60);
         assert_eq!(

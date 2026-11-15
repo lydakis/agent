@@ -1142,7 +1142,10 @@ has something on it, or is off the screen, no time shows.
   (`working` while its turn runs), `left` (`3 of 5 runs`, `until Tue 1 Dec
   09:00`), `budget`, and then its whole message; folders are written from
   `~` and break at a `/`, and its next run is read from its schedule only
-  while the page is open; a
+  while the page is open; a next time at or past its end reads `no run
+  before it ends`, and a check that could not run is no run: `last` keeps
+  the last run that was, the alert says `its check could not run`, and
+  `if` says `could not check since 15:45`; a
   follow's page says what it does now after how it was set: what it
   watches and every agent that matches now, each a link with its mark and
   state, those not done first and two done or more folded to `3 done`,

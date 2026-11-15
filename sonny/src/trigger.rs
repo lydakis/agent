@@ -5610,7 +5610,14 @@ fn fire(places: &Places, trigger: &Trigger, ask: Option<&Asked>) {
             // Its `--if` could not answer: no run, and a later check that
             // answers ends this failure (the person's `/background` says so).
             let failed = named(json!({"outcome": "failed", "detail": broken, "gate": "failed"}));
-            settle(places, trigger, &failed, &kept);
+            if trigger.at.is_some() {
+                settle(places, trigger, &failed, &kept);
+                return;
+            }
+            // A repeating one ran nothing: its row keeps its last run, as
+            // one its check said no to does, and the check says why.
+            noted(places, trigger, &kept);
+            received(places, trigger, &failed);
             return;
         }
     }

@@ -105,13 +105,13 @@ impl Keys {
         let mut pairs = self.pairs.iter();
         let first = self.pairs.first().filter(|(key, _)| key == "↑↓");
         if let Some((key, does)) = first {
-            out.push((key.clone(), does.clone(), Kind::Rest));
+            out.push((key.clone(), does.clone(), Kind::Pick));
             pairs.next();
         }
         if let Some(enter) = self.enter {
             out.push(("enter".into(), enter.label().into(), Kind::Enter));
         }
-        out.extend(pairs.map(|(key, does)| (key.clone(), does.clone(), Kind::Rest)));
+        out.extend(pairs.map(|(key, does)| (key.clone(), does.clone(), kind_of(key))));
         if let Some(esc) = self.esc {
             out.push(("esc".into(), esc.label().into(), Kind::Esc));
         }
@@ -123,8 +123,9 @@ impl Keys {
         join(&self.said())
     }
 
-    /// The keys in at most `room` columns: pairs go from the right, before
-    /// the last; `esc` stays, then `enter`, then the rest.
+    /// The keys in at most `room` columns: `↑↓ pick` goes first, then the
+    /// way back, then the view's letters from the right, then `enter`;
+    /// `esc` stays, as the last pair does.
     pub fn fit(&self, room: usize) -> String {
         fitted(self.said(), room)
     }
@@ -138,20 +139,41 @@ impl std::fmt::Display for Keys {
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum Kind {
+    /// `↑↓`, the same in every view.
+    Pick,
+    /// The way back to the conversation: `ctrl+\`, `tab`.
+    Back,
+    /// A view's own letters.
     Rest,
     Enter,
     Esc,
 }
 
-/// `said` joined in at most `room` columns. Pairs go from the right,
-/// before the last, which stays as `esc` does wherever it is named; the
-/// rest go first, then `enter`.
+/// What a pair named by `key` is, as a line of keys gives way.
+fn kind_of(key: &str) -> Kind {
+    match key {
+        "esc" => Kind::Esc,
+        "enter" => Kind::Enter,
+        "↑↓" => Kind::Pick,
+        "tab" => Kind::Back,
+        key if key.starts_with("ctrl+\\") => Kind::Back,
+        _ => Kind::Rest,
+    }
+}
+
+/// `said` joined in at most `room` columns. The last pair stays, as `esc`
+/// does wherever it is named. Before it, `↑↓ pick` goes first, since the
+/// arrows are the same in every view; then the way back; then the view's
+/// letters, from the right, since a letter is the one key a person cannot
+/// guess; then `enter`.
 fn fitted(mut said: Vec<(String, String, Kind)>, room: usize) -> String {
     while join(&said).width() > room {
         let before = &said[..said.len().saturating_sub(1)];
-        let at = (before.iter())
-            .rposition(|(_, _, kind)| *kind == Kind::Rest)
-            .or_else(|| before.iter().position(|(_, _, kind)| *kind == Kind::Enter));
+        let last_of = |wanted: Kind| before.iter().rposition(|(_, _, kind)| *kind == wanted);
+        let at = last_of(Kind::Pick)
+            .or_else(|| last_of(Kind::Back))
+            .or_else(|| last_of(Kind::Rest))
+            .or_else(|| last_of(Kind::Enter));
         match at {
             Some(at) => said.remove(at),
             None => break,
@@ -171,19 +193,13 @@ fn join(said: &[(String, String, Kind)]) -> String {
 }
 
 /// A line of keys written as text, `keys`, in at most `room` columns, as
-/// [`Keys::fit`] fits them: a pair named `esc` stays, then `enter`, and
-/// the others go from the right.
+/// [`Keys::fit`] fits them.
 pub fn fit(keys: &str, room: usize) -> String {
     let said: Vec<(String, String, Kind)> = (keys.trim().split(" · "))
         .filter(|pair| !pair.is_empty())
         .map(|pair| {
             let (key, does) = pair.split_once(' ').unwrap_or((pair, ""));
-            let kind = match key {
-                "esc" => Kind::Esc,
-                "enter" => Kind::Enter,
-                _ => Kind::Rest,
-            };
-            (key.to_owned(), does.to_owned(), kind)
+            (key.to_owned(), does.to_owned(), kind_of(key))
         })
         .collect();
     fitted(said, room)
@@ -243,7 +259,7 @@ mod tests {
     }
 
     #[test]
-    fn too_long_the_pairs_go_from_the_right_and_esc_then_enter_stay() {
+    fn too_long_the_pick_goes_first_then_letters_from_the_right_and_esc_then_enter_stay() {
         let keys = Keys::new()
             .pick()
             .key("t", "kind")
@@ -252,10 +268,15 @@ mod tests {
             .esc(Esc::Close);
         let all = "↑↓ pick · enter open · t kind · p place · esc close";
         assert_eq!(keys.fit(80), all);
-        assert_eq!(keys.fit(41), "↑↓ pick · enter open · t kind · esc close");
+        assert_eq!(keys.fit(50), "enter open · t kind · p place · esc close");
+        assert_eq!(keys.fit(40), "enter open · t kind · esc close");
         assert_eq!(keys.fit(30), "enter open · esc close");
         assert_eq!(keys.fit(12), "esc close");
         assert_eq!(keys.fit(2), "esc close");
+        // The way back goes after the pick, before the view's letters.
+        let back = "↑↓ pick · r run · ctrl+\\ conversation · esc close";
+        assert_eq!(fit(back, 40), "r run · ctrl+\\ conversation · esc close");
+        assert_eq!(fit(back, 30), "r run · esc close");
         // With no esc named, the last pair stays all the same.
         let agent = "ctrl+g main view · ctrl+t its tab · ctrl+\\ conversation";
         assert_eq!(fit(agent, 40), "ctrl+g main view · ctrl+\\ conversation");
