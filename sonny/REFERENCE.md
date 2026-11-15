@@ -1738,6 +1738,16 @@ arrow, no words: `›↪` a steer, which goes in when the call under way ends,
 and `›⋯` a queued message, for after the turn. `[sonny] view = "steps"`
 brings back the steps, the view below, and `/verbose` draws every call.
 
+Two muted hints hang on a reply, drawn by Sonny from what it knows; no
+agent sees them. Under it, `└` says what its turn set going: `started`
+for each new task, `sent to` for each agent there already, each name a
+link with its state's mark, kept current (`└ started ● halves · ●
+readme`). With one alone and room left, its title follows, a brief's or
+a message's first line; names give way to `+N`. Above a reply to a turn
+you did not start, `↳` names who started it: an agent, a lookout note's
+tasks and sources (a source by its icon), an automation by `↻`. A turn
+that says nothing draws neither. Zen keeps `└`.
+
 ![Words only: a lead asked to check the work, its words as two tasks report in, and nothing between](../docs/sonny/words-only.png)
 
 ![A steer and a queued message waiting while the agent works, each a mark by its arrow](../docs/sonny/waiting-marks.png)

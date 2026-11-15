@@ -1698,6 +1698,59 @@ pub fn relayed_names(text: &str, from: Option<&str>) -> Vec<String> {
     from.map(|from| vec![from.to_owned()]).unwrap_or_default()
 }
 
+/// Who started a turn the person did not, for the words view's `↳` row
+/// above its reply: the agent that sent it by its whole name, each task
+/// and source a lookout's note is about (a source by its icon and name),
+/// an automation by `↻`, or what else sent it.
+pub fn came_names(text: &str, from: Option<&str>) -> Vec<String> {
+    if from == Some(LOOKOUT) {
+        let icons = crate::background::source_icons();
+        return crate::calls::once(text.lines().filter_map(header).filter_map(|parts| {
+            match parts.as_slice() {
+                ["lookout", ..] | [] => None,
+                [crate::lookout::activity::SOURCE, task, ..] => Some(task.to_string()),
+                [source, ..] => Some(match icons.get(*source) {
+                    Some(icon) => format!("{icon} {source}"),
+                    None => source.to_string(),
+                }),
+            }
+        }));
+    }
+    // News Sonny brings (an upgrade) by what it is.
+    if let Some(parts) = news(text) {
+        return parts.into_iter().take(1).collect();
+    }
+    match from {
+        Some(AUTOMATION) => vec!["↻ automation".to_owned()],
+        Some(from) => vec![from.to_owned()],
+        None => Vec::new(),
+    }
+}
+
+/// What sends an automation's prompts, as [`from_outside`] names it.
+const AUTOMATION: &str = "an automation";
+
+/// The words view's `↳` row: who started the turn its reply answers,
+/// muted; names give way to `+N` before it passes `width`.
+pub fn came_row(names: &[String], width: usize) -> Line<'static> {
+    let mut row = "↳".to_owned();
+    for (at, name) in names.iter().enumerate() {
+        let next = format!("{row}{}{name}", if at == 0 { " " } else { ", " });
+        let left = names.len() - at - 1;
+        let more = if left > 0 {
+            format!(" +{left}").width()
+        } else {
+            0
+        };
+        if at > 0 && next.width() + more > width {
+            row.push_str(&format!(" +{}", names.len() - at));
+            return Line::from(row).dim();
+        }
+        row = next;
+    }
+    Line::from(cut(&row, width)).dim()
+}
+
 /// The row that gathers messages between agents that came one after
 /// another, each `kinds`' [`relayed_kind`]: how many of each and whom
 /// they name, so the row says whose news it holds, `▸` to list them;
@@ -4359,6 +4412,7 @@ mod tests {
     #[test]
     fn messages_in_a_row_are_counted_by_kind() {
         let note = "[tasks · a.b · a.b replied, completed]\ndone";
+        assert_eq!(came_names(note, Some(LOOKOUT)), ["a.b"]);
         let lookout = Some("the lookout");
         assert_eq!(relayed_kind(note, lookout), "lookout note");
         assert_eq!(relayed_kind("Look at this", Some("a.b")), "message");
@@ -4370,6 +4424,14 @@ mod tests {
         ];
         assert_eq!(relayed_names(note, lookout), ["a.b"]);
         assert_eq!(relayed_names("Look at this", Some("a.c")), ["a.c"]);
+        assert_eq!(came_names("Look at this", Some("a.c")), ["a.c"]);
+        assert_eq!(
+            came_names("Run the check", Some("an automation")),
+            ["↻ automation"]
+        );
+        assert_eq!(came_names("hi", None), Vec::<String>::new());
+        let upgraded = format!("{}\n- set up backup: on", crate::skills::UPGRADED);
+        assert_eq!(came_names(&upgraded, Some("outside")), ["Sonny upgraded"]);
         let names = ["a.b", "a.c", "a.b", "a.d"].map(String::from);
         assert_eq!(
             gathered(&kinds, &names, false, 80).to_string(),

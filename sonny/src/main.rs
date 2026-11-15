@@ -3475,6 +3475,16 @@ impl Live {
     }
 }
 
+/// The words view's hints on the turn being drawn: who started it, when
+/// the person did not, for the `↳` row above its first words; what it
+/// set going, for the `└` row under its last; and whether it said any.
+#[derive(Debug, Default)]
+struct TurnHints {
+    came: Vec<String>,
+    set: Vec<started::SetGoing>,
+    replied: bool,
+}
+
 /// What the bot's words turned out to be once something followed them.
 #[derive(Clone, Copy, PartialEq)]
 enum Words {
@@ -4749,6 +4759,13 @@ struct App {
     tasks_all_read: Option<Instant>,
     /// The width the tasks started were drawn at.
     tasks_width: usize,
+    /// The words view's hints on the turn being drawn.
+    turn_hints: TurnHints,
+    /// The `└` rows drawn, by the client's number for each, with what
+    /// each names; and what the agents they name that are no task of
+    /// this window's are doing, read as a task's state is.
+    set_rows: BTreeMap<usize, Vec<started::SetGoing>>,
+    set_states: HashMap<String, String>,
     /// When what runs for this agent in the background was last read, for
     /// what of it failed.
     behind_read: Option<Instant>,
@@ -6403,6 +6420,9 @@ impl App {
             tasks_read: None,
             tasks_all_read: None,
             tasks_width: 0,
+            turn_hints: TurnHints::default(),
+            set_rows: BTreeMap::new(),
+            set_states: HashMap::new(),
         }
     }
 
@@ -7744,6 +7764,9 @@ impl App {
             if name == served::START && !failed {
                 self.track_started(arguments, output);
             }
+            if !failed {
+                self.set_going(name, arguments, output);
+            }
             return;
         }
         if name == margin::TOOL {
@@ -7941,11 +7964,7 @@ impl App {
     /// The task a `start_task` call made, its name known from now on.
     fn started_task(&mut self, arguments: &Value, output: &str) -> started::Task {
         let name = arguments["name"].as_str().unwrap_or("task").to_owned();
-        let bot = (output.split(|c: char| c.is_whitespace() || c == '"'))
-            .find(|word| calls::handle_parts(word).is_some())
-            .map(calls::handle_bot)
-            .or_else(|| (self.project.as_ref()).map(|project| format!("{project}.{name}")))
-            .unwrap_or_else(|| name.clone());
+        let bot = self.started_bot(arguments, output);
         let task = started::Task {
             bot,
             name,
@@ -7958,6 +7977,120 @@ impl App {
         self.screen.relink();
         self.tasks_read = None;
         task
+    }
+
+    /// The whole name of the task a `start_task` call started: as its
+    /// output says it, else its name in this project.
+    fn started_bot(&self, arguments: &Value, output: &str) -> String {
+        let name = arguments["name"].as_str().unwrap_or("task");
+        (output.split(|c: char| c.is_whitespace() || c == '"'))
+            .find(|word| calls::handle_parts(word).is_some())
+            .map(calls::handle_bot)
+            .or_else(|| (self.project.as_ref()).map(|project| format!("{project}.{name}")))
+            .unwrap_or_else(|| name.to_owned())
+    }
+
+    /// An agent's name as the words view's hints say it: short in its own
+    /// project, `halves` for `calc.halves`, else whole.
+    fn hint_name(&self, bot: &str) -> String {
+        (self.project.as_deref())
+            .and_then(|project| bot.strip_prefix(project)?.strip_prefix('.'))
+            .filter(|name| !name.is_empty())
+            .unwrap_or(bot)
+            .to_owned()
+    }
+
+    /// What a call of the turn being drawn set going, for the `└` row
+    /// under its reply, words only: a task it started, or a message it
+    /// sent an agent there already; each agent once.
+    fn set_going(&mut self, name: &str, arguments: &Value, output: &str) {
+        let (verb, bot, title) = match name {
+            served::START => (
+                started::STARTED,
+                self.started_bot(arguments, output),
+                arguments["brief"].as_str().unwrap_or(""),
+            ),
+            "send_message" => {
+                // One the daemon refused (no such agent) sent nothing.
+                if serde_json::from_str::<Value>(output)
+                    .is_ok_and(|reply| reply["error"].is_string())
+                {
+                    return;
+                }
+                let Some(to) = arguments["to"]
+                    .as_str()
+                    .map(str::trim)
+                    .filter(|to| !to.is_empty())
+                else {
+                    return;
+                };
+                let bot = match (to.contains('.'), self.project.as_ref()) {
+                    (false, Some(project)) => format!("{project}.{to}"),
+                    _ => to.to_owned(),
+                };
+                (
+                    started::SENT,
+                    bot,
+                    arguments["message"].as_str().unwrap_or(""),
+                )
+            }
+            _ => return,
+        };
+        if self.turn_hints.set.iter().any(|one| one.bot == bot) {
+            return;
+        }
+        let going = started::SetGoing {
+            verb,
+            name: self.hint_name(&bot),
+            bot,
+            title: started::first(title),
+        };
+        self.turn_hints.set.push(going);
+    }
+
+    /// What `bot`, named on a `└` row, is doing: as the task this window
+    /// tracks, else as read for the row.
+    fn set_state(&self, bot: &str) -> String {
+        (self.tasks.values().flatten())
+            .find(|task| task.bot == bot)
+            .map(|task| task.state.clone())
+            .or_else(|| self.set_states.get(bot).cloned())
+            .unwrap_or_else(|| "working".to_owned())
+    }
+
+    /// The `└` row `at` and the buttons on it that open each agent it names.
+    fn set_row(&self, at: usize) -> (Line<'static>, screen::Buttons) {
+        let set = self.set_rows.get(&at).map_or(&[][..], Vec::as_slice);
+        let (line, links) = started::hint(set, |bot| self.set_state(bot), self.prose());
+        let buttons = (links.into_iter())
+            .map(|(from, to, bot)| (from, to, format!("{}task/{bot}", screen::BUTTON)))
+            .collect();
+        (line, buttons)
+    }
+
+    /// The turn drawn ends its hints: what it set going, a `└` row under
+    /// its last words, when it said any; a turn that said nothing draws
+    /// nothing.
+    fn end_hints(&mut self) {
+        let hints = std::mem::take(&mut self.turn_hints);
+        if !self.words() || !hints.replied || hints.set.is_empty() {
+            return;
+        }
+        let at = self.group();
+        self.set_rows.insert(at, hints.set);
+        let (line, buttons) = self.set_row(at);
+        self.commit_after(vec![line], false);
+        self.mark_last(screen::Mark::Tag(screen::Tag::SetGoing(at as u64)));
+        self.mark_last(screen::Mark::Buttons(buttons));
+    }
+
+    /// The `↳` row above the first words of a turn the person did not
+    /// start, naming who started it, words only; none once drawn, and
+    /// none for the person's own. Its words are said from here on.
+    fn came_row(&mut self) -> Option<Line<'static>> {
+        self.turn_hints.replied = true;
+        let came = std::mem::take(&mut self.turn_hints.came);
+        (self.words() && !came.is_empty()).then(|| transcript::came_row(&came, self.prose()))
     }
 
     /// The rows of the tasks started together as `at`, and the buttons
@@ -8016,15 +8149,26 @@ impl App {
         for at in gone {
             self.tasks.remove(&at);
         }
+        // `└` rows the conversation let go name nothing to read.
+        let gone: Vec<usize> = (self.set_rows.keys().copied())
+            .filter(|at| !self.kept(screen::Tag::SetGoing(*at as u64)))
+            .collect();
+        for at in gone {
+            self.set_rows.remove(&at);
+        }
         // Drawn again at the width the conversation has now, as when the
         // pane opened beside it.
-        if !self.tasks.is_empty() && self.tasks_width != self.prose() {
+        if !(self.tasks.is_empty() && self.set_rows.is_empty()) && self.tasks_width != self.prose()
+        {
             self.tasks_width = self.prose();
             for at in self.tasks.keys().copied().collect::<Vec<_>>() {
                 self.draw_started(at);
             }
+            for at in self.set_rows.keys().copied().collect::<Vec<_>>() {
+                self.draw_set_row(at);
+            }
         }
-        if self.tasks.is_empty()
+        if (self.tasks.is_empty() && self.set_rows.is_empty())
             || self
                 .tasks_read
                 .is_some_and(|at| at.elapsed() < Duration::from_secs(3))
@@ -8047,7 +8191,27 @@ impl App {
             .collect();
         bots.sort();
         bots.dedup();
+        // The agents `└` rows name that are no tasks here: what each is
+        // doing, read as a task's state is, and nothing more.
+        let named: HashMap<String, String> = (self.set_rows.values().flatten())
+            .map(|one| (one.bot.clone(), self.set_state(&one.bot)))
+            .collect();
+        let mut others: Vec<String> = (named.keys())
+            .filter(|bot| !(self.tasks.values().flatten()).any(|task| task.bot == **bot))
+            .filter(|bot| all || !started::settled(&named[*bot]))
+            .cloned()
+            .collect();
+        others.sort();
+        for bot in others {
+            let state = match self.task_turn_at(&bot).await {
+                Ok((turn, _)) => started::state(&turn),
+                Err(error) if error.code == "bot_not_found" => "removed".to_owned(),
+                Err(_) => continue,
+            };
+            self.set_states.insert(bot, state);
+        }
         if bots.is_empty() {
+            self.redraw_set_rows(&named);
             return;
         }
         // What waits on the person, read as every surface reads it.
@@ -8151,6 +8315,30 @@ impl App {
                 self.draw_started(at);
             }
         }
+        self.redraw_set_rows(&named);
+    }
+
+    /// The `└` rows naming an agent whose state is no longer as `was`
+    /// had it, drawn again.
+    fn redraw_set_rows(&mut self, was: &HashMap<String, String>) {
+        let changed: Vec<usize> = (self.set_rows.iter())
+            .filter(|(_, set)| {
+                (set.iter()).any(|one| was.get(&one.bot) != Some(&self.set_state(&one.bot)))
+            })
+            .map(|(at, _)| *at)
+            .collect();
+        for at in changed {
+            self.draw_set_row(at);
+        }
+    }
+
+    /// The `└` row `at` drawn again where it is, with its agents' marks
+    /// as they are now.
+    fn draw_set_row(&mut self, at: usize) {
+        let (line, buttons) = self.set_row(at);
+        self.flush();
+        let tag = screen::Tag::SetGoing(at as u64);
+        (self.screen).replace_tagged(tag, vec![line], vec![(0, screen::Mark::Buttons(buttons))]);
     }
 
     /// The turn that says what `bot` does, as `/status` reads it
@@ -9309,7 +9497,13 @@ impl App {
     /// and the person's reactions to them right under it.
     fn commit_said(&mut self, node: i64, lines: Vec<Line<'static>>) {
         let count = lines.len();
-        self.commit(lines);
+        match self.came_row() {
+            Some(came) => {
+                self.commit(vec![came]);
+                self.commit_after(lines, false);
+            }
+            None => self.commit(lines),
+        }
         self.mark_first(count);
         self.mark_last(screen::Mark::Tag(screen::Tag::End(node)));
         if let Some(row) = self.reacted_row(node) {
@@ -9399,6 +9593,15 @@ impl App {
     /// was written with, and what follows wears the project's whose agents
     /// alone sent it, if one followed project's did.
     fn bar_turn(&mut self, woke: Option<(&str, Option<&str>)>) {
+        self.end_hints();
+        if let Some((text, from)) = woke
+            && transcript::relays(text, from)
+        {
+            let came = transcript::came_names(text, from);
+            self.turn_hints.came = (came.into_iter())
+                .map(|name| self.hint_name(&name))
+                .collect();
+        }
         let names = match woke {
             Some((text, from)) if transcript::relays(text, from) => {
                 transcript::relayed_names(text, from)
@@ -9946,6 +10149,11 @@ impl App {
         mut caught_up: Option<HashMap<String, Value>>,
     ) -> Vec<(i64, Value)> {
         let short = self.short_read.replace(false);
+        // An older page's turns end their own hints, apart from the newest's.
+        let hints = match older {
+            true => Some(std::mem::take(&mut self.turn_hints)),
+            false => None,
+        };
         let mut calls: HashMap<String, (String, Value)> = HashMap::new();
         let mut unpaired = Vec::new();
         // The bot's words, quiet if a call follows them, as they were live.
@@ -10179,6 +10387,10 @@ impl App {
         }
         if let Some((at, lines)) = said {
             self.commit_said(at, lines);
+        }
+        self.end_hints();
+        if let Some(hints) = hints {
+            self.turn_hints = hints;
         }
         if !older {
             self.elsewhere = aside;
@@ -10496,6 +10708,7 @@ impl App {
             self.pending.push(Line::default());
         }
         if !live.spilled {
+            self.came_above();
             self.marks.push((self.pending.len(), screen::Mark::Opens));
         }
         self.rows_drawn += live.rows.len();
@@ -10512,6 +10725,15 @@ impl App {
                 self.mark_last(screen::Mark::Tag(screen::Tag::Reactions(node)));
                 self.mark_last(screen::Mark::Buttons(self.reacted_buttons(node)));
             }
+        }
+    }
+
+    /// The `↳` row, when the words about to be written have one, right
+    /// above them.
+    fn came_above(&mut self) {
+        if let Some(came) = self.came_row() {
+            self.rows_drawn += 1;
+            self.pending.push(came);
         }
     }
 
@@ -10533,6 +10755,7 @@ impl App {
                 self.pending.push(Line::default());
             }
             if !live.spilled {
+                self.came_above();
                 self.marks.push((self.pending.len(), screen::Mark::Opens));
             }
             live.spilled = true;
@@ -11295,6 +11518,7 @@ impl App {
                         self.commit(line);
                     }
                 }
+                self.end_hints();
                 self.draw_bot_reactions();
                 // A task that marked itself done in it, or its lead did.
                 if ended && let Some(turn) = turn {
@@ -21880,14 +22104,16 @@ mod tests {
         assert_eq!(rows[at("Rounding now")].0, None);
         assert_eq!(rows[at("Pushed as")].0, None);
         // A message from shop's agent, and calc's task news, each bar the
-        // reply they woke, with no name added; the gap above each stays
-        // bare, so two replies read as two.
+        // reply they woke and the `↳` row over it naming who; the gap
+        // above each stays bare, so two replies read as two.
         let shop = at("Noted what shop.fix said.");
         assert_eq!(rows[shop], (Some(0), "• Noted what shop.fix said.".into()));
-        assert_eq!(rows[shop - 1], (None, String::new()));
+        assert_eq!(rows[shop - 1], (Some(0), "↳ shop.fix".into()));
+        assert_eq!(rows[shop - 2], (None, String::new()));
         let calc = at("calc.neg is done.");
         assert_eq!(rows[calc], (Some(1), "• calc.neg is done.".into()));
-        assert_eq!(rows[calc - 1], (None, String::new()));
+        assert_eq!(rows[calc - 1], (Some(1), "↳ calc.neg".into()));
+        assert_eq!(rows[calc - 2], (None, String::new()));
         // Off, nothing is barred.
         let mut app = super::tests::app(zen_daemon().await);
         app.width = 100;
@@ -23706,6 +23932,100 @@ mod tests {
         app.daemon(turn_event("turn_finished", 2, json!({"status": "failed"})))
             .await;
         assert_eq!(rows(&app)[2], "failed for 0s");
+    }
+
+    #[tokio::test]
+    async fn words_only_hangs_who_started_a_turn_and_what_it_set_going_on_its_reply() {
+        let client = daemon_answering(|asked| {
+            let item = match asked["nodes"][0].as_i64() {
+                Some(7) => json!({"type": "message", "role": "user", "from": "calc.halves",
+                    "content": [{"type": "input_text", "text": "Half cents round to even."}]}),
+                Some(8) => json!({"type": "message", "role": "assistant",
+                    "content": [{"type": "output_text", "text": "Two tasks check the rest."}]}),
+                _ => return json!({}),
+            };
+            json!({"items": [{"node": asked["nodes"][0], "item": item}]})
+        })
+        .await;
+        let mut app = app(client);
+        app.words_only = true;
+        app.any_history = true;
+        app.width = 120;
+        app.project = Some("calc".into());
+        let rows = |app: &App| -> Vec<String> {
+            (app.pending.iter())
+                .map(|line| line.to_string())
+                .filter(|row| !row.trim().is_empty())
+                .collect()
+        };
+        // A turn a task's message started: who above the reply, what it
+        // started and sent under it.
+        app.daemon(turn_event("accepted", 1, json!({"node": 7})))
+            .await;
+        let start = json!({"name": "readme", "brief": "Say how cents round\nmore"});
+        app.commit_call("s1", Some(1), served::START, &start, "calc.readme/1", false);
+        let send = json!({"to": "fix", "message": "Check div too.\nThanks"});
+        app.commit_call("m1", Some(1), "send_message", &send, "{}", false);
+        // One the daemon refused sent nothing.
+        let none = json!({"to": "nobody", "message": "Hi"});
+        let refused = r#"{"detail":null,"error":"bot_not_found"}"#;
+        app.commit_call("m2", Some(1), "send_message", &none, refused, false);
+        let said = json!({"event": "text_delta", "bot": "b", "turn": 1,
+            "text": "Two tasks check the rest."});
+        app.daemon(said).await;
+        app.daemon(turn_event("message", 1, json!({"node": 8})))
+            .await;
+        app.daemon(turn_event(
+            "turn_finished",
+            1,
+            json!({"status": "completed"}),
+        ))
+        .await;
+        assert_eq!(
+            rows(&app),
+            [
+                "↳ halves",
+                "• Two tasks check the rest.",
+                "└ started ◌ readme · sent to ● fix",
+            ]
+        );
+        // Right above and under the reply, and each name opens its agent.
+        let at = app.pending.len() - 1;
+        let buttons = (app.marks.iter())
+            .find_map(|(row, mark)| match mark {
+                screen::Mark::Buttons(buttons) if *row == at => Some(buttons.clone()),
+                _ => None,
+            })
+            .unwrap();
+        let opens: Vec<&str> = buttons.iter().map(|(_, _, to)| to.as_str()).collect();
+        assert_eq!(opens, ["sonny:task/calc.readme", "sonny:task/calc.fix"]);
+        // A turn that says nothing draws nothing, whatever it started.
+        app.daemon(turn_event("accepted", 2, json!({}))).await;
+        let start = json!({"name": "quiet", "brief": "Nothing"});
+        app.commit_call("s2", Some(2), served::START, &start, "calc.quiet/1", false);
+        app.daemon(turn_event(
+            "turn_finished",
+            2,
+            json!({"status": "completed"}),
+        ))
+        .await;
+        assert_eq!(rows(&app).len(), 3);
+        // The steps view draws its own rows, and no hint.
+        app.words_only = false;
+        app.daemon(turn_event("accepted", 3, json!({}))).await;
+        app.commit_call("m3", Some(3), "send_message", &send, "{}", false);
+        let said = json!({"event": "text_delta", "bot": "b", "turn": 3, "text": "Sent."});
+        app.daemon(said).await;
+        app.daemon(turn_event(
+            "turn_finished",
+            3,
+            json!({"status": "completed"}),
+        ))
+        .await;
+        assert_eq!(
+            rows(&app)[3..],
+            ["• Steered fix ▸", "Worked for 0s", "• Sent."]
+        );
     }
 
     #[tokio::test]
