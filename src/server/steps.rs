@@ -1054,14 +1054,15 @@ const ENVELOPE: usize = 256;
 /// A step's outcome with its pictures made to fit one reply, which the
 /// transport bounds: each re-encoded smaller when they do not, and its
 /// output saying so. The record keeps what the reply says. Measured and
-/// fitted on a blocking thread: a picture is megabytes to copy.
+/// fitted on a blocking thread, one picture at a time daemon-wide as
+/// pictures are read: a picture is megabytes to copy and decode.
 async fn fitted(outcome: Outcome, id: &str) -> Outcome {
     if !outcome.parts.iter().any(|part| part.image().is_some()) {
         return outcome;
     }
     let id = id.to_owned();
     let (output, failed) = (outcome.output.clone(), outcome.failed);
-    match tokio::task::spawn_blocking(move || fit(outcome, &id)).await {
+    match agent_runtime::tools::picture_apart(move || fit(outcome, &id)).await {
         Ok(outcome) => outcome,
         Err(_) => Outcome {
             output: output + "; the picture was left out",

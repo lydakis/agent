@@ -30,7 +30,6 @@ pub const HEAD: u64 = 12;
 pub async fn read_apart(
     load: impl Future<Output = Result<Vec<u8>>>,
 ) -> Result<Option<(Image, String)>> {
-    static ONE: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(1);
     let turn = ONE
         .acquire()
         .await
@@ -42,6 +41,25 @@ pub async fn read_apart(
     })
     .await
     .map_err(|_| Error::new("invalid_image"))?
+}
+
+/// The one picture decoded or encoded at a time, daemon-wide.
+static ONE: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(1);
+
+/// `work` on pictures done off the runtime in the one picture's turn, as
+/// [`read_apart`] reads one: fitting a picture to a reply decodes and
+/// re-encodes it, so many at once would hold as much memory.
+pub async fn apart<T: Send + 'static>(work: impl FnOnce() -> T + Send + 'static) -> Result<T> {
+    let turn = ONE
+        .acquire()
+        .await
+        .map_err(|_| Error::new("invalid_image"))?;
+    tokio::task::spawn_blocking(move || {
+        let _turn = turn;
+        work()
+    })
+    .await
+    .map_err(|_| Error::new("invalid_image"))
 }
 
 /// The format, media type and name of a picture of one of the four kinds
