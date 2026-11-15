@@ -2130,7 +2130,6 @@ fn main() -> std::process::ExitCode {
     }
     // Before anything reads the config, which refuses a key it no longer
     // knows.
-    lookout::subs::at_start();
     haiku::at_start();
     config::at_start();
     // Live memory facts are filled wherever Sonny reads memory or composes
@@ -2491,7 +2490,6 @@ async fn run() -> Result<(), String> {
     SIDE.store(options.side.is_some(), std::sync::atomic::Ordering::Relaxed);
     // Before any lead is made, so its instructions list the skills.
     skills::install_own();
-    approvals::at_start();
     trigger::at_start();
     home::at_start();
     boot::at_start();

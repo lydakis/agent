@@ -942,8 +942,7 @@ has something on it, or is off the screen, no time shows.
   offered, nor, as in Codex, a shell, an interpreter or a wrapper
   (`bash`, `python3`, `timeout`), which runs whatever follows it. Agents
   can't write the rules folder from their sandbox, and
-  an agent another made goes by its maker's rules. A
-  `[sonny] unsandboxed` list from before moves into `default.rules` once.
+  an agent another made goes by its maker's rules.
 
   An agent that reaches the network reaches every Unix socket too, as
   Codex's full network does, so MCPX, Docker and ssh-agent just work; and

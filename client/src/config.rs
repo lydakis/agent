@@ -573,10 +573,6 @@ pub struct Sonny {
     /// The profile every other agent Sonny starts is told, in place of
     /// `task`.
     pub task_profile: Option<String>,
-    /// What `[sonny] unsandboxed` named before command rules took its
-    /// place: read only so Sonny can move it into them (upgrade migration
-    /// `unsandboxed-rules`, retired with it).
-    pub unsandboxed: Vec<String>,
     /// The `/permissions` row a new lead starts in; unset, `auto`.
     pub default_permissions: Option<String>,
     /// `/permissions` rows of the person's own, by name.
@@ -870,7 +866,6 @@ impl Default for Sonny {
             task_speed: None,
             lead_profile: None,
             task_profile: None,
-            unsandboxed: Vec::new(),
             default_permissions: None,
             permissions: BTreeMap::new(),
             mcp_servers: BTreeMap::new(),
@@ -1712,7 +1707,6 @@ fn parse(text: &str) -> Result<Config, String> {
                 "sky_haiku_hold",
                 "tool_processes",
                 "lookout_waiting",
-                "unsandboxed",
                 "default_permissions",
                 "browser_confirm",
                 "project_colors",
@@ -1872,18 +1866,6 @@ fn parse(text: &str) -> Result<Config, String> {
                         {
                             Ok(category.to_owned())
                         }
-                        _ => Err(invalid()),
-                    })
-                    .collect::<Result<_, _>>()?;
-                continue;
-            }
-            if (name.as_str(), key.as_str()) == ("sonny", "unsandboxed") {
-                let invalid = || format!("{name}.{key} must be a list of commands");
-                let commands = value.as_array().ok_or_else(invalid)?;
-                config.sonny.unsandboxed = commands
-                    .iter()
-                    .map(|command| match command.as_str() {
-                        Some(command) if !command.trim().is_empty() => Ok(command.to_owned()),
                         _ => Err(invalid()),
                     })
                     .collect::<Result<_, _>>()?;
@@ -2779,7 +2761,7 @@ mod tests {
     fn the_file_sets_what_it_names_and_refuses_the_rest() {
         assert_eq!(parse("").unwrap(), Config::default());
         let config = parse(
-            "# mine\n[reviewer]\nmodel = \"openai/luna\"\n\n[sonny]\nlead_effort = \"medium\"\ntask_effort = \"high\"\nunsandboxed = [\"mcpx\", \"docker compose\"]\n",
+            "# mine\n[reviewer]\nmodel = \"openai/luna\"\n\n[sonny]\nlead_effort = \"medium\"\ntask_effort = \"high\"\n",
         )
         .unwrap();
         assert_eq!(config.reviewer.model.as_deref(), Some("openai/luna"));
@@ -2790,7 +2772,6 @@ mod tests {
         assert_eq!(config.sonny.lead_effort.as_deref(), Some("medium"));
         assert_eq!(config.sonny.task_effort.as_deref(), Some("high"));
         assert_eq!(config.sonny.lead_profile, None);
-        assert_eq!(config.sonny.unsandboxed, ["mcpx", "docker compose"]);
         assert_eq!(config.web_search, WebSearch::Live);
         let roles =
             parse("[sonny]\nlead_profile = \"my-lead\"\ntask_profile = \"worker\"").unwrap();
@@ -3111,12 +3092,8 @@ mod tests {
                 "reviewer.model must not be empty",
             ),
             (
-                "[sonny]\nunsandboxed = \"mcpx\"",
-                "sonny.unsandboxed must be a list of commands",
-            ),
-            (
-                "[sonny]\nunsandboxed = [\" \"]",
-                "sonny.unsandboxed must be a list of commands",
+                "[sonny]\nunsandboxed = [\"mcpx\"]",
+                "unknown key sonny.unsandboxed",
             ),
         ] {
             assert_eq!(parse(text).unwrap_err(), error, "{text}");

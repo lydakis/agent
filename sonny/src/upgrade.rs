@@ -155,54 +155,10 @@ pub struct Migration {
 /// Every migration, through [`once`] or where it is read, so none outlives
 /// its release.
 pub const MIGRATIONS: &[Migration] = &[
-    // Each trigger's own LaunchAgent or unit, and the backup's and
-    // start-at-login's, become Sonny's scheduler's (0.8.0).
-    Migration {
-        id: "scheduler-job",
-        retire: "0.10.0",
-    },
-    // Agents that posted in the commons are subscribed to its threads
-    // (0.8.0).
-    Migration {
-        id: crate::commons::POSTERS,
-        retire: "0.10.0",
-    },
-    // `~/.agent/triggers` becomes `~/.agent/automations`, and a restore's
-    // `restored-triggers.json` `restored-automations.json`, through
-    // [`once`] wherever the folder is found (`trigger::Places::moved`),
-    // since the script and the scheduler read it without Sonny's start
-    // (0.8.0).
-    Migration {
-        id: crate::trigger::MOVED,
-        retire: "0.10.0",
-    },
-    // Sonny's old `~/.agent/trigger` script goes, once
-    // `~/.agent/automation` is written (0.8.0).
-    Migration {
-        id: crate::skills::SCRIPT,
-        retire: "0.10.0",
-    },
-    // `[sonny] unsandboxed` becomes allow rules in ~/.agent/rules (0.8.0).
-    Migration {
-        id: crate::approvals::UNSANDBOXED_RULES,
-        retire: "0.10.0",
-    },
-    // A source's `urgent` becomes `steer`, and `[sonny] commons_digest`
-    // the commons source's `digest` (0.8.0).
-    Migration {
-        id: crate::lookout::subs::STEER,
-        retire: "0.10.0",
-    },
     // Sonny's scheduler job moves to a label that names no one (0.9.0).
     Migration {
         id: crate::scheduler::RELABELED,
         retire: "0.11.0",
-    },
-    // Each daemon's haiku claim is kept apart from the haiku shown, in
-    // `haiku.json` (0.8.1).
-    Migration {
-        id: crate::haiku::CLAIMS,
-        retire: "0.10.0",
     },
     // Each daemon's past haikus move from `haiku.json` to `haikus.jsonl`
     // (0.9.0).
