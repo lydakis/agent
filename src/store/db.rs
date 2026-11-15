@@ -1547,7 +1547,10 @@ pub struct Waiting {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub answer: Option<String>,
     /// What a paced summary copied of the bot's last call, so its retry
-    /// sends the same request.
+    /// copies that call again. The retry chooses its cut afresh, through
+    /// the span or the call's window whole, from the sizes it then sees,
+    /// and the turn may make a call of its own first: the retry covers at
+    /// least what the paced copy did, not always the same request.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub copied: Option<CopiedCall>,
     /// Until when a summary beside the turn that parked on its pool is not

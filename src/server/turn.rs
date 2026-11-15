@@ -392,7 +392,7 @@ struct Accounting {
     /// Persist the call's phase with its existing park transaction.
     compaction: bool,
     /// What the summary call copies, kept in the park record so its retry
-    /// sends the same request.
+    /// copies that call again, cut where the sizes it then sees choose.
     copied: Option<agent_runtime::store::CopiedCall>,
     /// The provider's sticky-routing token for this turn's model calls,
     /// kept in the park record while the turn waits.

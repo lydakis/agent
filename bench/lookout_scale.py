@@ -77,6 +77,11 @@ async def respond(request, writer, judge_ms):
         output = [{'type': 'function_call', 'name': 'shell', 'call_id': 'sh-1',
                    'arguments': json.dumps({'command': command,
                                             'timeout_ms': int(timeout or 5000)})}]
+    # A lead's turn on the lookout's note takes as long as a real model's
+    # answer would, `--lead-ms`, so notes batch as they would behind it.
+    lead_ms = int(os.environ.get('LS_LEAD_MS') or 0)
+    if lead_ms and not after_tool and text.startswith(('[', 'Task updates', 'From your sources')):
+        await asyncio.sleep(lead_ms / 1000)
     if os.environ.get('LS_MODEL_LOG'):
         with open(os.environ['LS_MODEL_LOG'], 'a') as log:
             log.write(json.dumps({'text': text[:200], 'last': str(last)[:200],
@@ -316,7 +321,7 @@ class Bench:
             if getattr(self.args, 'rules', False):
                 # Every event built and matched, none held or dropped: the
                 # rules' own cost, with the notes going as they would.
-                tasks['filter'] = {'type': [{'anything-but': 'note.changed'}]}
+                tasks['filter'] = {'type': [{'anything-but': 'margin'}]}
                 tasks['steer'] = {'status': ['never']}
             (folder / f'p{p}.lead.json').write_text(json.dumps({'subscriptions': [tasks]}))
         # One finished turn each lead's messages to its tasks come from: what
@@ -465,6 +470,8 @@ class Bench:
             request_id = note.get('request_id') or f"lookout-{fnv(','.join(note['woke']))}"
             begun = started.get((note['lead'], request_id))
             for key in note['woke']:
+                # The one pipe keys a task's event under its source.
+                key = key.removeprefix('tasks/')
                 task, _, rest = key.partition('/')
                 turn = rest.partition('/')[0]
                 if turn.isdigit():
@@ -564,6 +571,8 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--model')
     parser.add_argument('--judge-ms', type=int, default=0)
+    parser.add_argument('--lead-ms', type=int, default=0,
+                        help="how long a lead's turn on a lookout note takes, as a model's answer would")
     parser.add_argument('--projects', type=int, default=10)
     parser.add_argument('--tasks', type=int, default=10)
     parser.add_argument('--deltas', type=int, default=40)
@@ -576,7 +585,10 @@ def main():
     parser.add_argument('--rules', action='store_true',
                         help="give each lead's tasks subscription a filter and steer that match as they would")
     parser.add_argument('--out')
+    parser.add_argument('--sonny', help='the sonny binary to measure, as one built from another revision')
     args = parser.parse_args()
+    if args.lead_ms:
+        os.environ['LS_LEAD_MS'] = str(args.lead_ms)
     if args.model:
         return model_main(args.model, args.judge_ms)
     bench = Bench(args)

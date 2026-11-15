@@ -693,7 +693,7 @@ pub async fn invite(home: &Path, started: &Value, author: &str, invite: &Value) 
                 .as_array()
                 .map(Vec::as_slice)
                 .unwrap_or(&[]);
-            let automatic = [ORIGIN, crate::lookout::sources::ORIGIN];
+            let automatic = [ORIGIN, crate::lookout::ORIGIN];
             if prompts
                 .iter()
                 .all(|prompt| automatic.iter().any(|o| prompt["origin"] == *o))
