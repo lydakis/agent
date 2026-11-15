@@ -57,7 +57,7 @@ pub const GATED: [&str; 9] = [
 
 /// The most of what a call printed that its result holds, under the
 /// daemon's bound on an answer.
-const OUTPUT_BYTES: usize = 60 * 1024;
+pub(crate) const OUTPUT_BYTES: usize = 60 * 1024;
 
 /// How often waiting calls are listed with no call started to say so: a
 /// start missed while the daemon restarted is answered by then.

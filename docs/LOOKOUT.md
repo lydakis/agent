@@ -496,8 +496,8 @@ itself, newest first, as data (`topic`, `from`, `at`, `text`, `id`,
 `url`, the other fields under `fields`, `cut` when it was kept cut), a
 cleared topic left out; and `down`, the lookout's word, while the source
 is down. `outside` says the text comes from outside, as the listing's
-examples do. An answer holds as much as a note does, 192 KiB, and `more`
-counts the topics past it. The commons and what agents do keep nothing
+examples do. An answer holds what a tool's answer shows, 60 KiB, and
+`more` counts the topics past it. The commons and what agents do keep nothing
 here (`unread`): the commons tool and the history tool read them. A read
 costs one read of one file a source, each line read for its topic alone
 and whole only when it is a topic's newest word, whatever the number of

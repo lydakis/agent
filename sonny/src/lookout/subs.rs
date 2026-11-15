@@ -1151,7 +1151,9 @@ pub fn read_now(
         unread.push("its agents");
     }
     let mut listed = Vec::new();
-    let (mut bytes, mut more) = (0, 0);
+    // The whole answer fits what a tool's answer shows, its words besides
+    // the topics (`outside`, `more`, `unread`) counted first.
+    let (mut bytes, mut more) = (READ_WORDS, 0);
     for (n, source) in named.iter().enumerate() {
         if named[..n].contains(source) {
             continue;
@@ -1170,6 +1172,7 @@ pub fn read_now(
             of_it.contains(&None) || topic.is_some_and(|topic| of_it.contains(&Some(topic)))
         };
         let (newest, down) = super::sources::status(store, source, wanted);
+        bytes += source.len() + down.as_ref().map_or(0, |down| down.len() + 16) + 32;
         let mut topics = Vec::new();
         for (event, cut) in newest.iter().filter(|(event, _)| sub.hears(event)) {
             // Past what one answer holds, the rest are counted, not written.
@@ -1178,8 +1181,8 @@ pub fn read_now(
                 continue;
             }
             let said = as_read(event, *cut);
-            let size = said.to_string().len();
-            if bytes + size > super::sources::NOTE_BYTES {
+            let size = said.to_string().len() + 1;
+            if bytes + size > crate::served::OUTPUT_BYTES {
                 more += 1;
                 continue;
             }
@@ -1210,6 +1213,9 @@ pub fn read_now(
     }
     Ok(answer)
 }
+
+/// What a read's answer says besides its sources and topics, at most.
+const READ_WORDS: usize = 1024;
 
 /// An event as a read gives it: its topic, who wrote it, when, its text,
 /// ID and link, and its other fields, with whether it was kept cut.
@@ -1813,6 +1819,20 @@ mod tests {
             let refused = read(asked.clone()).unwrap_err();
             assert!(refused.contains(why), "{asked}: {refused}");
         }
+        // More than a tool's answer shows is counted, and the answer whole
+        // still fits.
+        kept_log(&store, "prs", 300, 300);
+        let all = read(json!({"sources": ["prs"]})).unwrap();
+        let shown = all["read"][0]["topics"].as_array().unwrap().len();
+        assert!(
+            all.to_string().len() <= crate::served::OUTPUT_BYTES,
+            "{}",
+            all.to_string().len()
+        );
+        assert_eq!(
+            all["more"],
+            format!("{} topics more than one answer holds", 300 - shown)
+        );
         // A source with nothing kept reads empty, and says nothing is outside.
         let names = ["ci".to_owned()];
         let empty = read_now(
@@ -1842,11 +1862,11 @@ mod tests {
             kept_log(&store, "prs", 2_000, agents);
             let names = ["prs".to_owned()];
             let asks = [
-                ("whole", json!({"sources": ["prs"]})),
-                ("topic", json!({"sources": ["prs:3"]})),
+                ("whole", json!({"name": "r", "sources": ["prs"]})),
+                ("topic", json!({"name": "r", "sources": ["prs:3"]})),
                 (
                     "filter",
-                    json!({"sources": ["prs"], "filter": {"state": ["red"]}}),
+                    json!({"name": "r", "sources": ["prs"], "filter": {"state": ["red"]}}),
                 ),
             ];
             for (what, asked) in &asks {
