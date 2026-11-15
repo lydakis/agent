@@ -224,8 +224,10 @@ class AcpTests(ModelFixture):
         [ended] = [u for u in updates if u['sessionUpdate'] == 'tool_call_update' and 'status' in u]
         self.assertEqual(ended['status'], 'completed')
         self.assertIn('Started calc.fix', ended['content'][0]['content']['text'])
-        self.assertIn('done', ''.join(u['content']['text'] for u in updates
-                                      if u['sessionUpdate'] == 'agent_message_chunk'))
+        # The lead's words after the call reach the client: its own, or its
+        # answer to the lookout note that joins the turn when the task ends.
+        self.assertTrue(''.join(u['content']['text'] for u in updates
+                                if u['sessionUpdate'] == 'agent_message_chunk'))
         # The thread was the lead it asked for, which T3 Code's words never
         # reached: Sonny took the person's out of them.
         [turn] = self.daemon.request('turns', bot='calc.lead')['result']['turns']
@@ -300,7 +302,9 @@ class AcpTests(ModelFixture):
         turns = self.daemon.request('turns', bot='calc.lead')['result']['turns']
         self.assertEqual([t['status'] for t in turns], ['completed'])
         sent = self.daemon.request('messages', bot='calc.lead')['result']['messages']
-        # The opener reads as its turn; the steer as taken into it.
+        # The opener reads as its turn; the steer as taken into it. The
+        # lookout's note of the task's end may join the turn too, at once.
+        sent = [m for m in sent if m.get('origin') != 'lookout']
         self.assertEqual([(m['status'], m['turn']) for m in sent],
                          [('completed', turns[0]['turn']), ('taken', turns[0]['turn'])])
         # T3 Code would not take the task as a child: it opens as a thread of
@@ -890,7 +894,10 @@ class AcpTests(ModelFixture):
         self.assertRegex(answer, r'^You asked \(ask:\d+/script-0\): Which database\?\n\nPostgres$')
         thread.send({'id': cache['id'], 'result': {'action': 'accept', 'content': {'pick': '1'}}})
         self.assertIn('Which cache?\n\nNone', until_answered('calc.fix', 2)[-1])
-        self.assertEqual(self.daemon.request('turns', bot='calc.lead')['result']['turns'], [])
+        # The answers went to the task: the lead's turns, if any, are the
+        # lookout's notes of the questions.
+        self.assertEqual([t['request_id'] for t in self.daemon.request('turns', bot='calc.lead')['result']['turns']
+                          if not t['request_id'].startswith('lookout-')], [])
         # Asked live.
         self.model.call_script.append(asked('Which queue?', 'None', 'SQS'))
         ran('calc.fix', 'script')

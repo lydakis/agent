@@ -371,7 +371,7 @@ class BurstLedgerTests(unittest.TestCase):
             out.mkdir()
             t0 = 1000.0
             update = lambda t, u: json.dumps({'t': t, 'm': {'method': 'session/update', 'params': {'update': u}}})
-            note = 'From your sources: ...\n' + '\n'.join(f'- {e["source"]}: {json.dumps(e["text"])}' for e in events[:2])
+            note = '\n'.join(f'[{e["source"]} · {e["from"]}]\n{e["text"]}' for e in events[:2])
             (out / 'acp.jsonl').write_text('\n'.join([
                 update(t0 + 20, {'sessionUpdate': 'user_message', 'content': [{'type': 'text', 'text': note}]}),
                 update(t0 + 25, {'sessionUpdate': 'tool_call', 'name': 'start_task',

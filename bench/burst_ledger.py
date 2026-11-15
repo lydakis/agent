@@ -336,8 +336,10 @@ def ledger(out, agent, repo, env, events, timeline, lookout_log, resources=None,
         spec = LEDGER[plant]
         released = timeline[event['step'] - 1]['t'] if event['step'] - 1 < len(timeline) else None
         after = released or 0
-        quoted = json.dumps(event['text'])[1:61]
-        reached = next((t for t, text in notes if t >= after and quoted in text), None)
+        # A note says an event's text as the source printed it; one from
+        # before the one pipe quoted it as a JSON string.
+        printed, quoted = event["text"][:60], json.dumps(event["text"])[1:61]
+        reached = next((t for t, text in notes if t >= after and (printed in text or quoted in text)), None)
         row = {'ask': plant, 'from': event['from'], 'released': released,
                'reached_s': reached and round(reached - after)}
         handled = None

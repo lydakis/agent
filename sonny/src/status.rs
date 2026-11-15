@@ -177,8 +177,9 @@ pub const PAUSED: &str = "paused";
 const PACED_SAID_MS: u64 = 5 * 60_000;
 
 /// A paced turn's state, as what it waits on says (`waiting_on`), at
-/// `now` in milliseconds: parked by a stop or the pause, or rate limited,
-/// with the time it is tried again once that is more than five minutes off.
+/// `now` in milliseconds: parked by a stop or the pause, or waiting out a
+/// rate limit or a failed call's backoff, with the time it is tried again
+/// once that is more than five minutes off.
 pub fn paced(on: &serde_json::Value, now: u64) -> String {
     if on["stopped"] == true {
         return PARKED.into();
@@ -186,14 +187,29 @@ pub fn paced(on: &serde_json::Value, now: u64) -> String {
     if on["paused"] == true {
         return PAUSED.into();
     }
+    let what = waits_out(on);
     match on["resume_at_ms"].as_u64() {
         Some(at) if at > now + PACED_SAID_MS => format!(
-            "rate limited until {}",
+            "{what} until {}",
             crate::asks::clock((at / 1000) as i64, (now / 1000) as i64)
         ),
-        _ => "rate limited".into(),
+        _ => what,
     }
 }
+
+/// What a paced turn waits out (`waiting_on`): a failed call's backoff
+/// says what failed, so a dropped connection never reads as a rate limit;
+/// else its provider's pool, closed by a rate limit.
+pub fn waits_out(on: &serde_json::Value) -> String {
+    match on["retrying"].as_str() {
+        Some(code) => format!("{RETRYING}{}", cause(code)),
+        None => "rate limited".into(),
+    }
+}
+
+/// A paced turn's state while it backs off from a failed call, before
+/// what failed.
+pub const RETRYING: &str = "retrying: ";
 
 /// A state's mark, alone, in its hue: the one table every surface that
 /// shows a state draws from. Muted unless it needs you, failed or works.
@@ -204,7 +220,9 @@ pub fn sign(state: &str) -> Span<'static> {
         "failed" => Span::raw("✗").fg(Color::Red),
         "working" => Span::raw("●").fg(Color::Cyan),
         _ if state.starts_with("waiting") => Span::raw("◌").dim(),
-        _ if state.starts_with("rate limited") => Span::raw("◌").dim(),
+        _ if state.starts_with("rate limited") || state.starts_with(RETRYING) => {
+            Span::raw("◌").dim()
+        }
         "queued" | "starting" | PARKED | PAUSED => Span::raw("◌").dim(),
         crate::started::IDLE | crate::started::QUIET | "completed" => Span::raw("○").dim(),
         crate::started::INTERRUPTED | "removed" => Span::raw("■").dim(),
@@ -582,43 +600,58 @@ pub fn temp_alerts(temp: &serde_json::Value) -> Vec<Alert> {
 /// How `/status` names an agent whose turn is held, before the cause.
 pub const HELD: &str = "held: ";
 
-/// What holds a turn, in the person's words, and how to set it right,
-/// from the daemon's cause (`code`) and what the provider said (`detail`).
-pub fn held_cause(code: &str, detail: Option<&str>) -> (String, String) {
-    let (what, fix) = match code {
-        "provider_login_rejected" | "provider_login_expired" | "provider_login_unavailable" => (
-            "ChatGPT sign-in",
-            "run agent login chatgpt; held turns go on at once".to_owned(),
-        ),
-        "provider_quota_exhausted" => (
-            "usage limit reached",
-            "they go on when the limit resets, tried again each hour at most".to_owned(),
-        ),
-        "provider_http_401" => (
-            "API key refused",
-            "fix the key in ~/.agent/keys/env and restart the daemon".to_owned(),
-        ),
-        "provider_http_403" => (
-            "access refused",
-            "check the account's access, then agent retry".to_owned(),
-        ),
-        "provider_unavailable" => (
-            "provider not set up",
-            format!(
-                "add {} to ~/.agent/config.toml and restart the daemon",
-                detail.unwrap_or("it")
-            ),
-        ),
-        "workspace_required" => (
-            "no folder to work in",
-            "give the agent a folder, then agent retry".to_owned(),
-        ),
-        _ => (
-            "provider unreachable",
-            format!("{code}; tried again on its own, or now with agent retry"),
-        ),
+/// A provider failure in the person's words, from the daemon's code: the
+/// one table every view that says why a provider failed reads (a held
+/// turn, a backoff, `/model`'s listing). A code it does not know is said
+/// as the daemon's own, never guessed at.
+pub fn cause(code: &str) -> String {
+    let what = match code {
+        "provider_login_rejected" | "provider_login_expired" | "provider_login_unavailable" => {
+            "ChatGPT sign-in"
+        }
+        _ if code.starts_with("provider_aws_credentials") => "AWS sign-in",
+        "provider_quota_exhausted" => "usage limit reached",
+        "provider_http_401" => "API key refused",
+        "provider_http_403" => "access refused",
+        "provider_unavailable" => "provider not set up",
+        "workspace_required" => "no folder to work in",
+        "provider_overloaded" | "provider_http_529" => "provider overloaded",
+        "provider_rate_limited" | "provider_http_429" => "rate limited",
+        "provider_models_limit" | "provider_response_limit" => "reply too large",
+        _ if code.starts_with("provider_connection_") || code.starts_with("provider_stream_") => {
+            "provider unreachable"
+        }
+        _ => {
+            return match code.strip_prefix("provider_http_") {
+                Some(status) => format!("HTTP {status}"),
+                None => code.to_owned(),
+            };
+        }
     };
-    (what.to_owned(), fix)
+    what.to_owned()
+}
+
+/// What holds a turn, in the person's words ([`cause`]), and how to set it
+/// right, from the daemon's cause (`code`) and what the provider said
+/// (`detail`).
+pub fn held_cause(code: &str, detail: Option<&str>) -> (String, String) {
+    let fix = match code {
+        "provider_login_rejected" | "provider_login_expired" | "provider_login_unavailable" => {
+            "run agent login chatgpt; held turns go on at once".to_owned()
+        }
+        "provider_quota_exhausted" => {
+            "they go on when the limit resets, tried again each hour at most".to_owned()
+        }
+        "provider_http_401" => "fix the key in ~/.agent/keys/env and restart the daemon".to_owned(),
+        "provider_http_403" => "check the account's access, then agent retry".to_owned(),
+        "provider_unavailable" => format!(
+            "add {} to ~/.agent/config.toml and restart the daemon",
+            detail.unwrap_or("it")
+        ),
+        "workspace_required" => "give the agent a folder, then agent retry".to_owned(),
+        _ => format!("{code}; tried again on its own, or now with agent retry"),
+    };
+    (cause(code), fix)
 }
 
 /// The turns held on a cause (`held`'s answer: its counts by cause and
@@ -793,6 +826,29 @@ mod tests {
     use super::*;
 
     #[test]
+    fn one_table_says_every_provider_failure_truly() {
+        for (code, said) in [
+            ("provider_http_401", "API key refused"),
+            ("provider_http_403", "access refused"),
+            ("provider_login_expired", "ChatGPT sign-in"),
+            ("provider_aws_credentials_expired", "AWS sign-in"),
+            ("provider_connection_timeout", "provider unreachable"),
+            ("provider_stream_failed", "provider unreachable"),
+            ("provider_http_501", "HTTP 501"),
+            ("provider_http_529", "provider overloaded"),
+            // Reached fine, its answer too big: not "unreachable".
+            ("provider_models_limit", "reply too large"),
+            ("provider_response_limit", "reply too large"),
+            // Unknown: the daemon's own word, never a guess.
+            ("provider_incomplete", "provider_incomplete"),
+        ] {
+            assert_eq!(cause(code), said, "{code}");
+        }
+        // A held turn says what the table says.
+        assert_eq!(held_cause("provider_http_401", None).0, "API key refused");
+    }
+
+    #[test]
     fn a_paced_turn_says_what_holds_it() {
         use serde_json::json;
         let now = 1_800_000_000_000;
@@ -816,7 +872,30 @@ mod tests {
                 crate::asks::clock((later / 1000) as i64, (now / 1000) as i64)
             )
         );
-        for state in [PARKED, PAUSED, "rate limited until 14:05"] {
+        // A dropped connection's backoff says so, not a rate limit.
+        assert_eq!(
+            paced(
+                &json!({"resume_at_ms": now + 4_000, "retrying": "provider_stream_failed"}),
+                now
+            ),
+            "retrying: provider unreachable"
+        );
+        assert_eq!(
+            paced(
+                &json!({"resume_at_ms": later, "retrying": "provider_http_529"}),
+                now
+            ),
+            format!(
+                "retrying: provider overloaded until {}",
+                crate::asks::clock((later / 1000) as i64, (now / 1000) as i64)
+            )
+        );
+        for state in [
+            PARKED,
+            PAUSED,
+            "rate limited until 14:05",
+            "retrying: provider unreachable",
+        ] {
             assert_eq!(mark(state).content, "◌ ", "{state}");
         }
     }
@@ -973,6 +1052,7 @@ mod tests {
             ("waiting on its reviewer", "◌", None),
             ("queued", "◌", None),
             ("rate limited", "◌", None),
+            ("retrying: provider unreachable", "◌", None),
             ("starting", "◌", None),
             ("idle", "○", None),
             ("no reply", "○", None),

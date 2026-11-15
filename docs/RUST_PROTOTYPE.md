@@ -466,7 +466,8 @@ view's own name where the two meet, so `turns` shows it after retention drops
 the turn's events.
 `waiting_on` is what a parked turn waits for, as its `turn_waiting` or
 `turn_paced` event said (`call_id` and `approval`, `load` or `handles`, or
-`resume_at_ms`, null with `paused: true` for a turn the pull cord parked), and
+`resume_at_ms` with `blocked` or `retrying` when either parked it, null with
+`paused: true` for a turn the pull cord parked), and
 null otherwise. A `wait` result is the view, plus the
 outcome once finished; an `interrupt` reply is the view plus
 `interrupt_requested`; a `turns` item is the view plus the fields below.
@@ -1773,7 +1774,9 @@ the refused call's `name` and argument preview as `tool_started` would),
 verdict it waits for, or with `load: true` the command the load gate holds, and its wake-up), `turn_paced` (a turn parked at its model-call boundary because its
 provider's pool is closed by a rate limit, with `resume_at_ms`, or because the
 pull cord stopped it, with `resume_at_ms` null and `paused: true`, or because
-a cause a person can fix holds it, with `blocked`; it resumes
+a cause a person can fix holds it, with `blocked`, or because a failed call
+backs off for a second or more, with `retrying` naming the error it failed
+with, so a dropped connection never reads as a rate limit; it resumes
 through `turn_resumed` like a parked wait), `held` (a ready message whose
 start was refused for such a cause, held in line: see
 [held turns](#held-turns)), `steered` (a message's item joining
@@ -3827,7 +3830,7 @@ says what every agent is doing and a client asks no agent for its turns.
 | `status` | `idle` (never ran), `running`, `waiting`, `paced`, `held` (the turn at the front of its line, refused at its start for a cause a person can fix, keeps its place and is tried again), `completed`, `failed`, `interrupted` (how its newest turn that counts ended), or `deleting` |
 | `running_turn` | The turn running or parked, `null` when none |
 | `started_ms` | When the running turn started, `null` when none runs |
-| `waiting_on` | For `waiting`, `paced` and `held`: what that turn's own `waiting_on` says (its call, approval, answer, load, `resume_at_ms`, `blocked`); `null` otherwise |
+| `waiting_on` | For `waiting`, `paced` and `held`: what that turn's own `waiting_on` says (its call, approval, answer, load, `resume_at_ms`, `blocked`, `retrying`); `null` otherwise |
 | `last` | `{turn, status, started_ms, finished_ms, error}` for the bot's newest turn that ran, or that failed before it started (`started_ms` null, `error` its code); `null` before any |
 
 A message steered into a running turn, one riding the next call, and one
@@ -4032,7 +4035,10 @@ way could not be sent, and whether the summary ran `beside` the turn (below). A 
 keeps in its park record the floor that window was read under, where it
 starts, where it ends when the copy had the call's window whole, and that
 prefix when the view no longer sends it, so its retry, after a restart
-too, sends the same request, though the view since holds another round. A summary
+too, copies that call again, though the view since holds another round. The
+retry chooses its cut afresh from the sizes it then sees, through the span or
+the call's window whole, and the turn may make a call of its own first, so it
+covers at least what the paced copy did rather than repeating its request. A summary
 the budget forced keeps that prefix, and its retry reads the window from
 the saved start the call's window was read from, past the budget, since
 the view it summarizes holds one round more than the call it copied. The copy does not set `tool_choice`, which on

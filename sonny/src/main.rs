@@ -11124,7 +11124,9 @@ impl App {
                         );
                         format!("Held: {what}")
                     } else {
-                        "Rate limited".into()
+                        // A failed call's backoff says what failed: a
+                        // dropped connection is not a rate limit.
+                        crate::task::capitalized(&status::waits_out(data))
                     };
                 }
             }
@@ -11221,7 +11223,7 @@ impl App {
                     self.draw_bot_reactions();
                 }
                 // A turn the lookout's note started that ended with nothing
-                // to say stays under its task updates: no line, no sound;
+                // to say stays under its lookout notes: no line, no sound;
                 // so does one whose model said nothing at the end.
                 let quiet = ((note || empty) && !words && ended) || self.zen_hides();
                 // A turn that ended well puts its reply under the line, apart
@@ -17471,11 +17473,18 @@ impl App {
                     .collect();
                 let room = composer.y as usize;
                 let mut rows = list::lines(&items, at, width, room);
-                // Why the list is short, in the rows it leaves.
+                // Why the list is short, in the rows it leaves: muted
+                // beside models to pick, in ink when it is the whole answer.
+                let alone = items.is_empty();
                 for refused in (picker.refused.iter())
                     .take((list::ROWS + 1).min(room).saturating_sub(rows.len()))
                 {
-                    rows.push(Line::from(format!("    {refused}")).dim());
+                    let why = Span::raw(refused.clone());
+                    rows.push(Line::from(vec![
+                        Span::raw("    "),
+                        Span::raw("✗ ").fg(Color::Red),
+                        if alone { why } else { why.dim() },
+                    ]));
                 }
                 over(frame, rows, composer);
                 let effort = picker.effort().unwrap_or("default");
@@ -21452,8 +21461,7 @@ mod tests {
             "options": [{"label": "Now", "explanation": "We stop here."},
                 {"label": "After", "explanation": "It waits for the focus."}],
             "recommended": 1, "reason": "Nobody waits on it today."});
-        let news = "Task updates: what happened in your tasks since you last heard.\n\
-            - calc.neg: calc.neg/3 completed";
+        let news = "[tasks · calc.neg · calc.neg replied, completed]\ndone";
         let items: Vec<(i64, i64, Value)> = vec![
             (1, 1, say("user", "Fix the rounding")),
             (
@@ -21503,6 +21511,7 @@ mod tests {
                 .filter_map(|node| items.iter().find(|(n, _, _)| Some(*n) == node.as_i64()))
                 .map(|(node, _, item)| match node {
                     5 => json!({"node": node, "item": item, "from": {"bot": "shop.fix"}}),
+                    9 => json!({"node": node, "item": item, "origin": "lookout"}),
                     _ => json!({"node": node, "item": item}),
                 })
                 .collect::<Vec<_>>()}),
@@ -21702,7 +21711,7 @@ mod tests {
             "Noted",
             "calc.neg",
             "cargo test",
-            "Task updates",
+            "Lookout",
         ] {
             assert!(!rows.contains(unseen), "{unseen} is not drawn in {rows}");
         }
@@ -23153,9 +23162,8 @@ mod tests {
         app.commit(vec![Line::from("› check on the tasks")]);
         app.daemon(turn_event("accepted", 1, json!({}))).await;
         // News in, a plan, a send, a call: none of them a row.
-        let updates = "Task updates: what happened in your tasks since you last heard.\n\
-            - calc.neg: calc.neg/3 completed";
-        app.land(5, (updates, ""), (None, false), false);
+        let updates = "[tasks · calc.neg · calc.neg replied, completed]\ndone";
+        app.land(5, (updates, ""), (Some("the lookout"), false), false);
         let plan = json!({"steps": ["[x] Read", "[>] Fix", "[ ] Test"]});
         app.commit_call("p1", Some(1), "plan", &plan, "Plan set.", false);
         let steer = json!({"command":
@@ -24722,10 +24730,7 @@ mod tests {
             let node = asked["nodes"][0].as_i64().unwrap_or(0);
             let content = match node {
                 4 => "The build is green.\nI pushed the fix to calc.add.",
-                _ => {
-                    "Task updates: what happened in your tasks since you last heard.\n\
-                      - calc.neg: calc.neg/3 completed"
-                }
+                _ => "[tasks · calc.neg · calc.neg replied, completed]\ndone",
             };
             match asked["op"].as_str() {
                 Some("history_items") => json!({"items": [{"node": node, "item":
@@ -24772,9 +24777,8 @@ mod tests {
         assert_eq!(drawn(&mut app), ["↳ From calc.add ▸"]);
         // Those that come one after another are one row that counts them,
         // and says what the agent did while it said nothing.
-        let updates = "Task updates: what happened in your tasks since you last heard.\n\
-            - calc.neg: calc.neg/3 completed";
-        app.land(5, (updates, ""), (None, false), false);
+        let updates = "[tasks · calc.neg · calc.neg replied, completed]\ndone";
+        app.land(5, (updates, ""), (Some("the lookout"), false), false);
         let steer =
             r#""$AGENT_BIN" run --detach --delivery steer --bot calc.neg -- 'Check div too.'"#;
         app.commit_call(
@@ -24785,7 +24789,7 @@ mod tests {
             "calc.neg/4",
             false,
         );
-        let shut = "↳ 1 message, 1 task update · calc.add, calc.neg · sent to calc.neg ▸";
+        let shut = "↳ 1 message, 1 lookout note · calc.add, calc.neg · sent to calc.neg ▸";
         assert_eq!(drawn(&mut app), [shut]);
         // A click lists them, each in the order it came; a click on a
         // message opens it.
@@ -24794,28 +24798,32 @@ mod tests {
         assert_eq!(
             open[..3],
             [
-                "↳ 1 message, 1 task update · calc.add, calc.neg · sent to calc.neg ▾",
+                "↳ 1 message, 1 lookout note · calc.add, calc.neg · sent to calc.neg ▾",
                 "  ↳ From calc.add ▸",
-                "  ↳ Task updates · calc.neg completed ▸",
+                "  ↳ Lookout · calc.neg completed ▸",
             ]
         );
         assert!(open[3].starts_with("  • Steered calc.neg"), "{open:?}");
         app.press("said/5").await;
         let open = drawn(&mut app);
-        assert_eq!(open[2], "  ↳ Task updates ▾");
-        assert_eq!(open[4], "    - calc.neg: calc.neg/3 completed");
+        assert_eq!(open[2], "  ↳ Lookout ▾");
+        assert_eq!(
+            open[3],
+            "    [tasks · calc.neg · calc.neg replied, completed]"
+        );
+        assert_eq!(open[4], "    done");
         assert!(open[5].starts_with("  • Steered calc.neg"), "{open:?}");
         app.press("fold/0").await;
         assert_eq!(drawn(&mut app), [shut]);
         // The agent's words end it: what comes after starts anew.
         app.commit(vec![Line::from("• calc.neg is done.")]);
-        app.land(6, (updates, ""), (None, false), false);
+        app.land(6, (updates, ""), (Some("the lookout"), false), false);
         assert_eq!(
             drawn(&mut app)[2..],
             [
                 "• calc.neg is done.",
                 "",
-                "↳ Task updates · calc.neg completed ▸"
+                "↳ Lookout · calc.neg completed ▸"
             ]
         );
         // The person's own words are drawn as ever.
@@ -24824,11 +24832,11 @@ mod tests {
         // A message a page drawn again put in a newer cluster opens there,
         // not in the cluster its rows were let go from.
         app.next_group = 9;
-        app.land(8, (updates, ""), (None, false), false);
+        app.land(8, (updates, ""), (Some("the lookout"), false), false);
         let stale = Cluster {
             entries: vec![Gathered::Message(Clustered {
                 node: 8,
-                kind: "task update",
+                kind: "lookout note",
                 names: Vec::new(),
             })],
             took: Vec::new(),
@@ -24836,10 +24844,7 @@ mod tests {
         };
         app.clusters.insert(1, stale);
         app.press("said/8").await;
-        assert_eq!(
-            drawn(&mut app).last().unwrap(),
-            "  - calc.neg: calc.neg/3 completed"
-        );
+        assert_eq!(drawn(&mut app).last().unwrap(), "  done");
         // A cluster let go takes its messages with it, so Ctrl+O reads
         // none of them; one a newer cluster holds stays.
         let stale = app.clusters.remove(&1).unwrap();
@@ -26161,6 +26166,25 @@ mod tests {
             }
         })
         .await
+    }
+
+    #[tokio::test]
+    async fn a_dropped_connection_backing_off_never_reads_as_a_rate_limit() {
+        let client = daemon_answering(|_| json!({})).await;
+        let mut app = app(client);
+        app.daemon(turn_event("accepted", 1, json!({}))).await;
+        let paced = |data: Value| turn_event("turn_paced", 1, data);
+        app.daemon(paced(
+            json!({"resume_at_ms": 9, "retrying": "provider_stream_failed"}),
+        ))
+        .await;
+        assert_eq!(
+            app.running.as_ref().unwrap().phase,
+            "Retrying: provider unreachable"
+        );
+        // A pool a rate limit closed says so.
+        app.daemon(paced(json!({"resume_at_ms": 9}))).await;
+        assert_eq!(app.running.as_ref().unwrap().phase, "Rate limited");
     }
 
     #[tokio::test]
@@ -29217,7 +29241,7 @@ mod tests {
     fn a_message_read_in_full_shows_the_words_it_quotes_under_who_wrote_them() {
         let item = json!({"role": "user", "content": [
             {"type": "input_text", "text": "News from your tasks."},
-            {"type": "input_text", "text": "[Sent by lookout.tasks.]"},
+            {"type": "input_text", "text": "[Sent by lookout.]"},
             {"type": "input_text", "text": "[Quoted from calc.fix/5, written by a person:]"},
             {"type": "input_text", "text": "yes, ship it\nand tag it"},
             {"type": "input_text", "text": "[Quoted from the reply of calc.fix/6, written by ana:]"},
@@ -29825,9 +29849,8 @@ mod tests {
         // News in, a plan, two sends, a memory: one row, in that order.
         let plan = json!({"steps": ["[x] Read", "[>] Fix", "[ ] Test"]});
         app.commit_call("p1", Some(1), "plan", &plan, "Plan set.", false);
-        let updates = "Task updates: what happened in your tasks since you last heard.\n\
-            - calc.neg: calc.neg/3 completed";
-        app.land(5, (updates, ""), (None, false), false);
+        let updates = "[tasks · calc.neg · calc.neg replied, completed]\ndone";
+        app.land(5, (updates, ""), (Some("the lookout"), false), false);
         let steer = |bot: &str| {
             json!({"command": format!(
                 r#""$AGENT_BIN" run --detach --delivery steer --bot {bot} -- 'Check div too.'"#
@@ -29854,7 +29877,7 @@ mod tests {
         app.commit(vec![Line::from("• calc.neg is on it.")]);
         app.flush();
         app.fold_notes(true);
-        let shut = "↳ 1 task update · calc.neg · sent 2 to calc.neg, saved a memory, plan 1/3 ▸";
+        let shut = "↳ 1 lookout note · calc.neg · sent 2 to calc.neg, saved a memory, plan 1/3 ▸";
         assert_eq!(texts(&app)[1..], [shut, "• calc.neg is on it."]);
         // The plan it holds is still the margin's.
         let margin = app.margin.lines(60, std::path::Path::new("/"), None).0;
@@ -29877,7 +29900,7 @@ mod tests {
             rows[2].starts_with("  • Updated the plan · 1/3"),
             "{rows:?}"
         );
-        assert_eq!(rows[3], "  ↳ Task updates · calc.neg completed ▸");
+        assert_eq!(rows[3], "  ↳ Lookout · calc.neg completed ▸");
         assert!(rows[4].starts_with("  • Steered calc.neg"), "{rows:?}");
         assert!(
             rows.iter()
@@ -29958,14 +29981,9 @@ mod tests {
     async fn a_gap_cut_where_a_page_of_history_ends_is_one_row() {
         let mut app = app(daemon_with(json!([])).await);
         app.width = 120;
-        let news = |task: &str| {
-            format!(
-                "Task updates: what happened in your tasks since you last heard.\n\
-                - {task}: {task}/1 completed"
-            )
-        };
+        let news = |task: &str| format!("[tasks · {task} · {task} replied, completed]\ndone");
         let land = |app: &mut App, node: i64, task: &str| {
-            app.land(node, (&news(task), ""), (None, false), false);
+            app.land(node, (&news(task), ""), (Some("the lookout"), false), false);
         };
         let texts = |app: &App| -> Vec<String> {
             (app.screen.texts().iter())
@@ -29983,7 +30001,11 @@ mod tests {
         app.join_page(1);
         assert_eq!(
             texts(&app),
-            ["↳ 2 task updates · calc.div, calc.neg ▸", "", "• All done."]
+            [
+                "↳ 2 lookout notes · calc.div, calc.neg ▸",
+                "",
+                "• All done."
+            ]
         );
         let oldest = |app: &mut App| {
             app.commit(vec![Line::from("› check the tasks")]);
@@ -29995,7 +30017,7 @@ mod tests {
         let one = [
             "› check the tasks",
             "",
-            "↳ 3 task updates · calc.add, calc.div, calc.neg ▸",
+            "↳ 3 lookout notes · calc.add, calc.div, calc.neg ▸",
             "",
             "• All done.",
         ];
@@ -30016,9 +30038,9 @@ mod tests {
         assert_eq!(
             named,
             [
-                "  ↳ Task updates · calc.add completed ▸",
-                "  ↳ Task updates · calc.div completed ▸",
-                "  ↳ Task updates · calc.neg completed ▸",
+                "  ↳ Lookout · calc.add completed ▸",
+                "  ↳ Lookout · calc.div completed ▸",
+                "  ↳ Lookout · calc.neg completed ▸",
             ],
             "{rows:?}"
         );
@@ -30046,7 +30068,7 @@ mod tests {
         let rows = texts(&app);
         let once = |row: &str| rows.iter().filter(|r| r.as_str() == row).count() == 1;
         assert!(
-            once("› check the tasks") && once("  ↳ Task updates · calc.add completed ▸"),
+            once("› check the tasks") && once("  ↳ Lookout · calc.add completed ▸"),
             "{rows:?}"
         );
     }

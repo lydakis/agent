@@ -19,7 +19,7 @@ pub struct Agent {
 
 /// What a `bots` row says its agent is doing, as `/status` reads it: needs
 /// you while it `waits` on the person; else held on a cause, waiting,
-/// rate limited or working while a turn runs; an ended one as its end
+/// rate limited, retrying or working while a turn runs; an ended one as its end
 /// did; one never run starting.
 fn state(bot: &Value, waits: bool) -> String {
     if waits {
@@ -37,7 +37,7 @@ fn state(bot: &Value, waits: bool) -> String {
             "waiting on its reviewer".to_owned()
         }
         (false, Some("waiting")) => "waiting".to_owned(),
-        (false, Some("paced")) => "rate limited".to_owned(),
+        (false, Some("paced")) => crate::status::waits_out(&bot["waiting_on"]),
         (false, _) => "working".to_owned(),
         (true, _) => match &bot["last"] {
             Value::Null => "starting".to_owned(),
