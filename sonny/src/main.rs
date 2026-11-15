@@ -4761,6 +4761,9 @@ struct App {
     tasks_width: usize,
     /// The words view's hints on the turn being drawn.
     turn_hints: TurnHints,
+    /// The turn the oldest page drawn starts in: an older page ending in
+    /// it ends inside that turn, whose hints are its newer page's.
+    top_turn: Option<i64>,
     /// The `└` rows drawn, by the client's number for each, with what
     /// each names; and what the agents they name that are no task of
     /// this window's are doing, read as a task's state is.
@@ -6421,6 +6424,7 @@ impl App {
             tasks_all_read: None,
             tasks_width: 0,
             turn_hints: TurnHints::default(),
+            top_turn: None,
             set_rows: BTreeMap::new(),
             set_states: HashMap::new(),
         }
@@ -10080,6 +10084,7 @@ impl App {
         // The open questions are those the replay asks and does not answer.
         let from_start = self.seen_node == 0 || after < self.seen_node;
         if from_start {
+            self.top_turn = None;
             self.bot_reactions.clear();
             self.react_calls.clear();
             self.answering = None;
@@ -10201,7 +10206,8 @@ impl App {
         // the turn's own prompt says who started it, and with project
         // colors whose project its rows are about.
         let colored = !self.palette().is_empty();
-        if (self.zen.is_some() || colored)
+        // In words, who started it, for the `↳` over its reply.
+        if (self.zen.is_some() || colored || self.words())
             && let Some(&turn) = nodes.first().and_then(|node| turns.get(node))
             && let Ok(read) = (self.client)
                 .request(
@@ -10232,8 +10238,17 @@ impl App {
             // about; the steers the page holds say the rest.
             if colored && let Some((text, from)) = prompts.first().map(said) {
                 self.bar_turn(Some((&text, from.as_deref())));
+            } else if let Some((text, from)) = prompts.first().map(said)
+                && transcript::relays(&text, from.as_deref())
+            {
+                let came = transcript::came_names(&text, from.as_deref());
+                self.turn_hints.came = (came.into_iter())
+                    .map(|name| self.hint_name(&name))
+                    .collect();
             }
-            began.insert(turn);
+            if self.zen.is_some() || colored {
+                began.insert(turn);
+            }
         }
         // A chunk read at a time, what it held let go before the next.
         let mut chunks = nodes.chunks(100);
@@ -10423,8 +10438,15 @@ impl App {
             self.commit_said(at, lines);
         }
         // The newest page's turn, still running, ends its hints when it
-        // ends: the page's end is not the turn's.
+        // ends: the page's end is not the turn's. An older page ending in
+        // the turn the newer one starts in leaves its hints to that page.
+        let turn_of = |node: Option<&i64>| node.and_then(|node| turns.get(node)).copied();
+        let continues = turn_of(nodes.last()).is_some_and(|turn| Some(turn) == self.top_turn);
+        if older || self.top_turn.is_none() {
+            self.top_turn = turn_of(nodes.first());
+        }
         match hints {
+            Some(hints) if continues => self.turn_hints = hints,
             Some(hints) => {
                 self.end_hints();
                 self.turn_hints = hints;
