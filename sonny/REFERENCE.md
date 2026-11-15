@@ -1501,11 +1501,18 @@ has something on it, or is off the screen, no time shows.
   at the text's own weight under `Run this in your own terminal; a click
   copies it.`, and a click on it copies it. Such an ask always waits
   (`Waits for you to run it; a reminder at 21:30.`), and what you type next
-  says how it went. A task asking this way reads `needs you` like any
+  says how it went. Run it here with `!` while the question is in focus
+  and that answers it too: the agent is given what it printed, as for any
+  `!` command, and your answer, `Ran ! COMMAND · exit N`, in the same turn.
+  Press Esc first for a `!` command that has nothing to do with it. A task asking this way reads `needs you` like any
   other, and its lead hears the line to run. Agents no longer send such
   commands to a pane, where they sat unnoticed.
 
   ![An action card: Sign in to the package registry, why, then npm login --auth-type=web under Run this in your own terminal; a click copies it.](../docs/sonny/action-card.png)
+
+  ![A step to run in focus: the composer answering “Make the local HTTPS certificate?” with !./scripts/dev-cert.sh typed](../docs/sonny/ask-bang-before.png)
+
+  ![After the ! run: the card folded to Answered · Ran ! ./scripts/dev-cert.sh · exit 0, the output, the answer and the agent going on](../docs/sonny/ask-bang-after.png)
 
   ![Two open decisions, their bars whole after the window narrowed, and the composer answering the first of two](../docs/sonny/ask-several.png)
 
