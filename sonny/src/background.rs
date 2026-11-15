@@ -1389,6 +1389,41 @@ impl View {
         &mut self,
         width: usize,
     ) -> (Vec<Line<'static>>, usize, Vec<(usize, crate::screen::Mark)>) {
+        // The link picked, by where it leads: rows that reorder on their
+        // own, as a follow's agents do, keep it on the same thing.
+        let wanted = (self.page.as_ref())
+            .and_then(|page| page.links.get(page.pick?))
+            .map(|link| link.3.clone());
+        let drawn = self.draw_page(width);
+        let (Some(wanted), Some(page)) = (wanted, self.page.as_mut()) else {
+            return drawn;
+        };
+        let now = page.pick.and_then(|at| page.links.get(at));
+        if now.is_some_and(|link| link.3 == wanted) {
+            return drawn;
+        }
+        // An agent folded into `N done` since: the fold.
+        let found = (page.links.iter())
+            .position(|link| link.3 == wanted)
+            .or_else(|| {
+                matches!(wanted, Target::Agent(_))
+                    .then(|| page.links.iter().position(|link| link.3 == Target::Done))
+                    .flatten()
+            });
+        match found {
+            Some(at) => {
+                page.pick = Some(at);
+                self.draw_page(width)
+            }
+            None => drawn,
+        }
+    }
+
+    /// [`View::page_lines`] with the pick where it is.
+    fn draw_page(
+        &mut self,
+        width: usize,
+    ) -> (Vec<Line<'static>>, usize, Vec<(usize, crate::screen::Mark)>) {
         let mut out = Vec::new();
         // What the line under the name says, in parts a ` · ` apart: an
         // agent in a part is a link to it.
@@ -1655,6 +1690,16 @@ impl View {
         if !watched.is_empty() {
             let mut rows = vec![Field::text(watched.join(", "))];
             rows.extend(self.watched(sub, subscriber));
+            // Another project's tasks are not among the rows this window
+            // reads: said, so the page does not read as "none".
+            for root in sub.tasks_of.iter().filter(|root| !self.scope.takes(root)) {
+                rows.push(Field {
+                    spans: vec![
+                        Span::raw(format!("  tasks of {} are not listed here", root)).dim(),
+                    ],
+                    link: None,
+                });
+            }
             fields.push(("watches", rows));
         }
         if !sub.sources.is_empty() {
@@ -1768,13 +1813,15 @@ impl View {
             }
             false
         };
-        // Nor the one it is for, nor a workflow's workers, as the lookout.
+        // Nor the one it is for, nor a workflow's workers or its row, as
+        // the lookout.
         let (done, live): (Vec<&Value>, Vec<&Value>) = (self.tasks.iter())
             .filter(|task| {
                 let name = agent(task);
                 !name.is_empty()
                     && name != subscriber
                     && !crate::workflow::is_worker(&name)
+                    && !name.contains(crate::workflow::view::MARK)
                     && (descends(&name)
                         || (sub.agents.iter()).any(|glob| lookout::subs::matches(glob, &name)))
             })
@@ -2402,6 +2449,9 @@ mod tests {
             task("other", "calc.someone", "working", "working"),
             task("readme", "calc.lead", "idle", "done"),
             task("docs", "calc.lead", "idle", "done"),
+            // A workflow's own row is no agent.
+            json!({"name": "lead#wf-1a2b", "agent": "calc.lead#wf-1a2b", "state": "working",
+                "group": "working", "maker": "calc.lead"}),
         ]));
         view.key(
             KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
@@ -2457,6 +2507,58 @@ mod tests {
                 "           ✓ readme   done",
                 "           ✓ docs     done",
                 "told     nothing yet",
+            ]
+        );
+        // The pick stays on its agent as the rows reorder, and goes to the
+        // fold once the agent folds into it.
+        let picked = |view: &View| {
+            let page = view.page.as_ref().unwrap();
+            page.links[page.pick.unwrap()].3.clone()
+        };
+        let page = view.page.as_mut().unwrap();
+        (page.done_open, page.pick) = (false, Some(1));
+        let _ = page_text(&mut view, 60);
+        assert_eq!(picked(&view), Target::Agent("calc.halves".into()));
+        let mut tasks = vec![
+            task("tests", "calc.halves", "working", "working"),
+            task("halves", "calc.lead", "idle", "idle"),
+            task("readme", "calc.lead", "idle", "done"),
+            task("docs", "calc.lead", "idle", "done"),
+        ];
+        view.set_tasks(&Arc::new(tasks.clone()));
+        let _ = page_text(&mut view, 60);
+        assert_eq!(picked(&view), Target::Agent("calc.halves".into()));
+        tasks[1] = task("halves", "calc.lead", "idle", "done");
+        view.set_tasks(&Arc::new(tasks));
+        let _ = page_text(&mut view, 60);
+        assert_eq!(picked(&view), Target::Done);
+    }
+
+    #[test]
+    fn a_follow_of_another_projects_tasks_says_they_are_not_listed() {
+        let sub = lookout::subs::Sub {
+            name: "web".into(),
+            tasks_of: vec!["web.lead".into()],
+            agents: Vec::new(),
+            sources: Vec::new(),
+            filter: None,
+            digest: None,
+            steer: None,
+            owner: None,
+            until: None,
+            runs: None,
+            made: None,
+        };
+        let mut view = view_of(std::env::temp_dir(), vec![follow_item(sub, false)]);
+        view.key(
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            0..usize::MAX,
+        );
+        assert_eq!(
+            page_text(&mut view, 60)[3..5],
+            [
+                "watches  tasks of web.lead",
+                "           tasks of web.lead are not listed here",
             ]
         );
     }
