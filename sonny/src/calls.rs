@@ -828,10 +828,20 @@ fn redirects_elsewhere(command: &str) -> bool {
                 }
             }
             (None, '>') => {
+                // The whole target, up to a blank or an operator: only a
+                // descriptor's copy or the exact discard path writes no file.
                 let rest = line[at + 1..].trim_start_matches('>').trim_start();
+                let (copy, word) = match rest.strip_prefix('&') {
+                    Some(fd) => (true, fd),
+                    None => (false, rest),
+                };
+                let target = &word[..word
+                    .find(|c: char| c.is_whitespace() || ";&|<>()".contains(c))
+                    .unwrap_or(word.len())];
                 let duplicated =
-                    rest.starts_with('&') && rest[1..].starts_with(|c: char| c.is_ascii_digit());
-                if !duplicated && !rest.starts_with("/dev/null") {
+                    copy && !target.is_empty() && target.bytes().all(|b| b.is_ascii_digit());
+                let discarded = !copy && target == "/dev/null";
+                if !duplicated && !discarded {
                     return true;
                 }
             }
@@ -1613,6 +1623,7 @@ Keep the rest.'"#,
             r#""$AGENT_BIN" fork --bot shop.fix --allow '' -- 'What is left?'"#,
             r#""$AGENT_BIN" ls --name 'a>b' 2>&1"#,
             r#""$AGENT_BIN" ls 2>/dev/null"#,
+            r#""$AGENT_BIN" ls >/dev/null 2>&1&& "$AGENT_BIN" ls 2> /dev/null; "$AGENT_BIN" ls 2>&1|head -1"#,
             r#""$AGENT_BIN" ls --pretty | jq -r '.name | ascii_upcase' | head -5"#,
             r#""$AGENT_BIN" ls | tail -n +2 | head --lines=3 | jq -rc --arg b x '.[$b]'"#,
             "\"$AGENT_BIN\" run --bot shop.fix --detach - <<<'Done.'",
@@ -1647,6 +1658,10 @@ Keep the rest.'"#,
             r#"git push && "$AGENT_BIN" run --bot shop.lead -- pushed"#,
             r#""$AGENT_BIN" ls > "$HOME/report.json""#,
             r#""$AGENT_BIN" turns --bot shop.fix >> /tmp/out 2>&1"#,
+            r#""$AGENT_BIN" ls >&1.txt"#,
+            r#""$AGENT_BIN" ls 2>&1x"#,
+            r#""$AGENT_BIN" ls >/dev/null-report"#,
+            r#""$AGENT_BIN" ls >/dev/nullx 2>&1"#,
             r#""$AGENT_BIN" ls | head | tee "$HOME/report.json""#,
             r#""$AGENT_BIN" ls | jq . | sh"#,
             r#""$AGENT_BIN" ls | head /private/report.txt"#,
