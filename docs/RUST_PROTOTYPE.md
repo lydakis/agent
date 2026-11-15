@@ -3597,7 +3597,8 @@ cut off, a file could be left half written; until its sandbox is ready,
 nothing of it has begun and a stop ends it. Its asker is told
 `step_stopped`, and its `step_completed` records how it really ended. A
 picture a `read` step finds is answered with its line and the picture in
-`parts`, as `tool_result` takes them. The step is decided exactly as the same call from
+`parts`, as `tool_result` takes them; one too large for a reply's 1 MiB
+comes back as a smaller JPEG, and its line says so. The step is decided exactly as the same call from
 the model would be, by one planner every caller shares: the bot's rules
 (`command_forbidden`), `approval_policy`, the gates that name the step's
 own tool, its sandbox and the way out of it. A declared tool with

@@ -148,6 +148,20 @@ class DaemonStepTests(ModelFixture):
         [picture] = ran['parts']
         self.assertEqual((picture['type'], picture['media_type']), ('image', 'image/png'))
 
+    def test_a_picture_too_large_for_one_reply_comes_back_smaller(self):
+        from tests.test_images import noise
+        heavy = noise(512)
+        self.assertLess(len(heavy), 1024 * 1024)
+        self.assertGreater(len(heavy) * 4 // 3, 1024 * 1024)
+        (self.path / 'noise.png').write_bytes(heavy)
+        client, turn = self.script(tools='echo,read', bot_tools=['read'])
+        ran = self.step(client, turn, name='read', arguments={'path': 'noise.png'})['result']
+        self.assertIn('JPEG of', ran['output'])
+        self.assertIn('to fit the reply', ran['output'])
+        [picture] = ran['parts']
+        self.assertEqual(picture['media_type'], 'image/jpeg')
+        self.assertLessEqual(len(picture['data']), 1024 * 1024)
+
     @unittest.skipUnless(shutil.which('bwrap') or sys.platform == 'darwin', 'sandboxes need bubblewrap')
     def test_a_sandboxed_bot_s_file_steps_stay_in_its_sandbox(self):
         client, turn = self.script(tools='echo,shell,read,write,web_fetch',
@@ -316,6 +330,20 @@ class DaemonStepTests(ModelFixture):
         request = self.ask(client, turn)
         self.running(client)
         client.request('interrupt', bot='Lead', turn=turn)
+        self.assertEqual(self.reply(client, request, timeout=10)['error'], 'step_stopped')
+        self.ended(client, turn, 'script-0/1')
+        self.assertEqual(client.request('stats')['result']['steps']['in_flight'], 0)
+
+    def test_an_interrupt_of_a_parked_turn_stops_its_steps(self):
+        client, turn = self.script(settings={'approval_hold_ms': 0})
+        client.receive(lambda m: m.get('event') == 'turn_waiting' and m.get('turn') == turn)
+        deadline = time.monotonic() + 5
+        while client.request('stats')['result']['active_turns']:
+            self.assertLess(time.monotonic(), deadline)
+            time.sleep(.01)
+        request = self.ask(client, turn)
+        self.running(client)
+        self.assertIn('result', client.request('interrupt', bot='Lead', turn=turn))
         self.assertEqual(self.reply(client, request, timeout=10)['error'], 'step_stopped')
         self.ended(client, turn, 'script-0/1')
         self.assertEqual(client.request('stats')['result']['steps']['in_flight'], 0)

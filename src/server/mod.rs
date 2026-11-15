@@ -6609,6 +6609,8 @@ impl Service {
                 self.handles.forget(Waiter::Turn(turn));
                 self.wakes.cancel(turn);
                 self.steer_wakes.remove(&turn);
+                // Its calls' daemon steps end with it, as a reaped turn's.
+                self.steps_turn_ended(turn);
                 if next_ready {
                     self.ready_hint = true;
                 }

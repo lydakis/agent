@@ -22,8 +22,10 @@
 //! way back in.
 use super::{Service, Stepping, turn};
 use agent_runtime::{
-    Error, Result, fail_with,
-    output::Output,
+    Error, Result,
+    codec::Part,
+    fail_with,
+    output::{self, Output},
     store::{Capture, StepAsk, StepOpened, Stepped},
     tools::{Outcome, Prepared, Slot},
 };
@@ -716,7 +718,7 @@ impl Service {
                 }
                 _ => outcome,
             };
-            let outcome = turn::annotate(outcome, turn, &id);
+            let outcome = fitted(turn::annotate(outcome, turn, &id), &id).await;
             let mut reply = json!({"call_id":id,"output":outcome.output,"failed":outcome.failed});
             // A picture read goes back as one, in the parts `tool_result`
             // takes, so the script can hand it on to the model.
@@ -1020,4 +1022,65 @@ async fn run(
         Ok(why) = &mut stopping => Err(stopped(why)),
         ran = cord.until_pulled(work) => ran,
     }
+}
+
+/// What a reply carries beside its result: its id and the object around it.
+const ENVELOPE: usize = 256;
+
+/// A step's outcome with its pictures made to fit one reply, which the
+/// transport bounds: each re-encoded smaller when they do not, and its
+/// output saying so. The record keeps what the reply says.
+async fn fitted(mut outcome: Outcome, id: &str) -> Outcome {
+    let images = outcome
+        .parts
+        .iter()
+        .filter(|part| part.image().is_some())
+        .count();
+    if images == 0 {
+        return outcome;
+    }
+    let size = |value: &Value| serde_json::to_vec(value).map_or(usize::MAX, |bytes| bytes.len());
+    let bare = size(&json!({"call_id":id,"output":outcome.output,"failed":outcome.failed}));
+    let room = output::MAX_EVENT.saturating_sub(bare + ENVELOPE);
+    if size(&json!(outcome.parts)) <= room {
+        return outcome;
+    }
+    // Words among the parts stay; the pictures share what is left.
+    let words: usize = (outcome.parts.iter())
+        .filter(|part| part.image().is_none())
+        .map(|part| size(&json!(part)))
+        .sum();
+    let each = room.saturating_sub(words + ENVELOPE) / images;
+    let parts = std::mem::take(&mut outcome.parts);
+    let fitted = tokio::task::spawn_blocking(move || {
+        let mut lines = Vec::new();
+        let parts = (parts.into_iter())
+            .filter_map(|part| match part {
+                Part::Image(image) => match agent_runtime::tools::fit_picture(&image, each) {
+                    Ok((image, line)) => {
+                        lines.push(line);
+                        Some(Part::Image(image))
+                    }
+                    Err(error) => {
+                        lines.push(format!("a picture left out: {error}"));
+                        None
+                    }
+                },
+                words => Some(words),
+            })
+            .collect::<Vec<_>>();
+        (parts, lines)
+    })
+    .await;
+    match fitted {
+        Ok((parts, lines)) => {
+            outcome.parts = parts;
+            for line in lines {
+                outcome.output.push_str("; ");
+                outcome.output.push_str(&line);
+            }
+        }
+        Err(_) => outcome.output.push_str("; the picture was left out"),
+    }
+    outcome
 }
