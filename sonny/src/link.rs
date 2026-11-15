@@ -292,6 +292,29 @@ fn news_in(dir: &Path, cursor: &Path) -> crate::lookout::sources::News {
         };
         lines.push(line.to_string());
     }
+    // A machine forgotten or renamed while connected tells that it went;
+    // one already away just leaves the cursor.
+    for (name, was) in &had {
+        if now.contains_key(name) || first {
+            continue;
+        }
+        // Only a record surely gone: one unread this look keeps its state.
+        let gone = std::fs::metadata(dir.join(format!("{name}.json")))
+            .is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound);
+        if !gone {
+            now.insert(name.clone(), was.clone());
+            continue;
+        }
+        if was["state"] != "up" {
+            continue;
+        }
+        let changes = was["changes"].as_u64().unwrap_or(0) + 1;
+        lines.push(
+            json!({"id": format!("{name}/down/{changes}"), "topic": name,
+                "text": "no longer linked", "state": "down"})
+            .to_string(),
+        );
+    }
     let changed = first || now != had;
     crate::lookout::sources::News {
         lines,
@@ -2053,6 +2076,18 @@ mod tests {
         assert_eq!(back.len(), 1);
         assert_eq!(back[0]["state"], "up");
         assert_ne!(back[0]["id"], lines[0]["id"]);
+        // Forgotten while connected: it went, and is then known no more.
+        let back = news_in(&dir, &cursor);
+        assert!(back.mark_read());
+        std::fs::remove_file(dir.join("laptop.json")).unwrap();
+        let forgot = news_in(&dir, &cursor);
+        let lines = said(&forgot);
+        assert_eq!(
+            (lines.len(), &lines[0]["state"], &lines[0]["text"]),
+            (1, &json!("down"), &json!("no longer linked"))
+        );
+        assert!(forgot.mark_read());
+        assert!(news_in(&dir, &cursor).lines.is_empty());
     }
 
     fn scratch(name: &str) -> PathBuf {
