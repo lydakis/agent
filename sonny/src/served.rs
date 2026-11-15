@@ -267,18 +267,19 @@ fn project() -> Value {
 fn follows() -> Value {
     json!({
         "name": FOLLOWS,
-        "description": "Your follows in the person's lookout, which watches agents for you and tells you \
-            what happens in them in a note starting \"Task updates\": every message someone other than you \
-            writes in them, the person's quoted, and how each turn ends, by the handle your wait tool reads. \
-            Each note joins your running turn, or starts one. A \
-            follow watches the tasks of a bot (every agent it or its tasks made) or bots by name. It also hears the \
-            sources the person set up outside (a chat, a mailbox, a feed), each by name, in a note starting \
-            \"From your sources\": every event, at once when the source says it steers, or one topic of a \
-            source as NAME:TOPIC, or only those its filter matches. The commons is a source too, each thread \
-            a topic: posting in a thread follows it as commons.THREAD, and removing that leaves it. \
-            Add steer yourself for what you own; a filter or a digest only when the person asks for one: \
-            what a filter leaves out you never hear, and a digest makes you late. Add or remove one by name; \
-            with neither, it lists them all, with the sources there are and their events' recent fields.",
+        "description": "Your follows in the person's lookout, which tells you in a note starting \"Task updates\" \
+            what happens in the agents a follow watches: messages others write, the person's quoted, \
+            questions to the person, waits for approval, long silences and ended turns with their replies, \
+            by turn handle. Each note joins your running turn, or starts one. A follow watches the tasks \
+            of a bot (every agent it or its tasks made) or bots by name, and the sources the person set up \
+            outside (a chat, a mailbox, a feed), heard in a note starting \"From your sources\": every \
+            event, at once when the source says it steers, or one topic as NAME:TOPIC, or only those its \
+            filter matches. The commons is a source too, each thread a topic: posting in a thread follows \
+            it as commons.THREAD, and removing that leaves it. Add steer yourself for what you own; a \
+            filter or a digest only when the person asks: what a filter leaves out you never hear, and a \
+            digest makes you late. Add or remove one by name, as \
+            {\"name\": \"leads\", \"bots\": [\"web.lead\"], \"sources\": [\"mail\"]}; with neither, \
+            it lists them all, the sources there are and their events' recent fields.",
         "parameters": {
             "type": "object",
             "properties": {
@@ -303,10 +304,9 @@ fn follows() -> Value {
                                 AWS EventBridge writes one. Each field maps to a list of values, \
                                 any of which will do, or to a pattern for an object field; every field \
                                 must match, and a field that is a list matches when any item does. A value is a \
-                                string, number, boolean or null, or {\"prefix\": S}, {\"suffix\": S}, \
-                                {\"wildcard\": S} (* any run of characters), {\"equals-ignore-case\": S}, \
-                                {\"anything-but\": V or [V, ...]}, {\"numeric\": [\">\", 0, \"<=\", 5]} or \
-                                {\"exists\": true or false}; \"$or\": [pattern, ...] takes any of several. \
+                                string, number, boolean or null, or one of EventBridge's matchers: prefix, \
+                                suffix, wildcard, equals-ignore-case, anything-but, numeric or exists; \
+                                $or takes any of several patterns. \
                                 As {\"paths\": [{\"prefix\": \"src/billing/\"}], \"author\": [{\"anything-but\": \"me\"}]}."},
                         "digest": {"type": "string", "pattern": "^(0|[0-9]+[smh])$",
                             "description": "Tell what it hears at most once this long, as 15m or 1h, in place of \
