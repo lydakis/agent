@@ -1133,7 +1133,16 @@ has something on it, or is off the screen, no time shows.
   it is open. `↑`/`↓` picks one, and Enter, `→` or a click opens it as a
   page, as a fact opens in `/memory`: an automation's whole message, when
   it runs, its last run and how that ended, and who gets the answers; a
-  follow's agents, sources, filter, digest, steer and end; a command's
+  follow's page says what it does now after how it was set: what it
+  watches and every agent that matches now, each a link with its mark and
+  state, those not done first and two done or more folded to `3 done`,
+  which Enter lists; each source it hears with the newest thing it said
+  on what the follow hears and how long ago, or `✗ down since 11:28`; its
+  filter and steer in words (`where text starts with "main:"`; one that
+  nests or has `$or` as written), digest, end as a date and what is left
+  of the updates it lasts (`2 of 3 updates left`); and what it told in the
+  last day (`2 updates in the last day, 1 steered · last 2m ago`), read
+  from the lookout's own files only while the page is open; a command's
   whole line, its kind and pid, and how long it has run. The agent it
   belongs to (the one an automation wakes, the follow's, the one that
   left the command running) is the page's first link, picked: Enter
@@ -1162,6 +1171,8 @@ has something on it, or is off the screen, no time shows.
   ![/background in the pane](../docs/sonny/pane-background.png)
 
   ![/background's pages: enter on an automation, a follow and a command, each with the agent it belongs to as its first link](../docs/sonny/background-pages-60.png)
+
+  ![A follow's page: its sources' newest words or down since when, and the lead's tasks follow with the agents it watches, the done folded](../docs/sonny/follow-page-60.png)
 - `/usage` shows, in the pane beside the conversation,
   the tokens the project's agents spent in the last 24 hours, as their
   retained history records them: in all, as

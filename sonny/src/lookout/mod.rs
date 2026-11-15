@@ -1725,8 +1725,7 @@ impl Service {
         // Less what was made for another bot of its name.
         lookout.subs = file.into_iter().filter(|sub| sub.held_by(record)).collect();
         lookout.roots(&self.records, &self.made);
-        let held = beside(&self.store, ".sources").join(".held");
-        lookout.restore(held.join(format!("{lead}.json")));
+        lookout.restore(held_file(&self.store, lead));
         lookout.counts = subs::counts(&self.store, lead);
         lookout.counts_file = Some(subs::counts_file(&self.store, lead));
         lookout.counting();
@@ -1979,6 +1978,23 @@ const STATUS_BYTES: u64 = 1 << 20;
 /// starting meanwhile tries again (`lock`).
 pub fn running(store: &std::path::Path) -> bool {
     held(&beside(store, ".lookout.lock"))
+}
+
+/// Where the lookout keeps what waits to be told to `subscriber`, and
+/// what each of its subscriptions that lasts so many notes has told.
+pub fn held_file(store: &Path, subscriber: &str) -> PathBuf {
+    (beside(store, ".sources").join(".held")).join(format!("{subscriber}.json"))
+}
+
+/// How many notes each subscription of `subscriber` that lasts so many
+/// has told, by its [`subs::Sub::counter`], as its lookout last kept them.
+pub fn runs_told(store: &Path, subscriber: &str) -> HashMap<String, usize> {
+    let kept: Value = (std::fs::read_to_string(held_file(store, subscriber)).ok())
+        .and_then(|text| serde_json::from_str(&text).ok())
+        .unwrap_or_default();
+    (kept["runs_told"].as_object().into_iter().flatten())
+        .map(|(sub, told)| (sub.clone(), told.as_array().map_or(0, Vec::len)))
+        .collect()
 }
 
 /// Whether a process holds the lock file at `path`.

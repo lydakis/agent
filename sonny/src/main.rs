@@ -11458,13 +11458,14 @@ impl App {
         self.failed = 0;
         let scope = self.scope();
         let project = scope.project.clone();
-        let view = background::View::open(
+        let mut view = background::View::open(
             scope,
             self.options.store.clone(),
             self.client.store().map(str::to_owned),
             self.bot.clone(),
             self.turns.clone(),
         );
+        view.set_tasks(&self.blanks.tasks);
         self.watch = Some(Watch {
             project,
             rows: Vec::new(),
@@ -11750,6 +11751,7 @@ impl App {
             return;
         }
         if let Some(mut view) = self.watch.as_mut().and_then(|w| w.background.take()) {
+            view.set_tasks(&self.blanks.tasks);
             view.reload();
             if view.commands_due() {
                 self.read_commands(&mut view).await;
