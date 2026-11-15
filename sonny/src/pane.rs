@@ -1172,10 +1172,15 @@ mod tests {
             pane.head_button(column).as_deref(),
             Some(&*format!("{}switch", crate::screen::BUTTON))
         );
-        // Narrow, the way back goes before the view's own keys do: they
-        // outrank it, and `?` shows it with the rest.
+        // Narrow, the pick goes first, then the way back, before the
+        // view's own keys do; `?` shows them all.
         let head = rows(&mut pane, 44, 3).remove(0);
-        assert!(head.ends_with("  ↑↓ pick · esc close"), "{head}");
+        assert!(
+            head.ends_with("  ctrl+\\ conversation · esc close"),
+            "{head}"
+        );
+        let head = rows(&mut pane, 36, 3).remove(0);
+        assert!(head.ends_with("  esc close"), "{head}");
         pane.sheet = true;
         let shown = rows(&mut pane, 44, 10);
         assert_eq!(
