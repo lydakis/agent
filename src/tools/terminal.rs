@@ -50,6 +50,15 @@ pub struct Terminal {
     group: i32,
     state: Mutex<State>,
     exited: watch::Receiver<bool>,
+    /// Its newest output, which a client may look at while it runs; the
+    /// agent's reads take nothing from it.
+    peek: super::Peek,
+}
+
+/// Terminal `handle`'s newest output, while it is open.
+pub fn peek(terminals: &Terminals, handle: i64) -> Option<super::Peek> {
+    let terminals = terminals.lock().unwrap_or_else(|e| e.into_inner());
+    terminals.get(&handle).map(|terminal| terminal.peek.clone())
 }
 
 struct State {
@@ -490,6 +499,11 @@ impl Registry {
                 used: Instant::now(),
             }),
             exited,
+            peek: {
+                let peek = super::Peek::default();
+                peek.runs_in(&workspace);
+                peek
+            },
         });
         // Two starts at once can both find room: the later one's insert
         // ends the bot's least recently used, as before.
@@ -532,6 +546,7 @@ impl Registry {
                         // An end of file, or the far end gone (EIO).
                         Ok(Ok(0) | Err(_)) => return,
                         Ok(Ok(n)) => {
+                            terminal.peek.push(&buffer[..n]);
                             let dropping = {
                                 let mut state =
                                     terminal.state.lock().unwrap_or_else(|e| e.into_inner());

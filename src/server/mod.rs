@@ -778,6 +778,16 @@ enum Command {
         bot: String,
         handle: String,
     },
+    /// The last lines `bot`'s command `handle` (`proc:N`) wrote, while it
+    /// runs: a background command's or a terminal's newest output, kept
+    /// beside what its result keeps, redacted, taking nothing from what
+    /// its agent reads.
+    ProcessOutput {
+        bot: String,
+        handle: String,
+        #[serde(default)]
+        lines: Option<usize>,
+    },
 }
 /// Where a `processes` page ends: the last row's bot and handle, which
 /// place the next page in the listing's order whether or not that row is
@@ -893,9 +903,14 @@ impl Command {
             Command::RetryHeld { .. } => "retry_held",
             Command::Processes { .. } => "processes",
             Command::StopProcess { .. } => "stop_process",
+            Command::ProcessOutput { .. } => "process_output",
         }
     }
 }
+/// How many lines `process_output` answers with when it names none, and
+/// the most it answers with.
+const OUTPUT_LINES: usize = 10;
+const OUTPUT_LINES_MAX: usize = 200;
 /// The most agents a pause names as the ones it parked; it counts them all.
 const PAUSE_NAMES: usize = 64;
 /// The variable a Bedrock API key is read from, as the AWS tools name it.
@@ -3333,7 +3348,8 @@ impl Service {
             | Command::Prune { bot, .. }
             | Command::Compact { bot, .. }
             | Command::Interrupt { bot, .. }
-            | Command::StopProcess { bot, .. } => {
+            | Command::StopProcess { bot, .. }
+            | Command::ProcessOutput { bot, .. } => {
                 let bot = bot.clone();
                 match self.store.op("inspect", move |db| db.inspect(&bot)).await {
                     Ok(target)
@@ -5322,6 +5338,31 @@ impl Service {
                     None => fail_with(
                         "process_not_running",
                         format!("{handle} is not a command of {bot}'s that runs"),
+                    ),
+                }
+            }
+            Command::ProcessOutput { bot, handle, lines } => {
+                let id = match handles::Handle::parse(&handle) {
+                    Ok(handles::Handle::Process(id)) => id,
+                    _ => {
+                        return fail_with(
+                            "invalid_handle",
+                            format!("{handle} is not a command's handle, proc:N"),
+                        );
+                    }
+                };
+                let count = lines.unwrap_or(OUTPUT_LINES).clamp(1, OUTPUT_LINES_MAX);
+                let owner = bot.clone();
+                let runs = store
+                    .read("runs_for", move |db| db.runs_for(&owner, id))
+                    .await?;
+                match runs.then(|| self.registry.output(id, count)).flatten() {
+                    Some((folder, lines)) => {
+                        Ok(json!({"handle": handle, "folder": folder, "lines": lines}))
+                    }
+                    None => fail_with(
+                        "process_not_running",
+                        format!("{handle} is not a command of {bot}'s that runs with output kept"),
                     ),
                 }
             }

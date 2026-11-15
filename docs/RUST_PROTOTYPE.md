@@ -2493,7 +2493,20 @@ that ends between pages, its row pruned with its turn, does not break the
 listing. `{"op":"stop_process","bot":NAME,"handle":"proc:N"}` stops it as
 its agent's `write_stdin` with `kill: true` does and answers as that does,
 `{handle, stopped: true, ran}`; a handle that is not a command of that
-bot's still running answers `process_not_running`. `agent ps [--bot NAME]`
+bot's still running answers `process_not_running`.
+`{"op":"process_output","bot":NAME,"handle":"proc:N","lines":10}`
+(protocol 78) answers where a background command or terminal of that bot's
+runs and the last lines it wrote, `{handle, folder, lines}`, while it
+runs: `lines` (default 10, at most 200) of its newest 16 KiB of output,
+both streams as they came, escape sequences and control characters left
+out, a line a carriage return rewrote as it ended, redacted as its result
+is. A line cut where older output was let go is left out. Nothing is taken
+from what its agent reads. The daemon keeps that 16 KiB beside what the
+command's result keeps, for each such command while it runs, a command a
+steer moved to the background included. A detached command's output goes
+nowhere, so it answers its folder with `lines: null`. A call, a handle that
+has ended, or a detached command an earlier daemon started answers
+`process_not_running`. `agent ps [--bot NAME]`
 and `agent stop --bot NAME proc:N` send them, and Sonny's `/ps` lists the
 project's and stops one. A bot whose command still runs is not deleted
 (`bot_busy`, naming the two requests): nothing an agent started runs
@@ -3060,7 +3073,7 @@ command reaches another bot's. A request on it:
 | `audit_trim` | `not_permitted`: the audit trail is the person's record of what agents did |
 | `create`, `fork` | Made by the caller, whatever `created_by` names (another is `not_permitted`), so the bot inherits its sandbox; its workspace and `writable` folders, and a fork's source's, must be ones the caller may write. A fork with `allow: []`, which only answers, may be of any bot |
 | `submit` | Reads as the caller's: `from` its turn when the request names it (the CLI does, from `AGENT_TURN`), else with its name as `origin`; `from` naming another bot is `not_permitted`. A workspace for a sandboxed bot must be one the caller may write |
-| `delete`, `prune`, `compact`, `interrupt`, `stop_process` | The caller itself, or a bot it made; another is `not_permitted` |
+| `delete`, `prune`, `compact`, `interrupt`, `stop_process`, `process_output` | The caller itself, or a bot it made; another is `not_permitted` |
 | Everything else | As on the daemon's socket |
 
 The folder of these sockets stays read-only in every root, so no bot can

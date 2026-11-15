@@ -781,6 +781,66 @@ pub struct View {
     next_run: Option<i64>,
     /// What the open source's page says.
     source: SourcePage,
+    /// The open command's newest output, read only while its page is.
+    output: Output,
+}
+
+/// A command's newest output as the daemon last said it, shared with
+/// the read that goes out for it beside the window.
+#[derive(Clone, Debug, Default)]
+pub struct Output(Arc<Mutex<OutputRead>>);
+
+#[derive(Debug, Default)]
+struct OutputRead {
+    /// A read is out: no other goes until it comes back.
+    asking: bool,
+    /// The command it was read for, by its handle.
+    handle: String,
+    /// What the daemon said (its `folder` and `lines`), none where it
+    /// could not say.
+    said: Option<Value>,
+}
+
+impl Output {
+    /// What the read for `handle` came back with.
+    pub fn came(&self, handle: &str, said: Option<Value>) {
+        let mut read = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        read.asking = false;
+        read.handle = handle.to_owned();
+        read.said = said;
+    }
+
+    /// What was last read for `handle`.
+    fn of(&self, handle: &str) -> Option<Value> {
+        let read = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        (read.handle == handle).then(|| read.said.clone()).flatten()
+    }
+}
+
+/// The newest lines a command's page shows, at most.
+const OUTPUT_LINES: usize = 10;
+
+/// A running command's fields on its page, as the daemon said them: the
+/// folder it runs in, and its newest lines.
+fn output_fields(said: &Value) -> Vec<(&'static str, Vec<Field>)> {
+    let mut fields = Vec::new();
+    if let Some(folder) = said["folder"].as_str() {
+        fields.push(("folder", vec![Field::text(home_path(folder))]));
+    }
+    let dim = |words: &str| Field {
+        spans: vec![Span::raw(words.to_owned()).dim()],
+        link: None,
+    };
+    let output = match said["lines"].as_array() {
+        None => vec![dim("not kept")],
+        Some(lines) if lines.is_empty() => vec![dim("nothing yet")],
+        Some(lines) => (lines.iter())
+            .filter_map(Value::as_str)
+            .map(|line| Field::text(line.to_owned()))
+            .collect(),
+    };
+    fields.push(("output", output));
+    fields
 }
 
 /// What a source's page says, read only while it is open, as often as
@@ -1096,6 +1156,7 @@ impl View {
             follow: Follow::default(),
             next_run: None,
             source: SourcePage::default(),
+            output: Output::default(),
         };
         view.reload();
         view
@@ -1119,6 +1180,27 @@ impl View {
     /// The `processes` request for the project's commands.
     pub fn commands_query(&self) -> Value {
         json!({"bot": self.scope.glob})
+    }
+
+    /// The `process_output` request for the command whose page is open,
+    /// and where its answer goes: none while no command's page is open,
+    /// for a call waiting on its approval, or while the last is still out.
+    pub fn output_query(&self) -> Option<(Value, Output)> {
+        let handle = self.page.as_ref()?.handle.clone()?;
+        let row = self.command()?;
+        if !matches!(
+            row["kind"].as_str(),
+            Some("background" | "terminal" | "detached")
+        ) {
+            return None;
+        }
+        let mut read = self.output.0.lock().unwrap_or_else(|e| e.into_inner());
+        if read.asking {
+            return None;
+        }
+        read.asking = true;
+        let query = json!({"bot": row["bot"], "handle": handle, "lines": OUTPUT_LINES});
+        Some((query, self.output.clone()))
     }
 
     /// What the read of the commands came back with.
@@ -1845,9 +1927,6 @@ impl View {
                 _ => "call waiting on its approval",
             };
             about.push(vec![(kind.into(), None)]);
-            if let Some(pid) = row["pid"].as_i64() {
-                about.push(vec![(format!("pid {pid}"), None)]);
-            }
             about.push(vec![
                 ("left running by ".into(), None),
                 (short(&bot), Some(bot.clone())),
@@ -1858,6 +1937,20 @@ impl View {
                     format!("for {}", ago(ran).trim_end_matches(" ago")),
                     None,
                 )]);
+            }
+            if let Some(pid) = row["pid"].as_i64() {
+                about.push(vec![(format!("pid {pid}"), None)]);
+            }
+            let handle = row["handle"].as_str().unwrap_or_default();
+            if let Some(said) = self.output.of(handle) {
+                let pick = self.page.as_ref().and_then(|page| page.pick);
+                lay(
+                    output_fields(&said),
+                    width,
+                    pick,
+                    &mut body,
+                    &mut body_links,
+                );
             }
         } else if let Some((item, reminder)) = (self.items.get(self.selected))
             .and_then(|item| Some((item.clone(), item.reminder.clone()?)))
@@ -3084,6 +3177,7 @@ mod tests {
             follow: Follow::default(),
             next_run: None,
             source: SourcePage::default(),
+            output: Output::default(),
         }
     }
 
@@ -3989,6 +4083,7 @@ mod tests {
             follow: Follow::default(),
             next_run: None,
             source: SourcePage::default(),
+            output: Output::default(),
         };
         let rows: Vec<String> = (view.card(100).0.iter())
             .map(|l| l.to_string())
@@ -4070,6 +4165,7 @@ mod tests {
             follow: Follow::default(),
             next_run: None,
             source: SourcePage::default(),
+            output: Output::default(),
         };
         let clock = crate::asks::clock(at, now);
         // The pick reaches a column past the last word.
@@ -4412,6 +4508,7 @@ mod tests {
             follow: Follow::default(),
             next_run: None,
             source: SourcePage::default(),
+            output: Output::default(),
         };
         let (card, at) = view.card(100);
         let lines: Vec<String> = card.iter().map(|l| l.to_string()).collect();
@@ -4478,6 +4575,7 @@ mod tests {
             follow: Follow::default(),
             next_run: None,
             source: SourcePage::default(),
+            output: Output::default(),
         };
         let text = |view: &View| -> Vec<String> {
             view.card(100)
@@ -4620,12 +4718,54 @@ mod tests {
             .map(|l| l.to_string())
             .collect();
         assert_eq!(page[0], "npm run dev more");
+        // Under the name: its kind, who left it running, for how long,
+        // its pid.
         assert!(
-            page[1].starts_with("detached service · pid 4242"),
+            page[1].starts_with("detached service · left running by fix"),
             "{page:?}"
         );
-        assert!(page[2].starts_with("left running by fix"), "{page:?}");
+        assert!(page[2].ends_with("· pid 4242"), "{page:?}");
         assert_eq!(view.keys(), "enter open · x stop · esc close");
+        // Its newest lines are asked for while its page is open, one read
+        // out at a time.
+        let (query, output) = view.output_query().unwrap();
+        assert_eq!(
+            query,
+            json!({"bot": "calc.fix", "handle": "proc:9", "lines": 10})
+        );
+        assert!(view.output_query().is_none(), "one read out at a time");
+        let home = std::env::var("HOME").unwrap_or_default();
+        output.came(
+            "proc:9",
+            Some(json!({"folder": format!("{home}/web"), "lines": null})),
+        );
+        let page: Vec<String> = (view.page_lines(44).0.iter())
+            .map(|l| l.to_string())
+            .collect();
+        assert_eq!(page[4], "folder  ~/web", "{page:?}");
+        assert_eq!(page[5], "output  not kept", "{page:?}");
+        let (_, output) = view.output_query().unwrap();
+        output.came("proc:9", Some(json!({"folder": "/srv/web", "lines": []})));
+        let page: Vec<String> = (view.page_lines(44).0.iter())
+            .map(|l| l.to_string())
+            .collect();
+        assert_eq!(page[5], "output  nothing yet", "{page:?}");
+        let (_, output) = view.output_query().unwrap();
+        output.came(
+            "proc:9",
+            Some(json!({"folder": "/srv/web", "lines": ["ready in 412ms", "GET / 200"]})),
+        );
+        let page: Vec<String> = (view.page_lines(44).0.iter())
+            .map(|l| l.to_string())
+            .collect();
+        assert_eq!(
+            page[4..7],
+            [
+                "folder  /srv/web",
+                "output  ready in 412ms",
+                "        GET / 200"
+            ]
+        );
         // It stays on its command as the commands are read again, and
         // closes once the command ends.
         view.commands_loaded(Ok(json!({"processes": [
