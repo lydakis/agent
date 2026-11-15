@@ -1488,7 +1488,7 @@ async fn lends(link: &agent_client::config::Link, hub: &crate::mcp::Hub, calls: 
     }
     json!({
         "id": this_id(),
-        "browser": crate::setup::on_path("agent-browser"),
+        "browser": crate::trusted::here("agent-browser"),
         "signed_in": !link.browser_profile.is_empty(),
         "calls": calls,
         "desktop": crate::desktop::here(),

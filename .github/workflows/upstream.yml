@@ -6,7 +6,9 @@ name: Upstream
 # sonny/upstream/<program>.txt does not is new: it opens an issue naming
 # each new command and flag with its help, and the job stays green, since
 # the tools refuse what they do not list. Supporting it, or deciding not
-# to, and refreshing the list with sonny/upstream/inventory.py closes it.
+# to, and refreshing the list with sonny/upstream/inventory.py, with the
+# version and integrity Sonny installs pinned to match in
+# sonny/src/trusted.rs, closes it.
 # A command or flag the tools pass that the release no longer documents,
 # or a line agent-desktop's own parser no longer takes, is breakage: the
 # job fails and opens an issue. It runs on its own, so neither blocks a
@@ -76,7 +78,7 @@ jobs:
             {
               cat "$news"
               echo
-              echo "Sonny's tool refuses each of these until it lists it. Add those agents should have to its lists in \`sonny/src/\` (or decide not to), then refresh \`sonny/upstream/$program.txt\` with \`python3 sonny/upstream/inventory.py list $program <native program>\` in the same pull request, which closes this."
+              echo "Sonny's tool refuses each of these until it lists it. Add those agents should have to its lists in \`sonny/src/\` (or decide not to), then refresh \`sonny/upstream/$program.txt\` with \`python3 sonny/upstream/inventory.py list $program <native program>\` and move its pin in \`sonny/src/trusted.rs\` to that version and its npm integrity in the same pull request, which closes this."
               echo
               echo "Found by [this run]($GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID)."
             } > "$news.issue"

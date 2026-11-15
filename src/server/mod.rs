@@ -2105,8 +2105,11 @@ pub async fn run(config: Configuration) -> Result<()> {
                 })
             })
             .transpose()?,
-        // Read once at start: what runs a confined write is this binary.
-        helper: std::env::current_exe().ok(),
+        // Read once at start: what runs a confined write is this binary,
+        // by the path its agents run it by, not a name of its starter's
+        // own that it was started by, which may be in a folder kept from
+        // them.
+        helper: agent_bin().ok(),
         capabilities: None,
         protected: config.protected.clone(),
         protected_existing: config.protected_existing.clone(),

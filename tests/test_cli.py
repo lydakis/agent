@@ -1987,12 +1987,60 @@ class CliTests(ModelFixture):
         if cmdline.exists():
             args = cmdline.read_text().split('\0')
             self.assertEqual([args[i + 1] for i, arg in enumerate(args) if arg == '--unreadable'],
-                             [str(home/'.agent'/'keys'), str(home/'cookies'), str(home/'later'/'keys')])
+                             [str(home/'.agent'/'keys'), str(home/'.agent'/'sonny'/'programs'),
+                              str(home/'cookies'), str(home/'later'/'keys')])
         # A folder named from neither / nor ~/ is refused by name.
         config.write_text('[sandbox]\nunreadable = ["cookies"]\n')
         refused = run(*read)
         self.assertEqual(refused.returncode, 125, refused.stderr)
         self.assertIn('sandbox.unreadable', refused.stderr)
+
+    @unittest.skipUnless(shutil.which('bwrap') or sys.platform == 'darwin', 'sandboxes need bubblewrap')
+    def test_sonny_s_programs_are_kept_from_a_sandbox_given_them_by_name(self):
+        # The programs Sonny's tool host runs as the person: a command given
+        # their folder, or Sonny's above it, neither reads nor replaces one.
+        home = self.path/'home'
+        programs = home/'.agent'/'sonny'/'programs'
+        program = programs/'agent-browser'/'agent-browser-linux-x64'
+        program.parent.mkdir(parents=True)
+        program.write_text('#!/bin/sh\necho pinned\n')
+        env = {**clean_env(), 'HOME': str(home)}
+        for given in (programs, programs/'agent-browser', programs.parent):
+            replaced = subprocess.run(
+                [str(self.binary), 'sandbox', '--writable', str(given), '--',
+                 '/bin/sh', '-c', f'cat {program}; echo swapped > {program}'],
+                env=env, capture_output=True, text=True, timeout=20, cwd=self.path)
+            self.assertNotEqual(replaced.returncode, 0, given)
+            self.assertNotIn('pinned', replaced.stdout)
+            self.assertEqual(program.read_text(), '#!/bin/sh\necho pinned\n')
+
+    @unittest.skipUnless(shutil.which('bwrap') or sys.platform == 'darwin', 'sandboxes need bubblewrap')
+    def test_a_daemon_started_by_a_name_in_sonny_s_programs_still_writes_for_a_sandboxed_bot(self):
+        # Sonny starts the daemon by a name in its programs folder, kept
+        # from every sandbox: a sandboxed bot's write runs Agent by the
+        # path its starter named, not by that name.
+        home = self.path/'named-home'
+        names = home/'.agent'/'sonny'/'programs'/'names'
+        names.mkdir(parents=True)
+        daemon = names/'sonny-daemon'
+        try:
+            os.link(self.binary, daemon)
+        except OSError:
+            shutil.copy2(self.binary, daemon)
+        work = self.path/'named-work'
+        work.mkdir()
+        store = self.path/'named.db'
+        env = {**clean_env(), 'HOME': str(home), 'AGENT_BIN': str(self.binary)}
+        run = lambda binary, *args: subprocess.run([str(binary), *args], env=env, capture_output=True,
+                                                   text=True, timeout=30, cwd=work)
+        started = run(daemon, 'start', '--store', str(store), '--provider', f'openai=responses,{self.url}')
+        self.addCleanup(run, self.binary, 'shutdown', '--store', str(store))
+        self.assertEqual(started.returncode, 0, started.stderr)
+        wrote = run(self.binary, 'run', '--store', str(store), '--new', '--bot', 'w',
+                    '--model', 'openai/synthetic-model', '--tools', 'write', '--sandbox', 'workspace-write',
+                    'calls:' + json.dumps([['write', {'path': 'out.txt', 'content': 'hi'}]]))
+        self.assertEqual(wrote.returncode, 0, wrote.stderr)
+        self.assertEqual((work/'out.txt').read_text(), 'hi')
 
     def test_explicit_store_overrides_inherited_socket(self):
         client = SocketClient(self.binary, self.path/'first.db', self.url, 'echo')

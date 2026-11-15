@@ -1360,6 +1360,14 @@ pub fn home() -> Option<PathBuf> {
     std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".agent"))
 }
 
+/// Where Sonny installs the pinned programs its tool host runs as the
+/// person, outside every sandbox, `~/.agent/sonny/programs`: kept from
+/// agents ([`crate::hidden`]), so no bot, even one given the folder by
+/// name, replaces what runs next as the person.
+pub fn programs() -> Option<PathBuf> {
+    std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".agent/sonny/programs"))
+}
+
 /// Where the agent's clients keep the sockets of programs they run outside
 /// the sandbox for bots, `~/.agent/run`, such as Sonny's agent-desktop
 /// host and agent-browser sessions: the daemon walls it off from every

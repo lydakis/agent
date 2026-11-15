@@ -25,8 +25,9 @@ class NightlyFormulaTest(unittest.TestCase):
         self.assertIn('libexec.install libexec/"bin/agent"', formula)
         self.assertIn('std_cargo_args(path: "sonny")', formula)
         self.assertNotIn('depends_on "lydakis/agent/agent"', formula)
-        for dependency in ["rust", "ripgrep", "agent-browser", "bubblewrap"]:
+        for dependency in ["rust", "ripgrep", "bubblewrap"]:
             self.assertIn(f'depends_on "{dependency}"', formula)
+        self.assertNotIn('agent-browser', formula)
         self.assertIn('ENV["AGENT_BWRAP"]', formula)
         self.assertIn('conflicts_with "sonny"', formula)
         # Both the client and its bundled daemon are exercised by brew test.
