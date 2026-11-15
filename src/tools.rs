@@ -55,6 +55,12 @@ const MAX_WAIT_TIMEOUT_MS: u64 = 86_400_000;
 const MAX_BACKGROUND_TIMEOUT_MS: u64 = MAX_WAIT_TIMEOUT_MS;
 /// Simultaneously running child processes, foreground or background.
 pub const DEFAULT_PROCESS_BUDGET: usize = 64;
+/// The background commands of an agent's that a prune spares at most:
+/// those it started or waited on most recently, as Codex spares 8 of a
+/// session's 64; under a bound of 8, the bound, so one agent past a small
+/// bound is pruned rather than refused, while one waiting for a slot
+/// behind another's is not ([`Registry::own`]).
+const PRUNE_SPARES: usize = 8;
 /// Processes that outlive their call, terminals and detached commands,
 /// running at once daemon-wide unless configured: four per logical CPU,
 /// which keeps their descriptors well inside a default 256-descriptor
@@ -132,7 +138,7 @@ impl Tool {
                 "properties":{"text":{"type":"string"}},"required":["text"],"additionalProperties":false}),
             ),
             Tool::Shell => (
-                "Run a noninteractive bash command (sh where bash is not installed) in the workspace, or in workdir when given (relative to the workspace unless absolute). stdout and stderr are returned separately; each is truncated to a head and tail beyond 64 KiB, and retained whole in a file the result names under files, up to 1 GiB, or, where there is no such file, up to 1 MiB: past that, its first and last 512 KiB. The command keeps running. Default timeout 120 s, maximum 600 s; with background=true there is no timeout unless timeout_ms sets one, of up to a day. A command that times out is killed and returns its output so far with timed_out. Every result reports wall_time_ms. Commands run with no terminal: TERM=dumb, NO_COLOR=1, and cat as the pager; AI_AGENT=agent tells tools an agent runs them. When the command returns or times out, every process it started is killed, so `cmd &` does not outlive it. With background=true the command is started and a proc handle is returned immediately; collect its result later with wait. If no wait collects it, its end comes as a message once no turn of yours runs: {\"finished\":{\"proc:N\":{how it ended}}}; wait on the handle reads the output. A steer that arrives while a command runs moves it to the background: the result is its proc handle with steered=true, and the command keeps running. A background command runs until it exits, its timeout_ms passes, kill=true on its handle stops it, or the daemon stops; each agent keeps at most as many as the daemon's process bound, and starting one past them kills the one it started or waited on least recently. With detach=true it starts in its own session and returns a proc handle and pid at once; it outlives the turn and the daemon until it exits, a pause or kill=true, its output discarded unless redirected, its end told as a background command's. With tty=true it runs in a terminal, for a REPL or a program that prompts: the result is what it wrote within yield_time_ms (default 1000) and, while it runs, a proc handle for write_stdin.",
+                "Run a noninteractive bash command (sh where bash is not installed) in the workspace, or in workdir when given (relative to the workspace unless absolute). stdout and stderr are returned separately; each is truncated to a head and tail beyond 64 KiB, and retained whole in a file the result names under files, up to 1 GiB, or, where there is no such file, up to 1 MiB: past that, its first and last 512 KiB. The command keeps running. Default timeout 120 s, maximum 600 s; with background=true there is no timeout unless timeout_ms sets one, of up to a day. A command that times out is killed and returns its output so far with timed_out. Every result reports wall_time_ms. Commands run with no terminal: TERM=dumb, NO_COLOR=1, and cat as the pager; AI_AGENT=agent tells tools an agent runs them. When the command returns or times out, every process it started is killed, so `cmd &` does not outlive it. With background=true the command is started and a proc handle is returned immediately; collect its result later with wait. If no wait collects it, its end comes as a message once no turn of yours runs: {\"finished\":{\"proc:N\":{how it ended}}}; wait on the handle reads the output. A steer that arrives while a command runs moves it to the background: the result is its proc handle with steered=true, and the command keeps running. A background command runs until it exits, its timeout_ms passes, kill=true on its handle stops it, or the daemon stops; once the daemon's background commands fill its process bound, starting one more kills a command of the agent holding the most: the one it started or waited on least recently, never one of its 8 most recent (a smaller bound's number). With detach=true it starts in its own session and returns a proc handle and pid at once; it outlives the turn and the daemon until it exits, a pause or kill=true, its output discarded unless redirected, its end told as a background command's. With tty=true it runs in a terminal, for a REPL or a program that prompts: the result is what it wrote within yield_time_ms (default 1000) and, while it runs, a proc handle for write_stdin.",
                 json!({"type":"object","properties":{"command":{"type":"string"},
                 "workdir":{"type":"string"},
                 "timeout_ms":{"type":"integer","minimum":1,"maximum":MAX_BACKGROUND_TIMEOUT_MS},
@@ -3732,11 +3738,15 @@ impl Registry {
         stop.is_some_and(|stop| stop.sender.send(Kill::Agent).is_ok())
     }
 
-    /// Count `stopper`'s command toward bot `owner`'s share, as just used.
-    /// The share is the process bound (64 by default, Codex's number for a
-    /// session's processes): one past it kills the bot's command it used
-    /// least recently, as Codex prunes, so an agent that loses track of
-    /// what it started cannot hold the whole bound forever. With no bound,
+    /// Count `stopper`'s command as bot `owner`'s, as just used. No agent
+    /// has a share of its own: once the daemon's background commands are
+    /// past its process bound, the agent holding the most loses the one it
+    /// used least recently, sparing its [`PRUNE_SPARES`] most recent (the
+    /// bound's number, under 8), as Codex prunes a session's processes. So
+    /// an agent that loses track of
+    /// what it started cannot crowd out the rest of the fleet, and one
+    /// that needs many keeps them while there is room. A command that ended
+    /// holds no place here, so none is left to prune first. With no bound,
     /// nothing is pruned.
     pub fn own(&self, stopper: &Stopper, owner: i64) {
         let pruned = {
@@ -3746,11 +3756,30 @@ impl Registry {
                 return;
             };
             (entry.owner, entry.used) = (Some(owner), used);
-            let own = (stops.running.iter())
-                .filter(|(_, stop)| stop.owner == Some(owner))
-                .map(|(id, stop)| (*id, stop.used));
-            let least = match self.budget > 0 && own.clone().count() > self.budget {
-                true => own.min_by_key(|(_, used)| *used).map(|(id, _)| id),
+            // Counted in place: grouped by agent only past the bound.
+            let owned = (stops.running.values())
+                .filter(|stop| stop.owner.is_some())
+                .count();
+            let least = match self.budget > 0 && owned > self.budget {
+                // The most held, a tie going to the agent whose oldest
+                // command is oldest.
+                true => {
+                    let mut held: HashMap<i64, Vec<(u64, i64)>> = HashMap::new();
+                    for (id, stop) in &stops.running {
+                        if let Some(owner) = stop.owner {
+                            held.entry(owner).or_default().push((stop.used, *id));
+                        }
+                    }
+                    let spares = PRUNE_SPARES.min(self.budget);
+                    (held.into_values())
+                        .filter(|commands| commands.len() > spares)
+                        .max_by_key(|commands| {
+                            let oldest = commands.iter().map(|(used, _)| *used).min();
+                            (commands.len(), std::cmp::Reverse(oldest))
+                        })
+                        .and_then(|commands| commands.into_iter().min())
+                        .map(|(_, id)| id)
+                }
                 false => None,
             };
             least.and_then(|id| stops.running.remove(&id))
@@ -3894,7 +3923,8 @@ impl Registry {
 }
 
 /// How a background command that was killed answers: by its agent, or
-/// pruned as its agent started one past its share.
+/// pruned as the daemon's process bound filled while its agent held the
+/// most.
 fn stopped(kill: Kill) -> Error {
     Error::with(
         "stopped",
@@ -3903,7 +3933,7 @@ fn stopped(kill: Kill) -> Error {
                 "its agent killed this command before it finished, so it may have had effects"
             }
             Kill::Pruned => {
-                "its agent started more background commands than the daemon's process bound, so this one, the one it used least recently, was killed before it finished; it may have had effects"
+                "the daemon's background commands filled its process bound while its agent held the most of them, so this one, the one its agent used least recently, was killed before it finished; it may have had effects"
             }
         },
     )
@@ -3914,8 +3944,8 @@ fn stopped(kill: Kill) -> Error {
 enum Kill {
     /// Its agent killed it by its handle.
     Agent,
-    /// Its agent started one past its share, and it was the one used least
-    /// recently.
+    /// The daemon's bound filled while its agent held the most, and it was
+    /// the one that agent used least recently.
     Pruned,
 }
 
@@ -6106,37 +6136,70 @@ mod tests {
             assert_eq!(redact(kept), kept);
         }
     }
-    /// A bot keeps at most the process bound's number of background
-    /// commands, as Codex keeps a session's processes: starting one past
-    /// them kills the one its bot used least recently, a wait counting as
-    /// a use. Another bot's and a command no bot owns, such as a detached
-    /// one, never count, and with no bound nothing is pruned.
+    /// No agent has a share of its own: once the daemon's background
+    /// commands are past its process bound, the agent holding the most
+    /// loses the one it used least recently, a wait counting as a use, and
+    /// never one of its 8 most recent, as Codex prunes. Another agent's and
+    /// a command no agent owns, such as a detached one, are never taken for
+    /// it, and with no bound nothing is pruned.
     #[test]
-    fn a_bot_past_its_share_loses_the_command_it_used_least_recently() {
-        let registry = Registry::new("shell").unwrap().with_process_budget(4);
+    fn a_full_bound_prunes_the_agent_holding_the_most() {
+        let registry = Registry::new("shell").unwrap().with_process_budget(12);
         let pruned = |stopper: &mut Stopper| matches!(stopper.stop.try_recv(), Ok(Kill::Pruned));
-        let mut own: Vec<Stopper> = (1..=4)
-            .map(|id| {
-                let stopper = registry.stopper(id);
-                registry.own(&stopper, 7);
-                stopper
-            })
-            .collect();
-        let mut other = registry.stopper(1000);
-        registry.own(&other, 8);
+        let start = |id: i64, owner: i64| {
+            let stopper = registry.stopper(id);
+            registry.own(&stopper, owner);
+            stopper
+        };
+        // One agent may hold most of the bound while there is room.
+        let mut big: Vec<Stopper> = (1..=10).map(|id| start(id, 7)).collect();
+        let mut small: Vec<Stopper> = (11..=12).map(|id| start(id, 8)).collect();
         let mut unowned = registry.stopper(2000);
-        assert!(own.iter_mut().all(|stopper| !pruned(stopper)));
-        // The oldest was waited on since, so the next oldest goes.
+        assert!(big.iter_mut().all(|stopper| !pruned(stopper)));
+        // Past the bound, the small one's start costs the big one its least
+        // recently used: its oldest was waited on since, so the next goes.
         registry.used(&[1]);
-        let mut next = registry.stopper(5);
-        registry.own(&next, 7);
-        assert!(!pruned(&mut own[0]));
-        assert!(pruned(&mut own[1]));
-        assert!(own[2..].iter_mut().all(|stopper| !pruned(stopper)));
-        assert!(!pruned(&mut other) && !pruned(&mut unowned) && !pruned(&mut next));
+        let mut next = start(13, 8);
+        assert!(!pruned(&mut big[0]) && pruned(&mut big[1]));
+        assert!(big[2..].iter_mut().all(|stopper| !pruned(stopper)));
+        assert!(small.iter_mut().all(|stopper| !pruned(stopper)));
+        assert!(!pruned(&mut unowned) && !pruned(&mut next));
         // Gone from those its agent can kill: a kill by its handle finds none.
         assert!(!registry.stop(2));
         assert!(registry.stop(3));
+        // An agent's 8 most recent are spared: past the bound with no agent
+        // holding more than 8, nothing is pruned.
+        let spread = Registry::new("shell").unwrap().with_process_budget(64);
+        let mut held: Vec<Stopper> = (1..=72)
+            .map(|id| {
+                let stopper = spread.stopper(id);
+                spread.own(&stopper, id % 9);
+                stopper
+            })
+            .collect();
+        assert!(held.iter_mut().all(|stopper| !pruned(stopper)));
+        // A bound under 8 spares its own number: one agent past it loses
+        // its least recent rather than being refused, while agents that
+        // each hold no more than it wait for a slot as they would.
+        let small = Registry::new("shell").unwrap().with_process_budget(4);
+        let mut waiting: Vec<Stopper> = (11..=18)
+            .map(|id| {
+                let stopper = small.stopper(id);
+                small.own(&stopper, id);
+                stopper
+            })
+            .collect();
+        assert!(waiting.iter_mut().all(|stopper| !pruned(stopper)));
+        let small = Registry::new("shell").unwrap().with_process_budget(4);
+        let mut held: Vec<Stopper> = (1..=5)
+            .map(|id| {
+                let stopper = small.stopper(id);
+                small.own(&stopper, 7);
+                stopper
+            })
+            .collect();
+        assert!(pruned(&mut held[0]));
+        assert!(held[1..].iter_mut().all(|stopper| !pruned(stopper)));
         let unbounded = Registry::new("shell").unwrap().with_process_budget(0);
         let mut first = unbounded.stopper(1);
         unbounded.own(&first, 7);

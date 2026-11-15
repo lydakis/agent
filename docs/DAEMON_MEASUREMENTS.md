@@ -9882,3 +9882,42 @@ At 5,000 stored agents, `bench.fleet_screen --bots 5000 --max-active 64
 
 Store jobs per turn are the same on both sides at both scales, and the
 timing moves fall within run-to-run spread.
+
+## Background commands pruned from the agent holding the most (#1035)
+
+Once the daemon's background commands are past its process bound, a new
+one kills the least recently used command of the agent holding the most,
+sparing its 8 most recent (the bound's number under a bound of 8), where
+before each agent had a share the size of the whole bound. The check runs
+as a background command starts or a steer lifts one: it counts the owned
+commands in place, with no allocation, and groups them by agent only once
+they are past the bound. That is at most the bound's number of entries,
+64 by default, under the registry's lock.
+
+### Required matched screen
+
+The Perf workflow's screen of da440ac7 against its base 752e045b, in
+base/head order for two rounds, with the workflow's settings. Admission and
+completion use five measured repeats, footprint uses two (1,000 bots), and
+lifecycle uses one (32 bots, socket echo, five tool schemas). Medians over
+every measured run:
+
+| Bench | Measure | Base | Head | Change |
+| --- | --- | ---: | ---: | ---: |
+| admission | lone submit CPU, ms | 33.576 | 33.544 | -0.1% |
+| admission | burst submit p99, ms | 3.858 | 3.974 | +3.0% |
+| completion | release to terminal p99, ms | 10.151 | 10.5 | +3.4% |
+| footprint | idle RSS, MiB | 15.605 | 16.371 | +4.9% |
+| footprint | per idle bot, KiB | 2.018 | 1.936 | -4.1% |
+| footprint | RSS after a turn each, MiB | 38.006 | 43.227 | +13.7% |
+| footprint | CPU per turn, ms | 0.871 | 0.881 | +1.2% |
+| lifecycle | CPU, s | 0.475 | 0.48 | +1.1% |
+| lifecycle | p95 turn, ms | 624.081 | 574.195 | -8.0% |
+| lifecycle | peak RSS, MiB | 25.154 | 25.041 | -0.5% |
+
+`bench.perf_gate` reports no count failures and no warnings: store work per
+turn is the same. None of these workloads starts a background command, so
+none runs the changed check; the moves are the runner's. The footprint's
+RSS after a turn is the allocator's high-water mark from 1,000 turns of
+model and history work, which this change does not touch, and stays under
+the gate's 15%.
