@@ -1745,8 +1745,10 @@ link with its state's mark, kept current (`└ started ● halves · ●
 readme`). With one alone and room left, its title follows, a brief's or
 a message's first line; names give way to `+N`. Above a reply to a turn
 you did not start, `↳` names who started it: an agent, a lookout note's
-tasks and sources (a source by its icon), an automation by `↻`. A turn
-that says nothing draws neither. Zen keeps `└`.
+tasks and sources (a source by its icon), an automation by `↻`. Only a
+turn's final reply wears them, once, with everything the turn set going
+in one row; words partway through a turn get none. A turn that says
+nothing draws neither. Zen keeps `└`.
 
 ![Words only: a lead asked to check the work, its words as two tasks report in, and nothing between](../docs/sonny/words-only.png)
 

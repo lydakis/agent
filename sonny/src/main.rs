@@ -9524,8 +9524,14 @@ impl App {
     /// The bot's words at `node`, as replayed: their last row tagged,
     /// and the person's reactions to them right under it.
     fn commit_said(&mut self, node: i64, lines: Vec<Line<'static>>) {
+        self.commit_words(node, lines, true);
+    }
+
+    /// The bot's words at `node`, as replayed: a reply's, which a turn's
+    /// hints hang on, or a step's, which has none.
+    fn commit_words(&mut self, node: i64, lines: Vec<Line<'static>>, reply: bool) {
         let count = lines.len();
-        match self.came_row() {
+        match reply.then(|| self.came_row()).flatten() {
             Some(came) => {
                 self.commit(vec![came]);
                 self.commit_after(lines, false);
@@ -10244,11 +10250,11 @@ impl App {
                 // A reaction leaves the words before it as they were.
                 let call = item["type"] == "function_call" && item["name"] != reactions::TOOL;
                 if let Some((at, lines)) = said.take_if(|_| call || item["role"].is_string()) {
-                    let lines = match call {
-                        true => transcript::quiet(lines),
-                        false => lines,
-                    };
-                    self.commit_said(at, lines);
+                    // Words a call followed are a step: no hint hangs on them.
+                    match call {
+                        true => self.commit_words(at, transcript::quiet(lines), false),
+                        false => self.commit_said(at, lines),
+                    }
                 }
                 match (item["type"].as_str(), item["role"].as_str()) {
                     // A reaction is drawn under the reply it answers.
@@ -10742,7 +10748,10 @@ impl App {
             self.pending.push(Line::default());
         }
         if !live.spilled {
-            self.came_above();
+            // Only the turn's reply wears its hints, never a step's words.
+            if matches!(words, Words::Reply) {
+                self.came_above();
+            }
             self.marks.push((self.pending.len(), screen::Mark::Opens));
         }
         self.rows_drawn += live.rows.len();
@@ -24069,6 +24078,70 @@ mod tests {
         assert_eq!(
             rows(&app)[3..],
             ["• Steered calc.fix ▸", "Worked for 0s", "• Sent."]
+        );
+    }
+
+    #[tokio::test]
+    async fn only_a_turns_final_reply_wears_its_hints_merged_into_one_row() {
+        let client = daemon_answering(|asked| match asked["nodes"][0].as_i64() {
+            Some(7) => json!({"items": [{"node": 7, "item": {"type": "message",
+                "role": "user", "from": "calc.halves",
+                "content": [{"type": "input_text", "text": "Half cents round to even."}]}}]}),
+            _ => json!({}),
+        })
+        .await;
+        let mut app = app(client);
+        app.words_only = true;
+        app.any_history = true;
+        app.width = 120;
+        app.project = Some("calc".into());
+        let rows = |app: &App| -> Vec<String> {
+            (app.pending.iter())
+                .map(|line| line.to_string())
+                .filter(|row| !row.trim().is_empty())
+                .collect()
+        };
+        app.daemon(turn_event("accepted", 1, json!({"node": 7})))
+            .await;
+        // Words partway through, a call after each: steps, no hints.
+        for (at, (words, id)) in [("Checking first.", "m1"), ("Now the readme.", "s1")]
+            .into_iter()
+            .enumerate()
+        {
+            let said = json!({"event": "text_delta", "bot": "b", "turn": 1, "text": words});
+            app.daemon(said).await;
+            let started = json!({"name": "send_message", "call_id": id});
+            app.daemon(turn_event("tool_started", 1, started)).await;
+            if at == 0 {
+                let send = json!({"to": "calc.fix", "message": "Check div too."});
+                app.commit_call("m1", Some(1), "send_message", &send, "{}", false);
+                let send = json!({"to": "calc.neg", "message": "And negatives."});
+                app.commit_call("m2", Some(1), "send_message", &send, "{}", false);
+            } else {
+                let start = json!({"name": "readme", "brief": "Say how cents round"});
+                app.commit_call("s1", Some(1), served::START, &start, "calc.readme/1", false);
+            }
+        }
+        let said = json!({"event": "text_delta", "bot": "b", "turn": 1,
+            "text": "Two agents check the rest."});
+        app.daemon(said).await;
+        app.daemon(turn_event(
+            "turn_finished",
+            1,
+            json!({"status": "completed"}),
+        ))
+        .await;
+        // One ↳ above the final reply and one └ under it, everything the
+        // turn set going in it.
+        assert_eq!(
+            rows(&app),
+            [
+                "• Checking first.",
+                "• Now the readme.",
+                "↳ halves",
+                "• Two agents check the rest.",
+                "└ sent to ● fix · ● neg · started ◌ readme",
+            ]
         );
     }
 
