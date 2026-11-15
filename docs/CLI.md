@@ -536,6 +536,14 @@ The file is read only then, never for a command a running daemon answers.
 As Codex keeps `~/.codex/.env` from setting `CODEX_` names, names starting
 `AGENT_` (any case) are passed over: they are Agent's own settings. A key
 there names its provider as one in the environment would.
+A provider whose key variable is unset or blank when the daemon starts (or
+when a config change binds it) does not stop the daemon, as Codex starts
+without one: its `ready.providers` entry carries `unresolved` with
+`provider_key_unavailable`, whose detail names the variable first, then the
+provider and the keys file, and each of its calls fails with that error
+before anything is sent. Its other providers serve as usual. A turn that
+meets it is held, as on a refused key, until the daemon restarts with the
+key set.
 On a machine whose `/tmp` is small (a RAM disk, say), make a folder and
 put `TMPDIR=/that/folder` there: the daemon and every tool shell, which
 inherit its environment, then write temporary files there, and a sandboxed
@@ -549,8 +557,7 @@ the providers they started with, and a turn parked meanwhile (on a tool
 wait or an approval) resumes on the set in use when it resumes, as it would
 after a restart, so a rotated key or a moved endpoint reaches it. A provider whose spec is unchanged is kept
 as it was, with its pacing, connections and keys. A file that does not
-parse, a spec that does not bind (a key variable the daemon was not started
-with, say), and the removal of a provider an agent's model, fallback or
+parse, a spec that does not bind, and the removal of a provider an agent's model, fallback or
 compaction model, or an unfinished turn's own model, or the daemon's
 `[fallbacks]`, still names, or that binds such a provider to another API
 family (`provider_in_use`, naming them), are refused

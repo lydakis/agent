@@ -425,6 +425,9 @@ pub struct Provider {
     key: Option<String>,
     /// A ChatGPT login re-read from its file, in place of a fixed key.
     login: Option<Arc<login::Login>>,
+    /// Why every call fails before it starts: the key variable the spec
+    /// names was not set when the daemon started.
+    unkeyed: Option<Box<Error>>,
     max_output_tokens: Option<u32>,
     stall_timeout: Duration,
     /// Ask Anthropic to cache for an hour instead of five minutes.
@@ -856,6 +859,7 @@ impl Provider {
             url,
             key,
             login: None,
+            unkeyed: None,
             max_output_tokens: None,
             stall_timeout: STALL_TIMEOUT,
             cache_hour: false,
@@ -1081,6 +1085,23 @@ impl Provider {
         self.login = Some(login);
         self.catalog = &CHATGPT;
         Ok(self)
+    }
+
+    /// Fail every call with `error` before it is paced, admitted or its body
+    /// read, as Codex fails a request whose key variable is unset: the key
+    /// variable the spec names was not set when the daemon started. The
+    /// daemon starts all the same, and its other providers serve.
+    pub fn without_key(mut self, error: Error) -> Self {
+        self.unkeyed = Some(Box::new(error));
+        self
+    }
+
+    /// Refuses a call on a provider bound [`without_key`](Self::without_key).
+    fn keyed(&self) -> Result<()> {
+        match &self.unkeyed {
+            Some(error) => Err((**error).clone()),
+            None => Ok(()),
+        }
     }
 
     /// Sign every request for this Bedrock endpoint with SigV4, in place of
@@ -1437,8 +1458,10 @@ impl Provider {
         // none is configured; that is an estimate to reserve against, not a
         // ceiling on what the provider generates or bills, and the usage the
         // response reports corrects it.
-        // Keys the AWS CLI cannot resolve fail the turn here, before it
-        // reserves pace, takes admission or reads the body.
+        // A key variable the daemon started without, or keys the AWS CLI
+        // cannot resolve, fail the turn here, before it reserves pace,
+        // takes admission or reads the body.
+        self.keyed()?;
         if let Some(aws) = &self.aws {
             aws.current().await?;
         }

@@ -134,6 +134,7 @@ impl Provider {
     }
 
     async fn run_search_inner(&self, model: &str, session: &str, commands: &str) -> Result<String> {
+        self.keyed()?;
         if self.search(model) != Search::Run {
             return fail_with("web_search_unavailable", "this provider runs no web.run");
         }

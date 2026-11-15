@@ -19,6 +19,7 @@ class Errors(http.server.BaseHTTPRequestHandler):
         pass
 
     def do_POST(self):
+        self.server.posts = getattr(self.server, 'posts', 0) + 1
         self.rfile.read(int(self.headers['Content-Length']))
         mode = self.server.mode
         message = 'problem: '+KEY+' / '+KEY
@@ -129,3 +130,40 @@ class ProviderErrorTests(unittest.TestCase):
                             self.assertEqual(client.finished(turn)['data']['status'], 'interrupted')
                     finally:
                         client.close()
+
+    def test_a_key_the_daemon_started_without_holds_only_that_providers_turns(self):
+        root = Path(__file__).resolve().parent.parent
+        server = http.server.ThreadingHTTPServer(('127.0.0.1', 0), Errors)
+        server.mode = 'responses_cutoff'
+        server.posts = 0
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        with tempfile.TemporaryDirectory(dir=root/'.local') as directory:
+            env = {**clean_env(), 'HOME': directory, 'AGENT_ERROR_TEST_KEY': ''}
+            # Blank is unset, as Codex reads its key variables.
+            client = Client(root/'.local/target/release/agent', Path(directory)/'k.db',
+                            f'http://127.0.0.1:{server.server_port}/v1',
+                            provider='fixture', key_env='AGENT_ERROR_TEST_KEY', env=env)
+            try:
+                # The daemon starts, and says which binding has no key.
+                unresolved = client.ready['providers']['fixture']['unresolved']
+                self.assertEqual(unresolved['error'], 'provider_key_unavailable')
+                self.assertTrue(unresolved['detail'].startswith('AGENT_ERROR_TEST_KEY (provider fixture)'))
+                self.assertIn(directory+'/.agent/keys/env', unresolved['detail'])
+                listed = client.request('provider_models', provider='fixture')
+                self.assertIn('provider_key_unavailable', json.dumps(listed))
+                client.request('create', bot='Bob', workspace=directory)
+                turn = client.request('submit', bot='Bob', request_id='r', prompt='check')['result']['message']
+                # The person can fix it: the turn holds rather than ends.
+                paced = client.receive(lambda e: e.get('event') == 'turn_paced'
+                                       and e.get('turn') == turn and 'blocked' in e['data'])
+                self.assertEqual(paced['data']['blocked']['code'], 'provider_key_unavailable')
+                self.assertTrue(paced['data']['blocked']['detail'].startswith('AGENT_ERROR_TEST_KEY '))
+                client.request('interrupt', bot='Bob', turn=turn)
+                self.assertEqual(client.finished(turn)['data']['status'], 'interrupted')
+            finally:
+                client.close()
+        # Nothing went to the provider without its key.
+        self.assertEqual(server.posts, 0)
+

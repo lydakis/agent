@@ -678,7 +678,10 @@ Responses gateways can be configured as named providers, for example
 `--provider gw=responses,https://gateway.example.test/v1,GW_KEY`. Model IDs may
 contain slashes, so `openrouter/anthropic/claude-sonnet-4-5` is valid. A key
 variable is read only when it is named in the spec or implied by a default
-endpoint; a custom URL without a key field sends no credential. Compatibility
+endpoint; a custom URL without a key field sends no credential. A key variable
+that is unset or blank leaves its binding failing each call with
+`provider_key_unavailable` before it is paced, not the daemon, as Codex
+fails a request whose key variable is unset (see [CLI.md](CLI.md)). Compatibility
 requires the request fields and streaming subset implemented by this adapter;
 the family label alone does not establish support for an arbitrary gateway.
 
@@ -2437,7 +2440,8 @@ it, as email holds mail for a host that is down and a workflow engine
 retries an activity until it is fixed, since the person who would see the
 error is often not the one who sent the message. Held on its call: a login
 refused or expired (`provider_login_rejected`, `provider_login_expired`,
-`provider_login_unavailable`), a key or account the provider refuses
+`provider_login_unavailable`), a key the daemon started without
+(`provider_key_unavailable`), a key or account the provider refuses
 (`provider_http_401`, `provider_http_403`), a provider quota spent
 (`provider_quota_exhausted`), or a transient failure still failing past the
 attempt and time limits above (an outage). Held in line: a turn whose start
