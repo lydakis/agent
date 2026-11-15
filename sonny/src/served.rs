@@ -347,7 +347,8 @@ fn follows() -> Value {
                     "additionalProperties": false
                 },
                 "remove": {"type": "string", "minLength": 1, "description": "The name of one to remove."},
-                "test": {"type": "boolean", "description": "What add would have heard of its sources' last day; adds nothing."}
+                "test": {"type": "boolean", "description": "What add would have heard of its sources' last day; adds nothing."},
+                "read": {"type": "boolean", "description": "What add's sources say now, each topic's newest event; adds nothing."}
             },
             "additionalProperties": false
         },
@@ -776,6 +777,19 @@ async fn called(name: &str, arguments: &Value) -> Answer {
             let caller_id = std::env::var("AGENT_BOT_ID")
                 .ok()
                 .and_then(|id| id.parse().ok());
+            if arguments["read"] == true {
+                let (Some(add), None) = (arguments.get("add"), arguments.get("remove")) else {
+                    return Err(("follow_refused", "read reads an add alone".into()));
+                };
+                return crate::lookout::subs::read_now(
+                    &store,
+                    &caller,
+                    add,
+                    &crate::lookout::sources::names(),
+                )
+                .map(|read| read.to_string())
+                .map_err(|e| ("follow_refused", e));
+            }
             if arguments["test"] == true {
                 let Some(add) = arguments.get("add") else {
                     return Err(("follow_refused", "test tries an add".into()));

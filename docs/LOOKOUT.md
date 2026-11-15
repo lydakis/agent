@@ -235,7 +235,12 @@ every = "1m"   # how long after it exits it runs again: 30s, 5m, 1h; a minute un
 
 Every line the command prints is one event: plain text, or a JSON object
 with `text` and, if it has them, `id`, `topic` (what it is about: a
-channel, a thread), `from` (who wrote it there), `url` and `steer`. One that exits runs again `every` later, so a poller that
+channel, a thread), `from` (who wrote it there), `url` and `steer`. An
+object whose `text` is empty, as `{"topic": "12", "text": ""}`, is no
+event: it clears what the source last said of that topic, or of the
+source itself with no topic, as an MQTT message with an empty payload
+clears a topic's retained one. No follow hears it; a read (below) no
+longer gives the topic. One that exits runs again `every` later, so a poller that
 prints what is new and exits and a stream that never exits both work. An
 event whose `id` the source printed lately (the last 1024) is not news
 again; a poller keeps its own cursor in `$SONNY_SOURCE_DIR`, a folder of
@@ -434,15 +439,46 @@ outside content as the listing's are. For this the lookout keeps what
 each source's command printed in `STORE.sources/.recent/NAME.jsonl`, an
 event a line: a day of it, at most 2,000 events and 4 MiB, an event's
 fields cut as a shape's examples are past 16 KiB (`cut` then counts them,
-since a filter may misjudge a cut event). The same writer thread appends
-it and cuts it back once an hour or when it grows past its bytes. The
-commons is not kept, since its threads are their members'. What bots do
-is not kept either, so a follow that watches bots says so under
-`untested`.
+since a filter may misjudge a cut event). Past the day, it keeps the
+newest event of each topic, of the source itself (its events with no
+topic) and the lookout's newest word on it, however old, as an MQTT
+broker retains each topic's last message: at most 1,000 of them in 512
+KiB. A clear is kept as a line with no text while it is within the day,
+and past it goes with all before it, as Kafka compacts a tombstone away.
+The same writer thread appends it and cuts it back once an hour or when
+it grows past its bytes. The commons is not kept, since its threads are
+their members'. What bots do is not kept either, so a follow that
+watches bots says so under `untested`.
 
 ```
 {"add": {"name": "red", "sources": ["ci:main"], "filter": {"status": ["failed"]}}, "test": true}
 → {"test": {"since": "Fri 7 Nov 05:10", "events": 412, "heard": 9, "steers": 1, "notes": 9, "examples": […]}, "examples": "The fields' examples are…"}
+```
+
+To know what a source says now without following it, a call sends a
+follow as `add` with `"read": true`, as it would a `test`, and nothing
+is added: Kubernetes reads a resource with `get` or follows it with
+`watch` by one selector, and Alertmanager's alerts API reads the alerts
+it holds by a route's matchers or a receiver's name. The add names
+sources as any does, `NAME` or `NAME:TOPIC`, with a `filter` if it wants
+one; an add that names nothing but its `name` reads the caller's follow
+of that name, what it hears. Each source answers with its status as kept
+above: the newest event of each topic it hears, and of the source
+itself, newest first, as data (`topic`, `from`, `at`, `text`, `id`,
+`url`, the other fields under `fields`, `cut` when it was kept cut), a
+cleared topic left out; and `down`, the lookout's word, while the source
+is down. `outside` says the text comes from outside, as the listing's
+examples do. An answer holds as much as a note does, 192 KiB, and `more`
+counts the topics past it. The commons and what agents do keep nothing
+here (`unread`): the commons tool and the history tool read them. A read
+costs one read of one file a source, each line read for its topic alone
+and whole only when it is a topic's newest word, whatever the number of
+agents: about 2 ms for one topic.
+
+```
+{"add": {"name": "red", "sources": ["prs"], "filter": {"state": ["red"]}}, "read": true}
+→ {"read": [{"source": "prs", "topics": [{"topic": "12", "from": "ci", "at": "Sat 14 Nov 22:10", "text": "#12 red", "id": "prs/88", "fields": {"state": "red"}}]}], "outside": "What a read gives is…"}
+{"add": {"name": "leads"}, "read": true}
 ```
 
 What sources said goes in the follower's next note, with what the tasks
