@@ -1053,17 +1053,30 @@ const ENVELOPE: usize = 256;
 
 /// A step's outcome with its pictures made to fit one reply, which the
 /// transport bounds: each re-encoded smaller when they do not, and its
-/// output saying so. The record keeps what the reply says.
-async fn fitted(mut outcome: Outcome, id: &str) -> Outcome {
-    let images = outcome
-        .parts
-        .iter()
-        .filter(|part| part.image().is_some())
-        .count();
-    if images == 0 {
+/// output saying so. The record keeps what the reply says. Measured and
+/// fitted on a blocking thread: a picture is megabytes to copy.
+async fn fitted(outcome: Outcome, id: &str) -> Outcome {
+    if !outcome.parts.iter().any(|part| part.image().is_some()) {
         return outcome;
     }
+    let id = id.to_owned();
+    let (output, failed) = (outcome.output.clone(), outcome.failed);
+    match tokio::task::spawn_blocking(move || fit(outcome, &id)).await {
+        Ok(outcome) => outcome,
+        Err(_) => Outcome {
+            output: output + "; the picture was left out",
+            failed,
+            ..failure(Error::new("invalid_image"))
+        },
+    }
+}
+
+/// [`fitted`]'s work, off the runtime.
+fn fit(mut outcome: Outcome, id: &str) -> Outcome {
     let size = |value: &Value| serde_json::to_vec(value).map_or(usize::MAX, |bytes| bytes.len());
+    let images = (outcome.parts.iter())
+        .filter(|part| part.image().is_some())
+        .count();
     let bare = size(&json!({"call_id":id,"output":outcome.output,"failed":outcome.failed}));
     let room = output::MAX_EVENT.saturating_sub(bare + ENVELOPE);
     if size(&json!(outcome.parts)) <= room {
@@ -1075,36 +1088,25 @@ async fn fitted(mut outcome: Outcome, id: &str) -> Outcome {
         .map(|part| size(&json!(part)))
         .sum();
     let each = room.saturating_sub(words + ENVELOPE) / images;
-    let parts = std::mem::take(&mut outcome.parts);
-    let fitted = tokio::task::spawn_blocking(move || {
-        let mut lines = Vec::new();
-        let parts = (parts.into_iter())
-            .filter_map(|part| match part {
-                Part::Image(image) => match agent_runtime::tools::fit_picture(&image, each) {
-                    Ok((image, line)) => {
-                        lines.push(line);
-                        Some(Part::Image(image))
-                    }
-                    Err(error) => {
-                        lines.push(format!("a picture left out: {error}"));
-                        None
-                    }
-                },
-                words => Some(words),
-            })
-            .collect::<Vec<_>>();
-        (parts, lines)
-    })
-    .await;
-    match fitted {
-        Ok((parts, lines)) => {
-            outcome.parts = parts;
-            for line in lines {
-                outcome.output.push_str("; ");
-                outcome.output.push_str(&line);
-            }
-        }
-        Err(_) => outcome.output.push_str("; the picture was left out"),
+    let mut lines = Vec::new();
+    outcome.parts = (std::mem::take(&mut outcome.parts).into_iter())
+        .filter_map(|part| match part {
+            Part::Image(image) => match agent_runtime::tools::fit_picture(&image, each) {
+                Ok((image, line)) => {
+                    lines.push(line);
+                    Some(Part::Image(image))
+                }
+                Err(error) => {
+                    lines.push(format!("a picture left out: {error}"));
+                    None
+                }
+            },
+            words => Some(words),
+        })
+        .collect();
+    for line in lines {
+        outcome.output.push_str("; ");
+        outcome.output.push_str(&line);
     }
     outcome
 }

@@ -14667,9 +14667,23 @@ impl Database {
         for turn in &turns {
             // Background commands may outlive their launching turn; their
             // running row is required when the result commits and waiters wake.
-            files.extend(artifact::files(&tx, *turn)?);
-            tx.prepare_cached("DELETE FROM artifacts WHERE turn=?")?
-                .execute([turn])?;
+            // A lifted call that still waits keeps its steps' outputs,
+            // which its script may still read.
+            files.extend(
+                tx.prepare_cached(
+                    "SELECT file FROM artifacts WHERE turn=?1 AND file IS NOT NULL
+                     AND NOT EXISTS(SELECT 1 FROM answers a WHERE a.turn=?1 AND a.output IS NULL
+                         AND substr(artifacts.call_id,1,length(a.call_id)+1)=a.call_id||'/')",
+                )?
+                .query_map([turn], |r| r.get::<_, String>(0))?
+                .collect::<rusqlite::Result<Vec<_>>>()?,
+            );
+            tx.prepare_cached(
+                "DELETE FROM artifacts WHERE turn=?1
+                 AND NOT EXISTS(SELECT 1 FROM answers a WHERE a.turn=?1 AND a.output IS NULL
+                     AND substr(artifacts.call_id,1,length(a.call_id)+1)=a.call_id||'/')",
+            )?
+            .execute([turn])?;
             tx.prepare_cached("DELETE FROM processes WHERE turn=? AND status!='running'")?
                 .execute([turn])?;
             // A running command's call stays until it ends: a lifted one's
