@@ -180,20 +180,28 @@ impl Markdown {
                 .collect();
         }
         // Kept in a file a click on the picture opens in the pane, bigger:
-        // the diagram's source, or the formula as MathJax drew it.
+        // the diagram's source, or the formula as MathJax drew it. Only
+        // counted, it is kept nowhere: counting writes no file.
+        let measured = crate::term::measured();
         let kept = match lang.as_str() {
-            "mermaid" => keep(&source, "mmd", |path| std::fs::write(path, &source)),
-            "svg" => keep(&source, "svg", |path| std::fs::write(path, &source)),
+            _ if measured => None,
+            "mermaid" => keep(&source, "mmd", |path| {
+                crate::cache::write_new(path, &source)
+            }),
+            "svg" => keep(&source, "svg", |path| {
+                crate::cache::write_new(path, &source)
+            }),
             _ => None,
         };
-        let math = (lang == "math").then(|| kept_path(&(&source, crate::term::light()), "svg"));
+        let math = (lang == "math" && !measured)
+            .then(|| kept_path(&(&source, crate::term::light()), "svg"));
         let drawn = crate::cache::drawn(&lang, &source, width, || {
             let svg = match lang.as_str() {
                 "mermaid" => crate::mermaid::svg(&source)?,
                 "math" => {
                     let svg = crate::math::svg(&source)?;
                     if let Some(Some(path)) = &math {
-                        let _ = std::fs::write(path, &svg);
+                        let _ = crate::cache::write_new(path, &svg);
                     }
                     svg
                 }
@@ -962,7 +970,9 @@ fn page(source: &str, width: usize) -> Vec<Line<'static>> {
             .as_millis()
     );
     let path = dir.join(name);
-    if let Err(error) = std::fs::create_dir_all(&dir).and_then(|()| std::fs::write(&path, source)) {
+    if let Err(error) =
+        std::fs::create_dir_all(&dir).and_then(|()| crate::cache::write_new(&path, source))
+    {
         return vec![Line::from(format!("    could not keep the page: {error}")).dim()];
     }
     let drawn = match crate::term::graphics() {
@@ -4459,6 +4469,30 @@ mod tests {
                 "• Saved to memory flow",
             ],
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn counting_a_drawing_writes_no_file_even_through_a_link_left_where_it_would_be_kept() {
+        let nonce = format!("{}-{:?}", std::process::id(), std::time::SystemTime::now());
+        let svg = format!(
+            "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"80\" height=\"40\"><!-- {nonce} --><rect width=\"80\" height=\"40\"/></svg>"
+        );
+        // As a fence keeps it: each of its lines and a newline.
+        let kept = kept_path(&format!("{svg}\n").as_str(), "svg").unwrap();
+        let target = std::env::temp_dir().join(format!("sonny-counted-{}", std::process::id()));
+        let _ = std::fs::remove_file(&kept);
+        let _ = std::fs::remove_file(&target);
+        std::os::unix::fs::symlink(&target, &kept).unwrap();
+        let text = format!("```svg\n{svg}\n```");
+        let leads = (Line::from("    "), Line::from("    "));
+        let rows = crate::term::measuring(|| {
+            markdown(&mut Markdown::default(), &text, 35, leads.clone()).len()
+        });
+        // Counted as the rows the picture draws, and nothing written.
+        assert!(rows > 1, "{rows}");
+        assert!(!target.exists());
+        let _ = std::fs::remove_file(&kept);
     }
 
     #[test]
