@@ -9,7 +9,8 @@ slice 2, daemon steps for `shell` and `echo` (protocol 78, schema 102;
 measured in
 [DAEMON_MEASUREMENTS.md](DAEMON_MEASUREMENTS.md#daemon-steps-at-1000-and-10000-bots-protocol-78-schema-102),
 where three of its gates are missed, why, and the derived gate proposed
-for the step p99).
+for the step p99); slice 3, daemon steps for the file tools (`read`,
+`write`, `edit`, `apply_patch`, `web_fetch`; no protocol or schema change).
 GPT-6 Astra reviewed two
 drafts the same day and approved neither slice as scoped. This draft takes
 the narrower scopes it said it would approve and has not been reviewed

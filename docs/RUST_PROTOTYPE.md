@@ -3584,11 +3584,22 @@ host would otherwise run the bot's own tools on its behalf:
 `{"op":"run_step","bot","turn","call_id","step","name","arguments"}`,
 beside `approve_step`, with the same `step` and `arguments` rules and the
 same call checks. `name` is one of the daemon's tools that may run as a
-step, `shell` (foreground only) and `echo` for now (`invalid_step`
-otherwise, or for `background`, `detach` or `tty`), and one the bot may
-call (`tool_not_available`); the call's tool must take steps, and the bot
-must have a workspace. A command starts only with a process slot in hand.
-The step is decided exactly as the same call from
+step: `shell` (foreground only), `read` (of a file; an artifact is read
+with `artifact`), `write`, `edit`, `apply_patch`, `web_fetch`, and `echo`
+(`invalid_step` otherwise, or for `background`, `detach` or `tty`), and
+one the bot may call (`tool_not_available`, as `web_fetch` is for a bot its
+sandbox keeps off the network); the call's tool must take steps, and the
+bot must have a workspace. A command, and a confined change to files
+(whose sandbox helper runs as a process), starts only with a process slot
+in hand; a read or a fetch takes none. A change to files (`write`,
+`edit`, `apply_patch`) runs to its end once begun, whatever stops its step:
+cut off, a file could be left half written; until its sandbox is ready,
+nothing of it has begun and a stop ends it. Its asker is told
+`step_stopped`, and its `step_completed` records how it really ended. A
+picture a `read` step finds is answered with its line and the picture in
+`parts`, as `tool_result` takes them; one past what a reply's 1 MiB holds
+is kept whole as the step's output `picture-N` (its base64, read with
+`artifact`), never encoded again, and its line names it. The step is decided exactly as the same call from
 the model would be, by one planner every caller shares: the bot's rules
 (`command_forbidden`), `approval_policy`, the gates that name the step's
 own tool, its sandbox and the way out of it. A declared tool with
@@ -3599,7 +3610,7 @@ workspace, model and effort once, at its first step, and every later step
 of the call is decided and run against them.
 
 The reply waits until the step has ended and its end is committed:
-`{call_id: CALL/STEP, output, failed}`, `output` being what the model
+`{call_id: CALL/STEP, output, failed, parts?}`, `output` being what the model
 would have read from the same call, or for a refused step
 `{call_id, decision: "deny", output, failed: true}` with the refusal's
 `error` and `detail` in `output` (and a gate's `reason`). A step's name is
@@ -3615,8 +3626,9 @@ call ends.
 
 A step waits for its decision, and then, when it takes a process slot,
 for its place, in daemon-wide lines, first come first served, holding its
-request and no task or timer. One that takes none (`echo`) starts once
-allowed, never behind a command waiting for a slot. At most 64 steps' store jobs are under way at once, so a fleet's
+request and no task or timer. One that takes none (`echo`, `read`,
+`web_fetch`, an unconfined change to files) starts once allowed, never
+behind a command waiting for a slot. At most 64 steps' store jobs are under way at once, so a fleet's
 steps share the store with other bots' turns rather than fill its queue.
 A step that needs a process slot takes one from the semaphore the
 turns' commands share before its task exists; while none is free, one
