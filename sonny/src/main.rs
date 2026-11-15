@@ -3943,11 +3943,23 @@ const SHORTCUTS: [(&str, &str); 21] = [
     ("ctrl+l", "draw the screen again"),
 ];
 
+/// Whether Enter runs the menu's pick (`picked`, at `pick`): when what is
+/// `typed` begins its name, or the person picked it. A name the letters
+/// only scatter across, as `/ps` across `/pause`, is not what was meant:
+/// Enter sends what is typed, to be answered.
+fn menu_runs(picked: &str, pick: usize, typed: &str) -> bool {
+    pick > 0 || picked.starts_with(typed)
+}
+
 /// The slash menu's keys, while it is open: Tab completes the pick's name
-/// until it is whole.
+/// until it is whole; Enter runs it where [`menu_runs`].
 fn menu_keys(menu: &[(&str, &str, Vec<usize>)], pick: usize, typed: &str) -> Option<hint::Keys> {
     let picked = menu.get(pick.min(menu.len().checked_sub(1)?))?.0;
-    let keys = hint::Keys::new().pick().enter(hint::Enter::Run);
+    let keys = hint::Keys::new().pick();
+    let keys = match menu_runs(picked, pick, typed) {
+        true => keys.enter(hint::Enter::Run),
+        false => keys,
+    };
     let keys = match typed == picked {
         true => keys,
         false => keys.key("tab", "complete"),
@@ -4619,6 +4631,9 @@ struct App {
     /// read, as each read comes back: who, the turn it ended, and what
     /// its history said, if it could be read.
     agents_asked: Option<tokio::sync::mpsc::UnboundedReceiver<(String, i64, Option<Seen>)>>,
+    /// What was typed when Enter sent it past the slash menu, which stays
+    /// shut over the answer until the words change ([`menu_runs`]).
+    menu_shut: Option<String>,
     /// `/new`, its lists over the composer, then its first message in it.
     making: Option<new::Making>,
     /// The file with the first message for the agent this window becomes,
@@ -6328,6 +6343,7 @@ impl App {
             config: None,
             listing: None,
             agents_asked: None,
+            menu_shut: None,
             reach: None,
             reaching: None,
             agents: None,
@@ -12401,6 +12417,7 @@ impl App {
         // new agent's first message is words as written.
         if !self.input.starts_with('/')
             || self.input.contains(char::is_whitespace)
+            || self.menu_shut.as_deref() == Some(&self.input[..])
             || self.recall.showing(&self.input)
             || self.new_brief()
         {
@@ -14174,6 +14191,9 @@ impl App {
             self.fit_speed();
             return;
         }
+        if self.menu_shut.as_deref() != Some(&self.input[..]) {
+            self.menu_shut = None;
+        }
         let menu = self.menu();
         if let Event::Key(key) = &event
             && key.kind != KeyEventKind::Release
@@ -14194,18 +14214,20 @@ impl App {
                     self.pick = 0;
                     return;
                 }
-                // What is typed begins the pick's name, or the person
-                // picked it: Enter runs it. A name the letters only
-                // scatter across, as `/ps` across `/pause`, is not what
-                // was meant, so it goes as typed and is answered.
                 KeyCode::Enter
                     if !key
                         .modifiers
-                        .intersects(KeyModifiers::SHIFT | KeyModifiers::ALT)
-                        && (self.pick > 0 || picked.starts_with(&self.input[..])) =>
+                        .intersects(KeyModifiers::SHIFT | KeyModifiers::ALT) =>
                 {
-                    self.input.set(picked);
+                    let runs = menu_runs(picked, self.pick, &self.input);
                     self.pick = 0;
+                    if runs {
+                        self.input.set(picked);
+                    } else {
+                        // Answered, the menu steps aside for the answer
+                        // until the words change.
+                        self.menu_shut = Some(self.input.to_string());
+                    }
                     self.submit().await;
                     return;
                 }
@@ -25083,11 +25105,7 @@ mod tests {
         app.land(6, (updates, ""), (Some("the lookout"), false), false);
         assert_eq!(
             drawn(&mut app)[2..],
-            [
-                "• calc.neg is done.",
-                "",
-                "↳ Lookout · calc.neg finished ▸"
-            ]
+            ["• calc.neg is done.", "", "↳ Lookout · calc.neg finished ▸"]
         );
         // The person's own words are drawn as ever.
         app.land(7, ("thanks", ""), (None, false), false);
@@ -26236,9 +26254,38 @@ mod tests {
         app.key(Event::Key(KeyCode::Enter.into())).await;
         assert_eq!(app.notice.as_deref(), Some("no command /ps · / lists them"));
         assert_eq!(&*app.input, "/ps");
+        // A beginning of the name runs it.
         app.input.set("/verb");
         app.key(Event::Key(KeyCode::Enter.into())).await;
         assert!(app.input.is_empty(), "/verbose ran");
+        app.input.set("/ps");
+        app.key(Event::Key(KeyCode::Enter.into())).await;
+        // The menu steps aside for the answer until the words change, and
+        // its keys offer Enter only where it runs the pick.
+        assert!(app.menu().is_empty());
+        app.input.set("/p");
+        assert!(
+            menu_keys(&app.menu(), 0, "/p")
+                .unwrap()
+                .text()
+                .contains("enter run")
+        );
+        assert!(
+            !menu_keys(&app.menu(), 0, "/ps")
+                .unwrap()
+                .text()
+                .contains("enter")
+        );
+        // Picked by hand, it runs whatever was typed.
+        app.key(Event::Key(KeyCode::Char('s').into())).await;
+        assert_eq!(&*app.input, "/ps");
+        assert!(!app.menu().is_empty());
+        app.key(Event::Key(KeyCode::Down.into())).await;
+        app.key(Event::Key(KeyCode::Up.into())).await;
+        app.key(Event::Key(KeyCode::Down.into())).await;
+        let second = app.menu()[1].0;
+        app.key(Event::Key(KeyCode::Enter.into())).await;
+        assert_ne!(&*app.input, "/ps", "{second} ran");
         // Words that only start with a slash word, or a path, go as written.
         for typed in ["/etc/hosts", "/tmp is full", "/ alone"] {
             app.input.set(typed);
