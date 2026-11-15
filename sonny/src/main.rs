@@ -12643,6 +12643,26 @@ impl App {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         let copy =
             key.code == KeyCode::Char('c') && (ctrl || key.modifiers.contains(KeyModifiers::SUPER));
+        // `?` shows the keys of the view that has them, every one its
+        // title would name however narrow, until the next key; `esc`
+        // there only hides them again. A view that names `?` itself, as
+        // the sky's legend, keeps it.
+        if self.finding.is_none()
+            && self.pane_keys
+            && !program
+            && let Some(pane) = &mut self.pane
+            && !(pane.title_keys().split(" · ")).any(|pair| pair.starts_with("? "))
+        {
+            let plain = !(key.modifiers)
+                .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER);
+            if key.code == KeyCode::Char('?') && plain {
+                pane.sheet = !pane.sheet;
+                return true;
+            }
+            if std::mem::take(&mut pane.sheet) && key.code == KeyCode::Esc {
+                return true;
+            }
+        }
         // `/status` picks an agent from the keys and opens it, as a click
         // on it does.
         if self.finding.is_none()
@@ -13390,7 +13410,7 @@ impl App {
             // away: the keys, and in a window with room for one, the view,
             // over to the other.
             "switch" if self.pane.is_some() => self.pane_keys = !self.pane_keys,
-            // An unfocused pane's `tab focus` hint: the keys to it.
+            // An unfocused pane's `tab keys` hint: the keys to it.
             "focus" if self.pane.is_some() => self.pane_keys = true,
             // The pane's picture or drawing, opened bigger outside Sonny.
             "bigger" => {
