@@ -423,6 +423,7 @@ fn parse(args: &[String]) -> Result<Options> {
                     | "--compact-at"
                     | "--compact-keep"
                     | "--compact-tokens"
+                    | "--post-turn-compact-percent"
                     | "--max-rounds"
                     | "--max-drops"
                     | "--max-output-tokens" => {

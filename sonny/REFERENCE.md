@@ -854,7 +854,10 @@ has something on it, or is off the screen, no time shows.
   its next model call: at the running turn's next step, or before an idle lead's next
   reply. The daemon also compacts on its own once a call's input reaches
   the bot's `compact_tokens`, which follows the model's context window
-  unless set (900,000 tokens on a 1M window).
+  unless set (900,000 tokens on a 1M window). A turn that ends past the
+  soft limit, `post_turn_compact_percent` of the window (70 unless set),
+  is summarized right after its reply instead, so most summaries land
+  between turns rather than in the middle of one.
 - `/permissions` picks what agents may do, and who approves the rest, as
   Codex's `/permissions` pairs a sandbox with a reviewer:
 

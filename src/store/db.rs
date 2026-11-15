@@ -280,6 +280,15 @@ pub struct Settings {
     /// leaves only the byte threshold.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub compact_tokens: Option<u64>,
+    /// The soft limit: percent of the model's context window at which a
+    /// turn that ends on its reply is summarized then, in the background,
+    /// rather than mid-turn at the next one past `compact_tokens`, which
+    /// stays the hard limit inside a turn and as one starts. Codex's
+    /// `model_post_turn_compact_threshold_percent`. A token threshold
+    /// like `compact_tokens`, it needs the view's token estimate; zero
+    /// leaves only the hard limit.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub post_turn_compact_percent: Option<u64>,
     /// After each of its turns finishes, prune the bot to this many turns'
     /// records; none keeps them until an explicit `prune`.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -401,6 +410,9 @@ pub fn compact_threshold(window: u64) -> u64 {
         .min(window / 10 * 9)
         .max(MIN_COMPACT_TOKENS)
 }
+/// The soft limit's percent of the window unless the bot sets
+/// `post_turn_compact_percent`.
+pub const POST_TURN_COMPACT_PERCENT: u64 = 70;
 const MIN_CONTEXT_ITEMS: usize = 2;
 /// Replies in a row the model's cap may cut short before a turn ends on
 /// the last, unless the bot sets `max_drops`.
@@ -429,6 +441,16 @@ impl Settings {
             Some(tokens) => Some(tokens),
             None => Some(compact_threshold(window)),
         }
+    }
+    /// The soft limit for a model whose context holds `window` tokens:
+    /// `post_turn_compact_percent` of it, at most the hard limit. `None`
+    /// when set to zero or when only the byte threshold applies.
+    pub fn post_turn_compact_tokens(&self, window: u64) -> Option<u64> {
+        let percent = self
+            .post_turn_compact_percent
+            .unwrap_or(POST_TURN_COMPACT_PERCENT);
+        let hard = self.compact_tokens(window)?;
+        (percent > 0).then(|| (window * percent / 100).min(hard))
     }
     /// Model calls a turn may make; unset, more than any turn reaches.
     pub fn max_rounds(&self) -> usize {
@@ -565,6 +587,11 @@ impl Settings {
         {
             return refuse("compact_tokens is at least 1024; 0 leaves only compact_at");
         }
+        if self.post_turn_compact_percent.is_some_and(|n| n > 100) {
+            return refuse(
+                "post_turn_compact_percent is a percentage from 0 to 100; 0 turns it off",
+            );
+        }
         if self.max_rounds == Some(0) {
             return refuse("max_rounds is at least 1");
         }
@@ -655,6 +682,8 @@ impl Settings {
         json!({"context_bytes":self.context_bytes(),"context_items":self.context_items(),
             "note_turns":self.note_turns(),"compact_at":self.compact_at(),
             "compact_keep":self.compact_keep(),"compact_tokens":self.compact_tokens,
+            "post_turn_compact_percent":self.post_turn_compact_percent
+                .unwrap_or(POST_TURN_COMPACT_PERCENT),
             "keep_turns":self.keep_turns,"max_rounds":self.max_rounds,
             "max_drops":self.max_drops(),
             "approval_hold_ms":self.approval_hold_ms(),"max_output_tokens":self.max_output_tokens,
@@ -688,13 +717,14 @@ pub fn web(name: &str) -> bool {
     matches!(name, "web_fetch" | "web_search")
 }
 /// Every setting's name, as `create` and `configure` take it.
-pub const SETTINGS: [&str; 24] = [
+pub const SETTINGS: [&str; 25] = [
     "context_bytes",
     "context_items",
     "note_turns",
     "compact_at",
     "compact_keep",
     "compact_tokens",
+    "post_turn_compact_percent",
     "keep_turns",
     "approval_hold_ms",
     "max_output_tokens",
@@ -19081,6 +19111,7 @@ mod tests {
             compact_at: Some(1),
             compact_keep: Some(1),
             compact_tokens: Some(1),
+            post_turn_compact_percent: Some(1),
             keep_turns: Some(1),
             approval_hold_ms: Some(1),
             max_output_tokens: Some(1),
@@ -19266,6 +19297,43 @@ mod tests {
             ..Settings::default()
         };
         assert_eq!(off.compact_tokens(200_000), None);
+    }
+
+    #[test]
+    fn the_soft_limit_is_a_share_of_the_window_below_the_hard_one() {
+        let unset = Settings::default();
+        assert_eq!(unset.post_turn_compact_tokens(200_000), Some(140_000));
+        assert_eq!(unset.post_turn_compact_tokens(272_000), Some(190_400));
+        assert_eq!(unset.post_turn_compact_tokens(1_000_000), Some(700_000));
+        // Never past the hard limit.
+        let late = Settings {
+            post_turn_compact_percent: Some(95),
+            ..Settings::default()
+        };
+        assert_eq!(late.post_turn_compact_tokens(200_000), Some(167_000));
+        let low_hard = Settings {
+            compact_tokens: Some(50_000),
+            ..Settings::default()
+        };
+        assert_eq!(low_hard.post_turn_compact_tokens(200_000), Some(50_000));
+        // Zero, or a bot on bytes alone, has none.
+        for off in [
+            Settings {
+                post_turn_compact_percent: Some(0),
+                ..Settings::default()
+            },
+            Settings {
+                compact_tokens: Some(0),
+                ..Settings::default()
+            },
+        ] {
+            assert_eq!(off.post_turn_compact_tokens(200_000), None);
+        }
+        let over = Settings {
+            post_turn_compact_percent: Some(101),
+            ..Settings::default()
+        };
+        assert_eq!(over.validate().unwrap_err().code, "invalid_setting");
     }
 
     #[test]

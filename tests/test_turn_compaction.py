@@ -249,6 +249,37 @@ class TurnCompactionTests(ModelFixture):
                     self.assertGreater(largest, 40 * 11000)
                 client.close()
 
+    def test_a_turn_past_only_the_soft_limit_compacts_as_it_ends(self):
+        # Four bytes a token: the hard limit, 16K tokens, is about 64 KiB;
+        # the soft one, 20% of a 40,000-token window, about 32 KiB. Four
+        # 11 KiB rounds pass the soft limit and stay under the hard one.
+        self.model.bytes_per_token = 4
+        for percent, expected in ((20, True), (0, False)):
+            with self.subTest(post_turn_compact_percent=percent):
+                bot = f'Bob{percent}'
+                client = self.client(tools='shell', extra=('--context-window', 'openai/*=40000'),
+                                     settings={'compact_tokens': 16384,
+                                               'post_turn_compact_percent': percent})
+                client.request('provider_models')
+                client.request('create', bot=bot, workspace=str(self.path), tools=['shell'],
+                               compaction_instructions='Summarize.')
+                record = client.request('inspect', bot=bot)['result']
+                self.assertEqual(record['settings']['post_turn_compact_percent'], percent)
+                turn = client.request('submit', bot=bot, request_id='1', prompt='long:4')['result']['message']
+                ended = client.finished(turn, timeout=60)
+                self.assertEqual(ended['data']['status'], 'completed', ended)
+                if expected:
+                    landed = client.summarized(bot, timeout=15)
+                    self.assertEqual((landed['event'], landed['turn']), ('compacted', ended['turn']))
+                    # Written after the turn, never inside it.
+                    self.assertTrue(landed['data']['request']['after_turn'])
+                    self.assertLess(landed['data']['trigger']['at_bytes'], 40000)
+                compacted = [e for e in all_events(client, bot) if e['event'] == 'compacted']
+                self.assertEqual(len(compacted), int(expected))
+                self.assertTrue(all(e['data']['request'].get('after_turn') for e in compacted))
+                drain(self.model)
+                client.close()
+
     def test_an_unset_threshold_follows_the_models_listed_window(self):
         # A 40,000-token window compacts at 7,000 tokens, its window less
         # 33,000: about 28 KiB at four bytes a token. The window is the
@@ -506,6 +537,8 @@ class TurnCompactionTests(ModelFixture):
         token, with `overhead` bytes of instructions, each turn four rounds
         of `lines` lines, until it has compacted `compactions` times; each
         summary as long as it is asked for, the least room it can leave.
+        The person reads each reply before writing again, so a summary
+        started as a turn ends lands before the next turn.
         The compacted events, oldest first."""
         self.model.bytes_per_token = per_token
         self.model.compaction_text = lambda request: 's' * asked_bytes(request)
@@ -516,7 +549,11 @@ class TurnCompactionTests(ModelFixture):
         for n in range(400):
             turn = client.request('submit', bot='Lead', request_id=str(n),
                                   prompt=f'long:4x{lines}')['result']['message']
-            self.assertEqual(client.finished(turn, timeout=60)['data']['status'], 'completed')
+            ended = client.finished(turn, timeout=60)
+            self.assertEqual(ended['data']['status'], 'completed')
+            time.sleep(.3)
+            if getattr(self.model, 'summarizing', False):
+                client.summarized('Lead', timeout=30, turn=ended['turn'])
             drain(self.model)
             compacted = [e['data'] for e in all_events(client, 'Lead') if e['event'] == 'compacted']
             if len(compacted) >= compactions:
@@ -542,6 +579,10 @@ class TurnCompactionTests(ModelFixture):
         # about 36 KB, each summary a full 64 KiB.
         compacted = self.drive(200_000, 4, 40_000, 2000)
         self.assert_room(compacted, 200_000)
+        # Past the first, each is written as a turn ends, at the soft
+        # limit, before any turn reaches the hard one.
+        self.assertTrue(all(d['request'].get('after_turn') for d in compacted[1:]), compacted)
+        self.assertLess(compacted[1]['trigger']['at_bytes'], compacted[0]['trigger']['at_bytes'])
 
     def test_a_lead_keeps_room_to_work_across_twenty_compactions_at_1m(self):
         # A byte a token, so the test sends a million bytes, not four.

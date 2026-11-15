@@ -625,6 +625,7 @@ when it sets either.
 | `compact_at` (`--compact-at`) | Percent of either context envelope that triggers compaction, and of the byte envelope that triggers tool-result elision first. Estimated completion headroom can advance the byte trigger without reducing the input allowance. | 75 |
 | `compact_keep` (`--compact-keep`) | Target percent of either context envelope kept verbatim: as newest whole turns by compaction, as newest items by elision. Reduced when pinned context leaves less room. Must be below `compact_at`. | 25 |
 | `compact_tokens` (`--compact-tokens`) | Input tokens per request that start elision and compaction too, whichever of this and `compact_at` comes first (see [compaction](#compaction)). 0 leaves only `compact_at`; otherwise at least 1,024. | from the model's context window |
+| `post_turn_compact_percent` (`--post-turn-compact-percent`) | The soft limit: percent of the model's context window at which a turn that ends on its reply is summarized then, [after the turn](#summaries-after-the-turn), rather than mid-turn once a call reaches `compact_tokens`, the hard limit. At most the hard limit; like `compact_tokens` it needs the view's token estimate. 0 to 100; 0 leaves only the hard limit. Codex's `model_post_turn_compact_threshold_percent`. | 70 |
 | `max_rounds` (`--max-rounds`) | Model calls each turn may make; the last goes with no tool call allowed, and the turn fails `tool_round_limit` past it. | none |
 | `max_drops` (`--max-drops`) | Replies in a row the model's own output cap may cut short in a turn; each before the last is dropped and the model told, and the last ends the turn `provider_incomplete`. | 3 |
 | `keep_turns` (`--keep-turns`) | After each of its turns finishes, prune the bot to this many turns' records (see [Retention](#retention)). | none |
@@ -4141,8 +4142,27 @@ summarizer's pool. The time the turn waits for it counts toward the turn's
 #### Summaries after the turn
 
 A turn that ends on its reply with the view, that reply included, past the
-threshold plans the next turn's summary as it ends, rather than leaving it
+soft limit plans the next turn's summary as it ends, rather than leaving it
 to that turn's start, where it would hold the turn before its first call.
+
+There are two limits, as in Codex. The hard limit is the threshold above
+(`compact_tokens`, or `compact_at` of the byte envelope): it is checked at
+every round boundary inside a turn and at a turn's start. The soft limit,
+`post_turn_compact_percent` of the model's context window (70 unless set,
+at most the hard limit), is checked only here, as a turn ends. With one
+limit, a turn's growth, mostly tool results, crossed it inside the turn
+nearly every time, so the summary ran mid-turn; the room between the two
+is what a turn may add before the hard limit cuts in, so most summaries
+land after the reply. On 200K, 272K and 1M windows the soft limit is
+140,000, 190,400 and 700,000 tokens against hard limits of 167,000,
+239,000 and 900,000. A turn's start keeps the hard limit, as Codex's
+pre-turn check does, so a new prompt never waits for a summary the soft
+limit asked for. A bot on bytes alone (`compact_tokens` 0), or before its
+first call, has no token estimate and no soft limit: its turns end on the
+hard one. A summary keeps verbatim the same share (`compact_keep` of
+`compact_at`) of whichever limit it passed, so one written at the soft
+limit leaves the view under it with the same room.
+The `compacted` event's `trigger.at_bytes` is the limit that was passed.
 Below the threshold the turn ends on one comparison; past it, the view is
 read again and the summary planned as at a boundary, copying the turn's
 last call while its cache is warm. Its call starts once the turn's end is
