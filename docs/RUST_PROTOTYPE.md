@@ -3597,8 +3597,9 @@ cut off, a file could be left half written; until its sandbox is ready,
 nothing of it has begun and a stop ends it. Its asker is told
 `step_stopped`, and its `step_completed` records how it really ended. A
 picture a `read` step finds is answered with its line and the picture in
-`parts`, as `tool_result` takes them; one too large for a reply's 1 MiB
-comes back as a smaller JPEG, and its line says so. The step is decided exactly as the same call from
+`parts`, as `tool_result` takes them; one past what a reply's 1 MiB holds
+is kept whole as the step's output `picture-N` (its base64, read with
+`artifact`), never encoded again, and its line names it. The step is decided exactly as the same call from
 the model would be, by one planner every caller shares: the bot's rules
 (`command_forbidden`), `approval_policy`, the gates that name the step's
 own tool, its sandbox and the way out of it. A declared tool with
@@ -3613,16 +3614,21 @@ The reply waits until the step has ended and its end is committed:
 would have read from the same call, or for a refused step
 `{call_id, decision: "deny", output, failed: true}` with the refusal's
 `error` and `detail` in `output` (and a gate's `reason`). A step's name is
-one step for its call's life: asked again, it is `step_exists`. Every
+one step for its call's life: asked again, it is `step_exists`. A step is
+refused `call_already_answered` once its call's answer is held for its
+running turn, before anything stores it; a call that ends unanswered with
+its turn takes its steps' kept outputs with it, as an answered one does. Every
 daemon step writes `step_decided` (`daemon: true`) and, once it ran,
 `step_completed` with `daemon`, `ms`, and `failed` and `error` when they
 apply, and its own audit row. Output past the preview is an artifact under
 `CALL/STEP`, read with `artifact` while the call waits, and dropped when the
 call ends.
 
-A step waits for its decision, and then for its place, in daemon-wide
-lines, first come first served, holding its request and no task or
-timer. At most 64 steps' store jobs are under way at once, so a fleet's
+A step waits for its decision, and then, when it takes a process slot,
+for its place, in daemon-wide lines, first come first served, holding its
+request and no task or timer. One that takes none (`echo`, `read`,
+`web_fetch`, an unconfined change to files) starts once allowed, never
+behind a command waiting for a slot. At most 64 steps' store jobs are under way at once, so a fleet's
 steps share the store with other bots' turns rather than fill its queue.
 A step that needs a process slot takes one from the semaphore the
 turns' commands share before its task exists; while none is free, one

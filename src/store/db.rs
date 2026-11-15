@@ -1957,6 +1957,9 @@ struct Live {
     /// which its `tool_finish` writes. A park writes none: it parks only
     /// on a call with no answer held.
     answers: HashMap<String, Outcome>,
+    /// The calls whose held answer the turn took and has not yet written:
+    /// answered, though nothing stored says so yet.
+    taken: std::collections::HashSet<String>,
 }
 /// One page of `approvals` as it fills.
 struct ApprovalPage {
@@ -9289,10 +9292,10 @@ impl Database {
     /// An answered call's answer, held or stored, `tool_unserved` once its
     /// time ran out, or how long it may still wait.
     pub fn answer_take(&mut self, turn: i64, call_id: &str, now_ms: u64) -> Result<CallAnswer> {
-        if let Some(given) = self
-            .live_changed(turn)
-            .and_then(|live| live.answers.remove(call_id))
+        if let Some(live) = self.live_changed(turn)
+            && let Some(given) = live.answers.remove(call_id)
         {
+            live.taken.insert(call_id.to_owned());
             return Ok(CallAnswer::Given(given));
         }
         #[allow(clippy::type_complexity)]
@@ -9606,7 +9609,13 @@ impl Database {
         let Some((parent, answered, status, expires_ms, paused, lifted)) = call else {
             return fail("no_pending_call");
         };
-        if answered {
+        // A running turn's answer is held, or taken by the turn, and not
+        // yet stored.
+        let held = self
+            .live
+            .get(&turn)
+            .is_some_and(|live| live.answers.contains_key(call_id) || live.taken.contains(call_id));
+        if answered || held {
             return fail("call_already_answered");
         }
         if status.as_deref() != Some("executing") && !lifted {
@@ -9968,7 +9977,13 @@ impl Database {
         let Some((parent, answered, status, expires_ms, paused, lifted)) = call else {
             return fail("no_pending_call");
         };
-        if answered {
+        // A running turn's answer is held, or taken by the turn, and not
+        // yet stored.
+        let held = self
+            .live
+            .get(&turn)
+            .is_some_and(|live| live.answers.contains_key(call_id) || live.taken.contains(call_id));
+        if answered || held {
             return fail("call_already_answered");
         }
         if status.as_deref() != Some("executing") && !lifted {
@@ -11843,11 +11858,19 @@ impl Database {
             self.steps_gone.push((id, turn));
             self.stepped.push(id);
         }
+        let mut outputs_gone = Vec::new();
         if bot.declared.iter().any(|tool| tool.answered_by.is_some()) {
-            tx.execute(
-                "DELETE FROM answers WHERE turn=? AND process IS NULL",
-                [turn],
-            )?;
+            // What the daemon steps of a call ending unanswered with its
+            // turn kept goes with it; a lifted call keeps its steps'.
+            let calls: Vec<String> = tx
+                .prepare_cached(
+                    "DELETE FROM answers WHERE turn=? AND process IS NULL RETURNING call_id",
+                )?
+                .query_map([turn], |r| r.get(0))?
+                .collect::<rusqlite::Result<_>>()?;
+            for call in &calls {
+                outputs_gone.extend(drop_step_outputs(&tx, turn, call)?);
+            }
             // The ended steps of a call that ended unanswered with its turn,
             // an interrupted one's; a running step's row goes as it ends.
             tx.prepare_cached(
@@ -12007,6 +12030,7 @@ impl Database {
         }
         let cursor = event(&tx, &bot.name, Some(turn), "turn_finished", data.clone())?;
         tx.commit()?;
+        self.forget_files(outputs_gone);
         self.approvals -= unstarted;
         self.forget_live(turn);
         entries.push(entry(cursor, &bot.name, Some(turn), "turn_finished", data));

@@ -148,7 +148,8 @@ class DaemonStepTests(ModelFixture):
         [picture] = ran['parts']
         self.assertEqual((picture['type'], picture['media_type']), ('image', 'image/png'))
 
-    def test_a_picture_too_large_for_one_reply_comes_back_smaller(self):
+    def test_a_picture_too_large_for_one_reply_is_kept_whole_under_the_step(self):
+        import base64
         from tests.test_images import noise
         heavy = noise(512)
         self.assertLess(len(heavy), 1024 * 1024)
@@ -156,11 +157,18 @@ class DaemonStepTests(ModelFixture):
         (self.path / 'noise.png').write_bytes(heavy)
         client, turn = self.script(tools='echo,read', bot_tools=['read'])
         ran = self.step(client, turn, name='read', arguments={'path': 'noise.png'})['result']
-        self.assertIn('JPEG of', ran['output'])
-        self.assertIn('to fit the reply', ran['output'])
-        [picture] = ran['parts']
-        self.assertEqual(picture['media_type'], 'image/jpeg')
-        self.assertLessEqual(len(picture['data']), 1024 * 1024)
+        self.assertIn(f'too large for the reply kept as {turn}/script-0/1/picture-1', ran['output'])
+        self.assertNotIn('parts', ran)
+        data, offset = '', 0
+        while True:
+            page = client.request('artifact', bot='Lead', turn=turn, call_id='script-0/1',
+                                  stream='picture-1', offset=offset)['result']
+            data += page['text']
+            offset = page['next_offset']
+            if page['done']:
+                break
+        # The very bytes the direct call reads: nothing encoded again.
+        self.assertEqual(base64.b64decode(data), heavy)
 
     @unittest.skipUnless(shutil.which('bwrap') or sys.platform == 'darwin', 'sandboxes need bubblewrap')
     def test_a_sandboxed_bot_s_file_steps_stay_in_its_sandbox(self):
@@ -415,6 +423,43 @@ class DaemonStepTests(ModelFixture):
         self.assertEqual(json.loads(ran['output'])['stdout'], 'ran\n')
         self.assertEqual(client.finished(held)['data']['status'], 'completed')
 
+    def test_a_step_that_takes_no_process_never_waits_behind_a_command_in_line(self):
+        client = self.client('echo,shell,read', extra=('--max-processes', '1'))
+        self.model.call_script = [('exec', {'code': 'run()'})]
+        turns = {}
+        for bot in ('Lead', 'Second'):
+            client.request('create', bot=bot, workspace=str(self.path), declare=[EXEC])
+            turns[bot] = client.request('submit', bot=bot, request_id='t', prompt='script')['result']['message']
+        deadline = time.monotonic() + 5
+        while len(client.request('tool_calls', tag='sonny')['result']['calls']) < 2:
+            self.assertLess(time.monotonic(), deadline)
+            time.sleep(.01)
+        # Lead's command holds the one slot; Second's waits in line for it.
+        slow = self.ask(client, turns['Lead'], arguments={'command': 'sleep 30'})
+        self.running(client)
+        lined = self.ask(client, turns['Second'], arguments={'command': 'echo later'}, bot='Second')
+        while client.request('stats')['result']['steps']['in_line'] == 0:
+            self.assertLess(time.monotonic(), deadline, 'the command never lined up')
+            time.sleep(.01)
+        # A read and an echo of a third call run at once regardless.
+        client.request('create', bot='Third', workspace=str(self.path), declare=[EXEC])
+        third = client.request('submit', bot='Third', request_id='t', prompt='script')['result']['message']
+        while len(client.request('tool_calls', tag='sonny')['result']['calls']) < 3:
+            self.assertLess(time.monotonic(), deadline)
+            time.sleep(.01)
+        (self.path / 'note.txt').write_text('hello\n')
+        for step, (name, arguments) in enumerate([('echo', {'text': 'hi'}), ('read', {'path': 'note.txt'})], 1):
+            started = time.monotonic()
+            ran = client.request('run_step', bot='Third', turn=third, call_id='script-0', step=str(step),
+                                 name=name, arguments=arguments)
+            self.assertIn('result', ran, ran)
+            self.assertLess(time.monotonic() - started, 2)
+        self.assertEqual(client.request('stats')['result']['steps']['in_line'], 1)
+        client.request('interrupt', bot='Lead', turn=turns['Lead'])
+        self.assertEqual(self.reply(client, slow, timeout=10)['error'], 'step_stopped')
+        ran = self.reply(client, lined, timeout=10)['result']
+        self.assertEqual(json.loads(ran['output'])['stdout'], 'later\n')
+
     def test_no_process_bound_lets_every_call_s_command_step_run_at_once(self):
         client = self.client('echo,shell', extra=('--max-processes', '0'))
         self.model.call_script = [('exec', {'code': 'run()'})]
@@ -446,13 +491,37 @@ class DaemonStepTests(ModelFixture):
         self.answer(client, turn)
         self.assertEqual(self.reply(client, request, timeout=10)['error'], 'step_stopped')
 
-    def test_an_interrupted_call_s_steps_leave_no_rows(self):
+    def test_an_interrupted_call_s_steps_leave_no_rows_or_outputs(self):
         client, turn = self.script()
         self.assertIn('result', self.step(client, turn))
+        long = self.step(client, turn, step='2', name='shell',
+                         arguments={'command': 'head -c 200000 /dev/zero | tr "\\0" a'})
+        self.assertEqual(json.loads(long['result']['output'])['artifacts'], [f'{turn}/script-0/2/stdout'])
         client.request('interrupt', bot='Lead', turn=turn)
         self.assertEqual(client.finished(turn, timeout=10)['data']['status'], 'interrupted')
         with sqlite3.connect(self.path / 'state.sqlite') as db:
             self.assertEqual(db.execute('SELECT count(*) FROM steps').fetchone()[0], 0)
+            self.assertEqual(db.execute('SELECT count(*) FROM artifacts').fetchone()[0], 0)
+        gone = client.request('artifact', bot='Lead', turn=turn, call_id='script-0/2', stream='stdout')
+        self.assertIn('error', gone)
+
+    def test_a_step_asked_once_its_call_s_answer_is_held_is_refused(self):
+        client, turn = self.script(settings={'approval_hold_ms': 250})
+        # Sent together: the answer is held for the running turn, or taken
+        # by it, before anything stores it, when the step is decided.
+        client.next_id += 1
+        answer = dict(id=client.next_id, op='tool_result', bot='Lead', turn=turn, call_id='script-0',
+                      output='done')
+        client.next_id += 1
+        step = dict(id=client.next_id, op='run_step', bot='Lead', turn=turn, call_id='script-0', step='1',
+                    name='echo', arguments={'text': 'hi'})
+        client.process.stdin.write(json.dumps(answer) + '\n' + json.dumps(step) + '\n')
+        client.process.stdin.flush()
+        self.assertIn('result', self.reply(client, answer['id']))
+        refused = self.reply(client, step['id'])
+        self.assertIn(refused.get('error'), ('call_already_answered', 'no_pending_call'), refused)
+        self.assertEqual(self.events(client, turn, 'step_decided'), [])
+        self.assertEqual(client.finished(turn)['data']['status'], 'completed')
 
     def test_a_step_cut_off_by_a_restart_ends_of_unknown_outcome(self):
         client, turn = self.script()

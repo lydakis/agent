@@ -30,6 +30,7 @@ pub const HEAD: u64 = 12;
 pub async fn read_apart(
     load: impl Future<Output = Result<Vec<u8>>>,
 ) -> Result<Option<(Image, String)>> {
+    static ONE: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(1);
     let turn = ONE
         .acquire()
         .await
@@ -41,25 +42,6 @@ pub async fn read_apart(
     })
     .await
     .map_err(|_| Error::new("invalid_image"))?
-}
-
-/// The one picture decoded or encoded at a time, daemon-wide.
-static ONE: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(1);
-
-/// `work` on pictures done off the runtime in the one picture's turn, as
-/// [`read_apart`] reads one: fitting a picture to a reply decodes and
-/// re-encodes it, so many at once would hold as much memory.
-pub async fn apart<T: Send + 'static>(work: impl FnOnce() -> T + Send + 'static) -> Result<T> {
-    let turn = ONE
-        .acquire()
-        .await
-        .map_err(|_| Error::new("invalid_image"))?;
-    tokio::task::spawn_blocking(move || {
-        let _turn = turn;
-        work()
-    })
-    .await
-    .map_err(|_| Error::new("invalid_image"))
 }
 
 /// The format, media type and name of a picture of one of the four kinds
@@ -170,58 +152,6 @@ fn read(bytes: &[u8]) -> Result<Option<(Image, String)>> {
     Ok(Some((image, line)))
 }
 
-/// A picture as a JPEG whose base64 is at most `most` bytes, for a reply
-/// the transport bounds: at falling quality, then smaller, until it fits.
-/// The picture and the line that says what it became.
-pub fn fit(image: &Image, most: usize) -> Result<(Image, String)> {
-    let engine = base64::engine::general_purpose::STANDARD;
-    let unreadable = |e: image::ImageError| {
-        Error::with(
-            "invalid_image",
-            format!("a picture that cannot be read: {e}"),
-        )
-    };
-    let bytes = engine
-        .decode(&image.data)
-        .map_err(|_| Error::new("invalid_image"))?;
-    let picture = image::load_from_memory(&bytes).map_err(unreadable)?;
-    let rgb = image::DynamicImage::ImageRgb8(picture.to_rgb8());
-    let (width, height) = rgb.dimensions();
-    let mut side = width.max(height);
-    while side >= 64 {
-        let scaled = match side < width.max(height) {
-            true => rgb.resize(side, side, FilterType::CatmullRom),
-            false => rgb.clone(),
-        };
-        for quality in [85, 70, 50] {
-            let mut data = Vec::new();
-            scaled
-                .write_with_encoder(image::codecs::jpeg::JpegEncoder::new_with_quality(
-                    &mut std::io::Cursor::new(&mut data),
-                    quality,
-                ))
-                .map_err(unreadable)?;
-            if data.len().div_ceil(3) * 4 <= most {
-                let (w, h) = scaled.dimensions();
-                let line = format!(
-                    "sent as a {w}×{h} JPEG of {} bytes to fit the reply",
-                    data.len()
-                );
-                let image = Image {
-                    media_type: "image/jpeg".to_owned(),
-                    data: engine.encode(data),
-                };
-                return Ok((image, line));
-            }
-        }
-        side = side * 3 / 4;
-    }
-    Err(Error::with(
-        "image_limit",
-        format!("a picture that does not fit a reply of {most} bytes"),
-    ))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -296,28 +226,6 @@ mod tests {
         let error = read(&bomb).unwrap_err();
         assert_eq!(error.code, "image_limit");
         assert!(error.to_string().contains("12000×12000"), "{error}");
-    }
-
-    #[test]
-    fn a_picture_fits_a_bound_as_a_smaller_jpeg() {
-        let mut seed = 7_u32;
-        let noise = image::RgbImage::from_fn(1024, 1024, |_, _| {
-            seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
-            image::Rgb([(seed >> 24) as u8, (seed >> 16) as u8, (seed >> 8) as u8])
-        });
-        let mut png = Vec::new();
-        noise
-            .write_to(&mut std::io::Cursor::new(&mut png), ImageFormat::Png)
-            .unwrap();
-        let image = Image {
-            media_type: "image/png".to_owned(),
-            data: base64::engine::general_purpose::STANDARD.encode(&png),
-        };
-        let (fitted, line) = fit(&image, 256 * 1024).unwrap();
-        assert!(fitted.data.len() <= 256 * 1024);
-        assert_eq!(fitted.media_type, "image/jpeg");
-        assert!(line.contains("JPEG"), "{line}");
-        assert!(decoded(&fitted).dimensions().0 <= 1024);
     }
 
     #[test]

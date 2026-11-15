@@ -611,12 +611,19 @@ impl Service {
             flight.prepared,
             Some(Prepared::Write { .. } | Prepared::Edit { .. } | Prepared::ApplyPatch(_))
         );
+        let slot = command || (confined && writes);
         flight.state = State::Lined {
             capture,
             confined,
             command,
-            slot: command || (confined && writes),
+            slot,
         };
+        // One that needs no process slot needs no place: it starts now,
+        // never behind a command waiting for one.
+        if !slot {
+            self.start_step(key, None);
+            return;
+        }
         let serial = flight.serial;
         self.steps.line.push(key, serial);
         self.pump_steps();
@@ -658,37 +665,45 @@ impl Service {
             };
             let (key, _) = self.steps.line.entries.pop_front().expect("an entry");
             self.steps.line.live -= 1;
-            let flight = self.steps.flights.get_mut(&key).expect("a flight");
-            let State::Lined {
-                capture, confined, ..
-            } = std::mem::replace(&mut flight.state, State::Ending)
-            else {
-                unreachable!("a lined flight");
-            };
-            let prepared = flight.prepared.take().expect("its tool");
-            let (stop, stopping) = oneshot::channel();
-            flight.state = State::Running {
-                stop: Some(stop),
-                command,
-            };
-            if command {
-                self.steps.commands += 1;
-            }
-            let running = Running {
-                capture,
-                confined,
-                prepared,
-                slot,
-                cord: self.registry.cord(),
-                turn: key.0,
-                id: flight.ask.id(),
-            };
-            let (registry, serial) = (self.registry.clone(), flight.serial);
-            self.steps.jobs.spawn(async move {
-                let ran = run(registry, running, stopping).await;
-                (key, serial, Done::Ran(ran))
-            });
+            self.start_step(key, slot);
         }
+    }
+
+    /// Start a lined step, with its process slot when it takes one.
+    fn start_step(&mut self, key: Key, slot: Option<Slot>) {
+        let flight = self.steps.flights.get_mut(&key).expect("a flight");
+        let State::Lined {
+            capture,
+            confined,
+            command,
+            ..
+        } = std::mem::replace(&mut flight.state, State::Ending)
+        else {
+            unreachable!("a lined flight");
+        };
+        let prepared = flight.prepared.take().expect("its tool");
+        let (stop, stopping) = oneshot::channel();
+        flight.state = State::Running {
+            stop: Some(stop),
+            command,
+        };
+        if command {
+            self.steps.commands += 1;
+        }
+        let running = Running {
+            capture,
+            confined,
+            prepared,
+            slot,
+            cord: self.registry.cord(),
+            turn: key.0,
+            id: flight.ask.id(),
+        };
+        let (registry, serial) = (self.registry.clone(), flight.serial);
+        self.steps.jobs.spawn(async move {
+            let ran = run(registry, running, stopping).await;
+            (key, serial, Done::Ran(ran))
+        });
     }
 
     /// Stand one waiter for the whole line in the semaphore's fair line,
@@ -736,13 +751,14 @@ impl Service {
                     (failure(error), Some(code))
                 }
             };
+            let outcome = parted(outcome, turn, &id);
             let outcome = match outputs {
                 Some(outputs) if !outcome.artifacts.is_empty() => {
                     outputs.keep(outcome, turn, &id).await
                 }
                 _ => outcome,
             };
-            let outcome = fitted(turn::annotate(outcome, turn, &id), &id).await;
+            let outcome = turn::annotate(outcome, turn, &id);
             let mut reply = json!({"call_id":id,"output":outcome.output,"failed":outcome.failed});
             // A picture read goes back as one, in the parts `tool_result`
             // takes, so the script can hand it on to the model.
@@ -1051,58 +1067,66 @@ async fn run(
 /// What a reply carries beside its result: its id and the object around it.
 const ENVELOPE: usize = 256;
 
-/// A step's outcome with its pictures made to fit one reply, which the
-/// transport bounds: each re-encoded smaller when they do not, and its
-/// output saying so. The record keeps what the reply says. Measured and
-/// fitted on a blocking thread, one picture at a time daemon-wide as
-/// pictures are read: a picture is megabytes to copy and decode.
-async fn fitted(outcome: Outcome, id: &str) -> Outcome {
+/// The streams a step's pictures too large for its reply are kept under.
+const PICTURES: [&str; 20] = [
+    "picture-1",
+    "picture-2",
+    "picture-3",
+    "picture-4",
+    "picture-5",
+    "picture-6",
+    "picture-7",
+    "picture-8",
+    "picture-9",
+    "picture-10",
+    "picture-11",
+    "picture-12",
+    "picture-13",
+    "picture-14",
+    "picture-15",
+    "picture-16",
+    "picture-17",
+    "picture-18",
+    "picture-19",
+    "picture-20",
+];
+
+/// A step's outcome with what of its pictures fits one reply, which the
+/// transport bounds, in the reply, in order; each one past that is kept
+/// as its own output, its base64 under `CALL/STEP` as `picture-N`, read
+/// with `artifact` as any kept output is, and its output says so. Nothing
+/// is decoded or encoded again: a step reads what the direct call does.
+fn parted(mut outcome: Outcome, turn: i64, id: &str) -> Outcome {
     if !outcome.parts.iter().any(|part| part.image().is_some()) {
         return outcome;
     }
-    let id = id.to_owned();
-    let (output, failed) = (outcome.output.clone(), outcome.failed);
-    match agent_runtime::tools::picture_apart(move || fit(outcome, &id)).await {
-        Ok(outcome) => outcome,
-        Err(_) => Outcome {
-            output: output + "; the picture was left out",
-            failed,
-            ..failure(Error::new("invalid_image"))
-        },
-    }
-}
-
-/// [`fitted`]'s work, off the runtime.
-fn fit(mut outcome: Outcome, id: &str) -> Outcome {
     let size = |value: &Value| serde_json::to_vec(value).map_or(usize::MAX, |bytes| bytes.len());
-    let images = (outcome.parts.iter())
-        .filter(|part| part.image().is_some())
-        .count();
     let bare = size(&json!({"call_id":id,"output":outcome.output,"failed":outcome.failed}));
-    let room = output::MAX_EVENT.saturating_sub(bare + ENVELOPE);
-    if size(&json!(outcome.parts)) <= room {
-        return outcome;
-    }
-    // Words among the parts stay; the pictures share what is left.
-    let words: usize = (outcome.parts.iter())
-        .filter(|part| part.image().is_none())
-        .map(|part| size(&json!(part)))
-        .sum();
-    let each = room.saturating_sub(words + ENVELOPE) / images;
-    let mut lines = Vec::new();
+    let mut room = output::MAX_EVENT.saturating_sub(bare + ENVELOPE);
+    let (mut kept, mut lines) = (0, Vec::new());
     outcome.parts = (std::mem::take(&mut outcome.parts).into_iter())
-        .filter_map(|part| match part {
-            Part::Image(image) => match agent_runtime::tools::fit_picture(&image, each) {
-                Ok((image, line)) => {
-                    lines.push(line);
-                    Some(Part::Image(image))
-                }
-                Err(error) => {
-                    lines.push(format!("a picture left out: {error}"));
-                    None
-                }
-            },
-            words => Some(words),
+        .filter_map(|part| {
+            // A picture's base64 is sent as it is, in its own object.
+            let bytes = match &part {
+                Part::Image(image) => image.data.len() + image.media_type.len() + 64,
+                Part::Text { .. } => size(&json!(part)),
+            };
+            if bytes <= room {
+                room -= bytes;
+                return Some(part);
+            }
+            let Part::Image(image) = part else {
+                lines.push("words past the reply's room left out".to_owned());
+                return None;
+            };
+            let stream = PICTURES[kept.min(PICTURES.len() - 1)];
+            kept += 1;
+            lines.push(format!(
+                "a {} picture too large for the reply kept as {turn}/{id}/{stream}; read it with artifact",
+                image.media_type
+            ));
+            outcome.artifacts.push((stream, image.data.into_bytes()));
+            None
         })
         .collect();
     for line in lines {

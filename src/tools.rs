@@ -29,7 +29,6 @@ mod picture;
 mod terminal;
 use files::read_bounded;
 pub use patch::Patch;
-pub use picture::{apart as picture_apart, fit as fit_picture};
 #[cfg(unix)]
 pub use terminal::POLL_YIELD_MS;
 
