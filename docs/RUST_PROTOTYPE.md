@@ -2829,8 +2829,9 @@ started with. No bot has a share of its own: once the daemon's background
 commands, steered ones included, are past `--max-processes` (64 a CPU by
 default), starting one more kills a command of the bot holding the most,
 the one it started or waited on least recently, never one of its 8 most
-recent (an eighth of a bound under 64, so one bot past a small bound is
-pruned rather than refused), as Codex prunes a session's processes, and its handle says it was
+recent (under a bound of 8, the bound's number, so one bot past a small
+bound is pruned rather than refused while bots that each hold no more wait
+for a slot), as Codex prunes a session's processes, and its handle says it was
 killed for that (`stopped`). So a bot that loses track of what it started
 cannot crowd out the rest of the fleet, and one that needs many keeps them
 while there is room. Detached commands never count, and with no bound

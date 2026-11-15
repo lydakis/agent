@@ -57,8 +57,9 @@ const MAX_BACKGROUND_TIMEOUT_MS: u64 = MAX_WAIT_TIMEOUT_MS;
 pub const DEFAULT_PROCESS_BUDGET: usize = 64;
 /// The background commands of an agent's that a prune spares at most:
 /// those it started or waited on most recently, as Codex spares 8 of a
-/// session's 64. A bound under 64 spares an eighth of itself, so one agent
-/// past it is always pruned rather than refused ([`Registry::own`]).
+/// session's 64; under a bound of 8, the bound, so one agent past a small
+/// bound is pruned rather than refused, while one waiting for a slot
+/// behind another's is not ([`Registry::own`]).
 const PRUNE_SPARES: usize = 8;
 /// Processes that outlive their call, terminals and detached commands,
 /// running at once daemon-wide unless configured: four per logical CPU,
@@ -128,7 +129,7 @@ impl Tool {
                 "properties":{"text":{"type":"string"}},"required":["text"],"additionalProperties":false}),
             ),
             Tool::Shell => (
-                "Run a noninteractive bash command (sh where bash is not installed) in the workspace, or in workdir when given (relative to the workspace unless absolute). stdout and stderr are returned separately; each is truncated to a head and tail beyond 64 KiB, and retained whole in a file the result names under files, up to 1 GiB, or, where there is no such file, up to 1 MiB: past that, its first and last 512 KiB. The command keeps running. Default timeout 120 s, maximum 600 s; with background=true there is no timeout unless timeout_ms sets one, of up to a day. A command that times out is killed and returns its output so far with timed_out. Every result reports wall_time_ms. Commands run with no terminal: TERM=dumb, NO_COLOR=1, and cat as the pager; AI_AGENT=agent tells tools an agent runs them. When the command returns or times out, every process it started is killed, so `cmd &` does not outlive it. With background=true the command is started and a proc handle is returned immediately; collect its result later with wait. If no wait collects it, its end comes as a message once no turn of yours runs: {\"finished\":{\"proc:N\":{how it ended}}}; wait on the handle reads the output. A steer that arrives while a command runs moves it to the background: the result is its proc handle with steered=true, and the command keeps running. A background command runs until it exits, its timeout_ms passes, kill=true on its handle stops it, or the daemon stops; once the daemon's background commands fill its process bound, starting one more kills a command of the agent holding the most: the one it started or waited on least recently, never one of its 8 most recent (an eighth of a bound under 64). With detach=true it starts in its own session and returns a proc handle and pid at once; it outlives the turn and the daemon until it exits, a pause or kill=true, its output discarded unless redirected, its end told as a background command's. With tty=true it runs in a terminal, for a REPL or a program that prompts: the result is what it wrote within yield_time_ms (default 1000) and, while it runs, a proc handle for write_stdin.",
+                "Run a noninteractive bash command (sh where bash is not installed) in the workspace, or in workdir when given (relative to the workspace unless absolute). stdout and stderr are returned separately; each is truncated to a head and tail beyond 64 KiB, and retained whole in a file the result names under files, up to 1 GiB, or, where there is no such file, up to 1 MiB: past that, its first and last 512 KiB. The command keeps running. Default timeout 120 s, maximum 600 s; with background=true there is no timeout unless timeout_ms sets one, of up to a day. A command that times out is killed and returns its output so far with timed_out. Every result reports wall_time_ms. Commands run with no terminal: TERM=dumb, NO_COLOR=1, and cat as the pager; AI_AGENT=agent tells tools an agent runs them. When the command returns or times out, every process it started is killed, so `cmd &` does not outlive it. With background=true the command is started and a proc handle is returned immediately; collect its result later with wait. If no wait collects it, its end comes as a message once no turn of yours runs: {\"finished\":{\"proc:N\":{how it ended}}}; wait on the handle reads the output. A steer that arrives while a command runs moves it to the background: the result is its proc handle with steered=true, and the command keeps running. A background command runs until it exits, its timeout_ms passes, kill=true on its handle stops it, or the daemon stops; once the daemon's background commands fill its process bound, starting one more kills a command of the agent holding the most: the one it started or waited on least recently, never one of its 8 most recent (a smaller bound's number). With detach=true it starts in its own session and returns a proc handle and pid at once; it outlives the turn and the daemon until it exits, a pause or kill=true, its output discarded unless redirected, its end told as a background command's. With tty=true it runs in a terminal, for a REPL or a program that prompts: the result is what it wrote within yield_time_ms (default 1000) and, while it runs, a proc handle for write_stdin.",
                 json!({"type":"object","properties":{"command":{"type":"string"},
                 "workdir":{"type":"string"},
                 "timeout_ms":{"type":"integer","minimum":1,"maximum":MAX_BACKGROUND_TIMEOUT_MS},
@@ -3530,8 +3531,9 @@ impl Registry {
     /// Count `stopper`'s command as bot `owner`'s, as just used. No agent
     /// has a share of its own: once the daemon's background commands are
     /// past its process bound, the agent holding the most loses the one it
-    /// used least recently, sparing its [`PRUNE_SPARES`] most recent (an
-    /// eighth of a bound under 64), as Codex prunes a session's processes. So an agent that loses track of
+    /// used least recently, sparing its [`PRUNE_SPARES`] most recent (the
+    /// bound's number, under 8), as Codex prunes a session's processes. So
+    /// an agent that loses track of
     /// what it started cannot crowd out the rest of the fleet, and one
     /// that needs many keeps them while there is room. A command that ended
     /// holds no place here, so none is left to prune first. With no bound,
@@ -3558,7 +3560,7 @@ impl Registry {
                             held.entry(owner).or_default().push((stop.used, *id));
                         }
                     }
-                    let spares = PRUNE_SPARES.min(self.budget / 8);
+                    let spares = PRUNE_SPARES.min(self.budget);
                     (held.into_values())
                         .filter(|commands| commands.len() > spares)
                         .max_by_key(|commands| {
@@ -5966,8 +5968,18 @@ mod tests {
             })
             .collect();
         assert!(held.iter_mut().all(|stopper| !pruned(stopper)));
-        // A bound under 64 spares an eighth of itself: at 4, none, so one
-        // agent past it loses its least recent rather than being refused.
+        // A bound under 8 spares its own number: one agent past it loses
+        // its least recent rather than being refused, while agents that
+        // each hold no more than it wait for a slot as they would.
+        let small = Registry::new("shell").unwrap().with_process_budget(4);
+        let mut waiting: Vec<Stopper> = (11..=18)
+            .map(|id| {
+                let stopper = small.stopper(id);
+                small.own(&stopper, id);
+                stopper
+            })
+            .collect();
+        assert!(waiting.iter_mut().all(|stopper| !pruned(stopper)));
         let small = Registry::new("shell").unwrap().with_process_budget(4);
         let mut held: Vec<Stopper> = (1..=5)
             .map(|id| {
