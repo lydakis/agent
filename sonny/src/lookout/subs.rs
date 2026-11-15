@@ -4,7 +4,7 @@
 //! seconds. The lookout watches for whoever has a file and knows no leads:
 //! Sonny writes a lead's `tasks` subscription when it opens the lead's
 //! project (`lead`, `ensure`).
-use agent_client::config::COMMONS_SOURCE;
+use agent_client::config::{COMMONS_SOURCE, LINKS_SOURCE, MEMORY_SOURCE};
 use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
 
@@ -1192,10 +1192,14 @@ fn preview(store: &Path, subscriber: &str, sub: &Sub) -> Value {
             "{cut} of the events it heard were kept cut, which a filter may misjudge"
         ));
     }
-    // The commons keeps no recent log, as no bot does.
+    // Sonny's own sources keep no recent log, as no bot does.
     let untested: Vec<&str> = [
         (!sub.tasks_of.is_empty() || !sub.agents.is_empty()).then_some("its agents"),
         named.contains(&COMMONS_SOURCE).then_some("the commons"),
+        named.contains(&MEMORY_SOURCE).then_some("memory"),
+        named
+            .contains(&LINKS_SOURCE)
+            .then_some("the linked machines"),
     ]
     .into_iter()
     .flatten()

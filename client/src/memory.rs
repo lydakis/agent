@@ -854,6 +854,13 @@ fn entries(dir: &Path) -> Result<usize, String> {
 /// Every fact in the folder, sorted by name, or the first file that is not
 /// one: a fact the index would leave out is refused, not skipped.
 fn facts(dir: &Path) -> Result<Vec<Fact>, String> {
+    Ok(stamped(dir)?.into_iter().map(|(fact, _)| fact).collect())
+}
+
+/// [`facts`], each with when its file was last written, in ms, taken from
+/// the file it was read from, so a save that replaces the file meanwhile
+/// cannot pair the old fact with the new time.
+fn stamped(dir: &Path) -> Result<Vec<(Fact, u64)>, String> {
     let failed = |e: std::io::Error| format!("memory_failed: {}: {e}", dir.display());
     let entries = match std::fs::read_dir(dir) {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
@@ -876,15 +883,20 @@ fn facts(dir: &Path) -> Result<Vec<Fact>, String> {
         let path = entry.path();
         let invalid = |why: String| format!("memory_invalid: {}: {why}", path.display());
         let mut text = String::new();
-        std::fs::File::open(&path)
-            .and_then(|f| f.take(LIMIT as u64 + 1).read_to_string(&mut text))
+        let opened = std::fs::File::open(&path).map_err(|e| invalid(e.to_string()))?;
+        let modified = (opened.metadata().and_then(|m| m.modified()).ok())
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map_or(0, |d| d.as_millis() as u64);
+        opened
+            .take(LIMIT as u64 + 1)
+            .read_to_string(&mut text)
             .map_err(|e| invalid(e.to_string()))?;
         if text.len() > LIMIT {
             return Err(invalid(format!("larger than {LIMIT} bytes")));
         }
-        found.push(Fact::parse(&file, &text).map_err(invalid)?);
+        found.push((Fact::parse(&file, &text).map_err(invalid)?, modified));
     }
-    found.sort_by(|a, b| a.name.cmp(&b.name));
+    found.sort_by(|a, b| a.0.name.cmp(&b.0.name));
     Ok(found)
 }
 
@@ -1917,16 +1929,25 @@ const MAX_PROJECTS: usize = 100;
 /// and when it was last written. A folder that is not all facts says so in
 /// place of its facts.
 pub fn view(root: &Path, project: Option<&str>) -> Value {
+    let (names, more) = match project {
+        Some(name) => (vec![name.to_owned()], 0),
+        None => self::projects(root),
+    };
+    view_of(root, &names, more)
+}
+
+/// [`view`] of every project, however many there are, for what watches
+/// memory for changes.
+pub fn view_all(root: &Path) -> Value {
+    view_of(root, &every_project(root), 0)
+}
+
+fn view_of(root: &Path, names: &[String], more: usize) -> Value {
     let scope = |dir: PathBuf, name: Option<&str>| {
-        let listed = facts(&dir).map(|all| {
+        let listed = stamped(&dir).map(|all| {
             all.iter()
-                .map(|fact| {
+                .map(|(fact, modified)| {
                     let path = dir.join(format!("{}.md", fact.name));
-                    let modified = std::fs::metadata(&path)
-                        .and_then(|m| m.modified())
-                        .ok()
-                        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                        .map_or(0, |d| d.as_millis() as u64);
                     json!({"name": fact.name, "type": fact.kind, "description": fact.description,
                         "source": fact.source, "verified": fact.verified, "path": path, "modified": modified})
                 })
@@ -1940,10 +1961,6 @@ pub fn view(root: &Path, project: Option<&str>) -> Value {
         out
     };
     let projects = root.join("projects");
-    let (names, more) = match project {
-        Some(name) => (vec![name.to_owned()], 0),
-        None => self::projects(root),
-    };
     let listed: Vec<Value> = names
         .iter()
         .map(|name| scope(projects.join(name), Some(name)))
@@ -1954,6 +1971,14 @@ pub fn view(root: &Path, project: Option<&str>) -> Value {
 /// The projects with a memory folder under `root`, by name, at most
 /// [`MAX_PROJECTS`] of them, and how many more there are.
 pub fn projects(root: &Path) -> (Vec<String>, usize) {
+    let mut names = every_project(root);
+    let more = names.len().saturating_sub(MAX_PROJECTS);
+    names.truncate(MAX_PROJECTS);
+    (names, more)
+}
+
+/// Every project with a memory folder under `root`, by name.
+fn every_project(root: &Path) -> Vec<String> {
     let mut names: Vec<String> = std::fs::read_dir(root.join("projects"))
         .into_iter()
         .flatten()
@@ -1964,9 +1989,7 @@ pub fn projects(root: &Path) -> (Vec<String>, usize) {
         .filter(|name| crate::project::valid_name(name))
         .collect();
     names.sort();
-    let more = names.len().saturating_sub(MAX_PROJECTS);
-    names.truncate(MAX_PROJECTS);
-    (names, more)
+    names
 }
 
 /// What `~/.agent/memory` says it takes.

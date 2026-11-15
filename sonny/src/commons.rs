@@ -8,6 +8,7 @@
 //! as any source's news does; an invite is the one note the commons sends
 //! of its own. The commons judges nothing and asks nothing of anyone, so what
 //! agents make of it is theirs.
+use crate::lookout::sources::News;
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::{
     style::Stylize,
@@ -1197,38 +1198,6 @@ fn first_post(path: &Path) -> Option<Value> {
     serde_json::from_str(first.trim()).ok()
 }
 
-/// What one look at the commons found: its lines, and how far each
-/// thread is read once they are kept. The cursor moves only when the
-/// lookout says so (`mark_read`), once whoever hears the lines holds them
-/// on disk: a crash before then reads them again, never past them.
-#[derive(Default)]
-pub struct News {
-    pub lines: Vec<String>,
-    /// The cursor's file and what it holds after this look; none when
-    /// nothing changed.
-    read: Option<(PathBuf, serde_json::Map<String, Value>)>,
-}
-
-impl News {
-    /// Moves the cursor past these lines: whether it moved, or had no
-    /// need to. A cursor that did not move reads them again next look.
-    pub fn mark_read(self) -> bool {
-        let Some((path, read)) = self.read else {
-            return true;
-        };
-        let Some(cursor) = path.parent() else {
-            return false;
-        };
-        std::fs::create_dir_all(cursor).is_ok()
-            && agent_client::files::replace_mode(
-                &path,
-                Value::Object(read).to_string().as_bytes(),
-                0o600,
-            )
-            .is_ok()
-    }
-}
-
 /// What the commons source says: a line for each post since the last
 /// look, as a source's command would print it, its thread the topic.
 /// `cursor` is the source's own folder, where how far each thread was
@@ -1311,7 +1280,12 @@ pub fn subscribed(store: &Path, bot: &str, id: Option<i64>, thread: &str) -> Opt
         .unwrap_or_else(|| crate::lookout::subs::Sub::commons(thread, id));
     let source = crate::kept::config().map_or_else(
         |_| Some(agent_client::config::COMMONS_DIGEST.to_owned()),
-        |config| config.sonny.commons_source.digest,
+        |config| {
+            config
+                .sonny
+                .own_source(agent_client::config::COMMONS_SOURCE)
+                .digest
+        },
     );
     Some(said_of(&held, thread, source.as_deref()))
 }
