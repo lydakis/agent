@@ -1899,7 +1899,11 @@ conversation. Keys go
 to the pane after a click in it; Ctrl+\ (or Tab, in a pane that is not a
 chat) takes them back to the composer, and Ctrl+\, or Tab with nothing
 typed and no guess showing, puts them in the pane again; the pane's title
-names the key that does. Sonny binds no Shift+Tab: multiplexers
+names the key that does (`tab keys` while the keys are in the
+conversation). In a pane that fills a narrow window, the view's own keys
+outrank `ctrl+\ conversation` in its title: it is the first to give way.
+A view's foot (a confirm, or what a key did) wraps onto as many rows as it
+needs rather than being cut. Sonny binds no Shift+Tab: multiplexers
 switch tabs with it. A window too narrow for
 both shows the one the keys are in. With nothing typed, Home goes up to
 the conversation's first turn, drawing the turns over it on the way, and
@@ -1912,7 +1916,14 @@ redraws it by hand, as in a shell.
 
 ### Help and command search
 
-With nothing typed, `?` lists every key beside the conversation. Every
+With nothing typed, `?` lists every key beside the conversation. In the
+pane, `?` lists every key the view in it takes, those its title has no
+room for too, one to a row, until the next key (`esc` only hides them);
+the sky keeps `?` for its legend.
+
+![/background at 44 columns: ? lists every key the title has no room for, and a confirm wraps rather than being cut](../docs/sonny/pane-keys-44.png)
+
+Every
 hint on screen is written one way, as Codex writes them: the key, then
 what it does muted, `·` between them (`↑↓ pick · enter open · esc
 close`). Each view names its keys once, and the same few words say what

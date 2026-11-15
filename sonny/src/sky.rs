@@ -4137,7 +4137,9 @@ impl View {
         };
         for &state in states {
             let n = shown.iter().filter(|a| a.state() == Some(state)).count();
-            if n > 0 || state == State::Working {
+            // A state with none in it is not counted, as `/status` draws
+            // no empty group.
+            if n > 0 {
                 let (mark, color, word) = state.mark();
                 let word = if state == State::NeedsYou && n != 1 {
                     "need you"
@@ -8669,7 +8671,7 @@ mod tests {
         assert_eq!(beating(&mut view, 50, 20), 0);
         assert_eq!(
             text(&[view.footer(100)]),
-            "  3 agents · ? 2 need you · ● 0 working · ✗ 1 failed · 3 messages in the last minute"
+            "  3 agents · ? 2 need you · ✗ 1 failed · 3 messages in the last minute"
         );
 
         // The call allowed, the agent works again; a new turn for what

@@ -126,6 +126,9 @@ pub struct Pane {
     /// again at the width it is drawn at whenever that changes, so a
     /// table or a list is never wrapped into pieces as the pane narrows.
     laid: Option<(PathBuf, usize)>,
+    /// `?` pressed while it has the keys: every key its title would name,
+    /// one to a row, in place of what it shows, until the next key.
+    pub sheet: bool,
 }
 
 /// The button beside an agent's name that opens it in the main view: the
@@ -232,6 +235,7 @@ impl Pane {
             name_at: None,
             tab: false,
             laid,
+            sheet: false,
         })
     }
 
@@ -322,6 +326,50 @@ impl Pane {
         }
     }
 
+    /// Every key the title names while the pane has the keys, before
+    /// any gives way: `← back` first, beside the `‹`; then the view's
+    /// own; then, alone, the way back to the conversation, ahead of
+    /// `esc` and the first of the view's own to give way, so its letters
+    /// outrank it.
+    pub fn title_keys(&self) -> String {
+        let mut pairs: Vec<String> = (self.keys.split(" · "))
+            .filter(|pair| !pair.trim().is_empty())
+            .map(|pair| pair.trim().to_owned())
+            .collect();
+        if self.alone && !self.keys.contains(SWITCH) {
+            let at = match pairs.last() {
+                Some(last) if last.starts_with("esc ") => pairs.len() - 1,
+                _ => pairs.len(),
+            };
+            pairs.insert(at, format!("{SWITCH} conversation"));
+        }
+        if self.goes_back() {
+            pairs.insert(0, "← back".into());
+        }
+        pairs.join(" · ")
+    }
+
+    /// The `?` sheet: each key the title names, one to a row, the key at
+    /// the text's own weight and what it does muted, `?` itself last.
+    fn sheet_lines(&self) -> Vec<Line<'static>> {
+        let mut pairs: Vec<(String, String)> = (self.title_keys().split(" · "))
+            .map(|pair| match pair.split_once(' ') {
+                Some((key, does)) => (key.to_owned(), does.to_owned()),
+                None => (pair.to_owned(), String::new()),
+            })
+            .collect();
+        pairs.push(("?".into(), "these keys".into()));
+        let wide = pairs.iter().map(|(key, _)| key.width()).max().unwrap_or(0);
+        let mut lines = vec![Line::from(" Keys").bold(), Line::default()];
+        for (key, does) in pairs {
+            lines.push(Line::from(vec![
+                Span::raw(format!(" {key:wide$}  ")),
+                Span::raw(does).dim(),
+            ]));
+        }
+        lines
+    }
+
     /// Whether back goes somewhere: to what was shown before, or to the
     /// margin under it.
     pub fn goes_back(&self) -> bool {
@@ -365,6 +413,7 @@ impl Pane {
             name_at: None,
             tab: false,
             laid: None,
+            sheet: false,
         }
     }
 
@@ -400,6 +449,7 @@ impl Pane {
             name_at: None,
             tab: false,
             laid: None,
+            sheet: false,
         }
     }
 
@@ -490,7 +540,7 @@ impl Pane {
         if let Some((from, to)) = self.switch_at
             && (from..to).contains(&column)
         {
-            // Unfocused, the hint says `tab focus`: a click there gives
+            // Unfocused, the hint says `tab keys`: a click there gives
             // the pane the keys, as a click anywhere on it already has.
             let what = match self.focused {
                 true => "switch",
@@ -588,16 +638,9 @@ impl Pane {
         if area.height == 0 {
             return None;
         }
-        // Alone, the way back to the conversation comes first after back,
-        // the last of the keys to go when the title runs out of room.
-        let own = match self.alone && !self.keys.contains(SWITCH) {
-            true => format!("{SWITCH} conversation · {}", self.keys),
-            false => self.keys.clone(),
-        };
         let mut keys = match focused {
-            true if self.goes_back() => format!("  ← back · {own} "),
-            true => format!("  {own} "),
-            false => format!("  {switch} focus "),
+            true => format!("  {} ", self.title_keys()),
+            false => format!("  {switch} keys "),
         };
         let mut style = Style::new();
         // A file's name is a link to it. A laid out agent's goes to its
@@ -690,11 +733,32 @@ impl Pane {
             height: area.height.saturating_sub(2),
             ..area
         };
-        if let Some(foot) = &self.foot
-            && rows.height > 2
-        {
-            rows.height -= 2;
-            buf.set_line(area.x, rows.bottom() + 1, &inset(foot), area.width);
+        // The foot wraps, never cut: a confirm or a notice is read whole,
+        // its rows above the last, a row clear between it and the rest.
+        if let Some(foot) = &self.foot {
+            let width = (area.width as usize).saturating_sub(1).max(1);
+            let foot = crate::transcript::wrap(inset(foot), width, Span::raw(""), Span::raw(" "));
+            let high = foot.len() as u16;
+            if rows.height > high + 1 {
+                rows.height -= high + 1;
+                for (at, line) in foot.iter().enumerate() {
+                    buf.set_line(area.x, rows.bottom() + 1 + at as u16, line, area.width);
+                }
+            } else {
+                // Too short for both: the foot takes the rows, since a
+                // confirm Enter acts on is never hidden.
+                for (at, line) in foot.iter().take(rows.height as usize).enumerate() {
+                    buf.set_line(area.x, rows.y + at as u16, line, area.width);
+                }
+                rows.height = 0;
+            }
+        }
+        if self.sheet {
+            let lines = self.sheet_lines();
+            for (at, line) in lines.iter().take(rows.height as usize).enumerate() {
+                buf.set_line(rows.x, rows.y + at as u16, line, rows.width);
+            }
+            return None;
         }
         match &mut self.program {
             // A column off the line between, as the title is.
@@ -778,7 +842,7 @@ fn is_markdown(path: &Path) -> bool {
 
 /// The columns within `keys`, as the title holds them, of the hint that
 /// starts with `said`, to its ` · `: the switch key's, `ctrl+\
-/// conversation` while the keys are here and `tab focus` while not, or
+/// conversation` while the keys are here and `tab keys` while not, or
 /// [`BIGGER`]'s.
 fn hint_at(keys: &str, said: &str) -> Option<(u16, u16)> {
     let start = keys.find(said)?;
@@ -1099,27 +1163,44 @@ mod tests {
         pane.alone = true;
         let head = rows(&mut pane, 70, 3).remove(0);
         assert!(
-            head.ends_with("ctrl+\\ conversation · ↑↓ pick · esc close"),
+            head.ends_with("↑↓ pick · ctrl+\\ conversation · esc close"),
             "{head}"
         );
-        // Narrow, the pick goes before the way back does.
-        let head = rows(&mut pane, 44, 3).remove(0);
-        assert!(head.ends_with("ctrl+\\ conversation · esc close"), "{head}");
         // The hint is a button that does what the key does.
-        let column = pane.area.x + 43 - "ctrl+\\ conversation · esc close".width() as u16;
+        let column = pane.area.x + 69 - "ctrl+\\ conversation · esc close".width() as u16;
         assert_eq!(
             pane.head_button(column).as_deref(),
             Some(&*format!("{}switch", crate::screen::BUTTON))
         );
+        // Narrow, the way back goes before the view's own keys do: they
+        // outrank it, and `?` shows it with the rest.
+        let head = rows(&mut pane, 44, 3).remove(0);
+        assert!(head.ends_with("  ↑↓ pick · esc close"), "{head}");
+        pane.sheet = true;
+        let shown = rows(&mut pane, 44, 10);
+        assert_eq!(
+            shown[2..8],
+            [
+                " Keys",
+                "",
+                " ↑↓      pick",
+                " ctrl+\\  conversation",
+                " esc     close",
+                " ?       these keys",
+            ]
+        );
+        pane.sheet = false;
+        let head = rows(&mut pane, 70, 3).remove(0);
+        assert!(head.contains("ctrl+\\ conversation"), "{head}");
         // Beside the conversation it needs no saying.
         pane.alone = false;
         let head = rows(&mut pane, 70, 3).remove(0);
         assert!(!head.contains("conversation"), "{head}");
-        // Unfocused, its `tab focus` hint gives the pane the keys, never
+        // Unfocused, its `tab keys` hint gives the pane the keys, never
         // takes them away, though a click on the pane gave them first.
         let mut buf = Buffer::empty(Rect::new(0, 0, 70, 3));
         pane.render(Rect::new(0, 0, 70, 3), &mut buf, false, "tab", |_| None);
-        let column = 70 - "tab focus ".width() as u16;
+        let column = 70 - "tab keys ".width() as u16;
         assert_eq!(
             pane.head_button(column).as_deref(),
             Some(&*format!("{}focus", crate::screen::BUTTON))
@@ -1142,6 +1223,22 @@ mod tests {
         let shown = rows(&mut pane, 30, 8);
         assert_eq!(shown[5], "row 19");
         assert_eq!(shown[7], " d again removes nightly");
+        // A foot too long for its row wraps, never cut: a confirm is read
+        // whole.
+        pane.foot = Some(Line::from(
+            "Remove tally.halves.ask-10-a11? It can't be undone.",
+        ));
+        let shown = rows(&mut pane, 30, 8);
+        assert_eq!(shown[4], "");
+        assert_eq!(shown[5], " Remove");
+        assert_eq!(shown[6], " tally.halves.ask-10-a11? It");
+        assert_eq!(shown[7], " can't be undone.");
+        // Too short for both, the foot takes the rows: a confirm Enter
+        // acts on is never hidden.
+        let shown = rows(&mut pane, 30, 5);
+        assert_eq!(shown[2], " Remove");
+        assert_eq!(shown[3], " tally.halves.ask-10-a11? It");
+        assert_eq!(shown[4], " can't be undone.");
     }
 
     #[test]

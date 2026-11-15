@@ -12528,6 +12528,14 @@ impl App {
                 }
                 let action = match &mut self.pane {
                     Some(pane) if in_pane => {
+                        // The `?` sheet hides what is under it, its links
+                        // too: a press only hides the sheet, as a key does.
+                        if pane.sheet {
+                            if down {
+                                pane.sheet = false;
+                            }
+                            return true;
+                        }
                         // A button on its first row.
                         if down
                             && pane.on_title(mouse.column, mouse.row)
@@ -12643,6 +12651,26 @@ impl App {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         let copy =
             key.code == KeyCode::Char('c') && (ctrl || key.modifiers.contains(KeyModifiers::SUPER));
+        // `?` shows the keys of the view that has them, every one its
+        // title would name however narrow, until the next key; `esc`
+        // there only hides them again. A view that names `?` itself, as
+        // the sky's legend, keeps it.
+        if self.finding.is_none()
+            && self.pane_keys
+            && !program
+            && let Some(pane) = &mut self.pane
+            && !(pane.title_keys().split(" · ")).any(|pair| pair.starts_with("? "))
+        {
+            let plain = !(key.modifiers)
+                .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER);
+            if key.code == KeyCode::Char('?') && plain {
+                pane.sheet = !pane.sheet;
+                return true;
+            }
+            if std::mem::take(&mut pane.sheet) && key.code == KeyCode::Esc {
+                return true;
+            }
+        }
         // `/status` picks an agent from the keys and opens it, as a click
         // on it does.
         if self.finding.is_none()
@@ -13390,7 +13418,7 @@ impl App {
             // away: the keys, and in a window with room for one, the view,
             // over to the other.
             "switch" if self.pane.is_some() => self.pane_keys = !self.pane_keys,
-            // An unfocused pane's `tab focus` hint: the keys to it.
+            // An unfocused pane's `tab keys` hint: the keys to it.
             "focus" if self.pane.is_some() => self.pane_keys = true,
             // The pane's picture or drawing, opened bigger outside Sonny.
             "bigger" => {
@@ -23588,6 +23616,34 @@ mod tests {
         assert!(app.footer_line(140).to_string().contains("✗ 2"));
         app.failed = 0;
         assert!(!app.footer_line(140).to_string().contains('✗'));
+    }
+
+    #[tokio::test]
+    async fn a_press_on_the_key_sheet_only_hides_it() {
+        use ratatui::crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+        let mut app = app(daemon_with(json!([])).await);
+        let mut card = pane::Pane::card("background", "↑↓ pick · esc close");
+        card.area = ratatui::layout::Rect::new(60, 0, 40, 20);
+        card.sheet = true;
+        app.pane = Some(card);
+        let press = |kind| {
+            Event::Mouse(MouseEvent {
+                kind,
+                column: 70,
+                row: 6,
+                modifiers: KeyModifiers::NONE,
+            })
+        };
+        // A wheel over it leaves the sheet; a press hides it and reaches
+        // nothing under it.
+        app.key(press(MouseEventKind::ScrollDown)).await;
+        assert!(app.pane.as_ref().is_some_and(|p| p.sheet));
+        app.key(press(MouseEventKind::Down(MouseButton::Left)))
+            .await;
+        app.key(press(MouseEventKind::Up(MouseButton::Left))).await;
+        let pane = app.pane.as_ref().unwrap();
+        assert!(!pane.sheet);
+        assert!(pane.is_card());
     }
 
     #[tokio::test]
