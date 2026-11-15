@@ -1694,7 +1694,7 @@ impl Service {
                 for lookout in self.lookouts.values_mut() {
                     lookout.flush();
                 }
-                held::then(move |written| {
+                held::then(self.store.clone(), move |written| {
                     let _ = kept.send(written);
                 });
             }
@@ -1903,7 +1903,7 @@ impl Service {
         let path = cursor_path(&self.store);
         let partial = path.with_extension(format!("cursor.{}.partial", std::process::id()));
         self.saved = Some(text.clone());
-        held::then(move |written| {
+        held::then(self.store.clone(), move |written| {
             if written {
                 let _ = write_moved(&partial, &path, &text);
             }
@@ -3259,12 +3259,14 @@ mod held {
     use std::sync::{Mutex, OnceLock, mpsc};
 
     /// What is called once the writes handed over before it are done:
-    /// whether every file holds what it was last handed.
+    /// whether every file of its store holds what it was last handed.
     type Then = Box<dyn FnOnce(bool) + Send>;
 
     enum Job {
         Write(PathBuf, Option<Vec<u8>>),
-        Done(Then),
+        /// The store whose files it asks about, by the path each is
+        /// named beside, and what to call.
+        Done(PathBuf, Then),
     }
 
     fn sender() -> &'static Mutex<mpsc::Sender<Job>> {
@@ -3284,7 +3286,7 @@ mod held {
                                 writes.retain(|(had, _)| *had != path);
                                 writes.push((path, body));
                             }
-                            Job::Done(then) => done.push(then),
+                            Job::Done(store, then) => done.push((store, then)),
                         }
                     }
                     for (path, body) in failed.drain() {
@@ -3297,8 +3299,15 @@ mod held {
                             failed.insert(path, body);
                         }
                     }
-                    for then in done {
-                        then(failed.is_empty());
+                    // Another store's write failing is not this one's: one
+                    // process holds one store, but tests hold many at once.
+                    for (store, then) in done {
+                        let store = store.as_os_str().as_encoded_bytes();
+                        then(
+                            !failed
+                                .keys()
+                                .any(|path| path.as_os_str().as_encoded_bytes().starts_with(store)),
+                        );
                     }
                 }
             });
@@ -3329,22 +3338,23 @@ mod held {
     }
 
     /// Calls `then` once every write handed over before it is done, with
-    /// whether each file holds what it was last handed. Never called
-    /// only if the writer is gone, which drops `then`.
-    pub fn then(then: impl FnOnce(bool) + Send + 'static) {
+    /// whether each file of `store`, named beside it, holds what it was
+    /// last handed. Never called only if the writer is gone, which drops
+    /// `then`.
+    pub fn then(store: PathBuf, then: impl FnOnce(bool) + Send + 'static) {
         if let Ok(send) = sender().lock() {
-            let _ = send.send(Job::Done(Box::new(then)));
+            let _ = send.send(Job::Done(store, Box::new(then)));
         }
     }
 
     /// Waits for every write handed over before it.
     #[cfg(test)]
-    pub fn written() -> bool {
+    pub fn written() {
         let (tell, told) = mpsc::channel();
-        then(move |written| {
-            let _ = tell.send(written);
+        then(PathBuf::new(), move |_| {
+            let _ = tell.send(());
         });
-        told.recv().unwrap_or(false)
+        let _ = told.recv();
     }
 }
 
@@ -4391,11 +4401,13 @@ mod tests {
         service.cursor = Some(90);
         service.in_flight.insert(("calc.fix".into(), 7), 40);
         service.in_flight.insert(("calc.docs".into(), 9), 60);
-        saved(&mut service);
+        service.save_cursor();
+        held::written();
         assert_eq!(marks(&store), (Some(90), Some(39)));
         // Nothing under way: it starts again where its news ended.
         service.in_flight.clear();
-        saved(&mut service);
+        service.save_cursor();
+        held::written();
         assert_eq!(marks(&store), (Some(90), Some(90)));
         // A failed fire whose note is under way is told again from its
         // start: its end is news and its start names its trigger.
@@ -4405,30 +4417,17 @@ mod tests {
             ended: Some(50),
         };
         service.telling.insert(("calc.fix".into(), 7), telling);
-        saved(&mut service);
+        service.save_cursor();
+        held::written();
         assert_eq!(marks(&store), (Some(49), Some(29)));
         // The daemon took it: nothing holds the stream.
         service.telling.clear();
-        saved(&mut service);
+        service.save_cursor();
+        held::written();
         assert_eq!(marks(&store), (Some(90), Some(90)));
         std::fs::write(cursor_path(&store), "12").unwrap();
         assert_eq!(marks(&store), (Some(12), Some(12)));
         std::fs::remove_dir_all(&dir).unwrap();
-    }
-
-    /// Saves the cursor and waits until it is on disk. Every test shares
-    /// the one writer, so a write another test makes as its folder goes
-    /// can fail in the same batch and hold this one back: it is saved
-    /// again then, as the next save would.
-    fn saved(service: &mut Service) {
-        for _ in 0..20 {
-            service.save_cursor();
-            if held::written() {
-                return;
-            }
-            service.saved = None;
-        }
-        panic!("the cursor never reached the disk");
     }
 
     #[tokio::test]
@@ -4471,7 +4470,8 @@ mod tests {
             .lookouts
             .insert("shop.lead".into(), lead("shop.lead", "shop.fix"));
         first.cursor = Some(90);
-        saved(&mut first);
+        first.save_cursor();
+        held::written();
         // The stream starts again before calc.lead's news; shop.lead's own
         // mark is kept beside it.
         assert_eq!(marks(&store), (Some(49), Some(49)));
@@ -4481,7 +4481,8 @@ mod tests {
         );
         // Nothing waits: no mark of its own past where the stream starts.
         first.lookouts.get_mut("calc.lead").unwrap().due.clear();
-        saved(&mut first);
+        first.save_cursor();
+        held::written();
         assert_eq!(marks(&store), (Some(90), Some(90)));
         assert!(told_marks(&store).is_empty());
         first
@@ -4491,7 +4492,8 @@ mod tests {
             .due
             .push(pending(5));
         first.lookouts.get_mut("calc.lead").unwrap().from = Some(50);
-        saved(&mut first);
+        first.save_cursor();
+        held::written();
 
         // The next lookout, as it starts.
         let mut again = service(store.clone(), &[]);

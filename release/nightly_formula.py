@@ -29,7 +29,6 @@ def render_formula(commit: str, version: str) -> str:
   end
 
   depends_on "rust" => :build
-  depends_on "agent-browser"
   depends_on "ripgrep"
 
   on_linux do

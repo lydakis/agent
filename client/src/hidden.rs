@@ -2,13 +2,17 @@
 //! or renames what is in them, and nothing read for an agent outside its
 //! sandbox (the daemon's `read` tool, a client's template `file()`) gives
 //! it back. `~/.agent/keys`, the keys the CLI starts the daemon with, is
-//! always one; the person adds more as `[sandbox] unreadable`.
+//! always one, and so is `~/.agent/sonny/programs`, the programs Sonny's
+//! tool host runs as the person; the person adds more as
+//! `[sandbox] unreadable`.
 use std::path::PathBuf;
 
-/// `~/.agent/keys` and the folders `config` lists, as named: the agent CLI
-/// starts the daemon with each as `--unreadable`, which makes the missing.
+/// `~/.agent/keys`, Sonny's programs and the folders `config` lists, as
+/// named: the agent CLI starts the daemon with each as `--unreadable`,
+/// which makes the missing.
 pub fn folders(config: &crate::config::Config) -> Vec<PathBuf> {
     (crate::env_file::folder().into_iter())
+        .chain(crate::config::programs())
         .chain(crate::config::unreadable(config))
         .collect()
 }

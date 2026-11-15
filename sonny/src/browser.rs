@@ -327,22 +327,6 @@ impl Reach {
         Ok(file.to_string_lossy().into_owned())
     }
 
-    /// The folders its sandbox writes, the temporary ones with them, as
-    /// the daemon's sandbox lets it: none when it writes nothing, or when
-    /// it runs unconfined, as the person does.
-    pub fn written(&self) -> Vec<PathBuf> {
-        match (&self.roots, self.writes) {
-            (Some(roots), true) => {
-                let temporary = (std::env::var_os("TMPDIR").map(PathBuf::from))
-                    .filter(|path| path.is_absolute())
-                    .into_iter()
-                    .chain([PathBuf::from("/tmp")]);
-                roots.iter().cloned().chain(temporary).collect()
-            }
-            _ => Vec::new(),
-        }
-    }
-
     /// `path` as a file the browser writes, inside the reach, or why not.
     fn output(&self, path: &str) -> Result<String, String> {
         if !self.writes {
@@ -1200,7 +1184,7 @@ fn profile_listed(state: &str, name: &str) -> bool {
 /// The tool, while agent-browser is installed here or on a machine linked
 /// here, which `machine` names.
 pub fn tool() -> Option<Value> {
-    let here = crate::setup::on_path(PROGRAM);
+    let here = crate::trusted::here(PROGRAM);
     let lent: Vec<crate::link::Machine> = (crate::link::machines().into_iter())
         .filter(|machine| machine.browser)
         .collect();
@@ -1284,9 +1268,8 @@ async fn output(
     launch: &Launch,
 ) -> Result<std::process::Output, String> {
     let confirm = launch.confirm.as_str();
-    // Checked again as it starts, so a copy changed since, while the call
-    // waited for a confirmation, is admitted again or not run.
-    let program = match crate::trusted::program(PROGRAM).await {
+    // Sonny's own copy, still there as it starts.
+    let program = match crate::trusted::program(PROGRAM) {
         Ok(program) => program,
         Err(e) => {
             return Err(format!("{PROGRAM} is not run: {e}"));
@@ -1436,11 +1419,8 @@ pub async fn lent(
     steps: &crate::exec::Steps,
 ) -> Result<Value, (&'static str, String)> {
     let lines = lines_of(&payload["commands"])?;
-    if !crate::setup::on_path(PROGRAM) {
-        return Err((
-            "browser_refused",
-            format!("{PROGRAM} is not installed here"),
-        ));
+    if let Err(why) = crate::trusted::program(PROGRAM) {
+        return Err(("browser_refused", why));
     }
     let bot = payload["bot"].as_str().unwrap_or_default();
     // As here: by its store too, since two stores there may each have an
@@ -2252,10 +2232,6 @@ async fn drive(
         Ok(config) => confirmed(&config.sonny.browser_confirm),
         Err(_) => confirmed(&agent_client::config::BROWSER_CONFIRM.map(str::to_owned)),
     };
-    // Refused before anything runs; checked again as each command starts.
-    crate::trusted::program(PROGRAM)
-        .await
-        .map_err(|e| ("browser_refused", format!("{PROGRAM} is not run: {e}")))?;
     let launch = Launch {
         confirm: confirm.clone(),
         profile: profile.map(str::to_owned),
@@ -3298,20 +3274,6 @@ mod tests {
                 confirmation: None
             }
         );
-    }
-
-    #[test]
-    fn the_program_is_found_in_folders_named_from_the_root() {
-        let dir = scratch("program");
-        std::fs::create_dir_all(dir.join("bin")).unwrap();
-        std::fs::write(dir.join("bin").join(PROGRAM), "").unwrap();
-        let path = std::env::join_paths(["bin".into(), dir.join("bin")]).unwrap();
-        // `bin` is relative: a folder of whoever runs it, so skipped.
-        assert_eq!(
-            crate::trusted::native(PROGRAM, &path),
-            dir.join("bin").join(PROGRAM)
-        );
-        assert!(crate::trusted::native(PROGRAM, std::ffi::OsStr::new("bin")).is_absolute());
     }
 
     #[test]
