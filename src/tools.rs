@@ -29,6 +29,18 @@ mod picture;
 mod terminal;
 use files::read_bounded;
 pub use patch::Patch;
+/// The daemon's tools a script may run as daemon steps (`run_step`): those
+/// whose place in line and whose stop are specified. A bot's `steps_only`
+/// entry `"*"` stands for these.
+pub const STEP_TOOLS: [&str; 7] = [
+    "shell",
+    "echo",
+    "read",
+    "write",
+    "edit",
+    "apply_patch",
+    "web_fetch",
+];
 #[cfg(unix)]
 pub use terminal::POLL_YIELD_MS;
 
@@ -2584,6 +2596,7 @@ impl Registry {
         grammars: bool,
         names: &[String],
         declared: &ToolList,
+        hidden: &[String],
         sandboxed: bool,
     ) -> Result<Arc<RawValue>> {
         let mut key = (family, names.join(","));
@@ -2598,6 +2611,11 @@ impl Registry {
         if let Some(digest) = declared.digest() {
             key.1.push('\0');
             key.1.push_str(digest);
+        }
+        // Declared tools its model is not shown, callable only as steps.
+        if !hidden.is_empty() {
+            key.1.push_str("\0hidden:");
+            key.1.push_str(&hidden.join(","));
         }
         if let Some(found) = self.encodings.lock().unwrap().get(&key) {
             return Ok(found.clone());
@@ -2614,12 +2632,16 @@ impl Registry {
                 }
                 schema
             })
-            .chain(declared.iter().map(|tool| ToolSchema {
-                name: tool.name.clone().into(),
-                description: tool.description.clone().into(),
-                parameters: tool.parameters.clone(),
-                grammar: tool.grammar.clone().map(Into::into),
-            }))
+            .chain(
+                (declared.iter())
+                    .filter(|tool| !hidden.contains(&tool.name))
+                    .map(|tool| ToolSchema {
+                        name: tool.name.clone().into(),
+                        description: tool.description.clone().into(),
+                        parameters: tool.parameters.clone(),
+                        grammar: tool.grammar.clone().map(Into::into),
+                    }),
+            )
             .collect();
         let encoded: Arc<RawValue> = Arc::from(RawValue::from_string(serde_json::to_string(
             &family.tools(&schemas, grammars),

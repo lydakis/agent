@@ -460,7 +460,18 @@ pub struct Settings {
     /// gates are asked.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub approval_policy: Option<ApprovalPolicy>,
+    /// Tools left out of what its model is shown and callable only as
+    /// steps of a script: each by name, the daemon's or its client's, and
+    /// `"*"` for every one of the daemon's tools that runs as a step
+    /// ([`crate::tools::STEP_TOOLS`]). `"*"` hides nothing while the bot
+    /// has no declared tool that takes steps. A bot made by another takes
+    /// its creator's unless its client sets one; an empty list hides
+    /// nothing. Unset, every tool is shown.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub steps_only: Option<Vec<String>>,
 }
+/// The most names a bot's `steps_only` lists.
+pub const STEPS_ONLY_NAMES: usize = 256;
 /// Why a call that would need approval fails on a bot that never asks.
 pub const NEVER_ASKS: &str =
     "approval_policy is never: this call would need approval, and no one is asked";
@@ -715,6 +726,13 @@ impl Settings {
         {
             return refuse("unix_sockets names at most 64 absolute paths, 32 KiB in all");
         }
+        if let Some(names) = &self.steps_only
+            && (names.len() > STEPS_ONLY_NAMES
+                || (names.iter()).any(|name| name.is_empty() || name.len() > 64)
+                || (names.iter().enumerate()).any(|(index, name)| names[..index].contains(name)))
+        {
+            return refuse("steps_only names at most 256 tools, each once and 1 to 64 bytes");
+        }
         if let Some(rules) = &self.rules {
             rules
                 .validate()
@@ -783,7 +801,8 @@ impl Settings {
             "trailer":self.trailer(),"quiet_background":self.quiet_background,
             "hold_ms":self.hold_ms(),
             "unix_sockets":self.unix_sockets,
-            "rules":self.rules,"env":self.env,"approval_policy":self.approval_policy})
+            "rules":self.rules,"env":self.env,"approval_policy":self.approval_policy,
+            "steps_only":self.steps_only})
     }
     fn stored(&self) -> Result<Option<String>> {
         Ok((*self != Self::default())
@@ -804,7 +823,7 @@ pub fn web(name: &str) -> bool {
     matches!(name, "web_fetch" | "web_search")
 }
 /// Every setting's name, as `create` and `configure` take it.
-pub const SETTINGS: [&str; 25] = [
+pub const SETTINGS: [&str; 26] = [
     "context_bytes",
     "context_items",
     "note_turns",
@@ -830,6 +849,7 @@ pub const SETTINGS: [&str; 25] = [
     "rules",
     "env",
     "approval_policy",
+    "steps_only",
 ];
 /// Settings as their stored fields, those at their defaults left out.
 fn settings_map(settings: &Settings) -> Result<serde_json::Map<String, Value>> {
@@ -1176,10 +1196,12 @@ impl Bot {
             read: call.name == "read",
         }
     }
-    /// Whether one of the bot's gates holds this call back, asked or not.
+    /// Whether one of the bot's gates holds this call, from its model, back,
+    /// asked or not: never a call of a tool kept for steps, which is refused.
     fn held(&self, call: &ToolCall, workspace: &std::path::Path, rules: &Rules) -> bool {
         gated(&self.gates, &call.name)
             && self.may_call(&call.name)
+            && !self.steps_only(&call.name)
             && !self.declared(&call.name).is_some_and(|tool| tool.steps)
             && match self.ruling(call, rules) {
                 Ok(Ruling::Prompt(_)) => true,
@@ -1310,15 +1332,44 @@ impl Bot {
         self.sandboxed() && !self.settings.network
     }
     /// Its tools as offered to the model now: [`Bot::calls`]'s, so an
-    /// offline bot is offered no web tool, from its next call on.
+    /// offline bot is offered no web tool, from its next call on, and none
+    /// its `steps_only` keeps for steps.
     pub fn offered(&self) -> std::borrow::Cow<'_, [String]> {
-        match self.offline() && self.tools.iter().any(|tool| web(tool)) {
+        let hides = |tool: &String| (self.offline() && web(tool)) || self.steps_only(tool);
+        match self.tools.iter().any(hides) {
             true => (self.tools.iter())
-                .filter(|tool| !web(tool))
+                .filter(|tool| !hides(tool))
                 .cloned()
                 .collect::<Vec<_>>()
                 .into(),
             false => self.tools.as_slice().into(),
+        }
+    }
+    /// Whether `name` is left out of what its model is shown, callable only
+    /// as a step of a script: named in its `steps_only`, or one of the
+    /// daemon's step tools under `"*"` while it has a declared tool that
+    /// takes steps. A direct call of it is `tool_not_available`.
+    pub fn steps_only(&self, name: &str) -> bool {
+        let Some(names) = &self.settings.steps_only else {
+            return false;
+        };
+        if names.iter().any(|hidden| hidden == name) {
+            return true;
+        }
+        names.iter().any(|hidden| hidden == "*")
+            && crate::tools::STEP_TOOLS.contains(&name)
+            && self.declared(name).is_none()
+            && (self.declared.iter()).any(|tool| tool.steps && self.declared(&tool.name).is_some())
+    }
+    /// Its declared tools its model is not shown, by name, for the
+    /// encoding of what it is.
+    pub fn declared_hidden(&self) -> Vec<String> {
+        match &self.settings.steps_only {
+            None => Vec::new(),
+            Some(_) => (self.declared.iter())
+                .filter(|tool| self.steps_only(&tool.name))
+                .map(|tool| tool.name.clone())
+                .collect(),
         }
     }
     /// The bot id that keys this bot's provider prompt cache.
@@ -4280,6 +4331,10 @@ impl Database {
         let mut kin = Vec::new();
         let tx = self.conn.savepoint()?;
         tx.execute("UPDATE bots SET settings=? WHERE id=?", params![stored, id])?;
+        // What its model is shown changed: its prompt cache is its own.
+        if changed.iter().any(|key| key == "steps_only") {
+            tx.execute("UPDATE bots SET cache_bot=NULL WHERE id=?", [id])?;
+        }
         // The bots it made, and theirs, go by the same rules and `env`.
         for key in INHERITED {
             if !changed.iter().any(|changed| changed == key) {
@@ -4662,7 +4717,13 @@ impl Database {
                 if let Some(why) = binding.settings.beyond(&creator) {
                     return fail_with("invalid_setting", why);
                 }
-                binding.settings.clone().under(&creator)
+                let mut settings = binding.settings.clone().under(&creator);
+                // Its creator's way of calling tools, as with declared
+                // tools, unless its own client chose one.
+                if settings.steps_only.is_none() {
+                    settings.steps_only = creator.steps_only;
+                }
+                settings
             }
             None => binding.settings.clone(),
         };
@@ -20008,6 +20069,7 @@ mod tests {
             }),
             env: [("A".to_owned(), "1".to_owned())].into(),
             approval_policy: Some(ApprovalPolicy::Never),
+            steps_only: Some(vec!["*".into()]),
         };
         let mut names: Vec<String> = settings_map(&all)
             .unwrap()

@@ -11,16 +11,6 @@ mod session;
 mod socket;
 mod steps;
 
-/// The daemon's tools a script may run as daemon steps (`run_step`).
-const STEP_TOOLS: [&str; 7] = [
-    "shell",
-    "echo",
-    "read",
-    "write",
-    "edit",
-    "apply_patch",
-    "web_fetch",
-];
 mod turn;
 
 use actives::{Actives, Slot};
@@ -706,6 +696,10 @@ enum Command {
     /// Each provider's own model listing, for a client writing its model
     /// list. Asked when requested and kept five minutes; nothing runs on it.
     ProviderModels,
+    /// The daemon's tools as a model is shown them, each with whether a
+    /// script can run it as a daemon step: what a client that hands tools
+    /// to a script declares them by.
+    Tools,
     /// A page of bots in name order: with `name`, those matching a GLOB
     /// pattern; with `active`, those with a turn running; with
     /// `created_by_id`, those the bot with that id made.
@@ -902,6 +896,7 @@ impl Command {
             Command::Companions { .. } => "companions",
             Command::Stats => "stats",
             Command::ProviderModels => "provider_models",
+            Command::Tools => "tools",
             Command::Bots { .. } => "bots",
             Command::Shutdown { .. } => "shutdown",
             Command::Pause { .. } => "pause",
@@ -5239,6 +5234,20 @@ impl Service {
                     })
                     .await
             }
+            Command::Tools => {
+                let tools: Vec<Value> = (self.registry.schemas().into_iter())
+                    .map(|schema| {
+                        let step = agent_runtime::tools::STEP_TOOLS.contains(&&*schema.name);
+                        let mut tool = json!({"name":schema.name,"description":schema.description,
+                            "parameters":schema.parameters,"step":step});
+                        if let Some(grammar) = schema.grammar {
+                            tool["grammar"] = json!(grammar);
+                        }
+                        tool
+                    })
+                    .collect();
+                Ok(json!({"tools":tools}))
+            }
             Command::ProviderModels => {
                 // Off the dispatch path: a listing waits on the network.
                 let (providers, output) = (self.providers.clone(), output.clone());
@@ -5847,12 +5856,12 @@ impl Service {
                 })?;
                 // The daemon's tools a step may run: those whose place in
                 // line and whose stop are specified.
-                if !STEP_TOOLS.contains(&tool.as_str()) {
+                if !agent_runtime::tools::STEP_TOOLS.contains(&tool.as_str()) {
                     return fail_with(
                         "invalid_step",
                         format!(
                             "{tool} does not run as a daemon step: {} do",
-                            STEP_TOOLS.join(", ")
+                            agent_runtime::tools::STEP_TOOLS.join(", ")
                         ),
                     );
                 }
