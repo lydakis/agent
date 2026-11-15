@@ -418,7 +418,6 @@ impl Agent {
         self.ready
             .get_or_try_init(|| async {
                 crate::skills::install_own();
-                crate::approvals::at_start();
                 crate::trigger::at_start();
                 crate::connect(&self.options, crate::Asking::AtStart)
                     .await

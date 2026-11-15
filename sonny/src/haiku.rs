@@ -379,14 +379,8 @@ impl Past {
     }
 }
 
-/// The upgrade migration that keeps each daemon's claim apart from the
-/// haiku shown, in `haiku.json` (0.8.1).
-pub const CLAIMS: &str = "haiku-claims";
-
-/// `haiku.json` as Sonny 0.8.0 wrote it, made current once for its HOME,
-/// recorded in `migrated` beside it: each daemon's claim was its `by` and
-/// `since_ms`, and a claim cleared the haiku, so one that wrote nothing
-/// left none; the last of the day's shows in its place.
+/// `haiku.json` made current once for its HOME, recorded in `migrated`
+/// beside it: each daemon's past moves to `haikus.jsonl` ([`PAST`]).
 pub fn upgrade(store: &Store) {
     let Some(file) = store.file.clone() else {
         return;
@@ -394,40 +388,6 @@ pub fn upgrade(store: &Store) {
     let Some(record) = file.parent().map(|dir| dir.join("migrated")) else {
         return;
     };
-    crate::upgrade::once(&record, CLAIMS, || {
-        if !file.exists() {
-            return true;
-        }
-        let Some(_lock) = store.lock() else {
-            return false;
-        };
-        // A file that can't be read as one is left as it is, and tried
-        // again at the next sky, rather than written over empty.
-        let Some(Value::Object(mut all)) = (std::fs::read(&file).ok())
-            .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
-        else {
-            return false;
-        };
-        for kept in all.values_mut().filter_map(Value::as_object_mut) {
-            if kept.contains_key("claim") {
-                continue;
-            }
-            let claim = json!({"by": kept.get("by").cloned().unwrap_or(json!("")),
-                "since_ms": kept.get("since_ms").cloned().unwrap_or(json!(0))});
-            kept.insert("claim".into(), claim);
-            let three = |poem: &Value| poem["lines"].as_array().is_some_and(|l| l.len() == 3);
-            if !three(&Value::Object(kept.clone())) {
-                let past = kept.get("past").and_then(Value::as_array);
-                let last = (past.and_then(|past| past.iter().rev().find(|poem| three(poem))))
-                    .cloned()
-                    .unwrap_or_else(|| json!({"by": "", "lines": [], "at_ms": 0, "since_ms": 0}));
-                for field in ["by", "lines", "at_ms", "since_ms"] {
-                    kept.insert(field.into(), last[field].clone());
-                }
-            }
-        }
-        store.write(&Value::Object(all)).is_ok()
-    });
     crate::upgrade::once(&record, PAST, || {
         if !file.exists() {
             return true;
@@ -1445,65 +1405,6 @@ mod tests {
         Kept::unwritten(&store, socket, "b", next, late, third + 1);
         assert_eq!(Kept::load(&store, socket).unwritten, None);
         let _ = std::fs::remove_dir_all(store.file.unwrap().parent().unwrap());
-    }
-
-    #[test]
-    fn a_file_whose_claim_cleared_the_haiku_shows_the_last_one_written_once_upgraded() {
-        // As Sonny 0.8.0 left it: a claim that wrote nothing saved no lines.
-        let store = Store::new();
-        let file = store.file.clone().unwrap();
-        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
-        let ms = 1_793_400_000_000_i64;
-        let old = json!({"/tmp/agent.sock": {"day": "2026-11-02", "written": 2,
-            "by": "b", "lines": [], "at_ms": ms + 9, "since_ms": ms + 5,
-            "past": [{"by": "a", "lines": ["x", "y", "z"], "at_ms": ms + 1, "since_ms": ms}]}});
-        std::fs::write(&file, old.to_string()).unwrap();
-        upgrade(&store);
-        let kept = Kept::load(&store, Path::new("/tmp/agent.sock"));
-        assert_eq!(
-            (kept.by.as_str(), kept.at_ms, kept.since_ms),
-            ("a", ms + 1, ms)
-        );
-        assert_eq!(kept.lines, ["x", "y", "z"]);
-        // The claim it held stays spent.
-        assert_eq!(kept.claim, ("b".to_owned(), ms + 5));
-        // Once: the file as written since is left as it is.
-        let lines = ["n".to_owned(), "o".into(), "w".into()];
-        let socket = Path::new("/tmp/agent.sock");
-        assert!(Kept::publish(
-            &store,
-            socket,
-            "b",
-            ms + 5,
-            &lines,
-            ms + 20,
-            None
-        ));
-        upgrade(&store);
-        assert_eq!(Kept::load(&store, socket).lines, lines);
-        let _ = std::fs::remove_dir_all(file.parent().unwrap());
-    }
-
-    #[test]
-    fn a_file_that_cannot_be_read_is_left_as_it_is_and_upgraded_once_it_can() {
-        let store = Store::new();
-        let file = store.file.clone().unwrap();
-        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
-        std::fs::write(&file, b"{\"/tmp/agent.sock\": {\"by\"").unwrap();
-        upgrade(&store);
-        assert_eq!(
-            std::fs::read(&file).unwrap(),
-            b"{\"/tmp/agent.sock\": {\"by\""
-        );
-        // Not counted done: once the file reads, it is upgraded.
-        let ms = 1_793_400_000_000_i64;
-        let old = json!({"/tmp/agent.sock": {"day": "2026-11-02", "written": 1,
-            "by": "a", "lines": ["x", "y", "z"], "at_ms": ms + 1, "since_ms": ms}});
-        std::fs::write(&file, old.to_string()).unwrap();
-        upgrade(&store);
-        let kept = Kept::load(&store, Path::new("/tmp/agent.sock"));
-        assert_eq!(kept.claim, ("a".to_owned(), ms));
-        let _ = std::fs::remove_dir_all(file.parent().unwrap());
     }
 }
 

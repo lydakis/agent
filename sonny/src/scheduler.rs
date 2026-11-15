@@ -322,21 +322,6 @@ pub(crate) fn let_go(scheduler: Scheduler, dir: &Path, label: &str) {
     }
 }
 
-/// A job of its own an earlier Sonny kept, which the scheduler runs now:
-/// let go of, and its file removed.
-pub(crate) fn retire_old(label: &str) {
-    let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else {
-        return;
-    };
-    let scheduler = Scheduler::here();
-    let dir = scheduler.jobs(&home);
-    let file = dir.join(format!("{label}{}", scheduler.suffix()));
-    if file.exists() {
-        let_go(scheduler, &dir, label);
-        let _ = std::fs::remove_file(&file);
-    }
-}
-
 /// The job under its label from before 0.9.0 in `home`, when there is
 /// one: let go of, its file removed, and the job made again by `make`,
 /// under [`LABEL`]. Whether it is done, so a job that could not be made
@@ -673,13 +658,9 @@ pub fn run() -> i32 {
         // So does a new one when the time zone changed, as the C library
         // keeps the zone it read at the start: its calendar times are
         // worked out again from the times kept, as at any start.
-        // Or the folder of triggers from before 0.8.0, which it works in
-        // while a fire of the old Sonny ran there, moved now that none
-        // does: the new one schedules from its new place.
         if every_minute
             && let Some(me) = &me
-            && (identity(me).is_some_and(|now| Some(now) != born || zone() != zoned)
-                || moved(&places))
+            && identity(me).is_some_and(|now| Some(now) != born || zone() != zoned)
         {
             use std::os::unix::process::CommandExt;
             let error = std::process::Command::new(me).arg(VERB).exec();
@@ -1024,17 +1005,6 @@ fn let_job_go() -> i32 {
         &label(&home),
     );
     0
-}
-
-/// Whether `places`, the folder of triggers from before 0.8.0 this
-/// scheduler works in, moved to its new place just now.
-fn moved(places: &Places) -> bool {
-    let Some(home) = std::env::var_os("HOME") else {
-        return false;
-    };
-    let home = Path::new(&home);
-    places.state != Places::under(home).state
-        && Places::moved(home, true).state == Places::under(home).state
 }
 
 /// Whether HOME is gone, as a test's or an eval's is.

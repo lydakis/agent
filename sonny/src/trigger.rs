@@ -50,9 +50,6 @@ pub fn sent_it(origin: &str) -> bool {
 }
 /// What a trigger's job runs.
 pub const FIRE_FLAG: &str = "--trigger-fire";
-/// How each trigger's own launchd label and systemd unit name started,
-/// before triggers moved to Sonny's scheduler: what [`migrate`] looks for.
-const LABEL: &str = "me.lydakis.agent.trigger.";
 /// A message is a reminder of what to do, not a document.
 const MAX_MESSAGE: usize = 16 * 1024;
 /// Calendar entries one trigger may expand to.
@@ -111,10 +108,6 @@ impl Scheduler {
     }
 }
 
-/// The upgrade migration that moves `~/.agent/triggers` to
-/// `~/.agent/automations`.
-pub(crate) const MOVED: &str = "automations-folder";
-
 /// Where triggers live, `~/.agent/automations`: `jobs` holds their
 /// definitions, and `state` what each one's fires did, their queues of
 /// asks, and the scheduler's own files.
@@ -126,101 +119,12 @@ pub struct Places {
 
 impl Places {
     pub fn home() -> Result<Self, String> {
-        /// The HOME whose folder was found moved: the record that says so
-        /// is not read again for each look at the folder, as a window
-        /// looks every ten seconds.
-        static MOVED_IN: std::sync::Mutex<Option<std::ffi::OsString>> = std::sync::Mutex::new(None);
         let home = std::env::var_os("HOME").ok_or("no HOME for automations")?;
-        let mut moved = MOVED_IN.lock().unwrap_or_else(|p| p.into_inner());
-        if moved.as_ref() == Some(&home) {
-            return Ok(Self::under(Path::new(&home)));
-        }
-        let places = Self::moved(Path::new(&home), false);
-        if places.state == Self::under(Path::new(&home)).state {
-            *moved = Some(home);
-        }
-        Ok(places)
-    }
-    /// The places under `home`, with `~/.agent/triggers`, as the folder was
-    /// named before 0.8.0, moved to its place first, and a restore's list
-    /// renamed with it (upgrade migration `automations-folder`, through
-    /// [`crate::upgrade::once`] here, since the script and the scheduler
-    /// read the folder without Sonny's start). It moves only while nothing
-    /// works in it: no change to its files, no fire running, and no
-    /// scheduler but the caller, when `scheduling` says the caller is its
-    /// scheduler. Else this caller works in the old folder, as what works
-    /// there does, and the scheduler moves it once its fires are done. A
-    /// folder made in its place since is left as it is.
-    pub(crate) fn moved(home: &Path, scheduling: bool) -> Self {
-        let places = Self::under(home);
-        let old = Self::at(home.join(".agent/triggers"));
-        // Nothing to move, and its record would make a HOME gone again.
-        if !home.join(".agent").is_dir() {
-            return places;
-        }
-        let record = home.join(".agent/sonny/migrated");
-        let done = crate::upgrade::once(&record, MOVED, || {
-            // For leads not opened since a restore before 0.8.0,
-            // whether or not the folder can move yet.
-            let list = home.join(".agent/sonny/restored-automations.json");
-            let before = home.join(".agent/sonny/restored-triggers.json");
-            if !list.exists() && before.exists() {
-                let _ = std::fs::rename(&before, &list);
-            }
-            if !places.state.exists() && old.state.is_dir() {
-                let Some(_held) = old.quiet(scheduling) else {
-                    return false;
-                };
-                if std::fs::rename(&old.state, &places.state).is_err() {
-                    return false;
-                }
-                // What chose the old folder before the move, such as an
-                // add still asking its daemon, writes once it takes the
-                // files' lock, held here until this link is there: it
-                // reaches the new folder through it.
-                let _ = std::os::unix::fs::symlink("automations", &old.state);
-            }
-            true
-        });
-        if done { places } else { old }
-    }
-    /// Locks on everything that works in this folder: its files' lock, its
-    /// scheduler's unless the caller is that scheduler, and each running
-    /// fire's. None while any of them is held.
-    fn quiet(&self, scheduling: bool) -> Option<Vec<std::fs::File>> {
-        let mut paths = vec![self.state.join(".lock")];
-        if !scheduling {
-            paths.push(self.scheduling());
-        }
-        let fires = std::fs::read_dir(self.locks())
-            .into_iter()
-            .flatten()
-            .flatten();
-        paths.extend(
-            fires
-                .map(|entry| entry.path())
-                .filter(|path| path.extension().is_some_and(|e| e == "lock")),
-        );
-        let mut held = vec![];
-        for path in paths {
-            // One never made is held by nobody.
-            let Ok(file) = std::fs::OpenOptions::new().write(true).open(&path) else {
-                continue;
-            };
-            use std::os::fd::AsRawFd;
-            // SAFETY: flock on a descriptor this function owns.
-            if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
-                return None;
-            }
-            held.push(file);
-        }
-        Some(held)
+        Ok(Self::under(Path::new(&home)))
     }
     /// Under the HOME `home`.
     pub(crate) fn under(home: &Path) -> Self {
-        Self::at(home.join(".agent/automations"))
-    }
-    fn at(state: PathBuf) -> Self {
+        let state = home.join(".agent/automations");
         Self {
             jobs: state.join("jobs"),
             state,
@@ -1132,14 +1036,6 @@ pub(crate) fn escape(text: &str) -> String {
         .replace('\'', "&apos;")
 }
 
-fn unescape(text: &str) -> String {
-    text.replace("&lt;", "<")
-        .replace("&gt;", ">")
-        .replace("&quot;", "\"")
-        .replace("&apos;", "'")
-        .replace("&amp;", "&")
-}
-
 /// `--file PATH`: a write to the file, or a file added to or removed from
 /// it when it is a folder. It need not exist yet.
 pub fn file(value: &str) -> Result<When, String> {
@@ -1442,38 +1338,6 @@ pub(crate) fn quoted(text: &str, command: bool) -> String {
     out + "\""
 }
 
-/// The words of a command `quoted` wrote.
-fn words(line: &str) -> Option<Vec<String>> {
-    let mut words = Vec::new();
-    let mut chars = line.chars();
-    loop {
-        match chars.find(|c| *c != ' ') {
-            None => return Some(words),
-            Some('"') => {}
-            Some(_) => return None,
-        }
-        let mut word = String::new();
-        loop {
-            match chars.next()? {
-                '"' => break,
-                '\\' => word.push(match chars.next()? {
-                    'n' => '\n',
-                    't' => '\t',
-                    'r' => '\r',
-                    c => c,
-                }),
-                // Doubled: `%%` and `$$`.
-                c @ ('%' | '$') => {
-                    chars.next().filter(|next| *next == c)?;
-                    word.push(c);
-                }
-                c => word.push(c),
-            }
-        }
-        words.push(word);
-    }
-}
-
 /// A definition's trigger and how the scheduler runs it, or why it could
 /// not be read.
 type Read = Result<(Trigger, Job), String>;
@@ -1717,8 +1581,6 @@ impl Trigger {
 /// Where a restore leaves the backup's list of triggers, and which
 /// projects' leads were handed theirs, a line each.
 fn restored_list(home: &Path) -> PathBuf {
-    // Its name before 0.8.0 moves with the folder.
-    let _ = Places::moved(home, false);
     home.join(".agent/sonny/restored-automations.json")
 }
 
@@ -1932,7 +1794,7 @@ pub fn upcoming(places: &Places, store_id: &str, now: i64) -> Vec<Upcoming> {
             let (next, then) = match t.at {
                 Some(at) => ((at > now).then_some(at), None),
                 None => {
-                    let entries = when_again(&t, None).entries;
+                    let entries = when_again(&t).entries;
                     let from = t.not_before.map_or(now, |first| now.max(first - 1));
                     let next = crate::scheduler::next_after(&entries, from);
                     (
@@ -2247,15 +2109,6 @@ impl Lock {
     }
 
     fn flock(places: &Places, how: libc::c_int) -> Result<Self, String> {
-        // The folder from before 0.8.0, gone between its move and its
-        // link: made again here, it would keep what is written in it from
-        // every other process.
-        if places.state.ends_with(".agent/triggers") && places.state.symlink_metadata().is_err() {
-            return Err(format!(
-                "automations_moved: {} moved to automations just now; try again",
-                places.state.display()
-            ));
-        }
         std::fs::create_dir_all(&places.state)
             .map_err(|e| format!("{}: {e}", places.state.display()))?;
         let path = places.state.join(".lock");
@@ -3178,8 +3031,7 @@ pub(crate) fn error_json(message: &str) -> Value {
     }
 }
 
-/// At Sonny's start, off its way: finish what was cut short, carry over
-/// triggers made when each was a job of the system's own, point every
+/// At Sonny's start, off its way: finish what was cut short, point every
 /// trigger at this Sonny when it moved, and see that the scheduler runs
 /// this Sonny when there is anything for it.
 pub fn at_start() {
@@ -3192,17 +3044,6 @@ pub fn refresh_now() {
         return;
     };
     finish(&places);
-    if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
-        let record = home.join(".agent/sonny/migrated");
-        crate::upgrade::once(&record, "scheduler-job", || {
-            let scheduler = Scheduler::here();
-            let let_go = |dir: &Path, label: &str| crate::scheduler::let_go(scheduler, dir, label);
-            let moved = migrate(&places, &home, scheduler, &ring, &let_go);
-            crate::scheduler::retire_old(crate::boot::OLD_LABEL);
-            crate::scheduler::retire_old(crate::home::OLD_LABEL);
-            moved
-        });
-    }
     refresh(&places, &sonny);
     crate::scheduler::at_start();
 }
@@ -3387,197 +3228,10 @@ fn upgrade_done(home: &Path) -> bool {
         .any(|id| id == CLEANUP_FRESH)
 }
 
-/// Each trigger made when it was a job of the system's own (a LaunchAgent
-/// or a user service of its own, under [`LABEL`]) becomes a definition for
-/// the scheduler, and the system lets go of its job. Only one made from
-/// `home` moves: its tag is `home`'s, or, from before labels had a tag, it
-/// runs with `home` as HOME; systemd's unit folder can be one that several
-/// HOMEs share, and another HOME's trigger is that HOME's to move, at its
-/// own Sonny's start. One that cannot be read is left as it is. `let_go`
-/// asks the system to let go of an old job, given its folder and label.
-/// Whether every one this HOME's start could move moved: one that failed is
-/// tried again at the next start.
-pub fn migrate(
-    places: &Places,
-    home: &Path,
-    scheduler: Scheduler,
-    ring: Ring,
-    let_go: &dyn Fn(&Path, &str),
-) -> bool {
-    let dir = scheduler.jobs(home);
-    let tag = home_tag(home.as_os_str());
-    let suffix = scheduler.suffix();
-    let old: Vec<(String, String)> = std::fs::read_dir(&dir)
-        .into_iter()
-        .flatten()
-        .flatten()
-        .filter_map(|e| e.file_name().into_string().ok())
-        .filter_map(|f| {
-            let rest = f.strip_prefix(LABEL)?.strip_suffix(suffix)?;
-            let name = match rest.strip_prefix(&format!("{tag}.")) {
-                Some(name) => name,
-                None if !tagged(rest) => rest,
-                None => return None,
-            };
-            valid_name(name).ok()?;
-            Some((format!("{LABEL}{rest}"), name.to_owned()))
-        })
-        .collect();
-    let (mut moved, mut all) = (false, true);
-    for (label, name) in old {
-        match migrated(places, home, scheduler, &dir, &label, &name, let_go) {
-            Ok(done) => moved |= done,
-            Err(error) => {
-                all = false;
-                eprintln!("{}", error_json(&error));
-            }
-        }
-    }
-    if moved && let Err(error) = ring() {
-        eprintln!("{}", error_json(&error));
-    }
-    all
-}
-
-/// Whether a label, past [`LABEL`], starts with a HOME's tag.
-fn tagged(rest: &str) -> bool {
-    let bytes = rest.as_bytes();
-    bytes.get(8) == Some(&b'.')
-        && bytes[..8]
-            .iter()
-            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(b))
-}
-
-/// Under the lock, move one trigger's old job to its definition: written
-/// unless a definition of the name is there already, then the old job let
-/// go of and its file removed. Whether it moved.
-fn migrated(
-    places: &Places,
-    home: &Path,
-    scheduler: Scheduler,
-    dir: &Path,
-    label: &str,
-    name: &str,
-    let_go: &dyn Fn(&Path, &str),
-) -> Result<bool, String> {
-    let _lock = Lock::take(places)?;
-    let old = dir.join(format!("{label}{}", scheduler.suffix()));
-    let text = match read_record(&old) {
-        Ok(text) => text,
-        Err(_) if !old.exists() => return Ok(false),
-        Err(error) => return Err(format!("{}: {error}", old.display())),
-    };
-    let plist = text.trim_start().starts_with('<');
-    let Some((trigger, app)) = old_program(&text, plist).and_then(|args| trigger_of(&args)) else {
-        return Ok(false);
-    };
-    // A label from before tags: only a trigger made from this HOME.
-    let home = home.to_string_lossy();
-    let from_home = match old_environment(&text, plist)
-        .into_iter()
-        .find(|(k, _)| k == "HOME")
-    {
-        Some((_, value)) => value == home,
-        None => true,
-    };
-    if !label.ends_with(&format!(
-        ".{}.{name}",
-        home_tag(std::ffi::OsStr::new(&*home))
-    )) && !from_home
-    {
-        return Ok(false);
-    }
-    if !stored(&places.job(name)) {
-        let environment = old_environment(&text, plist);
-        let environment: Vec<(&str, String)> = environment
-            .iter()
-            .map(|(k, v)| (k.as_str(), v.clone()))
-            .collect();
-        let when = when_again(&trigger, old_watched(&text, plist));
-        queues(&places.asks(name))?;
-        replace(
-            &places.job(name),
-            &definition(&app, &trigger, &when, &environment),
-        )?;
-    }
-    let_go(dir, label);
-    forget(&old)?;
-    Ok(true)
-}
-
-/// An old job's program arguments: a plist's, or a unit's command.
-fn old_program(text: &str, plist: bool) -> Option<Vec<String>> {
-    if !plist {
-        let line = text.lines().find_map(|l| l.strip_prefix("ExecStart="))?;
-        return words(line);
-    }
-    let rest = &text[text.find("<key>ProgramArguments</key>")?..];
-    let array = &rest[rest.find("<array>")? + "<array>".len()..rest.find("</array>")?];
-    Some(plist_strings(array))
-}
-
-/// Every `<string>` in a plist's piece, unescaped.
-fn plist_strings(mut at: &str) -> Vec<String> {
-    let mut found = Vec::new();
-    while let Some(start) = at.find("<string>") {
-        let body = &at[start + "<string>".len()..];
-        let Some(end) = body.find("</string>") else {
-            break;
-        };
-        found.push(unescape(&body[..end]));
-        at = &body[end + "</string>".len()..];
-    }
-    found
-}
-
-/// An old job's environment.
-fn old_environment(text: &str, plist: bool) -> Vec<(String, String)> {
-    if !plist {
-        return text
-            .lines()
-            .filter_map(|l| words(l.strip_prefix("Environment=")?)?.pop())
-            .filter_map(|pair| {
-                let (key, value) = pair.split_once('=')?;
-                Some((key.to_owned(), value.to_owned()))
-            })
-            .collect();
-    }
-    // Each `<key>K</key><string>V</string>` on a line of its own, as Sonny
-    // wrote them.
-    let Some(at) = text.find("<key>EnvironmentVariables</key>") else {
-        return Vec::new();
-    };
-    let rest = &text[at..];
-    rest[..rest.find("</dict>").unwrap_or(rest.len())]
-        .lines()
-        .filter_map(|line| {
-            let key = line.trim().strip_prefix("<key>")?;
-            let (key, value) = key.split_once("</key>")?;
-            Some((key.to_owned(), plist_strings(value).into_iter().next()?))
-        })
-        .collect()
-}
-
-/// The path an old job had its scheduler watch.
-fn old_watched(text: &str, plist: bool) -> Option<PathBuf> {
-    if !plist {
-        let at = text.find("\n[X-Path]\n")?;
-        let line = text[at..]
-            .lines()
-            .find_map(|l| l.strip_prefix("PathChanged="))?;
-        return Some(PathBuf::from(line.replace("%%", "%")));
-    }
-    let rest = &text[text.find("<key>WatchPaths</key>")?..];
-    plist_strings(&rest[..rest.find("</array>")?])
-        .into_iter()
-        .next()
-        .map(PathBuf::from)
-}
-
 /// A trigger's calendar again, from what it carries: a one-off's time, an
 /// interval counted from the minute it was made (its first time less one
-/// interval), a cron expression; and the path it watched.
-fn when_again(trigger: &Trigger, watch: Option<PathBuf>) -> When {
+/// interval), a cron expression.
+fn when_again(trigger: &Trigger) -> When {
     let entries = if let Some(at) = trigger.at {
         let at = local(at);
         vec![Entry {
@@ -3610,7 +3264,7 @@ fn when_again(trigger: &Trigger, watch: Option<PathBuf>) -> When {
         entries,
         not_before: trigger.not_before,
         at: trigger.at,
-        watch,
+        watch: None,
     }
 }
 
@@ -6923,19 +6577,6 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn a_unit_s_words_read_back_as_they_were_quoted() {
-        let tricky = [
-            "", "a b", "\"q\"", "\\", "%%", "$$x", ";", "é\n\t\r", "-- x",
-        ];
-        let line: Vec<String> = tricky.iter().map(|w| quoted(w, true)).collect();
-        assert_eq!(words(&line.join(" ")).unwrap(), tricky);
-        // Only what Sonny quoted reads back.
-        assert_eq!(words("\"a\" b"), None);
-        assert_eq!(words("\"open"), None);
-        assert_eq!(words("\"50%\""), None);
-    }
-
-    #[test]
     fn a_path_systemd_cannot_hold_is_refused() {
         for bad in [
             "/tmp/a\nExecStartPre=/bin/true",
@@ -8711,62 +8352,6 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn the_triggers_folder_moves_to_automations_once() {
-        let w = World::new("moved");
-        let old = w.root.join(".agent/triggers");
-        std::fs::create_dir_all(old.join("jobs")).unwrap();
-        std::fs::write(old.join("jobs/p.x.json"), "{}").unwrap();
-        let hold = |path: PathBuf| {
-            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-            let file = std::fs::File::create(path).unwrap();
-            use std::os::fd::AsRawFd;
-            // SAFETY: flock on a descriptor this closure owns.
-            assert_eq!(unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) }, 0);
-            file
-        };
-        // A fire of the old Sonny still running there: everything stays
-        // in the old folder until it is done, its scheduler too.
-        let sonny = w.root.join(".agent/sonny");
-        std::fs::create_dir_all(&sonny).unwrap();
-        std::fs::write(sonny.join("restored-triggers.json"), "[]").unwrap();
-        let fire = hold(old.join(".scheduler/p.x.lock"));
-        for scheduling in [false, true] {
-            assert_eq!(Places::moved(&w.root, scheduling).state, old);
-        }
-        assert!(!w.places.state.exists());
-        let record = sonny.join("migrated");
-        assert!(!crate::upgrade::lines(&record).contains(&MOVED.to_owned()));
-        // A restore's list is renamed without waiting for the folder.
-        assert!(sonny.join("restored-automations.json").exists());
-        drop(fire);
-        // Its scheduler, still running: only that scheduler moves it.
-        let scheduler = hold(old.join(".scheduler/scheduler"));
-        assert_eq!(Places::moved(&w.root, false).state, old);
-        assert_eq!(Places::moved(&w.root, true).state, w.places.state);
-        drop(scheduler);
-        assert!(w.places.jobs.join("p.x.json").exists());
-        assert!(crate::upgrade::lines(&record).contains(&MOVED.to_owned()));
-        assert!(!sonny.join("restored-triggers.json").exists());
-        // What chose the old folder before the move reaches the new one
-        // through a link.
-        let before = Places::at(old.clone());
-        assert!(old.symlink_metadata().unwrap().file_type().is_symlink());
-        drop(Lock::take(&before).unwrap());
-        assert!(before.job("p.x").exists());
-        // Between the move and the link, it is told to try again rather
-        // than make the old folder again.
-        std::fs::remove_file(&old).unwrap();
-        assert!(Lock::take(&before).is_err_and(|e| e.starts_with("automations_moved:")));
-        assert!(!old.exists());
-        // One made in its place since stays as it is.
-        std::fs::create_dir_all(old.join("jobs")).unwrap();
-        assert_eq!(Places::moved(&w.root, false).state, w.places.state);
-        assert!(old.is_dir() && w.places.jobs.join("p.x.json").exists());
-        // Prompts from before the rename are still an automation's.
-        assert!(sent_it("trigger") && sent_it(ORIGIN) && !sent_it("commons"));
-    }
-
-    #[test]
     fn a_file_trigger_cannot_watch_the_triggers_own_folder() {
         let w = World::new("own-state");
         std::fs::create_dir_all(&w.places.state).unwrap();
@@ -9577,206 +9162,6 @@ pub(crate) mod tests {
         assert_eq!(home_tag(OsStr::new("/Users/ana/")), "21fce129");
         assert_eq!(home_tag(OsStr::new("/tmp/eval-1")), "535e3091");
         assert_eq!(home_tag(OsStr::new("/")), "29622bb2");
-        assert!(tagged("11c173e6.p.fix-login"));
-        assert!(!tagged("p.fix-login") && !tagged("11C173E6.x") && !tagged("11c173e6"));
-    }
-
-    /// A trigger's LaunchAgent as an earlier Sonny wrote it, with what
-    /// moving it reads.
-    fn old_plist(
-        label: &str,
-        s: &Trigger,
-        environment: &[(&str, &str)],
-        watch: Option<&str>,
-    ) -> String {
-        let string = |v: &str| format!("<string>{}</string>", escape(v));
-        let mut out = format!(
-            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<plist version=\"1.0\">\n<dict>\n  <key>Label</key>\n  {}\n  <key>ProgramArguments</key>\n  <array>\n",
-            string(label)
-        );
-        for arg in std::iter::once("/A/agent-app".to_owned()).chain(s.args()) {
-            out += &format!("    {}\n", string(&arg));
-        }
-        out += "  </array>\n  <key>StartCalendarInterval</key>\n  <array>\n    <dict><key>Minute</key><integer>7</integer></dict>\n  </array>\n";
-        if let Some(path) = watch {
-            out += &format!(
-                "  <key>WatchPaths</key>\n  <array>\n    {}\n  </array>\n",
-                string(path)
-            );
-        }
-        if !environment.is_empty() {
-            out += "  <key>EnvironmentVariables</key>\n  <dict>\n";
-            for (key, value) in environment {
-                out += &format!("    <key>{key}</key>{}\n", string(value));
-            }
-            out += "  </dict>\n";
-        }
-        out + "  <key>ProcessType</key>\n  <string>Background</string>\n</dict>\n</plist>\n"
-    }
-
-    /// A trigger's user service as an earlier Sonny wrote it.
-    fn old_unit(s: &Trigger, environment: &[(&str, &str)], watch: Option<&str>) -> String {
-        let command: Vec<String> = std::iter::once("/A/agent-app".to_owned())
-            .chain(s.args())
-            .map(|arg| quoted(&arg, true))
-            .collect();
-        let mut out = format!(
-            "# Sonny's trigger {0}\n[Unit]\nDescription=Sonny trigger {0}\n\n[Service]\nType=oneshot\nExecStart={1}\n",
-            s.name,
-            command.join(" ")
-        );
-        for (key, value) in environment {
-            out += &format!("Environment={}\n", quoted(&format!("{key}={value}"), false));
-        }
-        out += "\n[X-Timer]\nOnCalendar=*-*-* *:07:00\nPersistent=true\n\n[X-Path]\n";
-        if let Some(path) = watch {
-            out += &format!("PathChanged={}\n", path.replace('%', "%%"));
-        }
-        out + "DirectoryNotEmpty=/q\n"
-    }
-
-    #[test]
-    fn a_launchagent_from_before_becomes_a_definition_once() {
-        let w = World::new("migrate");
-        let home = w.root.join("home");
-        let dir = Scheduler::Launchd.jobs(&home);
-        std::fs::create_dir_all(&dir).unwrap();
-        let tag = home_tag(home.as_os_str());
-        let first = every("1d", clock(2026, 9, 28, 9, 7)).unwrap();
-        let s = Trigger {
-            not_before: first.not_before,
-            when: "every 1d".into(),
-            message: "a <look> & \"more\"".into(),
-            ..trigger()
-        };
-        // Tagged with this HOME's tag, and watching a path.
-        let label = format!("{LABEL}{tag}.{}", s.name);
-        let old = dir.join(format!("{label}.plist"));
-        let environment = [("HOME", home.to_str().unwrap()), ("SHELL", "/bin/zsh")];
-        std::fs::write(
-            &old,
-            old_plist(&label, &s, &environment, Some("/repo/.git/HEAD")),
-        )
-        .unwrap();
-        // From before tags: this HOME's moves, another's stays for its own Sonny.
-        let mine = Trigger {
-            name: "mine".into(),
-            ..s.clone()
-        };
-        let untagged = dir.join(format!("{LABEL}mine.plist"));
-        std::fs::write(
-            &untagged,
-            old_plist(&format!("{LABEL}mine"), &mine, &environment, None),
-        )
-        .unwrap();
-        let theirs = Trigger {
-            name: "theirs".into(),
-            ..s.clone()
-        };
-        let elsewhere = dir.join(format!("{LABEL}theirs.plist"));
-        let other = old_plist(
-            &format!("{LABEL}theirs"),
-            &theirs,
-            &[("HOME", "/elsewhere")],
-            None,
-        );
-        std::fs::write(&elsewhere, &other).unwrap();
-        // Another HOME's tag is never this one's.
-        let tagged_other = dir.join(format!("{LABEL}0123abcd.x.plist"));
-        std::fs::write(&tagged_other, &other).unwrap();
-        let let_go = std::cell::RefCell::new(Vec::new());
-        let record =
-            |at: &Path, label: &str| let_go.borrow_mut().push((at.to_owned(), label.to_owned()));
-        assert!(migrate(
-            &w.places,
-            &home,
-            Scheduler::Launchd,
-            &|| w.fake.ring(),
-            &record,
-        ));
-        assert!(!old.exists() && !untagged.exists());
-        assert_eq!(std::fs::read_to_string(&elsewhere).unwrap(), other);
-        assert!(tagged_other.exists() && !w.places.job("theirs").exists());
-        let mut gone = let_go.borrow().clone();
-        gone.sort();
-        let mut want = vec![
-            (dir.clone(), label.clone()),
-            (dir.clone(), format!("{LABEL}mine")),
-        ];
-        want.sort();
-        assert_eq!(gone, want);
-        assert_eq!(w.fake.rings.get(), 1);
-        // The definition fires as the job did, at the times it had.
-        let job = Job::read(&w.plist(&s.name)).unwrap();
-        assert_eq!(read_job(&w.plist(&s.name)).unwrap().0, s);
-        assert_eq!(job.calendar, first.entries);
-        assert_eq!(job.watch, Some(PathBuf::from("/repo/.git/HEAD")));
-        assert!(
-            job.environment
-                .contains(&("SHELL".into(), "/bin/zsh".into()))
-        );
-        assert!(w.places.asks(&s.name).is_dir());
-        assert_eq!(w.rows().len(), 2);
-        // Once: nothing is left to move.
-        assert!(migrate(
-            &w.places,
-            &home,
-            Scheduler::Launchd,
-            &|| w.fake.ring(),
-            &record,
-        ));
-        assert_eq!(w.fake.rings.get(), 1);
-        assert_eq!(let_go.borrow().len(), 2);
-    }
-
-    #[test]
-    fn a_user_service_from_before_becomes_a_definition() {
-        let w = World::new("migrate-unit");
-        let home = w.root.join("home");
-        let dir = Scheduler::Systemd.jobs(&home);
-        std::fs::create_dir_all(&dir).unwrap();
-        let s = Trigger {
-            message: "100% $HOME \"quoted\"".into(),
-            ..trigger()
-        };
-        let label = format!("{LABEL}{}", s.name);
-        let old = dir.join(format!("{label}.service"));
-        let environment = [("HOME", home.to_str().unwrap())];
-        std::fs::write(&old, old_unit(&s, &environment, Some("/repo/50%"))).unwrap();
-        // A definition of the name already there stays as it is.
-        let kept = Trigger {
-            name: "kept".into(),
-            ..s.clone()
-        };
-        assert_eq!(w.install(&kept).unwrap(), None);
-        let before = w.plist("kept");
-        let older = dir.join(format!("{LABEL}kept.service"));
-        std::fs::write(
-            &older,
-            old_unit(
-                &Trigger {
-                    message: "older".into(),
-                    ..kept.clone()
-                },
-                &environment,
-                None,
-            ),
-        )
-        .unwrap();
-        assert!(migrate(
-            &w.places,
-            &home,
-            Scheduler::Systemd,
-            &|| w.fake.ring(),
-            &|_, _| {},
-        ));
-        assert!(!old.exists() && !older.exists());
-        assert_eq!(w.plist("kept"), before);
-        assert_eq!(read_job(&w.plist(&s.name)).unwrap().0, s);
-        assert_eq!(
-            Job::read(&w.plist(&s.name)).unwrap().watch,
-            Some(PathBuf::from("/repo/50%"))
-        );
     }
 
     #[test]
