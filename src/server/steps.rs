@@ -29,7 +29,7 @@ use agent_runtime::{
 };
 use serde_json::{Value, json};
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
     path::PathBuf,
     sync::Arc,
 };
@@ -86,6 +86,9 @@ pub(super) struct Steps {
     captured: HashMap<Key, Arc<Capture>>,
     /// Each bot's steps in flight.
     by_bot: HashMap<Box<str>, usize>,
+    /// The calls of each turn with a step in flight or a capture, so a
+    /// turn's end visits only its own.
+    by_turn: HashMap<i64, HashSet<Box<str>>>,
     /// Steps waiting for their decision's store job.
     asking: Queue,
     /// Steps' store jobs under way, at most [`STORE_WINDOW`] decisions.
@@ -188,8 +191,33 @@ impl Steps {
             "commands":self.commands,"bytes":self.bytes,"ran":self.ran,"refused":self.refused})
     }
 
+    /// Call `key` has a flight or a capture now.
+    fn index(&mut self, (turn, call): &Key) {
+        self.by_turn.entry(*turn).or_default().insert(call.clone());
+    }
+
+    /// Call `key` may have neither a flight nor a capture now.
+    fn unindex(&mut self, key: &Key) {
+        if self.flights.contains_key(key) || self.captured.contains_key(key) {
+            return;
+        }
+        if let Some(calls) = self.by_turn.get_mut(&key.0) {
+            calls.remove(&key.1);
+            if calls.is_empty() {
+                self.by_turn.remove(&key.0);
+            }
+        }
+    }
+
+    /// Let call `key`'s capture go.
+    fn forget(&mut self, key: &Key) {
+        self.captured.remove(key);
+        self.unindex(key);
+    }
+
     fn take(&mut self, key: &Key) -> Option<Flight> {
         let flight = self.flights.remove(key)?;
+        self.unindex(key);
         self.bytes -= flight.bytes;
         if let Some(count) = self.by_bot.get_mut(flight.ask.bot.as_str()) {
             *count -= 1;
@@ -320,6 +348,7 @@ impl Service {
                 stopped: None,
             },
         );
+        steps.index(&key);
         steps.asking.push(key, serial);
         self.ask_steps();
         Err(Error::new("deferred"))
@@ -420,6 +449,7 @@ impl Service {
         };
         if let Some(capture) = capture {
             self.steps.captured.entry(key.clone()).or_insert(capture);
+            self.steps.index(&key);
         }
         match opened {
             Ok(StepOpened::Run { capture, confined }) => self.line_step(key, capture, confined),
@@ -490,7 +520,7 @@ impl Service {
                             | "turn_not_found"
                     )
                 {
-                    self.steps.captured.remove(&key);
+                    self.steps.forget(&key);
                 }
                 self.steps.refused += 1;
                 reply(&mut self.steps, &flight, Err(error));
@@ -758,7 +788,7 @@ impl Service {
     /// An answered call ended: its step stopped, and what it captured let go.
     pub(super) fn call_ended(&mut self, turn: i64, call_id: &str, why: &'static str) {
         let key: Key = (turn, call_id.into());
-        self.steps.captured.remove(&key);
+        self.steps.forget(&key);
         self.stop_step(&key, why, false);
     }
 
@@ -766,14 +796,10 @@ impl Service {
     /// message lifted, which waits on past its turn. Which those are, the
     /// store says, read only when the turn has steps.
     pub(super) fn steps_turn_ended(&mut self, turn: i64) {
-        let calls: Vec<Box<str>> = (self.steps.captured.keys())
-            .chain(self.steps.flights.keys())
-            .filter(|(of, _)| *of == turn)
-            .map(|(_, call)| call.clone())
-            .collect();
-        if calls.is_empty() {
+        let Some(calls) = self.steps.by_turn.get(&turn) else {
             return;
-        }
+        };
+        let calls: Vec<Box<str>> = calls.iter().cloned().collect();
         let (store, handles) = (self.store.clone(), self.handles.clone());
         tokio::spawn(async move {
             let lifted = store
