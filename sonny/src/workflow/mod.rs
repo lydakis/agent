@@ -2190,6 +2190,7 @@ mod tests {
         // A journal it can read but not write loads broken, knowing the
         // workers it submitted to, so its end interrupts them. (Root writes
         // past a file's mode.)
+        // SAFETY: geteuid takes nothing and cannot fail.
         if unsafe { libc::geteuid() } != 0 {
             use std::os::unix::fs::PermissionsExt;
             let mut file = std::fs::OpenOptions::new()
