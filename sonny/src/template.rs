@@ -401,6 +401,9 @@ fn environment() -> Environment<'static> {
     env.set_undefined_behavior(UndefinedBehavior::SemiStrict);
     env.set_fuel(Some(FUEL));
     env.set_recursion_limit(DEPTH);
+    // Python's methods on what a blank gives, such as a file's
+    // `.splitlines()` or a string's `.startswith()`: what a model writes.
+    env.set_unknown_method_callback(minijinja_contrib::pycompat::unknown_method_callback);
     env
 }
 
@@ -861,6 +864,29 @@ mod tests {
         );
         std::fs::write(dir.join("gone.json"), "{}").unwrap();
         assert!(changed(&reads), "a file written since shows");
+    }
+
+    #[test]
+    fn a_file_blank_takes_the_python_methods_a_model_writes() {
+        // As a model picked the timeout's line out of a file in the live eval.
+        let dir = tempfile_dir("file-lines");
+        std::fs::write(
+            dir.join("session.py"),
+            "\"\"\"Sessions.\"\"\"\n# five hours\nTIMEOUT = timedelta(seconds=5 * 60)\n",
+        )
+        .unwrap();
+        for template in [
+            "{% for line in file('session.py').splitlines() if 'TIMEOUT =' in line %}{{ line }}{% endfor %}",
+            "{% for line in file('session.py').split('\\n') if line.startswith('TIMEOUT') %}{{ line }}{% endfor %}",
+            "{{ file('session.py').splitlines()[2:3] | join('\\n') }}",
+        ] {
+            let (text, _) = render(template, &data(&dir));
+            assert_eq!(
+                text.unwrap(),
+                "TIMEOUT = timedelta(seconds=5 * 60)",
+                "{template}"
+            );
+        }
     }
 
     #[test]
