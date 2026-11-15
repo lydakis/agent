@@ -952,21 +952,17 @@ pub(crate) fn kept_seen(
     seen
 }
 
-/// Keep what the sky read of every agent's question for the next one,
-/// beside the leads' own (a leading dot, as no lead is named).
-pub(crate) fn keep_sky_seen(
+/// Keep what the sky (`.sky`) or `/switch` (`.switch`) read of every
+/// agent's question for the next, beside the leads' own (a leading dot, as
+/// no lead is named).
+pub(crate) fn keep_seen(
     store: &std::path::Path,
+    by: &str,
     identity: Option<&str>,
     seen: &HashMap<String, (i64, Seen)>,
 ) {
     let store = agent_client::socket::canonical_store(store).unwrap_or_else(|_| store.into());
-    write_reads(
-        &store,
-        ".sky",
-        identity,
-        &HashMap::new(),
-        seen.iter().collect(),
-    );
+    write_reads(&store, by, identity, &HashMap::new(), seen.iter().collect());
 }
 
 /// The build that kept them, which another may read a history otherwise,
@@ -4619,6 +4615,10 @@ struct App {
     picker: Option<models::Picker>,
     /// `/switch`'s list of every agent, open over the composer.
     agents: Option<switch::Picker>,
+    /// The questions of the agents `/switch` lists that no window had
+    /// read, as each read comes back: who, the turn it ended, and what
+    /// its history said, if it could be read.
+    agents_asked: Option<tokio::sync::mpsc::UnboundedReceiver<(String, i64, Option<Seen>)>>,
     /// `/new`, its lists over the composer, then its first message in it.
     making: Option<new::Making>,
     /// The file with the first message for the agent this window becomes,
@@ -6327,6 +6327,7 @@ impl App {
             searching: None,
             config: None,
             listing: None,
+            agents_asked: None,
             reach: None,
             reaching: None,
             agents: None,
@@ -6709,6 +6710,7 @@ impl App {
             self.shell_ran().await;
             self.listed();
             self.reached();
+            self.switch_asked();
             self.follow_place().await;
             self.follow_tab().await;
             self.count_behind().await;
@@ -16462,7 +16464,95 @@ impl App {
         if !typed.is_empty() {
             picker.narrow(typed.to_owned());
         }
+        self.switch_asks(&mut picker);
         self.agents = Some(picker);
+    }
+
+    /// The questions open of the agents `picker` lists, as `/status` and
+    /// the sky read them: each idle one's last turn, as any window or sky
+    /// read it, or, where none did, read now beside the open list, each
+    /// marked as its read comes back ([`App::switch_asked`]) and kept for
+    /// the next. An agent nobody looked at in another project may well be
+    /// the one asking.
+    fn switch_asks(&mut self, picker: &mut switch::Picker) {
+        let store = self.store();
+        let identity = self.client.identity().map(str::to_owned);
+        let kept = kept_seen(&store, identity.as_deref());
+        let mut read: HashMap<String, (i64, Seen)> = HashMap::new();
+        let mut unread = Vec::new();
+        let mut open = Vec::new();
+        for (name, turn) in picker.ended() {
+            let had = [self.asks_seen.get(name), kept.get(name)];
+            match had.into_iter().flatten().find(|(at, _)| *at == turn) {
+                Some((_, seen)) => {
+                    read.insert(name.to_owned(), (turn, seen.clone()));
+                    if seen.clone().open(&store, name, false).is_some() {
+                        open.push((name.to_owned(), turn));
+                    }
+                }
+                // Read on from where an older read stopped.
+                None => {
+                    let was = had
+                        .into_iter()
+                        .flatten()
+                        .map(|(_, seen)| seen.clone())
+                        .next();
+                    unread.push((name.to_owned(), turn, was));
+                }
+            }
+        }
+        for (name, turn) in open {
+            picker.asks(&name, turn);
+        }
+        if unread.is_empty() {
+            self.agents_asked = None;
+            return;
+        }
+        let (tell, told) = tokio::sync::mpsc::unbounded_channel();
+        self.agents_asked = Some(told);
+        let client = self.client.clone();
+        tokio::spawn(async move {
+            for (name, turn, was) in unread {
+                let seen = match &was {
+                    Some(was) => needs::scan_since(&client, &name, Some(turn), was).await,
+                    None => needs::scan(&client, &name, Some(turn)).await,
+                };
+                if let Some(seen) = &seen {
+                    read.insert(name.clone(), (turn, seen.clone()));
+                }
+                if tell.send((name, turn, seen)).is_err() {
+                    break;
+                }
+            }
+            keep_seen(&store, ".switch", identity.as_deref(), &read);
+        });
+    }
+
+    /// Each question `/switch`'s reads found open since, on its row while
+    /// the list is open.
+    fn switch_asked(&mut self) {
+        if self.agents_asked.is_none() {
+            return;
+        }
+        let store = self.store();
+        let Some(told) = &mut self.agents_asked else {
+            return;
+        };
+        loop {
+            match told.try_recv() {
+                Ok((name, turn, Some(seen))) => {
+                    if let Some(picker) = &mut self.agents
+                        && seen.open(&store, &name, false).is_some()
+                    {
+                        picker.asks(&name, turn);
+                    }
+                }
+                Ok((_, _, None)) => {}
+                Err(tokio::sync::mpsc::error::TryRecvError::Empty) => return,
+                Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => break,
+            }
+        }
+        self.agents_asked = None;
     }
 
     /// Takes the agent picked in `/switch`'s list: it opens in this window.
@@ -19903,6 +19993,80 @@ mod tests {
                 .unwrap()
                 .contains(&"shop.fix".to_owned())
         );
+    }
+
+    #[tokio::test]
+    async fn switch_marks_an_agent_whose_question_is_open_as_needing_you() {
+        // `blog.lead`'s last turn asked and nobody answered; no window read
+        // it, so the open list reads it. `notes` asked in a turn already
+        // read, as a window kept it; `done.lead` answered nothing new.
+        let ask = json!({"question": "Ship it now?", "why": "w", "reason": "r",
+            "options": [{"label": "Now"}, {"label": "Later"}], "recommended": 1});
+        let client = daemon_answering(move |asked| {
+            match (asked["op"].as_str().unwrap_or(""), asked["bot"].as_str()) {
+                ("bots", _) => json!({"bots": [
+                    {"name": "blog.lead", "workspace": "/w/blog", "running_turn": null,
+                        "last": {"turn": 4, "status": "completed"}},
+                    {"name": "notes", "workspace": "/w/notes", "running_turn": null,
+                        "last": {"turn": 2, "status": "completed"}},
+                    {"name": "shop.lead", "workspace": "/w/shop", "running_turn": null,
+                        "last": {"turn": 9, "status": "completed"}},
+                ], "next_after": null}),
+                ("history_nodes", Some("blog.lead")) => {
+                    json!({"nodes": [{"node": 16, "turn": 4}], "next_from": null})
+                }
+                ("history_items", Some("blog.lead")) => json!({"items": [
+                    {"node": 16, "item": {"type": "function_call", "name": "ask",
+                        "call_id": "c1", "arguments": ask.to_string()}}]}),
+                ("history_nodes", _) => json!({"nodes": [], "next_from": null}),
+                ("history_items", _) => json!({"items": []}),
+                _ => json!({"nodes": [], "approvals": [], "next_after": null}),
+            }
+        })
+        .await;
+        let home = std::env::temp_dir().join(format!("switch-asks-{}", std::process::id()));
+        std::fs::create_dir_all(&home).unwrap();
+        let mut app = app(client);
+        app.options.store = home.join("state.sqlite");
+        app.project = Some("shop".into());
+        app.workspace = "/w/shop".into();
+        let arguments = json!({"question": "Which name?", "options": [{"label": "A"}]});
+        let call = json!({"type": "function_call", "name": "ask", "call_id": "c2",
+            "turn": 2, "arguments": arguments.to_string()});
+        let question = needs::Seen {
+            ask: asks::open(&[call]),
+            turn: Some(2),
+            ..Default::default()
+        };
+        assert!(question.ask.is_some());
+        app.asks_seen.insert("notes".into(), (2, question));
+        app.input.set("/switch");
+        app.submit().await;
+        let state = |app: &App, name: &str| {
+            let agents = app.agents.as_ref().expect("the list is open");
+            (agents.rows().into_iter())
+                .find(|(agent, _)| agent.name == name)
+                .map(|(agent, _)| agent.state.clone())
+                .unwrap()
+        };
+        // Read before: marked at once.
+        assert_eq!(state(&app, "notes"), "needs you");
+        assert_eq!(state(&app, "shop.lead"), "idle");
+        // Read beside the open list, marked once its read comes back.
+        for _ in 0..200 {
+            app.switch_asked();
+            if app.agents_asked.is_none() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert_eq!(state(&app, "blog.lead"), "needs you");
+        assert_eq!(state(&app, "shop.lead"), "idle");
+        // And kept, so the next list reads none of them again.
+        let kept = kept_seen(&app.store(), app.client.identity());
+        assert_eq!(kept["blog.lead"].0, 4);
+        assert!(kept["blog.lead"].1.ask.is_some());
+        std::fs::remove_dir_all(home).unwrap();
     }
 
     #[tokio::test]

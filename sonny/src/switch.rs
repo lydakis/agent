@@ -15,6 +15,22 @@ pub struct Agent {
     pub about: String,
     /// Its state, as the state table names it.
     pub state: String,
+    /// Another project's folder, which tells it apart.
+    folder: Option<String>,
+    /// The turn it last ended, while none runs: a question read of that
+    /// turn is still open.
+    pub ended: Option<i64>,
+}
+
+impl Agent {
+    /// Its mark says idle; any other state is said in words too, before
+    /// the folder.
+    fn about(state: &str, folder: Option<&str>) -> String {
+        let state = Some(state).filter(|state| *state != crate::started::IDLE);
+        (state.into_iter().chain(folder))
+            .collect::<Vec<_>>()
+            .join(" · ")
+    }
 }
 
 /// What a `bots` row says its agent is doing, as `/status` reads it: needs
@@ -103,23 +119,20 @@ impl Picker {
         let agents: Vec<Agent> = rows
             .into_iter()
             .map(|bot| {
-                // Its mark says idle; any other state is said in words too.
                 let state = state(bot, waits(bot["name"].as_str().unwrap_or("")));
-                let mut about = Vec::new();
-                if state != crate::started::IDLE {
-                    about.push(state.clone());
-                }
                 // Another project's folder tells it apart; this project's
                 // are this folder or its copies, which say nothing more.
-                if rank(bot) > 1
-                    && let Some(folder) = bot["workspace"].as_str().filter(|w| *w != workspace)
-                {
-                    about.push(crate::footer::fish(&crate::tilde(folder)));
-                }
+                let folder = (bot["workspace"].as_str())
+                    .filter(|w| rank(bot) > 1 && *w != workspace)
+                    .map(|folder| crate::footer::fish(&crate::tilde(folder)));
                 Agent {
                     name: bot["name"].as_str().unwrap_or("").to_owned(),
-                    about: about.join(" · "),
+                    about: Agent::about(&state, folder.as_deref()),
                     state,
+                    folder,
+                    ended: (bot["running_turn"].is_null())
+                        .then(|| bot["last"]["turn"].as_i64())
+                        .flatten(),
                 }
             })
             .collect();
@@ -136,6 +149,23 @@ impl Picker {
             agents,
             current: current.to_owned(),
         }
+    }
+
+    /// Every agent listed, with the turn it last ended while none runs.
+    pub fn ended(&self) -> impl Iterator<Item = (&str, i64)> {
+        (self.agents.iter()).filter_map(|agent| Some((agent.name.as_str(), agent.ended?)))
+    }
+
+    /// `name`'s question of its turn `turn` is open, as its history reads:
+    /// it needs the person, while that turn is still its last.
+    pub fn asks(&mut self, name: &str, turn: i64) {
+        let Some(agent) =
+            (self.agents.iter_mut()).find(|agent| agent.name == name && agent.ended == Some(turn))
+        else {
+            return;
+        };
+        agent.state = "needs you".to_owned();
+        agent.about = Agent::about(&agent.state, agent.folder.as_deref());
     }
 
     /// What is typed to narrow the list.
