@@ -273,8 +273,9 @@ fn follows() -> Value {
             its tasks made) or bots by name, through the tasks source, each agent its topic: messages others \
             write in them, the person's quoted, questions to the person, calls awaiting their approval, margin \
             notes put or removed, and each turn's end with its reply. It also hears the sources the person set up outside, each \
-            by name, or one topic of a source as NAME:TOPIC. The commons is a source too, each thread a topic: \
-            posting in a thread follows it as commons.THREAD, and removing that leaves it. \
+            by name, or one topic of a source as NAME:TOPIC, and Sonny's own: the commons, each thread a topic \
+            (posting in a thread follows it as commons.THREAD, removing that leaves it), memory, each fact \
+            saved or removed, and links, each linked machine that comes or goes. \
             Add steer yourself for what you own; a filter or a digest only when the person asks: \
             what a filter leaves out you never hear, and a digest makes you late. Add or remove one by name, \
             as {\"name\": \"leads\", \"bots\": [\"web.lead\"], \"sources\": [\"mail\"]}; with neither, \

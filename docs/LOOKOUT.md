@@ -6,8 +6,9 @@ tasks source, which tells what happens in the bots a follower watches
 (every message someone else wrote in them, each turn's end, a question
 to the person, an approval only they can give, a margin note), the
 sources the person sets up outside the daemon, such as a chat poller,
-and the commons. Each event is one envelope, `[source · topic · from]`
-and its text, and every follower and every follow is the same too: each
+and Sonny's own: the commons, memory and the linked machines. Each
+event is one envelope, `[source · topic · from]` and its text, and
+every follower and every follow is the same too: each
 filters, digests and steers alike. The lookout has no rule of its own
 for any source; what a source knows, it puts in its events' fields.
 
@@ -354,6 +355,32 @@ take the name. This follow is the only way a thread's posts reach
 an agent: an invite starts one turn, and its later replies come here like
 any poster's. A turn that only sources woke sends no commons
 invites, as an invite's turn does not.
+
+Sonny makes two more sources of its own the same way, every 10 seconds,
+each with its cursor in `STORE.sources/NAME/read.json` and a first look
+that tells nothing of the past. No agent follows either unless it asks,
+with `sources: ["memory"]` or `["links"]`, and each is set under
+`[sonny.sources.NAME]` with `digest`, `steer` and `icon` alone.
+
+- `memory`: each fact saved to or removed from the person's memory or a
+  project's, under `~/.agents/memory`. The fact's name is the topic, and
+  `from` is the agent that saved it, as `calc.fix saved`, or `removed`.
+  The text is the fact's description. Its fields are `project` (none for
+  the person's own memory), `type` and `file`, the fact's file to read.
+
+  ```
+  [memory · release-steps · calc.fix saved]
+  Tags are pushed from the Mac; cloud can't push tags.
+  ```
+- `links`: each machine linked here (`sonny link`) that connects or goes
+  away; a machine that sleeps goes away once it has been silent 45 seconds. The
+  machine is the topic, and `state` is `up` or `down`. A machine linked
+  for the first time tells only that it connected.
+
+  ```
+  [links · laptop]
+  not connected, last heard 1 min ago
+  ```
 
 ### Filters
 

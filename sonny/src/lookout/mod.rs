@@ -17,6 +17,7 @@
 //! are another companion's (`tool_host`), which signals it to read the
 //! subscription files a call wrote (`reread_now`).
 pub(crate) mod activity;
+pub(crate) mod memory;
 pub(crate) mod pattern;
 pub(crate) mod sources;
 pub(crate) mod subs;

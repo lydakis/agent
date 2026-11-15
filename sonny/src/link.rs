@@ -205,7 +205,12 @@ pub fn stamp() -> Vec<(String, std::time::SystemTime)> {
 
 /// When `machine` last said a word here, in milliseconds.
 fn seen(machine: &str) -> Option<u64> {
-    let text = std::fs::read_to_string(here()?.join(format!("{machine}.seen"))).ok()?;
+    seen_in(&here()?, machine)
+}
+
+/// [`seen`], kept in `dir`.
+fn seen_in(dir: &Path, machine: &str) -> Option<u64> {
+    let text = std::fs::read_to_string(dir.join(format!("{machine}.seen"))).ok()?;
     text.trim().parse().ok()
 }
 
@@ -213,9 +218,77 @@ fn seen(machine: &str) -> Option<u64> {
 /// heard from it lately. A session ends by removing its socket, so one
 /// just ended is not connected however lately it heard.
 fn up(machine: &str) -> bool {
-    let serving = here().is_some_and(|dir| dir.join(format!("{machine}.sock")).exists());
-    serving
-        && seen(machine).is_some_and(|ms| now_ms().saturating_sub(ms) < SILENT.as_millis() as u64)
+    here().is_some_and(|dir| up_in(&dir, machine))
+}
+
+/// [`up`], kept in `dir`: when the session serving it started, while it
+/// is connected.
+fn up_in(dir: &Path, machine: &str) -> bool {
+    since_in(dir, machine).is_some()
+}
+
+/// When the session serving `machine` in `dir` started, in milliseconds,
+/// while it is connected.
+fn since_in(dir: &Path, machine: &str) -> Option<u64> {
+    let socket = std::fs::metadata(dir.join(format!("{machine}.sock"))).ok()?;
+    let heard = seen_in(dir, machine)?;
+    (now_ms().saturating_sub(heard) < SILENT.as_millis() as u64).then_some(())?;
+    let started = socket
+        .modified()
+        .ok()?
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?;
+    Some(started.as_millis() as u64)
+}
+
+/// What Sonny's own `links` source says since its last look: a line for
+/// each machine linked here that came or went, the machine its topic.
+/// `cursor` is the source's own folder, where how each machine stood is
+/// kept; the first look tells none, so a new store is not told the past.
+pub fn news(cursor: &Path) -> crate::lookout::sources::News {
+    here().map_or_else(Default::default, |dir| news_in(&dir, cursor))
+}
+
+fn news_in(dir: &Path, cursor: &Path) -> crate::lookout::sources::News {
+    let path = cursor.join("read.json");
+    let first = !path.exists();
+    let had: serde_json::Map<String, Value> = std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|text| serde_json::from_str::<Value>(&text).ok())
+        .and_then(|value| value.as_object().cloned())
+        .unwrap_or_default();
+    let mut now = serde_json::Map::new();
+    let mut lines = Vec::new();
+    for machine in machines_in(dir) {
+        let name = machine.name;
+        let since = since_in(dir, &name);
+        let state = if since.is_some() { "up" } else { "down" };
+        now.insert(name.clone(), json!(state));
+        let was = had.get(&name).and_then(Value::as_str);
+        // A machine first linked tells that it came, never that it is away.
+        if first || was == Some(state) || (was.is_none() && state == "down") {
+            continue;
+        }
+        let line = match since {
+            Some(since) => json!({"id": format!("{name}/up/{since}"), "topic": name,
+                "text": "connected", "state": "up"}),
+            None => {
+                let heard = seen_in(dir, &name);
+                let text = heard.map_or_else(
+                    || "not connected".to_owned(),
+                    |ms| format!("not connected, last heard {}", ago(ms)),
+                );
+                json!({"id": format!("{name}/down/{}", heard.unwrap_or(0)), "topic": name,
+                    "text": text, "state": "down"})
+            }
+        };
+        lines.push(line.to_string());
+    }
+    let changed = first || now != had;
+    crate::lookout::sources::News {
+        lines,
+        read: changed.then_some((path, now)),
+    }
 }
 
 /// How long ago `ms` was, in a few words.
@@ -1913,6 +1986,56 @@ mod tests {
         assert_eq!(name_of("me@devbox.example.com"), "devbox");
         assert_eq!(name_of("me@10.0.0.2"), "10");
         assert_eq!(name_of("we_ird!"), "we_ird-");
+    }
+
+    #[test]
+    fn a_machine_that_comes_or_goes_is_one_event_and_the_past_is_not_told() {
+        let dir = scratch("news");
+        let cursor = dir.join("cursor");
+        std::fs::write(dir.join("laptop.json"), "{}").unwrap();
+        let said = |news: &crate::lookout::sources::News| -> Vec<Value> {
+            news.lines
+                .iter()
+                .map(|line| serde_json::from_str(line).unwrap())
+                .collect()
+        };
+        // Away at the first look: nothing told, as nothing changed.
+        let first = news_in(&dir, &cursor);
+        assert!(first.lines.is_empty());
+        assert!(first.mark_read());
+        // It dials in.
+        std::fs::write(dir.join("laptop.sock"), "").unwrap();
+        std::fs::write(dir.join("laptop.seen"), now_ms().to_string()).unwrap();
+        let came = news_in(&dir, &cursor);
+        let lines = said(&came);
+        assert_eq!(lines.len(), 1);
+        assert_eq!(
+            (&lines[0]["topic"], &lines[0]["text"], &lines[0]["state"]),
+            (&json!("laptop"), &json!("connected"), &json!("up"))
+        );
+        // Read again before it is kept, it is the same event.
+        assert_eq!(said(&news_in(&dir, &cursor))[0]["id"], lines[0]["id"]);
+        assert!(came.mark_read());
+        assert!(news_in(&dir, &cursor).lines.is_empty());
+        // It goes quiet, as a machine asleep does.
+        let quiet = now_ms() - SILENT.as_millis() as u64 - 60_000;
+        std::fs::write(dir.join("laptop.seen"), quiet.to_string()).unwrap();
+        let went = said(&news_in(&dir, &cursor));
+        assert_eq!(went.len(), 1);
+        assert_eq!(
+            (&went[0]["state"], &went[0]["text"]),
+            (
+                &json!("down"),
+                &json!("not connected, last heard 1 min ago")
+            )
+        );
+        // A machine linked for the first time tells only that it came.
+        std::fs::write(dir.join("desk.json"), "{}").unwrap();
+        let told = said(&news_in(&dir, &cursor));
+        assert_eq!(
+            told.iter().map(|l| &l["topic"]).collect::<Vec<_>>(),
+            [&json!("laptop")]
+        );
     }
 
     fn scratch(name: &str) -> PathBuf {
