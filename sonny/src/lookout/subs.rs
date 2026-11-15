@@ -570,6 +570,35 @@ impl Counts {
         let last = super::sources::clock(u128::from(count.last_ms));
         Some(json!({"heard": heard, "notes": notes, "steers": steers, "last": last}))
     }
+
+    /// What `sub` told in the last 24 hours as of `now_ms`, as its page
+    /// says it, counted under the same settings for whichever bot of the
+    /// subscriber's name it is for: none when it told nothing yet.
+    pub fn lately(&self, sub: &Sub, now_ms: u64) -> Option<Lately> {
+        let settings = sub.identity(None);
+        let mut count = (self.0.get(&sub.name))
+            .filter(|count| count.of.ends_with(&settings))?
+            .clone();
+        count.recent(now_ms);
+        let (mut notes, mut steers) = (0, 0);
+        for (_, [_, n, s]) in &count.hours {
+            (notes, steers) = (notes + n, steers + s);
+        }
+        Some(Lately {
+            notes,
+            steers,
+            last_ms: count.last_ms,
+        })
+    }
+}
+
+/// What a subscription told in the last 24 hours: its notes, how many of
+/// them steered, and when it last told, in ms.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Lately {
+    pub notes: u64,
+    pub steers: u64,
+    pub last_ms: u64,
 }
 
 /// Where the lookout keeps a subscriber's counts.

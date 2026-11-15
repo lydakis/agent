@@ -205,6 +205,92 @@ fn down(store: &Path) -> HashMap<String, lookout::sources::Down> {
     })
 }
 
+/// The newest word each source `sub` names said that it hears, by the
+/// name as written (`ci`, `ci:main`), and when: as
+/// [`lookout::sources::status`] reads it, or, for a follow with a filter,
+/// the newest its filter takes, read from the log's end. Read again only
+/// once one of their logs changes, or the follow does.
+fn newest(store: &Path, sub: &lookout::subs::Sub) -> HashMap<String, (String, u128)> {
+    static KEPT: kept::Slot<HashMap<String, (String, u128)>> = kept::Slot::new(None);
+    let dir = lookout::beside(store, ".sources");
+    let named: Vec<(&str, Option<&str>)> = (sub.sources.iter())
+        .map(|s| lookout::sources::named(s))
+        .collect();
+    let paths = (named.iter())
+        .map(|(name, _)| lookout::sources::recent_file(&dir, name))
+        .collect();
+    let filter = sub
+        .filter
+        .as_ref()
+        .map(Value::to_string)
+        .unwrap_or_default();
+    let key = format!("{}\n{}\n{filter}", store.display(), sub.sources.join("\n"));
+    kept::read(&KEPT, &key, paths, || {
+        let newest = (sub.sources.iter().zip(&named))
+            .filter_map(|(written, (name, topic))| {
+                let newest = match sub.filter {
+                    // What this row's source and topic say that the
+                    // filter takes, as the lookout tells it.
+                    Some(_) => {
+                        let row = lookout::subs::Sub {
+                            sources: vec![written.clone()],
+                            ..sub.clone()
+                        };
+                        heard(store, name, |event| row.hears(event))?
+                    }
+                    None => {
+                        let wanted =
+                            |said: Option<&str>| topic.is_none_or(|topic| said == Some(topic));
+                        let (said, _) = lookout::sources::status(store, name, wanted);
+                        (said.into_iter())
+                            .map(|(event, _)| event)
+                            .max_by_key(|e| e.at_ms)?
+                    }
+                };
+                Some((written.clone(), (newest.text, newest.at_ms)))
+            })
+            .collect();
+        (newest, None)
+    })
+}
+
+/// The newest word `source`'s log keeps that `hears` takes, read from the
+/// log's end: the lookout's own words, and a topic's clearing, left out.
+fn heard(
+    store: &Path,
+    source: &str,
+    hears: impl Fn(&lookout::sources::Event) -> bool,
+) -> Option<lookout::sources::Event> {
+    let file = lookout::sources::recent_file(&lookout::beside(store, ".sources"), source);
+    let text = std::fs::read_to_string(file).ok()?;
+    (text.lines().rev())
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .filter(|kept| kept["clear"] != true)
+        .filter_map(|kept| lookout::sources::Event::from_json(&kept))
+        .find(|event| !event.lookout && hears(event))
+}
+
+/// What `subscriber`'s follows told lately, as the lookout last counted
+/// it, read again only once its file changes.
+fn counted(store: &Path, subscriber: &str) -> lookout::subs::Counts {
+    static KEPT: kept::Slot<lookout::subs::Counts> = kept::Slot::new(None);
+    let file = lookout::subs::counts_file(store, subscriber);
+    kept::read(&KEPT, &file.to_string_lossy(), vec![file.clone()], || {
+        (lookout::subs::counts(store, subscriber), None)
+    })
+}
+
+/// How many notes each of `subscriber`'s follows that lasts so many has
+/// told, as [`lookout::runs_told`] reads it, read again only once its
+/// file changes.
+fn runs_told(store: &Path, subscriber: &str) -> HashMap<String, usize> {
+    static KEPT: kept::Slot<HashMap<String, usize>> = kept::Slot::new(None);
+    let file = lookout::held_file(store, subscriber);
+    kept::read(&KEPT, &file.to_string_lossy(), vec![file.clone()], || {
+        (lookout::runs_told(store, subscriber), None)
+    })
+}
+
 /// When something past began, `ms` since the epoch: the time today, else
 /// its date.
 fn since_of(ms: u128) -> String {
@@ -638,6 +724,26 @@ pub struct View {
     /// The picked row's thing open as a page over the list: an
     /// automation, a follow or a command.
     page: Option<Page>,
+    /// The tasks as `/status` last read them, whose agents a follow's
+    /// page lists.
+    tasks: Arc<Vec<Value>>,
+    /// What the open follow's page says beyond its settings.
+    follow: Follow,
+}
+
+/// What a follow's page says beyond how it was set, read only while it
+/// is open, as often as the list is.
+#[derive(Clone, Debug, Default)]
+struct Follow {
+    /// Each source it names, as written: the newest word it said on what
+    /// the follow hears, and when, in ms.
+    newest: HashMap<String, (String, u128)>,
+    /// Each source the lookout last told is down.
+    down: HashMap<String, lookout::sources::Down>,
+    /// What it told in the last day.
+    lately: Option<lookout::subs::Lately>,
+    /// How many notes it told of the ones it lasts.
+    runs_told: usize,
 }
 
 /// A thing open as a page: the agents it names, linked as `/memory`'s
@@ -651,8 +757,103 @@ struct Page {
     what: String,
     pick: Option<usize>,
     /// Where each link was last drawn: its row, its columns on that row,
-    /// and the agent it opens.
-    links: Vec<(usize, u16, u16, String)>,
+    /// and where it leads.
+    links: Vec<(usize, u16, u16, Target)>,
+    /// Whether a follow's done agents are listed, not folded to a count.
+    done_open: bool,
+}
+
+/// One row of a field on a page: its words, and the one that is a link,
+/// by its place among them, with where it leads.
+struct Field {
+    spans: Vec<Span<'static>>,
+    link: Option<(usize, Target)>,
+}
+
+impl Field {
+    fn text(text: String) -> Field {
+        Field {
+            spans: vec![Span::raw(text)],
+            link: None,
+        }
+    }
+}
+
+/// `text` broken after its words into rows `room` wide, two at most, the
+/// second cut short with an ellipsis where more is left.
+fn two_rows(text: &str, room: usize) -> Vec<String> {
+    let room = room.max(8);
+    let mut rows = vec![String::new()];
+    for word in text.split(' ').filter(|w| !w.is_empty()) {
+        let full = rows.len() == 2;
+        let row = rows.last_mut().expect("a row");
+        let wide = row.width() + usize::from(!row.is_empty()) + word.width();
+        if row.is_empty() || wide <= room {
+            if !row.is_empty() {
+                row.push(' ');
+            }
+            row.push_str(word);
+            continue;
+        }
+        // Past the second row: it is cut where the row ends.
+        if full {
+            *row = crate::transcript::cut(&format!("{row} {word}"), room);
+            return rows;
+        }
+        rows.push(word.to_owned());
+    }
+    // A single word wider than a row is cut too.
+    for row in &mut rows {
+        if row.width() > room {
+            *row = crate::transcript::cut(row, room);
+        }
+    }
+    rows
+}
+
+/// `text` with every control character a space, for one row.
+fn plain(text: &str) -> String {
+    (text.chars())
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect()
+}
+
+/// `spans` cut to `room` columns: the span that crosses it cut short with
+/// an ellipsis, the rest left out.
+fn fit(spans: Vec<Span<'static>>, room: usize) -> Vec<Span<'static>> {
+    let mut out = Vec::new();
+    let mut used = 0;
+    for span in spans {
+        let wide = span.width();
+        if used + wide <= room {
+            used += wide;
+            out.push(span);
+            continue;
+        }
+        if room > used + 1 {
+            let cut = crate::transcript::cut(&span.content, room - used);
+            out.push(Span::styled(cut, span.style));
+        }
+        break;
+    }
+    out
+}
+
+/// How wide a follow's labels are, with the space after them: its
+/// longest, `watches` and `sources`.
+const FOLLOW_LABEL: usize = 9;
+
+fn plural(n: u64) -> &'static str {
+    if n == 1 { "" } else { "s" }
+}
+
+/// Where a page's link leads.
+#[derive(Clone, Debug, PartialEq)]
+enum Target {
+    /// The agent, by its name, opened out of the view.
+    Agent(String),
+    /// A follow's done agents, folded: the link lists them.
+    Done,
 }
 
 /// The view's link to its clicks: a button's address is this, then what
@@ -698,6 +899,8 @@ impl View {
             stopping: None,
             notice: None,
             page: None,
+            tasks: Arc::default(),
+            follow: Follow::default(),
         };
         view.reload();
         view
@@ -790,6 +993,39 @@ impl View {
         self.lookout =
             crate::tool_host::with_status(lookout::status(&self.store, &self.bot), &self.store);
         self.icons = source_icons();
+        self.follow = self.read_follow();
+    }
+
+    /// The tasks as `/status` read them now.
+    pub fn set_tasks(&mut self, tasks: &Arc<Vec<Value>>) {
+        self.tasks = tasks.clone();
+    }
+
+    /// The follow whose page is open, and whom it is for.
+    fn follow_open(&self) -> Option<(&Item, &lookout::subs::Sub)> {
+        self.page.as_ref().filter(|page| page.handle.is_none())?;
+        let item = self.items.get(self.selected)?;
+        Some((item, item.sub.as_ref()?))
+    }
+
+    /// What the open follow's page says beyond its settings: nothing
+    /// read while no follow's page is open.
+    fn read_follow(&self) -> Follow {
+        let Some((item, sub)) = self.follow_open() else {
+            return Follow::default();
+        };
+        let runs_told = match sub.runs {
+            Some(_) => (runs_told(&self.store, &item.bot).get(&sub.counter()))
+                .copied()
+                .unwrap_or(0),
+            None => 0,
+        };
+        Follow {
+            newest: newest(&self.store, sub),
+            down: down(&self.store),
+            lately: counted(&self.store, &item.bot).lately(sub, now_ms()),
+            runs_told,
+        }
     }
 
     /// How the turns ended, as the window has since asked the daemon.
@@ -944,7 +1180,9 @@ impl View {
             what: command.map(commands::what).unwrap_or_default(),
             pick: Some(0),
             links: Vec::new(),
+            done_open: false,
         });
+        self.follow = self.read_follow();
     }
 
     /// Whether a thing is open as a page.
@@ -993,8 +1231,18 @@ impl View {
                 }
             }
             KeyCode::Right | KeyCode::Enter => {
-                if let Some(link) = page.pick.and_then(|at| page.links.get(at)) {
-                    return Key::Open(format!("{}{}", crate::links::AGENT, link.3));
+                match page
+                    .pick
+                    .and_then(|at| page.links.get(at))
+                    .map(|link| &link.3)
+                {
+                    Some(Target::Agent(bot)) => {
+                        return Key::Open(format!("{}{bot}", crate::links::AGENT));
+                    }
+                    // The done agents open in the fold's place, the
+                    // first of them picked.
+                    Some(Target::Done) => page.done_open = true,
+                    None => {}
                 }
             }
             KeyCode::Left => self.page = None,
@@ -1011,9 +1259,14 @@ impl View {
         let at = what.strip_prefix("link/")?.parse::<usize>().ok()?;
         let page = self.page.as_mut()?;
         let link = page.links.get(at)?;
-        let url = format!("{}{}", crate::links::AGENT, link.3);
         page.pick = Some(at);
-        Some(url)
+        match &link.3 {
+            Target::Agent(bot) => Some(format!("{}{bot}", crate::links::AGENT)),
+            Target::Done => {
+                page.done_open = true;
+                None
+            }
+        }
     }
 
     fn fire(&mut self) {
@@ -1175,11 +1428,49 @@ impl View {
         &mut self,
         width: usize,
     ) -> (Vec<Line<'static>>, usize, Vec<(usize, crate::screen::Mark)>) {
+        // The link picked, by where it leads: rows that reorder on their
+        // own, as a follow's agents do, keep it on the same thing.
+        let wanted = (self.page.as_ref())
+            .and_then(|page| page.links.get(page.pick?))
+            .map(|link| link.3.clone());
+        let drawn = self.draw_page(width);
+        let (Some(wanted), Some(page)) = (wanted, self.page.as_mut()) else {
+            return drawn;
+        };
+        let now = page.pick.and_then(|at| page.links.get(at));
+        if now.is_some_and(|link| link.3 == wanted) {
+            return drawn;
+        }
+        // An agent folded into `N done` since: the fold.
+        let found = (page.links.iter())
+            .position(|link| link.3 == wanted)
+            .or_else(|| {
+                matches!(wanted, Target::Agent(_))
+                    .then(|| page.links.iter().position(|link| link.3 == Target::Done))
+                    .flatten()
+            });
+        match found {
+            Some(at) => {
+                page.pick = Some(at);
+                self.draw_page(width)
+            }
+            None => drawn,
+        }
+    }
+
+    /// [`View::page_lines`] with the pick where it is.
+    fn draw_page(
+        &mut self,
+        width: usize,
+    ) -> (Vec<Line<'static>>, usize, Vec<(usize, crate::screen::Mark)>) {
         let mut out = Vec::new();
         // What the line under the name says, in parts a ` · ` apart: an
         // agent in a part is a link to it.
         let mut about: Vec<Vec<(String, Option<String>)>> = Vec::new();
         let mut body = Vec::new();
+        // Each link in the body: its row there, its columns, where it
+        // leads.
+        let mut body_links: Vec<(usize, u16, u16, Target)> = Vec::new();
         let short = |bot: &str| self.scope.short(bot);
         if let Some(row) = self.command().cloned() {
             let bot = row["bot"].as_str().unwrap_or_default().to_owned();
@@ -1261,6 +1552,9 @@ impl View {
                 (what.into(), None),
                 (short(&item.bot), Some(item.bot.clone())),
             ]);
+            if item.own {
+                about.push(vec![("Sonny's own".into(), None)]);
+            }
             if let Some(to) = item.reply_to.as_ref().filter(|to| **to != item.bot) {
                 about.push(vec![
                     ("answers go to ".into(), None),
@@ -1276,62 +1570,51 @@ impl View {
                 ));
                 body.push(Line::default());
             }
-            let mut fields: Vec<(&str, String)> = Vec::new();
-            match &item.sub {
-                Some(sub) => {
-                    let watched: Vec<String> = (sub.tasks_of.iter())
-                        .map(|b| format!("tasks of {b}"))
-                        .chain(sub.agents.iter().map(|g| format!("agents {g}")))
-                        .collect();
-                    if !watched.is_empty() {
-                        fields.push(("watches", watched.join(", ")));
-                    }
-                    if !sub.sources.is_empty() {
-                        let sources: Vec<String> = (sub.sources.iter())
-                            .map(|source| {
-                                let name = source.split_once(':').map_or(source.as_str(), |s| s.0);
-                                match self.icons.get(name) {
-                                    Some(icon) => format!("{icon} {source}"),
-                                    None => source.clone(),
-                                }
-                            })
-                            .collect();
-                        fields.push(("sources", sources.join(", ")));
-                    }
-                    if let Some(filter) = &sub.filter {
-                        fields.push(("where", spaced(filter)));
-                    }
-                    if let Some(digest) = &sub.digest {
-                        fields.push(("tells", format!("at most every {digest}")));
-                    }
-                    if let Some(steer) = &sub.steer {
-                        fields.push(("steers", format!("when {}", spaced(steer))));
-                    }
-                    if let Some(until) = &sub.until {
-                        fields.push(("until", until.clone()));
-                    }
-                    if let Some(runs) = sub.runs {
-                        let s = if runs == 1 { "" } else { "s" };
-                        fields.push(("lasts", format!("{runs} update{s}")));
-                    }
-                }
-                None => fields.push(("when", item.when.clone())),
-            }
+            let fields: Vec<(&str, Vec<Field>)> = match &item.sub {
+                Some(sub) => self.follow_fields(sub, &item.bot, width),
+                None => vec![("when", vec![Field::text(item.when.clone())])],
+            };
+            // The links in the line under the name come first.
+            let first = about
+                .iter()
+                .flatten()
+                .filter(|(_, bot)| bot.is_some())
+                .count();
+            let pick = self.page.as_ref().and_then(|page| page.pick);
             let label = fields.iter().map(|(l, _)| l.width()).max().unwrap_or(0) + 2;
             let hang = " ".repeat(label);
-            for (name, value) in fields {
-                body.extend(crate::transcript::wrap(
-                    Line::from(vec![
-                        Span::raw(format!("{name:<label$}")).dim(),
-                        Span::raw(value),
-                    ]),
-                    width,
-                    Span::raw(""),
-                    Span::raw(hang.clone()),
-                ));
+            for (name, rows) in fields {
+                for (n, Field { mut spans, link }) in rows.into_iter().enumerate() {
+                    let lead = match n {
+                        0 => Span::raw(format!("{name:<label$}")).dim(),
+                        _ => Span::raw(hang.clone()),
+                    };
+                    // A row with a link stays one row, cut to fit, so the
+                    // link is where it is drawn.
+                    let Some((at, target)) = link else {
+                        body.extend(crate::transcript::wrap(
+                            Line::from([vec![lead], spans].concat()),
+                            width,
+                            Span::raw(""),
+                            Span::raw(hang.clone()),
+                        ));
+                        continue;
+                    };
+                    spans = fit(spans, width.saturating_sub(label));
+                    if let Some(linked) = spans.get(at).cloned() {
+                        let start = label + (spans[..at].iter()).map(Span::width).sum::<usize>();
+                        let end = start + linked.width();
+                        if pick == Some(first + body_links.len()) {
+                            spans[at] = linked.add_modifier(ratatui::style::Modifier::REVERSED);
+                        }
+                        body_links.push((body.len(), start as u16, end as u16, target));
+                    }
+                    body.push(Line::from([vec![lead], spans].concat()));
+                }
             }
-            // What its row says after it, whole.
-            if !item.facts.is_empty() {
+            // What an automation's row says after it, whole. A follow's
+            // page says it all in its fields.
+            if !item.facts.is_empty() && item.sub.is_none() {
                 body.extend(crate::transcript::wrap(
                     Line::from(item.facts.join(" · ")).dim(),
                     width,
@@ -1400,7 +1683,7 @@ impl View {
                         // drawn.
                         let button = format!("{}{BUTTON}link/{at}", crate::screen::BUTTON);
                         buttons.push((start + 1, end + 1, button));
-                        page.links.push((out.len(), start, end, bot));
+                        page.links.push((out.len(), start, end, Target::Agent(bot)));
                     }
                     None => row.push(Span::raw(text).dim()),
                 }
@@ -1412,12 +1695,235 @@ impl View {
         }
         if !body.is_empty() {
             out.push(Line::default());
+            let top = out.len();
+            for (row, start, end, target) in body_links {
+                let at = page.links.len();
+                let button = format!("{}{BUTTON}link/{at}", crate::screen::BUTTON);
+                let buttons = vec![(start + 1, end + 1, button)];
+                marks.push((top + row, crate::screen::Mark::Buttons(buttons)));
+                page.links.push((top + row, start, end, target));
+            }
             out.extend(body);
         }
         let at = (page.pick)
             .and_then(|pick| page.links.get(pick))
             .map_or(0, |link| link.0);
         (out, at, marks)
+    }
+
+    /// A follow's fields on its page: what it watches and every agent
+    /// that matches now, what each source it hears said last, how it was
+    /// set, and what it told.
+    fn follow_fields(
+        &self,
+        sub: &lookout::subs::Sub,
+        subscriber: &str,
+        width: usize,
+    ) -> Vec<(&'static str, Vec<Field>)> {
+        let now = now_ms();
+        let mut fields = Vec::new();
+        let watched: Vec<String> = (sub.tasks_of.iter())
+            .map(|bot| format!("tasks of {}", self.scope.short(bot)))
+            .chain(sub.agents.iter().map(|glob| format!("agents {glob}")))
+            .collect();
+        if !watched.is_empty() {
+            let mut rows = vec![Field::text(watched.join(", "))];
+            rows.extend(self.watched(sub, subscriber));
+            // Another project's tasks are not among the rows this window
+            // reads: said, so the page does not read as "none".
+            for root in sub.tasks_of.iter().filter(|root| !self.scope.takes(root)) {
+                rows.push(Field {
+                    spans: vec![
+                        Span::raw(format!("  tasks of {} are not listed here", root)).dim(),
+                    ],
+                    link: None,
+                });
+            }
+            fields.push(("watches", rows));
+        }
+        if !sub.sources.is_empty() {
+            let wide = sub.sources.iter().map(|s| s.width()).max().unwrap_or(0);
+            // Past the label, the mark, the name and the space after it.
+            let past = FOLLOW_LABEL + 2 + wide + 2;
+            // Each source's newest word on one row, and how long ago.
+            let said: Vec<Option<(String, String)>> = (sub.sources.iter())
+                .map(|written| {
+                    let (text, at) = self.follow.newest.get(written)?;
+                    let secs = (u128::from(now).saturating_sub(*at) / 1000) as u64;
+                    Some((plain(text.lines().next().unwrap_or_default()), ago(secs)))
+                })
+                .collect();
+            // A word is never cut beside its name: when any does not fit
+            // there, every word goes under its name, two rows at most.
+            let under = (sub.sources.iter().zip(&said)).any(|(written, said)| {
+                let name = lookout::sources::named(written).0;
+                !self.follow.down.contains_key(name)
+                    && said
+                        .as_ref()
+                        .is_some_and(|(text, age)| past + text.width() + 3 + age.width() > width)
+            });
+            let room = width.saturating_sub(FOLLOW_LABEL + 4);
+            let mut rows = Vec::new();
+            for (written, said) in sub.sources.iter().zip(said) {
+                let name = lookout::sources::named(written).0;
+                let pad = Span::raw(" ".repeat(wide - written.width() + 2));
+                let named = Span::raw(written.clone());
+                let mut words = Vec::new();
+                let spans = match self.follow.down.get(name) {
+                    Some(down) => vec![
+                        Span::raw("✗ ").fg(Color::Red),
+                        named,
+                        pad,
+                        Span::raw(format!("down since {}", since_of(down.since_ms))),
+                    ],
+                    None => {
+                        let mark = match self.icons.get(name) {
+                            Some(icon) => Span::raw(format!("{icon} ")),
+                            None => Span::raw("  "),
+                        };
+                        let said = match said {
+                            Some((text, age)) if under => {
+                                words = two_rows(&text, room);
+                                vec![Span::raw(age).dim()]
+                            }
+                            Some((text, age)) => {
+                                vec![Span::raw(text), Span::raw(format!(" · {age}")).dim()]
+                            }
+                            None => vec![Span::raw("nothing yet").dim()],
+                        };
+                        [vec![mark, named, pad], said].concat()
+                    }
+                };
+                rows.push(Field { spans, link: None });
+                rows.extend(words.into_iter().map(|row| Field {
+                    spans: vec![Span::raw(format!("  {row}"))],
+                    link: None,
+                }));
+            }
+            fields.push(("sources", rows));
+        }
+        let pattern = |pattern: &Value| in_words(pattern).unwrap_or_else(|| spaced(pattern));
+        if let Some(filter) = &sub.filter {
+            fields.push(("where", vec![Field::text(pattern(filter))]));
+        }
+        if let Some(steer) = &sub.steer {
+            fields.push(("steers", vec![Field::text(pattern(steer))]));
+        }
+        if let Some(digest) = &sub.digest {
+            fields.push((
+                "tells",
+                vec![Field::text(format!("at most every {digest}"))],
+            ));
+        }
+        if let Some(until) = &sub.until {
+            let until = sub.ends_at().map_or_else(|| until.clone(), trigger::date);
+            fields.push(("until", vec![Field::text(until)]));
+        }
+        if let Some(runs) = sub.runs {
+            let lasts = match self.follow.runs_told as u64 {
+                0 => format!("{runs} update{}, none told yet", plural(runs)),
+                told => format!("{} of {runs} updates left", runs.saturating_sub(told)),
+            };
+            fields.push(("lasts", vec![Field::text(lasts)]));
+        }
+        let told = match &self.follow.lately {
+            None => "nothing yet".to_owned(),
+            Some(lately) => {
+                let day = match lately.notes {
+                    0 => "none in the last day".to_owned(),
+                    n => format!("{n} update{} in the last day", plural(n)),
+                };
+                let steered = match lately.steers {
+                    0 => String::new(),
+                    n => format!(", {n} steered"),
+                };
+                let secs = now.saturating_sub(lately.last_ms) / 1000;
+                format!("{day}{steered} · last {}", ago(secs))
+            }
+        };
+        fields.push(("told", vec![Field::text(told)]));
+        fields
+    }
+
+    /// Every agent `sub` watches now, each a link with its mark and word,
+    /// those not done first; two done or more fold to a count, a link
+    /// that lists them.
+    fn watched(&self, sub: &lookout::subs::Sub, subscriber: &str) -> Vec<Field> {
+        let agent = |task: &Value| task["agent"].as_str().unwrap_or_default().to_owned();
+        let makers: HashMap<String, String> = (self.tasks.iter())
+            .filter_map(|task| Some((agent(task), task["maker"].as_str()?.to_owned())))
+            .collect();
+        // Made by one it names the tasks of, or by one of theirs, as the
+        // lookout follows them: never the one named itself.
+        let descends = |name: &str| {
+            let mut at = makers.get(name);
+            for _ in 0..64 {
+                let Some(maker) = at else {
+                    return false;
+                };
+                if sub.tasks_of.contains(maker) {
+                    return true;
+                }
+                at = makers.get(maker);
+            }
+            false
+        };
+        // Nor the one it is for, nor a workflow's workers or its row, as
+        // the lookout.
+        let (done, live): (Vec<&Value>, Vec<&Value>) = (self.tasks.iter())
+            .filter(|task| {
+                let name = agent(task);
+                !name.is_empty()
+                    && name != subscriber
+                    && !crate::workflow::is_worker(&name)
+                    && !name.contains(crate::workflow::view::MARK)
+                    && (descends(&name)
+                        || (sub.agents.iter()).any(|glob| lookout::subs::matches(glob, &name)))
+            })
+            .partition(|task| task["group"] == "done");
+        let open = self.page.as_ref().is_some_and(|page| page.done_open);
+        let fold = done.len() > 1 && !open;
+        let shown: Vec<&Value> = match fold {
+            true => live,
+            false => [live, done.clone()].concat(),
+        };
+        let name = |task: &Value| task["name"].as_str().unwrap_or_default().to_owned();
+        let wide = shown
+            .iter()
+            .map(|task| name(task).width())
+            .max()
+            .unwrap_or(0);
+        let mut rows: Vec<Field> = (shown.iter())
+            .map(|task| {
+                let state = match task["group"] == "done" {
+                    true => crate::started::DONE,
+                    false => task["state"].as_str().unwrap_or_default(),
+                };
+                let named = name(task);
+                let pad = " ".repeat(wide - named.width() + 2);
+                Field {
+                    spans: vec![
+                        Span::raw("  "),
+                        crate::status::mark(state),
+                        Span::raw(named).fg(Color::Blue),
+                        Span::raw(pad),
+                        Span::raw(state.to_owned()).dim(),
+                    ],
+                    link: Some((2, Target::Agent(agent(task)))),
+                }
+            })
+            .collect();
+        if fold {
+            rows.push(Field {
+                spans: vec![
+                    Span::raw("  "),
+                    crate::status::mark(crate::started::DONE),
+                    Span::raw(format!("{} done", done.len())).fg(Color::Blue),
+                ],
+                link: Some((2, Target::Done)),
+            });
+        }
+        rows
     }
 
     fn item_lines(&self, item: &Item, picked: bool, width: usize) -> Vec<Line<'static>> {
@@ -1487,15 +1993,54 @@ impl View {
                 Span::raw(INDENT),
             ));
         }
-        if !item.what.is_empty() {
+        // A follow in the words its page uses.
+        let what = match &item.sub {
+            Some(sub) => self.follow_words(sub),
+            None => item.what.clone(),
+        };
+        if !what.is_empty() {
             out.extend(crate::transcript::capped(
-                Line::from(item.what.clone()).dim(),
+                Line::from(what).dim(),
                 width,
                 Span::raw(format!("{INDENT}└ ")).dim(),
                 1,
             ));
         }
         out
+    }
+
+    /// What a follow watches and how it was set, in the words its page
+    /// uses: `tasks of lead, source ci where text starts with "main:",
+    /// until Fri 20 Nov 09:00`.
+    fn follow_words(&self, sub: &lookout::subs::Sub) -> String {
+        let pattern = |pattern: &Value| in_words(pattern).unwrap_or_else(|| spaced(pattern));
+        let mut words: Vec<String> = (sub.tasks_of.iter())
+            .map(|bot| format!("tasks of {}", self.scope.short(bot)))
+            .chain(sub.agents.iter().map(|glob| format!("agents {glob}")))
+            .chain(sub.sources.iter().map(|source| format!("source {source}")))
+            .collect();
+        if let Some(filter) = &sub.filter {
+            let last = words.pop().unwrap_or_default();
+            words.push(
+                format!("{last} where {}", pattern(filter))
+                    .trim_start()
+                    .to_owned(),
+            );
+        }
+        if let Some(digest) = &sub.digest {
+            words.push(format!("at most every {digest}"));
+        }
+        if let Some(steer) = &sub.steer {
+            words.push(format!("steers when {}", pattern(steer)));
+        }
+        if let Some(until) = &sub.until {
+            let until = sub.ends_at().map_or_else(|| until.clone(), trigger::date);
+            words.push(format!("until {until}"));
+        }
+        if let Some(runs) = sub.runs {
+            words.push(format!("for {runs} update{}", plural(runs)));
+        }
+        words.join(", ")
     }
 
     /// A question's reminder's rows: whose question and when, then what
@@ -1639,6 +2184,68 @@ fn said(reminder: &crate::asks::Reminder, now: i64) -> Line<'static> {
 
 /// A pattern as JSON with a space after each `:` and `,`, so a page
 /// wraps it between its parts rather than inside one.
+/// A pattern in words, as a page says it: `text starts with "main:"`,
+/// each field's values an `or` apart and the fields an `and`. None for one
+/// that nests or has `$or`, which a page shows as written.
+fn in_words(pattern: &Value) -> Option<String> {
+    let mut said = Vec::new();
+    for (field, values) in pattern.as_object()? {
+        if field == "$or" {
+            return None;
+        }
+        let words = (values.as_array()?.iter())
+            .map(value_words)
+            .collect::<Option<Vec<_>>>()?;
+        said.push(format!("{field} {}", words.join(" or ")));
+    }
+    (!said.is_empty()).then(|| said.join(" and "))
+}
+
+/// What one value of a pattern's field takes, in words.
+fn value_words(value: &Value) -> Option<String> {
+    let Value::Object(matcher) = value else {
+        return Some(format!("is {value}"));
+    };
+    let (name, arg) = matcher.iter().next().filter(|_| matcher.len() == 1)?;
+    let list = |values: &[Value], and: &str| {
+        let words: Vec<String> = (values.iter())
+            .map(|v| v.as_str().map_or_else(|| v.to_string(), str::to_owned))
+            .collect();
+        words.join(and)
+    };
+    Some(match (name.as_str(), arg) {
+        ("prefix", Value::String(_)) => format!("starts with {arg}"),
+        ("suffix", Value::String(_)) => format!("ends with {arg}"),
+        ("wildcard", Value::String(_)) => format!("matches {arg}"),
+        ("equals-ignore-case", Value::String(_)) => format!("is {arg} in any case"),
+        ("exists", Value::Bool(true)) => "exists".into(),
+        ("exists", Value::Bool(false)) => "is missing".into(),
+        // `[">", 0, "<=", 5]`: `is > 0 and <= 5`.
+        ("numeric", Value::Array(terms)) => {
+            let terms: Vec<String> = terms.chunks(2).map(|term| list(term, " ")).collect();
+            format!("is {}", terms.join(" and "))
+        }
+        ("anything-but", Value::Array(values)) => {
+            let values: Vec<String> = values.iter().map(Value::to_string).collect();
+            format!("is none of {}", values.join(", "))
+        }
+        ("anything-but", Value::Object(_)) => {
+            let words = value_words(arg)?;
+            let (from, to) = [
+                ("starts with", "does not start with"),
+                ("ends with", "does not end with"),
+                ("matches", "does not match"),
+                ("is", "is not"),
+            ]
+            .into_iter()
+            .find(|(from, _)| words.starts_with(from))?;
+            format!("{to}{}", &words[from.len()..])
+        }
+        ("anything-but", _) => format!("is not {arg}"),
+        _ => return None,
+    })
+}
+
 fn spaced(value: &Value) -> String {
     match value {
         Value::Array(items) => {
@@ -1748,66 +2355,415 @@ mod tests {
         assert_eq!(fact(&items, "calc.fix", &none), "");
     }
 
-    #[test]
-    fn a_follows_page_says_all_it_watches_and_wraps_its_pattern_between_parts() {
-        let sub = lookout::subs::Sub {
-            name: "fix-failures".into(),
-            tasks_of: Vec::new(),
-            agents: vec!["calc.fix".into()],
-            sources: vec!["mail:billing".into()],
-            filter: None,
-            digest: Some("15m".into()),
-            steer: Some(json!({"type": ["turn.ended"], "status": ["failed"]})),
-            owner: None,
-            until: None,
-            runs: Some(3),
-            made: None,
-        };
-        let mut view = View {
+    /// A view of `items` in project `calc`, its first row picked.
+    fn view_of(store: PathBuf, items: Vec<Item>) -> View {
+        View {
             scope: Scope {
                 project: "calc".into(),
                 lead: "calc.lead".into(),
                 glob: "calc.*".into(),
             },
-            store: std::env::temp_dir(),
+            store,
             store_id: None,
             bot: "calc.lead".into(),
-            items: vec![Item {
-                sub: Some(sub),
-                reminder: None,
-                facts: Vec::new(),
-                message: String::new(),
-                ..item(Kind::Subscription, "fix-failures", &["calc.lead"], false)
-            }],
+            items,
             turns: HashMap::new(),
             lookout: String::new(),
-            icons: HashMap::from([("mail".to_owned(), "✉".to_owned())]),
+            icons: HashMap::from([
+                ("mail".to_owned(), "✉".to_owned()),
+                ("ci".to_owned(), "⚙".to_owned()),
+            ]),
             selected: 0,
             confirm: None,
             commands: Commands::default(),
             stopping: None,
             notice: None,
             page: None,
-        };
-        let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
-        view.key(enter, 0..usize::MAX);
-        let page: Vec<String> = (view.page_lines(44).0.iter())
+            tasks: Arc::default(),
+            follow: Follow::default(),
+        }
+    }
+
+    fn follow_item(sub: lookout::subs::Sub, own: bool) -> Item {
+        Item {
+            sub: Some(sub.clone()),
+            reminder: None,
+            facts: match own {
+                true => vec!["Sonny's own, for the lead's tasks".into()],
+                false => Vec::new(),
+            },
+            message: String::new(),
+            ..item(Kind::Subscription, &sub.name, &["calc.lead"], own)
+        }
+    }
+
+    fn page_text(view: &mut View, width: usize) -> Vec<String> {
+        (view.page_lines(width).0.iter())
             .map(|l| l.to_string().trim_end().to_owned())
-            .collect();
+            .collect()
+    }
+
+    #[test]
+    fn a_follows_page_says_what_it_does_now_after_how_it_was_set() {
+        let dir = std::env::temp_dir().join(format!("background-follow-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = dir.join("state.sqlite");
+        let sub = lookout::subs::Sub {
+            name: "inbox".into(),
+            tasks_of: Vec::new(),
+            agents: Vec::new(),
+            sources: vec!["mail".into(), "ci:main".into()],
+            filter: Some(json!({"text": [{"prefix": "main:"}, {"prefix": "release:"}]})),
+            digest: Some("5m".into()),
+            steer: Some(json!({"$or": [{"text": [{"suffix": "failed"}]}]})),
+            owner: None,
+            until: Some("2026-11-20 09:00".into()),
+            runs: Some(3),
+            made: Some(7),
+        };
+        let now = now_ms();
+        // The lookout's files: mail down, ci's newest word on main, one
+        // note told of the three it lasts, two in the last day.
+        let sources = lookout::beside(&store, ".sources");
+        let since = now - 30 * 60 * 1000;
+        let health = lookout::sources::health_file(&sources, "mail");
+        std::fs::create_dir_all(health.parent().unwrap()).unwrap();
+        let word = json!({"down": true, "since_ms": since, "failed": "exit status: 3"});
+        std::fs::write(&health, word.to_string()).unwrap();
+        let recent = lookout::sources::recent_file(&sources, "ci");
+        std::fs::create_dir_all(recent.parent().unwrap()).unwrap();
+        let said = |topic: &str, text: &str, ago_ms: u64, seq: u64| {
+            json!({"source": "ci", "topic": topic, "text": text, "at_ms": now - ago_ms, "seq": seq})
+                .to_string()
+        };
+        let lines = [
+            said("main", "main: build 411 passed", 3_600_000, 1),
+            said(
+                "main",
+                "main: build 412 passed\nall 1,240 tests",
+                120_000,
+                2,
+            ),
+            said("nightly", "nightly: build 9 failed", 60_000, 3),
+            // Newer, but not what its filter takes: never its newest.
+            said("main", "deploy: started", 30_000, 4),
+        ];
+        std::fs::write(&recent, lines.join("\n") + "\n").unwrap();
+        let mut counts = lookout::subs::Counts::default();
+        let of = sub.identity(Some(5));
+        counts.told("inbox", &of, "lookout-a", 3, false, now - 3_600_000);
+        counts.told("inbox", &of, "lookout-b", 1, true, now - 120_000);
+        let file = lookout::subs::counts_file(&store, "calc.lead");
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        std::fs::write(&file, counts.to_json().to_string()).unwrap();
+        let held = lookout::held_file(&store, "calc.lead");
+        std::fs::create_dir_all(held.parent().unwrap()).unwrap();
+        std::fs::write(
+            &held,
+            json!({"runs_told": {"inbox@7": ["lookout-a"]}}).to_string(),
+        )
+        .unwrap();
+        // As the list reads it, failed.
+        let item = Item {
+            failed: Some(format!(
+                "mail is down since {}: exit status 3",
+                since_of(u128::from(since))
+            )),
+            ..follow_item(sub.clone(), false)
+        };
+        let mut view = view_of(store.clone(), vec![item]);
+        view.key(
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            0..usize::MAX,
+        );
+        let until = trigger::date(sub.ends_at().unwrap());
         assert_eq!(
-            page,
+            page_text(&mut view, 60),
             [
-                "fix-failures",
-                "follow for lead",
-                "",
-                "watches  agents calc.fix",
-                "sources  ✉ mail:billing",
-                "tells    at most every 15m",
-                "steers   when {\"status\": [\"failed\"], \"type\":",
-                "         [\"turn.ended\"]}",
-                "lasts    3 updates",
+                "inbox".to_owned(),
+                "follow for lead".into(),
+                "".into(),
+                format!(
+                    "✗ mail is down since {}: exit status 3",
+                    since_of(u128::from(since))
+                ),
+                "".into(),
+                format!(
+                    "sources  ✗ mail     down since {}",
+                    since_of(u128::from(since))
+                ),
+                "         ⚙ ci:main  main: build 412 passed · 2m ago".into(),
+                "where    text starts with \"main:\" or starts with \"release:\"".into(),
+                "steers   {\"$or\": [{\"text\": [{\"suffix\": \"failed\"}]}]}".into(),
+                "tells    at most every 5m".into(),
+                format!("until    {until}"),
+                "lasts    2 of 3 updates left".into(),
+                "told     2 updates in the last day, 1 steered · last 2m ago".into(),
             ]
         );
+        // At 44 columns the newest word is cut to fit its row.
+        let narrow = page_text(&mut view, 44);
+        // The list's row says it in the page's words.
+        let card: Vec<String> = (view.card(150).0.iter()).map(|l| l.to_string()).collect();
+        assert!(card.iter().any(|l| l.contains(
+            "└ source mail, source ci:main where text starts with \"main:\" or starts with"
+        )));
+        assert!(
+            view.follow_words(&sub)
+                .ends_with(&format!("at most every 5m, steers when {{\"$or\": [{{\"text\": [{{\"suffix\": \"failed\"}}]}}]}}, until {until}, for 3 updates")),
+        );
+        // At 44 columns the newest word goes under its name, whole.
+        assert_eq!(
+            narrow[5..8],
+            [
+                format!(
+                    "sources  ✗ mail     down since {}",
+                    since_of(u128::from(since))
+                ),
+                "         ⚙ ci:main  2m ago".into(),
+                "           main: build 412 passed".into(),
+            ]
+        );
+        // Before any note, it says so.
+        std::fs::remove_file(&file).unwrap();
+        std::fs::remove_file(&held).unwrap();
+        view.follow = view.read_follow();
+        let page = page_text(&mut view, 60);
+        assert!(page.contains(&"lasts    3 updates, none told yet".to_owned()));
+        assert!(page.contains(&"told     nothing yet".to_owned()));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_word_too_long_for_its_row_breaks_after_a_word_onto_two_rows_at_most() {
+        assert_eq!(
+            two_rows("main: build 417 passed", 33),
+            ["main: build 417 passed"]
+        );
+        assert_eq!(
+            two_rows(
+                "release: build 417 failed in the integration suite on the arm64 runner after 14 minutes",
+                33
+            ),
+            [
+                "release: build 417 failed in the",
+                "integration suite on the arm64 r…"
+            ]
+        );
+    }
+
+    #[test]
+    fn a_follows_page_lists_the_agents_it_watches_with_the_done_folded() {
+        let sub = lookout::subs::Sub {
+            name: "tasks".into(),
+            tasks_of: vec!["calc.lead".into()],
+            agents: vec!["calc.site*".into()],
+            sources: Vec::new(),
+            filter: None,
+            digest: None,
+            steer: None,
+            owner: None,
+            until: None,
+            runs: None,
+            made: None,
+        };
+        let task = |name: &str, maker: &str, state: &str, group: &str| {
+            json!({"name": name, "agent": format!("calc.{name}"), "state": state,
+                "group": group, "maker": maker})
+        };
+        let mut view = view_of(std::env::temp_dir(), vec![follow_item(sub, true)]);
+        view.set_tasks(&Arc::new(vec![
+            task("halves", "calc.lead", "needs you", "needs_you"),
+            // A task of its task is the lead's too.
+            task("tests", "calc.halves", "working", "working"),
+            task("sitemap", "", "idle", "idle"),
+            task("other", "calc.someone", "working", "working"),
+            task("readme", "calc.lead", "idle", "done"),
+            task("docs", "calc.lead", "idle", "done"),
+            // A workflow's own row is no agent.
+            json!({"name": "lead#wf-1a2b", "agent": "calc.lead#wf-1a2b", "state": "working",
+                "group": "working", "maker": "calc.lead"}),
+        ]));
+        view.key(
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            0..usize::MAX,
+        );
+        assert_eq!(
+            page_text(&mut view, 60),
+            [
+                "tasks",
+                "follow for lead · Sonny's own",
+                "",
+                "watches  tasks of lead, agents calc.site*",
+                "           ? halves   needs you",
+                "           ● tests    working",
+                "           ○ sitemap  idle",
+                "           ✓ 2 done",
+                "told     nothing yet",
+            ]
+        );
+        // The lead first, then each agent, then the fold.
+        let targets: Vec<Target> = (view.page.as_ref().unwrap().links.iter())
+            .map(|link| link.3.clone())
+            .collect();
+        assert_eq!(
+            targets,
+            [
+                Target::Agent("calc.lead".into()),
+                Target::Agent("calc.halves".into()),
+                Target::Agent("calc.tests".into()),
+                Target::Agent("calc.sitemap".into()),
+                Target::Done,
+            ]
+        );
+        let links = &view.page.as_ref().unwrap().links;
+        assert_eq!((links[1].0, links[1].1, links[1].2), (4, 13, 19));
+        // `↓` to an agent, which `→` opens.
+        let down = KeyEvent::new(KeyCode::Down, KeyModifiers::NONE);
+        let right = KeyEvent::new(KeyCode::Right, KeyModifiers::NONE);
+        view.key(down, 0..usize::MAX);
+        assert_eq!(
+            view.key(right, 0..usize::MAX),
+            Key::Open(format!("{}calc.halves", crate::links::AGENT))
+        );
+        // `→` on the fold lists the done agents in its place.
+        for _ in 0..3 {
+            view.key(down, 0..usize::MAX);
+        }
+        assert_eq!(view.key(right, 0..usize::MAX), Key::Stay);
+        let page = page_text(&mut view, 60);
+        assert_eq!(
+            page[7..10],
+            [
+                "           ✓ readme   done",
+                "           ✓ docs     done",
+                "told     nothing yet",
+            ]
+        );
+        // The pick stays on its agent as the rows reorder, and goes to the
+        // fold once the agent folds into it.
+        let picked = |view: &View| {
+            let page = view.page.as_ref().unwrap();
+            page.links[page.pick.unwrap()].3.clone()
+        };
+        let page = view.page.as_mut().unwrap();
+        (page.done_open, page.pick) = (false, Some(1));
+        let _ = page_text(&mut view, 60);
+        assert_eq!(picked(&view), Target::Agent("calc.halves".into()));
+        let mut tasks = vec![
+            task("tests", "calc.halves", "working", "working"),
+            task("halves", "calc.lead", "idle", "idle"),
+            task("readme", "calc.lead", "idle", "done"),
+            task("docs", "calc.lead", "idle", "done"),
+        ];
+        view.set_tasks(&Arc::new(tasks.clone()));
+        let _ = page_text(&mut view, 60);
+        assert_eq!(picked(&view), Target::Agent("calc.halves".into()));
+        tasks[1] = task("halves", "calc.lead", "idle", "done");
+        view.set_tasks(&Arc::new(tasks));
+        let _ = page_text(&mut view, 60);
+        assert_eq!(picked(&view), Target::Done);
+    }
+
+    #[test]
+    fn a_follow_of_another_projects_tasks_says_they_are_not_listed() {
+        let sub = lookout::subs::Sub {
+            name: "web".into(),
+            tasks_of: vec!["web.lead".into()],
+            agents: Vec::new(),
+            sources: Vec::new(),
+            filter: None,
+            digest: None,
+            steer: None,
+            owner: None,
+            until: None,
+            runs: None,
+            made: None,
+        };
+        let mut view = view_of(std::env::temp_dir(), vec![follow_item(sub, false)]);
+        view.key(
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            0..usize::MAX,
+        );
+        assert_eq!(
+            page_text(&mut view, 60)[3..5],
+            [
+                "watches  tasks of web.lead",
+                "           tasks of web.lead are not listed here",
+            ]
+        );
+    }
+
+    #[test]
+    fn a_follow_of_a_tasks_tasks_lists_them_not_it_and_cuts_a_long_name_to_its_row() {
+        let sub = lookout::subs::Sub {
+            name: "fix".into(),
+            tasks_of: vec!["calc.fix".into()],
+            agents: Vec::new(),
+            sources: Vec::new(),
+            filter: None,
+            digest: None,
+            steer: None,
+            owner: None,
+            until: None,
+            runs: None,
+            made: None,
+        };
+        let task = |name: &str, maker: &str| {
+            json!({"name": name, "agent": format!("calc.{name}"), "state": "working",
+                "group": "working", "maker": maker})
+        };
+        let mut view = view_of(std::env::temp_dir(), vec![follow_item(sub, false)]);
+        view.set_tasks(&Arc::new(vec![
+            task("fix", "calc.lead"),
+            task("fix-tests-for-the-rounding-of-half-cents", "calc.fix"),
+        ]));
+        view.key(
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            0..usize::MAX,
+        );
+        let page = page_text(&mut view, 44);
+        // The task it names the tasks of is no agent it hears from.
+        assert_eq!(page[3], "watches  tasks of fix");
+        assert_eq!(page[4], "           ● fix-tests-for-the-rounding-of-…");
+        assert_eq!(page[5], "told     nothing yet");
+        // Its link covers the name as drawn, on its own row.
+        let links = &view.page.as_ref().unwrap().links;
+        assert_eq!(links.len(), 2);
+        assert_eq!((links[1].0, links[1].1, links[1].2), (4, 13, 44));
+    }
+
+    #[test]
+    fn a_pattern_reads_in_words_unless_it_nests() {
+        let words = |pattern: Value| in_words(&pattern);
+        assert_eq!(
+            words(json!({"text": [{"prefix": "main:"}]})).as_deref(),
+            Some("text starts with \"main:\"")
+        );
+        assert_eq!(
+            words(json!({"status": ["failed", "cancelled"], "type": [{"suffix": ".ended"}]}))
+                .as_deref(),
+            Some("status is \"failed\" or is \"cancelled\" and type ends with \".ended\"")
+        );
+        assert_eq!(
+            words(json!({"from": [{"equals-ignore-case": "ana"}], "size": [{"numeric": [">", 0, "<=", 5]}]}))
+                .as_deref(),
+            Some("from is \"ana\" in any case and size is > 0 and <= 5")
+        );
+        assert_eq!(
+            words(
+                json!({"from": [{"anything-but": {"prefix": "bot"}}], "pr": [{"exists": false}]})
+            )
+            .as_deref(),
+            Some("from does not start with \"bot\" and pr is missing")
+        );
+        assert_eq!(
+            words(json!({"from": [{"anything-but": ["a", "b"]}]})).as_deref(),
+            Some("from is none of \"a\", \"b\"")
+        );
+        assert_eq!(words(json!({"meta": {"team": ["web"]}})), None);
+        assert_eq!(words(json!({"$or": [{"a": [1]}]})), None);
     }
 
     #[test]
@@ -1912,6 +2868,8 @@ mod tests {
             stopping: None,
             notice: None,
             page: None,
+            tasks: Arc::default(),
+            follow: Follow::default(),
         };
         let rows: Vec<String> = (view.card(100).0.iter())
             .map(|l| l.to_string())
@@ -1989,6 +2947,8 @@ mod tests {
             stopping: None,
             notice: None,
             page: None,
+            tasks: Arc::default(),
+            follow: Follow::default(),
         };
         let clock = crate::asks::clock(at, now);
         // The pick reaches a column past the last word.
@@ -2043,7 +3003,10 @@ mod tests {
         assert!(page.contains(&format!("Goes with 1 at {clock} unless you pick.")));
         assert!(page.contains(&question.to_owned()));
         assert!(!page.iter().any(|l| l.contains("This is Sonny")));
-        assert_eq!(view.page.as_ref().unwrap().links[0].3, "calc.halves");
+        assert_eq!(
+            view.page.as_ref().unwrap().links[0].3,
+            Target::Agent("calc.halves".into())
+        );
     }
 
     #[test]
@@ -2324,6 +3287,8 @@ mod tests {
             stopping: None,
             notice: None,
             page: None,
+            tasks: Arc::default(),
+            follow: Follow::default(),
         };
         let (card, at) = view.card(100);
         let lines: Vec<String> = card.iter().map(|l| l.to_string()).collect();
@@ -2386,6 +3351,8 @@ mod tests {
             stopping: None,
             notice: None,
             page: None,
+            tasks: Arc::default(),
+            follow: Follow::default(),
         };
         let text = |view: &View| -> Vec<String> {
             view.card(100)

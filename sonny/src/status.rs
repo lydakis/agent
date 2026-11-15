@@ -120,7 +120,8 @@ pub fn group(state: &str, running: bool, asking: bool, done: bool) -> Group {
 
 /// The tasks among `rows`, as a template note's `tasks()` gives them:
 /// each its name, agent, state, group (`needs_you`, `working`, `idle`,
-/// `done`), whether a turn runs, its pull request and latest step.
+/// `done`), whether a turn runs, its pull request and latest step, and
+/// the agent that made it.
 pub fn tasks(rows: &[Row]) -> Vec<serde_json::Value> {
     (rows.iter())
         .filter(|row| row.name != "lead")
@@ -131,7 +132,7 @@ pub fn tasks(rows: &[Row]) -> Vec<serde_json::Value> {
             serde_json::json!({"name": row.name, "agent": row.bot, "state": row.state,
                 "group": row.group.key(), "running": row.running, "pr": row.pr,
                 "latest": row.latest, "at": row.at.map(|ms| ms / 1000),
-                "seconds": row.seconds.filter(|_| !row.running)})
+                "seconds": row.seconds.filter(|_| !row.running), "maker": row.maker})
         })
         .collect()
 }
