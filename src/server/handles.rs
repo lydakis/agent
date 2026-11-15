@@ -151,6 +151,9 @@ struct Inner {
     lifted: HashMap<i64, u64>,
     /// Lifted calls whose time came, by command, for the run loop to check.
     lifted_due: Vec<i64>,
+    /// Answered calls that ended, by turn and id, for the run loop to stop
+    /// their daemon steps.
+    ended: Vec<(i64, String)>,
 }
 
 #[derive(Clone)]
@@ -245,13 +248,25 @@ impl Handles {
         self.sooner.notify_one();
     }
 
-    /// Until something on the schedule comes due or a step was stepped:
-    /// the run loop's one sleep for every deadline here.
+    /// An answered call ended, answered or out of time, while its turn or
+    /// its command goes on: the run loop stops its daemon steps.
+    pub fn call_ended(&self, turn: i64, call_id: String) {
+        self.inner.lock().unwrap().ended.push((turn, call_id));
+        self.sooner.notify_one();
+    }
+
+    /// The answered calls that ended since the last look.
+    pub fn take_ended(&self) -> Vec<(i64, String)> {
+        std::mem::take(&mut self.inner.lock().unwrap().ended)
+    }
+
+    /// Until something on the schedule comes due, a step was stepped or a
+    /// call ended: the run loop's one sleep for every deadline here.
     pub async fn due(&self) {
         loop {
             let next = {
                 let inner = self.inner.lock().unwrap();
-                if !inner.stepped.is_empty() {
+                if !inner.stepped.is_empty() || !inner.ended.is_empty() {
                     return;
                 }
                 inner.schedule.first().map(|&(at, _)| at)

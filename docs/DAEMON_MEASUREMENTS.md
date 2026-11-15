@@ -10054,3 +10054,64 @@ moved the other way at 10 × 10.
 | lifecycle | CPU, s | 0.545 | 0.545 | +0.0% |
 | lifecycle | p95 turn, ms | 579.7 | 579.3 | -0.1% |
 | lifecycle | peak RSS, MiB | 25.06 | 24.78 | -1.1% |
+
+## Daemon steps at 1,000 and 10,000 bots (protocol 78, schema 102)
+
+`bench.steps_fleet` (new) speaks the socket protocol alone, with no Sonny
+in the path. Each fleet bot's model calls a declared script tool (`exec`,
+`steps: true`); once every call waits, the bench asks five `echo` steps
+of each call with `run_step`, one after another per call and every call's
+at once, then answers the calls. Beside the fleet, 32 other bots run plain
+turns, five rounds of 32, first on the idle daemon and then while the
+fleet steps. One step on its own (200 in a row on one call) is timed
+before the fleet starts. Release build, synthetic model, 4-core Linux
+container, store at `synchronous=FULL`, 2026-11-15.
+
+| | 1,000 bots | 10,000 bots |
+| --- | ---: | ---: |
+| Steps finished / asked | 5,000 / 5,000 | 50,000 / 50,000 |
+| Steps refused | 0 | 0 |
+| Store jobs a step | 2.0 | 2.0 |
+| Steps a second | 4,822 | 6,185 |
+| One step alone, p50 / p99 | 1.10 / 3.10 ms | 0.93 / 2.39 ms |
+| Every call stepping at once: step p50 / p99 | 189 / 271 ms | 1,510 / 1,707 ms |
+| Other bots' turn p99, idle / while the fleet steps | 69 / 128 ms | 68 / 170 ms |
+| Peak bytes the steps held | 282 KB | 2.82 MB (282 bytes a step) |
+| Daemon RSS at the end (fleet's turns parked on their calls) | 84 MB | 268 MB |
+| Processor share while stepping: runtime thread / store thread | 0.40 / 0.68 | 0.36 / 0.69 |
+
+Against the design's slice 2 gates:
+
+- **Met:** one step alone at most 1 ms p50 (0.93 ms at 10,000; 1.1 ms in
+  the 1,000 run's sample, as noisy as the direct `echo` call it is gated
+  against); at most two store jobs a step (2.0); a step held for its
+  request and under 1 KiB more (282 bytes); every step of the fleet
+  finishes, none refused or expired.
+- **Missed: step p99 wait under 1 s** with all 10,000 calls stepping at
+  once (1.71 s). Each step waits behind one step of every other call, so
+  its wait is about the fleet's size over the daemon's step rate: 10,000
+  over 6,185 a second.
+- **Missed: other bots' turn p99 within 15%** of idle while that fleet
+  steps (170 ms against 68 ms; 128 against 69 at 1,000).
+
+The bound is the store's commit rate. A step is two durable store jobs;
+the store thread is busy about 70% of the time, and its commits (one
+`fsync` each, at most 32 jobs a commit) take 0.88 ms each, as long as the
+jobs in them take to run (about 35 µs to decide a step and 30 µs to end
+one). The runtime thread is at 36 to 40%.
+
+What was tried, at 2,000 bots (10,000 steps):
+
+| Change | Steps a second | Step p99 | Other bots' p99 (idle 68 to 90 ms) |
+| --- | ---: | ---: | ---: |
+| No bound on steps' store jobs | 5,267 | 517 ms | 417 ms |
+| At most 64 steps' store jobs at once (kept) | 6,695 | 403 ms | 118 ms |
+| At most 16 | 6,171 | 448 ms | 121 ms |
+| 64, with commits of up to 128 jobs (not kept) | 7,921 | 340 ms | 133 ms |
+
+Without a bound, 2,000 waiting steps filled the store's queue and every
+other bot's store job waited behind them; the window of 64 keeps the
+steps' jobs to a few commits' worth, which more than halved the other
+bots' tail and raised the step rate. Commits of up to 128 jobs raise the
+step rate a further 18%, but they change every store job's latency and
+belong in a change of their own with the store's screens.

@@ -3866,6 +3866,7 @@ fn schema_78_counts_a_call_left_unanswered_before_the_upgrade_as_taken() {
             expire_ms: None,
             grammar: None,
             steps: false,
+            gate_daemon_steps: false,
             lift: false,
             inherit: Inherit::All,
             kind: None,
@@ -5538,6 +5539,7 @@ fn declared_tools_pass_to_created_bots_and_forks_and_a_forks_allow_narrows_them(
         expire_ms: None,
         grammar: None,
         steps: false,
+        gate_daemon_steps: false,
         lift: false,
         kind: None,
     };
@@ -5552,6 +5554,7 @@ fn declared_tools_pass_to_created_bots_and_forks_and_a_forks_allow_narrows_them(
         expire_ms: None,
         grammar: None,
         steps: false,
+        gate_daemon_steps: false,
         lift: false,
         kind: None,
     };
@@ -5661,6 +5664,7 @@ fn a_tool_declared_for_some_generations_goes_that_far_down_and_no_further() {
         expire_ms: None,
         grammar: None,
         steps: false,
+        gate_daemon_steps: false,
         lift: false,
         kind: None,
     };
@@ -5727,6 +5731,7 @@ fn a_call_is_taken_once_and_a_second_take_is_refused_so_it_never_runs_twice() {
         expire_ms: None,
         grammar: None,
         steps: false,
+        gate_daemon_steps: false,
         lift: false,
         inherit: Inherit::All,
         kind: None,
@@ -5823,6 +5828,7 @@ fn waiting_calls_page_past_held_answers_and_an_answer_out_of_time_is_refused() {
         expire_ms: None,
         grammar: None,
         steps: false,
+        gate_daemon_steps: false,
         lift: false,
         inherit: Inherit::All,
         kind: None,
@@ -5900,6 +5906,7 @@ fn a_parked_answer_s_pictures_are_stored_once_its_result_is() {
         expire_ms: None,
         grammar: None,
         steps: false,
+        gate_daemon_steps: false,
         lift: false,
         inherit: Inherit::All,
         kind: None,
@@ -18219,6 +18226,7 @@ fn a_waiting_step_ended_in_a_group_that_fails_is_told_of_once_one_commits() {
         expire_ms: None,
         grammar: None,
         steps: true,
+        gate_daemon_steps: false,
         lift: false,
         inherit: Inherit::All,
         kind: None,
@@ -19782,6 +19790,7 @@ fn stepping_turn_under(db: &mut Database, gated: bool, settings: Settings) -> (i
         expire_ms: None,
         grammar: None,
         steps: true,
+        gate_daemon_steps: false,
         lift: false,
         inherit: Inherit::All,
         kind: Some("mcp".into()),
@@ -21039,7 +21048,7 @@ fn a_lifted_call_waits_on_past_its_turn_and_its_verdict_runs_or_ends_it() {
         })
         .unwrap();
     assert_eq!(denied.lifted, Some(p2));
-    let Lifted::Ended { result, ready } = db.lifted_check(p2, now, false).unwrap() else {
+    let Lifted::Ended { result, ready, .. } = db.lifted_check(p2, now, false).unwrap() else {
         panic!("a denied call did not end");
     };
     assert_eq!(
@@ -21204,6 +21213,7 @@ fn a_lifted_answered_call_takes_its_answer_or_is_stopped_and_outlives_a_restart(
         expire_ms: None,
         grammar: None,
         steps: false,
+        gate_daemon_steps: false,
         lift: false,
         inherit: Inherit::All,
         kind: None,
@@ -21314,6 +21324,7 @@ fn a_lifted_answered_call_keeps_its_time_steps_listing_and_audit_row() {
         expire_ms: Some(600_000),
         grammar: None,
         steps: true,
+        gate_daemon_steps: false,
         lift: false,
         inherit: Inherit::All,
         kind: None,

@@ -285,6 +285,13 @@ pub struct Declared {
     /// whose nested calls are each approved, as in Codex's code mode.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub steps: bool,
+    /// Whether a gate that names the tool also judges the daemon steps of
+    /// its calls (`run_step`), beside the gates that name each step's own
+    /// tool. Left out, a `shell` step is judged as `shell` and nothing
+    /// more, as a script tool whose gate judges only its client's steps
+    /// wants.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub gate_daemon_steps: bool,
     /// Whether a steer lifts a call still waiting for its answer to the
     /// background once it has waited the grace a foreground command gets,
     /// as it lifts that command: for a tool whose calls may run long, a
@@ -298,6 +305,14 @@ pub struct Declared {
     /// calls' rows there name; none when its client says nothing.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub kind: Option<String>,
+}
+/// A command that asks to leave its sandbox with no gate to let it.
+pub fn escalation_refused() -> Error {
+    Error::with(
+        "escalation_refused",
+        "no approval lets this bot run a command outside its sandbox; \
+             run it without sandbox_permissions",
+    )
 }
 fn declared_result() -> String {
     "ok".into()
@@ -2341,9 +2356,10 @@ impl ReadSource {
         {
             return Ok(ReadSource::Result { node });
         }
-        let mut parts = text.splitn(3, '/');
-        if let (Some(turn), Some(call_id), Some(stream)) =
-            (parts.next(), parts.next(), parts.next())
+        // A daemon step's call id is `CALL/STEP`: the stream is the last
+        // part, the turn the first.
+        if let Some((turn, rest)) = text.split_once('/')
+            && let Some((call_id, stream)) = rest.rsplit_once('/')
             && let Ok(turn) = turn.parse::<i64>()
             && turn > 0
             && !call_id.is_empty()

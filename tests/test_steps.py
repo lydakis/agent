@@ -1,0 +1,304 @@
+"""Daemon steps: a script's calls of its bot's own tools, which the daemon
+decides as the same call from the model, runs, records and answers with
+what the model would have read (`run_step`)."""
+import json
+import os
+import queue
+import shutil
+import sys
+import time
+import unittest
+
+from bench.socket_client import Connection, SocketClient
+from tests.test_runtime import ModelFixture
+
+# A script tool whose daemon steps the bot's own gates judge, each by its
+# own tool.
+EXEC = {'name': 'exec', 'description': 'Run a script.',
+        'parameters': {'type': 'object', 'properties': {'code': {'type': 'string'}},
+                       'required': ['code'], 'additionalProperties': False},
+        'answered_by': 'sonny', 'steps': True}
+
+
+@unittest.skipUnless(os.environ.get('AGENT_TEST_RUNTIME') == '1', 'set AGENT_TEST_RUNTIME=1 after a Rust release build')
+class DaemonStepTests(ModelFixture):
+    def script(self, tools='echo,shell', tool=EXEC, settings=None, client=None, **create):
+        client = client or self.client(tools, settings=settings)
+        created = client.request('create', bot='Lead', workspace=str(self.path), declare=[tool], **create)
+        self.assertIn('result', created, created)
+        self.model.call_script = [('exec', {'code': 'run()'})]
+        turn = client.request('submit', bot='Lead', request_id='t', prompt='script')['result']['message']
+        client.receive(lambda m: m.get('event') == 'tool_started' and m.get('turn') == turn)
+        return client, turn
+
+    def step(self, client, turn, step='1', name='echo', arguments=None, call_id='script-0'):
+        return client.request('run_step', bot='Lead', turn=turn, call_id=call_id, step=step, name=name,
+                              arguments={'text': 'hi'} if arguments is None else arguments)
+
+    def ask(self, client, turn, step='1', name='shell', arguments=None):
+        """Send a run_step without waiting for it; its id, to receive the reply by."""
+        client.next_id += 1
+        request = dict(id=client.next_id, op='run_step', bot='Lead', turn=turn, call_id='script-0',
+                       step=step, name=name, arguments=arguments or {'command': 'sleep 30'})
+        client.process.stdin.write(json.dumps(request) + '\n')
+        client.process.stdin.flush()
+        return client.next_id
+
+    def reply(self, client, request, timeout=5):
+        return client.receive(lambda m: m.get('id') == request, timeout)
+
+    def answer(self, client, turn, output='done'):
+        return client.request('tool_result', bot='Lead', turn=turn, call_id='script-0', output=output)
+
+    def events(self, client, turn, kind):
+        events = client.request('events', bot='Lead', after=0, limit=256)['result']['events']
+        return [e['data'] for e in events if e.get('turn') == turn and e['event'] == kind]
+
+    def ended(self, client, turn, call_id, timeout=5):
+        deadline = time.monotonic() + timeout
+        while True:
+            done = [d for d in self.events(client, turn, 'step_completed') if d['call_id'] == call_id]
+            if done:
+                return done[0]
+            self.assertLess(time.monotonic(), deadline, f'{call_id} never ended')
+            time.sleep(.02)
+
+    def running(self, client, timeout=5):
+        deadline = time.monotonic() + timeout
+        while client.request('stats')['result']['steps']['commands'] == 0:
+            self.assertLess(time.monotonic(), deadline, 'no step command started')
+            time.sleep(.01)
+
+    def test_an_echo_step_runs_at_once_and_answers_what_the_model_would_read(self):
+        client, turn = self.script()
+        step = self.step(client, turn)
+        self.assertEqual(step['result'], {'call_id': 'script-0/1', 'output': 'hi', 'failed': False})
+        # Decided and ended as events a judge reads, and a row in the trail.
+        [decided] = self.events(client, turn, 'step_decided')
+        self.assertEqual({k: decided[k] for k in ('call_id', 'step_of', 'name', 'decision', 'daemon', 'arguments')},
+                         {'call_id': 'script-0/1', 'step_of': 'script-0', 'name': 'echo', 'decision': 'allow',
+                          'daemon': True, 'arguments': '{"text":"hi"}'})
+        [done] = self.events(client, turn, 'step_completed')
+        self.assertEqual((done['call_id'], done['step_of'], done.get('failed')), ('script-0/1', 'script-0', None))
+        rows = client.request('audit', bot='Lead')['result']['rows']
+        [row] = [r for r in rows if r['step'] == '1']
+        self.assertEqual((row['tool'], row['approved'], row['outcome'], row['call_id']),
+                         ('echo', 'nobody', 'completed', 'script-0'))
+        # Steps one after another, each its own.
+        self.assertEqual(self.step(client, turn, step='2', arguments={'text': 'again'})['result']['output'], 'again')
+        self.assertEqual(self.step(client, turn, step='1')['error'], 'step_exists')
+        self.assertEqual(client.request('stats')['result']['steps']['in_flight'], 0)
+        self.answer(client, turn)
+        self.assertEqual(client.finished(turn)['data']['status'], 'completed')
+
+    def test_a_shell_step_runs_in_the_turn_s_folder_with_its_environment(self):
+        client, turn = self.script()
+        step = self.step(client, turn, name='shell',
+                         arguments={'command': 'pwd; echo "$AGENT_BOT $AGENT_TURN"; exit 3'})['result']
+        self.assertEqual(step['call_id'], 'script-0/1')
+        self.assertTrue(step['failed'])
+        output = json.loads(step['output'])
+        self.assertEqual(output['stdout'].split('\n')[:2], [str(self.path.resolve()), f'Lead {turn}'])
+        self.assertEqual((output['exit_code'], output['success']), (3, False))
+        self.assertTrue(self.ended(client, turn, 'script-0/1')['failed'])
+        self.answer(client, turn)
+        self.assertEqual(client.finished(turn)['data']['status'], 'completed')
+
+    def test_a_step_is_refused_at_once_for_what_it_cannot_be(self):
+        client, turn = self.script()
+        ask = dict(bot='Lead', turn=turn, call_id='script-0', step='1', name='echo', arguments={'text': 'hi'})
+        for change, error in [({'step': 'a b'}, 'invalid_step'), ({'name': 'read'}, 'invalid_step'),
+                              ({'name': 'mcp__x__y'}, 'invalid_step'), ({'arguments': []}, 'invalid_step'),
+                              ({'arguments': {'nope': 1}}, 'invalid_tool_arguments'),
+                              ({'name': 'shell', 'arguments': {'command': 'x', 'background': True}}, 'invalid_step'),
+                              ({'arguments': {'text': 'x' * 65537}}, 'step_arguments_limit'),
+                              ({'call_id': 'nope'}, 'no_pending_call'), ({'bot': 'Other'}, 'turn_not_found'),
+                              ({'call_id': ''}, 'invalid_call_id')]:
+            self.assertEqual(client.request('run_step', **(ask | change))['error'], error, change)
+        # One daemon step of a call at a time.
+        request = self.ask(client, turn)
+        self.running(client)
+        self.assertEqual(client.request('run_step', **(ask | {'step': '2'}))['error'], 'step_in_flight')
+        self.answer(client, turn)
+        self.assertEqual(self.reply(client, request)['error'], 'step_stopped')
+        self.assertEqual(client.finished(turn)['data']['status'], 'completed')
+        self.assertEqual(client.request('run_step', **ask)['error'], 'stale_turn')
+        self.assertEqual(client.request('stats')['result']['steps']['in_flight'], 0)
+        # Nothing was recorded for a step refused at once.
+        self.assertEqual([d['call_id'] for d in self.events(client, turn, 'step_decided')], ['script-0/1'])
+
+    def test_a_step_needs_a_tool_the_bot_may_call_and_a_call_that_takes_steps(self):
+        client, turn = self.script(tools='echo')
+        self.assertEqual(self.step(client, turn, name='shell', arguments={'command': 'true'})['error'],
+                         'tool_not_available')
+        self.answer(client, turn)
+        client.finished(turn)
+        self.setUp()
+        client, turn = self.script(tool={k: v for k, v in EXEC.items() if k != 'steps'})
+        self.assertEqual(self.step(client, turn)['error'], 'invalid_step')
+
+    def test_a_step_is_decided_as_its_direct_call_would_be(self):
+        rules = {'prefix_rules': [{'pattern': ['rm'], 'decision': 'forbidden', 'source': 'default.rules:1'}]}
+        client, turn = self.script(settings={'rules': rules})
+        refused = self.step(client, turn, name='shell', arguments={'command': 'rm -rf x'})['result']
+        self.assertEqual((refused['decision'], refused['failed']), ('deny', True))
+        self.assertEqual(json.loads(refused['output'])['error'], 'command_forbidden')
+        [decided] = self.events(client, turn, 'step_decided')
+        self.assertEqual((decided['decision'], decided['error'], decided.get('denied')),
+                         ('deny', 'command_forbidden', None))
+        self.assertEqual(self.events(client, turn, 'step_completed'), [])
+        # A refused step's name is spent too: one name, one step, while its call lives.
+        self.assertEqual(self.step(client, turn, name='shell', arguments={'command': 'ls'})['error'], 'step_exists')
+        # A gate that names shell holds a shell step, as it holds the call.
+        self.answer(client, turn)
+        client.finished(turn)
+        self.setUp()
+        client, turn = self.script(approve=['shell'], approver='manual')
+        request = self.ask(client, turn, arguments={'command': 'echo allowed'})
+        [call] = client.receive(lambda m: m.get('event') == 'approval_requested')['data']['calls']
+        self.assertEqual((call['call_id'], call['step_of'], call['name'], call['gates']),
+                         ('script-0/1', 'script-0', 'shell', ['manual']))
+        [listed] = client.request('approvals', bot='Lead')['result']['approvals']
+        self.assertTrue(listed['daemon'])
+        client.request('answer', bot='Lead', turn=turn, call_id='script-0/1', request=1, decision='allow', by='test')
+        ran = self.reply(client, request)['result']
+        self.assertEqual(json.loads(ran['output'])['stdout'], 'allowed\n')
+        request = self.ask(client, turn, step='2', arguments={'command': 'echo denied'})
+        client.receive(lambda m: m.get('event') == 'approval_requested')
+        client.request('answer', bot='Lead', turn=turn, call_id='script-0/2', request=1, decision='deny',
+                       reason='not now', by='test')
+        denied = self.reply(client, request)['result']
+        self.assertEqual((denied['decision'], denied['reason'], denied['failed']), ('deny', 'not now', True))
+        self.assertEqual(json.loads(denied['output'])['error'], 'approval_denied')
+        self.assertEqual([(d['call_id'], d['decision'], d.get('daemon')) for d in self.events(client, turn, 'step_decided')],
+                         [('script-0/1', 'allow', True), ('script-0/2', 'deny', True)])
+        self.assertEqual([d['call_id'] for d in self.events(client, turn, 'step_completed')], ['script-0/1'])
+        self.assertEqual(self.step(client, turn, step='2')['error'], 'step_exists')
+        # An echo step no gate names runs at once beside them.
+        self.assertEqual(self.step(client, turn, step='3')['result']['output'], 'hi')
+        self.answer(client, turn)
+        self.assertEqual(client.finished(turn)['data']['status'], 'completed')
+
+    def test_a_bot_that_never_asks_has_a_held_step_refused(self):
+        client, turn = self.script(approve=['shell'], approver='manual', settings={'approval_policy': 'never'})
+        refused = self.step(client, turn, name='shell', arguments={'command': 'true'})['result']
+        self.assertEqual(json.loads(refused['output'])['error'], 'approval_refused')
+        [decided] = self.events(client, turn, 'step_decided')
+        self.assertTrue(decided['denied'])
+        self.answer(client, turn)
+        client.finished(turn)
+
+    def test_the_script_tool_s_gate_judges_its_daemon_steps_only_when_it_says_so(self):
+        client, turn = self.script(approve=['exec'], approver='manual')
+        self.assertEqual(self.step(client, turn)['result']['output'], 'hi')
+        self.answer(client, turn)
+        client.finished(turn)
+        self.setUp()
+        client, turn = self.script(tool=dict(EXEC, gate_daemon_steps=True), approve=['exec'], approver='manual')
+        request = self.ask(client, turn, name='echo', arguments={'text': 'judged'})
+        [call] = client.receive(lambda m: m.get('event') == 'approval_requested')['data']['calls']
+        self.assertEqual((call['call_id'], call['name'], call['gates']), ('script-0/1', 'echo', ['manual']))
+        client.request('answer', bot='Lead', turn=turn, call_id='script-0/1', request=1, decision='allow', by='test')
+        self.assertEqual(self.reply(client, request)['result']['output'], 'judged')
+        self.answer(client, turn)
+        self.assertEqual(client.finished(turn)['data']['status'], 'completed')
+
+    def test_the_call_answered_stops_its_step_first(self):
+        client, turn = self.script()
+        request = self.ask(client, turn)
+        self.running(client)
+        self.assertIn('result', self.answer(client, turn))
+        stopped = self.reply(client, request)
+        self.assertEqual((stopped['error'], stopped['detail']), ('step_stopped', 'the call was answered'))
+        done = self.ended(client, turn, 'script-0/1')
+        self.assertEqual((done['failed'], done['error']), (True, 'step_stopped'))
+        self.assertEqual(client.finished(turn)['data']['status'], 'completed')
+        rows = client.request('audit', bot='Lead')['result']['rows']
+        [row] = [r for r in rows if r['step'] == '1']
+        self.assertEqual(row['outcome'], 'failed')
+
+    def test_the_call_running_out_of_time_stops_its_step(self):
+        client, turn = self.script(tool=dict(EXEC, expire_ms=1500))
+        request = self.ask(client, turn)
+        self.running(client)
+        stopped = self.reply(client, request, timeout=10)
+        self.assertEqual(stopped['error'], 'step_stopped')
+        self.ended(client, turn, 'script-0/1')
+        self.assertEqual(client.finished(turn, timeout=10)['data']['status'], 'completed')
+
+    def test_an_interrupt_stops_the_step_with_its_call(self):
+        client, turn = self.script()
+        request = self.ask(client, turn)
+        self.running(client)
+        client.request('interrupt', bot='Lead', turn=turn)
+        self.assertEqual(self.reply(client, request, timeout=10)['error'], 'step_stopped')
+        self.ended(client, turn, 'script-0/1')
+        self.assertEqual(client.request('stats')['result']['steps']['in_flight'], 0)
+
+    def test_a_pause_stops_a_running_step_and_refuses_new_ones(self):
+        client, turn = self.script()
+        request = self.ask(client, turn)
+        self.running(client)
+        client.request('pause', reason='look first')
+        stopped = self.reply(client, request, timeout=10)
+        self.assertEqual(stopped['result']['failed'], True)
+        self.assertEqual(json.loads(stopped['result']['output'])['error'], 'daemon_paused')
+        self.assertEqual(self.step(client, turn, step='2')['error'], 'daemon_paused')
+        client.request('resume')
+
+    def test_a_step_goes_with_the_session_that_asked(self):
+        daemon = SocketClient(self.binary, self.path / 'state.sqlite', self.url, 'echo,shell')
+        self.addCleanup(daemon.close)
+        daemon.request('create', bot='Lead', workspace=str(self.path), declare=[EXEC])
+        self.model.call_script = [('exec', {'code': 'run()'})]
+        turn = daemon.request('submit', bot='Lead', request_id='t', prompt='script')['result']['message']
+        deadline = time.monotonic() + 5
+        while not daemon.request('tool_calls', tag='sonny')['result']['calls']:
+            self.assertLess(time.monotonic(), deadline)
+            time.sleep(.01)
+        asker = Connection(daemon.socket_path)
+        asker.socket.sendall((json.dumps(dict(id=1, op='run_step', bot='Lead', turn=turn, call_id='script-0',
+                                              step='1', name='shell', arguments={'command': 'sleep 30'})) + '\n').encode())
+        while daemon.request('stats')['result']['steps']['commands'] == 0:
+            self.assertLess(time.monotonic(), deadline)
+            time.sleep(.01)
+        asker.close()
+        done = self.ended(daemon, turn, 'script-0/1')
+        self.assertEqual(done['error'], 'step_stopped')
+        self.assertEqual(daemon.request('stats')['result']['steps']['in_flight'], 0)
+        self.assertIn('result', daemon.request('tool_result', bot='Lead', turn=turn, call_id='script-0', output='ok'))
+        self.assertEqual(daemon.finished(turn)['data']['status'], 'completed')
+
+    def test_a_step_cut_off_by_a_restart_ends_of_unknown_outcome(self):
+        client, turn = self.script()
+        self.ask(client, turn)
+        self.running(client)
+        client.close(kill=True)
+        client = self.client('echo,shell')
+        done = self.ended(client, turn, 'script-0/1')
+        self.assertEqual((done['failed'], done['error']), (True, 'tool_outcome_unknown'))
+
+    def test_a_step_s_long_output_is_kept_under_its_id_until_its_call_is_answered(self):
+        client, turn = self.script()
+        step = self.step(client, turn, name='shell', arguments={'command': 'head -c 200000 /dev/zero | tr "\\0" a'})
+        output = json.loads(step['result']['output'])
+        self.assertEqual(output['artifacts'], [f'{turn}/script-0/1/stdout'])
+        page = client.request('artifact', bot='Lead', turn=turn, call_id='script-0/1', stream='stdout', limit=10)
+        self.assertEqual(page['result']['text'], 'a' * 10)
+        self.answer(client, turn)
+        client.finished(turn)
+        gone = client.request('artifact', bot='Lead', turn=turn, call_id='script-0/1', stream='stdout')
+        self.assertIn('error', gone)
+
+    def test_a_lifted_call_keeps_its_step_past_its_turn(self):
+        client, turn = self.script(tool=dict(EXEC, lift=True), settings={'approval_hold_ms': 0})
+        request = self.ask(client, turn, arguments={'command': 'sleep 1; echo lifted'})
+        self.running(client)
+        steered = client.request('submit', bot='Lead', request_id='s', prompt='go on', delivery='steer')
+        self.assertIn('result', steered)
+        ran = self.reply(client, request, timeout=15)['result']
+        self.assertEqual(json.loads(ran['output'])['stdout'], 'lifted\n')
+
+
+if __name__ == '__main__':
+    unittest.main()
