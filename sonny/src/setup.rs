@@ -65,7 +65,7 @@ pub const STEPS: [Step; 3] = [
 /// Whether there is a signed-in browser to offer: agent-browser here, its
 /// settings naming no profile, and Chrome's own profile to copy.
 fn browser_profile_offered() -> bool {
-    on_path("agent-browser")
+    crate::trusted::here("agent-browser")
         && !browser_profile_set()
         && crate::browser::chrome_has_profile(crate::browser::SEEDED_PROFILE)
 }
@@ -840,15 +840,11 @@ pub async fn model(client: &Client) -> Result<String, String> {
         }
         false
     });
+    programs();
     if let Err(error) = chrome()
         && error != "setup cancelled"
     {
         println!("{DIM}Chrome not downloaded: {error}{RESET}");
-    }
-    if let Err(error) = desktop()
-        && error != "setup cancelled"
-    {
-        println!("{DIM}agent-desktop not installed: {error}{RESET}");
     }
     crate::skills::note_offered("browser-profile");
     if let Err(error) = signed_in_browser()
@@ -905,7 +901,7 @@ fn chrome() -> Result<(), String> {
     if !matches!(answer.to_ascii_lowercase().as_str(), "" | "y" | "yes") {
         return Ok(());
     }
-    let ran = std::process::Command::new("agent-browser")
+    let ran = std::process::Command::new(crate::trusted::program("agent-browser")?)
         .arg("install")
         .status()
         .map_err(|e| e.to_string())?;
@@ -915,28 +911,15 @@ fn chrome() -> Result<(), String> {
     }
 }
 
-/// agent-desktop, through which agents use this computer's desktop,
-/// offered where there is one and npm can install it; an answer other
-/// than yes skips it. The permissions it needs are asked for by the agent
-/// that first uses it, from where it runs.
-fn desktop() -> Result<(), String> {
-    if on_path("agent-desktop") || !on_path("npm") || !desktop_shows() {
-        return Ok(());
-    }
-    println!(
-        "\nAgents can see and use this computer's apps with agent-desktop, through the\naccessibility tree, asking you before they click or type."
-    );
-    let answer = line("Install it with npm now? [Y/n] ")?;
-    if !matches!(answer.to_ascii_lowercase().as_str(), "" | "y" | "yes") {
-        return Ok(());
-    }
-    let ran = std::process::Command::new("npm")
-        .args(["install", "-g", "agent-desktop"])
-        .status()
-        .map_err(|e| e.to_string())?;
-    match ran.success() {
-        true => Ok(()),
-        false => Err(format!("`npm install -g agent-desktop` {ran}")),
+/// Sonny's own agent-browser, which agents browse with, and agent-desktop,
+/// through which they use this computer's apps where it shows a desktop,
+/// installed at the versions Sonny pins, as `sonny upgrade` keeps them. The
+/// permissions agent-desktop needs are asked for by the agent that first
+/// uses it, from where it runs.
+fn programs() {
+    let say = |line: &str| println!("{DIM}{line}{RESET}");
+    for error in crate::trusted::bring_up(&say) {
+        println!("{DIM}Not installed: {error}{RESET}");
     }
 }
 
@@ -952,10 +935,8 @@ pub fn desktop_shows() -> bool {
 /// Whether agent-browser finds a Chrome, by its own check; `None` when it
 /// is not installed or does not say.
 fn has_chrome() -> Option<bool> {
-    if !on_path("agent-browser") {
-        return None;
-    }
-    let report = std::process::Command::new("agent-browser")
+    let program = crate::trusted::program("agent-browser").ok()?;
+    let report = std::process::Command::new(program)
         .args(["doctor", "--offline", "--quick", "--json"])
         .stdin(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
@@ -1089,23 +1070,19 @@ fn missing_tools() -> Vec<String> {
             install("ripgrep")
         ));
     }
-    // Not in distributions' packages: Homebrew's, or npm's.
-    if !on_path("agent-browser") {
-        let command = match on_path("brew") {
-            true => "brew install agent-browser",
-            false => "npm install -g agent-browser",
-        };
-        missing.push(format!(
-            "agent-browser, which agents browse with: `{command}`"
-        ));
+    // Sonny's own, which `sonny upgrade` installs.
+    if !crate::trusted::here("agent-browser") {
+        missing.push("agent-browser, which agents browse with: `sonny upgrade`".into());
     } else if has_chrome() == Some(false) {
-        missing.push("Chrome, which agent-browser drives: `agent-browser install`".into());
+        let program = crate::trusted::program("agent-browser").unwrap_or_default();
+        missing.push(format!(
+            "Chrome, which agent-browser drives: `{} install`",
+            crate::tilde(&program.display().to_string())
+        ));
     }
-    // npm's only, and only where there is a desktop to use.
-    if desktop_shows() && !on_path("agent-desktop") {
+    if desktop_shows() && !crate::trusted::here("agent-desktop") {
         missing.push(
-            "agent-desktop, which agents use this computer's apps with: `npm install -g agent-desktop`"
-                .into(),
+            "agent-desktop, which agents use this computer's apps with: `sonny upgrade`".into(),
         );
     }
     missing

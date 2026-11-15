@@ -16,8 +16,9 @@ On macOS or Linux with Homebrew:
 brew install lydakis/agent/sonny
 ```
 
-This builds Sonny from a release's source and installs Agent, ripgrep, and
-agent-browser. If Homebrew refuses the tap as untrusted, run
+This builds Sonny from a release's source and installs Agent and ripgrep.
+Sonny installs its own agent-browser and agent-desktop, at the versions
+its tools are written for, when you run `sonny setup`. If Homebrew refuses the tap as untrusted, run
 `brew trust lydakis/agent` first.
 
 On Linux, the installer downloads the latest release's static builds for

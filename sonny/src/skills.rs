@@ -93,12 +93,12 @@ pub fn install_own() {
 /// with agent-browser gone, Sonny's copy goes too.
 fn install_browser() {
     const NAME: &str = "agent-browser";
-    if !crate::setup::on_path(NAME) {
+    let Ok(program) = crate::trusted::program(NAME) else {
         remove(NAME);
         return;
-    }
-    let refresh = || {
-        let served = std::process::Command::new(NAME)
+    };
+    let refresh = move || {
+        let served = std::process::Command::new(program)
             .args(["skills", "get", NAME])
             .stdin(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
@@ -129,12 +129,12 @@ fn install_browser() {
 /// can use the desktop, which the `desktop` tool says.
 fn install_desktop() {
     const NAME: &str = "agent-desktop";
-    if !crate::desktop::here() {
+    let (true, Ok(program)) = (crate::desktop::here(), crate::trusted::program(NAME)) else {
         remove(NAME);
         return;
-    }
-    let refresh = || {
-        let served = std::process::Command::new(NAME)
+    };
+    let refresh = move || {
+        let served = std::process::Command::new(program)
             .args(["skills", "get", "desktop"])
             .stdin(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())

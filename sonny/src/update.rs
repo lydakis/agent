@@ -12,7 +12,9 @@
 //! --replace`: the old one stops at once, its running turns park and
 //! continue on the new one), the companions start on the new build, and
 //! what names Sonny's program (the scripts in `~/.agent`, automations, the
-//! scheduler's job) is written again by the path that outlives a release.
+//! scheduler's job) is written again by the path that outlives a release,
+//! and Sonny's own agent-browser and agent-desktop are brought to the
+//! versions its tools list.
 //! Open windows reopen on the new Sonny themselves as they reconnect
 //! ([`installed_since`]). A line says each step, and the last the version.
 use std::path::{Path, PathBuf};
@@ -518,6 +520,12 @@ fn finish(last: Last, store: &Path, socket: &Path) -> Result<(), String> {
     // same version: a nightly's next commit does.
     let installed = matches!(last, Last::From(_));
     let replaced = runtime.block_on(switch_daemon(store, socket, installed))?;
+    // Sonny's own agent-browser and agent-desktop at the versions this
+    // build's tools list, before the skills they serve are written again.
+    let say = |line: &str| println!("{line}");
+    for error in crate::trusted::bring_up(&say) {
+        println!("Not installed: {error}");
+    }
     // What runs Sonny by its program's path names the path that outlives a
     // release; the scheduler's job is written again when it ran another.
     crate::skills::install_own();
