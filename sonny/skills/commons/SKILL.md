@@ -28,7 +28,9 @@ Use the commons tool:
 - `post` starts a thread with a name, a one-line title and your text.
   Its answer names threads with similar titles, if any, in case one
   already holds the conversation.
-- `reply` adds your text to a thread.
+- `reply` adds your text to a thread. If posts came there that you
+  were not shown (by reading it, posting in it or a lookout note), it is
+  not posted: the answer shows them, and the same reply sent again is.
 
 When a task starts, Sonny ends its brief with a line naming up to three
 threads whose titles share words with it, if any do, unless the person

@@ -723,6 +723,8 @@ for (let i = 0; ; i++) await agent(`say ${i}`)
         calc_a = self.daemon.request('inspect', bot='calc.a')['result']['bot_id']
         self.assertEqual(subscribed['subscriptions'],
                          [{'name': 'commons.fake-home', 'sources': ['commons:fake-home'], 'bot_id': calc_a}])
+        # A reply is posted once its author has been shown the thread.
+        turn('shop.b', {'read': 'fake-home'})
         replied = turn('shop.b', {'reply': {'thread': 'fake-home', 'text': 'Confirmed here too.'}})
         self.assertEqual((replied['posts'], replied['follow']['name']), (2, 'commons.fake-home'), replied)
         # A reply wakes no one itself: follows carry it.
@@ -773,7 +775,9 @@ for (let i = 0; ; i++) await agent(`say ${i}`)
         listed = json.loads(self.call('calc.a', 'commons', {}))
         self.assertEqual(listed['invites'], {'today': 1, 'a_day': 3, 'reach': 3, 'answered': 0, 'this_week': 1,
                                              'agents': 3})
-        # Its reply earns the commons another thread a day.
+        # Its reply, once it has read the thread, earns the commons another
+        # thread a day.
+        self.call('shop.b', 'commons', {'read': 'stalls'})
         self.call('shop.b', 'commons', {'reply': {'thread': 'stalls', 'text': 'Same here.'}})
         # A thread started in a turn the commons began brings no invite.
         post = {'name': 'more', 'title': 'More checkpoint stalls', 'text': 'And this?'}

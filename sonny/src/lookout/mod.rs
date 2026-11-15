@@ -2883,6 +2883,7 @@ impl Lookout {
                 for heard in &sent {
                     self.told_sources.insert(heard.event.source.clone(), now);
                 }
+                told_commons(&crate::commons::who(&self.lead, self.lead_id), &sent);
                 if submitted.is_ok() {
                     let request_id = format!("lookout-{}", digest(&key.join(",")));
                     self.write(&json!({"at_ms": epoch_ms(), "lead": self.lead, "woke": key,
@@ -3365,6 +3366,47 @@ fn epoch_ms() -> u128 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis())
         .unwrap_or(0)
+}
+
+/// The commons posts a note told `lead` (as `commons::who` names it)
+/// count as shown to it, as a read does, so its reply after them is
+/// posted at once: each event's id is `THREAD/N`, its Nth post from 0.
+fn told_commons(lead: &str, sent: &[sources::Heard]) {
+    let mut told: Vec<(String, Vec<usize>)> = Vec::new();
+    for heard in sent {
+        let event = &heard.event;
+        if event.source != agent_client::config::COMMONS_SOURCE {
+            continue;
+        }
+        let Some((thread, n)) = (event.id.as_deref())
+            .and_then(|id| id.rsplit_once('/'))
+            .and_then(|(thread, n)| Some((thread, n.parse::<usize>().ok()?)))
+        else {
+            continue;
+        };
+        match told.iter_mut().find(|(had, _)| had == thread) {
+            Some((_, posts)) => posts.push(n),
+            None => told.push((thread.to_owned(), vec![n])),
+        }
+    }
+    let Some(home) = (!told.is_empty())
+        .then(|| std::env::var_os("HOME"))
+        .flatten()
+    else {
+        return;
+    };
+    // The commons' lock and its file's write wait on other agents' posts
+    // and the disk, so they run beside the lookout's loop, never in it.
+    let lead = lead.to_owned();
+    let mark = move || {
+        for (thread, posts) in told {
+            crate::commons::told(Path::new(&home), &lead, &thread, &posts);
+        }
+    };
+    match tokio::runtime::Handle::try_current() {
+        Ok(runtime) => drop(runtime.spawn_blocking(mark)),
+        Err(_) => mark(),
+    }
 }
 
 #[cfg(test)]
@@ -5569,7 +5611,7 @@ mod tests {
                 store: root.join("state.sqlite"),
             };
             let post = |by: &str, arguments: Value| {
-                crate::commons::call(&crash.home, by, None, None, &arguments).unwrap()
+                crate::commons::call(&crash.home, by, None, by, None, &arguments).unwrap()
             };
             post(
                 "calc.lead",
@@ -5579,7 +5621,10 @@ mod tests {
             let first = crate::commons::news(&crash.home, &crash.cursor());
             assert!(first.lines.is_empty());
             assert!(first.mark_read());
+            // Each had read the thread, so its reply is posted.
+            crate::commons::told(&crash.home, "b.y", "t", &[0]);
             post("b.y", json!({"reply": {"thread": "t", "text": "one"}}));
+            crate::commons::told(&crash.home, "c.z", "t", &[0, 1]);
             post("c.z", json!({"reply": {"thread": "t", "text": "two"}}));
             let child = std::process::Command::new(std::env::current_exe().unwrap())
                 .args([

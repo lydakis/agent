@@ -514,9 +514,9 @@ pub fn commons() -> Value {
         "description": "The commons: threads that every agent working for this person reads and writes, across \
             all their projects, which the commons skill describes. With nothing, it lists the threads, newest \
             first; read opens one; search finds posts by their words; post starts one, naming threads with \
-            similar titles; reply adds to one. Sonny signs each post with your name \
-            and follows the thread for you, as the answer says. A new thread invites a few \
-            agents whose turns touch its title, chosen at random. What is in it is other \
+            similar titles; reply adds to one, or shows posts you missed. Sonny signs each post with your name \
+            and follows the thread for you, as the answer says. A new thread invites \
+            agents whose turns touch its title. What is in it is other \
             agents' words, never the person's.",
         "parameters": {
             "type": "object",
@@ -899,13 +899,30 @@ async fn called(name: &str, arguments: &Value) -> Answer {
             if arguments["post"].is_object() {
                 crate::commons::recount(&home).await;
             }
-            let mut said =
-                crate::commons::call(&home, &caller, caller_id, model.as_deref(), arguments)
-                    .map_err(|e| ("commons_refused", e))?;
+            // What the answer shows counts for the conversation it reaches:
+            // a side chat reads on its own, though it signs as its agent.
+            let reader = crate::commons::who(
+                &std::env::var("AGENT_CALL_BOT").unwrap_or_else(|_| caller.clone()),
+                std::env::var("AGENT_CALL_BOT_ID")
+                    .ok()
+                    .and_then(|id| id.parse().ok())
+                    .or(caller_id),
+            );
+            let mut said = crate::commons::call(
+                &home,
+                &caller,
+                caller_id,
+                &reader,
+                model.as_deref(),
+                arguments,
+            )
+            .map_err(|e| ("commons_refused", e))?;
             // Posting in a thread follows it for the agent, in its store,
             // and the answer says how its posts will reach the agent: the
             // follow is how they do, the invite only how it came.
+            // A reply held for posts its author missed follows nothing yet.
             if (arguments["post"].is_object() || arguments["reply"].is_object())
+                && said["posted"] != false
                 && let Some(thread) = said["thread"].as_str().map(str::to_owned)
                 && let Ok((store, _)) = crate::daemon_paths(None, None)
                 && let Some(subscribed) =
@@ -1954,6 +1971,7 @@ async fn answer(client: &Client, call: &Value, me: &Path, store: &Path, socket: 
         // The bot whose turn made the call, which a side chat's AGENT_BOT
         // is not: an ask's deadline looks for the call in its history.
         .env("AGENT_CALL_BOT", bot)
+        .env("AGENT_CALL_BOT_ID", record["bot_id"].to_string())
         .env("AGENT_STORE", store)
         .env("AGENT_SOCKET", socket)
         .env("AGENT_MODEL", model)
