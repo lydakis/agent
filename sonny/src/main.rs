@@ -8024,13 +8024,11 @@ impl App {
                 else {
                     return;
                 };
-                let bot = match (to.contains('.'), self.project.as_ref()) {
-                    (false, Some(project)) => format!("{project}.{to}"),
-                    _ => to.to_owned(),
-                };
+                // The daemon sends to `to` as written: its link opens that
+                // one, and only the label is shortened.
                 (
                     started::SENT,
-                    bot,
+                    to.to_owned(),
                     arguments["message"].as_str().unwrap_or(""),
                 )
             }
@@ -8202,27 +8200,57 @@ impl App {
             .cloned()
             .collect();
         others.sort();
+        // What waits on the person, read as every surface reads it.
+        let held = match bots.is_empty() && others.is_empty() {
+            true => None,
+            false => Some(needs::listing(&self.client, None).await),
+        };
+        let store = self.store();
+        // Those others wait on the person for a call held for approval, or
+        // the question their turn ended on.
+        let mut waiting = needs::Needs::default();
+        if let Some(Ok(held)) = &held {
+            waiting.held(held.clone(), |_| true);
+        }
         for bot in others {
             let state = match self.task_turn_at(&bot).await {
-                Ok((turn, _)) => started::state(&turn),
+                Ok((turn, _)) => {
+                    let state = started::state(&turn);
+                    if let (true, Some(last)) = (started::settled(&state), turn["turn"].as_i64()) {
+                        let seen = match self.asks_seen.get(&bot) {
+                            Some((at, seen)) if *at == last => Some(seen.clone()),
+                            _ => {
+                                let seen = needs::scan(&self.client, &bot, Some(last)).await;
+                                if let Some(seen) = &seen {
+                                    self.asks_seen.insert(bot.clone(), (last, seen.clone()));
+                                }
+                                seen
+                            }
+                        };
+                        if let Some(seen) = seen {
+                            waiting.asked(&bot, seen.open(&store, &bot, false));
+                        }
+                    }
+                    match waiting.waits(&bot) {
+                        true => "needs you".to_owned(),
+                        false => state,
+                    }
+                }
                 Err(error) if error.code == "bot_not_found" => "removed".to_owned(),
                 Err(_) => continue,
             };
             self.set_states.insert(bot, state);
         }
-        if bots.is_empty() {
+        let Some(held) = held.filter(|_| !bots.is_empty()) else {
             self.redraw_set_rows(&named);
             return;
-        }
-        // What waits on the person, read as every surface reads it.
+        };
         let mut needs = needs::Needs::default();
-        let held = needs::listing(&self.client, None).await;
         if let Ok(held) = &held {
             needs.held(held.clone(), |_| true);
         }
         let (mut read, mut ended) = (Vec::new(), Vec::new());
         let mut states = HashMap::new();
-        let store = self.store();
         // The tasks whose questions were read this pass.
         let mut asked = Vec::new();
         for bot in bots {
@@ -10388,9 +10416,15 @@ impl App {
         if let Some((at, lines)) = said {
             self.commit_said(at, lines);
         }
-        self.end_hints();
-        if let Some(hints) = hints {
-            self.turn_hints = hints;
+        // The newest page's turn, still running, ends its hints when it
+        // ends: the page's end is not the turn's.
+        match hints {
+            Some(hints) => {
+                self.end_hints();
+                self.turn_hints = hints;
+            }
+            None if self.running.is_none() => self.end_hints(),
+            None => {}
         }
         if !older {
             self.elsewhere = aside;
@@ -23964,8 +23998,11 @@ mod tests {
             .await;
         let start = json!({"name": "readme", "brief": "Say how cents round\nmore"});
         app.commit_call("s1", Some(1), served::START, &start, "calc.readme/1", false);
-        let send = json!({"to": "fix", "message": "Check div too.\nThanks"});
+        let send = json!({"to": "calc.fix", "message": "Check div too.\nThanks"});
         app.commit_call("m1", Some(1), "send_message", &send, "{}", false);
+        // Sent as written: a bot outside the project is not taken for one in it.
+        let outside = json!({"to": "reviewer", "message": "Look too"});
+        app.commit_call("m4", Some(1), "send_message", &outside, "{}", false);
         // One the daemon refused sent nothing.
         let none = json!({"to": "nobody", "message": "Hi"});
         let refused = r#"{"detail":null,"error":"bot_not_found"}"#;
@@ -23986,7 +24023,7 @@ mod tests {
             [
                 "↳ halves",
                 "• Two tasks check the rest.",
-                "└ started ◌ readme · sent to ● fix",
+                "└ started ◌ readme · sent to ● fix · ● reviewer",
             ]
         );
         // Right above and under the reply, and each name opens its agent.
@@ -23998,7 +24035,14 @@ mod tests {
             })
             .unwrap();
         let opens: Vec<&str> = buttons.iter().map(|(_, _, to)| to.as_str()).collect();
-        assert_eq!(opens, ["sonny:task/calc.readme", "sonny:task/calc.fix"]);
+        assert_eq!(
+            opens,
+            [
+                "sonny:task/calc.readme",
+                "sonny:task/calc.fix",
+                "sonny:task/reviewer"
+            ]
+        );
         // A turn that says nothing draws nothing, whatever it started.
         app.daemon(turn_event("accepted", 2, json!({}))).await;
         let start = json!({"name": "quiet", "brief": "Nothing"});
@@ -24024,7 +24068,7 @@ mod tests {
         .await;
         assert_eq!(
             rows(&app)[3..],
-            ["• Steered fix ▸", "Worked for 0s", "• Sent."]
+            ["• Steered calc.fix ▸", "Worked for 0s", "• Sent."]
         );
     }
 
