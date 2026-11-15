@@ -2883,7 +2883,7 @@ impl Lookout {
                 for heard in &sent {
                     self.told_sources.insert(heard.event.source.clone(), now);
                 }
-                told_commons(&self.lead, &sent);
+                told_commons(&crate::commons::who(&self.lead, self.lead_id), &sent);
                 if submitted.is_ok() {
                     let request_id = format!("lookout-{}", digest(&key.join(",")));
                     self.write(&json!({"at_ms": epoch_ms(), "lead": self.lead, "woke": key,
@@ -3368,11 +3368,11 @@ fn epoch_ms() -> u128 {
         .unwrap_or(0)
 }
 
-/// The commons posts a note told `lead` count as shown to it, as a read
-/// does, so its reply after them is posted at once: each event's id is
-/// `THREAD/N`, its Nth post from 0.
+/// The commons posts a note told `lead` (as `commons::who` names it)
+/// count as shown to it, as a read does, so its reply after them is
+/// posted at once: each event's id is `THREAD/N`, its Nth post from 0.
 fn told_commons(lead: &str, sent: &[sources::Heard]) {
-    let mut told: Vec<(&str, Vec<usize>)> = Vec::new();
+    let mut told: Vec<(String, Vec<usize>)> = Vec::new();
     for heard in sent {
         let event = &heard.event;
         if event.source != agent_client::config::COMMONS_SOURCE {
@@ -3384,9 +3384,9 @@ fn told_commons(lead: &str, sent: &[sources::Heard]) {
         else {
             continue;
         };
-        match told.iter_mut().find(|(had, _)| *had == thread) {
+        match told.iter_mut().find(|(had, _)| had == thread) {
             Some((_, posts)) => posts.push(n),
-            None => told.push((thread, vec![n])),
+            None => told.push((thread.to_owned(), vec![n])),
         }
     }
     let Some(home) = (!told.is_empty())
@@ -3395,8 +3395,17 @@ fn told_commons(lead: &str, sent: &[sources::Heard]) {
     else {
         return;
     };
-    for (thread, posts) in told {
-        crate::commons::told(Path::new(&home), lead, thread, &posts);
+    // The commons' lock and its file's write wait on other agents' posts
+    // and the disk, so they run beside the lookout's loop, never in it.
+    let lead = lead.to_owned();
+    let mark = move || {
+        for (thread, posts) in told {
+            crate::commons::told(Path::new(&home), &lead, &thread, &posts);
+        }
+    };
+    match tokio::runtime::Handle::try_current() {
+        Ok(runtime) => drop(runtime.spawn_blocking(mark)),
+        Err(_) => mark(),
     }
 }
 

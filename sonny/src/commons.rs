@@ -201,10 +201,17 @@ pub fn call(
     let dir = dir(home);
     let from = arguments["from"].as_u64().unwrap_or(0) as usize;
     if let Some(name) = arguments["read"].as_str() {
-        return read(&dir, name, author, from);
+        return read(&dir, name, author, &who(author, author_id), from);
     }
     if let Some(words) = arguments["search"].as_str() {
-        return search(&dir, words, author, from, LIST_BYTES);
+        return search(
+            &dir,
+            words,
+            author,
+            &who(author, author_id),
+            from,
+            LIST_BYTES,
+        );
     }
     if arguments["post"].is_object() {
         let post = &arguments["post"];
@@ -357,7 +364,7 @@ fn start(dir: &Path, name: &str, title: &str, post: &Value) -> Result<Value, Str
     first["title"] = json!(title);
     append(&path, &first)?;
     saw(dir, name, post["by"].as_str().unwrap_or_default());
-    show(dir, name, post["by"].as_str().unwrap_or_default(), 1);
+    show(dir, name, &posted_by(post), 1);
     let mut started = json!({"thread": name, "posts": 1});
     let similar = similar(dir, name, title);
     if !similar.is_empty() {
@@ -766,10 +773,11 @@ fn add(dir: &Path, name: &str, post: &Value) -> Result<Value, String> {
         ));
     }
     let by = post["by"].as_str().unwrap_or_default();
-    let upto = shown(dir, name, by);
+    let who = posted_by(post);
+    let upto = shown(dir, name, &who);
     if upto < earlier.len() {
         let missed = earlier.len() - upto;
-        let mut said = read_locked(dir, name, by, upto)?;
+        let mut said = read_locked(dir, name, by, &who, upto)?;
         said["posted"] = json!(false);
         said["missed"] = json!(format!(
             "Not posted: {missed} post{} came that you had not been shown, below. The same reply sent again is posted.",
@@ -779,7 +787,7 @@ fn add(dir: &Path, name: &str, post: &Value) -> Result<Value, String> {
     }
     append(&path, post)?;
     saw(dir, name, by);
-    show(dir, name, by, earlier.len() + 1);
+    show(dir, name, &who, earlier.len() + 1);
     answered(dir, name, by);
     let title = earlier.first().map_or(Value::Null, |p| p["title"].clone());
     Ok(json!({"thread": name, "title": title, "posts": earlier.len() + 1}))
@@ -799,7 +807,25 @@ fn json_file(path: &Path) -> serde_json::Map<String, Value> {
 
 /// `bot` has looked at `thread` once more: by reading it or posting in
 /// it. How many times it has, now.
-/// How many of `thread`'s posts `bot` has been shown.
+/// Whom `.shown` counts for: an agent by its name and, where known, the
+/// daemon's id for it, so a new agent given a gone one's name starts
+/// shown nothing, as its subscriptions start empty.
+pub fn who(name: &str, id: Option<i64>) -> String {
+    match id {
+        Some(id) => format!("{name}#{id}"),
+        None => name.to_owned(),
+    }
+}
+
+/// Whom `.shown` counts a post's author as.
+fn posted_by(post: &Value) -> String {
+    who(
+        post["by"].as_str().unwrap_or_default(),
+        post["by_id"].as_i64(),
+    )
+}
+
+/// How many of `thread`'s posts `bot` (as `who` names it) has been shown.
 fn shown(dir: &Path, thread: &str, bot: &str) -> usize {
     let shown = json_file(&dir.join(SHOWN));
     shown
@@ -828,6 +854,7 @@ fn show(dir: &Path, thread: &str, bot: &str, upto: usize) {
 /// what `bot` was shown already, unbroken, so a post a filter kept from it
 /// stays unshown, and so does every one after it.
 pub fn told(home: &Path, bot: &str, thread: &str, told: &[usize]) {
+    // `bot` as `who` names it.
     let dir = dir(home);
     if valid_name(thread).is_err() || !dir.join(format!("{thread}.jsonl")).exists() {
         return;
@@ -906,13 +933,19 @@ fn thread(dir: &Path, name: &str) -> Result<Value, String> {
 /// fit, with `next` where the rest start. A read from the start is
 /// counted, so whoever looks later can tell which threads agents read.
 /// The person's reads in `/commons` are not.
-fn read(dir: &Path, name: &str, author: &str, from: usize) -> Result<Value, String> {
+fn read(dir: &Path, name: &str, author: &str, who: &str, from: usize) -> Result<Value, String> {
     let _lock = lock(dir)?;
-    read_locked(dir, name, author, from)
+    read_locked(dir, name, author, who, from)
 }
 
 /// `read`, under the lock the caller holds.
-fn read_locked(dir: &Path, name: &str, author: &str, from: usize) -> Result<Value, String> {
+fn read_locked(
+    dir: &Path,
+    name: &str,
+    author: &str,
+    who: &str,
+    from: usize,
+) -> Result<Value, String> {
     let mut shown = thread(dir, name)?;
     let all = shown["posts"].take();
     let all = all.as_array().map_or(&[][..], Vec::as_slice);
@@ -936,8 +969,8 @@ fn read_locked(dir: &Path, name: &str, author: &str, from: usize) -> Result<Valu
     saw(dir, name, author);
     // Only from where it had been shown on: a later page read alone
     // leaves the posts before it unshown.
-    if from <= self::shown(dir, name, author) {
-        show(dir, name, author, next);
+    if from <= self::shown(dir, name, who) {
+        show(dir, name, who, next);
     }
     if from == 0 {
         count_reads(dir, &[name]);
@@ -1094,6 +1127,7 @@ fn search(
     dir: &Path,
     text: &str,
     author: &str,
+    who: &str,
     from: usize,
     bytes: usize,
 ) -> Result<Value, String> {
@@ -1202,7 +1236,7 @@ fn search(
         let _lock = lock(dir)?;
         for (name, posts) in &read {
             saw(dir, name, author);
-            show(dir, name, author, *posts);
+            show(dir, name, who, *posts);
         }
         count_reads(
             dir,
@@ -1948,6 +1982,25 @@ mod tests {
     }
 
     #[test]
+    fn a_new_agent_given_a_gone_one_s_name_starts_shown_nothing() {
+        let home = home("missed-id");
+        let send = |id: i64, arguments: Value| {
+            super::call(&home, "b.y", Some(id), None, &arguments).unwrap()
+        };
+        send(
+            1,
+            json!({"post": {"name": "t", "title": "T", "text": "one"}}),
+        );
+        let reply = json!({"reply": {"thread": "t", "text": "two"}});
+        assert_eq!(send(1, reply.clone())["posts"], 2);
+        // Another agent under the same name has read nothing.
+        assert_eq!(send(2, reply.clone())["posted"], false);
+        assert_eq!(send(2, reply)["posts"], 3);
+        assert_eq!(shown(&dir(&home), "t", &who("b.y", Some(1))), 2);
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
     fn a_later_page_read_alone_leaves_the_posts_before_it_unshown() {
         let home = home("missed-page");
         let send = |by: &str, arguments: Value| super::call(&home, by, None, None, &arguments);
@@ -2534,7 +2587,7 @@ mod tests {
         let edge = format!("needle {}", "x".repeat(SNIPPET_CHARS - 4));
         let post = json!({"post": {"name": "edge", "title": "E", "text": edge}});
         caught_up(home, "a.x", None, None, &post).unwrap();
-        search(&dir(home), "needle", "d.w", 0, LIST_BYTES).unwrap();
+        search(&dir(home), "needle", "d.w", "d.w", 0, LIST_BYTES).unwrap();
         let listed = caught_up(home, "e.v", None, None, &json!({})).unwrap();
         assert_eq!(listed["threads"][0]["reads"], 0);
         std::fs::remove_file(dir(home).join("edge.jsonl")).unwrap();
@@ -2543,12 +2596,12 @@ mod tests {
             let post = json!({"post": {"name": format!("t{n}"), "title": "T", "text": long}});
             caught_up(home, "a.x", None, None, &post).unwrap();
         }
-        let found = search(&dir(home), "needle", "d.w", 0, 1).unwrap();
+        let found = search(&dir(home), "needle", "d.w", "d.w", 0, 1).unwrap();
         assert_eq!(found["next"], 1);
         let text = found["threads"][0]["matches"][0]["text"].as_str().unwrap();
         assert_eq!(text.chars().count(), SNIPPET_CHARS + 1);
         assert!(text.ends_with('…'));
-        let rest = search(&dir(home), "needle", "d.w", 1, LIST_BYTES).unwrap();
+        let rest = search(&dir(home), "needle", "d.w", "d.w", 1, LIST_BYTES).unwrap();
         assert_eq!(rest["threads"].as_array().unwrap().len(), 2);
         assert!(rest.get("next").is_none());
         // One thread's matches past a page: how many more, and where to
@@ -2557,7 +2610,7 @@ mod tests {
             let reply = json!({"reply": {"thread": "t0", "text": long, "external": external}});
             caught_up(home, "b.y", None, None, &reply).unwrap();
         }
-        let many = search(&dir(home), "needle", "d.w", 0, 3 * SNIPPET_CHARS).unwrap();
+        let many = search(&dir(home), "needle", "d.w", "d.w", 0, 3 * SNIPPET_CHARS).unwrap();
         let thread = &many["threads"][0];
         assert_eq!(thread["thread"], "t0");
         assert_eq!(thread["matches"].as_array().unwrap().len(), 2);
