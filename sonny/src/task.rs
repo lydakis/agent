@@ -2046,7 +2046,7 @@ pub fn remove(
     }
 }
 
-fn capitalized(word: &str) -> String {
+pub fn capitalized(word: &str) -> String {
     let mut chars = word.chars();
     chars.next().map_or(String::new(), |first| {
         first.to_uppercase().chain(chars).collect()
