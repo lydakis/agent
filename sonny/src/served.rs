@@ -2130,7 +2130,7 @@ fn refused_as(code: &'static str, said: String) -> (&'static str, String) {
 
 /// The error codes `sonny tool` answers with, as static names.
 fn code(said: &str) -> &'static str {
-    const CODES: [&str; 23] = [
+    const CODES: [&str; 24] = [
         "not_in_folder",
         "no_caller",
         "invalid_arguments",
@@ -2145,6 +2145,7 @@ fn code(said: &str) -> &'static str {
         "automation_refused",
         "memory_refused",
         "margin_full",
+        "margin_kind",
         "margin_note_too_long",
         "margin_unread",
         "live_template",

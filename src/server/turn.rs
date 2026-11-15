@@ -2333,9 +2333,13 @@ impl Turn {
                 None => match summarizer.family() {
                     agent_runtime::codec::Family::Anthropic => (Body::Span(&plan, stripped), tools),
                     agent_runtime::codec::Family::Responses => {
-                        empty =
-                            self.registry
-                                .encoded(summarizer.family(), false, &[], &[], false)?;
+                        empty = self.registry.encoded(
+                            summarizer.family(),
+                            false,
+                            &[],
+                            &Default::default(),
+                            false,
+                        )?;
                         (Body::Span(&plan, stripped), &*empty)
                     }
                 },
@@ -2790,7 +2794,7 @@ impl Turn {
                 agent_runtime::codec::Family::Anthropic => tools.get().len(),
                 agent_runtime::codec::Family::Responses => self
                     .registry
-                    .encoded(family, false, &[], &[], false)?
+                    .encoded(family, false, &[], &Default::default(), false)?
                     .get()
                     .len(),
             })

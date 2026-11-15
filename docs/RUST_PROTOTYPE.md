@@ -3558,6 +3558,27 @@ not a generation, and keeps the count its source has. A client bounding
 how deep its agents delegate gives its tool for starting them that count,
 so each bot's tools are right from its first turn.
 
+Protocol version 77 stores a list of declared tools once, by its content,
+and lets a client name it instead of sending it. The daemon keeps each
+distinct list under its digest (SHA-256 of the list's bytes as the daemon
+writes them, 64 lowercase hex digits), and a bot's row holds the digest:
+every bot, fork and bot made by another that has the same tools refers to
+one row, and the daemon parses each list once however many bots or turns
+hold it. `inspect` reports `declared_digest` beside `declared`, and `bots`
+lists `declared_digest` alone. `create` and `configure` take that digest
+as `declare` in place of the list: a known one declares the same tools
+and sends a few bytes, so configuring a fleet whose tools have not changed
+writes nothing, and an unknown one is `tool_list_unknown`, after which the
+client sends the list once. A list no bot holds any longer is let go. A
+`configure` kept for a turn's end keeps the tools themselves, and a
+creation's record keeps the digest of what it declared (`""` for none), so
+a resend compares equal whether it sends the list or its digest. Nothing a
+bot does changes meaning: the limits stay 32 tools and 64 KiB a bot, a bot
+made by another still takes its creator's tools a generation fewer (that
+list stored once too), and a fork keeps its source's. Schema 101 moves
+every bot's list into `tool_lists` and rewrites creation records' lists as
+digests.
+
 ### Tool approval
 
 A bot may be created with a gate (one no bot made, which a client

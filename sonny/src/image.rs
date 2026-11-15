@@ -133,6 +133,10 @@ pub struct Drawn {
 pub fn show(drawn: Drawn) -> Vec<Line<'static>> {
     let id = next_id();
     let rows = placeholders(id, drawn.cols, drawn.rows);
+    // Counted, never shown: nothing kept to send.
+    if crate::term::measured() {
+        return rows;
+    }
     let mut waiting = WAITING.lock().unwrap_or_else(|e| e.into_inner());
     waiting.get_or_insert_with(Waiting::default).add(id, drawn);
     rows
@@ -208,6 +212,9 @@ static SOURCES: Mutex<Option<HashMap<u32, String>>> = Mutex::new(None);
 /// from, shown bigger in the pane.
 pub fn show_linked(drawn: Drawn, url: Option<String>) -> Vec<Line<'static>> {
     let rows = show(drawn);
+    if crate::term::measured() {
+        return rows;
+    }
     if let (Some(url), Some(id)) = (url, rows.first().and_then(|row| id(row.spans.get(1)?))) {
         let mut sources = SOURCES.lock().unwrap_or_else(|e| e.into_inner());
         sources.get_or_insert_with(HashMap::new).insert(id, url);
@@ -586,7 +593,7 @@ pub fn bigger(path: &std::path::Path) -> Result<std::path::PathBuf, String> {
         dir.join(format!("{:016x}.png", hasher.finish()))
     };
     if !out.is_file() {
-        std::fs::write(&out, large(&svg, background)?).map_err(|e| e.to_string())?;
+        crate::cache::write_new(&out, large(&svg, background)?).map_err(|e| e.to_string())?;
     }
     Ok(out)
 }

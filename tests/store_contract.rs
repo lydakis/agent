@@ -7,7 +7,7 @@ use agent_runtime::{
         Counts, Database, Decision, Delivery, Fork, Gate, Gated, Halt, Halted, Lifted, Limit,
         Planning, ProcessKind, QuoteRef, Settings, Strip, Trailer, TurnBudget, TurnOptions, Wake,
     },
-    tools::{Declared, Inherit, Outcome},
+    tools::{Declared, Inherit, Outcome, ToolList},
 };
 use bytes::Bytes;
 use rusqlite::Connection;
@@ -3874,7 +3874,7 @@ fn schema_78_counts_a_call_left_unanswered_before_the_upgrade_as_taken() {
             "Lead",
             Some("/synthetic"),
             Binding {
-                declared: Some(std::slice::from_ref(&start)),
+                declared: Some(&ToolList::new(vec![start.clone()]).unwrap()),
                 ..binding()
             },
         )
@@ -5557,17 +5557,18 @@ fn declared_tools_pass_to_created_bots_and_forks_and_a_forks_allow_narrows_them(
     };
     let declared = [react.clone()];
     let leads = [react.clone(), resolve];
+    let list = |tools: &[Declared]| ToolList::new(tools.to_vec()).unwrap();
     let (lead, _) = db
         .create(
             "Lead",
             Some("/synthetic"),
             Binding {
-                declared: Some(&leads),
+                declared: Some(&list(&leads)),
                 ..binding()
             },
         )
         .unwrap();
-    assert_eq!(lead.declared, leads);
+    assert_eq!(**lead.declared, leads);
     assert_eq!(
         serde_json::to_value(&lead).unwrap()["declared"],
         json!([{"name":"react","description":"React to a message.",
@@ -5576,7 +5577,7 @@ fn declared_tools_pass_to_created_bots_and_forks_and_a_forks_allow_narrows_them(
             "result":"ok","inherit":false}])
     );
     // A bot the lead creates takes its tools unless its client declares others.
-    let child = |db: &mut Database, name: &str, declared: Option<&[Declared]>| {
+    let child = |db: &mut Database, name: &str, declared: Option<&ToolList>| {
         let mut b = binding();
         b.created_by = Some("Lead");
         b.created_by_id = Some(lead.bot_id);
@@ -5584,21 +5585,28 @@ fn declared_tools_pass_to_created_bots_and_forks_and_a_forks_allow_narrows_them(
         db.create(name, Some("/synthetic"), b).unwrap().0
     };
     // All but the lead's own.
-    assert_eq!(child(&mut db, "Task", None).declared, declared);
-    assert!(child(&mut db, "Own", Some(&[])).declared.is_empty());
+    assert_eq!(**child(&mut db, "Task", None).declared, declared);
+    assert!(
+        child(&mut db, "Own", Some(&ToolList::default()))
+            .declared
+            .is_empty()
+    );
     // A bot nobody created declares nothing it was not given.
     let plain = db.create("Plain", Some("/synthetic"), binding()).unwrap().0;
     assert!(plain.declared.is_empty() && !plain.may_call("react"));
     // Declaring again says whether anything changed.
-    assert!(!db.set_declared("Lead", None, &leads).unwrap());
-    assert!(db.set_declared("Plain", None, &declared).unwrap());
+    assert!(!db.set_declared("Lead", None, &list(&leads)).unwrap());
+    assert!(db.set_declared("Plain", None, &list(&declared)).unwrap());
     assert!(db.inspect("Plain").unwrap().may_call("react"));
-    assert!(db.set_declared("Plain", None, &[]).unwrap());
+    assert!(
+        db.set_declared("Plain", None, &ToolList::default())
+            .unwrap()
+    );
     assert!(db.inspect("Plain").unwrap().declared.is_empty());
     // A fork keeps them all, and its allowed list narrows them like the rest.
     converse(&mut db, "Lead", 1);
     let fork = db.fork("Lead", "Copy", Fork::default()).unwrap().0;
-    assert_eq!(fork.declared, leads);
+    assert_eq!(**fork.declared, leads);
     assert!(fork.declared("react").is_some());
     let only_read = ["read".to_owned()];
     let narrowed = db
@@ -5661,7 +5669,7 @@ fn a_tool_declared_for_some_generations_goes_that_far_down_and_no_further() {
             "Lead",
             Some("/synthetic"),
             Binding {
-                declared: Some(std::slice::from_ref(&start)),
+                declared: Some(&ToolList::new(vec![start.clone()]).unwrap()),
                 ..binding()
             },
         )
@@ -5727,7 +5735,7 @@ fn a_call_is_taken_once_and_a_second_take_is_refused_so_it_never_runs_twice() {
         "Lead",
         Some("/synthetic"),
         Binding {
-            declared: Some(std::slice::from_ref(&start)),
+            declared: Some(&ToolList::new(vec![start.clone()]).unwrap()),
             ..binding()
         },
     )
@@ -5823,7 +5831,7 @@ fn waiting_calls_page_past_held_answers_and_an_answer_out_of_time_is_refused() {
         "Lead",
         Some("/synthetic"),
         Binding {
-            declared: Some(std::slice::from_ref(&start)),
+            declared: Some(&ToolList::new(vec![start.clone()]).unwrap()),
             ..binding()
         },
     )
@@ -5900,7 +5908,7 @@ fn a_parked_answer_s_pictures_are_stored_once_its_result_is() {
         "Lead",
         Some("/synthetic"),
         Binding {
-            declared: Some(std::slice::from_ref(&start)),
+            declared: Some(&ToolList::new(vec![start.clone()]).unwrap()),
             ..binding()
         },
     )
@@ -11260,6 +11268,181 @@ fn schema_98_hidden_senders_become_an_empty_trailer() {
         db.inspect("Carol").unwrap().configure_pending,
         Some(json!({"settings": {"trailer": []}}))
     );
+    drop(db);
+    std::fs::remove_file(path).unwrap();
+}
+
+/// A store in a file, which a second connection can read.
+fn file_db(tag: &str) -> (Database, std::path::PathBuf) {
+    let path = std::env::temp_dir().join(format!("agent-{tag}-{}.sqlite", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+    (
+        Database::initialize(Connection::open(&path).unwrap()).unwrap(),
+        path,
+    )
+}
+/// A number the store at `path` holds, read as SQL.
+fn count(path: &std::path::Path, sql: &str) -> i64 {
+    Connection::open(path)
+        .unwrap()
+        .query_row(sql, [], |r| r.get(0))
+        .unwrap()
+}
+/// A declared tool for these tests, by name.
+fn tool_named(name: &str) -> Declared {
+    serde_json::from_value(json!({"name": name, "description": "A tool.",
+        "parameters": {"type": "object"}}))
+    .unwrap()
+}
+
+#[test]
+fn a_declared_list_is_stored_once_and_let_go_when_no_bot_holds_it() {
+    let (mut db, path) = file_db("lists-once");
+    let tools: Vec<Declared> = (0..8).map(|i| tool_named(&format!("t{i}"))).collect();
+    let list = ToolList::new(tools.clone()).unwrap();
+    let digest = list.digest().unwrap().to_owned();
+    assert!(agent_runtime::tools::is_digest(&digest));
+    for name in ["A", "B", "C"] {
+        db.create(
+            name,
+            Some("/synthetic"),
+            Binding {
+                declared: Some(&list),
+                ..binding()
+            },
+        )
+        .unwrap();
+    }
+    // One row for the list; each bot's row holds its digest.
+    assert_eq!(count(&path, "SELECT COUNT(*) FROM tool_lists"), 1);
+    assert_eq!(
+        count(&path, "SELECT MAX(length(declared)) FROM bots"),
+        digest.len() as i64
+    );
+    // A bot read shows the tools and their digest; a listing the digest.
+    let a = db.inspect("A").unwrap();
+    assert_eq!(**a.declared, tools);
+    let record = serde_json::to_value(&a).unwrap();
+    assert_eq!(record["declared_digest"], json!(digest));
+    assert_eq!(record["declared"].as_array().unwrap().len(), 8);
+    let listed = db.list(None, 64, None, false, None).unwrap();
+    assert!(
+        (listed["bots"].as_array().unwrap())
+            .iter()
+            .all(|bot| bot["declared_digest"] == json!(digest) && bot["declared"].is_null())
+    );
+    // Every holder in this process shares one parsed copy.
+    let b = db.inspect("B").unwrap();
+    assert!(std::ptr::eq(a.declared.as_ptr(), b.declared.as_ptr()));
+    // The same list again is no change.
+    assert!(!db.set_declared("A", None, &list).unwrap());
+    // Moving every holder off the list lets it go; until then it stays.
+    let other = ToolList::new(vec![tool_named("other")]).unwrap();
+    assert!(db.set_declared("A", None, &other).unwrap());
+    assert!(db.set_declared("B", None, &ToolList::default()).unwrap());
+    assert_eq!(count(&path, "SELECT COUNT(*) FROM tool_lists"), 2);
+    assert_eq!(db.tool_list(&digest).unwrap(), list);
+    db.delete_bot("C").unwrap();
+    assert_eq!(count(&path, "SELECT COUNT(*) FROM tool_lists"), 1);
+    assert_eq!(
+        count(
+            &path,
+            "SELECT COUNT(*) FROM tool_lists WHERE digest IN (SELECT declared FROM bots)"
+        ),
+        1
+    );
+    drop((list, a, b));
+    assert_eq!(db.tool_list(&digest).unwrap_err().code, "tool_list_unknown");
+    drop(db);
+    std::fs::remove_file(path).unwrap();
+}
+
+#[test]
+fn a_bot_made_by_another_takes_one_stored_list() {
+    let (mut db, path) = file_db("lists-made");
+    let mut once: Declared = tool_named("own");
+    once.inherit = Inherit::Generations(1);
+    let lead = ToolList::new(vec![tool_named("start"), once]).unwrap();
+    let (made, _) = db
+        .create(
+            "Lead",
+            Some("/synthetic"),
+            Binding {
+                declared: Some(&lead),
+                ..binding()
+            },
+        )
+        .unwrap();
+    let child = |db: &mut Database, name: &str| {
+        let mut b = binding();
+        b.created_by = Some("Lead");
+        b.created_by_id = Some(made.bot_id);
+        db.create(name, Some("/synthetic"), b).unwrap().0
+    };
+    // Each takes the list a generation fewer, one list for all of them.
+    let (one, two) = (child(&mut db, "T1"), child(&mut db, "T2"));
+    assert_eq!(one.declared.digest(), two.declared.digest());
+    assert_ne!(one.declared.digest(), lead.digest());
+    assert_eq!(one.declared[1].inherit, Inherit::Generations(0));
+    assert_eq!(count(&path, "SELECT COUNT(*) FROM tool_lists"), 2);
+    drop(db);
+    std::fs::remove_file(path).unwrap();
+}
+
+#[test]
+fn schema_100_declared_tools_move_to_lists_by_digest() {
+    let path = std::env::temp_dir().join(format!("agent-schema100-{}.sqlite", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+    let tools = vec![tool_named("start"), tool_named("react")];
+    let text = serde_json::to_string(&tools).unwrap();
+    {
+        let mut db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
+        for name in ["Bob", "Carol"] {
+            db.create(
+                name,
+                Some("/synthetic"),
+                Binding {
+                    request_id: Some("once"),
+                    starts_line: false,
+                    ..binding()
+                },
+            )
+            .unwrap();
+        }
+    }
+    // Before 101 each bot's row held its own copy, and so did the record of
+    // a creation that declared some.
+    let old = Connection::open(&path).unwrap();
+    old.execute_batch("DROP TABLE tool_lists; DROP INDEX bots_declared; PRAGMA user_version=100;")
+        .unwrap();
+    old.execute(
+        "UPDATE bots SET declared=?1, creation=json_set(creation,'$.request.declare',json(?1))",
+        [&text],
+    )
+    .unwrap();
+    drop(old);
+    let mut db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
+    let list = ToolList::new(tools.clone()).unwrap();
+    assert_eq!(count(&path, "SELECT COUNT(*) FROM tool_lists"), 1);
+    assert_eq!(**db.inspect("Bob").unwrap().declared, tools);
+    assert_eq!(
+        db.inspect("Carol").unwrap().declared.digest(),
+        list.digest()
+    );
+    // A resend of the creation, with the list or its digest, is the same request.
+    let (again, event) = db
+        .create(
+            "Bob",
+            Some("/synthetic"),
+            Binding {
+                declared: Some(&list),
+                request_id: Some("once"),
+                starts_line: false,
+                ..binding()
+            },
+        )
+        .unwrap();
+    assert_eq!((again.name.as_str(), event), ("Bob", None));
     drop(db);
     std::fs::remove_file(path).unwrap();
 }
@@ -18049,7 +18232,7 @@ fn a_waiting_step_ended_in_a_group_that_fails_is_told_of_once_one_commits() {
         "Lead",
         Some("/synthetic"),
         Binding {
-            declared: Some(std::slice::from_ref(&run)),
+            declared: Some(&ToolList::new(vec![run.clone()]).unwrap()),
             gate: Some(&gate),
             ..binding()
         },
@@ -19612,7 +19795,7 @@ fn stepping_turn_under(db: &mut Database, gated: bool, settings: Settings) -> (i
         "Lead",
         Some("/synthetic"),
         Binding {
-            declared: Some(std::slice::from_ref(&run)),
+            declared: Some(&ToolList::new(vec![run.clone()]).unwrap()),
             gate: gated.then_some(&gate),
             settings,
             ..binding()
@@ -21031,7 +21214,7 @@ fn a_lifted_answered_call_takes_its_answer_or_is_stopped_and_outlives_a_restart(
             "Lead",
             Some("/synthetic"),
             Binding {
-                declared: Some(std::slice::from_ref(&start)),
+                declared: Some(&ToolList::new(vec![start.clone()]).unwrap()),
                 ..binding()
             },
         )
@@ -21144,7 +21327,7 @@ fn a_lifted_answered_call_keeps_its_time_steps_listing_and_audit_row() {
         "Lead",
         Some("/synthetic"),
         Binding {
-            declared: Some(std::slice::from_ref(&run)),
+            declared: Some(&ToolList::new(vec![run.clone()]).unwrap()),
             gate: Some(&gate),
             ..binding()
         },

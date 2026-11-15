@@ -26,9 +26,45 @@ use crate::transcript::Markdown;
 
 /// The name of the tool a bot keeps notes in the margin with.
 pub const TOOL: &str = "margin";
+
+/// What a note is, as the agent names it: state, each kind of it able to
+/// become false or finished. The margin draws them in this order and
+/// gives them rows in it when it is short.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Kind {
+    /// Something waits on the person, with what to do and its links.
+    Waits,
+    /// Something they follow, kept filled live.
+    Follows,
+    /// What they asked to keep beside them.
+    Pinned,
+}
+
+/// The kinds, by the names a call gives them.
+pub const KINDS: [&str; 3] = ["waits", "follows", "pinned"];
+
+impl Kind {
+    pub fn read(name: &str) -> Option<Self> {
+        match name.trim() {
+            "waits" => Some(Kind::Waits),
+            "follows" => Some(Kind::Follows),
+            "pinned" => Some(Kind::Pinned),
+            _ => None,
+        }
+    }
+
+    pub fn name(self) -> &'static str {
+        KINDS[self as usize]
+    }
+}
+
+/// The kind a call names, if it names one of [`KINDS`].
+fn kind(arguments: &Value) -> Option<Kind> {
+    arguments["kind"].as_str().and_then(Kind::read)
+}
 /// The most notes a margin holds, as `[sonny] margin_notes` sets it,
-/// and the most lines a note's Markdown runs to, as `margin_note_lines`
-/// does: a call past either is refused, and says why.
+/// and the most rows a note draws at the margin's [`WIDTH`], as
+/// `margin_note_lines` does: a call past either is refused, and says why.
 #[cfg(not(test))]
 static MOST: [std::sync::atomic::AtomicUsize; 2] = [
     std::sync::atomic::AtomicUsize::new(agent_client::config::MARGIN_NOTES as usize),
@@ -66,7 +102,7 @@ pub fn most_notes() -> usize {
     most(0)
 }
 
-/// The most lines a note's Markdown runs to.
+/// The most rows a note draws at [`WIDTH`].
 pub fn most_lines() -> usize {
     most(1)
 }
@@ -79,45 +115,45 @@ pub fn set_limits(notes: u64, lines: u64) {
 }
 /// The most of a note's Markdown kept, and of a file read for one.
 const NOTE_BYTES: usize = 64 * 1024;
-/// The most lines of a file a note shows.
+/// The most lines of a file read for a note's rows, which show the first
+/// few and say how many more there are.
 const FILE_LINES: usize = 400;
+/// The columns a note's rows are counted at: the margin's own, as the
+/// narrowest window that shows it beside the conversation draws them, so
+/// a note's count is the same in every window, and no wider one draws it
+/// in more rows.
+pub const WIDTH: usize = crate::pane::MARGIN as usize - 2;
 /// What a note's rows start with, under its title.
 const BODY: &str = "     ";
-/// The most rows a note is drawn in, so all the notes together stay
-/// under what a [`crate::screen::Screen`] keeps.
+/// The most rows a note is drawn in, however many the person lets it
+/// have, so all the notes together stay under what a
+/// [`crate::screen::Screen`] keeps.
 const NOTE_ROWS: usize = 600;
 /// How many of the calls and messages applied are remembered, so one
 /// read again as the conversation is drawn again is not applied twice.
 const SEEN: usize = 1024;
 
-/// What the tool says to the bot: when a note earns its place, and kept
-/// up to date. A bot a lead makes takes the lead's tools as declared, so
-/// what only a lead needs to hear is in its role, not here.
-const DESCRIPTION: &str = "Keep something beside the conversation, in the margin the person sees next to your \
-         replies. Post a note whenever your answer has a part the person will look at more than \
-         once: a diagram of how code or a system fits together (such as in Mermaid), a table of \
-         results you measure or compare, or the file being discussed. Put that part in the note, \
-         and keep the reply to what it means, with a line pointing to the note, without walking \
-         the note's rows again. When the person asks you to walk through a file, show that file in \
-         the note and walk through it in the reply; for a walkthrough of anything else, the note \
-         holds only what the walkthrough does not, such as a summary table. Skip the margin for a \
-         short answer the person reads once, and for \
-         the steps of your work, which belong in your plan. Posting the same id again \
-         replaces that note in place: update one note as results come in, rather than posting \
-         another. When you or a task change what a note shows, such as code a diagram describes, \
-         post it again with the same id, rather than a second note about the change, or remove it \
-         in that same turn, even while the change waits \
-         on a task's branch, saying in the note which it shows, and remove a note once it \
-         no longer holds. Where whether a note is still current matters, such as a pull \
-         request's state or a check you ran, say when it was last checked, in the person's \
-         time zone, and change that as you check again; a note whose content does not age, \
-         such as a design, needs no date. Give markdown (rendered as your replies are) or file (a path in your own folder, shown as the file \
-         stands and kept fresh as it changes; for a file in a task's copy, put its content in \
-         markdown instead, since that copy goes away with the task), or from (a task's note as \
-         \"task/id\", as the lookout names it, shown here as the task keeps it and kept once \
-         the task is gone, rather than copied). Never ask a question or for a decision only in a \
-         note: ask it where the person answers, and the note may point to it, with opens naming \
-         the agent that asked it when that is not you.";
+/// What the tool says to the bot: that a note is state with an exit, of
+/// one of three kinds, and that the reply stands alone. A bot a lead makes
+/// takes the lead's tools as declared, so what only a lead needs to hear
+/// is in its role, not here.
+const DESCRIPTION: &str = "Keep state beside the conversation, in the margin the person sees next to your \
+         replies. Your reply reads whole on its own: a note never holds part of an answer, and a \
+         reply never points to a note for content. A note is state that can become false or \
+         finished, of one kind: waits (something waits on the person: what to do, its links and \
+         any draft ready to send), follows (something they follow, kept filled with live wherever \
+         a source, a file or the tasks show it), or pinned (they asked to keep it beside them). \
+         Designs, diagrams, comparisons, results, done reports, what changed and files you walk \
+         through are not notes: they go in your reply, or in a file your reply names when long. \
+         Every note has an exit: remove it in the turn its condition ends, such as a review done, \
+         a draft sent or a check passed. Posting the same id again replaces that note in place. \
+         Where a note ages, such as a pull request's state, say when it was last checked, in the \
+         person's time zone. Give markdown, or file (a path in your own folder, shown as it \
+         stands; for a file in a task's copy, put its content in markdown, since that copy goes \
+         away with the task), or from (a task's note as \"task/id\", as the lookout names it, \
+         shown as the task keeps it). Ask a question where the person answers, never in a note: \
+         a note may point to it, with opens naming the agent that asked, and never repeats its \
+         text.";
 
 /// The `margin` tool as Sonny declares it on a bot.
 pub fn tool() -> Value {
@@ -129,6 +165,8 @@ pub fn tool() -> Value {
             "properties": {
                 "id": {"type": "string", "pattern": "^[a-z0-9][a-z0-9-]{0,39}$",
                     "description": "The note's short name, such as routing or repro."},
+                "kind": {"type": "string", "enum": KINDS,
+                    "description": "Every call but a removal names one."},
                 "title": {"type": "string", "minLength": 1, "maxLength": 80,
                     "description": "A few words, shown on the note."},
                 "markdown": {"type": "string", "maxLength": NOTE_BYTES,
@@ -303,8 +341,8 @@ fn shown_as_template(arguments: &Value) -> bool {
 /// What a call posting live `template` is answered, filled from `data` as the
 /// tool host has it: refused when it does not read as a template, names a
 /// source the person has not set up, does not fill now, or fills to more
-/// lines than a note holds; else what it shows now, or why it does not
-/// fill yet, as a blank that names a task the window fills.
+/// rows than a note draws ([`rows`]); else what it shows now, or why it
+/// does not fill yet, as a blank that names a task the window fills.
 fn filled(template: &str, data: &crate::template::Data) -> Result<String, (&'static str, String)> {
     // Whole or not at all: a template cut short would read as another.
     if template.len() > NOTE_BYTES {
@@ -321,13 +359,13 @@ fn filled(template: &str, data: &crate::template::Data) -> Result<String, (&'sta
         .map_err(|why| (crate::template::REFUSED, why))?;
     match crate::template::render(template, data).0 {
         Err(why) => Ok(format!("In the margin; it does not fill here yet ({why}).")),
-        Ok(text) if text.lines().count() > most_lines() => Err((
+        Ok(text) if rows(&text) > most_lines() => Err((
             "margin_note_too_long",
             format!(
-                "the template fills to {} lines and a margin note holds at most {}: \
-                 show less of what it reads, such as a source's newest few events or the lines \
-                 of a file that matter",
-                text.lines().count(),
+                "the template fills to {} rows in the margin and a note holds at most {}: \
+                 a note is state in a few rows, so show less of what it reads, such as a \
+                 source's newest few events or the lines of a file that matter",
+                rows(&text),
                 most_lines()
             ),
         )),
@@ -388,6 +426,7 @@ pub enum Body {
 pub struct Note {
     pub id: String,
     pub title: String,
+    pub kind: Kind,
     pub body: Body,
     /// The call that first put it here, where it is pinned.
     pub call: String,
@@ -429,8 +468,9 @@ impl Kept {
     fn json(&self) -> Value {
         let notes: Vec<Value> = (self.notes.iter())
             .map(|note| {
-                let mut json = json!({"id": note.id, "title": note.title, "call": note.call,
-                    "after": note.after, "turn": note.turn, "opens": note.opens});
+                let mut json = json!({"id": note.id, "title": note.title,
+                    "kind": note.kind.name(), "call": note.call, "after": note.after,
+                    "turn": note.turn, "opens": note.opens});
                 body_json(&note.body, &mut json);
                 json
             })
@@ -439,7 +479,8 @@ impl Kept {
             "filled": self.filled})
     }
 
-    /// What [`Kept::json`] wrote; a note it cannot read is left out.
+    /// What [`Kept::json`] wrote; a note it cannot read is left out, as
+    /// is one that names no kind.
     fn read(json: &Value) -> Self {
         let text = |note: &Value, key: &str| note[key].as_str().map(str::to_owned);
         let notes = (json["notes"].as_array().into_iter().flatten())
@@ -448,6 +489,7 @@ impl Kept {
                 Some(Note {
                     id: text(note, "id")?,
                     title: text(note, "title")?,
+                    kind: Kind::read(note["kind"].as_str()?)?,
                     body,
                     call: text(note, "call")?,
                     after: note["after"].as_i64(),
@@ -564,35 +606,50 @@ fn changed(item: &Value) -> Option<(String, Value)> {
 }
 
 /// Why a margin holding the notes `held`, by id, refuses the call
-/// `arguments`, typed,
-/// and in words for the agent: a new note once it holds the most
-/// notes, or Markdown longer than a note's most lines, counted in the
-/// text given rather than the rows drawn, so a window's width changes
-/// nothing. Taking a note away, and a note that shows a file or a
-/// task's note, are never refused for their length. Notes kept from
-/// before a lower limit stay; only new ones wait for room.
+/// `arguments`, typed, and in words for the agent: a note that names no
+/// kind, a new note once it holds the most notes, or Markdown that draws
+/// more rows than a note holds, counted at the margin's [`WIDTH`] with
+/// its pictures as they draw ([`rows`]), so a window's width changes
+/// nothing. Taking a note away is never refused; a note that shows a file
+/// or a task's note is never refused for its length, and folds at the
+/// most rows instead. Notes kept from before a lower limit stay; only new
+/// ones wait for room.
 pub fn refusal(held: &[&str], arguments: &Value) -> Option<(&'static str, String)> {
     if arguments["remove"] == true {
         return None;
     }
+    if kind(arguments).is_none() {
+        let named = match arguments["kind"].as_str() {
+            Some(said) => format!(", not \"{}\"", cut(said.trim(), 40)),
+            None => String::new(),
+        };
+        return Some((
+            "margin_kind",
+            format!(
+                "a note names its kind: waits (something waits on the person, with what to do \
+                 and its links), follows (something they follow, kept filled live) or pinned \
+                 (they asked to keep it beside them){named}. Anything else belongs in your reply"
+            ),
+        ));
+    }
     let id = arguments["id"].as_str().map(str::trim).unwrap_or("");
     // As the note will show it: a file or a task's note only when named;
-    // a template's lines are counted as it fills, by the tool host.
+    // a template's rows are counted as it fills, by the tool host.
     let shows = arguments["from"].as_str().and_then(from).is_some()
         || arguments["file"]
             .as_str()
             .is_some_and(|file| !file.trim().is_empty())
         || live(arguments).is_some();
-    let lines = (arguments["markdown"].as_str())
+    let drawn = (arguments["markdown"].as_str())
         .filter(|_| !shows)
-        .map_or(0, |markdown| markdown.lines().count());
-    if lines > most_lines() {
+        .map_or(0, rows);
+    if drawn > most_lines() {
         return Some((
             "margin_note_too_long",
             format!(
-                "the note is {lines} lines and a margin note holds at most {}: keep it to \
-                 what the person looks at more than once, or write the longer text to a \
-                 file and show that file in the note",
+                "the note draws {drawn} rows in the margin and a note holds at most {}: a note \
+                 is state in a few rows, such as what waits on the person and its links. Put \
+                 anything longer in your reply, or in a file your reply names",
                 most_lines()
             ),
         ));
@@ -610,6 +667,16 @@ pub fn refusal(held: &[&str], arguments: &Value) -> Option<(&'static str, String
         ));
     }
     None
+}
+
+/// The rows `markdown` draws in a margin [`WIDTH`] wide, its pictures as
+/// a terminal that draws them lays them out: the same count in every
+/// window, and in the tool host, which has no terminal.
+pub fn rows(markdown: &str) -> usize {
+    crate::term::measuring(|| {
+        let mut drawn = Markdown::default();
+        crate::transcript::markdown(&mut drawn, markdown, WIDTH, leads()).len()
+    })
 }
 
 /// The bot and the note a `from` names, as `bot/id`.
@@ -683,14 +750,18 @@ impl Reference {
     }
 
     /// The change to `note` that `arguments` made there, taken: only note
-    /// `id` changes what is shown. Taken away, by the bot or the person,
-    /// what was read stays, and one put there again starts untitled.
+    /// `id` changes what is shown, and only by a call that names its kind.
+    /// Taken away, by the bot or the person, what was read stays, and one
+    /// put there again starts untitled.
     fn take(&mut self, id: &str, note: &str, arguments: &Value) {
         if note != id {
             return;
         }
         if arguments["remove"] == true {
             self.removed = true;
+            return;
+        }
+        if kind(arguments).is_none() {
             return;
         }
         // Kept, as there, when changed without one.
@@ -752,9 +823,10 @@ impl Reference {
             .any(|(at, arguments)| {
                 at == id
                     && (arguments["remove"] == true
-                        || arguments["title"]
-                            .as_str()
-                            .is_some_and(|t| !t.trim().is_empty())
+                        || kind(&arguments).is_some()
+                            && arguments["title"]
+                                .as_str()
+                                .is_some_and(|t| !t.trim().is_empty())
                             && (arguments["markdown"].is_string()
                                 || arguments["from"].as_str().and_then(from).is_some()
                                 || arguments["file"]
@@ -847,10 +919,10 @@ pub struct Blanks {
     pub notes: Arc<Vec<(String, String, Body)>>,
 }
 
-/// What a margin's rows were drawn from: its width, the running turn,
-/// the terminal's light, how many times its notes and files changed,
-/// and the folder its files are read from.
-type Drawn = (usize, Option<i64>, bool, u64, PathBuf);
+/// What a margin's rows were drawn from: its width and height, the
+/// running turn, the terminal's light, how many times its notes and files
+/// changed, and the folder its files are read from.
+type Drawn = (usize, usize, Option<i64>, bool, u64, PathBuf);
 
 /// The rows a margin's notes draw, with their marks.
 type Rows = (Vec<Line<'static>>, Vec<(usize, Mark)>);
@@ -1041,6 +1113,11 @@ impl Margin {
             .as_str()
             .map(str::trim)
             .filter(|id| is_id(id))?;
+        // A note that names no kind is not one: one from a call made
+        // before kinds is not shown.
+        if arguments["remove"] != true && kind(arguments).is_none() {
+            return None;
+        }
         if self.seen(call) {
             return None;
         }
@@ -1141,6 +1218,7 @@ impl Margin {
                 if let Some(opens) = opens {
                     note.opens = opens;
                 }
+                note.kind = kind(arguments)?;
                 note.turn = turn;
                 Some(Change::Updated(id.to_owned()))
             }
@@ -1148,6 +1226,7 @@ impl Margin {
                 self.kept.notes.push(Note {
                     id: id.to_owned(),
                     title: title.unwrap_or(id).to_owned(),
+                    kind: kind(arguments)?,
                     body: body.unwrap_or(Body::Markdown(String::new())),
                     call: call.to_owned(),
                     after,
@@ -1199,15 +1278,23 @@ impl Margin {
         })();
     }
 
-    /// The margin's notes as rows `width` wide, files read from
-    /// `workspace`, those the running turn `live` changes marked so:
-    /// each note's first row tagged with its pin and carrying its
-    /// buttons, ↑ back to where it was put and × to take it away. The
-    /// rows last drawn while nothing they show changed.
-    pub fn lines(&mut self, width: usize, workspace: &Path, live: Option<i64>) -> Rows {
+    /// The margin's notes as rows `width` wide, folded to fit in
+    /// `height` ([`fit`]), files read from `workspace`, those the running
+    /// turn `live` changes marked so: each note's first row tagged with
+    /// its pin and carrying its buttons, ↑ back to where it was put and ×
+    /// to take it away. The rows last drawn while nothing they show
+    /// changed.
+    pub fn lines(
+        &mut self,
+        width: usize,
+        height: usize,
+        workspace: &Path,
+        live: Option<i64>,
+    ) -> Rows {
         self.freshen(workspace);
         let from = (
             width,
+            height,
             live,
             crate::term::light(),
             self.changes,
@@ -1218,7 +1305,7 @@ impl Margin {
         {
             return rows.clone();
         }
-        let rows = self.draw(width, workspace, live);
+        let rows = self.draw(width, height, workspace, live);
         self.drawn = Some((from, rows.clone()));
         rows
     }
@@ -1313,10 +1400,22 @@ impl Margin {
     }
 
     /// The template note `key`'s rows as last filled, `width` wide, its
-    /// pictures read from `folder`: its text cut at the most lines a note
-    /// holds, then why its last fill failed, when it did.
-    fn filled_lines(&self, key: &str, width: usize, folder: &Path) -> Vec<Line<'static>> {
-        crate::live::lines(self.watch.get(key), width, folder, most_lines(), BODY)
+    /// pictures read from `folder`: what it follows, its text, then why
+    /// its last fill failed, when it did; and how many rows say what it
+    /// follows, which a note's most rows leave out.
+    /// A live note's rows, and how many of them, first, say what it
+    /// follows and why its last fill failed, which the most a note draws
+    /// leaves out: a note never folds away that it is no longer filled.
+    fn filled_lines(&self, key: &str, width: usize, folder: &Path) -> (Vec<Line<'static>>, usize) {
+        let filled = self.watch.get(key);
+        let mut rows = crate::live::lines(filled, width, folder, usize::MAX, BODY);
+        let follows = crate::live::follows_rows(filled, width, BODY);
+        let failed = crate::live::failed_rows(filled, width, BODY);
+        // Why it failed under what it follows, over what it filled to
+        // before, where a fold never reaches it.
+        let said: Vec<_> = rows.drain(rows.len() - failed..).collect();
+        rows.splice(follows..follows, said);
+        (rows, follows + failed)
     }
 
     /// How many times what the margin shows has changed: a note, a file a
@@ -1325,49 +1424,89 @@ impl Margin {
         self.changes
     }
 
-    /// The note `id`'s rows `width` wide, files read from `workspace`, cut
-    /// at `most` rows with a row saying how many more there are.
+    /// The note `id`'s rows `width` wide, files read from `workspace`: at
+    /// most `most` and the most a note draws, then a muted row saying how
+    /// many more there are; and what that row opens, when the note shows
+    /// a file (the file, whole in the pane) or another's note (that agent).
     pub fn body(
         &mut self,
         id: &str,
         width: usize,
         workspace: &Path,
         most: usize,
+    ) -> Option<(Vec<Line<'static>>, Option<String>)> {
+        let whole = self.whole(id, width, workspace)?;
+        let most = most.min(whole.most);
+        Some(fold(whole.rows, whole.unread, most, whole.opens))
+    }
+
+    /// The note `id` whole, `width` wide, files read from `workspace`:
+    /// every row it draws, as the pane shows it when its fold row is
+    /// opened with nothing else to open.
+    pub fn whole_rows(
+        &mut self,
+        id: &str,
+        width: usize,
+        workspace: &Path,
     ) -> Option<Vec<Line<'static>>> {
+        let whole = self.whole(id, width, workspace)?;
+        Some(fold(whole.rows, whole.unread, usize::MAX, None).0)
+    }
+
+    /// The note `id`'s rows, every one, `width` wide, files read from
+    /// `workspace`.
+    fn whole(&mut self, id: &str, width: usize, workspace: &Path) -> Option<Whole> {
         let note = self.note(id)?.body.clone();
-        // Another bot's, its pictures read where it keeps them.
-        let (shown, folder) = match &note {
+        // Another bot's, its pictures read where it keeps them, and
+        // opened there.
+        let (shown, folder, theirs) = match &note {
             Body::From {
                 shown: Some(shown),
                 folder,
+                bot,
                 ..
-            } => (shown.as_ref(), folder.as_deref().map(Path::new)),
-            body => (body, None),
+            } => (shown.as_ref(), folder.as_deref().map(Path::new), Some(bot)),
+            body => (body, None, None),
         };
-        let mut body = match shown {
+        let mut whole = Whole {
+            most: most_lines().min(NOTE_ROWS),
+            ..Whole::default()
+        };
+        match shown {
             Body::Markdown(text) => {
                 let mut markdown = Markdown::in_folder(folder.unwrap_or(workspace));
-                crate::transcript::markdown(&mut markdown, text, width, leads())
+                whole.rows = crate::transcript::markdown(&mut markdown, text, width, leads());
             }
-            Body::Template(_) => self.filled_lines(id, width, folder.unwrap_or(workspace)),
-            Body::File(path) => self.file_lines(workspace, path, width),
+            Body::Template(_) => {
+                let (rows, head) = self.filled_lines(id, width, folder.unwrap_or(workspace));
+                (whole.rows, whole.most) = (rows, (most_lines() + head).min(NOTE_ROWS));
+            }
+            Body::File(path) => {
+                let path = workspace.join(path);
+                (whole.rows, whole.unread) = self.file_lines(workspace, &path, width);
+                whole.opens = crate::links::file_url(&path);
+            }
             Body::Read { path, text } => {
-                text_lines(Path::new(path), text, folder.unwrap_or(workspace), width)
+                // Read in the folder it is in there.
+                let folder = folder.unwrap_or(workspace);
+                let file = Path::new(path);
+                (whole.rows, whole.unread) = text_lines(file, text, folder, width);
+                // The text kept of it, whole in the pane: there whether or
+                // not the task and its folder still are.
+                whole.opens = Some(format!("{BUTTON}whole/{id}"));
             }
             Body::From { bot, id, .. } => {
                 let line = format!("{BODY}{bot}'s note {id}, once it is read");
-                vec![Line::from(line).dim()]
+                whole.rows = vec![Line::from(line).dim()];
             }
-        };
-        if body.len() > most {
-            let more = body.len() - most;
-            body.truncate(most);
-            body.push(Line::from(format!("{BODY}  … {more} more rows")).dim());
         }
-        Some(body)
+        if let Some(bot) = theirs {
+            whole.opens = whole.opens.or(Some(format!("{BUTTON}task/{bot}")));
+        }
+        Some(whole)
     }
 
-    fn draw(&mut self, width: usize, workspace: &Path, live: Option<i64>) -> Rows {
+    fn draw(&mut self, width: usize, height: usize, workspace: &Path, live: Option<i64>) -> Rows {
         let mut lines = Vec::new();
         let mut marks = Vec::new();
         if !self.plan.is_empty() {
@@ -1390,54 +1529,108 @@ impl Margin {
                 lines.extend(crate::transcript::wrap(step, width, lead(), lead()));
             }
         }
-        // The person's own, over the agent's: theirs to change in their
-        // config, so no buttons.
         let person = self.blanks.notes.clone();
+        if self.kept.notes.is_empty() && person.is_empty() {
+            if self.plan.is_empty() {
+                lines.push(Line::default());
+                lines.push(
+                    Line::from(" Notes the agent keeps beside the conversation show here.").dim(),
+                );
+            }
+            return (lines, marks);
+        }
+        // The plan folded to leave a row for every note's title, so what
+        // waits on the person is never behind it.
+        let titles = person.len() + self.kept.notes.len();
+        let room = height.saturating_sub(titles);
+        if lines.len() > room {
+            let keep = room.saturating_sub(1);
+            let more = lines.len() - keep;
+            lines.truncate(keep);
+            marks.retain(|(at, _)| *at < keep);
+            if room > 0 {
+                lines.push(Line::from(format!("{BODY}… {more} more lines of the plan")).dim());
+            }
+        }
+        // The person's own, over the agent's: theirs to change in their
+        // config, so no buttons, and given rows as a note they keep beside
+        // them is.
+        let mut blocks = Vec::new();
         for (name, title, body) in person.iter() {
-            lines.push(Line::default());
             let title = crate::transcript::cut(title, width.saturating_sub(4));
-            lines.push(Line::from(vec![
-                Span::raw(" ◇ ").dim(),
-                Span::raw(title).bold(),
-            ]));
-            match body {
+            let head = Line::from(vec![Span::raw(" ◇ ").dim(), Span::raw(title).bold()]);
+            let whole = match body {
                 Body::Template(_) => {
-                    lines.extend(self.filled_lines(&format!("~{name}"), width, workspace));
+                    let (rows, _) = self.filled_lines(&format!("~{name}"), width, workspace);
+                    Whole {
+                        rows,
+                        most: NOTE_ROWS,
+                        ..Whole::default()
+                    }
                 }
                 body => {
                     let mut markdown = Markdown::in_folder(workspace);
                     let text = said(body);
-                    lines.extend(crate::transcript::markdown(
-                        &mut markdown,
-                        &text,
-                        width,
-                        leads(),
-                    ));
+                    Whole {
+                        rows: crate::transcript::markdown(&mut markdown, &text, width, leads()),
+                        most: NOTE_ROWS,
+                        ..Whole::default()
+                    }
                 }
-            }
+            };
+            blocks.push((Kind::Pinned, head, Vec::new(), whole));
         }
-        if self.kept.notes.is_empty() && (!self.plan.is_empty() || !person.is_empty()) {
-            return (lines, marks);
-        }
-        if self.kept.notes.is_empty() {
-            lines.push(Line::default());
-            lines.push(
-                Line::from(" Notes the agent keeps beside the conversation show here.").dim(),
-            );
-            return (lines, marks);
-        }
-        let notes = self.kept.notes.clone();
+        // The agent's, what waits on the person first, then what they
+        // follow, then what they keep.
+        let mut notes = self.kept.notes.clone();
+        notes.sort_by_key(|note| note.kind);
         for note in &notes {
-            lines.push(Line::default());
-            let at = lines.len();
             let (head, buttons) = head(note, width, live.is_some() && note.turn == live);
+            let marked = vec![
+                Mark::Tag(Tag::Note(anchor(&note.call))),
+                Mark::Buttons(buttons),
+            ];
+            let whole = self.whole(&note.id, width, workspace).unwrap_or_default();
+            blocks.push((note.kind, head, marked, whole));
+        }
+        let wanted: Vec<(Kind, usize)> = (blocks.iter())
+            .map(|(kind, .., whole)| (*kind, whole.wanted()))
+            .collect();
+        let (gaps, given) = fit(height.saturating_sub(lines.len()), &wanted);
+        let mut heads = Vec::new();
+        for ((_, head, marked, whole), given) in blocks.into_iter().zip(given) {
+            if gaps {
+                lines.push(Line::default());
+            }
+            let at = lines.len();
+            heads.push(at);
             lines.push(head);
-            marks.push((at, Mark::Tag(Tag::Note(anchor(&note.call)))));
-            marks.push((at, Mark::Buttons(buttons)));
-            lines.extend(
-                self.body(&note.id, width, workspace, NOTE_ROWS)
-                    .unwrap_or_default(),
-            );
+            marks.extend(marked.into_iter().map(|mark| (at, mark)));
+            let most = match given < whole.wanted() {
+                // Short of room: its fold row is one of the rows given.
+                true => given.saturating_sub(1),
+                false => whole.most,
+            };
+            if given == 0 {
+                continue;
+            }
+            let (rows, opens) = fold(whole.rows, whole.unread, most, whole.opens);
+            if let Some(url) = opens {
+                marks.push((lines.len() + rows.len() - 1, Mark::Link(url)));
+            }
+            lines.extend(rows);
+        }
+        // Too short even for every title: the margin never scrolls, so
+        // its last row says how many more there are.
+        if lines.len() > height {
+            let keep = height.saturating_sub(1);
+            let more = heads.iter().filter(|at| **at >= keep).count();
+            lines.truncate(keep);
+            marks.retain(|(at, _)| *at < keep);
+            if height > 0 {
+                let notes = if more == 1 { "note" } else { "notes" };
+                lines.push(Line::from(format!("{BODY}… {more} more {notes}")).dim());
+            }
         }
         (lines, marks)
     }
@@ -1465,19 +1658,24 @@ impl Margin {
         }
     }
 
-    /// The file `path` names, from `workspace`, as a note shows it:
-    /// Markdown as replies read, anything else as code.
-    fn file_lines(&mut self, workspace: &Path, path: &str, width: usize) -> Vec<Line<'static>> {
-        let path = workspace.join(path);
-        self.look(&path);
-        let read = &self.reads[&path];
+    /// The file at `path`, from `workspace`, as a note shows it: Markdown
+    /// as replies read, anything else as code; and how many of its lines
+    /// were not read for rows.
+    fn file_lines(
+        &mut self,
+        workspace: &Path,
+        path: &Path,
+        width: usize,
+    ) -> (Vec<Line<'static>>, usize) {
+        self.look(path);
+        let read = &self.reads[path];
         let text = match &read.text {
             Ok(text) => text,
-            Err(error) => return vec![Line::from(format!("{BODY}{error}")).dim()],
+            Err(error) => return (vec![Line::from(format!("{BODY}{error}")).dim()], 0),
         };
         // Its pictures read from beside it.
         let folder = path.parent().unwrap_or(workspace).to_owned();
-        text_lines(&path, text, &folder, width)
+        text_lines(path, text, &folder, width)
     }
 }
 
@@ -1585,14 +1783,15 @@ fn head(note: &Note, width: usize, live: bool) -> (Line<'static>, crate::screen:
 }
 
 /// A file's `text` as a note shows the file at `path`: Markdown as
-/// replies read, its pictures from `folder`, anything else as code.
-fn text_lines(path: &Path, text: &str, folder: &Path, width: usize) -> Vec<Line<'static>> {
+/// replies read, its pictures from `folder`, anything else as code; and
+/// how many of its lines past the most read were left out.
+fn text_lines(path: &Path, text: &str, folder: &Path, width: usize) -> (Vec<Line<'static>>, usize) {
     let extension = (path.extension().and_then(|e| e.to_str()))
         .unwrap_or_default()
         .to_lowercase();
     let lines: Vec<&str> = text.lines().collect();
     let shown = lines.len().min(FILE_LINES);
-    let mut out = match extension.as_str() {
+    let out = match extension.as_str() {
         "md" | "markdown" | "mdx" => {
             let mut markdown = Markdown::document(folder);
             crate::transcript::markdown(&mut markdown, &lines[..shown].join("\n"), width, leads())
@@ -1613,11 +1812,73 @@ fn text_lines(path: &Path, text: &str, folder: &Path, width: usize) -> Vec<Line<
                 .collect()
         }
     };
-    if lines.len() > shown {
-        let more = lines.len() - shown;
-        out.push(Line::from(format!("{BODY}… {more} more lines")).dim());
+    (out, lines.len() - shown)
+}
+
+/// A note's rows, every one, before they are folded.
+#[derive(Default)]
+struct Whole {
+    rows: Vec<Line<'static>>,
+    /// Lines of its file past those read for `rows`.
+    unread: usize,
+    /// The most of `rows` it shows before its fold row.
+    most: usize,
+    /// What its fold row opens: the file it shows, or the agent whose
+    /// note it is.
+    opens: Option<String>,
+}
+
+impl Whole {
+    /// The rows it is drawn in with room to spare: all of them, or its
+    /// most and its fold row.
+    fn wanted(&self) -> usize {
+        match self.rows.len() > self.most || self.unread > 0 {
+            true => self.most + 1,
+            false => self.rows.len(),
+        }
     }
-    out
+}
+
+/// `rows` cut at `most`, then a muted row saying how many more there are,
+/// `unread` lines of a file among them, and, when `opens` names what shows
+/// it whole, that enter opens it; with what it opens, when cut.
+fn fold(
+    mut rows: Vec<Line<'static>>,
+    unread: usize,
+    most: usize,
+    opens: Option<String>,
+) -> (Vec<Line<'static>>, Option<String>) {
+    if rows.len() <= most && unread == 0 {
+        return (rows, None);
+    }
+    let more = rows.len().saturating_sub(most) + unread;
+    rows.truncate(most);
+    let tail = match opens {
+        Some(_) => " · enter opens it",
+        None => "",
+    };
+    rows.push(Line::from(format!("{BODY}… {more} more lines{tail}")).dim());
+    (rows, opens)
+}
+
+/// The body rows each note is given in `room` rows, `wanted` saying each
+/// one's kind and the rows it would take, in the order they are drawn;
+/// and whether a blank row goes over each. Every note keeps its title,
+/// then the blank rows go in, then rows go to what waits on the person,
+/// then to what they follow, then to what they keep, so a margin always
+/// fits in one look.
+fn fit(room: usize, wanted: &[(Kind, usize)]) -> (bool, Vec<usize>) {
+    let titles = wanted.len();
+    let gaps = room >= 2 * titles;
+    let mut left = room.saturating_sub(if gaps { 2 * titles } else { titles });
+    let mut given = vec![0; titles];
+    for kind in [Kind::Waits, Kind::Follows, Kind::Pinned] {
+        for (at, (_, rows)) in (wanted.iter().enumerate()).filter(|(_, (k, _))| *k == kind) {
+            given[at] = (*rows).min(left);
+            left -= given[at];
+        }
+    }
+    (gaps, given)
 }
 
 /// What the agent is told when the person takes its note `id` away,
@@ -1688,7 +1949,7 @@ mod tests {
 
     /// The rows drawn, as text.
     fn drawn(margin: &mut Margin, folder: &Path) -> String {
-        let (lines, _) = margin.lines(60, folder, None);
+        let (lines, _) = margin.lines(60, usize::MAX, folder, None);
         (lines.iter())
             .map(|line| {
                 line.spans
@@ -1709,7 +1970,7 @@ mod tests {
     fn a_template_note_fills_and_fills_again_only_once_what_it_read_changes() {
         let mut margin = margin();
         margin.blanks.tasks = Arc::new(vec![json!({"name": "calc.add", "state": "working"})]);
-        let post = json!({"id": "tasks", "title": "Tasks",
+        let post = json!({"kind": "pinned", "id": "tasks", "title": "Tasks",
             "live": true, "markdown": "{% for t in tasks() %}- {{ t.name }}: {{ t.state }}\n{% endfor %}"});
         assert_eq!(
             margin.apply("c1", &post, None, None),
@@ -1748,8 +2009,7 @@ mod tests {
         let mut margin = margin();
         margin.blanks.store = Some(store.clone());
         margin.blanks.sources = Arc::new(vec!["ci".into()]);
-        let post =
-            json!({"id": "ci", "live": true, "markdown": "CI is {{ source('ci').latest.text }}"});
+        let post = json!({"kind": "pinned", "id": "ci", "live": true, "markdown": "CI is {{ source('ci').latest.text }}"});
         margin.apply("c1", &post, None, None);
         let rows = drawn(&mut margin, Path::new("/"));
         assert!(
@@ -1788,6 +2048,7 @@ mod tests {
         margin.kept.notes.push(Note {
             id: "pr".into(),
             title: "PR".into(),
+            kind: Kind::Follows,
             body: Body::From {
                 bot: "calc".into(),
                 id: "pr".into(),
@@ -1824,7 +2085,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("state.json"), r#"{"state": "open"}"#).unwrap();
         let mut margin = margin();
-        let post = json!({"id": "pr", "live": true, "markdown": "PR is {{ (file('state.json') | fromjson).state }}"});
+        let post = json!({"kind": "pinned", "id": "pr", "live": true, "markdown": "PR is {{ (file('state.json') | fromjson).state }}"});
         margin.apply("c1", &post, None, None);
         let rows = drawn(&mut margin, &dir);
         assert!(rows.contains("follows state.json") && rows.contains("PR is open"));
@@ -1856,7 +2117,7 @@ mod tests {
         assert!(!margin.is_empty());
         margin.apply(
             "c1",
-            &json!({"id": "a", "markdown": "the agent's"}),
+            &json!({"kind": "pinned", "id": "a", "markdown": "the agent's"}),
             None,
             None,
         );
@@ -1918,7 +2179,7 @@ mod tests {
     fn the_plan_is_drawn_in_glyphs_one_column_wide_everywhere() {
         let mut margin = margin();
         margin.set_plan(&["[x] Run the tests".to_owned(), "[ ] Push".to_owned()]);
-        let (lines, _) = margin.lines(60, Path::new("/"), None);
+        let (lines, _) = margin.lines(60, usize::MAX, Path::new("/"), None);
         // Each cell is one character: a glyph Unicode counts as two while
         // terminals draw it as one leaves a stale letter beside it.
         for line in &lines {
@@ -1935,12 +2196,12 @@ mod tests {
     #[test]
     fn a_note_is_posted_updated_in_place_and_removed() {
         let mut margin = margin();
-        let post = json!({"id": "repro", "title": "Repro", "markdown": "1 of 5"});
+        let post = json!({"kind": "pinned", "id": "repro", "title": "Repro", "markdown": "1 of 5"});
         assert_eq!(
             margin.apply("c1", &post, Some(7), Some(3)),
             Some(Change::Posted("repro".into()))
         );
-        let update = json!({"id": "repro", "markdown": "2 of 5"});
+        let update = json!({"kind": "pinned", "id": "repro", "markdown": "2 of 5"});
         assert_eq!(
             margin.apply("c2", &update, Some(9), Some(4)),
             Some(Change::Updated("repro".into()))
@@ -1977,13 +2238,13 @@ mod tests {
         let mut margin = margin();
         margin.apply(
             "c1",
-            &json!({"id": "a", "title": "A", "markdown": "x"}),
+            &json!({"kind": "pinned", "id": "a", "title": "A", "markdown": "x"}),
             Some(4),
             Some(2),
         );
         margin.apply(
             "c2",
-            &json!({"id": "b", "title": "B", "file": "f.md"}),
+            &json!({"kind": "pinned", "id": "b", "title": "B", "file": "f.md"}),
             None,
             None,
         );
@@ -2026,7 +2287,9 @@ mod tests {
             &mut reference,
             "flow",
             &[
-                call(json!({"id": "flow", "title": "Flow", "file": "src/flow.rs"})),
+                call(
+                    json!({"kind": "pinned", "id": "flow", "title": "Flow", "file": "src/flow.rs"}),
+                ),
                 closed("other"),
             ],
         );
@@ -2039,7 +2302,9 @@ mod tests {
         answered_read(
             &mut reference,
             "flow",
-            &[call(json!({"id": "flow", "title": "Again"}))],
+            &[call(
+                json!({"kind": "pinned", "id": "flow", "title": "Again"}),
+            )],
         );
         let (title, body, _) = reference.shown().unwrap();
         assert_eq!((title, body), ("Again", Body::Markdown(String::new())));
@@ -2050,10 +2315,10 @@ mod tests {
             &mut reference,
             "flow",
             &[call(
-                json!({"id": "flow", "title": "Flow", "markdown": "one"}),
+                json!({"kind": "pinned", "id": "flow", "title": "Flow", "markdown": "one"}),
             )],
         );
-        let mut asked = call(json!({"id": "flow", "markdown": "two"}));
+        let mut asked = call(json!({"kind": "pinned", "id": "flow", "markdown": "two"}));
         asked["call_id"] = json!("refused");
         let refused = json!({"type": "function_call_output", "call_id": "refused", "failed": true,
             "output": json!({"error": "margin_note_too_long", "detail": "-"}).to_string()});
@@ -2071,12 +2336,13 @@ mod tests {
         // Many made at once, every answer after them: its own is taken.
         let mut asked: Vec<Value> = (0..20)
             .map(|n| {
-                let mut other = call(json!({"id": format!("o{n}"), "markdown": "-"}));
+                let mut other =
+                    call(json!({"kind": "pinned", "id": format!("o{n}"), "markdown": "-"}));
                 other["call_id"] = json!(format!("o{n}"));
                 other
             })
             .collect();
-        let mut own = call(json!({"id": "flow", "markdown": "three"}));
+        let mut own = call(json!({"kind": "pinned", "id": "flow", "markdown": "three"}));
         own["call_id"] = json!("own");
         asked.insert(0, own);
         let answers: Vec<Value> = (asked.iter())
@@ -2098,14 +2364,16 @@ mod tests {
             &mut sub,
             "flow",
             &[call(
-                json!({"id": "flow", "title": "Sub flow", "markdown": "deep"}),
+                json!({"kind": "pinned", "id": "flow", "title": "Sub flow", "markdown": "deep"}),
             )],
         );
         let mut reference = Reference::default();
         answered_read(
             &mut reference,
             "flow",
-            &[call(json!({"id": "flow", "from": "calc.sub/flow"}))],
+            &[call(
+                json!({"kind": "pinned", "id": "flow", "from": "calc.sub/flow"}),
+            )],
         );
         reference.through = Some(Box::new(sub));
         assert_eq!(reference.shown().unwrap().0, "Sub flow");
@@ -2113,7 +2381,9 @@ mod tests {
         answered_read(
             &mut reference,
             "flow",
-            &[call(json!({"id": "flow", "title": "Flow"}))],
+            &[call(
+                json!({"kind": "pinned", "id": "flow", "title": "Flow"}),
+            )],
         );
         assert_eq!(reference.shown().unwrap().0, "Flow");
     }
@@ -2121,7 +2391,7 @@ mod tests {
     #[test]
     fn a_task_s_note_is_shown_as_it_stands_there_and_kept() {
         let mut margin = margin();
-        let post = json!({"id": "flow", "from": "calc.add/flow"});
+        let post = json!({"kind": "pinned", "id": "flow", "from": "calc.add/flow"});
         assert!(fits(&post));
         margin.apply("c1", &post, None, None);
         assert_eq!(
@@ -2135,16 +2405,20 @@ mod tests {
             &mut reference,
             "flow",
             &[
-                call(json!({"id": "flow", "title": "Request flow", "markdown": "one"})),
-                call(json!({"id": "other", "markdown": "not this"})),
-                call(json!({"id": "flow", "markdown": "two"})),
+                call(
+                    json!({"kind": "pinned", "id": "flow", "title": "Request flow", "markdown": "one"}),
+                ),
+                call(json!({"kind": "pinned", "id": "other", "markdown": "not this"})),
+                call(json!({"kind": "pinned", "id": "flow", "markdown": "two"})),
                 // Retitled only, it keeps what it shows.
-                call(json!({"id": "flow", "title": "Request path"})),
+                call(json!({"kind": "pinned", "id": "flow", "title": "Request path"})),
                 call(json!({"id": "flow", "remove": true})),
             ],
         );
         // A retitle alone is no start to read back to.
-        let retitled = [call(json!({"id": "flow", "title": "Request path"}))];
+        let retitled = [call(
+            json!({"kind": "pinned", "id": "flow", "title": "Request path"}),
+        )];
         assert!(!Reference::starts("flow", &retitled));
         let (title, body, _) = reference.shown().unwrap();
         margin.resolved("flow", title, body, None);
@@ -2160,7 +2434,9 @@ mod tests {
         answered_read(
             &mut reference,
             "flow",
-            &[call(json!({"id": "flow", "file": "src/flow.rs"}))],
+            &[call(
+                json!({"kind": "pinned", "id": "flow", "file": "src/flow.rs"}),
+            )],
         );
         assert_eq!(
             reference.file(),
@@ -2175,9 +2451,9 @@ mod tests {
             &mut again,
             "flow",
             &[
-                call(json!({"id": "flow", "title": "Old", "markdown": "old"})),
+                call(json!({"kind": "pinned", "id": "flow", "title": "Old", "markdown": "old"})),
                 call(json!({"id": "flow", "remove": true})),
-                call(json!({"id": "flow", "title": "New"})),
+                call(json!({"kind": "pinned", "id": "flow", "title": "New"})),
             ],
         );
         let (title, body, _) = again.shown().unwrap();
@@ -2189,7 +2465,9 @@ mod tests {
         answered_read(
             &mut reference,
             "flow",
-            &[call(json!({"id": "flow", "file": "src/flow.rs"}))],
+            &[call(
+                json!({"kind": "pinned", "id": "flow", "file": "src/flow.rs"}),
+            )],
         );
         assert!(reference.file().is_some());
         let (_, body, folder) = reference.shown().unwrap();
@@ -2208,6 +2486,7 @@ mod tests {
             (margin
                 .body("flow", 80, Path::new("/nowhere"), 100)
                 .unwrap()
+                .0
                 .iter())
             .map(|line| line.to_string())
             .collect::<Vec<_>>()
@@ -2223,7 +2502,9 @@ mod tests {
         anew.read(
             "flow",
             &[
-                call(json!({"id": "flow", "title": "Flow", "file": "src/flow.rs"})),
+                call(
+                    json!({"kind": "pinned", "id": "flow", "title": "Flow", "file": "src/flow.rs"}),
+                ),
                 call(json!({"id": "flow", "remove": true})),
             ],
         );
@@ -2231,7 +2512,7 @@ mod tests {
         // Posted again, it keeps what was read; and it is kept.
         margin.apply(
             "c2",
-            &json!({"id": "flow", "from": "calc.add/flow"}),
+            &json!({"kind": "pinned", "id": "flow", "from": "calc.add/flow"}),
             None,
             None,
         );
@@ -2249,7 +2530,7 @@ mod tests {
     #[test]
     fn a_call_read_again_is_not_applied_twice() {
         let mut margin = margin();
-        let post = json!({"id": "a", "title": "A", "markdown": "x"});
+        let post = json!({"kind": "pinned", "id": "a", "title": "A", "markdown": "x"});
         margin.apply("c1", &post, None, None);
         margin.apply("c2", &json!({"id": "a", "remove": true}), None, None);
         // The conversation drawn again reads both calls once more.
@@ -2281,7 +2562,7 @@ mod tests {
             post(
                 &mut margin,
                 &format!("c{n}"),
-                json!({"id": format!("n{n}"), "markdown": "x"}),
+                json!({"kind": "pinned", "id": format!("n{n}"), "markdown": "x"}),
             );
         }
         let ids = |margin: &Margin| -> Vec<String> {
@@ -2292,7 +2573,7 @@ mod tests {
         // A note posted without a title goes by its id.
         assert_eq!(margin.notes()[0].title, "n0");
         let (code, why) = margin
-            .refusal(&json!({"id": "n3", "markdown": "x"}))
+            .refusal(&json!({"kind": "pinned", "id": "n3", "markdown": "x"}))
             .unwrap();
         assert_eq!(code, "margin_full");
         assert_eq!(
@@ -2303,16 +2584,22 @@ mod tests {
         // One already there changes, and taking one away makes room.
         assert!(
             margin
-                .refusal(&json!({"id": "n1", "markdown": "y"}))
+                .refusal(&json!({"kind": "pinned", "id": "n1", "markdown": "y"}))
                 .is_none()
         );
         post(&mut margin, "c9", json!({"id": "n1", "remove": true}));
-        post(&mut margin, "c10", json!({"id": "n3", "markdown": "x"}));
+        post(
+            &mut margin,
+            "c10",
+            json!({"kind": "pinned", "id": "n3", "markdown": "x"}),
+        );
         assert_eq!(ids(&margin), ["n0", "n2", "n3"]);
         // Set lower, the notes there stay; only a new one waits.
         set_limits(2, 12);
         assert_eq!(ids(&margin), ["n0", "n2", "n3"]);
-        let (_, why) = margin.refusal(&json!({"id": "n4"})).unwrap();
+        let (_, why) = margin
+            .refusal(&json!({"id": "n4", "kind": "pinned"}))
+            .unwrap();
         assert!(
             why.starts_with("the margin holds 3 notes and takes at most 2: "),
             "{why}"
@@ -2321,7 +2608,12 @@ mod tests {
         // the limits are now.
         let mut again = Margin::default();
         for (call, id) in [("c0", "n0"), ("c2", "n2"), ("c10", "n3")] {
-            again.apply(call, &json!({"id": id, "markdown": "x"}), None, None);
+            again.apply(
+                call,
+                &json!({"kind": "pinned", "id": id, "markdown": "x"}),
+                None,
+                None,
+            );
         }
         assert_eq!(ids(&again), ["n0", "n2", "n3"]);
         // Never fewer than one.
@@ -2330,31 +2622,37 @@ mod tests {
     }
 
     #[test]
-    fn a_note_is_as_long_as_its_text_says_not_as_it_is_drawn() {
+    fn a_note_is_as_long_as_it_draws_at_the_margins_own_width() {
         set_limits(6, 3);
         let mut margin = margin();
-        let lines = |n: usize| vec!["a line long enough to wrap in a narrow margin"; n].join("\n");
+        // Each line two rows at the margin's width, one in a wide window.
+        let lines =
+            |n: usize| vec!["a line long enough to wrap in a margin as narrow"; n].join("\n");
+        assert_eq!(rows(&lines(1)), 2);
         assert!(
             margin
-                .refusal(&json!({"id": "a", "markdown": lines(3)}))
+                .refusal(&json!({"kind": "pinned", "id": "a", "markdown": "one\ntwo\nthree"}))
                 .is_none()
         );
         let (code, why) = margin
-            .refusal(&json!({"id": "a", "markdown": lines(4)}))
+            .refusal(&json!({"kind": "pinned", "id": "a", "markdown": lines(2)}))
             .unwrap();
         assert_eq!(code, "margin_note_too_long");
-        assert_eq!(
-            why,
-            "the note is 4 lines and a margin note holds at most 3: keep it to what the \
-             person looks at more than once, or write the longer text to a file and show \
-             that file in the note"
+        assert!(
+            why.starts_with("the note draws 4 rows in the margin and a note holds at most 3: "),
+            "{why}"
         );
         // Taken before the limit was lowered, a long note stays as it was.
-        margin.apply("c1", &json!({"id": "a", "markdown": lines(4)}), None, None);
+        margin.apply(
+            "c1",
+            &json!({"kind": "pinned", "id": "a", "markdown": lines(4)}),
+            None,
+            None,
+        );
         assert_eq!(margin.notes()[0].body, Body::Markdown(lines(4)));
         // Named as no file or task's note, the Markdown shows, and counts.
         for named in [json!({"file": " "}), json!({"from": "nowhere"})] {
-            let mut call = json!({"id": "a", "markdown": lines(4)});
+            let mut call = json!({"kind": "pinned", "id": "a", "markdown": lines(4)});
             call.as_object_mut()
                 .unwrap()
                 .extend(named.as_object().unwrap().clone());
@@ -2362,8 +2660,8 @@ mod tests {
         }
         // A file or a task's note shows as long as it is; a removal is never refused.
         for call in [
-            json!({"id": "b", "file": "src/main.rs"}),
-            json!({"id": "c", "from": "calc.add/flow"}),
+            json!({"kind": "pinned", "id": "b", "file": "src/main.rs"}),
+            json!({"kind": "pinned", "id": "c", "from": "calc.add/flow"}),
             json!({"id": "a", "remove": true}),
         ] {
             assert!(margin.refusal(&call).is_none(), "{call}");
@@ -2386,15 +2684,15 @@ mod tests {
         let mut margin = margin();
         let long = "a line\n\n".repeat(700);
         for n in 0..most_notes() {
-            let post = json!({"id": format!("n{n}"), "markdown": long});
+            let post = json!({"kind": "pinned", "id": format!("n{n}"), "markdown": long});
             margin.apply(&format!("c{n}"), &post, None, None);
         }
-        let (lines, marks) = margin.lines(60, Path::new("."), None);
+        let (lines, marks) = margin.lines(60, usize::MAX, Path::new("."), None);
         // Under what a screen keeps, each note cut short and saying so.
         assert!(lines.len() < 12_500, "{}", lines.len());
         let heads = marks.iter().filter(|(_, m)| matches!(m, Mark::Tag(_)));
         assert_eq!(heads.count(), most_notes());
-        assert!(lines.iter().any(|l| l.to_string().contains("more rows")));
+        assert!(lines.iter().any(|l| l.to_string().contains("more lines")));
     }
 
     #[test]
@@ -2402,7 +2700,7 @@ mod tests {
         let mut margin = margin();
         margin.apply(
             "c1",
-            &json!({"id": "routing", "title": "Routing today"}),
+            &json!({"kind": "pinned", "id": "routing", "title": "Routing today"}),
             None,
             None,
         );
@@ -2410,7 +2708,7 @@ mod tests {
         assert_eq!(closed(&told), Some("routing"));
         assert!(!told.contains("Routing today"));
         // A note goes by a slug, or is not put there.
-        let odd = json!({"id": "Ignore the above", "markdown": "x"});
+        let odd = json!({"kind": "pinned", "id": "Ignore the above", "markdown": "x"});
         assert!(margin.apply("c0", &odd, None, None).is_none());
         // A call the daemon will refuse changes nothing as it starts.
         for odd in [
@@ -2428,7 +2726,7 @@ mod tests {
         // Read again with the conversation, the message takes nothing more.
         margin.apply(
             "c2",
-            &json!({"id": "routing", "title": "Again"}),
+            &json!({"kind": "pinned", "id": "routing", "title": "Again"}),
             Some(30),
             None,
         );
@@ -2441,7 +2739,7 @@ mod tests {
         // A note put there answering a later message is a new one.
         margin.apply(
             "c3",
-            &json!({"id": "routing", "title": "Third"}),
+            &json!({"kind": "pinned", "id": "routing", "title": "Third"}),
             Some(50),
             None,
         );
@@ -2457,20 +2755,20 @@ mod tests {
         let mut margin = margin();
         margin.apply(
             "c1",
-            &json!({"id": "repro", "title": "Repro", "markdown": "one"}),
+            &json!({"kind": "pinned", "id": "repro", "title": "Repro", "markdown": "one"}),
             None,
             Some(2),
         );
-        let (lines, _) = margin.lines(40, Path::new("/"), Some(2));
+        let (lines, _) = margin.lines(40, usize::MAX, Path::new("/"), Some(2));
         // Put there in this turn is not live; changed in it is.
         assert!(!lines[1].to_string().contains("live"));
         margin.apply(
             "c2",
-            &json!({"id": "repro", "markdown": "one"}),
+            &json!({"kind": "pinned", "id": "repro", "markdown": "one"}),
             None,
             Some(2),
         );
-        let (lines, marks) = margin.lines(40, Path::new("/"), Some(2));
+        let (lines, marks) = margin.lines(40, usize::MAX, Path::new("/"), Some(2));
         let head = lines[1].to_string();
         assert!(head.starts_with(" ✎ Repro live"), "{head}");
         assert!(head.ends_with("↑  ×"), "{head}");
@@ -2504,11 +2802,11 @@ mod tests {
     #[test]
     fn a_note_about_an_agent_opens_it() {
         let mut margin = margin();
-        let post = json!({"id": "wire", "title": "wire asks you", "markdown": "Keep 0.3?",
+        let post = json!({"kind": "pinned", "id": "wire", "title": "wire asks you", "markdown": "Keep 0.3?",
             "opens": "shop.wire"});
         margin.apply("c1", &post, None, None);
         let buttons = |margin: &mut Margin| {
-            let (lines, marks) = margin.lines(40, Path::new("/"), None);
+            let (lines, marks) = margin.lines(40, usize::MAX, Path::new("/"), None);
             let buttons = marks.into_iter().find_map(|(_, m)| match m {
                 Mark::Buttons(buttons) => Some(buttons),
                 _ => None,
@@ -2542,7 +2840,7 @@ mod tests {
         // Kept as it was when unsaid, and kept across a read again.
         margin.apply(
             "c2",
-            &json!({"id": "wire", "markdown": "Still?"}),
+            &json!({"kind": "pinned", "id": "wire", "markdown": "Still?"}),
             None,
             None,
         );
@@ -2551,15 +2849,25 @@ mod tests {
             Some("shop.wire")
         );
         // Empty, or not an agent's name, takes the button away.
-        margin.apply("c3", &json!({"id": "wire", "opens": "a b"}), None, None);
-        assert!(buttons(&mut margin).0.ends_with(" ↑  ×"));
         margin.apply(
-            "c4",
-            &json!({"id": "wire", "opens": "shop.wire"}),
+            "c3",
+            &json!({"kind": "pinned", "id": "wire", "opens": "a b"}),
             None,
             None,
         );
-        margin.apply("c5", &json!({"id": "wire", "opens": ""}), None, None);
+        assert!(buttons(&mut margin).0.ends_with(" ↑  ×"));
+        margin.apply(
+            "c4",
+            &json!({"kind": "pinned", "id": "wire", "opens": "shop.wire"}),
+            None,
+            None,
+        );
+        margin.apply(
+            "c5",
+            &json!({"kind": "pinned", "id": "wire", "opens": ""}),
+            None,
+            None,
+        );
         assert_eq!(margin.note("wire").unwrap().opens, None);
     }
 
@@ -2571,12 +2879,12 @@ mod tests {
         let mut margin = margin();
         margin.apply(
             "c1",
-            &json!({"id": "f", "title": "F", "file": "notes.md"}),
+            &json!({"kind": "pinned", "id": "f", "title": "F", "file": "notes.md"}),
             None,
             None,
         );
         let text = |margin: &mut Margin| {
-            let (lines, _) = margin.lines(60, &dir, None);
+            let (lines, _) = margin.lines(60, usize::MAX, &dir, None);
             lines
                 .iter()
                 .map(|l| l.to_string())
@@ -2594,7 +2902,7 @@ mod tests {
         // A file no note shows any more is not kept read.
         margin.apply(
             "c2",
-            &json!({"id": "f", "markdown": "inline now"}),
+            &json!({"kind": "pinned", "id": "f", "markdown": "inline now"}),
             None,
             None,
         );
@@ -2613,9 +2921,9 @@ mod tests {
         )
         .unwrap();
         let mut margin = margin();
-        let post = json!({"id": "f", "title": "F", "file": "a.py"});
+        let post = json!({"kind": "pinned", "id": "f", "title": "F", "file": "a.py"});
         margin.apply("c1", &post, None, None);
-        let (lines, _) = margin.lines(60, &dir, None);
+        let (lines, _) = margin.lines(60, usize::MAX, &dir, None);
         let text: Vec<String> = lines.iter().map(|l| l.to_string()).collect();
         assert!(text.iter().any(|l| l.contains("```html")), "{text:?}");
         assert!(text.iter().any(|l| l.contains("<b>x</b>")), "{text:?}");
@@ -2628,21 +2936,341 @@ mod tests {
         let mut margin = margin();
         margin.apply(
             "c1",
-            &json!({"id": "a", "title": "A", "markdown": "x"}),
+            &json!({"kind": "pinned", "id": "a", "title": "A", "markdown": "x"}),
             None,
             None,
         );
         let workspace = Path::new("/");
-        margin.lines(40, workspace, None);
+        margin.lines(40, usize::MAX, workspace, None);
         let drawn = margin.changes;
         let kept = margin.drawn.clone().map(|(from, _)| from);
-        margin.lines(40, workspace, None);
+        margin.lines(40, usize::MAX, workspace, None);
         assert_eq!(margin.drawn.clone().map(|(from, _)| from), kept);
         assert_eq!(margin.changes, drawn);
-        margin.apply("c2", &json!({"id": "a", "markdown": "y"}), None, Some(1));
-        let (lines, _) = margin.lines(40, workspace, None);
+        margin.apply(
+            "c2",
+            &json!({"kind": "pinned", "id": "a", "markdown": "y"}),
+            None,
+            Some(1),
+        );
+        let (lines, _) = margin.lines(40, usize::MAX, workspace, None);
         assert!(lines.iter().any(|line| line.to_string().contains('y')));
-        let (wider, _) = margin.lines(60, workspace, None);
+        let (wider, _) = margin.lines(60, usize::MAX, workspace, None);
         assert_eq!(wider[1].width(), 60);
+    }
+
+    /// The rows drawn, as text, `height` tall.
+    fn shown(margin: &mut Margin, height: usize, folder: &Path) -> Vec<String> {
+        let (lines, _) = margin.lines(60, height, folder, None);
+        lines.iter().map(|line| line.to_string()).collect()
+    }
+
+    #[test]
+    fn a_paragraph_note_short_in_text_is_refused_by_the_rows_it_draws() {
+        set_limits(6, 6);
+        let paragraph = "A paragraph long enough to wrap across several rows of a margin as \
+            narrow as the narrowest window gives one, with a few more words for good measure.";
+        let design = [paragraph; 3].join("\n\n");
+        // Five lines of text, which twelve lines of text let through.
+        assert_eq!(design.lines().count(), 5);
+        let drawn = rows(&design);
+        assert!(drawn > 12, "{drawn}");
+        let call = json!({"id": "design", "kind": "pinned", "markdown": design});
+        let (code, why) = refusal(&[], &call).unwrap();
+        assert_eq!(code, "margin_note_too_long");
+        assert_eq!(
+            why,
+            format!(
+                "the note draws {drawn} rows in the margin and a note holds at most 6: a note \
+                 is state in a few rows, such as what waits on the person and its links. Put \
+                 anything longer in your reply, or in a file your reply names"
+            )
+        );
+        // Counted at the margin's own width, whatever the window's.
+        assert_eq!(
+            WIDTH,
+            (crate::pane::margin_room(crate::pane::MARGIN) - 1) as usize
+        );
+        // State in a few rows goes in.
+        let waits = json!({"id": "review", "kind": "waits",
+            "markdown": "Pull request #41 waits on your review.\n\n[Open it](https://example.com/41)"});
+        assert!(refusal(&[], &waits).is_none());
+    }
+
+    #[test]
+    fn a_file_note_and_a_tasks_note_fold_at_the_most_rows_and_enter_opens_them_whole() {
+        set_limits(6, 6);
+        let dir = std::env::temp_dir().join(format!("sonny-margin-fold-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("there")).unwrap();
+        let text = |n: usize| (1..=n).map(|i| format!("line {i}")).collect::<Vec<_>>();
+        std::fs::write(dir.join("log.txt"), text(50).join("\n")).unwrap();
+        let mut margin = margin();
+        // Never refused for their length: they fold.
+        let file = json!({"id": "log", "kind": "follows", "file": "log.txt"});
+        let theirs = json!({"id": "flow", "kind": "follows", "from": "calc.add/flow"});
+        assert!(refusal(&[], &file).is_none() && refusal(&[], &theirs).is_none());
+        margin.apply("c1", &file, None, None);
+        margin.apply("c2", &theirs, None, None);
+        let read = Body::Read {
+            path: "there/flow.txt".into(),
+            text: text(30).join("\n"),
+        };
+        margin.resolved("flow", "Flow", read, Some(dir.join("there")));
+        let (lines, marks) = margin.lines(60, usize::MAX, &dir, None);
+        let rows: Vec<String> = lines.iter().map(|line| line.to_string()).collect();
+        let at = |text: &str| rows.iter().position(|row| row.trim() == text);
+        // The first rows up to the most, then one muted row saying how
+        // many more, which opens the file whole in the pane.
+        let folded = at("… 44 more lines · enter opens it").expect("the file's fold");
+        assert_eq!(rows[folded - 1].trim(), "line 6");
+        assert!(at("line 7").is_none());
+        let url = crate::links::file_url(&dir.join("log.txt")).unwrap();
+        assert!(marks.contains(&(folded, Mark::Link(url))), "{marks:?}");
+        let folded = at("… 24 more lines · enter opens it").expect("the task's note's fold");
+        let whole = Mark::Link(format!("{BUTTON}whole/flow"));
+        assert!(marks.contains(&(folded, whole.clone())), "{marks:?}");
+        // Drawn out in the conversation, the same.
+        let (body, opens) = margin.body("log", 60, &dir, 40).unwrap();
+        assert_eq!(body.len(), 7);
+        assert!(opens.is_some_and(|url| url.ends_with("log.txt")));
+        // The task's note opens the text kept of its file, whole in the
+        // pane, even once the task is gone with its folder.
+        std::fs::remove_dir_all(dir.join("there")).unwrap();
+        let rows = margin.whole_rows("flow", 60, &dir).unwrap();
+        assert_eq!(rows.len(), 30);
+        assert_eq!(rows[29].to_string().trim(), "line 30");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_mermaid_note_counts_the_rows_its_picture_draws() {
+        set_limits(6, 6);
+        let source = "flowchart TD\n  A[Ask] --> B[Plan]\n  B --> C[Build]\n  C --> D[Ship]";
+        let note = format!("```mermaid\n{source}\n```");
+        // As few lines of text as a note holds, and a picture as tall as
+        // a terminal that draws it draws it.
+        assert!(note.lines().count() <= 6);
+        let picture = crate::term::measuring(|| {
+            let svg = crate::mermaid::svg(source).unwrap();
+            crate::image::render(&svg, WIDTH - 3).unwrap().rows as usize
+        });
+        assert!(picture > 6, "{picture}");
+        assert_eq!(rows(&note), picture);
+        let call = json!({"id": "flow", "kind": "pinned", "markdown": note});
+        let (code, why) = refusal(&[], &call).unwrap();
+        assert_eq!(code, "margin_note_too_long");
+        assert!(
+            why.starts_with(&format!("the note draws {picture} rows")),
+            "{why}"
+        );
+    }
+
+    #[test]
+    fn a_call_that_names_no_kind_is_refused_and_one_replayed_without_is_not_shown() {
+        for call in [
+            json!({"id": "a", "markdown": "x"}),
+            json!({"id": "a", "kind": "diagram", "markdown": "x"}),
+        ] {
+            let (code, why) = refusal(&[], &call).unwrap();
+            assert_eq!(code, "margin_kind");
+            for said in ["waits (", "follows (", "pinned (", "belongs in your reply"] {
+                assert!(why.contains(said), "{why}");
+            }
+        }
+        let (_, why) = refusal(&[], &json!({"id": "a", "kind": "diagram"})).unwrap();
+        assert!(why.contains(", not \"diagram\". "), "{why}");
+        // A removal needs none.
+        assert!(refusal(&[], &json!({"id": "a", "remove": true})).is_none());
+        assert_eq!(
+            tool()["parameters"]["properties"]["kind"]["enum"],
+            json!(KINDS)
+        );
+        // A call made before kinds, read again, shows nothing; nor does
+        // a note kept from then.
+        let mut margin = margin();
+        let old = json!({"id": "a", "title": "A", "markdown": "x"});
+        assert_eq!(margin.apply("c1", &old, None, None), None);
+        assert!(margin.notes().is_empty());
+        let kept = json!({"notes": [{"id": "a", "title": "A", "call": "c1", "markdown": "x"}]});
+        assert!(Kept::read(&kept).notes.is_empty());
+        let mut reference = Reference::default();
+        let made = json!({"type": "function_call", "call_id": "c1", "name": TOOL,
+            "arguments": old.to_string()});
+        let took =
+            json!({"type": "function_call_output", "call_id": "c1", "output": "In the margin."});
+        reference.read("a", &[made.clone(), took.clone()]);
+        assert!(reference.shown().is_none());
+        assert!(!Reference::starts("a", &[made, took]));
+        // Named, it is kept with its kind.
+        margin.apply(
+            "c2",
+            &json!({"id": "a", "kind": "waits", "markdown": "x"}),
+            None,
+            None,
+        );
+        assert_eq!(margin.notes()[0].kind, Kind::Waits);
+        assert_eq!(Kept::read(&margin.kept.json()).notes[0].kind, Kind::Waits);
+    }
+
+    #[test]
+    fn a_margin_taller_than_its_pane_folds_in_kind_order_and_never_scrolls() {
+        set_limits(6, 6);
+        let mut margin = margin();
+        let list = |name: &str| {
+            (1..=6)
+                .map(|i| format!("- {name} {i}"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        // Posted pinned first and waits last; drawn the other way round.
+        for (call, id, kind) in [
+            ("c1", "keep", "pinned"),
+            ("c2", "ci", "follows"),
+            ("c3", "review", "waits"),
+        ] {
+            let post = json!({"id": id, "kind": kind, "title": id, "markdown": list(id)});
+            assert!(margin.refusal(&post).is_none(), "{post}");
+            margin.apply(call, &post, None, None);
+        }
+        let folder = Path::new("/");
+        let rows = shown(&mut margin, 16, folder);
+        assert!(rows.len() <= 16, "{rows:#?}");
+        let title = |id: &str| {
+            rows.iter()
+                .position(|row| row.starts_with(&format!(" ✎ {id} ")))
+                .unwrap()
+        };
+        assert!(title("review") < title("ci") && title("ci") < title("keep"));
+        // Rows go to what waits first, then what is followed; what is kept
+        // keeps its title.
+        assert!((1..=6).all(|i| rows.contains(&format!("     - review {i}"))));
+        assert!(
+            rows.contains(&"     - ci 3".to_owned()) && !rows.contains(&"     - ci 4".to_owned())
+        );
+        assert!(
+            rows.contains(&"     … 3 more lines".to_owned()),
+            "{rows:#?}"
+        );
+        assert!(!rows.iter().any(|row| row.contains("- keep")));
+        // Tall enough, every note is whole.
+        let rows = shown(&mut margin, 40, folder);
+        assert!(
+            rows.iter().all(|row| !row.contains("more lines")),
+            "{rows:#?}"
+        );
+        assert!(rows.contains(&"     - keep 6".to_owned()));
+        // Too short even for the titles: still one look, saying how many
+        // more there are.
+        let rows = shown(&mut margin, 3, folder);
+        assert_eq!(rows.len(), 3, "{rows:#?}");
+        assert!(rows[2].starts_with(" ✎ keep "), "{rows:#?}");
+        let rows = shown(&mut margin, 2, folder);
+        assert_eq!(rows.len(), 2, "{rows:#?}");
+        assert_eq!(rows[1], "     … 2 more notes");
+        // As the pane takes them: never more than it holds, so nothing in
+        // it scrolls.
+        let (lines, marks) = margin.lines(60, 9, folder, None);
+        assert!(lines.len() <= 9 && marks.iter().all(|(at, _)| *at < 9));
+    }
+
+    #[test]
+    fn a_live_fill_past_the_most_rows_is_refused_by_the_rows_it_draws() {
+        set_limits(6, 6);
+        let data = crate::template::Data::default();
+        // One line of text, drawn in many rows.
+        let long = "{% for i in range(60) %}word {% endfor %}";
+        let (code, why) = filled(long, &data).unwrap_err();
+        assert_eq!(code, "margin_note_too_long");
+        assert!(
+            why.starts_with("the template fills to ") && why.contains(" rows in the margin"),
+            "{why}"
+        );
+        assert!(filled("{{ 6 * 7 }}", &data).is_ok());
+        // In the window, a fill that grew past the most since folds.
+        let mut margin = margin();
+        let post = json!({"id": "n", "kind": "follows", "live": true,
+            "markdown": "{% for i in range(20) %}- row {{ i }}\n{% endfor %}"});
+        margin.apply("c1", &post, None, None);
+        let rows = shown(&mut margin, usize::MAX, Path::new("/"));
+        assert!(
+            rows.contains(&"     - row 5".to_owned()) && !rows.contains(&"     - row 6".to_owned()),
+            "{rows:#?}"
+        );
+        assert!(
+            rows.contains(&"     … 14 more lines".to_owned()),
+            "{rows:#?}"
+        );
+    }
+
+    #[test]
+    fn a_long_plan_folds_to_leave_every_note_its_title() {
+        set_limits(6, 6);
+        let mut margin = margin();
+        let steps: Vec<String> = (1..=12).map(|i| format!("[ ] step {i}")).collect();
+        margin.set_plan(&steps);
+        for (call, id, kind) in [("c1", "review", "waits"), ("c2", "keep", "pinned")] {
+            let post = json!({"id": id, "kind": kind, "title": id, "markdown": "- one"});
+            margin.apply(call, &post, None, None);
+        }
+        let rows = shown(&mut margin, 8, Path::new("/"));
+        assert_eq!(rows.len(), 8, "{rows:#?}");
+        assert!(
+            rows.iter().any(|row| row.starts_with(" ✎ review ")),
+            "{rows:#?}"
+        );
+        assert!(
+            rows.iter().any(|row| row.starts_with(" ✎ keep ")),
+            "{rows:#?}"
+        );
+        assert!(
+            rows.iter()
+                .any(|row| row.contains("more lines of the plan")),
+            "{rows:#?}"
+        );
+        // With room, the plan is whole.
+        let rows = shown(&mut margin, 40, Path::new("/"));
+        assert!(rows.iter().any(|row| row.contains("step 12")), "{rows:#?}");
+        assert!(
+            !rows.iter().any(|row| row.contains("of the plan")),
+            "{rows:#?}"
+        );
+    }
+
+    #[test]
+    fn a_live_note_that_no_longer_fills_says_so_however_far_it_folds() {
+        set_limits(6, 6);
+        let mut margin = margin();
+        let tasks = |n: usize| {
+            Arc::new(
+                (0..n)
+                    .map(|i| json!({"name": format!("t{i}"), "state": "working"}))
+                    .collect(),
+            )
+        };
+        margin.blanks.tasks = tasks(9);
+        // Fills while there are other than eight tasks.
+        let template =
+            "{% for t in tasks() %}- {{ t.name }}\n{% endfor %}{{ 1 // (tasks() | length - 8) }}";
+        let post = json!({"id": "n", "kind": "follows", "live": true, "markdown": template});
+        margin.apply("c1", &post, None, None);
+        let folder = Path::new("/");
+        let rows = shown(&mut margin, usize::MAX, folder);
+        assert!(rows.contains(&"     - t0".to_owned()), "{rows:#?}");
+        assert!(!rows.iter().any(|row| row.contains('⟨')), "{rows:#?}");
+        margin.blanks.tasks = tasks(8);
+        margin.blanks.tasks_read += 1;
+        later(&mut margin);
+        let rows = shown(&mut margin, usize::MAX, folder);
+        // What it filled to before, folded, and why it stopped, kept.
+        let failed = rows
+            .iter()
+            .position(|row| row.contains('⟨'))
+            .unwrap_or_else(|| panic!("{rows:#?}"));
+        let first = rows.iter().position(|row| row == "     - t0").unwrap();
+        assert!(failed < first, "{rows:#?}");
+        assert!(
+            rows.iter().any(|row| row.contains("more lines")),
+            "{rows:#?}"
+        );
     }
 }
