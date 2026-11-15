@@ -16,8 +16,9 @@ On macOS or Linux with Homebrew:
 brew install lydakis/agent/sonny
 ```
 
-This builds Sonny from a release's source and installs Agent, ripgrep, and
-agent-browser. If Homebrew refuses the tap as untrusted, run
+This builds Sonny from a release's source and installs Agent and ripgrep.
+Sonny installs its own agent-browser and agent-desktop, at the versions
+its tools are written for, when you run `sonny setup`. If Homebrew refuses the tap as untrusted, run
 `brew trust lydakis/agent` first.
 
 On Linux, the installer downloads the latest release's static builds for
@@ -173,7 +174,7 @@ speed, display, and terminal layout options.
 ## Integrations and further reading
 
 - [Memory, skills, automations, and MCP](../docs/SONNY.md): capabilities agents use across conversations.
-- [Lookout](../docs/LOOKOUT.md): task updates and configured outside sources.
+- [Lookout](../docs/LOOKOUT.md): what happens in tasks and configured outside sources, in one pipe.
 - [Terminal layout](REFERENCE.md#terminal-layout): Rex, Herdr, and cmux setup and behavior.
 - [Feature history](FEATURES.md): what changed and why.
 - [Documentation index](../docs/README.md): runtime, CLI, design, and measurements.

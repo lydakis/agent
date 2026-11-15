@@ -225,19 +225,30 @@ class AnthropicCompactionTests(ModelFixture):
         self.assertEqual([(r['form'], r['items']) for r in requested], [('copy', 5), ('copy', 5)])
         self.assertTrue(all(r['estimate']['copy'] * 5 < r['estimate']['own'] for r in requested))
 
-    def test_a_paced_copy_inside_a_turn_sends_the_same_call_after_a_restart(self):
-        # Small rounds, so the span ends before the call's window does. The
-        # copy had that window whole; the retry reads the view with the
-        # round since, and sends the call again through the node it ended
-        # at, not through the span or a later node.
+    def test_a_paced_copy_retried_after_a_restart_copies_a_sent_call_and_drops_nothing(self):
+        # A summary refused at its pool parks; the daemon restarts; the retry
+        # copies a call the bot sent, at least as far as the paced copy went.
+        # Where the copy cuts (through the span, or the call's window whole)
+        # is chosen again from the sizes at the retry, and the turn may make
+        # its own call before it, so the two copies need not be the same
+        # request (#942). Several windows around the edge where the choice
+        # flips, so no size of the tools' text decides the outcome.
+        for size in (8000, 8100, 8121, 8192, 8250):
+            with self.subTest(context_bytes=size):
+                self.paced_copy_retried_after_a_restart(size)
+
+    def paced_copy_retried_after_a_restart(self, size):
+        store = self.path / f'state-{size}.sqlite'
         def start():
-            client = Client(self.binary, self.path / 'state.sqlite', self.url,
+            client = Client(self.binary, store, self.url,
                             tools='echo,shell', provider='anthropic', family='anthropic',
                             model='synthetic-claude', key_env='ANTHROPIC_TEST_KEY',
                             env={**clean_env(), 'ANTHROPIC_TEST_KEY': 'synthetic-anthropic-key'},
-                            settings={'context_bytes': 8192})
+                            settings={'context_bytes': size})
             self.addCleanup(client.close)
             return client
+        while not self.model.requests.empty():
+            self.model.requests.get()
         client = start()
         self.assertIn('result', client.request('create', bot='Bob', workspace=str(self.path),
                                                tools=['echo', 'shell'], compaction_instructions='Summarize.',
@@ -251,15 +262,23 @@ class AnthropicCompactionTests(ModelFixture):
         requests = []
         while not self.model.requests.empty():
             requests.append(self.model.requests.get())
-        # The copies after the retry depend on how many bytes the tools'
-        # own text takes, so only the first two are pinned.
-        paced, retry = [n for n, r in enumerate(requests) if is_summary(r)][:2]
-        self.assertEqual(retry, paced + 1)
-        self.assertEqual(requests[retry], requests[paced])
-        self.assertEqual(requests[paced]['messages'][:-1], requests[paced - 1]['messages'])
+        summaries = [n for n, r in enumerate(requests) if is_summary(r)]
+        self.assertGreaterEqual(len(summaries), 2)
+        paced, retry = summaries[:2]
+        for index in (paced, retry):
+            # A copy of a call the bot sent before it: the same system and
+            # tools, its messages that call's, through some node.
+            summary = requests[index]
+            sent = [r for r in requests[:index] if not is_summary(r)
+                    and r['messages'][:len(summary['messages']) - 1] == summary['messages'][:-1]]
+            self.assertTrue(sent, f'summary {index} copies no call sent before it')
+            self.assertEqual((summary['system'], summary['tools']), (sent[-1]['system'], sent[-1]['tools']))
+        # Nothing the paced copy covered is missing from the retry.
+        covered = requests[paced]['messages'][:-1]
+        self.assertEqual(requests[retry]['messages'][:len(covered)], covered)
         events = client.request('events', bot='Bob', after=0, limit=256)['result']['events']
         requested = [e['data']['request'] for e in events if e['event'] == 'compacted']
-        self.assertEqual((requested[0]['form'], requested[0]['items']), ('copy', 11))
+        self.assertTrue(requested)
         self.assertTrue(all(r['form'] == 'copy' for r in requested))
 
 
@@ -446,13 +465,17 @@ class CompactionTests(ModelFixture):
                     client = Client(self.binary, path, self.url)
                     self.addCleanup(client.close)
                 self.assertEqual(client.finished(turn)['data']['status'], 'completed')
+                # The 64 refused summaries, then the one ordinary call. A
+                # summary for the next head may follow once the turn ends,
+                # before or after this read: it is the later head's.
                 requests = self.requests()
-                self.assertEqual(sum(is_summary(r) for r in requests), 64)
-                self.assertEqual(sum(not is_summary(r) for r in requests), 1)
+                self.assertEqual([i for i, r in enumerate(requests) if not is_summary(r)], [64])
+                later = requests[65:]
                 # A subsequent head may compact again; the failed attempt does
                 # not permanently disable compaction for this bot.
                 self.run_turn(client, 'Bob', 'later', 'continue')
-                self.assertTrue(any(is_summary(r) for r in self.requests()))
+                later += self.requests()
+                self.assertTrue(any(is_summary(r) for r in later))
                 client.close()
 
     def run_turn(self, client, bot, request, prompt):

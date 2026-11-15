@@ -23,8 +23,8 @@ the machine slept through runs once when it wakes (as launchd's
 times; cron skips them). The daemon has no clock or watcher of its own, and
 no process of an automation is left between its runs: while nothing happens an
 automation costs its definition and the scheduler's look, and no model call.
-A lead hears of its tasks' turns from Sonny's task updates and lookout, not
-from automations.
+A lead hears of its tasks' turns from Sonny's lookout, not from
+automations.
 
 Sonny's agents add and change automations with the `automations` tool, which
 Sonny's tool host answers outside the agent's sandbox, since an automation runs
@@ -244,8 +244,8 @@ at SHA`, or `run now`), so a
 catch-up run after sleep reads as late; an
 answer passed on by `--reply-to` starts with the agent and turn it is from.
 Submissions carry `origin: "automation"`, and a passed-on answer carries
-`from: {bot, turn}`, the turn it is; task updates carry `origin:
-"tasks"`. All are automated input, not human consent for the reviewer.
+`from: {bot, turn}`, the turn it is; the lookout's notes carry `origin:
+"lookout"`. All are automated input, not human consent for the reviewer.
 
 **Adding again.** An automation is named after its agent unless `--name` says
 otherwise. `add` with a name in use and the same definition changes nothing
@@ -660,10 +660,9 @@ was made; an index not written yet adds nothing. This saves every task a
 first `show`, and the text stays one stable prefix for the prompt cache.
 
 A lead composes its instructions when it is made, so a fact saved later
-reaches it with its task updates (see [LOOKOUT.md](LOOKOUT.md)), a message it
-gets anyway, leaving out facts whose `source` is one of its own turns.
-Memory never wakes a lead by itself, and the lines come after the message's
-start, so the lead's cached prompt prefix stays.
+reaches it when it reads memory again, as its memory skill says to before
+starting work. Memory never wakes a lead, so the lead's cached prompt
+prefix stays.
 
 Sonny installs a `memory` skill ([SKILL.md](../sonny/skills/memory/SKILL.md))
 that says to use those indexes, or `show` when they are missing or old,
@@ -755,7 +754,7 @@ Posting in a thread, starting it or replying, follows it for the agent
 in the lookout, as `commons.THREAD` with the source `commons:THREAD`. The
 commons is a source of Sonny's own (docs/LOOKOUT.md, Sources): every new
 post is an event, its thread the topic and its author `from`, told in the
-"From your sources" note with the rest, never what the agent wrote
+lookout's note with the rest, never what the agent wrote
 itself. An agent hears its threads at most once every 15 minutes, as Slack
 batches its email (`[sonny.sources.commons] digest`, in `/config`; `0` for
 as they come; `steer` there makes posts cut in), so a busy thread costs it
@@ -853,13 +852,22 @@ holds, every window says above the footer who paused and why, and whose
 running turns it parked (the first three, and how many more), so the one doing
 harm can be stopped first: in that agent's window the line adds `Esc ends this
 one`, and Esc ends its parked turn before `/resume`. Agents pull the
-same cord from their shell with `"$AGENT_BIN" pause --reason WHY`, and get no
-tool for it: `task.md` and `lead.md` say to, when they see agents doing harm
+same cord with the daemon's `pause_agents` tool, as themselves: `task.md` and `lead.md` say to, when they see agents doing harm
 someone needs to look at, and that resuming is the person's call.
 `/sky` shows a pull from whoever pulled it (the `pause`'s `by`, the person
 when none) and a resume from whoever resumed (the `resumed` notice's `by`),
 from the notices every session hears, and a pause already holding from
 `ready`; a replay has none, since the notices are not events.
+
+![A lead pulling the cord with the pause_agents tool, its reason under the row, and the banner every window shows](sonny/agent-tools-pause.png)
+
+Agents message, list and pause each other with the daemon's own tools,
+`send_message`, `list_agents` and `pause_agents`, which every agent has by
+default; Sonny draws them as it drew the `agent` commands they replace:
+`Steered`, `Queued for` or `Started a turn for` with the message under it,
+the agents listed with each one's status, the calls awaiting approval.
+
+![The steps view: messages sent with send_message folded into one row, list_agents with each agent's status, and a check of approvals](sonny/agent-tools-verbose.png)
 
 ## Upgrading
 

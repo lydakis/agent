@@ -19,6 +19,24 @@ from tests.test_images import image
 from tests.test_runtime import ModelFixture
 
 
+def platform():
+    """How npm names this machine's native programs: `linux-x64`."""
+    arch = {'x86_64': 'x64', 'aarch64': 'arm64', 'arm64': 'arm64'}[os.uname().machine]
+    return f"{'darwin' if sys.platform == 'darwin' else 'linux'}-{arch}"
+
+
+def sonny_program(home, name, origin=None):
+    """Where Sonny runs its own `name` from in `home`, with `origin`'s
+    native program linked there when given."""
+    path = home / '.agent/sonny/programs' / name / f'{name}-{platform()}'
+    if origin:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        launcher = Path(origin).resolve()
+        native = launcher.with_name(f'{name}-{platform()}')
+        path.symlink_to(native if native.is_file() else launcher)
+    return path
+
+
 def declared(name, inherit=True):
     """One of Sonny's answered tools, as small as the daemon takes it."""
     tool = {'name': name, 'description': name, 'answered_by': 'sonny',
@@ -370,8 +388,8 @@ class ServedToolTests(ModelFixture):
         self.assertEqual(answered['output'][2]['text'], 'after')
 
     def browser(self, **create):
-        """A lead with the browser tool, and the tool host, with
-        agent-browser on its PATH."""
+        """A lead with the browser tool, and the tool host, with this
+        machine's agent-browser as Sonny's own."""
         tool = {**declared('browser'), 'steps': True}
         # Its folder holds no home: agent-browser's own settings are there.
         self.work = self.path / 'work'
@@ -379,36 +397,35 @@ class ServedToolTests(ModelFixture):
         made = self.daemon.request('create', bot='calc.lead', workspace=str(self.work), model='openai/synthetic-model',
                                    instructions='Lead.', declare=[tool], **create)
         self.assertIn('result', made)
-        program = shutil.which('agent-browser')
+        program = sonny_program(self.path, 'agent-browser', shutil.which('agent-browser'))
         # Its sockets in Sonny's own folder, the one the daemon walls off,
         # whatever the tool host's environment says.
         sockets = self.path / '.agent/run/sonny'
         self.addCleanup(lambda: subprocess.run([program, 'close', '--all'], capture_output=True,
                                                env={**clean_env(), 'HOME': str(self.path),
                                                     'AGENT_BROWSER_SOCKET_DIR': str(sockets)}))
-        self.host(PATH=f"{Path(program).parent}:{os.environ['PATH']}",
-                  AGENT_BROWSER_SOCKET_DIR=str(self.path / 'elsewhere'))
+        self.host(AGENT_BROWSER_SOCKET_DIR=str(self.path / 'elsewhere'))
 
     def desktop(self, **create):
         """A lead with the desktop tool, and the tool host, with a stand-in
-        agent-desktop on its PATH that answers as agent-desktop does and
+        for Sonny's own agent-desktop that answers as agent-desktop does and
         notes each command it ran, on a Linux desktop as far as Sonny can
         tell."""
         tool = {**declared('desktop'), 'steps': True}
         made = self.daemon.request('create', bot='calc.lead', workspace=str(self.path), model='openai/synthetic-model',
                                    instructions='Lead.', declare=[tool], **create)
         self.assertIn('result', made)
-        bin = self.stand_in_desktop(self.path)
-        self.host(PATH=f"{bin}:{os.environ['PATH']}", DISPLAY=':99')
+        self.stand_in_desktop(sonny_program(self.path, 'agent-desktop'))
+        self.host(DISPLAY=':99')
 
-    def stand_in_desktop(self, home):
-        """A folder in `home` holding a stand-in agent-desktop that answers
-        as agent-desktop does and notes each command it ran."""
-        bin = home / 'desktop-bin'
-        bin.mkdir()
+    def stand_in_desktop(self, program):
+        """A stand-in agent-desktop at `program` that answers as
+        agent-desktop does and notes each command it ran."""
+        program.parent.mkdir(parents=True, exist_ok=True)
+        home = program.parent
         self.desktop_ran = home / 'desktop-ran'
         self.desktop_temporary = home / 'desktop-temporary'
-        (bin / 'agent-desktop').write_text(f"""#!{sys.executable}
+        program.write_text(f"""#!{sys.executable}
 import json, os, sys
 args = sys.argv[1:]
 with open({json.dumps(str(self.desktop_ran))}, 'a') as ran:
@@ -421,8 +438,7 @@ if command == 'screenshot':
     data = {{'data': {json.dumps(image()['data'])}, 'format': 'png', 'width': 1, 'height': 1}}
 print(json.dumps({{'version': '2.5', 'ok': True, 'command': command, 'data': data}}))
 """)
-        (bin / 'agent-desktop').chmod(0o755)
-        return bin
+        program.chmod(0o755)
 
     def ran_on_desktop(self):
         if not self.desktop_ran.exists():
@@ -478,20 +494,18 @@ print(json.dumps({{'version': '2.5', 'ok': True, 'command': command, 'data': dat
             self.assertIn(named, refused['detail'])
         self.assertEqual(len(self.ran_on_desktop()), 5)
 
-    def test_an_agent_desktop_any_agent_could_swap_is_never_run(self):
-        # The stand-in is in calc.lead's own folder, which its sandbox writes.
-        self.desktop(settings={'sandbox': 'workspace-write'}, approve=['desktop'], approver='manual')
+    def test_an_agent_desktop_on_path_is_never_run(self):
+        # Only Sonny's own runs: one on PATH, here in the agent's own
+        # folder, is not looked for.
+        self.daemon.request('create', bot='calc.lead', workspace=str(self.path), model='openai/synthetic-model',
+                            instructions='Lead.', declare=[{**declared('desktop'), 'steps': True}],
+                            approve=['desktop'], approver='manual')
+        bin = self.path / 'desktop-bin'
+        self.stand_in_desktop(bin / 'agent-desktop')
+        self.host(PATH=f"{bin}:{os.environ['PATH']}", DISPLAY=':99')
         refused = json.loads(self.call('calc.lead', 'desktop', {'commands': ['list-apps']}))
         self.assertEqual(refused['error'], 'desktop_refused')
-        self.assertIn('which the agent calc.lead writes from its sandbox, so it could put a program', refused['detail'])
-        self.assertIn('Set calc.lead to Read only with /permissions', refused['detail'])
-        # Nor for another agent, with no sandbox, while calc.lead could swap it.
-        self.daemon.request('create', bot='free.lead', workspace=str(self.path / 'desktop-bin'),
-                            model='openai/synthetic-model', instructions='Lead.',
-                            declare=[{**declared('desktop'), 'steps': True}])
-        refused = json.loads(self.call('free.lead', 'desktop', {'commands': ['list-apps']}))
-        self.assertEqual(refused['error'], 'desktop_refused')
-        self.assertIn('which the agent calc.lead writes', refused['detail'])
+        self.assertIn('not installed here', refused['detail'])
         self.assertEqual(self.ran_on_desktop(), [])
 
     @unittest.skipUnless(shutil.which('agent-browser'), 'agent-browser is not installed')
@@ -714,12 +728,12 @@ for (let i = 0; ; i++) await agent(`say ${i}`)
         thread = (self.path / '.agents/commons/fake-home.jsonl').read_text().splitlines()
         self.assertEqual([json.loads(line)['by'] for line in thread], ['calc.a', 'shop.b'])
         # The lookout tells calc.a of the reply, and shop.b nothing of its own.
-        note = self.note_for('calc.a', 'Confirmed here too.', starts='From your sources: ')
-        self.assertIn('- commons:fake-home, from "shop.b" (for your commons.fake-home): '
-                      '"reply in fake-home, \\"Live tests want a fake HOME\\": Confirmed here too."', note)
+        note = self.note_for('calc.a', 'Confirmed here too.')
+        self.assertIn('[commons · fake-home · shop.b]\nreply in fake-home, "Live tests want a fake HOME": '
+                      'Confirmed here too.', note)
         for t in self.daemon.request('turns', bot='shop.b')['result']['turns']:
             prompts = self.daemon.request('prompts', bot='shop.b', turn=t['turn'])['result']['prompts']
-            self.assertFalse(prompts and prompts[0]['text'].startswith('From your sources: '), prompts)
+            self.assertFalse(prompts and prompts[0].get('origin') == 'lookout', prompts)
         listed = turn('shop.b', {})
         self.assertEqual([t['thread'] for t in listed['threads']], ['fake-home'])
         # Search finds it by its words, case aside, with the posts that hold them.
@@ -818,13 +832,13 @@ for (let i = 0; ; i++) await agent(`say ${i}`)
         self.assertIn('# Memory of api', lead['instructions'])
         self.assertNotIn('# Memory of ws', lead['instructions'])
 
-    def note_for(self, bot, having, timeout=30, starts='Task updates: '):
+    def note_for(self, bot, having, timeout=30):
         """The first note the lookout gave `bot` that says `having`."""
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
             for turn in self.daemon.request('turns', bot=bot)['result']['turns']:
                 text = self.daemon.request('prompts', bot=bot, turn=turn['turn'])['result']['prompts']
-                if text and text[0]['text'].startswith(starts) and having in text[0]['text']:
+                if text and text[0].get('origin') == 'lookout' and having in text[0]['text']:
                     return text[0]['text']
             time.sleep(.2)
         self.fail(f'{bot} heard nothing saying {having!r}')
@@ -942,7 +956,7 @@ for (let i = 0; ; i++) await agent(`say ${i}`)
         the command it is given here, in the box's home. Its MCP server
         `test` is there for the box's agents."""
         laptop = self.path / 'laptop'
-        (laptop / '.agent').mkdir(parents=True)
+        (laptop / '.agent').mkdir(parents=True, exist_ok=True)
         server = Path(__file__).with_name('mcp_server.py')
         (laptop / '.agent/config.toml').write_text(
             f'[sonny.links.box]\nhost = "box"\nmachine = "laptop"\ncommand = {json.dumps(str(self.sonny))}\n{link}\n'
@@ -1056,8 +1070,8 @@ there.wait()
     def test_a_box_agent_uses_the_linked_machine_s_desktop_with_its_own_gate(self):
         laptop = self.path / 'laptop'
         laptop.mkdir()
-        bin = self.stand_in_desktop(laptop)
-        self.linked(PATH=f"{bin}:{os.environ['PATH']}", DISPLAY=':99')
+        self.stand_in_desktop(sonny_program(laptop, 'agent-desktop'))
+        self.linked(DISPLAY=':99')
         listed = subprocess.run([str(self.sonny), 'link'], env={**clean_env(), 'HOME': str(self.path)},
                                 check=True, capture_output=True, text=True).stdout
         self.assertRegex(listed, r'laptop  linked here · connected · .*desktop')
@@ -1145,10 +1159,10 @@ there.wait()
     @unittest.skipUnless(shutil.which('agent-browser') and os.environ.get('AGENT_BROWSER_EXECUTABLE_PATH'),
                          'agent-browser, or a Chrome named in AGENT_BROWSER_EXECUTABLE_PATH, is missing')
     def test_a_link_s_agents_share_one_chrome_on_a_kept_profile_each_in_its_own_tab(self):
-        program = shutil.which('agent-browser')
+        laptop = self.path / 'laptop'
+        program = sonny_program(laptop, 'agent-browser', shutil.which('agent-browser'))
         kept = self.path / 'kept-profile'
         laptop, _ = self.linked(link=f'browser_profile = {json.dumps(str(kept))}\n',
-                                PATH=f"{Path(program).parent}:{os.environ['PATH']}",
                                 AGENT_BROWSER_EXECUTABLE_PATH=os.environ['AGENT_BROWSER_EXECUTABLE_PATH'])
         sockets = laptop / '.agent/run/sonny'
         self.addCleanup(lambda: subprocess.run([program, 'close', '--all'], capture_output=True,

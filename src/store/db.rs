@@ -1547,7 +1547,10 @@ pub struct Waiting {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub answer: Option<String>,
     /// What a paced summary copied of the bot's last call, so its retry
-    /// sends the same request.
+    /// copies that call again. The retry chooses its cut afresh, through
+    /// the span or the call's window whole, from the sizes it then sees,
+    /// and the turn may make a call of its own first: the retry covers at
+    /// least what the paced copy did, not always the same request.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub copied: Option<CopiedCall>,
     /// Until when a summary beside the turn that parked on its pool is not
@@ -2827,7 +2830,7 @@ impl Database {
     /// before versioning, stores at versions 1 to 5 and stores from newer
     /// binaries are rejected; an older store from version 6 on is migrated
     /// forward, one version at a time, at open.
-    pub const SCHEMA: i32 = 99;
+    pub const SCHEMA: i32 = 100;
     /// The person's messages a compaction keeps verbatim, newest first:
     /// per-message text, and the total text plus `(ordinal, String)` entry
     /// metadata. Empty entries cost space too, so the retained list cannot
@@ -17920,14 +17923,27 @@ fn migrate_since_73(conn: &Connection, from: i32) -> Result<()> {
         )?;
     }
 
+    // Schema 100: an agent sends messages, lists agents and pulls the cord
+    // with tools of its own, which every new bot has beside wait and
+    // history; a bot that has those two takes them too.
+    if from < 100 {
+        conn.execute(
+            "UPDATE bots SET tools=tools||',send_message,list_agents,pause_agents'
+             WHERE ','||tools||',' LIKE '%,wait,%' AND ','||tools||',' LIKE '%,history,%'
+                 AND ','||tools||',' NOT LIKE '%,send_message,%'",
+            [],
+        )?;
+    }
+
     Ok(())
 }
 /// 97 -> 98: the tool calls and tool time of every turn with timed model
 /// calls, from its rows in the audit trail that ended, as a call ending in
 /// its turn counts them: a call lifted to the background (its `call_lifted`
-/// event) is left out, a terminal's call with a process of its own is not.
-/// The trail is in time order, so it is read from the first of those
-/// turns' starts on.
+/// event) is left out, and so is one that ended after its turn did, as a
+/// lifted call whose turn's events retention removed did; a terminal's
+/// call with a process of its own is not. The trail is in time order, so
+/// it is read from the first of those turns' starts on.
 fn clock_timed_turns(conn: &Connection) -> Result<()> {
     let first: Option<i64> = conn.query_row(
         "SELECT MIN(started_ms) FROM turns WHERE timed_rounds>0",
@@ -17940,8 +17956,9 @@ fn clock_timed_turns(conn: &Connection) -> Result<()> {
     let from = audit::first_at(conn, first)?;
     let mut clocks: HashMap<i64, (i64, i64, i64)> = HashMap::new();
     let mut rows = conn.prepare(
-        "SELECT a.turn,a.at_ms,a.at_ms+a.ms FROM audit a
+        "SELECT a.turn,a.at_ms,a.at_ms+a.ms FROM audit a JOIN turns t ON t.id=a.turn
          WHERE a.id>=? AND a.step IS NULL AND a.ms IS NOT NULL
+             AND (t.finished_ms IS NULL OR a.at_ms+a.ms<=t.finished_ms)
              AND NOT EXISTS(SELECT 1 FROM events e WHERE e.turn=a.turn AND e.kind='call_lifted'
                  AND e.data->>'$.call_id'=a.call_id)
          ORDER BY a.turn,a.at_ms",

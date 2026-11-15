@@ -8,7 +8,7 @@ description: Use when the person wrote `/zen FOCUS`, or asked in words to work o
 `/zen FOCUS` from the person turns zen on: they want to work on one thing
 with you and hear about nothing else. `/zen off` turns it off. While it is
 on, Sonny shows them only their own messages, your replies to them, and
-your `ask` questions. Messages from other agents, task updates, the
+your `ask` questions. Messages from other agents, the lookout's notes, the
 commons, automations (your own too), and whatever you write in the
 turns those start, are not shown.
 

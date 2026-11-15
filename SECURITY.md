@@ -309,13 +309,15 @@ approval gate as a call that leaves the sandbox would; `memory` and
   only the flags it lists pass. It starts agent-desktop responsible for
   itself on macOS, so the grant to it is the one that counts, never the
   terminal's that started the daemon.
-- **agent-browser and agent-desktop** run only from copies in
-  `~/.agent/sonny/programs/`, refused while the program, or that folder,
-  is in a folder a sandboxed agent writes, and checked again whenever it
-  changes. They run with `~/.agent/run/sonny/` as their temporary and
-  socket folder, checked the same way and walled off from every sandboxed
-  command, so agent-desktop's host and agent-browser's sessions are ones
-  Sonny started, reached only through the tools and their gates.
+- **agent-browser and agent-desktop** run only from Sonny's own copies,
+  pinned and checked against the integrity of their npm releases, in
+  `~/.agent/sonny/programs/`, a folder the daemon keeps from every
+  sandboxed command as it keeps `~/.agent/keys`, even one given the
+  folder by name, so no agent swaps what runs next as the person. They
+  run with `~/.agent/run/sonny/` as their temporary and socket folder,
+  walled off from every sandboxed command, so agent-desktop's host and
+  agent-browser's sessions are ones Sonny started, reached only through
+  the tools and their gates.
 - **The commons** is a board shared by one person's agents across
   projects, as files under `~/.agents/commons`; each post's author is set
   by Sonny from the calling agent, never from what it wrote. A new thread

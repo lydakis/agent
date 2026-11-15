@@ -167,9 +167,8 @@ fn start() -> Value {
                     "description": "Run the folder's .agents/setup in the copy first: true for a task \
                         that will change files, false for one that only reads."},
                 "model": {"type": "string", "minLength": 1,
-                    "description": "PROVIDER/MODEL, one of the models \"$AGENT_BIN\" models lists with \
-                        the person's notes on them, when the work suits another model than yours; \
-                        without one, the project's task_model, else yours."},
+                    "description": format!("PROVIDER/MODEL, when the work suits another model than yours; \
+                        without one, the project's task_model, else yours.{}", noted_models())},
                 "effort": {"type": "string", "minLength": 1,
                     "description": "The task's effort level, when the work calls for one."},
                 "reason": {"type": "string", "minLength": 1,
@@ -184,6 +183,32 @@ fn start() -> Value {
         // A setup script may build for minutes.
         "expire_ms": 20 * 60 * 1000
     })
+}
+
+/// The most of the person's model notes the start tool carries.
+const NOTED_BYTES: usize = 2048;
+
+/// The models the person wrote a note on in `~/.agent/models`, each with
+/// its note, for the start tool's model parameter; none, the command that
+/// lists every model. Only their own lines: discovery's catalog notes what
+/// the providers report, not what the person thinks of a model.
+fn noted_models() -> String {
+    let listed = agent_client::models::path()
+        .and_then(|path| agent_client::models::mine(&path).ok())
+        .unwrap_or_default();
+    let mut said = String::new();
+    for model in &listed {
+        let Some(note) = &model.note else { continue };
+        let line = format!("\n- {}: {note}", model.id);
+        if said.len() + line.len() > NOTED_BYTES {
+            break;
+        }
+        said.push_str(&line);
+    }
+    match said.is_empty() {
+        true => " \"$AGENT_BIN\" models lists the models there are.".to_owned(),
+        false => format!(" The person's notes on their models:{said}"),
+    }
 }
 
 /// Open the task `name` just started in a tab of its own, as its starter
@@ -267,18 +292,17 @@ fn project() -> Value {
 fn follows() -> Value {
     json!({
         "name": FOLLOWS,
-        "description": "Your follows in the person's lookout, which tells you in an update starting \"Task updates\" \
-            what happens in the agents a follow watches: messages others write, the person's quoted, \
-            questions to the person, waits for approval, long silences and ended turns with their replies, \
-            by turn handle. Each update joins your running turn, or starts one. A follow watches the tasks \
-            of an agent (every agent it or its tasks made) or agents by name, and the sources the person set up \
-            outside (a chat, a mailbox, a feed), heard in an update starting \"From your sources\": every \
-            event, at once when the source says it steers, or one topic as NAME:TOPIC, or only those its \
-            filter matches. The commons is a source too, each thread a topic: posting in a thread follows \
-            it as commons.THREAD, and removing that leaves it. Add steer yourself for what you own; a \
-            filter or a digest only when the person asks: what a filter leaves out you never hear, and a \
-            digest makes you late. Add or remove one by name, as \
-            {\"name\": \"leads\", \"agents\": [\"web.lead\"], \"sources\": [\"mail\"]}; with neither, \
+        "description": "Your follows in the person's lookout, which tells you what happens in what you \
+            follow, in a message sent by lookout that joins your running turn or starts one: each event a \
+            line [source · topic · from], then its text. A follow watches the tasks of an agent (every agent it or \
+            its tasks made) or agents by name, through the tasks source, each agent its topic: messages others \
+            write in them, the person's quoted, questions to the person, calls awaiting their approval, margin \
+            notes put or removed, and each turn's end with its reply. It also hears the sources the person set up outside, each \
+            by name, or one topic of a source as NAME:TOPIC. The commons is a source too, each thread a topic: \
+            posting in a thread follows it as commons.THREAD, and removing that leaves it. \
+            Add steer yourself for what you own; a filter or a digest only when the person asks: \
+            what a filter leaves out you never hear, and a digest makes you late. Add or remove one by name, \
+            as {\"name\": \"leads\", \"agents\": [\"web.lead\"], \"sources\": [\"mail\"]}; with neither, \
             it lists them all, the sources there are and their events' recent fields.",
         "parameters": {
             "type": "object",
@@ -296,11 +320,11 @@ fn follows() -> Value {
                             "description": "Sources it hears, by name, or NAME:TOPIC for one topic of it."},
                         "filter": {"type": "object",
                             "description": "Only the events this matches are heard, its sources' and its agents' \
-                                alike. An agent's events have type (message.written, turn.ended, approval.waiting, \
-                                ask.posted, turn.silent, note.changed), bot, maker, by (you, person, an agent's \
-                                name, automation), turn, status (completed, failed, stopped, interrupted), done, \
-                                theirs (the person asked for the turn themselves), text (the person's \
-                                words), question, options and id (a margin note's). An event pattern as \
+                                alike. A task's event has type (wrote, turn.ended, question, approval, \
+                                margin), bot, maker, from, turn, text, status (completed, failed, \
+                                stopped, interrupted), done, asked_by (you, the person, an agent's name, \
+                                automation), options, command, call, id and removed (a margin note's). \
+                                An event pattern as \
                                 AWS EventBridge writes one. Each field maps to a list of values, \
                                 any of which will do, or to a pattern for an object field; every field \
                                 must match, and a field that is a list matches when any item does. A value is a \
@@ -310,8 +334,8 @@ fn follows() -> Value {
                                 As {\"paths\": [{\"prefix\": \"src/billing/\"}], \"author\": [{\"anything-but\": \"me\"}]}."},
                         "digest": {"type": "string", "pattern": "^(0|[0-9]+[smh])$",
                             "description": "Tell what it hears at most once this long, as 15m or 1h, in place of \
-                                its sources' own digest. The person's words, a question to them and an approval only they can give \
-                                never wait."},
+                                its sources' own digest. What steers never waits: the person's words in a task, a question \
+                                to them, an approval only they can give, and what steer matches."},
                         "steer": {"type": "object",
                             "description": "What it hears that this matches, a pattern as filter's, goes at once, \
                                 past any digest, as the person's words do. As \
@@ -1313,7 +1337,6 @@ async fn serve(store: PathBuf, socket: PathBuf, nudge: Arc<Notify>, serving: Ser
     tokio::spawn(crate::link::keep(hub.clone()));
     loop {
         if let Ok((client, _events)) = Client::connect(&socket).await {
-            crate::trusted::against(client.clone());
             loop {
                 let run = {
                     let (client, me, store, socket, hub) = (

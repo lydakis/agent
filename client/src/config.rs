@@ -840,6 +840,10 @@ pub const TEXT_WIDTH_LEAST: u64 = 40;
 /// The name of the source Sonny's lookout makes of the commons.
 pub const COMMONS_SOURCE: &str = "commons";
 
+/// The name of the lookout's own source of what happens in the tasks a
+/// subscriber watches: no source in the settings takes it.
+pub const TASKS_SOURCE: &str = "tasks";
+
 /// A span of time as a count and `s`, `m` or `h`, as `30s`, `5m` or `1h`,
 /// in seconds; `0` alone is none. `key` names it in the error.
 pub fn span(key: &str, text: &str) -> Result<u64, String> {
@@ -1069,7 +1073,7 @@ pub struct Source {
     pub watch: Vec<String>,
     /// One character cell that marks it wherever Sonny names it: on the
     /// `/status` row of each agent that follows it, its follows in
-    /// `/background`, and the "From your sources" row.
+    /// `/background`, and the lookout's row.
     pub icon: Option<String>,
     /// A field of its events whose values subscriptions' filters name,
     /// as `id` or `meta.repo`: the lookout writes those values to a file
@@ -1354,6 +1358,14 @@ pub fn path() -> Option<PathBuf> {
 /// there only what it is given by name, as Codex keeps `~/.codex`.
 pub fn home() -> Option<PathBuf> {
     std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".agent"))
+}
+
+/// Where Sonny installs the pinned programs its tool host runs as the
+/// person, outside every sandbox, `~/.agent/sonny/programs`: kept from
+/// agents ([`crate::hidden`]), so no bot, even one given the folder by
+/// name, replaces what runs next as the person.
+pub fn programs() -> Option<PathBuf> {
+    std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".agent/sonny/programs"))
 }
 
 /// Where the agent's clients keep the sockets of programs they run outside
@@ -2100,6 +2112,12 @@ fn sources(value: &toml::Value) -> Result<(Vec<Source>, Source), String> {
         {
             return Err(format!(
                 "sonny.sources.{name}: a source's name is 1 to 64 of A-Z a-z 0-9 _ -"
+            ));
+        }
+        if name == TASKS_SOURCE {
+            return Err(format!(
+                "sonny.sources.{name}: the lookout's own source of what happens in tasks has this \
+                 name; name yours another way"
             ));
         }
         let fields =

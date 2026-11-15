@@ -114,7 +114,7 @@ const DESCRIPTION: &str = "Keep something beside the conversation, in the margin
          such as a design, needs no date. Give markdown (rendered as your replies are) or file (a path in your own folder, shown as the file \
          stands and kept fresh as it changes; for a file in a task's copy, put its content in \
          markdown instead, since that copy goes away with the task), or from (a task's note as \
-         \"task/id\", as your task updates name it, shown here as the task keeps it and kept once \
+         \"task/id\", as the lookout names it, shown here as the task keeps it and kept once \
          the task is gone, rather than copied). Never ask a question or for a decision only in a \
          note: ask it where the person answers, and the note may point to it, with opens naming \
          the agent that asked it when that is not you.";
@@ -325,7 +325,8 @@ fn filled(template: &str, data: &crate::template::Data) -> Result<String, (&'sta
             "margin_note_too_long",
             format!(
                 "the template fills to {} lines and a margin note holds at most {}: \
-                 show less of what it reads, such as the newest few events",
+                 show less of what it reads, such as a source's newest few events or the lines \
+                 of a file that matter",
                 text.lines().count(),
                 most_lines()
             ),
