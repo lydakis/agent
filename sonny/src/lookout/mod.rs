@@ -183,6 +183,9 @@ struct Sent {
     /// Who asked for the turn, as its start named them: the sender's
     /// filters hear its end with the asker the end's event carries.
     asker: Option<Asked>,
+    /// Whether a turn took the message in: one that ended in line is no
+    /// event of the tasks source, so only its bounce tells its sender.
+    taken: bool,
 }
 
 /// Who a message that started a turn came from: a bot, the origin it
@@ -1450,6 +1453,7 @@ impl Service {
                         status: status.to_owned(),
                         error: error.to_owned(),
                         asker: asker.clone(),
+                        taken: event["event"] == "turn_finished",
                     })
                     .collect()
             }
@@ -2568,7 +2572,10 @@ impl Lookout {
     /// no event, and one whose start was not seen names no asker.
     fn hears_end(&self, sent: &Sent) -> bool {
         let bot = sent.bot.as_str();
-        if !self.watched.contains(bot) || sent.asker.as_ref().is_some_and(|asked| asked.note) {
+        if !sent.taken
+            || !self.watched.contains(bot)
+            || sent.asker.as_ref().is_some_and(|asked| asked.note)
+        {
             return false;
         }
         let mut fields = json!({"type": "turn.ended", "bot": bot, "from": bot, "turn": sent.turn,
@@ -3695,6 +3702,28 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_message_that_ends_in_line_bounces_though_its_sender_hears_every_end() {
+        let mut service = service(PathBuf::from("/nonexistent"), &[]);
+        service
+            .watchers
+            .insert("calc.fix".into(), vec!["calc.lead".into()]);
+        service.lookouts.insert("calc.lead".into(), seated());
+        let from = json!({"from": {"bot": "calc.lead", "turn": 1, "bot_id": 1}});
+        let failed = json!({"status": "failed", "error": "provider_http_400"});
+        // A turn that ends is told by the tasks source: no bounce.
+        service.bounced(&ev("calc.fix", 4, "accepted", from.clone()), true);
+        let told = service.bounced(&ev("calc.fix", 4, "turn_finished", failed.clone()), true);
+        assert!(told.is_empty());
+        // A message that fails before any turn takes it is no event there,
+        // so only its bounce tells its sender.
+        let queued = in_line("calc.fix", 5, "queued", from.clone());
+        service.bounced(&queued, true);
+        let mut ended = in_line("calc.fix", 5, "message_ended", failed);
+        ended["data"]["from"] = from["from"].clone();
+        assert_eq!(service.bounced(&ended, true).len(), 1);
+    }
+
+    #[tokio::test]
     async fn a_message_a_failed_turn_never_carried_out_goes_back_to_its_sender() {
         let mut service = service(PathBuf::from("/nonexistent"), &[]);
         let from = |bot: &str| json!({"from": {"bot": bot, "turn": 1, "bot_id": 7}});
@@ -4024,6 +4053,7 @@ mod tests {
             status: status.into(),
             error: status.into(),
             asker,
+            taken: true,
         };
         let you = Some(asked(Some("calc.lead")));
         assert!(lookout.hears_end(&sent("calc.fix", "failed", you.clone())));
