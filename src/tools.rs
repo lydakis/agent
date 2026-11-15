@@ -377,6 +377,158 @@ impl<'de> Deserialize<'de> for Inherit {
         )
     }
 }
+/// A bot's declared tools: one list, stored once by the digest of its
+/// bytes and shared by every bot, fork and record that refers to it. A
+/// list never changes, so a digest names the same tools for as long as
+/// it is known. The empty list has no digest and costs nothing.
+#[derive(Debug, Clone, Default)]
+pub struct ToolList(Option<Arc<Listed>>);
+#[derive(Debug)]
+struct Listed {
+    digest: Box<str>,
+    /// The bytes the digest is of, as the store keeps them.
+    json: Box<str>,
+    tools: Vec<Declared>,
+}
+/// Every list in use in this process, by digest: one parsed copy for all
+/// its holders. A list no one holds is dropped from it as it grows.
+type Lists = std::sync::Mutex<(HashMap<Box<str>, std::sync::Weak<Listed>>, usize)>;
+static LISTS: std::sync::LazyLock<Lists> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new((HashMap::new(), 64)));
+impl ToolList {
+    /// The list of `tools`, by its digest: the copy in use if there is one.
+    pub fn new(tools: Vec<Declared>) -> Result<Self> {
+        if tools.is_empty() {
+            return Ok(Self(None));
+        }
+        let json = serde_json::to_string(&tools)?;
+        let digest = digest_of(&json);
+        Self::interned(digest, || Ok((json, tools)))
+    }
+    /// The list the store keeps as `json` under `digest`, parsed only
+    /// when no copy is in use.
+    pub fn stored(digest: &str, json: impl FnOnce() -> Result<String>) -> Result<Self> {
+        Self::interned(digest.into(), || {
+            let json = json()?;
+            let tools = serde_json::from_str(&json)?;
+            Ok((json, tools))
+        })
+    }
+    /// The copy of the list `digest` names in use in this process, if any.
+    pub fn in_use(digest: &str) -> Option<Self> {
+        let lists = LISTS.lock().unwrap();
+        lists
+            .0
+            .get(digest)?
+            .upgrade()
+            .map(|listed| Self(Some(listed)))
+    }
+    fn interned(
+        digest: Box<str>,
+        make: impl FnOnce() -> Result<(String, Vec<Declared>)>,
+    ) -> Result<Self> {
+        if let Some(found) = Self::in_use(&digest) {
+            return Ok(found);
+        }
+        let (json, tools) = make()?;
+        let listed = Arc::new(Listed {
+            digest,
+            json: json.into(),
+            tools,
+        });
+        let mut lists = LISTS.lock().unwrap();
+        let (map, bound) = &mut *lists;
+        // Another holder may have made it meanwhile: keep theirs.
+        if let Some(found) = map.get(&listed.digest).and_then(std::sync::Weak::upgrade) {
+            return Ok(Self(Some(found)));
+        }
+        if map.len() >= *bound {
+            map.retain(|_, listed| listed.strong_count() > 0);
+            *bound = (map.len() * 2).max(64);
+        }
+        map.insert(listed.digest.clone(), Arc::downgrade(&listed));
+        Ok(Self(Some(listed)))
+    }
+    /// The digest that names the list; `None` for the empty one.
+    pub fn digest(&self) -> Option<&str> {
+        self.0.as_ref().map(|listed| &*listed.digest)
+    }
+    /// The bytes the store keeps for the list.
+    pub fn json(&self) -> Option<&str> {
+        self.0.as_ref().map(|listed| &*listed.json)
+    }
+}
+impl std::ops::Deref for ToolList {
+    type Target = [Declared];
+    fn deref(&self) -> &[Declared] {
+        self.0.as_ref().map_or(&[], |listed| &listed.tools)
+    }
+}
+impl PartialEq for ToolList {
+    fn eq(&self, other: &Self) -> bool {
+        self.digest() == other.digest()
+    }
+}
+impl Serialize for ToolList {
+    fn serialize<S: serde::Serializer>(
+        &self,
+        serializer: S,
+    ) -> std::result::Result<S::Ok, S::Error> {
+        (**self).serialize(serializer)
+    }
+}
+/// The digest that names a list's bytes: SHA-256, in hex.
+pub fn digest_of(json: &str) -> Box<str> {
+    let hash = aws_lc_rs::digest::digest(&aws_lc_rs::digest::SHA256, json.as_bytes());
+    let mut hex = String::with_capacity(64);
+    for byte in hash.as_ref() {
+        use std::fmt::Write;
+        let _ = write!(hex, "{byte:02x}");
+    }
+    hex.into()
+}
+/// What a client declares on a bot: the tools, or the digest of a list
+/// the daemon already holds, which sends a list once however many bots
+/// take it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum Declare {
+    Digest(String),
+    Tools(Vec<Declared>),
+    /// The list the daemon found for either, checked; shown as its tools.
+    #[serde(skip_deserializing)]
+    Held(ToolList),
+}
+impl Declare {
+    /// The list declared, checked: `Held` as it is, tools once checked.
+    /// A digest must have been found first (`tool_list_unknown`).
+    pub fn into_list(self) -> Result<ToolList> {
+        match self {
+            Self::Held(list) => Ok(list),
+            Self::Tools(tools) => {
+                validate_declared(&tools)?;
+                ToolList::new(tools)
+            }
+            Self::Digest(digest) => match ToolList::in_use(&digest) {
+                Some(list) => Ok(list),
+                None => fail_with("tool_list_unknown", digest),
+            },
+        }
+    }
+    /// The tools declared, once found.
+    pub fn tools(&self) -> &[Declared] {
+        match self {
+            Self::Held(list) => list,
+            Self::Tools(tools) => tools,
+            Self::Digest(_) => &[],
+        }
+    }
+}
+/// Whether `text` could be a list's digest: 64 lowercase hex digits.
+pub fn is_digest(text: &str) -> bool {
+    text.len() == 64 && text.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+}
+
 /// The most tools a bot may have declared, and the most bytes they take.
 pub const MAX_DECLARED: usize = 32;
 pub const DECLARED_BYTES: usize = 64 * 1024;
@@ -2405,7 +2557,7 @@ impl Registry {
         family: Family,
         grammars: bool,
         names: &[String],
-        declared: &[Declared],
+        declared: &ToolList,
         sandboxed: bool,
     ) -> Result<Arc<RawValue>> {
         let mut key = (family, names.join(","));
@@ -2415,9 +2567,11 @@ impl Registry {
         if sandboxed {
             key.1.push_str("\0sandboxed");
         }
-        if !declared.is_empty() {
+        // A list by its digest: one encoding for every bot that holds it,
+        // and nothing serialized to find it.
+        if let Some(digest) = declared.digest() {
             key.1.push('\0');
-            key.1.push_str(&serde_json::to_string(declared)?);
+            key.1.push_str(digest);
         }
         if let Some(found) = self.encodings.lock().unwrap().get(&key) {
             return Ok(found.clone());

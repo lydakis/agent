@@ -24,7 +24,7 @@ use agent_runtime::{
         Wake,
     },
     tools::{
-        ANSWER_BYTES, DECLARED_BYTES, Declared, MAX_DECLARED, Outcome, Registry, validate_declared,
+        ANSWER_BYTES, DECLARED_BYTES, Declare, MAX_DECLARED, Outcome, Registry, ToolList, is_digest,
     },
 };
 use handles::{Completion, Handles, Waiter, now_ms};
@@ -153,8 +153,11 @@ fn admission_bound(command: &Command, id: &Value, deliveries: usize) -> Bound {
             .map(|bytes| {
                 bytes
                     + match declare {
-                        Some(declare) => output::encoded_len(declare).unwrap_or(DECLARED_BYTES),
-                        None => DECLARED_BYTES,
+                        // A digest's list is shown whole, as is the creator's.
+                        Some(Declare::Digest(_)) | None => DECLARED_BYTES + 128,
+                        Some(declare) => {
+                            output::encoded_len(declare).unwrap_or(DECLARED_BYTES) + 128
+                        }
                     }
             }),
             output::encoded_len(&(bot, created_by)),
@@ -275,8 +278,9 @@ enum Command {
         settings: Box<Settings>,
         /// Tools the client declares: shown to the model after `tools`,
         /// never run, each call recorded with the tool's fixed result.
-        /// Left out, a bot takes its creator's.
-        declare: Option<Vec<Declared>>,
+        /// Left out, a bot takes its creator's. The digest of a list the
+        /// daemon holds (a record's `declared_digest`) declares that list.
+        declare: Option<Declare>,
         /// An idempotency key: resending the request with it gets the bot
         /// it made, `duplicate: true`, instead of `bot_exists`.
         request_id: Option<String>,
@@ -321,9 +325,9 @@ enum Command {
         approve: Option<Vec<String>>,
         approver: Option<String>,
         approve_expire_ms: Option<u64>,
-        /// The tools its client declares, replacing those it has; `[]`
-        /// removes them.
-        declare: Option<Vec<Declared>>,
+        /// The tools its client declares, replacing those it has, or the
+        /// digest of a list the daemon holds; `[]` removes them.
+        declare: Option<Declare>,
         /// `create`'s settings, by its names: each one given replaces the
         /// bot's, `null` puts it back to its default, and the rest stay.
         /// `sandbox` given puts `writable`, `network` and `unix_sockets`
@@ -1384,7 +1388,7 @@ struct Configure {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     approve_expire_ms: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    declare: Option<Vec<Declared>>,
+    declare: Option<Declare>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     settings: Option<serde_json::Map<String, Value>>,
     #[serde(
@@ -3174,7 +3178,11 @@ impl Service {
                 if *starts_line {
                     return refuse("start a line");
                 }
-                if declare.iter().flatten().any(|tool| !passes(tool)) {
+                self.find_declared(declare).await?;
+                if (declare.iter())
+                    .flat_map(Declare::tools)
+                    .any(|tool| !passes(tool))
+                {
                     return refuse("declare a tool a client answers that it can't pass on");
                 }
                 // Without its own list, a bot takes the tools its creator
@@ -3189,7 +3197,9 @@ impl Service {
                         })
                         .collect();
                     if passed.iter().any(|tool| !passes(tool)) {
-                        *declare = Some(passed.into_iter().filter(|tool| passes(tool)).collect());
+                        *declare = Some(Declare::Held(ToolList::new(
+                            passed.into_iter().filter(|tool| passes(tool)).collect(),
+                        )?));
                     }
                 }
                 folders.extend(workspace.clone());
@@ -4272,6 +4282,27 @@ impl Service {
         Ok(())
     }
 
+    /// The list a `declare` names, found and checked once: tools are
+    /// checked and named by their digest, and a digest is the list in use
+    /// or the store's (`tool_list_unknown` for one no bot holds now).
+    async fn find_declared(&self, declare: &mut Option<Declare>) -> Result<()> {
+        let list = match declare.take() {
+            None => return Ok(()),
+            Some(Declare::Digest(digest)) => match ToolList::in_use(&digest) {
+                Some(list) => list,
+                None if !is_digest(&digest) => return fail_with("tool_list_unknown", digest),
+                None => {
+                    (self.store)
+                        .read("tool_list", move |db| db.tool_list(&digest))
+                        .await?
+                }
+            },
+            Some(other) => other.into_list()?,
+        };
+        *declare = Some(Declare::Held(list));
+        Ok(())
+    }
+
     /// Change what a bot's client chose for it (`configure`). While a turn
     /// of it runs, the change, merged over one kept before, is checked as
     /// the store would take it and kept for the turn's end, when
@@ -4310,7 +4341,15 @@ impl Service {
             }
             false => change,
         };
+        // A digest is found and tools checked before the change is kept,
+        // so what waits holds the tools themselves.
+        let mut change = change;
+        self.find_declared(&mut change.declare).await?;
+        // The tools go into what is kept only if it is kept, and then off
+        // this thread: a fleet configured to the list it has pays nothing.
+        let declaring = change.declare.take();
         let raw = serde_json::to_value(&change)?;
+        change.declare = declaring;
         let Configure {
             instructions,
             model,
@@ -4351,9 +4390,7 @@ impl Service {
                 ));
             }
         }
-        if let Some(declare) = &declare {
-            validate_declared(declare)?;
-        }
+        let declare = declare.map(Declare::into_list).transpose()?;
         // The settings named, `sandbox` taking the rest of the
         // sandbox with it, over the bot's own.
         let mut named = Vec::new();
@@ -4490,6 +4527,7 @@ impl Service {
                         true => None,
                         false => db.inspect(&bot)?.running_turn,
                     };
+                    let kept_tools = declare.clone();
                     let write = move |db: &mut agent_runtime::store::Database| {
                         let mut changed: Vec<String> = Vec::new();
                         // First: the changes that may be refused here.
@@ -4554,6 +4592,10 @@ impl Service {
                             )?,
                             None => (Vec::new(), Vec::new()),
                         };
+                        let mut rest = rest;
+                        if let Some(tools) = &kept_tools {
+                            rest["declare"] = serde_json::to_value(tools)?;
+                        }
                         let mut kept = db.keep_configure(&bot, id, turn, &rest)?;
                         kept["changed"] = json!(changed);
                         return Ok((kept, kin));
@@ -4779,9 +4821,9 @@ impl Service {
                         format!("{provider} offers no web search"),
                     );
                 }
-                if let Some(declare) = &declare {
-                    validate_declared(declare)?;
-                }
+                let mut declare = declare;
+                self.find_declared(&mut declare).await?;
+                let declare = declare.map(Declare::into_list).transpose()?;
                 if compaction_instructions
                     .as_ref()
                     .is_some_and(|text| text.len() > 64 * 1024)
@@ -4835,7 +4877,7 @@ impl Service {
                                 fallback: fallback.as_deref(),
                                 gate: gate.as_ref(),
                                 settings: *settings,
-                                declared: declare.as_deref(),
+                                declared: declare.as_ref(),
                                 request_id: request_id.as_deref(),
                                 starts_line,
                             },
