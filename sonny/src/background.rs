@@ -74,6 +74,10 @@ pub struct Item {
     pub message: String,
     /// A follow as the lookout keeps it, which its page shows whole.
     pub sub: Option<lookout::subs::Sub>,
+    /// A question's reminder: Sonny's own automation for an agent's open
+    /// question, shown as the question and what happens when, never as
+    /// its gate. It goes once the question is answered.
+    pub reminder: Option<crate::asks::Reminder>,
 }
 
 /// Every trigger made on the daemon whose store is `store_id` and every
@@ -134,6 +138,7 @@ pub fn read(
                 sources,
                 message: String::new(),
                 sub: Some(sub.clone()),
+                reminder: None,
             });
         }
     }
@@ -265,6 +270,7 @@ fn unscheduled(cleanup: Option<(String, i64)>) -> Option<Item> {
         fired_ms: None,
         message: String::new(),
         sub: None,
+        reminder: None,
     })
 }
 
@@ -310,6 +316,7 @@ fn servers(view: &Value) -> Vec<Item> {
                 sources: Vec::new(),
                 message: String::new(),
                 sub: None,
+                reminder: None,
             });
         }
     }
@@ -460,6 +467,7 @@ fn trigger_item(row: &Value, bots: Vec<String>) -> Item {
         sources: Vec::new(),
         message: text("message"),
         sub: None,
+        reminder: crate::asks::reminder(&text("if"), &text("when"), &text("message")),
     }
 }
 
@@ -834,6 +842,9 @@ impl View {
             KeyCode::Down => {
                 self.selected = (self.selected + 1).min(self.rows().saturating_sub(1));
             }
+            KeyCode::Char('r') if self.picked_reminder() => {
+                self.notice = Some("a question's reminder runs at its time".into());
+            }
             KeyCode::Char('r') => self.fire(),
             KeyCode::Char('x') | KeyCode::Delete if self.command().is_some() => {
                 let row = self.command().cloned().unwrap_or_default();
@@ -844,7 +855,9 @@ impl View {
                 let Some(item) = self.items.get(self.selected).cloned() else {
                     return Key::Stay;
                 };
-                if item.own {
+                if item.reminder.is_some() {
+                    self.notice = Some("it goes once the question is answered".into());
+                } else if item.own {
                     self.notice = Some(
                         "Sonny keeps the lead's tasks follow; the lookout watches its tasks with it"
                             .into(),
@@ -865,6 +878,12 @@ impl View {
             _ => {}
         }
         Key::Stay
+    }
+
+    /// Whether the picked row is a question's reminder.
+    fn picked_reminder(&self) -> bool {
+        self.command().is_none()
+            && (self.items.get(self.selected)).is_some_and(|item| item.reminder.is_some())
     }
 
     /// Whether the picked row is a thing with a page: an automation, a
@@ -1161,6 +1180,39 @@ impl View {
                     None,
                 )]);
             }
+        } else if let Some((item, reminder)) = (self.items.get(self.selected))
+            .and_then(|item| Some((item.clone(), item.reminder.clone()?)))
+        {
+            // A question's reminder: whose question, when, what happens
+            // then, and the question.
+            let now = (now_ms() / 1000) as i64;
+            out.push(Line::from("a question's reminder").bold());
+            about.push(vec![
+                ("question from ".into(), None),
+                (short(&reminder.asker), Some(reminder.asker.clone())),
+            ]);
+            about.push(vec![(crate::asks::clock(reminder.at, now), None)]);
+            if let Some(why) = &item.failed {
+                body.extend(crate::transcript::wrap(
+                    Line::from(vec![Span::raw("✗ ").fg(Color::Red), Span::raw(why.clone())]),
+                    width,
+                    Span::raw(""),
+                    Span::raw("  "),
+                ));
+            }
+            body.extend(crate::transcript::wrap(
+                said(&reminder, now),
+                width,
+                Span::raw(""),
+                Span::raw(""),
+            ));
+            body.push(Line::default());
+            body.extend(crate::transcript::wrap(
+                Line::from(reminder.question.clone()),
+                width,
+                Span::raw(""),
+                Span::raw(""),
+            ));
         } else if let Some(item) = self.items.get(self.selected).cloned() {
             out.push(Line::from(item.name.clone()).bold());
             let what = match item.kind {
@@ -1349,6 +1401,10 @@ impl View {
             },
             Kind::Server | Kind::Setup => Span::raw("  "),
         };
+        let now = (now_ms() / 1000) as i64;
+        if let Some(reminder) = &item.reminder {
+            return self.reminder_lines(item, reminder, pick, mark, picked, width, now);
+        }
         let name = Span::raw(item.name.clone()).bold();
         let mut spans = vec![pick, mark, name];
         match item.kind {
@@ -1400,6 +1456,60 @@ impl View {
                 1,
             ));
         }
+        out
+    }
+
+    /// A question's reminder's rows: whose question and when, then what
+    /// happens then in the card's words, then the question.
+    #[allow(clippy::too_many_arguments)]
+    fn reminder_lines(
+        &self,
+        item: &Item,
+        reminder: &crate::asks::Reminder,
+        pick: Span<'static>,
+        mark: Span<'static>,
+        picked: bool,
+        width: usize,
+        now: i64,
+    ) -> Vec<Line<'static>> {
+        let mut out = Vec::new();
+        let spans = vec![
+            pick,
+            mark,
+            Span::raw(format!(
+                "question from {}",
+                self.scope.short(&reminder.asker)
+            ))
+            .bold(),
+            Span::raw(format!("  {}", crate::asks::clock(reminder.at, now))),
+            Span::raw(format!(" → {}", self.scope.short(&item.bot))).dim(),
+        ];
+        let mut first =
+            crate::transcript::wrap(Line::from(spans), width, Span::raw(""), Span::raw(INDENT));
+        if picked && let Some(row) = first.first_mut() {
+            crate::list::pick(row);
+        }
+        out.extend(first);
+        if let Some(why) = &item.failed {
+            out.extend(crate::transcript::wrap(
+                Line::from(why.clone()),
+                width,
+                Span::raw(INDENT),
+                Span::raw(INDENT),
+            ));
+        }
+        out.extend(crate::transcript::wrap(
+            said(reminder, now),
+            width,
+            Span::raw(INDENT),
+            Span::raw(INDENT),
+        ));
+        out.extend(crate::transcript::capped(
+            Line::from(reminder.question.clone()).dim(),
+            width,
+            Span::raw(format!("{INDENT}└ ")).dim(),
+            1,
+        ));
         out
     }
 
@@ -1461,6 +1571,8 @@ impl View {
             return keys.key("x", "stop").esc(Esc::Close).text();
         }
         match self.items.get(self.selected) {
+            // A question's reminder goes once the question is answered.
+            Some(item) if item.reminder.is_some() => {}
             Some(item) if item.kind == Kind::Trigger => {
                 keys = keys.key("r", "run now").key("x", "remove")
             }
@@ -1471,6 +1583,19 @@ impl View {
         }
         keys.esc(Esc::Close).text()
     }
+}
+
+/// What a question's reminder does unless the person answers first, as
+/// the card says it: muted, the time at the text's own weight.
+fn said(reminder: &crate::asks::Reminder, now: i64) -> Line<'static> {
+    Line::from(
+        (reminder.says(now).into_iter())
+            .map(|(text, weight)| match weight {
+                true => Span::raw(text),
+                false => Span::raw(text).dim(),
+            })
+            .collect::<Vec<_>>(),
+    )
 }
 
 /// A pattern as JSON with a space after each `:` and `,`, so a page
@@ -1557,6 +1682,7 @@ mod tests {
             sources: Vec::new(),
             message: "Read preferences.md".into(),
             sub: None,
+            reminder: None,
         }
     }
 
@@ -1609,6 +1735,7 @@ mod tests {
             bot: "calc.lead".into(),
             items: vec![Item {
                 sub: Some(sub),
+                reminder: None,
                 facts: Vec::new(),
                 message: String::new(),
                 ..item(Kind::Subscription, "fix-failures", &["calc.lead"], false)
@@ -1725,6 +1852,98 @@ mod tests {
         );
         assert_eq!(fresh.facts, ["not run yet"]);
         assert_eq!(fresh.failed, None);
+    }
+
+    #[test]
+    fn a_questions_reminder_reads_as_the_question_and_its_card_not_its_gate() {
+        // Two hours on, at a whole minute, as Sonny sets a deadline.
+        let now = (now_ms() / 1000) as i64;
+        let at = (now + 2 * 3600) / 60 * 60;
+        let local = crate::trigger::local(at);
+        let when = format!(
+            "at {}-{:02}-{:02} {:02}:{:02}",
+            local.year, local.month, local.day, local.hour, local.minute
+        );
+        let question = "Round half cents up, or to even?";
+        let row = json!({"name": "calc.halves.ask-10-a11", "when": when, "bot": "calc.halves",
+            "message": crate::asks::fire(question, crate::asks::Unanswered::Later, Some(0), "Up", false),
+            "if": "'/opt/sonny' ask open 'calc.halves' 10 'toolu_a11'", "sent": 0, "last": null});
+        let item = trigger_item(&row, vec!["calc.halves".into()]);
+        assert!(item.reminder.is_some());
+        let mut view = View {
+            scope: Scope {
+                project: "calc".into(),
+                lead: "calc.lead".into(),
+                glob: "calc.*".into(),
+            },
+            store: std::env::temp_dir().join("background-reminder.sqlite"),
+            store_id: None,
+            bot: "calc.lead".into(),
+            items: vec![item],
+            turns: HashMap::new(),
+            lookout: String::new(),
+            icons: HashMap::new(),
+            selected: 0,
+            confirm: None,
+            commands: Commands::default(),
+            stopping: None,
+            notice: None,
+            page: None,
+        };
+        let clock = crate::asks::clock(at, now);
+        // The pick reaches a column past the last word.
+        let lines: Vec<String> = (view.card(100).0.iter())
+            .map(|l| l.to_string().trim_end().to_owned())
+            .collect();
+        let row = lines
+            .iter()
+            .position(|l| l.contains("question from"))
+            .unwrap();
+        assert_eq!(
+            lines[row..row + 3],
+            [
+                format!("  ↻ question from halves  {clock} → halves"),
+                format!("    Goes with 1 at {clock} unless you pick."),
+                format!("    └ {question}"),
+            ]
+        );
+        // No gate, no install path, no internal name.
+        assert!(
+            !lines
+                .iter()
+                .any(|l| l.contains("ask open") || l.contains("ask-10"))
+        );
+        // It goes once the question is answered: no run, no removal.
+        let keys = view.keys();
+        assert!(
+            !keys.contains("run now") && !keys.contains("remove"),
+            "{keys}"
+        );
+        let key = |view: &mut View, code| {
+            view.key(KeyEvent::new(code, KeyModifiers::NONE), 0..usize::MAX)
+        };
+        key(&mut view, KeyCode::Char('x'));
+        assert!(view.confirm.is_none());
+        assert_eq!(
+            view.notice.as_deref(),
+            Some("it goes once the question is answered")
+        );
+        key(&mut view, KeyCode::Char('r'));
+        assert_eq!(
+            view.notice.as_deref(),
+            Some("a question's reminder runs at its time")
+        );
+        // `enter` opens its page: whose question, when, what happens, and
+        // the question; the agent that asked is the first link.
+        key(&mut view, KeyCode::Enter);
+        let (page, _, _) = view.page_lines(60);
+        let page: Vec<String> = page.iter().map(|l| l.to_string()).collect();
+        assert_eq!(page[0], "a question's reminder");
+        assert_eq!(page[1], format!("question from halves · {clock}"));
+        assert!(page.contains(&format!("Goes with 1 at {clock} unless you pick.")));
+        assert!(page.contains(&question.to_owned()));
+        assert!(!page.iter().any(|l| l.contains("This is Sonny")));
+        assert_eq!(view.page.as_ref().unwrap().links[0].3, "calc.halves");
     }
 
     #[test]
