@@ -757,10 +757,12 @@ Sonny turns it on while it runs and back off when it leaves.
 
 To answer one message, point at it: its bullet turns into `↩`, and a
 click quotes it into the composer (`> ` before each line, six lines at
-most) ahead of whatever you had typed. `/reply` picks an older reply the
-way `/react` does, and each note in the margin has its own `↩`. Sent, a
-reply shows your own words whole, with what it quotes over them on a
-tinted bar, dim: two lines of it, then `… quoted, N more lines ▸`, which a
+most) ahead of whatever you had typed. Quote another and it goes after
+the first, so several read in the order you picked them. `/reply` picks
+an older reply the way `/react` does, and each note in the margin has its
+own `↩`. Sent, a reply shows your own words whole, with all it quotes
+over them on a tinted bar, dim: two lines of it, then `… quoted, N more
+lines ▸`, which a
 click opens and closes. The bar is a coloured cell, not a character, so a
 copy of the quote is its words alone.
 
@@ -769,6 +771,10 @@ copy of the quote is its words alone.
 ![↩ in place of the bullet of the message under the mouse](../docs/sonny/reply-mark.png)
 
 ![The message quoted into the composer](../docs/sonny/reply-quoted.png)
+
+![Two replies quoted into the composer, in the order picked, over the words](../docs/sonny/reply-quoted-several.png)
+
+![Two replies quoted and sent: both fold onto the one bar over the words](../docs/sonny/reply-quote-fold-several.png)
 
 The message under the mouse also says when it was written, muted, at
 its top right edge, the right end of the empty row over it:

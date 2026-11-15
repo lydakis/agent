@@ -18232,7 +18232,9 @@ impl App {
 
     /// A message quoted before what the person is writing, as a mail or a
     /// GitHub reply quotes: `> ` before each of its lines, the first
-    /// [`QUOTE_LINES`] of them, a blank line, then the cursor.
+    /// [`QUOTE_LINES`] of them, a blank line, then the cursor. Quoted
+    /// after the quotes already there, so several read in the order
+    /// they were picked.
     fn quote(&mut self, said: &str) {
         let lines: Vec<&str> = said.trim().lines().collect();
         let mut quoted: Vec<String> = (lines.iter().take(QUOTE_LINES))
@@ -18242,7 +18244,13 @@ impl App {
             quoted.push("> …".into());
         }
         let typed = self.input.trim().to_owned();
-        self.input.set(&format!("{}\n\n{typed}", quoted.join("\n")));
+        let (before, typed) = transcript::opening_quote(&typed);
+        let before = match before.is_empty() {
+            true => String::new(),
+            false => format!("{before}\n\n"),
+        };
+        self.input
+            .set(&format!("{before}{}\n\n{typed}", quoted.join("\n")));
         self.pane_keys = false;
     }
 
@@ -24110,6 +24118,11 @@ mod tests {
         app.input.clear();
         app.quote("Merged it.\n\nThe tests pass.");
         assert_eq!(&*app.input, "> Merged it.\n>\n> The tests pass.\n\n");
+        // Another quoted goes after it, in the order picked, before what
+        // is being written.
+        app.input.set("> Merged it.\n\nShip both");
+        app.quote("Tagged v2.");
+        assert_eq!(&*app.input, "> Merged it.\n\n> Tagged v2.\n\nShip both");
     }
 
     #[tokio::test]
