@@ -689,12 +689,14 @@ class TriggerFireTests(ModelFixture):
         self.assertIsNone(no)
         self.assertFalse(job(self.home, 'p.task').exists())
 
-    def test_a_gate_that_cannot_run_is_a_failed_fire(self):
+    def test_a_gate_that_cannot_run_is_no_run(self):
         self.agent('run', *self.common, '--new', '--bot', 'p.task', 'hello')
         gone = self.path / 'gone'
         failed = self.fire('p.task', 'x', extra=['--if', 'true', '--dir', str(gone)])
-        self.assertEqual(failed['last']['outcome'], 'failed', failed)
-        self.assertIn('--if', failed['last']['detail'])
+        # No run: its last run stays as it was, and the check says why.
+        self.assertIsNone(failed['last'], failed)
+        self.assertEqual(failed['checked']['gate'], 'failed', failed)
+        self.assertIn('--if', failed['checked']['detail'])
         # The fire sent nothing; the agent hears one note, a steer that wakes it.
         notes = [m for m in self.messages('p.task') if m['message'] > 1]
         self.assertEqual([(m['delivery'], m['origin']) for m in notes], [('steer', 'automation')], notes)
@@ -717,9 +719,9 @@ class TriggerFireTests(ModelFixture):
         # A command that is not there is a check that failed, not a quiet no,
         # and the fire says what the shell said.
         failed = self.fire('p.task', 'x', extra=['--if', 'no-such-gate-here', '--dir', str(self.path)])
-        self.assertEqual((failed['last']['outcome'], failed['checked']['gate']), ('failed', 'failed'), failed)
-        self.assertIn('127', failed['last']['detail'])
-        self.assertIn('no-such-gate-here', failed['last']['detail'])
+        self.assertEqual((failed['last'], failed['checked']['gate']), (None, 'failed'), failed)
+        self.assertIn('127', failed['checked']['detail'])
+        self.assertIn('no-such-gate-here', failed['checked']['detail'])
         notes = [m for m in self.messages('p.task') if m['message'] > 1]
         self.assertEqual([m['delivery'] for m in notes], ['steer'], notes)
         self.assertIn('its --if could not check', notes[0]['prompt_preview'])
