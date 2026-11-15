@@ -463,7 +463,8 @@ many of those steer, by the source's mark or the follow's `steer`
 (`steers`), and about how many notes they would have been with its
 digest or its sources' (`notes`), with the newest 3 it hears as examples,
 outside content as the listing's are. For this the lookout keeps what
-each source's command printed in `STORE.sources/.recent/NAME.jsonl`, an
+each source printed, a command's and Sonny's own `memory` and `links`
+alike, in `STORE.sources/.recent/NAME.jsonl`, an
 event a line: a day of it, at most 2,000 events and 4 MiB, an event's
 fields cut as a shape's examples are past 16 KiB (`cut` then counts them,
 since a filter may misjudge a cut event). Past the day, it keeps the

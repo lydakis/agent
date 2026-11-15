@@ -24,7 +24,7 @@
 //!
 //! What a source says is no one's words here: its note goes with an
 //! origin, so the approver never reads it as the person's.
-use agent_client::config::Source;
+use agent_client::config::{COMMONS_SOURCE, Source};
 use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
@@ -586,7 +586,7 @@ impl Runner {
                     source.clone(),
                     every,
                     dir,
-                    shape,
+                    (shape, keeps),
                     sent,
                     self.poked.clone(),
                 )),
@@ -899,7 +899,7 @@ async fn own(
     source: Source,
     every: Duration,
     dir: PathBuf,
-    shape: PathBuf,
+    (shape, keeps): (PathBuf, PathBuf),
     sent: Sender<Said>,
     poked: std::sync::Arc<tokio::sync::Notify>,
 ) {
@@ -908,6 +908,9 @@ async fn own(
     };
     let mut seen = Seen::default();
     let mut shape = Shape::read(shape);
+    // Kept as a command's is, but for the commons, whose threads are
+    // their members'.
+    shape.keeps = (source.name != COMMONS_SOURCE).then_some(keeps);
     loop {
         let (home, dir, name) = (home.clone(), dir.clone(), source.name.clone());
         let news = tokio::task::spawn_blocking(move || own_news(&name, &home, &dir))
@@ -1394,8 +1397,9 @@ struct Shape {
     written_kinds: Vec<(String, Vec<&'static str>)>,
     /// It saw events since it last wrote.
     dirty: bool,
-    /// Where what its source printed is kept to test filters on: a
-    /// command's, never the commons', whose threads are their members'.
+    /// Where what its source printed is kept to test filters on and to
+    /// read: any source's but the commons', whose threads are their
+    /// members'.
     keeps: Option<PathBuf>,
 }
 

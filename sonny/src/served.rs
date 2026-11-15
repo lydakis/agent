@@ -349,7 +349,7 @@ fn follows() -> Value {
                 },
                 "remove": {"type": "string", "minLength": 1, "description": "The name of one to remove."},
                 "test": {"type": "boolean", "description": "What add would have heard of its sources' last day; adds nothing."},
-                "read": {"type": "boolean", "description": "What add's sources say now, each topic's newest event; adds nothing."}
+                "read": {"type": "boolean", "description": "What add hears now; adds nothing."}
             },
             "additionalProperties": false
         },
