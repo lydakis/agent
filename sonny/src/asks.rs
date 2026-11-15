@@ -995,10 +995,31 @@ fn hang(row: &Line<'static>, lead: usize) -> Line<'static> {
 /// What the card says the agent does until the person answers, `now`
 /// in seconds since the epoch: words, each muted or at the text's weight.
 fn meanwhile(ask: &Ask, now: i64) -> Option<Vec<(String, bool)>> {
-    let pick = ask.recommended.map(|at| (at + 1).to_string());
+    let plan = ask.unanswered?;
+    Some(until_picked(
+        plan,
+        ask.recommended,
+        ask.deadline,
+        ask.command.is_some(),
+        now,
+    ))
+}
+
+/// What the agent does until the person answers, in the card's words:
+/// `plan`, the option it goes with (`pick`, from 0), when (`deadline`),
+/// and whether it is a step of the person's (`step`), `now` in seconds
+/// since the epoch. A question's reminder in `/background` says the same.
+pub fn until_picked(
+    plan: Unanswered,
+    pick: Option<usize>,
+    deadline: Option<i64>,
+    step: bool,
+    now: i64,
+) -> Vec<(String, bool)> {
+    let pick = pick.map(|at| (at + 1).to_string());
     let muted = |text: &str| (text.to_owned(), false);
     let at = |deadline: i64| (clock(deadline, now), true);
-    Some(match (ask.unanswered?, pick, ask.deadline) {
+    match (plan, pick, deadline) {
         (Unanswered::Now, Some(pick), _) => vec![muted(&format!(
             "Going with {pick} meanwhile; another pick undoes it."
         ))],
@@ -1007,7 +1028,7 @@ fn meanwhile(ask: &Ask, now: i64) -> Option<Vec<(String, bool)>> {
             at(deadline),
             muted(" unless you pick."),
         ],
-        (Unanswered::Wait, _, Some(deadline)) if ask.command.is_some() => vec![
+        (Unanswered::Wait, _, Some(deadline)) if step => vec![
             muted("Waits for you to run it; a reminder at "),
             at(deadline),
             muted("."),
@@ -1019,9 +1040,9 @@ fn meanwhile(ask: &Ask, now: i64) -> Option<Vec<(String, bool)>> {
         ],
         // No deadline: the person's setting turned them off, or Sonny
         // could not say when.
-        _ if ask.command.is_some() => vec![muted("Waits for you to run it.")],
+        _ if step => vec![muted("Waits for you to run it.")],
         _ => vec![muted("Waits for your pick.")],
-    })
+    }
 }
 
 /// `epoch` as a clock shows it: the time today, else tomorrow's or the
@@ -1182,7 +1203,13 @@ fn set_deadline(
         &trigger_name(bot, turn, call),
         &at,
         &gate,
-        &fire(&ask.question, plan, label),
+        &fire(
+            &ask.question,
+            plan,
+            ask.recommended,
+            label,
+            ask.command.is_some(),
+        ),
     )
     .map(|_| ())
 }
@@ -1241,25 +1268,136 @@ fn trigger_name(bot: &str, turn: i64, call: &str) -> String {
 }
 
 /// What the deadline's fire tells the agent: Sonny's words, never the
-/// person's, so it allows nothing that needs theirs.
-fn fire(question: &str, plan: Unanswered, label: &str) -> String {
+/// person's, so it allows nothing that needs theirs. It says the option
+/// it goes with (`pick`, from 0) by its number and label, as the card
+/// does, and a `step` of the person's as one; [`reminder`] reads it back.
+pub(crate) fn fire(
+    question: &str,
+    plan: Unanswered,
+    pick: Option<usize>,
+    label: &str,
+    step: bool,
+) -> String {
     let first = question.lines().next().unwrap_or_default();
     let question = crate::transcript::cut(first, QUOTED);
     let label = crate::transcript::cut(label.lines().next().unwrap_or_default(), QUOTED);
     let tail = "This is Sonny, not the person: it is no answer of theirs, and it allows nothing \
         that needs their own words.";
-    match plan {
-        Unanswered::Later => format!(
-            "Nobody answered your question \"{question}\" in time, so go on now with \"{label}\", \
-             the option you recommended, as you said you would. Keep it undoable, and if they pick \
-             another later, undo it and follow their pick. {tail}"
+    match (plan, pick) {
+        (Unanswered::Later, Some(pick)) => format!(
+            "{LATER}{question}{LATER_GOES}{} \"{label}\", the option you recommended, as you said \
+             you would. Keep it undoable, and if they pick another later, undo it and follow their \
+             pick. {tail}",
+            pick + 1
+        ),
+        _ if step => format!(
+            "{STEP}{question}{STEP_WAITS} so do not go ahead with what needs it. Go on with what \
+             does not depend on it, and say in one line what it holds up, so they see it again. \
+             {tail}"
         ),
         _ => format!(
-            "Your question \"{question}\" still has no answer, and you said it waits for the \
-             person, so do not go ahead with it. Go on with what does not depend on it, and say in \
-             one line what it holds up, so they see it again. {tail}"
+            "{WAIT}{question}{WAIT_WAITS} person, so do not go ahead with it. Go on with what does \
+             not depend on it, and say in one line what it holds up, so they see it again. {tail}"
         ),
     }
+}
+
+/// How a fire's message opens and goes on past its question, for each
+/// plan: [`fire`] writes them and [`reminder`] reads them.
+const LATER: &str = "Nobody answered your question \"";
+const LATER_GOES: &str = "\" in time, so go on now with option ";
+const STEP: &str = "Nobody has said yet how your step went: \"";
+const STEP_WAITS: &str = "\" waits for the person to run it,";
+const WAIT: &str = "Your question \"";
+const WAIT_WAITS: &str = "\" still has no answer, and you said it waits for the";
+
+/// A question's reminder, as `/background` lists it: Sonny's deadline for
+/// an agent's open question, the one-off automation [`set_deadline`]
+/// adds, read from its `--if`, its time and its message.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Reminder {
+    /// The agent that asked.
+    pub asker: String,
+    /// The question's first line, as the fire quotes it.
+    pub question: String,
+    pub plan: Unanswered,
+    /// The option it goes with, from 0.
+    pub pick: Option<usize>,
+    /// A step only the person can take, not a pick.
+    pub step: bool,
+    /// When, in seconds since the epoch.
+    pub at: i64,
+}
+
+impl Reminder {
+    /// What it does unless the person answers first, in the card's words,
+    /// `now` in seconds since the epoch.
+    pub fn says(&self, now: i64) -> Vec<(String, bool)> {
+        until_picked(self.plan, self.pick, Some(self.at), self.step, now)
+    }
+}
+
+/// The reminder an automation is, when it is a question's: its `--if`
+/// (`gate`) is `'SONNY' ask open 'BOT' TURN 'CALL'`, it runs once `when`
+/// (`at YYYY-MM-DD HH:MM`), and its message is a [`fire`].
+pub fn reminder(gate: &str, when: &str, message: &str) -> Option<Reminder> {
+    let asker = {
+        let (_, rest) = gate.split_once("' ask open '")?;
+        let mut asker = String::new();
+        let mut chars = rest.chars().peekable();
+        // A quote in the name is written `'\''`.
+        loop {
+            match chars.next()? {
+                '\'' if chars.peek() == Some(&'\\') => {
+                    // The backslash, its quote and the quote that opens
+                    // the rest.
+                    for _ in 0..3 {
+                        chars.next();
+                    }
+                    asker.push('\'');
+                }
+                '\'' => break,
+                c => asker.push(c),
+            }
+        }
+        asker
+    };
+    let at = {
+        let at = when.strip_prefix("at ")?;
+        let (date, time) = at.split_once(' ')?;
+        let mut date = date.split('-');
+        let (hour, minute) = time.split_once(':')?;
+        crate::trigger::epoch_of(crate::trigger::Local {
+            year: date.next()?.parse().ok()?,
+            month: date.next()?.parse().ok()?,
+            day: date.next()?.parse().ok()?,
+            hour: hour.parse().ok()?,
+            minute: minute.parse().ok()?,
+        })?
+    };
+    let between = |head: &str, tail: &str| -> Option<(String, String)> {
+        let rest = message.strip_prefix(head)?;
+        let (question, after) = rest.split_once(tail)?;
+        Some((question.to_owned(), after.to_owned()))
+    };
+    let (question, plan, pick, step) = if let Some((question, after)) = between(LATER, LATER_GOES) {
+        let digits: String = after.chars().take_while(char::is_ascii_digit).collect();
+        let pick = digits.parse::<usize>().ok()?.checked_sub(1)?;
+        (question, Unanswered::Later, Some(pick), false)
+    } else if let Some((question, _)) = between(STEP, STEP_WAITS) {
+        (question, Unanswered::Wait, None, true)
+    } else {
+        let (question, _) = between(WAIT, WAIT_WAITS)?;
+        (question, Unanswered::Wait, None, false)
+    };
+    Some(Reminder {
+        asker,
+        question,
+        plan,
+        pick,
+        step,
+        at,
+    })
 }
 
 /// Where an ask stands, read from its agent's history newest first, one
@@ -2688,14 +2826,84 @@ mod tests {
 
     #[test]
     fn a_fire_is_sonnys_words_and_says_what_to_do() {
-        let later = fire("Keep the old API?\nmore", Unanswered::Later, "Drop it");
+        let later = fire(
+            "Keep the old API?\nmore",
+            Unanswered::Later,
+            Some(1),
+            "Drop it",
+            false,
+        );
         assert!(later.contains("\"Keep the old API?\""));
-        assert!(later.contains("go on now with \"Drop it\""));
+        assert!(later.contains("go on now with option 2 \"Drop it\""));
         assert!(later.contains("undo it and follow their pick"));
         assert!(later.contains("This is Sonny, not the person"));
-        let wait = fire("Tag it?", Unanswered::Wait, "");
+        let wait = fire("Tag it?", Unanswered::Wait, None, "", false);
         assert!(wait.contains("do not go ahead with it"));
         assert!(wait.contains("This is Sonny, not the person"));
+        let step = fire("Sign in to npm", Unanswered::Wait, None, "", true);
+        assert!(step.contains("your step went: \"Sign in to npm\""));
+        assert!(step.contains("do not go ahead with what needs it"));
+    }
+
+    #[test]
+    fn a_reminder_reads_back_what_its_fire_says_and_says_it_as_the_card_does() {
+        let gate = "'/opt/sonny' ask open 'tally.halves' 10 'toolu_01'";
+        let when = "at 2026-11-15 01:55";
+        let at = crate::trigger::epoch_of(crate::trigger::Local {
+            year: 2026,
+            month: 11,
+            day: 15,
+            hour: 1,
+            minute: 55,
+        })
+        .unwrap();
+        let question = "Round half cents up, or to even?";
+        let later = fire(question, Unanswered::Later, Some(0), "Up", false);
+        let read = reminder(gate, when, &later).unwrap();
+        assert_eq!(
+            read,
+            Reminder {
+                asker: "tally.halves".into(),
+                question: question.into(),
+                plan: Unanswered::Later,
+                pick: Some(0),
+                step: false,
+                at,
+            }
+        );
+        let said = |r: &Reminder| {
+            r.says(at - 3600)
+                .into_iter()
+                .map(|(t, _)| t)
+                .collect::<String>()
+        };
+        assert_eq!(said(&read), "Goes with 1 at 01:55 unless you pick.");
+        let wait = reminder(
+            gate,
+            when,
+            &fire(question, Unanswered::Wait, None, "", false),
+        )
+        .unwrap();
+        assert_eq!(
+            (wait.plan, wait.pick, wait.step),
+            (Unanswered::Wait, None, false)
+        );
+        assert_eq!(said(&wait), "Waits for your pick; a reminder at 01:55.");
+        let step = reminder(
+            gate,
+            when,
+            &fire("npm login", Unanswered::Wait, None, "", true),
+        )
+        .unwrap();
+        assert_eq!((step.question.as_str(), step.step), ("npm login", true));
+        assert_eq!(said(&step), "Waits for you to run it; a reminder at 01:55.");
+        // A name with a quote in it, as the gate writes it.
+        let quoted = reminder("'/s' ask open 'it'\\''s' 3 'c'", when, &later).unwrap();
+        assert_eq!(quoted.asker, "it's");
+        // Not a question's: another `--if`, another time, another message.
+        assert!(reminder("'/s' changed", when, &later).is_none());
+        assert!(reminder(gate, "every 30m", &later).is_none());
+        assert!(reminder(gate, when, "Check the build.").is_none());
     }
 
     #[test]

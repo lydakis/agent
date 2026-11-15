@@ -1473,8 +1473,12 @@ has something on it, or is off the screen, no time shows.
   (`Goes with 2 at 21:30 unless you pick.`), or waits for anything that
   goes out in your name or to other people, approves, merges, deletes or
   cannot be undone (`Waits for your pick; a reminder at 21:30.`). The
-  deadline is a one-off automation (`/background`) the tool host sets,
-  `[sonny] ask_wait_minutes` from the ask (60 by default, 0 for none,
+  deadline is a one-off automation the tool host sets. `/background`
+  lists it as the question, not its gate: `question from halves  21:30`,
+  the card's own sentence under it, then the question; it takes no `r`
+  or `x`, since it goes once the question is answered, and `enter` opens
+  its page with the agent that asked as its first link. It runs
+  `[sonny] ask_wait_minutes` after the ask (60 by default, 0 for none,
   which makes every ask wait) unless the agent sets its own for work on a
   clock. Your answer, picked or typed, removes it once the agent
   takes it up, as the agent's close does; it runs nothing once you answer or write to that agent, since the
