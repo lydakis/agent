@@ -12736,12 +12736,24 @@ impl App {
                     KeyCode::PageDown => pane.screen.page(false),
                     KeyCode::Home => pane.screen.hold(usize::MAX),
                     KeyCode::End => pane.screen.latest(),
-                    _ => match view.key(*key) {
-                        background::Key::Stay => {}
-                        background::Key::Close => self.close_pane(true),
-                        background::Key::Open(bot) => self.enter_agent(&bot),
-                        background::Key::Stop { bot, handle } => self.stop_process(bot, handle),
-                    },
+                    _ => {
+                        let paged = view.on_page();
+                        match view.key(*key, pane.screen.in_view()) {
+                            background::Key::Stay => {}
+                            background::Key::Close => self.close_pane(true),
+                            background::Key::Scroll(up) => {
+                                pane.screen.scroll(if up { 1 } else { -1 })
+                            }
+                            background::Key::Open(url) => self.follow(&url),
+                            background::Key::Stop { bot, handle } => self.stop_process(bot, handle),
+                        }
+                        // A page opened or left is scrolled to anew.
+                        if let Some(watch) = &mut self.watch
+                            && (watch.background.as_ref()).is_some_and(|v| v.on_page() != paged)
+                        {
+                            watch.picked = None;
+                        }
+                    }
                 }
                 return true;
             }
@@ -13337,6 +13349,16 @@ impl App {
                 self.jump = Some((pin, JUMP_PAGES));
             }
             "back" => self.close_pane(true),
+            // A link on a page of `/background`'s.
+            "background-page" => {
+                if let Some(view) = self.watch.as_mut().and_then(|w| w.background.as_mut()) {
+                    let leaves = view.click(id);
+                    self.pane_keys = true;
+                    if let Some(url) = leaves {
+                        self.follow(&url);
+                    }
+                }
+            }
             // A row or a link in `/memory`.
             "memory" => {
                 if let Some(view) = self.watch.as_mut().and_then(|w| w.memory.as_mut()) {
@@ -13568,8 +13590,11 @@ impl App {
         // A view's own pages go back first, as `←` on them does.
         if back
             && let Some(watch) = &mut self.watch
-            && let Some(view) = &mut watch.memory
-            && view.back()
+            && (watch.memory.as_mut().is_some_and(memory::View::back)
+                || watch
+                    .background
+                    .as_mut()
+                    .is_some_and(background::View::back))
         {
             watch.picked = None;
             return true;
@@ -16993,10 +17018,19 @@ impl App {
                 };
                 pane.set_card(lines, keys);
                 pane.foot = (!view.zen).then(|| view.footer(width));
-            } else if let Some(view) = &watch.background {
+            } else if let Some(view) = &mut watch.background {
                 // Its card, with what was done or the keys the pick takes
-                // kept in view under it.
-                let (card, at, starts) = view.card_rows(width);
+                // kept in view under it; or the page of the thing picked,
+                // whose title's ‹ goes back from it.
+                pane.page = view.on_page();
+                let (card, at, marks) = match view.on_page() {
+                    true => view.page_lines(width),
+                    false => {
+                        let (card, at, starts) = view.card_rows(width);
+                        let marks = row_marks(&card, &starts);
+                        (card, at, marks)
+                    }
+                };
                 let lines: Vec<Line<'static>> = card
                     .into_iter()
                     .map(|line| {
@@ -17005,13 +17039,19 @@ impl App {
                         Line::from(spans).style(line.style)
                     })
                     .collect();
-                let marks = row_marks(&lines, &starts);
                 pane.set_card_marked(lines, marks, &view.keys());
                 pane.foot = view.footer();
-                // A new pick is scrolled to, with the two rows under it.
+                // A new pick is scrolled to, with the two rows under it; a
+                // page just opened starts at its top; a page whose link
+                // scrolled out of view, so none is picked, stays where the
+                // scroll took it.
                 if watch.picked != Some(at) {
+                    match (view.on_page(), watch.picked.is_none()) {
+                        (true, true) => pane.screen.show_row(0, 0),
+                        (true, false) if !view.link_picked() => {}
+                        _ => pane.screen.keep_in_view(at, 2),
+                    }
                     watch.picked = Some(at);
-                    pane.screen.keep_in_view(at, 2);
                 }
             } else if let Some(view) = &mut watch.memory {
                 view.drain();
@@ -29584,9 +29624,9 @@ mod tests {
                 if view.keys().contains("x stop") {
                     break;
                 }
-                view.key(event::KeyEvent::from(KeyCode::Down));
+                view.key(event::KeyEvent::from(KeyCode::Down), 0..usize::MAX);
             }
-            view.key(event::KeyEvent::from(KeyCode::Char('x')));
+            view.key(event::KeyEvent::from(KeyCode::Char('x')), 0..usize::MAX);
             assert_eq!(view.keys(), "enter stop · esc cancel");
         };
         let keys = |app: &App| {

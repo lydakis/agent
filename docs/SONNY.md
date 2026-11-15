@@ -1221,8 +1221,9 @@ as Codex's `/ps` shows its background terminals: each background command,
 terminal, detached service and call waiting on its approval, oldest
 first, with its agent, how long it has run, a detached one's pid and the
 start of its command, read from the daemon's `processes` every two seconds
-while it is open. Enter opens a row's agent, and `x` asks once to stop the
-picked one with all it started, naming its command; Enter stops it
+while it is open. Enter opens a command as a page, with its whole line and
+the agent that left it running as its first link, and `x` asks once to
+stop the picked one with all it started, naming its command; Enter stops it
 (`stop_process`), beside the window, and any other key leaves it running.
 
 ![/background's Commands: its lead's detached docs server, with its pid, and a background test watcher](sonny/background-commands.png)

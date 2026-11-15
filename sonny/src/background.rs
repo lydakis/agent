@@ -70,6 +70,10 @@ pub struct Item {
     /// What makes its failure the same one when `failed`'s words change:
     /// a broken `--if`'s break, whatever each failed check printed.
     pub episode: Option<String>,
+    /// An automation's whole message, which its page shows.
+    pub message: String,
+    /// A follow as the lookout keeps it, which its page shows whole.
+    pub sub: Option<lookout::subs::Sub>,
 }
 
 /// Every trigger made on the daemon whose store is `store_id` and every
@@ -112,7 +116,7 @@ pub fn read(
                 .to_owned();
             items.push(Item {
                 kind: Kind::Subscription,
-                name: sub.name,
+                name: sub.name.clone(),
                 bot: subscriber.clone(),
                 bots: vec![subscriber.clone()],
                 when: String::new(),
@@ -128,6 +132,8 @@ pub fn read(
                 fired_ms: None,
                 episode: None,
                 sources,
+                message: String::new(),
+                sub: Some(sub.clone()),
             });
         }
     }
@@ -257,6 +263,8 @@ fn unscheduled(cleanup: Option<(String, i64)>) -> Option<Item> {
         sources: Vec::new(),
         handle: None,
         fired_ms: None,
+        message: String::new(),
+        sub: None,
     })
 }
 
@@ -300,6 +308,8 @@ fn servers(view: &Value) -> Vec<Item> {
                 fired_ms: None,
                 episode: None,
                 sources: Vec::new(),
+                message: String::new(),
+                sub: None,
             });
         }
     }
@@ -448,6 +458,8 @@ fn trigger_item(row: &Value, bots: Vec<String>) -> Item {
         fired_ms,
         episode,
         sources: Vec::new(),
+        message: text("message"),
+        sub: None,
     }
 }
 
@@ -577,15 +589,39 @@ pub struct View {
     /// waiting for Enter.
     stopping: Option<(String, String)>,
     notice: Option<String>,
+    /// The picked row's thing open as a page over the list: an
+    /// automation, a follow or a command.
+    page: Option<Page>,
 }
+
+/// A thing open as a page: the agents it names, linked as `/memory`'s
+/// facts link, and the one picked.
+#[derive(Default)]
+struct Page {
+    /// The command the page shows, by its handle: the pick follows it as
+    /// the commands are read again.
+    handle: Option<String>,
+    /// What the command's page names it by, when it ends.
+    what: String,
+    pick: Option<usize>,
+    /// Where each link was last drawn: its row, its columns on that row,
+    /// and the agent it opens.
+    links: Vec<(usize, u16, u16, String)>,
+}
+
+/// The view's link to its clicks: a button's address is this, then what
+/// was clicked.
+pub const BUTTON: &str = "background-page/";
 
 /// What a key did to the view.
 #[derive(Debug, PartialEq)]
 pub enum Key {
     Stay,
     Close,
-    /// The agent the picked row is for, to go to.
+    /// A link followed out of the view: an agent a page names.
     Open(String),
+    /// Scroll the page one row: up (true) or down.
+    Scroll(bool),
     /// Stop this agent's command, by its handle.
     Stop {
         bot: String,
@@ -615,6 +651,7 @@ impl View {
             commands: Commands::default(),
             stopping: None,
             notice: None,
+            page: None,
         };
         view.reload();
         view
@@ -645,6 +682,17 @@ impl View {
         if let Some(came) = self.commands.loaded(page) {
             self.notice = Some(came);
         }
+        // A command's page stays on it, wherever it is now; one that
+        // ended closes.
+        if let Some(handle) = self.page.as_ref().and_then(|p| p.handle.clone()) {
+            match (self.commands.rows.iter()).position(|row| row["handle"] == *handle) {
+                Some(at) => self.selected = self.items.len() + at,
+                None => {
+                    let what = self.page.take().map(|p| p.what).unwrap_or_default();
+                    self.notice.get_or_insert_with(|| format!("{what} ended"));
+                }
+            }
+        }
         self.selected = self.selected.min(self.rows().saturating_sub(1));
         // A stop asked of a command that has gone since is no stop.
         if let Some((handle, _)) = &self.stopping
@@ -672,10 +720,23 @@ impl View {
         );
         items.sort_by_key(|item| (item.failed.is_none(), item.kind != Kind::Trigger));
         self.items = items;
-        self.selected = picked
-            .and_then(|k| self.items.iter().position(|i| key_of(i) == k))
+        let at = picked
+            .clone()
+            .and_then(|k| self.items.iter().position(|i| key_of(i) == k));
+        // An item's page closes once the item is gone, as one removed is.
+        if at.is_none() && self.page.as_ref().is_some_and(|p| p.handle.is_none()) {
+            self.page = None;
+        }
+        self.selected = at
             .unwrap_or(self.selected)
             .min(self.rows().saturating_sub(1));
+        // A command's page stays on its command, wherever the items moved
+        // it.
+        if let Some(handle) = self.page.as_ref().and_then(|p| p.handle.as_deref())
+            && let Some(at) = (self.commands.rows.iter()).position(|row| row["handle"] == *handle)
+        {
+            self.selected = self.items.len() + at;
+        }
         // A removal waits only on the row it was asked for, still picked.
         if self.confirm.is_some() && self.items.get(self.selected).map(key_of) != self.confirm {
             self.confirm = None;
@@ -704,7 +765,9 @@ impl View {
         }
     }
 
-    pub fn key(&mut self, key: KeyEvent) -> Key {
+    /// A key, with the rows of the card now in view, for `↑` `↓` on a
+    /// page to pick among the links there before scrolling.
+    pub fn key(&mut self, key: KeyEvent, in_view: std::ops::Range<usize>) -> Key {
         self.notice = None;
         let plain = !key
             .modifiers
@@ -738,21 +801,15 @@ impl View {
                 None => Key::Stay,
             };
         }
-        match key.code {
+        let code = match key.code {
+            KeyCode::Char('k') if plain => KeyCode::Up,
+            KeyCode::Char('j') if plain => KeyCode::Down,
+            KeyCode::Char('h') if plain => KeyCode::Left,
+            KeyCode::Char('l') if plain => KeyCode::Right,
+            code => code,
+        };
+        match code {
             KeyCode::Esc => return Key::Close,
-            // Enter goes to the agent the row is for: the one an
-            // automation wakes, the subscriber, the one that left a
-            // command running.
-            KeyCode::Enter => {
-                if let Some(item) = self.items.get(self.selected)
-                    && !item.bot.is_empty()
-                {
-                    return Key::Open(item.bot.clone());
-                }
-                if let Some(bot) = self.command().and_then(|row| row["bot"].as_str()) {
-                    return Key::Open(bot.to_owned());
-                }
-            }
             KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 return Key::Close;
             }
@@ -762,8 +819,19 @@ impl View {
                 if key.modifiers.intersects(
                     KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER,
                 ) => {}
-            KeyCode::Up | KeyCode::Char('k') => self.selected = self.selected.saturating_sub(1),
-            KeyCode::Down | KeyCode::Char('j') => {
+            // On a page the arrows pick among its links, as on a fact in
+            // `/memory`; `←` goes back to the list.
+            KeyCode::Up | KeyCode::Down | KeyCode::Right | KeyCode::Enter | KeyCode::Left
+                if self.page.is_some() =>
+            {
+                return self.page_key(code, in_view);
+            }
+            // `enter` opens the row's thing as a page, as `→` does: an
+            // automation, a follow, a command. The agent it belongs to is
+            // the page's first link.
+            KeyCode::Enter | KeyCode::Right => self.open_page(),
+            KeyCode::Up => self.selected = self.selected.saturating_sub(1),
+            KeyCode::Down => {
                 self.selected = (self.selected + 1).min(self.rows().saturating_sub(1));
             }
             KeyCode::Char('r') => self.fire(),
@@ -797,6 +865,98 @@ impl View {
             _ => {}
         }
         Key::Stay
+    }
+
+    /// Whether the picked row is a thing with a page: an automation, a
+    /// follow or a command.
+    fn has_page(&self) -> bool {
+        match self.items.get(self.selected) {
+            Some(item) => matches!(item.kind, Kind::Trigger | Kind::Subscription),
+            None => self.command().is_some(),
+        }
+    }
+
+    /// The picked row's thing opened as a page, its agent's link picked.
+    fn open_page(&mut self) {
+        if !self.has_page() {
+            return;
+        }
+        let command = self.command();
+        self.page = Some(Page {
+            handle: command.and_then(|row| row["handle"].as_str().map(str::to_owned)),
+            what: command.map(commands::what).unwrap_or_default(),
+            pick: Some(0),
+            links: Vec::new(),
+        });
+    }
+
+    /// Whether a thing is open as a page.
+    pub fn on_page(&self) -> bool {
+        self.page.is_some()
+    }
+
+    /// Whether a link is picked on the open page: none once the arrows
+    /// scrolled it out of view.
+    pub fn link_picked(&self) -> bool {
+        self.page.as_ref().is_some_and(|page| page.pick.is_some())
+    }
+
+    /// Back to the list from a page, as `←` there and the title's `‹`
+    /// go. Whether there was one to leave.
+    pub fn back(&mut self) -> bool {
+        self.page.take().is_some()
+    }
+
+    /// A key on a page: the arrows pick among the links in view, as Lynx
+    /// does, and scroll where none is left that way; `→` or `enter`
+    /// follows the picked link and `←` goes back to the list.
+    fn page_key(&mut self, code: KeyCode, in_view: std::ops::Range<usize>) -> Key {
+        let Some(page) = self.page.as_mut() else {
+            return Key::Stay;
+        };
+        match code {
+            KeyCode::Up | KeyCode::Down => {
+                let down = code == KeyCode::Down;
+                let shown: Vec<usize> = (0..page.links.len())
+                    .filter(|&at| in_view.contains(&page.links[at].0))
+                    .collect();
+                let next = match (page.pick, down) {
+                    (Some(at), true) => shown.iter().copied().find(|&s| s > at),
+                    (Some(at), false) => shown.iter().copied().rev().find(|&s| s < at),
+                    (None, true) => shown.first().copied(),
+                    (None, false) => shown.last().copied(),
+                };
+                match next {
+                    Some(at) => page.pick = Some(at),
+                    None => {
+                        // A link scrolled out of view is no longer picked.
+                        page.pick = page.pick.filter(|&at| shown.contains(&at));
+                        return Key::Scroll(!down);
+                    }
+                }
+            }
+            KeyCode::Right | KeyCode::Enter => {
+                if let Some(link) = page.pick.and_then(|at| page.links.get(at)) {
+                    return Key::Open(format!("{}{}", crate::links::AGENT, link.3));
+                }
+            }
+            KeyCode::Left => self.page = None,
+            _ => {}
+        }
+        Key::Stay
+    }
+
+    /// A click on one of a page's links, `what` past [`BUTTON`]: the
+    /// address to follow out of the view.
+    pub fn click(&mut self, what: &str) -> Option<String> {
+        self.confirm = None;
+        self.stopping = None;
+        let at = what.strip_prefix("link/")?.parse::<usize>().ok()?;
+        let page = self.page.as_mut()?;
+        let link = page.links.get(at)?;
+        let url = format!("{}{}", crate::links::AGENT, link.3);
+        page.pick = Some(at);
+        Some(url)
     }
 
     fn fire(&mut self) {
@@ -950,6 +1110,225 @@ impl View {
         (out, at, starts)
     }
 
+    /// The page of the picked row's thing at `width`: its name, then the
+    /// agent it belongs to as the page's first link, then everything its
+    /// row cut short. The row the picked link is on, and the links'
+    /// buttons.
+    pub fn page_lines(
+        &mut self,
+        width: usize,
+    ) -> (Vec<Line<'static>>, usize, Vec<(usize, crate::screen::Mark)>) {
+        let mut out = Vec::new();
+        // What the line under the name says, in parts a ` · ` apart: an
+        // agent in a part is a link to it.
+        let mut about: Vec<Vec<(String, Option<String>)>> = Vec::new();
+        let mut body = Vec::new();
+        let short = |bot: &str| self.scope.short(bot);
+        if let Some(row) = self.command().cloned() {
+            let bot = row["bot"].as_str().unwrap_or_default().to_owned();
+            let command: String = (row["command"].as_str().unwrap_or_default().chars())
+                .map(|c| if c.is_control() { ' ' } else { c })
+                .collect();
+            let command = match command.trim() {
+                "" => row["handle"].as_str().unwrap_or_default().to_owned(),
+                command => command.to_owned(),
+            };
+            // Its whole line is its name.
+            out.extend(crate::transcript::wrap(
+                Line::from(command).bold(),
+                width,
+                Span::raw(""),
+                Span::raw(""),
+            ));
+            let kind = match row["kind"].as_str().unwrap_or("call") {
+                "background" => "background command",
+                "terminal" => "terminal",
+                "detached" => "detached service",
+                _ => "call waiting on its approval",
+            };
+            about.push(vec![(kind.into(), None)]);
+            if let Some(pid) = row["pid"].as_i64() {
+                about.push(vec![(format!("pid {pid}"), None)]);
+            }
+            about.push(vec![
+                ("left running by ".into(), None),
+                (short(&bot), Some(bot.clone())),
+            ]);
+            if let Some(started) = row["started_ms"].as_i64() {
+                let ran = (now_ms() as i64 - started).max(0) as u64 / 1000;
+                about.push(vec![(
+                    format!("for {}", ago(ran).trim_end_matches(" ago")),
+                    None,
+                )]);
+            }
+        } else if let Some(item) = self.items.get(self.selected).cloned() {
+            out.push(Line::from(item.name.clone()).bold());
+            let what = match item.kind {
+                Kind::Subscription => "follow for ",
+                _ => "automation for ",
+            };
+            about.push(vec![
+                (what.into(), None),
+                (short(&item.bot), Some(item.bot.clone())),
+            ]);
+            if let Some(to) = item.reply_to.as_ref().filter(|to| **to != item.bot) {
+                about.push(vec![
+                    ("answers go to ".into(), None),
+                    (short(to), Some(to.clone())),
+                ]);
+            }
+            if let Some(why) = &item.failed {
+                body.extend(crate::transcript::wrap(
+                    Line::from(vec![Span::raw("✗ ").fg(Color::Red), Span::raw(why.clone())]),
+                    width,
+                    Span::raw(""),
+                    Span::raw("  "),
+                ));
+            }
+            let mut fields: Vec<(&str, String)> = Vec::new();
+            match &item.sub {
+                Some(sub) => {
+                    let watched: Vec<String> = (sub.tasks_of.iter())
+                        .map(|b| format!("tasks of {b}"))
+                        .chain(sub.agents.iter().map(|g| format!("agents {g}")))
+                        .collect();
+                    if !watched.is_empty() {
+                        fields.push(("watches", watched.join(", ")));
+                    }
+                    if !sub.sources.is_empty() {
+                        let sources: Vec<String> = (sub.sources.iter())
+                            .map(|source| {
+                                let name = source.split_once(':').map_or(source.as_str(), |s| s.0);
+                                match self.icons.get(name) {
+                                    Some(icon) => format!("{icon} {source}"),
+                                    None => source.clone(),
+                                }
+                            })
+                            .collect();
+                        fields.push(("sources", sources.join(", ")));
+                    }
+                    if let Some(filter) = &sub.filter {
+                        fields.push(("where", spaced(filter)));
+                    }
+                    if let Some(digest) = &sub.digest {
+                        fields.push(("tells", format!("at most every {digest}")));
+                    }
+                    if let Some(steer) = &sub.steer {
+                        fields.push(("steers", format!("when {}", spaced(steer))));
+                    }
+                    if let Some(until) = &sub.until {
+                        fields.push(("until", until.clone()));
+                    }
+                    if let Some(runs) = sub.runs {
+                        let s = if runs == 1 { "" } else { "s" };
+                        fields.push(("lasts", format!("{runs} update{s}")));
+                    }
+                }
+                None => fields.push(("when", item.when.clone())),
+            }
+            let label = fields.iter().map(|(l, _)| l.width()).max().unwrap_or(0) + 2;
+            let hang = " ".repeat(label);
+            for (name, value) in fields {
+                body.extend(crate::transcript::wrap(
+                    Line::from(vec![
+                        Span::raw(format!("{name:<label$}")).dim(),
+                        Span::raw(value),
+                    ]),
+                    width,
+                    Span::raw(""),
+                    Span::raw(hang.clone()),
+                ));
+            }
+            // What its row says after it, whole.
+            if !item.facts.is_empty() {
+                body.extend(crate::transcript::wrap(
+                    Line::from(item.facts.join(" · ")).dim(),
+                    width,
+                    Span::raw(hang.clone()),
+                    Span::raw(hang.clone()),
+                ));
+            }
+            // An automation's whole message, as it is sent.
+            if !item.message.trim().is_empty() {
+                body.push(Line::default());
+                for line in item.message.trim_end().lines() {
+                    body.extend(crate::transcript::wrap(
+                        Line::from(line.to_owned()),
+                        width,
+                        Span::raw(""),
+                        Span::raw(""),
+                    ));
+                }
+            }
+        }
+        let Some(page) = self.page.as_mut() else {
+            return (out, 0, Vec::new());
+        };
+        // The parts laid a ` · ` apart, a part that would pass the edge
+        // starting the next row; each agent a link, picked as `/memory`'s
+        // are.
+        page.links.clear();
+        let mut marks: Vec<(usize, crate::screen::Mark)> = Vec::new();
+        let mut row: Vec<Span<'static>> = Vec::new();
+        let mut buttons = Vec::new();
+        let mut column = 0;
+        let flush = |out: &mut Vec<Line<'static>>,
+                     marks: &mut Vec<(usize, crate::screen::Mark)>,
+                     row: &mut Vec<Span<'static>>,
+                     buttons: &mut crate::screen::Buttons| {
+            if !buttons.is_empty() {
+                marks.push((
+                    out.len(),
+                    crate::screen::Mark::Buttons(std::mem::take(buttons)),
+                ));
+            }
+            out.push(Line::from(std::mem::take(row)));
+        };
+        for part in about {
+            let wide: usize = part.iter().map(|(text, _)| text.width()).sum();
+            if column > 0 && column + 3 + wide > width {
+                flush(&mut out, &mut marks, &mut row, &mut buttons);
+                column = 0;
+            }
+            if column > 0 {
+                row.push(Span::raw(" · ").dim());
+                column += 3;
+            }
+            for (text, bot) in part {
+                let wide = text.width();
+                match bot {
+                    Some(bot) => {
+                        let at = page.links.len();
+                        let mut name = Span::raw(text).fg(Color::Blue);
+                        if page.pick == Some(at) {
+                            name = name.add_modifier(ratatui::style::Modifier::REVERSED);
+                        }
+                        row.push(name);
+                        let (start, end) = (column as u16, (column + wide) as u16);
+                        // A column in from the line between, as the card is
+                        // drawn.
+                        let button = format!("{}{BUTTON}link/{at}", crate::screen::BUTTON);
+                        buttons.push((start + 1, end + 1, button));
+                        page.links.push((out.len(), start, end, bot));
+                    }
+                    None => row.push(Span::raw(text).dim()),
+                }
+                column += wide;
+            }
+        }
+        if !row.is_empty() {
+            flush(&mut out, &mut marks, &mut row, &mut buttons);
+        }
+        if !body.is_empty() {
+            out.push(Line::default());
+            out.extend(body);
+        }
+        let at = (page.pick)
+            .and_then(|pick| page.links.get(pick))
+            .map_or(0, |link| link.0);
+        (out, at, marks)
+    }
+
     fn item_lines(&self, item: &Item, picked: bool, width: usize) -> Vec<Line<'static>> {
         let mut out = Vec::new();
         // The pick has a column of its own, as the composer's `› ` does,
@@ -1059,21 +1438,27 @@ impl View {
                 .text();
         }
         let mut keys = Keys::new();
-        if self.rows() > 1 {
-            keys = keys.pick();
+        match &self.page {
+            // The pane's title says `← back` first, beside its `‹`.
+            Some(page) => {
+                if page.links.len() > 1 {
+                    keys = keys.pick();
+                }
+                if page.pick.is_some() {
+                    keys = keys.enter(crate::hint::Enter::Open);
+                }
+            }
+            None => {
+                if self.rows() > 1 {
+                    keys = keys.pick();
+                }
+                if self.has_page() {
+                    keys = keys.enter(crate::hint::Enter::Open);
+                }
+            }
         }
         if self.command().is_some() {
-            return (keys.enter(crate::hint::Enter::Open))
-                .key("x", "stop")
-                .esc(Esc::Close)
-                .text();
-        }
-        if self
-            .items
-            .get(self.selected)
-            .is_some_and(|item| !item.bot.is_empty())
-        {
-            keys = keys.enter(crate::hint::Enter::Open);
+            return keys.key("x", "stop").esc(Esc::Close).text();
         }
         match self.items.get(self.selected) {
             Some(item) if item.kind == Kind::Trigger => {
@@ -1085,6 +1470,24 @@ impl View {
             _ => {}
         }
         keys.esc(Esc::Close).text()
+    }
+}
+
+/// A pattern as JSON with a space after each `:` and `,`, so a page
+/// wraps it between its parts rather than inside one.
+fn spaced(value: &Value) -> String {
+    match value {
+        Value::Array(items) => {
+            let items: Vec<String> = items.iter().map(spaced).collect();
+            format!("[{}]", items.join(", "))
+        }
+        Value::Object(fields) => {
+            let fields: Vec<String> = (fields.iter())
+                .map(|(key, value)| format!("{}: {}", Value::from(key.as_str()), spaced(value)))
+                .collect();
+            format!("{{{}}}", fields.join(", "))
+        }
+        value => value.to_string(),
     }
 }
 
@@ -1152,6 +1555,8 @@ mod tests {
             fired_ms: None,
             episode: None,
             sources: Vec::new(),
+            message: "Read preferences.md".into(),
+            sub: None,
         }
     }
 
@@ -1176,6 +1581,67 @@ mod tests {
         );
         assert_eq!(fact(&items, "calc.digest", &none), "↻ 1 automation");
         assert_eq!(fact(&items, "calc.fix", &none), "");
+    }
+
+    #[test]
+    fn a_follows_page_says_all_it_watches_and_wraps_its_pattern_between_parts() {
+        let sub = lookout::subs::Sub {
+            name: "fix-failures".into(),
+            tasks_of: Vec::new(),
+            agents: vec!["calc.fix".into()],
+            sources: vec!["mail:billing".into()],
+            filter: None,
+            digest: Some("15m".into()),
+            steer: Some(json!({"type": ["turn.ended"], "status": ["failed"]})),
+            owner: None,
+            until: None,
+            runs: Some(3),
+            made: None,
+        };
+        let mut view = View {
+            scope: Scope {
+                project: "calc".into(),
+                lead: "calc.lead".into(),
+                glob: "calc.*".into(),
+            },
+            store: std::env::temp_dir(),
+            store_id: None,
+            bot: "calc.lead".into(),
+            items: vec![Item {
+                sub: Some(sub),
+                facts: Vec::new(),
+                message: String::new(),
+                ..item(Kind::Subscription, "fix-failures", &["calc.lead"], false)
+            }],
+            turns: HashMap::new(),
+            lookout: String::new(),
+            icons: HashMap::from([("mail".to_owned(), "✉".to_owned())]),
+            selected: 0,
+            confirm: None,
+            commands: Commands::default(),
+            stopping: None,
+            notice: None,
+            page: None,
+        };
+        let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+        view.key(enter, 0..usize::MAX);
+        let page: Vec<String> = (view.page_lines(44).0.iter())
+            .map(|l| l.to_string().trim_end().to_owned())
+            .collect();
+        assert_eq!(
+            page,
+            [
+                "fix-failures",
+                "follow for lead",
+                "",
+                "watches  agents calc.fix",
+                "sources  ✉ mail:billing",
+                "tells    at most every 15m",
+                "steers   when {\"status\": [\"failed\"], \"type\":",
+                "         [\"turn.ended\"]}",
+                "lasts    3 updates",
+            ]
+        );
     }
 
     #[test]
@@ -1218,6 +1684,7 @@ mod tests {
             commands: Commands::default(),
             stopping: None,
             notice: None,
+            page: None,
         };
         let rows: Vec<String> = (view.card(100).0.iter())
             .map(|l| l.to_string())
@@ -1537,6 +2004,7 @@ mod tests {
             commands: Commands::default(),
             stopping: None,
             notice: None,
+            page: None,
         };
         let (card, at) = view.card(100);
         let lines: Vec<String> = card.iter().map(|l| l.to_string()).collect();
@@ -1563,7 +2031,9 @@ mod tests {
         assert_eq!(lines[11], "Automations · 1");
         assert_eq!(view.keys(), "↑↓ pick · esc close");
         assert_eq!(view.footer(), None);
-        let press = |view: &mut View, code| view.key(KeyEvent::new(code, KeyModifiers::NONE));
+        let press = |view: &mut View, code| {
+            view.key(KeyEvent::new(code, KeyModifiers::NONE), 0..usize::MAX)
+        };
         press(&mut view, KeyCode::Char('x'));
         assert_eq!(view.confirm, None);
         assert!(view.notice.as_deref().unwrap().contains("reads again"));
@@ -1596,6 +2066,7 @@ mod tests {
             commands: Commands::default(),
             stopping: None,
             notice: None,
+            page: None,
         };
         let text = |view: &View| -> Vec<String> {
             view.card(100)
@@ -1611,13 +2082,51 @@ mod tests {
         assert_eq!(lines[5], "    sent 2");
         assert_eq!(lines[6], "    └ Read preferences.md");
         assert_eq!(lines[8], "Follows · 1");
-        // Enter goes to the agent the automation wakes; it closes nothing.
-        let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
-        assert_eq!(view.key(enter), Key::Open("calc.lead".into()));
         assert_eq!(lines[9], "  ◎ tasks for lead");
-        let press = |view: &mut View, code| view.key(KeyEvent::new(code, KeyModifiers::NONE));
+        // Enter opens the automation as a page, the agent it wakes its
+        // first link, picked; it closes nothing.
+        let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+        assert_eq!(
+            view.keys(),
+            "↑↓ pick · enter open · r run now · x remove · esc close"
+        );
+        assert_eq!(view.key(enter, 0..usize::MAX), Key::Stay);
+        assert!(view.on_page());
+        let (page, at, marks) = view.page_lines(100);
+        let page: Vec<String> = page.iter().map(|l| l.to_string()).collect();
+        assert_eq!(
+            page,
+            [
+                "nightly",
+                "automation for lead",
+                "",
+                "when  every 1d",
+                "      sent 2",
+                "",
+                "Read preferences.md",
+            ]
+        );
+        assert_eq!((at, marks.len()), (1, 1));
+        assert_eq!(view.keys(), "enter open · r run now · x remove · esc close");
+        // Enter there goes to the agent, as a click on its name does.
+        assert_eq!(
+            view.key(enter, 0..usize::MAX),
+            Key::Open("sonny:agent/calc.lead".into())
+        );
+        assert_eq!(view.click("link/0"), Some("sonny:agent/calc.lead".into()));
+        // `←` goes back to the list, the pick where it was.
+        let left = KeyEvent::new(KeyCode::Left, KeyModifiers::NONE);
+        assert_eq!(view.key(left, 0..usize::MAX), Key::Stay);
+        assert!(!view.on_page());
+        assert_eq!(view.selected, 0);
+        let press = |view: &mut View, code| {
+            view.key(KeyEvent::new(code, KeyModifiers::NONE), 0..usize::MAX)
+        };
         // Ctrl+X is not x.
-        view.key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL));
+        view.key(
+            KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL),
+            0..usize::MAX,
+        );
         assert_eq!(view.confirm, None);
         assert_eq!(press(&mut view, KeyCode::Char('x')), Key::Stay);
         assert_eq!(
@@ -1655,14 +2164,14 @@ mod tests {
         for modifier in [KeyModifiers::CONTROL, KeyModifiers::ALT] {
             press(&mut view, KeyCode::Char('x'));
             let enter = KeyEvent::new(KeyCode::Enter, modifier);
-            assert_eq!(view.key(enter), Key::Stay);
+            assert_eq!(view.key(enter, 0..usize::MAX), Key::Stay);
             assert_eq!(view.confirm, None);
             assert_eq!(view.items.len(), 2);
             assert_eq!(view.notice.as_deref(), Some("not removed"));
         }
         press(&mut view, KeyCode::Char('x'));
         let close = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
-        assert_eq!(view.key(close), Key::Close);
+        assert_eq!(view.key(close, 0..usize::MAX), Key::Close);
         assert_eq!(view.confirm, None);
         press(&mut view, KeyCode::Down);
         assert_eq!(view.card(100).1, 9);
@@ -1692,10 +2201,49 @@ mod tests {
         press(&mut view, KeyCode::Down);
         assert_eq!(view.card_at(80, 0).1, at + 1);
         assert_eq!(view.keys(), "↑↓ pick · enter open · x stop · esc close");
+        // Enter opens the command as a page: its whole line, and who
+        // left it running as its first link.
+        press(&mut view, KeyCode::Down);
+        assert_eq!(press(&mut view, KeyCode::Enter), Key::Stay);
+        let page: Vec<String> = (view.page_lines(44).0.iter())
+            .map(|l| l.to_string())
+            .collect();
+        assert_eq!(page[0], "npm run dev more");
+        assert!(
+            page[1].starts_with("detached service · pid 4242"),
+            "{page:?}"
+        );
+        assert!(page[2].starts_with("left running by fix"), "{page:?}");
+        assert_eq!(view.keys(), "enter open · x stop · esc close");
+        // It stays on its command as the commands are read again, and
+        // closes once the command ends.
+        view.commands_loaded(Ok(json!({"processes": [
+            {"handle": "proc:9", "bot": "calc.fix", "kind": "detached",
+             "command": "npm run dev\nmore", "started_ms": 1_000, "pid": 4242},
+        ]})));
+        // The items read again, however many there are now, it stays on
+        // its command too.
+        let items = view.items.clone();
+        view.reload();
+        assert_eq!(view.command().unwrap()["handle"], "proc:9");
+        view.items = items;
+        view.commands_loaded(Ok(json!({"processes": [
+            {"handle": "proc:9", "bot": "calc.fix", "kind": "detached",
+             "command": "npm run dev\nmore", "started_ms": 1_000, "pid": 4242},
+        ]})));
         assert_eq!(
             press(&mut view, KeyCode::Enter),
-            Key::Open("calc.lead".into())
+            Key::Open("sonny:agent/calc.fix".into())
         );
+        view.commands_loaded(Ok(json!({"processes": []})));
+        assert!(!view.on_page());
+        assert_eq!(view.footer().unwrap().to_string(), "npm run dev more ended");
+        view.commands_loaded(Ok(json!({"processes": [
+            {"handle": "proc:4", "bot": "calc.lead", "kind": "background",
+             "command": "cargo build", "started_ms": 1_000, "pid": null},
+            {"handle": "proc:9", "bot": "calc.fix", "kind": "detached",
+             "command": "npm run dev\nmore", "started_ms": 1_000, "pid": 4242},
+        ]})));
         press(&mut view, KeyCode::Down);
         press(&mut view, KeyCode::Down);
         assert_eq!(press(&mut view, KeyCode::Char('x')), Key::Stay);
@@ -1711,12 +2259,12 @@ mod tests {
         for modifier in [KeyModifiers::CONTROL, KeyModifiers::ALT] {
             press(&mut view, KeyCode::Char('x'));
             let enter = KeyEvent::new(KeyCode::Enter, modifier);
-            assert_eq!(view.key(enter), Key::Stay);
+            assert_eq!(view.key(enter, 0..usize::MAX), Key::Stay);
             assert_eq!(view.footer().unwrap().to_string(), "not stopped");
         }
         press(&mut view, KeyCode::Char('x'));
         let close = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
-        assert_eq!(view.key(close), Key::Close);
+        assert_eq!(view.key(close, 0..usize::MAX), Key::Close);
         assert_ne!(view.keys(), "enter stop · esc cancel");
         press(&mut view, KeyCode::Char('x'));
         assert_eq!(

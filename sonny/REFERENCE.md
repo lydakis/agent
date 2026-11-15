@@ -1125,14 +1125,21 @@ has something on it, or is off the screen, no time shows.
   detached service and call waiting on its approval, oldest first, with
   its agent, how long it has run, a detached one's pid and the start of
   its command, read from the daemon's `processes` every two seconds while
-  it is open. `↑`/`↓` picks one, Enter (or a click) goes to the agent it
-  wakes, or that left the command running, `r` runs an automation now,
-  and `x` removes an automation or follow, or stops a command with all it
-  started (`stop_process`, beside the window), once Enter confirms; any
-  other key keeps it. The follow Sonny keeps for a lead's tasks stays. What runs
+  it is open. `↑`/`↓` picks one, and Enter, `→` or a click opens it as a
+  page, as a fact opens in `/memory`: an automation's whole message, when
+  it runs, its last run and how that ended, and who gets the answers; a
+  follow's agents, sources, filter, digest, steer and end; a command's
+  whole line, its kind and pid, and how long it has run. The agent it
+  belongs to (the one an automation wakes, the follow's, the one that
+  left the command running) is the page's first link, picked: Enter
+  there, or a click on its name, goes to it, and `←` or the title's `‹`
+  goes back to the list. On the list and on a page `r` runs an
+  automation now, and `x` removes an automation or follow, or stops a
+  command with all it started (`stop_process`, beside the window), once
+  Enter confirms; any other key keeps it. The follow Sonny keeps for a lead's tasks stays. What runs
   there while healthy asks nothing of you, so the footer leaves it out.
   What failed is listed first, with a red `✗` and the error: an automation
-  whose run failed (one that ended on it stays listed until `d` removes
+  whose run failed (one that ended on it stays listed until `x` removes
   it), or whose run went out and whose turn then failed (as
   when the machine was offline or a login expired), and a server the
   nightly memory cleanup could not read. Your own agents' failures, such as
@@ -1146,6 +1153,8 @@ has something on it, or is off the screen, no time shows.
   ![/background listing a nightly run whose turn failed offline and a server the cleanup could not read](../docs/sonny/background-failed.png)
 
   ![/background in the pane](../docs/sonny/pane-background.png)
+
+  ![/background's pages: enter on an automation, a follow and a command, each with the agent it belongs to as its first link](../docs/sonny/background-pages-60.png)
 - `/usage` shows, in the pane beside the conversation,
   the tokens the project's agents spent in the last 24 hours, as their
   retained history records them: in all, as
