@@ -275,8 +275,10 @@ fn news_in(dir: &Path, cursor: &Path) -> crate::lookout::sources::News {
         }
         let changes = changes + 1;
         now.insert(name.clone(), json!({"state": state, "changes": changes}));
-        // A machine first linked tells that it came, never that it is away.
-        if first || (was.is_none() && state == "down") {
+        // A machine first linked, or linked again after it was forgotten,
+        // tells that it came, never that it is away.
+        let new = was_state.is_none_or(|was| was == "gone");
+        if first || (new && state == "down") {
             continue;
         }
         let id = format!("{name}/{state}/{changes}");
@@ -292,8 +294,9 @@ fn news_in(dir: &Path, cursor: &Path) -> crate::lookout::sources::News {
         };
         lines.push(line.to_string());
     }
-    // A machine forgotten or renamed while connected tells that it went;
-    // one already away just leaves the cursor.
+    // A machine forgotten or renamed while connected tells that it went.
+    // The cursor keeps its count as gone, so linked again under the name
+    // its events never take an ID one of its past ones had.
     for (name, was) in &had {
         if now.contains_key(name) || first {
             continue;
@@ -305,10 +308,13 @@ fn news_in(dir: &Path, cursor: &Path) -> crate::lookout::sources::News {
             now.insert(name.clone(), was.clone());
             continue;
         }
+        let changes = was["changes"].as_u64().unwrap_or(0);
         if was["state"] != "up" {
+            now.insert(name.clone(), json!({"state": "gone", "changes": changes}));
             continue;
         }
-        let changes = was["changes"].as_u64().unwrap_or(0) + 1;
+        let changes = changes + 1;
+        now.insert(name.clone(), json!({"state": "gone", "changes": changes}));
         lines.push(
             json!({"id": format!("{name}/down/{changes}"), "topic": name,
                 "text": "no longer linked", "state": "down"})
@@ -2076,18 +2082,30 @@ mod tests {
         assert_eq!(back.len(), 1);
         assert_eq!(back[0]["state"], "up");
         assert_ne!(back[0]["id"], lines[0]["id"]);
-        // Forgotten while connected: it went, and is then known no more.
-        let back = news_in(&dir, &cursor);
-        assert!(back.mark_read());
+        // Forgotten while connected: it went, once.
+        let kept = news_in(&dir, &cursor);
+        assert!(kept.mark_read());
         std::fs::remove_file(dir.join("laptop.json")).unwrap();
         let forgot = news_in(&dir, &cursor);
-        let lines = said(&forgot);
+        let unlinked = said(&forgot);
         assert_eq!(
-            (lines.len(), &lines[0]["state"], &lines[0]["text"]),
+            (unlinked.len(), &unlinked[0]["state"], &unlinked[0]["text"]),
             (1, &json!("down"), &json!("no longer linked"))
         );
         assert!(forgot.mark_read());
         assert!(news_in(&dir, &cursor).lines.is_empty());
+        // Linked again under the name: news under an ID none before had.
+        std::fs::write(dir.join("laptop.json"), "{}").unwrap();
+        let again = said(&news_in(&dir, &cursor));
+        assert_eq!(again.len(), 1);
+        assert_eq!(again[0]["state"], "up");
+        let ids = [
+            &lines[0]["id"],
+            &went[0]["id"],
+            &back[0]["id"],
+            &unlinked[0]["id"],
+        ];
+        assert!(!ids.contains(&&again[0]["id"]), "{ids:?}");
     }
 
     fn scratch(name: &str) -> PathBuf {
