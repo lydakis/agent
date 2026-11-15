@@ -2883,6 +2883,7 @@ impl Lookout {
                 for heard in &sent {
                     self.told_sources.insert(heard.event.source.clone(), now);
                 }
+                told_commons(&self.lead, &sent);
                 if submitted.is_ok() {
                     let request_id = format!("lookout-{}", digest(&key.join(",")));
                     self.write(&json!({"at_ms": epoch_ms(), "lead": self.lead, "woke": key,
@@ -3365,6 +3366,38 @@ fn epoch_ms() -> u128 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis())
         .unwrap_or(0)
+}
+
+/// The commons posts a note told `lead` count as shown to it, as a read
+/// does, so its reply after them is posted at once: each event's id is
+/// `THREAD/N`, its Nth post from 0.
+fn told_commons(lead: &str, sent: &[sources::Heard]) {
+    let mut upto: Vec<(&str, usize)> = Vec::new();
+    for heard in sent {
+        let event = &heard.event;
+        if event.source != agent_client::config::COMMONS_SOURCE {
+            continue;
+        }
+        let Some((thread, n)) = (event.id.as_deref())
+            .and_then(|id| id.rsplit_once('/'))
+            .and_then(|(thread, n)| Some((thread, n.parse::<usize>().ok()? + 1)))
+        else {
+            continue;
+        };
+        match upto.iter_mut().find(|(had, _)| *had == thread) {
+            Some((_, most)) => *most = (*most).max(n),
+            None => upto.push((thread, n)),
+        }
+    }
+    let Some(home) = (!upto.is_empty())
+        .then(|| std::env::var_os("HOME"))
+        .flatten()
+    else {
+        return;
+    };
+    for (thread, n) in upto {
+        crate::commons::told(Path::new(&home), lead, thread, n);
+    }
 }
 
 #[cfg(test)]
@@ -5579,7 +5612,10 @@ mod tests {
             let first = crate::commons::news(&crash.home, &crash.cursor());
             assert!(first.lines.is_empty());
             assert!(first.mark_read());
+            // Each had read the thread, so its reply is posted.
+            crate::commons::told(&crash.home, "b.y", "t", 1);
             post("b.y", json!({"reply": {"thread": "t", "text": "one"}}));
+            crate::commons::told(&crash.home, "c.z", "t", 2);
             post("c.z", json!({"reply": {"thread": "t", "text": "two"}}));
             let child = std::process::Command::new(std::env::current_exe().unwrap())
                 .args([
