@@ -166,6 +166,22 @@ class DaemonStepTests(ModelFixture):
         self.answer(client, turn)
         self.assertEqual(client.finished(turn)['data']['status'], 'completed')
 
+    @unittest.skipUnless(shutil.which('bwrap') or sys.platform == 'darwin', 'sandboxes need bubblewrap')
+    def test_a_file_step_through_a_link_into_the_workspace_is_judged_where_it_leads(self):
+        outside = self.path.parent / f'{self.path.name}-links'
+        outside.mkdir()
+        self.addCleanup(shutil.rmtree, outside, True)
+        (outside / 'ws').symlink_to(self.path)
+        client, turn = self.script(tools='echo,write', bot_tools=['write'], approve=['write'],
+                                   approver='manual', settings={'sandbox': 'workspace-write'})
+        # Spelled outside, it leads into the workspace: confined, no gate asked.
+        ran = self.step(client, turn, name='write',
+                        arguments={'path': str(outside / 'ws' / 'via.txt'), 'content': 'ok'})['result']
+        self.assertFalse(ran['failed'], ran)
+        self.assertEqual((self.path / 'via.txt').read_text(), 'ok')
+        self.answer(client, turn)
+        self.assertEqual(client.finished(turn)['data']['status'], 'completed')
+
     def test_a_tool_the_bot_lacks_is_not_a_step_it_may_run(self):
         client, turn = self.script(tools='echo,shell,write', bot_tools=['echo', 'shell'])
         refused = self.step(client, turn, name='write', arguments={'path': 'x', 'content': 'y'})

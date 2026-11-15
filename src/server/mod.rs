@@ -2900,6 +2900,9 @@ pub async fn run(config: Configuration) -> Result<()> {
     // ends, or was registered before and ends here.
     service.registry.end_background();
     service.registry.end_terminals();
+    // Daemon steps still running end now that stopping is said, but for a
+    // change to files already begun, which finishes; each end is recorded.
+    service.steps_stopping().await;
     // Every completion is committed. Allow publication to drain before
     // releasing waiters. Background result tasks may still own Store clones,
     // keeping the stream open even after the service is dropped.
@@ -5848,6 +5851,7 @@ impl Service {
                     step,
                     tool,
                     arguments,
+                    links: Default::default(),
                 };
                 self.run_step(session, output, id, ask, prepared)
             }

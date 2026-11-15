@@ -98,8 +98,10 @@ pub(super) struct Steps {
     commands: usize,
     /// A process slot the line's waiter got, for the step at its front.
     spare: Option<Slot>,
-    /// Whether the line's waiter stands in the semaphore's line.
-    awaiting_slot: bool,
+    /// The line's waiter, while it stands in the semaphore's line.
+    waiter: Option<tokio::task::AbortHandle>,
+    /// The semaphore closed: no waiter stands again.
+    slots_closed: bool,
     /// Each flight's number, so a job's result finds the flight it was for.
     serial: u64,
     /// The store jobs and tool runs under way.
@@ -228,6 +230,13 @@ fn reply(steps: &mut Steps, flight: &Flight, result: Result<Value>) {
                 Ok(value) => agent_runtime::output::encoded_len(value).unwrap_or(0),
                 Err(_) => 0,
             } + STEP_OVERHEAD;
+            // Past the daemon's bound, a session that stopped reading is
+            // closed, as a lagging follower is: EOF is the overload signal,
+            // and each step's end is in the store already.
+            if steps.bytes + bytes > MAX_STEP_BYTES {
+                output.close();
+                return;
+            }
             steps.bytes += bytes;
             steps.sending.spawn(async move {
                 let _ = output.respond(request, result).await;
@@ -332,11 +341,30 @@ impl Service {
             let captured = steps.captured.get(&key).cloned();
             let store = self.store.clone();
             steps.jobs.spawn(async move {
-                let opened = store
-                    .op("step_open", move |db| {
+                let mut asked = asked;
+                // A later step of a call reads its links before it is
+                // asked; the first, once its call is captured.
+                if let Some(capture) = &captured {
+                    learn_links(capture, &mut asked).await;
+                }
+                let open = |asked: StepAsk, captured| {
+                    store.op("step_open", move |db| {
                         db.step_open(&asked, captured, handles_now())
                     })
-                    .await;
+                };
+                let opened = match open(asked.clone(), captured).await {
+                    Ok(StepOpened::Learn { capture }) => {
+                        learn_links(&capture, &mut asked).await;
+                        match open(asked, Some(capture)).await {
+                            Ok(StepOpened::Learn { .. }) => Err(Error::with(
+                                "invalid_step",
+                                "the step's links could not be read",
+                            )),
+                            opened => opened,
+                        }
+                    }
+                    opened => opened,
+                };
                 (key, serial, Done::Opened(opened))
             });
         }
@@ -345,8 +373,9 @@ impl Service {
     /// What a step's job brought back.
     pub(super) fn step_done(&mut self, key: Key, serial: u64, done: Done) {
         if let Done::Slot(slot) = done {
+            self.steps.waiter = None;
             // A closed semaphore starts nothing more: no waiter again.
-            self.steps.awaiting_slot = slot.is_none();
+            self.steps.slots_closed = slot.is_none();
             self.steps.spare = slot;
             self.pump_steps();
             return;
@@ -383,13 +412,15 @@ impl Service {
                 | StepOpened::Refused { capture, .. }
                 | StepOpened::Pending { capture, .. },
             ) => Some(capture.clone()),
-            Err(_) => None,
+            // Taken up in the job that asked, never brought back here.
+            Ok(StepOpened::Learn { .. }) | Err(_) => None,
         };
         if let Some(capture) = capture {
             self.steps.captured.entry(key.clone()).or_insert(capture);
         }
         match opened {
             Ok(StepOpened::Run { capture, confined }) => self.line_step(key, capture, confined),
+            Ok(StepOpened::Learn { .. }) => unreachable!("links are read in the job that asked"),
             Ok(StepOpened::Refused { reply: refused, .. }) => {
                 let flight = self.steps.take(&key).expect("a flight");
                 self.steps.ran += 1;
@@ -443,13 +474,21 @@ impl Service {
             }
             Err(error) => {
                 // A call no longer waiting takes no more steps.
-                if matches!(
-                    error.code.as_str(),
-                    "no_pending_call" | "call_already_answered" | "stale_turn" | "turn_not_found"
-                ) {
+                // Another bot's asking of it, refused, leaves it be.
+                let flight = self.steps.take(&key).expect("a flight");
+                let owner = (self.steps.captured.get(&key))
+                    .is_none_or(|capture| capture.bot.name == flight.ask.bot);
+                if owner
+                    && matches!(
+                        error.code.as_str(),
+                        "no_pending_call"
+                            | "call_already_answered"
+                            | "stale_turn"
+                            | "turn_not_found"
+                    )
+                {
                     self.steps.captured.remove(&key);
                 }
-                let flight = self.steps.take(&key).expect("a flight");
                 self.steps.refused += 1;
                 reply(&mut self.steps, &flight, Err(error));
                 self.pump_steps();
@@ -595,13 +634,12 @@ impl Service {
     /// Stand one waiter for the whole line in the semaphore's fair line,
     /// beside the turns' own commands, unless one stands there already.
     fn await_slot(&mut self) {
-        if std::mem::replace(&mut self.steps.awaiting_slot, true) {
+        if self.steps.waiter.is_some() || self.steps.slots_closed {
             return;
         }
         let slot = self.registry.slot();
-        self.steps
-            .jobs
-            .spawn(async move { (waiter_key(), 0, Done::Slot(slot.await)) });
+        self.steps.waiter =
+            Some((self.steps.jobs).spawn(async move { (waiter_key(), 0, Done::Slot(slot.await)) }));
     }
 
     fn step_ran(&mut self, key: Key, ran: Result<Outcome>) {
@@ -772,6 +810,25 @@ impl Service {
         }
     }
 
+    /// The daemon stops: the line's waiter goes, and the steps still running
+    /// are seen to their ends and recorded, a change to files already begun
+    /// finishing, the rest ended by the stop the registry says. Bounded, as
+    /// the daemon's other drains are.
+    pub(super) async fn steps_stopping(&mut self) {
+        self.steps_held("the daemon is stopping");
+        if let Some(waiter) = self.steps.waiter.take() {
+            waiter.abort();
+        }
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while let Some(done) = self.steps.jobs.join_next().await {
+                if let Ok((key, serial, done)) = done {
+                    self.step_done(key, serial, done);
+                }
+            }
+        })
+        .await;
+    }
+
     /// A reply that waited for room was sent, or its session closed.
     pub(super) fn step_sent(&mut self, bytes: usize) {
         self.steps.bytes -= bytes;
@@ -790,6 +847,27 @@ fn failure(error: Error) -> Outcome {
         files: Default::default(),
         parts: Vec::new(),
         failed: true,
+    }
+}
+
+/// Read off the runtime thread the links a sandboxed bot's change to files
+/// passes, as a direct call's are read before it is judged.
+async fn learn_links(capture: &Capture, ask: &mut StepAsk) {
+    let folder = PathBuf::from(capture.workspace.as_deref().unwrap_or_default());
+    let calls = vec![ask.call()];
+    let Some(learn) = capture.bot.links_to_learn(&calls, &folder, false) else {
+        return;
+    };
+    let learned = tokio::task::spawn_blocking(move || {
+        let mut calls = calls;
+        learn(&mut calls);
+        calls
+    })
+    .await;
+    if let Ok(mut calls) = learned
+        && let Some(call) = calls.pop()
+    {
+        ask.links = call.links;
     }
 }
 

@@ -2086,11 +2086,24 @@ pub struct StepAsk {
     pub tool: String,
     /// A JSON object, bounded by its asker.
     pub arguments: String,
+    /// The links its paths pass, once read off the runtime thread as a
+    /// direct call's are ([`StepOpened::Learn`]).
+    pub links: crate::sandbox::Links,
 }
 impl StepAsk {
     /// The step's id among its turn's calls: `CALL/STEP`.
     pub fn id(&self) -> String {
         format!("{}/{}", self.call_id, self.step)
+    }
+    /// The step as the call the planner judges.
+    pub fn call(&self) -> ToolCall {
+        ToolCall {
+            name: self.tool.clone(),
+            call_id: self.id(),
+            arguments: self.arguments.clone(),
+            custom: false,
+            links: self.links.clone(),
+        }
     }
 }
 /// How a daemon step was decided, in the store job that decided it.
@@ -2110,6 +2123,10 @@ pub enum StepOpened {
         confined: bool,
         stepped: Stepped,
     },
+    /// Not decided, nothing recorded: a sandboxed bot's change to files
+    /// whose links are read first, off the runtime thread, as a direct
+    /// call's are, and the step is asked again with them.
+    Learn { capture: Arc<Capture> },
 }
 /// What an answered call has, read on the storage worker.
 pub enum CallAnswer {
@@ -9991,14 +10008,15 @@ impl Database {
                 format!("step {} of {call_id} was asked already", ask.step),
             );
         }
-        let call = ToolCall {
-            name: ask.tool.clone(),
-            call_id: id.clone(),
-            arguments: ask.arguments.clone(),
-            custom: false,
-            links: Default::default(),
-        };
-        let plan = bot.plan(&call, std::path::Path::new(workspace), &capture.rules);
+        let call = ask.call();
+        let folder = std::path::Path::new(workspace);
+        if bot
+            .links_to_learn(std::slice::from_ref(&call), folder, false)
+            .is_some()
+        {
+            return Ok(StepOpened::Learn { capture });
+        }
+        let plan = bot.plan(&call, folder, &capture.rules);
         let refusal = if plan.refused_unasked() {
             Some((Error::with("approval_refused", NEVER_ASKS), true))
         } else if let Some(error) = plan.ruled_out() {
