@@ -1153,6 +1153,8 @@ has something on it, or is off the screen, no time shows.
   ![/background listing a nightly run whose turn failed offline and a server the cleanup could not read](../docs/sonny/background-failed.png)
 
   ![/background in the pane](../docs/sonny/pane-background.png)
+
+  ![/background's pages: enter on an automation, a follow and a command, each with the agent it belongs to as its first link](../docs/sonny/background-pages-60.png)
 - `/usage` shows, in the pane beside the conversation,
   the tokens the project's agents spent in the last 24 hours, as their
   retained history records them: in all, as

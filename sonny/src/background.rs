@@ -1195,13 +1195,13 @@ impl View {
                         fields.push(("sources", sources.join(", ")));
                     }
                     if let Some(filter) = &sub.filter {
-                        fields.push(("where", filter.to_string()));
+                        fields.push(("where", spaced(filter)));
                     }
                     if let Some(digest) = &sub.digest {
                         fields.push(("tells", format!("at most every {digest}")));
                     }
                     if let Some(steer) = &sub.steer {
-                        fields.push(("steers", format!("when {steer}")));
+                        fields.push(("steers", format!("when {}", spaced(steer))));
                     }
                     if let Some(until) = &sub.until {
                         fields.push(("until", until.clone()));
@@ -1460,6 +1460,24 @@ impl View {
     }
 }
 
+/// A pattern as JSON with a space after each `:` and `,`, so a page
+/// wraps it between its parts rather than inside one.
+fn spaced(value: &Value) -> String {
+    match value {
+        Value::Array(items) => {
+            let items: Vec<String> = items.iter().map(spaced).collect();
+            format!("[{}]", items.join(", "))
+        }
+        Value::Object(fields) => {
+            let fields: Vec<String> = (fields.iter())
+                .map(|(key, value)| format!("{}: {}", Value::from(key.as_str()), spaced(value)))
+                .collect();
+            format!("{{{}}}", fields.join(", "))
+        }
+        value => value.to_string(),
+    }
+}
+
 /// Where a row's lines after the first start: under its name, past the
 /// pick and the mark.
 const INDENT: &str = "    ";
@@ -1550,6 +1568,67 @@ mod tests {
         );
         assert_eq!(fact(&items, "calc.digest", &none), "↻ 1 automation");
         assert_eq!(fact(&items, "calc.fix", &none), "");
+    }
+
+    #[test]
+    fn a_follows_page_says_all_it_watches_and_wraps_its_pattern_between_parts() {
+        let sub = lookout::subs::Sub {
+            name: "fix-failures".into(),
+            tasks_of: Vec::new(),
+            agents: vec!["calc.fix".into()],
+            sources: vec!["mail:billing".into()],
+            filter: None,
+            digest: Some("15m".into()),
+            steer: Some(json!({"type": ["turn.ended"], "status": ["failed"]})),
+            owner: None,
+            until: None,
+            runs: Some(3),
+            made: None,
+        };
+        let mut view = View {
+            scope: Scope {
+                project: "calc".into(),
+                lead: "calc.lead".into(),
+                glob: "calc.*".into(),
+            },
+            store: std::env::temp_dir(),
+            store_id: None,
+            bot: "calc.lead".into(),
+            items: vec![Item {
+                sub: Some(sub),
+                facts: Vec::new(),
+                message: String::new(),
+                ..item(Kind::Subscription, "fix-failures", &["calc.lead"], false)
+            }],
+            turns: HashMap::new(),
+            lookout: String::new(),
+            icons: HashMap::from([("mail".to_owned(), "✉".to_owned())]),
+            selected: 0,
+            confirm: None,
+            commands: Commands::default(),
+            stopping: None,
+            notice: None,
+            page: None,
+        };
+        let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+        view.key(enter, 0..usize::MAX);
+        let page: Vec<String> = (view.page_lines(44).0.iter())
+            .map(|l| l.to_string().trim_end().to_owned())
+            .collect();
+        assert_eq!(
+            page,
+            [
+                "fix-failures",
+                "follow for lead",
+                "",
+                "watches  agents calc.fix",
+                "sources  ✉ mail:billing",
+                "tells    at most every 15m",
+                "steers   when {\"status\": [\"failed\"], \"type\":",
+                "         [\"turn.ended\"]}",
+                "lasts    3 updates",
+            ]
+        );
     }
 
     #[test]
