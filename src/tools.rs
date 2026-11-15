@@ -3351,9 +3351,9 @@ impl Registry {
             Prepared::Write { path, content } => {
                 let target = resolve(workspace, &path);
                 writable(sandbox.clone(), &target, &path).await?;
-                let _held = crate::sandbox::hold_for(sandbox.as_deref()).await;
+                let mut held = crate::sandbox::hold_for(sandbox.as_deref()).await;
                 let _slot = self.helper_slot(&sandbox).await?;
-                files::write(&target, content.as_bytes(), sandbox).await?;
+                files::write(&target, content.as_bytes(), sandbox, held.as_mut()).await?;
                 Ok(Outcome::text(format!(
                     "wrote {} bytes to {}",
                     content.len(),
@@ -3374,12 +3374,12 @@ impl Registry {
                     .map_or(&[][..], |policy| &policy.unreadable);
                 let staged = patch.stage(workspace, hidden).await?;
                 // A process slot only while the sandbox's helper writes.
-                let _held = crate::sandbox::hold_for(sandbox.as_deref()).await;
+                let mut held = crate::sandbox::hold_for(sandbox.as_deref()).await;
                 let _slot = match staged.writes() {
                     true => self.helper_slot(&sandbox).await?,
                     false => None,
                 };
-                Ok(Outcome::text(staged.commit(sandbox).await?))
+                Ok(Outcome::text(staged.commit(sandbox, held.as_mut()).await?))
             }
             Prepared::Edit {
                 path,
@@ -3417,9 +3417,9 @@ impl Registry {
                     text.replacen(&old, &new, 1)
                 };
                 debug_assert_eq!(updated.len(), expanded);
-                let _held = crate::sandbox::hold_for(sandbox.as_deref()).await;
+                let mut held = crate::sandbox::hold_for(sandbox.as_deref()).await;
                 let _slot = self.helper_slot(&sandbox).await?;
-                files::write(&target, updated.as_bytes(), sandbox).await?;
+                files::write(&target, updated.as_bytes(), sandbox, held.as_mut()).await?;
                 Ok(Outcome::text(format!(
                     "replaced {count} occurrence{} in {path}",
                     if count == 1 { "" } else { "s" }
@@ -3578,7 +3578,7 @@ impl Registry {
                 // gone, and taken before the slot, so no slot waits on it.
                 // Both go before the output is redacted, so a result
                 // waiting for that holds no process budget.
-                let _held = crate::sandbox::hold_for(sandbox.as_deref()).await;
+                let mut held = crate::sandbox::hold_for(sandbox.as_deref()).await;
                 let _slot = registry
                     .slots
                     .acquire()
@@ -3593,6 +3593,7 @@ impl Registry {
                     &registry,
                     &environment,
                     sandbox.as_deref(),
+                    held.as_mut(),
                     spill.as_ref(),
                 )
                 .await?
@@ -3647,7 +3648,7 @@ impl Registry {
                 // done, before its output is redacted.
                 let (mut stdout, mut stderr, exit, elapsed) = {
                     let _slot = slot.map_err(|_| Error::new("tool_scheduler_closed"))?;
-                    let _held = crate::sandbox::hold_for(sandbox.as_deref()).await;
+                    let mut held = crate::sandbox::hold_for(sandbox.as_deref()).await;
                     shell(
                         &command,
                         &workspace,
@@ -3655,6 +3656,7 @@ impl Registry {
                         &registry,
                         &environment,
                         sandbox.as_deref(),
+                        held.as_mut(),
                         spill.as_ref(),
                     )
                     .await?
@@ -4833,7 +4835,8 @@ pub(crate) fn not_started(error: std::io::Error, folder: &Path) -> Error {
 }
 
 /// `shell_path() -c command` in the workspace, with the registry's
-/// environment and none of the credentials the daemon holds.
+/// environment and none of the credentials the daemon holds, and when its
+/// sandbox is gone, for the sandbox's hold to wait for.
 #[cfg(unix)]
 fn sh(
     command: &str,
@@ -4842,13 +4845,13 @@ fn sh(
     environment: &[(String, String)],
     sandbox: Option<&Policy>,
     detached: bool,
-) -> Result<tokio::process::Command> {
-    let mut process = match sandbox {
+) -> Result<(tokio::process::Command, crate::sandbox::Ended)> {
+    let (mut process, ended) = match sandbox {
         Some(policy) => crate::sandbox::command(policy, shell_path(), &["-c", command], detached)?,
         None => {
             let mut process = tokio::process::Command::new(shell_path());
             process.arg("-c").arg(command);
-            process
+            (process, crate::sandbox::Ended::none())
         }
     };
     let (removed, set) = shell_environment(registry, environment);
@@ -4863,7 +4866,7 @@ fn sh(
         process.env("AGENT_SOCKET", own);
     }
     process.current_dir(workspace);
-    Ok(process)
+    Ok((process, ended))
 }
 
 /// A detached command once started: its pid, which leads its session and
@@ -4971,7 +4974,7 @@ async fn spawn_detached(
     stopper: Option<&mut Stopper>,
 ) -> Result<Spawned> {
     use std::process::Stdio;
-    let mut process = sh(
+    let (mut process, ended) = sh(
         command,
         workspace,
         registry,
@@ -4997,7 +5000,7 @@ async fn spawn_detached(
     let permit = registry.lasting()?;
     // What the sandbox holds in place stays held while the command runs.
     let sandboxed = sandbox.is_some();
-    let held = crate::sandbox::hold_for(sandbox.as_deref()).await;
+    let mut held = crate::sandbox::hold_for(sandbox.as_deref()).await;
     // The bot's socket listens while anything the command left in its
     // group runs, not only while the command itself does.
     let listening = sandbox.as_ref().and_then(|policy| policy.listening.clone());
@@ -5007,6 +5010,11 @@ async fn spawn_detached(
     }
     let started = std::time::Instant::now();
     let child = process.spawn().map_err(|e| not_started(e, workspace))?;
+    // Its sandbox is held until it is gone, not only the command.
+    drop(process);
+    if let Some(held) = &mut held {
+        held.waits_for(ended);
+    }
     let pid = child.id().ok_or(Error::new("shell_spawn_failed"))?;
     let held: Box<dyn Send> = Box::new((permit, held, listening));
     Ok((
@@ -5362,6 +5370,7 @@ async fn shell(
     registry: &Registry,
     environment: &[(String, String)],
     sandbox: Option<&Policy>,
+    held: Option<&mut crate::sandbox::Hold>,
     spill: Option<&Spill>,
 ) -> Result<(Captured, Captured, Exit, Duration)> {
     use std::process::Stdio;
@@ -5382,7 +5391,8 @@ async fn shell(
             }
         }
     }
-    let child = sh(command, workspace, registry, environment, sandbox, false)?
+    let (mut process, ended) = sh(command, workspace, registry, environment, sandbox, false)?;
+    let child = process
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -5390,6 +5400,11 @@ async fn shell(
         .kill_on_drop(true)
         .spawn()
         .map_err(|e| not_started(e, workspace))?;
+    // Its sandbox is held until it is gone, not only the command.
+    drop(process);
+    if let Some(held) = held {
+        held.waits_for(ended);
+    }
     let started = tokio::time::Instant::now();
     let group = child.id().ok_or(Error::new("shell_spawn_failed"))? as i32;
     let mut owned = ProcessGroup { child, group };
@@ -5478,6 +5493,7 @@ async fn shell(
     _: &Registry,
     _: &[(String, String)],
     _: Option<&Policy>,
+    _: Option<&mut crate::sandbox::Hold>,
     _: Option<&Spill>,
 ) -> Result<(Captured, Captured, Exit, Duration)> {
     fail("shell_platform_unsupported")

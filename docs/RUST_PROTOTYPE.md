@@ -3126,10 +3126,15 @@ On Linux, bubblewrap needs an empty folder on the host to mount a missing
 lock file under `~/.agent/placeholders`, read-only to every sandbox. Every
 sandbox that mounts it holds a read lock on that file while it runs:
 bubblewrap's own init (`--lock-file`), out of the command's reach, and the
-daemon or `agent sandbox` that started it, from before it is made. The last
-one out takes the write lock and removes the placeholder, when it is still
-the empty folder recorded, so a sandbox in another process, or a detached
-command that outlived its daemon, never has its mount lifted under it. The
+daemon or `agent sandbox` that started it, from before it is made until the
+sandbox is gone. Init outlives its command while anything the command left
+runs, so the daemon waits for init too: bubblewrap's `--sync-fd` pipe reads
+to its end once init has closed its files, its locks with them. The last
+one out lets its own read lock go and then takes the write lock, so two
+letting go at once never each refuse the other, and removes the placeholder
+when it is still the empty folder recorded, so a sandbox in another process,
+or a detached command that outlived its daemon, never has its mount lifted
+under it. The
 kernel lets locks go with whoever held them, so one a crash left behind is
 removed by the next sandbox that holds it; an empty folder anything else
 made there is left, as Codex leaves what it did not make. An empty folder at

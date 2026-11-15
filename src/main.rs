@@ -332,14 +332,21 @@ fn run_in(
         // runs, and what it left in place for it is gone before this exits,
         // as for a bot's command. A lent sandbox's the daemon holds, in the
         // list its own commands share, until this session closes.
-        let held = match environment {
+        let mut held = match environment {
             Some(_) => None,
             None => Some(agent_runtime::sandbox::hold(policy).await),
         };
         let status = match agent_runtime::sandbox::command(policy, program, rest, false) {
-            Ok(mut child) => {
+            Ok((mut child, ended)) => {
                 given(&mut child);
-                child.status().await.map_err(Error::from)
+                let status = child.status().await.map_err(Error::from);
+                // Its copy of the pipe goes first: the hold waits for its
+                // end, once the sandbox is gone.
+                drop(child);
+                if let Some(held) = &mut held {
+                    held.waits_for(ended);
+                }
+                status
             }
             Err(e) => Err(e),
         };

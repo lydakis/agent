@@ -1344,7 +1344,7 @@ async fn a_read_only_sandbox_writes_nothing() {
     // The write a confined write tool runs is held by the kernel as well,
     // whatever the daemon checked before it.
     let target = dir.join(&marker);
-    let mut write = agent_runtime::sandbox::command(
+    let (mut write, _) = agent_runtime::sandbox::command(
         &policy,
         env!("CARGO_BIN_EXE_agent"),
         &[agent_runtime::sandbox::WRITE, target.to_str().unwrap()],
