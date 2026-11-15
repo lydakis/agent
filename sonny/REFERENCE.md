@@ -340,7 +340,7 @@ at its model's own effort (`AGENT_EFFORT` when its model is
 | Whether agents have the commons | `[sonny] commons` (true, the default, or false) | |
 | When a note opens the margin | `[sonny] margin_opens` (`always`, the default, `unless-closed` or `never`) | |
 | The most notes a margin holds | `[sonny] margin_notes` (6 by default, at least 1; past it the agent's new note is refused, and it is told which notes are there) | |
-| The most lines a margin note runs to | `[sonny] margin_note_lines` (12 by default, at least 1, counted in the note's text; a longer one is refused, and the agent told to show a file instead) | |
+| The most rows a margin note draws | `[sonny] margin_note_lines` (6 by default, at least 1; the key keeps its name and counts rows drawn at the margin's own width, 38 columns, pictures as the rows they draw, so the count is the same in every window; a longer note or live fill is refused, and the agent told that a note is state and anything longer goes in its reply or a file the reply names; a file or a task's note folds at it) | |
 | Margin notes of your own, filled as their blanks change | `[sonny.notes.NAME] markdown`, `live`, `title` | |
 | Where a click on an agent's name goes | `[sonny] agent_opens` (`tab`, the default, or `beside`) | |
 | Which tasks open in a tab | `[sonny] task_tabs` (`asked`, the default, or `every`) | |
@@ -2074,9 +2074,25 @@ what asks something of you: the `?`, the `✗`, the `●` and a context half
 used.
 
 ![The footer at 100, 80, 60 and 44 columns: needs you, failed, working and at rest as marks and numbers, at rest giving way first, what needs you stays](../docs/sonny/footer-widths.png) Under its title are the notes the agent keeps there with its `margin`
-tool: a diagram, a table of findings, a file it is discussing (kept fresh
-as the file changes), or a live view it updates while it works. Each
-note is pinned where the agent first put it: a quiet `✎ title · in the
+tool. A note is state, something that can become false or finished, and
+names its kind: `waits` (something waits on you, with what to do and its
+links, such as a pull request to review or a draft to send), `follows`
+(something you follow, kept filled live wherever a source, a file or the
+tasks show it) or `pinned` (you asked to keep it beside you). The agent's
+reply reads whole on its own: designs, diagrams, comparisons, results and
+what changed go in the reply, or a file it names, never in a note, and a
+note goes in the turn its condition ends. A call that names no kind is
+refused (`margin_kind`) with the three kinds and that anything else
+belongs in the reply; a note from a call made before kinds is not shown.
+The margin draws what waits on you first, then what you follow, then what
+you keep, and never scrolls: in a short window it folds notes until the
+whole margin fits, giving rows to what waits first, then what you follow,
+then what you keep, each folded note keeping its title, and a note cut
+short ends with a muted `… N more lines`. A note that shows a file, or a
+task's note, shows its first rows up to the most a note draws, then a
+muted `… N more lines · enter opens it` row; Enter on it, or a click,
+opens the file whole in the pane (a task's note that shows no file opens
+the task). Each note is pinned where the agent first put it: a quiet `✎ title · in the
 margin` row there scrolls the margin to it when clicked, and the note's
 `↑` scrolls the conversation back there, drawing older messages again
 when it is further back. Its `×` takes the note away and tells the agent
@@ -2107,7 +2123,7 @@ that wants something no source covers writes it to a file from its own
 commands. The tool host fills the template once as it is posted and
 answers what it shows; a template that does not read as one, names a
 source you have not set up, does not fill now (a file not written yet,
-a field a source's events lack), or fills to more lines than a note holds
+a field a source's events lack), or fills to more rows than a note draws
 is refused (`live_template`, `margin_note_too_long`), so a broken note
 never reaches the margin. A template's error names its line and quotes
 the blank that failed (``line 1, `file('pr.json')`: ...``). The window then
@@ -2173,8 +2189,8 @@ with `/margin`. It never closes by itself: emptied, or opened to look at
 with nothing in it, it stays until Esc. In a narrower window Tab with nothing typed shows
 the margin. Where the margin
 cannot show, because the window is narrower or it is closed, each note is
-drawn in the conversation where it was put instead of its marker, up to
-40 rows with the rest a click away, and it goes back beside the
+drawn in the conversation where it was put instead of its marker, as
+many rows as the margin draws it in, and it goes back beside the
 conversation once there is room again. The agent's plan sits over the
 notes, one plan however often it changes; each `plan` call in the
 conversation is a row of how far it had got, and where the margin cannot
@@ -2187,6 +2203,10 @@ now.
 A note is drawn the way the conversation and the pane draw things:
 Markdown with its tables and math, Mermaid diagrams, HTML pages,
 pictures, and code in syntax colors.
+
+![A full margin in one look in a short window: two notes that wait on the person, two it follows filled live from sources, and a pinned checklist folded to a row and its fold row, then a pinned note folded to its title, beside a reply that reads whole on its own](../docs/sonny/margin-one-look.png)
+
+![The same margin in a taller window: the checklist file folds at the most rows a note draws, its last row saying how many more lines and that enter opens it](../docs/sonny/margin-fold.png)
 
 ![The agent puts a diagram and a live table in the margin while it works; × takes the table away, /status opens over the margin and Esc goes back, Esc closes the margin and /margin brings it back](../docs/sonny/margin.gif)
 

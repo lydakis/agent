@@ -8654,12 +8654,13 @@ impl App {
             if !self.screen.has(tag) {
                 continue;
             }
-            let body = (self.margin.body(&id, width, &workspace, INLINE_ROWS)).unwrap_or_default();
+            let (body, opens) =
+                (self.margin.body(&id, width, &workspace, INLINE_ROWS)).unwrap_or_default();
             let link = || screen::Mark::Link(format!("{}note/{id}", screen::BUTTON));
             let mut marks = vec![(0, link())];
-            // The rest of it a click away, in the margin.
-            if body.len() > INLINE_ROWS {
-                marks.push((body.len(), link()));
+            // The rest of a file or another's note a click away, whole.
+            if let Some(url) = opens {
+                marks.push((body.len(), screen::Mark::Link(url)));
             }
             let mut lines = vec![note_marker(title.clone(), false)];
             lines.extend(body);
@@ -17163,8 +17164,11 @@ impl App {
         {
             let live = self.running.as_ref().map(|running| running.turn);
             let width = (pane::margin_room(at.width).saturating_sub(1) as usize).min(measure());
+            // Under the pane's title and the row after it: the margin is
+            // folded to fit, and never scrolls.
+            let height = at.height.saturating_sub(2) as usize;
             self.margin_blanks();
-            let (lines, marks) = self.margin.lines(width, &workspace, live);
+            let (lines, marks) = self.margin.lines(width, height, &workspace, live);
             if let Some(pane) = &mut self.pane {
                 pane.set_margin(lines, marks);
                 if let Some(pin) = self.margin_focus.take() {
@@ -23619,7 +23623,10 @@ mod tests {
         assert_eq!(rows(&app), ["› check on the tasks", "• Done."]);
         // The plan is the margin's still.
         app.fold_notes(true);
-        let margin = app.margin.lines(60, std::path::Path::new("/"), None).0;
+        let margin = app
+            .margin
+            .lines(60, usize::MAX, std::path::Path::new("/"), None)
+            .0;
         let margin: Vec<String> = margin.iter().map(|l| l.to_string()).collect();
         assert!(margin.iter().any(|r| r.contains("Plan  1/3")), "{margin:?}");
         // And never in the conversation, the margin beside it or not.
@@ -25698,9 +25705,9 @@ mod tests {
                 Some("history_items") => {
                     json!({"items": (asked["nodes"].as_array().unwrap().iter())
                     .map(|node| json!({"node": node, "item": match node.as_i64() {
-                        Some(1) => call("t1", json!({"id": "flow", "title": "Flow", "markdown": "one"})),
+                        Some(1) => call("t1", json!({"kind": "pinned", "id": "flow", "title": "Flow", "markdown": "one"})),
                         Some(2) => answer("t1"),
-                        Some(3) => call("t3", json!({"id": "flow", "file": "flow.md"})),
+                        Some(3) => call("t3", json!({"kind": "pinned", "id": "flow", "file": "flow.md"})),
                         _ => answer("t3"),
                     }}))
                     .collect::<Vec<_>>()})
@@ -25710,7 +25717,11 @@ mod tests {
         })
         .await;
         let mut app = app(client);
-        app.note_call("c1", &json!({"id": "flow", "from": "calc.add/flow"}), None);
+        app.note_call(
+            "c1",
+            &json!({"kind": "pinned", "id": "flow", "from": "calc.add/flow"}),
+            None,
+        );
         let shown = |app: &App| match &app.margin.note("flow").unwrap().body {
             margin::Body::From { shown, .. } => shown.as_deref().cloned(),
             _ => None,
@@ -25757,10 +25768,10 @@ mod tests {
             let arguments = match (asked["bot"].as_str(), later) {
                 (Some("calc.add"), 1) => json!({"id": "flow", "remove": true}),
                 (Some("calc.add"), _) => {
-                    json!({"id": "flow", "title": "Flow", "from": "calc.sub/flow"})
+                    json!({"kind": "pinned", "id": "flow", "title": "Flow", "from": "calc.sub/flow"})
                 }
-                (_, 0) => json!({"id": "flow", "title": "Sub", "markdown": "deep"}),
-                _ => json!({"id": "flow", "markdown": "deeper"}),
+                (_, 0) => json!({"kind": "pinned", "id": "flow", "title": "Sub", "markdown": "deep"}),
+                _ => json!({"kind": "pinned", "id": "flow", "markdown": "deeper"}),
             };
             let node = if later > 0 { 2 } else { 1 };
             match asked["op"].as_str() {
@@ -25783,7 +25794,11 @@ mod tests {
         for then in [1, 2] {
             phase.store(0, SeqCst);
             let mut app = app(client.clone());
-            app.note_call("c1", &json!({"id": "flow", "from": "calc.add/flow"}), None);
+            app.note_call(
+                "c1",
+                &json!({"kind": "pinned", "id": "flow", "from": "calc.add/flow"}),
+                None,
+            );
             app.read_references().await;
             assert_eq!(shown(&app), Some(margin::Body::Markdown("deep".into())));
             assert_eq!(app.margin.note("flow").unwrap().title, "Flow");
@@ -25814,7 +25829,7 @@ mod tests {
                 Some("history_nodes") => json!({"nodes": [{"node": if reused { 9 } else { 1 }}]}),
                 _ => json!({"items": (asked["nodes"].as_array().unwrap().iter())
                     .flat_map(|node| [json!({"node": node, "item": {"type": "function_call",
-                        "call_id": "t", "name": margin::TOOL, "arguments": json!({"id": "flow",
+                        "call_id": "t", "name": margin::TOOL, "arguments": json!({"kind": "pinned", "id": "flow",
                         "title": "Flow", "markdown": markdown}).to_string()}}),
                         json!({"node": node, "item": {"type": "function_call_output",
                         "call_id": "t", "output": "In the margin."}})])
@@ -25823,7 +25838,11 @@ mod tests {
         })
         .await;
         let mut app = app(client);
-        app.note_call("c1", &json!({"id": "flow", "from": "calc.add/flow"}), None);
+        app.note_call(
+            "c1",
+            &json!({"kind": "pinned", "id": "flow", "from": "calc.add/flow"}),
+            None,
+        );
         let shown = |app: &App| match &app.margin.note("flow").unwrap().body {
             margin::Body::From { shown, .. } => shown.as_deref().cloned(),
             _ => None,
@@ -25861,17 +25880,17 @@ mod tests {
             Some("history_items") => {
                 json!({"items": (asked["nodes"].as_array().unwrap().iter())
                 .flat_map(|node| [json!({"node": node, "item": match node.as_i64() {
-                    Some(3) => call(json!({"id": "flow", "title": "Flow", "markdown": "start"})),
+                    Some(3) => call(json!({"kind": "pinned", "id": "flow", "title": "Flow", "markdown": "start"})),
                     // A call its own margin turns down.
-                    Some(5) => call(json!({"id": "flow", "title": 1, "markdown": "wrong"})),
+                    Some(5) => call(json!({"kind": "pinned", "id": "flow", "title": 1, "markdown": "wrong"})),
                     // Two calls in one response, as some providers keep them.
                     Some(4) => json!({"role": "assistant", "content": [
                         {"type": "tool_use", "id": "u1", "name": margin::TOOL,
-                            "input": {"id": "flow", "markdown": "a"}},
+                            "input": {"kind": "pinned", "id": "flow", "markdown": "a"}},
                         {"type": "tool_use", "id": "u2", "name": margin::TOOL,
-                            "input": {"id": "flow", "markdown": "b"}}]}),
-                    Some(6) => call(json!({"id": "flow", "title": "Flow two", "markdown": "c"})),
-                    _ => call(json!({"id": "flow", "title": "Flow three", "markdown": "d"})),
+                            "input": {"kind": "pinned", "id": "flow", "markdown": "b"}}]}),
+                    Some(6) => call(json!({"kind": "pinned", "id": "flow", "title": "Flow two", "markdown": "c"})),
+                    _ => call(json!({"kind": "pinned", "id": "flow", "title": "Flow three", "markdown": "d"})),
                 }}), json!({"node": node, "item": match node.as_i64() {
                     // Each answered as taken.
                     Some(4) => json!({"role": "user", "content": [
@@ -25886,7 +25905,11 @@ mod tests {
         })
         .await;
         let mut app = app(client);
-        app.note_call("c1", &json!({"id": "flow", "from": "calc.add/flow"}), None);
+        app.note_call(
+            "c1",
+            &json!({"kind": "pinned", "id": "flow", "from": "calc.add/flow"}),
+            None,
+        );
         let shown = |app: &App| match &app.margin.note("flow").unwrap().body {
             margin::Body::From { shown, .. } => shown.as_deref().cloned(),
             _ => None,
@@ -25909,7 +25932,8 @@ mod tests {
         assert_eq!(shown(&app), Some(margin::Body::Markdown("c".into())));
         assert_eq!(app.margin.note("flow").unwrap().title, "Flow two");
         // Given its own title here, it keeps it.
-        let titled = json!({"id": "flow", "title": "Mine", "from": "calc.add/flow"});
+        let titled =
+            json!({"kind": "pinned", "id": "flow", "title": "Mine", "from": "calc.add/flow"});
         app.note_call("c2", &titled, None);
         app.references_read = None;
         app.read_references().await;
@@ -28970,7 +28994,7 @@ mod tests {
         });
         app.failed = 1;
         for id in ["findings", "repro"] {
-            let post = json!({"id": id, "title": id, "markdown": "x"});
+            let post = json!({"kind": "pinned", "id": id, "title": id, "markdown": "x"});
             app.margin.apply(id, &post, None, None);
         }
         app.context = Some(126_000);
@@ -29789,7 +29813,7 @@ mod tests {
         let mut app = app(daemon_with(json!([])).await);
         app.any_history = true;
         let call = |id: &str, arguments: Value| json!({"call_id": id, "name": "margin", "arguments": arguments.to_string()});
-        let post = json!({"id": "routing", "title": "Routing today", "markdown": "a → b"});
+        let post = json!({"kind": "pinned", "id": "routing", "title": "Routing today", "markdown": "a → b"});
         app.daemon(turn_event("tool_started", 3, call("m1", post)))
             .await;
         // Not in the margin until Sonny takes it.
@@ -29809,7 +29833,7 @@ mod tests {
         assert!(app.marks.iter().any(|(_, m)| *m == link));
         // Changed in place: the margin shows it, the conversation does not.
         let drawn = app.pending.len();
-        let update = json!({"id": "routing", "markdown": "a → c"});
+        let update = json!({"kind": "pinned", "id": "routing", "markdown": "a → c"});
         app.daemon(turn_event("tool_started", 3, call("m2", update)))
             .await;
         app.daemon(turn_event("tool_completed", 3, json!({"call_id": "m2"})))
@@ -29821,7 +29845,7 @@ mod tests {
             ("m1", &margin::Body::Markdown("a → c".into()))
         );
         // Refused, or failed, it changes nothing.
-        let refused = json!({"id": "routing", "markdown": "a → d"});
+        let refused = json!({"kind": "pinned", "id": "routing", "markdown": "a → d"});
         app.daemon(turn_event("tool_started", 3, call("m3", refused)))
             .await;
         app.daemon(turn_event(
@@ -29847,12 +29871,16 @@ mod tests {
                 "arguments": arguments.to_string()})
         };
         let item = move |node: i64| match node {
-            1..=12 if node % 2 == 1 => {
-                call(node, json!({"id": format!("s{node}"), "markdown": "-"}))
-            }
+            1..=12 if node % 2 == 1 => call(
+                node,
+                json!({"kind": "pinned", "id": format!("s{node}"), "markdown": "-"}),
+            ),
             _ if node % 2 == 0 => json!({"type": "function_call_output",
                 "call_id": format!("c{}", node - 1), "output": "In the margin."}),
-            _ => call(node, json!({"id": format!("n{node}"), "markdown": "-"})),
+            _ => call(
+                node,
+                json!({"kind": "pinned", "id": format!("n{node}"), "markdown": "-"}),
+            ),
         };
         let last = Arc::new(AtomicI64::new(13));
         let read_from = Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -29875,7 +29903,7 @@ mod tests {
         std::fs::create_dir_all(&store).unwrap();
         let canonical = std::fs::canonicalize(&store).unwrap();
         let key = reactions::key(&canonical, 9);
-        let note = json!({"id": "n15", "markdown": "-"});
+        let note = json!({"kind": "pinned", "id": "n15", "markdown": "-"});
         let answer = || margin::answer(&client, &store, "calc.add.side-1", ("c99", &note));
         // Copied at node 12: none of its source's notes count for its own.
         margin::start_at(&store, 9, 12);
@@ -29921,7 +29949,7 @@ mod tests {
                 "arguments": json!({"id": "n1", "remove": true}).to_string()}),
             _ => json!({"type": "function_call", "call_id": format!("c{node}"),
                 "name": margin::TOOL,
-                "arguments": json!({"id": format!("n{node}"), "markdown": "-"}).to_string()}),
+                "arguments": json!({"kind": "pinned", "id": format!("n{node}"), "markdown": "-"}).to_string()}),
         };
         let client = daemon_answering(move |asked| match asked["op"].as_str() {
             Some("bots") => json!({"bots": [{"name": "calc.add", "bot_id": 10}]}),
@@ -29940,7 +29968,7 @@ mod tests {
         std::fs::create_dir_all(&store).unwrap();
         let key = reactions::key(&std::fs::canonicalize(&store).unwrap(), 10);
         let answer = |call: &'static str, id: &'static str| {
-            let note = json!({"id": id, "markdown": "-"});
+            let note = json!({"kind": "pinned", "id": id, "markdown": "-"});
             let (client, store) = (client.clone(), store.clone());
             async move { margin::answer(&client, &store, "calc.add", (call, &note)).await }
         };
@@ -29974,7 +30002,7 @@ mod tests {
         let margin = |app: &App| app.pane.as_ref().is_some_and(pane::Pane::is_margin);
         app.margin_back();
         assert!(!margin(&app));
-        let post = json!({"id": "repro", "title": "Repro", "markdown": "x"});
+        let post = json!({"kind": "pinned", "id": "repro", "title": "Repro", "markdown": "x"});
         app.margin.apply("m1", &post, None, None);
         app.margin_back();
         assert!(margin(&app));
@@ -29996,7 +30024,7 @@ mod tests {
         app.close_pane(true);
         app.close_pane(true);
         app.open_pane(pane::Pane::card("status", STATUS_KEYS));
-        let change = json!({"id": "repro", "markdown": "y"});
+        let change = json!({"kind": "pinned", "id": "repro", "markdown": "y"});
         app.margin.apply("m4", &change, None, None);
         app.margin_back();
         assert!(app.under.is_some() && app.pane.as_ref().unwrap().over);
@@ -30031,7 +30059,7 @@ mod tests {
     #[tokio::test]
     async fn what_opens_lays_over_the_margin_and_esc_steps_back_to_it() {
         let mut app = app(daemon_with(json!([])).await);
-        let post = json!({"id": "repro", "title": "Repro", "markdown": "x"});
+        let post = json!({"kind": "pinned", "id": "repro", "title": "Repro", "markdown": "x"});
         app.margin.apply("m1", &post, None, None);
         app.margin_back();
         assert!(app.pane.as_ref().is_some_and(pane::Pane::is_margin));
@@ -30116,7 +30144,7 @@ mod tests {
     #[tokio::test]
     async fn back_from_what_is_over_the_margin_is_the_margin_and_forward_lays_it_over_again() {
         let mut app = app(daemon_with(json!([])).await);
-        let post = json!({"id": "repro", "title": "Repro", "markdown": "x"});
+        let post = json!({"kind": "pinned", "id": "repro", "title": "Repro", "markdown": "x"});
         app.margin.apply("m1", &post, None, None);
         app.margin_back();
         app.open_pane(pane::Pane::card("status", STATUS_KEYS));
@@ -30135,7 +30163,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("a.md"), "# A\n").unwrap();
         let mut app = app(daemon_with(json!([])).await);
-        let post = json!({"id": "repro", "title": "Repro", "markdown": "x"});
+        let post = json!({"kind": "pinned", "id": "repro", "title": "Repro", "markdown": "x"});
         app.margin.apply("m1", &post, None, None);
         app.margin_back();
         app.follow(&format!("file://{}", dir.join("a.md").display()));
@@ -30150,7 +30178,7 @@ mod tests {
         let mut app = app(daemon_with(json!([])).await);
         app.any_history = true;
         let call = |id: &str, arguments: Value| json!({"call_id": id, "name": "margin", "arguments": arguments.to_string()});
-        let post = json!({"id": "routing", "title": "Routing today", "markdown": "a to b"});
+        let post = json!({"kind": "pinned", "id": "routing", "title": "Routing today", "markdown": "a to b"});
         app.daemon(turn_event("tool_started", 3, call("m1", post)))
             .await;
         app.daemon(turn_event("tool_completed", 3, json!({"call_id": "m1"})))
@@ -30168,7 +30196,7 @@ mod tests {
         app.fold_notes(false);
         assert_eq!(texts(&app)[..], ["✎ Routing today", "a to b", "after"]);
         // Changed, it changes there.
-        let update = json!({"id": "routing", "markdown": "a to c"});
+        let update = json!({"kind": "pinned", "id": "routing", "markdown": "a to c"});
         app.daemon(turn_event("tool_started", 3, call("m2", update)))
             .await;
         app.daemon(turn_event("tool_completed", 3, json!({"call_id": "m2"})))
@@ -30183,7 +30211,7 @@ mod tests {
         );
         // Retitled, as a task's note read for the first time is, its
         // marker says so.
-        let retitle = json!({"id": "routing", "title": "Routing now", "markdown": "a to c"});
+        let retitle = json!({"kind": "pinned", "id": "routing", "title": "Routing now", "markdown": "a to c"});
         app.daemon(turn_event("tool_started", 3, call("m3", retitle)))
             .await;
         app.daemon(turn_event("tool_completed", 3, json!({"call_id": "m3"})))
@@ -30234,7 +30262,10 @@ mod tests {
                 "reply 1"
             ]
         );
-        let margin = app.margin.lines(60, std::path::Path::new("/"), None).0;
+        let margin = app
+            .margin
+            .lines(60, usize::MAX, std::path::Path::new("/"), None)
+            .0;
         let margin: Vec<String> = margin.iter().map(|l| l.to_string()).collect();
         assert!(margin.iter().any(|r| r.contains("Plan  1/3")), "{margin:?}");
         assert!(margin.iter().any(|r| r.contains("→ Fix")));
@@ -30365,7 +30396,10 @@ mod tests {
         let shut = "↳ 1 lookout note · calc.neg · sent 2 to calc.neg, saved a memory, plan 1/3 ▸";
         assert_eq!(texts(&app)[1..], [shut, "• calc.neg is on it."]);
         // The plan it holds is still the margin's.
-        let margin = app.margin.lines(60, std::path::Path::new("/"), None).0;
+        let margin = app
+            .margin
+            .lines(60, usize::MAX, std::path::Path::new("/"), None)
+            .0;
         let margin: Vec<String> = margin.iter().map(|l| l.to_string()).collect();
         assert!(margin.iter().any(|r| r.contains("Plan  1/3")), "{margin:?}");
         // With no margin beside, the newest plan shows in full under it.
@@ -30405,7 +30439,7 @@ mod tests {
             "calc.neg/4",
             false,
         );
-        let note = json!({"call_id": "m1", "name": "margin", "arguments": json!({
+        let note = json!({"call_id": "m1", "name": "margin", "arguments": json!({"kind": "pinned", 
             "id": "routing", "title": "Routing today", "markdown": "a → b"
         }).to_string()});
         noted.daemon(turn_event("tool_started", 1, note)).await;
@@ -30596,7 +30630,7 @@ mod tests {
     #[tokio::test]
     async fn the_margin_shows_by_itself_only_where_the_conversation_keeps_its_width() {
         let mut app = app(daemon_with(json!([])).await);
-        let post = json!({"id": "repro", "title": "Repro", "markdown": "x"});
+        let post = json!({"kind": "pinned", "id": "repro", "title": "Repro", "markdown": "x"});
         app.margin.apply("m1", &post, None, None);
         app.margin_back();
         let (chat, margin) = app.split(Rect::new(0, 0, 170, 40));
@@ -30653,7 +30687,7 @@ mod tests {
         })
         .await;
         let mut app = app(client);
-        let post = json!({"id": "repro", "title": "Repro", "markdown": "x"});
+        let post = json!({"kind": "pinned", "id": "repro", "title": "Repro", "markdown": "x"});
         app.margin.apply("m1", &post, None, None);
         app.daemon(turn_event("steered", 4, json!({"node": 7})))
             .await;
@@ -30674,11 +30708,11 @@ mod tests {
         };
         let denied = r#"{"error":"approval_denied","detail":"no"}"#;
         let items = json!({
-            "1": call("m1", json!({"id": "kept", "title": "Kept", "markdown": "x"})),
+            "1": call("m1", json!({"kind": "pinned", "id": "kept", "title": "Kept", "markdown": "x"})),
             "2": {"type": "function_call_output", "call_id": "m1", "output": "In the margin."},
             "3": call("m2", json!({"id": "kept", "remove": true})),
             "4": {"type": "function_call_output", "call_id": "m2", "output": denied},
-            "5": call("m3", json!({"id": "never", "title": "Never", "markdown": "y"})),
+            "5": call("m3", json!({"kind": "pinned", "id": "never", "title": "Never", "markdown": "y"})),
             "6": {"type": "function_call_output", "call_id": "m3", "output": denied},
         });
         let client = daemon_answering(move |asked| match asked["op"].as_str() {
@@ -30705,7 +30739,7 @@ mod tests {
         };
         let told = margin::closed_message("gone");
         let items = json!({
-            "3": call("c5", json!({"id": "kept", "markdown": "new"})),
+            "3": call("c5", json!({"kind": "pinned", "id": "kept", "markdown": "new"})),
             "4": {"type": "function_call_output", "call_id": "c5", "output": "In the margin."},
             "5": {"type": "message", "role": "user", "content": [{"type": "input_text", "text": told}]},
             "9": {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "Done."}]},
@@ -30730,7 +30764,7 @@ mod tests {
         })
         .await;
         let mut app = app(client);
-        let post = |id: &str| json!({"id": id, "title": id, "markdown": "old"});
+        let post = |id: &str| json!({"kind": "pinned", "id": id, "title": id, "markdown": "old"});
         app.margin.apply("c1", &post("kept"), None, None);
         app.margin.apply("c2", &post("gone"), None, None);
         app.margin.advance(2);
@@ -30744,7 +30778,7 @@ mod tests {
     #[tokio::test]
     async fn a_note_whose_call_is_past_the_page_and_its_output_on_it_is_kept() {
         let call = json!({"type": "function_call", "call_id": "c8", "name": "margin",
-            "arguments": json!({"id": "plan", "title": "Plan", "markdown": "x"}).to_string()});
+            "arguments": json!({"kind": "pinned", "id": "plan", "title": "Plan", "markdown": "x"}).to_string()});
         let client = daemon_answering(move |asked| match asked["op"].as_str() {
             Some("history_nodes") if asked["min_node"].is_null() => json!({
                 "nodes": [{"node": 9}], "next_from": 8,
@@ -30788,7 +30822,7 @@ mod tests {
         let told = margin::closed_message("repro");
         let landed = told.clone();
         let call = json!({"type": "function_call", "call_id": "c9", "name": "margin",
-            "arguments": json!({"id": "repro", "title": "Repro", "markdown": "again"}).to_string()});
+            "arguments": json!({"kind": "pinned", "id": "repro", "title": "Repro", "markdown": "again"}).to_string()});
         let client = daemon_answering(move |asked| match asked["op"].as_str() {
             Some("history_nodes") => json!({
                 "nodes": [{"node": 9}, {"node": 8}, {"node": 7}], "next_from": null,
@@ -30804,14 +30838,14 @@ mod tests {
         })
         .await;
         let mut app = app(client);
-        let post = json!({"id": "repro", "title": "Repro", "markdown": "x"});
+        let post = json!({"kind": "pinned", "id": "repro", "title": "Repro", "markdown": "x"});
         app.margin.apply("c1", &post, None, None);
         // Taken away here; its message lands in a turn already running,
         // after which the agent puts the note back.
         app.margin.remove("repro", None);
         app.closing.insert("repro".into());
         assert!(app.note_closed(7, &told));
-        let again = json!({"id": "repro", "title": "Repro", "markdown": "again"});
+        let again = json!({"kind": "pinned", "id": "repro", "title": "Repro", "markdown": "again"});
         app.margin.apply("c9", &again, None, None);
         app.history().await;
         assert!(app.margin.note("repro").is_some());
@@ -30829,7 +30863,7 @@ mod tests {
         })
         .await;
         let mut app = app(client);
-        let post = json!({"id": "repro", "title": "Repro", "markdown": "x"});
+        let post = json!({"kind": "pinned", "id": "repro", "title": "Repro", "markdown": "x"});
         app.margin.apply("m1", &post, None, None);
         app.follow("sonny:close/repro");
         for what in std::mem::take(&mut app.pressed) {
@@ -30848,7 +30882,7 @@ mod tests {
     async fn a_note_the_agent_could_not_be_told_of_stays_to_close_again() {
         let client = daemon_answering(|_| json!({"error": "bot_busy", "detail": "busy"})).await;
         let mut app = app(client);
-        let post = json!({"id": "repro", "title": "Repro", "markdown": "x"});
+        let post = json!({"kind": "pinned", "id": "repro", "title": "Repro", "markdown": "x"});
         app.margin.apply("m1", &post, None, None);
         app.follow("sonny:close/repro");
         for what in std::mem::take(&mut app.pressed) {

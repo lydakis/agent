@@ -133,6 +133,10 @@ pub struct Drawn {
 pub fn show(drawn: Drawn) -> Vec<Line<'static>> {
     let id = next_id();
     let rows = placeholders(id, drawn.cols, drawn.rows);
+    // Counted, never shown: nothing kept to send.
+    if crate::term::measured() {
+        return rows;
+    }
     let mut waiting = WAITING.lock().unwrap_or_else(|e| e.into_inner());
     waiting.get_or_insert_with(Waiting::default).add(id, drawn);
     rows

@@ -255,6 +255,14 @@ pub fn lines(
     out
 }
 
+/// How many of the rows [`lines`] draws say what the template follows,
+/// before what it filled to.
+pub fn follows_rows(filled: Option<&Filled>, width: usize, lead: &'static str) -> usize {
+    filled.map_or(0, |filled| {
+        follows(&filled.reads, &filled.folder, width, lead).len()
+    })
+}
+
 /// What a live template follows, after `lead`, so a filled one never
 /// passes for one written: the sources it read, by icon, and since when
 /// one is down, the tasks, and its files from `folder`. None for one that

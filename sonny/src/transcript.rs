@@ -948,6 +948,10 @@ pub fn inline(text: &str, base: Style) -> Vec<Span<'static>> {
 /// a file whose path, under it, opens in the browser on a click; its first
 /// lines as code where it cannot be drawn.
 fn page(source: &str, width: usize) -> Vec<Line<'static>> {
+    // Counted as the most a page takes, never laid out by a browser.
+    if crate::term::measured() {
+        return vec![Line::default(); crate::image::ROWS as usize];
+    }
     let dir = std::env::temp_dir().join("sonny-pages");
     let name = format!(
         "{}-{}.html",

@@ -288,10 +288,10 @@ pub const SETTINGS: &[Setting] = &[
         key: "sonny.margin_note_lines",
         group: "Margin",
         name: "note lines",
-        label: "the most lines a margin note runs to",
-        about: "the most lines a margin note's text runs to; a longer one is refused, and the agent told to show a file instead",
+        label: "the most rows a margin note draws",
+        about: "the most rows a margin note draws, counted at the margin's own width, so the same in every window; a longer note is refused, and a file or a task's note folds at it",
         values: &[],
-        default: "12",
+        default: "6",
     },
     Setting {
         key: "sonny.agent_opens",

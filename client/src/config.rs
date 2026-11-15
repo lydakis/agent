@@ -53,7 +53,7 @@
 //! text_width = 0                # the widest the conversation is written, 100 by default; 0 the window's whole width
 //! margin_opens = "never"         # "always", the default, or "unless-closed"
 //! margin_notes = 8              # the most notes a margin holds, 6 by default; past it a new one is refused
-//! margin_note_lines = 20         # the most lines a note's Markdown runs to, 12 by default; past it the note is refused
+//! margin_note_lines = 10         # the most rows a note draws, at the margin's own width, 6 by default; past it the note is refused
 //! agent_opens = "beside"        # a click on an agent's name: "tab", the default, or "beside"
 //! suggest = false               # no guess at the next message, on by default
 //! suggest_ideas = false         # a guess never offers an idea or a tip in its place, on by default
@@ -597,8 +597,9 @@ pub struct Sonny {
     /// The most notes a margin holds: a new one past it is refused, and
     /// the agent told why. At least 1.
     pub margin_notes: u64,
-    /// The most lines a note's Markdown runs to, counted in the text, not
-    /// the rows drawn: a longer one is refused. At least 1.
+    /// The most rows a note draws, counted at the margin's own width with
+    /// its pictures as they draw, so the same in every window: a longer
+    /// one is refused, and a file or a task's note folds there. At least 1.
     pub margin_note_lines: u64,
     /// Where a click on an agent's name takes the person; a right click
     /// takes them to the other.
@@ -831,10 +832,10 @@ pub const TEXT_WIDTH: u64 = 100;
 /// list are, not an archive.
 pub const MARGIN_NOTES: u64 = 6;
 
-/// The most lines a note's Markdown runs to unless `margin_note_lines`
-/// says otherwise: something to glance at beside the conversation; a
-/// longer text goes in a file the note shows.
-pub const MARGIN_NOTE_LINES: u64 = 12;
+/// The most rows a note draws unless `margin_note_lines` says otherwise:
+/// state to glance at beside the conversation, so a whole margin fits in
+/// one look; anything longer goes in the reply or a file it names.
+pub const MARGIN_NOTE_LINES: u64 = 6;
 
 /// The narrowest `text_width` other than 0, the margin's own least width:
 /// a narrower column wraps a path or a line of code at every turn.
@@ -1878,7 +1879,7 @@ fn parse(text: &str) -> Result<Config, String> {
                 }
                 if key == "margin_note_lines" && config.sonny.margin_note_lines == 0 {
                     return Err(format!(
-                        "{name}.{key} is the most lines a margin note runs to, at least 1, not 0"
+                        "{name}.{key} is the most rows a margin note draws, at least 1, not 0"
                     ));
                 }
                 continue;
@@ -2895,7 +2896,10 @@ mod tests {
         assert_eq!(lines("[sonny]\nmargin_note_lines = 30"), Ok(30));
         assert_eq!(
             lines("[sonny]\nmargin_note_lines = 0"),
-            Err("sonny.margin_note_lines is the most lines a margin note runs to, at least 1, not 0".into())
+            Err(
+                "sonny.margin_note_lines is the most rows a margin note draws, at least 1, not 0"
+                    .into()
+            )
         );
         assert_eq!(
             parse("[sonny]\ntask_depth = 3").unwrap_err(),
