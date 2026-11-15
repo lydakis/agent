@@ -3021,6 +3021,9 @@ impl Turn {
                         )),
                     };
                     if let Some(outcome) = outcome {
+                        // Answered or out of time while parked: a daemon
+                        // step of it still running or in line is stopped.
+                        self.handles.call_ended(turn, waiting.call_id.clone());
                         let id = waiting.call_id.clone();
                         self.store
                             .op("tool_finish", move |db| db.tool_finish(turn, &id, &outcome))

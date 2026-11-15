@@ -174,6 +174,9 @@ struct Running {
     confined: bool,
     prepared: Prepared,
     slot: Option<Slot>,
+    /// The pull cord as it was when the step was let start: a pause
+    /// between then and its task's first poll still stops it.
+    cord: agent_runtime::tools::Cord,
     turn: i64,
     id: String,
 }
@@ -620,6 +623,7 @@ impl Service {
                 confined,
                 prepared,
                 slot,
+                cord: self.registry.cord(),
                 turn: key.0,
                 id: flight.ask.id(),
             };
@@ -888,10 +892,10 @@ async fn run(
         confined,
         prepared,
         slot,
+        cord,
         turn,
         id,
     } = running;
-    let cord = registry.cord();
     let mut stopping = futures_util::FutureExt::fuse(stopping);
     let bot = &capture.bot;
     let workspace = PathBuf::from(capture.workspace.as_deref().unwrap_or_default());
