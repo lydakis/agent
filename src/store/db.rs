@@ -3839,26 +3839,32 @@ impl Database {
     }
     /// The bot holding identity `id`, whatever it is named.
     pub fn inspect_id(&self, id: i64) -> Result<Bot> {
-        self.read_bot("id", id)
-    }
-    pub fn inspect(&self, name: &str) -> Result<Bot> {
-        self.read_bot("name", name)
-    }
-    /// The bot whose `key` is `value`, with its tools. Its list is most
-    /// often in use already and read from memory; when it is read from the
-    /// store, a configure between the two reads may have let it go, so a
-    /// list not found outside a transaction is read again with the bot,
-    /// in one snapshot.
-    fn read_bot(&self, key: &str, value: impl rusqlite::ToSql + Copy) -> Result<Bot> {
-        let read = || {
+        self.with_snapshot(|| {
             // Cached: parsing this many columns costs more than the read.
             self.conn
-                .prepare_cached(&format!("SELECT {} FROM bots WHERE {key}=?", Self::COLUMNS))?
-                .query_row([value], Self::row_held)
+                .prepare_cached(&format!("SELECT {} FROM bots WHERE id=?", Self::COLUMNS))?
+                .query_row([id], Self::row_held)
                 .optional()?
                 .ok_or(Error::new("bot_not_found"))
                 .and_then(|read| self.with_tools(read))
-        };
+        })
+    }
+    pub fn inspect(&self, name: &str) -> Result<Bot> {
+        self.with_snapshot(|| {
+            // Cached: parsing this many columns costs more than the read.
+            self.conn
+                .prepare_cached(&format!("SELECT {} FROM bots WHERE name=?", Self::COLUMNS))?
+                .query_row([name], Self::row_held)
+                .optional()?
+                .ok_or(Error::new("bot_not_found"))
+                .and_then(|read| self.with_tools(read))
+        })
+    }
+    /// Read a bot with its tools. Its list is most often in use already
+    /// and read from memory; when it is read from the store, a configure
+    /// between the two reads may have let it go, so a list not found
+    /// outside a transaction is read again with the bot, in one snapshot.
+    fn with_snapshot(&self, read: impl Fn() -> Result<Bot>) -> Result<Bot> {
         match read() {
             Err(error) if error.code == "tool_list_unknown" && self.conn.is_autocommit() => {
                 // Read only; dropping it rolls back.
