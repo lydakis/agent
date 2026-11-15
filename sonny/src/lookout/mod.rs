@@ -655,6 +655,7 @@ async fn serve(settings: Settings) -> Result<(), String> {
         log: PathBuf::from(log),
         seated: 0,
         live: false,
+        replay_over: false,
         cursor: None,
         saved: None,
         fires: HashMap::new(),
@@ -785,6 +786,9 @@ struct Service {
     seated: u64,
     /// The stream's replay is over: what happens now is news.
     live: bool,
+    /// The stream reached the present (`follow_live`): every event it held
+    /// for a lookout has come.
+    replay_over: bool,
     /// The newest event seen live, and the newest saved beside the store:
     /// a lookout started again tells what came after it.
     cursor: Option<i64>,
@@ -970,10 +974,12 @@ impl Service {
         for lookout in self.lookouts.values_mut() {
             // The replay's turns were news then; the live ones are now.
             lookout.live = false;
+            lookout.replay_over = false;
             lookout.lineage.insert(lookout.lead.clone());
         }
         let mut live = false;
         self.live = false;
+        self.replay_over = false;
         // News from before the oldest not told yet, as a restart would: a
         // message whose read the dropped connection cut short is read
         // again. What came before was told, or seen live by this lookout,
@@ -1150,6 +1156,7 @@ impl Service {
                     self.track(&event, !hearing.is_empty(), cursor);
                     // The replay is over: no subscriber's mark is ahead.
                     if event["event"] == "follow_live" {
+                        self.replay_over = true;
                         for lookout in self.lookouts.values_mut() {
                             lookout.caught_up();
                         }
@@ -1721,6 +1728,7 @@ impl Service {
         lookout.record = record.clone();
         lookout.lead_id = record["bot_id"].as_i64();
         lookout.live = self.live;
+        lookout.replay_over = self.replay_over;
         // What it subscribed to before it was made, or made again.
         // Less what was made for another bot of its name.
         lookout.subs = file.into_iter().filter(|sub| sub.held_by(record)).collect();
@@ -2105,6 +2113,9 @@ struct Lookout {
     /// What happens now is news to it: the replay is over, and the
     /// stream past its own mark.
     live: bool,
+    /// The stream reached the present: the reads of what its task events
+    /// kept on disk follow have begun, so those may go.
+    replay_over: bool,
     /// The agent source, for the tasks it watches.
     activity: activity::Activity,
     /// The subscriber's own tasks: every bot it or one of them made.
@@ -2198,6 +2209,7 @@ impl Lookout {
             lead: lead.to_owned(),
             lead_id: None,
             live: false,
+            replay_over: false,
             activity: activity::Activity::new(lead),
             lineage: [lead.to_owned()].into(),
             subs: Vec::new(),
@@ -2430,6 +2442,7 @@ impl Lookout {
 
     /// The replay is over: nothing it hears now was told before.
     fn caught_up(&mut self) {
+        self.replay_over = true;
         if self.told_to.take().is_some() {
             self.live = true;
         }
@@ -2674,11 +2687,14 @@ impl Lookout {
 
     /// Whether an event waits for a read of its task that came before it.
     fn blocked(&self, heard: &sources::Heard) -> bool {
+        // Until the stream reaches the present, an earlier event's read
+        // may not have begun: one kept on disk waits for it.
         heard.order > 0
             && heard.event.source == activity::SOURCE
-            && (self.reading.iter()).any(|(_, task, order)| {
-                *order < heard.order && heard.event.topic.as_deref() == Some(task.as_str())
-            })
+            && (!self.replay_over
+                || (self.reading.iter()).any(|(_, task, order)| {
+                    *order < heard.order && heard.event.topic.as_deref() == Some(task.as_str())
+                }))
     }
 
     /// Whether an event may be told now: it steers, or its digest has
@@ -3450,6 +3466,7 @@ mod tests {
         lookout.lead_id = Some(1);
         lookout.sync(&["calc.fix".to_owned()]);
         lookout.live = true;
+        lookout.replay_over = true;
         lookout
     }
 
@@ -3809,6 +3826,7 @@ mod tests {
             log: PathBuf::new(),
             seated: 0,
             live: true,
+            replay_over: true,
             cursor: None,
             saved: None,
             kept: HashMap::new(),
@@ -3964,9 +3982,15 @@ mod tests {
         lookout.flush();
         held::written();
         let mut again = seated();
+        again.replay_over = false;
         again.restore(path.clone());
         assert_eq!(again.heard.len(), 1);
         assert_eq!(again.heard[0].order, later.order);
+        // While the replay has not reached the earlier one, nothing has
+        // begun reading it: the kept event waits all the same.
+        assert!(again.blocked(&again.heard[0]));
+        again.caught_up();
+        assert!(!again.blocked(&again.heard[0]));
         // Read again from the stream, the earlier one holds it back while
         // under way, and is told before it.
         again
