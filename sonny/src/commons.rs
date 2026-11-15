@@ -1706,6 +1706,21 @@ impl View {
         Key::Stay
     }
 
+    /// The thread `name` opened, as a link elsewhere names it, and picked
+    /// in the list it goes back to.
+    pub fn open_thread(&mut self, name: &str) {
+        if let Some(at) = (self.threads.iter()).position(|t| t["thread"] == name) {
+            self.selected = at;
+        }
+        match thread(&self.dir, name) {
+            Ok(read) => {
+                self.open = Some((name.to_owned(), read));
+                self.open_stamp = None;
+            }
+            Err(error) => self.notice = Some(error),
+        }
+    }
+
     /// Whether a thread is open, whose rows scroll with the arrows.
     pub fn reading(&self) -> bool {
         self.open.is_some()

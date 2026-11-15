@@ -274,6 +274,29 @@ fn heard(
         .find(|event| !event.lookout && hears(event))
 }
 
+/// The newest word `source` said on each topic, as
+/// [`lookout::sources::status`] reads its log, read again only once that
+/// log changes.
+fn source_said(store: &Path, source: &str) -> Vec<lookout::sources::Event> {
+    static KEPT: kept::Slot<Vec<lookout::sources::Event>> = kept::Slot::new(None);
+    let file = lookout::sources::recent_file(&lookout::beside(store, ".sources"), source);
+    let key = format!("{}\n{source}", store.display());
+    kept::read(&KEPT, &key, vec![file], || {
+        let (said, _) = lookout::sources::status(store, source, |_| true);
+        (said.into_iter().map(|(event, _)| event).collect(), None)
+    })
+}
+
+/// Every subscriber's follows, as [`lookout::subs::all`] reads them, read
+/// again only once a subscriber's file comes, goes or is moved in anew.
+fn every_follow(store: &Path) -> Vec<(String, Vec<lookout::subs::Sub>)> {
+    static KEPT: kept::Slot<Vec<(String, Vec<lookout::subs::Sub>)>> = kept::Slot::new(None);
+    let key = store.to_string_lossy();
+    kept::read(&KEPT, &key, vec![lookout::subs::dir(store)], || {
+        (lookout::subs::all(store), None)
+    })
+}
+
 /// When each automation made on the daemon whose store is `store_id`
 /// runs next, in seconds, as [`trigger::upcoming`] reads them: read again
 /// once their folder changes or the first of those times comes.
@@ -756,6 +779,23 @@ pub struct View {
     follow: Follow,
     /// When the open automation's page says it runs next, in seconds.
     next_run: Option<i64>,
+    /// What the open source's page says.
+    source: SourcePage,
+}
+
+/// What a source's page says, read only while it is open, as often as
+/// the list is.
+#[derive(Clone, Debug, Default)]
+struct SourcePage {
+    /// As the settings have it: none for one not set up.
+    set: Option<agent_client::config::Source>,
+    /// Sonny's own, which has no command.
+    own: bool,
+    down: Option<lookout::sources::Down>,
+    /// The newest word on each topic it named, newest first.
+    said: Vec<lookout::sources::Event>,
+    /// Each follow of it, by its name, and whose.
+    followed: Vec<(String, String)>,
 }
 
 /// What a follow's page says beyond how it was set, read only while it
@@ -788,6 +828,9 @@ struct Page {
     links: Vec<(usize, u16, u16, Target)>,
     /// Whether a follow's done agents are listed, not folded to a count.
     done_open: bool,
+    /// The source whose page is open over the follow's, by its name, and
+    /// the link picked on the follow's page to go back to.
+    source: Option<(String, Option<usize>)>,
 }
 
 /// One row of a field on a page: its words, and the one that is a link,
@@ -893,6 +936,51 @@ fn plain(text: &str) -> String {
         .collect()
 }
 
+/// `fields` laid under their labels into `body`: a value too wide broken
+/// after a space or a `/`, a row with a link kept one row, cut to fit, so
+/// the link is where it is drawn; each link's row in `body`, its columns
+/// and where it leads in `links`, the one at `pick` among them reversed.
+/// How wide the labels are, with the space after them.
+fn lay(
+    fields: Vec<(&str, Vec<Field>)>,
+    width: usize,
+    pick: Option<usize>,
+    body: &mut Vec<Line<'static>>,
+    links: &mut Vec<(usize, u16, u16, Target)>,
+) -> usize {
+    let label = fields.iter().map(|(l, _)| l.width()).max().unwrap_or(0) + 2;
+    let hang = " ".repeat(label);
+    for (name, rows) in fields {
+        let rows = (rows.into_iter()).flat_map(|row| row.broken(width.saturating_sub(label)));
+        for (n, Field { mut spans, link }) in rows.enumerate() {
+            let lead = match n {
+                0 => Span::raw(format!("{name:<label$}")).dim(),
+                _ => Span::raw(hang.clone()),
+            };
+            let Some((at, target)) = link else {
+                body.extend(crate::transcript::wrap(
+                    Line::from([vec![lead], spans].concat()),
+                    width,
+                    Span::raw(""),
+                    Span::raw(hang.clone()),
+                ));
+                continue;
+            };
+            spans = fit(spans, width.saturating_sub(label));
+            if let Some(linked) = spans.get(at).cloned() {
+                let start = label + (spans[..at].iter()).map(Span::width).sum::<usize>();
+                let end = start + linked.width();
+                if pick == Some(links.len()) {
+                    spans[at] = linked.add_modifier(ratatui::style::Modifier::REVERSED);
+                }
+                links.push((body.len(), start as u16, end as u16, target));
+            }
+            body.push(Line::from([vec![lead], spans].concat()));
+        }
+    }
+    label
+}
+
 /// `spans` cut to `room` columns: the span that crosses it cut short with
 /// an ellipsis, the rest left out.
 fn fit(spans: Vec<Span<'static>>, room: usize) -> Vec<Span<'static>> {
@@ -918,6 +1006,29 @@ fn fit(spans: Vec<Span<'static>>, room: usize) -> Vec<Span<'static>> {
 /// longest, `watches` and `sources`.
 const FOLLOW_LABEL: usize = 9;
 
+/// How wide a source's labels are, with the space after them: its
+/// longest, `followed`.
+const SOURCE_LABEL: usize = 10;
+/// The most topics a source's page lists, and how wide a topic is at
+/// most there.
+const SAID_TOPICS: usize = 20;
+const TOPIC_WIDTH: usize = 24;
+
+/// Where a topic of Sonny's own sources leads: the agent the tasks
+/// source names, the commons thread, the fact still in memory.
+fn topic_target(source: &str, event: &lookout::sources::Event) -> Option<Target> {
+    let topic = event.topic.clone().filter(|topic| !topic.is_empty())?;
+    match source {
+        agent_client::config::TASKS_SOURCE => Some(Target::Agent(topic)),
+        agent_client::config::COMMONS_SOURCE => Some(Target::Thread(topic)),
+        agent_client::config::MEMORY_SOURCE if event.from.as_deref() != Some("removed") => {
+            let project = event.fields["project"].as_str().map(str::to_owned);
+            Some(Target::Fact(project, topic))
+        }
+        _ => None,
+    }
+}
+
 fn plural(n: u64) -> &'static str {
     if n == 1 { "" } else { "s" }
 }
@@ -929,6 +1040,13 @@ enum Target {
     Agent(String),
     /// A follow's done agents, folded: the link lists them.
     Done,
+    /// A source a follow hears: its page opens over the follow's.
+    Source(String),
+    /// A fact in memory, by its project (none for the person's) and its
+    /// name: opened in `/memory`.
+    Fact(Option<String>, String),
+    /// A commons thread, by its name: opened in `/commons`.
+    Thread(String),
 }
 
 /// The view's link to its clicks: a button's address is this, then what
@@ -977,6 +1095,7 @@ impl View {
             tasks: Arc::default(),
             follow: Follow::default(),
             next_run: None,
+            source: SourcePage::default(),
         };
         view.reload();
         view
@@ -1077,6 +1196,52 @@ impl View {
     fn read_page(&mut self) {
         self.follow = self.read_follow();
         self.next_run = self.read_next_run();
+        self.source = self.read_source();
+    }
+
+    /// The source whose page is open, by its name.
+    fn source_open(&self) -> Option<&str> {
+        let (name, _) = self.page.as_ref()?.source.as_ref()?;
+        Some(name)
+    }
+
+    /// What the open source's page says: nothing read while none is.
+    fn read_source(&self) -> SourcePage {
+        let Some(name) = self.source_open() else {
+            return SourcePage::default();
+        };
+        let set = (lookout::sources::configured()
+            .unwrap_or_default()
+            .into_iter())
+        .find(|source| source.name == name);
+        let own = name == agent_client::config::TASKS_SOURCE
+            || set.as_ref().is_some_and(|source| source.command.is_empty());
+        let hears = |sub: &lookout::subs::Sub| {
+            (sub.sources.iter()).any(|s| lookout::sources::named(s).0 == name)
+        };
+        let followed = (every_follow(&self.store).into_iter())
+            .flat_map(|(bot, subs)| {
+                (subs.into_iter())
+                    .filter(|sub| hears(sub))
+                    .map(move |sub| (sub.name, bot.clone()))
+            })
+            .collect();
+        SourcePage {
+            set,
+            own,
+            down: down(&self.store).remove(name),
+            said: source_said(&self.store, name),
+            followed,
+        }
+    }
+
+    /// How deep the view is: its list (0), a thing's page (1), or a
+    /// source's page over a follow's (2).
+    pub fn depth(&self) -> usize {
+        match &self.page {
+            None => 0,
+            Some(page) => 1 + usize::from(page.source.is_some()),
+        }
     }
 
     /// When the automation whose page is open runs next, as its schedule
@@ -1208,6 +1373,15 @@ impl View {
             KeyCode::Down => {
                 self.selected = (self.selected + 1).min(self.rows().saturating_sub(1));
             }
+            // A source is the person's to remove, where it is set; and it
+            // runs on its own.
+            KeyCode::Char('x') | KeyCode::Delete if self.source_open().is_some() => {
+                self.notice = Some(match self.source.own {
+                    true => "Sonny keeps its own sources".into(),
+                    false => "a source is yours to remove, where it is set".into(),
+                });
+            }
+            KeyCode::Char('r') if self.source_open().is_some() => {}
             KeyCode::Char('r') if self.picked_reminder() => {
                 self.notice = Some("a question's reminder runs at its time".into());
             }
@@ -1273,6 +1447,7 @@ impl View {
             pick: Some(0),
             links: Vec::new(),
             done_open: false,
+            source: None,
         });
         self.read_page();
     }
@@ -1291,7 +1466,46 @@ impl View {
     /// Back to the list from a page, as `←` there and the title's `‹`
     /// go. Whether there was one to leave.
     pub fn back(&mut self) -> bool {
+        // From a source's page back to the follow's, its link picked.
+        if let Some(page) = self.page.as_mut()
+            && let Some((_, pick)) = page.source.take()
+        {
+            page.pick = pick;
+            page.links.clear();
+            self.read_page();
+            return true;
+        }
         self.page.take().is_some()
+    }
+
+    /// Where a page's link leads: the address to follow out of the view,
+    /// or none for one that leads within it.
+    fn go(&mut self, target: Target) -> Option<String> {
+        let button = crate::screen::BUTTON;
+        match target {
+            Target::Agent(bot) => Some(format!("{}{bot}", crate::links::AGENT)),
+            Target::Done => {
+                if let Some(page) = self.page.as_mut() {
+                    page.done_open = true;
+                }
+                None
+            }
+            Target::Source(name) => {
+                // Another page: its links are its own, the first picked.
+                if let Some(page) = self.page.as_mut() {
+                    page.source = Some((name, page.pick));
+                    page.pick = Some(0);
+                    page.links.clear();
+                }
+                self.read_page();
+                None
+            }
+            Target::Fact(project, name) => Some(format!(
+                "{button}fact/{}/{name}",
+                project.unwrap_or_default()
+            )),
+            Target::Thread(name) => Some(format!("{button}thread/{name}")),
+        }
     }
 
     /// A key on a page: the arrows pick among the links in view, as Lynx
@@ -1322,22 +1536,19 @@ impl View {
                     }
                 }
             }
+            // The done agents open in the fold's place, the first of
+            // them picked; a source's page over the follow's.
             KeyCode::Right | KeyCode::Enter => {
-                match page
-                    .pick
+                let target = (page.pick)
                     .and_then(|at| page.links.get(at))
-                    .map(|link| &link.3)
-                {
-                    Some(Target::Agent(bot)) => {
-                        return Key::Open(format!("{}{bot}", crate::links::AGENT));
-                    }
-                    // The done agents open in the fold's place, the
-                    // first of them picked.
-                    Some(Target::Done) => page.done_open = true,
-                    None => {}
+                    .map(|link| link.3.clone());
+                if let Some(url) = target.and_then(|target| self.go(target)) {
+                    return Key::Open(url);
                 }
             }
-            KeyCode::Left => self.page = None,
+            KeyCode::Left => {
+                self.back();
+            }
             _ => {}
         }
         Key::Stay
@@ -1350,15 +1561,9 @@ impl View {
         self.stopping = None;
         let at = what.strip_prefix("link/")?.parse::<usize>().ok()?;
         let page = self.page.as_mut()?;
-        let link = page.links.get(at)?;
+        let target = page.links.get(at)?.3.clone();
         page.pick = Some(at);
-        match &link.3 {
-            Target::Agent(bot) => Some(format!("{}{bot}", crate::links::AGENT)),
-            Target::Done => {
-                page.done_open = true;
-                None
-            }
-        }
+        self.go(target)
     }
 
     fn fire(&mut self) {
@@ -1564,7 +1769,60 @@ impl View {
         // leads.
         let mut body_links: Vec<(usize, u16, u16, Target)> = Vec::new();
         let short = |bot: &str| self.scope.short(bot);
-        if let Some(row) = self.command().cloned() {
+        if let Some(name) = self.source_open().map(str::to_owned) {
+            // A source's page: how it runs, whether it works and why not,
+            // what it said lately, who follows it, and where it is set.
+            out.push(Line::from(name.clone()).bold());
+            let page = &self.source;
+            about.push(vec![("source".into(), None)]);
+            match &page.set {
+                _ if page.own => about.push(vec![("Sonny's own".into(), None)]),
+                Some(set) => {
+                    let every = set.every.as_deref().unwrap_or("1m");
+                    about.push(vec![(format!("runs every {every}"), None)]);
+                }
+                None => about.push(vec![("not set up".into(), None)]),
+            }
+            if let Some(digest) = page.set.as_ref().and_then(|set| set.digest.as_deref()) {
+                about.push(vec![(format!("tells at most every {digest}"), None)]);
+            }
+            if let Some(down) = &page.down {
+                let mut why = format!("down since {}", since_of(down.since_ms));
+                if !down.why.is_empty() {
+                    let said = down.why.replacen("exit status: ", "exit status ", 1);
+                    why.push_str(&format!(": {said}"));
+                }
+                body.extend(crate::transcript::wrap(
+                    Line::from(vec![Span::raw("✗ ").fg(Color::Red), Span::raw(why)]),
+                    width,
+                    Span::raw(""),
+                    Span::raw("  "),
+                ));
+                for line in down.stderr.iter().rev().take(5).rev() {
+                    body.extend(crate::transcript::wrap(
+                        Line::from(format!("  {}", plain(line))),
+                        width,
+                        Span::raw(""),
+                        Span::raw("  "),
+                    ));
+                }
+                body.push(Line::default());
+            }
+            let fields = self.source_fields(&name, width);
+            let pick = self.page.as_ref().and_then(|page| page.pick);
+            lay(fields, width, pick, &mut body, &mut body_links);
+            if !self.source.own
+                && self.source.set.is_some()
+                && let Some(path) = agent_client::config::path()
+            {
+                body.extend(crate::transcript::wrap(
+                    Line::from(format!("set in {}", home_path(&path.to_string_lossy()))).dim(),
+                    width,
+                    Span::raw(""),
+                    Span::raw(""),
+                ));
+            }
+        } else if let Some(row) = self.command().cloned() {
             let bot = row["bot"].as_str().unwrap_or_default().to_owned();
             let command: String = (row["command"].as_str().unwrap_or_default().chars())
                 .map(|c| if c.is_control() { ' ' } else { c })
@@ -1697,41 +1955,11 @@ impl View {
                 .flatten()
                 .filter(|(_, bot)| bot.is_some())
                 .count();
-            let pick = self.page.as_ref().and_then(|page| page.pick);
-            let label = fields.iter().map(|(l, _)| l.width()).max().unwrap_or(0) + 2;
+            let pick = (self.page.as_ref())
+                .and_then(|page| page.pick)
+                .and_then(|pick| pick.checked_sub(first));
+            let label = lay(fields, width, pick, &mut body, &mut body_links);
             let hang = " ".repeat(label);
-            for (name, rows) in fields {
-                // A value too wide breaks at a space or after a `/`.
-                let rows =
-                    (rows.into_iter()).flat_map(|row| row.broken(width.saturating_sub(label)));
-                for (n, Field { mut spans, link }) in rows.enumerate() {
-                    let lead = match n {
-                        0 => Span::raw(format!("{name:<label$}")).dim(),
-                        _ => Span::raw(hang.clone()),
-                    };
-                    // A row with a link stays one row, cut to fit, so the
-                    // link is where it is drawn.
-                    let Some((at, target)) = link else {
-                        body.extend(crate::transcript::wrap(
-                            Line::from([vec![lead], spans].concat()),
-                            width,
-                            Span::raw(""),
-                            Span::raw(hang.clone()),
-                        ));
-                        continue;
-                    };
-                    spans = fit(spans, width.saturating_sub(label));
-                    if let Some(linked) = spans.get(at).cloned() {
-                        let start = label + (spans[..at].iter()).map(Span::width).sum::<usize>();
-                        let end = start + linked.width();
-                        if pick == Some(first + body_links.len()) {
-                            spans[at] = linked.add_modifier(ratatui::style::Modifier::REVERSED);
-                        }
-                        body_links.push((body.len(), start as u16, end as u16, target));
-                    }
-                    body.push(Line::from([vec![lead], spans].concat()));
-                }
-            }
             // What a row says after it, whole, where its page has no field
             // for it.
             if !item.facts.is_empty() && item.sub.is_none() && item.kind != Kind::Trigger {
@@ -1831,6 +2059,111 @@ impl View {
         (out, at, marks)
     }
 
+    /// A source's fields on its page: its command, the newest word on
+    /// each topic it named in the last day, and each follow of it.
+    fn source_fields(&self, name: &str, width: usize) -> Vec<(&'static str, Vec<Field>)> {
+        let page = &self.source;
+        let mut fields = Vec::new();
+        if let Some(set) = page.set.as_ref().filter(|_| !page.own) {
+            fields.push(("command", vec![Field::text(plain(&set.command))]));
+        }
+        let newest = page.said.iter().map(|event| event.at_ms).max();
+        let said = match (&page.down, newest) {
+            (Some(_), Some(at)) => vec![Field::text(format!("nothing since {}", since_of(at)))],
+            (_, None) => vec![Field {
+                spans: vec![Span::raw("nothing yet").dim()],
+                link: None,
+            }],
+            (None, Some(_)) => self.said_rows(name, width),
+        };
+        fields.push(("said", said));
+        let followed = match page.followed.is_empty() {
+            true => vec![Field::text("no one follows it".into())],
+            false => (page.followed.iter())
+                .map(|(follow, bot)| Field {
+                    spans: vec![
+                        Span::raw(format!("{follow} for ")),
+                        Span::raw(self.scope.short(bot)).fg(Color::Blue),
+                    ],
+                    link: Some((1, Target::Agent(bot.clone()))),
+                })
+                .collect(),
+        };
+        fields.push(("followed", followed));
+        fields
+    }
+
+    /// The newest word on each topic the open source named in the last
+    /// day, newest first, or its newest word when it named none then:
+    /// `main  main: build 412 passed · 2m ago`. A topic Sonny has a view
+    /// for is a link there: an agent, a commons thread, a fact.
+    fn said_rows(&self, name: &str, width: usize) -> Vec<Field> {
+        let now = now_ms() as u128;
+        let day = lookout::sources::RECENT_SPAN.as_millis();
+        let mut said: Vec<&lookout::sources::Event> = (self.source.said.iter())
+            .filter(|event| now.saturating_sub(event.at_ms) <= day)
+            .collect();
+        if said.is_empty() {
+            said.extend(self.source.said.iter().max_by_key(|event| event.at_ms));
+        }
+        said.sort_by_key(|event| std::cmp::Reverse(event.at_ms));
+        let more = said.len().saturating_sub(SAID_TOPICS);
+        said.truncate(SAID_TOPICS);
+        let wide = (said.iter())
+            .filter_map(|event| event.topic.as_deref())
+            .map(|topic| topic.width().min(TOPIC_WIDTH))
+            .max();
+        let topic_room = wide.map_or(0, |wide| wide + 2);
+        let age_of =
+            |event: &lookout::sources::Event| ago((now.saturating_sub(event.at_ms) / 1000) as u64);
+        let text_of =
+            |event: &lookout::sources::Event| plain(event.text.lines().next().unwrap_or_default());
+        // A word is never cut beside its topic: when any does not fit
+        // there, every word goes under its topic, two rows at most.
+        let under = said.iter().any(|event| {
+            SOURCE_LABEL + topic_room + text_of(event).width() + 3 + age_of(event).width() > width
+        });
+        let mut rows = Vec::new();
+        for event in said {
+            let (text, age) = (text_of(event), age_of(event));
+            let mut spans = Vec::new();
+            let mut link = None;
+            if let Some(wide) = wide {
+                let topic = event.topic.as_deref().unwrap_or_default();
+                let shown = crate::transcript::cut(&plain(topic), wide);
+                let pad = " ".repeat(wide - shown.width() + 2);
+                match topic_target(name, event) {
+                    Some(target) => {
+                        spans.push(Span::raw(shown).fg(Color::Blue));
+                        link = Some((0, target));
+                    }
+                    None => spans.push(Span::raw(shown)),
+                }
+                spans.push(Span::raw(pad));
+            }
+            if !under {
+                spans.push(Span::raw(text));
+                spans.push(Span::raw(format!(" · {age}")).dim());
+                rows.push(Field { spans, link });
+                continue;
+            }
+            spans.push(Span::raw(age).dim());
+            rows.push(Field { spans, link });
+            let room = width.saturating_sub(SOURCE_LABEL + 2);
+            rows.extend(two_rows(&text, room).into_iter().map(|row| Field {
+                spans: vec![Span::raw(format!("  {row}"))],
+                link: None,
+            }));
+        }
+        if more > 0 {
+            rows.push(Field {
+                spans: vec![Span::raw(format!("{more} more in the last day")).dim()],
+                link: None,
+            });
+        }
+        rows
+    }
+
     /// A follow's fields on its page: what it watches and every agent
     /// that matches now, what each source it hears said last, how it was
     /// set, and what it told.
@@ -1887,7 +2220,7 @@ impl View {
             for (written, said) in sub.sources.iter().zip(said) {
                 let name = lookout::sources::named(written).0;
                 let pad = Span::raw(" ".repeat(wide - written.width() + 2));
-                let named = Span::raw(written.clone());
+                let named = Span::raw(written.clone()).fg(Color::Blue);
                 let mut words = Vec::new();
                 let spans = match self.follow.down.get(name) {
                     Some(down) => vec![
@@ -1914,7 +2247,11 @@ impl View {
                         [vec![mark, named, pad], said].concat()
                     }
                 };
-                rows.push(Field { spans, link: None });
+                // The name is a link to the source's page.
+                rows.push(Field {
+                    spans,
+                    link: Some((1, Target::Source(name.to_owned()))),
+                });
                 rows.extend(words.into_iter().map(|row| Field {
                     spans: vec![Span::raw(format!("  {row}"))],
                     link: None,
@@ -2411,6 +2748,10 @@ impl View {
                 }
             }
         }
+        // A source's page edits nothing.
+        if self.source_open().is_some() {
+            return keys.esc(Esc::Close).text();
+        }
         if self.command().is_some() {
             return keys.key("x", "stop").esc(Esc::Close).text();
         }
@@ -2742,6 +3083,7 @@ mod tests {
             tasks: Arc::default(),
             follow: Follow::default(),
             next_run: None,
+            source: SourcePage::default(),
         }
     }
 
@@ -2911,6 +3253,237 @@ mod tests {
                 "release: build 417 failed in the",
                 "integration suite on the arm64 r…"
             ]
+        );
+    }
+
+    #[test]
+    fn a_sources_page_opens_from_a_follows_and_says_how_it_runs_and_who_follows_it() {
+        let dir = std::env::temp_dir().join(format!("background-source-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = dir.join("state.sqlite");
+        let follow = |name: &str, sources: &[&str]| lookout::subs::Sub {
+            name: name.into(),
+            tasks_of: Vec::new(),
+            agents: Vec::new(),
+            sources: sources.iter().map(|s| s.to_string()).collect(),
+            filter: None,
+            digest: None,
+            steer: None,
+            owner: None,
+            until: None,
+            runs: None,
+            made: None,
+        };
+        let inbox = follow("inbox", &["mail", "ci:main"]);
+        lookout::subs::ensure(&store, "calc.lead", inbox.clone()).unwrap();
+        lookout::subs::ensure(&store, "calc.fix", follow("builds", &["ci:main"])).unwrap();
+        let now = now_ms();
+        let sources = lookout::beside(&store, ".sources");
+        // mail down, with what its failed run wrote; its last word before.
+        let since = now - 30 * 60 * 1000;
+        let health = lookout::sources::health_file(&sources, "mail");
+        std::fs::create_dir_all(health.parent().unwrap()).unwrap();
+        let word = json!({"down": true, "since_ms": since, "failed": "exit status: 3",
+            "stderr": ["connecting", "mail-poll: could not sign in"]});
+        std::fs::write(&health, word.to_string()).unwrap();
+        let said = |source: &str, topic: Option<&str>, text: &str, ago_ms: u64| {
+            json!({"source": source, "topic": topic, "text": text, "at_ms": now - ago_ms, "seq": 1})
+                .to_string()
+        };
+        let last = now - 31 * 60 * 1000;
+        let recent = lookout::sources::recent_file(&sources, "mail");
+        std::fs::create_dir_all(recent.parent().unwrap()).unwrap();
+        std::fs::write(
+            lookout::sources::recent_file(&sources, "mail"),
+            said("mail", None, "1 new", 31 * 60 * 1000) + "\n",
+        )
+        .unwrap();
+        // ci's newest word on each topic, one too old to say.
+        let lines = [
+            said(
+                "ci",
+                Some("release"),
+                "release: 2.1 shipped",
+                2 * 86_400_000,
+            ),
+            said("ci", Some("main"), "main: build 411 passed", 3_600_000),
+            said("ci", Some("main"), "main: build 412 passed", 120_000),
+            said("ci", Some("nightly"), "nightly: build 9 failed", 60_000),
+        ];
+        std::fs::write(
+            lookout::sources::recent_file(&sources, "ci"),
+            lines.join("\n") + "\n",
+        )
+        .unwrap();
+        let set = |name: &str, command: &str, every: Option<&str>, digest: Option<&str>| {
+            Some(agent_client::config::Source {
+                name: name.into(),
+                command: command.into(),
+                every: every.map(str::to_owned),
+                digest: digest.map(str::to_owned),
+                steer: None,
+                watch: Vec::new(),
+                icon: None,
+                wants: None,
+            })
+        };
+        let mut view = view_of(store.clone(), vec![follow_item(inbox, false)]);
+        let key = |view: &mut View, code: KeyCode| {
+            view.key(KeyEvent::new(code, KeyModifiers::NONE), 0..usize::MAX)
+        };
+        key(&mut view, KeyCode::Enter);
+        let _ = page_text(&mut view, 60);
+        // The follow's sources are links after its agent's: mail's opens
+        // its page over the follow's.
+        let links: Vec<Target> = (view.page.as_ref().unwrap().links.iter())
+            .map(|link| link.3.clone())
+            .collect();
+        assert_eq!(
+            links,
+            [
+                Target::Agent("calc.lead".into()),
+                Target::Source("mail".into()),
+                Target::Source("ci".into()),
+            ]
+        );
+        key(&mut view, KeyCode::Down);
+        key(&mut view, KeyCode::Enter);
+        assert_eq!(view.depth(), 2);
+        view.source.set = set("mail", "~/bin/mail-poll --inbox", Some("20s"), None);
+        let config = home_path(&agent_client::config::path().unwrap().to_string_lossy());
+        assert_eq!(
+            page_text(&mut view, 60),
+            [
+                "mail".to_owned(),
+                "source · runs every 20s".into(),
+                "".into(),
+                format!(
+                    "✗ down since {}: exit status 3",
+                    since_of(u128::from(since))
+                ),
+                "  connecting".into(),
+                "  mail-poll: could not sign in".into(),
+                "".into(),
+                "command   ~/bin/mail-poll --inbox".into(),
+                format!("said      nothing since {}", since_of(u128::from(last))),
+                "followed  inbox for lead".into(),
+                format!("set in {config}"),
+            ]
+        );
+        assert_eq!(view.keys(), "enter open · esc close");
+        // `x` removes nothing here: a source is the person's.
+        key(&mut view, KeyCode::Char('x'));
+        assert!(view.confirm.is_none());
+        assert_eq!(view.items.len(), 1);
+        // `←` goes back to the follow's page, mail's link picked.
+        key(&mut view, KeyCode::Left);
+        assert_eq!(view.depth(), 1);
+        assert_eq!(view.page.as_ref().unwrap().pick, Some(1));
+        let _ = page_text(&mut view, 60);
+        key(&mut view, KeyCode::Down);
+        key(&mut view, KeyCode::Enter);
+        view.source.set = set("ci", "ci-watch", None, Some("5m"));
+        assert_eq!(
+            page_text(&mut view, 60),
+            [
+                "ci".to_owned(),
+                "source · runs every 1m · tells at most every 5m".into(),
+                "".into(),
+                "command   ci-watch".into(),
+                "said      nightly  nightly: build 9 failed · 1m ago".into(),
+                "          main     main: build 412 passed · 2m ago".into(),
+                "followed  builds for fix".into(),
+                "          inbox for lead".into(),
+                format!("set in {config}"),
+            ]
+        );
+        // At 44 columns each word goes under its topic, whole.
+        assert_eq!(
+            page_text(&mut view, 44)[5..9],
+            [
+                "said      nightly  1m ago",
+                "            nightly: build 9 failed",
+                "          main     2m ago",
+                "            main: build 412 passed",
+            ]
+        );
+        let _ = page_text(&mut view, 60);
+        // Each follow's agent is a link; the title's ‹ goes back too.
+        let links: Vec<Target> = (view.page.as_ref().unwrap().links.iter())
+            .map(|link| link.3.clone())
+            .collect();
+        assert_eq!(
+            links,
+            [
+                Target::Agent("calc.fix".into()),
+                Target::Agent("calc.lead".into()),
+            ]
+        );
+        assert!(view.back());
+        assert!(view.back());
+        assert!(!view.on_page());
+        // One of Sonny's own has no command, nor any place it is set.
+        view.source = SourcePage {
+            own: true,
+            ..SourcePage::default()
+        };
+        view.page = Some(Page {
+            source: Some(("memory".into(), None)),
+            ..Page::default()
+        });
+        assert_eq!(
+            page_text(&mut view, 60),
+            [
+                "memory".to_owned(),
+                "source · Sonny's own".into(),
+                "".into(),
+                "said      nothing yet".into(),
+                "followed  no one follows it".into(),
+            ]
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_topic_of_sonnys_own_sources_links_where_sonny_shows_it() {
+        let event = |source: &str, topic: &str, from: &str, fields: Value| {
+            let mut event = lookout::sources::Event::parse(
+                source,
+                &json!({"text": "x", "topic": topic, "from": from}).to_string(),
+                0,
+            )
+            .unwrap();
+            event.fields = Arc::new(fields);
+            event
+        };
+        assert_eq!(
+            topic_target("tasks", &event("tasks", "calc.halves", "", json!({}))),
+            Some(Target::Agent("calc.halves".into()))
+        );
+        assert_eq!(
+            topic_target("commons", &event("commons", "builds", "", json!({}))),
+            Some(Target::Thread("builds".into()))
+        );
+        assert_eq!(
+            topic_target(
+                "memory",
+                &event(
+                    "memory",
+                    "no-force-push",
+                    "lead saved",
+                    json!({"project": "calc"})
+                )
+            ),
+            Some(Target::Fact(Some("calc".into()), "no-force-push".into()))
+        );
+        assert_eq!(
+            topic_target("memory", &event("memory", "gone", "removed", json!({}))),
+            None
+        );
+        assert_eq!(
+            topic_target("ci", &event("ci", "main", "", json!({}))),
+            None
         );
     }
 
@@ -3415,6 +3988,7 @@ mod tests {
             tasks: Arc::default(),
             follow: Follow::default(),
             next_run: None,
+            source: SourcePage::default(),
         };
         let rows: Vec<String> = (view.card(100).0.iter())
             .map(|l| l.to_string())
@@ -3495,6 +4069,7 @@ mod tests {
             tasks: Arc::default(),
             follow: Follow::default(),
             next_run: None,
+            source: SourcePage::default(),
         };
         let clock = crate::asks::clock(at, now);
         // The pick reaches a column past the last word.
@@ -3836,6 +4411,7 @@ mod tests {
             tasks: Arc::default(),
             follow: Follow::default(),
             next_run: None,
+            source: SourcePage::default(),
         };
         let (card, at) = view.card(100);
         let lines: Vec<String> = card.iter().map(|l| l.to_string()).collect();
@@ -3901,6 +4477,7 @@ mod tests {
             tasks: Arc::default(),
             follow: Follow::default(),
             next_run: None,
+            source: SourcePage::default(),
         };
         let text = |view: &View| -> Vec<String> {
             view.card(100)
