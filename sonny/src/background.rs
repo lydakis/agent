@@ -2060,7 +2060,10 @@ impl View {
         // The agent its run went to: the run whose turn it sent, where
         // each run starts its own; none where it sent no turn.
         let run = &row["run"];
-        let bot = last["handle"].as_str().map(|handle| {
+        // A shadow run went to a copy, gone once its report is passed on:
+        // said in words, no link.
+        let shadow = last["shadow"].is_string();
+        let bot = (last["handle"].as_str().filter(|_| !shadow)).map(|handle| {
             (["running", "finished", "failed"].iter())
                 .map(|key| &run[key])
                 .find(|run| run["handle"].as_str() == Some(handle))
@@ -2087,6 +2090,10 @@ impl View {
                 Span::raw(format!("{when} in ")),
                 Span::raw(self.scope.short(bot)).fg(Color::Blue),
             ],
+            None if shadow => vec![Span::raw(format!(
+                "{when} in a copy of {}",
+                self.scope.short(&item.bot)
+            ))],
             None => vec![Span::raw(when)],
         };
         if let Some(ended) = ended {
@@ -2624,7 +2631,8 @@ fn page_alert(item: &Item) -> Option<String> {
         let why = why.replace("exit status: ", "exit status ");
         format!("{words}: {}", first_line(&why))
     };
-    if item.kind == Kind::Trigger {
+    // A check it no longer has says nothing, as on the list.
+    if item.kind == Kind::Trigger && row["if"].is_string() {
         if let Some(why) = row["if_cannot_run"].as_str() {
             return Some(check("its check cannot run", why));
         }
@@ -3141,6 +3149,21 @@ mod tests {
         // Nothing went to the agent: no link to it under `last`.
         let links = &view.page.as_ref().unwrap().links;
         assert!(links.iter().all(|link| link.0 != 8), "{links:?}");
+        // Replaced with no check, its old check's failure says nothing.
+        view.items[0].row["if"] = Value::Null;
+        view.items[0].failed = None;
+        let page = page_text(&mut view, 80);
+        assert!(page.iter().all(|line| !line.contains("check")), "{page:?}");
+        // A shadow run went to a copy: said in words, with no link.
+        view.items[0].row["sent"] = json!(1);
+        view.items[0].row["last"] = json!({"outcome": "sent", "fired_ms": now - 60_000,
+            "handle": "calc.lead-shadow-1/1", "shadow": "calc.lead-shadow-1",
+            "turn_status": "completed"});
+        let page = page_text(&mut view, 80);
+        let at = page.iter().position(|l| l.starts_with("last")).unwrap();
+        assert_eq!(page[at], "last  1m ago in a copy of lead");
+        let links = &view.page.as_ref().unwrap().links;
+        assert!(links.iter().all(|link| link.0 != at), "{links:?}");
     }
 
     #[test]
