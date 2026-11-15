@@ -1,8 +1,8 @@
-//! A project is a folder, its coordinator bot `NAME.lead`, and
+//! A project is a folder, its lead bot `NAME.lead`, and
 //! `.agents/project.toml` in that folder, which holds mechanics only: the
-//! name, the coordinator's model and effort level, and its tasks' model,
+//! name, the lead's model and effort level, and its tasks' model,
 //! effort and speed and whether they work in their own worktrees or the project
-//! folder, the profiles its coordinator and its tasks run as, and whether
+//! folder, the profiles its lead and its tasks run as, and whether
 //! the folders below it are the project's too. Clients
 //! read it, and write it when they make a project; the
 //! daemon knows nothing of projects.
@@ -16,7 +16,7 @@ pub const LIMIT: u64 = 64 * 1024;
 /// Every key the file may hold; anything else is a mistake, not ignored.
 const KEYS: [&str; 11] = [
     "name",
-    "coordinator",
+    "lead",
     "model",
     "effort",
     "profile",
@@ -32,6 +32,12 @@ const KEYS: [&str; 11] = [
 /// Sonny runs it once for each file, before it first reads it, until it
 /// retires (Sonny's `upgrade::MIGRATIONS`).
 pub const TASK_KEYS: &str = "project-task-keys";
+/// The migration that renames a project file's `coordinator` key, as
+/// 0.9 and the first 0.10.0 builds wrote it, to `lead` (`rename_lead_key`),
+/// run as [`TASK_KEYS`] is.
+pub const LEAD_KEY: &str = "project-lead-key";
+/// The key before, and its name since.
+const LEAD_RENAMED: [(&str, &str); 1] = [("coordinator", "lead")];
 /// Each key before 0.10.0, and its name since.
 const RENAMED: [(&str, &str); 5] = [
     ("threads_model", "task_model"),
@@ -41,20 +47,20 @@ const RENAMED: [(&str, &str); 5] = [
     ("threads_in", "task_in"),
 ];
 
-/// `text`, the project file parsed as `table`, with its `threads_*` keys
-/// renamed `task_*` in place, comments and order kept; none when it has
+/// `text`, the project file parsed as `table`, with the keys `keys`
+/// names renamed in place, comments and order kept; none when it has
 /// none, or when the renamed file would not read as the same settings
 /// (a key in quotes, a line the rename does not find), which is then
 /// refused as an unknown key.
-fn task_keys(text: &str, table: &toml::Table) -> Option<String> {
-    if !RENAMED.iter().any(|(old, _)| table.contains_key(*old)) {
+fn renamed_keys(text: &str, table: &toml::Table, keys: &[(&str, &str)]) -> Option<String> {
+    if !keys.iter().any(|(old, _)| table.contains_key(*old)) {
         return None;
     }
     let renamed: String = (text.split_inclusive('\n'))
         .map(|line| {
             let start = line.len() - line.trim_start().len();
             let rest = &line[start..];
-            let found = RENAMED.iter().find(|(old, _)| {
+            let found = keys.iter().find(|(old, _)| {
                 rest.strip_prefix(old)
                     .is_some_and(|after| after.trim_start().starts_with('='))
             });
@@ -66,9 +72,9 @@ fn task_keys(text: &str, table: &toml::Table) -> Option<String> {
         .collect();
     let after: toml::Table = renamed.parse().ok()?;
     let mut expected = table.clone();
-    for (old, new) in RENAMED {
-        if let Some(value) = expected.remove(old)
-            && expected.insert(new.to_owned(), value).is_some()
+    for (old, new) in keys {
+        if let Some(value) = expected.remove(*old)
+            && expected.insert((*new).to_owned(), value).is_some()
         {
             return None;
         }
@@ -81,6 +87,16 @@ fn task_keys(text: &str, table: &toml::Table) -> Option<String> {
 /// none renames nothing; one that does not parse, or would not read as the
 /// same settings renamed, is left as it is, for `read` to refuse.
 pub fn rename_task_keys(dir: &Path) -> bool {
+    rename_keys(dir, &RENAMED)
+}
+
+/// The project file in `dir` with its `coordinator` key renamed `lead`
+/// (`LEAD_KEY`), as [`rename_task_keys`] renames.
+pub fn rename_lead_key(dir: &Path) -> bool {
+    rename_keys(dir, &LEAD_RENAMED)
+}
+
+fn rename_keys(dir: &Path, renamed: &[(&str, &str)]) -> bool {
     let path = dir.join(FILE);
     let Ok(text) = std::fs::read_to_string(&path) else {
         return false;
@@ -88,7 +104,7 @@ pub fn rename_task_keys(dir: &Path) -> bool {
     let Ok(table) = text.parse::<toml::Table>() else {
         return false;
     };
-    let Some(renamed) = task_keys(&text, &table) else {
+    let Some(renamed) = renamed_keys(&text, &table, renamed) else {
         return false;
     };
     let temp = path.with_extension(format!("toml.{}.tmp", std::process::id()));
@@ -168,7 +184,7 @@ pub fn read(dir: &Path) -> Result<Value, String> {
     let Some(text) = text else {
         let name = default_name(dir);
         return Ok(json!({
-            "dir": dir, "name": name, "coordinator": format!("{name}.lead"),
+            "dir": dir, "name": name, "lead": format!("{name}.lead"),
             "model": null, "effort": null, "profile": null, "task_model": null,
             "task_effort": null, "task_speed": null, "task_profile": null,
             "task_in": "worktree",
@@ -179,7 +195,7 @@ pub fn read(dir: &Path) -> Result<Value, String> {
         .parse()
         .map_err(|e: toml::de::Error| invalid(e.message()))?;
     if let Some(key) = table.keys().find(|key| !KEYS.contains(&key.as_str())) {
-        let renamed = RENAMED.iter().find(|(old, _)| old == key);
+        let renamed = (RENAMED.iter().chain(&LEAD_RENAMED)).find(|(old, _)| old == key);
         return Err(invalid(&match (key.as_str(), renamed) {
             ("reasoning", _) => "unknown key reasoning: it is called effort now".to_owned(),
             (_, Some((old, new))) => format!("unknown key {old}: it is called {new} now"),
@@ -195,9 +211,9 @@ pub fn read(dir: &Path) -> Result<Value, String> {
     if !valid_name(&name) {
         return Err(invalid("name must be 1-64 of A-Z a-z 0-9 - _ ."));
     }
-    let coordinator = format!("{name}.lead");
-    if field("coordinator")?.is_some_and(|c| c != coordinator) {
-        return Err(invalid(&format!("coordinator must be {coordinator}")));
+    let lead = format!("{name}.lead");
+    if field("lead")?.is_some_and(|l| l != lead) {
+        return Err(invalid(&format!("lead must be {lead}")));
     }
     let model = field("model")?;
     if model.as_deref() == Some("") {
@@ -245,7 +261,7 @@ pub fn read(dir: &Path) -> Result<Value, String> {
         return Err(invalid("subfolders must be \"own\" or \"project\""));
     }
     Ok(json!({
-        "dir": dir, "name": name, "coordinator": coordinator, "model": model,
+        "dir": dir, "name": name, "lead": lead, "model": model,
         "effort": effort, "profile": profile, "task_model": task_model,
         "task_effort": task_effort, "task_speed": task_speed,
         "task_profile": task_profile, "task_in": task_in,
@@ -253,7 +269,7 @@ pub fn read(dir: &Path) -> Result<Value, String> {
     }))
 }
 
-/// Where a project's tasks work, as its coordinator is told it; the client
+/// Where a project's tasks work, as its lead is told it; the client
 /// that starts them picks their model and effort from the file.
 pub fn tasks_rule(in_project: bool) -> String {
     match in_project {
@@ -265,7 +281,7 @@ pub fn tasks_rule(in_project: bool) -> String {
     .to_owned()
 }
 
-/// The task rule a project's file sets, as its coordinator is told it.
+/// The task rule a project's file sets, as its lead is told it.
 pub fn rule(info: &Value) -> String {
     tasks_rule(info["task_in"] == "project")
 }
@@ -293,7 +309,7 @@ pub fn write(
     let path = dir.join(FILE);
     let quote = |s: &str| toml::Value::String(s.to_owned()).to_string();
     let mut text = format!(
-        "name = {}\ncoordinator = {}\nmodel = {}\n",
+        "name = {}\nlead = {}\nmodel = {}\n",
         quote(name),
         quote(&format!("{name}.lead")),
         quote(model)
@@ -423,13 +439,13 @@ pub async fn create(
     let info = read(dir)?;
     let (name, coordinator) = (
         info["name"].as_str().unwrap_or_default(),
-        lead.unwrap_or(info["coordinator"].as_str().unwrap_or_default()),
+        lead.unwrap_or(info["lead"].as_str().unwrap_or_default()),
     );
     let at = dir
         .to_str()
         .ok_or("project_invalid: the folder must be valid UTF-8")?;
     let made = |created: bool, record: Value| {
-        json!({"project": name, "coordinator": coordinator, "dir": at, "created": created,
+        json!({"project": name, "lead": coordinator, "dir": at, "created": created,
                "from_file": info["file"] == true, "record": record})
     };
     let existing = async || -> Result<Option<Value>, String> {
@@ -646,7 +662,7 @@ mod tests {
         };
         let made = make(&daemon, &dir, &policy, &picks).unwrap();
         assert_eq!(
-            (&made["coordinator"], &made["created"], &made["from_file"]),
+            (&made["lead"], &made["created"], &made["from_file"]),
             (
                 &json!("my-synthetic-repo.lead"),
                 &json!(true),
@@ -727,7 +743,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(again["created"], false);
-        assert_eq!(again["record"]["name"], again["coordinator"]);
+        assert_eq!(again["record"]["name"], again["lead"]);
         assert_eq!(
             daemon
                 .calls
@@ -920,7 +936,7 @@ mod tests {
         let dir = root("default");
         let project = read(&dir).unwrap();
         assert_eq!(project["name"], "my-synthetic-repo");
-        assert_eq!(project["coordinator"], "my-synthetic-repo.lead");
+        assert_eq!(project["lead"], "my-synthetic-repo.lead");
         assert_eq!(project["file"], false);
         std::fs::remove_dir_all(dir.parent().unwrap()).unwrap();
     }
@@ -939,7 +955,7 @@ mod tests {
         assert!(refused.starts_with("project_changed: "), "{refused}");
         let project = read(&dir).unwrap();
         assert_eq!(project["name"], "demo");
-        assert_eq!(project["coordinator"], "demo.lead");
+        assert_eq!(project["lead"], "demo.lead");
         assert_eq!(project["model"], "alpha/one");
         assert_eq!(project["effort"], "high");
         assert_eq!(
@@ -1046,7 +1062,7 @@ mod tests {
             "name = ",
             "model = \"alpha/one\"",
             "name = 7",
-            "name = \"demo\"\ncoordinator = \"other.lead\"",
+            "name = \"demo\"\nlead = \"other.lead\"",
             "name = \"demo\"\ntask_in = \"elsewhere\"",
             "name = \"demo\"\ntask_effort = \"\"",
             "name = \"demo\"\nsubfolders = \"mine\"",
@@ -1098,10 +1114,26 @@ mod tests {
         );
         std::fs::write(
             dir.join(FILE),
-            "name = \"demo\"\ncoordinator = \"demo.lead\"\nmodel = \"alpha/one\"\n",
+            "name = \"demo\"\nlead = \"demo.lead\"\nmodel = \"alpha/one\"\n",
         )
         .unwrap();
         assert_eq!(read(&dir).unwrap()["model"], "alpha/one");
+        // The key the lead had before says its new name, and is renamed
+        // in its own step.
+        let before = "name = \"demo\"\ncoordinator = \"demo.lead\"\n";
+        std::fs::write(dir.join(FILE), before).unwrap();
+        assert!(
+            read(&dir)
+                .unwrap_err()
+                .ends_with("unknown key coordinator: it is called lead now")
+        );
+        assert!(rename_lead_key(&dir));
+        assert_eq!(
+            std::fs::read_to_string(dir.join(FILE)).unwrap(),
+            "name = \"demo\"\nlead = \"demo.lead\"\n"
+        );
+        assert_eq!(read(&dir).unwrap()["lead"], "demo.lead");
+        assert!(!rename_lead_key(&dir));
         std::fs::remove_dir_all(dir.parent().unwrap()).unwrap();
     }
 }

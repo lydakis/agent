@@ -827,7 +827,7 @@ for (let i = 0; ; i++) await agent(`say ${i}`)
                             instructions='Lead.', declare=[declared('new_project')])
         self.host()
         made = json.loads(self.call('ws.lead', 'new_project', {'folder': str(ws / 'api')}))
-        self.assertEqual((made['coordinator'], made['created']), ('api.lead', True), made)
+        self.assertEqual((made['lead'], made['created']), ('api.lead', True), made)
         # Its own project's memory, though the folder above is a project
         # and the new one had no file when its lead was made.
         lead = self.daemon.request('inspect', bot='api.lead')['result']

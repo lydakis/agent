@@ -1356,7 +1356,7 @@ impl View {
                 .filter(|(name, _)| self.agent(name).is_some_and(|at| !self.agents[at].gone))
                 .map(|(name, read)| (name.clone(), read.clone()))
                 .collect();
-            crate::keep_sky_seen(&self.resolved, from.as_deref(), &here);
+            crate::keep_seen(&self.resolved, ".sky", from.as_deref(), &here);
             self.kept_changed = false;
             self.kept_at = Some(now);
         }

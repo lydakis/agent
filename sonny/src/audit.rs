@@ -262,11 +262,13 @@ impl View {
 fn line(row: &Value, name: &str, name_width: usize, width: usize, picked: bool) -> Line<'static> {
     let word = |field: &str| row[field].as_str().unwrap_or("-").to_owned();
     let at = crate::usage::local(row["at_ms"].as_i64().unwrap_or(0) / 1000);
-    let outcome = word("outcome");
-    let color = match outcome.as_str() {
-        "failed" | "denied" => Color::Red,
-        "unknown" => Color::Yellow,
-        _ => Color::Reset,
+    // How the call ended in this book's words, never the daemon's: a
+    // failure is `✗` and words.
+    let (outcome, color) = match word("outcome").as_str() {
+        "completed" => ("worked".to_owned(), Color::Reset),
+        what @ ("failed" | "denied") => (format!("✗ {what}"), Color::Red),
+        "unknown" => ("unknown".to_owned(), Color::Yellow),
+        what => (what.to_owned(), Color::Reset),
     };
     let tool = match row["step"].as_str() {
         Some(_) => format!("  {}", word("tool")),

@@ -91,7 +91,9 @@ first), and `--new-lead NAME` makes one (numbered, as `lead.2`, with no
 name). In a window, `/switch` lists every agent the daemon keeps over the
 composer, found by typing as every list is: the folder's leads first, then
 the project's other agents, then other projects' leads, then the rest, the
-one beside the conversation picked to start. Enter opens the pick in the
+one beside the conversation picked to start. An agent that needs you, a
+question open in its last turn, reads `? NAME  needs you` as in `/status`.
+Enter opens the pick in the
 window. `/switch NAME` opens that agent at once (a name in this project may
 leave out the project), or lists what NAME narrows to. The `↗` beside the
 name of an agent open in the pane, or Ctrl+G, moves that agent into the
@@ -874,8 +876,8 @@ has something on it, or is off the screen, no time shows.
   reason, in either view; one you allow is drawn as `✓ You allowed …`, as
   Codex records each decision. The status row above the
   composer shows only the keys, since the call is written out whole right
-  above it. The footer leads with the row unless it is the one new leads
-  start in, each with its mark as Claude Code marks its modes: `⏵⏵ full
+  above it. The footer leads with the row unless it is Auto, even when
+  it is the one new leads start in, each with its mark as Claude Code marks its modes: `⏵⏵ full
   access`, `⏸ ask me`, `⊘ read only`. Full access's mark is in the text's
   own weight rather than muted (no hue: yellow is for what needs you),
   and on a narrow window the mark stays when the word goes.
@@ -1196,10 +1198,12 @@ has something on it, or is off the screen, no time shows.
   ![/commons in the pane](../docs/sonny/commons.png)
 - `/memory` shows, in the pane beside the conversation, what agents saved to
   memory: Work under way, newest first, with how long since each was saved;
-  This project's facts; and About you, the facts kept about you in every
-  project, folded at first. Each row has the fact's name, its type (left
+  This project's facts; and Everywhere, the facts kept in every project,
+  such as what agents know of you and rules like "never force-push", open
+  at first, and counted in the head (`tally · 5 facts · 2 everywhere`).
+  Each row has the fact's name, its type (left
   unsaid when it is its section's own: `project` under a project, `user`
-  under About you) and its index flags (`live`, `external`, `confirmed N`, `pushed back N`), its
+  under Everywhere) and its index flags (`live`, `external`, `confirmed N`, `pushed back N`), its
   description, and `verified DATE` at the right edge. It reads each
   folder's `MEMORY.md`, and a work fact's own file, since an index lists
   work by name and date alone. A live fact's description is filled as a
@@ -1999,7 +2003,11 @@ conversation.
 
 A slash word that names no command is answered, not sent: `/stauts`
 says `no command /stauts · / lists them` and stays in the composer to be
-fixed. So does a command given words it doesn't take (`/status foo`). A
+fixed. So does a command given words it doesn't take (`/status foo`). The
+menu offers `enter run` only while Enter runs its pick: when the pick is
+a command whose name does not start with what is typed, as `/pause` for
+`/ps`, Enter answers what is typed instead, and the menu steps aside
+until you type again. An arrow onto a row makes it the pick again. A
 message that only starts with a slash word, such as a path
 (`/etc/hosts is wrong`), goes to the agent as written.
 

@@ -268,6 +268,12 @@ pub const MIGRATIONS: &[Migration] = &[
         id: agent_client::project::TASK_KEYS,
         retire: "0.12.0",
     },
+    // A project file's `coordinator` key becomes `lead`, as `TASK_KEYS`
+    // (0.10.0).
+    Migration {
+        id: agent_client::project::LEAD_KEY,
+        retire: "0.12.0",
+    },
 ];
 
 /// `run` once for each `record`: a file of the ids done, a line each,

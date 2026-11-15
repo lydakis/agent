@@ -952,21 +952,17 @@ pub(crate) fn kept_seen(
     seen
 }
 
-/// Keep what the sky read of every agent's question for the next one,
-/// beside the leads' own (a leading dot, as no lead is named).
-pub(crate) fn keep_sky_seen(
+/// Keep what the sky (`.sky`) or `/switch` (`.switch`) read of every
+/// agent's question for the next, beside the leads' own (a leading dot, as
+/// no lead is named).
+pub(crate) fn keep_seen(
     store: &std::path::Path,
+    by: &str,
     identity: Option<&str>,
     seen: &HashMap<String, (i64, Seen)>,
 ) {
     let store = agent_client::socket::canonical_store(store).unwrap_or_else(|_| store.into());
-    write_reads(
-        &store,
-        ".sky",
-        identity,
-        &HashMap::new(),
-        seen.iter().collect(),
-    );
+    write_reads(&store, by, identity, &HashMap::new(), seen.iter().collect());
 }
 
 /// The build that kept them, which another may read a history otherwise,
@@ -3947,11 +3943,28 @@ const SHORTCUTS: [(&str, &str); 21] = [
     ("ctrl+l", "draw the screen again"),
 ];
 
+/// Whether Enter runs the menu's pick (`picked`): when what is `typed`
+/// begins its name, or the person `moved` to it with the arrows. A name
+/// the letters only scatter across, as `/ps` across `/pause`, is not what
+/// was meant: Enter sends what is typed, to be answered.
+fn menu_runs(picked: &str, moved: bool, typed: &str) -> bool {
+    moved || picked.starts_with(typed)
+}
+
 /// The slash menu's keys, while it is open: Tab completes the pick's name
-/// until it is whole.
-fn menu_keys(menu: &[(&str, &str, Vec<usize>)], pick: usize, typed: &str) -> Option<hint::Keys> {
+/// until it is whole; Enter runs it where [`menu_runs`].
+fn menu_keys(
+    menu: &[(&str, &str, Vec<usize>)],
+    pick: usize,
+    moved: bool,
+    typed: &str,
+) -> Option<hint::Keys> {
     let picked = menu.get(pick.min(menu.len().checked_sub(1)?))?.0;
-    let keys = hint::Keys::new().pick().enter(hint::Enter::Run);
+    let keys = hint::Keys::new().pick();
+    let keys = match menu_runs(picked, moved, typed) {
+        true => keys.enter(hint::Enter::Run),
+        false => keys,
+    };
     let keys = match typed == picked {
         true => keys,
         false => keys.key("tab", "complete"),
@@ -4154,7 +4167,7 @@ impl Search {
 struct App {
     client: Arc<Client>,
     bot: String,
-    /// The project whose lead this is, when opened as the folder's coordinator.
+    /// The project whose lead this is, when opened as the folder's lead.
     project: Option<String>,
     workspace: String,
     /// The workspace's branch, as last read, for the footer.
@@ -4619,6 +4632,16 @@ struct App {
     picker: Option<models::Picker>,
     /// `/switch`'s list of every agent, open over the composer.
     agents: Option<switch::Picker>,
+    /// The questions of the agents `/switch` lists that no window had
+    /// read, as each read comes back: who, the turn it ended, and what
+    /// its history said, if it could be read.
+    agents_asked: Option<tokio::sync::mpsc::UnboundedReceiver<(String, i64, Option<Seen>)>>,
+    /// What was typed when Enter sent it past the slash menu, which stays
+    /// shut over the answer until the words change ([`menu_runs`]).
+    menu_shut: Option<String>,
+    /// Whether the slash menu's pick was moved to by the arrows, so Enter
+    /// runs it whatever was typed ([`menu_runs`]).
+    menu_moved: bool,
     /// `/new`, its lists over the composer, then its first message in it.
     making: Option<new::Making>,
     /// The file with the first message for the agent this window becomes,
@@ -6327,6 +6350,9 @@ impl App {
             searching: None,
             config: None,
             listing: None,
+            agents_asked: None,
+            menu_shut: None,
+            menu_moved: false,
             reach: None,
             reaching: None,
             agents: None,
@@ -6709,6 +6735,7 @@ impl App {
             self.shell_ran().await;
             self.listed();
             self.reached();
+            self.switch_asked();
             self.follow_place().await;
             self.follow_tab().await;
             self.count_behind().await;
@@ -12399,6 +12426,7 @@ impl App {
         // new agent's first message is words as written.
         if !self.input.starts_with('/')
             || self.input.contains(char::is_whitespace)
+            || self.menu_shut.as_deref() == Some(&self.input[..])
             || self.recall.showing(&self.input)
             || self.new_brief()
         {
@@ -14172,19 +14200,25 @@ impl App {
             self.fit_speed();
             return;
         }
+        if self.menu_shut.as_deref() != Some(&self.input[..]) {
+            self.menu_shut = None;
+        }
         let menu = self.menu();
         if let Event::Key(key) = &event
             && key.kind != KeyEventKind::Release
             && !menu.is_empty()
         {
             let picked = menu[self.pick.min(menu.len() - 1)].0;
+            let moved = std::mem::take(&mut self.menu_moved);
             match key.code {
                 KeyCode::Up => {
                     self.pick = (self.pick + menu.len() - 1) % menu.len();
+                    self.menu_moved = true;
                     return;
                 }
                 KeyCode::Down => {
                     self.pick = (self.pick + 1) % menu.len();
+                    self.menu_moved = true;
                     return;
                 }
                 KeyCode::Tab => {
@@ -14197,8 +14231,15 @@ impl App {
                         .modifiers
                         .intersects(KeyModifiers::SHIFT | KeyModifiers::ALT) =>
                 {
-                    self.input.set(picked);
+                    let runs = menu_runs(picked, moved, &self.input);
                     self.pick = 0;
+                    if runs {
+                        self.input.set(picked);
+                    } else {
+                        // Answered, the menu steps aside for the answer
+                        // until the words change.
+                        self.menu_shut = Some(self.input.to_string());
+                    }
                     self.submit().await;
                     return;
                 }
@@ -16462,7 +16503,95 @@ impl App {
         if !typed.is_empty() {
             picker.narrow(typed.to_owned());
         }
+        self.switch_asks(&mut picker);
         self.agents = Some(picker);
+    }
+
+    /// The questions open of the agents `picker` lists, as `/status` and
+    /// the sky read them: each idle one's last turn, as any window or sky
+    /// read it, or, where none did, read now beside the open list, each
+    /// marked as its read comes back ([`App::switch_asked`]) and kept for
+    /// the next. An agent nobody looked at in another project may well be
+    /// the one asking.
+    fn switch_asks(&mut self, picker: &mut switch::Picker) {
+        let store = self.store();
+        let identity = self.client.identity().map(str::to_owned);
+        let kept = kept_seen(&store, identity.as_deref());
+        let mut read: HashMap<String, (i64, Seen)> = HashMap::new();
+        let mut unread = Vec::new();
+        let mut open = Vec::new();
+        for (name, turn) in picker.ended() {
+            let had = [self.asks_seen.get(name), kept.get(name)];
+            match had.into_iter().flatten().find(|(at, _)| *at == turn) {
+                Some((_, seen)) => {
+                    read.insert(name.to_owned(), (turn, seen.clone()));
+                    if seen.clone().open(&store, name, false).is_some() {
+                        open.push((name.to_owned(), turn));
+                    }
+                }
+                // Read on from where an older read stopped.
+                None => {
+                    let was = had
+                        .into_iter()
+                        .flatten()
+                        .map(|(_, seen)| seen.clone())
+                        .next();
+                    unread.push((name.to_owned(), turn, was));
+                }
+            }
+        }
+        for (name, turn) in open {
+            picker.asks(&name, turn);
+        }
+        if unread.is_empty() {
+            self.agents_asked = None;
+            return;
+        }
+        let (tell, told) = tokio::sync::mpsc::unbounded_channel();
+        self.agents_asked = Some(told);
+        let client = self.client.clone();
+        tokio::spawn(async move {
+            for (name, turn, was) in unread {
+                let seen = match &was {
+                    Some(was) => needs::scan_since(&client, &name, Some(turn), was).await,
+                    None => needs::scan(&client, &name, Some(turn)).await,
+                };
+                if let Some(seen) = &seen {
+                    read.insert(name.clone(), (turn, seen.clone()));
+                }
+                if tell.send((name, turn, seen)).is_err() {
+                    break;
+                }
+            }
+            keep_seen(&store, ".switch", identity.as_deref(), &read);
+        });
+    }
+
+    /// Each question `/switch`'s reads found open since, on its row while
+    /// the list is open.
+    fn switch_asked(&mut self) {
+        if self.agents_asked.is_none() {
+            return;
+        }
+        let store = self.store();
+        let Some(told) = &mut self.agents_asked else {
+            return;
+        };
+        loop {
+            match told.try_recv() {
+                Ok((name, turn, Some(seen))) => {
+                    if let Some(picker) = &mut self.agents
+                        && seen.open(&store, &name, false).is_some()
+                    {
+                        picker.asks(&name, turn);
+                    }
+                }
+                Ok((_, _, None)) => {}
+                Err(tokio::sync::mpsc::error::TryRecvError::Empty) => return,
+                Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => break,
+            }
+        }
+        self.agents_asked = None;
     }
 
     /// Takes the agent picked in `/switch`'s list: it opens in this window.
@@ -17671,7 +17800,7 @@ impl App {
             // right edge where the band's is.
             // The menu's keys while it is open, as every list over the
             // composer has them, saying what Enter does with the pick.
-            let (line, opens) = match menu_keys(&menu, self.pick, &self.input) {
+            let (line, opens) = match menu_keys(&menu, self.pick, self.menu_moved, &self.input) {
                 Some(keys) => (
                     Line::from(hint::under(&keys, footer.width.into())),
                     Vec::new(),
@@ -18080,7 +18209,7 @@ impl App {
     fn footer(&self, width: usize) -> (Line<'static>, Vec<(std::ops::Range<u16>, &'static str)>) {
         use footer::{Item, Slot};
         let mut items = Vec::new();
-        // The row it runs in, unless it is the one new leads start in:
+        // The mode it runs in, unless it is Auto:
         // full access's mark in the text's own weight, as nothing holds
         // it back; no hue, as yellow is for what needs the person.
         let mode = match self.gating {
@@ -19903,6 +20032,80 @@ mod tests {
                 .unwrap()
                 .contains(&"shop.fix".to_owned())
         );
+    }
+
+    #[tokio::test]
+    async fn switch_marks_an_agent_whose_question_is_open_as_needing_you() {
+        // `blog.lead`'s last turn asked and nobody answered; no window read
+        // it, so the open list reads it. `notes` asked in a turn already
+        // read, as a window kept it; `done.lead` answered nothing new.
+        let ask = json!({"question": "Ship it now?", "why": "w", "reason": "r",
+            "options": [{"label": "Now"}, {"label": "Later"}], "recommended": 1});
+        let client = daemon_answering(move |asked| {
+            match (asked["op"].as_str().unwrap_or(""), asked["bot"].as_str()) {
+                ("bots", _) => json!({"bots": [
+                    {"name": "blog.lead", "workspace": "/w/blog", "running_turn": null,
+                        "last": {"turn": 4, "status": "completed"}},
+                    {"name": "notes", "workspace": "/w/notes", "running_turn": null,
+                        "last": {"turn": 2, "status": "completed"}},
+                    {"name": "shop.lead", "workspace": "/w/shop", "running_turn": null,
+                        "last": {"turn": 9, "status": "completed"}},
+                ], "next_after": null}),
+                ("history_nodes", Some("blog.lead")) => {
+                    json!({"nodes": [{"node": 16, "turn": 4}], "next_from": null})
+                }
+                ("history_items", Some("blog.lead")) => json!({"items": [
+                    {"node": 16, "item": {"type": "function_call", "name": "ask",
+                        "call_id": "c1", "arguments": ask.to_string()}}]}),
+                ("history_nodes", _) => json!({"nodes": [], "next_from": null}),
+                ("history_items", _) => json!({"items": []}),
+                _ => json!({"nodes": [], "approvals": [], "next_after": null}),
+            }
+        })
+        .await;
+        let home = std::env::temp_dir().join(format!("switch-asks-{}", std::process::id()));
+        std::fs::create_dir_all(&home).unwrap();
+        let mut app = app(client);
+        app.options.store = home.join("state.sqlite");
+        app.project = Some("shop".into());
+        app.workspace = "/w/shop".into();
+        let arguments = json!({"question": "Which name?", "options": [{"label": "A"}]});
+        let call = json!({"type": "function_call", "name": "ask", "call_id": "c2",
+            "turn": 2, "arguments": arguments.to_string()});
+        let question = needs::Seen {
+            ask: asks::open(&[call]),
+            turn: Some(2),
+            ..Default::default()
+        };
+        assert!(question.ask.is_some());
+        app.asks_seen.insert("notes".into(), (2, question));
+        app.input.set("/switch");
+        app.submit().await;
+        let state = |app: &App, name: &str| {
+            let agents = app.agents.as_ref().expect("the list is open");
+            (agents.rows().into_iter())
+                .find(|(agent, _)| agent.name == name)
+                .map(|(agent, _)| agent.state.clone())
+                .unwrap()
+        };
+        // Read before: marked at once.
+        assert_eq!(state(&app, "notes"), "needs you");
+        assert_eq!(state(&app, "shop.lead"), "idle");
+        // Read beside the open list, marked once its read comes back.
+        for _ in 0..200 {
+            app.switch_asked();
+            if app.agents_asked.is_none() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert_eq!(state(&app, "blog.lead"), "needs you");
+        assert_eq!(state(&app, "shop.lead"), "idle");
+        // And kept, so the next list reads none of them again.
+        let kept = kept_seen(&app.store(), app.client.identity());
+        assert_eq!(kept["blog.lead"].0, 4);
+        assert!(kept["blog.lead"].1.ask.is_some());
+        std::fs::remove_dir_all(home).unwrap();
     }
 
     #[tokio::test]
@@ -24894,7 +25097,7 @@ mod tests {
             [
                 "↳ 1 message, 1 lookout note · calc.add, calc.neg · sent to calc.neg ▾",
                 "  ↳ From calc.add ▸",
-                "  ↳ Lookout · calc.neg completed ▸",
+                "  ↳ Lookout · calc.neg finished ▸",
             ]
         );
         assert!(open[3].starts_with("  • Steered calc.neg"), "{open:?}");
@@ -24914,11 +25117,7 @@ mod tests {
         app.land(6, (updates, ""), (Some("the lookout"), false), false);
         assert_eq!(
             drawn(&mut app)[2..],
-            [
-                "• calc.neg is done.",
-                "",
-                "↳ Lookout · calc.neg completed ▸"
-            ]
+            ["• calc.neg is done.", "", "↳ Lookout · calc.neg finished ▸"]
         );
         // The person's own words are drawn as ever.
         app.land(7, ("thanks", ""), (None, false), false);
@@ -26059,6 +26258,58 @@ mod tests {
             // Kept, to be fixed and sent again.
             assert_eq!(&*app.input, typed);
         }
+        // Enter with the menu open runs the pick only when what is typed
+        // begins its name: `/ps`, scattered across `/pause`, is answered.
+        app.notice = None;
+        app.input.set("/ps");
+        assert_eq!(app.menu()[0].0, "/pause");
+        app.key(Event::Key(KeyCode::Enter.into())).await;
+        assert_eq!(app.notice.as_deref(), Some("no command /ps · / lists them"));
+        assert_eq!(&*app.input, "/ps");
+        // A beginning of the name runs it.
+        app.input.set("/verb");
+        app.key(Event::Key(KeyCode::Enter.into())).await;
+        assert!(app.input.is_empty(), "/verbose ran");
+        app.input.set("/ps");
+        app.key(Event::Key(KeyCode::Enter.into())).await;
+        // The menu steps aside for the answer until the words change, and
+        // its keys offer Enter only where it runs the pick.
+        assert!(app.menu().is_empty());
+        app.input.set("/p");
+        assert!(
+            menu_keys(&app.menu(), 0, false, "/p")
+                .unwrap()
+                .text()
+                .contains("enter run")
+        );
+        assert!(
+            !menu_keys(&app.menu(), 0, false, "/ps")
+                .unwrap()
+                .text()
+                .contains("enter")
+        );
+        // Moved to with the arrows, even back to the first row, it runs
+        // whatever was typed.
+        app.input.set("/p");
+        app.key(Event::Key(KeyCode::Char('s').into())).await;
+        app.key(Event::Key(KeyCode::Down.into())).await;
+        app.key(Event::Key(KeyCode::Up.into())).await;
+        assert_eq!(app.menu()[app.pick].0, "/pause");
+        app.key(Event::Key(KeyCode::Enter.into())).await;
+        assert_eq!(
+            app.notice.as_deref(),
+            Some("/pause takes why: /pause REASON")
+        );
+        app.input.set("/p");
+        app.key(Event::Key(KeyCode::Char('s').into())).await;
+        assert_eq!(&*app.input, "/ps");
+        assert!(!app.menu().is_empty());
+        app.key(Event::Key(KeyCode::Down.into())).await;
+        app.key(Event::Key(KeyCode::Up.into())).await;
+        app.key(Event::Key(KeyCode::Down.into())).await;
+        let second = app.menu()[1].0;
+        app.key(Event::Key(KeyCode::Enter.into())).await;
+        assert_ne!(&*app.input, "/ps", "{second} ran");
         // Words that only start with a slash word, or a path, go as written.
         for typed in ["/etc/hosts", "/tmp is full", "/ alone"] {
             app.input.set(typed);
@@ -29085,7 +29336,9 @@ mod tests {
         };
         app.input.set("/co");
         assert_eq!(first(&app), ["/copy", "/compact", "/context", "/commons"]);
-        let keys = |app: &App| menu_keys(&app.menu(), app.pick, &app.input).map(|k| k.text());
+        let keys = |app: &App| {
+            menu_keys(&app.menu(), app.pick, app.menu_moved, &app.input).map(|k| k.text())
+        };
         assert_eq!(
             keys(&app),
             Some("↑↓ pick · enter run · tab complete · esc close".to_owned())
@@ -29994,7 +30247,7 @@ mod tests {
             rows[2].starts_with("  • Updated the plan · 1/3"),
             "{rows:?}"
         );
-        assert_eq!(rows[3], "  ↳ Lookout · calc.neg completed ▸");
+        assert_eq!(rows[3], "  ↳ Lookout · calc.neg finished ▸");
         assert!(rows[4].starts_with("  • Steered calc.neg"), "{rows:?}");
         assert!(
             rows.iter()
@@ -30132,9 +30385,9 @@ mod tests {
         assert_eq!(
             named,
             [
-                "  ↳ Lookout · calc.add completed ▸",
-                "  ↳ Lookout · calc.div completed ▸",
-                "  ↳ Lookout · calc.neg completed ▸",
+                "  ↳ Lookout · calc.add finished ▸",
+                "  ↳ Lookout · calc.div finished ▸",
+                "  ↳ Lookout · calc.neg finished ▸",
             ],
             "{rows:?}"
         );
@@ -30162,7 +30415,7 @@ mod tests {
         let rows = texts(&app);
         let once = |row: &str| rows.iter().filter(|r| r.as_str() == row).count() == 1;
         assert!(
-            once("› check the tasks") && once("  ↳ Lookout · calc.add completed ▸"),
+            once("› check the tasks") && once("  ↳ Lookout · calc.add finished ▸"),
             "{rows:?}"
         );
     }

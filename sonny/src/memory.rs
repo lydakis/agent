@@ -335,13 +335,14 @@ impl View {
         };
     }
 
-    /// Whether a section starts open: work and this project's facts do;
-    /// the person's, and with `a` every other project's, start folded.
+    /// Whether a section starts open: work, this project's facts and those
+    /// kept everywhere do; with `a`, every other project's start folded.
     fn is_open(&self, key: &str) -> bool {
         if let Some(open) = self.folds.get(key) {
             return *open;
         }
         key == WORK
+            || key == scope_key(None)
             || self
                 .places
                 .project
@@ -370,7 +371,7 @@ impl View {
             }
             let key = scope_key(scope.project.as_deref());
             let title = match &scope.project {
-                None => "About you".to_owned(),
+                None => "Everywhere".to_owned(),
                 Some(_) if !self.every => "This project".to_owned(),
                 Some(project) => project.clone(),
             };
@@ -657,7 +658,7 @@ impl View {
                 .map_or(0, |s| s.facts.len());
             let mut facts = format!(" · {all} fact{}", if all == 1 { "" } else { "s" });
             if yours > 0 {
-                facts.push_str(&format!(" · {yours} about you"));
+                facts.push_str(&format!(" · {yours} everywhere"));
             }
             spans.push(Span::raw(facts).dim());
         }
@@ -1292,7 +1293,7 @@ mod tests {
     }
 
     #[test]
-    fn the_list_has_work_this_project_and_you_folded_with_flags() {
+    fn the_list_has_work_this_project_and_everywhere_with_flags() {
         let places = places("list");
         save(
             &places,
@@ -1318,7 +1319,7 @@ mod tests {
         let mut view = view(&places);
         let (lines, at, _) = view.card(80);
         let lines = text(&lines);
-        assert_eq!(lines[0], "tally · 3 facts · 1 about you");
+        assert_eq!(lines[0], "tally · 3 facts · 1 everywhere");
         assert!(lines.contains(&"Work under way · 1".to_owned()));
         assert!(
             lines
@@ -1339,15 +1340,19 @@ mod tests {
         let row = row.unwrap();
         assert!(narrow[row].contains("verified "));
         assert_eq!(narrow[row + 1], "   confirmed 2");
-        // The person's facts start folded.
-        assert!(lines.contains(&"About you · 1 ▸".to_owned()));
-        assert!(!lines.iter().any(|l| l.contains("short-replies")));
+        // The facts kept in every project start open.
+        assert!(lines.contains(&"Everywhere · 1".to_owned()));
+        assert!(lines.iter().any(|l| l.contains("short-replies")));
         // The pick starts on the first fact.
         assert!(lines[at].starts_with(" rounding-fix"));
-        // → on the folded heading opens it.
+        // ← on the heading folds it, → opens it again.
         for _ in 0..3 {
             view.key(key(KeyCode::Down), 0..0);
         }
+        view.key(key(KeyCode::Left), 0..0);
+        let lines = text(&view.card(80).0);
+        assert!(lines.contains(&"Everywhere · 1 ▸".to_owned()));
+        assert!(!lines.iter().any(|l| l.contains("short-replies")));
         view.key(key(KeyCode::Right), 0..0);
         let lines = text(&view.card(80).0);
         assert!(
@@ -1358,7 +1363,7 @@ mod tests {
         // ← folds it again.
         view.key(key(KeyCode::Down), 0..0);
         view.key(key(KeyCode::Left), 0..0);
-        assert!(text(&view.card(80).0).contains(&"About you · 1 ▸".to_owned()));
+        assert!(text(&view.card(80).0).contains(&"Everywhere · 1 ▸".to_owned()));
         // enter opens a folded heading; on an open one it steps in, as →
         // does, and says nothing of itself.
         assert!(view.keys().contains("enter open"));
@@ -1373,7 +1378,7 @@ mod tests {
             .iter()
             .position(|i| *i == Item::Heading(YOU.into()));
         view.click(&format!("row/{}", heading.unwrap()));
-        assert!(text(&view.card(80).0).contains(&"About you · 1 ▸".to_owned()));
+        assert!(text(&view.card(80).0).contains(&"Everywhere · 1 ▸".to_owned()));
         let _ = std::fs::remove_dir_all(&places.home);
     }
 

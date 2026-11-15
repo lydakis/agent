@@ -194,7 +194,7 @@ pub fn start(here: &Path, project: &str, starter: &str, start: &Start) -> Result
         Some(row) => {
             let Some(found) = crate::approvals::find(row) else {
                 return Err(format!(
-                    "{row:?} is no /permissions row; the rows are {}",
+                    "{row:?} is no /permissions mode; the modes are {}",
                     crate::approvals::names().join(", ")
                 ));
             };

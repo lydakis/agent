@@ -149,7 +149,7 @@ fn start() -> Value {
                     "description": "A profile listed under Profiles that fits the task; without one, it \
                         starts with none."},
                 "permissions": {"type": "string", "minLength": 1,
-                    "description": "One of the person's /permissions rows to hold the task tighter \
+                    "description": "One of the person's /permissions modes to hold the task tighter \
                         than you, such as one that refuses what would need approval; one looser \
                         than yours is refused. Without one, it works as you do."},
                 "folder": {"type": "string", "minLength": 1,

@@ -1993,20 +1993,20 @@ pub(crate) fn held(path: &Path) -> bool {
 }
 
 /// One line on the lookout for a subscriber, as `/background` shows it:
-/// whether one runs and watches it, and today's notes.
+/// whether one runs and watches it, and today's updates.
 pub fn status(store: &std::path::Path, lead: &str) -> String {
     if !running(store) {
         return "Lookout · not running".to_owned();
     }
-    let (mut seated, mut notes, mut unkept, mut waiting) = (false, 0, 0, 0);
+    let (mut seated, mut updates, mut unkept, mut waiting) = (false, 0, 0, 0);
     for line in logged(store, lead) {
         seated |= line["seated"] == true;
-        // What a note left waiting, as of the latest.
+        // What an update left waiting, as of the latest.
         if line.get("woke").is_some() {
             waiting = line["waiting"].as_u64().unwrap_or(0);
         }
         if today(&line) {
-            notes += usize::from(line.get("woke").is_some());
+            updates += usize::from(line.get("woke").is_some());
             unkept += usize::from(line.get("skipped").is_some() && line.get("source").is_some());
         }
     }
@@ -2014,8 +2014,8 @@ pub fn status(store: &std::path::Path, lead: &str) -> String {
         return "Lookout · not watching this lead yet".to_owned();
     }
     let mut said = format!(
-        "Lookout · watching · {notes} note{} in the last day",
-        if notes == 1 { "" } else { "s" }
+        "Lookout · watching · {updates} update{} in the last day",
+        if updates == 1 { "" } else { "s" }
     );
     if waiting > 0 {
         said.push_str(&format!(" · {waiting} waiting"));
@@ -4638,7 +4638,7 @@ mod tests {
         );
         assert_eq!(
             status(&store, "calc.lead"),
-            "Lookout · watching · 1 note in the last day"
+            "Lookout · watching · 1 update in the last day"
         );
         // What a full lookout left waiting, and did not keep, shows too.
         append(
@@ -4651,7 +4651,7 @@ mod tests {
         );
         assert_eq!(
             status(&store, "calc.lead"),
-            "Lookout · watching · 2 notes in the last day · 40 waiting · 1 not kept"
+            "Lookout · watching · 2 updates in the last day · 40 waiting · 1 not kept"
         );
         assert_eq!(
             status(&store, "shop.lead"),

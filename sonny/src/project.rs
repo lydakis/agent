@@ -1,4 +1,4 @@
-//! The folder's coordinator: opened with no `--agent`, Sonny talks to the
+//! The folder's lead: opened with no `--agent`, Sonny talks to the
 //! project's lead, `<project>.lead`, the same bot whichever Sonny opens
 //! that folder. A folder that is not
 //! a project yet becomes one: its lead, then its `.agents/project.toml`.
@@ -46,17 +46,18 @@ const BUDGETS: [(&str, usize); 3] = [
 ];
 
 /// The project in `dir` (`agent_client::project::read`), its file's
-/// `threads_*` keys renamed `task_*` first, once for the file
-/// (`TASK_KEYS`, recorded in `~/.agent/sonny/migrated` when it renamed
-/// some), so old keys a checkout brings back after are refused by name.
+/// `threads_*` keys renamed `task_*` and its `coordinator` key `lead`
+/// first, once for the file each (`TASK_KEYS`, `LEAD_KEY`, recorded in
+/// `~/.agent/sonny/migrated` when it renamed some), so old keys a checkout
+/// brings back after are refused by name.
 pub fn read(dir: &Path) -> Result<Value, String> {
-    use agent_client::project::{FILE, TASK_KEYS, rename_task_keys};
+    use agent_client::project::{FILE, LEAD_KEY, TASK_KEYS, rename_lead_key, rename_task_keys};
     if let Some(home) = std::env::var_os("HOME") {
         let record = Path::new(&home).join(".agent/sonny/migrated");
         let file = dir.join(FILE);
-        crate::upgrade::once_for(&record, TASK_KEYS, &file.to_string_lossy(), || {
-            rename_task_keys(dir)
-        });
+        let file = file.to_string_lossy();
+        crate::upgrade::once_for(&record, TASK_KEYS, &file, || rename_task_keys(dir));
+        crate::upgrade::once_for(&record, LEAD_KEY, &file, || rename_lead_key(dir));
     }
     agent_client::project::read(dir)
 }
@@ -1032,7 +1033,7 @@ async fn make(
     // Writing its own state folder, by the name it is made under.
     let lead = (bot.map(str::to_owned)).or_else(|| {
         let info = read(dir).ok()?;
-        info["coordinator"].as_str().map(str::to_owned)
+        info["lead"].as_str().map(str::to_owned)
     });
     let state = lead.as_deref().and_then(crate::state::folder);
     let mut settings = crate::approvals::sandbox(mode, dir, state.as_deref());

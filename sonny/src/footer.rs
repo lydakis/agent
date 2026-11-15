@@ -12,7 +12,7 @@ use unicode_width::UnicodeWidthStr;
 /// Where an item sits, in its side's order; the left side first.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Slot {
-    /// The permissions row, when not the one new leads start in.
+    /// The permissions mode, when not Auto.
     Access,
     /// The model with its effort, boost and speed.
     Model,
