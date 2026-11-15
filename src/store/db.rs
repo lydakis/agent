@@ -18062,7 +18062,7 @@ fn migrate_since_73(conn: &Connection, from: i32) -> Result<()> {
     // and a bot's row holds the digest; a creation's record names the
     // list it declared by digest too.
     if from < 101 {
-        stored_lists_once(conn)?;
+        migrate_lists_once(conn)?;
     }
 
     Ok(())
@@ -18071,7 +18071,7 @@ fn migrate_since_73(conn: &Connection, from: i32) -> Result<()> {
 /// a distinct list, and its row left holding the digest; each creation's
 /// record that declared tools names them by digest, `""` for none. One
 /// bot at a time, so memory holds one list however many there are.
-fn stored_lists_once(conn: &Connection) -> Result<()> {
+fn migrate_lists_once(conn: &Connection) -> Result<()> {
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS tool_lists(digest TEXT PRIMARY KEY, tools TEXT NOT NULL);",
     )?;
