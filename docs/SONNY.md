@@ -422,38 +422,12 @@ LaunchAgents do; for automations to run while you are logged out,
 `systemd/private` in `XDG_RUNTIME_DIR`, or in `/run/user/UID` when that is
 unset), `add` refuses with `automations_unsupported`.
 
-Sonny's start moves what an earlier Sonny gave the system, once (an
-`upgrade::once` migration, retired at 0.10.0): each automation
-that was a LaunchAgent or a user service of its own
-(`me.lydakis.agent.trigger.TAG.NAME`, or `me.lydakis.agent.trigger.NAME`
-from before tags, when it runs with this HOME) becomes its definition, at
-the times it had, and the system lets go of the old job; another HOME's, in
-a unit folder they share, waits for that HOME's Sonny. The old backup
-(`me.lydakis.agent.backup`) and start-at-login (`me.lydakis.agent.boot`)
-jobs go the same way, for the scheduler runs both. The scheduler's own job
-was `me.lydakis.agent.scheduler.TAG` before 0.9.0; Sonny's start lets that
-go and makes the job again as `sonny.scheduler.TAG`, once (retired at
+The scheduler's own job was `me.lydakis.agent.scheduler.TAG` before
+0.9.0; Sonny's start lets that go and makes the job again as
+`sonny.scheduler.TAG`, once (an `upgrade::once` migration, retired at
 0.11.0), so the label names no one.
 
-Automations were triggers before 0.8.0. The first Sonny, scheduler or
-script of 0.8.0 to look moves `~/.agent/triggers` to
-`~/.agent/automations` (unless a folder is there already), but only while
-nothing works in it: no change to its files, no run going (a run of the
-old Sonny keeps its paths to its end) and no other scheduler. Until then
-each works in the old folder, and the scheduler moves it within a minute of
-the last run ending, then runs again from the new one. The old path stays
-as a link to the new folder, so what chose it just before the move (an
-`add` still asking its daemon, say) writes where everything else reads; one
-that finds neither between the move and the link is told
-`automations_moved` and tries again. A restore's list for leads not yet
-opened, `~/.agent/sonny/restored-triggers.json`, becomes
-`restored-automations.json` with the move. Both run once, through the
-upgrade migration `automations-folder` (recorded in
-`~/.agent/sonny/migrated`, retired at 0.10.0); a backup's sync while the
-move waits backs up the old folder's automations. A backup's
-`triggers.json` is read when the copy has no `automations.json` and goes
-at its next sync. Sonny's start removes its old `~/.agent/trigger` script
-(migration `automation-script`, retired at 0.10.0). Prompts sent before still carry
+Automations were triggers before 0.8.0. Prompts sent then still carry
 `origin: "trigger"`, which Sonny reads as an automation's.
 
 Earlier apps called these schedules (`me.lydakis.agent.schedule.NAME`).
@@ -852,13 +826,22 @@ holds, every window says above the footer who paused and why, and whose
 running turns it parked (the first three, and how many more), so the one doing
 harm can be stopped first: in that agent's window the line adds `Esc ends this
 one`, and Esc ends its parked turn before `/resume`. Agents pull the
-same cord from their shell with `"$AGENT_BIN" pause --reason WHY`, and get no
-tool for it: `task.md` and `lead.md` say to, when they see agents doing harm
+same cord with the daemon's `pause_agents` tool, as themselves: `task.md` and `lead.md` say to, when they see agents doing harm
 someone needs to look at, and that resuming is the person's call.
 `/sky` shows a pull from whoever pulled it (the `pause`'s `by`, the person
 when none) and a resume from whoever resumed (the `resumed` notice's `by`),
 from the notices every session hears, and a pause already holding from
 `ready`; a replay has none, since the notices are not events.
+
+![A lead pulling the cord with the pause_agents tool, its reason under the row, and the banner every window shows](sonny/agent-tools-pause.png)
+
+Agents message, list and pause each other with the daemon's own tools,
+`send_message`, `list_agents` and `pause_agents`, which every agent has by
+default; Sonny draws them as it drew the `agent` commands they replace:
+`Steered`, `Queued for` or `Started a turn for` with the message under it,
+the agents listed with each one's status, the calls awaiting approval.
+
+![The steps view: messages sent with send_message folded into one row, list_agents with each agent's status, and a check of approvals](sonny/agent-tools-verbose.png)
 
 ## Upgrading
 

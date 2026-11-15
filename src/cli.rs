@@ -408,7 +408,7 @@ fn print_flags(flags: &str) {
             ),
             "--tools" => (
                 "LIST",
-                "A new bot's tools; default shell,write_stdin,read,write,wait,history, apply_patch for a Responses model else edit, web_fetch, and web_search where the provider offers it",
+                "A new bot's tools; default shell,write_stdin,read,write,wait,history,send_message,list_agents,pause_agents, apply_patch for a Responses model else edit, web_fetch, and web_search where the provider offers it",
             ),
             "--allow" => (
                 "LIST",

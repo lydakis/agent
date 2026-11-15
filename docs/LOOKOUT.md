@@ -6,8 +6,9 @@ tasks source, which tells what happens in the bots a follower watches
 (every message someone else wrote in them, each turn's end, a question
 to the person, an approval only they can give, a margin note), the
 sources the person sets up outside the daemon, such as a chat poller,
-and the commons. Each event is one envelope, `[source · topic · from]`
-and its text, and every follower and every follow is the same too: each
+and Sonny's own: the commons, memory and the linked machines. Each
+event is one envelope, `[source · topic · from]` and its text, and
+every follower and every follow is the same too: each
 filters, digests and steers alike. The lookout has no rule of its own
 for any source; what a source knows, it puts in its events' fields.
 
@@ -142,7 +143,7 @@ Sonny opens a project it adds the lead's `tasks` follow, unless the
 lead's file already holds one by that name, which it keeps as it is:
 
 ```
-{"name": "tasks", "tasks_of": ["shop.lead"], "bots": ["shop.*"]}
+{"name": "tasks", "tasks_of": ["shop.lead"], "agents": ["shop.*"]}
 ```
 
 That is the folder's first lead's. Another lead of the folder,
@@ -155,7 +156,7 @@ a follow in the file's shape, and whose `remove` takes a name; each
 call answers with all of them:
 
 ```
-{"add": {"name": "deploys", "bots": ["ops.*"]}}
+{"add": {"name": "deploys", "agents": ["ops.*"]}}
 {"add": {"name": "review", "tasks_of": ["review.lead"]}}
 {}
 {"remove": "deploys"}
@@ -169,7 +170,7 @@ with a narrower `sources` or a filter. A follow is held by the bot that made it,
 its ID: a later task given the same name inherits none of it.
 
 `tasks_of` watches every bot one of them or one of its tasks made,
-`bots` every bot its name matches, `*` matching any run of characters,
+`agents` every agent its name matches, `*` matching any run of characters,
 and `sources` every event of the sources the person set up, by name
 (below). A follow needs one of them, and may have several. A glob
 never names a side chat, nor a bot that deletes itself once idle.
@@ -183,9 +184,9 @@ follow with none of them is heard as it always was, and costs the
 lookout nothing more: no event is built for the bots it watches.
 
 ```
-{"add": {"name": "api", "bots": ["api.lead"],
+{"add": {"name": "api", "agents": ["api.lead"],
          "filter": {"type": ["turn.ended"], "$or": [{"status": ["failed"]}, {"done": [true]}]}}}
-{"add": {"name": "leads", "bots": ["*.lead"], "digest": "1h"}}
+{"add": {"name": "leads", "agents": ["*.lead"], "digest": "1h"}}
 {"add": {"name": "migration", "tasks_of": ["shop.migrate"], "steer": {"status": ["failed"]}}}
 ```
 
@@ -200,7 +201,7 @@ that watched only bots by exact name, every one of them deleted now, and
 no source, ends too. Each end is a line in the lookout's log with why.
 
 ```
-{"add": {"name": "deploy", "bots": ["ops.deploy"], "steer": {"status": ["failed"]}, "runs": 1}}
+{"add": {"name": "deploy", "agents": ["ops.deploy"], "steer": {"status": ["failed"]}, "runs": 1}}
 {"add": {"name": "launch", "sources": ["slack:launch"], "until": "2026-11-08 18:00"}}
 ```
 
@@ -235,7 +236,12 @@ every = "1m"   # how long after it exits it runs again: 30s, 5m, 1h; a minute un
 
 Every line the command prints is one event: plain text, or a JSON object
 with `text` and, if it has them, `id`, `topic` (what it is about: a
-channel, a thread), `from` (who wrote it there), `url` and `steer`. One that exits runs again `every` later, so a poller that
+channel, a thread), `from` (who wrote it there), `url` and `steer`. An
+object whose `text` is empty, as `{"topic": "12", "text": ""}`, is no
+event: it clears what the source last said of that topic, or of the
+source itself with no topic, as an MQTT message with an empty payload
+clears a topic's retained one. No follow hears it; a read (below) no
+longer gives the topic. One that exits runs again `every` later, so a poller that
 prints what is new and exits and a stream that never exits both work. An
 event whose `id` the source printed lately (the last 1024) is not news
 again; a poller keeps its own cursor in `$SONNY_SOURCE_DIR`, a folder of
@@ -355,6 +361,32 @@ an agent: an invite starts one turn, and its later replies come here like
 any poster's. A turn that only sources woke sends no commons
 invites, as an invite's turn does not.
 
+Sonny makes two more sources of its own the same way, every 10 seconds,
+each with its cursor in `STORE.sources/NAME/read.json` and a first look
+that tells nothing of the past. No agent follows either unless it asks,
+with `sources: ["memory"]` or `["links"]`, and each is set under
+`[sonny.sources.NAME]` with `digest`, `steer` and `icon` alone.
+
+- `memory`: each fact saved to or removed from the person's memory or a
+  project's, under `~/.agents/memory`. The fact's name is the topic, and
+  `from` is the agent that saved it, as `calc.fix saved`, or `removed`.
+  The text is the fact's description. Its fields are `project` (none for
+  the person's own memory), `type` and `file`, the fact's file to read.
+
+  ```
+  [memory · release-steps · calc.fix saved]
+  Tags are pushed from the Mac; cloud can't push tags.
+  ```
+- `links`: each machine linked here (`sonny link`) that connects or goes
+  away; a machine that sleeps goes away once it has been silent 45 seconds. The
+  machine is the topic, and `state` is `up` or `down`. A machine linked
+  for the first time tells only that it connected.
+
+  ```
+  [links · laptop]
+  not connected, last heard 1 min ago
+  ```
+
 ### Filters
 
 An event's line may carry any other fields beside `text`, and a
@@ -431,18 +463,50 @@ many of those steer, by the source's mark or the follow's `steer`
 (`steers`), and about how many notes they would have been with its
 digest or its sources' (`notes`), with the newest 3 it hears as examples,
 outside content as the listing's are. For this the lookout keeps what
-each source's command printed in `STORE.sources/.recent/NAME.jsonl`, an
+each source printed, a command's and Sonny's own `memory` and `links`
+alike, in `STORE.sources/.recent/NAME.jsonl`, an
 event a line: a day of it, at most 2,000 events and 4 MiB, an event's
 fields cut as a shape's examples are past 16 KiB (`cut` then counts them,
-since a filter may misjudge a cut event). The same writer thread appends
-it and cuts it back once an hour or when it grows past its bytes. The
-commons is not kept, since its threads are their members'. What bots do
-is not kept either, so a follow that watches bots says so under
-`untested`.
+since a filter may misjudge a cut event). Past the day, it keeps the
+newest event of each topic, of the source itself (its events with no
+topic) and the lookout's newest word on it, however old, as an MQTT
+broker retains each topic's last message: at most 1,000 of them in 512
+KiB. A clear is kept as a line with no text while it is within the day,
+and past it goes with all before it, as Kafka compacts a tombstone away.
+The same writer thread appends it and cuts it back once an hour or when
+it grows past its bytes. The commons is not kept, since its threads are
+their members'. What bots do is not kept either, so a follow that
+watches bots says so under `untested`.
 
 ```
 {"add": {"name": "red", "sources": ["ci:main"], "filter": {"status": ["failed"]}}, "test": true}
 → {"test": {"since": "Fri 7 Nov 05:10", "events": 412, "heard": 9, "steers": 1, "notes": 9, "examples": […]}, "examples": "The fields' examples are…"}
+```
+
+To know what a source says now without following it, a call sends a
+follow as `add` with `"read": true`, as it would a `test`, and nothing
+is added: Kubernetes reads a resource with `get` or follows it with
+`watch` by one selector, and Alertmanager's alerts API reads the alerts
+it holds by a route's matchers or a receiver's name. The add names
+sources as any does, `NAME` or `NAME:TOPIC`, with a `filter` if it wants
+one; an add that names nothing but its `name` reads the caller's follow
+of that name, what it hears. Each source answers with its status as kept
+above: the newest event of each topic it hears, and of the source
+itself, newest first, as data (`topic`, `from`, `at`, `text`, `id`,
+`url`, the other fields under `fields`, `cut` when it was kept cut), a
+cleared topic left out; and `down`, the lookout's word, while the source
+is down. `outside` says the text comes from outside, as the listing's
+examples do. An answer holds what a tool's answer shows, 60 KiB, and
+`more` counts the topics past it. The commons and what agents do keep nothing
+here (`unread`): the commons tool and the history tool read them. A read
+costs one read of one file a source, each line read for its topic alone
+and whole only when it is a topic's newest word, whatever the number of
+agents: about 2 ms for one topic.
+
+```
+{"add": {"name": "red", "sources": ["prs"], "filter": {"state": ["red"]}}, "read": true}
+→ {"read": [{"source": "prs", "topics": [{"topic": "12", "from": "ci", "at": "Sat 14 Nov 22:10", "text": "#12 red", "id": "prs/88", "fields": {"state": "red"}}]}], "outside": "What a read gives is…"}
+{"add": {"name": "leads"}, "read": true}
 ```
 
 What sources said goes in the follower's next note, with what the tasks

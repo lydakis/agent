@@ -178,9 +178,10 @@ session), and Enter lists again. The pick is kept as `model`, and a new
 ends with what it chose and with any tool agents need that is missing
 (bubblewrap for the sandbox on Linux, ripgrep, agent-browser, and
 agent-desktop where there is a desktop), with the command that installs
-it. When agent-browser finds no Chrome to drive, setup offers to download
-Chrome for Testing for it (`agent-browser install`), and where npm is
-there and agent-desktop is not, it offers `npm install -g agent-desktop`.
+it. Setup installs Sonny's own agent-browser, and agent-desktop where there
+is a desktop, at the versions it pins (see the `browser` and `desktop`
+tools below). When agent-browser finds no Chrome to drive, setup offers to
+download Chrome for Testing for it (`agent-browser install`).
 Where agent-browser's own `~/.agent-browser/config.json` names no Chrome
 profile, it offers to name `"Default"` there, so agents' browsers start
 from a copy of your Chrome profile, signed in where you are (`sonny setup
@@ -941,8 +942,7 @@ has something on it, or is off the screen, no time shows.
   offered, nor, as in Codex, a shell, an interpreter or a wrapper
   (`bash`, `python3`, `timeout`), which runs whatever follows it. Agents
   can't write the rules folder from their sandbox, and
-  an agent another made goes by its maker's rules. A
-  `[sonny] unsandboxed` list from before moves into `default.rules` once.
+  an agent another made goes by its maker's rules.
 
   An agent that reaches the network reaches every Unix socket too, as
   Codex's full network does, so MCPX, Docker and ssh-agent just work; and
@@ -1623,17 +1623,17 @@ An agent refused for a missing one asks you, and `permissions --guide`,
 run through the tool, opens the settings page with a guide. agent-desktop
 is not signed by a developer, so macOS forgets the grant when it is
 upgraded, and asks again.
-Neither tool runs the agent-browser or agent-desktop on your `PATH`
-itself. Each runs a copy in `~/.agent/sonny/programs/`, made from it
-before its first call and again whenever it changes, and not while it,
-or that folder, is in a folder some agent of the store writes (its
-workspace, a folder its sandbox may write, or the temporary folders a
-workspace-write sandbox writes). So a program an agent could swap never
-runs, whichever agent calls, and a swap after the copy was made changes
-nothing until it is copied again. An agent with no sandbox is not
-counted, as it already runs as you. On macOS, the copy is what you grant
-Accessibility and Screen Recording to. Their temporary and socket folder
-is `~/.agent/run/sonny/`, private and checked the same way, so the
+Neither tool runs an agent-browser or agent-desktop on your `PATH`.
+Sonny installs its own, at the versions its tools list the commands of
+(agent-browser 0.41.1, agent-desktop 1.0.2), from their npm releases
+checked against the integrity it pins, into
+`~/.agent/sonny/programs/NAME/`: `sonny setup` installs them, and `sonny
+upgrade` brings them to the versions the new Sonny pins (agent-desktop only
+where there is a desktop). The daemon keeps that folder from every
+sandbox, as it keeps `~/.agent/keys`, even one given it by name, so no
+agent can swap a program that runs as you. On macOS, that
+copy is what you grant Accessibility and Screen Recording to. Their
+temporary and socket folder is `~/.agent/run/sonny/`, private, so the
 background host agent-desktop keeps for its commands, and agent-browser's
 sessions, are ones Sonny started: a copy run from elsewhere, a terminal or
 another app, gets its own host, under that app's permissions, and never

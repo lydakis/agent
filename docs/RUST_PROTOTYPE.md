@@ -88,7 +88,7 @@ It supplies no agent behavior: `create` names the bot's model, instructions,
 and tools, the bot keeps all three, a fork inherits them, and a later
 client's environment changes nothing about an existing bot. The CLI resolves
 `--model` or `AGENT_MODEL`, `--instructions` or its built-in text, and
-`--tools` or `shell,write_stdin,read,write,wait,history` with `apply_patch` for a
+`--tools` or `shell,write_stdin,read,write,wait,history,send_message,list_agents,pause_agents` with `apply_patch` for a
 Responses model and `edit` otherwise, plus `web_search` where the provider
 offers it and `web_fetch` for any, unless `web_search = "disabled"` in `~/.agent/config.toml`, before it asks. A bot's
 tools are what the model is shown and what dispatch allows: a call to any
@@ -119,7 +119,7 @@ of the well-known key variables (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`,
 `OPENROUTER_API_KEY`) are set. Like `AGENT_MODEL`, `AGENT_PROVIDER` is a default
 for starting a daemon: a running daemon is not checked against it, since every
 bot's shell inherits the daemon's environment. No other credential discovery happens. `--no-spawn` refuses to start a
-daemon. Default tools are `shell,write_stdin,read,write,wait,history` and the file editor
+daemon. Default tools are `shell,write_stdin,read,write,wait,history,send_message,list_agents,pause_agents` and the file editor
 the model's family is trained on, `apply_patch` (Responses) or `edit`, and
 `web_search` where the provider offers it, and `web_fetch`.
 
@@ -2808,13 +2808,30 @@ deleting the bot.
 ## Tools and validation scope
 
 The daemon registers `echo`, `shell`, `read`, `write`, `edit`, `apply_patch`,
-`wait`, `history`, `web_search`, `web_fetch` and `write_stdin`; each bot is created with the subset it may call (`run --tools`),
+`wait`, `history`, `web_search`, `web_fetch`, `write_stdin`, `send_message`,
+`list_agents` and `pause_agents`; each bot is created with the subset it may call (`run --tools`),
 which is what its model is shown and what dispatch allows. The
 registry validates tool names and arguments before execution; a tool that fails
 (unknown tool, invalid arguments, missing file, ambiguous edit, output
 overflow) returns an error result to the model and the turn continues. Only a
 closed tool scheduler fails the turn. Allowed tools run without approval
 prompts unless the bot was created with a gate (see [tool approval](#tool-approval)).
+
+`send_message`, `list_agents` and `pause_agents` are what an agent asks of
+the daemon about other agents, as Codex's `send_message`, `list_agents` and
+`followup_task` with `interrupt` are tools rather than a command line. Each
+call is a request on a session of its own, answered as the calling bot, as
+its own socket answers the `agent` in a sandboxed bot's shell (see the
+request table under [sandbox](#sandbox)), for every bot, sandboxed or not: a
+message reads as that turn's (`from`), never another's; `interrupt` stops a
+running turn only of the caller or a bot it made, and the message then
+waits for a turn of its own (`queue`); and `pause_agents` names the caller
+as who pulled the cord. A message's `request_id` is the call's own unless
+the model names one, so a call made again after a restart sends nothing
+new. `list_agents` lists the caller's project's bots by default (its name up
+to the first dot, then `*`), and with `approvals` the calls waiting on a
+gate instead. A store from before schema 100 gives the three to every bot
+that has `wait` and `history`; the approval modes never gate them.
 
 `shell` runs a noninteractive command with `/bin/bash -c` (`/bin/sh` where
 bash is not installed) in the bot workspace, or in `workdir` when the call
@@ -2828,13 +2845,17 @@ names one, of up to a day: as Codex's unified exec runs a command, it runs
 until it exits, `write_stdin` with `kill: true` on its handle stops it, or
 the daemon stops, and only a `timeout_ms` it was given ends it with
 `timed_out`. A command a steer moves to the background keeps the timeout it
-started with. Each bot keeps at most `--max-processes` background commands
-(64 by default, Codex's number for a session's processes), steered ones
-included: starting one past them kills the one the bot started or waited on
-least recently, as Codex prunes, and its handle says it was killed for that
-(`stopped`), so a bot that loses track of what it started cannot hold the
-whole bound forever. Another bot's commands and detached commands never
-count, and with no bound (`--max-processes 0`) nothing is pruned. Commands are at
+started with. No bot has a share of its own: once the daemon's background
+commands, steered ones included, are past `--max-processes` (64 a CPU by
+default), starting one more kills a command of the bot holding the most,
+the one it started or waited on least recently, never one of its 8 most
+recent (under a bound of 8, the bound's number, so one bot past a small
+bound is pruned rather than refused while bots that each hold no more wait
+for a slot), as Codex prunes a session's processes, and its handle says it was
+killed for that (`stopped`). So a bot that loses track of what it started
+cannot crowd out the rest of the fleet, and one that needs many keeps them
+while there is room. Detached commands never count, and with no bound
+(`--max-processes 0`) nothing is pruned. Commands are at
 most 16 KiB. At most `--max-processes` child processes run at once across the
 service, foreground or background; waiting never counts. Background commands
 the service has accepted but not started are bounded by the same number: when

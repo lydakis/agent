@@ -459,7 +459,7 @@ pub fn source_icons() -> HashMap<String, String> {
     let load = || {
         let icons = (agent_client::config::load().map(|config| {
             (config.sonny.sources.into_iter())
-                .chain([config.sonny.commons_source])
+                .chain(config.sonny.own_sources)
                 .filter_map(|source| Some((source.name, source.icon?)))
                 .collect()
         }))

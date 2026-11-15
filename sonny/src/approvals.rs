@@ -810,50 +810,6 @@ pub fn allow_always(prefix: &str) -> Result<(), String> {
     agent_client::config::allow_rule(&folder, &words).map(drop)
 }
 
-/// The upgrade migration that moves `[sonny] unsandboxed` into rules.
-pub const UNSANDBOXED_RULES: &str = "unsandboxed-rules";
-
-/// At start, once: the commands `[sonny] unsandboxed` let out of every
-/// sandbox become allow rules, and the key leaves the config, now that the
-/// daemon's command rules hold them (0.8.0). Run before any agent is made,
-/// so none runs a turn without them.
-pub fn at_start() {
-    let (Some(home), Some(path), Some(folder)) = (
-        std::env::var_os("HOME").map(std::path::PathBuf::from),
-        agent_client::config::path(),
-        agent_client::config::rules(),
-    ) else {
-        return;
-    };
-    let record = home.join(".agent/sonny/migrated");
-    crate::upgrade::once(&record, UNSANDBOXED_RULES, || {
-        move_unsandboxed(&path, &folder)
-    });
-}
-
-/// `[sonny] unsandboxed` in the config at `path`, as allow rules in
-/// `folder`: the rules first, then the key, so a stop between the two
-/// loses nothing. Whether it is done.
-fn move_unsandboxed(path: &std::path::Path, folder: &std::path::Path) -> bool {
-    let commands = match agent_client::config::read(path) {
-        Ok(config) => config.sonny.unsandboxed,
-        // No config, nothing to move.
-        Err(_) if !path.exists() => return true,
-        // One that doesn't read is told as Sonny starts; tried again next time.
-        Err(_) => return false,
-    };
-    if commands.is_empty() {
-        return true;
-    }
-    for command in &commands {
-        let words: Vec<String> = command.split_whitespace().map(str::to_owned).collect();
-        if agent_client::config::allow_rule(folder, &words).is_err() {
-            return false;
-        }
-    }
-    agent_client::config::write(path, &[("sonny.unsandboxed", None)]).is_ok()
-}
-
 /// The upgrade migration that takes the repositories inside an agent's
 /// folder out of its writable folders.
 pub const NESTED_GONE: &str = "nested-repositories-gone";
@@ -1831,35 +1787,6 @@ mod tests {
         assert!(may_run(&bot(json!("read-only"), gated), run));
         assert!(may_run(&bot(json!("danger-full-access"), json!([])), run));
         assert!(may_run(&bot(Value::Null, json!([])), run));
-    }
-
-    #[test]
-    fn the_commands_let_out_of_every_sandbox_become_allow_rules() {
-        let dir = std::env::temp_dir().join(format!("sonny-unsandboxed-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        let config = dir.join("config.toml");
-        let rules = dir.join("rules");
-        // Nothing to move: done, and nothing written.
-        assert!(move_unsandboxed(&config, &rules));
-        assert!(!rules.exists());
-        std::fs::write(
-            &config,
-            "[sonny]\nlead_effort = \"high\"\nunsandboxed = [\"mcpx\", \"docker compose\"]\n",
-        )
-        .unwrap();
-        // One already allowed stays once.
-        agent_client::config::allow_rule(&rules, &["mcpx".to_owned()]).unwrap();
-        assert!(move_unsandboxed(&config, &rules));
-        assert_eq!(
-            std::fs::read_to_string(rules.join("default.rules")).unwrap(),
-            "prefix_rule(pattern=[\"mcpx\"], decision=\"allow\")\n\
-             prefix_rule(pattern=[\"docker\",\"compose\"], decision=\"allow\")\n"
-        );
-        let left = agent_client::config::read(&config).unwrap();
-        assert!(left.sonny.unsandboxed.is_empty());
-        assert_eq!(left.sonny.lead_effort.as_deref(), Some("high"));
-        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

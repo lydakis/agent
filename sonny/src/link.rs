@@ -205,7 +205,12 @@ pub fn stamp() -> Vec<(String, std::time::SystemTime)> {
 
 /// When `machine` last said a word here, in milliseconds.
 fn seen(machine: &str) -> Option<u64> {
-    let text = std::fs::read_to_string(here()?.join(format!("{machine}.seen"))).ok()?;
+    seen_in(&here()?, machine)
+}
+
+/// [`seen`], kept in `dir`.
+fn seen_in(dir: &Path, machine: &str) -> Option<u64> {
+    let text = std::fs::read_to_string(dir.join(format!("{machine}.seen"))).ok()?;
     text.trim().parse().ok()
 }
 
@@ -213,9 +218,114 @@ fn seen(machine: &str) -> Option<u64> {
 /// heard from it lately. A session ends by removing its socket, so one
 /// just ended is not connected however lately it heard.
 fn up(machine: &str) -> bool {
-    let serving = here().is_some_and(|dir| dir.join(format!("{machine}.sock")).exists());
-    serving
-        && seen(machine).is_some_and(|ms| now_ms().saturating_sub(ms) < SILENT.as_millis() as u64)
+    here().is_some_and(|dir| up_in(&dir, machine))
+}
+
+/// [`up`], kept in `dir`: when the session serving it started, while it
+/// is connected.
+fn up_in(dir: &Path, machine: &str) -> bool {
+    since_in(dir, machine).is_some()
+}
+
+/// When the session serving `machine` in `dir` started, in milliseconds,
+/// while it is connected.
+fn since_in(dir: &Path, machine: &str) -> Option<u64> {
+    let socket = std::fs::metadata(dir.join(format!("{machine}.sock"))).ok()?;
+    let heard = seen_in(dir, machine)?;
+    (now_ms().saturating_sub(heard) < SILENT.as_millis() as u64).then_some(())?;
+    let started = socket
+        .modified()
+        .ok()?
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?;
+    Some(started.as_millis() as u64)
+}
+
+/// What Sonny's own `links` source says since its last look: a line for
+/// each machine linked here that came or went, the machine its topic.
+/// `cursor` is the source's own folder, where how each machine stood is
+/// kept; the first look tells none, so a new store is not told the past.
+pub fn news(cursor: &Path) -> crate::lookout::sources::News {
+    here().map_or_else(Default::default, |dir| news_in(&dir, cursor))
+}
+
+fn news_in(dir: &Path, cursor: &Path) -> crate::lookout::sources::News {
+    let path = cursor.join("read.json");
+    let first = !path.exists();
+    let had: serde_json::Map<String, Value> = std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|text| serde_json::from_str::<Value>(&text).ok())
+        .and_then(|value| value.as_object().cloned())
+        .unwrap_or_default();
+    let mut now = serde_json::Map::new();
+    let mut lines = Vec::new();
+    for machine in machines_in(dir) {
+        let name = machine.name;
+        let since = since_in(dir, &name);
+        let state = if since.is_some() { "up" } else { "down" };
+        let was = had.get(&name);
+        let was_state = was.and_then(|was| was["state"].as_str());
+        // Each change of state is counted, so a machine that comes back on
+        // the same connection is news again, and a look told again before
+        // the lookout keeps it gives the same ID.
+        let changes = was.and_then(|was| was["changes"].as_u64()).unwrap_or(0);
+        if was_state == Some(state) {
+            now.insert(name, json!({"state": state, "changes": changes}));
+            continue;
+        }
+        let changes = changes + 1;
+        now.insert(name.clone(), json!({"state": state, "changes": changes}));
+        // A machine first linked, or linked again after it was forgotten,
+        // tells that it came, never that it is away.
+        let new = was_state.is_none_or(|was| was == "gone");
+        if first || (new && state == "down") {
+            continue;
+        }
+        let id = format!("{name}/{state}/{changes}");
+        let line = match since {
+            Some(_) => json!({"id": id, "topic": name, "text": "connected", "state": "up"}),
+            None => {
+                let text = seen_in(dir, &name).map_or_else(
+                    || "not connected".to_owned(),
+                    |ms| format!("not connected, last heard {}", ago(ms)),
+                );
+                json!({"id": id, "topic": name, "text": text, "state": "down"})
+            }
+        };
+        lines.push(line.to_string());
+    }
+    // A machine forgotten or renamed while connected tells that it went.
+    // The cursor keeps its count as gone, so linked again under the name
+    // its events never take an ID one of its past ones had.
+    for (name, was) in &had {
+        if now.contains_key(name) || first {
+            continue;
+        }
+        // Only a record surely gone: one unread this look keeps its state.
+        let gone = std::fs::metadata(dir.join(format!("{name}.json")))
+            .is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound);
+        if !gone {
+            now.insert(name.clone(), was.clone());
+            continue;
+        }
+        let changes = was["changes"].as_u64().unwrap_or(0);
+        if was["state"] != "up" {
+            now.insert(name.clone(), json!({"state": "gone", "changes": changes}));
+            continue;
+        }
+        let changes = changes + 1;
+        now.insert(name.clone(), json!({"state": "gone", "changes": changes}));
+        lines.push(
+            json!({"id": format!("{name}/down/{changes}"), "topic": name,
+                "text": "no longer linked", "state": "down"})
+            .to_string(),
+        );
+    }
+    let changed = first || now != had;
+    crate::lookout::sources::News {
+        lines,
+        read: changed.then_some((path, now)),
+    }
 }
 
 /// How long ago `ms` was, in a few words.
@@ -1488,7 +1598,7 @@ async fn lends(link: &agent_client::config::Link, hub: &crate::mcp::Hub, calls: 
     }
     json!({
         "id": this_id(),
-        "browser": crate::setup::on_path("agent-browser"),
+        "browser": crate::trusted::here("agent-browser"),
         "signed_in": !link.browser_profile.is_empty(),
         "calls": calls,
         "desktop": crate::desktop::here(),
@@ -1913,6 +2023,89 @@ mod tests {
         assert_eq!(name_of("me@devbox.example.com"), "devbox");
         assert_eq!(name_of("me@10.0.0.2"), "10");
         assert_eq!(name_of("we_ird!"), "we_ird-");
+    }
+
+    #[test]
+    fn a_machine_that_comes_or_goes_is_one_event_and_the_past_is_not_told() {
+        let dir = scratch("news");
+        let cursor = dir.join("cursor");
+        std::fs::write(dir.join("laptop.json"), "{}").unwrap();
+        let said = |news: &crate::lookout::sources::News| -> Vec<Value> {
+            news.lines
+                .iter()
+                .map(|line| serde_json::from_str(line).unwrap())
+                .collect()
+        };
+        // Away at the first look: nothing told, as nothing changed.
+        let first = news_in(&dir, &cursor);
+        assert!(first.lines.is_empty());
+        assert!(first.mark_read());
+        // It dials in.
+        std::fs::write(dir.join("laptop.sock"), "").unwrap();
+        std::fs::write(dir.join("laptop.seen"), now_ms().to_string()).unwrap();
+        let came = news_in(&dir, &cursor);
+        let lines = said(&came);
+        assert_eq!(lines.len(), 1);
+        assert_eq!(
+            (&lines[0]["topic"], &lines[0]["text"], &lines[0]["state"]),
+            (&json!("laptop"), &json!("connected"), &json!("up"))
+        );
+        // Read again before it is kept, it is the same event.
+        assert_eq!(said(&news_in(&dir, &cursor))[0]["id"], lines[0]["id"]);
+        assert!(came.mark_read());
+        assert!(news_in(&dir, &cursor).lines.is_empty());
+        // It goes quiet, as a machine asleep does.
+        let quiet = now_ms() - SILENT.as_millis() as u64 - 60_000;
+        std::fs::write(dir.join("laptop.seen"), quiet.to_string()).unwrap();
+        let went = said(&news_in(&dir, &cursor));
+        assert_eq!(went.len(), 1);
+        assert_eq!(
+            (&went[0]["state"], &went[0]["text"]),
+            (
+                &json!("down"),
+                &json!("not connected, last heard 1 min ago")
+            )
+        );
+        // A machine linked for the first time tells only that it came.
+        std::fs::write(dir.join("desk.json"), "{}").unwrap();
+        let gone = news_in(&dir, &cursor);
+        let told = said(&gone);
+        assert_eq!(
+            told.iter().map(|l| &l["topic"]).collect::<Vec<_>>(),
+            [&json!("laptop")]
+        );
+        assert!(gone.mark_read());
+        // Heard again on the same connection, as a long answer arriving
+        // does: news again, under an ID of its own.
+        std::fs::write(dir.join("laptop.seen"), now_ms().to_string()).unwrap();
+        let back = said(&news_in(&dir, &cursor));
+        assert_eq!(back.len(), 1);
+        assert_eq!(back[0]["state"], "up");
+        assert_ne!(back[0]["id"], lines[0]["id"]);
+        // Forgotten while connected: it went, once.
+        let kept = news_in(&dir, &cursor);
+        assert!(kept.mark_read());
+        std::fs::remove_file(dir.join("laptop.json")).unwrap();
+        let forgot = news_in(&dir, &cursor);
+        let unlinked = said(&forgot);
+        assert_eq!(
+            (unlinked.len(), &unlinked[0]["state"], &unlinked[0]["text"]),
+            (1, &json!("down"), &json!("no longer linked"))
+        );
+        assert!(forgot.mark_read());
+        assert!(news_in(&dir, &cursor).lines.is_empty());
+        // Linked again under the name: news under an ID none before had.
+        std::fs::write(dir.join("laptop.json"), "{}").unwrap();
+        let again = said(&news_in(&dir, &cursor));
+        assert_eq!(again.len(), 1);
+        assert_eq!(again[0]["state"], "up");
+        let ids = [
+            &lines[0]["id"],
+            &went[0]["id"],
+            &back[0]["id"],
+            &unlinked[0]["id"],
+        ];
+        assert!(!ids.contains(&&again[0]["id"]), "{ids:?}");
     }
 
     fn scratch(name: &str) -> PathBuf {

@@ -55,6 +55,12 @@ const MAX_WAIT_TIMEOUT_MS: u64 = 86_400_000;
 const MAX_BACKGROUND_TIMEOUT_MS: u64 = MAX_WAIT_TIMEOUT_MS;
 /// Simultaneously running child processes, foreground or background.
 pub const DEFAULT_PROCESS_BUDGET: usize = 64;
+/// The background commands of an agent's that a prune spares at most:
+/// those it started or waited on most recently, as Codex spares 8 of a
+/// session's 64; under a bound of 8, the bound, so one agent past a small
+/// bound is pruned rather than refused, while one waiting for a slot
+/// behind another's is not ([`Registry::own`]).
+const PRUNE_SPARES: usize = 8;
 /// Processes that outlive their call, terminals and detached commands,
 /// running at once daemon-wide unless configured: four per logical CPU,
 /// which keeps their descriptors well inside a default 256-descriptor
@@ -82,6 +88,9 @@ enum Tool {
     WebSearch,
     WebFetch,
     WriteStdin,
+    SendMessage,
+    ListAgents,
+    PauseAgents,
 }
 impl Tool {
     fn parse(name: &str) -> Option<Tool> {
@@ -97,6 +106,9 @@ impl Tool {
             "web_search" => Tool::WebSearch,
             "web_fetch" => Tool::WebFetch,
             "write_stdin" => Tool::WriteStdin,
+            "send_message" => Tool::SendMessage,
+            "list_agents" => Tool::ListAgents,
+            "pause_agents" => Tool::PauseAgents,
             _ => return None,
         })
     }
@@ -113,6 +125,9 @@ impl Tool {
             Tool::WebSearch => "web_search",
             Tool::WebFetch => "web_fetch",
             Tool::WriteStdin => "write_stdin",
+            Tool::SendMessage => "send_message",
+            Tool::ListAgents => "list_agents",
+            Tool::PauseAgents => "pause_agents",
         }
     }
     fn schema(self) -> ToolSchema {
@@ -123,7 +138,7 @@ impl Tool {
                 "properties":{"text":{"type":"string"}},"required":["text"],"additionalProperties":false}),
             ),
             Tool::Shell => (
-                "Run a noninteractive bash command (sh where bash is not installed) in the workspace, or in workdir when given (relative to the workspace unless absolute). stdout and stderr are returned separately; each is truncated to a head and tail beyond 64 KiB, and retained whole in a file the result names under files, up to 1 GiB, or, where there is no such file, up to 1 MiB: past that, its first and last 512 KiB. The command keeps running. Default timeout 120 s, maximum 600 s; with background=true there is no timeout unless timeout_ms sets one, of up to a day. A command that times out is killed and returns its output so far with timed_out. Every result reports wall_time_ms. Commands run with no terminal: TERM=dumb, NO_COLOR=1, and cat as the pager; AI_AGENT=agent tells tools an agent runs them. When the command returns or times out, every process it started is killed, so `cmd &` does not outlive it. With background=true the command is started and a proc handle is returned immediately; collect its result later with wait. If no wait collects it, its end comes as a message once no turn of yours runs: {\"finished\":{\"proc:N\":{how it ended}}}; wait on the handle reads the output. A steer that arrives while a command runs moves it to the background: the result is its proc handle with steered=true, and the command keeps running. A background command runs until it exits, its timeout_ms passes, kill=true on its handle stops it, or the daemon stops; each agent keeps at most as many as the daemon's process bound, and starting one past them kills the one it started or waited on least recently. With detach=true it starts in its own session and returns a proc handle and pid at once; it outlives the turn and the daemon until it exits, a pause or kill=true, its output discarded unless redirected, its end told as a background command's. With tty=true it runs in a terminal, for a REPL or a program that prompts: the result is what it wrote within yield_time_ms (default 1000) and, while it runs, a proc handle for write_stdin.",
+                "Run a noninteractive bash command (sh where bash is not installed) in the workspace, or in workdir when given (relative to the workspace unless absolute). stdout and stderr are returned separately; each is truncated to a head and tail beyond 64 KiB, and retained whole in a file the result names under files, up to 1 GiB, or, where there is no such file, up to 1 MiB: past that, its first and last 512 KiB. The command keeps running. Default timeout 120 s, maximum 600 s; with background=true there is no timeout unless timeout_ms sets one, of up to a day. A command that times out is killed and returns its output so far with timed_out. Every result reports wall_time_ms. Commands run with no terminal: TERM=dumb, NO_COLOR=1, and cat as the pager; AI_AGENT=agent tells tools an agent runs them. When the command returns or times out, every process it started is killed, so `cmd &` does not outlive it. With background=true the command is started and a proc handle is returned immediately; collect its result later with wait. If no wait collects it, its end comes as a message once no turn of yours runs: {\"finished\":{\"proc:N\":{how it ended}}}; wait on the handle reads the output. A steer that arrives while a command runs moves it to the background: the result is its proc handle with steered=true, and the command keeps running. A background command runs until it exits, its timeout_ms passes, kill=true on its handle stops it, or the daemon stops; once the daemon's background commands fill its process bound, starting one more kills a command of the agent holding the most: the one it started or waited on least recently, never one of its 8 most recent (a smaller bound's number). With detach=true it starts in its own session and returns a proc handle and pid at once; it outlives the turn and the daemon until it exits, a pause or kill=true, its output discarded unless redirected, its end told as a background command's. With tty=true it runs in a terminal, for a REPL or a program that prompts: the result is what it wrote within yield_time_ms (default 1000) and, while it runs, a proc handle for write_stdin.",
                 json!({"type":"object","properties":{"command":{"type":"string"},
                 "workdir":{"type":"string"},
                 "timeout_ms":{"type":"integer","minimum":1,"maximum":MAX_BACKGROUND_TIMEOUT_MS},
@@ -182,6 +197,36 @@ impl Tool {
                 "chars":{"type":"string","maxLength":INPUT_BYTES},
                 "yield_time_ms":{"type":"integer","minimum":0,"maximum":MAX_YIELD_MS},"kill":{"type":"boolean"}},
                 "required":["handle"],"additionalProperties":false}),
+            ),
+            // An agent's own requests to the daemon, made as that agent
+            // ([`Agents`]): what its shell's `agent` would send, held to
+            // what the bot's own socket allows.
+            Tool::SendMessage => (
+                "Send a message to another bot, by its whole name, as this turn: the daemon records this bot and turn as its sender. delivery steer (the default) joins the bot's running turn at its next step, or starts a turn when none runs; queue waits for a turn of its own after what it has in line. interrupt=true, for a bot this one made, stops its running turn once the message is in line, and the message starts the next turn; for any other bot it is refused. quote names turns whose words the daemon copies after the message, each with who wrote them: BOT/N for the message turn N took in, BOT/N:reply for the reply that turn ended with. A request_id sent again starts nothing new; without one, the call's own is used. Returns the message's handle, BOT/N, which wait and history take, its status (running: it started a turn; queued: it waits or joins one), and interrupted_turn when it stopped one.",
+                json!({"type":"object","properties":{
+                "to":{"type":"string","minLength":1,"maxLength":128},
+                "message":{"type":"string","minLength":1},
+                "delivery":{"enum":["steer","queue"]},
+                "interrupt":{"type":"boolean"},
+                "quote":{"type":"array","items":{"type":"string","minLength":3,"maxLength":256},"maxItems":16},
+                "request_id":{"type":"string","minLength":1,"maxLength":128}},
+                "required":["to","message"],"additionalProperties":false}),
+            ),
+            Tool::ListAgents => (
+                "List bots by name: each one's status, running turn, what it waits on, workspace, model, the bot that made it (created_by), and how its last turn ended. name is a pattern where * is any run of characters and ? any one, such as *.lead or shop.*; without one, the bots named as this one is up to its first dot. running=true lists only those with a turn running. approvals=true lists instead the calls of those bots waiting on a gate, each with its bot, turn, tool, the start of its arguments, and the tags it waits on. Pages hold up to limit (default 50, at most 256); pass next_after as after for the next.",
+                json!({"type":"object","properties":{
+                "name":{"type":"string","minLength":1,"maxLength":256},
+                "running":{"type":"boolean"},
+                "approvals":{"type":"boolean"},
+                "after":{"type":["string","integer"]},
+                "limit":{"type":"integer","minimum":1,"maximum":256}},
+                "additionalProperties":false}),
+            ),
+            Tool::PauseAgents => (
+                "Pause the daemon: every running turn, this one included, parks where it is, and nothing starts until the daemon is resumed, which this bot cannot do. reason is recorded with the pause, with this bot as the one that paused it.",
+                json!({"type":"object","properties":{
+                "reason":{"type":"string","minLength":1,"maxLength":4096}},
+                "required":["reason"],"additionalProperties":false}),
             ),
             Tool::Wait => (
                 "Suspend until every handle resolves, without holding any execution capacity. Handles are 'BOT/N' (a message sent to a peer agent, numbered as run gives it) or 'proc:N' (a background or detached shell, or a call a message moved to the background). Each result reports the outcome: for a message that opened a turn, that turn's status and final text, with before_steer, the last text it wrote before it was steered, when it ended on a reply to a steer; for one another turn took in, status taken and that turn's number, to wait on in turn; or a process's output and exit code.
@@ -564,7 +609,20 @@ pub struct Registry {
     /// Bytes of tool output being redacted off the runtime at once; see
     /// `off_runtime`.
     heavy: Arc<Semaphore>,
+    /// How a bot's own tools reach the daemon, as that bot ([`Agents`]).
+    requests: Option<Requests>,
 }
+/// A request made of the daemon as bot `bot_id`, answered as a request on
+/// that bot's own socket is: the answer, or the daemon's refusal.
+pub type Requests = Arc<
+    dyn Fn(
+            i64,
+            serde_json::Value,
+        )
+            -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<serde_json::Value>> + Send>>
+        + Send
+        + Sync,
+>;
 type Encodings = Arc<std::sync::Mutex<HashMap<(Family, String), Arc<RawValue>>>>;
 /// What a file that is not text holds, named by its first bytes, as `file`
 /// would: a NUL in its first 8 KiB marks one as binary, as git decides.
@@ -1955,6 +2013,57 @@ impl PemBody {
     }
 }
 
+/// What an agent asks of the daemon with its own tools: what its shell's
+/// `agent` would send, made as that agent and held to what the bot's own
+/// socket allows it.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Agents {
+    /// A message to `to`, after stopping its running turn when `interrupt`.
+    Send {
+        to: String,
+        message: String,
+        /// `steer` or `queue`.
+        delivery: &'static str,
+        interrupt: bool,
+        /// `{"bot","message","reply"?}`, as `submit` takes them.
+        quotes: Vec<serde_json::Value>,
+        request_id: Option<String>,
+    },
+    /// Agents by name, or the calls waiting on an approval.
+    List {
+        name: Option<String>,
+        running: bool,
+        approvals: bool,
+        after: serde_json::Value,
+        limit: usize,
+    },
+    /// Pull the cord on every agent.
+    Pause { reason: String },
+}
+
+/// A quote's handle, `BOT/N` or `BOT/N:reply`, as `submit` takes it.
+fn quote(handle: &str) -> Result<serde_json::Value> {
+    let (handle, reply) = match handle.strip_suffix(":reply") {
+        Some(handle) => (handle, true),
+        None => (handle, false),
+    };
+    let parsed = handle.rsplit_once('/').and_then(|(bot, message)| {
+        let message = message.parse::<i64>().ok().filter(|message| *message > 0)?;
+        (!bot.is_empty() && !bot.contains(':')).then_some((bot, message))
+    });
+    let Some((bot, message)) = parsed else {
+        return fail_with(
+            "invalid_tool_arguments",
+            format!("{handle:?} is no BOT/N or BOT/N:reply"),
+        );
+    };
+    let mut quote = json!({"bot":bot,"message":message});
+    if reply {
+        quote["reply"] = json!(true);
+    }
+    Ok(quote)
+}
+
 pub enum Prepared {
     Echo(String),
     /// Each command runs in `workdir` when its call names one, read
@@ -2012,6 +2121,9 @@ pub enum Prepared {
         /// Search the turns before this one.
         before: Option<i64>,
     },
+    /// A request the bot makes of the daemon as itself. Resolved by the
+    /// runtime, never by the registry.
+    Agents(Agents),
     /// Resolved by the runtime, never by the registry.
     Wait {
         handles: Vec<String>,
@@ -2231,9 +2343,9 @@ impl Registry {
     /// of them a bot may call is the bot's own, chosen at creation.
     pub fn all() -> Result<Self> {
         Self::new(if cfg!(unix) {
-            "echo,shell,read,write,edit,apply_patch,wait,history,web_search,web_fetch,write_stdin"
+            "echo,shell,read,write,edit,apply_patch,wait,history,web_search,web_fetch,write_stdin,send_message,list_agents,pause_agents"
         } else {
-            "echo,read,write,edit,apply_patch,wait,history,web_search,web_fetch"
+            "echo,read,write,edit,apply_patch,wait,history,web_search,web_fetch,send_message,list_agents,pause_agents"
         })
     }
     pub fn new(names: &str) -> Result<Self> {
@@ -2270,6 +2382,7 @@ impl Registry {
             daemon: Arc::default(),
             encodings: Arc::default(),
             heavy: Arc::new(Semaphore::new(heavy_bytes())),
+            requests: None,
         })
     }
     /// A bot's selection must name registered tools, each once.
@@ -2605,6 +2718,23 @@ impl Registry {
     }
     pub fn daemon(&self) -> &Daemon {
         &self.daemon
+    }
+    /// How bots' own tools reach the daemon ([`Agents`]).
+    pub fn with_requests(mut self, requests: Requests) -> Self {
+        self.requests = Some(requests);
+        self
+    }
+    /// Make `request` of the daemon as bot `bot_id`; `agents_unavailable`
+    /// in a daemon that serves no requests.
+    pub async fn request(
+        &self,
+        bot_id: i64,
+        request: serde_json::Value,
+    ) -> Result<serde_json::Value> {
+        match &self.requests {
+            Some(requests) => requests(bot_id, request).await,
+            None => fail("agents_unavailable"),
+        }
     }
     pub fn names(&self) -> Vec<&'static str> {
         self.tools.iter().map(|t| t.name()).collect()
@@ -2957,6 +3087,91 @@ impl Registry {
                     }
                 }
             }
+            Tool::SendMessage => {
+                #[derive(Deserialize)]
+                #[serde(deny_unknown_fields)]
+                struct Send {
+                    to: String,
+                    message: String,
+                    delivery: Option<String>,
+                    #[serde(default)]
+                    interrupt: bool,
+                    #[serde(default)]
+                    quote: Vec<String>,
+                    request_id: Option<String>,
+                }
+                let args: Send = serde_json::from_str(args).map_err(invalid)?;
+                let delivery = match args.delivery.as_deref() {
+                    None | Some("steer") => "steer",
+                    Some("queue") => "queue",
+                    Some(other) => {
+                        return fail_with(
+                            "invalid_tool_arguments",
+                            format!("delivery is steer or queue, not {other:?}"),
+                        );
+                    }
+                };
+                if args.to.is_empty() || args.to.len() > 128 || args.message.is_empty() {
+                    return fail_with("invalid_tool_arguments", "to and message are needed");
+                }
+                if args.quote.len() > 16 {
+                    return fail_with("invalid_tool_arguments", "at most 16 quotes");
+                }
+                Prepared::Agents(Agents::Send {
+                    to: args.to,
+                    message: args.message,
+                    delivery,
+                    interrupt: args.interrupt,
+                    quotes: args.quote.iter().map(|q| quote(q)).collect::<Result<_>>()?,
+                    request_id: args.request_id,
+                })
+            }
+            Tool::ListAgents => {
+                #[derive(Deserialize)]
+                #[serde(deny_unknown_fields)]
+                struct List {
+                    name: Option<String>,
+                    #[serde(default)]
+                    running: bool,
+                    #[serde(default)]
+                    approvals: bool,
+                    #[serde(default)]
+                    after: serde_json::Value,
+                    limit: Option<usize>,
+                }
+                let args: List = serde_json::from_str(args).map_err(invalid)?;
+                let limit = args.limit.unwrap_or(50);
+                if !(1..=256).contains(&limit)
+                    || args
+                        .name
+                        .as_ref()
+                        .is_some_and(|n| n.is_empty() || n.len() > 256)
+                    || (args.running && args.approvals)
+                {
+                    return fail_with(
+                        "invalid_tool_arguments",
+                        "limit is 1 to 256, name 1 to 256 bytes, and running and approvals don't mix",
+                    );
+                }
+                Prepared::Agents(Agents::List {
+                    name: args.name,
+                    running: args.running,
+                    approvals: args.approvals,
+                    after: args.after,
+                    limit,
+                })
+            }
+            Tool::PauseAgents => {
+                #[derive(Deserialize)]
+                #[serde(deny_unknown_fields)]
+                struct Pause {
+                    reason: String,
+                }
+                let args: Pause = serde_json::from_str(args).map_err(invalid)?;
+                Prepared::Agents(Agents::Pause {
+                    reason: args.reason,
+                })
+            }
             Tool::Wait => {
                 let args: Wait = serde_json::from_str(args).map_err(invalid)?;
                 if args.handles.is_empty()
@@ -3063,6 +3278,7 @@ impl Registry {
                 ))
             }
             Prepared::Wait { .. } => fail("wait_requires_runtime"),
+            Prepared::Agents(_) => fail("agents_require_runtime"),
             Prepared::Terminal { .. } | Prepared::WriteStdin { .. } => {
                 fail("terminal_requires_runtime")
             }
@@ -3522,11 +3738,15 @@ impl Registry {
         stop.is_some_and(|stop| stop.sender.send(Kill::Agent).is_ok())
     }
 
-    /// Count `stopper`'s command toward bot `owner`'s share, as just used.
-    /// The share is the process bound (64 by default, Codex's number for a
-    /// session's processes): one past it kills the bot's command it used
-    /// least recently, as Codex prunes, so an agent that loses track of
-    /// what it started cannot hold the whole bound forever. With no bound,
+    /// Count `stopper`'s command as bot `owner`'s, as just used. No agent
+    /// has a share of its own: once the daemon's background commands are
+    /// past its process bound, the agent holding the most loses the one it
+    /// used least recently, sparing its [`PRUNE_SPARES`] most recent (the
+    /// bound's number, under 8), as Codex prunes a session's processes. So
+    /// an agent that loses track of
+    /// what it started cannot crowd out the rest of the fleet, and one
+    /// that needs many keeps them while there is room. A command that ended
+    /// holds no place here, so none is left to prune first. With no bound,
     /// nothing is pruned.
     pub fn own(&self, stopper: &Stopper, owner: i64) {
         let pruned = {
@@ -3536,11 +3756,30 @@ impl Registry {
                 return;
             };
             (entry.owner, entry.used) = (Some(owner), used);
-            let own = (stops.running.iter())
-                .filter(|(_, stop)| stop.owner == Some(owner))
-                .map(|(id, stop)| (*id, stop.used));
-            let least = match self.budget > 0 && own.clone().count() > self.budget {
-                true => own.min_by_key(|(_, used)| *used).map(|(id, _)| id),
+            // Counted in place: grouped by agent only past the bound.
+            let owned = (stops.running.values())
+                .filter(|stop| stop.owner.is_some())
+                .count();
+            let least = match self.budget > 0 && owned > self.budget {
+                // The most held, a tie going to the agent whose oldest
+                // command is oldest.
+                true => {
+                    let mut held: HashMap<i64, Vec<(u64, i64)>> = HashMap::new();
+                    for (id, stop) in &stops.running {
+                        if let Some(owner) = stop.owner {
+                            held.entry(owner).or_default().push((stop.used, *id));
+                        }
+                    }
+                    let spares = PRUNE_SPARES.min(self.budget);
+                    (held.into_values())
+                        .filter(|commands| commands.len() > spares)
+                        .max_by_key(|commands| {
+                            let oldest = commands.iter().map(|(used, _)| *used).min();
+                            (commands.len(), std::cmp::Reverse(oldest))
+                        })
+                        .and_then(|commands| commands.into_iter().min())
+                        .map(|(_, id)| id)
+                }
                 false => None,
             };
             least.and_then(|id| stops.running.remove(&id))
@@ -3684,7 +3923,8 @@ impl Registry {
 }
 
 /// How a background command that was killed answers: by its agent, or
-/// pruned as its agent started one past its share.
+/// pruned as the daemon's process bound filled while its agent held the
+/// most.
 fn stopped(kill: Kill) -> Error {
     Error::with(
         "stopped",
@@ -3693,7 +3933,7 @@ fn stopped(kill: Kill) -> Error {
                 "its agent killed this command before it finished, so it may have had effects"
             }
             Kill::Pruned => {
-                "its agent started more background commands than the daemon's process bound, so this one, the one it used least recently, was killed before it finished; it may have had effects"
+                "the daemon's background commands filled its process bound while its agent held the most of them, so this one, the one its agent used least recently, was killed before it finished; it may have had effects"
             }
         },
     )
@@ -3704,8 +3944,8 @@ fn stopped(kill: Kill) -> Error {
 enum Kill {
     /// Its agent killed it by its handle.
     Agent,
-    /// Its agent started one past its share, and it was the one used least
-    /// recently.
+    /// The daemon's bound filled while its agent held the most, and it was
+    /// the one that agent used least recently.
     Pruned,
 }
 
@@ -5896,37 +6136,70 @@ mod tests {
             assert_eq!(redact(kept), kept);
         }
     }
-    /// A bot keeps at most the process bound's number of background
-    /// commands, as Codex keeps a session's processes: starting one past
-    /// them kills the one its bot used least recently, a wait counting as
-    /// a use. Another bot's and a command no bot owns, such as a detached
-    /// one, never count, and with no bound nothing is pruned.
+    /// No agent has a share of its own: once the daemon's background
+    /// commands are past its process bound, the agent holding the most
+    /// loses the one it used least recently, a wait counting as a use, and
+    /// never one of its 8 most recent, as Codex prunes. Another agent's and
+    /// a command no agent owns, such as a detached one, are never taken for
+    /// it, and with no bound nothing is pruned.
     #[test]
-    fn a_bot_past_its_share_loses_the_command_it_used_least_recently() {
-        let registry = Registry::new("shell").unwrap().with_process_budget(4);
+    fn a_full_bound_prunes_the_agent_holding_the_most() {
+        let registry = Registry::new("shell").unwrap().with_process_budget(12);
         let pruned = |stopper: &mut Stopper| matches!(stopper.stop.try_recv(), Ok(Kill::Pruned));
-        let mut own: Vec<Stopper> = (1..=4)
-            .map(|id| {
-                let stopper = registry.stopper(id);
-                registry.own(&stopper, 7);
-                stopper
-            })
-            .collect();
-        let mut other = registry.stopper(1000);
-        registry.own(&other, 8);
+        let start = |id: i64, owner: i64| {
+            let stopper = registry.stopper(id);
+            registry.own(&stopper, owner);
+            stopper
+        };
+        // One agent may hold most of the bound while there is room.
+        let mut big: Vec<Stopper> = (1..=10).map(|id| start(id, 7)).collect();
+        let mut small: Vec<Stopper> = (11..=12).map(|id| start(id, 8)).collect();
         let mut unowned = registry.stopper(2000);
-        assert!(own.iter_mut().all(|stopper| !pruned(stopper)));
-        // The oldest was waited on since, so the next oldest goes.
+        assert!(big.iter_mut().all(|stopper| !pruned(stopper)));
+        // Past the bound, the small one's start costs the big one its least
+        // recently used: its oldest was waited on since, so the next goes.
         registry.used(&[1]);
-        let mut next = registry.stopper(5);
-        registry.own(&next, 7);
-        assert!(!pruned(&mut own[0]));
-        assert!(pruned(&mut own[1]));
-        assert!(own[2..].iter_mut().all(|stopper| !pruned(stopper)));
-        assert!(!pruned(&mut other) && !pruned(&mut unowned) && !pruned(&mut next));
+        let mut next = start(13, 8);
+        assert!(!pruned(&mut big[0]) && pruned(&mut big[1]));
+        assert!(big[2..].iter_mut().all(|stopper| !pruned(stopper)));
+        assert!(small.iter_mut().all(|stopper| !pruned(stopper)));
+        assert!(!pruned(&mut unowned) && !pruned(&mut next));
         // Gone from those its agent can kill: a kill by its handle finds none.
         assert!(!registry.stop(2));
         assert!(registry.stop(3));
+        // An agent's 8 most recent are spared: past the bound with no agent
+        // holding more than 8, nothing is pruned.
+        let spread = Registry::new("shell").unwrap().with_process_budget(64);
+        let mut held: Vec<Stopper> = (1..=72)
+            .map(|id| {
+                let stopper = spread.stopper(id);
+                spread.own(&stopper, id % 9);
+                stopper
+            })
+            .collect();
+        assert!(held.iter_mut().all(|stopper| !pruned(stopper)));
+        // A bound under 8 spares its own number: one agent past it loses
+        // its least recent rather than being refused, while agents that
+        // each hold no more than it wait for a slot as they would.
+        let small = Registry::new("shell").unwrap().with_process_budget(4);
+        let mut waiting: Vec<Stopper> = (11..=18)
+            .map(|id| {
+                let stopper = small.stopper(id);
+                small.own(&stopper, id);
+                stopper
+            })
+            .collect();
+        assert!(waiting.iter_mut().all(|stopper| !pruned(stopper)));
+        let small = Registry::new("shell").unwrap().with_process_budget(4);
+        let mut held: Vec<Stopper> = (1..=5)
+            .map(|id| {
+                let stopper = small.stopper(id);
+                small.own(&stopper, 7);
+                stopper
+            })
+            .collect();
+        assert!(pruned(&mut held[0]));
+        assert!(held[1..].iter_mut().all(|stopper| !pruned(stopper)));
         let unbounded = Registry::new("shell").unwrap().with_process_budget(0);
         let mut first = unbounded.stopper(1);
         unbounded.own(&first, 7);

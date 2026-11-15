@@ -40,8 +40,7 @@ pub fn install_own() {
     }
     install("sonny-setup", crate::setup::SKILL);
     install("sonny-config", &crate::config::skill());
-    install_browser();
-    install_desktop();
+    install_programs();
     // A job reaches the daemon the way every agent Sonny runs does.
     let automation = include_str!("../skills/automation/SKILL.md");
     install("automation", &agent_client::policy::with_cli(automation));
@@ -65,18 +64,6 @@ pub fn install_own() {
             eprintln!("sonny: {error}");
         }
     }
-    // The script `~/.agent/automation` was `~/.agent/trigger` before 0.8.0:
-    // Sonny's own goes, once its successor is written.
-    crate::upgrade::once(&state.join("sonny/migrated"), SCRIPT, || {
-        let old = state.join("trigger");
-        if std::fs::read_to_string(&old).is_ok_and(|text| {
-            text.starts_with("#!/bin/sh\n# usage: trigger add")
-                && text.ends_with(" trigger \"$@\"\n")
-        }) {
-            let _ = std::fs::remove_file(&old);
-        }
-        true
-    });
     // An older Sonny's `~/.agent/project`, for what the new_project tool
     // does now.
     let project = state.join("project");
@@ -87,18 +74,25 @@ pub fn install_own() {
     }
 }
 
+/// agent-browser's and agent-desktop's own skills, as their installed
+/// programs serve them: at each start, and again once setup installs them.
+pub fn install_programs() {
+    install_browser();
+    install_desktop();
+}
+
 /// agent-browser's own skill, as the installed binary serves it, so it
 /// matches that version: Sonny ships the tool, not words about it. Asking
 /// starts a process, so a skill already written is refreshed off the start;
 /// with agent-browser gone, Sonny's copy goes too.
 fn install_browser() {
     const NAME: &str = "agent-browser";
-    if !crate::setup::on_path(NAME) {
+    let Ok(program) = crate::trusted::program(NAME) else {
         remove(NAME);
         return;
-    }
-    let refresh = || {
-        let served = std::process::Command::new(NAME)
+    };
+    let refresh = move || {
+        let served = std::process::Command::new(program)
             .args(["skills", "get", NAME])
             .stdin(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
@@ -129,12 +123,12 @@ fn install_browser() {
 /// can use the desktop, which the `desktop` tool says.
 fn install_desktop() {
     const NAME: &str = "agent-desktop";
-    if !crate::desktop::here() {
+    let (true, Ok(program)) = (crate::desktop::here(), crate::trusted::program(NAME)) else {
         remove(NAME);
         return;
-    }
-    let refresh = || {
-        let served = std::process::Command::new(NAME)
+    };
+    let refresh = move || {
+        let served = std::process::Command::new(program)
             .args(["skills", "get", "desktop"])
             .stdin(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
@@ -430,10 +424,6 @@ impl Kind {
         }
     }
 }
-
-/// The upgrade migration that removes Sonny's old `~/.agent/trigger`
-/// script.
-pub(crate) const SCRIPT: &str = "automation-script";
 
 /// How Sonny's note to a bot of its upgrade starts; the transcript shows
 /// it as one quiet row.

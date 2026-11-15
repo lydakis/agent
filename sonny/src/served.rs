@@ -57,7 +57,7 @@ pub const GATED: [&str; 9] = [
 
 /// The most of what a call printed that its result holds, under the
 /// daemon's bound on an answer.
-const OUTPUT_BYTES: usize = 60 * 1024;
+pub(crate) const OUTPUT_BYTES: usize = 60 * 1024;
 
 /// How often waiting calls are listed with no call started to say so: a
 /// start missed while the daemon restarted is answered by then.
@@ -167,9 +167,8 @@ fn start() -> Value {
                     "description": "Run the folder's .agents/setup in the copy first: true for a task \
                         that will change files, false for one that only reads."},
                 "model": {"type": "string", "minLength": 1,
-                    "description": "PROVIDER/MODEL, one of the models \"$AGENT_BIN\" models lists with \
-                        the person's notes on them, when the work suits another model than yours; \
-                        without one, the project's task_model, else yours."},
+                    "description": format!("PROVIDER/MODEL, when the work suits another model than yours; \
+                        without one, the project's task_model, else yours.{}", noted_models())},
                 "effort": {"type": "string", "minLength": 1,
                     "description": "The task's effort level, when the work calls for one."},
                 "reason": {"type": "string", "minLength": 1,
@@ -184,6 +183,32 @@ fn start() -> Value {
         // A setup script may build for minutes.
         "expire_ms": 20 * 60 * 1000
     })
+}
+
+/// The most of the person's model notes the start tool carries.
+const NOTED_BYTES: usize = 2048;
+
+/// The models the person wrote a note on in `~/.agent/models`, each with
+/// its note, for the start tool's model parameter; none, the command that
+/// lists every model. Only their own lines: discovery's catalog notes what
+/// the providers report, not what the person thinks of a model.
+fn noted_models() -> String {
+    let listed = agent_client::models::path()
+        .and_then(|path| agent_client::models::mine(&path).ok())
+        .unwrap_or_default();
+    let mut said = String::new();
+    for model in &listed {
+        let Some(note) = &model.note else { continue };
+        let line = format!("\n- {}: {note}", model.id);
+        if said.len() + line.len() > NOTED_BYTES {
+            break;
+        }
+        said.push_str(&line);
+    }
+    match said.is_empty() {
+        true => " \"$AGENT_BIN\" models lists the models there are.".to_owned(),
+        false => format!(" The person's notes on their models:{said}"),
+    }
 }
 
 /// Open the task `name` just started in a tab of its own, as its starter
@@ -269,15 +294,16 @@ fn follows() -> Value {
         "name": FOLLOWS,
         "description": "Your follows in the person's lookout, which tells you what happens in what you \
             follow, in a message sent by lookout that joins your running turn or starts one: each event a \
-            line [source · topic · from], then its text. A follow watches the tasks of a bot (every agent it or \
-            its tasks made) or bots by name, through the tasks source, each agent its topic: messages others \
+            line [source · topic · from], then its text. A follow watches the tasks of an agent (every agent it or \
+            its tasks made) or agents by name, through the tasks source, each agent its topic: messages others \
             write in them, the person's quoted, questions to the person, calls awaiting their approval, margin \
             notes put or removed, and each turn's end with its reply. It also hears the sources the person set up outside, each \
-            by name, or one topic of a source as NAME:TOPIC. The commons is a source too, each thread a topic: \
-            posting in a thread follows it as commons.THREAD, and removing that leaves it. \
+            by name, or one topic of a source as NAME:TOPIC, and Sonny's own: the commons, each thread a topic \
+            (posting in a thread follows it as commons.THREAD, removing that leaves it), memory, each fact \
+            saved or removed, and links, each linked machine that comes or goes. \
             Add steer yourself for what you own; a filter or a digest only when the person asks: \
             what a filter leaves out you never hear, and a digest makes you late. Add or remove one by name, \
-            as {\"name\": \"leads\", \"bots\": [\"web.lead\"], \"sources\": [\"mail\"]}; with neither, \
+            as {\"name\": \"leads\", \"agents\": [\"web.lead\"], \"sources\": [\"mail\"]}; with neither, \
             it lists them all, the sources there are and their events' recent fields.",
         "parameters": {
             "type": "object",
@@ -287,14 +313,14 @@ fn follows() -> Value {
                     "properties": {
                         "name": {"type": "string", "pattern": "^[A-Za-z0-9_-][A-Za-z0-9._-]{0,79}$"},
                         "tasks_of": {"type": "array", "items": {"type": "string", "minLength": 1},
-                            "description": "Bots whose tasks it watches."},
-                        "bots": {"type": "array", "items": {"type": "string", "minLength": 1},
-                            "description": "Bots it watches by name, * matching any run of characters; \
+                            "description": "Agents whose tasks it watches."},
+                        "agents": {"type": "array", "items": {"type": "string", "minLength": 1},
+                            "description": "Agents it watches by name, * matching any run of characters; \
                                 another lead counts only where named exactly."},
                         "sources": {"type": "array", "items": {"type": "string", "minLength": 1},
                             "description": "Sources it hears, by name, or NAME:TOPIC for one topic of it."},
                         "filter": {"type": "object",
-                            "description": "Only the events this matches are heard, its sources' and its bots' \
+                            "description": "Only the events this matches are heard, its sources' and its agents' \
                                 alike. A task's event has type (wrote, turn.ended, question, approval, \
                                 margin), bot, maker, from, turn, text, status (completed, failed, \
                                 stopped, interrupted), done, asked_by (you, the person, an agent's name, \
@@ -322,7 +348,8 @@ fn follows() -> Value {
                     "additionalProperties": false
                 },
                 "remove": {"type": "string", "minLength": 1, "description": "The name of one to remove."},
-                "test": {"type": "boolean", "description": "What add would have heard of its sources' last day; adds nothing."}
+                "test": {"type": "boolean", "description": "What add would have heard of its sources' last day; adds nothing."},
+                "read": {"type": "boolean", "description": "What add hears now; adds nothing."}
             },
             "additionalProperties": false
         },
@@ -751,6 +778,19 @@ async fn called(name: &str, arguments: &Value) -> Answer {
             let caller_id = std::env::var("AGENT_BOT_ID")
                 .ok()
                 .and_then(|id| id.parse().ok());
+            if arguments["read"] == true {
+                let (Some(add), None) = (arguments.get("add"), arguments.get("remove")) else {
+                    return Err(("follow_refused", "read reads an add alone".into()));
+                };
+                return crate::lookout::subs::read_now(
+                    &store,
+                    &caller,
+                    add,
+                    &crate::lookout::sources::names(),
+                )
+                .map(|read| read.to_string())
+                .map_err(|e| ("follow_refused", e));
+            }
             if arguments["test"] == true {
                 let Some(add) = arguments.get("add") else {
                     return Err(("follow_refused", "test tries an add".into()));
@@ -1312,7 +1352,6 @@ async fn serve(store: PathBuf, socket: PathBuf, nudge: Arc<Notify>, serving: Ser
     tokio::spawn(crate::link::keep(hub.clone()));
     loop {
         if let Ok((client, _events)) = Client::connect(&socket).await {
-            crate::trusted::against(client.clone());
             loop {
                 let run = {
                     let (client, me, store, socket, hub) = (

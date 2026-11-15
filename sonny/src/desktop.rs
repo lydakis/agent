@@ -441,7 +441,7 @@ fn checked(line: &str) -> Result<Checked, String> {
 /// Whether agents here can use the desktop: agent-desktop is installed
 /// and there is a desktop to use.
 pub fn here() -> bool {
-    crate::setup::on_path(PROGRAM) && crate::setup::desktop_shows()
+    crate::trusted::here(PROGRAM) && crate::setup::desktop_shows()
 }
 
 /// The tool, while agents here can use the desktop, or a machine linked
@@ -527,9 +527,8 @@ fn nonce() -> String {
 /// person's agent-desktop session settings, which name files and IDs that
 /// are not the agent's.
 async fn run(args: &[String]) -> Ran {
-    // Checked again as it starts, so a copy changed since, while the call
-    // waited for its approval, is admitted again or not run.
-    let program = match crate::trusted::program(PROGRAM).await {
+    // Sonny's own copy, still there as it starts.
+    let program = match crate::trusted::program(PROGRAM) {
         Ok(program) => program,
         Err(e) => {
             return Ran {
@@ -709,11 +708,6 @@ pub async fn drive(
     let checked: Vec<Checked> = (lines.iter().map(|line| checked(line)))
         .collect::<Result<_, _>>()
         .map_err(|e| ("desktop_refused", e))?;
-    // Refused before anything is asked; checked again as each command
-    // starts.
-    crate::trusted::program(PROGRAM)
-        .await
-        .map_err(|e| ("desktop_refused", format!("{PROGRAM} is not run: {e}")))?;
     // Asked before the desktop is taken, so another agent's call goes on
     // while this one waits for its verdict.
     let acts: Vec<&String> = (lines.iter().zip(&checked))
@@ -1061,38 +1055,5 @@ mod tests {
             Ran::of("Usage: agent-desktop", "", true).said,
             "Usage: agent-desktop"
         );
-    }
-
-    #[test]
-    fn the_native_program_runs_beside_npm_s_launcher() {
-        let dir = std::env::temp_dir().join(format!("sonny-desktop-found-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(dir.join("bin")).unwrap();
-        let dir = std::fs::canonicalize(&dir).unwrap();
-        std::fs::write(dir.join("bin").join(PROGRAM), "#!/usr/bin/env node\n").unwrap();
-        let os = if cfg!(target_os = "macos") {
-            "darwin"
-        } else {
-            std::env::consts::OS
-        };
-        let arch = match std::env::consts::ARCH {
-            "x86_64" => "x64",
-            "aarch64" => "arm64",
-            arch => arch,
-        };
-        let path = std::ffi::OsString::from(format!("relative:{}", dir.join("bin").display()));
-        assert_eq!(
-            crate::trusted::native(PROGRAM, &path),
-            dir.join("bin").join(PROGRAM)
-        );
-        let native = dir.join("bin").join(format!("{PROGRAM}-{os}-{arch}"));
-        std::fs::write(&native, "").unwrap();
-        assert_eq!(crate::trusted::native(PROGRAM, &path), native);
-        // A folder not named from the root is never looked in.
-        assert_eq!(
-            crate::trusted::native(PROGRAM, std::ffi::OsStr::new("bin")),
-            Path::new("/nonexistent").join(PROGRAM)
-        );
-        let _ = std::fs::remove_dir_all(&dir);
     }
 }

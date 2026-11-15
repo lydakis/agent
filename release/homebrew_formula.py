@@ -33,8 +33,9 @@ FORMULAS = {
         "Terminal coordinator for a daemon that hosts many durable AI agents",
         # Sonny starts this daemon when none runs, by its `opt` path, which
         # outlasts the versions upgrades remove. Its bots search code with
-        # `rg`, as other harnesses' agents do, and browse with agent-browser.
-        '  depends_on "agent-browser"\n  depends_on "lydakis/agent/agent"\n  depends_on "ripgrep"\n',
+        # `rg`, as other harnesses' agents do. Sonny installs its own
+        # agent-browser, at the version its tools list.
+        '  depends_on "lydakis/agent/agent"\n  depends_on "ripgrep"\n',
         '    system "cargo", "install", *std_cargo_args(path: "sonny")\n',
         '    assert_equal "sonny #{version}", shell_output("#{bin}/sonny --version").strip\n',
     ),

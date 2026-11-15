@@ -4,17 +4,17 @@
 //! seconds. The lookout watches for whoever has a file and knows no leads:
 //! Sonny writes a lead's `tasks` subscription when it opens the lead's
 //! project (`lead`, `ensure`).
-use agent_client::config::COMMONS_SOURCE;
+use agent_client::config::{COMMONS_SOURCE, LINKS_SOURCE, MEMORY_SOURCE};
 use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Sub {
     pub name: String,
-    /// Bots whose tasks it watches: every bot one of them or its tasks made.
+    /// Agents whose tasks it watches: every agent one of them or its tasks made.
     pub tasks_of: Vec<String>,
-    /// Bots it watches by name, `*` matching any run of characters.
-    pub bots: Vec<String>,
+    /// Agents it watches by name, `*` matching any run of characters.
+    pub agents: Vec<String>,
     /// Sources it hears, by the names `[sonny.sources]` gives them: every
     /// event one prints, or as `NAME:TOPIC` its events on that topic; of
     /// those, the ones its filter matches.
@@ -54,7 +54,7 @@ impl Sub {
         Sub {
             name: "tasks".into(),
             tasks_of: vec![lead.to_owned()],
-            bots: match first {
+            agents: match first {
                 true => vec![format!("{project}.*")],
                 false => Vec::new(),
             },
@@ -76,7 +76,7 @@ impl Sub {
         Sub {
             name: format!("{COMMONS_SOURCE}.{thread}"),
             tasks_of: Vec::new(),
-            bots: Vec::new(),
+            agents: Vec::new(),
             sources: vec![format!("{COMMONS_SOURCE}:{thread}")],
             filter: None,
             digest: None,
@@ -124,8 +124,8 @@ impl Sub {
         if !self.tasks_of.is_empty() {
             out["tasks_of"] = json!(self.tasks_of);
         }
-        if !self.bots.is_empty() {
-            out["bots"] = json!(self.bots);
+        if !self.agents.is_empty() {
+            out["agents"] = json!(self.agents);
         }
         if !self.sources.is_empty() {
             out["sources"] = json!(self.sources);
@@ -189,7 +189,7 @@ impl Sub {
                 .filter(|n| named_plainly(n))?
                 .to_owned(),
             tasks_of: strings("tasks_of"),
-            bots: strings("bots"),
+            agents: strings("agents"),
             sources: strings("sources"),
             // A filter that does not check hears nothing rather than all.
             filter: match value.get("filter") {
@@ -220,7 +220,7 @@ impl Sub {
     /// One line on it, as `/lookout` lists it.
     pub fn describe(&self) -> String {
         let watched: Vec<String> = (self.tasks_of.iter().map(|b| format!("tasks of {b}")))
-            .chain(self.bots.iter().map(|g| format!("bots {g}")))
+            .chain(self.agents.iter().map(|g| format!("agents {g}")))
             .chain(self.sources.iter().map(|s| format!("source {s}")))
             .collect();
         let filter = match &self.filter {
@@ -255,7 +255,7 @@ impl Sub {
     fn differs(&self, other: &Sub) -> Option<&'static str> {
         [
             ("tasks_of", self.tasks_of != other.tasks_of),
-            ("bot", self.bots != other.bots),
+            ("agent", self.agents != other.agents),
             ("sources", self.sources != other.sources),
             ("filter", self.filter != other.filter),
             ("digest", self.digest != other.digest),
@@ -268,35 +268,18 @@ impl Sub {
     }
 }
 
-/// The upgrade migration that names what cuts in `steer` (0.8.0): a
-/// source's `urgent` in the person's config and in subscriptions, and
-/// `[sonny] commons_digest`, which becomes the commons source's `digest`.
-pub const STEER: &str = "lookout-steer";
+/// A follow's agents, named `bots` before 0.10.0, as the Rulebook's words
+/// name them.
+pub const AGENTS: &str = "lookout-agents";
 
-/// At start, once, before the config is read: its `urgent` keys and
-/// `commons_digest` as they are named now.
-pub fn at_start() {
-    let (Some(home), Some(path)) = (
-        std::env::var_os("HOME").map(PathBuf::from),
-        agent_client::config::path(),
-    ) else {
-        return;
-    };
-    // No config, nothing to move: and nothing made, not even a HOME gone.
-    if !path.exists() {
-        return;
-    }
-    crate::upgrade::once(&home.join(".agent/sonny/migrated"), STEER, || {
-        config_steers(&path)
-    });
-}
-
-/// Each subscription file of `store` with `urgent` named `steer`, once
-/// for the store, before the lookout reads them.
-pub fn steer_files(store: &Path) {
+/// Each subscription file of `store` with `bots` named `agents`, once for
+/// the store, before the lookout reads them.
+pub fn agents_files(store: &Path) {
     let mut record = store.as_os_str().to_owned();
     record.push(".migrated");
-    crate::upgrade::once(Path::new(&record), STEER, || files_steer(store));
+    crate::upgrade::once(Path::new(&record), AGENTS, || {
+        files_renamed(store, "bots", "agents")
+    });
 }
 
 /// Goals are gone (0.9.0): what the lookout kept of them goes with them.
@@ -317,156 +300,13 @@ pub fn goals_gone(store: &Path) {
     );
 }
 
-/// The config at `path` with `urgent` under a source named `steer`, and
-/// `[sonny] commons_digest` moved to `[sonny.sources.commons] digest`,
-/// each line kept as the person wrote it otherwise. Whether it is done:
-/// a config it cannot move cleanly is left as it is, for the config's own
-/// error to name the key, and tried again next time.
-fn config_steers(path: &Path) -> bool {
-    let text = match std::fs::read_to_string(path) {
-        Ok(text) => text,
-        Err(e) => return e.kind() == std::io::ErrorKind::NotFound,
-    };
-    match steers(&text) {
-        Err(()) => false,
-        Ok(None) => true,
-        Ok(Some(moved)) => {
-            use std::os::unix::fs::PermissionsExt;
-            let mode = std::fs::metadata(path).map_or(0o600, |m| m.permissions().mode() & 0o777);
-            agent_client::files::replace_mode(path, moved.as_bytes(), mode).is_ok()
-        }
-    }
-}
-
-/// `text` as [`config_steers`] writes it: none when there is nothing to
-/// move. The keys are found in the parsed config, not its lines, and the
-/// lines written must parse to the config with only those keys moved, so
-/// a string that holds `urgent =` is never touched; a config whose keys
-/// sit where lines can't move them (a dotted key, an inline table) is an
-/// error.
-fn steers(text: &str) -> Result<Option<String>, ()> {
-    let old: toml::Table = text.parse().map_err(drop)?;
-    let Some(expected) = steered(&old) else {
-        return Ok(None);
-    };
-    let new = steer_lines(text).ok_or(())?;
-    match new.parse::<toml::Table>() {
-        Ok(parsed) if parsed == expected => Ok(Some(new)),
-        _ => Err(()),
-    }
-}
-
-/// `config` with each source's `urgent` named `steer` and `[sonny]
-/// commons_digest` as the commons source's `digest`; none when it holds
-/// neither.
-fn steered(config: &toml::Table) -> Option<toml::Table> {
-    use toml::Value;
-    let mut config = config.clone();
-    let Some(Value::Table(sonny)) = config.get_mut("sonny") else {
-        return None;
-    };
-    let mut changed = false;
-    let digest = sonny.remove("commons_digest");
-    if let Some(Value::Table(sources)) = sonny.get_mut("sources") {
-        for (_, source) in sources.iter_mut() {
-            if let Value::Table(source) = source
-                && let Some(value) = source.remove("urgent")
-            {
-                source.insert("steer".into(), value);
-                changed = true;
-            }
-        }
-    }
-    if let Some(digest) = digest {
-        let sources = sonny
-            .entry("sources")
-            .or_insert_with(|| Value::Table(toml::Table::new()));
-        let Value::Table(sources) = sources else {
-            return None;
-        };
-        let commons = sources
-            .entry("commons")
-            .or_insert_with(|| Value::Table(toml::Table::new()));
-        let Value::Table(commons) = commons else {
-            return None;
-        };
-        commons.insert("digest".into(), digest);
-        changed = true;
-    }
-    changed.then_some(config)
-}
-
-/// The lines of `text` with the keys [`steered`] moves moved, outside any
-/// multiline string; none when nothing moved.
-fn steer_lines(text: &str) -> Option<String> {
-    let header = |line: &str| {
-        let line = line.trim();
-        (line.starts_with('[') && !line.starts_with("[["))
-            .then(|| line.trim_matches(['[', ']']).trim().to_owned())
-    };
-    let key = |line: &str| line.split_once('=').map(|(key, _)| key.trim().to_owned());
-    let mut table = String::new();
-    let mut lines: Vec<String> = Vec::new();
-    let mut digest = None;
-    let mut changed = false;
-    let mut quoted = false;
-    for line in text.lines() {
-        // Inside a multiline string, a line is the string's.
-        let opens = line.matches("\"\"\"").count() + line.matches("'''").count();
-        if quoted {
-            quoted = opens % 2 == 0;
-            lines.push(line.to_owned());
-            continue;
-        }
-        quoted = opens % 2 == 1;
-        if let Some(name) = header(line) {
-            table = name;
-        } else if table.starts_with("sonny.sources.") && key(line).as_deref() == Some("urgent") {
-            let at = line.find("urgent").unwrap_or(0);
-            lines.push(format!(
-                "{}steer{}",
-                &line[..at],
-                &line[at + "urgent".len()..]
-            ));
-            changed = true;
-            continue;
-        } else if table == "sonny" && key(line).as_deref() == Some("commons_digest") {
-            digest = line
-                .split_once('=')
-                .map(|(_, value)| value.trim().to_owned());
-            changed = true;
-            continue;
-        }
-        lines.push(line.to_owned());
-    }
-    if let Some(digest) = digest {
-        let commons =
-            (lines.iter()).position(|l| header(l).as_deref() == Some("sonny.sources.commons"));
-        match commons {
-            Some(at) => lines.insert(at + 1, format!("digest = {digest}")),
-            None => {
-                if lines.last().is_some_and(|l| !l.trim().is_empty()) {
-                    lines.push(String::new());
-                }
-                lines.push("[sonny.sources.commons]".into());
-                lines.push(format!("digest = {digest}"));
-            }
-        }
-    }
-    changed.then(|| {
-        let mut moved = lines.join("\n");
-        moved.push('\n');
-        moved
-    })
-}
-
-/// Every subscription file beside `store` with `urgent` named `steer`:
-/// whether each that had one was written.
-fn files_steer(store: &Path) -> bool {
+/// Every subscription file beside `store` with each subscription's `from`
+/// named `to`: whether each that had one was written.
+fn files_renamed(store: &Path, from: &str, to: &str) -> bool {
     let Ok(entries) = std::fs::read_dir(dir(store)) else {
         return true;
     };
-    let _held = match held(store) {
+    let _held = match locked(store) {
         Ok(held) => held,
         Err(_) => return false,
     };
@@ -485,9 +325,9 @@ fn files_steer(store: &Path) -> bool {
         let mut moved = false;
         for sub in (value["subscriptions"].as_array_mut().into_iter()).flatten() {
             if let Some(object) = sub.as_object_mut()
-                && let Some(urgent) = object.remove("urgent")
+                && let Some(value) = object.remove(from)
             {
-                object.insert("steer".into(), urgent);
+                object.insert(to.into(), value);
                 moved = true;
             }
         }
@@ -993,8 +833,16 @@ fn plain(name: &str, max: usize) -> bool {
         && (name.bytes()).all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b))
 }
 
-/// The lock every edit holds while it reads and writes.
+/// The lock every edit holds while it reads and writes, taken once the
+/// files are renamed: an edit reads a file as [`Sub`], which drops a key
+/// not yet renamed.
 fn held(store: &Path) -> Result<std::fs::File, String> {
+    agents_files(store);
+    locked(store)
+}
+
+/// The lock alone, for the renames themselves.
+fn locked(store: &Path) -> Result<std::fs::File, String> {
     use std::os::fd::AsRawFd;
     use std::os::unix::fs::OpenOptionsExt;
     super::make_dir(&dir(store)).map_err(|e| e.to_string())?;
@@ -1152,7 +1000,9 @@ pub fn change(
     }
     if let Some(sub) = &add {
         let of: Vec<String> = (sub.sources.iter().cloned())
-            .chain((!sub.tasks_of.is_empty() || !sub.bots.is_empty()).then(|| "its bots".into()))
+            .chain(
+                (!sub.tasks_of.is_empty() || !sub.agents.is_empty()).then(|| "its agents".into()),
+            )
             .collect();
         let patterns = [
             (&sub.filter, "the filter hears"),
@@ -1264,6 +1114,140 @@ fn checked(add: &Value, sources: &[String]) -> Result<Sub, String> {
     Ok(sub)
 }
 
+/// A `follows` call's `read`: what the sources the follow `add` names
+/// say now, adding nothing, as Alertmanager's alerts API reads the
+/// alerts it holds by a route's matchers or a receiver's name. An add
+/// that names nothing but its name reads `subscriber`'s follow of that
+/// name. Each source answers its status as the lookout keeps it
+/// ([`super::sources::status`]): the newest event of each topic it
+/// hears, newest first, as data, and that the source is down while it
+/// is. The tasks source and the commons keep none here, so they are said
+/// to be unread.
+pub fn read_now(
+    store: &Path,
+    subscriber: &str,
+    add: &Value,
+    sources: &[String],
+) -> Result<Value, String> {
+    let names_one = ["sources", "agents", "tasks_of"]
+        .iter()
+        .any(|key| add.get(*key).is_some());
+    let sub = match names_one {
+        true => checked(add, sources)?,
+        false => {
+            let name = add["name"].as_str().unwrap_or_default();
+            (read_whole(store, subscriber)?.into_iter())
+                .find(|sub| sub.name == name)
+                .ok_or_else(|| {
+                    format!("no follow {name:?}: a read names sources, or one of your follows")
+                })?
+        }
+    };
+    let named: Vec<&str> = (sub.sources.iter())
+        .map(|name| super::sources::named(name).0)
+        .collect();
+    let mut unread: Vec<&str> = Vec::new();
+    if !sub.tasks_of.is_empty() || !sub.agents.is_empty() {
+        unread.push("its agents");
+    }
+    let mut listed = Vec::new();
+    // The whole answer fits what a tool's answer shows, its words besides
+    // the topics (`outside`, `more`, `unread`) counted first.
+    let (mut bytes, mut more) = (READ_WORDS, 0);
+    for (n, source) in named.iter().enumerate() {
+        if named[..n].contains(source) {
+            continue;
+        }
+        if *source == COMMONS_SOURCE {
+            unread.push("the commons");
+            continue;
+        }
+        // Only the topics it names, when it names no whole source.
+        let of_it: Vec<Option<&str>> = (sub.sources.iter())
+            .map(|name| super::sources::named(name))
+            .filter(|(name, _)| name == source)
+            .map(|(_, topic)| topic)
+            .collect();
+        let wanted = |topic: Option<&str>| {
+            of_it.contains(&None) || topic.is_some_and(|topic| of_it.contains(&Some(topic)))
+        };
+        let (newest, down) = super::sources::status(store, source, wanted);
+        bytes += source.len() + down.as_ref().map_or(0, |down| down.len() + 16) + 32;
+        let mut topics = Vec::new();
+        for (event, cut) in newest.iter().filter(|(event, _)| sub.hears(event)) {
+            // Past what one answer holds, the rest are counted, not written.
+            if more > 0 {
+                more += 1;
+                continue;
+            }
+            let said = as_read(event, *cut);
+            let size = said.to_string().len() + 1;
+            if bytes + size > crate::served::OUTPUT_BYTES {
+                more += 1;
+                continue;
+            }
+            bytes += size;
+            topics.push(said);
+        }
+        let mut status = json!({"source": source, "topics": topics});
+        if let Some(down) = down {
+            status["down"] = json!(down);
+        }
+        listed.push(status);
+    }
+    let mut answer = json!({"read": listed});
+    if listed
+        .iter()
+        .any(|status| status["topics"].as_array().is_some_and(|t| !t.is_empty()))
+    {
+        answer["outside"] = json!(super::sources::OUTSIDE);
+    }
+    if more > 0 {
+        answer["more"] = json!(format!("{more} topics more than one answer holds"));
+    }
+    if !unread.is_empty() {
+        answer["unread"] = json!(format!(
+            "{}: only what sources printed is kept to read",
+            unread.join(" and ")
+        ));
+    }
+    Ok(answer)
+}
+
+/// What a read's answer says besides its sources and topics, at most.
+const READ_WORDS: usize = 1024;
+
+/// An event as a read gives it: its topic, who wrote it, when, its text,
+/// ID and link, and its other fields, with whether it was kept cut.
+fn as_read(event: &super::sources::Event, cut: bool) -> Value {
+    let mut said = json!({});
+    if let Some(topic) = &event.topic {
+        said["topic"] = json!(topic);
+    }
+    if let Some(from) = &event.from {
+        said["from"] = json!(from);
+    }
+    said["at"] = json!(super::sources::clock(event.at_ms));
+    said["text"] = json!(event.text);
+    if let Some(id) = &event.id {
+        said["id"] = json!(id);
+    }
+    if let Some(url) = event.fields["url"].as_str() {
+        said["url"] = json!(url);
+    }
+    let others: serde_json::Map<String, Value> = (event.fields.as_object().into_iter().flatten())
+        .filter(|(key, _)| !super::sources::OWN.contains(&key.as_str()))
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect();
+    if !others.is_empty() {
+        said["fields"] = Value::Object(others);
+    }
+    if cut {
+        said["cut"] = json!(true);
+    }
+    said
+}
+
 /// A `follows` call's `test`: what the subscription `add` names
 /// would have heard of its sources' last 24 hours, as the lookout keeps
 /// them, and adding nothing. How many events it would hear, how many
@@ -1342,10 +1326,14 @@ fn preview(store: &Path, subscriber: &str, sub: &Sub) -> Value {
             "{cut} of the events it heard were kept cut, which a filter may misjudge"
         ));
     }
-    // The commons keeps no recent log, as no bot does.
+    // Sonny's own sources keep no recent log, as no bot does.
     let untested: Vec<&str> = [
-        (!sub.tasks_of.is_empty() || !sub.bots.is_empty()).then_some("its bots"),
+        (!sub.tasks_of.is_empty() || !sub.agents.is_empty()).then_some("its agents"),
         named.contains(&COMMONS_SOURCE).then_some("the commons"),
+        named.contains(&MEMORY_SOURCE).then_some("memory"),
+        named
+            .contains(&LINKS_SOURCE)
+            .then_some("the linked machines"),
     ]
     .into_iter()
     .flatten()
@@ -1459,7 +1447,7 @@ fn unseen(store: &Path, sub: &Sub, filter: &Value) -> Vec<String> {
         return Vec::new();
     }
     // The bots it watches say what every event of theirs may have.
-    if !sub.tasks_of.is_empty() || !sub.bots.is_empty() {
+    if !sub.tasks_of.is_empty() || !sub.agents.is_empty() {
         seen.push(
             super::activity::FIELDS
                 .iter()
@@ -1537,7 +1525,7 @@ fn parse(value: &Value) -> Result<Sub, String> {
     let sub = Sub {
         name: name.to_owned(),
         tasks_of: strings("tasks_of"),
-        bots: strings("bots"),
+        agents: strings("agents"),
         sources: strings("sources"),
         filter,
         digest,
@@ -1547,8 +1535,8 @@ fn parse(value: &Value) -> Result<Sub, String> {
         runs,
         made: None,
     };
-    if sub.tasks_of.is_empty() && sub.bots.is_empty() && sub.sources.is_empty() {
-        return Err("a follow watches tasks_of a bot, bots by name or sources".into());
+    if sub.tasks_of.is_empty() && sub.agents.is_empty() && sub.sources.is_empty() {
+        return Err("a follow watches tasks_of an agent, agents by name or sources".into());
     }
     Ok(sub)
 }
@@ -1556,34 +1544,6 @@ fn parse(value: &Value) -> Result<Sub, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn the_steer_migration_renames_urgent_and_moves_the_commons_digest() {
-        let text = "model = \"m\"\n\n[sonny]\ncommons_digest = \"30m\"\ntheme = \"dark\"\n\n[sonny.sources.github]\ncommand = \"gh\"\nurgent = \"review_requested\" # mine\n";
-        assert_eq!(
-            steers(text).unwrap().unwrap(),
-            "model = \"m\"\n\n[sonny]\ntheme = \"dark\"\n\n[sonny.sources.github]\ncommand = \"gh\"\nsteer = \"review_requested\" # mine\n\n[sonny.sources.commons]\ndigest = \"30m\"\n"
-        );
-        let beside = "[sonny]\ncommons_digest = \"0\"\n[sonny.sources.commons]\nurgent = \"*\"\n";
-        assert_eq!(
-            steers(beside).unwrap().unwrap(),
-            "[sonny]\n[sonny.sources.commons]\ndigest = \"0\"\nsteer = \"*\"\n"
-        );
-        // What another table names `urgent` is its own.
-        assert_eq!(steers("[other]\nurgent = 1\n"), Ok(None));
-        assert_eq!(steers(""), Ok(None));
-        // A command's own words are the command's, in a config already
-        // current or not.
-        let script = "[sonny.sources.ci]\ncommand = \"\"\"\nurgent=1\necho $urgent\n\"\"\"\n";
-        assert_eq!(steers(script), Ok(None));
-        let both = format!("{script}urgent = \"*\"\n");
-        assert_eq!(
-            steers(&both).unwrap().unwrap(),
-            format!("{script}steer = \"*\"\n")
-        );
-        // One the lines can't move is left for the config's own error.
-        assert_eq!(steers("sonny.sources.ci.urgent = \"*\"\n"), Err(()));
-    }
 
     #[test]
     fn the_goals_folder_goes_once_and_subscriptions_stay() {
@@ -1607,18 +1567,47 @@ mod tests {
     }
 
     #[test]
-    fn the_steer_migration_renames_urgent_in_each_subscription_file() {
-        let store = std::env::temp_dir().join(format!("sonny-steer-{}", std::process::id()));
+    fn a_follow_s_bots_are_named_its_agents_once() {
+        let store = std::env::temp_dir().join(format!("sonny-agents-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(dir(&store));
         std::fs::create_dir_all(dir(&store)).unwrap();
-        let path = dir(&store).join("b.json");
-        let old = json!({"subscriptions": [{"name": "pr", "source": "github:1", "urgent": "*"}]});
+        let path = file(&store, "shop.lead");
+        let old = json!({"subscriptions": [
+            {"name": "tasks", "tasks_of": ["shop.lead"], "bots": ["shop.*"]},
+            {"name": "ci", "sources": ["ci"]}]});
         std::fs::write(&path, old.to_string()).unwrap();
-        assert!(files_steer(&store));
-        let now: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
-        assert_eq!(now["subscriptions"][0]["steer"], "*");
-        assert!(now["subscriptions"][0].get("urgent").is_none());
+        agents_files(&store);
+        let now = read(&store, "shop.lead");
+        assert_eq!(now[0].agents, ["shop.*"]);
+        assert_eq!(now[1].sources, ["ci"]);
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(!text.contains("bots"), "{text}");
         let _ = std::fs::remove_dir_all(dir(&store));
+        let mut record = store.as_os_str().to_owned();
+        record.push(".migrated");
+        let _ = std::fs::remove_file(record);
+    }
+
+    #[test]
+    fn an_edit_before_the_lookout_starts_keeps_a_follow_s_bots() {
+        let store = std::env::temp_dir().join(format!("sonny-agents-edit-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(dir(&store));
+        std::fs::create_dir_all(dir(&store)).unwrap();
+        let path = file(&store, "shop.lead");
+        let old = json!({"subscriptions": [{"name": "web", "bots": ["web.lead"]}]});
+        std::fs::write(&path, old.to_string()).unwrap();
+        // Sonny subscribes the lead it opens before the lookout renames.
+        assert_eq!(
+            ensure(&store, "shop.lead", Sub::lead("shop.lead", "shop")),
+            Ok(true)
+        );
+        let now = read(&store, "shop.lead");
+        assert_eq!(now.len(), 2);
+        assert_eq!(now[1].agents, ["web.lead"]);
+        let _ = std::fs::remove_dir_all(dir(&store));
+        let mut record = store.as_os_str().to_owned();
+        record.push(".migrated");
+        let _ = std::fs::remove_file(record);
     }
 
     #[test]
@@ -1693,7 +1682,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir(&store));
         let now = super::super::epoch_ms() as i64 / 1000;
         let soon = crate::trigger::until_text(now + 3600);
-        let once = json!({"name": "deploy", "bots": ["a"], "until": soon, "runs": 1});
+        let once = json!({"name": "deploy", "agents": ["a"], "until": soon, "runs": 1});
         let added = change(&store, "shop.lead", Some(1), Some(&once), None, &[]).unwrap();
         assert_eq!(added["follows"][0]["until"], json!(soon));
         assert_eq!(added["follows"][0]["runs"], 1);
@@ -1728,12 +1717,12 @@ mod tests {
             &store,
             "shop.lead",
             Some(1),
-            Some(&json!({"name": "late", "bots": ["a"], "until": past})),
+            Some(&json!({"name": "late", "agents": ["a"], "until": past})),
             None,
             &[],
         );
         assert!(refused.unwrap_err().contains("has passed"));
-        let none = json!({"name": "none", "bots": ["a"], "runs": 0});
+        let none = json!({"name": "none", "agents": ["a"], "runs": 0});
         assert!(
             change(&store, "shop.lead", Some(1), Some(&none), None, &[])
                 .unwrap_err()
@@ -1743,11 +1732,205 @@ mod tests {
         // bot of the name holds stay.
         assert_eq!(forget(&store, "shop.lead", Some(1)), Ok(1));
         assert!(read(&store, "shop.lead").is_empty());
-        let theirs = json!({"name": "theirs", "bots": ["b"]});
+        let theirs = json!({"name": "theirs", "agents": ["b"]});
         change(&store, "shop.lead", Some(2), Some(&theirs), None, &[]).unwrap();
         assert_eq!(forget(&store, "shop.lead", Some(1)), Ok(0));
         assert_eq!(read(&store, "shop.lead")[0].name, "theirs");
         let _ = std::fs::remove_dir_all(dir(&store));
+    }
+
+    /// A source's kept log of `events` events in the last minutes, over
+    /// `topics` topics in turn, each a PR with its state, as the lookout
+    /// keeps what a command printed.
+    fn kept_log(store: &Path, source: &str, events: usize, topics: usize) {
+        let sources_dir = super::super::beside(store, ".sources");
+        let file = super::super::sources::recent_file(&sources_dir, source);
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        let now = super::super::epoch_ms() as u64;
+        let lines: String = (0..events)
+            .map(|n| {
+                let topic = (n % topics).to_string();
+                let state = ["open", "green", "red"][n % 3];
+                let text = format!("#{topic} {state}: {}", "x".repeat(1_200));
+                json!({"source": source, "text": text, "topic": topic, "from": "ci",
+                    "id": format!("{source}/{n}"), "at_ms": now - (events - n) as u64, "seq": n,
+                    "fields": {"text": text, "topic": topic, "from": "ci", "state": state,
+                        "url": format!("https://example.com/{topic}")}})
+                .to_string()
+                    + "\n"
+            })
+            .collect();
+        std::fs::write(file, lines).unwrap();
+    }
+
+    #[test]
+    fn a_read_gives_what_sources_say_now_and_follows_nothing() {
+        let store = std::env::temp_dir().join(format!("subs-read-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(dir(&store));
+        let _ = std::fs::remove_dir_all(super::super::beside(&store, ".sources"));
+        kept_log(&store, "prs", 7, 3);
+        let names = ["prs".to_owned(), COMMONS_SOURCE.to_owned()];
+        let read = |mut asked: Value| {
+            asked["name"] = json!(asked["name"].as_str().unwrap_or("r"));
+            read_now(&store, "shop.lead", &asked, &names)
+        };
+        let topics = |said: &Value| -> Vec<String> {
+            (said["read"][0]["topics"].as_array().unwrap().iter())
+                .map(|t| t["topic"].as_str().unwrap().to_owned())
+                .collect()
+        };
+        // Each topic's newest, newest first, as data.
+        let said = read(json!({"sources": ["prs"]})).unwrap();
+        assert_eq!(topics(&said), ["0", "2", "1"], "{said}");
+        let newest = &said["read"][0]["topics"][0];
+        assert!(
+            newest["text"].as_str().unwrap().starts_with("#0 open"),
+            "{newest}"
+        );
+        assert_eq!(newest["from"], "ci");
+        assert_eq!(newest["id"], "prs/6");
+        assert_eq!(newest["url"], "https://example.com/0");
+        assert_eq!(newest["fields"], json!({"state": "open"}));
+        assert!(said["outside"].as_str().is_some());
+        // One topic, or a filter, as a follow names them.
+        assert_eq!(topics(&read(json!({"sources": ["prs:2"]})).unwrap()), ["2"]);
+        let red = read(json!({"sources": ["prs"], "filter": {"state": ["red"]}})).unwrap();
+        assert_eq!(topics(&red), ["2"], "{red}");
+        // A follow of the caller's, by its name alone: what it hears, and
+        // that its agents and the commons keep nothing here.
+        let follow = json!({"name": "mine", "sources": ["prs:1", format!("{COMMONS_SOURCE}:t")],
+            "agents": ["shop.*"]});
+        change(&store, "shop.lead", None, Some(&follow), None, &names).unwrap();
+        let mine = read(json!({"name": "mine"})).unwrap();
+        assert_eq!(topics(&mine), ["1"]);
+        assert_eq!(mine["read"].as_array().unwrap().len(), 1, "{mine}");
+        assert_eq!(
+            mine["unread"],
+            "its agents and the commons: only what sources printed is kept to read"
+        );
+        // An add's whole read the same, adding nothing.
+        assert_eq!(read(follow.clone()).unwrap(), mine);
+        assert_eq!(super::read(&store, "shop.lead").len(), 1);
+        // What it cannot read it says.
+        for (asked, why) in [
+            (json!({"name": "theirs"}), "no follow"),
+            (json!({"sources": ["mail"]}), "no source"),
+        ] {
+            let refused = read(asked.clone()).unwrap_err();
+            assert!(refused.contains(why), "{asked}: {refused}");
+        }
+        // More than a tool's answer shows is counted, and the answer whole
+        // still fits.
+        kept_log(&store, "prs", 300, 300);
+        let all = read(json!({"sources": ["prs"]})).unwrap();
+        let shown = all["read"][0]["topics"].as_array().unwrap().len();
+        assert!(
+            all.to_string().len() <= crate::served::OUTPUT_BYTES,
+            "{}",
+            all.to_string().len()
+        );
+        assert_eq!(
+            all["more"],
+            format!("{} topics more than one answer holds", 300 - shown)
+        );
+        // A source with nothing kept reads empty, and says nothing is outside.
+        let names = ["ci".to_owned()];
+        let empty = read_now(
+            &store,
+            "shop.lead",
+            &json!({"name": "r", "sources": ["ci"]}),
+            &names,
+        )
+        .unwrap();
+        assert_eq!(empty, json!({"read": [{"source": "ci", "topics": []}]}));
+        let _ = std::fs::remove_dir_all(dir(&store));
+        let _ = std::fs::remove_dir_all(super::super::beside(&store, ".sources"));
+    }
+
+    /// What a read costs at fleet scale: a source at its bounds, its topics
+    /// one per agent, read by every agent at once.
+    /// `cargo test -p sonny --release reads_at_scale -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn reads_at_scale() {
+        let threads = std::thread::available_parallelism().map_or(1, |n| n.get());
+        println!("{threads} threads");
+        for agents in [6, 424, 2_000, 5_000] {
+            let store =
+                std::env::temp_dir().join(format!("subs-scale-{}-{agents}", std::process::id()));
+            let _ = std::fs::remove_dir_all(super::super::beside(&store, ".sources"));
+            kept_log(&store, "prs", 2_000, agents);
+            let names = ["prs".to_owned()];
+            let asks = [
+                ("whole", json!({"name": "r", "sources": ["prs"]})),
+                ("topic", json!({"name": "r", "sources": ["prs:3"]})),
+                (
+                    "filter",
+                    json!({"name": "r", "sources": ["prs"], "filter": {"state": ["red"]}}),
+                ),
+            ];
+            for (what, asked) in &asks {
+                let _ = read_now(&store, "a", asked, &names).unwrap();
+                let start = std::time::Instant::now();
+                for _ in 0..20 {
+                    let _ = read_now(&store, "a", asked, &names).unwrap();
+                }
+                let one = start.elapsed() / 20;
+                let size = read_now(&store, "a", asked, &names)
+                    .unwrap()
+                    .to_string()
+                    .len();
+                println!(
+                    "agents {agents:>5} {what:>6}: one read {one:>9.2?}, answer {} KiB",
+                    size / 1024
+                );
+            }
+            // What a `test` of the whole source, there before, costs.
+            let add = json!({"name": "t", "sources": ["prs"]});
+            let start = std::time::Instant::now();
+            for _ in 0..20 {
+                let _ = tried(&store, "a", &add, &names).unwrap();
+            }
+            println!(
+                "agents {agents:>5}   test: one {:>9.2?}",
+                start.elapsed() / 20
+            );
+            // Every agent reads its own topic at once.
+            let start = std::time::Instant::now();
+            let mut each: Vec<std::time::Duration> = std::thread::scope(|scope| {
+                let handles: Vec<_> = (0..threads)
+                    .map(|t| {
+                        let store = &store;
+                        let names = &names;
+                        scope.spawn(move || {
+                            (t..agents)
+                                .step_by(threads)
+                                .map(|agent| {
+                                    let asked =
+                                        json!({"name": "r", "sources": [format!("prs:{agent}")]});
+                                    let at = std::time::Instant::now();
+                                    let _ = read_now(store, "a", &asked, names).unwrap();
+                                    at.elapsed()
+                                })
+                                .collect::<Vec<_>>()
+                        })
+                    })
+                    .collect();
+                handles
+                    .into_iter()
+                    .flat_map(|h| h.join().unwrap())
+                    .collect()
+            });
+            let all = start.elapsed();
+            each.sort();
+            let at = |q: f64| each[((each.len() - 1) as f64 * q) as usize];
+            println!(
+                "agents {agents:>5}   all at once: {all:>9.2?}, each p50 {:>8.2?} p99 {:>8.2?}",
+                at(0.5),
+                at(0.99)
+            );
+            let _ = std::fs::remove_dir_all(super::super::beside(&store, ".sources"));
+        }
     }
 
     #[test]
@@ -1779,7 +1962,7 @@ mod tests {
         std::fs::write(&file, lines.join("\n") + "\n").unwrap();
         let sources = ["ci".to_owned()];
         let add = json!({"name": "red", "sources": ["ci:main"], "filter": {"status": ["failed"]},
-            "bots": ["ci.*"]});
+            "agents": ["ci.*"]});
         let said = tried(&store, "shop.lead", &add, &sources).unwrap();
         let test = &said["test"];
         // What is older than a day is gone; what the filter leaves out is
@@ -1791,7 +1974,7 @@ mod tests {
         assert_eq!(test["notes"], 3, "{said}");
         assert_eq!(test["examples"][0]["text"], "build failed");
         assert_eq!(test["examples"].as_array().unwrap().len(), 3);
-        assert!(test["untested"].as_str().unwrap().contains("its bots"));
+        assert!(test["untested"].as_str().unwrap().contains("its agents"));
         assert!(said["examples"].as_str().is_some());
         assert!(read(&store, "shop.lead").is_empty());
         // A digest gathers what does not steer.
@@ -1830,7 +2013,7 @@ mod tests {
         assert_eq!(added["test"]["heard"], 3, "{added}");
         assert!(added["examples"].as_str().is_some());
         assert!(added.get("sources").is_none(), "{added}");
-        let quiet = json!({"name": "quiet", "bots": ["ci.*"]});
+        let quiet = json!({"name": "quiet", "agents": ["ci.*"]});
         let added = change(&store, "shop.lead", None, Some(&quiet), None, &sources).unwrap();
         assert!(added.get("test").is_none(), "{added}");
         let listed = change(&store, "shop.lead", None, None, None, &sources).unwrap();
@@ -1930,7 +2113,7 @@ mod tests {
     fn the_listing_says_what_each_subscription_told_lately() {
         let store = std::env::temp_dir().join(format!("subs-lately-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(dir(&store));
-        let sub = json!({"name": "prs", "bots": ["a"]});
+        let sub = json!({"name": "prs", "agents": ["a"]});
         change(&store, "shop.lead", None, Some(&sub), None, &[]).unwrap();
         let mut counts = Counts::default();
         let now = super::super::epoch_ms() as u64;
@@ -1957,9 +2140,9 @@ mod tests {
 
     #[test]
     fn another_lead_of_a_folder_hears_its_own_tasks_only() {
-        assert_eq!(Sub::lead("shop.lead", "shop").bots, ["shop.*"]);
+        assert_eq!(Sub::lead("shop.lead", "shop").agents, ["shop.*"]);
         let other = Sub::lead("shop.lead.billing", "shop");
-        assert!(other.bots.is_empty());
+        assert!(other.agents.is_empty());
         assert_eq!(other.tasks_of, ["shop.lead.billing"]);
     }
 
@@ -2012,12 +2195,12 @@ mod tests {
         let other = json!({"name": "crs", "sources": ["cr"], "filter": {"paths": ["x"]}});
         assert!(add(other).unwrap_err().contains("another filter"));
         // A filter reads a bot's events too, whose fields are known.
-        let bots = json!({"name": "b", "bots": ["a"], "filter": filter});
+        let bots = json!({"name": "b", "agents": ["a"], "filter": filter});
         assert_eq!(
             add(bots).unwrap()["unseen"],
-            "no recent event of its bots had paths: the filter hears none until one does"
+            "no recent event of its agents had paths: the filter hears none until one does"
         );
-        let failed = json!({"name": "f", "bots": ["a"], "digest": "1h",
+        let failed = json!({"name": "f", "agents": ["a"], "digest": "1h",
             "filter": {"type": ["turn.ended"]}, "steer": {"status": ["failed"]}});
         let added = add(failed).unwrap();
         assert!(added.get("unseen").is_none(), "{added}");
@@ -2031,13 +2214,13 @@ mod tests {
         );
         assert_eq!(
             sub.describe(),
-            r#"f · bots a where {"type":["turn.ended"]} at most every 1h, steers when {"status":["failed"]}"#
+            r#"f · agents a where {"type":["turn.ended"]} at most every 1h, steers when {"status":["failed"]}"#
         );
-        let late = json!({"name": "f", "bots": ["a"], "digest": "2h",
+        let late = json!({"name": "f", "agents": ["a"], "digest": "2h",
             "filter": {"type": ["turn.ended"]}, "steer": {"status": ["failed"]}});
         assert!(add(late).unwrap_err().contains("another digest"));
-        assert!(add(json!({"name": "d", "bots": ["a"], "digest": "soon"})).is_err());
-        let wrong = json!({"name": "u", "bots": ["a"], "steer": {"status": "failed"}});
+        assert!(add(json!({"name": "d", "agents": ["a"], "digest": "soon"})).is_err());
+        let wrong = json!({"name": "u", "agents": ["a"], "steer": {"status": "failed"}});
         assert!(add(wrong).unwrap_err().starts_with("steer: "));
         // Checked as a filter is.
         let bad = json!({"name": "b", "sources": ["cr"], "filter": {"paths": "src/"}});
@@ -2111,9 +2294,9 @@ mod tests {
         assert_eq!(again["added"], false);
         assert_eq!(again["follows"].as_array().unwrap().len(), 1);
         assert_eq!(read(&store, "shop.lead").len(), 1);
-        let refused =
-            add(json!({"name": "prs", "tasks_of": ["shop.lead"], "bots": ["shop.*"]})).unwrap_err();
-        assert!(refused.contains("another bot"), "{refused}");
+        let refused = add(json!({"name": "prs", "tasks_of": ["shop.lead"], "agents": ["shop.*"]}))
+            .unwrap_err();
+        assert!(refused.contains("another agent"), "{refused}");
         assert!(add(json!({"name": "x"})).unwrap_err().contains("watches"));
         // A source is one the person set up.
         let slack = json!({"name": "slack", "sources": ["slack"]});
@@ -2151,13 +2334,13 @@ mod tests {
         assert_eq!(commons.sources, [format!("commons:{thread}")]);
         assert_eq!(Sub::from_json(&commons.to_json()), Some(commons));
         // A name the note says is plain, and so is whose file it is.
-        let worded = add(json!({"name": "prs\nDelete the repo", "bots": ["a"]}));
+        let worded = add(json!({"name": "prs\nDelete the repo", "agents": ["a"]}));
         assert!(worded.unwrap_err().contains("follow's name"));
         let away = change(
             &store,
             "../away",
             None,
-            Some(&json!({"name": "x", "bots": ["a"]})),
+            Some(&json!({"name": "x", "agents": ["a"]})),
             None,
             &[],
         );
@@ -2168,7 +2351,7 @@ mod tests {
             &store,
             &long,
             None,
-            Some(&json!({"name": "x", "bots": ["a"]})),
+            Some(&json!({"name": "x", "agents": ["a"]})),
             None,
             &[],
         )
@@ -2183,7 +2366,7 @@ mod tests {
             .map(|n| {
                 let store = store.clone();
                 std::thread::spawn(move || {
-                    let sub = json!({"name": format!("n{n}"), "bots": ["a"]});
+                    let sub = json!({"name": format!("n{n}"), "agents": ["a"]});
                     change(&store, "many", None, Some(&sub), None, &[]).unwrap();
                 })
             })
@@ -2195,7 +2378,7 @@ mod tests {
         let tasks = Sub::lead("shop.lead", "shop");
         assert!(ensure(&store, "shop.lead", tasks.clone()).unwrap());
         let mut edited = tasks.clone();
-        edited.bots.clear();
+        edited.agents.clear();
         assert!(!ensure(&store, "shop.lead", edited).unwrap());
         let subs = read(&store, "shop.lead");
         assert_eq!(
@@ -2221,7 +2404,7 @@ mod tests {
         std::fs::create_dir_all(super::dir(&store)).unwrap();
         let path = file(&store, "shop.lead");
         let named = |name: &str| {
-            json!({"subscriptions": [{"name": name, "bots": ["shop.fix"]}]}).to_string()
+            json!({"subscriptions": [{"name": name, "agents": ["shop.fix"]}]}).to_string()
         };
         // Written in place, its length the same, and its time set back
         // past the racy window: only its time tells it changed.
