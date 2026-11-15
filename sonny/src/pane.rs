@@ -744,6 +744,13 @@ impl Pane {
                 for (at, line) in foot.iter().enumerate() {
                     buf.set_line(area.x, rows.bottom() + 1 + at as u16, line, area.width);
                 }
+            } else {
+                // Too short for both: the foot takes the rows, since a
+                // confirm Enter acts on is never hidden.
+                for (at, line) in foot.iter().take(rows.height as usize).enumerate() {
+                    buf.set_line(area.x, rows.y + at as u16, line, area.width);
+                }
+                rows.height = 0;
             }
         }
         if self.sheet {
@@ -1226,6 +1233,12 @@ mod tests {
         assert_eq!(shown[5], " Remove");
         assert_eq!(shown[6], " tally.halves.ask-10-a11? It");
         assert_eq!(shown[7], " can't be undone.");
+        // Too short for both, the foot takes the rows: a confirm Enter
+        // acts on is never hidden.
+        let shown = rows(&mut pane, 30, 5);
+        assert_eq!(shown[2], " Remove");
+        assert_eq!(shown[3], " tally.halves.ask-10-a11? It");
+        assert_eq!(shown[4], " can't be undone.");
     }
 
     #[test]
