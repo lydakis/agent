@@ -268,7 +268,10 @@ lines of stderr, and again each day it stays down; once a run works, they
 hear it works again. Its line in the note reads `- slack, said by the
 lookout (for your eng): "The source slack is down: …"`, and like any
 event from the source it waits for the source's digest. A source no
-longer needs code of its own to say that its reads fail.
+longer needs code of its own to say that its reads fail. The lookout keeps
+its last such word in `STORE.sources/.health/NAME.json` (down or not, since
+when, why, the stderr lines), so Sonny's `/background` marks each follow of
+a source that is down as failed by reading one small file per source.
 
 A source that cannot read everything, a code-review system with
 thousands of changes, say, can let the follows say what to fetch.

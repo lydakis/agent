@@ -1146,7 +1146,9 @@ has something on it, or is off the screen, no time shows.
   What failed is listed first, with a red `✗` and the error: an automation
   whose run failed (one that ended on it stays listed until `x` removes
   it), or whose run went out and whose turn then failed (as
-  when the machine was offline or a login expired), and a server the
+  when the machine was offline or a login expired), a follow one of whose
+  sources is down (`mail is down since 11:28: exit status 3`, until the
+  source works again), and a server the
   nightly memory cleanup could not read. Your own agents' failures, such as
   the memory cleanup's, show in every window. The footer's red `✗`
   counts them with the failed agents until you look here, and

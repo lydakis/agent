@@ -443,33 +443,78 @@ struct Lasting {
 }
 
 impl Lasting {
-    /// As a source starts in a new lookout: down, as its log `keeps`
+    /// As a source starts in a new lookout: down, as its health file
     /// says the last one told, so its first run that works says it is
     /// back, to its subscribers and to the notes that show it.
-    fn after(keeps: &Path) -> Lasting {
+    fn after(health_file: &Path) -> Lasting {
         let lasting = Lasting::default();
-        if let Some(since) = still_down(keeps)
+        if let Some(down) = read_down(health_file)
             && let Ok(mut health) = lasting.health.lock()
         {
             health.failed = DOWN_AFTER;
-            health.since_ms = Some(since);
+            health.since_ms = Some(down.since_ms);
             health.told = Some(std::time::Instant::now());
         }
         lasting
     }
 }
 
-/// When the source whose log is `keeps` started failing, while the
-/// lookout's newest word on it there is that it is down.
-fn still_down(keeps: &Path) -> Option<u128> {
-    let text = std::fs::read_to_string(keeps).ok()?;
-    let word = (text.lines().rev())
-        .filter(|line| line.contains("\"lookout\""))
-        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
-        .find(|kept| kept["lookout"] == true)?;
-    let down = word["id"].as_str()?.starts_with("lookout.down.");
-    let since = word["since_ms"].as_u64().or(word["at_ms"].as_u64())?;
-    down.then_some(u128::from(since))
+/// A source the lookout last told is down: since when it fails, why its
+/// last failed run did, and the last lines that run wrote to stderr.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Down {
+    pub since_ms: u128,
+    pub why: String,
+    pub stderr: Vec<String>,
+}
+
+/// Where the lookout keeps its last word on whether a source works: a
+/// file of a few hundred bytes, so a view reads every source's for the
+/// price of a folder, never what the source printed.
+pub fn health_file(dir: &Path, source: &str) -> PathBuf {
+    dir.join(".health").join(format!("{source}.json"))
+}
+
+/// What a source's health file says, while the lookout's last word there
+/// is that it is down.
+fn read_down(file: &Path) -> Option<Down> {
+    let word: Value = serde_json::from_slice(&std::fs::read(file).ok()?).ok()?;
+    (word["down"] == true).then(|| Down {
+        since_ms: u128::from(word["since_ms"].as_u64().unwrap_or_default()),
+        why: word["failed"].as_str().unwrap_or_default().to_owned(),
+        stderr: (word["stderr"].as_array().into_iter().flatten())
+            .filter_map(|line| line.as_str().map(str::to_owned))
+            .collect(),
+    })
+}
+
+/// Each source the lookout beside `store` last told is down, by name:
+/// one folder of small files, read whole.
+pub fn down(store: &Path) -> HashMap<String, Down> {
+    let dir = super::beside(store, ".sources").join(".health");
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return HashMap::new();
+    };
+    (entries.flatten())
+        .filter_map(|entry| {
+            let path = entry.path();
+            let name = path
+                .file_name()?
+                .to_str()?
+                .strip_suffix(".json")?
+                .to_owned();
+            Some((name, read_down(&path)?))
+        })
+        .collect()
+}
+
+/// The lookout's word on a source as its health file keeps it: whether
+/// it is down, since when, and why, with its stderr's last lines.
+fn health_word(told: &Event, since_ms: Option<u128>) -> String {
+    let down = (told.id.as_deref()).is_some_and(|id| id.starts_with("lookout.down."));
+    json!({"down": down, "since_ms": since_ms.map(|ms| ms as u64), "at_ms": told.at_ms as u64,
+        "failed": told.fields["failed"], "stderr": told.fields["stderr"]})
+    .to_string()
 }
 
 impl Runner {
@@ -591,14 +636,15 @@ impl Runner {
                     self.poked.clone(),
                 )),
                 false => {
+                    let health = health_file(&self.dir, &source.name);
                     let lasting = (self.lasting.entry(source.name.clone()))
-                        .or_insert_with(|| Lasting::after(&keeps))
+                        .or_insert_with(|| Lasting::after(&health))
                         .clone();
                     tokio::spawn(run(
                         source.clone(),
                         every,
                         dir,
-                        (shape, keeps, lasting),
+                        (shape, keeps, health, lasting),
                         sent,
                     ))
                 }
@@ -788,7 +834,7 @@ async fn run(
     source: Source,
     every: Duration,
     dir: PathBuf,
-    (shape, keeps, Lasting { health, seen }): (PathBuf, PathBuf, Lasting),
+    (shape, keeps, health_file, Lasting { health, seen }): (PathBuf, PathBuf, PathBuf, Lasting),
     sent: Sender<Said>,
 ) {
     // Held while it runs: a restart's run takes it once this one is gone.
@@ -840,6 +886,9 @@ async fn run(
                 if let Some(file) = shape.keeps.clone() {
                     shapes::append(file, lookout_line(&told, since_ms));
                 }
+                // And on its own, so a view knows it is down without
+                // reading what it printed.
+                shapes::write(health_file.clone(), health_word(&told, since_ms));
                 place.send(Said::Event(Box::new(told)))
             }
             // Given back before it sleeps, so it holds no place meanwhile.
@@ -2582,6 +2631,13 @@ mod tests {
             word["id"].as_str().unwrap().starts_with("lookout.down."),
             "{word}"
         );
+        // And on its own, with why and its stderr, for a view to show.
+        let down = read_down(&health_file(&dir.join("state"), "poll")).unwrap();
+        assert_eq!(
+            (down.since_ms, down.stderr),
+            (u128::from(since), vec!["boom".to_owned()])
+        );
+        assert!(down.why.contains("exit status: 1"), "{}", down.why);
         // Fixed, it starts again and is heard to work.
         edit("echo fine\n", 3);
         runner.set(vec![source]);
@@ -2647,12 +2703,12 @@ mod tests {
     async fn a_source_down_before_the_lookout_started_is_heard_to_work_again() {
         let dir = std::env::temp_dir().join(format!("lookout-down-before-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
-        let keeps = recent_file(&dir.join("state"), "poll");
-        std::fs::create_dir_all(keeps.parent().unwrap()).unwrap();
-        let down = json!({"source": "poll", "id": "lookout.down.9", "text": "down",
-            "lookout": true, "at_ms": 9000, "since_ms": 5000, "seq": 1});
-        std::fs::write(&keeps, format!("{down}\n")).unwrap();
-        assert_eq!(still_down(&keeps), Some(5000));
+        let health = health_file(&dir.join("state"), "poll");
+        std::fs::create_dir_all(health.parent().unwrap()).unwrap();
+        let down = json!({"down": true, "since_ms": 5000, "at_ms": 9000,
+            "failed": "exit status: 3", "stderr": ["could not sign in"]});
+        std::fs::write(&health, down.to_string()).unwrap();
+        assert_eq!(read_down(&health).map(|d| d.since_ms), Some(5000));
         let (sent, mut got) = tokio::sync::mpsc::channel(16);
         let mut runner = Runner::new(dir.join("state"), sent);
         let source = Source {
@@ -2672,7 +2728,7 @@ mod tests {
         }
         assert!(texts.iter().any(|t| t.contains("works again")), "{texts:?}");
         shapes::written();
-        assert_eq!(still_down(&keeps), None);
+        assert_eq!(read_down(&health), None);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
