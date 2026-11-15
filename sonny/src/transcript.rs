@@ -1307,15 +1307,28 @@ pub fn prompt(
 /// as `/reply` and `↩` write one: the quote and the words. None for one
 /// that is all quote, or quotes after words of its own.
 fn replying(text: &str) -> Option<(&str, &str)> {
-    let mut end = 0;
+    let (quote, words) = opening_quote(text);
+    (!quote.is_empty() && !words.trim().is_empty()).then_some((quote, words))
+}
+
+/// The quotes a text opens with, several apart by blank lines as `↩`
+/// writes them one after another, and the rest; an empty quote when it
+/// opens with none.
+pub fn opening_quote(text: &str) -> (&str, &str) {
+    let (mut end, mut at) = (0, 0);
     for line in text.split_inclusive('\n') {
-        if quote_line(line.trim_end_matches(['\n', '\r'])).is_none() {
+        let bare = line.trim_end_matches(['\n', '\r']);
+        if quote_line(bare).is_some() {
+            at += line.len();
+            end = at;
+        } else if end > 0 && bare.trim().is_empty() {
+            at += line.len();
+        } else {
             break;
         }
-        end += line.len();
     }
     let words = text[end..].trim_start_matches(['\n', '\r', ' ']);
-    (end > 0 && !words.trim().is_empty()).then(|| (text[..end].trim_end(), words))
+    (text[..end].trim_end(), words)
 }
 
 /// The most lines of a reply's quote shown while it is folded.
@@ -4269,6 +4282,17 @@ mod tests {
             "› ▌ only a quote"
         );
         assert_eq!(text(&prompt("ok\n> after", 80, None).0)[1], "› ok");
+        // Two quotes, as `↩` writes one after another, fold onto the one
+        // bar over the words.
+        let (rows, folds) = prompt("> first\n> a\n\n> second\n> b\n\nboth", 80, None);
+        let shown = text(&rows);
+        assert_eq!(shown[1..4], ["  ▌ first", "  ▌ a", "  ▌ … quoted, 3 more lines ▸"]);
+        assert_eq!(shown[4], "› both");
+        assert_eq!(folds.quoted, Some(3));
+        assert_eq!(
+            text(&prompt_quoted("> first\n> a\n\n> second\n> b\n\nboth", 80, true, None)),
+            ["  ", "  ▌ second", "  ▌ b", "  ▌ quoted, 3 more lines ▾"]
+        );
     }
 
     #[test]
