@@ -4515,6 +4515,9 @@ struct App {
     /// once it is drawn, one just put there or clicked in the conversation.
     margin: margin::Margin,
     under: Option<pane::Pane>,
+    /// The keys were on the margin when what is over it opened: `esc`
+    /// gives them back there, and otherwise to the conversation.
+    under_keys: bool,
     margin_focus: Option<u64>,
     /// Notes the person took away here whose message has not landed yet:
     /// it takes away nothing more once it does.
@@ -6304,6 +6307,7 @@ impl App {
             composer_click: None,
             margin: margin::Margin::default(),
             under: None,
+            under_keys: false,
             margin_focus: None,
             closing: std::collections::HashSet::new(),
             inline: HashMap::new(),
@@ -13286,6 +13290,7 @@ impl App {
         if let Some(open) = self.pane.take()
             && open.is_margin()
         {
+            self.under_keys = self.pane_keys;
             self.under = Some(open);
         }
         pane.over = self.under.is_some();
@@ -13316,7 +13321,9 @@ impl App {
                 }
                 self.closed = Some((open, watch));
                 self.pane = self.under.take();
-                self.pane_keys &= keep && self.pane.is_some();
+                // Back where they were when it opened: on the margin, or
+                // in the conversation, the margin staying.
+                self.pane_keys &= keep && self.pane.is_some() && self.under_keys;
             }
             None => {}
         }
@@ -13343,6 +13350,7 @@ impl App {
             {
                 over.over = true;
                 self.under = Some(pane::Pane::margin());
+                self.under_keys = false;
             }
         }
         if self.margin.closed() {
@@ -13381,6 +13389,8 @@ impl App {
             Some(over) => {
                 over.over = true;
                 self.under = Some(pane::Pane::margin());
+                // Asked for, it takes the keys once what is over it goes.
+                self.under_keys = true;
             }
             None => {
                 self.pane_keys = true;
@@ -30135,7 +30145,14 @@ mod tests {
         app.open_pane(pane::Pane::card("status", STATUS_KEYS));
         assert!(app.pane.as_ref().is_some_and(|p| p.is_card() && p.over));
         assert!(app.under.is_some());
-        // Esc: back to the margin, the keys with it.
+        // Esc: back to the margin, and the keys back to the conversation,
+        // where they were when the card opened.
+        app.close_pane(true);
+        assert!(app.pane.as_ref().is_some_and(pane::Pane::is_margin));
+        assert!(!app.pane_keys && !app.margin.closed());
+        // Opened while the margin had the keys, esc gives them back there.
+        app.pane_keys = true;
+        app.open_pane(pane::Pane::card("status", STATUS_KEYS));
         app.close_pane(true);
         assert!(app.pane.as_ref().is_some_and(pane::Pane::is_margin));
         assert!(app.pane_keys);
