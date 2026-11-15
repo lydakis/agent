@@ -700,6 +700,12 @@ async fn run(
     let bot = &capture.bot;
     let workspace = PathBuf::from(capture.workspace.as_deref().unwrap_or_default());
     let root = (bot.workspace.as_ref()).map_or_else(|| workspace.clone(), PathBuf::from);
+    // A change to files runs to its end once begun, a stop or not: cut
+    // off, it could be half made. Its end is recorded as it happened.
+    let lasting = matches!(
+        prepared,
+        Prepared::Write { .. } | Prepared::Edit { .. } | Prepared::ApplyPatch(_)
+    );
     let work = async {
         let sandbox = match confined {
             true => {
@@ -717,6 +723,11 @@ async fn run(
                 .flatten()?
                 .map(Arc::new)
             }
+            // A sandboxed bot's read, which the daemon does outside any
+            // sandbox, keeps out of the folders no sandboxed bot reads.
+            false if bot.sandboxed() && matches!(prepared, Prepared::Read { .. }) => Some(
+                Arc::new(agent_runtime::sandbox::Policy::reads(registry.daemon())),
+            ),
             false => None,
         };
         let environment = turn::commands_environment(
@@ -750,17 +761,26 @@ async fn run(
                     )
                     .await
             }
-            prepared @ Prepared::Echo(_) => {
+            prepared @ (Prepared::Echo(_)
+            | Prepared::Read { .. }
+            | Prepared::Write { .. }
+            | Prepared::Edit { .. }
+            | Prepared::ApplyPatch(_)
+            | Prepared::WebFetch(_)) => {
                 registry
                     .execute(prepared, &workspace, &environment, sandbox)
                     .await
             }
             _ => Err(Error::with(
                 "invalid_step",
-                "a daemon step runs a foreground shell command or echo",
+                "not one of the tools a daemon step runs",
             )),
         }
     };
+    if lasting {
+        drop(stopping);
+        return work.await;
+    }
     tokio::select! {
         biased;
         Ok(why) = stopping => Err(stopped(why)),

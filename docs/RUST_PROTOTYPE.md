@@ -3584,10 +3584,18 @@ host would otherwise run the bot's own tools on its behalf:
 `{"op":"run_step","bot","turn","call_id","step","name","arguments"}`,
 beside `approve_step`, with the same `step` and `arguments` rules and the
 same call checks. `name` is one of the daemon's tools that may run as a
-step, `shell` (foreground only) and `echo` for now (`invalid_step`
-otherwise, or for `background`, `detach` or `tty`), and one the bot may
-call (`tool_not_available`); the call's tool must take steps, and the bot
-must have a workspace. The step is decided exactly as the same call from
+step: `shell` (foreground only), `read` (of a file; an artifact is read
+with `artifact`), `write`, `edit`, `apply_patch`, `web_fetch`, and `echo`
+(`invalid_step` otherwise, or for `background`, `detach` or `tty`), and
+one the bot may call (`tool_not_available`, as `web_fetch` is for a bot its
+sandbox keeps off the network); the call's tool must take steps, and the
+bot must have a workspace. A command takes a process place; a read or a
+fetch takes none, and a confined change to files takes one inside itself,
+only while the sandbox's helper writes. A change to files (`write`,
+`edit`, `apply_patch`) runs to its end once begun, whatever stops its step:
+cut off, a file could be left half written. Its asker is told
+`step_stopped`, and its `step_completed` records how it really ended. A
+picture a `read` step finds is answered with its line, not the image. The step is decided exactly as the same call from
 the model would be, by one planner every caller shares: the bot's rules
 (`command_forbidden`), `approval_policy`, the gates that name the step's
 own tool, its sandbox and the way out of it. A declared tool with

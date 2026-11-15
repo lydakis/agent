@@ -10003,7 +10003,9 @@ impl Database {
             Some((Error::with("approval_refused", NEVER_ASKS), true))
         } else if let Some(error) = plan.ruled_out() {
             Some((error, false))
-        } else if plan.escapes() {
+        } else if plan.escapes() && ask.tool == "shell" {
+            // As the direct call: a command that asks to leave its sandbox
+            // is refused; a write outside it runs confined and fails there.
             Some((crate::tools::escalation_refused(), false))
         } else {
             None

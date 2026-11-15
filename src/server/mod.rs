@@ -10,6 +10,17 @@ mod reload;
 mod session;
 mod socket;
 mod steps;
+
+/// The daemon's tools a script may run as daemon steps (`run_step`).
+const STEP_TOOLS: [&str; 7] = [
+    "shell",
+    "echo",
+    "read",
+    "write",
+    "edit",
+    "apply_patch",
+    "web_fetch",
+];
 mod turn;
 
 use actives::{Actives, Slot};
@@ -5781,12 +5792,15 @@ impl Service {
                     code: "invalid_step".into(),
                     ..e
                 })?;
-                // The daemon's tools a step may run; more come as their
-                // stop and their place in line are specified.
-                if !matches!(tool.as_str(), "shell" | "echo") {
+                // The daemon's tools a step may run: those whose place in
+                // line and whose stop are specified.
+                if !STEP_TOOLS.contains(&tool.as_str()) {
                     return fail_with(
                         "invalid_step",
-                        format!("{tool} does not run as a daemon step: shell and echo do"),
+                        format!(
+                            "{tool} does not run as a daemon step: {} do",
+                            STEP_TOOLS.join(", ")
+                        ),
                     );
                 }
                 if !arguments.is_object() {
@@ -5800,21 +5814,32 @@ impl Service {
                     );
                 }
                 // Read as the call would be: a step that would not run as
-                // a foreground command or echo is refused before anything
-                // is recorded.
+                // a foreground command, or that reads anything but a file,
+                // is refused before anything is recorded.
                 let prepared = self.registry.prepare(&tool, &arguments)?;
-                if !matches!(
-                    prepared,
-                    Prepared::Echo(_)
-                        | Prepared::Shell {
-                            background: false,
-                            ..
-                        }
-                ) {
-                    return fail_with(
-                        "invalid_step",
-                        "a daemon step runs a command in the foreground: no background, detach or tty",
-                    );
+                match prepared {
+                    Prepared::Shell {
+                        background: true, ..
+                    }
+                    | Prepared::Detach { .. }
+                    | Prepared::Terminal { .. } => {
+                        return fail_with(
+                            "invalid_step",
+                            "a daemon step runs a command in the foreground: no background, detach or tty",
+                        );
+                    }
+                    Prepared::Read {
+                        source:
+                            agent_runtime::tools::ReadSource::Artifact { .. }
+                            | agent_runtime::tools::ReadSource::Result { .. },
+                        ..
+                    } => {
+                        return fail_with(
+                            "invalid_step",
+                            "a daemon step reads a file; an artifact is read with `artifact`",
+                        );
+                    }
+                    _ => {}
                 }
                 let ask = agent_runtime::store::StepAsk {
                     bot,
