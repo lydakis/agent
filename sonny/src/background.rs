@@ -747,6 +747,27 @@ impl Field {
     }
 }
 
+/// `spans` cut to `room` columns: the span that crosses it cut short with
+/// an ellipsis, the rest left out.
+fn fit(spans: Vec<Span<'static>>, room: usize) -> Vec<Span<'static>> {
+    let mut out = Vec::new();
+    let mut used = 0;
+    for span in spans {
+        let wide = span.width();
+        if used + wide <= room {
+            used += wide;
+            out.push(span);
+            continue;
+        }
+        if room > used + 1 {
+            let cut = crate::transcript::cut(&span.content, room - used);
+            out.push(Span::styled(cut, span.style));
+        }
+        break;
+    }
+    out
+}
+
 /// How wide a follow's labels are, with the space after them: its
 /// longest, `watches` and `sources`.
 const FOLLOW_LABEL: usize = 9;
@@ -1444,7 +1465,7 @@ impl View {
                 body.push(Line::default());
             }
             let fields: Vec<(&str, Vec<Field>)> = match &item.sub {
-                Some(sub) => self.follow_fields(sub, width),
+                Some(sub) => self.follow_fields(sub, &item.bot, width),
                 None => vec![("when", vec![Field::text(item.when.clone())])],
             };
             // The links in the line under the name come first.
@@ -1462,21 +1483,27 @@ impl View {
                         0 => Span::raw(format!("{name:<label$}")).dim(),
                         _ => Span::raw(hang.clone()),
                     };
-                    if let Some((at, target)) = link {
+                    // A row with a link stays one row, cut to fit, so the
+                    // link is where it is drawn.
+                    let Some((at, target)) = link else {
+                        body.extend(crate::transcript::wrap(
+                            Line::from([vec![lead], spans].concat()),
+                            width,
+                            Span::raw(""),
+                            Span::raw(hang.clone()),
+                        ));
+                        continue;
+                    };
+                    spans = fit(spans, width.saturating_sub(label));
+                    if let Some(linked) = spans.get(at).cloned() {
                         let start = label + (spans[..at].iter()).map(Span::width).sum::<usize>();
-                        let end = start + spans[at].width();
+                        let end = start + linked.width();
                         if pick == Some(first + body_links.len()) {
-                            spans[at] = (spans[at].clone())
-                                .add_modifier(ratatui::style::Modifier::REVERSED);
+                            spans[at] = linked.add_modifier(ratatui::style::Modifier::REVERSED);
                         }
                         body_links.push((body.len(), start as u16, end as u16, target));
                     }
-                    body.extend(crate::transcript::wrap(
-                        Line::from([vec![lead], spans].concat()),
-                        width,
-                        Span::raw(""),
-                        Span::raw(hang.clone()),
-                    ));
+                    body.push(Line::from([vec![lead], spans].concat()));
                 }
             }
             // What an automation's row says after it, whole. A follow's
@@ -1584,6 +1611,7 @@ impl View {
     fn follow_fields(
         &self,
         sub: &lookout::subs::Sub,
+        subscriber: &str,
         width: usize,
     ) -> Vec<(&'static str, Vec<Field>)> {
         let now = now_ms();
@@ -1594,7 +1622,7 @@ impl View {
             .collect();
         if !watched.is_empty() {
             let mut rows = vec![Field::text(watched.join(", "))];
-            rows.extend(self.watched(sub));
+            rows.extend(self.watched(sub, subscriber));
             fields.push(("watches", rows));
         }
         if !sub.sources.is_empty() {
@@ -1688,29 +1716,34 @@ impl View {
     /// Every agent `sub` watches now, each a link with its mark and word,
     /// those not done first; two done or more fold to a count, a link
     /// that lists them.
-    fn watched(&self, sub: &lookout::subs::Sub) -> Vec<Field> {
+    fn watched(&self, sub: &lookout::subs::Sub, subscriber: &str) -> Vec<Field> {
         let agent = |task: &Value| task["agent"].as_str().unwrap_or_default().to_owned();
-        // Its tasks, and theirs, as the lookout follows them.
-        let mut lineage: std::collections::HashSet<String> = sub.tasks_of.iter().cloned().collect();
-        loop {
-            let before = lineage.len();
-            for task in self.tasks.iter() {
-                if task["maker"]
-                    .as_str()
-                    .is_some_and(|maker| lineage.contains(maker))
-                {
-                    lineage.insert(agent(task));
+        let makers: HashMap<String, String> = (self.tasks.iter())
+            .filter_map(|task| Some((agent(task), task["maker"].as_str()?.to_owned())))
+            .collect();
+        // Made by one it names the tasks of, or by one of theirs, as the
+        // lookout follows them: never the one named itself.
+        let descends = |name: &str| {
+            let mut at = makers.get(name);
+            for _ in 0..64 {
+                let Some(maker) = at else {
+                    return false;
+                };
+                if sub.tasks_of.contains(maker) {
+                    return true;
                 }
+                at = makers.get(maker);
             }
-            if lineage.len() == before {
-                break;
-            }
-        }
+            false
+        };
+        // Nor the one it is for, nor a workflow's workers, as the lookout.
         let (done, live): (Vec<&Value>, Vec<&Value>) = (self.tasks.iter())
             .filter(|task| {
                 let name = agent(task);
                 !name.is_empty()
-                    && (lineage.contains(&name)
+                    && name != subscriber
+                    && !crate::workflow::is_worker(&name)
+                    && (descends(&name)
                         || (sub.agents.iter()).any(|glob| lookout::subs::matches(glob, &name)))
             })
             .partition(|task| task["group"] == "done");
@@ -2392,6 +2425,45 @@ mod tests {
                 "told     nothing yet",
             ]
         );
+    }
+
+    #[test]
+    fn a_follow_of_a_tasks_tasks_lists_them_not_it_and_cuts_a_long_name_to_its_row() {
+        let sub = lookout::subs::Sub {
+            name: "fix".into(),
+            tasks_of: vec!["calc.fix".into()],
+            agents: Vec::new(),
+            sources: Vec::new(),
+            filter: None,
+            digest: None,
+            steer: None,
+            owner: None,
+            until: None,
+            runs: None,
+            made: None,
+        };
+        let task = |name: &str, maker: &str| {
+            json!({"name": name, "agent": format!("calc.{name}"), "state": "working",
+                "group": "working", "maker": maker})
+        };
+        let mut view = view_of(std::env::temp_dir(), vec![follow_item(sub, false)]);
+        view.set_tasks(&Arc::new(vec![
+            task("fix", "calc.lead"),
+            task("fix-tests-for-the-rounding-of-half-cents", "calc.fix"),
+        ]));
+        view.key(
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            0..usize::MAX,
+        );
+        let page = page_text(&mut view, 44);
+        // The task it names the tasks of is no agent it hears from.
+        assert_eq!(page[3], "watches  tasks of fix");
+        assert_eq!(page[4], "           ● fix-tests-for-the-rounding-of-…");
+        assert_eq!(page[5], "told     nothing yet");
+        // Its link covers the name as drawn, on its own row.
+        let links = &view.page.as_ref().unwrap().links;
+        assert_eq!(links.len(), 2);
+        assert_eq!((links[1].0, links[1].1, links[1].2), (4, 13, 44));
     }
 
     #[test]
