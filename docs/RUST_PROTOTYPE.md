@@ -2495,7 +2495,7 @@ its agent's `write_stdin` with `kill: true` does and answers as that does,
 `{handle, stopped: true, ran}`; a handle that is not a command of that
 bot's still running answers `process_not_running`.
 `{"op":"process_output","bot":NAME,"handle":"proc:N","lines":10}`
-(protocol 78) answers where a background command or terminal of that bot's
+(protocol 80) answers where a background command or terminal of that bot's
 runs and the last lines it wrote, `{handle, folder, lines}`, while it
 runs: `lines` (default 10, at most 200) of its newest 16 KiB of output,
 both streams as they came, escape sequences and control characters left
