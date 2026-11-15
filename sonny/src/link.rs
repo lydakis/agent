@@ -263,23 +263,31 @@ fn news_in(dir: &Path, cursor: &Path) -> crate::lookout::sources::News {
         let name = machine.name;
         let since = since_in(dir, &name);
         let state = if since.is_some() { "up" } else { "down" };
-        now.insert(name.clone(), json!(state));
-        let was = had.get(&name).and_then(Value::as_str);
-        // A machine first linked tells that it came, never that it is away.
-        if first || was == Some(state) || (was.is_none() && state == "down") {
+        let was = had.get(&name);
+        let was_state = was.and_then(|was| was["state"].as_str());
+        // Each change of state is counted, so a machine that comes back on
+        // the same connection is news again, and a look told again before
+        // the lookout keeps it gives the same ID.
+        let changes = was.and_then(|was| was["changes"].as_u64()).unwrap_or(0);
+        if was_state == Some(state) {
+            now.insert(name, json!({"state": state, "changes": changes}));
             continue;
         }
+        let changes = changes + 1;
+        now.insert(name.clone(), json!({"state": state, "changes": changes}));
+        // A machine first linked tells that it came, never that it is away.
+        if first || (was.is_none() && state == "down") {
+            continue;
+        }
+        let id = format!("{name}/{state}/{changes}");
         let line = match since {
-            Some(since) => json!({"id": format!("{name}/up/{since}"), "topic": name,
-                "text": "connected", "state": "up"}),
+            Some(_) => json!({"id": id, "topic": name, "text": "connected", "state": "up"}),
             None => {
-                let heard = seen_in(dir, &name);
-                let text = heard.map_or_else(
+                let text = seen_in(dir, &name).map_or_else(
                     || "not connected".to_owned(),
                     |ms| format!("not connected, last heard {}", ago(ms)),
                 );
-                json!({"id": format!("{name}/down/{}", heard.unwrap_or(0)), "topic": name,
-                    "text": text, "state": "down"})
+                json!({"id": id, "topic": name, "text": text, "state": "down"})
             }
         };
         lines.push(line.to_string());
@@ -2031,11 +2039,20 @@ mod tests {
         );
         // A machine linked for the first time tells only that it came.
         std::fs::write(dir.join("desk.json"), "{}").unwrap();
-        let told = said(&news_in(&dir, &cursor));
+        let gone = news_in(&dir, &cursor);
+        let told = said(&gone);
         assert_eq!(
             told.iter().map(|l| &l["topic"]).collect::<Vec<_>>(),
             [&json!("laptop")]
         );
+        assert!(gone.mark_read());
+        // Heard again on the same connection, as a long answer arriving
+        // does: news again, under an ID of its own.
+        std::fs::write(dir.join("laptop.seen"), now_ms().to_string()).unwrap();
+        let back = said(&news_in(&dir, &cursor));
+        assert_eq!(back.len(), 1);
+        assert_eq!(back[0]["state"], "up");
+        assert_ne!(back[0]["id"], lines[0]["id"]);
     }
 
     fn scratch(name: &str) -> PathBuf {

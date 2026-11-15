@@ -29,11 +29,13 @@ fn news_in(root: &Path, cursor: &Path) -> News {
         std::iter::once(&view["user"]).chain(view["projects"].as_array().into_iter().flatten());
     let mut now = Map::new();
     let mut read = Vec::new();
+    let mut scanned = Vec::new();
     let mut lines = Vec::new();
     for scope in scopes {
         let Some(dir) = scope["dir"].as_str() else {
             continue;
         };
+        scanned.push(dir.to_owned());
         let project = &scope["name"];
         let Some(facts) = scope["facts"].as_array() else {
             // A folder that could not be read keeps what was known of it,
@@ -71,7 +73,19 @@ fn news_in(root: &Path, cursor: &Path) -> News {
         }
     }
     for (file, was) in &had {
-        if now.contains_key(file) || !read.iter().any(|dir| in_dir(file, dir)) {
+        if now.contains_key(file) {
+            continue;
+        }
+        // A fact is gone when its folder was read without it, or when the
+        // folder itself is gone, as a project's removed whole; a folder
+        // neither listed nor surely gone keeps what was known of it.
+        let gone = read.iter().any(|dir| in_dir(file, dir))
+            || (!scanned.iter().any(|dir| in_dir(file, dir))
+                && Path::new(file).parent().is_some_and(|dir| {
+                    std::fs::metadata(dir).is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound)
+                }));
+        if !gone {
+            now.insert(file.clone(), was.clone());
             continue;
         }
         let at = &was["at"];
@@ -210,6 +224,27 @@ mod tests {
         let lines = said(&news_in(&root, &cursor));
         assert_eq!(lines.len(), 1, "{lines:?}");
         assert_eq!(lines[0]["project"], "p100");
+    }
+
+    #[test]
+    fn a_project_removed_whole_tells_each_of_its_facts_removed() {
+        let temp = scratch("whole");
+        let (root, cursor) = (temp.join("memory"), temp.join("cursor"));
+        let shop = root.join("projects/shop");
+        save(
+            &shop,
+            "release-steps",
+            "shop.fix",
+            "Tags are pushed from the Mac.",
+        );
+        assert!(news_in(&root, &cursor).mark_read());
+        std::fs::remove_dir_all(&shop).unwrap();
+        let lines = said(&news_in(&root, &cursor));
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert_eq!(
+            (&lines[0]["from"], &lines[0]["project"]),
+            (&json!("removed"), &json!("shop"))
+        );
     }
 
     #[test]
