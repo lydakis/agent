@@ -4150,7 +4150,7 @@ impl Search {
 struct App {
     client: Arc<Client>,
     bot: String,
-    /// The project whose lead this is, when opened as the folder's coordinator.
+    /// The project whose lead this is, when opened as the folder's lead.
     project: Option<String>,
     workspace: String,
     /// The workspace's branch, as last read, for the footer.
@@ -14194,10 +14194,15 @@ impl App {
                     self.pick = 0;
                     return;
                 }
+                // What is typed begins the pick's name, or the person
+                // picked it: Enter runs it. A name the letters only
+                // scatter across, as `/ps` across `/pause`, is not what
+                // was meant, so it goes as typed and is answered.
                 KeyCode::Enter
                     if !key
                         .modifiers
-                        .intersects(KeyModifiers::SHIFT | KeyModifiers::ALT) =>
+                        .intersects(KeyModifiers::SHIFT | KeyModifiers::ALT)
+                        && (self.pick > 0 || picked.starts_with(&self.input[..])) =>
                 {
                     self.input.set(picked);
                     self.pick = 0;
@@ -18170,7 +18175,7 @@ impl App {
     fn footer(&self, width: usize) -> (Line<'static>, Vec<(std::ops::Range<u16>, &'static str)>) {
         use footer::{Item, Slot};
         let mut items = Vec::new();
-        // The row it runs in, unless it is the one new leads start in:
+        // The mode it runs in, unless it is Auto:
         // full access's mark in the text's own weight, as nothing holds
         // it back; no hue, as yellow is for what needs the person.
         let mode = match self.gating {
@@ -25058,7 +25063,7 @@ mod tests {
             [
                 "↳ 1 message, 1 lookout note · calc.add, calc.neg · sent to calc.neg ▾",
                 "  ↳ From calc.add ▸",
-                "  ↳ Lookout · calc.neg completed ▸",
+                "  ↳ Lookout · calc.neg finished ▸",
             ]
         );
         assert!(open[3].starts_with("  • Steered calc.neg"), "{open:?}");
@@ -25081,7 +25086,7 @@ mod tests {
             [
                 "• calc.neg is done.",
                 "",
-                "↳ Lookout · calc.neg completed ▸"
+                "↳ Lookout · calc.neg finished ▸"
             ]
         );
         // The person's own words are drawn as ever.
@@ -26223,6 +26228,17 @@ mod tests {
             // Kept, to be fixed and sent again.
             assert_eq!(&*app.input, typed);
         }
+        // Enter with the menu open runs the pick only when what is typed
+        // begins its name: `/ps`, scattered across `/pause`, is answered.
+        app.notice = None;
+        app.input.set("/ps");
+        assert_eq!(app.menu()[0].0, "/pause");
+        app.key(Event::Key(KeyCode::Enter.into())).await;
+        assert_eq!(app.notice.as_deref(), Some("no command /ps · / lists them"));
+        assert_eq!(&*app.input, "/ps");
+        app.input.set("/verb");
+        app.key(Event::Key(KeyCode::Enter.into())).await;
+        assert!(app.input.is_empty(), "/verbose ran");
         // Words that only start with a slash word, or a path, go as written.
         for typed in ["/etc/hosts", "/tmp is full", "/ alone"] {
             app.input.set(typed);
@@ -30158,7 +30174,7 @@ mod tests {
             rows[2].starts_with("  • Updated the plan · 1/3"),
             "{rows:?}"
         );
-        assert_eq!(rows[3], "  ↳ Lookout · calc.neg completed ▸");
+        assert_eq!(rows[3], "  ↳ Lookout · calc.neg finished ▸");
         assert!(rows[4].starts_with("  • Steered calc.neg"), "{rows:?}");
         assert!(
             rows.iter()
@@ -30296,9 +30312,9 @@ mod tests {
         assert_eq!(
             named,
             [
-                "  ↳ Lookout · calc.add completed ▸",
-                "  ↳ Lookout · calc.div completed ▸",
-                "  ↳ Lookout · calc.neg completed ▸",
+                "  ↳ Lookout · calc.add finished ▸",
+                "  ↳ Lookout · calc.div finished ▸",
+                "  ↳ Lookout · calc.neg finished ▸",
             ],
             "{rows:?}"
         );
@@ -30326,7 +30342,7 @@ mod tests {
         let rows = texts(&app);
         let once = |row: &str| rows.iter().filter(|r| r.as_str() == row).count() == 1;
         assert!(
-            once("› check the tasks") && once("  ↳ Lookout · calc.add completed ▸"),
+            once("› check the tasks") && once("  ↳ Lookout · calc.add finished ▸"),
             "{rows:?}"
         );
     }

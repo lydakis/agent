@@ -1196,10 +1196,12 @@ has something on it, or is off the screen, no time shows.
   ![/commons in the pane](../docs/sonny/commons.png)
 - `/memory` shows, in the pane beside the conversation, what agents saved to
   memory: Work under way, newest first, with how long since each was saved;
-  This project's facts; and About you, the facts kept about you in every
-  project, folded at first. Each row has the fact's name, its type (left
+  This project's facts; and Everywhere, the facts kept in every project,
+  such as what agents know of you and rules like "never force-push", open
+  at first, and counted in the head (`tally · 5 facts · 2 everywhere`).
+  Each row has the fact's name, its type (left
   unsaid when it is its section's own: `project` under a project, `user`
-  under About you) and its index flags (`live`, `external`, `confirmed N`, `pushed back N`), its
+  under Everywhere) and its index flags (`live`, `external`, `confirmed N`, `pushed back N`), its
   description, and `verified DATE` at the right edge. It reads each
   folder's `MEMORY.md`, and a work fact's own file, since an index lists
   work by name and date alone. A live fact's description is filled as a

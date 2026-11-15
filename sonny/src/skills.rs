@@ -612,7 +612,9 @@ fn note_offered_in(home: &Path, ids: &[String]) {
 /// What the next lead tells of beside the skills: a register changed since
 /// the person last heard of it, each setup step neither done nor offered,
 /// and each upgrade step not done that this Sonny has not asked for. The
-/// first register a person has is heard of without a word.
+/// first register a person has is heard of without a word, and so is all
+/// of it: a fresh install is no upgrade, so its first lead waits for the
+/// person's first words, and setup offers its own steps.
 fn queue_news(
     home: &Path,
     features: &str,
@@ -623,6 +625,7 @@ fn queue_news(
     match std::fs::read_to_string(heard(home)) {
         Err(_) => {
             keep(&shipped(home), &[("FEATURES.md", features)]);
+            return;
         }
         Ok(before) if before != features => queue_unclaimed(home, "features"),
         Ok(_) => {}
@@ -1276,10 +1279,13 @@ mod tests {
         let one =
             "# F\n| Feature | Status |\n|---|---|\n| Tasks | shipped |\n| Leads | experimental |\n";
         let two = "# F\n| Feature | Status |\n|---|---|\n| Tasks | shipped |\n| Leads | shipped |\n| Backup | experimental |\n";
-        // The first register is heard of without a word; the step not done
-        // is offered.
+        // A fresh install is no upgrade: its first register is heard of
+        // without a word, and setup offers its own steps.
         queue_news(&home, one, &steps, &[]);
         assert_eq!(std::fs::read_to_string(register(&home)).unwrap(), one);
+        assert!(upgraded_with(&home, one, &steps, &[]).is_none());
+        // Once past it, the step not done is offered.
+        queue_news(&home, one, &steps, &[]);
         let upgrades = upgraded_with(&home, one, &steps, &[]).unwrap();
         let note = upgrades.note();
         assert!(note.starts_with(UPGRADED), "{note}");
@@ -1338,6 +1344,9 @@ mod tests {
         }];
         let one = "# F\n| Tasks | shipped |\n";
         let two = "# F\n| Tasks | shipped, changed |\n";
+        // A fresh install asks for nothing.
+        queue_news(&home, one, &[], &steps);
+        assert!(upgraded_with(&home, one, &[], &steps).is_none());
         queue_news(&home, one, &[], &steps);
         let upgrades = upgraded_with(&home, one, &[], &steps).unwrap();
         let note = upgrades.note();

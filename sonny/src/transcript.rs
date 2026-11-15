@@ -1920,7 +1920,8 @@ fn lookout_news(text: &str, icons: &std::collections::HashMap<String, String>) -
 }
 
 /// A few words for one event in a task, from its header's `from`: "you
-/// wrote in shop.fix", "shop.fix completed", "shop.fix asks you".
+/// wrote in shop.fix", "shop.fix finished", "shop.fix asks you". A turn's
+/// end is said as an event, never in the daemon's words for it.
 fn task_news(task: &str, from: &str) -> String {
     if from == crate::lookout::activity::PERSON {
         return format!("you wrote in {task}");
@@ -1935,7 +1936,10 @@ fn task_news(task: &str, from: &str) -> String {
         // "replied to the person, completed, marked done"
         let mut said = did.split(", ").skip(1);
         let status = said.next().unwrap_or_default();
-        let status = status.split(':').next().unwrap_or_default();
+        let status = match status.split(':').next().unwrap_or_default() {
+            "completed" => "finished",
+            status => status,
+        };
         return match said.any(|part| part == "marked done") {
             true => format!("{task} {status}, done"),
             false => format!("{task} {status}"),
@@ -4297,7 +4301,7 @@ mod tests {
         assert_eq!(
             super::lookout_news(note, &icons).join(" · "),
             "Lookout · shop.fix failed · you wrote in shop.docs · shop.fix wrote in shop.api · \
-             shop.web completed, done · +2 more · 40 not kept · ▲ slack 2 · mail"
+             shop.web finished, done · +2 more · 40 not kept · ▲ slack 2 · mail"
         );
         assert_eq!(
             relayed_head(note, Some("the lookout")),

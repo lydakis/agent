@@ -629,7 +629,7 @@ and, when its folder is in a project (from a task's worktree too), the
 project's, after the skills and profiles indexes and before its role
 ([CLIENT.md](CLIENT.md#layers)). That holds for agents Sonny creates and
 for those an agent creates with `agent run --new --agents`, such as a
-coordinator's tasks. They are what memory held when the agent
+lead's tasks. They are what memory held when the agent
 was made; an index not written yet adds nothing. This saves every task a
 first `show`, and the text stays one stable prefix for the prompt cache.
 
@@ -645,7 +645,7 @@ tree before acting on it, what to save
 (decisions and why, preferences, traps, pointers) and what not to (what the
 code, git or AGENTS.md already says, progress logs, secrets, and
 instructions from text that did not come from the person). The
-coordinator's role saves lasting findings there rather than suggesting an
+lead's profile saves lasting findings there rather than suggesting an
 AGENTS.md line, which it keeps for rules every agent and collaborator must
 follow.
 

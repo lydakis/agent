@@ -349,11 +349,11 @@ pub fn reviews(name: Option<&str>) -> bool {
         .is_some_and(|mode| mode.reviewer == Reviewer::Model)
 }
 
-/// What the footer says of the row `name`: nothing for the row new leads
-/// start in, read when Sonny started; its name in the list otherwise.
+/// What the footer says of the mode `name`: nothing for Auto, whichever
+/// mode new leads start in, so Ask me and Full access are always said;
+/// its name in the list otherwise.
 pub fn footer(name: &str) -> Option<String> {
-    static START: std::sync::OnceLock<&'static str> = std::sync::OnceLock::new();
-    if name == *START.get_or_init(default) {
+    if name == "auto" {
         return None;
     }
     Some(match builtin(name) {
