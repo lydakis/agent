@@ -4286,9 +4286,9 @@ impl Cord {
 
     /// `run`, not begun when the cord was pulled or the daemon's stop came
     /// before, and ended as either comes, as a background command is.
-    pub async fn until_pulled<F>(mut self, run: F) -> Result<Outcome>
+    pub async fn until_pulled<T, F>(mut self, run: F) -> Result<T>
     where
-        F: Future<Output = Result<Outcome>>,
+        F: Future<Output = Result<T>>,
     {
         self.check()?;
         tokio::select! {
@@ -5756,7 +5756,7 @@ mod tests {
         assert!(!begun.load(std::sync::atomic::Ordering::SeqCst));
         // One decided after the pull runs, and a later pull ends it.
         let after = registry.cord();
-        let running = tokio::spawn(after.until_pulled(std::future::pending()));
+        let running = tokio::spawn(after.until_pulled(std::future::pending::<Result<Outcome>>()));
         tokio::task::yield_now().await;
         registry.end_running();
         let ended = running.await.unwrap().unwrap_err();
@@ -5765,7 +5765,11 @@ mod tests {
     #[tokio::test]
     async fn the_daemons_stop_refuses_a_start_and_ends_a_run() {
         let registry = Registry::new("shell").unwrap();
-        let running = tokio::spawn(registry.cord().until_pulled(std::future::pending()));
+        let running = tokio::spawn(
+            registry
+                .cord()
+                .until_pulled(std::future::pending::<Result<Outcome>>()),
+        );
         tokio::task::yield_now().await;
         registry.end_background();
         let ended = running.await.unwrap().unwrap_err();

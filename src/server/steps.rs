@@ -645,7 +645,12 @@ impl Service {
                 _ => outcome,
             };
             let outcome = turn::annotate(outcome, turn, &id);
-            let reply = json!({"call_id":id,"output":outcome.output,"failed":outcome.failed});
+            let mut reply = json!({"call_id":id,"output":outcome.output,"failed":outcome.failed});
+            // A picture read goes back as one, in the parts `tool_result`
+            // takes, so the script can hand it on to the model.
+            if !outcome.parts.is_empty() {
+                reply["parts"] = json!(outcome.parts);
+            }
             let closed = store
                 .op("step_close", move |db| {
                     db.step_close(turn, &id, &outcome, error.as_deref(), handles_now())
@@ -809,17 +814,19 @@ async fn run(
         id,
     } = running;
     let cord = registry.cord();
+    let mut stopping = futures_util::FutureExt::fuse(stopping);
     let bot = &capture.bot;
     let workspace = PathBuf::from(capture.workspace.as_deref().unwrap_or_default());
     let root = (bot.workspace.as_ref()).map_or_else(|| workspace.clone(), PathBuf::from);
     // A change to files runs to its end once begun, a stop or not: cut
     // off, it could be half made. Its end is recorded as it happened.
+    // Until its sandbox is ready, nothing of it has begun.
     let lasting = matches!(
         prepared,
         Prepared::Write { .. } | Prepared::Edit { .. } | Prepared::ApplyPatch(_)
     );
-    let work = async {
-        let sandbox = match confined {
+    let ready = async {
+        Ok::<_, Error>(match confined {
             true => {
                 let (settings, daemon, id, root) = (
                     bot.settings.clone(),
@@ -841,15 +848,22 @@ async fn run(
                 Arc::new(agent_runtime::sandbox::Policy::reads(registry.daemon())),
             ),
             false => None,
-        };
-        let environment = turn::commands_environment(
-            bot,
-            &capture.model,
-            (&bot.name, bot.bot_id),
-            turn,
-            capture.effort.as_deref(),
-            bot.created_by.as_deref().zip(bot.created_by_id),
-        );
+        })
+    };
+    let sandbox = tokio::select! {
+        biased;
+        Ok(why) = &mut stopping => return Err(stopped(why)),
+        ready = cord.clone().until_pulled(ready) => ready?,
+    };
+    let environment = turn::commands_environment(
+        bot,
+        &capture.model,
+        (&bot.name, bot.bot_id),
+        turn,
+        capture.effort.as_deref(),
+        bot.created_by.as_deref().zip(bot.created_by_id),
+    );
+    let work = async {
         match prepared {
             Prepared::Shell {
                 command,
@@ -891,12 +905,11 @@ async fn run(
         }
     };
     if lasting {
-        drop(stopping);
         return work.await;
     }
     tokio::select! {
         biased;
-        Ok(why) = stopping => Err(stopped(why)),
+        Ok(why) = &mut stopping => Err(stopped(why)),
         ran = cord.until_pulled(work) => ran,
     }
 }

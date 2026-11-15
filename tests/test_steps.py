@@ -139,6 +139,15 @@ class DaemonStepTests(ModelFixture):
         self.answer(client, turn)
         self.assertEqual(client.finished(turn)['data']['status'], 'completed')
 
+    def test_a_read_step_of_a_picture_answers_with_the_picture(self):
+        from tests.test_images import png
+        (self.path / 'shot.png').write_bytes(png(4, 4))
+        client, turn = self.script(tools='echo,read', bot_tools=['read'])
+        ran = self.step(client, turn, name='read', arguments={'path': 'shot.png'})['result']
+        self.assertTrue(ran['output'].startswith('shot.png: a PNG image, 4×4'), ran)
+        [picture] = ran['parts']
+        self.assertEqual((picture['type'], picture['media_type']), ('image', 'image/png'))
+
     @unittest.skipUnless(shutil.which('bwrap') or sys.platform == 'darwin', 'sandboxes need bubblewrap')
     def test_a_sandboxed_bot_s_file_steps_stay_in_its_sandbox(self):
         client, turn = self.script(tools='echo,shell,read,write,web_fetch',
