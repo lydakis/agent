@@ -10769,11 +10769,14 @@ impl App {
         if live.gap && !live.spilled {
             self.pending.push(Line::default());
         }
+        // Only the turn's reply wears its hints, never a step's words; a
+        // reply written as it came is under its `└` but has no `↳`.
+        match (live.spilled, words) {
+            (false, Words::Reply) => self.came_above(),
+            (true, Words::Reply) => drop(self.came_row()),
+            _ => {}
+        }
         if !live.spilled {
-            // Only the turn's reply wears its hints, never a step's words.
-            if matches!(words, Words::Reply) {
-                self.came_above();
-            }
             self.marks.push((self.pending.len(), screen::Mark::Opens));
         }
         self.rows_drawn += live.rows.len();
@@ -10819,8 +10822,9 @@ impl App {
             if live.gap && !live.spilled {
                 self.pending.push(Line::default());
             }
+            // Not yet known to be the reply, they wear no `↳`: a call may
+            // still make them a step's.
             if !live.spilled {
-                self.came_above();
                 self.marks.push((self.pending.len(), screen::Mark::Opens));
             }
             live.spilled = true;
