@@ -18182,14 +18182,6 @@ impl App {
         }
         match &self.notice {
             Some(notice) => Line::from(Span::raw(notice.clone())),
-            None if self.input.starts_with('!') => Line::from(vec![
-                Span::raw("! ").bold().fg(Color::Magenta),
-                Span::raw(format!(
-                    "runs in {}; the agent is told what it printed",
-                    tilde(&self.workspace)
-                ))
-                .dim(),
-            ]),
             None => Line::default(),
         }
     }
