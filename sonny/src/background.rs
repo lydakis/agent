@@ -205,37 +205,69 @@ fn down(store: &Path) -> HashMap<String, lookout::sources::Down> {
     })
 }
 
-/// The newest word each source `sub` names said on what it hears, by
-/// the name as written (`ci`, `ci:main`), and when, as
-/// [`lookout::sources::status`] reads it, read again only once one of
-/// their logs changes.
+/// The newest word each source `sub` names said that it hears, by the
+/// name as written (`ci`, `ci:main`), and when: as
+/// [`lookout::sources::status`] reads it, or, for a follow with a filter,
+/// the newest its filter takes, read from the log's end. Read again only
+/// once one of their logs changes, or the follow does.
 fn newest(store: &Path, sub: &lookout::subs::Sub) -> HashMap<String, (String, u128)> {
     static KEPT: kept::Slot<HashMap<String, (String, u128)>> = kept::Slot::new(None);
     let dir = lookout::beside(store, ".sources");
     let named: Vec<(&str, Option<&str>)> = (sub.sources.iter())
-        .map(|s| match s.split_once(':') {
-            Some((name, topic)) => (name, Some(topic)),
-            None => (s.as_str(), None),
-        })
+        .map(|s| lookout::sources::named(s))
         .collect();
     let paths = (named.iter())
         .map(|(name, _)| lookout::sources::recent_file(&dir, name))
         .collect();
-    let key = format!("{}\n{}", store.display(), sub.sources.join("\n"));
+    let filter = sub
+        .filter
+        .as_ref()
+        .map(Value::to_string)
+        .unwrap_or_default();
+    let key = format!("{}\n{}\n{filter}", store.display(), sub.sources.join("\n"));
     kept::read(&KEPT, &key, paths, || {
         let newest = (sub.sources.iter().zip(&named))
             .filter_map(|(written, (name, topic))| {
-                let wanted = |said: Option<&str>| topic.is_none_or(|topic| said == Some(topic));
-                let (said, _) = lookout::sources::status(store, name, wanted);
-                let newest = said
-                    .into_iter()
-                    .map(|(event, _)| event)
-                    .max_by_key(|e| e.at_ms)?;
+                let newest = match sub.filter {
+                    // What this row's source and topic say that the
+                    // filter takes, as the lookout tells it.
+                    Some(_) => {
+                        let row = lookout::subs::Sub {
+                            sources: vec![written.clone()],
+                            ..sub.clone()
+                        };
+                        heard(store, name, |event| row.hears(event))?
+                    }
+                    None => {
+                        let wanted =
+                            |said: Option<&str>| topic.is_none_or(|topic| said == Some(topic));
+                        let (said, _) = lookout::sources::status(store, name, wanted);
+                        (said.into_iter())
+                            .map(|(event, _)| event)
+                            .max_by_key(|e| e.at_ms)?
+                    }
+                };
                 Some((written.clone(), (newest.text, newest.at_ms)))
             })
             .collect();
         (newest, None)
     })
+}
+
+/// The newest word `source`'s log keeps that `hears` takes, read from the
+/// log's end: the lookout's own words, and a topic's clearing, left out.
+fn heard(
+    store: &Path,
+    source: &str,
+    hears: impl Fn(&lookout::sources::Event) -> bool,
+) -> Option<lookout::sources::Event> {
+    let file = lookout::sources::recent_file(&lookout::beside(store, ".sources"), source);
+    let text = std::fs::read_to_string(file).ok()?;
+    (text.lines().rev())
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .filter(|kept| kept["clear"] != true)
+        .filter_map(|kept| lookout::sources::Event::from_json(&kept))
+        .find(|event| !event.lookout && hears(event))
 }
 
 /// What `subscriber`'s follows told lately, as the lookout last counted
@@ -2273,6 +2305,8 @@ mod tests {
                 2,
             ),
             said("nightly", "nightly: build 9 failed", 60_000, 3),
+            // Newer, but not what its filter takes: never its newest.
+            said("main", "deploy: started", 30_000, 4),
         ];
         std::fs::write(&recent, lines.join("\n") + "\n").unwrap();
         let mut counts = lookout::subs::Counts::default();
