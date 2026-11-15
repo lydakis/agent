@@ -1186,14 +1186,15 @@ pub fn available() -> Result<()> {
     }
 }
 
-/// `program args...` confined by `policy`. A detached command outlives the
-/// daemon, so its sandbox doesn't die with it.
+/// `program args...` confined by `policy`, and what tells when its
+/// sandbox is gone, for its [`Hold`] to wait for. A detached command
+/// outlives the daemon, so its sandbox doesn't die with it.
 pub fn command(
     policy: &Policy,
     program: &str,
     args: &[&str],
     detached: bool,
-) -> Result<tokio::process::Command> {
+) -> Result<(tokio::process::Command, Ended)> {
     #[cfg(target_os = "linux")]
     {
         linux::command(policy, program, args, detached)
@@ -1201,7 +1202,7 @@ pub fn command(
     #[cfg(target_os = "macos")]
     {
         let _ = detached;
-        macos::command(policy, program, args)
+        Ok((macos::command(policy, program, args)?, Ended(None)))
     }
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
@@ -1438,16 +1439,19 @@ mod linux {
         program: &str,
         rest: &[&str],
         detached: bool,
-    ) -> Result<tokio::process::Command> {
+    ) -> Result<(tokio::process::Command, super::Ended)> {
         use std::os::fd::AsRawFd;
         let mut command = tokio::process::Command::new(checked()?);
         let filter = loaded(&filter(policy)?)?;
+        let (ended, sync) = pipe()?;
         command
             .args(args(policy, detached))
             .args(super::lock_args(policy))
             .arg("--seccomp")
-            .arg(filter.as_raw_fd().to_string());
-        let mut kept = vec![filter];
+            .arg(filter.as_raw_fd().to_string())
+            .arg("--sync-fd")
+            .arg(sync.as_raw_fd().to_string());
+        let mut kept = vec![filter, sync];
         if let Some(handing) = (policy.capability.as_deref().map(handing).transpose()?).flatten() {
             command.env(
                 agent_client::socket::HANDED,
@@ -1468,7 +1472,24 @@ mod linux {
                 Ok(())
             });
         }
-        Ok(command)
+        Ok((command, super::Ended(Some(ended))))
+    }
+
+    /// A pipe, both ends closed on exec: its read end and its write end.
+    fn pipe() -> Result<(std::os::fd::OwnedFd, std::os::fd::OwnedFd)> {
+        use std::os::fd::FromRawFd;
+        let mut ends = [0; 2];
+        // SAFETY: pipe2 writes two descriptors into the array it is given.
+        if unsafe { libc::pipe2(ends.as_mut_ptr(), libc::O_CLOEXEC) } < 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        // SAFETY: both are open, and each is owned only here.
+        Ok(unsafe {
+            (
+                std::os::fd::OwnedFd::from_raw_fd(ends[0]),
+                std::os::fd::OwnedFd::from_raw_fd(ends[1]),
+            )
+        })
     }
 
     /// The seccomp filter bubblewrap loads, as Codex's Linux sandbox and
@@ -1837,9 +1858,10 @@ fn placeholder(path: &Path) -> bool {
 /// sandbox holds a read lock on the placeholder's lock file while it runs,
 /// bubblewrap's own init holding it (`--lock-file`), out of the command's
 /// reach, and the daemon or CLI that started it holding another from
-/// before the sandbox is made until it is done. The last one out takes the
-/// write lock and removes the placeholder, when it is one this sandbox
-/// made: an empty folder, the one recorded in the lock file. The kernel
+/// before the sandbox is made until it is gone, init with it ([`Ended`]).
+/// The last one out lets its own read lock go, takes the write lock and
+/// removes the placeholder, when it is one this sandbox made: an empty
+/// folder, the one recorded in the lock file. The kernel
 /// lets the locks go with whoever held them, so a crash leaves none held,
 /// and a placeholder left by one is removed by the next sandbox that
 /// holds it. One made by anything else, Codex included, is left, as Codex
@@ -1979,7 +2001,12 @@ impl Held {
     fn free(self) {
         use std::io::{Read, Seek};
         let Held { path, mut lock } = self;
-        // Atomic for a record lock: refused while any other holds it.
+        // Its own read lock goes first. Two holders letting go at once,
+        // each asking for the write lock while still holding its read
+        // lock, would each be refused for the other's and both leave it.
+        // Let go first, the write lock is refused only while another holds
+        // on, and that one asks in turn as it goes.
+        let _ = self::lock(&lock, libc::F_UNLCK as _, false);
         if self::lock(&lock, libc::F_WRLCK as _, false).is_err() {
             return;
         }
@@ -1997,14 +2024,46 @@ impl Held {
     }
 }
 
+/// When a sandbox is gone: on Linux, the read end of a pipe whose write
+/// end bubblewrap's init keeps (`--sync-fd`), and once the command has
+/// started, it alone, so the pipe reads to its end when init is gone.
+/// Init's locks on the placeholders go before that: the kernel lets a
+/// process's record locks go as it closes each of its files, and only
+/// after it has closed them all finishes the pipe's close. `None` where
+/// nothing of the sandbox outlives its command.
+pub struct Ended(Option<std::os::fd::OwnedFd>);
+
+impl Ended {
+    /// For a command run unconfined.
+    pub fn none() -> Ended {
+        Ended(None)
+    }
+}
+
+/// Whether the sandbox `end` tells of is gone: its pipe at its end, as
+/// nothing is ever written to it. Asked without waiting.
+fn gone(end: &std::os::fd::OwnedFd) -> bool {
+    use std::os::fd::AsRawFd;
+    let mut asked = libc::pollfd {
+        fd: end.as_raw_fd(),
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    // SAFETY: one pollfd, valid for the call, which doesn't wait.
+    (unsafe { libc::poll(&mut asked, 1, 0) }) == 1
+        && asked.revents & (libc::POLLIN | libc::POLLHUP) != 0
+}
+
 /// What a running sandbox holds in place; dropping it lets the
 /// placeholders go once no other sandbox holds them, removes what the
-/// command may not leave made, and gives up its share in the bot's socket.
+/// command may not leave made, and gives up its share in the bot's socket,
+/// each once the sandboxes it [`waits for`](Hold::waits_for) are gone.
 pub struct Hold(
     Vec<Held>,
     Vec<PathBuf>,
     // Held only to be dropped with the rest.
     #[allow(dead_code)] Option<Listening>,
+    Vec<std::os::fd::OwnedFd>,
 );
 
 /// Hold `policy`'s placeholders while its command runs, once any of them
@@ -2050,7 +2109,7 @@ pub async fn hold(policy: &Policy) -> Hold {
         .await
         .unwrap_or_default(),
     };
-    Hold(held, left, policy.listening.clone())
+    Hold(held, left, policy.listening.clone(), Vec::new())
 }
 
 /// [`hold`] for a call that may run unconfined.
@@ -2062,6 +2121,17 @@ pub async fn hold_for(policy: Option<&Policy>) -> Option<Hold> {
 }
 
 impl Hold {
+    /// Let go only once `ended`'s sandbox is gone. Its command's end isn't
+    /// enough: bubblewrap's init, which holds the placeholders' locks too,
+    /// dies only after it, and a placeholder let go while init still holds
+    /// it is never removed. The caller drops its copy of the command first,
+    /// with the pipe's write end in it. One held over many sandboxes, as a
+    /// patch's over its writes, keeps the pipes of only those still running.
+    pub fn waits_for(&mut self, ended: Ended) {
+        self.3.retain(|end| !gone(end));
+        self.3.extend(ended.0);
+    }
+
     /// Let go now, on this thread, for a process that exits next, as
     /// `agent sandbox` does: a drop removes the placeholders on a thread of
     /// its own, which would end with the process, its work undone.
@@ -2072,6 +2142,7 @@ impl Hold {
     fn free(&mut self, here: bool) {
         let held = std::mem::take(&mut self.0);
         let left = std::mem::take(&mut self.1);
+        let ends = std::mem::take(&mut self.3);
         if held.is_empty() && left.is_empty() {
             return;
         }
@@ -2079,6 +2150,11 @@ impl Hold {
         // shutting down drops blocking work not yet started, which would
         // leave them in place.
         let remove = move || {
+            // Nothing is ever written to the pipe: it reads to its end once
+            // the sandbox is gone.
+            for end in ends {
+                let _ = std::io::copy(&mut std::fs::File::from(end), &mut std::io::sink());
+            }
             // Git never makes these in a repository's own folder: one there
             // now is the command's.
             for path in &left {
@@ -3395,6 +3471,97 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
     }
 
+    /// A hold over many sandboxes keeps the pipes of only those still
+    /// running, however many it waited for.
+    #[test]
+    fn a_hold_keeps_only_the_ends_of_sandboxes_still_running() {
+        let mut held = Hold(Vec::new(), Vec::new(), None, Vec::new());
+        let (running, _open) = std::io::pipe().unwrap();
+        held.waits_for(Ended(Some(running.into())));
+        for _ in 0..100 {
+            let (ended, closed) = std::io::pipe().unwrap();
+            drop(closed);
+            held.waits_for(Ended(Some(ended.into())));
+        }
+        assert_eq!(held.3.len(), 2, "the running one and the last one asked");
+    }
+
+    /// Two holders letting go at the same moment: one of them removes the
+    /// placeholder, never neither.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn holders_letting_go_at_once_leave_no_placeholder() {
+        let base = std::env::temp_dir().join(format!("agent-sandbox-once-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let base = std::fs::canonicalize(&base).unwrap();
+        let policy = Policy::new(
+            Some(Mode::WorkspaceWrite),
+            Some(&base),
+            &[],
+            false,
+            &protecting(),
+        )
+        .unwrap()
+        .unwrap();
+        let git = base.join(".git");
+        for _ in 0..200 {
+            let holds = [hold(&policy).await, hold(&policy).await];
+            assert!(git.is_dir());
+            let at_once = std::sync::Arc::new(std::sync::Barrier::new(2));
+            let going: Vec<_> = (holds.into_iter())
+                .map(|held| {
+                    let at_once = at_once.clone();
+                    std::thread::spawn(move || {
+                        at_once.wait();
+                        held.release();
+                    })
+                })
+                .collect();
+            going.into_iter().for_each(|going| going.join().unwrap());
+            assert!(!git.exists(), "one of them removes it");
+        }
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// A command that leaves something running: bubblewrap's init, which
+    /// holds the placeholder too, outlives it until the sandbox is taken
+    /// down. Its hold lets go once the sandbox is gone, so the placeholder
+    /// is removed rather than left with nothing holding it.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn a_hold_lets_go_once_its_sandbox_is_gone() {
+        if available().is_err() {
+            return;
+        }
+        let base = std::env::temp_dir().join(format!("agent-sandbox-gone-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let base = std::fs::canonicalize(&base).unwrap();
+        let policy = Policy::new(
+            Some(Mode::WorkspaceWrite),
+            Some(&base),
+            &[],
+            false,
+            &protecting(),
+        )
+        .unwrap()
+        .unwrap();
+        let git = base.join(".git");
+        for _ in 0..20 {
+            let mut held = hold(&policy).await;
+            let (mut sandboxed, ended) =
+                command(&policy, "sh", &["-c", "sleep 5 >/dev/null 2>&1 &"], false).unwrap();
+            let status = sandboxed.current_dir(&base).status().await.unwrap();
+            assert!(status.success());
+            drop(sandboxed);
+            held.waits_for(ended);
+            held.release();
+            assert!(!git.exists(), "removed once the sandbox is gone");
+        }
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
     /// bubblewrap's init holds the lock while the sandbox runs, out of the
     /// command's reach: a placeholder a running sandbox mounts is never
     /// removed under it, whoever lets go first.
@@ -3420,10 +3587,11 @@ mod tests {
         let git = base.join(".git");
         // Built before its hold, as a detached command is: the lock it names
         // was made as the policy was.
-        let mut sandboxed =
+        let (mut sandboxed, ended) =
             command(&policy, "sh", &["-c", "sleep 1; mkdir .git/x"], false).unwrap();
         let held = hold(&policy).await;
         let mut child = sandboxed.current_dir(&base).spawn().unwrap();
+        drop(sandboxed);
         // The daemon lets go first, as when it restarts under a detached
         // command: the sandbox's own lock keeps the placeholder.
         tokio::time::sleep(std::time::Duration::from_millis(300)).await;
@@ -3432,7 +3600,10 @@ mod tests {
         let status = child.wait().await.unwrap();
         assert!(!status.success(), "the placeholder stayed read-only");
         assert!(!git.join("x").exists());
-        hold(&policy).await.release();
+        // The next hold to let go, once the sandbox is gone, removes it.
+        let mut next = hold(&policy).await;
+        next.waits_for(ended);
+        next.release();
         assert!(!git.exists());
         let _ = std::fs::remove_dir_all(&base);
     }

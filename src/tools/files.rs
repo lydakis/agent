@@ -98,10 +98,16 @@ pub(super) async fn read_head(path: &Path, count: u64, hidden: &[PathBuf]) -> Re
 /// sandbox, in the agent binary, as Codex runs `apply_patch`: the kernel
 /// decides what it reaches, so a link swapped in after the path was
 /// checked can't carry it out. An unconfined one makes the folders above
-/// `path` itself first. The caller holds the sandbox's placeholders.
-pub(super) async fn write(path: &Path, content: &[u8], sandbox: Option<Arc<Policy>>) -> Result<()> {
+/// `path` itself first. The caller holds the sandbox's placeholders,
+/// `held`, which waits for the confined write's sandbox to be gone.
+pub(super) async fn write(
+    path: &Path,
+    content: &[u8],
+    sandbox: Option<Arc<Policy>>,
+    held: Option<&mut crate::sandbox::Hold>,
+) -> Result<()> {
     if let Some(policy) = sandbox {
-        return confined(&policy, path, content).await;
+        return confined(&policy, path, content, held).await;
     }
     if let Some(parent) = path.parent() {
         tokio::fs::create_dir_all(parent).await?;
@@ -115,14 +121,19 @@ pub(super) async fn write(path: &Path, content: &[u8], sandbox: Option<Arc<Polic
     Ok(())
 }
 
-async fn confined(policy: &Policy, path: &Path, content: &[u8]) -> Result<()> {
+async fn confined(
+    policy: &Policy,
+    path: &Path,
+    content: &[u8],
+    held: Option<&mut crate::sandbox::Hold>,
+) -> Result<()> {
     let Some(helper) = policy.helper.as_deref().and_then(Path::to_str) else {
         return fail("sandbox_unavailable");
     };
     let Some(target) = path.to_str() else {
         return fail("path_not_utf8");
     };
-    let mut command = crate::sandbox::command(policy, helper, &[WRITE, target], false)?;
+    let (mut command, ended) = crate::sandbox::command(policy, helper, &[WRITE, target], false)?;
     command
         .env_clear()
         .stdin(Stdio::piped())
@@ -130,6 +141,11 @@ async fn confined(policy: &Policy, path: &Path, content: &[u8]) -> Result<()> {
         .stderr(Stdio::piped())
         .kill_on_drop(true);
     let mut child = command.spawn()?;
+    // Its sandbox is held until it is gone, not only the helper.
+    drop(command);
+    if let Some(held) = held {
+        held.waits_for(ended);
+    }
     let mut stdin = child.stdin.take().ok_or(Error::new("io_error"))?;
     // A helper that fails before reading closes stdin; its own error says why.
     let _ = stdin.write_all(content).await;

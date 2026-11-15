@@ -268,7 +268,10 @@ impl Patch {
         let hidden = sandbox
             .as_ref()
             .map_or(&[][..], |policy| &policy.unreadable);
-        self.stage(workspace, hidden).await?.commit(sandbox).await
+        self.stage(workspace, hidden)
+            .await?
+            .commit(sandbox, None)
+            .await
     }
 
     /// Read and check every file the patch changes, and compute what each
@@ -372,12 +375,18 @@ impl Staged {
             .any(|write| matches!(write, Write::Put(..)))
     }
 
-    /// Write the changes, in `sandbox` when the bot has one.
-    pub async fn commit(self, sandbox: Option<Arc<Policy>>) -> Result<String> {
+    /// Write the changes, in `sandbox` when the bot has one, its
+    /// placeholders `held`.
+    pub async fn commit(
+        self,
+        sandbox: Option<Arc<Policy>>,
+        mut held: Option<&mut crate::sandbox::Hold>,
+    ) -> Result<String> {
         for write in self.writes {
             match write {
                 Write::Put(target, contents, permissions) => {
-                    files::write(&target, contents.as_bytes(), sandbox.clone()).await?;
+                    let held = held.as_deref_mut();
+                    files::write(&target, contents.as_bytes(), sandbox.clone(), held).await?;
                     if let Some(permissions) = permissions {
                         tokio::fs::set_permissions(&target, permissions).await?;
                     }

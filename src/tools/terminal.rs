@@ -418,7 +418,7 @@ impl Registry {
                 }
                 (Err(error), None) => return Err(error),
             };
-            let held = crate::sandbox::hold_for(sandbox.as_deref()).await;
+            let mut held = crate::sandbox::hold_for(sandbox.as_deref()).await;
             // Nothing awaits between this and the spawn, so a pull or a
             // kill either came before and it never starts, or comes after
             // and finds it.
@@ -431,7 +431,7 @@ impl Registry {
                 return Err(super::not_started_by_shutdown());
             }
             let (master, slave) = open()?;
-            let mut process = sh(
+            let (mut process, ended) = sh(
                 &command,
                 &workspace,
                 self,
@@ -456,8 +456,13 @@ impl Registry {
             }
             let child = (process.spawn()).map_err(|e| super::not_started(e, &workspace))?;
             // The parent's copies of the terminal's far end close here, so
-            // the master reads its end once the command's do.
+            // the master reads its end once the command's do, and so does
+            // its copy of the pipe that tells when its sandbox is gone,
+            // which its hold waits for.
             drop(process);
+            if let Some(held) = &mut held {
+                held.waits_for(ended);
+            }
             let group = child.id().ok_or(Error::new("shell_spawn_failed"))? as i32;
             // SAFETY: the OwnedFd is open, and it keeps the one descriptor
             // until the AsyncFd that owns it drops.
