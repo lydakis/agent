@@ -3223,7 +3223,11 @@ mod tests {
         // The lookout's files: mail down, ci's newest word on main, one
         // note told of the three it lasts, two in the last day.
         let sources = lookout::beside(&store, ".sources");
-        let since = now - 30 * 60 * 1000;
+        // Down for half an hour, but never since yesterday: a time on
+        // another day is written with its date, which would change the rows.
+        let today = trigger::local((now / 1000) as i64);
+        let into_day = (u64::from(today.hour) * 60 + u64::from(today.minute)) * 60 * 1000;
+        let since = now - into_day.min(30 * 60 * 1000);
         let health = lookout::sources::health_file(&sources, "mail");
         std::fs::create_dir_all(health.parent().unwrap()).unwrap();
         let word = json!({"down": true, "since_ms": since, "failed": "exit status: 3"});

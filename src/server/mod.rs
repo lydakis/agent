@@ -12,7 +12,15 @@ mod socket;
 mod steps;
 
 /// The daemon's tools a script may run as daemon steps (`run_step`).
-const STEP_TOOLS: [&str; 2] = ["shell", "echo"];
+const STEP_TOOLS: [&str; 7] = [
+    "shell",
+    "echo",
+    "read",
+    "write",
+    "edit",
+    "apply_patch",
+    "web_fetch",
+];
 mod turn;
 
 use actives::{Actives, Slot};
@@ -5852,8 +5860,8 @@ impl Service {
                     );
                 }
                 // Read as the call would be: a step that would not run as
-                // a foreground command is refused before anything is
-                // recorded.
+                // a foreground command, or that reads anything but a file,
+                // is refused before anything is recorded.
                 let prepared = self.registry.prepare(&tool, &arguments)?;
                 match prepared {
                     Prepared::Shell {
@@ -5866,6 +5874,17 @@ impl Service {
                             "a daemon step runs a command in the foreground: no background, detach or tty",
                         );
                     }
+                    Prepared::Read {
+                        source:
+                            agent_runtime::tools::ReadSource::Artifact { .. }
+                            | agent_runtime::tools::ReadSource::Result { .. },
+                        ..
+                    } => {
+                        return fail_with(
+                            "invalid_step",
+                            "a daemon step reads a file; an artifact is read with `artifact`",
+                        );
+                    }
                     _ => {}
                 }
                 let ask = agent_runtime::store::StepAsk {
@@ -5875,6 +5894,7 @@ impl Service {
                     step,
                     tool,
                     arguments,
+                    links: Default::default(),
                 };
                 self.run_step(session, output, id, ask, prepared)
             }

@@ -22,8 +22,10 @@
 //! way back in.
 use super::{Service, Stepping, turn};
 use agent_runtime::{
-    Error, Result, fail_with,
-    output::Output,
+    Error, Result,
+    codec::Part,
+    fail_with,
+    output::{self, Output},
     store::{Capture, StepAsk, StepOpened, Stepped},
     tools::{Outcome, Prepared, Slot},
 };
@@ -391,11 +393,30 @@ impl Service {
             let captured = steps.captured.get(&key).cloned();
             let store = self.store.clone();
             steps.jobs.spawn(async move {
-                let opened = store
-                    .op("step_open", move |db| {
+                let mut asked = asked;
+                // A later step of a call reads its links before it is
+                // asked; the first, once its call is captured.
+                if let Some(capture) = &captured {
+                    learn_links(capture, &mut asked).await;
+                }
+                let open = |asked: StepAsk, captured| {
+                    store.op("step_open", move |db| {
                         db.step_open(&asked, captured, handles_now())
                     })
-                    .await;
+                };
+                let opened = match open(asked.clone(), captured).await {
+                    Ok(StepOpened::Learn { capture }) => {
+                        learn_links(&capture, &mut asked).await;
+                        match open(asked, Some(capture)).await {
+                            Ok(StepOpened::Learn { .. }) => Err(Error::with(
+                                "invalid_step",
+                                "the step's links could not be read",
+                            )),
+                            opened => opened,
+                        }
+                    }
+                    opened => opened,
+                };
                 (key, serial, Done::Opened(opened))
             });
         }
@@ -443,7 +464,8 @@ impl Service {
                 | StepOpened::Refused { capture, .. }
                 | StepOpened::Pending { capture, .. },
             ) => Some(capture.clone()),
-            Err(_) => None,
+            // Taken up in the job that asked, never brought back here.
+            Ok(StepOpened::Learn { .. }) | Err(_) => None,
         };
         // Kept for the call's next steps, unless this one was stopped
         // while it was decided: a call that ended meanwhile asks no more,
@@ -457,6 +479,7 @@ impl Service {
         }
         match opened {
             Ok(StepOpened::Run { capture, confined }) => self.line_step(key, capture, confined),
+            Ok(StepOpened::Learn { .. }) => unreachable!("links are read in the job that asked"),
             Ok(StepOpened::Refused { reply: refused, .. }) => {
                 let flight = self.steps.take(&key).expect("a flight");
                 self.steps.ran += 1;
@@ -583,7 +606,12 @@ impl Service {
             return;
         }
         let command = matches!(flight.prepared, Some(Prepared::Shell { .. }));
-        let slot = command;
+        // A confined change to files runs its sandbox's helper as a process.
+        let writes = matches!(
+            flight.prepared,
+            Some(Prepared::Write { .. } | Prepared::Edit { .. } | Prepared::ApplyPatch(_))
+        );
+        let slot = command || (confined && writes);
         flight.state = State::Lined {
             capture,
             confined,
@@ -704,6 +732,9 @@ impl Service {
     fn close_step(&mut self, key: Key, ran: Result<Outcome>) {
         let flight = self.steps.flights.get(&key).expect("a flight");
         let (turn, id, serial) = (key.0, flight.ask.id(), flight.serial);
+        // The reply's id, as encoded, is part of what its pictures share.
+        let envelope = ENVELOPE
+            + agent_runtime::output::encoded_len(&flight.request).unwrap_or(usize::MAX / 2);
         let capture = self.steps.captured.get(&key).cloned();
         let outputs = capture.as_ref().and_then(|capture| {
             let root = PathBuf::from(
@@ -723,6 +754,21 @@ impl Service {
                     (failure(error), Some(code))
                 }
             };
+            // A picture's base64 is sized, moved and copied off the
+            // runtime thread, as a lifted call's pictures are.
+            let pictured = outcome.parts.iter().any(|part| part.image().is_some());
+            let outcome = if pictured {
+                let id = id.clone();
+                tokio::task::spawn_blocking(move || parted(outcome, turn, &id, envelope))
+                    .await
+                    .map_err(|_| Error::new("step_task_failed"))
+            } else {
+                Ok(outcome)
+            };
+            let outcome = match outcome {
+                Ok(outcome) => outcome,
+                Err(error) => return (key, serial, Done::Closed(Err(error))),
+            };
             let outcome = match outputs {
                 Some(outputs) if !outcome.artifacts.is_empty() => {
                     outputs.keep(outcome, turn, &id).await
@@ -730,7 +776,27 @@ impl Service {
                 _ => outcome,
             };
             let outcome = turn::annotate(outcome, turn, &id);
-            let reply = json!({"call_id":id,"output":outcome.output,"failed":outcome.failed});
+            let built = |outcome: Outcome, id: String| {
+                let mut reply =
+                    json!({"call_id":id,"output":outcome.output,"failed":outcome.failed});
+                // A picture read goes back as one, in the parts `tool_result`
+                // takes, so the script can hand it on to the model.
+                if !outcome.parts.is_empty() {
+                    reply["parts"] = json!(outcome.parts);
+                }
+                (outcome, id, reply)
+            };
+            let built = if pictured {
+                tokio::task::spawn_blocking(move || built(outcome, id))
+                    .await
+                    .map_err(|_| Error::new("step_task_failed"))
+            } else {
+                Ok(built(outcome, id))
+            };
+            let (outcome, id, reply) = match built {
+                Ok(built) => built,
+                Err(error) => return (key, serial, Done::Closed(Err(error))),
+            };
             let closed = store
                 .op("step_close", move |db| {
                     db.step_close(turn, &id, &outcome, error.as_deref(), handles_now())
@@ -888,6 +954,27 @@ fn failure(error: Error) -> Outcome {
     }
 }
 
+/// Read off the runtime thread the links a sandboxed bot's change to files
+/// passes, as a direct call's are read before it is judged.
+async fn learn_links(capture: &Capture, ask: &mut StepAsk) {
+    let folder = PathBuf::from(capture.workspace.as_deref().unwrap_or_default());
+    let calls = vec![ask.call()];
+    let Some(learn) = capture.bot.links_to_learn(&calls, &folder, false) else {
+        return;
+    };
+    let learned = tokio::task::spawn_blocking(move || {
+        let mut calls = calls;
+        learn(&mut calls);
+        calls
+    })
+    .await;
+    if let Ok(mut calls) = learned
+        && let Some(call) = calls.pop()
+    {
+        ask.links = call.links;
+    }
+}
+
 fn handles_now() -> u64 {
     super::handles::now_ms()
 }
@@ -913,6 +1000,13 @@ async fn run(
     let bot = &capture.bot;
     let workspace = PathBuf::from(capture.workspace.as_deref().unwrap_or_default());
     let root = (bot.workspace.as_ref()).map_or_else(|| workspace.clone(), PathBuf::from);
+    // A change to files runs to its end once begun, a stop or not: cut
+    // off, it could be half made. Its end is recorded as it happened.
+    // Until its sandbox is ready, nothing of it has begun.
+    let lasting = matches!(
+        prepared,
+        Prepared::Write { .. } | Prepared::Edit { .. } | Prepared::ApplyPatch(_)
+    );
     let ready = async {
         Ok::<_, Error>(match confined {
             true => {
@@ -930,6 +1024,11 @@ async fn run(
                 .flatten()?
                 .map(Arc::new)
             }
+            // A sandboxed bot's read, which the daemon does outside any
+            // sandbox, keeps out of the folders no sandboxed bot reads.
+            false if bot.sandboxed() && matches!(prepared, Prepared::Read { .. }) => Some(
+                Arc::new(agent_runtime::sandbox::Policy::reads(registry.daemon())),
+            ),
             false => None,
         })
     };
@@ -971,9 +1070,14 @@ async fn run(
                     )
                     .await
             }
-            prepared @ Prepared::Echo(_) => {
+            prepared @ (Prepared::Echo(_)
+            | Prepared::Read { .. }
+            | Prepared::Write { .. }
+            | Prepared::Edit { .. }
+            | Prepared::ApplyPatch(_)
+            | Prepared::WebFetch(_)) => {
                 registry
-                    .execute(prepared, &workspace, &environment, sandbox)
+                    .execute_holding(prepared, &workspace, &environment, sandbox, slot)
                     .await
             }
             _ => Err(Error::with(
@@ -982,9 +1086,85 @@ async fn run(
             )),
         }
     };
+    if lasting {
+        return work.await;
+    }
     tokio::select! {
         biased;
         Ok(why) = &mut stopping => Err(stopped(why)),
         ran = cord.until_pulled(work) => ran,
     }
+}
+
+/// What a reply carries beside its result and its encoded id: the object
+/// around them.
+const ENVELOPE: usize = 256;
+
+/// The streams a step's pictures too large for its reply are kept under.
+const PICTURES: [&str; 20] = [
+    "picture-1",
+    "picture-2",
+    "picture-3",
+    "picture-4",
+    "picture-5",
+    "picture-6",
+    "picture-7",
+    "picture-8",
+    "picture-9",
+    "picture-10",
+    "picture-11",
+    "picture-12",
+    "picture-13",
+    "picture-14",
+    "picture-15",
+    "picture-16",
+    "picture-17",
+    "picture-18",
+    "picture-19",
+    "picture-20",
+];
+
+/// A step's outcome with what of its pictures fits one reply, which the
+/// transport bounds, in the reply, in order; each one past that is kept
+/// as its own output, its base64 under `CALL/STEP` as `picture-N`, read
+/// with `artifact` as any kept output is, and its output says so. Nothing
+/// is decoded or encoded again: a step reads what the direct call does.
+fn parted(mut outcome: Outcome, turn: i64, id: &str, envelope: usize) -> Outcome {
+    if !outcome.parts.iter().any(|part| part.image().is_some()) {
+        return outcome;
+    }
+    let size = |value: &Value| serde_json::to_vec(value).map_or(usize::MAX, |bytes| bytes.len());
+    let bare = size(&json!({"call_id":id,"output":outcome.output,"failed":outcome.failed}));
+    let mut room = output::MAX_EVENT.saturating_sub(bare.saturating_add(envelope));
+    let (mut kept, mut lines) = (0, Vec::new());
+    outcome.parts = (std::mem::take(&mut outcome.parts).into_iter())
+        .filter_map(|part| {
+            // A picture's base64 is sent as it is, in its own object.
+            let bytes = match &part {
+                Part::Image(image) => image.data.len() + image.media_type.len() + 64,
+                Part::Text { .. } => size(&json!(part)),
+            };
+            if bytes <= room {
+                room -= bytes;
+                return Some(part);
+            }
+            let Part::Image(image) = part else {
+                lines.push("words past the reply's room left out".to_owned());
+                return None;
+            };
+            let stream = PICTURES[kept.min(PICTURES.len() - 1)];
+            kept += 1;
+            lines.push(format!(
+                "a {} picture too large for the reply kept as {turn}/{id}/{stream}; read it with artifact",
+                image.media_type
+            ));
+            outcome.artifacts.push((stream, image.data.into_bytes()));
+            None
+        })
+        .collect();
+    for line in lines {
+        outcome.output.push_str("; ");
+        outcome.output.push_str(&line);
+    }
+    outcome
 }

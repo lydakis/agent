@@ -10181,8 +10181,8 @@ one FIFO line, so a step waits about one pass of that line: the fleet's
 size over the daemon's step rate. The p99 sits within 1.06 to 1.51 times
 that pass in every run, highest at 2,000 bots, where the line's first
 pass is still filling. The 1 s gate was a number written before any run;
-it is met at 10,000 bots only by a step rate of 10,000 a second. The
-proposal that replaces it:
+it is met at 10,000 bots only by a step rate of 10,000 a second. What
+replaces it, agreed with George the same day:
 
 - **Fairness:** step p99 at most 1.6 times the fleet's size over its step
   rate, at 400, 2,000 and 10,000 bots. No step starves behind a line it
@@ -10219,3 +10219,82 @@ gate:
 | lifecycle | CPU, s | 0.315 | 0.33 | +4.8% |
 | lifecycle | p95 turn, ms | 573.6 | 572.5 | -0.2% |
 | lifecycle | peak RSS, MiB | 24.81 | 25.27 | +1.8% |
+
+## Code mode against 0.9.5 and main, at 400, 2,000 and 10,000 bots
+
+George's bar for code mode, 2026-11-15: it must beat the released 0.9.5
+on memory, processor time and latency, and every later change is
+measured against it the same way. `bench.code_mode_vs_direct` (new) runs
+the same fleet work two ways, through the socket alone. Every fleet bot's
+turn runs five `echo` tools:
+
+- **Direct** (`MODE=direct`): the model calls `echo` once a round, five
+  rounds, then answers: six model requests a turn. Any release since 0.9.5
+  runs it.
+- **Code mode** (`MODE=steps`): the model calls one script tool, the bench
+  runs the five `echo` calls as daemon steps with `run_step`, answers the
+  call, and the model answers: two model requests a turn.
+
+Every fleet turn is submitted at once. 32 other bots run plain turns from
+a process of their own, first on the idle daemon and then while the
+fleet runs. Reported: each fleet turn's time from submit to its end; the
+daemon's processor time a turn, every thread, with what the other bots'
+turns cost taken off (measured on the idle daemon); its peak resident
+memory while the fleet runs, read every 20 ms; and the other bots' p99.
+Release builds of v0.9.5 (3c73fcd), main before code mode (21b9740) and
+code mode (main with slices 2 and 3); 4-core Linux container; synthetic
+model; 2026-11-15 and 16. Each cell is the range over the runs named.
+
+| 400 bots | 0.9.5, direct (4 runs) | main, direct (3) | Code mode (3) |
+| --- | ---: | ---: | ---: |
+| Turn p50 | 2.47 to 2.83 s | 2.68 to 2.75 s | **1.39 to 1.54 s** |
+| Turn p99 | 2.8 to 42 s | 4.9 to 40 s | **1.83 to 2.02 s** |
+| Daemon processor time a turn | 5.5 to 7.9 ms | 7.5 to 8.0 ms | **4.05 to 4.18 ms** |
+| Peak memory | 61 to 63 MB | 58 to 61 MB | **51 to 52 MB** |
+| Other bots' p99, idle about 72 to 93 ms, while the fleet runs | 0.77 to 39.7 s | 0.72 to 1.43 s | **0.35 to 0.62 s** |
+
+| 2,000 bots | 0.9.5, direct (4) | main, direct (3) | Code mode (3) |
+| --- | ---: | ---: | ---: |
+| Turn p50 | 13.0 to 14.8 s | 12.3 to 14.1 s | **6.7 to 7.3 s** |
+| Turn p99 | 24 to 42 s | 17.7 to 32.4 s | **8.9 to 9.7 s** |
+| Daemon processor time a turn | 8.2 to 9.0 ms | 7.2 to 8.9 ms | **4.27 to 4.53 ms** |
+| Peak memory | 186 to 191 MB | 190 to 212 MB | **121 to 130 MB** |
+| Other bots' p99 while the fleet runs | 5.0 to 14.7 s | 4.1 to 6.4 s | **0.70 to 1.60 s** |
+
+| 10,000 bots | 0.9.5, direct (3) | main, direct (4) | Code mode (1) |
+| --- | ---: | ---: | ---: |
+| Turn p50 | 74 to 103 s | 73 to 106 s | **34 s** |
+| Turn p99 | 91 to 123 s | 104 to 130 s | **50 s** |
+| Daemon processor time a turn | 9.0 to 10.4 ms | 8.9 to 9.9 ms | **4.8 ms** |
+| Peak memory | 599 to 701 MB | 612 to 776 MB | **337 MB** |
+| Other bots' p99 while the fleet runs | 28 to 32 s | 15 to 48 s | **7.3 s** |
+
+**Where code mode stands: ahead of 0.9.5 on every row at every size.**
+Most of the time it saves is model rounds: two requests a turn instead of
+six. The processor time and memory it saves are the daemon's own: a step
+is two store jobs and no model round, and a turn waiting on its script
+holds less than one carrying five rounds of calls.
+
+**Main against 0.9.5 on direct calls: no regression found.** Processor
+time a turn and peak memory overlap at every size. A first single run at
+10,000 bots read main's whole fleet as about 30% slower; repeats put
+both between 96 and 135 s, in either order. While the fleet runs, the
+daemon's runtime thread is about 35% busy and its store thread about
+45%, in one run of each: the synthetic model, not the daemon, sets the fleet's pace.
+
+Caveats:
+
+- **The synthetic model shares the 4 cores** and is one Python process.
+  At 2,000 and 10,000 bots it is the bottleneck for direct calls, which
+  make three times its requests; the turn times include its queue.
+- **p99s of direct calls are noisy:** a run can stall on the synthetic
+  model's queue, which reads as a p99 of about 40 s at 400 bots on either
+  build. Ranges are given, not single numbers.
+- **The daemon's processor time is the steadier comparison:** it does not
+  count the model's time, and it moved under 10% run to run.
+- Code mode's 10,000-bot column is one run.
+
+    AGENT_TEST_RUNTIME=1 MODE=direct AGENTS=400,2000,10000 BINARY=PATH \
+        python3 -m bench.code_mode_vs_direct
+    AGENT_TEST_RUNTIME=1 MODE=steps AGENTS=400,2000,10000 \
+        python3 -m bench.code_mode_vs_direct
