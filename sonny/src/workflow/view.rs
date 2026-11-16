@@ -159,8 +159,12 @@ pub fn bar(counts: Counts) -> Vec<Cell> {
     let mut shares: Vec<(usize, usize, Cell)> = (states.iter())
         .map(|&(n, cell)| {
             let whole = n * BAR / all;
-            let floor = if n > 0 { whole.max(1) } else { 0 };
-            (floor, (n * BAR) % all, cell)
+            // A state lifted to its one cell has had more than its share.
+            match (n, whole) {
+                (0, _) => (0, 0, cell),
+                (_, 0) => (1, 0, cell),
+                _ => (whole, (n * BAR) % all, cell),
+            }
         })
         .collect();
     let mut given: usize = shares.iter().map(|(n, ..)| n).sum();
@@ -546,6 +550,12 @@ mod tests {
             text(&strip(&[(String::new(), counts(25, 0, 0))], 80)),
             "✓✓✓✓✓✓✓✓✓✓✓✓  25 finished"
         );
+        // A state lifted to its one cell takes no more on its remainder:
+        // 2 of 25 failed is one cell, not two.
+        let lifted: String = (bar(counts(11, 2, 12)).into_iter())
+            .map(|cell| cell.sign().content.into_owned())
+            .collect();
+        assert_eq!(lifted, "✓✓✓✓✓✗●●●●●●");
         // One failure in three hundred keeps its cell.
         let one = bar(counts(299, 1, 0));
         assert_eq!(one.len(), BAR);
