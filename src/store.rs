@@ -817,6 +817,10 @@ impl Store {
                                 }),
                                 commit_ns,
                             );
+                            // The calls it ended are told before anyone
+                            // hears of their ends; a group that did not
+                            // commit ended none.
+                            db.tell_calls_ended();
                             for job in group.drain(..) {
                                 job.answer(failure.as_ref());
                             }

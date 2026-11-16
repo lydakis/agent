@@ -524,6 +524,19 @@ store already allows for when it closes an interrupted call
 commands. None of these rows has its whole mechanism today; the
 [second review](#review-2026-11-15) lists what each lacks.
 
+**How a call's end reaches its steps, as built.** The store is the one
+place an answered call's end is noted: its answer held or recorded, taken
+by its turn (answered or out of time), or the call gone with its turn or
+its lifted command. The group that ended it tells the run loop as it
+commits, before any of its jobs is answered, so no one hears of a call's
+end before its steps do. The run loop looks at those ends again each time
+it lets a step start, so no step starts once its call's end was told. A
+step held by a pause before it starts answers `step_stopped` as every
+other stop does. A unit test runs the coordinator over every state a step
+can be in (asked, deciding, gated, in line, running, ending) against every
+cause that stops one (its call answered by its bot or by another, the
+call's end, a pause, its asker leaving).
+
 **The decision is the direct call's.** A step is validated, ruled, gated
 and confined exactly as the same call from the model would be: the bot's
 rules, the gates that name the step's own tool, `approval_policy`, its

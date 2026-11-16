@@ -2150,14 +2150,8 @@ pub enum Lifted {
     /// `Some(at)`.
     Waiting(Option<u64>),
     /// Ended: its result is its command's, and `ready` when the turn that
-    /// tells its bot is ready for a slot. `call` names the call, turn and
-    /// id, when it waited for its client's answer, as one with daemon steps
-    /// does.
-    Ended {
-        result: Value,
-        ready: bool,
-        call: Option<(i64, String)>,
-    },
+    /// tells its bot is ready for a slot.
+    Ended { result: Value, ready: bool },
     /// Every gate allowed it: the caller runs it as its command.
     Run(Box<LiftedRun>),
     /// Nothing waits on it any more.
@@ -2568,7 +2562,14 @@ pub struct Database {
     /// Files of outputs whose records the current group removed, removed
     /// once it commits: a group that does not keeps both.
     files_gone: Vec<String>,
+    /// Answered calls the current group ended, told once it commits.
+    calls_ended: Vec<(i64, String)>,
+    /// Where an answered call's end is told: the daemon's steps of it.
+    call_ends: Option<CallEnds>,
 }
+/// Told each answered call that ended, by turn and id, from the storage
+/// worker, before any job of the group that ended it is answered.
+pub type CallEnds = Box<dyn Fn(i64, String) + Send>;
 
 /// A pause as clients read it, from its columns in the order
 /// `id,reason,pulled_by,at_ms,parked,resumed_by,resumed_ms`: `parked` holds the agents whose running turns
@@ -3123,6 +3124,8 @@ impl Database {
             stepped: Vec::new(),
             steps_gone: Vec::new(),
             files_gone: Vec::new(),
+            calls_ended: Vec::new(),
+            call_ends: None,
         })
     }
 
@@ -3450,6 +3453,8 @@ impl Database {
             stepped: Vec::new(),
             steps_gone: Vec::new(),
             files_gone: Vec::new(),
+            calls_ended: Vec::new(),
+            call_ends: None,
         };
         // A deletion interrupted between pieces finishes now: the bot was
         // already refusing work, and nothing else may see it half gone.
@@ -3542,11 +3547,12 @@ impl Database {
     /// methods it calls release their own savepoints into this one.
     pub fn atomic<T>(&mut self, work: impl FnOnce(&mut Self) -> Result<T>) -> Result<T> {
         self.conn.execute_batch("SAVEPOINT atomic")?;
-        let (served, stepped, gone, files) = (
+        let (served, stepped, gone, files, ended) = (
             self.served.len(),
             self.stepped.len(),
             self.steps_gone.len(),
             self.files_gone.len(),
+            self.calls_ended.len(),
         );
         let done = work(self);
         if done.is_ok() {
@@ -3558,6 +3564,7 @@ impl Database {
             self.served.truncate(served);
             self.stepped.truncate(stepped);
             self.files_gone.truncate(files);
+            self.calls_ended.truncate(ended);
             self.restore_steps(gone);
             self.recount_pending()?;
         }
@@ -3603,6 +3610,28 @@ impl Database {
             }
         }
     }
+    /// Answered call `call_id` of `turn` ended: its answer was taken or
+    /// recorded, or it went with its turn or its lifted command. The one
+    /// place an answered call's end is noted, told once the group commits.
+    fn call_ended(&mut self, turn: i64, call_id: &str) {
+        if self.call_ends.is_some() {
+            self.calls_ended.push((turn, call_id.to_owned()));
+        }
+    }
+    /// Tell `call_ends` of each answered call that ends from now on.
+    pub fn on_call_end(&mut self, call_ends: CallEnds) {
+        self.call_ends = Some(call_ends);
+    }
+    /// Tell the calls the group that just committed ended, before any of
+    /// its jobs is answered: whoever hears of an end, the steps of its
+    /// call have been told first.
+    pub fn tell_calls_ended(&mut self) {
+        if let Some(tell) = &self.call_ends {
+            for (turn, call_id) in self.calls_ended.drain(..) {
+                tell(turn, call_id);
+            }
+        }
+    }
     /// Forget a group that did not commit: roll back whatever is still
     /// open, drop the outcomes its jobs announced, and recount the waiting
     /// turns they counted.
@@ -3610,6 +3639,7 @@ impl Database {
         self.outcomes.clear();
         self.served.clear();
         self.stepped.clear();
+        self.calls_ended.clear();
         self.files_gone.clear();
         self.restore_steps(0);
         self.pending_stale = true;
@@ -9292,6 +9322,13 @@ impl Database {
     /// An answered call's answer, held or stored, `tool_unserved` once its
     /// time ran out, or how long it may still wait.
     pub fn answer_take(&mut self, turn: i64, call_id: &str, now_ms: u64) -> Result<CallAnswer> {
+        let taken = self.take_answer(turn, call_id, now_ms)?;
+        if let CallAnswer::Given(_) = taken {
+            self.call_ended(turn, call_id);
+        }
+        Ok(taken)
+    }
+    fn take_answer(&mut self, turn: i64, call_id: &str, now_ms: u64) -> Result<CallAnswer> {
         if let Some(live) = self.live_changed(turn)
             && let Some(given) = live.answers.remove(call_id)
         {
@@ -9441,6 +9478,18 @@ impl Database {
     /// held by the worker and wakes its task, so its `tool_finish` is the
     /// one commit; a parked turn's is committed now and resumes the turn.
     pub fn answer_call(
+        &mut self,
+        bot: &str,
+        turn: i64,
+        call_id: &str,
+        outcome: Outcome,
+        now_ms: u64,
+    ) -> Result<Answered> {
+        let answered = self.record_answer(bot, turn, call_id, outcome, now_ms)?;
+        self.call_ended(turn, call_id);
+        Ok(answered)
+    }
+    fn record_answer(
         &mut self,
         bot: &str,
         turn: i64,
@@ -10147,15 +10196,6 @@ impl Database {
         event(&tx, &bot.name, Some(turn), "step_decided", decided)?;
         tx.commit()?;
         Ok(StepOpened::Run { capture, confined })
-    }
-    /// The calls of `turn` a message lifted that still wait for their
-    /// answer: they outlive their turn.
-    pub fn lifted_calls(&self, turn: i64) -> Result<Vec<String>> {
-        Ok(self
-            .conn
-            .prepare_cached("SELECT call_id FROM answers WHERE turn=? AND process IS NOT NULL")?
-            .query_map([turn], |r| r.get(0))?
-            .collect::<rusqlite::Result<_>>()?)
     }
     /// What a call captures at its first daemon step: see [`Capture`]. The
     /// turn's own folder, model and effort, else the bot's as it was while
@@ -11859,10 +11899,11 @@ impl Database {
             self.stepped.push(id);
         }
         let mut outputs_gone = Vec::new();
+        let mut calls: Vec<String> = Vec::new();
         if bot.declared.iter().any(|tool| tool.answered_by.is_some()) {
             // What the daemon steps of a call ending unanswered with its
             // turn kept goes with it; a lifted call keeps its steps'.
-            let calls: Vec<String> = tx
+            calls = tx
                 .prepare_cached(
                     "DELETE FROM answers WHERE turn=? AND process IS NULL RETURNING call_id",
                 )?
@@ -12031,6 +12072,10 @@ impl Database {
         let cursor = event(&tx, &bot.name, Some(turn), "turn_finished", data.clone())?;
         tx.commit()?;
         self.forget_files(outputs_gone);
+        // Its answered calls end with it, but a lifted one's.
+        for call in &calls {
+            self.call_ended(turn, call);
+        }
         self.approvals -= unstarted;
         self.forget_live(turn);
         entries.push(entry(cursor, &bot.name, Some(turn), "turn_finished", data));
@@ -13486,12 +13531,9 @@ impl Database {
         lifted_ended(&tx, process, &result, failed, outcome)?;
         tx.commit()?;
         self.forget_files(gone);
+        self.call_ended(turn, &call_id);
         let ready = self.tell_finished(&bot.name)?;
-        Ok(Lifted::Ended {
-            result,
-            ready,
-            call: Some((turn, call_id)),
-        })
+        Ok(Lifted::Ended { result, ready })
     }
     /// [`Database::lifted_check`] of a call waiting on its gates, decided as
     /// `approval_start` decides a turn's.
@@ -13641,11 +13683,7 @@ impl Database {
         let _ = outcome;
         self.approvals -= 1;
         let ready = self.tell_finished(&bot.name)?;
-        Ok(Lifted::Ended {
-            result,
-            ready,
-            call: None,
-        })
+        Ok(Lifted::Ended { result, ready })
     }
     /// Stop the call a message lifted to background command `process`, of
     /// `bot`'s, while it waits: its request for a verdict or its client's
@@ -13699,15 +13737,14 @@ impl Database {
         lifted_ended(&tx, process, &result, true, outcome)?;
         tx.commit()?;
         self.forget_files(gone);
+        if answering {
+            self.call_ended(turn, &call_id);
+        }
         if approval.is_some() {
             self.approvals -= 1;
         }
         let ready = self.tell_finished(bot)?;
-        Ok(Some(Lifted::Ended {
-            result,
-            ready,
-            call: answering.then_some((turn, call_id)),
-        }))
+        Ok(Some(Lifted::Ended { result, ready }))
     }
     /// Every call a message lifted that still waits, by its command: for
     /// the daemon to schedule each one's time again as it starts, and to
