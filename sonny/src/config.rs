@@ -1159,8 +1159,9 @@ impl View {
         (Line::from(vec![Span::raw("› ").bold(), what]), None)
     }
 
-    /// The keys the picked setting takes.
-    pub fn keys(&self) -> Line<'static> {
+    /// The keys the picked setting takes, in `width` columns. The muted
+    /// words after them come only where they fit whole.
+    pub fn keys(&self, width: usize) -> Line<'static> {
         let file = crate::tilde(&self.path.display().to_string());
         use crate::hint::{Enter, Esc, Keys};
         let picked = self.picked();
@@ -1176,10 +1177,13 @@ impl View {
             }
             keys = keys.esc(Esc::Close);
         }
-        let mut spans = crate::hint::spans(&format!("  {keys}"));
-        match self.typing {
-            Some(_) => spans.push(Span::raw("  empty for the default").dim()),
-            None => spans.push(Span::raw(format!("  {file}")).dim()),
+        let mut spans = crate::hint::under(&keys, width);
+        let after = match self.typing {
+            Some(_) => "  empty for the default".to_owned(),
+            None => format!("  {file}"),
+        };
+        if Line::from(spans.clone()).width() + after.width() <= width {
+            spans.push(Span::raw(after).dim());
         }
         Line::from(spans)
     }
@@ -1465,9 +1469,16 @@ mod tests {
         let view = View::at(PathBuf::from("/nowhere/config.toml"));
         assert_eq!(view.line().0.to_string(), "› find a setting");
         assert_eq!(
-            view.keys().to_string(),
+            view.keys(80).to_string(),
             "  ↑↓ pick · enter choose · esc close  /nowhere/config.toml"
         );
+        // Short of room, the file goes whole, then the keys as every
+        // key line's do: no word is cut.
+        assert_eq!(
+            view.keys(50).to_string(),
+            "  ↑↓ pick · enter choose · esc close"
+        );
+        assert_eq!(view.keys(30).to_string(), "  enter choose · esc close");
     }
 
     #[test]

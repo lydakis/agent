@@ -306,6 +306,44 @@ fn own_screen(own: bool) {
 /// escape codes made unambiguous, without release events. A terminal that
 /// does not know it ignores it. The main and alternate screens each keep
 /// their own, so each push is popped on the screen it was made on.
+/// `/model`'s values under its list, `width` wide: `effort` and, where
+/// the picked model serves more than one, `speed`, the one ← and → move
+/// bold in `‹ ›`. Where they and `esc close` do not fit together, the one
+/// ← and → do not move gives way, so no key is cut.
+fn model_values(
+    effort: &str,
+    speed: Option<&str>,
+    on_speed: bool,
+    width: usize,
+) -> Vec<([Span<'static>; 2], models::Click)> {
+    let value = |shown: &str, on: bool| match on {
+        true => Span::raw(format!("‹ {shown} ›")).bold(),
+        false => Span::raw(shown.to_owned()),
+    };
+    let mut pairs = vec![(
+        [Span::raw("  effort ").dim(), value(effort, !on_speed)],
+        models::Click::Effort,
+    )];
+    if let Some(speed) = speed {
+        pairs.push((
+            [Span::raw(" · speed ").dim(), value(speed, on_speed)],
+            models::Click::Speed,
+        ));
+    }
+    let wide: usize = (pairs.iter().flat_map(|(pair, _)| pair))
+        .map(Span::width)
+        .sum();
+    if pairs.len() > 1 && wide + "  esc close".width() > width {
+        pairs.retain(|(_, click)| (*click == models::Click::Speed) == on_speed);
+        let name = pairs[0].0[0]
+            .content
+            .trim_start_matches([' ', '·'])
+            .to_owned();
+        pairs[0].0[0] = Span::raw(format!("  {name}")).dim();
+    }
+    pairs
+}
+
 fn keys_apart(on: bool) {
     let _ = match on {
         true => execute!(
@@ -17693,7 +17731,7 @@ impl App {
                 if let Some(column) = cursor {
                     frame.set_cursor_position((composer.x + column, composer.y));
                 }
-                frame.render_widget(Paragraph::new(view.keys()), footer);
+                frame.render_widget(Paragraph::new(view.keys(footer.width.into())), footer);
                 return;
             }
             if let Some(search) = &self.searching {
@@ -17815,29 +17853,19 @@ impl App {
                     .map(|(model, _)| self.speeds_of(&model))
                     .unwrap_or_default();
                 let on_speed = picker.on_speed && speeds.len() > 1;
-                let value = |shown: String, on: bool| match on {
-                    true => Span::raw(format!("‹ {shown} ›")).bold(),
-                    false => Span::raw(shown),
-                };
-                let mut keys = vec![
-                    Span::raw("  effort ").dim(),
-                    value(effort.to_owned(), !on_speed),
-                ];
-                if speeds.len() > 1 {
-                    let speed = Some(picker.speed)
+                let speed = (speeds.len() > 1).then(|| {
+                    Some(picker.speed)
                         .filter(|speed| speeds.contains(speed))
-                        .unwrap_or("standard");
-                    keys.push(Span::raw(" · speed ").dim());
-                    keys.push(value(speed.to_owned(), on_speed));
-                }
+                        .unwrap_or("standard")
+                });
+                let pairs = model_values(effort, speed, on_speed, footer.width.into());
+                let mut keys: Vec<Span<'static>> =
+                    (pairs.iter()).flat_map(|(pair, _)| pair.clone()).collect();
                 // A click on a name or value moves ← and → to it; on `‹`
                 // or `›`, steps it. The arrows go first, to be found first.
                 let mut x = footer.x;
                 let mut names = Vec::new();
-                for (pair, click) in keys
-                    .chunks(2)
-                    .zip([models::Click::Effort, models::Click::Speed])
-                {
+                for (pair, click) in pairs.iter().map(|(pair, click)| (pair, *click)) {
                     let start = x;
                     x += pair.iter().map(|span| span.width() as u16).sum::<u16>();
                     names.push((footer.y, start..x, click));
@@ -25120,6 +25148,29 @@ mod tests {
         app.model = "openai/gpt-6.1-sol".into();
         let footer = app.footer_line(200).to_string();
         assert!(footer.contains("ultrafast"), "{footer}");
+    }
+
+    #[test]
+    fn model_values_give_way_to_the_one_the_arrows_move_before_a_key_is_cut() {
+        let said = |pairs: Vec<([Span<'static>; 2], models::Click)>| -> String {
+            (pairs.iter().flat_map(|(pair, _)| pair))
+                .map(|span| span.content.as_ref())
+                .collect()
+        };
+        let wide = model_values("default", Some("standard"), false, 60);
+        assert_eq!(said(wide), "  effort ‹ default › · speed standard");
+        // At 44 columns both and `esc close` do not fit: the one ← and →
+        // move stays, by its name.
+        let narrow = model_values("default", Some("standard"), false, 44);
+        assert_eq!(said(narrow), "  effort ‹ default ›");
+        let narrow = model_values("default", Some("fast"), true, 40);
+        assert_eq!(said(narrow.clone()), "  speed ‹ fast ›");
+        assert_eq!(narrow[0].1, models::Click::Speed);
+        // One value alone stays whatever the width.
+        assert_eq!(
+            said(model_values("high", None, false, 10)),
+            "  effort ‹ high ›"
+        );
     }
 
     #[tokio::test]
