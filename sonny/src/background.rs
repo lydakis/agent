@@ -2939,7 +2939,7 @@ fn home_path(text: &str) -> String {
 }
 
 /// `9000` as `9,000`.
-fn thousands(n: u64) -> String {
+pub(crate) fn thousands(n: u64) -> String {
     let digits = n.to_string();
     let mut out = String::new();
     for (i, c) in digits.chars().enumerate() {
