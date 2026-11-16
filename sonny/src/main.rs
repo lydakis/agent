@@ -3491,6 +3491,14 @@ struct TurnHints {
     replied: bool,
 }
 
+impl TurnHints {
+    /// Whether the turn has told anything its hints keep: what reconnecting
+    /// inside it must not start again, as its replay starts past it.
+    fn heard(&self) -> bool {
+        self.replied || !(self.came.is_empty() && self.set.is_empty() && self.runs.is_empty())
+    }
+}
+
 /// What the bot's words turned out to be once something followed them.
 #[derive(Clone, Copy, PartialEq)]
 enum Words {
@@ -10372,7 +10380,7 @@ impl App {
                 true => std::mem::take(&mut self.turn_hints),
                 false => TurnHints::default(),
             };
-            let heard = !(kept.came.is_empty() && kept.set.is_empty() && !kept.replied);
+            let heard = kept.heard();
             // Its first message, before the page, says what the turn is
             // about; the steers the page holds say the rest.
             if colored && let Some((text, from)) = prompts.first().map(said) {
@@ -24539,6 +24547,16 @@ mod tests {
                 "└ sent to ● fix · ● neg · started ◌ readme",
             ]
         );
+    }
+
+    #[test]
+    fn a_turn_that_only_ran_a_workflow_keeps_it_on_reconnecting() {
+        assert!(!TurnHints::default().heard());
+        let ran = TurnHints {
+            runs: vec!["run1".into()],
+            ..Default::default()
+        };
+        assert!(ran.heard());
     }
 
     #[tokio::test]
