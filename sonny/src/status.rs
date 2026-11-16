@@ -44,6 +44,9 @@ pub struct Row {
     /// The agent that made it, when one did.
     pub maker: String,
     pub group: Group,
+    /// The workflow run this row is, whose strip stands where an
+    /// agent's state does.
+    pub run: Option<crate::workflow::view::Live>,
 }
 
 /// Where a task stands, as `/status` groups the tasks, in its order.
@@ -741,6 +744,54 @@ pub fn alert_lines(alert: &Alert, width: usize) -> Vec<Line<'static>> {
     out
 }
 
+/// A workflow run's row after its mark, `width` wide with `before` and
+/// `time` around it: its script's name, the phase it is in, then its strip where
+/// an agent's state stands. The strip is never broken over two rows: a
+/// name too long for both gives way first, cut to no less than a few
+/// columns.
+fn run_spans(
+    run: &crate::workflow::view::Live,
+    width: usize,
+    before: &[Span<'static>],
+    time: Option<&Span<'static>>,
+) -> Vec<Span<'static>> {
+    use crate::workflow::view;
+    let phase = match run.phase.as_str() {
+        "" => " ".to_owned(),
+        phase => format!(" {phase} · "),
+    };
+    let stopping = match run.stopping {
+        true => " · stopping",
+        false => "",
+    };
+    let fixed = before.iter().map(|s| s.content.width()).sum::<usize>()
+        + phase.width()
+        + stopping.width()
+        + time.map_or(0, |t| t.content.width());
+    // The least the strip takes: each worker's cell, or the bar's.
+    let workers: usize = (run.phases.iter())
+        .map(|(_, c)| c.running + c.done + c.failed)
+        .sum();
+    let least = match workers {
+        0 => "starting".len(),
+        n if n <= view::STRIP_MOST => view::cells(&run.phases).len(),
+        _ => view::BAR,
+    };
+    const NAME_LEAST: usize = 8;
+    let name_room = width.saturating_sub(fixed + least).max(NAME_LEAST);
+    // Its script's name alone, as the Rulebook's row has it: the strip
+    // says it is a workflow. Bold in the text's own color, as an
+    // automation's is: blue is an agent's name, and a run is no agent.
+    let name = crate::transcript::cut(&run.name, name_room);
+    let room = width.saturating_sub(fixed + name.width());
+    let mut out = vec![Span::raw(name).bold(), Span::raw(phase)];
+    out.extend(view::strip(&run.phases, room));
+    if !stopping.is_empty() {
+        out.push(Span::raw(stopping));
+    }
+    out
+}
+
 /// One agent's lines, after `indent`: its mark, name, state and time,
 /// at the right its code reviews, and with `trackers` what it follows,
 /// what runs for it and where its window is too; under it, with `details` or
@@ -762,18 +813,24 @@ fn row_lines(
     };
     let mark = match row.group {
         Group::Done => Span::raw("✓ ").dim(),
+        // A workflow that has not ended works.
+        _ if row.run.is_some() => mark("working"),
         _ => mark(&row.state),
     };
-    let mut spans = vec![
-        Span::raw(format!(" {indent}")),
-        mark,
-        // In the agents' color: a click opens it.
-        Span::raw(row.name.clone()).bold().fg(Color::Blue),
-        Span::raw(format!(" {}", row.state)),
-    ];
-    if !time.is_empty() {
-        spans.push(Span::raw(format!(" · {time}")).dim());
+    let time = match time.is_empty() {
+        true => None,
+        false => Some(Span::raw(format!(" · {time}")).dim()),
+    };
+    let mut spans = vec![Span::raw(format!(" {indent}")), mark];
+    match &row.run {
+        Some(run) => spans.extend(run_spans(run, width, &spans, time.as_ref())),
+        None => spans.extend([
+            // In the agents' color: a click opens it.
+            Span::raw(row.name.clone()).bold().fg(Color::Blue),
+            Span::raw(format!(" {}", row.state)),
+        ]),
     }
+    spans.extend(time);
     // Its code reviews always; the rest only when asked for more.
     let trackers: Vec<&str> = match trackers {
         true => vec![
@@ -840,6 +897,82 @@ fn row_lines(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_workflow_s_row_draws_its_strip_where_the_counts_were() {
+        use crate::workflow::view::{Counts, Live};
+        let text = |row: &Row, width: usize| -> String {
+            let lines = row_lines(row, width, "", false, false);
+            assert_eq!(lines.len(), 1, "one row");
+            lines[0].spans.iter().map(|s| s.content.as_ref()).collect()
+        };
+        let mut row = Row {
+            name: "workflow blind-role-eval-score".into(),
+            state: "Score · 2 working, 4 finished".into(),
+            running: true,
+            seconds: Some(19),
+            group: Group::Working,
+            run: Some(Live {
+                name: "blind-role-eval-score".into(),
+                phase: "Score".into(),
+                phases: vec![
+                    (
+                        "Find".into(),
+                        Counts {
+                            done: 3,
+                            ..Default::default()
+                        },
+                    ),
+                    (
+                        "Score".into(),
+                        Counts {
+                            running: 2,
+                            done: 1,
+                            failed: 0,
+                        },
+                    ),
+                ],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert_eq!(
+            text(&row, 80),
+            " ● blind-role-eval-score Score · ✓✓✓ ✓●● · 19s"
+        );
+        // The run's name is bold in the text's own color: blue is an agent's.
+        let lines = row_lines(&row, 80, "", false, false);
+        let name = (lines[0].spans.iter())
+            .find(|s| s.content == "blind-role-eval-score")
+            .expect("the run's name");
+        assert!(
+            name.style
+                .add_modifier
+                .contains(ratatui::style::Modifier::BOLD)
+        );
+        assert_eq!(name.style.fg, None, "no hue on a run's name");
+        // Short of room, the name gives way and the strip stays whole.
+        assert_eq!(text(&row, 40), " ● blind-role-eva… Score · ✓✓✓ ✓●● · 19s");
+        // Past 24 workers a bar and its counts, as far as they fit.
+        let run = row.run.as_mut().unwrap();
+        run.phases[1].1.running = 40;
+        assert_eq!(
+            text(&row, 100),
+            " ● blind-role-eval-score Score · ✓●●●●●●●●●●●  40 working, 4 finished · 19s"
+        );
+        assert_eq!(
+            text(&row, 60),
+            " ● blind-role-eval-score Score · ✓●●●●●●●●●●● · 19s"
+        );
+        let run = row.run.as_mut().unwrap();
+        run.stopping = true;
+        run.phase.clear();
+        run.phases[1].1.running = 2;
+        assert_eq!(
+            text(&row, 80),
+            " ● blind-role-eval-score ✓✓✓ ✓●● · stopping · 19s"
+        );
+    }
 
     #[test]
     fn one_table_says_every_provider_failure_truly() {
