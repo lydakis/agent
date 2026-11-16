@@ -10289,9 +10289,14 @@ impl App {
                 let call = item["type"] == "function_call" && item["name"] != reactions::TOOL;
                 if let Some((at, lines)) = said.take_if(|_| call || item["role"].is_string()) {
                     // Words a call followed are a step, and words another
-                    // message followed are not the reply: no hint hangs on
-                    // either.
-                    match (call, item["role"] == "assistant") {
+                    // message or a steer of the same turn followed are not
+                    // the reply: no hint hangs on either.
+                    let steer = item["role"] == "user"
+                        && !reactions::is_reaction(&text(&item))
+                        && turns
+                            .get(&node)
+                            .is_some_and(|turn| turns.get(&at) == Some(turn));
+                    match (call, item["role"] == "assistant" || steer) {
                         (true, _) => self.commit_words(at, transcript::quiet(lines), false),
                         (false, true) => self.commit_words(at, lines, false),
                         (false, false) => self.commit_said(at, lines),
@@ -11032,7 +11037,8 @@ impl App {
                     && !self.note_closed(node, &text(item))
                     && !quiet_message(&text(item))
                 {
-                    self.end_live(Words::Reply);
+                    // The turn goes on: what it said so far is not its reply.
+                    self.end_live(Words::Said);
                     // What the bot reacted with so far answered the
                     // message before this one.
                     self.draw_bot_reactions();
@@ -24251,6 +24257,11 @@ mod tests {
             Some(7) => json!({"items": [{"node": 7, "item": {"type": "message",
                 "role": "user", "from": "calc.halves",
                 "content": [{"type": "input_text", "text": "Half cents round to even."}]}}]}),
+            Some(13) => json!({"items": [{"node": 13, "item": {"type": "message",
+                "role": "user", "from": "calc.halves",
+                "content": [{"type": "input_text", "text": "Halves are done."}]}}]}),
+            Some(15) => json!({"items": [{"node": 15, "item": {"type": "message",
+                "role": "user", "content": [{"type": "input_text", "text": "Also negatives."}]}}]}),
             _ => json!({}),
         })
         .await;
@@ -24323,6 +24334,36 @@ mod tests {
             Some("└ started ◌ readme · Say how cents round")
         );
         assert!(!shown.iter().any(|row| row.starts_with('↳')));
+        // Words a steer of the same turn followed are not its reply.
+        app.pending.clear();
+        app.height = 40;
+        app.daemon(turn_event("accepted", 3, json!({"node": 13})))
+            .await;
+        let said = json!({"event": "text_delta", "bot": "b", "turn": 3, "text": "Partly done."});
+        app.daemon(said).await;
+        app.daemon(turn_event("steered", 3, json!({"node": 15})))
+            .await;
+        let said = json!({"event": "text_delta", "bot": "b", "turn": 3, "text": "All done."});
+        app.daemon(said).await;
+        app.daemon(turn_event(
+            "turn_finished",
+            3,
+            json!({"status": "completed"}),
+        ))
+        .await;
+        let shown = rows(&app);
+        let at = |row: &str| {
+            shown
+                .iter()
+                .position(|r| r == row)
+                .expect(&format!("{row} in {shown:?}"))
+        };
+        assert_eq!(
+            shown.iter().filter(|r| r.starts_with('↳')).count(),
+            1,
+            "{shown:?}"
+        );
+        assert_eq!(at("↳ halves") + 1, at("• All done."), "{shown:?}");
     }
 
     #[tokio::test]
