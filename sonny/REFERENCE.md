@@ -757,10 +757,12 @@ Sonny turns it on while it runs and back off when it leaves.
 
 To answer one message, point at it: its bullet turns into `↩`, and a
 click quotes it into the composer (`> ` before each line, six lines at
-most) ahead of whatever you had typed. `/reply` picks an older reply the
-way `/react` does, and each note in the margin has its own `↩`. Sent, a
-reply shows your own words whole, with what it quotes over them on a
-tinted bar, dim: two lines of it, then `… quoted, N more lines ▸`, which a
+most) ahead of whatever you had typed. Quote another and it goes after
+the first, so several read in the order you picked them. `/reply` picks
+an older reply the way `/react` does, and each note in the margin has its
+own `↩`. Sent, a reply shows your own words whole, with all it quotes
+over them on a tinted bar, dim: two lines of it, then `… quoted, N more
+lines ▸`, which a
 click opens and closes. The bar is a coloured cell, not a character, so a
 copy of the quote is its words alone.
 
@@ -769,6 +771,10 @@ copy of the quote is its words alone.
 ![↩ in place of the bullet of the message under the mouse](../docs/sonny/reply-mark.png)
 
 ![The message quoted into the composer](../docs/sonny/reply-quoted.png)
+
+![Two replies quoted into the composer, in the order picked, over the words](../docs/sonny/reply-quoted-several.png)
+
+![Two replies quoted and sent: both fold onto the one bar over the words](../docs/sonny/reply-quote-fold-several.png)
 
 The message under the mouse also says when it was written, muted, at
 its top right edge, the right end of the empty row over it:
@@ -1152,7 +1158,19 @@ has something on it, or is off the screen, no time shows.
   which Enter lists; each source it hears with the newest thing it said
   on what the follow hears and how long ago, or `✗ down since 11:28`,
   never cut: when any word does not fit beside its name, every word goes
-  under its name on two rows at most, the age on the name's row; its
+  under its name on two rows at most, the age on the name's row; and
+  its name a link to the source's page, which opens over the follow's
+  (`←` goes back to it): `source`, how often it runs and `tells at most
+  every 5m` where it has a digest (one of Sonny's own says `Sonny's own`
+  and has no command); while it is down, since when, why and the last
+  lines its failed run wrote, five at most; its command whole; `said`,
+  the newest word on each topic it named in the last day with its age,
+  under its topic as on a follow's page when one does not fit beside it,
+  or `nothing since 11:27` while it is down, a topic Sonny shows linked
+  there (an agent of the tasks source, a commons thread, a fact); each
+  follow of it and whose, the agent a link, or `no one follows it`; and,
+  muted, `set in ~/.agent/config.toml`, since a source is yours to remove
+  there and `x` removes nothing on its page; its
   filter and steer in words (`where text starts with "main:"`; one that
   nests or has `$or` as written), digest, end as a date and what is left
   of the updates it lasts (`2 of 3 updates left`); and what it told in the
@@ -1188,6 +1206,8 @@ has something on it, or is off the screen, no time shows.
   ![/background's pages: enter on an automation, a follow and a command, each with the agent it belongs to as its first link](../docs/sonny/background-pages-60.png)
 
   ![A follow's page: its sources' newest words or down since when, and the lead's tasks follow with the agents it watches, the done folded](../docs/sonny/follow-page-60.png)
+
+  ![A source's page, opened from a follow's: mail down with why and its last lines, and ci's newest word on each topic and who follows it](../docs/sonny/source-page-60.png)
 
   ![An automation's page after a run: when it runs next, its check and what it said, its last run, what is left; and one whose agent its first run starts](../docs/sonny/automation-page-60.png)
 - `/usage` shows, in the pane beside the conversation,

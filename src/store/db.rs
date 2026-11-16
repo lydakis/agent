@@ -100,6 +100,66 @@ impl Serialize for Holding {
         map.end()
     }
 }
+/// How the daemon takes one call, from [`Bot::plan`]: what holds it, what
+/// the command rules make of it, and where it runs.
+#[derive(Debug, Clone)]
+pub struct Plan {
+    /// It waits for a verdict.
+    pub gated: bool,
+    /// It would wait for one, but the bot never asks.
+    pub unasked: bool,
+    pub ruling: Result<Ruling>,
+    /// The bot has a sandbox, and it holds this tool.
+    pub confinable: bool,
+    /// It runs inside that sandbox as asked: no escape.
+    pub confines: bool,
+    sandboxed: bool,
+    read: bool,
+}
+impl Plan {
+    /// Refused with no one asked, as Codex refuses a call under `never`:
+    /// an escape its sandbox holds is refused as one no gate holds, by
+    /// [`Plan::escapes`], instead.
+    pub fn refused_unasked(&self) -> bool {
+        self.unasked && !self.confinable
+    }
+    /// Nothing holds it back and no rule refuses or asks about it.
+    pub fn free(&self) -> bool {
+        !self.gated && !self.unasked && matches!(self.ruling, Ok(Ruling::None | Ruling::Allow))
+    }
+    /// It runs in the bot's sandbox, or fails rather than run unconfined.
+    /// An escape runs unconfined only once a gate allowed it, and a
+    /// command a rule allows runs unconfined, as in Codex.
+    pub fn confined(&self) -> bool {
+        self.confinable && !(self.gated && !self.confines) && self.ruling != Ok(Ruling::Allow)
+    }
+    /// It asks to leave the sandbox that confines it, with no gate to let
+    /// it: refused.
+    pub fn escapes(&self) -> bool {
+        self.confined() && !self.confines
+    }
+    /// Where its row in the audit trail says it ran: a sandbox holds
+    /// writes only, so a sandboxed bot's read is within it.
+    pub fn in_sandbox(&self) -> bool {
+        self.confined() || (self.sandboxed && self.read)
+    }
+    /// What the command rules refuse, given the gate: a forbidden command,
+    /// or one a rule asks about with no gate to ask.
+    pub fn ruled_out(&self) -> Option<Error> {
+        match &self.ruling {
+            Ok(Ruling::Forbidden(why)) => Some(Error::with("command_forbidden", why.as_str())),
+            Ok(Ruling::Prompt(why)) if !self.gated => {
+                Some(Error::with("command_needs_approval", why.as_str()))
+            }
+            Err(error) => Some(error.clone()),
+            Ok(_) => None,
+        }
+    }
+    /// A rule allowed or forbade it, which its row in the audit trail names.
+    pub fn ruled(&self) -> bool {
+        matches!(self.ruling, Ok(Ruling::Allow | Ruling::Forbidden(_)))
+    }
+}
 #[derive(Debug, Clone, Serialize)]
 pub struct Bot {
     pub name: String,
@@ -1088,6 +1148,34 @@ impl Bot {
     pub fn unasked(&self, call: &ToolCall, workspace: &std::path::Path, rules: &Rules) -> bool {
         self.settings.never_asks() && self.held(call, workspace, rules)
     }
+    /// How the daemon takes this call, whoever makes it: the model alone,
+    /// beside other calls, or a script as a daemon step. Every caller
+    /// decides from this one plan, so a step and the same call from the
+    /// model are decided alike.
+    pub fn plan(&self, call: &ToolCall, workspace: &std::path::Path, rules: &Rules) -> Plan {
+        let ruling = self.ruling(call, rules);
+        let confinable = self.sandboxed() && crate::sandbox::confinable(&call.name);
+        // As `confines` finds it: false for a tool no sandbox holds.
+        let confines = confinable && self.confines(call, workspace);
+        let held = gated(&self.gates, &call.name)
+            && self.may_call(&call.name)
+            && !self.declared(&call.name).is_some_and(|tool| tool.steps)
+            && match &ruling {
+                Ok(Ruling::Prompt(_)) => true,
+                Ok(Ruling::None) => !confines,
+                Ok(Ruling::Allow | Ruling::Forbidden(_)) | Err(_) => false,
+            };
+        let never = self.settings.never_asks();
+        Plan {
+            gated: !never && held,
+            unasked: never && held,
+            ruling,
+            confinable,
+            confines,
+            sandboxed: self.sandboxed(),
+            read: call.name == "read",
+        }
+    }
     /// Whether one of the bot's gates holds this call back, asked or not.
     fn held(&self, call: &ToolCall, workspace: &std::path::Path, rules: &Rules) -> bool {
         gated(&self.gates, &call.name)
@@ -1869,6 +1957,9 @@ struct Live {
     /// which its `tool_finish` writes. A park writes none: it parks only
     /// on a call with no answer held.
     answers: HashMap<String, Outcome>,
+    /// The calls whose held answer the turn took and has not yet written:
+    /// answered, though nothing stored says so yet.
+    taken: std::collections::HashSet<String>,
 }
 /// One page of `approvals` as it fills.
 struct ApprovalPage {
@@ -1973,6 +2064,73 @@ pub struct Stepped {
     /// now that its step is decided: its caller checks it.
     pub lifted: Option<i64>,
 }
+/// What a call captured when its first daemon step was asked: its bot as
+/// a round of its turn would read it, the command rules of that bot, and
+/// its turn's folder, model and effort. Every step of the call is decided
+/// and run against it: a pause, an interrupt or the call's end takes
+/// permission away, and nothing adds any while a script runs.
+pub struct Capture {
+    pub bot: Bot,
+    pub rules: Arc<Rules>,
+    /// None when neither the turn nor the bot names one: a command
+    /// needs one.
+    pub workspace: Option<String>,
+    pub model: String,
+    pub effort: Option<String>,
+}
+/// A daemon step a client asked for: step `step` of call `call_id`, of
+/// the daemon's tool `tool`.
+#[derive(Clone)]
+pub struct StepAsk {
+    pub bot: String,
+    pub turn: i64,
+    pub call_id: String,
+    pub step: String,
+    pub tool: String,
+    /// A JSON object, bounded by its asker.
+    pub arguments: String,
+    /// The links its paths pass, once read off the runtime thread as a
+    /// direct call's are ([`StepOpened::Learn`]).
+    pub links: crate::sandbox::Links,
+}
+impl StepAsk {
+    /// The step's id among its turn's calls: `CALL/STEP`.
+    pub fn id(&self) -> String {
+        format!("{}/{}", self.call_id, self.step)
+    }
+    /// The step as the call the planner judges.
+    pub fn call(&self) -> ToolCall {
+        ToolCall {
+            name: self.tool.clone(),
+            call_id: self.id(),
+            arguments: self.arguments.clone(),
+            custom: false,
+            links: self.links.clone(),
+        }
+    }
+}
+/// How a daemon step was decided, in the store job that decided it.
+pub enum StepOpened {
+    /// Allowed, recorded and marked started: the daemon runs it, confined
+    /// to the bot's sandbox when `confined`.
+    Run {
+        capture: Arc<Capture>,
+        confined: bool,
+    },
+    /// Refused before it ran, recorded so: what its asker reads.
+    Refused { capture: Arc<Capture>, reply: Value },
+    /// Put to a gate, as a step its client puts there is: the daemon runs
+    /// it once the gate allows it, confined when `confined`.
+    Pending {
+        capture: Arc<Capture>,
+        confined: bool,
+        stepped: Stepped,
+    },
+    /// Not decided, nothing recorded: a sandboxed bot's change to files
+    /// whose links are read first, off the runtime thread, as a direct
+    /// call's are, and the step is asked again with them.
+    Learn { capture: Arc<Capture> },
+}
 /// What an answered call has, read on the storage worker.
 pub enum CallAnswer {
     /// Its client's answer, or `tool_unserved` once its time ran out.
@@ -1992,8 +2150,14 @@ pub enum Lifted {
     /// `Some(at)`.
     Waiting(Option<u64>),
     /// Ended: its result is its command's, and `ready` when the turn that
-    /// tells its bot is ready for a slot.
-    Ended { result: Value, ready: bool },
+    /// tells its bot is ready for a slot. `call` names the call, turn and
+    /// id, when it waited for its client's answer, as one with daemon steps
+    /// does.
+    Ended {
+        result: Value,
+        ready: bool,
+        call: Option<(i64, String)>,
+    },
     /// Every gate allowed it: the caller runs it as its command.
     Run(Box<LiftedRun>),
     /// Nothing waits on it any more.
@@ -2915,7 +3079,7 @@ impl Database {
     /// before versioning, stores at versions 1 to 5 and stores from newer
     /// binaries are rejected; an older store from version 6 on is migrated
     /// forward, one version at a time, at open.
-    pub const SCHEMA: i32 = 101;
+    pub const SCHEMA: i32 = 102;
     /// The person's messages a compaction keeps verbatim, newest first:
     /// per-message text, and the total text plus `(ordinal, String)` entry
     /// metadata. Empty entries cost space too, so the retained list cannot
@@ -3101,6 +3265,10 @@ impl Database {
                 WHERE configure_pending IS NOT NULL;
             CREATE INDEX IF NOT EXISTS bots_declared ON bots(declared) WHERE declared IS NOT NULL;
             CREATE TABLE IF NOT EXISTS tool_lists(digest TEXT PRIMARY KEY, tools TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS steps(turn INTEGER NOT NULL, call_id TEXT NOT NULL,
+                step_of TEXT NOT NULL, bot TEXT NOT NULL, audit INTEGER, started_ms INTEGER NOT NULL,
+                ended_ms INTEGER, PRIMARY KEY(turn,call_id)) WITHOUT ROWID;
+            CREATE INDEX IF NOT EXISTS steps_running ON steps(turn,call_id) WHERE ended_ms IS NULL;
             CREATE TABLE IF NOT EXISTS bot_sequence(singleton INTEGER PRIMARY KEY CHECK(singleton=1),
                 last_id INTEGER NOT NULL CHECK(last_id>=0));
             INSERT OR IGNORE INTO bot_sequence VALUES (1,0);
@@ -3253,6 +3421,20 @@ impl Database {
             [epoch_ms()],
         )?;
         conn.execute("DELETE FROM approvals WHERE step_of IS NOT NULL", [])?;
+        // A daemon step the daemon stopped running when it stopped ended
+        // with no outcome known: it may have had effects.
+        let started: Vec<(i64, String)> = conn
+            .prepare("SELECT turn,call_id FROM steps WHERE ended_ms IS NULL")?
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect::<rusqlite::Result<_>>()?;
+        if !started.is_empty() {
+            let now = epoch_ms().max(0) as u64;
+            let tx = conn.unchecked_transaction()?;
+            for (turn, id) in started {
+                step_ended(&tx, turn, &id, true, Some("tool_outcome_unknown"), now)?;
+            }
+            tx.commit()?;
+        }
         let mut db = Self {
             conn,
             pending_limits: (0, 0),
@@ -8590,17 +8772,25 @@ impl Database {
     ) -> Result<(Bytes, Value)> {
         let bot = self.active(turn)?;
         let family = bot.family()?;
-        let custom: bool = self
+        let (custom, name): (bool, Option<String>) = self
             .conn
             .query_row(
-                "SELECT custom FROM tools WHERE turn=? AND call_id=?",
+                "SELECT t.custom,a.name FROM tools t
+                 LEFT JOIN answers a ON a.turn=t.turn AND a.call_id=t.call_id
+                 WHERE t.turn=? AND t.call_id=?",
                 params![turn, call_id],
-                |r| r.get(0),
+                |r| Ok((r.get(0)?, r.get(1)?)),
             )
             .optional()?
-            .unwrap_or(false);
+            .unwrap_or((false, None));
         let item =
             family.tool_result_item_with(call_id, custom, &outcome.output, &outcome.parts)?;
+        // A call that takes steps lets its daemon steps' kept outputs go
+        // with its answer: the model never saw them.
+        let stepped = name
+            .as_deref()
+            .and_then(|name| bot.declared(name))
+            .is_some_and(|tool| tool.steps);
         // Verdicts are for the round as planned: after a failure the gated
         // calls still to run are announced again, in this same commit.
         // Unless one of them lapsed while this call ran: a new request would
@@ -8630,6 +8820,10 @@ impl Database {
         for (stream, file) in outcome.files.iter() {
             artifact::put_file(&tx, turn, call_id, stream, file)?;
         }
+        let gone = match stepped {
+            true => drop_step_outputs(&tx, turn, call_id)?,
+            false => Vec::new(),
+        };
         // A parked answer's pictures were kept for the result, which now
         // holds them: stored once.
         if !outcome.parts.is_empty() {
@@ -8685,6 +8879,9 @@ impl Database {
         };
         tx.commit()?;
         outcome.files.recorded();
+        if !gone.is_empty() {
+            self.forget_files(gone);
+        }
         if let Some(served) = served {
             self.served.push(served);
             if let Some(live) = self.live_changed(turn) {
@@ -9095,10 +9292,10 @@ impl Database {
     /// An answered call's answer, held or stored, `tool_unserved` once its
     /// time ran out, or how long it may still wait.
     pub fn answer_take(&mut self, turn: i64, call_id: &str, now_ms: u64) -> Result<CallAnswer> {
-        if let Some(given) = self
-            .live_changed(turn)
-            .and_then(|live| live.answers.remove(call_id))
+        if let Some(live) = self.live_changed(turn)
+            && let Some(given) = live.answers.remove(call_id)
         {
+            live.taken.insert(call_id.to_owned());
             return Ok(CallAnswer::Given(given));
         }
         #[allow(clippy::type_complexity)]
@@ -9412,7 +9609,13 @@ impl Database {
         let Some((parent, answered, status, expires_ms, paused, lifted)) = call else {
             return fail("no_pending_call");
         };
-        if answered {
+        // A running turn's answer is held, or taken by the turn, and not
+        // yet stored.
+        let held = self
+            .live
+            .get(&turn)
+            .is_some_and(|live| live.answers.contains_key(call_id) || live.taken.contains(call_id));
+        if answered || held {
             return fail("call_already_answered");
         }
         if status.as_deref() != Some("executing") && !lifted {
@@ -9496,6 +9699,27 @@ impl Database {
         // item of its own for a reader to find them in. Its facts wait
         // with it for its row.
         let arguments = json!({"arguments":arguments,"audit":facts.to_json()});
+        self.gate_step(
+            &bot, turn, call_id, &id, tool, arguments, gates, lifted, now_ms,
+        )
+    }
+    /// Put a step to `gates`: its approval row, announced and listed as a
+    /// gated call is, its call's time stopped while it waits. `arguments`
+    /// holds the step's arguments and its facts for the audit trail, and
+    /// what else its approvers read.
+    #[allow(clippy::too_many_arguments)]
+    fn gate_step(
+        &mut self,
+        bot: &Bot,
+        turn: i64,
+        call_id: &str,
+        id: &str,
+        tool: &str,
+        arguments: Value,
+        gates: Vec<CallGate>,
+        lifted: bool,
+        now_ms: u64,
+    ) -> Result<Stepped> {
         let tx = self.conn.savepoint()?;
         tx.prepare_cached(
             "INSERT INTO approvals(turn,call_id,name,node,request,announced_ms,gates,arguments,step_of)
@@ -9538,7 +9762,7 @@ impl Database {
         let judged = pending_call(
             &bot.name,
             turn,
-            &id,
+            id,
             &request,
             tool,
             0,
@@ -9713,6 +9937,291 @@ impl Database {
         )?;
         tx.commit()?;
         self.stepped(&bot, turn, &request, resumed, data)
+    }
+    /// Decide a daemon step of an answered call, as the same call from the
+    /// model would be decided, against what the call captured at its first
+    /// step (`captured`, or read now): validated, ruled, gated and confined
+    /// by one plan. Allowed, it is recorded and marked started in this one
+    /// job: its row in the audit trail, and a `step_decided` event in the
+    /// shape a judge of a later call reads. Refused, it is recorded so.
+    /// Gated, it waits on its gates as a step its client asks about does,
+    /// and on the gates that name its call's tool too when that tool says
+    /// they judge its daemon steps.
+    pub fn step_open(
+        &mut self,
+        ask: &StepAsk,
+        captured: Option<Arc<Capture>>,
+        now_ms: u64,
+    ) -> Result<StepOpened> {
+        let (name, turn, call_id) = (ask.bot.as_str(), ask.turn, ask.call_id.as_str());
+        self.step_turn(name, turn, Some(call_id))?;
+        let call: Option<(String, bool, Option<String>, i64, bool, bool)> = self
+            .conn
+            .prepare_cached(
+                "SELECT a.name,a.output IS NOT NULL,t.status,a.expires_ms,a.paused_ms IS NOT NULL,
+                    a.process IS NOT NULL
+                 FROM answers a LEFT JOIN tools t ON t.turn=a.turn AND t.call_id=a.call_id
+                 WHERE a.turn=? AND a.call_id=?",
+            )?
+            .query_row(params![turn, call_id], |r| {
+                Ok((
+                    r.get(0)?,
+                    r.get(1)?,
+                    r.get(2)?,
+                    r.get(3)?,
+                    r.get(4)?,
+                    r.get(5)?,
+                ))
+            })
+            .optional()?;
+        let Some((parent, answered, status, expires_ms, paused, lifted)) = call else {
+            return fail("no_pending_call");
+        };
+        // A running turn's answer is held, or taken by the turn, and not
+        // yet stored.
+        let held = self
+            .live
+            .get(&turn)
+            .is_some_and(|live| live.answers.contains_key(call_id) || live.taken.contains(call_id));
+        if answered || held {
+            return fail("call_already_answered");
+        }
+        if status.as_deref() != Some("executing") && !lifted {
+            return fail_with("no_pending_call", "the call ended unanswered");
+        }
+        if !paused && now_ms >= expires_ms.max(0) as u64 {
+            return fail_with("no_pending_call", "the call ran out of time");
+        }
+        let capture = match captured {
+            Some(capture) => capture,
+            None => Arc::new(self.capture(turn, call_id)?),
+        };
+        let bot = &capture.bot;
+        let Some(declared) = bot.declared(&parent).filter(|tool| tool.steps) else {
+            return fail_with("invalid_step", format!("{parent} does not take steps"));
+        };
+        let gates_parent = declared.gate_daemon_steps;
+        // A tool the bot may not call is not one its scripts may call.
+        if bot.declared(&ask.tool).is_some() || !bot.calls(&ask.tool) {
+            return Err(Error::with("tool_not_available", ask.tool.as_str()));
+        }
+        let Some(workspace) = capture.workspace.as_deref() else {
+            return fail("workspace_required");
+        };
+        let id = ask.id();
+        let reused: bool = self
+            .conn
+            .prepare_cached(
+                "SELECT EXISTS(SELECT 1 FROM artifacts WHERE turn=?1 AND call_id=?2)
+                    OR EXISTS(SELECT 1 FROM steps WHERE turn=?1 AND call_id=?2)
+                    OR EXISTS(SELECT 1 FROM approvals WHERE turn=?1 AND call_id=?2)",
+            )?
+            .query_row(params![turn, id], |r| r.get(0))?;
+        if reused {
+            return fail_with(
+                "step_exists",
+                format!("step {} of {call_id} was asked already", ask.step),
+            );
+        }
+        let call = ask.call();
+        let folder = std::path::Path::new(workspace);
+        if bot
+            .links_to_learn(std::slice::from_ref(&call), folder, false)
+            .is_some()
+        {
+            return Ok(StepOpened::Learn { capture });
+        }
+        let plan = bot.plan(&call, folder, &capture.rules);
+        let refusal = if plan.refused_unasked() {
+            Some((Error::with("approval_refused", NEVER_ASKS), true))
+        } else if let Some(error) = plan.ruled_out() {
+            Some((error, false))
+        } else if plan.escapes() && ask.tool == "shell" {
+            // As the direct call: a command that asks to leave its sandbox
+            // is refused; a write outside it runs confined and fails there.
+            Some((crate::tools::escalation_refused(), false))
+        } else {
+            None
+        };
+        let mut gates: Vec<CallGate> = Vec::new();
+        let mut gate = |named: &str| {
+            for g in bot
+                .gates
+                .iter()
+                .filter(|g| g.tools.iter().any(|t| t == named))
+            {
+                if !gates.iter().any(|kept| kept.tag == g.tag) {
+                    gates.push(CallGate {
+                        tag: g.tag.clone(),
+                        expire_ms: g.expire_ms,
+                    });
+                }
+            }
+        };
+        if plan.gated {
+            gate(&ask.tool);
+        }
+        if gates_parent {
+            gate(&parent);
+        }
+        // Gates its call's tool brings, of a bot that never asks, refuse
+        // it with no one asked.
+        let refusal = refusal.or_else(|| {
+            (!gates.is_empty() && bot.settings.never_asks())
+                .then(|| (Error::with("approval_refused", NEVER_ASKS), true))
+        });
+        let facts = audit::of_call(&ask.tool, None, plan.in_sandbox());
+        let mut decided = json!({"call_id":id,"step_of":call_id,"name":ask.tool,"daemon":true});
+        let preview: String = ask.arguments.chars().take(2048).collect();
+        if preview.len() < ask.arguments.len() {
+            decided["arguments_truncated"] = json!(true);
+        }
+        decided["arguments"] = json!(preview);
+        if let Some((error, denied)) = refusal {
+            let tx = self.conn.savepoint()?;
+            audit::insert(
+                &tx,
+                now_ms as i64,
+                bot.bot_id,
+                &bot.name,
+                turn,
+                call_id,
+                Some(&ask.step),
+                &ask.tool,
+                audit::Facts {
+                    place: None,
+                    ..facts
+                },
+                "nobody",
+                "denied",
+                &ask.arguments,
+            )?;
+            step_refused(&tx, &bot.name, turn, &id, call_id, now_ms)?;
+            decided["decision"] = json!("deny");
+            decided["approvals"] = json!([]);
+            decided["error"] = json!(error.code);
+            decided["reason"] = json!(error.detail);
+            if denied {
+                decided["denied"] = json!(true);
+            }
+            event(&tx, &bot.name, Some(turn), "step_decided", decided)?;
+            tx.commit()?;
+            let output = json!({"error":error.code,"detail":error.detail}).to_string();
+            return Ok(StepOpened::Refused {
+                reply: json!({"call_id":id,"decision":"deny","output":output,"failed":true}),
+                capture,
+            });
+        }
+        let confined = plan.confined();
+        if !gates.is_empty() {
+            let arguments: Value = serde_json::from_str(&ask.arguments)?;
+            let arguments = json!({"arguments":arguments,"audit":facts.to_json(),"daemon":true});
+            let bot = bot.clone();
+            let stepped = self.gate_step(
+                &bot, turn, call_id, &id, &ask.tool, arguments, gates, lifted, now_ms,
+            )?;
+            return Ok(StepOpened::Pending {
+                capture,
+                confined,
+                stepped,
+            });
+        }
+        let tx = self.conn.savepoint()?;
+        let row = audit::insert(
+            &tx,
+            now_ms as i64,
+            bot.bot_id,
+            &bot.name,
+            turn,
+            call_id,
+            Some(&ask.step),
+            &ask.tool,
+            facts,
+            if plan.ruled() { "rule" } else { "nobody" },
+            "unknown",
+            &ask.arguments,
+        )?;
+        step_started(&tx, &bot.name, turn, &id, call_id, row, now_ms)?;
+        decided["decision"] = json!("allow");
+        decided["approvals"] = json!([]);
+        event(&tx, &bot.name, Some(turn), "step_decided", decided)?;
+        tx.commit()?;
+        Ok(StepOpened::Run { capture, confined })
+    }
+    /// The calls of `turn` a message lifted that still wait for their
+    /// answer: they outlive their turn.
+    pub fn lifted_calls(&self, turn: i64) -> Result<Vec<String>> {
+        Ok(self
+            .conn
+            .prepare_cached("SELECT call_id FROM answers WHERE turn=? AND process IS NOT NULL")?
+            .query_map([turn], |r| r.get(0))?
+            .collect::<rusqlite::Result<_>>()?)
+    }
+    /// What a call captures at its first daemon step: see [`Capture`]. The
+    /// turn's own folder, model and effort, else the bot's as it was while
+    /// the turn ran, else the bot's now, as a lifted call reads them.
+    fn capture(&self, turn: i64, call_id: &str) -> Result<Capture> {
+        let bot = self.call_bot(turn, call_id)?;
+        let (workspace, model, effort): (Option<String>, String, Option<String>) = self
+            .conn
+            .prepare_cached(
+                "SELECT t.workspace,COALESCE(t.model,t.bot_model,?2),
+                        COALESCE(t.reasoning,CASE WHEN t.bot_model IS NULL THEN ?3 ELSE t.bot_reasoning END)
+                 FROM turns t WHERE t.id=?1",
+            )?
+            .query_row(
+                params![turn, format!("{}/{}", bot.provider, bot.model), bot.effort],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )?;
+        let rules = Arc::new(Rules::new(bot.settings.rules.clone().unwrap_or_default()));
+        Ok(Capture {
+            workspace: workspace.or_else(|| bot.workspace.clone()),
+            bot,
+            rules,
+            model,
+            effort,
+        })
+    }
+    /// End a daemon step the daemon ran, or stopped: its row in the audit
+    /// trail finished and its `step_completed` event, with its kept output
+    /// under `CALL/STEP` while its call still waits for its answer (a step
+    /// of a call answered meanwhile keeps nothing). `error` names why the
+    /// daemon stopped it, when it did.
+    pub fn step_close(
+        &mut self,
+        turn: i64,
+        id: &str,
+        outcome: &Outcome,
+        error: Option<&str>,
+        now_ms: u64,
+    ) -> Result<()> {
+        let parent = step_parent(id).ok_or(Error::new("invalid_step"))?;
+        let tx = self.conn.savepoint()?;
+        if !step_ended(&tx, turn, id, outcome.failed, error, now_ms)? {
+            return Ok(());
+        }
+        let waiting: bool = tx
+            .prepare_cached(
+                "SELECT EXISTS(SELECT 1 FROM answers WHERE turn=? AND call_id=? AND output IS NULL)",
+            )?
+            .query_row(params![turn, parent], |r| r.get(0))?;
+        if waiting {
+            for (stream, data) in &outcome.artifacts {
+                artifact::put(&tx, turn, id, stream, data)?;
+            }
+            for (stream, file) in outcome.files.iter() {
+                artifact::put_file(&tx, turn, id, stream, file)?;
+            }
+        } else {
+            // Its call ended while it ran: nothing of it is kept.
+            tx.prepare_cached("DELETE FROM steps WHERE turn=? AND call_id=?")?
+                .execute(params![turn, id])?;
+        }
+        tx.commit()?;
+        if waiting {
+            outcome.files.recorded();
+        }
+        Ok(())
     }
     /// Record how a step its gates allowed ended once its client ran it,
     /// so a judge of a later call sees it among the turn's calls as done.
@@ -11349,11 +11858,26 @@ impl Database {
             self.steps_gone.push((id, turn));
             self.stepped.push(id);
         }
+        let mut outputs_gone = Vec::new();
         if bot.declared.iter().any(|tool| tool.answered_by.is_some()) {
-            tx.execute(
-                "DELETE FROM answers WHERE turn=? AND process IS NULL",
-                [turn],
-            )?;
+            // What the daemon steps of a call ending unanswered with its
+            // turn kept goes with it; a lifted call keeps its steps'.
+            let calls: Vec<String> = tx
+                .prepare_cached(
+                    "DELETE FROM answers WHERE turn=? AND process IS NULL RETURNING call_id",
+                )?
+                .query_map([turn], |r| r.get(0))?
+                .collect::<rusqlite::Result<_>>()?;
+            for call in &calls {
+                outputs_gone.extend(drop_step_outputs(&tx, turn, call)?);
+            }
+            // The ended steps of a call that ended unanswered with its turn,
+            // an interrupted one's; a running step's row goes as it ends.
+            tx.prepare_cached(
+                "DELETE FROM steps WHERE turn=?1 AND ended_ms IS NOT NULL
+                 AND step_of NOT IN (SELECT call_id FROM answers WHERE turn=?1)",
+            )?
+            .execute([turn])?;
         }
         // Interrupted, by cause: a client's interrupt, the daemon shutting
         // down or paused around the turn, a daemon that died with it
@@ -11506,6 +12030,7 @@ impl Database {
         }
         let cursor = event(&tx, &bot.name, Some(turn), "turn_finished", data.clone())?;
         tx.commit()?;
+        self.forget_files(outputs_gone);
         self.approvals -= unstarted;
         self.forget_live(turn);
         entries.push(entry(cursor, &bot.name, Some(turn), "turn_finished", data));
@@ -12957,10 +13482,16 @@ impl Database {
         let tx = self.conn.savepoint()?;
         tx.prepare_cached("DELETE FROM answers WHERE turn=? AND call_id=?")?
             .execute(params![turn, call_id])?;
+        let gone = drop_step_outputs(&tx, turn, &call_id)?;
         lifted_ended(&tx, process, &result, failed, outcome)?;
         tx.commit()?;
+        self.forget_files(gone);
         let ready = self.tell_finished(&bot.name)?;
-        Ok(Lifted::Ended { result, ready })
+        Ok(Lifted::Ended {
+            result,
+            ready,
+            call: Some((turn, call_id)),
+        })
     }
     /// [`Database::lifted_check`] of a call waiting on its gates, decided as
     /// `approval_start` decides a turn's.
@@ -13110,7 +13641,11 @@ impl Database {
         let _ = outcome;
         self.approvals -= 1;
         let ready = self.tell_finished(&bot.name)?;
-        Ok(Lifted::Ended { result, ready })
+        Ok(Lifted::Ended {
+            result,
+            ready,
+            call: None,
+        })
     }
     /// Stop the call a message lifted to background command `process`, of
     /// `bot`'s, while it waits: its request for a verdict or its client's
@@ -13160,13 +13695,19 @@ impl Database {
         }
         tx.prepare_cached("DELETE FROM answers WHERE turn=? AND call_id=?")?
             .execute(params![turn, call_id])?;
+        let gone = drop_step_outputs(&tx, turn, &call_id)?;
         lifted_ended(&tx, process, &result, true, outcome)?;
         tx.commit()?;
+        self.forget_files(gone);
         if approval.is_some() {
             self.approvals -= 1;
         }
         let ready = self.tell_finished(bot)?;
-        Ok(Some(Lifted::Ended { result, ready }))
+        Ok(Some(Lifted::Ended {
+            result,
+            ready,
+            call: answering.then_some((turn, call_id)),
+        }))
     }
     /// Every call a message lifted that still waits, by its command: for
     /// the daemon to schedule each one's time again as it starts, and to
@@ -13929,6 +14470,10 @@ impl Database {
                     tx.prepare_cached(&format!("DELETE FROM {table} WHERE turn=?"))?
                         .execute([turn])?;
                 }
+                // A step still running keeps its row until it ends, which
+                // finds its call gone and drops it.
+                tx.prepare_cached("DELETE FROM steps WHERE turn=? AND ended_ms IS NOT NULL")?
+                    .execute([turn])?;
                 events += tx
                     .prepare_cached("DELETE FROM events WHERE turn=?")?
                     .execute([turn])?;
@@ -14146,9 +14691,23 @@ impl Database {
         for turn in &turns {
             // Background commands may outlive their launching turn; their
             // running row is required when the result commits and waiters wake.
-            files.extend(artifact::files(&tx, *turn)?);
-            tx.prepare_cached("DELETE FROM artifacts WHERE turn=?")?
-                .execute([turn])?;
+            // A lifted call that still waits keeps its steps' outputs,
+            // which its script may still read.
+            files.extend(
+                tx.prepare_cached(
+                    "SELECT file FROM artifacts WHERE turn=?1 AND file IS NOT NULL
+                     AND NOT EXISTS(SELECT 1 FROM answers a WHERE a.turn=?1 AND a.output IS NULL
+                         AND substr(artifacts.call_id,1,length(a.call_id)+1)=a.call_id||'/')",
+                )?
+                .query_map([turn], |r| r.get::<_, String>(0))?
+                .collect::<rusqlite::Result<Vec<_>>>()?,
+            );
+            tx.prepare_cached(
+                "DELETE FROM artifacts WHERE turn=?1
+                 AND NOT EXISTS(SELECT 1 FROM answers a WHERE a.turn=?1 AND a.output IS NULL
+                     AND substr(artifacts.call_id,1,length(a.call_id)+1)=a.call_id||'/')",
+            )?
+            .execute([turn])?;
             tx.prepare_cached("DELETE FROM processes WHERE turn=? AND status!='running'")?
                 .execute([turn])?;
             // A running command's call stays until it ends: a lifted one's
@@ -14157,6 +14716,13 @@ impl Database {
             tx.prepare_cached(
                 "DELETE FROM tools WHERE turn=?1 AND call_id NOT IN
                  (SELECT call_id FROM processes WHERE turn=?1 AND status='running')",
+            )?
+            .execute([turn])?;
+            // A lifted call's steps stay while it waits; a running step's
+            // row goes as it ends.
+            tx.prepare_cached(
+                "DELETE FROM steps WHERE turn=?1 AND ended_ms IS NOT NULL
+                 AND step_of NOT IN (SELECT call_id FROM answers WHERE turn=?1 AND output IS NULL)",
             )?
             .execute([turn])?;
             let last: Option<i64> = tx
@@ -15543,15 +16109,16 @@ fn end_step(
         .step_of
         .as_deref()
         .ok_or(Error::new("invalid_tool_state"))?;
-    let (id, name, arguments, facts): (String, String, String, Option<String>) = tx
+    let (id, name, arguments, facts, daemon): (String, String, String, Option<String>, bool) = tx
         .prepare_cached(
             "DELETE FROM approvals WHERE id=? RETURNING call_id,name,
-                json_extract(arguments,'$.arguments'),json_extract(arguments,'$.audit')",
+                json_extract(arguments,'$.arguments'),json_extract(arguments,'$.audit'),
+                json_extract(arguments,'$.daemon') IS 1",
         )?
         .query_row([request.id], |r| {
-            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
         })?;
-    audit_step(
+    let row = audit_step(
         tx,
         bot,
         turn,
@@ -15564,6 +16131,16 @@ fn end_step(
         &arguments,
         now_ms,
     )?;
+    // A daemon step its gates allowed is started with its decision: the
+    // daemon runs it next.
+    if daemon && allowed {
+        step_started(tx, &bot.name, turn, &id, parent, row, now_ms)?;
+    } else if daemon {
+        step_refused(tx, &bot.name, turn, &id, parent, now_ms)?;
+    }
+    if daemon {
+        data["daemon"] = json!(true);
+    }
     let bot = bot.name.as_str();
     data["step_of"] = json!(parent);
     // Previewed as a started call is, for a judge of a later call that
@@ -15586,6 +16163,97 @@ fn end_step(
             )?
             .execute(params![now_ms as i64, turn, parent])?
             == 1)
+}
+/// Let go of what call `call_id`'s daemon steps kept, `CALL/STEP`: the
+/// files that held some of it, for removal once this commits.
+fn drop_step_outputs(tx: &Connection, turn: i64, call_id: &str) -> Result<Vec<String>> {
+    // Every id `CALL/...`, and none other: '0' follows '/'.
+    let (from, to) = (format!("{call_id}/"), format!("{call_id}0"));
+    // A step still running keeps its row until it ends, which drops it.
+    tx.prepare_cached(
+        "DELETE FROM steps WHERE turn=? AND call_id>=? AND call_id<? AND ended_ms IS NOT NULL",
+    )?
+    .execute(params![turn, from, to])?;
+    let files: Vec<String> = tx
+        .prepare_cached(
+            "DELETE FROM artifacts WHERE turn=? AND call_id>=? AND call_id<? RETURNING file",
+        )?
+        .query_map(params![turn, from, to], |r| r.get::<_, Option<String>>(0))?
+        .filter_map(|file| file.transpose())
+        .collect::<rusqlite::Result<_>>()?;
+    Ok(files)
+}
+/// Mark a daemon step started, for its end to find, or the store's next
+/// opening to close as of unknown outcome when the daemon stopped first.
+/// Its row stays, ended, until its call ends: a step's name is one step
+/// for its call's life.
+fn step_started(
+    tx: &Connection,
+    bot: &str,
+    turn: i64,
+    id: &str,
+    parent: &str,
+    audit: i64,
+    now_ms: u64,
+) -> Result<()> {
+    tx.prepare_cached(
+        "INSERT INTO steps(turn,call_id,step_of,bot,audit,started_ms) VALUES (?,?,?,?,?,?)",
+    )?
+    .execute(params![turn, id, parent, bot, audit, now_ms as i64])?;
+    Ok(())
+}
+/// Mark a daemon step refused: ended as it was decided, its name spent.
+fn step_refused(
+    tx: &Connection,
+    bot: &str,
+    turn: i64,
+    id: &str,
+    parent: &str,
+    now_ms: u64,
+) -> Result<()> {
+    tx.prepare_cached(
+        "INSERT INTO steps(turn,call_id,step_of,bot,started_ms,ended_ms) VALUES (?1,?2,?3,?4,?5,?5)",
+    )?
+    .execute(params![turn, id, parent, bot, now_ms as i64])?;
+    Ok(())
+}
+/// End a daemon step: its row in the audit trail finished, and its
+/// `step_completed` event, which a judge of a later call reads. `error`
+/// names why the daemon ended it, when it did. Nothing when it was ended
+/// already.
+fn step_ended(
+    tx: &Connection,
+    turn: i64,
+    id: &str,
+    failed: bool,
+    error: Option<&str>,
+    now_ms: u64,
+) -> Result<bool> {
+    let row: Option<(String, String, Option<i64>, i64)> = tx
+        .prepare_cached(
+            "UPDATE steps SET ended_ms=?3 WHERE turn=?1 AND call_id=?2 AND ended_ms IS NULL
+                RETURNING bot,step_of,audit,started_ms",
+        )?
+        .query_row(params![turn, id, now_ms as i64], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+        })
+        .optional()?;
+    let Some((bot, parent, audit, started_ms)) = row else {
+        return Ok(false);
+    };
+    if let Some(audit) = audit {
+        audit::finish(tx, audit, now_ms as i64, failed)?;
+    }
+    let mut data = json!({"call_id":id,"step_of":parent,"daemon":true,
+        "ms":(now_ms as i64 - started_ms).max(0)});
+    if failed {
+        data["failed"] = json!(true);
+    }
+    if let Some(error) = error {
+        data["error"] = json!(error);
+    }
+    event(tx, &bot, Some(turn), "step_completed", data)?;
+    Ok(true)
 }
 /// Count a denial under each of `tags`, or end their runs of denials when
 /// a call they allowed starts. A denial in a new turn starts both counts
@@ -18082,6 +18750,9 @@ fn migrate_since_73(conn: &Connection, from: i32) -> Result<()> {
     if from < 101 {
         migrate_lists_once(conn)?;
     }
+
+    // Schema 102: daemon steps under way, in `steps`, which the schema
+    // makes; nothing older holds any.
 
     Ok(())
 }

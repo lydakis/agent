@@ -10054,3 +10054,247 @@ moved the other way at 10 × 10.
 | lifecycle | CPU, s | 0.545 | 0.545 | +0.0% |
 | lifecycle | p95 turn, ms | 579.7 | 579.3 | -0.1% |
 | lifecycle | peak RSS, MiB | 25.06 | 24.78 | -1.1% |
+
+## Daemon steps at 1,000 and 10,000 bots (protocol 78, schema 102)
+
+`bench.steps_fleet` (new) speaks the socket protocol alone, with no Sonny
+in the path. Each fleet bot's model calls a declared script tool (`exec`,
+`steps: true`); once every call waits, the bench asks five `echo` steps
+of each call with `run_step`, one after another per call and every call's
+at once, then answers the calls. Beside the fleet, 32 other bots run plain
+turns, five rounds of 32, first on the idle daemon and then while the
+fleet steps. One step on its own (200 in a row on one call) is timed
+before the fleet starts. Release build, synthetic model, 4-core Linux
+container, store at `synchronous=FULL`, 2026-11-15.
+
+| | 1,000 bots | 10,000 bots |
+| --- | ---: | ---: |
+| Steps finished / asked | 5,000 / 5,000 | 50,000 / 50,000 |
+| Steps refused | 0 | 0 |
+| Store jobs a step | 2.0 | 2.0 |
+| Steps a second | 4,822 | 6,185 |
+| One step alone, p50 / p99 | 1.10 / 3.10 ms | 0.93 / 2.39 ms |
+| Every call stepping at once: step p50 / p99 | 189 / 271 ms | 1,510 / 1,707 ms |
+| Other bots' turn p99, idle / while the fleet steps | 69 / 128 ms | 68 / 170 ms |
+| Peak bytes the steps held | 282 KB | 2.82 MB (282 bytes a step) |
+| Daemon RSS at the end (fleet's turns parked on their calls) | 84 MB | 268 MB |
+| Processor share while stepping: runtime thread / store thread | 0.40 / 0.68 | 0.36 / 0.69 |
+
+Against the design's slice 2 gates:
+
+- **Met:** one step alone at most 1 ms p50 (0.93 ms at 10,000; 1.1 ms in
+  the 1,000 run's sample, as noisy as the direct `echo` call it is gated
+  against); at most two store jobs a step (2.0); a step held for its
+  request and under 1 KiB more (282 bytes); every step of the fleet
+  finishes, none refused or expired.
+- **Missed: step p99 wait under 1 s** with all 10,000 calls stepping at
+  once (1.71 s). Each step waits behind one step of every other call, so
+  its wait is about the fleet's size over the daemon's step rate: 10,000
+  over 6,185 a second.
+- **Missed: other bots' turn p99 within 15%** of idle while that fleet
+  steps (170 ms against 68 ms; 128 against 69 at 1,000).
+
+The bound is the store's commit rate. A step is two durable store jobs;
+the store thread is busy about 70% of the time, and its commits (one
+`fsync` each, at most 32 jobs a commit) take 0.88 ms each, as long as the
+jobs in them take to run (about 35 µs to decide a step and 30 µs to end
+one). The runtime thread is at 36 to 40%.
+
+What was tried, at 2,000 bots (10,000 steps):
+
+| Change | Steps a second | Step p99 | Other bots' p99 (idle 68 to 90 ms) |
+| --- | ---: | ---: | ---: |
+| No bound on steps' store jobs | 5,267 | 517 ms | 417 ms |
+| At most 64 steps' store jobs at once (kept) | 6,695 | 403 ms | 118 ms |
+| At most 16 | 6,171 | 448 ms | 121 ms |
+| 64, with commits of up to 128 jobs (not kept) | 7,921 | 340 ms | 133 ms |
+
+Without a bound, 2,000 waiting steps filled the store's queue and every
+other bot's store job waited behind them; the window of 64 keeps the
+steps' jobs to a few commits' worth, which more than halved the other
+bots' tail and raised the step rate. Commits of up to 128 jobs raise the
+step rate a further 18%, but they change every store job's latency and
+belong in a change of their own with the store's screens.
+
+### Remeasured after review: a second process, measured memory, and a derived gate
+
+Reviews of the run above asked for three fixes to the bench and one to the
+gate, and this section reports them. The tables above stay as they were
+measured.
+
+- **Other bots run in their own process.** The 32 other bots now run from a
+  forked process with their own socket, so the fleet client's work no
+  longer lands in their times. Their idle p99 reads higher than before (75
+  to 112 ms against 68), because it now includes that process's own
+  scheduling on the same 4 cores.
+- **Memory a waiting step holds is measured, not added up.** With every
+  call waiting, one `sleep 3` shell step holds the only process slot
+  (`--max-processes 1`) and up to 2,000 other calls each line a `true`
+  shell step behind it. The daemon's RSS is read before and after, both
+  after a second's settle and before any other step has run. The 282
+  bytes reported above was the coordinator's own count of the request's
+  bytes, not memory.
+- **The fleet's steps are `echo`.** They measure the coordinator, its
+  lines and the store: what a step costs the daemon apart from the work
+  the tool does. A `shell` step's process is bounded by the process slots
+  as a turn's command is, and the footprint phase above is the only place
+  this bench runs one.
+
+Two rounds of each arm, release build, the same 4-core container,
+2026-11-15. The `32` arm is this change; `128` is the same build with
+commits of up to 128 store jobs (`GROUP_JOBS`), which is not part of this
+change.
+
+| Bots | Arm | Steps a second | Step p50 / p99 | Bots ÷ rate | p99 ÷ (bots ÷ rate) | Other bots' p99, idle / while stepping |
+| ---: | --- | ---: | ---: | ---: | ---: | ---: |
+| 6 | 32 | 605 / 913 | 4 / 15, 3 / 13 ms | 10 / 7 ms | n/a | 77 / 77, 75 / 73 ms |
+| 6 | 128 | 657 / 581 | 4 / 20, 3 / 19 ms | 9 / 10 ms | n/a | 72 / 83, 76 / 82 ms |
+| 400 | 32 | 3,829 / 4,313 | 107 / 133, 77 / 116 ms | 104 / 93 ms | 1.28 / 1.24 | 90 / 125, 88 / 119 ms |
+| 400 | 128 | 8,061 / 7,369 | 44 / 65, 48 / 68 ms | 50 / 54 ms | 1.30 / 1.25 | 79 / 97, 84 / 91 ms |
+| 2,000 | 32 | 4,694 / 5,466 | 365 / 643, 337 / 502 ms | 426 / 366 ms | 1.51 / 1.37 | 89 / 147, 84 / 124 ms |
+| 2,000 | 128 | 7,469 / 6,688 | 231 / 388, 257 / 426 ms | 268 / 299 ms | 1.45 / 1.42 | 98 / 125, 104 / 123 ms |
+| 10,000 | 32 | 6,098 / 6,148 | 1,558 / 1,852, 1,560 / 1,841 ms | 1,640 / 1,627 ms | 1.13 / 1.13 | 94 / 143, 104 / 129 ms |
+| 10,000 | 128 | 8,002 / 7,705 | 1,166 / 1,325, 1,253 / 1,403 ms | 1,250 / 1,298 ms | 1.06 / 1.08 | 112 / 137, 84 / 120 ms |
+
+One step alone stayed at 0.86 to 1.43 ms p50 and 1.8 to 6.1 ms p99 in
+every run of both arms (200 steps a run; the 1.43 and 6.1 ms are single
+runs, each with a sub-millisecond run of the same arm beside it). Every
+run finished every step, none refused, at 2.0 store jobs a step.
+
+| Steps in line | Measured RSS a step | The coordinator's count |
+| ---: | ---: | ---: |
+| 399 (400 bots) | 1,735 to 1,950 bytes | 289 bytes |
+| 1,999 (2,000 bots) | 2,848 to 2,998 bytes | 289 bytes |
+| 2,000 (10,000 bots) | 950 to 1,128 bytes | 289 bytes |
+
+At 10,000 bots the allocator reuses memory the fleet's calls freed on
+the way to waiting, so the lower figure is the one the allocator can
+hide; the 2,000-bot runs, read on a daemon that had freed less, are the
+honest bound. A step in line costs about 3 KB, not 289 bytes: the parsed
+request (a JSON tree, not its text), its key, its flight and its place in
+the line. **The design's gate of the request and under 1 KiB more is
+missed.** Holding the request's text and parsing it when the step starts
+is the follow-up that would meet it.
+
+**What the step p99 is.** A fleet whose every call steps at once waits in
+one FIFO line, so a step waits about one pass of that line: the fleet's
+size over the daemon's step rate. The p99 sits within 1.06 to 1.51 times
+that pass in every run, highest at 2,000 bots, where the line's first
+pass is still filling. The 1 s gate was a number written before any run;
+it is met at 10,000 bots only by a step rate of 10,000 a second. What
+replaces it, agreed with George the same day:
+
+- **Fairness:** step p99 at most 1.6 times the fleet's size over its step
+  rate, at 400, 2,000 and 10,000 bots. No step starves behind a line it
+  did not join.
+- **Rate:** steps a second at 10,000 bots no lower than main's on the same
+  machine (6,098 to 6,148 here).
+
+**Other bots beside the fleet.** Timed from their own process, the other
+bots' p99 rises 24 to 65% with the `32` arm and 8 to 43% with `128`,
+against the gate's 15%. Neither the bench client nor its interpreter is
+in those times now. The daemon's runtime thread is 32 to 52% busy and its
+store thread 63 to 69%; the other bots' turns are store jobs too, and
+they wait behind the fleet's commits. Commits of up to 128 jobs raise the
+step rate by a quarter at 10,000 bots and up to twice at 400, and leave
+the other bots' tail no worse, but they
+change every store job's latency and are their own change, screened on
+their own.
+
+**The rerouted planner, screened.** Every call, alone or together, now
+goes through `Bot::plan`, the same planner a step uses. The Perf
+workflow's screen finished on the change's earlier head, with that
+planner in place and the same in this slice-2-only head; it passed every
+gate:
+
+| Bench | Measure | main | This change | Change |
+| --- | --- | ---: | ---: | ---: |
+| admission | lone submit CPU, ms | 23.52 | 23.84 | +1.4% |
+| admission | burst submit p99, ms | 2.622 | 2.703 | +3.1% |
+| completion | release to terminal p99, ms | 6.635 | 6.62 | -0.2% |
+| footprint | idle RSS, MiB | 16.49 | 16.84 | +2.2% |
+| footprint | per idle bot, KiB | 1.888 | 1.76 | -6.8% |
+| footprint | RSS after a turn each, MiB | 55.90 | 56.56 | +1.2% |
+| footprint | CPU per turn, ms | 0.671 | 0.672 | +0.2% |
+| lifecycle | CPU, s | 0.315 | 0.33 | +4.8% |
+| lifecycle | p95 turn, ms | 573.6 | 572.5 | -0.2% |
+| lifecycle | peak RSS, MiB | 24.81 | 25.27 | +1.8% |
+
+## Code mode against 0.9.5 and main, at 400, 2,000 and 10,000 bots
+
+George's bar for code mode, 2026-11-15: it must beat the released 0.9.5
+on memory, processor time and latency, and every later change is
+measured against it the same way. `bench.code_mode_vs_direct` (new) runs
+the same fleet work two ways, through the socket alone. Every fleet bot's
+turn runs five `echo` tools:
+
+- **Direct** (`MODE=direct`): the model calls `echo` once a round, five
+  rounds, then answers: six model requests a turn. Any release since 0.9.5
+  runs it.
+- **Code mode** (`MODE=steps`): the model calls one script tool, the bench
+  runs the five `echo` calls as daemon steps with `run_step`, answers the
+  call, and the model answers: two model requests a turn.
+
+Every fleet turn is submitted at once. 32 other bots run plain turns from
+a process of their own, first on the idle daemon and then while the
+fleet runs. Reported: each fleet turn's time from submit to its end; the
+daemon's processor time a turn, every thread, with what the other bots'
+turns cost taken off (measured on the idle daemon); its peak resident
+memory while the fleet runs, read every 20 ms; and the other bots' p99.
+Release builds of v0.9.5 (3c73fcd), main before code mode (21b9740) and
+code mode (main with slices 2 and 3); 4-core Linux container; synthetic
+model; 2026-11-15 and 16. Each cell is the range over the runs named.
+
+| 400 bots | 0.9.5, direct (4 runs) | main, direct (3) | Code mode (3) |
+| --- | ---: | ---: | ---: |
+| Turn p50 | 2.47 to 2.83 s | 2.68 to 2.75 s | **1.39 to 1.54 s** |
+| Turn p99 | 2.8 to 42 s | 4.9 to 40 s | **1.83 to 2.02 s** |
+| Daemon processor time a turn | 5.5 to 7.9 ms | 7.5 to 8.0 ms | **4.05 to 4.18 ms** |
+| Peak memory | 61 to 63 MB | 58 to 61 MB | **51 to 52 MB** |
+| Other bots' p99, idle about 72 to 93 ms, while the fleet runs | 0.77 to 39.7 s | 0.72 to 1.43 s | **0.35 to 0.62 s** |
+
+| 2,000 bots | 0.9.5, direct (4) | main, direct (3) | Code mode (3) |
+| --- | ---: | ---: | ---: |
+| Turn p50 | 13.0 to 14.8 s | 12.3 to 14.1 s | **6.7 to 7.3 s** |
+| Turn p99 | 24 to 42 s | 17.7 to 32.4 s | **8.9 to 9.7 s** |
+| Daemon processor time a turn | 8.2 to 9.0 ms | 7.2 to 8.9 ms | **4.27 to 4.53 ms** |
+| Peak memory | 186 to 191 MB | 190 to 212 MB | **121 to 130 MB** |
+| Other bots' p99 while the fleet runs | 5.0 to 14.7 s | 4.1 to 6.4 s | **0.70 to 1.60 s** |
+
+| 10,000 bots | 0.9.5, direct (3) | main, direct (4) | Code mode (1) |
+| --- | ---: | ---: | ---: |
+| Turn p50 | 74 to 103 s | 73 to 106 s | **34 s** |
+| Turn p99 | 91 to 123 s | 104 to 130 s | **50 s** |
+| Daemon processor time a turn | 9.0 to 10.4 ms | 8.9 to 9.9 ms | **4.8 ms** |
+| Peak memory | 599 to 701 MB | 612 to 776 MB | **337 MB** |
+| Other bots' p99 while the fleet runs | 28 to 32 s | 15 to 48 s | **7.3 s** |
+
+**Where code mode stands: ahead of 0.9.5 on every row at every size.**
+Most of the time it saves is model rounds: two requests a turn instead of
+six. The processor time and memory it saves are the daemon's own: a step
+is two store jobs and no model round, and a turn waiting on its script
+holds less than one carrying five rounds of calls.
+
+**Main against 0.9.5 on direct calls: no regression found.** Processor
+time a turn and peak memory overlap at every size. A first single run at
+10,000 bots read main's whole fleet as about 30% slower; repeats put
+both between 96 and 135 s, in either order. While the fleet runs, the
+daemon's runtime thread is about 35% busy and its store thread about
+45%, in one run of each: the synthetic model, not the daemon, sets the fleet's pace.
+
+Caveats:
+
+- **The synthetic model shares the 4 cores** and is one Python process.
+  At 2,000 and 10,000 bots it is the bottleneck for direct calls, which
+  make three times its requests; the turn times include its queue.
+- **p99s of direct calls are noisy:** a run can stall on the synthetic
+  model's queue, which reads as a p99 of about 40 s at 400 bots on either
+  build. Ranges are given, not single numbers.
+- **The daemon's processor time is the steadier comparison:** it does not
+  count the model's time, and it moved under 10% run to run.
+- Code mode's 10,000-bot column is one run.
+
+    AGENT_TEST_RUNTIME=1 MODE=direct AGENTS=400,2000,10000 BINARY=PATH \
+        python3 -m bench.code_mode_vs_direct
+    AGENT_TEST_RUNTIME=1 MODE=steps AGENTS=400,2000,10000 \
+        python3 -m bench.code_mode_vs_direct

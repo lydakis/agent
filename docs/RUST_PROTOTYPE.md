@@ -3579,6 +3579,76 @@ list stored once too), and a fork keeps its source's. Schema 101 moves
 every bot's list into `tool_lists` and rewrites creation records' lists as
 digests.
 
+Protocol version 78 lets the daemon run a step itself, for a script whose
+host would otherwise run the bot's own tools on its behalf:
+`{"op":"run_step","bot","turn","call_id","step","name","arguments"}`,
+beside `approve_step`, with the same `step` and `arguments` rules and the
+same call checks. `name` is one of the daemon's tools that may run as a
+step: `shell` (foreground only), `read` (of a file; an artifact is read
+with `artifact`), `write`, `edit`, `apply_patch`, `web_fetch`, and `echo`
+(`invalid_step` otherwise, or for `background`, `detach` or `tty`), and
+one the bot may call (`tool_not_available`, as `web_fetch` is for a bot its
+sandbox keeps off the network); the call's tool must take steps, and the
+bot must have a workspace. A command, and a confined change to files
+(whose sandbox helper runs as a process), starts only with a process slot
+in hand; a read or a fetch takes none. A change to files (`write`,
+`edit`, `apply_patch`) runs to its end once begun, whatever stops its step:
+cut off, a file could be left half written; until its sandbox is ready,
+nothing of it has begun and a stop ends it. Its asker is told
+`step_stopped`, and its `step_completed` records how it really ended. A
+picture a `read` step finds is answered with its line and the picture in
+`parts`, as `tool_result` takes them; one past what a reply's 1 MiB holds
+is kept whole as the step's output `picture-N` (its base64, read with
+`artifact`), never encoded again, and its line names it. The step is decided exactly as the same call from
+the model would be, by one planner every caller shares: the bot's rules
+(`command_forbidden`), `approval_policy`, the gates that name the step's
+own tool, its sandbox and the way out of it. A declared tool with
+`"gate_daemon_steps": true` has its own gates judge its daemon steps as
+well. A gated step is announced, listed and answered as an `approve_step`
+one is, with `daemon: true` in its listing. A call takes its bot's rules,
+workspace, model and effort once, at its first step, and every later step
+of the call is decided and run against them.
+
+The reply waits until the step has ended and its end is committed:
+`{call_id: CALL/STEP, output, failed, parts?}`, `output` being what the model
+would have read from the same call, or for a refused step
+`{call_id, decision: "deny", output, failed: true}` with the refusal's
+`error` and `detail` in `output` (and a gate's `reason`). A step's name is
+one step for its call's life: asked again, it is `step_exists`. A step is
+refused `call_already_answered` once its call's answer is held for its
+running turn, before anything stores it; a call that ends unanswered with
+its turn takes its steps' kept outputs with it, as an answered one does. Every
+daemon step writes `step_decided` (`daemon: true`) and, once it ran,
+`step_completed` with `daemon`, `ms`, and `failed` and `error` when they
+apply, and its own audit row. Output past the preview is an artifact under
+`CALL/STEP`, read with `artifact` while the call waits, and dropped when the
+call ends.
+
+A step waits for its decision, and then, when it takes a process slot,
+for its place, in daemon-wide lines, first come first served, holding its
+request and no task or timer. One that takes none (`echo`, `read`,
+`web_fetch`, an unconfined change to files) starts once allowed, never
+behind a command waiting for a slot. At most 64 steps' store jobs are under way at once, so a fleet's
+steps share the store with other bots' turns rather than fill its queue.
+A step that needs a process slot takes one from the semaphore the
+turns' commands share before its task exists; while none is free, one
+waiter for the whole line stands in that semaphore's fair line, and a
+command also waits for the load gate. A step stopped in line is passed
+over where it stands, so a bulk stop costs one pass. Refused at once: while the daemon is held (`daemon_paused`,
+`daemon_draining`), a second step of a call while one is in flight
+(`step_in_flight`), a bot's steps past the width of one round
+(`steps_full`), and the line past 65,536 steps or 64 MiB (`step_line_full`).
+A reply its session has no room for waits in the coordinator, its bytes
+counted. A step is stopped, and answered `step_stopped` with why, when its
+call is answered, runs out of time or is interrupted with its turn, when a
+lifted call's handle stops (a lifted call keeps its steps past its turn),
+when the daemon is paused or stops, and when the session that asked
+closes. `stats` reports `steps`: `in_flight`, `asked`, `in_line`, `commands`,
+`bytes`, `ran`, `refused` (`asked` waits for its decision, `in_line` for its place). Schema 102 adds `steps`, a row per daemon step
+until its call ends; a step the daemon was running when it stopped is
+closed at the next open as `tool_outcome_unknown`. A bot's own socket may
+not ask for steps.
+
 ### Tool approval
 
 A bot may be created with a gate (one no bot made, which a client

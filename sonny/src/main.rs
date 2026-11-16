@@ -4528,6 +4528,9 @@ struct App {
     /// once it is drawn, one just put there or clicked in the conversation.
     margin: margin::Margin,
     under: Option<pane::Pane>,
+    /// The keys were on the margin when what is over it opened: `esc`
+    /// gives them back there, and otherwise to the conversation.
+    under_keys: bool,
     margin_focus: Option<u64>,
     /// Notes the person took away here whose message has not landed yet:
     /// it takes away nothing more once it does.
@@ -6327,6 +6330,7 @@ impl App {
             composer_click: None,
             margin: margin::Margin::default(),
             under: None,
+            under_keys: false,
             margin_focus: None,
             closing: std::collections::HashSet::new(),
             inline: HashMap::new(),
@@ -13139,7 +13143,7 @@ impl App {
                     KeyCode::Home => pane.screen.hold(usize::MAX),
                     KeyCode::End => pane.screen.latest(),
                     _ => {
-                        let paged = view.on_page();
+                        let paged = view.depth();
                         match view.key(*key, pane.screen.in_view()) {
                             background::Key::Stay => {}
                             background::Key::Close => self.close_pane(true),
@@ -13151,7 +13155,7 @@ impl App {
                         }
                         // A page opened or left is scrolled to anew.
                         if let Some(watch) = &mut self.watch
-                            && (watch.background.as_ref()).is_some_and(|v| v.on_page() != paged)
+                            && (watch.background.as_ref()).is_some_and(|v| v.depth() != paged)
                         {
                             watch.picked = None;
                         }
@@ -13608,6 +13612,7 @@ impl App {
         if let Some(open) = self.pane.take()
             && open.is_margin()
         {
+            self.under_keys = self.pane_keys;
             self.under = Some(open);
         }
         pane.over = self.under.is_some();
@@ -13638,7 +13643,9 @@ impl App {
                 }
                 self.closed = Some((open, watch));
                 self.pane = self.under.take();
-                self.pane_keys &= keep && self.pane.is_some();
+                // Back where they were when it opened: on the margin, or
+                // in the conversation, the margin staying.
+                self.pane_keys &= keep && self.pane.is_some() && self.under_keys;
             }
             None => {}
         }
@@ -13665,6 +13672,7 @@ impl App {
             {
                 over.over = true;
                 self.under = Some(pane::Pane::margin());
+                self.under_keys = false;
             }
         }
         if self.margin.closed() {
@@ -13703,6 +13711,8 @@ impl App {
             Some(over) => {
                 over.over = true;
                 self.under = Some(pane::Pane::margin());
+                // Asked for, it takes the keys once what is over it goes.
+                self.under_keys = true;
             }
             None => {
                 self.pane_keys = true;
@@ -13768,13 +13778,40 @@ impl App {
             "back" => self.close_pane(true),
             // A link on a page of `/background`'s.
             "background-page" => {
-                if let Some(view) = self.watch.as_mut().and_then(|w| w.background.as_mut()) {
+                if let Some(watch) = self.watch.as_mut()
+                    && let Some(view) = watch.background.as_mut()
+                {
+                    let depth = view.depth();
                     let leaves = view.click(id);
+                    // A source's page opened over a follow's starts at
+                    // its top.
+                    if view.depth() != depth {
+                        watch.picked = None;
+                    }
                     self.pane_keys = true;
                     if let Some(url) = leaves {
                         self.follow(&url);
                     }
                 }
+            }
+            // A fact a source's page names, by its project and name:
+            // `/memory` open on it.
+            "fact" if self.options.side.is_none() => {
+                let (project, name) = id.rsplit_once('/').unwrap_or(("", id));
+                let project = (!project.is_empty()).then(|| project.to_owned());
+                self.memory_view();
+                if let Some(view) = self.watch.as_mut().and_then(|w| w.memory.as_mut()) {
+                    view.open_named(project, name.to_owned());
+                }
+                self.pane_keys = true;
+            }
+            // A commons thread a source's page names: `/commons` open on it.
+            "thread" if self.options.side.is_none() => {
+                self.commons();
+                if let Some(view) = self.watch.as_mut().and_then(|w| w.commons.as_mut()) {
+                    view.open_thread(id);
+                }
+                self.pane_keys = true;
             }
             // A row or a link in `/memory`.
             "memory" => {
@@ -18544,7 +18581,9 @@ impl App {
 
     /// A message quoted before what the person is writing, as a mail or a
     /// GitHub reply quotes: `> ` before each of its lines, the first
-    /// [`QUOTE_LINES`] of them, a blank line, then the cursor.
+    /// [`QUOTE_LINES`] of them, a blank line, then the cursor. Quoted
+    /// after the quotes already there, so several read in the order
+    /// they were picked.
     fn quote(&mut self, said: &str) {
         let lines: Vec<&str> = said.trim().lines().collect();
         let mut quoted: Vec<String> = (lines.iter().take(QUOTE_LINES))
@@ -18554,7 +18593,13 @@ impl App {
             quoted.push("> …".into());
         }
         let typed = self.input.trim().to_owned();
-        self.input.set(&format!("{}\n\n{typed}", quoted.join("\n")));
+        let (before, typed) = transcript::opening_quote(&typed);
+        let before = match before.is_empty() {
+            true => String::new(),
+            false => format!("{before}\n\n"),
+        };
+        self.input
+            .set(&format!("{before}{}\n\n{typed}", quoted.join("\n")));
         self.pane_keys = false;
     }
 
@@ -24672,6 +24717,11 @@ mod tests {
         app.input.clear();
         app.quote("Merged it.\n\nThe tests pass.");
         assert_eq!(&*app.input, "> Merged it.\n>\n> The tests pass.\n\n");
+        // Another quoted goes after it, in the order picked, before what
+        // is being written.
+        app.input.set("> Merged it.\n\nShip both");
+        app.quote("Tagged v2.");
+        assert_eq!(&*app.input, "> Merged it.\n\n> Tagged v2.\n\nShip both");
     }
 
     #[tokio::test]
@@ -30707,7 +30757,14 @@ mod tests {
         app.open_pane(pane::Pane::card("status", STATUS_KEYS));
         assert!(app.pane.as_ref().is_some_and(|p| p.is_card() && p.over));
         assert!(app.under.is_some());
-        // Esc: back to the margin, the keys with it.
+        // Esc: back to the margin, and the keys back to the conversation,
+        // where they were when the card opened.
+        app.close_pane(true);
+        assert!(app.pane.as_ref().is_some_and(pane::Pane::is_margin));
+        assert!(!app.pane_keys && !app.margin.closed());
+        // Opened while the margin had the keys, esc gives them back there.
+        app.pane_keys = true;
+        app.open_pane(pane::Pane::card("status", STATUS_KEYS));
         app.close_pane(true);
         assert!(app.pane.as_ref().is_some_and(pane::Pane::is_margin));
         assert!(app.pane_keys);

@@ -9,6 +9,18 @@ mod lane;
 mod reload;
 mod session;
 mod socket;
+mod steps;
+
+/// The daemon's tools a script may run as daemon steps (`run_step`).
+const STEP_TOOLS: [&str; 7] = [
+    "shell",
+    "echo",
+    "read",
+    "write",
+    "edit",
+    "apply_patch",
+    "web_fetch",
+];
 mod turn;
 
 use actives::{Actives, Slot};
@@ -24,7 +36,8 @@ use agent_runtime::{
         Wake,
     },
     tools::{
-        ANSWER_BYTES, DECLARED_BYTES, Declare, MAX_DECLARED, Outcome, Registry, ToolList, is_digest,
+        ANSWER_BYTES, DECLARED_BYTES, Declare, MAX_DECLARED, Outcome, Prepared, Registry, ToolList,
+        is_digest,
     },
 };
 use handles::{Completion, Handles, Waiter, now_ms};
@@ -629,6 +642,19 @@ enum Command {
         place: Option<String>,
         access: Option<String>,
     },
+    /// Run one step of a declared call this client answers with the bot's
+    /// own tool: a script's call of `shell`, say. The daemon decides it as
+    /// the same call from the model, runs it in the bot's sandbox and
+    /// folder, records it, and answers with what the model would have read.
+    /// `step` is the client's id for it within the call.
+    RunStep {
+        bot: String,
+        turn: i64,
+        call_id: String,
+        step: String,
+        name: String,
+        arguments: Value,
+    },
     /// How a step the daemon allowed ended once the client ran it.
     StepResult {
         bot: String,
@@ -858,6 +884,7 @@ impl Command {
             Command::TakeCall { .. } => "take_call",
             Command::ApproveStep { .. } => "approve_step",
             Command::StepResult { .. } => "step_result",
+            Command::RunStep { .. } => "run_step",
             Command::ToolCalls { .. } => "tool_calls",
             Command::Approvals { .. } => "approvals",
             Command::ServeApprovals { .. } => "serve_approvals",
@@ -1230,6 +1257,9 @@ struct Stepping {
     /// once that one is back.
     checking: bool,
     again: bool,
+    /// A daemon step, by its call: its decision goes to the step
+    /// coordinator, which runs it or answers.
+    daemon: Option<(i64, Box<str>)>,
 }
 /// Tell the turn waiting on a step's call that the call's time runs again,
 /// and give the step's reply once it is decided.
@@ -1535,6 +1565,8 @@ struct Service {
     stepping: HashMap<i64, Stepping>,
     /// Checks of waiting steps with the store.
     step_checks: JoinSet<Vec<(i64, Result<Stepped>)>>,
+    /// Daemon steps, from their asking to their reply.
+    steps: steps::Steps,
     companions: companions::Companions,
     transport: Arc<Transport>,
     providers: Arc<HashMap<String, Provider>>,
@@ -2368,6 +2400,7 @@ pub async fn run(config: Configuration) -> Result<()> {
         stepping: HashMap::new(),
         lent: HashMap::new(),
         step_checks: JoinSet::new(),
+        steps: Default::default(),
         companions,
         identity,
         transport,
@@ -2505,6 +2538,7 @@ pub async fn run(config: Configuration) -> Result<()> {
             let lapses = service.lapses;
             let holds = service.holds;
             let ramp_lapse = ramp_lapses.keys().next().copied();
+            let step_retry = service.steps.retry_at;
             tokio::select! {
                 _ = stdout_closed.wait_for(|closed| *closed), if stdio_owner => return fail("output_closed"),
                 Some(error) = failures.recv() => return Err(error),
@@ -2634,6 +2668,20 @@ pub async fn run(config: Configuration) -> Result<()> {
                     service.check_steps(due, false);
                     let lifted = service.handles.take_lifted();
                     service.check_lifted(lifted);
+                    for (turn, call_id) in service.handles.take_ended() {
+                        service.call_ended(turn, &call_id, "its call ended");
+                    }
+                }
+                Some(done) = service.steps.jobs.join_next(), if !service.steps.jobs.is_empty() => {
+                    let (key, serial, done) = done.map_err(|_| Error::new("step_task_failed"))?;
+                    service.step_done(key, serial, done);
+                }
+                Some(sent) = service.steps.sending.join_next(), if !service.steps.sending.is_empty() => {
+                    service.step_sent(sent.unwrap_or(0));
+                }
+                _ = tokio::time::sleep_until(step_retry.unwrap_or_else(tokio::time::Instant::now)), if step_retry.is_some() => {
+                    service.steps.retry_at = None;
+                    service.pump_steps();
                 }
                 Some(checked) = service.step_checks.join_next(), if !service.step_checks.is_empty() => {
                     service.steps_checked(checked.map_err(|_| Error::new("step_check_failed"))?);
@@ -2683,6 +2731,7 @@ pub async fn run(config: Configuration) -> Result<()> {
                             service.hub.close_session(id);
                             service.handles.close_session(id);
                             service.abandon_steps(id);
+                            service.steps_session_closed(id);
                             if id == 0 && stdio_owner { break; }
                         }
                         // The line's credit goes back as this request is taken up.
@@ -2786,6 +2835,7 @@ pub async fn run(config: Configuration) -> Result<()> {
                                 let until = tokio::time::Instant::now() + Duration::from_millis(grace_ms);
                                 drain_until = Some(drain_until.map_or(until, |current| current.min(until)));
                                 service.draining.store(true, std::sync::atomic::Ordering::Relaxed);
+                                service.steps_held("the daemon is stopping");
                                 if grace_ms == 0 || service.active.is_empty() {
                                     // The socket writer is a task on this runtime. Give
                                     // it time to acknowledge shutdown before exiting.
@@ -2850,6 +2900,9 @@ pub async fn run(config: Configuration) -> Result<()> {
     // ends, or was registered before and ends here.
     service.registry.end_background();
     service.registry.end_terminals();
+    // Daemon steps still running end now that stopping is said, but for a
+    // change to files already begun, which finishes; each end is recorded.
+    service.steps_stopping().await;
     // Every completion is committed. Allow publication to drain before
     // releasing waiters. Background result tasks may still own Store clones,
     // keeping the stream open even after the service is dropped.
@@ -3102,6 +3155,7 @@ impl Service {
             Command::ToolResult { .. } => return refuse("answer a declared tool call"),
             Command::TakeCall { .. } => return refuse("take a declared tool call"),
             Command::ApproveStep { .. } => return refuse("put a declared call's step to a gate"),
+            Command::RunStep { .. } => return refuse("run a declared call's step"),
             Command::StepResult { .. } => return refuse("record a declared call's step"),
             // The trail is the person's record of what bots did.
             Command::AuditTrim { .. } => return refuse("trim the audit trail"),
@@ -3888,6 +3942,10 @@ impl Service {
             };
             self.handles.step_lapses(approval, None);
             let stepping = self.stepping.remove(&approval).expect("a waiting step");
+            if let Some(key) = stepping.daemon {
+                self.step_gated(key, result);
+                continue;
+            }
             if !stepping.gone
                 && stepping
                     .output
@@ -4247,6 +4305,8 @@ impl Service {
                 }
                 self.steer_wakes.remove(&turn);
                 self.pool_woken.remove(&turn);
+                // Its calls' daemon steps end with it, but a lifted call's.
+                self.steps_turn_ended(turn);
                 // Before the bot's next turn can start: it starts on what
                 // a `configure` during this one kept. A store refusing it
                 // now leaves it for that start, which waits on it.
@@ -5204,6 +5264,7 @@ impl Service {
                     // summaries started as turns ended among it: each
                     // stops its call and bills what it spent.
                     self.registry.end_running();
+                    self.steps_held("the pause stopped it");
                     turn::stop_aheads(&self.aheads);
                     self.notices
                         .push(json!({"event": "paused", "pause": pause, "durable": false}));
@@ -5295,6 +5356,7 @@ impl Service {
                     self.ready_hint = true;
                     let waiting: Vec<i64> = self.stepping.keys().copied().collect();
                     self.check_steps(waiting, false);
+                    self.pump_steps();
                     // So do the lifted calls allowed meanwhile.
                     let waiting = (self.store)
                         .read("lifted_waiting", |db| db.lifted_waiting())
@@ -5397,6 +5459,10 @@ impl Service {
                     "store": store.stats(),
                     "tokens": self.tokens.snapshot(),
                     "handles": {"waiters": waiters, "retained": retained},
+                    // Daemon steps asked and not answered, those in line,
+                    // the commands they run, the bytes they and their
+                    // unsent replies hold, and counts since start.
+                    "steps": self.steps.counts(),
                     // What the daemon holds open against its limit, so a
                     // leak (growing while idle) is told from a busy peak.
                     "files": {"open": open_files, "limit": file_limit},
@@ -5590,8 +5656,12 @@ impl Service {
                         return fail_with("invalid_tool_result", "give output or error, not both");
                     }
                 };
+                // A daemon step of the call still running is stopped
+                // first: the answer is recorded once its stop is sent.
+                self.call_answered(&bot, turn, &call_id);
                 let name = bot.clone();
-                let answered = store
+                let answered = self
+                    .store
                     .op("tool_result", move |db| {
                         db.answer_call(&name, turn, &call_id, outcome, now_ms())
                     })
@@ -5670,6 +5740,7 @@ impl Service {
                     gone: false,
                     checking: false,
                     again: false,
+                    daemon: None,
                 };
                 let name = bot;
                 let stepped = store
@@ -5708,6 +5779,83 @@ impl Service {
                 }
                 Ok(settle_step(&self.handles, &stepping.bot, turn, stepped)
                     .expect("a decided step"))
+            }
+            Command::RunStep {
+                bot,
+                turn,
+                call_id,
+                step,
+                name: tool,
+                arguments,
+            } => {
+                // Bounded before the coordinator holds any of it.
+                name("bot", &bot)?;
+                if call_id.is_empty() {
+                    return fail_with("invalid_call_id", "call_id may not be empty");
+                }
+                name("step", &step).map_err(|e| Error {
+                    code: "invalid_step".into(),
+                    ..e
+                })?;
+                // The daemon's tools a step may run: those whose place in
+                // line and whose stop are specified.
+                if !STEP_TOOLS.contains(&tool.as_str()) {
+                    return fail_with(
+                        "invalid_step",
+                        format!(
+                            "{tool} does not run as a daemon step: {} do",
+                            STEP_TOOLS.join(", ")
+                        ),
+                    );
+                }
+                if !arguments.is_object() {
+                    return fail_with("invalid_step", "arguments must be an object");
+                }
+                let arguments = serde_json::to_string(&arguments)?;
+                if arguments.len() > ANSWER_BYTES {
+                    return fail_with(
+                        "step_arguments_limit",
+                        format!("arguments may be up to {ANSWER_BYTES} bytes"),
+                    );
+                }
+                // Read as the call would be: a step that would not run as
+                // a foreground command, or that reads anything but a file,
+                // is refused before anything is recorded.
+                let prepared = self.registry.prepare(&tool, &arguments)?;
+                match prepared {
+                    Prepared::Shell {
+                        background: true, ..
+                    }
+                    | Prepared::Detach { .. }
+                    | Prepared::Terminal { .. } => {
+                        return fail_with(
+                            "invalid_step",
+                            "a daemon step runs a command in the foreground: no background, detach or tty",
+                        );
+                    }
+                    Prepared::Read {
+                        source:
+                            agent_runtime::tools::ReadSource::Artifact { .. }
+                            | agent_runtime::tools::ReadSource::Result { .. },
+                        ..
+                    } => {
+                        return fail_with(
+                            "invalid_step",
+                            "a daemon step reads a file; an artifact is read with `artifact`",
+                        );
+                    }
+                    _ => {}
+                }
+                let ask = agent_runtime::store::StepAsk {
+                    bot,
+                    turn,
+                    call_id,
+                    step,
+                    tool,
+                    arguments,
+                    links: Default::default(),
+                };
+                self.run_step(session, output, id, ask, prepared)
             }
             Command::StepResult {
                 bot,
@@ -6463,6 +6611,8 @@ impl Service {
                 self.handles.forget(Waiter::Turn(turn));
                 self.wakes.cancel(turn);
                 self.steer_wakes.remove(&turn);
+                // Its calls' daemon steps end with it, as a reaped turn's.
+                self.steps_turn_ended(turn);
                 if next_ready {
                     self.ready_hint = true;
                 }
@@ -7248,6 +7398,7 @@ mod tests {
             stepping: HashMap::new(),
             lent: HashMap::new(),
             step_checks: JoinSet::new(),
+            steps: Default::default(),
             companions: companions::Companions::new(
                 std::path::Path::new("/nonexistent"),
                 Vec::new(),
@@ -7469,6 +7620,7 @@ mod tests {
             stepping: HashMap::new(),
             lent: HashMap::new(),
             step_checks: JoinSet::new(),
+            steps: Default::default(),
             companions: companions::Companions::new(
                 std::path::Path::new("/nonexistent"),
                 Vec::new(),
@@ -7784,6 +7936,7 @@ mod tests {
             stepping: HashMap::new(),
             lent: HashMap::new(),
             step_checks: JoinSet::new(),
+            steps: Default::default(),
             companions: companions::Companions::new(
                 std::path::Path::new("/nonexistent"),
                 Vec::new(),
@@ -8043,6 +8196,7 @@ mod tests {
             stepping: HashMap::new(),
             lent: HashMap::new(),
             step_checks: JoinSet::new(),
+            steps: Default::default(),
             companions: companions::Companions::new(
                 std::path::Path::new("/nonexistent"),
                 Vec::new(),
