@@ -7,9 +7,11 @@
 //! those cells are written again.
 use ratatui::{
     buffer::{Buffer, Cell},
-    style::Modifier,
+    style::{Color, Modifier},
+    text::{Line, Span},
 };
 use std::path::Path;
+use unicode_width::UnicodeWidthStr;
 
 /// Where a link shows: its row, and its first column and the one after its
 /// last.
@@ -240,6 +242,88 @@ impl Names {
         let not = (!agent).then(std::time::Instant::now);
         self.known.insert(word, not);
     }
+}
+
+/// Whether `c` may be part of an agent's name.
+pub fn name_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-')
+}
+
+/// Each agent a card's rows name: its row, the columns it runs over, and
+/// the bot it opens.
+pub type Agents = Vec<(usize, u16, u16, String)>;
+
+/// `rows` with each of `names` drawn in the agents' color where the words
+/// before it, on its row or ending the row before, are ones `after` says
+/// lead to an agent, as a link draws it: [`agents_on`] finds them there.
+pub fn name_agents(
+    rows: Vec<Line<'static>>,
+    names: &[&str],
+    after: impl Fn(&str) -> bool,
+) -> Vec<Line<'static>> {
+    let mut before = String::new();
+    let mut out = Vec::new();
+    for row in rows {
+        let mut said = before.clone();
+        let mut spans = Vec::new();
+        for span in row.spans {
+            let style = span.style;
+            let text = span.content.into_owned();
+            let mut from = 0;
+            let mut at = 0;
+            while at < text.len() {
+                let found = (names.iter())
+                    .filter(|name| !name.is_empty() && text[at..].starts_with(**name))
+                    .filter(|name| !text[at + name.len()..].starts_with(name_char))
+                    .filter(|_| !text[..at].ends_with(name_char))
+                    .find(|_| {
+                        let context = format!("{said}{}", &text[..at]);
+                        after(&format!("{} ", context.trim_end()))
+                    });
+                match found {
+                    Some(name) => {
+                        if from < at {
+                            spans.push(Span::styled(text[from..at].to_owned(), style));
+                        }
+                        let blue = style.fg(Color::Blue).remove_modifier(Modifier::DIM);
+                        spans.push(Span::styled((*name).to_owned(), blue));
+                        at += name.len();
+                        from = at;
+                    }
+                    None => at += text[at..].chars().next().map_or(1, char::len_utf8),
+                }
+            }
+            if from < text.len() {
+                spans.push(Span::styled(text[from..].to_owned(), style));
+            }
+            said.push_str(&text);
+        }
+        // A row's last words may lead to a name the next row starts with.
+        before = format!("{} ", said.trim_end());
+        out.push(Line::from(spans).style(row.style));
+    }
+    out
+}
+
+/// Where [`name_agents`] drew each of `names` (as drawn, with its bot)
+/// on `rows`.
+pub fn agents_on(rows: &[Line<'static>], names: &[(String, String)]) -> Agents {
+    let mut links = Agents::new();
+    for (y, row) in rows.iter().enumerate() {
+        let mut column = 0;
+        for span in &row.spans {
+            let wide = span.content.width();
+            // A row's own name, bold, is its row's link already.
+            if span.style.fg == Some(Color::Blue)
+                && !span.style.add_modifier.contains(Modifier::BOLD)
+                && let Some((_, bot)) = names.iter().find(|(name, _)| *name == span.content)
+            {
+                links.push((y, column as u16, (column + wide) as u16, bot.clone()));
+            }
+            column += wide;
+        }
+    }
+    links
 }
 
 /// Where a web address starts in `word`, if one does: not inside a word,

@@ -801,6 +801,12 @@ impl Screen {
         self.rows.iter().map(|row| row.link.clone()).collect()
     }
 
+    /// The buttons on each row.
+    #[cfg(test)]
+    pub fn buttons(&self) -> Vec<Buttons> {
+        self.rows.iter().map(|row| row.buttons.clone()).collect()
+    }
+
     /// Where the row `row` starts among the rows drawn, if it was laid out.
     fn shown_at(&self, row: usize) -> Option<usize> {
         if row >= self.wrapped {

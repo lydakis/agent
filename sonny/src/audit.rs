@@ -229,6 +229,25 @@ impl View {
         out
     }
 
+    /// Each agent the card's rows name, where its name runs: after the
+    /// head and its gap, at the time's end.
+    pub fn agents(&self) -> crate::links::Agents {
+        if self.error.is_some() {
+            return Vec::new();
+        }
+        let names: Vec<String> = (self.rows.iter())
+            .map(|row| self.name(row["bot"].as_str().unwrap_or("?")))
+            .collect();
+        let name_width = names.iter().map(|n| n.width()).max().unwrap_or(0).min(20);
+        (self.rows.iter().zip(&names).enumerate())
+            .filter_map(|(at, (row, name))| {
+                let bot = row["bot"].as_str()?;
+                let wide = name.width().min(name_width) as u16;
+                Some((2 + at, NAME_AT, NAME_AT + wide, bot.to_owned()))
+            })
+            .collect()
+    }
+
     /// A bot's name as the card shows it: short in the project, whole
     /// across every agent.
     fn name(&self, bot: &str) -> String {
@@ -259,6 +278,9 @@ impl View {
 /// A call on one line: its local time, agent, tool, kind and place, who
 /// allowed it, how it ended, and the start of its arguments, cut to
 /// `width`.
+/// The column a row's agent starts at: past ` HH:MM:SS `.
+const NAME_AT: u16 = 10;
+
 fn line(row: &Value, name: &str, name_width: usize, width: usize, picked: bool) -> Line<'static> {
     let word = |field: &str| row[field].as_str().unwrap_or("-").to_owned();
     let at = crate::usage::local(row["at_ms"].as_i64().unwrap_or(0) / 1000);
@@ -380,6 +402,23 @@ mod tests {
             .map(|line| line.spans.iter().map(|s| s.content.as_ref()).collect())
             .collect();
         assert!(text[2].contains(" fix "), "{text:?}");
+        // Each row's agent opens it from its name.
+        let named: Vec<(String, String)> = (view.agents().into_iter())
+            .map(|(row, from, to, bot)| {
+                let name: String = (text[row].chars())
+                    .skip(usize::from(from))
+                    .take(usize::from(to - from))
+                    .collect();
+                (name, bot)
+            })
+            .collect();
+        assert_eq!(
+            named,
+            [
+                ("fix".to_owned(), "shop.fix".to_owned()),
+                ("lead".to_owned(), "shop.lead".to_owned())
+            ]
+        );
         // The pick is reversed from the row's first word, never a `›`.
         assert!(
             text[3].contains("lead") && !text[3].contains('›'),
