@@ -859,6 +859,7 @@ async fn read_status(
             follows: background::icons(&behind, name, &icons),
             maker: bot["created_by"].as_str().unwrap_or("").to_owned(),
             group,
+            run: None,
         });
     }
     // Each workflow that runs is one row, under the agent that started it.
@@ -876,6 +877,7 @@ async fn read_status(
             latest: run.more(),
             maker: run.caller.clone(),
             group: status::Group::Working,
+            run: Some(run),
             ..Default::default()
         });
     }
@@ -20683,7 +20685,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_running_workflow_is_one_row_under_its_caller_and_s_stops_it() {
+    async fn a_running_workflow_is_one_row_under_its_caller_and_x_stops_it() {
         let client = daemon_answering(|asked| match asked["op"].as_str().unwrap_or_default() {
             "bots" => json!({"bots": [{"name": "shop.lead", "bot_id": 1, "head": 1,
                 "status": "idle", "running_turn": null},

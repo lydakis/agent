@@ -3,11 +3,13 @@
 //! journal gained since its last look, and never reads a run that ended
 //! again; it stops a run by leaving a `stop` file in the run's folder,
 //! which the tool host running it acts on.
+use ratatui::text::Span;
 use serde_json::Value;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::{Read as _, Seek as _, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::{LazyLock, Mutex};
+use unicode_width::UnicodeWidthStr;
 
 /// What stands between a row's caller and its run in the row's `bot`:
 /// `shop.lead#wf-1a2b3c4d`, which no agent's name holds.
@@ -87,6 +89,131 @@ impl Live {
         parts.push(format!("{} output tokens", self.tokens));
         parts.join(" · ")
     }
+}
+
+/// Past this many workers a strip is a bar of [`BAR`] cells.
+pub const STRIP_MOST: usize = 24;
+
+/// The cells of a bar.
+pub const BAR: usize = 12;
+
+/// One cell of a strip: a worker that came back, failed, or works.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Cell {
+    Back,
+    Failed,
+    Working,
+}
+
+impl Cell {
+    /// Its mark in its hue, from the one state table: `✓` muted, `✗` red,
+    /// `●` live, so each says its state with no colour.
+    fn sign(self) -> Span<'static> {
+        crate::status::sign(match self {
+            Cell::Back => crate::started::DONE,
+            Cell::Failed => "failed",
+            Cell::Working => "working",
+        })
+    }
+}
+
+/// A run's workers as cells, a phase at a time in the order the phases
+/// came, each phase's back, then failed, then working, so it fills from
+/// the left; `None` parts two phases.
+pub fn cells(phases: &[(String, Counts)]) -> Vec<Option<Cell>> {
+    let mut out = Vec::new();
+    for (_, counts) in phases.iter().filter(|(_, c)| total(*c) > 0) {
+        if !out.is_empty() {
+            out.push(None);
+        }
+        for (n, cell) in [
+            (counts.done, Cell::Back),
+            (counts.failed, Cell::Failed),
+            (counts.running, Cell::Working),
+        ] {
+            out.extend(std::iter::repeat_n(Some(cell), n));
+        }
+    }
+    out
+}
+
+fn total(counts: Counts) -> usize {
+    counts.done + counts.failed + counts.running
+}
+
+/// `counts` as a bar of [`BAR`] cells in proportion, back, failed, then
+/// working, where a state that has any keeps a cell: one failure in three
+/// hundred still shows. Shares by the largest remainder.
+pub fn bar(counts: Counts) -> Vec<Cell> {
+    let states = [
+        (counts.done, Cell::Back),
+        (counts.failed, Cell::Failed),
+        (counts.running, Cell::Working),
+    ];
+    let all = total(counts);
+    if all == 0 {
+        return Vec::new();
+    }
+    // Each state's whole cells, at least one when it has any, and what
+    // its share had left over, in BARths of a worker.
+    let mut shares: Vec<(usize, usize, Cell)> = (states.iter())
+        .map(|&(n, cell)| {
+            let whole = n * BAR / all;
+            let floor = if n > 0 { whole.max(1) } else { 0 };
+            (floor, (n * BAR) % all, cell)
+        })
+        .collect();
+    let mut given: usize = shares.iter().map(|(n, ..)| n).sum();
+    while given < BAR {
+        // The largest remainder of those that have any takes the next.
+        let at = (0..shares.len())
+            .filter(|&at| states[at].0 > 0)
+            .max_by_key(|&at| (shares[at].1, std::cmp::Reverse(at)))
+            .expect("some state has workers");
+        shares[at].0 += 1;
+        shares[at].1 = 0;
+        given += 1;
+    }
+    while given > BAR {
+        // Taken from the largest share, never below one.
+        let at = (0..shares.len())
+            .filter(|&at| shares[at].0 > 1)
+            .min_by_key(|&at| (shares[at].1, std::cmp::Reverse(shares[at].0)))
+            .expect("a share above one");
+        shares[at].0 -= 1;
+        given -= 1;
+    }
+    (shares.into_iter())
+        .flat_map(|(n, _, cell)| std::iter::repeat_n(cell, n))
+        .collect()
+}
+
+/// A run's strip in at most `room` columns: each worker a mark, phases a
+/// space apart; past [`STRIP_MOST`] workers, or wider than both `room`
+/// and the bar, a bar of [`BAR`] cells and the counts after it, the counts left out where
+/// they do not fit. `starting` before any worker.
+pub fn strip(phases: &[(String, Counts)], room: usize) -> Vec<Span<'static>> {
+    let all = phases.iter().fold(Counts::default(), |all, (_, c)| Counts {
+        running: all.running + c.running,
+        done: all.done + c.done,
+        failed: all.failed + c.failed,
+    });
+    let cells = cells(phases);
+    if total(all) == 0 {
+        return vec![Span::raw(counted(all))];
+    }
+    // A strip no wider than the bar stays a strip, room or not.
+    if total(all) <= STRIP_MOST && (cells.len() <= room || cells.len() <= BAR) {
+        return (cells.into_iter())
+            .map(|cell| cell.map_or_else(|| Span::raw(" "), Cell::sign))
+            .collect();
+    }
+    let mut out: Vec<Span<'static>> = bar(all).into_iter().map(Cell::sign).collect();
+    let counts = format!("  {}", counted(all));
+    if BAR + counts.width() <= room {
+        out.push(Span::raw(counts));
+    }
+    out
 }
 
 /// `2 working, 3 finished, 1 failed`, leaving out what is none;
@@ -368,6 +495,79 @@ mod tests {
         // A stop its caller or the lead asked for shows as the window's does.
         fold.take(&json!({"t": "stop"}));
         assert!(fold.live().state().ends_with(" · stopping"));
+    }
+
+    fn text(spans: &[Span]) -> String {
+        spans.iter().map(|s| s.content.as_ref()).collect()
+    }
+
+    fn counts(done: usize, failed: usize, running: usize) -> Counts {
+        Counts {
+            running,
+            done,
+            failed,
+        }
+    }
+
+    #[test]
+    fn a_strip_is_each_worker_s_mark_a_phase_at_a_time() {
+        let phases = vec![
+            ("Find".to_owned(), counts(4, 0, 0)),
+            ("Score".to_owned(), counts(1, 1, 2)),
+        ];
+        assert_eq!(text(&strip(&phases, 80)), "✓✓✓✓ ✓✗●●");
+        // A phase no worker has reached yet takes no room.
+        let phases = vec![
+            ("Find".to_owned(), counts(0, 0, 3)),
+            ("Score".to_owned(), Counts::default()),
+        ];
+        assert_eq!(text(&strip(&phases, 80)), "●●●");
+        assert_eq!(text(&strip(&[], 80)), "starting");
+        // Each mark keeps its state's hue, from the one table.
+        let marks = strip(&[(String::new(), counts(1, 1, 1))], 80);
+        assert_eq!(marks[0].style, crate::status::sign("done").style);
+        assert_eq!(marks[1].style, crate::status::sign("failed").style);
+        assert_eq!(marks[2].style, crate::status::sign("working").style);
+    }
+
+    #[test]
+    fn past_24_workers_a_strip_is_a_bar_of_12_and_its_counts() {
+        let phases = vec![("Verify".to_owned(), counts(31, 2, 12))];
+        assert_eq!(
+            text(&strip(&phases, 80)),
+            "✓✓✓✓✓✓✓✓✗●●●  12 working, 31 finished, 2 failed"
+        );
+        // 24 is still a strip; 25 is a bar.
+        assert_eq!(strip(&[(String::new(), counts(24, 0, 0))], 80).len(), 24);
+        assert_eq!(
+            text(&strip(&[(String::new(), counts(25, 0, 0))], 80)),
+            "✓✓✓✓✓✓✓✓✓✓✓✓  25 finished"
+        );
+        // One failure in three hundred keeps its cell.
+        let one = bar(counts(299, 1, 0));
+        assert_eq!(one.len(), BAR);
+        assert_eq!(one.iter().filter(|c| **c == Cell::Failed).count(), 1);
+        for (done, failed, running) in [(1, 1, 1), (0, 0, 1000), (5, 300, 2), (13, 13, 13)] {
+            let bar = bar(counts(done, failed, running));
+            assert_eq!(bar.len(), BAR, "{done} {failed} {running}");
+            for (n, cell) in [
+                (done, Cell::Back),
+                (failed, Cell::Failed),
+                (running, Cell::Working),
+            ] {
+                assert_eq!(bar.contains(&cell), n > 0, "{done} {failed} {running}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_strip_too_wide_for_its_row_is_a_bar_and_then_drops_its_counts() {
+        let phases = vec![("Find".to_owned(), counts(20, 0, 0))];
+        assert_eq!(text(&strip(&phases, 20)).chars().count(), 20);
+        assert_eq!(text(&strip(&phases, 19)), "✓✓✓✓✓✓✓✓✓✓✓✓");
+        let phases = vec![("Find".to_owned(), counts(40, 0, 0))];
+        assert_eq!(text(&strip(&phases, 25)), "✓✓✓✓✓✓✓✓✓✓✓✓  40 finished");
+        assert_eq!(text(&strip(&phases, 24)), "✓✓✓✓✓✓✓✓✓✓✓✓");
     }
 
     #[test]
