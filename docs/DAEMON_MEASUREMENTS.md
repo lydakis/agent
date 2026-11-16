@@ -10318,3 +10318,23 @@ folder):
 No row moved past the runs' spread: still ahead of 0.9.5 on every row.
 A turn whose calls took daemon steps no longer costs a store read at its
 end (the lifted calls were read to spare them; the store now knows).
+
+The daemon screens for ordinary work, bots that never ask for a step
+included, from the pull request's perf screen (`bench.perf_gate`, main as
+base and this change as head on the same runner, two alternating rounds):
+
+| Bench | Measure | Main | This change |
+| --- | --- | ---: | ---: |
+| admission | lone submit processor time | 28.1 ms | 28.0 ms |
+| admission | burst submit p99 | 3.37 ms | 3.01 ms |
+| completion | release to terminal p99 | 8.52 ms | 8.40 ms |
+| footprint | idle memory | 16.7 MiB | 17.0 MiB |
+| footprint | each idle bot | 2.02 KiB | 1.90 KiB |
+| footprint | memory after a turn each | 33.6 MiB | 32.5 MiB |
+| footprint | processor time a turn | 0.70 ms | 0.69 ms |
+| lifecycle | processor time | 0.385 s | 0.390 s |
+| lifecycle | p95 turn | 783 ms | 700 ms |
+| lifecycle | peak memory | 25.9 MiB | 26.0 MiB |
+
+Every row is within 2% or better but idle memory (+0.3 MiB, under the
+screen's spread between runs).
