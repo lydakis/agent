@@ -8415,6 +8415,9 @@ impl App {
     /// [`Self::open_agent`] opens it; this window's own is here already,
     /// so `/status` listing it closes, as Esc does.
     fn open_picked(&mut self, bot: &str) {
+        // Opening anything ends a confirm, as a key other than `enter`
+        // does: a stop asked on one run never stops it from another's page.
+        self.keep_asked();
         // A workflow's row opens its run's page, as a thing's row does.
         if let (_, Some(run)) = workflow::view::split(bot) {
             if let Some(watch) = &mut self.watch {
@@ -17875,10 +17878,10 @@ impl App {
                         .text(),
                 };
                 pane.set_card_marked(lines, marks, &keys);
-                pane.foot = watch
-                    .stop
-                    .as_ref()
-                    .map(|_| workflow::view::stop_question(&live));
+                // The question names the run it stops, whatever is shown.
+                pane.foot = (watch.stop.as_deref())
+                    .and_then(|run| run_of(watch, run))
+                    .map(workflow::view::stop_question);
                 if watch.picked.is_none() {
                     watch.picked = Some(0);
                     pane.screen.show_row(0, 0);
@@ -30239,6 +30242,18 @@ mod tests {
         app.key(key(KeyCode::Esc)).await;
         assert_eq!(watch(&app), (None, None));
         assert!(!run.join(workflow::view::STOP).exists());
+        // Opening another run, as a click does, ends the confirm: its page
+        // never asks to stop it on the first run's behalf.
+        app.key(key(KeyCode::Char('x'))).await;
+        let other = workflow::view::Live {
+            id: "run2".into(),
+            caller: "calc.lead".into(),
+            ..Default::default()
+        };
+        app.open_picked(&other.bot());
+        assert_eq!(watch(&app), (Some("run2".into()), None));
+        assert_eq!(app.notice.as_deref(), Some("not stopped"));
+        app.watch.as_mut().unwrap().run = None;
         // `enter` opens its page; `←` goes back to the list.
         app.key(key(KeyCode::Enter)).await;
         assert_eq!(watch(&app), (Some("run1".into()), None));
