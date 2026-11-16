@@ -531,8 +531,9 @@ its lifted command. The group that ended it tells the run loop as it
 commits, before any of its jobs is answered, so no one hears of a call's
 end before its steps do. The run loop looks at those ends again each time
 it lets a step start, so no step starts once its call's end was told. A
-step held by a pause before it starts answers `step_stopped` as every
-other stop does. A unit test runs the coordinator over every state a step
+pause stops every step asking, in line or running, and one decided or
+gated meanwhile before it starts; each answers `step_stopped` with the
+pause as its reason, as every other stop does. A unit test runs the coordinator over every state a step
 can be in (asked, deciding, gated, in line, running, ending) against every
 cause that stops one (its call answered by its bot or by another, the
 call's end, a pause, its asker leaving).

@@ -885,14 +885,21 @@ impl Service {
         }
     }
 
-    /// The daemon is held, paused or stopping: steps in line are stopped,
-    /// as a running one is by the pull of the cord.
+    /// The daemon is held, paused or stopping: steps asking, in line or
+    /// running are stopped, and answer `step_stopped` for `why` as every
+    /// stop does, a running one's tool ending as the pull of the cord ends
+    /// it. One decided or gated meanwhile is stopped before it can start.
     pub(super) fn steps_held(&mut self, why: &'static str) {
         let flights = &self.steps.flights;
+        let running = flights
+            .iter()
+            .filter(|(_, flight)| matches!(flight.state, State::Running { .. }))
+            .map(|(key, _)| key.clone());
         let lined: Vec<Key> = (self.steps.asking.entries.iter())
             .filter(|entry| Steps::asked(flights, entry))
             .chain((self.steps.line.entries.iter()).filter(|entry| Steps::lined(flights, entry)))
             .map(|(key, _)| key.clone())
+            .chain(running)
             .collect();
         for key in lined {
             self.stop_step(&key, why, false);
@@ -1424,16 +1431,15 @@ mod tests {
         const ENDED: End = Stopped("its call ended");
         const PAUSED: End = Stopped("the pause stopped it");
         const HELD: End = Stopped("the daemon was held before it started");
-        // Each state's row: Answered, Others, Ended, Paused, Left. A step
-        // paused once it runs is stopped by the cord its tool reads, not
-        // here; one paused while decided or gated is stopped before it can
-        // start.
+        // Each state's row: Answered, Others, Ended, Paused, Left. One
+        // paused while decided or gated is stopped before it can start; one
+        // ending has its end with the store already.
         let table: [(Phase, [End; 5]); 6] = [
             (Phase::Asked, [ANSWERED, Asking, ENDED, PAUSED, Silent]),
             (Phase::Deciding, [ANSWERED, Started, ENDED, HELD, Silent]),
             (Phase::Gated, [ANSWERED, Started, ENDED, HELD, Silent]),
             (Phase::Lined, [ANSWERED, Started, ENDED, PAUSED, Silent]),
-            (Phase::Running, [ANSWERED, Ran, ENDED, Ran, Silent]),
+            (Phase::Running, [ANSWERED, Ran, ENDED, PAUSED, Silent]),
             (Phase::Ending, [ANSWERED, Ran, ENDED, Ran, Silent]),
         ];
         let root = std::env::temp_dir().join(format!("agent-step-stops-{}", std::process::id()));
@@ -1447,7 +1453,7 @@ mod tests {
                 // A running step is sent its stop at once, when stopped.
                 if let Some(stopping) = &mut bench.stop {
                     let sent = stopping.try_recv().ok();
-                    let stopped = !matches!(cause, Others | Paused);
+                    let stopped = !matches!(cause, Others);
                     assert_eq!(sent.is_some(), stopped, "{phase:?} {cause:?}: {sent:?}");
                 }
                 go_on(&mut bench, phase);

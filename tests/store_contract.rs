@@ -21800,15 +21800,17 @@ fn an_answered_call_s_end_is_told_once_its_group_commits() {
         inherit: Inherit::All,
         kind: None,
     };
-    db.create(
-        "Lead",
-        Some("/synthetic"),
-        Binding {
-            declared: Some(&ToolList::new(vec![start]).unwrap()),
-            ..binding()
-        },
-    )
-    .unwrap();
+    for bot in ["Lead", "Halted"] {
+        db.create(
+            bot,
+            Some("/synthetic"),
+            Binding {
+                declared: Some(&ToolList::new(vec![start.clone()]).unwrap()),
+                ..binding()
+            },
+        )
+        .unwrap();
+    }
     let turn = db
         .begin(
             "Lead",
@@ -21836,6 +21838,20 @@ fn an_answered_call_s_end_is_told_once_its_group_commits() {
             .as_u64()
             .unwrap();
     }
+    // Another bot's turn waits on its answered call too.
+    let halted = db
+        .begin(
+            "Halted",
+            "request",
+            "work",
+            true,
+            &TurnOptions::default(),
+            allow_provider,
+        )
+        .unwrap()
+        .turn;
+    db.append(halted, vec![], &calls[..1], None).unwrap();
+    db.tool_start(halted, &calls[0], false, false).unwrap();
     let told = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
     let sink = told.clone();
     db.on_call_end(Box::new(move |turn, call_id| {
@@ -21882,4 +21898,8 @@ fn an_answered_call_s_end_is_told_once_its_group_commits() {
         ended,
         vec![(turn, "c2".to_owned()), (turn, "c3".to_owned())]
     );
+    // A pause that parks a turn ends the answered calls it leaves.
+    db.suspend_halted(halted, Halt::Pause, 0, 0, 0, None)
+        .unwrap();
+    assert_eq!(heard(&mut db), vec![(halted, "c1".to_owned())]);
 }

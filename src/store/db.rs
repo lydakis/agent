@@ -12529,7 +12529,7 @@ impl Database {
         // What waited on those calls went with them: their requests, what a
         // client was to answer, and each step a call asked about, denied as
         // an answered call's are.
-        let (mut requests, mut steps) = (0, Vec::new());
+        let (mut requests, mut steps, mut ended) = (0, Vec::new(), Vec::new());
         for call_id in &unanswered {
             let asked: Vec<(i64, String, String)> = tx
                 .prepare_cached(
@@ -12554,8 +12554,13 @@ impl Database {
                     "DELETE FROM approvals WHERE turn=? AND call_id=? AND step_of IS NULL",
                 )?
                 .execute(params![turn, call_id])? as i64;
-            tx.prepare_cached("DELETE FROM answers WHERE turn=? AND call_id=?")?
-                .execute(params![turn, call_id])?;
+            if tx
+                .prepare_cached("DELETE FROM answers WHERE turn=? AND call_id=?")?
+                .execute(params![turn, call_id])?
+                > 0
+            {
+                ended.push(call_id);
+            }
         }
         tx.execute(
             "UPDATE turns SET status='paced',waiting=?,retries=retries+?,paced_ms=paced_ms+?,
@@ -12579,6 +12584,10 @@ impl Database {
         self.approvals -= requests + steps.len() as i64;
         for approval in steps {
             self.unstep(approval, true);
+        }
+        // Its answered calls end with the halt: their daemon steps are told.
+        for call_id in ended {
+            self.call_ended(turn, call_id);
         }
         entries.push(entry(cursor, &bot.name, Some(turn), "turn_paced", data));
         Ok(Halted::Parked(entries))
