@@ -4108,6 +4108,12 @@ struct Watch {
     /// each tracks, and the picked one's model, profile and latest step.
     /// `m` shows it and hides it again; it opens without.
     more: bool,
+    /// The workflow run whose page shows over the list, by its id: `enter`
+    /// on its row opens it, `←` goes back, and it closes once the run ends.
+    run: Option<String>,
+    /// The workflow run a stop was asked for, by its id, until the confirm
+    /// is answered: only `enter` stops it.
+    stop: Option<String>,
 }
 
 impl Watch {
@@ -8409,8 +8415,17 @@ impl App {
     /// [`Self::open_agent`] opens it; this window's own is here already,
     /// so `/status` listing it closes, as Esc does.
     fn open_picked(&mut self, bot: &str) {
-        // A workflow's row opens the agent that started it.
-        let bot = workflow::view::split(bot).0;
+        // Opening anything ends a confirm, as a key other than `enter`
+        // does: a stop asked on one run never stops it from another's page.
+        self.keep_asked();
+        // A workflow's row opens its run's page, as a thing's row does.
+        if let (_, Some(run)) = workflow::view::split(bot) {
+            if let Some(watch) = &mut self.watch {
+                watch.run = Some(run.to_owned());
+                watch.picked = None;
+            }
+            return;
+        }
         if bot != self.bot {
             return self.open_agent(bot, false);
         }
@@ -11782,6 +11797,8 @@ impl App {
             pick: None,
             helpers: Vec::new(),
             more: false,
+            run: None,
+            stop: None,
         });
         // The first row picked, or the agent named last in what shows:
         // Enter opens the one the conversation just pointed to.
@@ -11828,6 +11845,8 @@ impl App {
             pick: None,
             helpers: Vec::new(),
             more: false,
+            run: None,
+            stop: None,
         });
         self.open_pane(pane::Pane::card("background", STATUS_KEYS));
     }
@@ -11900,6 +11919,8 @@ impl App {
             pick: None,
             helpers: Vec::new(),
             more: false,
+            run: None,
+            stop: None,
         });
         self.open_pane(pane::Pane::card("usage", STATUS_KEYS));
     }
@@ -11927,6 +11948,8 @@ impl App {
             pick: None,
             helpers: Vec::new(),
             more: false,
+            run: None,
+            stop: None,
         });
         self.open_pane(pane::Pane::card("audit", STATUS_KEYS));
     }
@@ -12021,6 +12044,8 @@ impl App {
             pick: None,
             helpers: Vec::new(),
             more: false,
+            run: None,
+            stop: None,
         });
         self.open_pane(pane::Pane::card("memory", STATUS_KEYS));
     }
@@ -12048,6 +12073,8 @@ impl App {
             pick: None,
             helpers: Vec::new(),
             more: false,
+            run: None,
+            stop: None,
         });
         self.open_pane(pane::Pane::card("commons", STATUS_KEYS));
     }
@@ -12071,6 +12098,8 @@ impl App {
             pick: None,
             helpers: Vec::new(),
             more: false,
+            run: None,
+            stop: None,
         });
         self.open_pane(pane::Pane::card("sky", STATUS_KEYS));
     }
@@ -13071,10 +13100,64 @@ impl App {
                 .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER);
             if key.code == KeyCode::Char('?') && plain {
                 pane.sheet = !pane.sheet;
+                // A key other than `enter` keeps what a confirm asked
+                // about, `?` too: the sheet hides the question.
+                self.keep_asked();
                 return true;
             }
             if std::mem::take(&mut pane.sheet) && key.code == KeyCode::Esc {
                 return true;
+            }
+        }
+        // A workflow stop asked for in `/status`: only `enter` stops it, and
+        // any other key keeps it running, saying so. On a run's page, `←`
+        // goes back to the list, `enter` to the agent that ran it, `x`
+        // asks to stop it.
+        if self.finding.is_none()
+            && self.pane_keys
+            && self.pane.as_ref().is_some_and(|pane| pane.is_card())
+            && let Some(watch) = &mut self.watch
+            && (watch.stop.is_some() || watch.run.is_some())
+            && watch.background.is_none()
+            && watch.usage.is_none()
+            && watch.audit.is_none()
+            && watch.commons.is_none()
+            && watch.memory.is_none()
+            && watch.sky.is_none()
+        {
+            let plain = !(key.modifiers)
+                .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER);
+            if let Some(run) = watch.stop.take() {
+                let name = run_named(watch, &run);
+                self.notice = Some(match key.code == KeyCode::Enter && plain {
+                    true => match workflow::view::stop(&self.options.store, &run) {
+                        Ok(()) => format!("stopping {name}"),
+                        Err(error) => format!("could not stop {name}: {error}"),
+                    },
+                    false => "not stopped".into(),
+                });
+                return true;
+            }
+            let caller = (watch.run.as_deref())
+                .and_then(|run| run_of(watch, run))
+                .map(|live| live.caller.clone());
+            match key.code {
+                KeyCode::Left | KeyCode::Backspace => {
+                    watch.run = None;
+                    watch.picked = None;
+                    return true;
+                }
+                KeyCode::Char('x') if plain => {
+                    watch.stop = watch.run.clone();
+                    return true;
+                }
+                KeyCode::Enter | KeyCode::Right if plain => {
+                    if let Some(caller) = caller {
+                        self.open_picked(&caller);
+                    }
+                    return true;
+                }
+                _ => {}
             }
         }
         // `/status` picks an agent from the keys and opens it, as a click
@@ -13093,6 +13176,8 @@ impl App {
             && watch.commons.is_none()
             && watch.memory.is_none()
             && watch.sky.is_none()
+            && watch.run.is_none()
+            && watch.stop.is_none()
         {
             let picks = card_picks(watch, self.width.max(40));
             if !picks.is_empty() {
@@ -13112,6 +13197,12 @@ impl App {
                     // Enter goes to the picked agent; on a heading it
                     // does the heading's one thing, opening or folding.
                     (KeyCode::Enter, Some(Picked::Agent(bot))) => self.open_picked(&bot),
+                    // `→` goes into a workflow's row, as `enter` does.
+                    (KeyCode::Right, Some(Picked::Agent(bot)))
+                        if workflow::view::split(&bot).1.is_some() =>
+                    {
+                        self.open_picked(&bot)
+                    }
                     (KeyCode::Enter, Some(Picked::Group(group))) => {
                         if let Some(watch) = &mut self.watch {
                             watch.toggle(group);
@@ -13372,6 +13463,7 @@ impl App {
                     KeyCode::Char('m')
                         if pane.is_card()
                             && let Some(watch) = &mut self.watch
+                            && watch.run.is_none()
                             && watch.background.is_none()
                             && watch.usage.is_none()
                             && watch.audit.is_none()
@@ -13381,10 +13473,10 @@ impl App {
                     {
                         watch.more = !watch.more
                     }
-                    // `/status` stops the workflow picked.
+                    // `/status` asks to stop the workflow picked.
                     KeyCode::Char('x')
                         if pane.is_card()
-                            && let Some(watch) = &self.watch
+                            && let Some(watch) = &mut self.watch
                             && watch.background.is_none()
                             && watch.usage.is_none()
                             && watch.audit.is_none()
@@ -13396,10 +13488,7 @@ impl App {
                             })
                             && let (_, Some(run)) = workflow::view::split(&bot) =>
                     {
-                        self.notice = Some(match workflow::view::stop(&self.options.store, run) {
-                            Ok(()) => format!("stopping workflow run {run}"),
-                            Err(error) => error,
-                        });
+                        watch.stop = Some(run.to_owned());
                     }
                     _ if switches(key) || key.code == KeyCode::Tab => self.pane_keys = false,
                     // The picture or drawing shown, opened bigger outside Sonny.
@@ -14072,7 +14161,8 @@ impl App {
         // A view's own pages go back first, as `←` on them does.
         if back
             && let Some(watch) = &mut self.watch
-            && (watch.memory.as_mut().is_some_and(memory::View::back)
+            && (watch.run.take().is_some()
+                || watch.memory.as_mut().is_some_and(memory::View::back)
                 || watch
                     .background
                     .as_mut()
@@ -14118,6 +14208,9 @@ impl App {
         }
         if let Some(view) = &mut watch.memory {
             view.keep();
+        }
+        if watch.stop.take().is_some() {
+            self.notice = Some("not stopped".into());
         }
     }
 
@@ -17744,7 +17837,59 @@ impl App {
                     .collect();
                 pane.set_card(lines, &view.keys());
                 pane.foot = None;
+            } else if let Some(live) = (watch.run.as_deref())
+                .and_then(|run| run_of(watch, run))
+                .cloned()
+            {
+                // The run's page over the list: its title's ‹ goes back.
+                pane.page = true;
+                let by = (watch.rows.iter())
+                    .find(|row| row.bot == live.caller)
+                    .map_or_else(|| live.caller.clone(), |row| row.name.clone());
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis() as u64;
+                let seconds = now.saturating_sub(live.started_ms) / 1000;
+                let (page, (row, start, end)) =
+                    workflow::view::page(&live, &by, seconds, width.saturating_sub(1));
+                let lines: Vec<Line<'static>> = (page.into_iter())
+                    .map(|line| {
+                        let mut spans = vec![Span::raw(" ")];
+                        spans.extend(line.spans);
+                        Line::from(spans).style(line.style)
+                    })
+                    .collect();
+                // The agent that ran it is the page's link, a column in.
+                let button = Picked::Agent(live.caller.clone()).link();
+                let marks = vec![(
+                    row,
+                    screen::Mark::Buttons(vec![(start as u16 + 1, end as u16 + 1, button)]),
+                )];
+                let keys = match watch.stop.is_some() {
+                    true => hint::Keys::new()
+                        .enter(hint::Enter::Confirm("stop"))
+                        .esc(hint::Esc::Cancel)
+                        .text(),
+                    false => hint::Keys::new()
+                        .enter(hint::Enter::Open)
+                        .key("x", "stop")
+                        .esc(hint::Esc::Close)
+                        .text(),
+                };
+                pane.set_card_marked(lines, marks, &keys);
+                // The question names the run it stops, whatever is shown.
+                pane.foot = (watch.stop.as_deref())
+                    .and_then(|run| run_of(watch, run))
+                    .map(workflow::view::stop_question);
+                if watch.picked.is_none() {
+                    watch.picked = Some(0);
+                    pane.screen.show_row(0, 0);
+                }
             } else {
+                // A run's page closes once the run ends.
+                watch.run = None;
+                pane.page = false;
                 let (mut lines, folding, marks) = watch_card(watch, width);
                 let mut picked = None;
                 // The agent picked from the keys is drawn as the picker
@@ -17766,6 +17911,15 @@ impl App {
                         usize::MAX,
                     );
                 }
+                // The stop asked for, which only `enter` carries out.
+                let asked = (watch.stop.as_deref()).and_then(|run| run_of(watch, run));
+                if asked.is_some() {
+                    keys = hint::Keys::new()
+                        .enter(hint::Enter::Confirm("stop"))
+                        .esc(hint::Esc::Cancel)
+                        .text();
+                }
+                pane.foot = asked.map(workflow::view::stop_question);
                 pane.set_card_marked(lines, marks, &keys);
                 // Scrolled to once, as a new pick, so the page keys still
                 // move away from it; after the card, whose swap would
@@ -18935,6 +19089,17 @@ const SKY_REPLAY_KEYS: &str = sky::REPLAY_KEYS;
 const PICK_KEYS: &str = "↑↓ pick · enter open · esc close";
 
 /// The agents `/status` lists, in its order: what its keys pick from.
+/// The workflow run `id` as `/status` last read it, while it runs.
+fn run_of<'a>(watch: &'a Watch, id: &str) -> Option<&'a workflow::view::Live> {
+    (watch.rows.iter()).find_map(|row| row.run.as_ref().filter(|run| run.id == id))
+}
+
+/// What the confirm and its notices call the run `id`: its script's
+/// name, never its id while it is known.
+fn run_named(watch: &Watch, id: &str) -> String {
+    run_of(watch, id).map_or_else(|| "the workflow".into(), |run| run.name.clone())
+}
+
 fn card_picks(watch: &Watch, width: usize) -> Vec<Picked> {
     (watch_card(watch, width).2)
         .into_iter()
@@ -29524,6 +29689,8 @@ mod tests {
             pick: None,
             helpers: Vec::new(),
             more: false,
+            run: None,
+            stop: None,
         };
         // The folder's other lead opens by its own name, not its label.
         let (lines, _, marks) = watch_card(&watch, 80);
@@ -29983,6 +30150,8 @@ mod tests {
             pick: None,
             helpers: Vec::new(),
             more: false,
+            run: None,
+            stop: None,
         });
         let key = |code| Event::Key(event::KeyEvent::new(code, KeyModifiers::NONE));
         let pick = |app: &App| app.watch.as_ref().unwrap().pick;
@@ -30010,6 +30179,95 @@ mod tests {
         assert!(app.beside().is_none(), "never this window's own agent");
         app.key(key(KeyCode::Enter)).await;
         assert!(app.pane.is_none(), "closed, as Esc closes it");
+    }
+
+    #[tokio::test]
+    async fn enter_on_a_workflow_s_row_opens_its_page_and_x_stops_it_after_the_confirm() {
+        let mut app = app(daemon_answering(|_| json!({})).await);
+        let dir = std::env::temp_dir().join(format!("sonny-wf-page-{}", std::process::id()));
+        let store = dir.join("state.sqlite");
+        std::fs::create_dir_all(&dir).unwrap();
+        let run = workflow::view::plant(&store, "run1", "calc.lead", "audit", &[]);
+        app.options.store = store.clone();
+        let live = workflow::view::Live {
+            id: "run1".into(),
+            name: "audit".into(),
+            caller: "calc.lead".into(),
+            running: 2,
+            ..Default::default()
+        };
+        app.open_pane(pane::Pane::card("status", PICK_KEYS));
+        app.watch = Some(Watch {
+            project: "calc".into(),
+            rows: vec![status::Row {
+                name: "workflow audit".into(),
+                bot: live.bot(),
+                group: status::Group::Working,
+                running: true,
+                run: Some(live),
+                ..Default::default()
+            }],
+            read: Instant::now(),
+            alerts: Vec::new(),
+            open: Vec::new(),
+            background: None,
+            usage: None,
+            audit: None,
+            commons: None,
+            memory: None,
+            sky: None,
+            picked: None,
+            pick: None,
+            helpers: Vec::new(),
+            more: false,
+            run: None,
+            stop: None,
+        });
+        let key = |code| Event::Key(event::KeyEvent::new(code, KeyModifiers::NONE));
+        let watch = |app: &App| {
+            let watch = app.watch.as_ref().unwrap();
+            (watch.run.clone(), watch.stop.clone())
+        };
+        // `x` on the row asks, naming the workflow; another key keeps it.
+        app.key(key(KeyCode::Down)).await;
+        app.key(key(KeyCode::Char('x'))).await;
+        assert_eq!(watch(&app), (None, Some("run1".into())));
+        app.key(key(KeyCode::Char('q'))).await;
+        assert_eq!(watch(&app), (None, None));
+        assert_eq!(app.notice.as_deref(), Some("not stopped"));
+        assert!(!run.join(workflow::view::STOP).exists());
+        // `?` keeps it too, so `esc` then `enter` stops nothing.
+        app.key(key(KeyCode::Char('x'))).await;
+        app.key(key(KeyCode::Char('?'))).await;
+        app.key(key(KeyCode::Esc)).await;
+        assert_eq!(watch(&app), (None, None));
+        assert!(!run.join(workflow::view::STOP).exists());
+        // Opening another run, as a click does, ends the confirm: its page
+        // never asks to stop it on the first run's behalf.
+        app.key(key(KeyCode::Char('x'))).await;
+        let other = workflow::view::Live {
+            id: "run2".into(),
+            caller: "calc.lead".into(),
+            ..Default::default()
+        };
+        app.open_picked(&other.bot());
+        assert_eq!(watch(&app), (Some("run2".into()), None));
+        assert_eq!(app.notice.as_deref(), Some("not stopped"));
+        app.watch.as_mut().unwrap().run = None;
+        // `enter` opens its page; `←` goes back to the list.
+        app.key(key(KeyCode::Enter)).await;
+        assert_eq!(watch(&app), (Some("run1".into()), None));
+        app.key(key(KeyCode::Left)).await;
+        assert_eq!(watch(&app), (None, None));
+        // On the page, `x` asks and only `enter` stops it.
+        app.key(key(KeyCode::Right)).await;
+        app.key(key(KeyCode::Char('x'))).await;
+        assert_eq!(watch(&app), (Some("run1".into()), Some("run1".into())));
+        app.key(key(KeyCode::Enter)).await;
+        assert_eq!(app.notice.as_deref(), Some("stopping audit"));
+        assert!(run.join(workflow::view::STOP).exists());
+        assert_eq!(watch(&app), (Some("run1".into()), None));
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
@@ -30076,6 +30334,8 @@ mod tests {
             pick: Some(0),
             helpers: Vec::new(),
             more: false,
+            run: None,
+            stop: None,
         });
         let key = |code| Event::Key(event::KeyEvent::new(code, KeyModifiers::NONE));
         let picks = |app: &App| card_picks(app.watch.as_ref().unwrap(), 80);
