@@ -1176,7 +1176,11 @@ has something on it, or is off the screen, no time shows.
   of the updates it lasts (`2 of 3 updates left`); and what it told in the
   last day (`2 updates in the last day, 1 steered · last 2m ago`), read
   from the lookout's own files only while the page is open; a command's
-  whole line, its kind and pid, and how long it has run. The agent it
+  whole line, then `background command · left running by lead · for 12m
+  · pid 4312`, the `folder` it runs in, and its `output`: its newest ten
+  lines, as plain text with secrets hidden, `nothing yet` before the
+  first, and `not kept` for a detached service, read from the daemon
+  (`process_output`) every two seconds only while the page is open. The agent it
   belongs to (the one an automation wakes, the follow's, the one that
   left the command running) is the page's first link, picked: Enter
   there, or a click on its name, goes to it, and `←` or the title's `‹`
