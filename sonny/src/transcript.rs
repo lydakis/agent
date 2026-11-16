@@ -1482,6 +1482,7 @@ pub fn from_outside(origin: Option<&str>) -> &'static str {
         Some("tasks") => "a task",
         Some("reviewer") => "the reviewer",
         Some("background") => "a background command",
+        Some("workflow") => WORKFLOW,
         Some("limit") => "the model's output limit",
         _ => "outside",
     }
@@ -1735,6 +1736,12 @@ pub fn came_names(text: &str, from: Option<&str>) -> Vec<String> {
     }
     match from {
         Some(AUTOMATION) => vec!["↻ automation".to_owned()],
+        // A workflow that ended, by its name.
+        Some(WORKFLOW) => vec![
+            crate::workflow::ended_name(text)
+                .unwrap_or(WORKFLOW)
+                .to_owned(),
+        ],
         Some(from) => vec![from.to_owned()],
         None => Vec::new(),
     }
@@ -1742,6 +1749,9 @@ pub fn came_names(text: &str, from: Option<&str>) -> Vec<String> {
 
 /// What sends an automation's prompts, as [`from_outside`] names it.
 const AUTOMATION: &str = "an automation";
+
+/// What tells a workflow's caller it ended, as [`from_outside`] names it.
+const WORKFLOW: &str = "a workflow";
 
 /// The words view's `↳` row: who started the turn its reply answers,
 /// muted; names give way to `+N` before it passes `width`.
@@ -4462,6 +4472,15 @@ mod tests {
             ["↻ automation"]
         );
         assert_eq!(came_names("hi", None), Vec::<String>::new());
+        // A workflow that ended, by its name.
+        let from = from_outside(Some("workflow"));
+        assert_eq!(
+            came_names(
+                "Workflow blind-role-eval-score (run ab12cd34) completed in 42s",
+                Some(from)
+            ),
+            ["blind-role-eval-score"]
+        );
         let upgraded = format!("{}\n- set up backup: on", crate::skills::UPGRADED);
         assert_eq!(came_names(&upgraded, Some("outside")), ["Sonny upgraded"]);
         let names = ["a.b", "a.c", "a.b", "a.d"].map(String::from);

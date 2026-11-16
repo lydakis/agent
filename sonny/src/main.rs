@@ -3524,7 +3524,17 @@ struct TurnHints {
     turn: Option<i64>,
     came: Vec<String>,
     set: Vec<started::SetGoing>,
+    /// The workflow runs it started, by id, the newest last.
+    runs: Vec<String>,
     replied: bool,
+}
+
+impl TurnHints {
+    /// Whether the turn has told anything its hints keep: what reconnecting
+    /// inside it must not start again, as its replay starts past it.
+    fn heard(&self) -> bool {
+        self.replied || !(self.came.is_empty() && self.set.is_empty() && self.runs.is_empty())
+    }
 }
 
 /// What the bot's words turned out to be once something followed them.
@@ -4823,6 +4833,10 @@ struct App {
     /// this window's are doing, read as a task's state is.
     set_rows: BTreeMap<usize, Vec<started::SetGoing>>,
     set_states: HashMap<String, String>,
+    /// The words view's second `└` rows, by the client's number for each:
+    /// the runs its turn started, the newest last, and the newest as the
+    /// row last drew it, kept as it was once it ended.
+    run_rows: BTreeMap<usize, (Vec<String>, Option<workflow::view::Ran>)>,
     /// When what runs for this agent in the background was last read, for
     /// what of it failed.
     behind_read: Option<Instant>,
@@ -6482,6 +6496,7 @@ impl App {
             top_turn: None,
             set_rows: BTreeMap::new(),
             set_states: HashMap::new(),
+            run_rows: BTreeMap::new(),
         }
     }
 
@@ -8091,6 +8106,15 @@ impl App {
                     arguments["message"].as_str().unwrap_or(""),
                 )
             }
+            // A workflow it started has a row of its own.
+            workflow::NAME => {
+                if let Some(run) = workflow::started_run(output)
+                    && !self.turn_hints.runs.contains(&run)
+                {
+                    self.turn_hints.runs.push(run);
+                }
+                return;
+            }
             _ => return,
         };
         if self.turn_hints.set.iter().any(|one| one.bot == bot) {
@@ -8130,15 +8154,72 @@ impl App {
     /// nothing.
     fn end_hints(&mut self) {
         let hints = std::mem::take(&mut self.turn_hints);
-        if !self.words() || !hints.replied || hints.set.is_empty() {
+        if !self.words() || !hints.replied {
             return;
         }
-        let at = self.group();
-        self.set_rows.insert(at, hints.set);
-        let (line, buttons) = self.set_row(at);
-        self.commit_after(vec![line], false);
-        self.mark_last(screen::Mark::Tag(screen::Tag::SetGoing(at as u64)));
-        self.mark_last(screen::Mark::Buttons(buttons));
+        if !hints.set.is_empty() {
+            let at = self.group();
+            self.set_rows.insert(at, hints.set);
+            let (line, buttons) = self.set_row(at);
+            self.commit_after(vec![line], false);
+            self.mark_last(screen::Mark::Tag(screen::Tag::SetGoing(at as u64)));
+            self.mark_last(screen::Mark::Buttons(buttons));
+        }
+        // The workflows it ran, on a second row under the first.
+        if !hints.runs.is_empty() {
+            let at = self.group();
+            self.run_rows.insert(at, (hints.runs, None));
+            if let Some((line, buttons)) = self.run_row(at) {
+                self.commit_after(vec![line], false);
+                self.mark_last(screen::Mark::Tag(screen::Tag::Ran(at as u64)));
+                self.mark_last(screen::Mark::Buttons(buttons));
+            }
+        }
+    }
+
+    /// The `└` row `at` for the workflows a turn ran: the newest, read as
+    /// it is now unless the row saw it end, with `+N` for the others; its
+    /// name a button to its page while it runs. None when its run cannot
+    /// be read.
+    fn run_row(&mut self, at: usize) -> Option<(Line<'static>, screen::Buttons)> {
+        let store = self.store();
+        let (runs, seen) = self.run_rows.get_mut(&at)?;
+        let newest = runs.last()?.clone();
+        let ran = match seen.take() {
+            Some(ran) if ran.ended.is_some() => ran,
+            _ => workflow::view::ran(&store, &newest)?,
+        };
+        let more = runs.len() - 1;
+        *seen = Some(ran.clone());
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        let (line, link) = workflow::view::ran_row(&ran, more, now, self.prose());
+        let buttons = (link.into_iter())
+            .map(|(from, to)| (from, to, format!("{}run/{newest}", screen::BUTTON)))
+            .collect();
+        Some((line, buttons))
+    }
+
+    /// The run rows whose newest run has not ended, drawn again: its
+    /// strip and time as they are now.
+    fn redraw_run_rows(&mut self, all: bool) {
+        let at: Vec<usize> = (self.run_rows.iter())
+            .filter(|(_, (_, seen))| all || seen.as_ref().is_none_or(|ran| ran.ended.is_none()))
+            .map(|(at, _)| *at)
+            .collect();
+        for at in at {
+            if let Some((line, buttons)) = self.run_row(at) {
+                self.flush();
+                let tag = screen::Tag::Ran(at as u64);
+                (self.screen).replace_tagged(
+                    tag,
+                    vec![line],
+                    vec![(0, screen::Mark::Buttons(buttons))],
+                );
+            }
+        }
     }
 
     /// The `↳` row above the first words of a turn the person did not
@@ -8213,10 +8294,16 @@ impl App {
         for at in gone {
             self.set_rows.remove(&at);
         }
+        let gone: Vec<usize> = (self.run_rows.keys().copied())
+            .filter(|at| !self.kept(screen::Tag::Ran(*at as u64)))
+            .collect();
+        for at in gone {
+            self.run_rows.remove(&at);
+        }
+        let none = self.tasks.is_empty() && self.set_rows.is_empty() && self.run_rows.is_empty();
         // Drawn again at the width the conversation has now, as when the
         // pane opened beside it.
-        if !(self.tasks.is_empty() && self.set_rows.is_empty()) && self.tasks_width != self.prose()
-        {
+        if !none && self.tasks_width != self.prose() {
             self.tasks_width = self.prose();
             for at in self.tasks.keys().copied().collect::<Vec<_>>() {
                 self.draw_started(at);
@@ -8224,14 +8311,17 @@ impl App {
             for at in self.set_rows.keys().copied().collect::<Vec<_>>() {
                 self.draw_set_row(at);
             }
+            self.redraw_run_rows(true);
         }
-        if (self.tasks.is_empty() && self.set_rows.is_empty())
+        if none
             || self
                 .tasks_read
                 .is_some_and(|at| at.elapsed() < Duration::from_secs(3))
         {
             return;
         }
+        // The runs still going, read again from their journals.
+        self.redraw_run_rows(false);
         // A task that ended can be given more work: every one is read
         // again now and then.
         let all = self.tasks_read.is_none()
@@ -8472,6 +8562,23 @@ impl App {
         }
     }
 
+    /// The page of workflow run `run`, over `/status`, opened for it when
+    /// it is not open; a run that has ended has none.
+    async fn open_run(&mut self, run: &str) {
+        let listed = |watch: &Watch| watch.background.is_none() && run_of(watch, run).is_some();
+        if !self.watch.as_ref().is_some_and(listed) {
+            self.status().await;
+        }
+        self.keep_asked();
+        match &mut self.watch {
+            Some(watch) if listed(watch) => {
+                watch.run = Some(run.to_owned());
+                watch.picked = None;
+            }
+            _ => self.notice = Some("that workflow has ended".into()),
+        }
+    }
+
     /// An agent named or picked: to its own tab, when the lead's layout
     /// has one for it, or a look at it in the pane, as `[sonny]
     /// agent_opens` says; `other`, a right click, the one it doesn't. With
@@ -8671,6 +8778,10 @@ impl App {
         }
         if let Some(bot) = button.strip_prefix("other/") {
             self.open_agent(bot, true);
+        }
+        // A run's name under the reply that ran it opens its page.
+        if let Some(run) = button.strip_prefix("run/") {
+            self.open_run(run).await;
         }
         if let Some(node) = button
             .strip_prefix("said/")
@@ -10307,7 +10418,7 @@ impl App {
                 true => std::mem::take(&mut self.turn_hints),
                 false => TurnHints::default(),
             };
-            let heard = !(kept.came.is_empty() && kept.set.is_empty() && !kept.replied);
+            let heard = kept.heard();
             // Its first message, before the page, says what the turn is
             // about; the steers the page holds say the rest.
             if colored && let Some((text, from)) = prompts.first().map(said) {
@@ -24464,6 +24575,144 @@ mod tests {
                 "└ sent to ● fix · ● neg · started ◌ readme",
             ]
         );
+    }
+
+    #[test]
+    fn a_turn_that_only_ran_a_workflow_keeps_it_on_reconnecting() {
+        assert!(!TurnHints::default().heard());
+        let ran = TurnHints {
+            runs: vec!["run1".into()],
+            ..Default::default()
+        };
+        assert!(ran.heard());
+    }
+
+    #[tokio::test]
+    async fn a_workflow_a_turn_ran_has_a_second_row_under_its_reply_that_opens_its_page() {
+        // The turn is woken by an earlier run's end: the ↳ names it.
+        let client = daemon_answering(|asked| match asked["nodes"][0].as_i64() {
+            Some(7) => json!({"items": [{"node": 7, "item": {"type": "message",
+                "role": "user", "from": "a workflow",
+                "content": [{"type": "input_text",
+                    "text": "Workflow find-cases (run run0) completed in 9s: 3 agents."}]}}]}),
+            _ => json!({}),
+        })
+        .await;
+        let mut app = app(client);
+        let dir = std::env::temp_dir().join(format!("sonny-wf-row-{}", std::process::id()));
+        let store = dir.join("state.sqlite");
+        std::fs::create_dir_all(&dir).unwrap();
+        let run = workflow::view::plant(
+            &store,
+            "run1",
+            "calc.lead",
+            "blind-role-eval-score",
+            &[
+                json!({"t": "asking", "key": "a", "phase": "Find"}),
+                json!({"t": "agent", "key": "a", "phase": "Find", "value": 1}),
+                json!({"t": "asking", "key": "b", "phase": "Score"}),
+                json!({"t": "asking", "key": "c", "phase": "Score"}),
+            ],
+        );
+        app.options.store = store.clone();
+        app.words_only = true;
+        app.any_history = true;
+        app.width = 120;
+        app.project = Some("calc".into());
+        let rows = |app: &App| -> Vec<String> {
+            (app.pending.iter())
+                .map(|line| line.to_string())
+                .filter(|row| !row.trim().is_empty())
+                .collect()
+        };
+        app.daemon(turn_event("accepted", 1, json!({"node": 7})))
+            .await;
+        let said = json!({"event": "text_delta", "bot": "b", "turn": 1, "text": "Scoring now."});
+        app.daemon(said).await;
+        let started = json!({"name": "send_message", "call_id": "m1"});
+        app.daemon(turn_event("tool_started", 1, started)).await;
+        let send = json!({"to": "calc.fix", "message": "Check div too."});
+        app.commit_call("m1", Some(1), "send_message", &send, "{}", false);
+        let output = "\"Started workflow blind-role-eval-score as run run1. You hear back once.\"";
+        let args = json!({"name": "blind-role-eval-score"});
+        app.commit_call("w1", Some(1), workflow::NAME, &args, output, false);
+        // A stop names no run it started.
+        let stop = json!({"stop": "run1"});
+        app.commit_call(
+            "w2",
+            Some(1),
+            workflow::NAME,
+            &stop,
+            "\"Stopping workflow\"",
+            false,
+        );
+        let said = json!({"event": "text_delta", "bot": "b", "turn": 1,
+            "text": "A workflow scores them."});
+        app.daemon(said).await;
+        app.daemon(turn_event(
+            "turn_finished",
+            1,
+            json!({"status": "completed"}),
+        ))
+        .await;
+        let drawn = rows(&app);
+        assert_eq!(
+            drawn[..4],
+            [
+                "• Scoring now.",
+                "↳ find-cases",
+                "• A workflow scores them.",
+                "└ sent to ● fix · Check div too.",
+            ]
+        );
+        // Below the first, a row of its own: the strip and its time.
+        assert!(
+            drawn[4].starts_with("└ runs blind-role-eval-score  ✓ ●●  "),
+            "{drawn:?}"
+        );
+        assert_eq!(drawn.len(), 5);
+        // Its name opens the run's page over `/status`, while it runs.
+        let at = *app.run_rows.keys().next().unwrap();
+        let (_, buttons) = app.run_row(at).unwrap();
+        assert_eq!(buttons, [(7, 28, format!("{}run/run1", screen::BUTTON))]);
+        app.watch = Some(Watch {
+            project: "calc".into(),
+            rows: vec![status::Row {
+                name: "workflow blind-role-eval-score".into(),
+                bot: "calc.lead#wf-run1".into(),
+                group: status::Group::Working,
+                running: true,
+                run: workflow::view::ran(&store, "run1").map(|ran| ran.live),
+                ..Default::default()
+            }],
+            read: Instant::now(),
+            alerts: Vec::new(),
+            open: Vec::new(),
+            background: None,
+            usage: None,
+            audit: None,
+            commons: None,
+            memory: None,
+            sky: None,
+            picked: None,
+            pick: None,
+            helpers: Vec::new(),
+            more: false,
+            run: None,
+            stop: None,
+        });
+        app.press("run/run1").await;
+        assert_eq!(app.watch.as_ref().unwrap().run.as_deref(), Some("run1"));
+        // Once it ends, the row stays as it ended, with no link.
+        std::fs::write(
+            run.join("result.json"),
+            json!({"status": "stopped", "ended_ms": 42_001}).to_string(),
+        )
+        .unwrap();
+        let (row, buttons) = app.run_row(at).unwrap();
+        assert_eq!(row.to_string(), "└ stopped blind-role-eval-score  ✓  42s");
+        assert!(buttons.is_empty());
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[tokio::test]

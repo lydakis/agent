@@ -524,6 +524,123 @@ pub fn live(store: &Path, project: &str) -> Vec<Live> {
     out
 }
 
+/// A run a turn ran, for the `└` row under its reply: as it stands, and
+/// once it has ended, how (`completed`, `failed` or `stopped`) and when.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Ran {
+    pub live: Live,
+    pub ended: Option<(String, u64)>,
+}
+
+/// The runs this process read whole once they ended: an ended run's
+/// journal never grows, so it is read once.
+static ENDS: LazyLock<Mutex<HashMap<PathBuf, Ran>>> = LazyLock::new(Mutex::default);
+
+/// The run `id` under `store`, as [`live`] reads it while it runs, and
+/// read whole once when it has ended; none when there is no such run.
+pub fn ran(store: &Path, id: &str) -> Option<Ran> {
+    let dir = super::runs(store).join(super::valid_id(id).ok()?);
+    if let Some(ran) = ENDS.lock().unwrap().get(&dir) {
+        return Some(ran.clone());
+    }
+    let fresh = |dir: &Path| {
+        let plan = super::read_plan(dir).ok()?;
+        Some(Fold {
+            live: Live {
+                id: plan.id,
+                name: plan.meta["name"].as_str().unwrap_or("workflow").to_owned(),
+                caller: plan.caller,
+                project: plan.project,
+                started_ms: plan.started_ms,
+                ..Default::default()
+            },
+            ..Default::default()
+        })
+    };
+    if let Ok(text) = std::fs::read(dir.join("result.json")) {
+        let result: Value = serde_json::from_slice(&text).ok()?;
+        let mut fold = fresh(&dir)?;
+        read_on(&dir.join("events.jsonl"), &mut fold);
+        // What was still asked when it ended never came back: no worker
+        // of an ended run works.
+        let mut live = fold.live();
+        for (_, counts) in &mut live.phases {
+            counts.running = 0;
+        }
+        live.running = 0;
+        live.stopping = false;
+        let status = result["status"].as_str().unwrap_or("failed").to_owned();
+        let at = result["ended_ms"].as_u64().unwrap_or(live.started_ms);
+        let ran = Ran {
+            live,
+            ended: Some((status, at)),
+        };
+        ENDS.lock().unwrap().insert(dir, ran.clone());
+        return Some(ran);
+    }
+    let mut folds = FOLDS.lock().unwrap();
+    let fold = match folds.0.entry(dir.clone()) {
+        std::collections::hash_map::Entry::Occupied(fold) => fold.into_mut(),
+        std::collections::hash_map::Entry::Vacant(at) => at.insert(fresh(&dir)?),
+    };
+    read_on(&dir.join("events.jsonl"), fold);
+    if !fold.live.stopping {
+        fold.live.stopping = dir.join(STOP).exists();
+    }
+    Some(Ran {
+        live: fold.live(),
+        ended: None,
+    })
+}
+
+/// The words view's `└` row for a run a turn ran, `width` wide: `└ runs
+/// NAME  STRIP  19s` while it runs, `ran` once it ended, `stopped` once
+/// stopped, then `+N` for the turn's other runs; the name gives way
+/// before the strip. `now_ms` counts a running one's time. With where
+/// the name stands, its first and last column, while it runs: a link to
+/// its page.
+pub fn ran_row(
+    ran: &Ran,
+    more: usize,
+    now_ms: u64,
+    width: usize,
+) -> (Line<'static>, Option<(u16, u16)>) {
+    let live = &ran.live;
+    let (verb, to) = match &ran.ended {
+        None => ("runs", now_ms),
+        Some((status, at)) if status == "stopped" => ("stopped", *at),
+        Some((_, at)) => ("ran", *at),
+    };
+    let head = format!("└ {verb} ");
+    let took = crate::transcript::elapsed(to.saturating_sub(live.started_ms) / 1000);
+    let tail = match more {
+        0 => format!("  {took}"),
+        more => format!("  {took} +{more}"),
+    };
+    // The strip keeps its room before the name does: the name gets what
+    // is left, at least a few columns, and the strip fits in the rest.
+    const NAME_LEAST: usize = 8;
+    let fixed = head.width() + 2 + tail.width();
+    let name_least = live.name.width().min(NAME_LEAST);
+    let mut strip = strip(&live.phases, width.saturating_sub(fixed + name_least));
+    // A bar here is the cells alone: the run's page has the counts.
+    strip.retain(|span| !span.content.starts_with("  "));
+    let strip_wide: usize = strip.iter().map(|span| span.content.width()).sum();
+    let name = crate::transcript::cut(&live.name, width.saturating_sub(fixed + strip_wide).max(1));
+    let link = (ran.ended.is_none()).then(|| {
+        let from = head.width();
+        (from as u16, (from + name.width()) as u16)
+    });
+    let mut spans = vec![
+        Span::raw(head).dim(),
+        Span::raw(name).bold(),
+        Span::raw("  "),
+    ];
+    spans.extend(strip);
+    spans.push(Span::raw(tail).dim());
+    (Line::from(spans), link)
+}
+
 /// Fold what `journal` gained since `fold` last read it, to its last
 /// whole line.
 fn read_on(journal: &Path, fold: &mut Fold) {
@@ -596,6 +713,7 @@ pub fn plant(store: &Path, id: &str, caller: &str, name: &str, journal: &[Value]
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ratatui::style::Modifier;
     use serde_json::json;
 
     #[test]
@@ -801,5 +919,120 @@ mod tests {
         assert_eq!(split("shop.lead#wf-1a2b"), ("shop.lead", Some("1a2b")));
         assert_eq!(split("shop.lead"), ("shop.lead", None));
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_turn_s_run_row_is_its_name_strip_and_time_and_stays_as_it_ended() {
+        let live = Live {
+            name: "blind-role-eval-score".into(),
+            started_ms: 1_000,
+            phases: vec![
+                ("Find".into(), counts(3, 0, 0)),
+                ("Score".into(), counts(1, 0, 2)),
+            ],
+            ..Default::default()
+        };
+        let running = Ran {
+            live: live.clone(),
+            ended: None,
+        };
+        let (row, link) = ran_row(&running, 0, 20_000, 80);
+        assert_eq!(
+            row.to_string(),
+            "└ runs blind-role-eval-score  ✓✓✓ ✓●●  19s"
+        );
+        assert_eq!(link, Some((7, 28)));
+        assert!(row.spans[1].style.add_modifier.contains(Modifier::BOLD));
+        assert_eq!(row.spans[1].style.fg, None);
+        // A turn that ran more says so after the newest's time.
+        assert!(
+            ran_row(&running, 2, 20_000, 80)
+                .0
+                .to_string()
+                .ends_with("  19s +2")
+        );
+        // The name gives way before the strip.
+        assert_eq!(
+            ran_row(&running, 0, 20_000, 30).0.to_string(),
+            "└ runs blind-ro…  ✓✓✓ ✓●●  19s"
+        );
+        let ended = |status: &str, phases| Ran {
+            live: Live {
+                phases,
+                ..live.clone()
+            },
+            ended: Some((status.into(), 43_000)),
+        };
+        let done = vec![
+            ("Find".into(), counts(3, 0, 0)),
+            ("Score".into(), counts(2, 1, 0)),
+        ];
+        let (row, link) = ran_row(&ended("completed", done.clone()), 0, 99_000, 80);
+        assert_eq!(row.to_string(), "└ ran blind-role-eval-score  ✓✓✓ ✓✓✗  42s");
+        assert_eq!(link, None);
+        assert_eq!(
+            ran_row(&ended("failed", done.clone()), 0, 99_000, 80)
+                .0
+                .to_string(),
+            "└ ran blind-role-eval-score  ✓✓✓ ✓✓✗  42s"
+        );
+        assert_eq!(
+            ran_row(&ended("stopped", done), 0, 99_000, 80)
+                .0
+                .to_string(),
+            "└ stopped blind-role-eval-score  ✓✓✓ ✓✓✗  42s"
+        );
+        // Past 24 workers, the bar alone: the page has the counts.
+        let big = Ran {
+            live: Live {
+                name: "audit".into(),
+                started_ms: 1_000,
+                phases: vec![("Verify".into(), counts(31, 2, 12))],
+                ..Default::default()
+            },
+            ended: None,
+        };
+        assert_eq!(
+            ran_row(&big, 0, 20_000, 120).0.to_string(),
+            "└ runs audit  ✓✓✓✓✓✓✓✓✗●●●  19s"
+        );
+    }
+
+    #[test]
+    fn a_run_is_read_by_its_id_while_it_runs_and_once_whole_when_it_ended() {
+        let store = std::env::temp_dir()
+            .join(format!("sonny-wf-ran-{}", std::process::id()))
+            .join("store.db");
+        let dir = plant(
+            &store,
+            "ran12345",
+            "calc.lead",
+            "score",
+            &[
+                json!({"t": "phase", "title": "Find"}),
+                json!({"t": "asking", "key": "a", "phase": "Find"}),
+                json!({"t": "asking", "key": "b", "phase": "Find"}),
+                json!({"t": "agent", "key": "a", "phase": "Find", "value": 1}),
+            ],
+        );
+        let ran = ran(&store, "ran12345").unwrap();
+        assert_eq!(
+            (ran.live.name.as_str(), ran.ended.as_ref()),
+            ("score", None)
+        );
+        assert_eq!((ran.live.done, ran.live.running), (1, 1));
+        assert_eq!(super::ran(&store, "nosuchrun"), None);
+        assert_eq!(super::ran(&store, "../x"), None);
+        // Stopped with one still asked: it no longer works.
+        std::fs::write(
+            dir.join("result.json"),
+            json!({"status": "stopped", "ended_ms": 5_001}).to_string(),
+        )
+        .unwrap();
+        let ran = super::ran(&store, "ran12345").unwrap();
+        assert_eq!(ran.ended, Some(("stopped".into(), 5_001)));
+        assert_eq!((ran.live.done, ran.live.running), (1, 0));
+        assert_eq!(ran.live.phases, [("Find".to_owned(), counts(1, 0, 0))]);
+        std::fs::remove_dir_all(store.parent().unwrap()).unwrap();
     }
 }
