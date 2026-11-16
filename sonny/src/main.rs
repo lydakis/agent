@@ -3475,11 +3475,26 @@ impl Live {
     }
 }
 
+/// The words view's hints on the turn being drawn: who started it, when
+/// the person did not, for the `↳` row above its first words; what it
+/// set going, for the `└` row under its last; and whether it said any.
+#[derive(Debug, Default)]
+struct TurnHints {
+    /// The turn they are of: only its end draws them.
+    turn: Option<i64>,
+    came: Vec<String>,
+    set: Vec<started::SetGoing>,
+    replied: bool,
+}
+
 /// What the bot's words turned out to be once something followed them.
 #[derive(Clone, Copy, PartialEq)]
 enum Words {
     /// A step: a call came next.
     Step,
+    /// Words another message followed: drawn as a reply's, but no hint
+    /// hangs on them.
+    Said,
     /// The turn's reply, or words nothing told apart.
     Reply,
 }
@@ -4752,6 +4767,16 @@ struct App {
     tasks_all_read: Option<Instant>,
     /// The width the tasks started were drawn at.
     tasks_width: usize,
+    /// The words view's hints on the turn being drawn.
+    turn_hints: TurnHints,
+    /// The turn the oldest page drawn starts in: an older page ending in
+    /// it ends inside that turn, whose hints are its newer page's.
+    top_turn: Option<i64>,
+    /// The `└` rows drawn, by the client's number for each, with what
+    /// each names; and what the agents they name that are no task of
+    /// this window's are doing, read as a task's state is.
+    set_rows: BTreeMap<usize, Vec<started::SetGoing>>,
+    set_states: HashMap<String, String>,
     /// When what runs for this agent in the background was last read, for
     /// what of it failed.
     behind_read: Option<Instant>,
@@ -6407,6 +6432,10 @@ impl App {
             tasks_read: None,
             tasks_all_read: None,
             tasks_width: 0,
+            turn_hints: TurnHints::default(),
+            top_turn: None,
+            set_rows: BTreeMap::new(),
+            set_states: HashMap::new(),
         }
     }
 
@@ -7748,6 +7777,9 @@ impl App {
             if name == served::START && !failed {
                 self.track_started(arguments, output);
             }
+            if !failed {
+                self.set_going(name, arguments, output);
+            }
             return;
         }
         if name == margin::TOOL {
@@ -7945,11 +7977,7 @@ impl App {
     /// The task a `start_task` call made, its name known from now on.
     fn started_task(&mut self, arguments: &Value, output: &str) -> started::Task {
         let name = arguments["name"].as_str().unwrap_or("task").to_owned();
-        let bot = (output.split(|c: char| c.is_whitespace() || c == '"'))
-            .find(|word| calls::handle_parts(word).is_some())
-            .map(calls::handle_bot)
-            .or_else(|| (self.project.as_ref()).map(|project| format!("{project}.{name}")))
-            .unwrap_or_else(|| name.clone());
+        let bot = self.started_bot(arguments, output);
         let task = started::Task {
             bot,
             name,
@@ -7962,6 +7990,118 @@ impl App {
         self.screen.relink();
         self.tasks_read = None;
         task
+    }
+
+    /// The whole name of the task a `start_task` call started: as its
+    /// output says it, else its name in this project.
+    fn started_bot(&self, arguments: &Value, output: &str) -> String {
+        let name = arguments["name"].as_str().unwrap_or("task");
+        (output.split(|c: char| c.is_whitespace() || c == '"'))
+            .find(|word| calls::handle_parts(word).is_some())
+            .map(calls::handle_bot)
+            .or_else(|| (self.project.as_ref()).map(|project| format!("{project}.{name}")))
+            .unwrap_or_else(|| name.to_owned())
+    }
+
+    /// An agent's name as the words view's hints say it: short in its own
+    /// project, `halves` for `calc.halves`, else whole.
+    fn hint_name(&self, bot: &str) -> String {
+        (self.project.as_deref())
+            .and_then(|project| bot.strip_prefix(project)?.strip_prefix('.'))
+            .filter(|name| !name.is_empty())
+            .unwrap_or(bot)
+            .to_owned()
+    }
+
+    /// What a call of the turn being drawn set going, for the `└` row
+    /// under its reply, words only: a task it started, or a message it
+    /// sent an agent there already; each agent once.
+    fn set_going(&mut self, name: &str, arguments: &Value, output: &str) {
+        let (verb, bot, title) = match name {
+            served::START => (
+                started::STARTED,
+                self.started_bot(arguments, output),
+                arguments["brief"].as_str().unwrap_or(""),
+            ),
+            "send_message" => {
+                // One the daemon refused (no such agent) sent nothing.
+                if serde_json::from_str::<Value>(output)
+                    .is_ok_and(|reply| reply["error"].is_string())
+                {
+                    return;
+                }
+                let Some(to) = arguments["to"]
+                    .as_str()
+                    .map(str::trim)
+                    .filter(|to| !to.is_empty())
+                else {
+                    return;
+                };
+                // The daemon sends to `to` as written: its link opens that
+                // one, and only the label is shortened.
+                (
+                    started::SENT,
+                    to.to_owned(),
+                    arguments["message"].as_str().unwrap_or(""),
+                )
+            }
+            _ => return,
+        };
+        if self.turn_hints.set.iter().any(|one| one.bot == bot) {
+            return;
+        }
+        let going = started::SetGoing {
+            verb,
+            name: self.hint_name(&bot),
+            bot,
+            title: started::first(title),
+        };
+        self.turn_hints.set.push(going);
+    }
+
+    /// What `bot`, named on a `└` row, is doing: as the task this window
+    /// tracks, else as read for the row.
+    fn set_state(&self, bot: &str) -> String {
+        (self.tasks.values().flatten())
+            .find(|task| task.bot == bot)
+            .map(|task| task.state.clone())
+            .or_else(|| self.set_states.get(bot).cloned())
+            .unwrap_or_else(|| "working".to_owned())
+    }
+
+    /// The `└` row `at` and the buttons on it that open each agent it names.
+    fn set_row(&self, at: usize) -> (Line<'static>, screen::Buttons) {
+        let set = self.set_rows.get(&at).map_or(&[][..], Vec::as_slice);
+        let (line, links) = started::hint(set, |bot| self.set_state(bot), self.prose());
+        let buttons = (links.into_iter())
+            .map(|(from, to, bot)| (from, to, format!("{}task/{bot}", screen::BUTTON)))
+            .collect();
+        (line, buttons)
+    }
+
+    /// The turn drawn ends its hints: what it set going, a `└` row under
+    /// its last words, when it said any; a turn that said nothing draws
+    /// nothing.
+    fn end_hints(&mut self) {
+        let hints = std::mem::take(&mut self.turn_hints);
+        if !self.words() || !hints.replied || hints.set.is_empty() {
+            return;
+        }
+        let at = self.group();
+        self.set_rows.insert(at, hints.set);
+        let (line, buttons) = self.set_row(at);
+        self.commit_after(vec![line], false);
+        self.mark_last(screen::Mark::Tag(screen::Tag::SetGoing(at as u64)));
+        self.mark_last(screen::Mark::Buttons(buttons));
+    }
+
+    /// The `↳` row above the first words of a turn the person did not
+    /// start, naming who started it, words only; none once drawn, and
+    /// none for the person's own. Its words are said from here on.
+    fn came_row(&mut self) -> Option<Line<'static>> {
+        self.turn_hints.replied = true;
+        let came = std::mem::take(&mut self.turn_hints.came);
+        (self.words() && !came.is_empty()).then(|| transcript::came_row(&came, self.prose()))
     }
 
     /// The rows of the tasks started together as `at`, and the buttons
@@ -8020,15 +8160,26 @@ impl App {
         for at in gone {
             self.tasks.remove(&at);
         }
+        // `└` rows the conversation let go name nothing to read.
+        let gone: Vec<usize> = (self.set_rows.keys().copied())
+            .filter(|at| !self.kept(screen::Tag::SetGoing(*at as u64)))
+            .collect();
+        for at in gone {
+            self.set_rows.remove(&at);
+        }
         // Drawn again at the width the conversation has now, as when the
         // pane opened beside it.
-        if !self.tasks.is_empty() && self.tasks_width != self.prose() {
+        if !(self.tasks.is_empty() && self.set_rows.is_empty()) && self.tasks_width != self.prose()
+        {
             self.tasks_width = self.prose();
             for at in self.tasks.keys().copied().collect::<Vec<_>>() {
                 self.draw_started(at);
             }
+            for at in self.set_rows.keys().copied().collect::<Vec<_>>() {
+                self.draw_set_row(at);
+            }
         }
-        if self.tasks.is_empty()
+        if (self.tasks.is_empty() && self.set_rows.is_empty())
             || self
                 .tasks_read
                 .is_some_and(|at| at.elapsed() < Duration::from_secs(3))
@@ -8051,18 +8202,68 @@ impl App {
             .collect();
         bots.sort();
         bots.dedup();
-        if bots.is_empty() {
-            return;
-        }
+        // The agents `└` rows name that are no tasks here: what each is
+        // doing, read as a task's state is, and nothing more.
+        let named: HashMap<String, String> = (self.set_rows.values().flatten())
+            .map(|one| (one.bot.clone(), self.set_state(&one.bot)))
+            .collect();
+        let mut others: Vec<String> = (named.keys())
+            .filter(|bot| !(self.tasks.values().flatten()).any(|task| task.bot == **bot))
+            .filter(|bot| all || !started::settled(&named[*bot]))
+            .cloned()
+            .collect();
+        others.sort();
         // What waits on the person, read as every surface reads it.
+        let held = match bots.is_empty() && others.is_empty() {
+            true => None,
+            false => Some(needs::listing(&self.client, None).await),
+        };
+        let store = self.store();
+        // Those others wait on the person for a call held for approval, or
+        // the question their turn ended on.
+        let mut waiting = needs::Needs::default();
+        if let Some(Ok(held)) = &held {
+            waiting.held(held.clone(), |_| true);
+        }
+        for bot in others {
+            let state = match self.task_turn_at(&bot).await {
+                Ok((turn, _)) => {
+                    let state = started::state(&turn);
+                    if let (true, Some(last)) = (started::settled(&state), turn["turn"].as_i64()) {
+                        let seen = match self.asks_seen.get(&bot) {
+                            Some((at, seen)) if *at == last => Some(seen.clone()),
+                            _ => {
+                                let seen = needs::scan(&self.client, &bot, Some(last)).await;
+                                if let Some(seen) = &seen {
+                                    self.asks_seen.insert(bot.clone(), (last, seen.clone()));
+                                }
+                                seen
+                            }
+                        };
+                        if let Some(seen) = seen {
+                            waiting.asked(&bot, seen.open(&store, &bot, false));
+                        }
+                    }
+                    match waiting.waits(&bot) {
+                        true => "needs you".to_owned(),
+                        false => state,
+                    }
+                }
+                Err(error) if error.code == "bot_not_found" => "removed".to_owned(),
+                Err(_) => continue,
+            };
+            self.set_states.insert(bot, state);
+        }
+        let Some(held) = held.filter(|_| !bots.is_empty()) else {
+            self.redraw_set_rows(&named);
+            return;
+        };
         let mut needs = needs::Needs::default();
-        let held = needs::listing(&self.client, None).await;
         if let Ok(held) = &held {
             needs.held(held.clone(), |_| true);
         }
         let (mut read, mut ended) = (Vec::new(), Vec::new());
         let mut states = HashMap::new();
-        let store = self.store();
         // The tasks whose questions were read this pass.
         let mut asked = Vec::new();
         for bot in bots {
@@ -8155,6 +8356,30 @@ impl App {
                 self.draw_started(at);
             }
         }
+        self.redraw_set_rows(&named);
+    }
+
+    /// The `└` rows naming an agent whose state is no longer as `was`
+    /// had it, drawn again.
+    fn redraw_set_rows(&mut self, was: &HashMap<String, String>) {
+        let changed: Vec<usize> = (self.set_rows.iter())
+            .filter(|(_, set)| {
+                (set.iter()).any(|one| was.get(&one.bot) != Some(&self.set_state(&one.bot)))
+            })
+            .map(|(at, _)| *at)
+            .collect();
+        for at in changed {
+            self.draw_set_row(at);
+        }
+    }
+
+    /// The `└` row `at` drawn again where it is, with its agents' marks
+    /// as they are now.
+    fn draw_set_row(&mut self, at: usize) {
+        let (line, buttons) = self.set_row(at);
+        self.flush();
+        let tag = screen::Tag::SetGoing(at as u64);
+        (self.screen).replace_tagged(tag, vec![line], vec![(0, screen::Mark::Buttons(buttons))]);
     }
 
     /// The turn that says what `bot` does, as `/status` reads it
@@ -9312,8 +9537,20 @@ impl App {
     /// The bot's words at `node`, as replayed: their last row tagged,
     /// and the person's reactions to them right under it.
     fn commit_said(&mut self, node: i64, lines: Vec<Line<'static>>) {
+        self.commit_words(node, lines, true);
+    }
+
+    /// The bot's words at `node`, as replayed: a reply's, which a turn's
+    /// hints hang on, or a step's, which has none.
+    fn commit_words(&mut self, node: i64, lines: Vec<Line<'static>>, reply: bool) {
         let count = lines.len();
-        self.commit(lines);
+        match reply.then(|| self.came_row()).flatten() {
+            Some(came) => {
+                self.commit(vec![came]);
+                self.commit_after(lines, false);
+            }
+            None => self.commit(lines),
+        }
         self.mark_first(count);
         self.mark_last(screen::Mark::Tag(screen::Tag::End(node)));
         if let Some(row) = self.reacted_row(node) {
@@ -9403,6 +9640,15 @@ impl App {
     /// was written with, and what follows wears the project's whose agents
     /// alone sent it, if one followed project's did.
     fn bar_turn(&mut self, woke: Option<(&str, Option<&str>)>) {
+        self.end_hints();
+        if let Some((text, from)) = woke
+            && transcript::relays(text, from)
+        {
+            let came = transcript::came_names(text, from);
+            self.turn_hints.came = (came.into_iter())
+                .map(|name| self.hint_name(&name))
+                .collect();
+        }
         let names = match woke {
             Some((text, from)) if transcript::relays(text, from) => {
                 transcript::relayed_names(text, from)
@@ -9847,6 +10093,7 @@ impl App {
         // The open questions are those the replay asks and does not answer.
         let from_start = self.seen_node == 0 || after < self.seen_node;
         if from_start {
+            self.top_turn = None;
             self.bot_reactions.clear();
             self.react_calls.clear();
             self.answering = None;
@@ -9950,6 +10197,11 @@ impl App {
         mut caught_up: Option<HashMap<String, Value>>,
     ) -> Vec<(i64, Value)> {
         let short = self.short_read.replace(false);
+        // An older page's turns end their own hints, apart from the newest's.
+        let hints = match older {
+            true => Some(std::mem::take(&mut self.turn_hints)),
+            false => None,
+        };
         let mut calls: HashMap<String, (String, Value)> = HashMap::new();
         let mut unpaired = Vec::new();
         // The bot's words, quiet if a call follows them, as they were live.
@@ -9963,7 +10215,11 @@ impl App {
         // the turn's own prompt says who started it, and with project
         // colors whose project its rows are about.
         let colored = !self.palette().is_empty();
-        if (self.zen.is_some() || colored)
+        // The first message of the turn the page starts in, as its prompt
+        // reads, when only the words view's `↳` asked for it.
+        let mut opening: Option<(i64, String)> = None;
+        // In words, who started it, for the `↳` over its reply.
+        if (self.zen.is_some() || colored || self.words())
             && let Some(&turn) = nodes.first().and_then(|node| turns.get(node))
             && let Ok(read) = (self.client)
                 .request(
@@ -9990,11 +10246,34 @@ impl App {
             if self.zen.is_some() {
                 aside = prompts.first().is_some_and(relays) && prompts.iter().all(relays);
             }
+            // The turn this window was following when it lost the daemon
+            // keeps what it already heard: its replay starts past those calls.
+            let kept = match !older && self.running.as_ref().is_some_and(|r| r.turn == turn) {
+                true => std::mem::take(&mut self.turn_hints),
+                false => TurnHints::default(),
+            };
+            let heard = !(kept.came.is_empty() && kept.set.is_empty() && !kept.replied);
             // Its first message, before the page, says what the turn is
             // about; the steers the page holds say the rest.
             if colored && let Some((text, from)) = prompts.first().map(said) {
                 self.bar_turn(Some((&text, from.as_deref())));
+            } else if let Some((text, from)) = prompts.first().map(said) {
+                if transcript::relays(&text, from.as_deref()) {
+                    let came = transcript::came_names(&text, from.as_deref());
+                    self.turn_hints.came = (came.into_iter())
+                        .map(|name| self.hint_name(&name))
+                        .collect();
+                }
+                // The page may start at that message itself: it still
+                // begins the turn, and a later one steers it.
+                if !(self.zen.is_some() || colored) {
+                    opening = Some((turn, text));
+                }
             }
+            if heard {
+                self.turn_hints = kept;
+            }
+            self.turn_hints.turn = Some(turn);
             began.insert(turn);
         }
         // A chunk read at a time, what it held let go before the next.
@@ -10012,11 +10291,19 @@ impl App {
                 // A reaction leaves the words before it as they were.
                 let call = item["type"] == "function_call" && item["name"] != reactions::TOOL;
                 if let Some((at, lines)) = said.take_if(|_| call || item["role"].is_string()) {
-                    let lines = match call {
-                        true => transcript::quiet(lines),
-                        false => lines,
-                    };
-                    self.commit_said(at, lines);
+                    // Words a call followed are a step, and words another
+                    // message or a steer of the same turn followed are not
+                    // the reply: no hint hangs on either.
+                    let steer = item["role"] == "user"
+                        && !reactions::is_reaction(&text(&item))
+                        && turns
+                            .get(&node)
+                            .is_some_and(|turn| turns.get(&at) == Some(turn));
+                    match (call, item["role"] == "assistant" || steer) {
+                        (true, _) => self.commit_words(at, transcript::quiet(lines), false),
+                        (false, true) => self.commit_words(at, lines, false),
+                        (false, false) => self.commit_said(at, lines),
+                    }
                 }
                 match (item["type"].as_str(), item["role"].as_str()) {
                     // A reaction is drawn under the reply it answers.
@@ -10027,15 +10314,23 @@ impl App {
                     }
                     (_, Some("user")) => {
                         let turn = turns.get(&node).copied();
-                        let first = turn.is_none_or(|turn| began.insert(turn));
                         let (said, from) = (text(&item), item["from"].as_str());
+                        let opens = opening.take_if(|(at, text)| {
+                            Some(*at) == turn && !text.is_empty() && said.starts_with(text.as_str())
+                        });
+                        let first = opens.is_some() || turn.is_none_or(|turn| began.insert(turn));
+                        // Only the page's first message can be the turn's.
+                        opening = None;
                         match transcript::relays(&said, from) {
                             false => aside = false,
                             true if first => aside = true,
                             true => {}
                         }
                         match first {
-                            true => self.bar_turn(Some((&said, from))),
+                            true => {
+                                self.bar_turn(Some((&said, from)));
+                                self.turn_hints.turn = turn;
+                            }
                             false => self.bar_steered(&said, from),
                         }
                         // The bot's reactions to the message before, as they
@@ -10183,6 +10478,23 @@ impl App {
         }
         if let Some((at, lines)) = said {
             self.commit_said(at, lines);
+        }
+        // The newest page's turn, still running, ends its hints when it
+        // ends: the page's end is not the turn's. An older page ending in
+        // the turn the newer one starts in leaves its hints to that page.
+        let turn_of = |node: Option<&i64>| node.and_then(|node| turns.get(node)).copied();
+        let continues = turn_of(nodes.last()).is_some_and(|turn| Some(turn) == self.top_turn);
+        if older || self.top_turn.is_none() {
+            self.top_turn = turn_of(nodes.first());
+        }
+        match hints {
+            Some(hints) if continues => self.turn_hints = hints,
+            Some(hints) => {
+                self.end_hints();
+                self.turn_hints = hints;
+            }
+            None if self.running.is_none() => self.end_hints(),
+            None => {}
         }
         if !older {
             self.elsewhere = aside;
@@ -10463,7 +10775,7 @@ impl App {
             self.rows_drawn,
             self.live.as_ref().is_some_and(|l| l.spilled),
         );
-        self.end_live(Words::Reply);
+        self.end_live(Words::Said);
         if self.rows_drawn > drawn || spilled {
             self.mark_last(screen::Mark::Tag(screen::Tag::Streamed(item)));
         }
@@ -10493,11 +10805,20 @@ impl App {
     }
 
     fn write_words(&mut self, live: Live, words: Words) {
+        // Only the turn's reply wears its hints, never a step's words; a
+        // reply written as it came (all its rows already out) is under its
+        // `└` but has no `↳`.
+        if live.spilled && words == Words::Reply {
+            drop(self.came_row());
+        }
         if live.rows.is_empty() {
             return;
         }
         if live.gap && !live.spilled {
             self.pending.push(Line::default());
+        }
+        if !live.spilled && words == Words::Reply {
+            self.came_above();
         }
         if !live.spilled {
             self.marks.push((self.pending.len(), screen::Mark::Opens));
@@ -10505,7 +10826,7 @@ impl App {
         self.rows_drawn += live.rows.len();
         self.pending.extend(match words {
             Words::Step => transcript::quiet(live.rows),
-            Words::Reply => live.rows,
+            Words::Said | Words::Reply => live.rows,
         });
         self.any_history = true;
         if let Some(node) = live.node {
@@ -10516,6 +10837,15 @@ impl App {
                 self.mark_last(screen::Mark::Tag(screen::Tag::Reactions(node)));
                 self.mark_last(screen::Mark::Buttons(self.reacted_buttons(node)));
             }
+        }
+    }
+
+    /// The `↳` row, when the words about to be written have one, right
+    /// above them.
+    fn came_above(&mut self) {
+        if let Some(came) = self.came_row() {
+            self.rows_drawn += 1;
+            self.pending.push(came);
         }
     }
 
@@ -10536,6 +10866,8 @@ impl App {
             if live.gap && !live.spilled {
                 self.pending.push(Line::default());
             }
+            // Not yet known to be the reply, they wear no `↳`: a call may
+            // still make them a step's.
             if !live.spilled {
                 self.marks.push((self.pending.len(), screen::Mark::Opens));
             }
@@ -10687,6 +11019,7 @@ impl App {
                         .as_ref()
                         .map(|item| (text(item), item["from"].as_str()));
                     self.bar_turn(woke.as_ref().map(|(said, from)| (said.as_str(), *from)));
+                    self.turn_hints.turn = turn;
                 }
                 if let Some(node) = data["node"].as_i64()
                     && let Some(item) = &woke
@@ -10711,7 +11044,8 @@ impl App {
                     && !self.note_closed(node, &text(item))
                     && !quiet_message(&text(item))
                 {
-                    self.end_live(Words::Reply);
+                    // The turn goes on: what it said so far is not its reply.
+                    self.end_live(Words::Said);
                     // What the bot reacted with so far answered the
                     // message before this one.
                     self.draw_bot_reactions();
@@ -10935,7 +11269,7 @@ impl App {
                 // does, part of it in the scrollback already; the notice
                 // says the agent did not keep it.
                 self.live_item = None;
-                self.end_live(Words::Reply);
+                self.end_live(Words::Said);
                 self.ahead.clear();
                 self.streamed = false;
                 self.said.clear();
@@ -10957,7 +11291,7 @@ impl App {
                 // the message being streamed.
                 self.live_item = None;
                 if !self.ahead.is_empty() {
-                    self.end_live(Words::Reply);
+                    self.end_live(Words::Said);
                     self.ahead.clear();
                     self.streamed = false;
                     self.said.clear();
@@ -11298,6 +11632,11 @@ impl App {
                         }
                         self.commit(line);
                     }
+                }
+                // Another turn's hints, when reconnecting heard the next
+                // turn begin before this one's end, wait for that turn's.
+                if self.turn_hints.turn.is_none_or(|of| Some(of) == turn) {
+                    self.end_hints();
                 }
                 self.draw_bot_reactions();
                 // A task that marked itself done in it, or its lead did.
@@ -21934,14 +22273,16 @@ mod tests {
         assert_eq!(rows[at("Rounding now")].0, None);
         assert_eq!(rows[at("Pushed as")].0, None);
         // A message from shop's agent, and calc's task news, each bar the
-        // reply they woke, with no name added; the gap above each stays
-        // bare, so two replies read as two.
+        // reply they woke and the `↳` row over it naming who; the gap
+        // above each stays bare, so two replies read as two.
         let shop = at("Noted what shop.fix said.");
         assert_eq!(rows[shop], (Some(0), "• Noted what shop.fix said.".into()));
-        assert_eq!(rows[shop - 1], (None, String::new()));
+        assert_eq!(rows[shop - 1], (Some(0), "↳ shop.fix".into()));
+        assert_eq!(rows[shop - 2], (None, String::new()));
         let calc = at("calc.neg is done.");
         assert_eq!(rows[calc], (Some(1), "• calc.neg is done.".into()));
-        assert_eq!(rows[calc - 1], (None, String::new()));
+        assert_eq!(rows[calc - 1], (Some(1), "↳ calc.neg".into()));
+        assert_eq!(rows[calc - 2], (None, String::new()));
         // Off, nothing is barred.
         let mut app = super::tests::app(zen_daemon().await);
         app.width = 100;
@@ -23760,6 +24101,360 @@ mod tests {
         app.daemon(turn_event("turn_finished", 2, json!({"status": "failed"})))
             .await;
         assert_eq!(rows(&app)[2], "failed for 0s");
+    }
+
+    #[tokio::test]
+    async fn words_only_hangs_who_started_a_turn_and_what_it_set_going_on_its_reply() {
+        let client = daemon_answering(|asked| {
+            let item = match asked["nodes"][0].as_i64() {
+                Some(7) => json!({"type": "message", "role": "user", "from": "calc.halves",
+                    "content": [{"type": "input_text", "text": "Half cents round to even."}]}),
+                Some(8) => json!({"type": "message", "role": "assistant",
+                    "content": [{"type": "output_text", "text": "Two tasks check the rest."}]}),
+                _ => return json!({}),
+            };
+            json!({"items": [{"node": asked["nodes"][0], "item": item}]})
+        })
+        .await;
+        let mut app = app(client);
+        app.words_only = true;
+        app.any_history = true;
+        app.width = 120;
+        app.project = Some("calc".into());
+        let rows = |app: &App| -> Vec<String> {
+            (app.pending.iter())
+                .map(|line| line.to_string())
+                .filter(|row| !row.trim().is_empty())
+                .collect()
+        };
+        // A turn a task's message started: who above the reply, what it
+        // started and sent under it.
+        app.daemon(turn_event("accepted", 1, json!({"node": 7})))
+            .await;
+        let start = json!({"name": "readme", "brief": "Say how cents round\nmore"});
+        app.commit_call("s1", Some(1), served::START, &start, "calc.readme/1", false);
+        let send = json!({"to": "calc.fix", "message": "Check div too.\nThanks"});
+        app.commit_call("m1", Some(1), "send_message", &send, "{}", false);
+        // Sent as written: a bot outside the project is not taken for one in it.
+        let outside = json!({"to": "reviewer", "message": "Look too"});
+        app.commit_call("m4", Some(1), "send_message", &outside, "{}", false);
+        // One the daemon refused sent nothing.
+        let none = json!({"to": "nobody", "message": "Hi"});
+        let refused = r#"{"detail":null,"error":"bot_not_found"}"#;
+        app.commit_call("m2", Some(1), "send_message", &none, refused, false);
+        let said = json!({"event": "text_delta", "bot": "b", "turn": 1,
+            "text": "Two tasks check the rest."});
+        app.daemon(said).await;
+        app.daemon(turn_event("message", 1, json!({"node": 8})))
+            .await;
+        app.daemon(turn_event(
+            "turn_finished",
+            1,
+            json!({"status": "completed"}),
+        ))
+        .await;
+        assert_eq!(
+            rows(&app),
+            [
+                "↳ halves",
+                "• Two tasks check the rest.",
+                "└ started ◌ readme · sent to ● fix · ● reviewer",
+            ]
+        );
+        // Right above and under the reply, and each name opens its agent.
+        let at = app.pending.len() - 1;
+        let buttons = (app.marks.iter())
+            .find_map(|(row, mark)| match mark {
+                screen::Mark::Buttons(buttons) if *row == at => Some(buttons.clone()),
+                _ => None,
+            })
+            .unwrap();
+        let opens: Vec<&str> = buttons.iter().map(|(_, _, to)| to.as_str()).collect();
+        assert_eq!(
+            opens,
+            [
+                "sonny:task/calc.readme",
+                "sonny:task/calc.fix",
+                "sonny:task/reviewer"
+            ]
+        );
+        // A turn that says nothing draws nothing, whatever it started.
+        app.daemon(turn_event("accepted", 2, json!({}))).await;
+        let start = json!({"name": "quiet", "brief": "Nothing"});
+        app.commit_call("s2", Some(2), served::START, &start, "calc.quiet/1", false);
+        app.daemon(turn_event(
+            "turn_finished",
+            2,
+            json!({"status": "completed"}),
+        ))
+        .await;
+        assert_eq!(rows(&app).len(), 3);
+        // The steps view draws its own rows, and no hint.
+        app.words_only = false;
+        app.daemon(turn_event("accepted", 3, json!({}))).await;
+        app.commit_call("m3", Some(3), "send_message", &send, "{}", false);
+        let said = json!({"event": "text_delta", "bot": "b", "turn": 3, "text": "Sent."});
+        app.daemon(said).await;
+        app.daemon(turn_event(
+            "turn_finished",
+            3,
+            json!({"status": "completed"}),
+        ))
+        .await;
+        assert_eq!(
+            rows(&app)[3..],
+            ["• Steered calc.fix ▸", "Worked for 0s", "• Sent."]
+        );
+    }
+
+    #[tokio::test]
+    async fn only_a_turns_final_reply_wears_its_hints_merged_into_one_row() {
+        let client = daemon_answering(|asked| match asked["nodes"][0].as_i64() {
+            Some(7) => json!({"items": [{"node": 7, "item": {"type": "message",
+                "role": "user", "from": "calc.halves",
+                "content": [{"type": "input_text", "text": "Half cents round to even."}]}}]}),
+            _ => json!({}),
+        })
+        .await;
+        let mut app = app(client);
+        app.words_only = true;
+        app.any_history = true;
+        app.width = 120;
+        app.project = Some("calc".into());
+        let rows = |app: &App| -> Vec<String> {
+            (app.pending.iter())
+                .map(|line| line.to_string())
+                .filter(|row| !row.trim().is_empty())
+                .collect()
+        };
+        app.daemon(turn_event("accepted", 1, json!({"node": 7})))
+            .await;
+        // Words partway through, a call after each: steps, no hints.
+        for (at, (words, id)) in [("Checking first.", "m1"), ("Now the readme.", "s1")]
+            .into_iter()
+            .enumerate()
+        {
+            let said = json!({"event": "text_delta", "bot": "b", "turn": 1, "text": words});
+            app.daemon(said).await;
+            let started = json!({"name": "send_message", "call_id": id});
+            app.daemon(turn_event("tool_started", 1, started)).await;
+            if at == 0 {
+                let send = json!({"to": "calc.fix", "message": "Check div too."});
+                app.commit_call("m1", Some(1), "send_message", &send, "{}", false);
+                let send = json!({"to": "calc.neg", "message": "And negatives."});
+                app.commit_call("m2", Some(1), "send_message", &send, "{}", false);
+            } else {
+                let start = json!({"name": "readme", "brief": "Say how cents round"});
+                app.commit_call("s1", Some(1), served::START, &start, "calc.readme/1", false);
+            }
+        }
+        let said = json!({"event": "text_delta", "bot": "b", "turn": 1,
+            "text": "Two agents check the rest."});
+        app.daemon(said).await;
+        app.daemon(turn_event(
+            "turn_finished",
+            1,
+            json!({"status": "completed"}),
+        ))
+        .await;
+        // One ↳ above the final reply and one └ under it, everything the
+        // turn set going in it.
+        assert_eq!(
+            rows(&app),
+            [
+                "• Checking first.",
+                "• Now the readme.",
+                "↳ halves",
+                "• Two agents check the rest.",
+                "└ sent to ● fix · ● neg · started ◌ readme",
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn words_another_message_followed_wear_no_hint_and_a_long_reply_keeps_its_row() {
+        let client = daemon_answering(|asked| match asked["nodes"][0].as_i64() {
+            Some(7) => json!({"items": [{"node": 7, "item": {"type": "message",
+                "role": "user", "from": "calc.halves",
+                "content": [{"type": "input_text", "text": "Half cents round to even."}]}}]}),
+            Some(13) => json!({"items": [{"node": 13, "item": {"type": "message",
+                "role": "user", "from": "calc.halves",
+                "content": [{"type": "input_text", "text": "Halves are done."}]}}]}),
+            Some(15) => json!({"items": [{"node": 15, "item": {"type": "message",
+                "role": "user", "content": [{"type": "input_text", "text": "Also negatives."}]}}]}),
+            Some(node @ (21 | 23)) => json!({"items": [{"node": node, "item": {"type": "message",
+                "role": "user", "from": "calc.halves",
+                "content": [{"type": "input_text", "text": "Check refunds."}]}}]}),
+            _ => json!({}),
+        })
+        .await;
+        let mut app = app(client);
+        app.words_only = true;
+        app.any_history = true;
+        app.width = 120;
+        app.height = 8;
+        app.project = Some("calc".into());
+        let rows = |app: &App| -> Vec<String> {
+            (app.pending.iter())
+                .map(|line| line.to_string())
+                .filter(|row| !row.trim().is_empty())
+                .collect()
+        };
+        app.daemon(turn_event("accepted", 1, json!({"node": 7})))
+            .await;
+        // Two messages, then a call: neither is the reply.
+        for (item, words) in [(1, "First thoughts."), (2, "More.")] {
+            let said = json!({"event": "text_delta", "bot": "b", "turn": 1,
+                "item": item, "text": words});
+            app.daemon(said).await;
+        }
+        let started = json!({"name": "send_message", "call_id": "m1"});
+        app.daemon(turn_event("tool_started", 1, started)).await;
+        let send = json!({"to": "calc.fix", "message": "Check div too."});
+        app.commit_call("m1", Some(1), "send_message", &send, "{}", false);
+        let said = json!({"event": "text_delta", "bot": "b", "turn": 1,
+            "item": 3, "text": "Sent."});
+        app.daemon(said).await;
+        app.daemon(turn_event(
+            "turn_finished",
+            1,
+            json!({"status": "completed"}),
+        ))
+        .await;
+        assert_eq!(
+            rows(&app),
+            [
+                "• First thoughts.",
+                "• More.",
+                "↳ halves",
+                "• Sent.",
+                "└ sent to ● fix · Check div too."
+            ]
+        );
+        // A reply longer than half the screen, written as it came, still
+        // has the turn's row under it.
+        app.pending.clear();
+        app.daemon(turn_event("accepted", 2, json!({"node": 9})))
+            .await;
+        let start = json!({"name": "readme", "brief": "Say how cents round"});
+        let started = json!({"name": served::START, "call_id": "s1"});
+        app.daemon(turn_event("tool_started", 2, started)).await;
+        app.commit_call("s1", Some(2), served::START, &start, "calc.readme/1", false);
+        let long = (1..=12)
+            .map(|n| format!("Line {n}.\n\n"))
+            .collect::<String>();
+        let said = json!({"event": "text_delta", "bot": "b", "turn": 2, "text": long});
+        app.daemon(said).await;
+        app.daemon(turn_event(
+            "turn_finished",
+            2,
+            json!({"status": "completed"}),
+        ))
+        .await;
+        let shown = rows(&app);
+        assert_eq!(
+            shown.last().map(String::as_str),
+            Some("└ started ◌ readme · Say how cents round")
+        );
+        assert!(!shown.iter().any(|row| row.starts_with('↳')));
+        // Words a steer of the same turn followed are not its reply.
+        app.pending.clear();
+        app.height = 40;
+        app.daemon(turn_event("accepted", 3, json!({"node": 13})))
+            .await;
+        let said = json!({"event": "text_delta", "bot": "b", "turn": 3, "text": "Partly done."});
+        app.daemon(said).await;
+        app.daemon(turn_event("steered", 3, json!({"node": 15})))
+            .await;
+        let said = json!({"event": "text_delta", "bot": "b", "turn": 3, "text": "All done."});
+        app.daemon(said).await;
+        app.daemon(turn_event(
+            "turn_finished",
+            3,
+            json!({"status": "completed"}),
+        ))
+        .await;
+        let shown = rows(&app);
+        let at = |row: &str| {
+            shown
+                .iter()
+                .position(|r| r == row)
+                .unwrap_or_else(|| panic!("{row} in {shown:?}"))
+        };
+        assert_eq!(
+            shown.iter().filter(|r| r.starts_with('↳')).count(),
+            1,
+            "{shown:?}"
+        );
+        assert_eq!(at("↳ halves") + 1, at("• All done."), "{shown:?}");
+        // A turn's end draws only its own hints: reconnecting can hear
+        // the next turn begin before the last one's end.
+        app.pending.clear();
+        app.daemon(turn_event("accepted", 4, json!({"node": 17})))
+            .await;
+        app.daemon(turn_event("accepted", 5, json!({"node": 19})))
+            .await;
+        let start = json!({"name": "docs", "brief": "Write the docs"});
+        app.commit_call("s5", Some(5), served::START, &start, "calc.docs/1", false);
+        // As reconnecting leaves it: still following the turn that ended.
+        app.running.as_mut().unwrap().turn = 4;
+        app.daemon(turn_event(
+            "turn_finished",
+            4,
+            json!({"status": "completed"}),
+        ))
+        .await;
+        let said = json!({"event": "text_delta", "bot": "b", "turn": 5, "text": "Docs started."});
+        app.daemon(said).await;
+        app.daemon(turn_event(
+            "turn_finished",
+            5,
+            json!({"status": "completed"}),
+        ))
+        .await;
+        let shown = rows(&app);
+        assert_eq!(
+            shown.last().map(String::as_str),
+            Some("└ started ◌ docs · Write the docs"),
+            "{shown:?}"
+        );
+        // Words the model's output limit cut, or a retry dropped, are not
+        // the reply either: the daemon goes on with the turn.
+        for (turn, event, node) in [(6, "dropped", 21), (7, "retry", 23)] {
+            app.pending.clear();
+            app.daemon(turn_event("accepted", turn, json!({"node": node})))
+                .await;
+            let said = json!({"event": "text_delta", "bot": "b", "turn": turn,
+                "item": 1, "text": "Cut sh"});
+            app.daemon(said).await;
+            if event == "retry" {
+                let ahead = json!({"event": "text_delta", "bot": "b", "turn": turn,
+                    "item": 2, "text": "ort."});
+                app.daemon(ahead).await;
+            }
+            app.daemon(turn_event(event, turn, json!({}))).await;
+            let said = json!({"event": "text_delta", "bot": "b", "turn": turn,
+                "item": 1, "text": "Whole reply."});
+            app.daemon(said).await;
+            app.daemon(turn_event(
+                "turn_finished",
+                turn,
+                json!({"status": "completed"}),
+            ))
+            .await;
+            let shown = rows(&app);
+            let at = |row: &str| shown.iter().position(|r| r == row);
+            assert_eq!(
+                shown.iter().filter(|r| r.starts_with('↳')).count(),
+                1,
+                "{event}: {shown:?}"
+            );
+            assert_eq!(
+                at("↳ halves").map(|at| at + 1),
+                at("• Whole reply."),
+                "{event}: {shown:?}"
+            );
+        }
     }
 
     #[tokio::test]

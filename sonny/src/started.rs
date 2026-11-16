@@ -109,6 +109,81 @@ pub fn draw(tasks: &[Task], width: usize) -> Vec<(Line<'static>, Option<usize>)>
     out
 }
 
+/// One thing a turn set going, for the `└` row under its reply: a task
+/// it `started`, or an agent there already it `sent to`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SetGoing {
+    pub verb: &'static str,
+    /// The bot's whole name, `shop.fix`, which its link opens.
+    pub bot: String,
+    /// Its name as the conversation says it, `fix`.
+    pub name: String,
+    /// Its title: a started task's brief's first line, or the first line
+    /// of the message sent.
+    pub title: String,
+}
+
+/// The `└` row under a reply: what its turn set going, `width` wide, each
+/// name with its state's mark before it, as `state` reads it; and where
+/// each name is on the row, with the bot it opens. With one task and
+/// room left its title follows; names give way to `+N`.
+pub fn hint(
+    set: &[SetGoing],
+    state: impl Fn(&str) -> String,
+    width: usize,
+) -> (Line<'static>, Vec<(u16, u16, String)>) {
+    // How many names fit: each drawn group is `verb ● name · ● name`.
+    let draw = |shown: usize| {
+        let mut spans = vec![Span::raw("└ ").dim()];
+        let mut links = Vec::new();
+        let mut column = 2;
+        let mut verb = None;
+        for (at, one) in set.iter().take(shown).enumerate() {
+            let words = match verb == Some(one.verb) {
+                true => " · ".to_owned(),
+                false if at == 0 => format!("{} ", one.verb),
+                false => format!(" · {} ", one.verb),
+            };
+            verb = Some(one.verb);
+            column += words.width();
+            spans.push(Span::raw(words).dim());
+            spans.push(crate::status::sign(&state(&one.bot)));
+            spans.push(Span::raw(" "));
+            column += 2;
+            let wide = one.name.width();
+            spans.push(Span::raw(one.name.clone()).fg(Color::Blue));
+            links.push((column as u16, (column + wide) as u16, one.bot.clone()));
+            column += wide;
+        }
+        if shown < set.len() {
+            let more = format!(" +{}", set.len() - shown);
+            column += more.width();
+            spans.push(Span::raw(more).dim());
+        }
+        (spans, links, column)
+    };
+    let mut shown = set.len();
+    let (mut spans, mut links, mut column) = draw(shown);
+    while column > width && shown > 1 {
+        shown -= 1;
+        (spans, links, column) = draw(shown);
+    }
+    // One alone, and room for its title.
+    if let [one] = set
+        && !one.title.is_empty()
+        && column + 3 + 8 <= width
+    {
+        spans.push(Span::raw(format!(" · {}", cut(&one.title, width - column - 3))).dim());
+    }
+    (Line::from(spans), links)
+}
+
+/// The verb of a task a turn started.
+pub const STARTED: &str = "started";
+
+/// The verb of a message a turn sent an agent there already.
+pub const SENT: &str = "sent to";
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -125,6 +200,46 @@ mod tests {
 
     fn texts(rows: Vec<(Line<'static>, Option<usize>)>) -> Vec<String> {
         rows.into_iter().map(|(line, _)| line.to_string()).collect()
+    }
+
+    #[test]
+    fn the_hint_names_what_a_turn_set_going_with_marks_and_gives_way_to_a_count() {
+        let one = |verb, name: &str, title: &str| SetGoing {
+            verb,
+            bot: format!("calc.{name}"),
+            name: name.into(),
+            title: title.into(),
+        };
+        let working = |_: &str| "working".to_owned();
+        let set = [one(STARTED, "halves", "Add a test for half cents")];
+        let (row, links) = hint(&set, working, 80);
+        assert_eq!(
+            row.to_string(),
+            "└ started ● halves · Add a test for half cents"
+        );
+        assert_eq!(links, [(12, 18, "calc.halves".to_owned())]);
+        // No room for the title: the name alone.
+        assert_eq!(hint(&set, working, 24).0.to_string(), "└ started ● halves");
+        let set = [
+            one(STARTED, "halves", "Add a test"),
+            one(STARTED, "readme", "Say how"),
+            one(SENT, "fix", ""),
+        ];
+        let (row, links) = hint(&set, working, 80);
+        assert_eq!(
+            row.to_string(),
+            "└ started ● halves · ● readme · sent to ● fix"
+        );
+        assert_eq!(links[2], (42, 45, "calc.fix".to_owned()));
+        // Too narrow: names give way to a count.
+        assert_eq!(
+            hint(&set, working, 32).0.to_string(),
+            "└ started ● halves · ● readme +1"
+        );
+        assert_eq!(
+            hint(&set, |_| "idle".into(), 24).0.to_string(),
+            "└ started ○ halves +2"
+        );
     }
 
     #[test]
