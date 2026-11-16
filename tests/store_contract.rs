@@ -14762,6 +14762,51 @@ fn a_bot_without_read_stores_no_stubs() {
 }
 
 #[test]
+fn a_bot_whose_read_is_kept_for_steps_stores_no_stubs() {
+    // Its model is not shown `read`, so it could not follow a stub either.
+    let path = std::env::temp_dir().join(format!("agent-steps-read-{}.sqlite", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+    let mut db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
+    let tools = vec!["shell".to_owned(), "read".to_owned()];
+    db.create(
+        "Bob",
+        Some("/synthetic"),
+        Binding {
+            tools: &tools,
+            settings: Settings {
+                steps_only: Some(vec!["read".into()]),
+                ..Default::default()
+            },
+            ..binding()
+        },
+    )
+    .unwrap();
+    let turn = db
+        .begin(
+            "Bob",
+            "r1",
+            "task",
+            true,
+            &TurnOptions::default(),
+            allow_provider,
+        )
+        .unwrap()
+        .turn;
+    exchange(&mut db, turn, "c0", &lines(0, 400));
+    exchange(&mut db, turn, "c1", &lines(1, 400));
+    let stored = |sql: &str| -> i64 {
+        Connection::open(&path)
+            .unwrap()
+            .query_row(sql, [], |r| r.get(0))
+            .unwrap()
+    };
+    assert_eq!(stored("SELECT count(*) FROM stubs"), 0);
+    assert_eq!(stored("SELECT count(*) FROM nodes WHERE elided>0"), 0);
+    drop(db);
+    std::fs::remove_file(path).unwrap();
+}
+
+#[test]
 fn a_result_s_text_parts_elide_together() {
     // A short output then a long text part: the stub counts and quotes
     // the whole text, as a read of the result returns it.

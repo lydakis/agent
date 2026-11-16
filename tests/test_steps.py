@@ -669,6 +669,22 @@ class DaemonStepTests(ModelFixture):
         refused = client.request('configure', bot='Maker', settings={'steps_only': ['shell', 'shell']})
         self.assertEqual(refused['error'], 'invalid_setting')
 
+    def test_a_direct_call_of_a_hidden_client_tool_never_reaches_its_client(self):
+        lookup = {'name': 'lookup', 'description': 'Look up.', 'answered_by': 'sonny',
+                  'parameters': {'type': 'object', 'properties': {}, 'additionalProperties': False}}
+        client = self.client('echo')
+        client.request('create', bot='Lead', workspace=str(self.path), tools=['echo'],
+                       declare=[EXEC, lookup], settings={'steps_only': ['lookup']})
+        prompt = 'calls:' + json.dumps([['lookup', {}]])
+        turn = client.request('submit', bot='Lead', request_id='h', prompt=prompt)['result']['message']
+        self.assertEqual(client.finished(turn)['data']['status'], 'completed')
+        [started] = self.events(client, turn, 'tool_started')
+        self.assertNotIn('answered_by', started)
+        self.assertEqual(client.request('tool_calls', tag='sonny')['result']['calls'], [])
+        [done] = self.events(client, turn, 'tool_completed')
+        output = node_item(client, 'Lead', done['node'])['result']['output']
+        self.assertEqual(json.loads(output)['error'], 'tool_not_available')
+
     def test_tools_lists_each_tool_s_schema_and_whether_it_runs_as_a_step(self):
         client = self.client('echo,shell,read,history')
         tools = {t['name']: t for t in client.request('tools')['result']['tools']}

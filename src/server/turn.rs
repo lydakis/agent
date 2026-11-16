@@ -3159,7 +3159,7 @@ impl Turn {
         )?;
         // A stub names the `read` call that returns its result, so only a
         // bot whose model can make that call elides.
-        let elides = record.tools.iter().any(|tool| tool == "read") && !record.steps_only("read");
+        let elides = record.follows_stubs();
         // How a steer stayed queued for lack of room, while one still is.
         let mut capped = None;
         // Whether a call went without tool calls for a budget: the next
@@ -7011,8 +7011,10 @@ fn withhold_thinking(context: &Context, error: &Error) -> Option<Strip> {
 
 /// Whether the bot may search the web: its provider declares the search
 /// when it offers one, and a fork's allowed list narrows it as any tool.
+/// A search its `steps_only` keeps is not declared: a model's own search
+/// is no step a script can take.
 fn searches(record: &agent_runtime::store::Bot) -> bool {
-    record.calls("web_search")
+    record.calls("web_search") && !record.steps_only("web_search")
 }
 
 /// Whether a turn whose budget is spent makes one more call, without tool

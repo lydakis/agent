@@ -1361,6 +1361,11 @@ impl Bot {
             && self.declared(name).is_none()
             && (self.declared.iter()).any(|tool| tool.steps && self.declared(&tool.name).is_some())
     }
+    /// Whether its model can follow a stub of a tool result: it has `read`
+    /// and is shown it. A bot whose model cannot gets no text stubs.
+    pub fn follows_stubs(&self) -> bool {
+        self.tools.iter().any(|tool| tool == "read") && !self.steps_only("read")
+    }
     /// Its declared tools its model is not shown, by name, for the
     /// encoding of what it is.
     pub fn declared_hidden(&self) -> Vec<String> {
@@ -8925,9 +8930,9 @@ impl Database {
         }
         // The stub names the result's node, so it is made for the id the
         // insert takes, and its savings go in with the node. Written with
-        // the result, eliding it later reads no output. A bot without the
-        // read tool never elides, since the model could not follow a stub,
-        // so it gets none.
+        // the result, eliding it later reads no output. A bot whose model
+        // is not shown the read tool never elides, since the model could not
+        // follow a stub, so it gets none.
         // Pictures count at their weight, so a stub saves only what the
         // result weighs over it.
         let next = next_node(&tx)?;
@@ -8936,7 +8941,7 @@ impl Database {
         let words = outcome.words();
         let stub = if pictured.count > 0 {
             super::context::picture_stub(family, call_id, custom, &words, weight)?
-        } else if bot.tools.iter().any(|tool| tool == "read") {
+        } else if bot.follows_stubs() {
             super::context::stub(family, call_id, custom, &words, next, weight)?
         } else {
             None
@@ -16080,7 +16085,12 @@ const STARTED_PATHS_BYTES: usize = 64 * 1024;
 /// name that client and the call's deadline in `tool_started`. A call
 /// whose arguments do not fit is refused at once, so it waits for none.
 fn ask(tx: &Connection, bot: &Bot, turn: i64, call: &ToolCall, data: &mut Value) -> Result<()> {
-    let Some(tool) = bot.declared(&call.name) else {
+    // A tool kept for steps is refused from the model, so its client is
+    // never told of the call.
+    let Some(tool) = bot
+        .declared(&call.name)
+        .filter(|_| !bot.steps_only(&call.name))
+    else {
         return Ok(());
     };
     let (Some(tag), Some(expires_ms)) =
