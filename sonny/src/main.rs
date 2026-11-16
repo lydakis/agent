@@ -3480,6 +3480,8 @@ impl Live {
 /// set going, for the `└` row under its last; and whether it said any.
 #[derive(Debug, Default)]
 struct TurnHints {
+    /// The turn they are of: only its end draws them.
+    turn: Option<i64>,
     came: Vec<String>,
     set: Vec<started::SetGoing>,
     replied: bool,
@@ -10271,6 +10273,7 @@ impl App {
             if heard {
                 self.turn_hints = kept;
             }
+            self.turn_hints.turn = Some(turn);
             began.insert(turn);
         }
         // A chunk read at a time, what it held let go before the next.
@@ -10324,7 +10327,10 @@ impl App {
                             true => {}
                         }
                         match first {
-                            true => self.bar_turn(Some((&said, from))),
+                            true => {
+                                self.bar_turn(Some((&said, from)));
+                                self.turn_hints.turn = turn;
+                            }
                             false => self.bar_steered(&said, from),
                         }
                         // The bot's reactions to the message before, as they
@@ -11013,6 +11019,7 @@ impl App {
                         .as_ref()
                         .map(|item| (text(item), item["from"].as_str()));
                     self.bar_turn(woke.as_ref().map(|(said, from)| (said.as_str(), *from)));
+                    self.turn_hints.turn = turn;
                 }
                 if let Some(node) = data["node"].as_i64()
                     && let Some(item) = &woke
@@ -11626,7 +11633,11 @@ impl App {
                         self.commit(line);
                     }
                 }
-                self.end_hints();
+                // Another turn's hints, when reconnecting heard the next
+                // turn begin before this one's end, wait for that turn's.
+                if self.turn_hints.turn.is_none_or(|of| Some(of) == turn) {
+                    self.end_hints();
+                }
                 self.draw_bot_reactions();
                 // A task that marked itself done in it, or its lead did.
                 if ended && let Some(turn) = turn {
@@ -24364,6 +24375,37 @@ mod tests {
             "{shown:?}"
         );
         assert_eq!(at("↳ halves") + 1, at("• All done."), "{shown:?}");
+        // A turn's end draws only its own hints: reconnecting can hear
+        // the next turn begin before the last one's end.
+        app.pending.clear();
+        app.daemon(turn_event("accepted", 4, json!({"node": 17})))
+            .await;
+        app.daemon(turn_event("accepted", 5, json!({"node": 19})))
+            .await;
+        let start = json!({"name": "docs", "brief": "Write the docs"});
+        app.commit_call("s5", Some(5), served::START, &start, "calc.docs/1", false);
+        // As reconnecting leaves it: still following the turn that ended.
+        app.running.as_mut().unwrap().turn = 4;
+        app.daemon(turn_event(
+            "turn_finished",
+            4,
+            json!({"status": "completed"}),
+        ))
+        .await;
+        let said = json!({"event": "text_delta", "bot": "b", "turn": 5, "text": "Docs started."});
+        app.daemon(said).await;
+        app.daemon(turn_event(
+            "turn_finished",
+            5,
+            json!({"status": "completed"}),
+        ))
+        .await;
+        let shown = rows(&app);
+        assert_eq!(
+            shown.last().map(String::as_str),
+            Some("└ started ◌ docs · Write the docs"),
+            "{shown:?}"
+        );
     }
 
     #[tokio::test]
