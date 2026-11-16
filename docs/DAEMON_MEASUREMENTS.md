@@ -10301,12 +10301,13 @@ Caveats:
 
 ## A running command's newest output, kept for its page (protocol 80)
 
-Every background command and terminal now also feeds what it writes, as
-its streaming redactor lets it through, into a ring of its newest 16 KiB,
-which `process_output` reads. A foreground command keeps nothing extra. The
-ring is filled on the reader that already copies the output into the
-command's result, so it adds a lock and a copy per read, and nothing when no
-page is open.
+Every command and terminal now also feeds what it writes, as its
+streaming redactor lets it through, into a ring of its newest 16 KiB, which
+`process_output` reads. A foreground command feeds one too, so one a steer
+moves to the background has its output; the ring goes when the command
+ends. It is filled on the reader that already copies the output into the
+command's result, so it adds a redaction pass, a lock and a copy per read,
+whether or not a page is open; only the read itself waits for a page.
 
 The Perf workflow's screen of this change against main (Linux runner, 16
 Nov 2026), within every gate:
@@ -10324,7 +10325,7 @@ Nov 2026), within every gate:
 | lifecycle | p95 turn, ms | 577.501 | 577.108 | -0.1% |
 | lifecycle | peak RSS, MiB | 25.271 | 25.502 | +0.9% |
 
-These benches run no commands, so none of them reaches the new ring. The
+These benches run no shell commands, so none of them reaches the new ring. The
 largest move, RSS after a turn each, is inside its run-to-run spread: main
 alone measured 55.90 MiB on the same bench in the previous section.
 
