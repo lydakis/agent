@@ -24356,7 +24356,7 @@ mod tests {
             shown
                 .iter()
                 .position(|r| r == row)
-                .expect(&format!("{row} in {shown:?}"))
+                .unwrap_or_else(|| panic!("{row} in {shown:?}"))
         };
         assert_eq!(
             shown.iter().filter(|r| r.starts_with('↳')).count(),
