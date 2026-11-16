@@ -137,9 +137,9 @@ class DaemonStepTests(ModelFixture):
         self.assertEqual(decided, [('script-0/w', 'write'), ('script-0/e', 'edit'), ('script-0/p', 'apply_patch'),
                                    ('script-0/r', 'read'), ('script-0/m', 'edit')])
         self.assertEqual(len(self.events(client, turn, 'step_completed')), 5)
-        # A step reads files; a retained output is read with `artifact`.
+        # A recorded result is not a step's to read.
         self.assertEqual(self.step(client, turn, step='a', name='read',
-                                   arguments={'artifact': f'{turn}/script-0/w/stdout'})['error'], 'invalid_step')
+                                   arguments={'artifact': 'result/1'})['error'], 'invalid_step')
         self.answer(client, turn)
         self.assertEqual(client.finished(turn)['data']['status'], 'completed')
 
@@ -569,12 +569,22 @@ class DaemonStepTests(ModelFixture):
         self.assertEqual((done['failed'], done['error']), (True, 'tool_outcome_unknown'))
 
     def test_a_step_s_long_output_is_kept_under_its_id_until_its_call_is_answered(self):
-        client, turn = self.script()
+        client, turn = self.script(tools='echo,shell,read')
         step = self.step(client, turn, name='shell', arguments={'command': 'head -c 200000 /dev/zero | tr "\\0" a'})
         output = json.loads(step['result']['output'])
         self.assertEqual(output['artifacts'], [f'{turn}/script-0/1/stdout'])
         page = client.request('artifact', bot='Lead', turn=turn, call_id='script-0/1', stream='stdout', limit=10)
         self.assertEqual(page['result']['text'], 'a' * 10)
+        # A later step of the script pages it as the model's own read would.
+        lines = self.step(client, turn, step='2', name='shell', arguments={'command': 'seq 1 60000'})
+        [kept] = json.loads(lines['result']['output'])['artifacts']
+        self.assertEqual(kept, f'{turn}/script-0/2/stdout')
+        read = self.step(client, turn, step='3', name='read',
+                         arguments={'artifact': kept, 'offset': 30000, 'limit': 2})['result']
+        self.assertFalse(read.get('failed'), read)
+        self.assertIn('30000', read['output'])
+        self.assertIn('30001', read['output'])
+        self.assertNotIn('30002', read['output'])
         self.answer(client, turn)
         client.finished(turn)
         gone = client.request('artifact', bot='Lead', turn=turn, call_id='script-0/1', stream='stdout')

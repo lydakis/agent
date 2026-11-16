@@ -590,7 +590,8 @@ takes steps (no script inside a script), `wait`, background `shell`,
 the tools about other bots. Never: `web_search`, which the provider runs.
 
 **The reply** is what the model would have read. Output past the preview
-is an artifact under `CALL/STEP`, read in pages with `artifact`. A
+is an artifact under `CALL/STEP`, read in pages with `artifact`, or by a
+later step's `read`, in lines, as the model's own read pages it. A
 command's output is bounded or spilled to a file as it runs, as a direct
 call's is (src/tools.rs:4404). A step's artifacts go when its call is
 answered: the model never saw them, and what the script wants kept it

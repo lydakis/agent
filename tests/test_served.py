@@ -126,6 +126,8 @@ class ServedToolTests(ModelFixture):
         rules = self.path / '.agent/rules/default.rules'
         rules.parent.mkdir(parents=True)
         rules.write_text('prefix_rule(pattern=["cp"], decision="prompt")\n')
+        # The model calls shell itself: code mode off.
+        (self.path / '.agent/config.toml').write_text('[sonny]\ncode_mode = false\n')
         self.daemon.request('create', bot='calc.lead', workspace=str(self.path), model='openai/synthetic-model',
                             instructions='Lead.', settings={'sandbox': 'workspace-write'},
                             declare=[declared('show_agent')], approve=['shell'], approver='manual')
@@ -148,7 +150,7 @@ class ServedToolTests(ModelFixture):
         # long its parked calls hold, which waits for it to be idle.
         rules.write_text('prefix_rule(pattern=["cp"], decision="prompt")\n'
                          'prefix_rule(pattern=["mkdir"], decision="forbidden")\n')
-        (self.path / '.agent/config.toml').write_text('hold = "2d"\n')
+        (self.path / '.agent/config.toml').write_text('hold = "2d"\n[sonny]\ncode_mode = false\n')
         ruled('mkdir')
         self.assertNotEqual(self.daemon.request('inspect', bot='calc.lead')['result']['settings']['hold_ms'], 172_800_000)
         [call] = asked

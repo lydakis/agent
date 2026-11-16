@@ -1180,16 +1180,15 @@ async fn discover(hub: &Hub) -> (BTreeMap<String, Nested>, Vec<Value>, Vec<Strin
     (nested, listed, failed)
 }
 
-/// The agent's own tools a script calls in code mode, as its daemon's
-/// `tools` lists those that run as steps, each with its declaration;
-/// none outside code mode or for a call made over a link.
+/// The agent's own tools a script calls, as its daemon's `tools` lists
+/// those that run as steps, each with its declaration; none for a call
+/// made over a link. Whatever the setting says now: an agent's turn keeps
+/// the tools it began with, and its daemon gates each step as it would
+/// the same call made directly.
 async fn daemon_tools(steps: Option<&Steps>) -> Vec<(String, Nested, Value)> {
     let Some(Via::Daemon { client, .. }) = steps.map(|steps| &steps.via) else {
         return Vec::new();
     };
-    if !code_mode() {
-        return Vec::new();
-    }
     // The daemon's tools are its build's, so they are asked once.
     static LISTED: tokio::sync::OnceCell<Vec<Value>> = tokio::sync::OnceCell::const_new();
     let asked = LISTED.get_or_try_init(|| async {
@@ -2038,11 +2037,20 @@ impl Caller {
                 Value::Null => json!({}),
                 arguments => arguments,
             };
+            // The daemon decides it, a person perhaps, and runs it under
+            // its own bounds (a command's timeout, the call's stop): the
+            // script's time stops and its place goes to another script
+            // meanwhile, as while a server's tool waits on its gate.
+            let stopped = self.clock.stop();
             let ran = Abort(
                 self.host
                     .spawn(async move { steps.run(&id, arguments).await }),
-            );
-            return ran.await.map_err(|e| e.to_string())?;
+            )
+            .await;
+            let placed = self.clock.take_place().await;
+            drop(stopped);
+            placed?;
+            return ran.map_err(|e| e.to_string())?;
         }
         // Told to the agent's daemon first, with the script's time stopped,
         // on the host's runtime, where its connection lives: put to its

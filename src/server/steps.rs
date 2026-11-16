@@ -26,8 +26,8 @@ use agent_runtime::{
     codec::Part,
     fail_with,
     output::{self, Output},
-    store::{Capture, StepAsk, StepOpened, Stepped},
-    tools::{Outcome, Prepared, Slot},
+    store::{ArtifactLines, Capture, StepAsk, StepOpened, Stepped, Store},
+    tools::{Outcome, Prepared, ReadSource, Slot},
 };
 use serde_json::{Value, json};
 use std::{
@@ -187,6 +187,8 @@ struct Running {
     cord: agent_runtime::tools::Cord,
     turn: i64,
     id: String,
+    /// Where a read of the bot's kept output pages it from.
+    store: Store,
 }
 
 impl Steps {
@@ -708,6 +710,7 @@ impl Service {
             cord: self.registry.cord(),
             turn: key.0,
             id: flight.ask.id(),
+            store: self.store.clone(),
         };
         let (registry, serial) = (self.registry.clone(), flight.serial);
         self.steps.jobs.spawn(async move {
@@ -999,6 +1002,7 @@ async fn run(
         cord,
         turn,
         id,
+        store,
     } = running;
     let mut stopping = futures_util::FutureExt::fuse(stopping);
     let bot = &capture.bot;
@@ -1073,6 +1077,34 @@ async fn run(
                         slot,
                     )
                     .await
+            }
+            // A command's output kept past its result, paged as the
+            // turn's own read pages it, from any of the bot's turns.
+            Prepared::Read {
+                source:
+                    ReadSource::Artifact {
+                        turn: owner,
+                        call_id,
+                        stream,
+                    },
+                offset,
+                limit,
+            } => {
+                let name = bot.name.clone();
+                let page = match (store.op("artifact_lines", move |db| {
+                    db.artifact_lines(&name, owner, &call_id, &stream, offset, limit)
+                }))
+                .await?
+                {
+                    ArtifactLines::Page(page) => page,
+                    ArtifactLines::File(file) => tokio::task::spawn_blocking(move || {
+                        agent_runtime::tools::page_file(&file, offset, limit)
+                    })
+                    .await
+                    .map_err(|_| Error::new("storage_error"))??
+                    .ok_or(Error::new("artifact_not_found"))?,
+                };
+                Ok(Outcome::text(registry.redact_text(page)))
             }
             prepared @ (Prepared::Echo(_)
             | Prepared::Read { .. }
