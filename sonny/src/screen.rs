@@ -77,6 +77,9 @@ pub enum Tag {
     /// The words view's `└` row under a reply: what its turn set going,
     /// by the client's number for it.
     SetGoing(u64),
+    /// The words view's second `└` row under a reply: the workflows its
+    /// turn ran, by the client's number for it.
+    Ran(u64),
     /// Where a note was put in the margin, by [`crate::margin::anchor`].
     Note(u64),
     /// A `plan` call, by the client's number for it.

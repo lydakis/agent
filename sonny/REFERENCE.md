@@ -1767,9 +1767,14 @@ agent sees them. Under it, `└` says what its turn set going: `started`
 for each new task, `sent to` for each agent there already, each name a
 link with its state's mark, kept current (`└ started ● halves · ●
 readme`). With one alone and room left, its title follows, a brief's or
-a message's first line; names give way to `+N`. Above a reply to a turn
-you did not start, `↳` names who started it: an agent, a lookout note's
-tasks and sources (a source by its icon), an automation by `↻`. Only a
+a message's first line; names give way to `+N`. A workflow the turn
+ran has a `└` row of its own under that one, its name, strip and time,
+kept current (`└ runs blind-role-eval-score  ✓✓✓ ✓●●  19s`); the name
+opens the run's page while it runs, and the row stays as the run ended
+(`└ ran …`, `└ stopped …`). Above a reply to a turn you did not start,
+`↳` names who started it: an agent, a lookout note's tasks and sources
+(a source by its icon), an automation by `↻`, a workflow that ended by
+its name. Only a
 turn's final reply wears them, once, with everything the turn set going
 in one row; words partway through a turn get none. A turn that says
 nothing draws neither. Zen keeps `└`.

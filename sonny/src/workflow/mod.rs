@@ -1826,6 +1826,27 @@ async fn tell(plan: &Plan, ended: &Value, dir: &Path, socket: &Path) {
     }
 }
 
+/// The run a `workflow` call says it started, by its output: `Started
+/// workflow NAME as run ID.`; none for a call that started none.
+pub fn started_run(output: &str) -> Option<String> {
+    let output = match serde_json::from_str::<Value>(output) {
+        Ok(Value::String(said)) => said,
+        _ => output.to_owned(),
+    };
+    let (_, rest) = output
+        .strip_prefix("Started workflow ")?
+        .split_once(" as run ")?;
+    let id = rest.split(['.', ' ']).next().unwrap_or("");
+    valid_id(id).ok().map(str::to_owned)
+}
+
+/// The name of the workflow whose end `text` tells its caller, as
+/// [`told`] says it: `Workflow NAME (run ID) completed in 42s…`.
+pub fn ended_name(text: &str) -> Option<&str> {
+    let (name, _) = text.strip_prefix("Workflow ")?.split_once(" (run ")?;
+    (!name.is_empty()).then_some(name)
+}
+
 /// The message a run's caller is sent at its end.
 fn told(plan: &Plan, ended: &Value, dir: &Path) -> String {
     let name = plan.meta["name"].as_str().unwrap_or("workflow");
@@ -2261,6 +2282,9 @@ mod tests {
         );
         assert!(said.contains("\"bugs\": 2"), "{said}");
         assert!(said.contains("/runs/r1/result.json"), "{said}");
+        // The words view names the workflow that ended by it.
+        assert_eq!(ended_name(&said), Some("audit"));
+        assert_eq!(ended_name("Workflows are on"), None);
         let failed = json!({"status": "failed", "error": "TypeError: x", "agents": 1,
             "ended_ms": 5000});
         let said = told(&plan, &failed, Path::new("/runs/r1"));
@@ -2297,5 +2321,15 @@ mod tests {
             said.contains(" more kept; see \"kept\" in result.json."),
             "{said}"
         );
+    }
+
+    #[test]
+    fn a_call_s_output_names_the_run_it_started() {
+        let said = "Started workflow audit as run ab12cd34. You hear back once, when it ends.";
+        assert_eq!(started_run(said).as_deref(), Some("ab12cd34"));
+        let quoted = serde_json::to_string(said).unwrap();
+        assert_eq!(started_run(&quoted).as_deref(), Some("ab12cd34"));
+        assert_eq!(started_run("Stopping run ab12cd34."), None);
+        assert_eq!(started_run("{\"error\": \"no\"}"), None);
     }
 }
