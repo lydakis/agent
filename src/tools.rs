@@ -832,11 +832,18 @@ pub struct Place {
     /// `WAITING`, then `COUNTED` while it holds its place, then `LEFT`.
     state: Arc<std::sync::atomic::AtomicU8>,
     count: Arc<std::sync::atomic::AtomicUsize>,
+    /// The command's newest output, which a client may look at once a
+    /// steer moves it to the background.
+    peek: Peek,
 }
 const WAITING: u8 = 0;
 const COUNTED: u8 = 1;
 const LEFT: u8 = 2;
 impl Place {
+    /// The command's newest output, as it writes it.
+    pub fn peek(&self) -> Peek {
+        self.peek.clone()
+    }
     /// The command now runs as a background process, which the store counts.
     pub fn lift(&self) {
         if self.state.swap(LEFT, std::sync::atomic::Ordering::AcqRel) == COUNTED {
@@ -2878,6 +2885,7 @@ impl Registry {
         Place {
             state: Arc::default(),
             count: self.foreground.clone(),
+            peek: Peek::default(),
         }
     }
     /// Variables added to every shell child, such as the store and binary
@@ -3831,6 +3839,7 @@ impl Registry {
                     sandbox.as_deref(),
                     hold.as_mut(),
                     spill.as_ref(),
+                    Some(&place.peek),
                 )
                 .await?
             };
@@ -3871,6 +3880,8 @@ impl Registry {
         let mut stopping = self.stopping.subscribe();
         let mut pulls = self.pulls.subscribe();
         self.own(&stopper, owner);
+        let peek = Peek::default();
+        self.watch(stopper.listed.id, peek.clone());
         let Stopper { stop, listed } = stopper;
         tokio::spawn(async move {
             let _listed = listed;
@@ -3894,6 +3905,7 @@ impl Registry {
                         sandbox.as_deref(),
                         held.as_mut(),
                         spill.as_ref(),
+                        Some(&peek),
                     )
                     .await?
                 };
@@ -3938,6 +3950,7 @@ impl Registry {
             sender,
             owner: None,
             used: 0,
+            peek: None,
         };
         self.stops.lock().unwrap().running.insert(id, entry);
         let listed = Stoppable {
@@ -3971,6 +3984,27 @@ impl Registry {
 
     /// Kill background command `id`, dropping it, which kills its group:
     /// false when none of that handle runs. Whose it is, the caller checks.
+    /// Keep `peek` as background command `id`'s newest output, for
+    /// [`Self::output`], for as long as it runs.
+    pub fn watch(&self, id: i64, peek: Peek) {
+        if let Some(stop) = self.stops.lock().unwrap().running.get_mut(&id) {
+            stop.peek = Some(peek);
+        }
+    }
+
+    /// Where command or terminal `id` runs and the last `count` lines it
+    /// wrote, redacted, while it runs, with no lines for one whose output
+    /// goes nowhere (a detached one); None once it has ended, or for one
+    /// an earlier daemon started, whose folder is not known here.
+    pub fn output(&self, id: i64, count: usize) -> Option<(Option<PathBuf>, Option<Vec<String>>)> {
+        let peek = (self.stops.lock().unwrap().running.get(&id))
+            .and_then(|stop| stop.peek.clone())
+            .or_else(|| terminal::peek(&self.terminals, id))?;
+        let discarded = peek.0.lock().unwrap_or_else(|e| e.into_inner()).discarded;
+        let lines = (!discarded).then(|| peek.lines(count, &self.credentials));
+        Some((peek.folder(), lines))
+    }
+
     pub fn stop(&self, id: i64) -> bool {
         let stop = self.stops.lock().unwrap().running.remove(&id);
         stop.is_some_and(|stop| stop.sender.send(Kill::Agent).is_ok())
@@ -4054,6 +4088,10 @@ impl Registry {
         sandbox: Option<Arc<Policy>>,
         done: tokio::sync::oneshot::Sender<Result<Outcome>>,
     ) -> Result<Detached> {
+        // Where it runs is kept; what it writes goes nowhere.
+        let peek = Peek::discarded();
+        peek.runs_in(workspace);
+        self.watch(stopper.listed.id, peek);
         let tracked = Tracked { stopper, done };
         detach(
             cord,
@@ -4208,6 +4246,156 @@ struct Stop {
     sender: tokio::sync::oneshot::Sender<Kill>,
     owner: Option<i64>,
     used: u64,
+    /// Its newest output, once [`Registry::watch`] names it.
+    peek: Option<Peek>,
+}
+
+/// The most of a command's newest output kept for a client to look at
+/// while it runs (`process_output`), both streams as they come.
+pub const PEEK_BYTES: usize = 16 * 1024;
+
+/// A running command's newest output, at most [`PEEK_BYTES`], kept beside
+/// what its result keeps so a client may look while it runs: nothing is
+/// taken from it, and it goes with the command.
+#[derive(Clone, Default)]
+pub struct Peek(Arc<std::sync::Mutex<PeekRing>>);
+
+#[derive(Default)]
+struct PeekRing {
+    /// Where the command runs.
+    folder: Option<PathBuf>,
+    bytes: std::collections::VecDeque<u8>,
+    /// Whether older output was let go, so the first line kept may be a
+    /// line's end.
+    cut: bool,
+    /// Whether the command's output goes nowhere, as a detached one's.
+    discarded: bool,
+}
+
+impl Peek {
+    /// One for a command whose output goes nowhere: only where it runs.
+    pub fn discarded() -> Peek {
+        let peek = Peek::default();
+        peek.0.lock().unwrap_or_else(|e| e.into_inner()).discarded = true;
+        peek
+    }
+
+    /// The command runs in `folder`.
+    pub fn runs_in(&self, folder: &Path) {
+        let mut ring = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        ring.folder = Some(folder.to_path_buf());
+    }
+
+    /// Where the command runs, once it started.
+    pub fn folder(&self) -> Option<PathBuf> {
+        let ring = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        ring.folder.clone()
+    }
+
+    /// Keep `bytes`, the next output of the stream `redacting` reads,
+    /// redacted as that stream goes before any of it is kept: a secret
+    /// cut across reads is held until it is whole, and a secret block's
+    /// body never reaches the ring, so letting older output go can never
+    /// show part of one. Only the newest [`PEEK_BYTES`] are kept.
+    pub fn feed(&self, redacting: &mut Redacting, bytes: &[u8]) {
+        let text = redacting.feed(bytes);
+        if !text.is_empty() {
+            self.push(text.as_bytes());
+        }
+    }
+
+    /// The stream `redacting` reads ended: keep what it still held,
+    /// redacted.
+    pub fn end(&self, redacting: &mut Redacting) {
+        let fresh = Redacting::new(redacting.credentials.clone());
+        let text = std::mem::replace(redacting, fresh).finish();
+        if !text.is_empty() {
+            self.push(text.as_bytes());
+        }
+    }
+
+    /// Keep `bytes`, already redacted: only the newest [`PEEK_BYTES`].
+    fn push(&self, bytes: &[u8]) {
+        let bytes = &bytes[bytes.len().saturating_sub(PEEK_BYTES)..];
+        let mut ring = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        let over = (ring.bytes.len() + bytes.len()).saturating_sub(PEEK_BYTES);
+        if over > 0 {
+            let over = over.min(ring.bytes.len());
+            ring.bytes.drain(..over);
+            ring.cut = true;
+        }
+        ring.bytes.extend(bytes);
+    }
+
+    /// Its last `count` lines that hold anything, oldest first, as text:
+    /// escape sequences and control characters left out, a line a
+    /// carriage return rewrote as it ended. What [`Self::feed`] kept is
+    /// redacted already; `credentials` redacts it again for any added
+    /// since. A line cut where older output was let go is left out.
+    pub fn lines(&self, count: usize, credentials: &Credentials) -> Vec<String> {
+        let (bytes, cut) = {
+            let ring = self.0.lock().unwrap_or_else(|e| e.into_inner());
+            (ring.bytes.iter().copied().collect::<Vec<u8>>(), ring.cut)
+        };
+        let text = credentials.redact(plain_output(&bytes));
+        let mut lines: Vec<&str> = text.split('\n').collect();
+        if cut && !lines.is_empty() {
+            lines.remove(0);
+        }
+        let mut kept: Vec<String> = (lines.iter().rev())
+            .map(|line| {
+                line.rsplit('\r')
+                    .find(|part| !part.trim().is_empty())
+                    .unwrap_or("")
+            })
+            .map(|line| line.trim_end().to_owned())
+            .filter(|line| !line.is_empty())
+            .take(count)
+            .collect();
+        kept.reverse();
+        kept
+    }
+}
+
+/// `bytes` as text with terminal escape sequences (CSI, OSC and the two
+/// byte kind) and control characters other than line ends and tabs left
+/// out; tabs become spaces.
+fn plain_output(bytes: &[u8]) -> String {
+    let text = String::from_utf8_lossy(bytes);
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '\u{1b}' => match chars.next() {
+                // CSI: parameters, then one final byte in @..~.
+                Some('[') => {
+                    for c in chars.by_ref() {
+                        if ('@'..='~').contains(&c) {
+                            break;
+                        }
+                    }
+                }
+                // OSC: up to BEL or ST.
+                Some(']') => {
+                    while let Some(c) = chars.next() {
+                        if c == '\u{7}' {
+                            break;
+                        }
+                        if c == '\u{1b}' {
+                            chars.next_if_eq(&'\\');
+                            break;
+                        }
+                    }
+                }
+                _ => {}
+            },
+            '\n' | '\r' => out.push(c),
+            '\t' => out.push(' '),
+            c if c.is_control() => {}
+            c => out.push(c),
+        }
+    }
+    out
 }
 
 /// How a command its agent killed before it started answers.
@@ -4658,6 +4846,9 @@ struct Captured {
     waiting: Arc<std::sync::atomic::AtomicUsize>,
     /// The file that holds it, once its writer is done.
     spilled: Option<Spilled>,
+    /// Where its newest output is kept for a client to look at, and what
+    /// redacts this stream on its way there.
+    peek: Option<(Peek, Redacting)>,
 }
 
 /// The most a retained stream's file holds: `SPILL_BYTES` of output, each
@@ -4736,10 +4927,12 @@ impl Captured {
         stream: &'static str,
         registry: &Registry,
         waiting: &Arc<std::sync::atomic::AtomicUsize>,
+        peek: Option<&Peek>,
     ) -> Self {
         Captured {
             spill: spill.map(|spill| (spill.clone(), stream, registry.credentials.clone())),
             waiting: waiting.clone(),
+            peek: peek.map(|peek| (peek.clone(), Redacting::new(registry.credentials.clone()))),
             ..Captured::default()
         }
     }
@@ -4961,19 +5154,43 @@ impl SpillFile {
 async fn capture(pipe: &mut (impl AsyncRead + Unpin), captured: &mut Captured) -> Result<()> {
     let room = KEPT_END.saturating_sub(captured.head.len());
     if room > 0 {
-        (&mut *pipe)
-            .take(room as u64)
-            .read_to_end(&mut captured.head)
-            .await?;
-        if captured.head.len() < KEPT_END {
-            return Ok(());
+        match &mut captured.peek {
+            // Read as it comes, so a client looking sees it at once.
+            Some((peek, redacting)) => {
+                let mut chunk = vec![0; room.min(64 * 1024)];
+                while captured.head.len() < KEPT_END {
+                    let room = (KEPT_END - captured.head.len()).min(chunk.len());
+                    let read = pipe.read(&mut chunk[..room]).await?;
+                    if read == 0 {
+                        peek.end(redacting);
+                        return Ok(());
+                    }
+                    captured.head.extend_from_slice(&chunk[..read]);
+                    peek.feed(redacting, &chunk[..read]);
+                }
+            }
+            None => {
+                (&mut *pipe)
+                    .take(room as u64)
+                    .read_to_end(&mut captured.head)
+                    .await?;
+                if captured.head.len() < KEPT_END {
+                    return Ok(());
+                }
+            }
         }
     }
     let mut chunk = vec![0; 64 * 1024];
     loop {
         let read = pipe.read(&mut chunk).await?;
         if read == 0 {
+            if let Some((peek, redacting)) = &mut captured.peek {
+                peek.end(redacting);
+            }
             return Ok(());
+        }
+        if let Some((peek, redacting)) = &mut captured.peek {
+            peek.feed(redacting, &chunk[..read]);
         }
         if captured.spill.is_some() || captured.writer.is_some() {
             captured.spill(&chunk[..read]).await;
@@ -5608,6 +5825,7 @@ async fn shell(
     sandbox: Option<&Policy>,
     held: Option<&mut crate::sandbox::Hold>,
     spill: Option<&Spill>,
+    peek: Option<&Peek>,
 ) -> Result<(Captured, Captured, Exit, Duration)> {
     use std::process::Stdio;
     use tokio::process::Child;
@@ -5626,6 +5844,9 @@ async fn shell(
                 }
             }
         }
+    }
+    if let Some(peek) = peek {
+        peek.runs_in(workspace);
     }
     let (mut process, ended) = sh(command, workspace, registry, environment, sandbox, false)?;
     let child = process
@@ -5656,8 +5877,8 @@ async fn shell(
         .ok_or(Error::new("shell_pipe_failed"))?;
     let waiting = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let (mut out, mut err) = (
-        Captured::spilling(spill, "stdout", registry, &waiting),
-        Captured::spilling(spill, "stderr", registry, &waiting),
+        Captured::spilling(spill, "stdout", registry, &waiting, peek),
+        Captured::spilling(spill, "stderr", registry, &waiting, peek),
     );
     let status = {
         let reads = async {
@@ -5731,12 +5952,65 @@ async fn shell(
     _: Option<&Policy>,
     _: Option<&mut crate::sandbox::Hold>,
     _: Option<&Spill>,
+    _: Option<&Peek>,
 ) -> Result<(Captured, Captured, Exit, Duration)> {
     fail("shell_platform_unsupported")
 }
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_commands_peek_keeps_its_newest_lines_plain_and_redacted() {
+        let credentials = Credentials::default();
+        credentials.redact_also(&["password".to_owned()], &["PRIVATE KEY".to_owned()]);
+        credentials.set("TOKEN", "sk-fake9fake9fake9fake9");
+        let feed = |pieces: &[&[u8]]| {
+            let peek = Peek::default();
+            let mut redacting = Redacting::new(credentials.clone());
+            for piece in pieces {
+                peek.feed(&mut redacting, piece);
+            }
+            (peek, redacting)
+        };
+        let (peek, _) = feed(&[
+            b"\x1b[1mbuilding\x1b[0m\n\x1b]0;title\x07step 1\rstep 2\r\n",
+            b"\n\tpassword: fake8fake8fake8\n",
+        ]);
+        assert_eq!(
+            peek.lines(10, &credentials),
+            ["building", "step 2", " password: [REDACTED]"]
+        );
+        assert_eq!(peek.lines(1, &credentials), [" password: [REDACTED]"]);
+        // Past the bound, only the newest are kept, and the first line,
+        // cut where the older went, is left out.
+        let (peek, _) = feed(&[&[b'x'; PEEK_BYTES], b"password: fake8fake8fake8\nlast\n"]);
+        assert_eq!(peek.lines(10, &credentials), ["last"]);
+        // A secret cut across reads is held until it is whole, never
+        // kept in part, and what is held at the end is kept redacted.
+        let (peek, mut redacting) =
+            feed(&[b"token sk-fake9fa", b"ke9fake9fake9 ok\nnext sk-fake9"]);
+        assert_eq!(
+            peek.lines(10, &credentials),
+            ["token [REDACTED] ok", "next"]
+        );
+        peek.end(&mut redacting);
+        assert_eq!(
+            peek.lines(10, &credentials),
+            ["token [REDACTED] ok", "next sk-fake9"]
+        );
+        // A key's body whose BEGIN went past the bound is never shown:
+        // it was dropped before it was kept.
+        let body = "MIIEvQIBADANBgkqhkiG9w0BAQEFAASC\n".repeat(PEEK_BYTES / 32 + 8);
+        let (peek, _) = feed(&[
+            b"-----BEGIN PRIVATE KEY-----\n",
+            body.as_bytes(),
+            b"-----END PRIVATE KEY-----\nafter\n",
+        ]);
+        let lines = peek.lines(10, &credentials);
+        assert!(!lines.iter().any(|line| line.contains("MIIE")), "{lines:?}");
+        assert_eq!(lines.last().map(String::as_str), Some("after"));
+    }
+
     #[tokio::test]
     async fn a_start_decided_before_a_pull_never_begins_and_one_running_ends() {
         let registry = Registry::new("shell").unwrap();
