@@ -3438,6 +3438,20 @@ impl Registry {
         environment: &[(String, String)],
         sandbox: Option<Arc<Policy>>,
     ) -> Result<Outcome> {
+        self.execute_holding(tool, workspace, environment, sandbox, None)
+            .await
+    }
+
+    /// [`execute`](Self::execute) with a process slot the caller took for
+    /// a confined write, which then waits for none.
+    pub async fn execute_holding(
+        &self,
+        tool: Prepared,
+        workspace: &Path,
+        environment: &[(String, String)],
+        sandbox: Option<Arc<Policy>>,
+        mut slot: Option<Slot>,
+    ) -> Result<Outcome> {
         match tool {
             Prepared::Echo(text) => Ok(Outcome::text(self.redact(text))),
             Prepared::Shell {
@@ -3536,7 +3550,7 @@ impl Registry {
                 let target = resolve(workspace, &path);
                 writable(sandbox.clone(), &target, &path).await?;
                 let mut held = crate::sandbox::hold_for(sandbox.as_deref()).await;
-                let _slot = self.helper_slot(&sandbox).await?;
+                let _slot = self.helper_slot(&sandbox, &mut slot).await?;
                 files::write(&target, content.as_bytes(), sandbox, held.as_mut()).await?;
                 Ok(Outcome::text(format!(
                     "wrote {} bytes to {}",
@@ -3560,7 +3574,7 @@ impl Registry {
                 // A process slot only while the sandbox's helper writes.
                 let mut held = crate::sandbox::hold_for(sandbox.as_deref()).await;
                 let _slot = match staged.writes() {
-                    true => self.helper_slot(&sandbox).await?,
+                    true => self.helper_slot(&sandbox, &mut slot).await?,
                     false => None,
                 };
                 Ok(Outcome::text(staged.commit(sandbox, held.as_mut()).await?))
@@ -3602,7 +3616,7 @@ impl Registry {
                 };
                 debug_assert_eq!(updated.len(), expanded);
                 let mut held = crate::sandbox::hold_for(sandbox.as_deref()).await;
-                let _slot = self.helper_slot(&sandbox).await?;
+                let _slot = self.helper_slot(&sandbox, &mut slot).await?;
                 files::write(&target, updated.as_bytes(), sandbox, held.as_mut()).await?;
                 Ok(Outcome::text(format!(
                     "replaced {count} occurrence{} in {path}",
@@ -3723,18 +3737,24 @@ impl Registry {
     }
 
     /// A process slot for a confined write, which runs as a process of
-    /// its own and so waits its turn as a command does.
+    /// its own and so waits its turn as a command does: `held` when the
+    /// caller took one for it.
     async fn helper_slot(
         &self,
         sandbox: &Option<Arc<Policy>>,
-    ) -> Result<Option<tokio::sync::SemaphorePermit<'_>>> {
+        held: &mut Option<Slot>,
+    ) -> Result<Option<Slot>> {
         match sandbox {
-            Some(_) => Ok(Some(
-                self.slots
-                    .acquire()
-                    .await
-                    .map_err(|_| Error::new("tool_scheduler_closed"))?,
-            )),
+            Some(_) => match held.take() {
+                Some(slot) => Ok(Some(slot)),
+                None => Ok(Some(
+                    self.slots
+                        .clone()
+                        .acquire_owned()
+                        .await
+                        .map_err(|_| Error::new("tool_scheduler_closed"))?,
+                )),
+            },
             None => Ok(None),
         }
     }

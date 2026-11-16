@@ -107,10 +107,143 @@ class DaemonStepTests(ModelFixture):
         self.answer(client, turn)
         self.assertEqual(client.finished(turn)['data']['status'], 'completed')
 
+    def test_file_steps_read_write_edit_and_patch_in_the_turn_s_folder(self):
+        client, turn = self.script(tools='echo,shell,read,write,edit,apply_patch')
+        wrote = self.step(client, turn, step='w', name='write',
+                          arguments={'path': 'notes.md', 'content': 'one\ntwo\n'})['result']
+        self.assertEqual((wrote['output'], wrote['failed']), ('wrote 8 bytes to notes.md', False))
+        self.assertEqual((self.path / 'notes.md').read_text(), 'one\ntwo\n')
+        edited = self.step(client, turn, step='e', name='edit',
+                           arguments={'path': 'notes.md', 'old': 'two', 'new': 'three'})['result']
+        self.assertFalse(edited['failed'], edited)
+        patch = '*** Begin Patch\n*** Add File: more.md\n+four\n*** End Patch'
+        patched = self.step(client, turn, step='p', name='apply_patch', arguments={'input': patch})['result']
+        self.assertFalse(patched['failed'], patched)
+        self.assertEqual((self.path / 'more.md').read_text(), 'four\n')
+        read = self.step(client, turn, step='r', name='read', arguments={'path': 'notes.md'})['result']
+        self.assertFalse(read['failed'])
+        self.assertIn('three', read['output'])
+        self.assertNotIn('two', read['output'])
+        # A file the edit cannot find fails as the direct call does.
+        missed = self.step(client, turn, step='m', name='edit',
+                           arguments={'path': 'notes.md', 'old': 'nowhere', 'new': 'x'})['result']
+        self.assertTrue(missed['failed'])
+        # Each is decided and ended as its direct call, by its own name.
+        decided = [(d['call_id'], d['name']) for d in self.events(client, turn, 'step_decided')]
+        self.assertEqual(decided, [('script-0/w', 'write'), ('script-0/e', 'edit'), ('script-0/p', 'apply_patch'),
+                                   ('script-0/r', 'read'), ('script-0/m', 'edit')])
+        self.assertEqual(len(self.events(client, turn, 'step_completed')), 5)
+        # A step reads files; a retained output is read with `artifact`.
+        self.assertEqual(self.step(client, turn, step='a', name='read',
+                                   arguments={'artifact': f'{turn}/script-0/w/stdout'})['error'], 'invalid_step')
+        self.answer(client, turn)
+        self.assertEqual(client.finished(turn)['data']['status'], 'completed')
+
+    def test_a_read_step_of_a_picture_answers_with_the_picture(self):
+        from tests.test_images import png
+        (self.path / 'shot.png').write_bytes(png(4, 4))
+        client, turn = self.script(tools='echo,read', bot_tools=['read'])
+        ran = self.step(client, turn, name='read', arguments={'path': 'shot.png'})['result']
+        self.assertTrue(ran['output'].startswith('shot.png: a PNG image, 4×4'), ran)
+        [picture] = ran['parts']
+        self.assertEqual((picture['type'], picture['media_type']), ('image', 'image/png'))
+
+    def test_a_picture_too_large_for_one_reply_is_kept_whole_under_the_step(self):
+        import base64
+        from tests.test_images import noise
+        heavy = noise(512)
+        self.assertLess(len(heavy), 1024 * 1024)
+        self.assertGreater(len(heavy) * 4 // 3, 1024 * 1024)
+        (self.path / 'noise.png').write_bytes(heavy)
+        client, turn = self.script(tools='echo,read', bot_tools=['read'])
+        ran = self.step(client, turn, name='read', arguments={'path': 'noise.png'})['result']
+        self.assertIn(f'too large for the reply kept as {turn}/script-0/1/picture-1', ran['output'])
+        self.assertNotIn('parts', ran)
+        data, offset = '', 0
+        while True:
+            page = client.request('artifact', bot='Lead', turn=turn, call_id='script-0/1',
+                                  stream='picture-1', offset=offset)['result']
+            data += page['text']
+            offset = page['next_offset']
+            if page['done']:
+                break
+        # The very bytes the direct call reads: nothing encoded again.
+        self.assertEqual(base64.b64decode(data), heavy)
+
+    def test_a_picture_that_fits_only_beside_a_short_request_id_is_kept_for_a_long_one(self):
+        # A picture sized to fit a reply with a short id, not one beside a
+        # request id of 128 control characters (six JSON bytes each): its
+        # step still answers, the picture kept under the step.
+        import struct
+        import zlib
+        from tests.test_images import png
+
+        def chunk(kind, data):
+            return struct.pack('>I', len(data)) + kind + data + struct.pack('>I', zlib.crc32(kind + data))
+        small = png(4, 4)
+        encoded = 1024 * 1024 - 900
+        size = encoded // 4 * 3
+        filler = size - len(small) - 12
+        picture = small[:-12] + chunk(b'tEXt', b'k\x00' + b'x' * (filler - 2)) + small[-12:]
+        self.assertEqual(len(picture), size)
+        (self.path / 'wide.png').write_bytes(picture)
+        client, turn = self.script(tools='echo,read', bot_tools=['read'])
+        request = '\u0001' * 128
+        line = dict(id=request, op='run_step', bot='Lead', turn=turn, call_id='script-0', step='1',
+                    name='read', arguments={'path': 'wide.png'})
+        client.process.stdin.write(json.dumps(line) + '\n')
+        client.process.stdin.flush()
+        replied = self.reply(client, request, timeout=10)
+        self.assertIn('result', replied, replied)
+        ran = replied['result']
+        self.assertIn(f'too large for the reply kept as {turn}/script-0/1/picture-1', ran['output'])
+        self.assertNotIn('parts', ran)
+
+    @unittest.skipUnless(shutil.which('bwrap') or sys.platform == 'darwin', 'sandboxes need bubblewrap')
+    def test_a_sandboxed_bot_s_file_steps_stay_in_its_sandbox(self):
+        client, turn = self.script(tools='echo,shell,read,write,web_fetch',
+                                   settings={'sandbox': 'workspace-write'})
+        inside = self.step(client, turn, step='1', name='write',
+                           arguments={'path': 'in.txt', 'content': 'ok'})['result']
+        self.assertFalse(inside['failed'], inside)
+        outside = self.path.parent / f'{self.path.name}-outside.txt'
+        escaped = self.step(client, turn, step='2', name='write',
+                            arguments={'path': str(outside), 'content': 'no'})['result']
+        self.assertTrue(escaped['failed'], escaped)
+        self.assertFalse(outside.exists())
+        # Off the network, its web tool is not one it may call.
+        fetched = self.step(client, turn, step='3', name='web_fetch', arguments={'url': 'https://example.test/'})
+        self.assertEqual(fetched['error'], 'tool_not_available')
+        self.answer(client, turn)
+        self.assertEqual(client.finished(turn)['data']['status'], 'completed')
+
+    @unittest.skipUnless(shutil.which('bwrap') or sys.platform == 'darwin', 'sandboxes need bubblewrap')
+    def test_a_file_step_through_a_link_into_the_workspace_is_judged_where_it_leads(self):
+        outside = self.path.parent / f'{self.path.name}-links'
+        outside.mkdir()
+        self.addCleanup(shutil.rmtree, outside, True)
+        (outside / 'ws').symlink_to(self.path)
+        client, turn = self.script(tools='echo,write', bot_tools=['write'], approve=['write'],
+                                   approver='manual', settings={'sandbox': 'workspace-write'})
+        # Spelled outside, it leads into the workspace: confined, no gate asked.
+        ran = self.step(client, turn, name='write',
+                        arguments={'path': str(outside / 'ws' / 'via.txt'), 'content': 'ok'})['result']
+        self.assertFalse(ran['failed'], ran)
+        self.assertEqual((self.path / 'via.txt').read_text(), 'ok')
+        self.answer(client, turn)
+        self.assertEqual(client.finished(turn)['data']['status'], 'completed')
+
+    def test_a_tool_the_bot_lacks_is_not_a_step_it_may_run(self):
+        client, turn = self.script(tools='echo,shell,write', bot_tools=['echo', 'shell'])
+        refused = self.step(client, turn, name='write', arguments={'path': 'x', 'content': 'y'})
+        self.assertEqual(refused['error'], 'tool_not_available')
+        self.assertFalse((self.path / 'x').exists())
+        self.answer(client, turn)
+
     def test_a_step_is_refused_at_once_for_what_it_cannot_be(self):
         client, turn = self.script()
         ask = dict(bot='Lead', turn=turn, call_id='script-0', step='1', name='echo', arguments={'text': 'hi'})
-        for change, error in [({'step': 'a b'}, 'invalid_step'), ({'name': 'wait'}, 'invalid_step'), ({'name': 'read'}, 'invalid_step'),
+        for change, error in [({'step': 'a b'}, 'invalid_step'), ({'name': 'wait'}, 'invalid_step'), ({'name': 'read'}, 'invalid_tool_arguments'),
                               ({'name': 'mcp__x__y'}, 'invalid_step'), ({'arguments': []}, 'invalid_step'),
                               ({'arguments': {'nope': 1}}, 'invalid_tool_arguments'),
                               ({'name': 'shell', 'arguments': {'command': 'x', 'background': True}}, 'invalid_step'),
@@ -315,12 +448,14 @@ class DaemonStepTests(ModelFixture):
             time.sleep(.01)
         # It waits as an entry in the line, not as a started command.
         self.assertEqual(client.request('stats')['result']['steps']['commands'], 0)
-        ran = self.reply(client, request, timeout=10)['result']
+        replied = self.reply(client, request, timeout=10)
+        self.assertIn('result', replied, replied)
+        ran = replied['result']
         self.assertEqual(json.loads(ran['output'])['stdout'], 'ran\n')
         self.assertEqual(client.finished(held)['data']['status'], 'completed')
 
     def test_a_step_that_takes_no_process_never_waits_behind_a_command_in_line(self):
-        client = self.client('echo,shell', extra=('--max-processes', '1'))
+        client = self.client('echo,shell,read', extra=('--max-processes', '1'))
         self.model.call_script = [('exec', {'code': 'run()'})]
         turns = {}
         for bot in ('Lead', 'Second'):
@@ -337,17 +472,19 @@ class DaemonStepTests(ModelFixture):
         while client.request('stats')['result']['steps']['in_line'] == 0:
             self.assertLess(time.monotonic(), deadline, 'the command never lined up')
             time.sleep(.01)
-        # An echo of a third call runs at once regardless.
+        # A read and an echo of a third call run at once regardless.
         client.request('create', bot='Third', workspace=str(self.path), declare=[EXEC])
         third = client.request('submit', bot='Third', request_id='t', prompt='script')['result']['message']
         while len(client.request('tool_calls', tag='sonny')['result']['calls']) < 3:
             self.assertLess(time.monotonic(), deadline)
             time.sleep(.01)
-        started = time.monotonic()
-        ran = client.request('run_step', bot='Third', turn=third, call_id='script-0', step='1',
-                             name='echo', arguments={'text': 'hi'})
-        self.assertIn('result', ran, ran)
-        self.assertLess(time.monotonic() - started, 2)
+        (self.path / 'note.txt').write_text('hello\n')
+        for step, (name, arguments) in enumerate([('echo', {'text': 'hi'}), ('read', {'path': 'note.txt'})], 1):
+            started = time.monotonic()
+            ran = client.request('run_step', bot='Third', turn=third, call_id='script-0', step=str(step),
+                                 name=name, arguments=arguments)
+            self.assertIn('result', ran, ran)
+            self.assertLess(time.monotonic() - started, 2)
         self.assertEqual(client.request('stats')['result']['steps']['in_line'], 1)
         client.request('interrupt', bot='Lead', turn=turns['Lead'])
         self.assertEqual(self.reply(client, slow, timeout=10)['error'], 'step_stopped')

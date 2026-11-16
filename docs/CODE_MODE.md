@@ -9,7 +9,8 @@ slice 2, daemon steps for `shell` and `echo` (protocol 78, schema 102;
 measured in
 [DAEMON_MEASUREMENTS.md](DAEMON_MEASUREMENTS.md#daemon-steps-at-1000-and-10000-bots-protocol-78-schema-102),
 where three of its gates are missed, why, and the derived gate proposed
-for the step p99).
+for the step p99); slice 3, daemon steps for the file tools (`read`,
+`write`, `edit`, `apply_patch`, `web_fetch`; no protocol or schema change).
 GPT-6 Astra reviewed two
 drafts the same day and approved neither slice as scoped. This draft takes
 the narrower scopes it said it would approve and has not been reviewed
@@ -787,7 +788,7 @@ no Agent-only number exists yet, and says so.
 | 2 | At most two store jobs for a step no gate holds, with reads, group sizes and bytes counted | Two for a client step |
 | 2 | Store jobs per turn unchanged for a turn with no steps | 7.5 |
 | 2 | A step in line holds its request and under 1 KiB more; running and ended-but-unsent bytes each bounded and reported | New |
-| 2 | Fleet: 10,000 bots, five `echo` steps each, all finish; no step refused or expired; step p99 wait under 1 s | New |
+| 2 | Fleet: 10,000 bots, five `echo` steps each, all finish; no step refused or expired; at 400, 2,000 and 10,000 bots, step p99 wait at most 1.6 times the fleet's size over its step rate, and the step rate at 10,000 bots no lower than main's (was: under 1 s; changed with George's agreement on 2026-11-15) | New |
 | 2 | Beside that fleet, other bots' turn p99 within the perf gate's 15% | New |
 
 The fleet row is the one that matters. A screen where steps are refused
@@ -798,8 +799,9 @@ at 10,000 bots), the other bots' 15% (24 to 65% from their own process),
 and the 1 KiB a step in line (about 3 KB measured). The 1 s figure was
 written before any run. A fleet stepping at once waits in one FIFO line,
 so its p99 is about one pass of that line, the fleet's size over the step
-rate; the proposed replacement is a p99 at most 1.6 times that, with a
-step rate no lower than main's. The numbers and the reasoning are in
+rate; George agreed the same day to replace it with a p99 at most 1.6
+times that, with a step rate no lower than main's, the gate in the table
+above. The numbers and the reasoning are in
 [DAEMON_MEASUREMENTS.md](DAEMON_MEASUREMENTS.md#remeasured-after-review-a-second-process-measured-memory-and-a-derived-gate).
 
 **Sonny's gates,** on Agent, with the bench the numbers above came from:
