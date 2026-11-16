@@ -648,7 +648,12 @@ machine at fleet size, and every client would write its own `edit` and
 - **The daemon reports its tools' schemas.** `ready` lists names only
   (src/server/mod.rs:2200). A client that declares tools to a script needs
   each tool's `parameters`, and whether it can be a step: facts, not
-  advice.
+  advice. Built as its own op, `tools`, rather than in `ready`: the
+  schemas take about 25 KiB, and `ready` greets every session, a bot's
+  socket included.
+- **Built in protocol 81** as the setting `steps_only`, beside the others
+  a bot is created and configured with. A bot whose `read` is hidden writes
+  no stubs, until the evaluation says otherwise.
 
 ### 4. Replay, later
 

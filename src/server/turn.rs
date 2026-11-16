@@ -2338,6 +2338,7 @@ impl Turn {
                             false,
                             &[],
                             &Default::default(),
+                            &[],
                             false,
                         )?;
                         (Body::Span(&plan, stripped), &*empty)
@@ -2794,7 +2795,7 @@ impl Turn {
                 agent_runtime::codec::Family::Anthropic => tools.get().len(),
                 agent_runtime::codec::Family::Responses => self
                     .registry
-                    .encoded(family, false, &[], &Default::default(), false)?
+                    .encoded(family, false, &[], &Default::default(), &[], false)?
                     .get()
                     .len(),
             })
@@ -3153,11 +3154,12 @@ impl Turn {
             provider.grammars(),
             &record.offered(),
             &record.declared,
+            &record.declared_hidden(),
             record.sandboxed(),
         )?;
         // A stub names the `read` call that returns its result, so only a
-        // bot that has the tool elides.
-        let elides = record.tools.iter().any(|tool| tool == "read");
+        // bot whose model can make that call elides.
+        let elides = record.follows_stubs();
         // How a steer stayed queued for lack of room, while one still is.
         let mut capped = None;
         // Whether a call went without tool calls for a budget: the next
@@ -4622,7 +4624,12 @@ impl Turn {
             // than run unconfined. A command a rule allows runs unconfined,
             // as in Codex; one a rule asked about runs where it asked to,
             // once allowed.
-            let plan = record.plan(&call, workspace, &self.ruled());
+            let mut plan = record.plan(&call, workspace, &self.ruled());
+            // A tool kept for steps is no call the model may make: refused
+            // below, with no one asked.
+            if record.steps_only(&call.name) {
+                (plan.gated, plan.unasked) = (false, false);
+            }
             let (approved, confined, in_sandbox) = (plan.gated, plan.confined(), plan.in_sandbox());
             if plan.refused_unasked() {
                 let refused = call.clone();
@@ -4663,7 +4670,12 @@ impl Turn {
             // A tool failure is a result the model can act on. Only the
             // scheduler closing is a runtime failure. The bot's selection is
             // enforced here, not only by what the model was shown.
-            let prepared = if let Some(tool) = record.declared(&call.name) {
+            let prepared = if record.steps_only(&call.name) {
+                Err(Error::with(
+                    "tool_not_available",
+                    format!("{}: callable only as a step of a script", call.name),
+                ))
+            } else if let Some(tool) = record.declared(&call.name) {
                 agent_runtime::tools::check_declared(tool, &call.arguments)
                     .map(|()| Prepared::Declared(tool.result.clone()))
             } else if record.calls(&call.name) {
@@ -5073,6 +5085,7 @@ impl Turn {
         if !matches!(call.name.as_str(), "shell" | "read")
             || record.declared(&call.name).is_some()
             || !record.calls(&call.name)
+            || record.steps_only(&call.name)
         {
             return None;
         }
@@ -5481,6 +5494,7 @@ impl Turn {
         if self.registry.admits()
             || record.declared(&call.name).is_some()
             || !record.calls(&call.name)
+            || record.steps_only(&call.name)
         {
             return false;
         }
@@ -6997,8 +7011,10 @@ fn withhold_thinking(context: &Context, error: &Error) -> Option<Strip> {
 
 /// Whether the bot may search the web: its provider declares the search
 /// when it offers one, and a fork's allowed list narrows it as any tool.
+/// A search its `steps_only` keeps is not declared: a model's own search
+/// is no step a script can take.
 fn searches(record: &agent_runtime::store::Bot) -> bool {
-    record.calls("web_search")
+    record.calls("web_search") && !record.steps_only("web_search")
 }
 
 /// Whether a turn whose budget is spent makes one more call, without tool

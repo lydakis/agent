@@ -10381,3 +10381,23 @@ Where the ring is reached, measured locally (release build, a
 
 The cost grows with the output a background command writes, not with bots,
 turns or history, and only while that command runs.
+
+## Code mode: tools kept for scripts (protocol 81)
+
+A bot's `steps_only` leaves the daemon's step tools out of what its model
+is shown, as Sonny's code mode will set it. Measured with
+`bench.code_mode_vs_direct MODE=steps`, the same build with and without
+`STEPS_ONLY=1`, two alternating rounds:
+
+| Code mode | Tools shown, 400 bots | `steps_only`, 400 | Tools shown, 2,000 | `steps_only`, 2,000 |
+| --- | ---: | ---: | ---: | ---: |
+| Turn p50 | 1.52 to 1.55 s | 1.51 to 1.52 s | 6.6 to 7.0 s | 6.8 to 7.0 s |
+| Daemon processor time a turn | 4.18 to 4.38 ms | 4.23 ms | 4.21 to 4.25 ms | 4.29 to 4.41 ms |
+| Idle / peak memory | 25 / 53 to 54 MB | 24 to 25 / 52 to 53 MB | 29 to 30 / 122 to 129 MB | 30 / 129 to 133 MB |
+| Other bots' p99 while the fleet runs | 0.43 to 0.48 s | 0.47 to 0.57 s | 0.67 to 1.86 s | 0.68 to 0.69 s |
+| Model request a turn | 2.5 KiB | 2.0 KiB | 1.8 KiB | 1.4 KiB |
+
+Each row is within the runs' spread but the model request, a fifth
+smaller, since the model is shown the script tool alone. Code mode stays
+ahead of 0.9.5 on every row (0.9.5 direct: turn p50 2.5 and 13.0 s,
+processor time 5.5 and 8.2 ms a turn, peak memory 62 and 191 MB).

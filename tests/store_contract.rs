@@ -5423,7 +5423,7 @@ fn a_bot_keeps_its_settings_and_a_fork_copies_them() {
             "compact_keep":25,"compact_tokens":null,"post_turn_compact_percent":70,"keep_turns":1,"max_rounds":null,"max_drops":3,"approval_hold_ms":2000,"max_output_tokens":null,
             "cache_ttl":"1h","speed":"fast","sandbox":null,"writable":[],"network":false,"outputs":null,"trailer":["sender"],
             "quiet_background":false,"hold_ms":432000000,"unix_sockets":[],"rules":null,"env":{},
-            "approval_policy":null})
+            "approval_policy":null,"steps_only":null})
     );
     // Retention follows the bot's own setting.
     for n in 1..=3 {
@@ -14757,6 +14757,51 @@ fn a_bot_without_read_stores_no_stubs() {
     assert_eq!(stored("SELECT count(*) FROM nodes WHERE elided>0"), 0);
     db.window("Bob", 1 << 20, 1 << 20).unwrap();
     assert!(db.elision_plan("Bob", 1, 1).unwrap().is_none());
+    drop(db);
+    std::fs::remove_file(path).unwrap();
+}
+
+#[test]
+fn a_bot_whose_read_is_kept_for_steps_stores_no_stubs() {
+    // Its model is not shown `read`, so it could not follow a stub either.
+    let path = std::env::temp_dir().join(format!("agent-steps-read-{}.sqlite", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+    let mut db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
+    let tools = vec!["shell".to_owned(), "read".to_owned()];
+    db.create(
+        "Bob",
+        Some("/synthetic"),
+        Binding {
+            tools: &tools,
+            settings: Settings {
+                steps_only: Some(vec!["read".into()]),
+                ..Default::default()
+            },
+            ..binding()
+        },
+    )
+    .unwrap();
+    let turn = db
+        .begin(
+            "Bob",
+            "r1",
+            "task",
+            true,
+            &TurnOptions::default(),
+            allow_provider,
+        )
+        .unwrap()
+        .turn;
+    exchange(&mut db, turn, "c0", &lines(0, 400));
+    exchange(&mut db, turn, "c1", &lines(1, 400));
+    let stored = |sql: &str| -> i64 {
+        Connection::open(&path)
+            .unwrap()
+            .query_row(sql, [], |r| r.get(0))
+            .unwrap()
+    };
+    assert_eq!(stored("SELECT count(*) FROM stubs"), 0);
+    assert_eq!(stored("SELECT count(*) FROM nodes WHERE elided>0"), 0);
     drop(db);
     std::fs::remove_file(path).unwrap();
 }

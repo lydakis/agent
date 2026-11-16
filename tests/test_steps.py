@@ -10,6 +10,7 @@ import sys
 import time
 import unittest
 
+from bench.runtime_client import node_item
 from bench.socket_client import Connection, SocketClient
 from tests.test_runtime import ModelFixture
 
@@ -23,10 +24,13 @@ EXEC = {'name': 'exec', 'description': 'Run a script.',
 
 @unittest.skipUnless(os.environ.get('AGENT_TEST_RUNTIME') == '1', 'set AGENT_TEST_RUNTIME=1 after a Rust release build')
 class DaemonStepTests(ModelFixture):
-    def script(self, tools='echo,shell', tool=EXEC, settings=None, client=None, bot_tools=None, **create):
+    def script(self, tools='echo,shell', tool=EXEC, settings=None, client=None, bot_tools=None,
+               bot_settings=None, **create):
         client = client or self.client(tools, settings=settings)
         if bot_tools is not None:
             create['tools'] = bot_tools
+        if bot_settings is not None:
+            create['settings'] = bot_settings
         created = client.request('create', bot='Lead', workspace=str(self.path), declare=[tool], **create)
         self.assertIn('result', created, created)
         self.model.call_script = [('exec', {'code': 'run()'})]
@@ -584,6 +588,111 @@ class DaemonStepTests(ModelFixture):
         self.assertIn('result', steered)
         ran = self.reply(client, request, timeout=15)['result']
         self.assertEqual(json.loads(ran['output'])['stdout'], 'lifted\n')
+
+    def offered(self):
+        return [t['name'] for t in self.model.requests.get(timeout=3)['tools']]
+
+    def drain(self):
+        while not self.model.requests.empty():
+            self.model.requests.get_nowait()
+
+    def test_steps_only_star_shows_the_model_the_script_tool_and_keeps_the_rest_for_steps(self):
+        client, turn = self.script(tools='echo,shell,read', bot_tools=['echo', 'shell', 'read'],
+                                   bot_settings={'steps_only': ['*']})
+        self.assertEqual(self.offered(), ['exec'])
+        # Hidden from the model, still a step.
+        self.assertEqual(self.step(client, turn)['result']['output'], 'hi')
+        ran = self.step(client, turn, step='2', name='shell', arguments={'command': 'echo ok'})['result']
+        self.assertEqual(json.loads(ran['output'])['stdout'], 'ok\n')
+        self.answer(client, turn)
+        self.assertEqual(client.finished(turn)['data']['status'], 'completed')
+        # A direct call of a hidden tool is refused, with no one asked.
+        self.drain()
+        prompt = 'calls:' + json.dumps([['shell', {'command': 'echo direct > direct'}]])
+        direct = client.request('submit', bot='Lead', request_id='d', prompt=prompt)['result']['message']
+        self.assertEqual(client.finished(direct)['data']['status'], 'completed')
+        self.assertFalse((self.path / 'direct').exists())
+        [done] = self.events(client, direct, 'tool_completed')
+        output = node_item(client, 'Lead', done['node'])['result']['output']
+        self.assertEqual(json.loads(output)['error'], 'tool_not_available')
+        record = client.request('inspect', bot='Lead')['result']
+        self.assertEqual(record['settings']['steps_only'], ['*'])
+
+    def test_a_direct_call_of_a_gated_hidden_tool_asks_no_one(self):
+        client = self.client('echo,shell')
+        client.request('create', bot='Kept', workspace=str(self.path), tools=['echo', 'shell'],
+                       declare=[EXEC], approve=['shell'], approver='person',
+                       settings={'steps_only': ['shell']})
+        prompt = 'calls:' + json.dumps([['shell', {'command': 'echo asked > asked'}]])
+        turn = client.request('submit', bot='Kept', request_id='k', prompt=prompt)['result']['message']
+        self.assertEqual(client.finished(turn)['data']['status'], 'completed')
+        events = client.request('events', bot='Kept', after=0, limit=256)['result']['events']
+        self.assertFalse([e for e in events if e['event'] == 'approval_requested'])
+        self.assertFalse((self.path / 'asked').exists())
+
+    def test_steps_only_star_hides_nothing_without_a_script_tool(self):
+        client = self.client('echo,shell')
+        client.request('create', bot='Plain', workspace=str(self.path), tools=['echo', 'shell'],
+                       settings={'steps_only': ['*']})
+        turn = client.request('submit', bot='Plain', request_id='p', prompt='hello')['result']['message']
+        self.assertEqual(client.finished(turn)['data']['status'], 'completed')
+        self.assertEqual(self.offered(), ['echo', 'shell'])
+
+    def test_steps_only_by_name_hides_a_daemon_tool_and_a_client_tool(self):
+        lookup = {'name': 'lookup', 'description': 'Look up.', 'answered_by': 'sonny',
+                  'parameters': {'type': 'object', 'properties': {}, 'additionalProperties': False}}
+        client = self.client('echo,shell')
+        client.request('create', bot='Named', workspace=str(self.path), tools=['echo', 'shell'],
+                       declare=[EXEC, lookup], settings={'steps_only': ['shell', 'lookup']})
+        turn = client.request('submit', bot='Named', request_id='n', prompt='hello')['result']['message']
+        self.assertEqual(client.finished(turn)['data']['status'], 'completed')
+        self.assertEqual(self.offered(), ['echo', 'exec'])
+        # Shown again from the next turn once the setting is cleared.
+        self.assertIn('result', client.request('configure', bot='Named', settings={'steps_only': []}))
+        self.drain()
+        turn = client.request('submit', bot='Named', request_id='m', prompt='hello')['result']['message']
+        self.assertEqual(client.finished(turn)['data']['status'], 'completed')
+        self.assertEqual(self.offered(), ['echo', 'shell', 'exec', 'lookup'])
+
+    def test_a_bot_made_by_another_takes_its_steps_only_unless_its_client_sets_one(self):
+        client = self.client('echo,shell')
+        maker = client.request('create', bot='Maker', workspace=str(self.path), tools=['echo', 'shell'],
+                               declare=[EXEC], settings={'steps_only': ['*']})['result']['bot_id']
+        made = client.request('create', bot='Made', workspace=str(self.path), tools=['echo'],
+                              created_by='Maker', created_by_id=maker)['result']
+        self.assertEqual(made['settings']['steps_only'], ['*'])
+        own = client.request('create', bot='Own', workspace=str(self.path), tools=['echo'],
+                             created_by='Maker', created_by_id=maker, settings={'steps_only': []})['result']
+        self.assertEqual(own['settings']['steps_only'], [])
+        fork = client.request('fork', source='Maker', bot='Copy')['result']
+        self.assertEqual(fork['settings']['steps_only'], ['*'])
+        refused = client.request('configure', bot='Maker', settings={'steps_only': ['shell', 'shell']})
+        self.assertEqual(refused['error'], 'invalid_setting')
+
+    def test_a_direct_call_of_a_hidden_client_tool_never_reaches_its_client(self):
+        lookup = {'name': 'lookup', 'description': 'Look up.', 'answered_by': 'sonny',
+                  'parameters': {'type': 'object', 'properties': {}, 'additionalProperties': False}}
+        client = self.client('echo')
+        client.request('create', bot='Lead', workspace=str(self.path), tools=['echo'],
+                       declare=[EXEC, lookup], settings={'steps_only': ['lookup']})
+        prompt = 'calls:' + json.dumps([['lookup', {}]])
+        turn = client.request('submit', bot='Lead', request_id='h', prompt=prompt)['result']['message']
+        self.assertEqual(client.finished(turn)['data']['status'], 'completed')
+        [started] = self.events(client, turn, 'tool_started')
+        self.assertNotIn('answered_by', started)
+        self.assertEqual(client.request('tool_calls', tag='sonny')['result']['calls'], [])
+        [done] = self.events(client, turn, 'tool_completed')
+        output = node_item(client, 'Lead', done['node'])['result']['output']
+        self.assertEqual(json.loads(output)['error'], 'tool_not_available')
+
+    def test_tools_lists_each_tool_s_schema_and_whether_it_runs_as_a_step(self):
+        client = self.client('echo,shell,read,history')
+        tools = {t['name']: t for t in client.request('tools')['result']['tools']}
+        self.assertLessEqual({'echo', 'history', 'read', 'shell'}, set(tools))
+        self.assertTrue(tools['shell']['step'] and tools['read']['step'] and tools['echo']['step'])
+        self.assertFalse(tools['history']['step'])
+        self.assertIn('command', tools['shell']['parameters']['properties'])
+        self.assertTrue(tools['echo']['description'])
 
 
 if __name__ == '__main__':
