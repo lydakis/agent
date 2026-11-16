@@ -3075,6 +3075,7 @@ pub(crate) fn made(
         settings.insert("outputs".into(), json!(outputs));
     }
     settings.insert("trailer".into(), json!(crate::stamp::trailer(&config)));
+    settings.insert("steps_only".into(), crate::exec::steps_only(&config));
     if let Some(ms) = config.hold_ms {
         settings.insert("hold_ms".into(), json!(ms));
     }

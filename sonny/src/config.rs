@@ -195,6 +195,15 @@ pub const SETTINGS: &[Setting] = &[
         default: "live",
     },
     Setting {
+        key: "sonny.code_mode",
+        group: "Agents",
+        name: "code mode",
+        label: "whether agents run their shell and file tools from scripts",
+        about: "whether agents reach their shell and file tools only from exec scripts, which run them as the same calls would, under the same rules; off, they call them directly again; from each agent's next turn",
+        values: SWITCH,
+        default: "true",
+    },
+    Setting {
         key: "trailer",
         group: "Agents",
         name: "senders",
@@ -1363,7 +1372,7 @@ mod tests {
                 assert!(!setting.name.contains(['_', '.']), "{}", setting.name);
             }
         }
-        assert_eq!(listed().len(), 34);
+        assert_eq!(listed().len(), 35);
         // What only tunes stays in the file, and in the reference.
         for key in [
             "sonny.sky_haiku_daily",

@@ -3597,8 +3597,9 @@ host would otherwise run the bot's own tools on its behalf:
 `{"op":"run_step","bot","turn","call_id","step","name","arguments"}`,
 beside `approve_step`, with the same `step` and `arguments` rules and the
 same call checks. `name` is one of the daemon's tools that may run as a
-step: `shell` (foreground only), `read` (of a file; an artifact is read
-with `artifact`), `write`, `edit`, `apply_patch`, `web_fetch`, and `echo`
+step: `shell` (foreground only), `read` (of a file, or of a command's
+kept output by its `TURN/CALL/STREAM` reference, paged in lines as the
+model's own read pages it; not a recorded result), `write`, `edit`, `apply_patch`, `web_fetch`, and `echo`
 (`invalid_step` otherwise, or for `background`, `detach` or `tty`), and
 one the bot may call (`tool_not_available`, as `web_fetch` is for a bot its
 sandbox keeps off the network); the call's tool must take steps, and the

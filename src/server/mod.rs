@@ -5891,14 +5891,12 @@ impl Service {
                         );
                     }
                     Prepared::Read {
-                        source:
-                            agent_runtime::tools::ReadSource::Artifact { .. }
-                            | agent_runtime::tools::ReadSource::Result { .. },
+                        source: agent_runtime::tools::ReadSource::Result { .. },
                         ..
                     } => {
                         return fail_with(
                             "invalid_step",
-                            "a daemon step reads a file; an artifact is read with `artifact`",
+                            "a daemon step reads a file or a command's kept output, not a recorded result",
                         );
                     }
                     _ => {}
