@@ -13097,6 +13097,9 @@ impl App {
                 .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER);
             if key.code == KeyCode::Char('?') && plain {
                 pane.sheet = !pane.sheet;
+                // A key other than `enter` keeps what a confirm asked
+                // about, `?` too: the sheet hides the question.
+                self.keep_asked();
                 return true;
             }
             if std::mem::take(&mut pane.sheet) && key.code == KeyCode::Esc {
@@ -30229,6 +30232,12 @@ mod tests {
         app.key(key(KeyCode::Char('q'))).await;
         assert_eq!(watch(&app), (None, None));
         assert_eq!(app.notice.as_deref(), Some("not stopped"));
+        assert!(!run.join(workflow::view::STOP).exists());
+        // `?` keeps it too, so `esc` then `enter` stops nothing.
+        app.key(key(KeyCode::Char('x'))).await;
+        app.key(key(KeyCode::Char('?'))).await;
+        app.key(key(KeyCode::Esc)).await;
+        assert_eq!(watch(&app), (None, None));
         assert!(!run.join(workflow::view::STOP).exists());
         // `enter` opens its page; `←` goes back to the list.
         app.key(key(KeyCode::Enter)).await;
