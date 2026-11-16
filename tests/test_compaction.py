@@ -441,9 +441,12 @@ class CompactionTests(ModelFixture):
         client = Client(self.binary, self.path / 'state.sqlite', self.url)
         self.addCleanup(client.close)
         self.assertEqual(client.finished(turn)['data']['status'], 'completed')
+        # The refused summary and its retry, then the one ordinary call. A
+        # summary for the next head may follow once the turn ends, before
+        # or after this read: it is the later head's.
         requests = self.requests()
-        self.assertEqual(sum(is_summary(r) for r in requests), 2)
-        self.assertEqual(sum(not is_summary(r) for r in requests), 1)
+        self.assertEqual([i for i, r in enumerate(requests) if not is_summary(r)], [2])
+        self.assertLessEqual(len(requests), 4)
         self.assertIsNotNone(client.request('inspect', bot='Bob')['result']['compaction'])
 
     def test_exhausted_summary_is_skipped_when_the_ordinary_call_resumes(self):
