@@ -2956,7 +2956,14 @@ mod tests {
                 Provider::new(transport.clone(), family, "http://example.test", None).unwrap();
             let schemas = crate::tools::Registry::all()
                 .unwrap()
-                .encoded(family, false, &["echo".into()], &Default::default(), false)
+                .encoded(
+                    family,
+                    false,
+                    &["echo".into()],
+                    &Default::default(),
+                    &[],
+                    false,
+                )
                 .unwrap();
             for allow in [true, false] {
                 for tools in [&*schemas, &*none()] {
@@ -3019,7 +3026,14 @@ mod tests {
             let provider =
                 Provider::new(transport.clone(), family, "http://example.test", None).unwrap();
             let schemas = tools
-                .encoded(family, false, &["echo".into()], &Default::default(), false)
+                .encoded(
+                    family,
+                    false,
+                    &["echo".into()],
+                    &Default::default(),
+                    &[],
+                    false,
+                )
                 .unwrap();
             let body = |output_schema, reasoning| {
                 let mut prefix = provider

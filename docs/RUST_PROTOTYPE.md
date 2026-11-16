@@ -3662,6 +3662,23 @@ until its call ends; a step the daemon was running when it stopped is
 closed at the next open as `tool_outcome_unknown`. A bot's own socket may
 not ask for steps.
 
+Protocol version 81 lets a client keep tools for its scripts. A bot's
+setting `steps_only` lists tools left out of what its model is shown and
+callable only as steps of a script: each by name, the daemon's or one its
+client declared, and `"*"` for every one of the daemon's tools that runs as
+a daemon step. `"*"` hides nothing while the bot has no declared tool that
+takes steps (`"steps": true`). A direct call of a hidden tool is
+`tool_not_available`, with no one asked, and a step of it runs as before.
+A bot made by another takes its creator's `steps_only` unless its client
+sets one, a fork keeps its source's, and an empty list hides nothing. A
+change applies from the bot's next turn and gives it its own prompt cache.
+A bot whose `read` is hidden writes no stubs of its tool results, since
+its model could not read them back. `{"op":"tools"}` answers the daemon's
+tools as a model is shown them, each with `step`, whether a script can run
+it as a daemon step: `{"tools":[{"name","description","parameters",
+"grammar"?,"step"}]}`. The settings change no stored shape; no schema
+change.
+
 ### Tool approval
 
 A bot may be created with a gate (one no bot made, which a client

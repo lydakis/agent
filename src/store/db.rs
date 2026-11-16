@@ -460,7 +460,18 @@ pub struct Settings {
     /// gates are asked.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub approval_policy: Option<ApprovalPolicy>,
+    /// Tools left out of what its model is shown and callable only as
+    /// steps of a script: each by name, the daemon's or its client's, and
+    /// `"*"` for every one of the daemon's tools that runs as a step
+    /// ([`crate::tools::STEP_TOOLS`]). `"*"` hides nothing while the bot
+    /// has no declared tool that takes steps. A bot made by another takes
+    /// its creator's unless its client sets one; an empty list hides
+    /// nothing. Unset, every tool is shown.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub steps_only: Option<Vec<String>>,
 }
+/// The most names a bot's `steps_only` lists.
+pub const STEPS_ONLY_NAMES: usize = 256;
 /// Why a call that would need approval fails on a bot that never asks.
 pub const NEVER_ASKS: &str =
     "approval_policy is never: this call would need approval, and no one is asked";
@@ -715,6 +726,13 @@ impl Settings {
         {
             return refuse("unix_sockets names at most 64 absolute paths, 32 KiB in all");
         }
+        if let Some(names) = &self.steps_only
+            && (names.len() > STEPS_ONLY_NAMES
+                || (names.iter()).any(|name| name.is_empty() || name.len() > 64)
+                || (names.iter().enumerate()).any(|(index, name)| names[..index].contains(name)))
+        {
+            return refuse("steps_only names at most 256 tools, each once and 1 to 64 bytes");
+        }
         if let Some(rules) = &self.rules {
             rules
                 .validate()
@@ -783,7 +801,8 @@ impl Settings {
             "trailer":self.trailer(),"quiet_background":self.quiet_background,
             "hold_ms":self.hold_ms(),
             "unix_sockets":self.unix_sockets,
-            "rules":self.rules,"env":self.env,"approval_policy":self.approval_policy})
+            "rules":self.rules,"env":self.env,"approval_policy":self.approval_policy,
+            "steps_only":self.steps_only})
     }
     fn stored(&self) -> Result<Option<String>> {
         Ok((*self != Self::default())
@@ -804,7 +823,7 @@ pub fn web(name: &str) -> bool {
     matches!(name, "web_fetch" | "web_search")
 }
 /// Every setting's name, as `create` and `configure` take it.
-pub const SETTINGS: [&str; 25] = [
+pub const SETTINGS: [&str; 26] = [
     "context_bytes",
     "context_items",
     "note_turns",
@@ -830,6 +849,7 @@ pub const SETTINGS: [&str; 25] = [
     "rules",
     "env",
     "approval_policy",
+    "steps_only",
 ];
 /// Settings as their stored fields, those at their defaults left out.
 fn settings_map(settings: &Settings) -> Result<serde_json::Map<String, Value>> {
@@ -1176,10 +1196,12 @@ impl Bot {
             read: call.name == "read",
         }
     }
-    /// Whether one of the bot's gates holds this call back, asked or not.
+    /// Whether one of the bot's gates holds this call, from its model, back,
+    /// asked or not: never a call of a tool kept for steps, which is refused.
     fn held(&self, call: &ToolCall, workspace: &std::path::Path, rules: &Rules) -> bool {
         gated(&self.gates, &call.name)
             && self.may_call(&call.name)
+            && !self.steps_only(&call.name)
             && !self.declared(&call.name).is_some_and(|tool| tool.steps)
             && match self.ruling(call, rules) {
                 Ok(Ruling::Prompt(_)) => true,
@@ -1310,15 +1332,49 @@ impl Bot {
         self.sandboxed() && !self.settings.network
     }
     /// Its tools as offered to the model now: [`Bot::calls`]'s, so an
-    /// offline bot is offered no web tool, from its next call on.
+    /// offline bot is offered no web tool, from its next call on, and none
+    /// its `steps_only` keeps for steps.
     pub fn offered(&self) -> std::borrow::Cow<'_, [String]> {
-        match self.offline() && self.tools.iter().any(|tool| web(tool)) {
+        let hides = |tool: &String| (self.offline() && web(tool)) || self.steps_only(tool);
+        match self.tools.iter().any(hides) {
             true => (self.tools.iter())
-                .filter(|tool| !web(tool))
+                .filter(|tool| !hides(tool))
                 .cloned()
                 .collect::<Vec<_>>()
                 .into(),
             false => self.tools.as_slice().into(),
+        }
+    }
+    /// Whether `name` is left out of what its model is shown, callable only
+    /// as a step of a script: named in its `steps_only`, or one of the
+    /// daemon's step tools under `"*"` while it has a declared tool that
+    /// takes steps. A direct call of it is `tool_not_available`.
+    pub fn steps_only(&self, name: &str) -> bool {
+        let Some(names) = &self.settings.steps_only else {
+            return false;
+        };
+        if names.iter().any(|hidden| hidden == name) {
+            return true;
+        }
+        names.iter().any(|hidden| hidden == "*")
+            && crate::tools::STEP_TOOLS.contains(&name)
+            && self.declared(name).is_none()
+            && (self.declared.iter()).any(|tool| tool.steps && self.declared(&tool.name).is_some())
+    }
+    /// Whether its model can follow a stub of a tool result: it has `read`
+    /// and is shown it. A bot whose model cannot gets no text stubs.
+    pub fn follows_stubs(&self) -> bool {
+        self.tools.iter().any(|tool| tool == "read") && !self.steps_only("read")
+    }
+    /// Its declared tools its model is not shown, by name, for the
+    /// encoding of what it is.
+    pub fn declared_hidden(&self) -> Vec<String> {
+        match &self.settings.steps_only {
+            None => Vec::new(),
+            Some(_) => (self.declared.iter())
+                .filter(|tool| self.steps_only(&tool.name))
+                .map(|tool| tool.name.clone())
+                .collect(),
         }
     }
     /// The bot id that keys this bot's provider prompt cache.
@@ -2150,14 +2206,8 @@ pub enum Lifted {
     /// `Some(at)`.
     Waiting(Option<u64>),
     /// Ended: its result is its command's, and `ready` when the turn that
-    /// tells its bot is ready for a slot. `call` names the call, turn and
-    /// id, when it waited for its client's answer, as one with daemon steps
-    /// does.
-    Ended {
-        result: Value,
-        ready: bool,
-        call: Option<(i64, String)>,
-    },
+    /// tells its bot is ready for a slot.
+    Ended { result: Value, ready: bool },
     /// Every gate allowed it: the caller runs it as its command.
     Run(Box<LiftedRun>),
     /// Nothing waits on it any more.
@@ -2568,7 +2618,14 @@ pub struct Database {
     /// Files of outputs whose records the current group removed, removed
     /// once it commits: a group that does not keeps both.
     files_gone: Vec<String>,
+    /// Answered calls the current group ended, told once it commits.
+    calls_ended: Vec<(i64, String)>,
+    /// Where an answered call's end is told: the daemon's steps of it.
+    call_ends: Option<CallEnds>,
 }
+/// Told each answered call that ended, by turn and id, from the storage
+/// worker, before any job of the group that ended it is answered.
+pub type CallEnds = Box<dyn Fn(i64, String) + Send>;
 
 /// A pause as clients read it, from its columns in the order
 /// `id,reason,pulled_by,at_ms,parked,resumed_by,resumed_ms`: `parked` holds the agents whose running turns
@@ -3123,6 +3180,8 @@ impl Database {
             stepped: Vec::new(),
             steps_gone: Vec::new(),
             files_gone: Vec::new(),
+            calls_ended: Vec::new(),
+            call_ends: None,
         })
     }
 
@@ -3450,6 +3509,8 @@ impl Database {
             stepped: Vec::new(),
             steps_gone: Vec::new(),
             files_gone: Vec::new(),
+            calls_ended: Vec::new(),
+            call_ends: None,
         };
         // A deletion interrupted between pieces finishes now: the bot was
         // already refusing work, and nothing else may see it half gone.
@@ -3542,11 +3603,12 @@ impl Database {
     /// methods it calls release their own savepoints into this one.
     pub fn atomic<T>(&mut self, work: impl FnOnce(&mut Self) -> Result<T>) -> Result<T> {
         self.conn.execute_batch("SAVEPOINT atomic")?;
-        let (served, stepped, gone, files) = (
+        let (served, stepped, gone, files, ended) = (
             self.served.len(),
             self.stepped.len(),
             self.steps_gone.len(),
             self.files_gone.len(),
+            self.calls_ended.len(),
         );
         let done = work(self);
         if done.is_ok() {
@@ -3558,6 +3620,7 @@ impl Database {
             self.served.truncate(served);
             self.stepped.truncate(stepped);
             self.files_gone.truncate(files);
+            self.calls_ended.truncate(ended);
             self.restore_steps(gone);
             self.recount_pending()?;
         }
@@ -3603,6 +3666,28 @@ impl Database {
             }
         }
     }
+    /// Answered call `call_id` of `turn` ended: its answer was taken or
+    /// recorded, or it went with its turn or its lifted command. The one
+    /// place an answered call's end is noted, told once the group commits.
+    fn call_ended(&mut self, turn: i64, call_id: &str) {
+        if self.call_ends.is_some() {
+            self.calls_ended.push((turn, call_id.to_owned()));
+        }
+    }
+    /// Tell `call_ends` of each answered call that ends from now on.
+    pub fn on_call_end(&mut self, call_ends: CallEnds) {
+        self.call_ends = Some(call_ends);
+    }
+    /// Tell the calls the group that just committed ended, before any of
+    /// its jobs is answered: whoever hears of an end, the steps of its
+    /// call have been told first.
+    pub fn tell_calls_ended(&mut self) {
+        if let Some(tell) = &self.call_ends {
+            for (turn, call_id) in self.calls_ended.drain(..) {
+                tell(turn, call_id);
+            }
+        }
+    }
     /// Forget a group that did not commit: roll back whatever is still
     /// open, drop the outcomes its jobs announced, and recount the waiting
     /// turns they counted.
@@ -3610,6 +3695,7 @@ impl Database {
         self.outcomes.clear();
         self.served.clear();
         self.stepped.clear();
+        self.calls_ended.clear();
         self.files_gone.clear();
         self.restore_steps(0);
         self.pending_stale = true;
@@ -4250,6 +4336,10 @@ impl Database {
         let mut kin = Vec::new();
         let tx = self.conn.savepoint()?;
         tx.execute("UPDATE bots SET settings=? WHERE id=?", params![stored, id])?;
+        // What its model is shown changed: its prompt cache is its own.
+        if changed.iter().any(|key| key == "steps_only") {
+            tx.execute("UPDATE bots SET cache_bot=NULL WHERE id=?", [id])?;
+        }
         // The bots it made, and theirs, go by the same rules and `env`.
         for key in INHERITED {
             if !changed.iter().any(|changed| changed == key) {
@@ -4632,7 +4722,13 @@ impl Database {
                 if let Some(why) = binding.settings.beyond(&creator) {
                     return fail_with("invalid_setting", why);
                 }
-                binding.settings.clone().under(&creator)
+                let mut settings = binding.settings.clone().under(&creator);
+                // Its creator's way of calling tools, as with declared
+                // tools, unless its own client chose one.
+                if settings.steps_only.is_none() {
+                    settings.steps_only = creator.steps_only;
+                }
+                settings
             }
             None => binding.settings.clone(),
         };
@@ -8834,9 +8930,9 @@ impl Database {
         }
         // The stub names the result's node, so it is made for the id the
         // insert takes, and its savings go in with the node. Written with
-        // the result, eliding it later reads no output. A bot without the
-        // read tool never elides, since the model could not follow a stub,
-        // so it gets none.
+        // the result, eliding it later reads no output. A bot whose model
+        // is not shown the read tool never elides, since the model could not
+        // follow a stub, so it gets none.
         // Pictures count at their weight, so a stub saves only what the
         // result weighs over it.
         let next = next_node(&tx)?;
@@ -8845,7 +8941,7 @@ impl Database {
         let words = outcome.words();
         let stub = if pictured.count > 0 {
             super::context::picture_stub(family, call_id, custom, &words, weight)?
-        } else if bot.tools.iter().any(|tool| tool == "read") {
+        } else if bot.follows_stubs() {
             super::context::stub(family, call_id, custom, &words, next, weight)?
         } else {
             None
@@ -9292,6 +9388,13 @@ impl Database {
     /// An answered call's answer, held or stored, `tool_unserved` once its
     /// time ran out, or how long it may still wait.
     pub fn answer_take(&mut self, turn: i64, call_id: &str, now_ms: u64) -> Result<CallAnswer> {
+        let taken = self.take_answer(turn, call_id, now_ms)?;
+        if let CallAnswer::Given(_) = taken {
+            self.call_ended(turn, call_id);
+        }
+        Ok(taken)
+    }
+    fn take_answer(&mut self, turn: i64, call_id: &str, now_ms: u64) -> Result<CallAnswer> {
         if let Some(live) = self.live_changed(turn)
             && let Some(given) = live.answers.remove(call_id)
         {
@@ -9441,6 +9544,18 @@ impl Database {
     /// held by the worker and wakes its task, so its `tool_finish` is the
     /// one commit; a parked turn's is committed now and resumes the turn.
     pub fn answer_call(
+        &mut self,
+        bot: &str,
+        turn: i64,
+        call_id: &str,
+        outcome: Outcome,
+        now_ms: u64,
+    ) -> Result<Answered> {
+        let answered = self.record_answer(bot, turn, call_id, outcome, now_ms)?;
+        self.call_ended(turn, call_id);
+        Ok(answered)
+    }
+    fn record_answer(
         &mut self,
         bot: &str,
         turn: i64,
@@ -10147,15 +10262,6 @@ impl Database {
         event(&tx, &bot.name, Some(turn), "step_decided", decided)?;
         tx.commit()?;
         Ok(StepOpened::Run { capture, confined })
-    }
-    /// The calls of `turn` a message lifted that still wait for their
-    /// answer: they outlive their turn.
-    pub fn lifted_calls(&self, turn: i64) -> Result<Vec<String>> {
-        Ok(self
-            .conn
-            .prepare_cached("SELECT call_id FROM answers WHERE turn=? AND process IS NOT NULL")?
-            .query_map([turn], |r| r.get(0))?
-            .collect::<rusqlite::Result<_>>()?)
     }
     /// What a call captures at its first daemon step: see [`Capture`]. The
     /// turn's own folder, model and effort, else the bot's as it was while
@@ -11859,10 +11965,11 @@ impl Database {
             self.stepped.push(id);
         }
         let mut outputs_gone = Vec::new();
+        let mut calls: Vec<String> = Vec::new();
         if bot.declared.iter().any(|tool| tool.answered_by.is_some()) {
             // What the daemon steps of a call ending unanswered with its
             // turn kept goes with it; a lifted call keeps its steps'.
-            let calls: Vec<String> = tx
+            calls = tx
                 .prepare_cached(
                     "DELETE FROM answers WHERE turn=? AND process IS NULL RETURNING call_id",
                 )?
@@ -12031,6 +12138,10 @@ impl Database {
         let cursor = event(&tx, &bot.name, Some(turn), "turn_finished", data.clone())?;
         tx.commit()?;
         self.forget_files(outputs_gone);
+        // Its answered calls end with it, but a lifted one's.
+        for call in &calls {
+            self.call_ended(turn, call);
+        }
         self.approvals -= unstarted;
         self.forget_live(turn);
         entries.push(entry(cursor, &bot.name, Some(turn), "turn_finished", data));
@@ -12484,7 +12595,7 @@ impl Database {
         // What waited on those calls went with them: their requests, what a
         // client was to answer, and each step a call asked about, denied as
         // an answered call's are.
-        let (mut requests, mut steps) = (0, Vec::new());
+        let (mut requests, mut steps, mut ended) = (0, Vec::new(), Vec::new());
         for call_id in &unanswered {
             let asked: Vec<(i64, String, String)> = tx
                 .prepare_cached(
@@ -12509,8 +12620,13 @@ impl Database {
                     "DELETE FROM approvals WHERE turn=? AND call_id=? AND step_of IS NULL",
                 )?
                 .execute(params![turn, call_id])? as i64;
-            tx.prepare_cached("DELETE FROM answers WHERE turn=? AND call_id=?")?
-                .execute(params![turn, call_id])?;
+            if tx
+                .prepare_cached("DELETE FROM answers WHERE turn=? AND call_id=?")?
+                .execute(params![turn, call_id])?
+                > 0
+            {
+                ended.push(call_id);
+            }
         }
         tx.execute(
             "UPDATE turns SET status='paced',waiting=?,retries=retries+?,paced_ms=paced_ms+?,
@@ -12534,6 +12650,10 @@ impl Database {
         self.approvals -= requests + steps.len() as i64;
         for approval in steps {
             self.unstep(approval, true);
+        }
+        // Its answered calls end with the halt: their daemon steps are told.
+        for call_id in ended {
+            self.call_ended(turn, call_id);
         }
         entries.push(entry(cursor, &bot.name, Some(turn), "turn_paced", data));
         Ok(Halted::Parked(entries))
@@ -13486,12 +13606,9 @@ impl Database {
         lifted_ended(&tx, process, &result, failed, outcome)?;
         tx.commit()?;
         self.forget_files(gone);
+        self.call_ended(turn, &call_id);
         let ready = self.tell_finished(&bot.name)?;
-        Ok(Lifted::Ended {
-            result,
-            ready,
-            call: Some((turn, call_id)),
-        })
+        Ok(Lifted::Ended { result, ready })
     }
     /// [`Database::lifted_check`] of a call waiting on its gates, decided as
     /// `approval_start` decides a turn's.
@@ -13641,11 +13758,7 @@ impl Database {
         let _ = outcome;
         self.approvals -= 1;
         let ready = self.tell_finished(&bot.name)?;
-        Ok(Lifted::Ended {
-            result,
-            ready,
-            call: None,
-        })
+        Ok(Lifted::Ended { result, ready })
     }
     /// Stop the call a message lifted to background command `process`, of
     /// `bot`'s, while it waits: its request for a verdict or its client's
@@ -13699,15 +13812,14 @@ impl Database {
         lifted_ended(&tx, process, &result, true, outcome)?;
         tx.commit()?;
         self.forget_files(gone);
+        if answering {
+            self.call_ended(turn, &call_id);
+        }
         if approval.is_some() {
             self.approvals -= 1;
         }
         let ready = self.tell_finished(bot)?;
-        Ok(Some(Lifted::Ended {
-            result,
-            ready,
-            call: answering.then_some((turn, call_id)),
-        }))
+        Ok(Some(Lifted::Ended { result, ready }))
     }
     /// Every call a message lifted that still waits, by its command: for
     /// the daemon to schedule each one's time again as it starts, and to
@@ -15973,7 +16085,12 @@ const STARTED_PATHS_BYTES: usize = 64 * 1024;
 /// name that client and the call's deadline in `tool_started`. A call
 /// whose arguments do not fit is refused at once, so it waits for none.
 fn ask(tx: &Connection, bot: &Bot, turn: i64, call: &ToolCall, data: &mut Value) -> Result<()> {
-    let Some(tool) = bot.declared(&call.name) else {
+    // A tool kept for steps is refused from the model, so its client is
+    // never told of the call.
+    let Some(tool) = bot
+        .declared(&call.name)
+        .filter(|_| !bot.steps_only(&call.name))
+    else {
         return Ok(());
     };
     let (Some(tag), Some(expires_ms)) =
@@ -19962,6 +20079,7 @@ mod tests {
             }),
             env: [("A".to_owned(), "1".to_owned())].into(),
             approval_policy: Some(ApprovalPolicy::Never),
+            steps_only: Some(vec!["*".into()]),
         };
         let mut names: Vec<String> = settings_map(&all)
             .unwrap()

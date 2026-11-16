@@ -248,8 +248,9 @@ impl Handles {
         self.sooner.notify_one();
     }
 
-    /// An answered call ended, answered or out of time, while its turn or
-    /// its command goes on: the run loop stops its daemon steps.
+    /// An answered call ended: its answer taken or recorded, or the call
+    /// gone with its turn or its lifted command. Told by the store as the
+    /// group that ended it commits; the run loop stops its daemon steps.
     pub fn call_ended(&self, turn: i64, call_id: String) {
         self.inner.lock().unwrap().ended.push((turn, call_id));
         self.sooner.notify_one();

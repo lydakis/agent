@@ -11,16 +11,6 @@ mod session;
 mod socket;
 mod steps;
 
-/// The daemon's tools a script may run as daemon steps (`run_step`).
-const STEP_TOOLS: [&str; 7] = [
-    "shell",
-    "echo",
-    "read",
-    "write",
-    "edit",
-    "apply_patch",
-    "web_fetch",
-];
 mod turn;
 
 use actives::{Actives, Slot};
@@ -706,6 +696,10 @@ enum Command {
     /// Each provider's own model listing, for a client writing its model
     /// list. Asked when requested and kept five minutes; nothing runs on it.
     ProviderModels,
+    /// The daemon's tools as a model is shown them, each with whether a
+    /// script can run it as a daemon step: what a client that hands tools
+    /// to a script declares them by.
+    Tools,
     /// A page of bots in name order: with `name`, those matching a GLOB
     /// pattern; with `active`, those with a turn running; with
     /// `created_by_id`, those the bot with that id made.
@@ -902,6 +896,7 @@ impl Command {
             Command::Companions { .. } => "companions",
             Command::Stats => "stats",
             Command::ProviderModels => "provider_models",
+            Command::Tools => "tools",
             Command::Bots { .. } => "bots",
             Command::Shutdown { .. } => "shutdown",
             Command::Pause { .. } => "pause",
@@ -2331,6 +2326,17 @@ pub async fn run(config: Configuration) -> Result<()> {
     });
     transport.set_wake(wake);
     let mut publisher = tokio::spawn(publish(publications, hub.clone(), handles.clone()));
+    // Every answered call's end, from the one place the store notes it, to
+    // the run loop that stops its daemon steps.
+    let ends = handles.clone();
+    store
+        .op("call_ends", move |db| {
+            db.on_call_end(Box::new(move |turn, call_id| {
+                ends.call_ended(turn, call_id)
+            }));
+            Ok(())
+        })
+        .await?;
     if let Some(gate) = registry.load_gate() {
         tokio::spawn(wake_load_parks(
             gate,
@@ -2683,9 +2689,7 @@ pub async fn run(config: Configuration) -> Result<()> {
                     service.check_steps(due, false);
                     let lifted = service.handles.take_lifted();
                     service.check_lifted(lifted);
-                    for (turn, call_id) in service.handles.take_ended() {
-                        service.call_ended(turn, &call_id, "its call ended");
-                    }
+                    service.calls_ended();
                 }
                 Some(done) = service.steps.jobs.join_next(), if !service.steps.jobs.is_empty() => {
                     let (key, serial, done) = done.map_err(|_| Error::new("step_task_failed"))?;
@@ -4321,8 +4325,6 @@ impl Service {
                 }
                 self.steer_wakes.remove(&turn);
                 self.pool_woken.remove(&turn);
-                // Its calls' daemon steps end with it, but a lifted call's.
-                self.steps_turn_ended(turn);
                 // Before the bot's next turn can start: it starts on what
                 // a `configure` during this one kept. A store refusing it
                 // now leaves it for that start, which waits on it.
@@ -5232,6 +5234,20 @@ impl Service {
                     })
                     .await
             }
+            Command::Tools => {
+                let tools: Vec<Value> = (self.registry.schemas().into_iter())
+                    .map(|schema| {
+                        let step = agent_runtime::tools::STEP_TOOLS.contains(&&*schema.name);
+                        let mut tool = json!({"name":schema.name,"description":schema.description,
+                            "parameters":schema.parameters,"step":step});
+                        if let Some(grammar) = schema.grammar {
+                            tool["grammar"] = json!(grammar);
+                        }
+                        tool
+                    })
+                    .collect();
+                Ok(json!({"tools":tools}))
+            }
             Command::ProviderModels => {
                 // Off the dispatch path: a listing waits on the network.
                 let (providers, output) = (self.providers.clone(), output.clone());
@@ -5840,12 +5856,12 @@ impl Service {
                 })?;
                 // The daemon's tools a step may run: those whose place in
                 // line and whose stop are specified.
-                if !STEP_TOOLS.contains(&tool.as_str()) {
+                if !agent_runtime::tools::STEP_TOOLS.contains(&tool.as_str()) {
                     return fail_with(
                         "invalid_step",
                         format!(
                             "{tool} does not run as a daemon step: {} do",
-                            STEP_TOOLS.join(", ")
+                            agent_runtime::tools::STEP_TOOLS.join(", ")
                         ),
                     );
                 }
@@ -6652,8 +6668,6 @@ impl Service {
                 self.handles.forget(Waiter::Turn(turn));
                 self.wakes.cancel(turn);
                 self.steer_wakes.remove(&turn);
-                // Its calls' daemon steps end with it, as a reaped turn's.
-                self.steps_turn_ended(turn);
                 if next_ready {
                     self.ready_hint = true;
                 }
@@ -8182,7 +8196,7 @@ mod tests {
     }
     /// Bots with one running turn each, bound to a provider the test service
     /// does not have, so their tasks finish at once without network I/O.
-    async fn running(store: &Store, names: &[String]) -> Vec<(String, i64)> {
+    pub(super) async fn running(store: &Store, names: &[String]) -> Vec<(String, i64)> {
         let names = names.to_vec();
         store
             .call(move |db| {
@@ -8230,7 +8244,7 @@ mod tests {
             .await
             .unwrap()
     }
-    fn bare_service(store: &Store) -> Service {
+    pub(super) fn bare_service(store: &Store) -> Service {
         Service {
             identity: 0,
             store: store.clone(),

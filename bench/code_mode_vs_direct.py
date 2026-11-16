@@ -14,6 +14,10 @@ release build.
 
     AGENT_TEST_RUNTIME=1 MODE=direct AGENTS=400,2000 [BINARY=PATH] \\
         python3 -m bench.code_mode_vs_direct
+
+`STEPS_ONLY=1` with `MODE=steps` sets the fleet bots' `steps_only` to
+`["*"]`, as Sonny's code mode does: their model is shown the script tool
+alone.
 """
 import json
 import multiprocessing
@@ -31,6 +35,7 @@ from tests.test_runtime import ModelFixture, PROTECTING
 MODE = os.environ.get('MODE', 'direct')
 AGENTS = [int(n) for n in os.environ.get('AGENTS', '400').split(',')]
 CALLS = int(os.environ.get('CALLS', '5'))
+STEPS_ONLY = os.environ.get('STEPS_ONLY') == '1'
 EXEC = {'name': 'exec', 'description': 'Run a script.',
         'parameters': {'type': 'object', 'properties': {'code': {'type': 'string'}},
                        'required': ['code'], 'additionalProperties': False},
@@ -118,7 +123,8 @@ class CodeModeVsDirect(ModelFixture):
         try:
             pid = daemon.process.pid
             fleet = dict(workspace=str(self.path), model='openai/synthetic-model', instructions='Test agent.',
-                         tools=['echo'], **({'declare': [EXEC]} if steps else {}))
+                         tools=['echo'], **({'declare': [EXEC]} if steps else {}),
+                         **({'settings': {'steps_only': ['*']}} if steps and STEPS_ONLY else {}))
             create = [('create', dict(bot=f'p.b{i}', **fleet)) for i in range(agents)]
             create += [('create', dict(bot=f's.b{i}', workspace=str(self.path), model='openai/synthetic-model',
                                        instructions='Test agent.', tools=['echo'])) for i in range(SIDE)]
@@ -192,7 +198,7 @@ class CodeModeVsDirect(ModelFixture):
             cpu -= side_cpu * len(busy)
             requests['n'] -= len(busy)
             return {
-                'mode': MODE, 'agents': agents, 'calls_each': CALLS,
+                'mode': MODE + ('+steps_only' if steps and STEPS_ONLY else ''), 'agents': agents, 'calls_each': CALLS,
                 'turn_ms_p50': round(percentile(times, 50), 1), 'turn_ms_p99': round(percentile(times, 99), 1),
                 'turn_ms_max': round(max(times), 1), 'wall_s': round(wall, 2),
                 'daemon_cpu_ms_a_turn': round(cpu * 1000 / agents, 3),

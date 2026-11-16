@@ -5423,7 +5423,7 @@ fn a_bot_keeps_its_settings_and_a_fork_copies_them() {
             "compact_keep":25,"compact_tokens":null,"post_turn_compact_percent":70,"keep_turns":1,"max_rounds":null,"max_drops":3,"approval_hold_ms":2000,"max_output_tokens":null,
             "cache_ttl":"1h","speed":"fast","sandbox":null,"writable":[],"network":false,"outputs":null,"trailer":["sender"],
             "quiet_background":false,"hold_ms":432000000,"unix_sockets":[],"rules":null,"env":{},
-            "approval_policy":null})
+            "approval_policy":null,"steps_only":null})
     );
     // Retention follows the bot's own setting.
     for n in 1..=3 {
@@ -14762,6 +14762,51 @@ fn a_bot_without_read_stores_no_stubs() {
 }
 
 #[test]
+fn a_bot_whose_read_is_kept_for_steps_stores_no_stubs() {
+    // Its model is not shown `read`, so it could not follow a stub either.
+    let path = std::env::temp_dir().join(format!("agent-steps-read-{}.sqlite", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+    let mut db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
+    let tools = vec!["shell".to_owned(), "read".to_owned()];
+    db.create(
+        "Bob",
+        Some("/synthetic"),
+        Binding {
+            tools: &tools,
+            settings: Settings {
+                steps_only: Some(vec!["read".into()]),
+                ..Default::default()
+            },
+            ..binding()
+        },
+    )
+    .unwrap();
+    let turn = db
+        .begin(
+            "Bob",
+            "r1",
+            "task",
+            true,
+            &TurnOptions::default(),
+            allow_provider,
+        )
+        .unwrap()
+        .turn;
+    exchange(&mut db, turn, "c0", &lines(0, 400));
+    exchange(&mut db, turn, "c1", &lines(1, 400));
+    let stored = |sql: &str| -> i64 {
+        Connection::open(&path)
+            .unwrap()
+            .query_row(sql, [], |r| r.get(0))
+            .unwrap()
+    };
+    assert_eq!(stored("SELECT count(*) FROM stubs"), 0);
+    assert_eq!(stored("SELECT count(*) FROM nodes WHERE elided>0"), 0);
+    drop(db);
+    std::fs::remove_file(path).unwrap();
+}
+
+#[test]
 fn a_result_s_text_parts_elide_together() {
     // A short output then a long text part: the stub counts and quotes
     // the whole text, as a read of the result returns it.
@@ -21781,4 +21826,125 @@ fn running_commands_are_listed_and_a_detached_one_outlives_a_restart() {
     );
     drop(db);
     std::fs::remove_file(path).unwrap();
+}
+
+#[test]
+fn an_answered_call_s_end_is_told_once_its_group_commits() {
+    let mut db = db();
+    let start = Declared {
+        name: "start".into(),
+        description: "Start.".into(),
+        parameters: json!({"type":"object"}),
+        result: "ok".into(),
+        answered_by: Some("sonny".into()),
+        expire_ms: None,
+        grammar: None,
+        steps: true,
+        gate_daemon_steps: false,
+        lift: false,
+        inherit: Inherit::All,
+        kind: None,
+    };
+    for bot in ["Lead", "Halted"] {
+        db.create(
+            bot,
+            Some("/synthetic"),
+            Binding {
+                declared: Some(&ToolList::new(vec![start.clone()]).unwrap()),
+                ..binding()
+            },
+        )
+        .unwrap();
+    }
+    let turn = db
+        .begin(
+            "Lead",
+            "request",
+            "work",
+            true,
+            &TurnOptions::default(),
+            allow_provider,
+        )
+        .unwrap()
+        .turn;
+    let calls: Vec<ToolCall> = (1..=3)
+        .map(|n| ToolCall {
+            name: "start".into(),
+            call_id: format!("c{n}"),
+            arguments: "{}".into(),
+            custom: false,
+            links: Default::default(),
+        })
+        .collect();
+    db.append(turn, vec![], &calls, None).unwrap();
+    let mut expires = 0;
+    for call in &calls {
+        expires = db.tool_start(turn, call, false, false).unwrap()["data"]["expires_ms"]
+            .as_u64()
+            .unwrap();
+    }
+    // Another bot's turn waits on its answered call too.
+    let halted = db
+        .begin(
+            "Halted",
+            "request",
+            "work",
+            true,
+            &TurnOptions::default(),
+            allow_provider,
+        )
+        .unwrap()
+        .turn;
+    db.append(halted, vec![], &calls[..1], None).unwrap();
+    db.tool_start(halted, &calls[0], false, false).unwrap();
+    let told = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let sink = told.clone();
+    db.on_call_end(Box::new(move |turn, call_id| {
+        sink.lock().unwrap().push((turn, call_id))
+    }));
+    let heard = |db: &mut Database| {
+        db.tell_calls_ended();
+        std::mem::take(&mut *told.lock().unwrap())
+    };
+    // An answer held for the running turn ends its call, told only once
+    // the group that held it commits; a group that did not, told nothing.
+    db.begin_group().unwrap();
+    db.answer_call("Lead", turn, "c2", result("started"), 0)
+        .unwrap();
+    assert_eq!(told.lock().unwrap().len(), 0, "told before the commit");
+    db.abandon_group().unwrap();
+    assert_eq!(heard(&mut db), vec![]);
+    db.begin_group().unwrap();
+    db.answer_call("Lead", turn, "c1", result("started"), 0)
+        .unwrap();
+    db.commit_group().unwrap();
+    assert_eq!(heard(&mut db), vec![(turn, "c1".to_owned())]);
+    // Taken by the turn, it is told again: either may come first.
+    let taken = db.answer_take(turn, "c1", 0).unwrap();
+    assert!(matches!(taken, agent_runtime::store::CallAnswer::Given(_)));
+    assert_eq!(heard(&mut db), vec![(turn, "c1".to_owned())]);
+    // Still waiting, nothing ends; an answer refused ends nothing either.
+    let pending = db.answer_take(turn, "c2", 0).unwrap();
+    assert!(matches!(
+        pending,
+        agent_runtime::store::CallAnswer::Pending { .. }
+    ));
+    assert!(
+        db.answer_call("Lead", turn, "c3", result("late"), expires)
+            .is_err()
+    );
+    assert_eq!(heard(&mut db), vec![]);
+    // The turn's end ends every call it leaves unanswered.
+    db.finish(turn, Some(&Error::new("cancelled"))).unwrap();
+    let mut ended = heard(&mut db);
+    ended.retain(|(_, call)| call != "c1");
+    ended.sort();
+    assert_eq!(
+        ended,
+        vec![(turn, "c2".to_owned()), (turn, "c3".to_owned())]
+    );
+    // A pause that parks a turn ends the answered calls it leaves.
+    db.suspend_halted(halted, Halt::Pause, 0, 0, 0, None)
+        .unwrap();
+    assert_eq!(heard(&mut db), vec![(halted, "c1".to_owned())]);
 }

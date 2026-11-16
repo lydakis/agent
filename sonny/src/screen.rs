@@ -74,6 +74,9 @@ pub enum Tag {
     Group(u64),
     /// Tasks the lead started together, by the client's number for them.
     Tasks(u64),
+    /// The words view's `└` row under a reply: what its turn set going,
+    /// by the client's number for it.
+    SetGoing(u64),
     /// Where a note was put in the margin, by [`crate::margin::anchor`].
     Note(u64),
     /// A `plan` call, by the client's number for it.

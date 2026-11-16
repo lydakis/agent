@@ -1372,6 +1372,15 @@ class AnthropicRuntimeTests(unittest.TestCase):
         events = client.request('events', bot='Bob', after=0, limit=64)['result']['events']
         self.assertFalse([e for e in events if e['event'].startswith('tool_')])
 
+    def test_a_hosted_search_kept_for_steps_is_not_declared(self):
+        client, model, path = self.start()
+        client.request('create', bot='Bob', workspace=str(path), effort='low',
+                       tools=['echo', 'shell', 'web_search'], settings={'steps_only': ['web_search']})
+        turn = client.request('submit', bot='Bob', request_id='s1', prompt='hello')['result']['message']
+        self.assertEqual(client.finished(turn)['data']['status'], 'completed')
+        sent = model.requests.get(timeout=1)
+        self.assertEqual([t.get('name') for t in sent['tools']], ['echo', 'shell'])
+
     @unittest.skipUnless(shutil.which('bwrap') or sys.platform == 'darwin', 'sandboxes need bubblewrap')
     def test_a_sandbox_off_the_network_is_offered_no_hosted_search(self):
         client, model, path = self.start()
@@ -2250,9 +2259,10 @@ class RuntimeTests(ModelFixture):
         client.request('create', bot='Bob', workspace=str(self.path), approve=['write_stdin'],
                        approver='manual', tools=['shell', 'write_stdin', 'wait'])
 
-        def call(request_id, name, arguments):
+        def call(request_id, name, arguments, **delivery):
             prompt = 'calls:' + json.dumps([[name, arguments]])
-            turn = client.request('submit', bot='Bob', request_id=request_id, prompt=prompt)['result']['turn']
+            turn = client.request('submit', bot='Bob', request_id=request_id, prompt=prompt,
+                                  **delivery)['result']['turn']
             self.assertEqual(client.finished(turn)['data']['status'], 'completed')
             return json.loads(poll(client, 'Bob', turn)['result']['text'][5:])
 
@@ -2269,7 +2279,9 @@ class RuntimeTests(ModelFixture):
                        request=waiting['request'], decision='allow', by='test')
         ended = client.receive(lambda m: m.get('event') == 'lifted_ended' and m['data']['handle'] == lifted)
         self.assertEqual(ended['data']['outcome'], 'allowed')
-        results = call('w', 'wait', {'handles': [lifted, background]})['results']
+        # The kill's end tells the bot in a turn of its own, which may be
+        # waiting as this is submitted: this one goes after it.
+        results = call('w', 'wait', {'handles': [lifted, background]}, delivery='queue')['results']
         self.assertEqual((results[lifted]['stopped'], results[lifted]['ran']), (True, True), results)
         self.assertEqual(results[background]['error'], 'stopped', results)
 
