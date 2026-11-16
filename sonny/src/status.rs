@@ -780,10 +780,11 @@ fn run_spans(
     const NAME_LEAST: usize = 8;
     let name_room = width.saturating_sub(fixed + least).max(NAME_LEAST);
     // Its script's name alone, as the Rulebook's row has it: the strip
-    // says it is a workflow.
+    // says it is a workflow. Bold in the text's own color, as an
+    // automation's is: blue is an agent's name, and a run is no agent.
     let name = crate::transcript::cut(&run.name, name_room);
     let room = width.saturating_sub(fixed + name.width());
-    let mut out = vec![Span::raw(name).bold().fg(Color::Blue), Span::raw(phase)];
+    let mut out = vec![Span::raw(name).bold(), Span::raw(phase)];
     out.extend(view::strip(&run.phases, room));
     if !stopping.is_empty() {
         out.push(Span::raw(stopping));
@@ -939,6 +940,17 @@ mod tests {
             text(&row, 80),
             " ● blind-role-eval-score Score · ✓✓✓ ✓●● · 19s"
         );
+        // The run's name is bold in the text's own color: blue is an agent's.
+        let lines = row_lines(&row, 80, "", false, false);
+        let name = (lines[0].spans.iter())
+            .find(|s| s.content == "blind-role-eval-score")
+            .expect("the run's name");
+        assert!(
+            name.style
+                .add_modifier
+                .contains(ratatui::style::Modifier::BOLD)
+        );
+        assert_eq!(name.style.fg, None, "no hue on a run's name");
         // Short of room, the name gives way and the strip stays whole.
         assert_eq!(text(&row, 40), " ● blind-role-eva… Score · ✓✓✓ ✓●● · 19s");
         // Past 24 workers a bar and its counts, as far as they fit.

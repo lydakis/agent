@@ -198,15 +198,18 @@ pub fn strip(phases: &[(String, Counts)], room: usize) -> Vec<Span<'static>> {
         done: all.done + c.done,
         failed: all.failed + c.failed,
     });
-    let cells = cells(phases);
     if total(all) == 0 {
         return vec![Span::raw(counted(all))];
     }
-    // A strip no wider than the bar stays a strip, room or not.
-    if total(all) <= STRIP_MOST && (cells.len() <= room || cells.len() <= BAR) {
-        return (cells.into_iter())
-            .map(|cell| cell.map_or_else(|| Span::raw(" "), Cell::sign))
-            .collect();
+    // Cells a worker only up to STRIP_MOST, so a big run's row costs what
+    // the bar does. A strip no wider than the bar stays a strip, room or not.
+    if total(all) <= STRIP_MOST {
+        let cells = cells(phases);
+        if cells.len() <= room || cells.len() <= BAR {
+            return (cells.into_iter())
+                .map(|cell| cell.map_or_else(|| Span::raw(" "), Cell::sign))
+                .collect();
+        }
     }
     let mut out: Vec<Span<'static>> = bar(all).into_iter().map(Cell::sign).collect();
     let counts = format!("  {}", counted(all));
