@@ -10299,6 +10299,46 @@ Caveats:
     AGENT_TEST_RUNTIME=1 MODE=steps AGENTS=400,2000,10000 \
         python3 -m bench.code_mode_vs_direct
 
+### Follow-up: stop handling in one place (2026-11-16)
+
+The store tells every answered call's end as the group that ended it
+commits, and the run loop looks at those ends before each step it lets
+start. Measured with `MODE=steps` against slice 3 (db09fa4), both built in
+the same folder, two alternating rounds each (a build from another folder
+read 1.4 MB more idle memory on either code, so the comparison keeps one
+folder):
+
+| Code mode | Slice 3, 400 bots | This change, 400 | Slice 3, 2,000 | This change, 2,000 |
+| --- | ---: | ---: | ---: | ---: |
+| Turn p50 | 1.42 to 1.47 s | 1.48 to 1.50 s | 6.8 to 8.3 s | 7.0 to 7.1 s |
+| Daemon processor time a turn | 4.10 to 4.13 ms | 4.00 to 4.20 ms | 4.36 to 5.36 ms | 4.40 to 4.51 ms |
+| Idle / peak memory | 26.0 to 26.2 / 53.6 to 54.5 MB | 26.3 / 54.3 to 54.8 MB | 31.9 to 32.0 / 124 to 132 MB | 31.7 to 31.8 / 126 to 133 MB |
+| Other bots' p99 while the fleet runs | 0.44 to 0.57 s | 0.42 to 0.58 s | 1.60 to 1.69 s | 0.69 to 0.70 s |
+
+No row moved past the runs' spread: still ahead of 0.9.5 on every row.
+A turn whose calls took daemon steps no longer costs a store read at its
+end (the lifted calls were read to spare them; the store now knows).
+
+The daemon screens for ordinary work, bots that never ask for a step
+included, from the pull request's perf screen (`bench.perf_gate`, main as
+base and this change as head on the same runner, two alternating rounds):
+
+| Bench | Measure | Main | This change |
+| --- | --- | ---: | ---: |
+| admission | lone submit processor time | 28.1 ms | 28.0 ms |
+| admission | burst submit p99 | 3.37 ms | 3.01 ms |
+| completion | release to terminal p99 | 8.52 ms | 8.40 ms |
+| footprint | idle memory | 16.7 MiB | 17.0 MiB |
+| footprint | each idle bot | 2.02 KiB | 1.90 KiB |
+| footprint | memory after a turn each | 33.6 MiB | 32.5 MiB |
+| footprint | processor time a turn | 0.70 ms | 0.69 ms |
+| lifecycle | processor time | 0.385 s | 0.390 s |
+| lifecycle | p95 turn | 783 ms | 700 ms |
+| lifecycle | peak memory | 25.9 MiB | 26.0 MiB |
+
+Every row is within 2% or better but idle memory (+0.3 MiB, under the
+screen's spread between runs).
+
 ## A running command's newest output, kept for its page (protocol 80)
 
 Every command and terminal now also feeds what it writes, as its

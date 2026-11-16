@@ -2250,9 +2250,10 @@ class RuntimeTests(ModelFixture):
         client.request('create', bot='Bob', workspace=str(self.path), approve=['write_stdin'],
                        approver='manual', tools=['shell', 'write_stdin', 'wait'])
 
-        def call(request_id, name, arguments):
+        def call(request_id, name, arguments, **delivery):
             prompt = 'calls:' + json.dumps([[name, arguments]])
-            turn = client.request('submit', bot='Bob', request_id=request_id, prompt=prompt)['result']['turn']
+            turn = client.request('submit', bot='Bob', request_id=request_id, prompt=prompt,
+                                  **delivery)['result']['turn']
             self.assertEqual(client.finished(turn)['data']['status'], 'completed')
             return json.loads(poll(client, 'Bob', turn)['result']['text'][5:])
 
@@ -2269,7 +2270,9 @@ class RuntimeTests(ModelFixture):
                        request=waiting['request'], decision='allow', by='test')
         ended = client.receive(lambda m: m.get('event') == 'lifted_ended' and m['data']['handle'] == lifted)
         self.assertEqual(ended['data']['outcome'], 'allowed')
-        results = call('w', 'wait', {'handles': [lifted, background]})['results']
+        # The kill's end tells the bot in a turn of its own, which may be
+        # waiting as this is submitted: this one goes after it.
+        results = call('w', 'wait', {'handles': [lifted, background]}, delivery='queue')['results']
         self.assertEqual((results[lifted]['stopped'], results[lifted]['ran']), (True, True), results)
         self.assertEqual(results[background]['error'], 'stopped', results)
 

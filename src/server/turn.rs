@@ -3021,9 +3021,6 @@ impl Turn {
                         )),
                     };
                     if let Some(outcome) = outcome {
-                        // Answered or out of time while parked: a daemon
-                        // step of it still running or in line is stopped.
-                        self.handles.call_ended(turn, waiting.call_id.clone());
                         let id = waiting.call_id.clone();
                         self.store
                             .op("tool_finish", move |db| db.tool_finish(turn, &id, &outcome))
@@ -4702,20 +4699,13 @@ impl Turn {
             let declared = record.declared(&call.name);
             let answered = declared.is_some_and(|tool| tool.answered_by.is_some());
             let lifts = declared.is_some_and(|tool| tool.lift);
-            let steps = declared.is_some_and(|tool| tool.steps);
             // A terminal whose end this result shows its bot.
             let mut seen = None;
             let outcome = match prepared {
                 // A declared tool runs nothing: its meaning is its client's,
                 // and so is its answer, when its client gives one.
                 Ok(Prepared::Declared(_)) if answered => match self
-                    .await_answer(
-                        &call.call_id,
-                        (lifts, steps),
-                        &mut calls,
-                        route,
-                        summary_retry_ms,
-                    )
+                    .await_answer(&call.call_id, lifts, &mut calls, route, summary_retry_ms)
                     .await?
                 {
                     ControlFlow::Continue(Some(outcome)) => outcome,
@@ -5595,7 +5585,7 @@ impl Turn {
     async fn await_answer(
         &self,
         call_id: &str,
-        (lifts, steps): (bool, bool),
+        lifts: bool,
         calls: &mut std::vec::IntoIter<ToolCall>,
         route: Option<&str>,
         summary_retry_ms: Option<u64>,
@@ -5614,14 +5604,9 @@ impl Turn {
                 .op("answer_take", move |db| db.answer_take(turn, &id, now_ms()))
                 .await?
             {
-                CallAnswer::Given(outcome) => {
-                    // Answered or out of time: a daemon step of it still
-                    // running is stopped.
-                    if steps {
-                        self.handles.call_ended(turn, call_id.to_owned());
-                    }
-                    return Ok(ControlFlow::Continue(Some(outcome)));
-                }
+                // Answered or out of time: the store told its daemon
+                // steps as it gave the answer.
+                CallAnswer::Given(outcome) => return Ok(ControlFlow::Continue(Some(outcome))),
                 CallAnswer::Pending { notify, expires_ms } => (notify, expires_ms),
             };
             // No deadline while a step of the call waits on a gate: it
@@ -6411,18 +6396,8 @@ impl Lifts {
             .await?;
         match (found, stopper) {
             (Lifted::Waiting(at), _) => self.handles.lifted_lapses(process, at),
-            (
-                Lifted::Ended {
-                    result,
-                    ready,
-                    call,
-                },
-                _,
-            ) => {
+            (Lifted::Ended { result, ready }, _) => {
                 self.handles.lifted_lapses(process, None);
-                if let Some((turn, call_id)) = call {
-                    self.handles.call_ended(turn, call_id);
-                }
                 self.handles.process_finished(process, result);
                 if ready {
                     self.handles.turn_ready();
@@ -6897,15 +6872,8 @@ pub(super) async fn stop_handle(
         .await?;
     let name = format!("proc:{handle}");
     Ok(match stopped {
-        Some(Some(Lifted::Ended {
-            result,
-            ready,
-            call,
-        })) => {
+        Some(Some(Lifted::Ended { result, ready })) => {
             handles.lifted_lapses(handle, None);
-            if let Some((turn, call_id)) = call {
-                handles.call_ended(turn, call_id);
-            }
             handles.process_finished(handle, result.clone());
             if ready {
                 handles.turn_ready();

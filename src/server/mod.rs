@@ -2331,6 +2331,17 @@ pub async fn run(config: Configuration) -> Result<()> {
     });
     transport.set_wake(wake);
     let mut publisher = tokio::spawn(publish(publications, hub.clone(), handles.clone()));
+    // Every answered call's end, from the one place the store notes it, to
+    // the run loop that stops its daemon steps.
+    let ends = handles.clone();
+    store
+        .op("call_ends", move |db| {
+            db.on_call_end(Box::new(move |turn, call_id| {
+                ends.call_ended(turn, call_id)
+            }));
+            Ok(())
+        })
+        .await?;
     if let Some(gate) = registry.load_gate() {
         tokio::spawn(wake_load_parks(
             gate,
@@ -2683,9 +2694,7 @@ pub async fn run(config: Configuration) -> Result<()> {
                     service.check_steps(due, false);
                     let lifted = service.handles.take_lifted();
                     service.check_lifted(lifted);
-                    for (turn, call_id) in service.handles.take_ended() {
-                        service.call_ended(turn, &call_id, "its call ended");
-                    }
+                    service.calls_ended();
                 }
                 Some(done) = service.steps.jobs.join_next(), if !service.steps.jobs.is_empty() => {
                     let (key, serial, done) = done.map_err(|_| Error::new("step_task_failed"))?;
@@ -4321,8 +4330,6 @@ impl Service {
                 }
                 self.steer_wakes.remove(&turn);
                 self.pool_woken.remove(&turn);
-                // Its calls' daemon steps end with it, but a lifted call's.
-                self.steps_turn_ended(turn);
                 // Before the bot's next turn can start: it starts on what
                 // a `configure` during this one kept. A store refusing it
                 // now leaves it for that start, which waits on it.
@@ -6652,8 +6659,6 @@ impl Service {
                 self.handles.forget(Waiter::Turn(turn));
                 self.wakes.cancel(turn);
                 self.steer_wakes.remove(&turn);
-                // Its calls' daemon steps end with it, as a reaped turn's.
-                self.steps_turn_ended(turn);
                 if next_ready {
                     self.ready_hint = true;
                 }
@@ -8182,7 +8187,7 @@ mod tests {
     }
     /// Bots with one running turn each, bound to a provider the test service
     /// does not have, so their tasks finish at once without network I/O.
-    async fn running(store: &Store, names: &[String]) -> Vec<(String, i64)> {
+    pub(super) async fn running(store: &Store, names: &[String]) -> Vec<(String, i64)> {
         let names = names.to_vec();
         store
             .call(move |db| {
@@ -8230,7 +8235,7 @@ mod tests {
             .await
             .unwrap()
     }
-    fn bare_service(store: &Store) -> Service {
+    pub(super) fn bare_service(store: &Store) -> Service {
         Service {
             identity: 0,
             store: store.clone(),

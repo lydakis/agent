@@ -598,9 +598,14 @@ impl Service {
     /// An allowed step, marked started, goes in line; one stopped while
     /// it was decided is closed so.
     fn line_step(&mut self, key: Key, capture: Arc<Capture>, confined: bool) {
+        self.calls_ended();
         let held = self.held().map(|_| "the daemon was held before it started");
         let flight = self.steps.flights.get_mut(&key).expect("a flight");
-        if let Some(why) = flight.stopped.map(|(why, _)| why).or(held) {
+        // Held, it is stopped as any stop does, and answers so.
+        if flight.stopped.is_none() {
+            flight.stopped = held.map(|why| (why, false));
+        }
+        if let Some((why, _)) = flight.stopped {
             flight.state = State::Ending;
             self.close_step(key, Err(stopped(why)));
             return;
@@ -638,7 +643,12 @@ impl Service {
         if self.held().is_some() {
             return;
         }
-        while let Some(entry) = self.steps.line.entries.front() {
+        loop {
+            // A call's end told by now stops its step before it can start.
+            self.calls_ended();
+            let Some(entry) = self.steps.line.entries.front() else {
+                return;
+            };
             if !Steps::lined(&self.steps.flights, entry) {
                 self.steps.line.entries.pop_front();
                 continue;
@@ -866,36 +876,30 @@ impl Service {
         self.stop_step(&key, why, false);
     }
 
-    /// A turn ended: the steps of its calls stopped, but those of a call a
-    /// message lifted, which waits on past its turn. Which those are, the
-    /// store says, read only when the turn has steps.
-    pub(super) fn steps_turn_ended(&mut self, turn: i64) {
-        let Some(calls) = self.steps.by_turn.get(&turn) else {
-            return;
-        };
-        let calls: Vec<Box<str>> = calls.iter().cloned().collect();
-        let (store, handles) = (self.store.clone(), self.handles.clone());
-        tokio::spawn(async move {
-            let lifted = store
-                .op("lifted_calls", move |db| db.lifted_calls(turn))
-                .await
-                .unwrap_or_default();
-            for call in calls {
-                if !lifted.iter().any(|lifted| **lifted == *call) {
-                    handles.call_ended(turn, call.into());
-                }
-            }
-        });
+    /// The answered calls the store ended since the last look: each one's
+    /// step stopped, and what it captured let go. Looked at as a step is
+    /// let start too, so none starts once its call's end was told.
+    pub(super) fn calls_ended(&mut self) {
+        for (turn, call_id) in self.handles.take_ended() {
+            self.call_ended(turn, &call_id, "its call ended");
+        }
     }
 
-    /// The daemon is held, paused or stopping: steps in line are stopped,
-    /// as a running one is by the pull of the cord.
+    /// The daemon is held, paused or stopping: steps asking, in line or
+    /// running are stopped, and answer `step_stopped` for `why` as every
+    /// stop does, a running one's tool ending as the pull of the cord ends
+    /// it. One decided or gated meanwhile is stopped before it can start.
     pub(super) fn steps_held(&mut self, why: &'static str) {
         let flights = &self.steps.flights;
+        let running = flights
+            .iter()
+            .filter(|(_, flight)| matches!(flight.state, State::Running { .. }))
+            .map(|(key, _)| key.clone());
         let lined: Vec<Key> = (self.steps.asking.entries.iter())
             .filter(|entry| Steps::asked(flights, entry))
             .chain((self.steps.line.entries.iter()).filter(|entry| Steps::lined(flights, entry)))
             .map(|(key, _)| key.clone())
+            .chain(running)
             .collect();
         for key in lined {
             self.stop_step(&key, why, false);
@@ -1167,4 +1171,307 @@ fn parted(mut outcome: Outcome, turn: i64, id: &str, envelope: usize) -> Outcome
         outcome.output.push_str(&line);
     }
     outcome
+}
+
+#[cfg(test)]
+mod tests {
+    //! The coordinator over every state a step can be in against every
+    //! cause that stops one: what it does at once, and how the step ends.
+    use super::super::tests::{bare_service, running};
+    use super::*;
+    use agent_runtime::store::Store;
+    use std::time::Duration;
+
+    #[derive(Clone, Copy, Debug)]
+    enum Cause {
+        /// Its own bot answers the call.
+        Answered,
+        /// Another bot's answer, which the store refuses.
+        Others,
+        /// The store told of the call's end: taken, out of time, or gone
+        /// with its turn or its lifted command.
+        Ended,
+        /// The daemon was paused.
+        Paused,
+        /// The session that asked closed.
+        Left,
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum Phase {
+        Asked,
+        Deciding,
+        Gated,
+        Lined,
+        Running,
+        Ending,
+    }
+
+    /// How a step came out.
+    #[derive(Debug, PartialEq)]
+    enum End {
+        /// Answered `step_stopped`, for this reason.
+        Stopped(&'static str),
+        /// Answered as it ran: nothing stopped it.
+        Ran,
+        /// Let start: nothing stopped it.
+        Started,
+        /// Still waiting for its decision: nothing stopped it.
+        Asking,
+        /// Told nothing: its asker left.
+        Silent,
+    }
+
+    struct Bench {
+        service: Service,
+        lines: output::Lines,
+        key: Key,
+        serial: u64,
+        capture: Arc<Capture>,
+        stop: Option<oneshot::Receiver<&'static str>>,
+    }
+
+    async fn bench(dir: &std::path::Path, phase: Phase) -> Bench {
+        let (store, _publications) = Store::open(&dir.join("state.sqlite")).await.unwrap();
+        let turn = running(&store, &["Bob".into()]).await[0].1;
+        let bot = store.call(|db| db.inspect("Bob")).await.unwrap();
+        let capture = Arc::new(Capture {
+            bot,
+            rules: Default::default(),
+            workspace: None,
+            model: "synthetic".into(),
+            effort: None,
+        });
+        let mut service = bare_service(&store);
+        let (output, lines) = Output::in_process();
+        let key: Key = (turn, "c".into());
+        let (state, prepared, stop) = match phase {
+            Phase::Asked => (State::Asked, Prepared::Echo("hi".into()), None),
+            Phase::Deciding => (State::Deciding, Prepared::Echo("hi".into()), None),
+            Phase::Gated => (
+                State::Gated { confined: false },
+                Prepared::Echo("hi".into()),
+                None,
+            ),
+            // A command waits in line for a process slot.
+            Phase::Lined => (
+                State::Lined {
+                    capture: capture.clone(),
+                    confined: false,
+                    command: true,
+                    slot: true,
+                },
+                Prepared::Shell {
+                    command: "true".into(),
+                    timeout_ms: None,
+                    background: false,
+                    workdir: None,
+                },
+                None,
+            ),
+            Phase::Running => {
+                let (stop, stopping) = oneshot::channel();
+                (
+                    State::Running {
+                        stop: Some(stop),
+                        command: false,
+                    },
+                    Prepared::Echo("hi".into()),
+                    Some(stopping),
+                )
+            }
+            Phase::Ending => (State::Ending, Prepared::Echo("hi".into()), None),
+        };
+        let steps = &mut service.steps;
+        steps.serial += 1;
+        let serial = steps.serial;
+        steps.flights.insert(
+            key.clone(),
+            Flight {
+                serial,
+                session: 1,
+                output,
+                request: json!(7),
+                ask: StepAsk {
+                    bot: "Bob".into(),
+                    turn,
+                    call_id: "c".into(),
+                    step: "s".into(),
+                    tool: "echo".into(),
+                    arguments: "{}".into(),
+                    links: Default::default(),
+                },
+                prepared: Some(prepared),
+                bytes: 0,
+                state,
+                stopped: None,
+            },
+        );
+        steps.index(&key);
+        (steps.by_session.entry(1).or_default()).insert(key.clone());
+        *steps.by_bot.entry("Bob".into()).or_default() += 1;
+        match phase {
+            Phase::Asked => steps.asking.push(key.clone(), serial),
+            Phase::Lined => steps.line.push(key.clone(), serial),
+            // Its decision's store job, or its end's, is under way.
+            Phase::Deciding | Phase::Ending => steps.storing += 1,
+            Phase::Gated | Phase::Running => {}
+        }
+        // Decided, it has captured its call.
+        if !matches!(phase, Phase::Asked | Phase::Deciding) {
+            steps.captured.insert(key.clone(), capture.clone());
+        }
+        Bench {
+            service,
+            lines,
+            key,
+            serial,
+            capture,
+            stop,
+        }
+    }
+
+    fn stop(bench: &mut Bench, cause: Cause) {
+        let (turn, call) = (bench.key.0, bench.key.1.to_string());
+        let service = &mut bench.service;
+        match cause {
+            Cause::Answered => service.call_answered("Bob", turn, &call),
+            Cause::Others => service.call_answered("Eve", turn, &call),
+            Cause::Ended => {
+                service.handles.call_ended(turn, call);
+                service.calls_ended();
+            }
+            Cause::Paused => {
+                service.paused = Some(json!({}));
+                service.steps_held("the pause stopped it");
+            }
+            Cause::Left => service.steps_session_closed(1),
+        }
+    }
+
+    /// What its decision's job, its gate, its run or its end's job brings
+    /// back next, as the store and its tool would.
+    fn go_on(bench: &mut Bench, phase: Phase) {
+        let (key, serial) = (bench.key.clone(), bench.serial);
+        let service = &mut bench.service;
+        if !service.steps.current(&key, serial) {
+            return;
+        }
+        let ran = || Outcome {
+            output: "hi".into(),
+            artifacts: Vec::new(),
+            files: Default::default(),
+            parts: Vec::new(),
+            failed: false,
+        };
+        match phase {
+            Phase::Asked | Phase::Lined => service.pump_steps(),
+            Phase::Deciding => {
+                let opened = StepOpened::Run {
+                    capture: bench.capture.clone(),
+                    confined: false,
+                };
+                service.step_done(key, serial, Done::Opened(Ok(opened)));
+            }
+            Phase::Gated => service.step_gated(key, Ok(json!({"decision":"allow"}))),
+            Phase::Running => service.step_done(key, serial, Done::Ran(Ok(ran()))),
+            Phase::Ending => {
+                let reply = json!({"call_id":"c/s","output":"hi","failed":false});
+                service.step_done(key, serial, Done::Closed(Ok(reply)));
+            }
+        }
+    }
+
+    async fn end(bench: &mut Bench) -> End {
+        let key = bench.key.clone();
+        // Its end's store job, when one was started, comes back.
+        while let Some(flight) = bench.service.steps.flights.get(&key) {
+            match flight.state {
+                State::Asked => return End::Asking,
+                State::Running { .. } => return End::Started,
+                State::Ending => {
+                    let done = tokio::time::timeout(
+                        Duration::from_secs(10),
+                        bench.service.steps.jobs.join_next(),
+                    )
+                    .await
+                    .expect("its end's job")
+                    .expect("a job")
+                    .expect("not panicked");
+                    let (key, serial, done) = done;
+                    bench.service.step_done(key, serial, done);
+                }
+                _ => panic!("left mid-way"),
+            }
+        }
+        let line = tokio::time::timeout(Duration::from_millis(100), bench.lines.next()).await;
+        let Ok(Some(line)) = line else {
+            return End::Silent;
+        };
+        let reply: Value = serde_json::from_slice(&line).unwrap();
+        assert_eq!(reply["id"], 7, "{reply}");
+        match reply["error"].as_str() {
+            Some("step_stopped") => End::Stopped(match reply["detail"].as_str().unwrap() {
+                "the call was answered" => "the call was answered",
+                "its call ended" => "its call ended",
+                "the pause stopped it" => "the pause stopped it",
+                "the daemon was held before it started" => "the daemon was held before it started",
+                other => panic!("stopped for {other}"),
+            }),
+            None => End::Ran,
+            Some(other) => panic!("answered {other}: {reply}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn every_state_against_every_cause_that_stops_a_step() {
+        use Cause::*;
+        use End::*;
+        const ANSWERED: End = Stopped("the call was answered");
+        const ENDED: End = Stopped("its call ended");
+        const PAUSED: End = Stopped("the pause stopped it");
+        const HELD: End = Stopped("the daemon was held before it started");
+        // Each state's row: Answered, Others, Ended, Paused, Left. One
+        // paused while decided or gated is stopped before it can start; one
+        // ending has its end with the store already.
+        let table: [(Phase, [End; 5]); 6] = [
+            (Phase::Asked, [ANSWERED, Asking, ENDED, PAUSED, Silent]),
+            (Phase::Deciding, [ANSWERED, Started, ENDED, HELD, Silent]),
+            (Phase::Gated, [ANSWERED, Started, ENDED, HELD, Silent]),
+            (Phase::Lined, [ANSWERED, Started, ENDED, PAUSED, Silent]),
+            (Phase::Running, [ANSWERED, Ran, ENDED, PAUSED, Silent]),
+            (Phase::Ending, [ANSWERED, Ran, ENDED, Ran, Silent]),
+        ];
+        let root = std::env::temp_dir().join(format!("agent-step-stops-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        for (phase, row) in table {
+            for (cause, want) in [Answered, Others, Ended, Paused, Left].into_iter().zip(row) {
+                let dir = root.join(format!("{phase:?}-{cause:?}"));
+                std::fs::create_dir_all(&dir).unwrap();
+                let mut bench = bench(&dir, phase).await;
+                stop(&mut bench, cause);
+                // A running step is sent its stop at once, when stopped.
+                if let Some(stopping) = &mut bench.stop {
+                    let sent = stopping.try_recv().ok();
+                    let stopped = !matches!(cause, Others);
+                    assert_eq!(sent.is_some(), stopped, "{phase:?} {cause:?}: {sent:?}");
+                }
+                go_on(&mut bench, phase);
+                let got = end(&mut bench).await;
+                assert_eq!(got, want, "{phase:?} stopped by {cause:?}");
+                // Stopped by its call's end, its capture went with it.
+                if matches!(cause, Answered | Ended) {
+                    assert!(!bench.service.steps.captured.contains_key(&bench.key));
+                }
+                // An ended step holds nothing.
+                if !matches!(got, Asking | Started) {
+                    let steps = &bench.service.steps;
+                    assert!(steps.flights.is_empty(), "{phase:?} {cause:?}");
+                    assert!(steps.by_bot.is_empty() && steps.by_session.is_empty());
+                    assert_eq!((steps.asking.live, steps.line.live), (0, 0));
+                }
+            }
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
 }

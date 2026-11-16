@@ -398,8 +398,9 @@ class DaemonStepTests(ModelFixture):
         self.running(client)
         client.request('pause', reason='look first')
         stopped = self.reply(client, request, timeout=10)
-        self.assertEqual(stopped['result']['failed'], True)
-        self.assertEqual(json.loads(stopped['result']['output'])['error'], 'daemon_paused')
+        self.assertEqual((stopped['error'], stopped['detail']), ('step_stopped', 'the pause stopped it'))
+        done = self.ended(client, turn, 'script-0/1')
+        self.assertEqual((done['failed'], done['error']), (True, 'step_stopped'))
         self.assertEqual(self.step(client, turn, step='2')['error'], 'daemon_paused')
         client.request('resume')
 
