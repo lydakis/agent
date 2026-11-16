@@ -10298,3 +10298,45 @@ Caveats:
         python3 -m bench.code_mode_vs_direct
     AGENT_TEST_RUNTIME=1 MODE=steps AGENTS=400,2000,10000 \
         python3 -m bench.code_mode_vs_direct
+
+## A running command's newest output, kept for its page (protocol 80)
+
+Every background command and terminal now also feeds what it writes, as
+its streaming redactor lets it through, into a ring of its newest 16 KiB,
+which `process_output` reads. A foreground command keeps nothing extra. The
+ring is filled on the reader that already copies the output into the
+command's result, so it adds a lock and a copy per read, and nothing when no
+page is open.
+
+The Perf workflow's screen of this change against main (Linux runner, 16
+Nov 2026), within every gate:
+
+| Bench | Measure | main | This change | Change |
+| --- | --- | ---: | ---: | ---: |
+| admission | lone submit CPU, ms | 34.402 | 34.406 | +0.0% |
+| admission | burst submit p99, ms | 4.278 | 4.343 | +1.5% |
+| completion | release to terminal p99, ms | 11.513 | 11.066 | -3.9% |
+| footprint | idle RSS, MiB | 16.58 | 16.773 | +1.2% |
+| footprint | per idle bot, KiB | 2.096 | 1.834 | -12.5% |
+| footprint | RSS after a turn each, MiB | 42.232 | 47.066 | +11.4% |
+| footprint | CPU per turn, ms | 0.991 | 1.033 | +4.2% |
+| lifecycle | CPU, s | 0.525 | 0.525 | +0.0% |
+| lifecycle | p95 turn, ms | 577.501 | 577.108 | -0.1% |
+| lifecycle | peak RSS, MiB | 25.271 | 25.502 | +0.9% |
+
+These benches run no commands, so none of them reaches the new ring. The
+largest move, RSS after a turn each, is inside its run-to-run spread: main
+alone measured 55.90 MiB on the same bench in the previous section.
+
+Where the ring is reached, measured locally (release build, a
+`current_thread` runtime, eight known credentials, medians of five runs):
+
+- A command writing 256 MiB as fast as it can (`yes | head -c 268435456`):
+  8.75 s wall on both, bounded by the drain's pause, and 446 ms of CPU
+  against main's 371 ms (+20%), the redactor and the ring's copy of every
+  byte.
+- 200 runs of `echo hi`: 0.203 ms a run against main's 0.240 ms, inside the
+  noise.
+
+The cost grows with the output a background command writes, not with bots,
+turns or history, and only while that command runs.
