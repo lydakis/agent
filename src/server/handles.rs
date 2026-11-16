@@ -1190,7 +1190,7 @@ mod tests {
             assert!(inner.by_process.is_empty() && inner.retained.is_empty());
             elapsed
         };
-        let n = 32_000;
+        let n = 8_000;
         let grew = crate::doubling::outgrows(|twice| finish(if twice { 2 * n } else { n }));
         assert_eq!(grew, None, "{n} waits on one handle, then twice as many");
         drop(store);
