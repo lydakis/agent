@@ -3,7 +3,10 @@
 //! journal gained since its last look, and never reads a run that ended
 //! again; it stops a run by leaving a `stop` file in the run's folder,
 //! which the tool host running it acts on.
-use ratatui::text::Span;
+use ratatui::{
+    style::{Color, Stylize},
+    text::{Line, Span},
+};
 use serde_json::Value;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::{Read as _, Seek as _, SeekFrom};
@@ -42,7 +45,13 @@ pub struct Live {
     pub log: String,
     /// Whether a stop is asked for and not yet carried out.
     pub stopping: bool,
+    /// The first workers that failed, each by its label and why where the
+    /// journal says: `d: no such profile`. At most [`FAILURES`].
+    pub failures: Vec<String>,
 }
+
+/// The most failed workers a run's page names; the rest are `+N`.
+pub const FAILURES: usize = 3;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Counts {
@@ -223,6 +232,90 @@ pub fn strip(phases: &[(String, Counts)], room: usize) -> Vec<Span<'static>> {
     out
 }
 
+/// A run's page, `width` wide: its name; what it is, who ran it and for
+/// how long; then a row a phase with its strip, its newest `log()` line,
+/// the workers that failed and why, and its output tokens. `by` is its
+/// caller as the page names it; `seconds`, how long it has run. With the
+/// lines, where the caller's name stands, to make it a link: its row and
+/// first and last column.
+pub fn page(
+    live: &Live,
+    by: &str,
+    seconds: u64,
+    width: usize,
+) -> (Vec<Line<'static>>, (usize, usize, usize)) {
+    let mut out = vec![Line::from(live.name.clone()).bold()];
+    let head = "workflow · run by ";
+    out.push(Line::from(vec![
+        Span::raw(head).dim(),
+        Span::raw(by.to_owned()).fg(Color::Blue),
+        Span::raw(format!(" · for {}", crate::transcript::elapsed(seconds))).dim(),
+    ]));
+    let link = (1, head.width(), head.width() + by.width());
+    out.push(Line::default());
+    let phases: Vec<&(String, Counts)> = (live.phases.iter())
+        .filter(|(_, counts)| total(*counts) > 0)
+        .collect();
+    let named = |phase: &str| match phase {
+        "" => "workers".to_owned(),
+        phase => phase.to_owned(),
+    };
+    let label = (phases.iter().map(|(phase, _)| named(phase).width()))
+        .chain(["log", "failed", "tokens"].map(str::len))
+        .max()
+        .unwrap_or(0)
+        + 2;
+    let room = width.saturating_sub(label);
+    let hang = Span::raw(" ".repeat(label));
+    let field = |name: &str, value: Vec<Span<'static>>, out: &mut Vec<Line<'static>>| {
+        let lead = Span::raw(format!("{name:<label$}")).dim();
+        out.extend(crate::transcript::wrap(
+            Line::from([vec![lead], value].concat()),
+            width,
+            Span::raw(""),
+            hang.clone(),
+        ));
+    };
+    if phases.is_empty() {
+        field("workers", vec![Span::raw("starting")], &mut out);
+    }
+    for (phase, counts) in phases {
+        let strip = strip(&[(phase.clone(), *counts)], room);
+        field(&named(phase), strip, &mut out);
+    }
+    if !live.log.is_empty() {
+        field("log", vec![Span::raw(live.log.clone())], &mut out);
+    }
+    for (at, failure) in live.failures.iter().enumerate() {
+        let name = if at == 0 { "failed" } else { "" };
+        field(name, vec![Span::raw(failure.clone())], &mut out);
+    }
+    if live.failed > live.failures.len() {
+        let name = if live.failures.is_empty() {
+            "failed"
+        } else {
+            ""
+        };
+        let more = format!("+{}", live.failed - live.failures.len());
+        field(name, vec![Span::raw(more).dim()], &mut out);
+    }
+    let tokens = format!("{} out", crate::background::thousands(live.tokens));
+    field("tokens", vec![Span::raw(tokens)], &mut out);
+    (out, link)
+}
+
+/// What the one confirm asks before `live` is stopped, naming it and
+/// what ends with it: `Stop audit? Its 2 working agents end.`
+pub fn stop_question(live: &Live) -> Line<'static> {
+    let mut spans = vec![Span::raw(format!("Stop {}?", live.name)).bold()];
+    match live.running {
+        0 => {}
+        1 => spans.push(Span::raw(" Its 1 working agent ends.").dim()),
+        n => spans.push(Span::raw(format!(" Its {n} working agents end.")).dim()),
+    }
+    Line::from(spans)
+}
+
 /// `2 working, 3 finished, 1 failed`, leaving out what is none;
 /// `starting` before any agent.
 fn counted(counts: Counts) -> String {
@@ -255,8 +348,8 @@ struct Fold {
     /// How far into the journal it read, to a line's end.
     read: u64,
     live: Live,
-    /// The keys running, with their phase.
-    asking: HashMap<String, String>,
+    /// The keys running, with their phase and what a failure names them.
+    asking: HashMap<String, (String, String)>,
     by_phase: BTreeMap<usize, (String, Counts)>,
     ended: bool,
 }
@@ -269,15 +362,20 @@ impl Fold {
             Some("log") => self.live.log = line["text"].as_str().unwrap_or("").to_owned(),
             Some("asking") => {
                 let key = line["key"].as_str().unwrap_or("").to_owned();
-                self.asking.insert(key, phase_of(line));
+                self.asking.insert(key, (phase_of(line), named(line)));
             }
             Some("agent") => {
                 let key = line["key"].as_str().unwrap_or("");
-                let phase = self.asking.remove(key).unwrap_or_else(|| phase_of(line));
+                let (phase, name) =
+                    (self.asking.remove(key)).unwrap_or_else(|| (phase_of(line), named(line)));
+                let failed = line["value"].is_null();
                 let counts = self.counts(phase);
-                match line["value"].is_null() {
+                match failed {
                     true => counts.failed += 1,
                     false => counts.done += 1,
+                }
+                if failed {
+                    self.failed(name, &line["error"]);
                 }
                 if line["earlier"] != true {
                     self.live.tokens += line["output_tokens"].as_u64().unwrap_or(0);
@@ -286,8 +384,10 @@ impl Fold {
             // A call that threw ends as failed, though a replay asks again.
             Some("thrown") => {
                 let key = line["key"].as_str().unwrap_or("");
-                let phase = self.asking.remove(key).unwrap_or_else(|| phase_of(line));
+                let (phase, name) =
+                    (self.asking.remove(key)).unwrap_or_else(|| (phase_of(line), named(line)));
                 self.counts(phase).failed += 1;
+                self.failed(name, &line["error"]);
             }
             // The script runs again from the top: what ran is asked again.
             Some("replay") => self.asking.clear(),
@@ -295,6 +395,19 @@ impl Fold {
             Some("end") => self.ended = true,
             _ => {}
         }
+    }
+
+    /// A worker named `name` failed, saying `why` where it does: kept
+    /// while fewer than [`FAILURES`] are.
+    fn failed(&mut self, name: String, why: &Value) {
+        if self.live.failures.len() >= FAILURES {
+            return;
+        }
+        let why = why.as_str().map(str::trim).filter(|why| !why.is_empty());
+        self.live.failures.push(match why {
+            Some(why) => format!("{name}: {}", why.lines().next().unwrap_or(why)),
+            None => name,
+        });
     }
 
     fn counts(&mut self, phase: String) -> &mut Counts {
@@ -311,7 +424,11 @@ impl Fold {
 
     /// The run as it stands.
     fn live(&mut self) -> Live {
-        let asking: Vec<String> = self.asking.values().cloned().collect();
+        let asking: Vec<String> = self
+            .asking
+            .values()
+            .map(|(phase, _)| phase.clone())
+            .collect();
         let mut phases: Vec<(String, Counts)> = self.by_phase.values().cloned().collect();
         for phase in asking {
             match phases.iter_mut().find(|(named, _)| *named == phase) {
@@ -331,6 +448,19 @@ impl Fold {
         live.failed = phases.iter().map(|(_, c)| c.failed).sum();
         live.phases = phases;
         live
+    }
+}
+
+/// What a run's page names a worker by: its `label`, else its name past
+/// its project, else its call's key.
+fn named(line: &Value) -> String {
+    let label = line["label"].as_str().map(str::trim).unwrap_or("");
+    if !label.is_empty() {
+        return label.to_owned();
+    }
+    match line["bot"].as_str() {
+        Some(bot) => bot.rsplit('.').next().unwrap_or(bot).to_owned(),
+        None => line["key"].as_str().unwrap_or("").to_owned(),
     }
 }
 
@@ -422,7 +552,7 @@ fn read_on(journal: &Path, fold: &mut Fold) {
 pub fn stop(store: &Path, run: &str) -> Result<(), String> {
     let dir = super::runs(store).join(super::valid_id(run)?);
     if dir.join("result.json").exists() {
-        return Err(format!("workflow run {run} has ended"));
+        return Err("it has ended".into());
     }
     std::fs::write(dir.join(STOP), b"").map_err(|e| e.to_string())
 }
@@ -581,6 +711,68 @@ mod tests {
         let phases = vec![("Find".to_owned(), counts(40, 0, 0))];
         assert_eq!(text(&strip(&phases, 25)), "✓✓✓✓✓✓✓✓✓✓✓✓  40 finished");
         assert_eq!(text(&strip(&phases, 24)), "✓✓✓✓✓✓✓✓✓✓✓✓");
+    }
+
+    #[test]
+    fn a_run_s_page_has_a_row_a_phase_then_log_failed_and_tokens() {
+        let mut fold = Fold::default();
+        let mut lines = vec![json!({"t": "phase", "title": "Find"})];
+        for key in ["a", "b", "c", "d"] {
+            lines.push(json!({"t": "asking", "key": key, "label": key, "phase": "Find"}));
+            lines.push(json!({"t": "agent", "key": key, "value": "x", "output_tokens": 3100}));
+        }
+        lines.push(json!({"t": "phase", "title": "Score"}));
+        lines.push(
+            json!({"t": "asking", "key": "e", "label": "e", "phase": "Score",
+            "bot": "calc.wf-run1-e"}),
+        );
+        lines.push(json!({"t": "agent", "key": "e", "value": "x"}));
+        for key in ["f", "g"] {
+            lines.push(json!({"t": "asking", "key": key, "phase": "Score",
+                "bot": format!("calc.wf-run1-{key}")}));
+        }
+        // Four fail: three are named, with why where the journal says.
+        for key in ["h", "i", "j", "k"] {
+            lines.push(json!({"t": "asking", "key": key, "label": key, "phase": "Score"}));
+        }
+        lines.push(json!({"t": "thrown", "key": "h", "error": "no such profile"}));
+        lines.push(json!({"t": "agent", "key": "i", "value": null}));
+        lines.push(json!({"t": "thrown", "key": "j", "error": "budget spent\nmore"}));
+        lines.push(json!({"t": "thrown", "key": "k", "error": "x"}));
+        lines.push(json!({"t": "log", "text": "scoring transcript 5"}));
+        for line in &lines {
+            fold.take(line);
+        }
+        let mut live = fold.live();
+        live.name = "blind-role-eval-score".into();
+        let (page, link) = page(&live, "lead", 19, 60);
+        let text: Vec<String> = (page.iter())
+            .map(|line| line.spans.iter().map(|s| s.content.as_ref()).collect())
+            .collect();
+        assert_eq!(
+            text,
+            [
+                "blind-role-eval-score",
+                "workflow · run by lead · for 19s",
+                "",
+                "Find    ✓✓✓✓",
+                "Score   ✓✗✗✗✗●●",
+                "log     scoring transcript 5",
+                "failed  h: no such profile",
+                "        i",
+                "        j: budget spent",
+                "        +1",
+                "tokens  12,400 out",
+            ]
+        );
+        assert_eq!(link, (1, 18, 22));
+        let asked: String = (stop_question(&live).spans.iter())
+            .map(|s| s.content.as_ref())
+            .collect();
+        assert_eq!(
+            asked,
+            "Stop blind-role-eval-score? Its 2 working agents end."
+        );
     }
 
     #[test]
