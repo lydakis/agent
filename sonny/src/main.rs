@@ -11269,7 +11269,7 @@ impl App {
                 // does, part of it in the scrollback already; the notice
                 // says the agent did not keep it.
                 self.live_item = None;
-                self.end_live(Words::Reply);
+                self.end_live(Words::Said);
                 self.ahead.clear();
                 self.streamed = false;
                 self.said.clear();
@@ -11291,7 +11291,7 @@ impl App {
                 // the message being streamed.
                 self.live_item = None;
                 if !self.ahead.is_empty() {
-                    self.end_live(Words::Reply);
+                    self.end_live(Words::Said);
                     self.ahead.clear();
                     self.streamed = false;
                     self.said.clear();
@@ -24282,6 +24282,9 @@ mod tests {
                 "content": [{"type": "input_text", "text": "Halves are done."}]}}]}),
             Some(15) => json!({"items": [{"node": 15, "item": {"type": "message",
                 "role": "user", "content": [{"type": "input_text", "text": "Also negatives."}]}}]}),
+            Some(node @ (21 | 23)) => json!({"items": [{"node": node, "item": {"type": "message",
+                "role": "user", "from": "calc.halves",
+                "content": [{"type": "input_text", "text": "Check refunds."}]}}]}),
             _ => json!({}),
         })
         .await;
@@ -24415,6 +24418,43 @@ mod tests {
             Some("└ started ◌ docs · Write the docs"),
             "{shown:?}"
         );
+        // Words the model's output limit cut, or a retry dropped, are not
+        // the reply either: the daemon goes on with the turn.
+        for (turn, event, node) in [(6, "dropped", 21), (7, "retry", 23)] {
+            app.pending.clear();
+            app.daemon(turn_event("accepted", turn, json!({"node": node})))
+                .await;
+            let said = json!({"event": "text_delta", "bot": "b", "turn": turn,
+                "item": 1, "text": "Cut sh"});
+            app.daemon(said).await;
+            if event == "retry" {
+                let ahead = json!({"event": "text_delta", "bot": "b", "turn": turn,
+                    "item": 2, "text": "ort."});
+                app.daemon(ahead).await;
+            }
+            app.daemon(turn_event(event, turn, json!({}))).await;
+            let said = json!({"event": "text_delta", "bot": "b", "turn": turn,
+                "item": 1, "text": "Whole reply."});
+            app.daemon(said).await;
+            app.daemon(turn_event(
+                "turn_finished",
+                turn,
+                json!({"status": "completed"}),
+            ))
+            .await;
+            let shown = rows(&app);
+            let at = |row: &str| shown.iter().position(|r| r == row);
+            assert_eq!(
+                shown.iter().filter(|r| r.starts_with('↳')).count(),
+                1,
+                "{event}: {shown:?}"
+            );
+            assert_eq!(
+                at("↳ halves").map(|at| at + 1),
+                at("• Whole reply."),
+                "{event}: {shown:?}"
+            );
+        }
     }
 
     #[tokio::test]
