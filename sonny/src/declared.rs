@@ -344,12 +344,24 @@ mod tests {
         )
         .unwrap();
         // Sonny's own take at most half of the daemon's budget, the rest
-        // left to the agent's.
-        let size = serde_json::to_vec(&lead).unwrap().len();
+        // left to the agent's: `exec` aside, which code mode always
+        // declares and whose servers' declarations have their own budget,
+        // and with it at its fullest, the agent still has 12 KiB of its own.
+        let size = |tools: &[&Value]| serde_json::to_vec(tools).unwrap().len();
+        let sonnys: Vec<&Value> = lead.as_array().unwrap().iter().collect();
+        let (exec, own): (Vec<&Value>, Vec<&Value>) = sonnys
+            .iter()
+            .partition(|tool| tool["name"] == crate::exec::NAME);
         assert!(
-            size <= DECLARED_BYTES / 2,
-            "{size} over {}",
+            size(&own) <= DECLARED_BYTES / 2,
+            "{} over {}",
+            size(&own),
             DECLARED_BYTES / 2
+        );
+        let fullest = size(&sonnys) + crate::exec::DECLARATIONS;
+        assert!(
+            exec.len() <= 1 && fullest + 12 * 1024 <= DECLARED_BYTES,
+            "{fullest}"
         );
         let wanted = declare(&json!({"declared": [other]}), a_helper()).unwrap();
         let mut all = vec![other];

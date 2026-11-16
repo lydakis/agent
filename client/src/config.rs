@@ -617,6 +617,11 @@ pub struct Sonny {
     /// Whether agents have the commons: its tool, skill and the roles'
     /// lines about it.
     pub commons: bool,
+    /// Code mode: whether agents reach the daemon's own tools (`shell`,
+    /// `read`, `write`, `edit`, `apply_patch`, `web_fetch`) only from
+    /// `exec` scripts, their model shown `exec` in their place. Off, their
+    /// model calls those tools directly again. On by default.
+    pub code_mode: bool,
     /// The least commons threads a day that send invites before answers
     /// earn more, the square root of the week's agents when that is more:
     /// each answered thread adds one, up to as many again.
@@ -902,6 +907,7 @@ impl Default for Sonny {
             suggest: true,
             suggest_ideas: true,
             commons: true,
+            code_mode: true,
             commons_invites: 3,
             commons_invite_tokens: 1_000_000,
             commons_pointer: true,
@@ -1724,6 +1730,7 @@ fn parse(text: &str) -> Result<Config, String> {
                 "suggest_ideas",
                 "start_at_boot",
                 "commons",
+                "code_mode",
                 "commons_invites",
                 "commons_invite_tokens",
                 "commons_pointer",
@@ -1826,6 +1833,7 @@ fn parse(text: &str) -> Result<Config, String> {
                 "suggest" => Some(&mut config.sonny.suggest),
                 "suggest_ideas" => Some(&mut config.sonny.suggest_ideas),
                 "commons" => Some(&mut config.sonny.commons),
+                "code_mode" => Some(&mut config.sonny.code_mode),
                 "commons_pointer" => Some(&mut config.sonny.commons_pointer),
                 "start_at_boot" => Some(&mut config.sonny.start_at_boot),
                 "sky_haikus" => Some(&mut config.sonny.sky_haikus),

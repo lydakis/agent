@@ -1356,10 +1356,12 @@ impl Bot {
         if names.iter().any(|hidden| hidden == name) {
             return true;
         }
+        // What is shown, not what the bot may call: a fork that `allow`
+        // narrows is shown its source's tools, as its prompt cache is.
         names.iter().any(|hidden| hidden == "*")
             && crate::tools::STEP_TOOLS.contains(&name)
-            && self.declared(name).is_none()
-            && (self.declared.iter()).any(|tool| tool.steps && self.declared(&tool.name).is_some())
+            && !(self.declared.iter()).any(|tool| tool.name == name)
+            && (self.declared.iter()).any(|tool| tool.steps)
     }
     /// Whether its model can follow a stub of a tool result: it has `read`
     /// and is shown it. A bot whose model cannot gets no text stubs.

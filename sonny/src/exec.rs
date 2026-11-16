@@ -61,7 +61,7 @@ const CALLS: usize = 8;
 /// holds, about 3,000 tokens as Pi's code mode allows; the rest are found
 /// from the script. Bounded whole, since the daemon caps an agent's
 /// declared tools and a description past it leaves the agent without them.
-const DECLARATIONS: usize = 12_000;
+pub const DECLARATIONS: usize = 12_000;
 
 /// The most of one server's own words the description holds, so one
 /// server's long instructions leave room for the others'.
@@ -91,6 +91,38 @@ Some nested tools may be omitted from this description. They are still available
 
 Use `await tools.tool_search({query: "...", limit: 8})` for BM25-ranked discovery of tools, a tool named exactly first (up to `limit` matches; 8 by default). It returns `{tools: [{name, description}]}` with callable names and full TypeScript declarations. Print results with `text()` and inspect unfamiliar declarations before calling `tools[result.name](arguments)` in a later execution."#;
 
+/// In code mode, the agent's own tools, which its model is shown only
+/// here: the daemon runs each call as a step of the `exec` call, decided
+/// and recorded as the same call from the model would be.
+const DAEMON_TOOLS: &str = r#"# This agent's own tools
+Your shell and file tools are on `tools` too, and only there: `tools.shell`, `tools.read`, `tools.write`, `tools.edit`, `tools.apply_patch` and `tools.web_fetch`, as far as you have them. Each runs as its own call would, in your folder, under the same rules, sandbox and approvals, and resolves to a `CallToolResult` whose text is what the tool returns (`tools.shell`'s is JSON with `stdout`, `stderr` and `exit_code`); one that fails resolves with `isError: true`. A command runs in the foreground: no `background`, `detach` or `tty`. One runs at a time. `ALL_TOOLS` has their full declarations and descriptions.
+```ts
+declare const tools: {
+  shell(args: { command: string; workdir?: string; timeout_ms?: number }): Promise<CallToolResult>;
+  read(args: { path: string; offset?: number; limit?: number }): Promise<CallToolResult>;
+  write(args: { path: string; content: string }): Promise<CallToolResult>;
+  edit(args: { path: string; old: string; new: string; replace_all?: boolean }): Promise<CallToolResult>;
+  apply_patch(args: { input: string }): Promise<CallToolResult>;
+  web_fetch(args: { url: string }): Promise<CallToolResult>;
+};
+```"#;
+
+/// Whether code mode is on: the agents' own tools reached only through
+/// `exec` (`[sonny] code_mode`, on unless the config says otherwise).
+pub fn code_mode() -> bool {
+    agent_client::config::load().map_or(true, |config| config.sonny.code_mode)
+}
+
+/// The `steps_only` setting `config` gives Sonny's agents: in code mode,
+/// every daemon tool that runs as a step, kept for `exec`; otherwise none,
+/// so an agent made by one in code mode shows its tools again.
+pub fn steps_only(config: &agent_client::config::Config) -> Value {
+    match config.sonny.code_mode {
+        true => json!(["*"]),
+        false => json!([]),
+    }
+}
+
 /// The MCP result types the declarations name, after Codex's.
 const TYPES: &str = r#"Shared MCP Types:
 ```ts
@@ -117,7 +149,8 @@ pub fn tool() -> Option<Value> {
     let machines: Vec<crate::link::Machine> = (crate::link::machines().into_iter())
         .filter(|machine| !machine.servers.is_empty())
         .collect();
-    if servers.is_empty() && machines.is_empty() {
+    let code_mode = code_mode();
+    if servers.is_empty() && machines.is_empty() && !code_mode {
         return None;
     }
     let cache = crate::mcp::cache_dir();
@@ -132,7 +165,7 @@ pub fn tool() -> Option<Value> {
         .collect();
     Some(json!({
         "name": NAME,
-        "description": description(&servers, &known, &machines),
+        "description": description(&servers, &known, &machines, code_mode),
         "parameters": {
             "type": "object",
             "properties": {"input": {"type": "string",
@@ -157,8 +190,12 @@ fn description(
     servers: &Servers,
     known: &BTreeMap<String, Known>,
     machines: &[crate::link::Machine],
+    code_mode: bool,
 ) -> String {
     let mut sections = vec![DESCRIPTION.to_owned(), TYPES.to_owned()];
+    if code_mode {
+        sections.push(DAEMON_TOOLS.to_owned());
+    }
     let mut left = DECLARATIONS;
     let mut omitted = 0;
     let mut collided = Vec::new();
@@ -591,6 +628,9 @@ struct Nested {
     /// Whether a call of it is refused outright: in a trigger's shadow
     /// run, whatever does not only read, or would ask.
     refused: bool,
+    /// One of the agent's own tools, which its daemon runs as a step of
+    /// the `exec` call (`run_step`), deciding and recording it itself.
+    daemon: bool,
 }
 
 /// Arguments sent with a step that is only recorded: whole up to
@@ -681,6 +721,8 @@ pub struct Steps {
     /// one, which the agent's judge would take as reviewed already.
     run: String,
     next: std::sync::atomic::AtomicU64,
+    /// The one step of the call the daemon runs at a time.
+    one: tokio::sync::Mutex<()>,
 }
 
 /// Where a step is put: this machine's daemon, or the gate of the agent of
@@ -723,6 +765,7 @@ impl Steps {
                 ANSWERINGS.fetch_add(1, Ordering::Relaxed)
             ),
             next: Default::default(),
+            one: Default::default(),
         }
     }
 
@@ -771,6 +814,43 @@ impl Steps {
             Err(error) if asks => Err(format!("{called} could not be approved: {error}")),
             Err(error) => Err(format!("{called} could not be recorded: {error}")),
         }
+    }
+
+    /// Run the agent's own tool `name` as a step of this call: its daemon
+    /// decides it as the same call from the model, runs it and records it,
+    /// and the result comes back as an MCP `CallToolResult`. Steps of one
+    /// call go one at a time, as the daemon takes them.
+    pub async fn run(&self, name: &str, arguments: Value) -> Result<crate::mcp::Called, String> {
+        let Via::Daemon {
+            client,
+            bot,
+            turn,
+            call_id,
+        } = &self.via
+        else {
+            return Err(format!("tools.{name} runs only on this machine"));
+        };
+        let _one = self.one.lock().await;
+        let step = format!(
+            "{}.{}",
+            self.run,
+            self.next.fetch_add(1, Ordering::SeqCst) + 1
+        );
+        let asked = json!({"bot": bot, "turn": turn, "call_id": call_id,
+            "step": step, "name": name, "arguments": arguments});
+        let reply = (client.request("run_step", asked).await)
+            .map_err(|error| format!("tools.{name} did not run: {error}"))?;
+        let mut content = vec![json!({"type": "text", "text": reply["output"]})];
+        for part in reply["parts"].as_array().into_iter().flatten() {
+            content.push(match part["type"].as_str() {
+                Some("image") => json!({"type": "image", "data": part["data"],
+                    "mimeType": part["media_type"]}),
+                _ => json!({"type": "text", "text": part["text"]}),
+            });
+        }
+        let is_error = reply["failed"] == true;
+        let json = json!({"content": content, "isError": is_error}).to_string();
+        Ok(crate::mcp::Called { json, is_error })
     }
 
     /// Tell the agent how an allowed step ended, so its judge counts it
@@ -898,11 +978,12 @@ async fn run_keeping(
     let readied = tokio::time::timeout_at(deadline.into(), async {
         let alive = ALIVE.acquire().await.map_err(|e| e.to_string())?;
         let running = RUNNING.acquire().await.map_err(|e| e.to_string())?;
-        Ok::<_, String>((alive, running, discover(hub).await))
+        let (discovered, own) = tokio::join!(discover(hub), daemon_tools(steps.as_ref()));
+        Ok::<_, String>((alive, running, discovered, own))
     })
     .await;
     let budget = script.max_output_tokens.unwrap_or(OUTPUT_TOKENS);
-    let (alive, running, (mut nested, listed, failed)) = match readied {
+    let (alive, running, (mut nested, mut listed, failed), own) = match readied {
         Ok(readied) => readied?,
         Err(_) => {
             let ended = Ended::Terminated("it ran out of time before it started".into());
@@ -912,6 +993,13 @@ async fn run_keeping(
             ));
         }
     };
+    // The agent's own tools first, under their own names.
+    let mut entries = Vec::with_capacity(own.len());
+    for (name, tool, entry) in own {
+        nested.insert(name, tool);
+        entries.push(entry);
+    }
+    listed.splice(0..0, entries);
     // A trigger's shadow run reads and does nothing else: a call of a tool
     // that does not say it only reads, or that would ask the person, is
     // refused, never asked about.
@@ -1084,11 +1172,69 @@ async fn discover(hub: &Hub) -> (BTreeMap<String, Nested>, Vec<Value>, Vec<Strin
                         access: mcp_access(&tool["annotations"]),
                     },
                     refused: false,
+                    daemon: false,
                 },
             );
         }
     }
     (nested, listed, failed)
+}
+
+/// The agent's own tools a script calls in code mode, as its daemon's
+/// `tools` lists those that run as steps, each with its declaration;
+/// none outside code mode or for a call made over a link.
+async fn daemon_tools(steps: Option<&Steps>) -> Vec<(String, Nested, Value)> {
+    let Some(Via::Daemon { client, .. }) = steps.map(|steps| &steps.via) else {
+        return Vec::new();
+    };
+    if !code_mode() {
+        return Vec::new();
+    }
+    // The daemon's tools are its build's, so they are asked once.
+    static LISTED: tokio::sync::OnceCell<Vec<Value>> = tokio::sync::OnceCell::const_new();
+    let asked = LISTED.get_or_try_init(|| async {
+        let listed = client.request("tools", json!({})).await.map_err(|_| ())?;
+        let tools = listed["tools"].as_array().ok_or(())?;
+        Ok::<_, ()>(
+            (tools.iter())
+                .filter(|tool| tool["step"] == true)
+                .cloned()
+                .collect(),
+        )
+    });
+    let Ok(listed) = asked.await else {
+        return Vec::new();
+    };
+    listed.iter()
+        .filter_map(|tool| {
+            let name = tool["name"].as_str()?.to_owned();
+            let mut text = format!("### `{name}`");
+            if let Some(about) = tool["description"].as_str().map(str::trim) {
+                text.push('\n');
+                text.push_str(about);
+            }
+            let input = typescript(&tool["parameters"]);
+            text.push_str(&format!(
+                "\n```ts\ndeclare const tools: {{ {name}(args: {input}): Promise<CallToolResult>; }};\n```"
+            ));
+            let reads = matches!(name.as_str(), "read" | "echo");
+            let nested = Nested {
+                server: String::new(),
+                tool: name.clone(),
+                description: text.clone(),
+                asks: false,
+                reads,
+                facts: Facts {
+                    kind: "daemon",
+                    place: None,
+                    access: None,
+                },
+                refused: false,
+                daemon: true,
+            };
+            Some((name.clone(), nested, json!({"name": name, "description": text})))
+        })
+        .collect()
 }
 
 /// What `exec` answers: how the script ended, its time and calls, then
@@ -1113,7 +1259,7 @@ fn said(
             .iter()
             .map(|(server, n)| format!("{server} {n}"))
             .collect();
-        head.push_str(&format!("MCP calls: {}\n", each.join(", ")));
+        head.push_str(&format!("Calls: {}\n", each.join(", ")));
     }
     head.push_str("Output:\n");
     if let Ended::Failed(error) = ended {
@@ -1878,6 +2024,26 @@ impl Caller {
             ));
         }
         let arguments: Value = serde_json::from_str(&arguments).map_err(|e| e.to_string())?;
+        // The agent's own tool: its daemon decides, runs and records it as
+        // a step of this call, one at a time.
+        if nested.daemon {
+            let steps = self
+                .steps
+                .clone()
+                .ok_or("the agent's own tools run only for its own calls")?;
+            let _place = self.at_once.acquire().await.map_err(|e| e.to_string())?;
+            self.halt.refuse(&named)?;
+            *self.calls.lock().unwrap().entry(id.clone()).or_default() += 1;
+            let arguments = match arguments {
+                Value::Null => json!({}),
+                arguments => arguments,
+            };
+            let ran = Abort(
+                self.host
+                    .spawn(async move { steps.run(&id, arguments).await }),
+            );
+            return ran.await.map_err(|e| e.to_string())?;
+        }
         // Told to the agent's daemon first, with the script's time stopped,
         // on the host's runtime, where its connection lives: put to its
         // gate when it asks, else recorded in its audit trail.
@@ -2272,7 +2438,7 @@ mod tests {
             },
         )]
         .into();
-        let text = description(&servers, &known, &[]);
+        let text = description(&servers, &known, &[], false);
         assert!(text.contains("## test\nTest tools"));
         assert!(text.contains("declare const tools: { mcp__test__tool0(args: { [key: string]: unknown; }): Promise<CallToolResult>; };"));
         let declared = text.matches("### `mcp__test__").count();
@@ -2280,7 +2446,7 @@ mod tests {
         assert!(text.ends_with(&format!("{} more tools are in `ALL_TOOLS`.", 40 - declared)));
         // A server not listed yet is still named.
         let unlisted: BTreeMap<String, Known> = [("test".to_owned(), Known::default())].into();
-        assert!(description(&servers, &unlisted, &[]).contains("once it starts"));
+        assert!(description(&servers, &unlisted, &[], false).contains("once it starts"));
     }
 
     #[test]
@@ -2315,7 +2481,7 @@ mod tests {
         )]
         .into();
         let known: BTreeMap<String, Known> = [("notes".to_owned(), Known::default())].into();
-        let text = description(&own, &known, std::slice::from_ref(&machine));
+        let text = description(&own, &known, std::slice::from_ref(&machine), false);
         let fixed = DESCRIPTION.len() + TYPES.len();
         // Headers and the machine's own paragraph are small and fixed.
         assert!(text.len() <= fixed + DECLARATIONS + 2_000, "{}", text.len());
@@ -2413,6 +2579,15 @@ mod tests {
                 tokio::spawn(async move {
                     let result = match request["name"].as_str() {
                         _ if request["op"] == "step_result" => json!({}),
+                        // The daemon's own tools, and one run as a step.
+                        _ if request["op"] == "tools" => json!({"tools": [
+                            {"name": "shell", "description": "Run a command.", "step": true,
+                                "parameters": {"type": "object", "properties": {"command": {"type": "string"}},
+                                    "required": ["command"]}},
+                            {"name": "history", "description": "Read a turn.", "step": false,
+                                "parameters": {"type": "object"}}]}),
+                        _ if request["op"] == "run_step" => json!({"failed": false,
+                            "output": format!("ran {}", request["arguments"]["command"].as_str().unwrap_or_default())}),
                         // Recorded only, as the daemon allows it: at once.
                         _ if request["record"] == true => {
                             json!({"decision": "allow", "approvals": []})
@@ -2596,6 +2771,60 @@ text("done");"#;
     }
 
     #[tokio::test]
+    async fn code_mode_runs_the_agent_s_own_tools_as_steps_of_its_call() {
+        let dir = scratch("own-tools");
+        let hub = hub(&dir).await;
+        let (client, mut steps) = gate(&dir, Duration::ZERO, None).await;
+        let asker = Steps::new(client, "shop.lead".into(), 7, "c1".into());
+        let script = r#"const r = await tools.shell({command: "ls"});
+text(`${r.content[0].text} ${r.isError}`);
+text(ALL_TOOLS.some(t => t.name === "history"));"#;
+        let said = run(
+            &hub,
+            Some(&dir),
+            "shop.lead",
+            script,
+            Duration::from_secs(30),
+            Some(asker),
+        )
+        .await
+        .unwrap()
+        .as_str()
+        .unwrap()
+        .to_owned();
+        assert!(said.ends_with("Output:\nran ls false\nfalse"), "{said}");
+        // Run by the daemon as a step of the call, asking no gate itself.
+        let mut told = Vec::new();
+        while let Ok(step) = steps.try_recv() {
+            told.push(step);
+        }
+        let [ran] = &told
+            .iter()
+            .filter(|s| s["op"] == "run_step")
+            .collect::<Vec<_>>()[..]
+        else {
+            panic!("{told:?}");
+        };
+        assert_eq!(
+            (
+                &ran["bot"],
+                &ran["turn"],
+                &ran["call_id"],
+                &ran["name"],
+                &ran["arguments"]
+            ),
+            (
+                &json!("shop.lead"),
+                &json!(7),
+                &json!("c1"),
+                &json!("shell"),
+                &json!({"command": "ls"})
+            )
+        );
+        assert!(told.iter().all(|s| s["op"] != "approve_step"), "{told:?}");
+    }
+
+    #[tokio::test]
     async fn a_shadow_runs_only_what_says_it_reads_and_asks_nothing() {
         let dir = scratch("shadow");
         let hub = hub(&dir).await;
@@ -2630,9 +2859,10 @@ text("done");"#;
         while let Ok(step) = steps.try_recv() {
             told.push(step);
         }
+        // The daemon's own tools are listed, which asks nothing.
         assert!(
             told.iter()
-                .all(|s| s["op"] == "step_result" || s["record"] == true),
+                .all(|s| s["op"] == "tools" || s["op"] == "step_result" || s["record"] == true),
             "nothing asked the gate: {told:?}"
         );
         assert!(
@@ -2810,7 +3040,7 @@ text(ALL_TOOLS.map(t => t.name).join(","));"#,
         .await;
         assert!(said.starts_with("Script completed\nWall time "), "{said}");
         assert!(
-            said.contains("MCP calls: test 2\nOutput:\none\n{\"sum\":5}\n"),
+            said.contains("Calls: test 2\nOutput:\none\n{\"sum\":5}\n"),
             "{said}"
         );
         assert!(said.ends_with("mcp__test__echo,mcp__test__add,mcp__test__fail,mcp__test__slow"));
@@ -2994,7 +3224,7 @@ text(ALL_TOOLS.map(t => t.name).join(","));"#,
                 )
             })
             .collect();
-        let described = description(&servers, &known, &[]);
+        let described = description(&servers, &known, &[], false);
         assert!(
             !described.contains("### `mcp__my_server__echo`"),
             "{described}"
@@ -3213,6 +3443,7 @@ text(ALL_TOOLS.map(t => t.name).join(","));"#,
     #[test]
     fn a_tool_named_exactly_comes_first() {
         let tool = |server: &str, name: &str, description: &str| Nested {
+            daemon: false,
             server: server.into(),
             tool: name.into(),
             description: description.into(),

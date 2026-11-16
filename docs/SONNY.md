@@ -1164,8 +1164,9 @@ set. Servers on the old SSE transport are named and left out.
 
 ![sonny mcp import](sonny/mcp-import.png)
 
-Agents do not get a tool per MCP tool. While any server is on, every agent
-Sonny opens has one tool, `exec`, with Codex's code mode contract
+Agents do not get a tool per MCP tool. In code mode, and otherwise while
+any server is on, every agent Sonny opens has one tool, `exec`, with
+Codex's code mode contract
 ([exec.rs](../sonny/src/exec.rs)): the model writes JavaScript, each tool is
 `await tools.mcp__SERVER__TOOL(args)` and resolves to its `CallToolResult`,
 and only what the script passes to `text()` and `image()` comes back, so
@@ -1197,6 +1198,23 @@ byte; eight of its calls are in flight at once, and a
 result over 16 MB is refused, as rmcp refuses such a message. Two tools
 whose identifiers would be the same (`my-server` and `my_server`'s
 `search`) are neither on `tools`, the description saying why.
+
+Code mode (`[sonny] code_mode`, on by default, in `/config`) gives a
+script the agent's own tools too: `tools.shell`, `tools.read`,
+`tools.write`, `tools.edit`, `tools.apply_patch` and `tools.web_fetch`, as
+far as the agent has them, and its model is shown `exec` in their place
+(the daemon's `steps_only` setting, `"*"`, on every agent Sonny makes or
+opens). The daemon runs each such call as a step of the `exec` call, decided
+as the same call from the model would be: the agent's rules, sandbox and
+approvals, its audit row and its stop. A command runs in the foreground,
+and one of them runs at a time. The script's result names its calls by
+server or tool (`Calls: shell 2, github 1`), and so does its line in the
+window. Off, every agent's model is shown its tools again from its next
+turn, and `exec` stays only while a server is on.
+
+![The every-tool-call view: a lead's script ran shell once as a step of its exec call, its result under the row](sonny/code-mode-script.png)
+
+![/config filtered to code mode, on](sonny/code-mode-config.png)
 
 The tool host runs the scripts and keeps the servers
 ([mcp.rs](../sonny/src/mcp.rs)): one connection per server for every agent,

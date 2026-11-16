@@ -3221,17 +3221,18 @@ fn drawn(
     out
 }
 
-/// An `exec` call as one line: the MCP calls its script made, by server,
+/// An `exec` call as one line: the calls its script made, by MCP server
+/// or by the agent's own tool,
 /// from the head of its result, and how it ended when not well.
 fn scripted(output: &str) -> String {
     let head = output.split_once("Output:\n").map_or("", |(head, _)| head);
-    let mut line = match head.lines().find_map(|l| l.strip_prefix("MCP calls: ")) {
+    let mut line = match head.lines().find_map(|l| l.strip_prefix("Calls: ")) {
         Some(calls) => {
             let total: usize = (calls.split(", "))
                 .filter_map(|each| each.rsplit_once(' ')?.1.parse::<usize>().ok())
                 .sum();
             let noun = if total == 1 { "call" } else { "calls" };
-            format!("a script: {total} MCP {noun} ({calls})")
+            format!("a script: {total} {noun} ({calls})")
         }
         None => "a script".to_owned(),
     };
@@ -5047,12 +5048,9 @@ mod tests {
     #[test]
     fn a_script_is_one_line_of_its_mcp_calls_over_what_it_printed() {
         let input = serde_json::json!({"input": "await tools.mcp__github__a({});"});
-        let output = "Script completed\nWall time 1.2 seconds\nMCP calls: github 10, linear 2\nOutput:\n3 open issues";
+        let output = "Script completed\nWall time 1.2 seconds\nCalls: github 10, shell 2\nOutput:\n3 open issues";
         let rows = text(&tool("exec", &input, Some(output), false, "/", 80));
-        assert_eq!(
-            rows[0],
-            "• Ran a script: 12 MCP calls (github 10, linear 2)"
-        );
+        assert_eq!(rows[0], "• Ran a script: 12 calls (github 10, shell 2)");
         assert!(rows[1].contains("3 open issues"), "{rows:#?}");
         let failed = "Script terminated: it ran out of time\nWall time 600.0 seconds\nOutput:\n";
         let rows = text(&tool("exec", &input, Some(failed), true, "/", 80));

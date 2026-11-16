@@ -669,6 +669,18 @@ class DaemonStepTests(ModelFixture):
         refused = client.request('configure', bot='Maker', settings={'steps_only': ['shell', 'shell']})
         self.assertEqual(refused['error'], 'invalid_setting')
 
+    def test_a_fork_that_allows_nothing_is_shown_what_its_source_is_shown(self):
+        client = self.client('echo,shell')
+        client.request('create', bot='Lead', workspace=str(self.path), tools=['echo', 'shell'],
+                       declare=[EXEC], settings={'steps_only': ['*']})
+        turn = client.request('submit', bot='Lead', request_id='l', prompt='hello')['result']['message']
+        self.assertEqual(client.finished(turn)['data']['status'], 'completed')
+        self.assertEqual(self.offered(), ['exec'])
+        client.request('fork', source='Lead', bot='Guess', allow=[])
+        turn = client.request('submit', bot='Guess', request_id='g', prompt='hello')['result']['message']
+        self.assertEqual(client.finished(turn)['data']['status'], 'completed')
+        self.assertEqual(self.offered(), ['exec'])
+
     def test_a_direct_call_of_a_hidden_client_tool_never_reaches_its_client(self):
         lookup = {'name': 'lookup', 'description': 'Look up.', 'answered_by': 'sonny',
                   'parameters': {'type': 'object', 'properties': {}, 'additionalProperties': False}}

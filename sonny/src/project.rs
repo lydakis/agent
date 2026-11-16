@@ -1044,6 +1044,7 @@ async fn make(
     // opens, and the defaults stand until it reads.
     let config = agent_client::config::load().unwrap_or_default();
     settings.insert("trailer".into(), json!(crate::stamp::trailer(&config)));
+    settings.insert("steps_only".into(), crate::exec::steps_only(&config));
     if let Some(ms) = config.hold_ms {
         settings.insert("hold_ms".into(), json!(ms));
     }

@@ -357,7 +357,7 @@ class ServedToolTests(ModelFixture):
         self.host()
         said = self.call('calc.lead', 'exec', 'const r = await tools.mcp__test__echo({text: "hi"});\ntext(r.content[0].text);')
         self.assertTrue(said.startswith('Script completed\n'), said)
-        self.assertTrue(said.endswith('MCP calls: test 1\nOutput:\nhi'), said)
+        self.assertTrue(said.endswith('Calls: test 1\nOutput:\nhi'), said)
         summed = self.call('calc.lead', 'exec', 'text((await tools.mcp__test__add({a: 1, b: 2})).structuredContent.sum);')
         self.assertTrue(summed.endswith('Output:\n3'), summed)
         # One server, started by the first script and kept for the next.
@@ -365,6 +365,28 @@ class ServedToolTests(ModelFixture):
         refused = json.loads(self.call('calc.lead', 'exec', '// @exec: {"wait": 1}\ntext(1);'))
         self.assertEqual(refused['error'], 'exec_refused')
         self.assertIn('`wait`', refused['detail'])
+
+    def test_in_code_mode_an_agent_s_script_runs_its_shell_as_steps_of_the_call(self):
+        # The tool as Sonny gives it in code mode, its default: no servers
+        # needed, and the agent's own tools shown only on `tools`.
+        script = json.loads(subprocess.run([str(self.sonny), 'mcp', 'tool'], env={**clean_env(), 'HOME': str(self.path)},
+                                           check=True, capture_output=True, text=True).stdout)
+        self.assertIn('tools.shell', script['description'])
+        self.daemon.request('create', bot='calc.lead', workspace=str(self.path), model='openai/synthetic-model',
+                            instructions='Lead.', tools=['echo', 'shell'], declare=[script],
+                            settings={'steps_only': ['*']})
+        self.host()
+        said = self.call('calc.lead', 'exec',
+                         'const r = await tools.shell({command: "echo hi > made && cat made"});\n'
+                         'text(`${JSON.parse(r.content[0].text).stdout.trim()} ${r.isError}`);')
+        self.assertTrue(said.endswith('Calls: shell 1\nOutput:\nhi false'), said)
+        self.assertEqual((self.path / 'made').read_text(), 'hi\n')
+        # The model was shown the script tool alone.
+        shown = [t['name'] for t in self.model.requests.get(timeout=3)['tools']]
+        self.assertEqual(shown, ['exec'])
+        # The command is in the audit trail as a step of the script's call.
+        rows = self.daemon.request('audit', bot='calc.lead')['result']['rows']
+        self.assertTrue([r for r in rows if r['tool'] == 'shell'], rows)
 
     def test_a_script_s_pictures_reach_the_model_in_order_with_its_text(self):
         server = Path(__file__).with_name('mcp_server.py')
@@ -1019,7 +1041,7 @@ there.wait()
         self.host()
         said = self.call('calc.lead', 'exec', '// @exec: {"machine": "laptop"}\n'
                          'const r = await tools.mcp__test__echo({text: "hi"});\ntext(r.content[0].text);', wait=30)
-        self.assertTrue(said.endswith('MCP calls: test 1\nOutput:\nhi'), said)
+        self.assertTrue(said.endswith('Calls: test 1\nOutput:\nhi'), said)
         # It ran there: the laptop started its server.
         self.assertEqual(len((laptop / 'starts').read_text().splitlines()), 1)
         # What the output's budget cuts comes back whole, saved here, where the agent reads it.

@@ -260,6 +260,8 @@ async fn follow_config(client: Arc<Client>) {
     let mut live = std::collections::HashSet::new();
     // What the machines linked here lend, which their agents' tools say.
     let mut lent = crate::link::stamp();
+    // Code mode, which says what `exec` reaches, read as the file changes.
+    let mut coded = crate::exec::code_mode();
     loop {
         let now_lent = crate::link::stamp();
         if now_lent != lent {
@@ -271,6 +273,11 @@ async fn follow_config(client: Arc<Client>) {
         let now = (stamp(), rules.clone());
         if seen.as_ref() != Some(&now) {
             seen = Some(now);
+            if crate::exec::code_mode() != coded {
+                coded = !coded;
+                let bots = crate::lookout::all_bots(&client).await;
+                tokio::spawn(refresh_tools(client.clone(), bots));
+            }
             waiting = crate::lookout::all_bots(&client).await;
             live = (waiting.iter())
                 .filter_map(|bot| bot["bot_id"].as_i64())
@@ -394,6 +401,11 @@ fn configured(record: &Value, given: &Given<'_>) -> Option<serde_json::Map<Strin
     if record["settings"]["trailer"] != trailer {
         settings.insert("trailer".into(), trailer);
     }
+    // Code mode on or off, as the config says.
+    let steps_only = crate::exec::steps_only(given.config);
+    if record["settings"]["steps_only"] != steps_only {
+        settings.insert("steps_only".into(), steps_only);
+    }
     // As long as the config says, or the daemon's own when it says none.
     let hold = given.config.hold_ms.unwrap_or(agent_client::HOLD_MS);
     // None is the daemon's own: a reset kept for the turn's end, say.
@@ -489,7 +501,7 @@ mod tests {
         let (both, sender) = (json!(["sender", "time"]), json!(["sender"]));
         let agent = |fallback: Value, trailer: &Value| {
             json!({"provider": "anthropic", "model": "claude", "fallback": fallback,
-                "settings": {"trailer": trailer},
+                "settings": {"trailer": trailer, "steps_only": ["*"]},
                 "declared": [{"name": "start_task", "answered_by": crate::served::TAG}]})
         };
         fn given(config: &agent_client::config::Config) -> Given<'_> {
@@ -564,6 +576,20 @@ mod tests {
             configured(&held, &given(&config)).map(Value::Object),
             Some(json!({"settings": {"hold_ms": 5}}))
         );
+        let mut config = agent_client::config::Config::default();
+        // Code mode, on by default, keeps the agent's own tools for `exec`;
+        // off, they are shown again.
+        let mut direct = agent(Value::Null, &both);
+        direct["settings"]["steps_only"] = Value::Null;
+        assert_eq!(
+            configured(&direct, &given(&config)).map(Value::Object),
+            Some(json!({"settings": {"steps_only": ["*"]}}))
+        );
+        config.sonny.code_mode = false;
+        assert_eq!(
+            configured(&agent(Value::Null, &both), &given(&config)).map(Value::Object),
+            Some(json!({"settings": {"steps_only": []}}))
+        );
         let config = agent_client::config::Config::default();
         // Another client's bot is its own.
         let mut other = agent(json!("x/y"), &sender);
@@ -592,7 +618,8 @@ mod tests {
         };
         let agent = |rules: Value, creator: Value| {
             json!({"provider": "anthropic", "model": "claude", "fallback": null,
-                "settings": {"rules": rules, "trailer": ["sender", "time"]}, "created_by_id": creator,
+                "settings": {"rules": rules, "trailer": ["sender", "time"], "steps_only": ["*"]},
+                "created_by_id": creator,
                 "declared": [{"name": "start_task", "answered_by": crate::served::TAG}]})
         };
         assert_eq!(

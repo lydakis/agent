@@ -1922,6 +1922,11 @@ mod tests {
             "automations",
             "workflow"
         ]);
+        // `exec`, always there in code mode, is gated as the rest; the
+        // daemon judges its script's calls, not the script.
+        if crate::exec::tool().is_some() {
+            waiting.as_array_mut().unwrap().push(json!("exec"));
+        }
         // The browser, there when agent-browser is, reaches outside.
         if crate::browser::tool().is_some() {
             waiting.as_array_mut().unwrap().push(json!("browser"));
