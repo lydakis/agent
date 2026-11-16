@@ -585,8 +585,10 @@ things are specified for them: their place under the coordinator's bound
 itself; src/tools.rs:3290, src/tools.rs:3351), and what stopping one
 means. A step's `read` also needs a rule for paging, which a turn takes
 from its context budget (src/tools.rs:3313). Not planned: a tool that
-takes steps (no script inside a script), `wait`, background `shell`,
-`write_stdin` and terminals, whose handles outlive a call; `history` and
+takes steps (no script inside a script), `wait`, `write_stdin` and
+terminals, whose handles outlive a call; background `shell` runs as a
+step since 2026-11-16, its command the bot's as a turn's is, not the
+call's; `history` and
 the tools about other bots. Never: `web_search`, which the provider runs.
 
 **The reply** is what the model would have read. Output past the preview

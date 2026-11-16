@@ -250,7 +250,7 @@ class DaemonStepTests(ModelFixture):
         for change, error in [({'step': 'a b'}, 'invalid_step'), ({'name': 'wait'}, 'invalid_step'), ({'name': 'read'}, 'invalid_tool_arguments'),
                               ({'name': 'mcp__x__y'}, 'invalid_step'), ({'arguments': []}, 'invalid_step'),
                               ({'arguments': {'nope': 1}}, 'invalid_tool_arguments'),
-                              ({'name': 'shell', 'arguments': {'command': 'x', 'background': True}}, 'invalid_step'),
+                              ({'name': 'shell', 'arguments': {'command': 'x', 'detach': True}}, 'invalid_step'),
                               ({'arguments': {'text': 'x' * 65537}}, 'step_arguments_limit'),
                               ({'call_id': 'nope'}, 'no_pending_call'), ({'bot': 'Other'}, 'turn_not_found'),
                               ({'call_id': ''}, 'invalid_call_id')]:
@@ -357,14 +357,53 @@ class DaemonStepTests(ModelFixture):
         [row] = [r for r in rows if r['step'] == '1']
         self.assertEqual(row['outcome'], 'failed')
 
-    def test_the_call_running_out_of_time_stops_its_step(self):
-        client, turn = self.script(tool=dict(EXEC, expire_ms=1500))
-        request = self.ask(client, turn)
+    def test_a_command_step_stops_its_call_s_time_until_it_ends(self):
+        # The script's clock stops while its command runs, and so does its
+        # call's: a command outlives the call's own time, and no clock
+        # kills it. Once it ends the time runs again, and the call, never
+        # answered, runs out of it.
+        client, turn = self.script(tool=dict(EXEC, expire_ms=1500), settings={'approval_hold_ms': 0})
+        request = self.ask(client, turn, arguments={'command': 'sleep 2.5; echo outlived'})
         self.running(client)
-        stopped = self.reply(client, request, timeout=10)
-        self.assertEqual(stopped['error'], 'step_stopped')
-        self.ended(client, turn, 'script-0/1')
+        ran = self.reply(client, request, timeout=10)['result']
+        self.assertEqual(json.loads(ran['output'])['stdout'], 'outlived\n', ran)
+        done = self.ended(client, turn, 'script-0/1')
+        self.assertNotIn('error', done)
         self.assertEqual(client.finished(turn, timeout=10)['data']['status'], 'completed')
+        events = client.request('events', bot='Lead', after=0, limit=256)['result']['events']
+        [completed] = [e['data'] for e in events if e.get('turn') == turn and e['event'] == 'tool_completed']
+        output = node_item(client, 'Lead', completed['node'])['result']['output']
+        self.assertIn('in time', output)
+
+    def test_a_background_command_step_hands_back_a_handle_that_outlives_its_call(self):
+        # As a turn's background command: the step answers at once with
+        # its handle, the command is the bot's, not the call's, so it runs
+        # on past the call's answer, and a wait on the handle reads it.
+        client, turn = self.script()
+        ran = self.step(client, turn, name='shell',
+                        arguments={'command': 'sleep 1; echo apart', 'background': True})['result']
+        said = json.loads(ran['output'])
+        self.assertEqual(said['background'], True, said)
+        handle = said['handle']
+        self.assertTrue(handle.startswith('proc:'), said)
+        self.ended(client, turn, 'script-0/1')
+        self.answer(client, turn, output=handle)
+        self.assertEqual(client.finished(turn)['data']['status'], 'completed')
+        ended = client.request('wait', handles=[handle], timeout_ms=10_000)['result']['results'][handle]
+        self.assertEqual((ended['exit_code'], ended['stdout']), (0, 'apart\n'), ended)
+        # Its end is told to the bot, as a direct background command's is.
+        told = client.receive(lambda m: m.get('event') == 'queued'
+                              and m.get('data', {}).get('origin') == 'background', 10)
+        self.assertEqual(client.finished(told['message'])['data']['status'], 'completed')
+
+    def test_a_command_step_that_names_a_timeout_ends_at_it(self):
+        # A step cannot be handed back as a handle, so a timeout its
+        # script names ends the command, with what it wrote so far.
+        client, turn = self.script()
+        ran = self.step(client, turn, name='shell',
+                        arguments={'command': 'echo early; sleep 30', 'timeout_ms': 300})['result']
+        said = json.loads(ran['output'])
+        self.assertEqual((said['timed_out'], said['stdout']), (True, 'early\n'), said)
 
     def test_a_step_naming_no_valid_bot_is_refused_before_it_is_held(self):
         client, turn = self.script()

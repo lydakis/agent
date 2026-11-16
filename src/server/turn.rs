@@ -296,15 +296,44 @@ impl Lift {
         tokio::time::sleep(LIFT_GRACE).await;
     }
 }
+
+/// Why a running foreground command moves to the background: a steer, or,
+/// when its call names a time to yield, that time passing first.
+async fn moved(lift: &Lift, yield_ms: Option<u64>) -> Moved {
+    let yielded = async {
+        match yield_ms {
+            Some(ms) => tokio::time::sleep(Duration::from_millis(ms)).await,
+            None => std::future::pending().await,
+        }
+    };
+    tokio::select! {
+        biased;
+        () = lift.lifted() => Moved::Steered,
+        () = yielded => Moved::Yielded,
+    }
+}
 const LIFT_GRACE: Duration = Duration::from_millis(250);
+/// The last lines of output a command that yields reports, as Codex hands
+/// back what a yielded command wrote so far.
+const YIELD_LINES: usize = 20;
 /// The most of one round's calls a bot runs at once. Each command also
 /// waits for the daemon's process budget, so this is a bot's share of it.
 pub(super) const PARALLEL_CALLS: usize = 4;
 
-/// A tool's result, or the command a steer moved to the background.
+/// A tool's result, or the command moved to the background, and why.
 enum Ran<F, T = Outcome> {
     Done(Result<T>),
-    Lifted(std::pin::Pin<Box<F>>),
+    Lifted(std::pin::Pin<Box<F>>, Moved),
+}
+
+/// Why a running foreground command moved to the background.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Moved {
+    /// A message for the turn came.
+    Steered,
+    /// It ran past its call's timeout_ms, which yields it, as Codex's
+    /// unified exec yields a command, and never kills it.
+    Yielded,
 }
 
 /// Provider-reported tokens across every turn since the daemon started,
@@ -4516,22 +4545,22 @@ impl Turn {
     }
 
     /// Run a prepared tool. The outer error is the runtime's; the inner one
-    /// is the tool's result. With `lift`, a steer moves the run to the
-    /// background instead, handed back unfinished, once the paired signal
-    /// says it is running: a command still waiting for a process slot stays
-    /// in line in the foreground.
+    /// is the tool's result. With `lift`, a steer, or its time to yield
+    /// passing, moves the run to the background instead, handed back
+    /// unfinished, once the paired signal says it is running: a command
+    /// still waiting for a process slot stays in line in the foreground.
     async fn run_tool<T, F: Future<Output = Result<T>>>(
         &self,
         run: F,
-        lift: Option<(&Lift, oneshot::Receiver<()>)>,
+        lift: Option<(&Lift, oneshot::Receiver<()>, Option<u64>)>,
     ) -> Result<Ran<F, T>> {
         let mut run = Box::pin(run);
         let lifted = async {
             // A run that ends before it starts wins the race below.
-            if let Some((lift, running)) = lift
+            if let Some((lift, running, yield_ms)) = lift
                 && running.await.is_ok()
             {
-                lift.lifted().await
+                moved(lift, yield_ms).await
             } else {
                 std::future::pending().await
             }
@@ -4540,7 +4569,7 @@ impl Turn {
         Ok(tokio::select! {
             biased;
             result = &mut run => Ran::Done(result),
-            () = &mut lifted => Ran::Lifted(run),
+            moved = &mut lifted => Ran::Lifted(run, moved),
         })
     }
 
@@ -4741,7 +4770,7 @@ impl Turn {
                             self.kept(outcome, record, workspace, &call.call_id).await
                         }
                         Ran::Done(Err(error)) => failure(error),
-                        Ran::Lifted(_) => unreachable!("only a command moves to the background"),
+                        Ran::Lifted(..) => unreachable!("only a command moves to the background"),
                     }
                 }
                 Ok(Prepared::Wait {
@@ -4833,7 +4862,7 @@ impl Turn {
                             seen = Some(id);
                             failure(error)
                         }
-                        Ran::Lifted(_) => unreachable!("only a command moves to the background"),
+                        Ran::Lifted(..) => unreachable!("only a command moves to the background"),
                     }
                 }
                 // A poll past the bot's hold parks the turn as `wait` does,
@@ -4880,7 +4909,7 @@ impl Turn {
                             failure(self.no_terminal(handle, error).await?)
                         }
                         Ran::Done(Err(error)) => failure(error),
-                        Ran::Lifted(_) => unreachable!("only a command moves to the background"),
+                        Ran::Lifted(..) => unreachable!("only a command moves to the background"),
                     }
                 }
                 Ok(Prepared::WriteStdin {
@@ -4910,7 +4939,7 @@ impl Turn {
                                 .unwrap_or_else(failure)
                         }
                         Ran::Done(Err(error)) => failure(error),
-                        Ran::Lifted(_) => unreachable!("only a command moves to the background"),
+                        Ran::Lifted(..) => unreachable!("only a command moves to the background"),
                     }
                 }
                 Ok(Prepared::Read {
@@ -4995,21 +5024,26 @@ impl Turn {
                 }) => {
                     let (started, running) = oneshot::channel();
                     let place = self.registry.place();
-                    // What lists it, should a steer move it to the background.
+                    // What lists it, should it move to the background.
                     let listed = listed(&command);
                     let spill = (self.outputs(record, workspace))
                         .map(|outputs| outputs.spill(self.turn, &call.call_id));
+                    // Its timeout yields it, never kills it: no clock of
+                    // its own, it runs until it exits or is stopped.
                     let run = self.registry.foreground(
                         command,
                         Prepared::folder(workspace, workdir.as_deref()),
-                        timeout_ms,
+                        None,
                         environment.to_vec(),
                         sandbox,
                         place.clone(),
                         started,
                         spill,
                     );
-                    match self.run_tool(run, Some((&self.lift, running))).await? {
+                    match self
+                        .run_tool(run, Some((&self.lift, running, timeout_ms)))
+                        .await?
+                    {
                         Ran::Done(Ok(outcome)) => {
                             self.kept(outcome, record, workspace, &call.call_id).await
                         }
@@ -5017,11 +5051,19 @@ impl Turn {
                             return Err(error);
                         }
                         Ran::Done(Err(error)) => failure(error),
-                        Ran::Lifted(run) => {
+                        Ran::Lifted(run, moved) => {
                             let outputs = self.outputs(record, workspace);
                             let owner = record.bot_id;
-                            self.lift_shell(&call.call_id, listed, owner, run, &place, outputs)
-                                .await?
+                            self.lift_shell(
+                                &call.call_id,
+                                listed,
+                                owner,
+                                run,
+                                &place,
+                                outputs,
+                                moved,
+                            )
+                            .await?
                         }
                     }
                 }
@@ -5053,7 +5095,7 @@ impl Turn {
                         return Err(error);
                     }
                     Ran::Done(Err(error)) => failure(error),
-                    Ran::Lifted(_) => unreachable!("only a command moves to the background"),
+                    Ran::Lifted(..) => unreachable!("only a command moves to the background"),
                 },
                 Err(error) => failure(error),
             };
@@ -5215,7 +5257,7 @@ impl Turn {
         };
         match self.run_tool(record, None).await? {
             Ran::Done(result) => result,
-            Ran::Lifted(_) => unreachable!("a batch is not lifted whole"),
+            Ran::Lifted(..) => unreachable!("a batch is not lifted whole"),
         }
     }
 
@@ -5255,10 +5297,11 @@ impl Turn {
                 let listed = listed(&command);
                 let spill = (self.outputs(record, workspace))
                     .map(|outputs| outputs.spill(self.turn, &call_id));
+                // Its timeout yields it, never kills it.
                 let mut run = Box::pin(self.registry.foreground(
                     command,
                     Prepared::folder(workspace, workdir.as_deref()),
-                    timeout_ms,
+                    None,
                     environment.to_vec(),
                     sandbox,
                     place.clone(),
@@ -5268,23 +5311,31 @@ impl Turn {
                 let lifted = async {
                     // A run that ends before it starts wins the race below.
                     match running.await {
-                        Ok(()) => self.lift.lifted().await,
+                        Ok(()) => moved(&self.lift, timeout_ms).await,
                         Err(_) => std::future::pending().await,
                     }
                 };
                 let finished = tokio::select! {
                     biased;
-                    result = &mut run => Some(result),
-                    () = lifted => None,
+                    result = &mut run => Ok(result),
+                    moved = lifted => Err(moved),
                 };
                 match finished {
-                    Some(result) => result,
-                    None => {
+                    Ok(result) => result,
+                    Err(moved) => {
                         let outputs = self.outputs(record, workspace);
                         return (
                             call_id.clone(),
-                            self.lift_shell(&call_id, listed, record.bot_id, run, &place, outputs)
-                                .await,
+                            self.lift_shell(
+                                &call_id,
+                                listed,
+                                record.bot_id,
+                                run,
+                                &place,
+                                outputs,
+                                moved,
+                            )
+                            .await,
                         );
                     }
                 }
@@ -6301,9 +6352,11 @@ impl Turn {
     }
 
     /// Move a running foreground command to the background: it keeps its
-    /// process slot and timeout, and its result arrives on a proc handle as
-    /// a background command's does. A failure to record it drops the
+    /// process slot, and its result arrives on a proc handle as a
+    /// background command's does. One `moved` there by its timeout says
+    /// so, with its last lines so far. A failure to record it drops the
     /// command, which kills it.
+    #[allow(clippy::too_many_arguments)]
     async fn lift_shell<F>(
         &self,
         call_id: &str,
@@ -6312,6 +6365,7 @@ impl Turn {
         run: std::pin::Pin<Box<F>>,
         place: &Place,
         outputs: Option<Outputs>,
+        moved: Moved,
     ) -> Result<Outcome>
     where
         F: Future<Output = Result<Outcome>> + Send + 'static,
@@ -6336,9 +6390,17 @@ impl Turn {
             let _ = sender.send(run.await);
         });
         self.collect(id, call_id, receiver, outputs, None);
-        Ok(Outcome::text(
-            json!({"handle":format!("proc:{id}"),"background":true,"steered":true}).to_string(),
-        ))
+        let mut said = json!({"handle":format!("proc:{id}"),"background":true});
+        match moved {
+            Moved::Steered => said["steered"] = json!(true),
+            Moved::Yielded => {
+                said["yielded"] = json!(true);
+                if let Some((_, Some(lines))) = self.registry.output(id, YIELD_LINES) {
+                    said["tail"] = json!(lines);
+                }
+            }
+        }
+        Ok(Outcome::text(said.to_string()))
     }
 
     /// Record a background command's result when it arrives and wake those
@@ -6755,7 +6817,7 @@ impl Lifts {
     /// daemon stops: no result then is no end, and the daemon that opens
     /// the store next looks for it again.
     #[allow(clippy::too_many_arguments)]
-    fn collect(
+    pub(super) fn collect(
         &self,
         bot: &str,
         turn: i64,
