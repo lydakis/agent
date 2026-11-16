@@ -111,7 +111,7 @@ impl Keys {
         if let Some(enter) = self.enter {
             out.push(("enter".into(), enter.label().into(), Kind::Enter));
         }
-        out.extend(pairs.map(|(key, does)| (key.clone(), does.clone(), kind_of(key))));
+        out.extend(pairs.map(|(key, does)| (key.clone(), does.clone(), kind_of(key, does))));
         if let Some(esc) = self.esc {
             out.push(("esc".into(), esc.label().into(), Kind::Esc));
         }
@@ -149,14 +149,16 @@ enum Kind {
     Esc,
 }
 
-/// What a pair named by `key` is, as a line of keys gives way.
-fn kind_of(key: &str) -> Kind {
-    match key {
-        "esc" => Kind::Esc,
-        "enter" => Kind::Enter,
-        "↑↓" => Kind::Pick,
-        "tab" => Kind::Back,
-        key if key.starts_with("ctrl+\\") => Kind::Back,
+/// What a pair, `key` and what it `does`, is as a line of keys gives way.
+/// `tab` is the way back only where it moves the keys: `tab keys`, not
+/// `tab complete` or `tab speed`.
+fn kind_of(key: &str, does: &str) -> Kind {
+    match (key, does) {
+        ("esc", _) => Kind::Esc,
+        ("enter", _) => Kind::Enter,
+        ("↑↓", _) => Kind::Pick,
+        ("tab", "keys") => Kind::Back,
+        (key, _) if key.starts_with("ctrl+\\") => Kind::Back,
         _ => Kind::Rest,
     }
 }
@@ -199,7 +201,7 @@ pub fn fit(keys: &str, room: usize) -> String {
         .filter(|pair| !pair.is_empty())
         .map(|pair| {
             let (key, does) = pair.split_once(' ').unwrap_or((pair, ""));
-            (key.to_owned(), does.to_owned(), kind_of(key))
+            (key.to_owned(), does.to_owned(), kind_of(key, does))
         })
         .collect();
     fitted(said, room)
@@ -277,6 +279,17 @@ mod tests {
         let back = "↑↓ pick · r run · ctrl+\\ conversation · esc close";
         assert_eq!(fit(back, 40), "r run · ctrl+\\ conversation · esc close");
         assert_eq!(fit(back, 30), "r run · esc close");
+        // `tab` is the way back only where it moves the keys; where it
+        // moves between values, as in `/model`, it is one of the view's.
+        let tabbed = "↑↓ pick · enter open · r run · tab keys · esc close";
+        assert_eq!(fit(tabbed, 32), "enter open · r run · esc close");
+        let values = Keys::new()
+            .pick()
+            .enter(Enter::Choose)
+            .key("←→", "effort")
+            .key("tab", "speed")
+            .esc(Esc::Close);
+        assert_eq!(values.fit(40), "enter choose · ←→ effort · esc close");
         // With no esc named, the last pair stays all the same.
         let agent = "ctrl+g main view · ctrl+t its tab · ctrl+\\ conversation";
         assert_eq!(fit(agent, 40), "ctrl+g main view · ctrl+\\ conversation");
