@@ -11761,6 +11761,15 @@ impl App {
             if view.commands_due() {
                 self.read_commands(&mut view).await;
             }
+            // The open command's newest lines, beside the window.
+            if let Some((query, output)) = view.output_query() {
+                let (client, woken) = (self.client.clone(), self.woken.clone());
+                tokio::spawn(async move {
+                    let said = client.request("process_output", query.clone()).await;
+                    output.came(query["handle"].as_str().unwrap_or_default(), said.ok());
+                    woken.notify_one();
+                });
+            }
             if let Some(watch) = &mut self.watch {
                 watch.background = Some(view);
                 watch.read = Instant::now();

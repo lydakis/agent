@@ -6313,6 +6313,8 @@ impl Turn {
         // It runs on as a background command, and counts as one.
         let stopper = self.registry.stopper(id);
         self.registry.own(&stopper, owner);
+        // What it wrote so far stays there to look at, as it goes on.
+        self.registry.watch(id, place.peek());
         let run = (self.registry).until_stopped(stopper, self.registry.until_pulled(run));
         // Counted as the process it is now, not as a foreground command too.
         place.lift();

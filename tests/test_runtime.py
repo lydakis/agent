@@ -1638,6 +1638,9 @@ class RuntimeTests(ModelFixture):
         self.assertEqual([(p['handle'], p['bot'], p['kind'], p['command'], p['pid']) for p in running(client, 'B*')],
                          [(first['handle'], 'Bob', 'detached', 'exec sleep 30', first['pid'])])
         self.assertEqual(running(client, 'Alice'), [])
+        # Where it runs is known; what it writes goes nowhere.
+        self.assertEqual(client.request('process_output', bot='Bob', handle=first['handle'])['result'],
+                         {'handle': first['handle'], 'folder': str(self.path), 'lines': None})
         stopped = client.request('stop_process', bot='Bob', handle=first['handle'])['result']
         self.assertEqual((stopped['handle'], stopped['stopped']), (first['handle'], True))
         until('the stopped command ended', lambda: not alive(first['pid']))
@@ -1661,6 +1664,42 @@ class RuntimeTests(ModelFixture):
         self.assertEqual(client.finished(told['message'])['data']['status'], 'completed')
         ended = client.request('wait', handles=[third['handle']], timeout_ms=0)['result']['results'][third['handle']]
         self.assertEqual((ended['exit_code'], ended['success']), (4, False))
+
+    def test_a_running_commands_newest_lines_are_read_while_it_runs(self):
+        client = self.client('shell')
+        client.request('create', bot='Bob', workspace=str(self.path), tools=['shell'])
+        command = ("printf 'one\\n'; printf 'two \\033[31mred\\033[0m\\tdone\\n';"
+                   " printf 'step 1\\rstep 2\\n'; sleep 30")
+        prompt = 'calls:' + json.dumps([['shell', {'command': command, 'background': True}]])
+        turn = client.request('submit', bot='Bob', request_id='bg', prompt=prompt)['result']['message']
+        self.assertEqual(client.finished(turn)['data']['status'], 'completed')
+        events = client.request('events', bot='Bob', after=0, limit=256)['result']['events']
+        completed = next(e for e in events if e['turn'] == turn and e['event'] == 'tool_completed')
+        handle = json.loads(node_item(client, 'Bob', completed['data']['node'])['result']['output'])['handle']
+        self.addCleanup(lambda: client.request('stop_process', bot='Bob', handle=handle))
+
+        def output(**asked):
+            return client.request('process_output', bot='Bob', handle=handle, **asked)
+
+        deadline = time.monotonic() + 10
+        while output().get('result', {}).get('lines') != ['one', 'two red done', 'step 2']:
+            self.assertLess(time.monotonic(), deadline, output())
+            time.sleep(.05)
+        # Nothing is taken: read again, the same; asked for fewer, the newest.
+        self.assertEqual(output()['result'], {'handle': handle, 'folder': str(self.path),
+                                              'lines': ['one', 'two red done', 'step 2']})
+        self.assertEqual(output(lines=1)['result']['lines'], ['step 2'])
+        # Another bot's handle, or one that is not a command's, says so.
+        self.assertEqual(client.request('process_output', bot='Alice', handle=handle)['error'],
+                         'process_not_running')
+        self.assertEqual(client.request('process_output', bot='Bob', handle='turn:1')['error'],
+                         'invalid_handle')
+        client.request('stop_process', bot='Bob', handle=handle)
+        deadline = time.monotonic() + 10
+        while 'error' not in output():
+            self.assertLess(time.monotonic(), deadline)
+            time.sleep(.05)
+        self.assertEqual(output()['error'], 'process_not_running')
 
     def test_shutdown_cancels_pending_retention_without_stdin_eof(self):
         client = self.client()
