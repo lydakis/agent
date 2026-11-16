@@ -3490,6 +3490,9 @@ struct TurnHints {
 enum Words {
     /// A step: a call came next.
     Step,
+    /// Words another message followed: drawn as a reply's, but no hint
+    /// hangs on them.
+    Said,
     /// The turn's reply, or words nothing told apart.
     Reply,
 }
@@ -10237,6 +10240,13 @@ impl App {
             if self.zen.is_some() {
                 aside = prompts.first().is_some_and(relays) && prompts.iter().all(relays);
             }
+            // The turn this window was following when it lost the daemon
+            // keeps what it already heard: its replay starts past those calls.
+            let kept = match !older && self.running.as_ref().is_some_and(|r| r.turn == turn) {
+                true => std::mem::take(&mut self.turn_hints),
+                false => TurnHints::default(),
+            };
+            let heard = !(kept.came.is_empty() && kept.set.is_empty() && !kept.replied);
             // Its first message, before the page, says what the turn is
             // about; the steers the page holds say the rest.
             if colored && let Some((text, from)) = prompts.first().map(said) {
@@ -10253,6 +10263,9 @@ impl App {
                 if !(self.zen.is_some() || colored) {
                     opening = Some((turn, text));
                 }
+            }
+            if heard {
+                self.turn_hints = kept;
             }
             began.insert(turn);
         }
@@ -10271,10 +10284,13 @@ impl App {
                 // A reaction leaves the words before it as they were.
                 let call = item["type"] == "function_call" && item["name"] != reactions::TOOL;
                 if let Some((at, lines)) = said.take_if(|_| call || item["role"].is_string()) {
-                    // Words a call followed are a step: no hint hangs on them.
-                    match call {
-                        true => self.commit_words(at, transcript::quiet(lines), false),
-                        false => self.commit_said(at, lines),
+                    // Words a call followed are a step, and words another
+                    // message followed are not the reply: no hint hangs on
+                    // either.
+                    match (call, item["role"] == "assistant") {
+                        (true, _) => self.commit_words(at, transcript::quiet(lines), false),
+                        (false, true) => self.commit_words(at, lines, false),
+                        (false, false) => self.commit_said(at, lines),
                     }
                 }
                 match (item["type"].as_str(), item["role"].as_str()) {
@@ -10744,7 +10760,7 @@ impl App {
             self.rows_drawn,
             self.live.as_ref().is_some_and(|l| l.spilled),
         );
-        self.end_live(Words::Reply);
+        self.end_live(Words::Said);
         if self.rows_drawn > drawn || spilled {
             self.mark_last(screen::Mark::Tag(screen::Tag::Streamed(item)));
         }
@@ -10774,18 +10790,20 @@ impl App {
     }
 
     fn write_words(&mut self, live: Live, words: Words) {
+        // Only the turn's reply wears its hints, never a step's words; a
+        // reply written as it came (all its rows already out) is under its
+        // `└` but has no `↳`.
+        if live.spilled && words == Words::Reply {
+            drop(self.came_row());
+        }
         if live.rows.is_empty() {
             return;
         }
         if live.gap && !live.spilled {
             self.pending.push(Line::default());
         }
-        // Only the turn's reply wears its hints, never a step's words; a
-        // reply written as it came is under its `└` but has no `↳`.
-        match (live.spilled, words) {
-            (false, Words::Reply) => self.came_above(),
-            (true, Words::Reply) => drop(self.came_row()),
-            _ => {}
+        if !live.spilled && words == Words::Reply {
+            self.came_above();
         }
         if !live.spilled {
             self.marks.push((self.pending.len(), screen::Mark::Opens));
@@ -10793,7 +10811,7 @@ impl App {
         self.rows_drawn += live.rows.len();
         self.pending.extend(match words {
             Words::Step => transcript::quiet(live.rows),
-            Words::Reply => live.rows,
+            Words::Said | Words::Reply => live.rows,
         });
         self.any_history = true;
         if let Some(node) = live.node {
@@ -24180,6 +24198,86 @@ mod tests {
                 "└ sent to ● fix · ● neg · started ◌ readme",
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn words_another_message_followed_wear_no_hint_and_a_long_reply_keeps_its_row() {
+        let client = daemon_answering(|asked| match asked["nodes"][0].as_i64() {
+            Some(7) => json!({"items": [{"node": 7, "item": {"type": "message",
+                "role": "user", "from": "calc.halves",
+                "content": [{"type": "input_text", "text": "Half cents round to even."}]}}]}),
+            _ => json!({}),
+        })
+        .await;
+        let mut app = app(client);
+        app.words_only = true;
+        app.any_history = true;
+        app.width = 120;
+        app.height = 8;
+        app.project = Some("calc".into());
+        let rows = |app: &App| -> Vec<String> {
+            (app.pending.iter())
+                .map(|line| line.to_string())
+                .filter(|row| !row.trim().is_empty())
+                .collect()
+        };
+        app.daemon(turn_event("accepted", 1, json!({"node": 7})))
+            .await;
+        // Two messages, then a call: neither is the reply.
+        for (item, words) in [(1, "First thoughts."), (2, "More.")] {
+            let said = json!({"event": "text_delta", "bot": "b", "turn": 1,
+                "item": item, "text": words});
+            app.daemon(said).await;
+        }
+        let started = json!({"name": "send_message", "call_id": "m1"});
+        app.daemon(turn_event("tool_started", 1, started)).await;
+        let send = json!({"to": "calc.fix", "message": "Check div too."});
+        app.commit_call("m1", Some(1), "send_message", &send, "{}", false);
+        let said = json!({"event": "text_delta", "bot": "b", "turn": 1,
+            "item": 3, "text": "Sent."});
+        app.daemon(said).await;
+        app.daemon(turn_event(
+            "turn_finished",
+            1,
+            json!({"status": "completed"}),
+        ))
+        .await;
+        assert_eq!(
+            rows(&app),
+            [
+                "• First thoughts.",
+                "• More.",
+                "↳ halves",
+                "• Sent.",
+                "└ sent to ● fix · Check div too."
+            ]
+        );
+        // A reply longer than half the screen, written as it came, still
+        // has the turn's row under it.
+        app.pending.clear();
+        app.daemon(turn_event("accepted", 2, json!({"node": 9})))
+            .await;
+        let start = json!({"name": "readme", "brief": "Say how cents round"});
+        let started = json!({"name": served::START, "call_id": "s1"});
+        app.daemon(turn_event("tool_started", 2, started)).await;
+        app.commit_call("s1", Some(2), served::START, &start, "calc.readme/1", false);
+        let long = (1..=12)
+            .map(|n| format!("Line {n}.\n\n"))
+            .collect::<String>();
+        let said = json!({"event": "text_delta", "bot": "b", "turn": 2, "text": long});
+        app.daemon(said).await;
+        app.daemon(turn_event(
+            "turn_finished",
+            2,
+            json!({"status": "completed"}),
+        ))
+        .await;
+        let shown = rows(&app);
+        assert_eq!(
+            shown.last().map(String::as_str),
+            Some("└ started ◌ readme · Say how cents round")
+        );
+        assert!(!shown.iter().any(|row| row.starts_with('↳')));
     }
 
     #[tokio::test]
