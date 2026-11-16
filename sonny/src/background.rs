@@ -541,6 +541,7 @@ fn trigger_item(row: &Value, bots: Vec<String>) -> Item {
         None => format!("sent {sent}"),
     });
     if let Some(until) = row["until"].as_str() {
+        let until = trigger::moment(until).map_or_else(|_| until.to_owned(), trigger::date);
         facts.push(format!("until {until}"));
     }
     if let Some(outcome) = last["outcome"].as_str().filter(|_| !gate_broke) {
@@ -593,7 +594,11 @@ fn trigger_item(row: &Value, bots: Vec<String>) -> Item {
     match checked["gate"].as_str() {
         Some("no") => facts.push(format!("checked{}, nothing new", checked_ago("checked_ms"))),
         Some("failed") => {
-            facts.push(format!("could not check since{}", checked_ago("since_ms")));
+            let since = checked["since_ms"].as_u64().unwrap_or_default();
+            facts.push(format!(
+                "could not check since {}",
+                since_of(u128::from(since))
+            ));
             failed = Some(match checked["detail"].as_str() {
                 Some(detail) if !detail.is_empty() => detail_line(detail),
                 _ => "could not check".into(),
@@ -608,7 +613,6 @@ fn trigger_item(row: &Value, bots: Vec<String>) -> Item {
     // An `--if` its next fire could not run, said before that fire finds
     // it: a failure until it can, the same one whatever each check said.
     if let Some(why) = row["if_cannot_run"].as_str() {
-        facts.push("its --if cannot run".into());
         failed = Some(first_line(why));
         episode = Some("its --if cannot run".into());
     }
@@ -2644,7 +2648,10 @@ impl View {
         let mut spans = vec![pick, mark, name];
         match item.kind {
             Kind::Trigger => {
-                spans.push(Span::raw(format!(" {}", item.when)));
+                // As its page says it, a folder from `~`; each `/` a place
+                // the row may break.
+                let when = format!(" {}", when_words(&item.when, None, now));
+                spans.extend((when.split_inclusive('/')).map(|part| Span::raw(part.to_owned())));
                 spans.push(Span::raw(format!(" → {}", self.scope.short(&item.bot))).dim());
             }
             Kind::Subscription => {
@@ -2663,9 +2670,11 @@ impl View {
             crate::list::pick(row);
         }
         out.extend(first);
-        if let Some(why) = &item.failed {
+        // What failed, in its page's words: a check that could not run
+        // says so.
+        if let Some(why) = page_alert(item) {
             out.extend(crate::transcript::wrap(
-                Line::from(why.clone()),
+                Line::from(why),
                 width,
                 Span::raw(INDENT),
                 Span::raw(INDENT),
@@ -2676,12 +2685,12 @@ impl View {
             facts.push(format!("answers go to {}", self.scope.short(to)));
         }
         if !facts.is_empty() {
-            out.extend(crate::transcript::wrap(
+            out.extend(undotted(crate::transcript::wrap(
                 Line::from(facts.join(" · ")).dim(),
                 width,
                 Span::raw(INDENT),
                 Span::raw(INDENT),
-            ));
+            )));
         }
         // A follow in the words its page uses.
         let what = match &item.sub {
@@ -2920,6 +2929,28 @@ fn coming(at: i64, now: i64) -> String {
         _ => format!("{}d", left / 86_400),
     };
     format!("{time}, in {off}")
+}
+
+/// Rows wrapped from parts a ` · ` apart, with no row that ends or starts
+/// in a `·`: where a row breaks at one, it goes.
+fn undotted(rows: Vec<Line<'static>>) -> Vec<Line<'static>> {
+    (rows.into_iter())
+        .map(|mut row| {
+            if let Some(last) = (row.spans.iter_mut()).rfind(|s| !s.content.trim().is_empty()) {
+                let kept = last.content.trim_end();
+                if let Some(kept) = kept.strip_suffix('·') {
+                    last.content = kept.trim_end().to_owned().into();
+                }
+            }
+            if let Some(first) = (row.spans.iter_mut()).find(|s| !s.content.trim().is_empty()) {
+                let lead = first.content.len() - first.content.trim_start().len();
+                if let Some(rest) = first.content.trim_start().strip_prefix("· ") {
+                    first.content = format!("{}{rest}", &first.content[..lead]).into();
+                }
+            }
+            row
+        })
+        .collect()
 }
 
 /// A path written from `~` where it is under the home folder, as the
@@ -4308,9 +4339,16 @@ mod tests {
             unhealthy.failed.as_deref(),
             Some("--if: exit status: 2: quiet: token expired")
         );
+        // Since when, as its page says it: the time it began.
+        let since = format!(
+            "could not check since {}",
+            since_of(u128::from(at - 600_000))
+        );
+        assert_eq!(unhealthy.facts[..2], ["sent 3".to_owned(), since]);
+        // Its row says what failed as its page's alert does.
         assert_eq!(
-            unhealthy.facts[..2],
-            ["sent 3", "could not check since 15m ago"]
+            page_alert(&unhealthy).as_deref(),
+            Some("its check could not run: exit status 2: quiet: token expired")
         );
         // Each check that fails again is the same break, not news, though
         // what it printed changed.
@@ -4351,11 +4389,17 @@ mod tests {
             stranded.failed.as_deref(),
             Some("--if: Agent's binary was not found at /gone/agent")
         );
+        // Its row's alert says so in the page's words, and no fact says
+        // it again.
+        assert_eq!(
+            page_alert(&stranded).as_deref(),
+            Some("its check cannot run: Agent's binary was not found at /gone/agent")
+        );
         assert!(
-            stranded
+            !stranded
                 .facts
                 .iter()
-                .any(|fact| fact == "its --if cannot run")
+                .any(|fact| fact.contains("cannot run"))
         );
         assert_eq!(failures(std::slice::from_ref(&stranded)).len(), 1);
     }
@@ -4545,6 +4589,90 @@ mod tests {
         press(&mut view, KeyCode::Char('x'));
         assert_eq!(view.confirm, None);
         assert!(view.notice.as_deref().unwrap().contains("reads again"));
+    }
+
+    #[test]
+    fn the_lists_rows_say_what_their_pages_say() {
+        let trigger = |name: &str, when: &str, more: Value| {
+            let mut row = json!({"name": name, "bot": "calc.lead", "when": when,
+                "message": "Check the ledger.", "sent": 0, "last": null});
+            for (key, value) in more.as_object().unwrap() {
+                row[key] = value.clone();
+            }
+            trigger_item(&row, vec!["calc.lead".into()])
+        };
+        let since = now_ms() - 600_000;
+        let view = view_of(
+            std::env::temp_dir().join("background-rows.sqlite"),
+            vec![
+                trigger("release-notes", trigger::ON_DEMAND, json!({})),
+                trigger("invoice-check", "at 2026-11-20 09:00", json!({})),
+                trigger(
+                    "nightly",
+                    "cron 0 3 * * *",
+                    json!({"runs": 5, "until": "2026-12-01 09:00"}),
+                ),
+                trigger(
+                    "ledger-push",
+                    "commit /srv/work/clients/acme-ledger/reconciliation/tally",
+                    json!({}),
+                ),
+                trigger(
+                    "watch",
+                    "cron 0 3 * * *",
+                    json!({"if": "exit 7", "until": "2026-11-16 23:59",
+                "checked": {"gate": "failed", "checked_ms": since, "since_ms": since,
+                    "detail": "--if: exit status: 7"}}),
+                ),
+            ],
+        );
+        let text = |view: &View, width| -> Vec<String> {
+            (view.card(width).0.iter())
+                .map(|l| {
+                    l.spans
+                        .iter()
+                        .map(|s| s.content.as_ref())
+                        .collect::<String>()
+                })
+                .map(|row| row.trim_end().to_owned())
+                .collect()
+        };
+        let rows = text(&view, 100);
+        let has = |row: &str| assert!(rows.iter().any(|r| r == row), "{row} in {rows:#?}");
+        has("  ↻ release-notes only when run → lead");
+        has("  ↻ invoice-check once, Fri 20 Nov 09:00 → lead");
+        has("    sent 0 of 5 · until Tue 1 Dec 09:00");
+        // A check that could not run, as its page's alert says it, and
+        // since when as a time.
+        has("    its check could not run: exit status 7");
+        let at = since_of(u128::from(since));
+        assert!(
+            rows.iter()
+                .any(|r| r.contains(&format!("could not check since {at}"))),
+            "{rows:#?}"
+        );
+        // A folder too long for its row breaks at a `/`.
+        let narrow = text(&view, 44);
+        // A row of facts broken at a ` · ` leaves the dot.
+        for row in &narrow {
+            let row = row.trim();
+            assert!(
+                !row.ends_with('·') && !row.starts_with('·'),
+                "{row} in {narrow:#?}"
+            );
+        }
+        let start = (narrow.iter())
+            .position(|r| r.starts_with("  ↻ ledger-push"))
+            .unwrap();
+        assert_eq!(
+            narrow[start..start + 3],
+            [
+                "  ↻ ledger-push a commit lands in /srv/work/",
+                "    clients/acme-ledger/reconciliation/tally",
+                "    → lead",
+            ],
+            "{narrow:#?}"
+        );
     }
 
     #[test]
