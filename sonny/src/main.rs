@@ -9707,6 +9707,7 @@ impl App {
         match reply.then(|| self.came_row()).flatten() {
             Some(came) => {
                 self.commit(vec![came]);
+                self.mark_last(screen::Mark::Over);
                 self.commit_after(lines, false);
             }
             None => self.commit(lines),
@@ -11006,6 +11007,7 @@ impl App {
         if let Some(came) = self.came_row() {
             self.rows_drawn += 1;
             self.pending.push(came);
+            self.mark_last(screen::Mark::Over);
         }
     }
 
@@ -22583,6 +22585,10 @@ mod tests {
         assert_eq!(rows[calc], (Some(1), "• calc.neg is done.".into()));
         assert_eq!(rows[calc - 1], (Some(1), "↳ calc.neg".into()));
         assert_eq!(rows[calc - 2], (None, String::new()));
+        // Each `↳` row hangs over its reply: the reply's time goes over it.
+        let overs = app.screen.overs();
+        assert!(overs[shop - 1] && overs[calc - 1]);
+        assert_eq!(overs.iter().filter(|over| **over).count(), 2);
         // Off, nothing is barred.
         let mut app = super::tests::app(zen_daemon().await);
         app.width = 100;
@@ -24461,6 +24467,9 @@ mod tests {
                 "└ started ◌ readme · sent to ● fix · ● reviewer",
             ]
         );
+        // The `↳` hangs over the reply: its time goes over it.
+        let over = app.pending.len() - 3;
+        assert!((app.marks.iter()).any(|(row, mark)| *row == over && *mark == screen::Mark::Over));
         // Right above and under the reply, and each name opens its agent.
         let at = app.pending.len() - 1;
         let buttons = (app.marks.iter())

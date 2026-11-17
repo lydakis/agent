@@ -775,7 +775,8 @@ copy of the quote is its words alone.
 ![Two replies quoted and sent: both fold onto the one bar over the words](../docs/sonny/reply-quote-fold-several.png)
 
 The message under the mouse also says when it was written, muted, at
-its top right edge, the right end of the empty row over it:
+its top right edge, the right end of the empty row over it (over the
+`↳` row naming who started its turn, when it has one):
 `Sat 7 Nov 09:13`, the
 year too when it is not this one, on the 12-hour clock where your
 locale's time format (`LC_TIME`) reads that way, `Sat 7 Nov 9:13 AM`.
@@ -785,6 +786,8 @@ rest, no line is made wider for it, and where the row over the words
 has something on it, or is off the screen, no time shows.
 
 ![When a message was written, over it under the mouse](../docs/sonny/message-time.png)
+
+![A reply's time over the ↳ row naming who started its turn](../docs/sonny/message-time-over-came-row.png)
 
 ## Commands
 
