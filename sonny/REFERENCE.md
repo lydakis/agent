@@ -943,13 +943,19 @@ has something on it, or is off the screen, no time shows.
   name stays in the sandbox, as the name's `allow` rules never let it out); Codex's
   `network_rule` is refused, since a sandbox's network is on or off. A
   file that doesn't read keeps the rules last read, or, with none read
-  yet, has every command refused with where it went wrong. When you
-  approve a plain command that asked to leave, `a` (always allow `cargo test`) adds the rule, and every agent
-  takes it from its next turn: Sonny reads the folder again when a file
-  in it changes. The rules hold for every folder, so a
-  program named from the folder it runs in (`./build.sh`) is never
-  offered, nor, as in Codex, a shell, an interpreter or a wrapper
-  (`bash`, `python3`, `timeout`), which runs whatever follows it. Agents
+  yet, has every command refused with where it went wrong. When a
+  command asks to leave, `a` always allows the prefix its agent proposed
+  with it (`prefix_rule`, as Codex's agents do), such as `a always allow
+  cargo test`, when that prefix allows every command of the call and no
+  rule names any of them yet; else, as in Codex, the call's first command
+  no rule names, whole. It adds the rule, and every agent takes it from
+  its next turn: Sonny reads the folder again when a file in it changes.
+  As in Codex, none is offered while a rule asks about the call, nor
+  Codex's banned suggestions (a shell or an interpreter alone, such as
+  `bash` or `python3`, or `git` or `rm` alone), nor for a script that
+  isn't plain, which no rule matches. The rules hold for every folder, so
+  a program named from the folder it runs in (`./build.sh`) is never
+  offered either. Agents
   can't write the rules folder from their sandbox, and
   an agent another made goes by its maker's rules.
 
@@ -1025,9 +1031,11 @@ has something on it, or is off the screen, no time shows.
 
   ![The same approval set aside with Esc: the composer types again and the row says it still waits](../docs/sonny/approval-aside.png)
 
-  ![An approval prompt offering to always allow cargo test](../docs/sonny/permissions-always.png)
+  ![An approval offering a always allow gh pr checks, the prefix the agent proposed for gh pr checks 12 --json 'name,state'](../docs/sonny/permissions-always.png)
 
-  ![The call allowed, and cargo test outside the sandbox from now on](../docs/sonny/permissions-allowed.png)
+  ![The call allowed, and gh pr checks outside the sandbox from now on](../docs/sonny/permissions-allowed.png)
+
+  ![With no prefix proposed for an install and a test run, the first command whole: a always allow python3 -m pip install -q 'pytest>=8'](../docs/sonny/permissions-always-first.png)
 - `/retry` lists the calls the reviewer denied while Sonny watched, with
   the reason for each. Enter writes the call out whole and asks once
   (`Allow one retry of shell? It can't be undone.`); Enter again sends
