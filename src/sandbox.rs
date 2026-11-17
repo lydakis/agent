@@ -2961,6 +2961,8 @@ mod tests {
             std::env::temp_dir().join(format!("agent-sandbox-ssh-copy-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&base);
         std::fs::create_dir_all(base.join("home/.ssh")).unwrap();
+        // By its real path, as the copy is named: macOS's temp is a link.
+        let base = std::fs::canonicalize(&base).unwrap();
         let file = base.join("home/.ssh/config");
         let copy = base.join("copies/home/.ssh/config");
         std::fs::write(&file, "Host *\n  ControlMaster auto\n").unwrap();
