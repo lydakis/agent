@@ -709,6 +709,8 @@ mod tests {
                     "send_message",
                     "list_agents",
                     "pause_agents",
+                    "spawn_agent",
+                    "close_agent",
                     "web_fetch"
                 ]),
                 &json!("keep")

@@ -105,6 +105,8 @@ enum Tool {
     SendMessage,
     ListAgents,
     PauseAgents,
+    SpawnAgent,
+    CloseAgent,
 }
 impl Tool {
     fn parse(name: &str) -> Option<Tool> {
@@ -123,6 +125,8 @@ impl Tool {
             "send_message" => Tool::SendMessage,
             "list_agents" => Tool::ListAgents,
             "pause_agents" => Tool::PauseAgents,
+            "spawn_agent" => Tool::SpawnAgent,
+            "close_agent" => Tool::CloseAgent,
             _ => return None,
         })
     }
@@ -142,6 +146,8 @@ impl Tool {
             Tool::SendMessage => "send_message",
             Tool::ListAgents => "list_agents",
             Tool::PauseAgents => "pause_agents",
+            Tool::SpawnAgent => "spawn_agent",
+            Tool::CloseAgent => "close_agent",
         }
     }
     fn schema(self) -> ToolSchema {
@@ -227,10 +233,11 @@ impl Tool {
                 "required":["to","message"],"additionalProperties":false}),
             ),
             Tool::ListAgents => (
-                "List bots by name: each one's status, running turn, what it waits on, workspace, model, the bot that made it (created_by), and how its last turn ended. name is a pattern where * is any run of characters and ? any one, such as *.lead or shop.*; without one, the bots named as this one is up to its first dot. running=true lists only those with a turn running. approvals=true lists instead the calls of those bots waiting on a gate, each with its bot, turn, tool, the start of its arguments, and the tags it waits on. Pages hold up to limit (default 50, at most 256); pass next_after as after for the next.",
+                "List bots by name: each one's status, running turn, what it waits on, workspace, model, the bot that made it (created_by), and how its last turn ended. name is a pattern where * is any run of characters and ? any one, such as *.lead or shop.*; without one, the bots named as this one is up to its first dot. running=true lists only those with a turn running. approvals=true lists instead the calls of those bots waiting on a gate, each with its bot, turn, tool, the start of its arguments, and the tags it waits on. Pages hold up to limit (default 50, at most 256); pass next_after as after for the next. Agents closed with close_agent are left out unless closed=true, which lists them too, each with closed_ms.",
                 json!({"type":"object","properties":{
                 "name":{"type":"string","minLength":1,"maxLength":256},
                 "running":{"type":"boolean"},
+                "closed":{"type":"boolean"},
                 "approvals":{"type":"boolean"},
                 "after":{"type":["string","integer"]},
                 "limit":{"type":"integer","minimum":1,"maximum":256}},
@@ -241,6 +248,42 @@ impl Tool {
                 json!({"type":"object","properties":{
                 "reason":{"type":"string","minLength":1,"maxLength":4096}},
                 "required":["reason"],"additionalProperties":false}),
+            ),
+            Tool::SpawnAgent => (
+                "Start a new agent, made by this one, on work of its own: it works in this agent's folder, in its sandbox and under its approval gates, never more loosely, with this agent's tools, and the message is its first. name is the new agent's whole name, or, with no dot, a name in this agent's project, the part of this agent's name before its first dot: review from shop.lead names shop.review. It starts fresh, told the preamble every new agent is told; with agents=true, also the folder's AGENTS.md files, skills and memory; with profile, those in the role its file .agents/agents/PROFILE.md describes, in the folder or the home folder, with the role's model and tools; or with instructions, exactly that text instead, which takes neither agents nor profile. model (PROVIDER/MODEL) and effort default to this agent's, or to the profile's model. With fork=true it starts instead from a copy of this agent's conversation so far, with its instructions, tools and model, and takes no instructions, agents, profile, model or effort. A request_id sent again starts nothing new; without one, the call's own is used. Returns the new agent's name and the handle of its first message, BOT/N, which wait and history take; close it with close_agent once its work is done.",
+                json!({"type":"object","properties":{
+                "name":{"type":"string","minLength":1,"maxLength":128},
+                "message":{"type":"string","minLength":1},
+                "instructions":{"type":"string","minLength":1},
+                "agents":{"type":"boolean"},
+                "profile":{"type":"string","minLength":1,"maxLength":128},
+                "model":{"type":"string","minLength":1,"maxLength":256},
+                "effort":{"type":"string","minLength":1,"maxLength":32},
+                "fork":{"type":"boolean"},
+                "checkpoint":{"type":"integer","minimum":1,"description":"With fork: copy the conversation up to this node, not all of it"},
+                "allow":{"type":"array","items":{"type":"string"},"maxItems":64,"description":"With fork: the tools the copy may call, within this agent's; [] allows none"},
+                "expire_ms":{"type":"integer","minimum":1000,"maximum":604800000,"description":"With fork: delete the copy once idle this long"},
+                "workspace":{"type":"string","minLength":1,"description":"Its folder, within what this agent may reach; default this turn's folder"},
+                "tools":{"type":"array","items":{"type":"string"},"maxItems":64,"description":"Its tools, within this agent's; default this agent's, or the profile's"},
+                "settings":{"type":"object","description":"Its settings over this agent's own, never looser: sandbox, writable, network, unix_sockets, approval_policy, speed, cache_ttl, context_bytes, context_items, note_turns, compact_at, compact_keep, compact_tokens, post_turn_compact_percent, keep_turns, max_rounds, max_drops, max_output_tokens, approval_hold_ms, hold_ms, outputs, trailer, quiet_background, rules, env"},
+                "budget_tokens":{"type":"integer","minimum":1,"description":"Its lifetime token budget"},
+                "budget_counts":{"type":"string","enum":["tokens","work"]},
+                "turn_budget_tokens":{"type":"integer","minimum":1,"description":"The first message's turn's token cap"},
+                "compaction_instructions":{"type":"string","description":"How it summarizes when it compacts; empty: it never compacts"},
+                "compaction_model":{"type":"string","minLength":1,"maxLength":256},
+                "fallback":{"type":"string","minLength":1,"maxLength":256,"description":"PROVIDER/MODEL answering a request a safety classifier declined"},
+                "approve":{"type":"array","items":{"type":"string"},"maxItems":64,"description":"Tools whose calls wait for approver's verdict, beside the gates it keeps from this agent"},
+                "approver":{"type":"string","minLength":1,"maxLength":128},
+                "approve_expire_ms":{"type":"integer","minimum":1,"maximum":86400000},
+                "quote":{"type":"array","items":{"type":"string","minLength":3,"maxLength":256},"maxItems":16,"description":"Messages copied after the first message, as send_message's quote"},
+                "request_id":{"type":"string","minLength":1,"maxLength":128}},
+                "required":["name","message"],"additionalProperties":false}),
+            ),
+            Tool::CloseAgent => (
+                "Close an agent this one made, by its whole name, once its work is done: a turn it is running stops, list_agents leaves it out unless asked for closed agents, and its history stays whole. A message sent to it later, or one already waiting in line for it, opens it again. Returns its name, whether it was open, and the turn stopped, if any.",
+                json!({"type":"object","properties":{
+                "name":{"type":"string","minLength":1,"maxLength":128}},
+                "required":["name"],"additionalProperties":false}),
             ),
             Tool::Wait => (
                 "Suspend until every handle resolves, without holding any execution capacity. Handles are 'BOT/N' (a message sent to a peer agent, numbered as run gives it) or 'proc:N' (a background or detached shell, or a call a message moved to the background). Each result reports the outcome: for a message that opened a turn, that turn's status and final text, with before_steer, the last text it wrote before it was steered, when it ended on a reply to a steer; for one another turn took in, status taken and that turn's number, to wait on in turn; or a process's output and exit code.
@@ -740,6 +783,9 @@ pub fn check_declared(tool: &Declared, arguments: &str) -> Result<()> {
 #[derive(Clone)]
 pub struct Registry {
     tools: Vec<Tool>,
+    /// The models spawn_agent's description names, as the person noted
+    /// them: read once, as the daemon starts.
+    spawn_models: Arc<str>,
     slots: Arc<Semaphore>,
     /// The running bound, also the bound on background commands accepted but
     /// not yet started; zero means neither is bounded.
@@ -1165,12 +1211,42 @@ pub enum Agents {
     List {
         name: Option<String>,
         running: bool,
+        /// Closed agents too.
+        closed: bool,
         approvals: bool,
         after: serde_json::Value,
         limit: usize,
     },
     /// Pull the cord on every agent.
     Pause { reason: String },
+    /// A new agent this one makes, sent `message` as its first.
+    Spawn {
+        name: String,
+        message: String,
+        /// Its instructions, as given; else composed, or the preamble.
+        instructions: Option<String>,
+        /// Composed: the preamble, the folder's AGENTS.md files, skills
+        /// and memory.
+        agents: bool,
+        /// Composed as `agents`, in this role.
+        profile: Option<String>,
+        model: Option<String>,
+        effort: Option<String>,
+        /// From a copy of this agent's conversation, rather than fresh.
+        fork: bool,
+        /// The rest of what `create` (or, with `fork`, `fork`) takes, by
+        /// its names, as the model gave them: the daemon checks each.
+        made: serde_json::Map<String, serde_json::Value>,
+        /// Settings over this agent's own.
+        settings: Option<serde_json::Map<String, serde_json::Value>>,
+        /// Copied after the first message.
+        quotes: Vec<serde_json::Value>,
+        /// The first turn's token cap.
+        turn_budget_tokens: Option<u64>,
+        request_id: Option<String>,
+    },
+    /// Close an agent this one made.
+    Close { name: String },
 }
 
 /// A quote's handle, `BOT/N` or `BOT/N:reply`, as `submit` takes it.
@@ -1479,9 +1555,9 @@ impl Registry {
     /// of them a bot may call is the bot's own, chosen at creation.
     pub fn all() -> Result<Self> {
         Self::new(if cfg!(unix) {
-            "echo,shell,read,write,edit,apply_patch,wait,history,web_search,web_fetch,write_stdin,send_message,list_agents,pause_agents"
+            "echo,shell,read,write,edit,apply_patch,wait,history,web_search,web_fetch,write_stdin,send_message,list_agents,pause_agents,spawn_agent,close_agent"
         } else {
-            "echo,read,write,edit,apply_patch,wait,history,web_search,web_fetch,send_message,list_agents,pause_agents"
+            "echo,read,write,edit,apply_patch,wait,history,web_search,web_fetch,send_message,list_agents,pause_agents,spawn_agent,close_agent"
         })
     }
     pub fn new(names: &str) -> Result<Self> {
@@ -1519,6 +1595,7 @@ impl Registry {
             encodings: Arc::default(),
             heavy: Arc::new(Semaphore::new(heavy_bytes())),
             requests: None,
+            spawn_models: Arc::from(""),
         })
     }
     /// A bot's selection must name registered tools, each once.
@@ -1571,7 +1648,7 @@ impl Registry {
             .filter_map(|name| Tool::parse(name))
             // Search is declared by the provider, as it offers it.
             .filter(|tool| self.tools.contains(tool) && *tool != Tool::WebSearch)
-            .map(Tool::schema)
+            .map(|tool| self.schema_of(tool))
             .map(|mut schema| {
                 if sandboxed && schema.name == "shell" {
                     escalation(&mut schema.parameters);
@@ -1879,6 +1956,23 @@ impl Registry {
     pub fn daemon(&self) -> &Daemon {
         &self.daemon
     }
+    /// The models spawn_agent's model parameter names, one line each, as
+    /// the person noted them; empty names none.
+    pub fn with_spawn_models(mut self, models: &str) -> Self {
+        self.spawn_models = Arc::from(models);
+        self.encodings.lock().unwrap().clear();
+        self
+    }
+    /// A tool's definition as this daemon shows it: spawn_agent's names
+    /// the person's models.
+    fn schema_of(&self, tool: Tool) -> ToolSchema {
+        let mut schema = tool.schema();
+        if tool == Tool::SpawnAgent && !self.spawn_models.is_empty() {
+            let models = format!("The person's models:\n{}", self.spawn_models);
+            schema.parameters["properties"]["model"]["description"] = json!(models);
+        }
+        schema
+    }
     /// How bots' own tools reach the daemon ([`Agents`]).
     pub fn with_requests(mut self, requests: Requests) -> Self {
         self.requests = Some(requests);
@@ -1904,7 +1998,7 @@ impl Registry {
         self.tools.len()
     }
     pub fn schemas(&self) -> Vec<ToolSchema> {
-        self.tools.iter().map(|t| t.schema()).collect()
+        self.tools.iter().map(|t| self.schema_of(*t)).collect()
     }
     fn redact(&self, text: String) -> String {
         self.credentials.redact(text)
@@ -2293,6 +2387,8 @@ impl Registry {
                     #[serde(default)]
                     running: bool,
                     #[serde(default)]
+                    closed: bool,
+                    #[serde(default)]
                     approvals: bool,
                     #[serde(default)]
                     after: serde_json::Value,
@@ -2315,6 +2411,7 @@ impl Registry {
                 Prepared::Agents(Agents::List {
                     name: args.name,
                     running: args.running,
+                    closed: args.closed,
                     approvals: args.approvals,
                     after: args.after,
                     limit,
@@ -2330,6 +2427,143 @@ impl Registry {
                 Prepared::Agents(Agents::Pause {
                     reason: args.reason,
                 })
+            }
+            Tool::SpawnAgent => {
+                #[derive(Deserialize)]
+                #[serde(deny_unknown_fields)]
+                struct Spawn {
+                    name: String,
+                    message: String,
+                    instructions: Option<String>,
+                    #[serde(default)]
+                    agents: bool,
+                    profile: Option<String>,
+                    model: Option<String>,
+                    effort: Option<String>,
+                    #[serde(default)]
+                    fork: bool,
+                    checkpoint: Option<i64>,
+                    allow: Option<Vec<String>>,
+                    expire_ms: Option<u64>,
+                    workspace: Option<String>,
+                    tools: Option<Vec<String>>,
+                    settings: Option<serde_json::Map<String, serde_json::Value>>,
+                    budget_tokens: Option<u64>,
+                    budget_counts: Option<String>,
+                    turn_budget_tokens: Option<u64>,
+                    compaction_instructions: Option<String>,
+                    compaction_model: Option<String>,
+                    fallback: Option<String>,
+                    approve: Option<Vec<String>>,
+                    approver: Option<String>,
+                    approve_expire_ms: Option<u64>,
+                    #[serde(default)]
+                    quote: Vec<String>,
+                    request_id: Option<String>,
+                }
+                let args: Spawn = serde_json::from_str(args).map_err(invalid)?;
+                let name = args.name.trim().to_owned();
+                if name.is_empty() || name.len() > 128 || args.message.trim().is_empty() {
+                    return fail_with(
+                        "invalid_tool_arguments",
+                        "name (up to 128 bytes) and message are needed",
+                    );
+                }
+                let instructions = args.instructions.filter(|i| !i.trim().is_empty());
+                let profile = args.profile.filter(|p| !p.trim().is_empty());
+                if args.fork
+                    && (instructions.is_some()
+                        || args.agents
+                        || profile.is_some()
+                        || args.model.is_some()
+                        || args.effort.is_some())
+                {
+                    return fail_with(
+                        "invalid_tool_arguments",
+                        "a fork keeps this agent's instructions, model and effort: give it no instructions, agents, profile, model or effort",
+                    );
+                }
+                if instructions.is_some() && (args.agents || profile.is_some()) {
+                    return fail_with(
+                        "invalid_tool_arguments",
+                        "agents and profile compose instructions; instructions sets them",
+                    );
+                }
+                // A fork keeps its source's tools, settings and compaction;
+                // a fresh agent has no conversation to copy part of.
+                let fresh_only = args.tools.is_some()
+                    || args.settings.is_some()
+                    || args.compaction_instructions.is_some()
+                    || args.compaction_model.is_some()
+                    || args.fallback.is_some();
+                if args.fork && fresh_only {
+                    return fail_with(
+                        "invalid_tool_arguments",
+                        "a fork keeps this agent's tools, settings and compaction: give it allow for its tools instead",
+                    );
+                }
+                if !args.fork
+                    && (args.checkpoint.is_some()
+                        || args.allow.is_some()
+                        || args.expire_ms.is_some())
+                {
+                    return fail_with(
+                        "invalid_tool_arguments",
+                        "checkpoint, allow and expire_ms are for a fork",
+                    );
+                }
+                if args.quote.len() > 16 {
+                    return fail_with("invalid_tool_arguments", "at most 16 quotes");
+                }
+                let mut made = serde_json::Map::new();
+                let mut put = |key: &str, value: serde_json::Value| {
+                    if !value.is_null() {
+                        made.insert(key.to_owned(), value);
+                    }
+                };
+                put("checkpoint", json!(args.checkpoint));
+                put("allow", json!(args.allow));
+                put("expire_ms", json!(args.expire_ms));
+                put("workspace", json!(args.workspace));
+                put("tools", json!(args.tools));
+                put("budget_tokens", json!(args.budget_tokens));
+                put("budget_counts", json!(args.budget_counts));
+                put(
+                    "compaction_instructions",
+                    json!(args.compaction_instructions),
+                );
+                put("compaction_model", json!(args.compaction_model));
+                put("fallback", json!(args.fallback));
+                put("approve", json!(args.approve));
+                put("approver", json!(args.approver));
+                put("approve_expire_ms", json!(args.approve_expire_ms));
+                Prepared::Agents(Agents::Spawn {
+                    name,
+                    message: args.message,
+                    instructions,
+                    agents: args.agents,
+                    profile,
+                    model: args.model.filter(|m| !m.trim().is_empty()),
+                    effort: args.effort.filter(|e| !e.trim().is_empty()),
+                    fork: args.fork,
+                    made,
+                    settings: args.settings,
+                    quotes: args.quote.iter().map(|q| quote(q)).collect::<Result<_>>()?,
+                    turn_budget_tokens: args.turn_budget_tokens,
+                    request_id: args.request_id,
+                })
+            }
+            Tool::CloseAgent => {
+                #[derive(Deserialize)]
+                #[serde(deny_unknown_fields)]
+                struct Close {
+                    name: String,
+                }
+                let args: Close = serde_json::from_str(args).map_err(invalid)?;
+                if args.name.is_empty() || args.name.len() > 128 {
+                    return fail_with("invalid_tool_arguments", "name is 1 to 128 bytes");
+                }
+                Prepared::Agents(Agents::Close { name: args.name })
             }
             Tool::Wait => {
                 let args: Wait = serde_json::from_str(args).map_err(invalid)?;

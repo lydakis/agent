@@ -284,6 +284,10 @@ pub struct Bot {
     /// later ones merged over earlier.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub configure_pending: Option<Value>,
+    /// When an agent that made it closed it, done with it: it is listed
+    /// only when closed agents are asked for, until a turn of its starts.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub closed_ms: Option<i64>,
     /// Its context, history and approval settings, reported as they apply.
     #[serde(serialize_with = "resolved_settings")]
     pub settings: Settings,
@@ -3362,7 +3366,7 @@ impl Database {
     /// before versioning, stores at versions 1 to 5 and stores from newer
     /// binaries are rejected; an older store from version 6 on is migrated
     /// forward, one version at a time, at open.
-    pub const SCHEMA: i32 = 104;
+    pub const SCHEMA: i32 = 105;
     /// The person's messages a compaction keeps verbatim, newest first:
     /// per-message text, and the total text plus `(ordinal, String)` entry
     /// metadata. Empty entries cost space too, so the retained list cannot
@@ -3546,7 +3550,7 @@ impl Database {
                 budget_counts TEXT, depth INTEGER NOT NULL DEFAULT 0,
                 started_ms INTEGER, waiting_on TEXT, last_turn INTEGER, last_status TEXT,
                 last_started_ms INTEGER, last_finished_ms INTEGER, last_error TEXT,
-                configure_pending TEXT, refused_summary TEXT);
+                configure_pending TEXT, refused_summary TEXT, closed_ms INTEGER);
             CREATE UNIQUE INDEX IF NOT EXISTS bots_id ON bots(id);
             CREATE INDEX IF NOT EXISTS bots_compaction ON bots(compaction);
             CREATE INDEX IF NOT EXISTS bots_elision ON bots(elision);
@@ -4218,6 +4222,7 @@ impl Database {
                 _ => None,
             },
             compaction_requested: r.get::<_, i64>(38)? != 0,
+            closed_ms: r.get(52)?,
             configure_pending: match r.get::<_, Option<String>>(51)? {
                 None => None,
                 Some(text) => Some(serde_json::from_str(&text).map_err(|error| {
@@ -4249,7 +4254,7 @@ impl Database {
     pub fn tool_list(&self, digest: &str) -> Result<ToolList> {
         tool_list(&self.conn, digest)
     }
-    const COLUMNS: &str = "name,head,workspace,status,running_turn,provider,family,model,instructions,reasoning,budget_tokens,tokens_used,tools,input_tokens,cached_input_tokens,id,created_by,created_by_id,compaction,compaction_instructions,compaction_model,cache_bot,thinking_prefix,thinking_floor,fallback,elision,thinking_from,thinking_to,thinking_elided,gates,denials,allowed,closed,settings,expire_ms,expires_at,sent_bytes,sent_tokens,compact_asked,declared,work,work_read,budget_counts,depth,started_ms,waiting_on,last_turn,last_status,last_started_ms,last_finished_ms,last_error,configure_pending";
+    const COLUMNS: &str = "name,head,workspace,status,running_turn,provider,family,model,instructions,reasoning,budget_tokens,tokens_used,tools,input_tokens,cached_input_tokens,id,created_by,created_by_id,compaction,compaction_instructions,compaction_model,cache_bot,thinking_prefix,thinking_floor,fallback,elision,thinking_from,thinking_to,thinking_elided,gates,denials,allowed,closed,settings,expire_ms,expires_at,sent_bytes,sent_tokens,compact_asked,declared,work,work_read,budget_counts,depth,started_ms,waiting_on,last_turn,last_status,last_started_ms,last_finished_ms,last_error,configure_pending,closed_ms";
     /// Validate the caller's captured identity in the same transaction that
     /// creates the child. Never resolve a stale shell's name to a new bot.
     /// Its id and depth, read in the same query.
@@ -4754,6 +4759,7 @@ impl Database {
         name: Option<&str>,
         active: bool,
         created_by: Option<i64>,
+        open: bool,
     ) -> Result<Value> {
         if !(1..=256).contains(&limit) || after.is_some_and(|s| s.len() > 128) {
             return fail_with(
@@ -4810,12 +4816,15 @@ impl Database {
         } else {
             ""
         };
+        // Closed agents only when asked for: a filter on the rows the
+        // name's range reads, which no index needs.
+        let open = if open { " AND closed_ms IS NULL" } else { "" };
         let mut statement = self.conn.prepare_cached(&format!(
             "SELECT name,head,workspace,status,running_turn,provider,family,model,reasoning,budget_tokens,tokens_used,tools,
                     input_tokens,cached_input_tokens,id,created_by,created_by_id,gates,allowed,expire_ms,expires_at,
                     work,budget_counts,depth,started_ms,waiting_on,last_turn,last_status,
-                    last_started_ms,last_finished_ms,last_error,declared
-             FROM bots WHERE {from}{maker}{running} ORDER BY name LIMIT ?2"
+                    last_started_ms,last_finished_ms,last_error,declared,closed_ms
+             FROM bots WHERE {from}{maker}{running}{open} ORDER BY name LIMIT ?2"
         ))?;
         let mut rows = statement.query(values.as_slice())?;
         let mut bots = Vec::new();
@@ -4855,6 +4864,9 @@ impl Database {
             if let Some(digest) = r.get::<_, Option<String>>(31)? {
                 bot["declared_digest"] = json!(digest);
             }
+            if let Some(closed_ms) = r.get::<_, Option<i64>>(32)? {
+                bot["closed_ms"] = json!(closed_ms);
+            }
             let size = crate::output::encoded_len(&bot)? + 1;
             if bots.len() == limit || bytes + size > crate::output::MAX_EVENT / 2 {
                 if bots.is_empty() {
@@ -4868,6 +4880,28 @@ impl Database {
         }
         let next = more.then(|| bots.last().unwrap()["name"].clone());
         Ok(json!({"bots":bots,"next_after":next,"cursor":cursor}))
+    }
+    /// Close bot `name` at `at`, done with: it says when until a turn of
+    /// its starts. Returns when it was closed before, if it was (a bot
+    /// closed already keeps its first time), and the turn it is running as
+    /// it is marked, read in the same job, so no turn starts between.
+    pub fn close(&self, name: &str, at: i64) -> Result<(Option<i64>, Option<i64>)> {
+        let found: Option<(Option<i64>, Option<i64>)> = self
+            .conn
+            .prepare_cached(
+                "SELECT closed_ms,running_turn FROM bots WHERE name=? AND status!='deleting'",
+            )?
+            .query_row([name], |r| Ok((r.get(0)?, r.get(1)?)))
+            .optional()?;
+        let Some((before, running)) = found else {
+            return fail("bot_not_found");
+        };
+        if before.is_none() {
+            self.conn
+                .prepare_cached("UPDATE bots SET closed_ms=? WHERE name=?")?
+                .execute(params![at, name])?;
+        }
+        Ok((before, running))
     }
     fn exists(&self, name: &str) -> Result<bool> {
         Ok(self
@@ -17615,7 +17649,7 @@ fn start_locked(
     // `finish` answers every call, so a turn starts on a closed head.
     tx.prepare_cached(
         "UPDATE bots SET head=?1,status='running',running_turn=?2,closed=?1,open_calls=0,
-            started_ms=?4,waiting_on=NULL WHERE name=?3",
+            started_ms=?4,waiting_on=NULL,closed_ms=NULL WHERE name=?3",
     )?
     .execute(params![head, turn, bot.name, now])?;
     Ok(Some(head))
@@ -19307,6 +19341,26 @@ fn migrate_since_73(conn: &Connection, from: i32) -> Result<()> {
 
     if from < 104 {
         migrate_approval_holders(conn)?;
+    }
+
+    // Schema 105: an agent closes an agent it made, which then says when;
+    // and every bot that sends messages with a tool of its own makes and
+    // closes agents with tools too.
+    if from < 105 {
+        let has: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('bots') WHERE name='closed_ms')",
+            [],
+            |r| r.get(0),
+        )?;
+        if !has {
+            conn.execute("ALTER TABLE bots ADD COLUMN closed_ms INTEGER", [])?;
+        }
+        conn.execute(
+            "UPDATE bots SET tools=tools||',spawn_agent,close_agent'
+             WHERE ','||tools||',' LIKE '%,send_message,%'
+                 AND ','||tools||',' NOT LIKE '%,spawn_agent,%'",
+            [],
+        )?;
     }
 
     Ok(())
