@@ -4956,7 +4956,10 @@ impl Turn {
                     Err(error) => failure(error),
                 },
                 Ok(Prepared::Agents(asked)) => {
-                    match self.agents(&call.call_id, record.bot_id, asked).await {
+                    match self
+                        .agents(&call.call_id, record.bot_id, workspace, asked)
+                        .await
+                    {
                         Ok(outcome) => outcome,
                         Err(error) => failure(error),
                     }
@@ -5840,7 +5843,13 @@ impl Turn {
     /// What the bot asked of the daemon with its own tools, made as the
     /// bot on a session of its own ([`Registry::request`]), so the bot's
     /// own socket's limits hold, and its answer as the call's result.
-    async fn agents(&self, call_id: &str, bot_id: i64, asked: Agents) -> Result<Outcome> {
+    async fn agents(
+        &self,
+        call_id: &str,
+        bot_id: i64,
+        workspace: &std::path::Path,
+        asked: Agents,
+    ) -> Result<Outcome> {
         let request = |request: Value| self.registry.request(bot_id, request);
         let answer = match asked {
             Agents::Send {
@@ -5990,7 +5999,9 @@ impl Turn {
                     .await?;
                 } else {
                     let me = request(json!({"op":"inspect","bot":self.bot})).await?;
-                    let mut create = self.spawned(&me, &name, profile, model, effort).await?;
+                    let mut create = self
+                        .spawned(&me, workspace, &name, profile, model, effort)
+                        .await?;
                     create["op"] = json!("create");
                     create["request_id"] = json!(request_id);
                     request(create).await?;
@@ -6010,7 +6021,7 @@ impl Turn {
             }
             Agents::Close { name } => {
                 // Its own record says whether this bot made it, before the
-                // daemon marks it, and which turn to stop.
+                // daemon marks it.
                 let target = request(json!({"op":"inspect","bot":name})).await?;
                 if target["created_by_id"].as_i64() != Some(bot_id) {
                     return Err(Error::with(
@@ -6022,7 +6033,9 @@ impl Turn {
                     "bot_id":target["bot_id"]}))
                 .await?;
                 let mut answer = json!({"name":name,"was_open":closed["was_open"]});
-                if let Some(turn) = target["running_turn"].as_i64() {
+                // The turn it ran as it was marked: one that starts after
+                // opens it again.
+                if let Some(turn) = closed["running_turn"].as_i64() {
                     // A turn that ended meanwhile answers how it ended.
                     let stopped = request(json!({"op":"interrupt","bot":name,"turn":turn})).await?;
                     if stopped["interrupt_requested"] == true {
@@ -6048,36 +6061,37 @@ impl Turn {
         format!("tool-{}-{call}", self.turn)
     }
 
-    /// The whole name of an agent this one makes named `name`: in this
-    /// one's project, the part of its name before the first dot, unless
-    /// `name` names it already. A bot whose name has no dot has no project.
+    /// The whole name of an agent this one makes named `name`: a name
+    /// with no dot is in this one's project, the part of its name before
+    /// the first dot; one with a dot is whole already. A bot whose name
+    /// has no dot has no project.
     fn spawned_name(&self, name: &str) -> String {
         match self.bot.split_once('.') {
-            Some((project, _)) if !name.starts_with(&format!("{project}.")) => {
-                format!("{project}.{name}")
-            }
+            Some((project, _)) if !name.contains('.') => format!("{project}.{name}"),
             _ => name.to_owned(),
         }
     }
 
     /// What `create` makes a fresh agent with, made by this one (`me`, its
-    /// record): its folder, settings and compaction; the model and effort
-    /// asked for, the profile's model, or its own; and the instructions a
-    /// client composes for the folder, in `profile`'s role when one is
-    /// named, with the role's tools or its own, the editor and search
-    /// fitted to the model's provider.
+    /// record) in `workspace`, the folder this turn works in: its settings
+    /// and compaction; the model and effort asked for, the profile's model,
+    /// or its own; and the instructions a client composes for the folder,
+    /// in `profile`'s role when one is named, with the role's tools or its
+    /// own, search kept to a model that has it.
     async fn spawned(
         &self,
         me: &Value,
+        workspace: &std::path::Path,
         name: &str,
         profile: Option<String>,
         model: Option<String>,
         effort: Option<String>,
     ) -> Result<Value> {
-        let Some(workspace) = me["workspace"].as_str().map(str::to_owned) else {
+        // The folder this turn works in, which may be its own for the turn.
+        let Some(workspace) = workspace.to_str().map(str::to_owned) else {
             return Err(Error::with(
                 "no_workspace",
-                "this agent has no folder for an agent it makes to work in",
+                "this agent's folder is not a name the daemon can pass on",
             ));
         };
         // Reading the role and the folder's files touches the filesystem:
@@ -6115,10 +6129,10 @@ impl Turn {
             me["model"].as_str().unwrap_or_default()
         );
         let chosen = model.or_else(|| role.as_ref().and_then(|role| role.model.clone()));
-        // An agent on this one's model takes its effort too; one on a model
-        // chosen for it, its own or none.
+        // The effort asked for; else, on this one's model, its effort too,
+        // and on a model chosen for it, the model's own.
         let effort = match &chosen {
-            None => me["effort"].as_str().map(str::to_owned),
+            None => effort.or_else(|| me["effort"].as_str().map(str::to_owned)),
             Some(_) => effort,
         };
         // A summarizer speaks its bot's family: this one's only on its model.
@@ -6128,29 +6142,20 @@ impl Turn {
         };
         let model = chosen.unwrap_or(own);
         let (provider, model_name) = model.split_once('/').unwrap_or((model.as_str(), ""));
+        // Its own tools, the very names its gates hold, so every gate it
+        // inherits covers them; a grammar tool reaches a family without
+        // grammars as a function taking its text. Search goes where the
+        // model has none.
         let tools: Vec<String> = match role.and_then(|role| role.tools) {
             Some(tools) => tools,
             None => {
-                let served = self.providers.get(provider);
-                let editor = match served.map(|p| p.family().name()) {
-                    Some("responses") => "apply_patch",
-                    _ => "edit",
-                };
-                let searches = served
+                let searches = (self.providers.get(provider))
                     .is_some_and(|p| p.search(model_name) != agent_runtime::provider::Search::None);
                 (me["tools"].as_array().into_iter().flatten())
                     .filter_map(Value::as_str)
                     .filter(|tool| *tool != "web_search" || searches)
-                    .map(|tool| match tool {
-                        "edit" | "apply_patch" => editor,
-                        tool => tool,
-                    })
-                    .fold(Vec::new(), |mut tools: Vec<String>, tool| {
-                        if !tools.iter().any(|have| have == tool) {
-                            tools.push(tool.to_owned());
-                        }
-                        tools
-                    })
+                    .map(str::to_owned)
+                    .collect()
             }
         };
         let settings = (self.settings.get())

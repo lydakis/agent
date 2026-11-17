@@ -381,7 +381,8 @@ enum Command {
     },
     /// Close a bot, done with: it is listed only when closed bots are
     /// asked for, its history kept whole, until a turn of its starts. Only
-    /// the mark: a turn it is running runs on unless interrupted.
+    /// the mark: a turn it is running runs on unless interrupted, and the
+    /// answer names that turn, read as the mark is made.
     Close {
         bot: String,
         /// The identity `bot` must hold; another is `bot_not_found`.
@@ -5073,7 +5074,7 @@ impl Service {
                     .duration_since(std::time::UNIX_EPOCH)
                     .map_or(0, |d| d.as_millis() as i64);
                 let name = bot.clone();
-                let before = store
+                let (before, running) = store
                     .op("close", move |db| {
                         if bot_id.is_some() {
                             db.identity(&name, bot_id)?;
@@ -5081,7 +5082,10 @@ impl Service {
                         db.close(&name, at)
                     })
                     .await?;
-                Ok(json!({"bot":bot,"was_open":before.is_none(),"closed_ms":before.unwrap_or(at)}))
+                Ok(
+                    json!({"bot":bot,"was_open":before.is_none(),"closed_ms":before.unwrap_or(at),
+                    "running_turn":running}),
+                )
             }
             Command::Delete { bot, bot_id } => {
                 if let Some(id) = bot_id {

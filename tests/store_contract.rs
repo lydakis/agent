@@ -22020,9 +22020,9 @@ fn a_closed_bot_is_listed_only_when_asked_until_a_turn_of_its_starts() {
             .map(|b| b["name"].as_str().unwrap().to_owned())
             .collect()
     };
-    assert_eq!(db.close("shop.fix", 1_000).unwrap(), None);
+    assert_eq!(db.close("shop.fix", 1_000).unwrap(), (None, None));
     // Closed again, it keeps the first time it was.
-    assert_eq!(db.close("shop.fix", 2_000).unwrap(), Some(1_000));
+    assert_eq!(db.close("shop.fix", 2_000).unwrap(), (Some(1_000), None));
     assert_eq!(db.inspect("shop.fix").unwrap().closed_ms, Some(1_000));
     assert_eq!(db.inspect("shop.look").unwrap().closed_ms, None);
     assert_eq!(
@@ -22063,6 +22063,20 @@ fn a_closed_bot_is_listed_only_when_asked_until_a_turn_of_its_starts() {
         ),
         ["shop.fix", "shop.lead", "shop.look"]
     );
+    // Closed while it runs, the close names the turn it is running.
+    let running = db
+        .begin(
+            "shop.look",
+            "r2",
+            "look again",
+            true,
+            &TurnOptions::default(),
+            allow_provider,
+        )
+        .unwrap()
+        .turn;
+    assert_eq!(db.close("shop.look", 4_000).unwrap(), (None, Some(running)));
+    db.finish(running, None).unwrap();
 }
 
 #[test]
@@ -22100,7 +22114,7 @@ fn schema_103_bots_that_message_with_tools_make_and_close_agents_too() {
         ]
     );
     assert_eq!(db.inspect("Carol").unwrap().tools, ["shell", "read"]);
-    assert_eq!(db.close("Carol", 5).unwrap(), None);
+    assert_eq!(db.close("Carol", 5).unwrap(), (None, None));
     assert_eq!(db.inspect("Carol").unwrap().closed_ms, Some(5));
     drop(db);
     std::fs::remove_file(path).unwrap();

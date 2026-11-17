@@ -4607,15 +4607,18 @@ impl Database {
         Ok(json!({"bots":bots,"next_after":next,"cursor":cursor}))
     }
     /// Close bot `name` at `at`, done with: it says when until a turn of
-    /// its starts. Returns when it was closed before, if it was: a bot
-    /// closed already keeps its first time.
-    pub fn close(&self, name: &str, at: i64) -> Result<Option<i64>> {
-        let before: Option<Option<i64>> = self
+    /// its starts. Returns when it was closed before, if it was (a bot
+    /// closed already keeps its first time), and the turn it is running as
+    /// it is marked, read in the same job, so no turn starts between.
+    pub fn close(&self, name: &str, at: i64) -> Result<(Option<i64>, Option<i64>)> {
+        let found: Option<(Option<i64>, Option<i64>)> = self
             .conn
-            .prepare_cached("SELECT closed_ms FROM bots WHERE name=? AND status!='deleting'")?
-            .query_row([name], |r| r.get(0))
+            .prepare_cached(
+                "SELECT closed_ms,running_turn FROM bots WHERE name=? AND status!='deleting'",
+            )?
+            .query_row([name], |r| Ok((r.get(0)?, r.get(1)?)))
             .optional()?;
-        let Some(before) = before else {
+        let Some((before, running)) = found else {
             return fail("bot_not_found");
         };
         if before.is_none() {
@@ -4623,7 +4626,7 @@ impl Database {
                 .prepare_cached("UPDATE bots SET closed_ms=? WHERE name=?")?
                 .execute(params![at, name])?;
         }
-        Ok(before)
+        Ok((before, running))
     }
     fn exists(&self, name: &str) -> Result<bool> {
         Ok(self
