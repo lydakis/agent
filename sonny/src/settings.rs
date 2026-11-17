@@ -29,8 +29,6 @@ pub struct Settings {
     pub project_color: std::collections::BTreeMap<String, String>,
     /// The person's own margin notes: name, title and what each shows.
     pub notes: Vec<(String, String, crate::margin::Body)>,
-    /// The sources the person set up, by name, for template notes.
-    pub sources: Vec<String>,
 }
 
 impl Default for Settings {
@@ -76,9 +74,6 @@ impl Settings {
                     (note.name, note.title, body)
                 })
                 .collect(),
-            // Only those the person set up keep what they printed for a
-            // blank to read: the commons keeps none.
-            sources: (sonny.sources.into_iter().map(|source| source.name)).collect(),
         }
     }
 }
