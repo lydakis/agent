@@ -4427,6 +4427,9 @@ struct App {
     needs_pulse: std::cell::Cell<look::Pulse>,
     /// The reply text the current model call has streamed.
     said: String,
+    /// Words streamed that show nothing yet, held until visible words
+    /// follow them, which they lead.
+    unseen: String,
     /// Prompts sent and not in the conversation yet, by their turn: a
     /// steer until the running turn takes it in, a prompt until its turn
     /// starts. Drawn above the status row until they land.
@@ -6380,6 +6383,7 @@ impl App {
             sounds: sound::Sounds::new(false),
             needs_pulse: std::cell::Cell::default(),
             said: String::new(),
+            unseen: String::new(),
             staged: Vec::new(),
             staged_drawn: std::cell::RefCell::default(),
             queued: Vec::new(),
@@ -7741,6 +7745,7 @@ impl App {
         self.live_item = None;
         self.ahead.clear();
         self.said.clear();
+        self.unseen.clear();
         self.replay = None;
         // The phase says it, until it is back; a notice of before
         // happened before it.
@@ -11226,6 +11231,7 @@ impl App {
         }
         self.ahead.push_back(item);
         self.said.clear();
+        self.unseen.clear();
         self.replay = None;
         self.streamed = false;
     }
@@ -11463,6 +11469,7 @@ impl App {
                 self.live_item = None;
                 self.ahead.clear();
                 self.said.clear();
+                self.unseen.clear();
                 self.thought.clear();
                 self.replay = None;
                 self.running = Some(Running {
@@ -11566,7 +11573,11 @@ impl App {
                 // Each item the bot streams is a message of its own, as
                 // Codex draws them.
                 if let Some(item) = event["item"].as_u64() {
-                    if self.live_item.is_some_and(|live| live != item) && self.streamed {
+                    // An item of only whitespace drew nothing, yet ends there
+                    // too, so its message does not take the next one's words.
+                    if self.live_item.is_some_and(|live| live != item)
+                        && (self.streamed || !self.said.is_empty())
+                    {
                         self.stream_ahead(self.live_item.unwrap_or(item));
                     }
                     self.live_item = Some(item);
@@ -11600,6 +11611,13 @@ impl App {
                     self.replay = None;
                 }
                 self.said.push_str(delta);
+                // Only whitespace so far draws no reply.
+                if !self.live.as_ref().is_some_and(|live| !live.closed) && blank(delta) {
+                    self.unseen.push_str(delta);
+                    return;
+                }
+                // Those held lead the words that show, as indentation does.
+                let held = std::mem::take(&mut self.unseen);
                 self.streamed = true;
                 if let Some(running) = &mut self.running {
                     running.phase = "Working".into();
@@ -11617,7 +11635,10 @@ impl App {
                 // Only the new words are searched for a line's end, and an
                 // ended line leaves whole: a long line streamed in small
                 // pieces costs its length once.
-                for piece in delta.split_inclusive('\n') {
+                for piece in held
+                    .split_inclusive('\n')
+                    .chain(delta.split_inclusive('\n'))
+                {
                     live.partial.push_str(piece);
                     if piece.ends_with('\n') {
                         let line = std::mem::take(&mut live.partial);
@@ -11663,15 +11684,17 @@ impl App {
                         self.dated(node, item);
                     }
                 }
-                // Words written when the next item began are this message.
+                // Words written when the next item began are this message,
+                // drawn or, of only whitespace, not.
                 if let (Some(item), Some(node)) = (&item, data["node"].as_i64())
-                    && !text(item).is_empty()
+                    && !joined(&item["content"]).is_empty()
                     && let Some(streamed) = self.ahead.pop_front()
                 {
                     self.streamed_at(streamed, node);
                     return;
                 }
                 let said = std::mem::take(&mut self.said);
+                self.unseen.clear();
                 self.replay = None;
                 if self.streamed {
                     self.streamed = false;
@@ -11762,6 +11785,7 @@ impl App {
                 self.ahead.clear();
                 self.streamed = false;
                 self.said.clear();
+                self.unseen.clear();
                 self.replay = None;
                 self.notice = Some(match data["in"].as_str() {
                     Some(what) => format!(
@@ -11784,10 +11808,16 @@ impl App {
                     self.ahead.clear();
                     self.streamed = false;
                     self.said.clear();
+                    self.unseen.clear();
                     self.notice = Some("the model retried; its reply may repeat".into());
                 }
-                if !self.said.is_empty() {
-                    self.replay = Some((std::mem::take(&mut self.said), 0));
+                // Only what was drawn is skipped when it comes again: held
+                // whitespace was not, and still leads the words after it.
+                let mut said = std::mem::take(&mut self.said);
+                said.truncate(said.len() - self.unseen.len());
+                self.unseen.clear();
+                if !said.is_empty() {
+                    self.replay = Some((said, 0));
                 }
                 if let Some(running) = &mut self.running {
                     running.phase = "Retrying".into();
@@ -11827,6 +11857,7 @@ impl App {
             }
             "tool_started" => {
                 self.said.clear();
+                self.unseen.clear();
                 self.thought.clear();
                 self.end_live(Words::Step);
                 let name = data["name"].as_str().unwrap_or("tool").to_owned();
@@ -20239,6 +20270,12 @@ fn quiet_message(text: &str) -> bool {
 /// A message item's text: a prompt's own words, without the line the
 /// daemon adds after them naming who sent it and when, or the `[Sent …]`
 /// line an older Sonny stored with them.
+/// Whether `words` are only whitespace, as Codex draws no such reply, or
+/// zero-width spaces, which models send for an empty reply.
+fn blank(words: &str) -> bool {
+    words.chars().all(|c| c.is_whitespace() || c == '\u{200B}')
+}
+
 fn text(item: &Value) -> String {
     match (&item["role"], &item["content"]) {
         (role, Value::Array(parts)) if role == "user" => (parts.iter())
@@ -20246,7 +20283,10 @@ fn text(item: &Value) -> String {
             .map(stamp::unstamped)
             .unwrap_or_default()
             .to_owned(),
-        (_, content) => joined(content),
+        // A reply of only whitespace is no reply.
+        (_, content) => Some(joined(content))
+            .filter(|words| !blank(words))
+            .unwrap_or_default(),
     }
 }
 
@@ -23251,6 +23291,166 @@ mod tests {
             .find(|(_, text)| text.contains("Noted what shop.fix said."))
             .unwrap_or_else(|| panic!("{rows:?}"));
         assert_eq!(noted, &(Some(0), "• Noted what shop.fix said.".into()));
+    }
+
+    #[tokio::test]
+    async fn a_reply_that_shows_nothing_draws_nothing() {
+        let mut app = app(zen_daemon().await);
+        app.width = 100;
+        app.daemon(turn_event("accepted", 2, json!({"node": 5})))
+            .await;
+        // The zero-width space a model sends for an empty reply.
+        app.daemon(json!({"event": "text_delta", "bot": "b", "turn": 2,
+            "text": "\u{200b}"}))
+            .await;
+        assert!(app.live.is_none() && !app.streamed);
+        // A stored reply of only that reads as no words at all.
+        let item = json!({"role": "assistant", "content": [{"type": "output_text", "text": "\u{200b}\n"}]});
+        assert_eq!(text(&item), "");
+        // Words after it draw as ever.
+        app.daemon(json!({"event": "text_delta", "bot": "b", "turn": 2,
+            "text": "Done."}))
+            .await;
+        assert!(app.live.is_some() && app.streamed);
+        // Blank words held before visible ones still lead them: indented,
+        // a line is code, live as replayed.
+        app.daemon(turn_event("accepted", 3, json!({"node": 7})))
+            .await;
+        for text in ["    ", "example()\n"] {
+            app.daemon(json!({"event": "text_delta", "bot": "b", "turn": 3, "text": text}))
+                .await;
+        }
+        let live: Vec<String> = (app.live.as_ref().unwrap().rows.iter())
+            .map(|row| row.to_string())
+            .collect();
+        let replayed: Vec<String> = transcript::reply("    example()\n", 100, Path::new(""))
+            .iter()
+            .map(|row| row.to_string())
+            .collect();
+        assert_eq!(live, replayed);
+    }
+
+    #[tokio::test]
+    async fn an_item_of_only_whitespace_keeps_to_itself() {
+        // One call streams a zero-width item, then a reply of its own.
+        let client = daemon_answering(|asked| {
+            let say = |text: &str| {
+                json!({"type": "message", "role": "assistant",
+                "content": [{"type": "output_text", "text": text}]})
+            };
+            let items = [(4, say("\u{200b}")), (5, say("First.\nSecond."))];
+            json!({"items": asked["nodes"].as_array().into_iter().flatten()
+                .filter_map(|node| items.iter().find(|(n, _)| Some(*n) == node.as_i64()))
+                .map(|(node, item)| json!({"node": node, "item": item}))
+                .collect::<Vec<_>>()})
+        })
+        .await;
+        let mut app = app(client);
+        app.width = 100;
+        app.daemon(turn_event("accepted", 1, json!({}))).await;
+        for (item, text) in [(0, "\u{200b}"), (1, "First.\nSecond.")] {
+            app.daemon(json!({"event": "text_delta", "bot": "b", "turn": 1,
+                "item": item, "text": text}))
+                .await;
+        }
+        for node in [4, 5] {
+            app.daemon(turn_event("message", 1, json!({"node": node})))
+                .await;
+        }
+        app.daemon(turn_event(
+            "turn_finished",
+            1,
+            json!({"status": "completed"}),
+        ))
+        .await;
+        let shown: Vec<String> = (app.pending.iter())
+            .map(|line| line.to_string())
+            .filter(|row| !row.trim().is_empty())
+            .collect();
+        assert_eq!(
+            shown.iter().filter(|row| row.contains("First.")).count(),
+            1,
+            "{shown:?}"
+        );
+        assert!(shown.iter().all(|row| row.trim() != "•"), "{shown:?}");
+    }
+
+    #[tokio::test]
+    async fn held_whitespace_still_leads_after_a_retry() {
+        let mut app = app(zen_daemon().await);
+        app.width = 100;
+        app.daemon(turn_event("accepted", 2, json!({"node": 5})))
+            .await;
+        let said = |text: &str| json!({"event": "text_delta", "bot": "b", "turn": 2, "text": text});
+        app.daemon(said("    ")).await;
+        app.daemon(turn_event("retry", 2, json!({}))).await;
+        assert!(app.replay.is_none() && app.unseen.is_empty());
+        for text in ["    ", "example()\n"] {
+            app.daemon(said(text)).await;
+        }
+        let live: Vec<String> = (app.live.as_ref().unwrap().rows.iter())
+            .map(|row| row.to_string())
+            .collect();
+        let replayed: Vec<String> = transcript::reply("    example()\n", 100, Path::new(""))
+            .iter()
+            .map(|row| row.to_string())
+            .collect();
+        assert_eq!(live, replayed);
+    }
+
+    #[tokio::test]
+    async fn a_turn_that_said_nothing_draws_no_reply_with_or_without_a_task_row() {
+        let say = |role: &str, text: &str| {
+            let kind = if role == "user" {
+                "input_text"
+            } else {
+                "output_text"
+            };
+            json!({"type": "message", "role": role, "content": [{"type": kind, "text": text}]})
+        };
+        // A task's message answered with one zero-width space, beside an
+        // empty thinking block as a Claude reply keeps it.
+        let reply = json!({"role": "assistant", "content": [
+            {"type": "thinking", "thinking": "", "signature": "s"},
+            {"type": "text", "text": "\u{200b}"}]});
+        let items = [
+            (1, 1, say("user", "Fix the rounding")),
+            (2, 1, say("assistant", "Rounding now.")),
+            (5, 2, say("user", "The release build broke.")),
+            (6, 2, reply),
+            // A turn of the person's, with no task row, answered the same.
+            (8, 3, say("user", "Anything new?")),
+            (9, 3, say("assistant", " ")),
+        ];
+        let client = daemon_answering(move |asked| match asked["op"].as_str() {
+            Some("history_nodes") => json!({"nodes": items.iter().rev()
+                .map(|(node, turn, _)| json!({"node": node, "turn": turn}))
+                .collect::<Vec<_>>(), "next_from": null}),
+            Some("prompts") => json!({"prompts": [{"turn": 1, "text": "Fix the rounding"},
+                {"turn": 3, "text": "Anything new?"}]}),
+            Some("history_items") => json!({"items": asked["nodes"].as_array().into_iter()
+                .flatten()
+                .filter_map(|node| items.iter().find(|(n, _, _)| Some(*n) == node.as_i64()))
+                .map(|(node, _, item)| match node {
+                    5 => json!({"node": node, "item": item, "from": {"bot": "shop.fix"}}),
+                    _ => json!({"node": node, "item": item}),
+                })
+                .collect::<Vec<_>>()}),
+            _ => json!({}),
+        })
+        .await;
+        let mut app = app(client);
+        app.width = 100;
+        app.words_only = true;
+        app.history().await;
+        app.flush();
+        let rows: Vec<String> = (app.screen.texts().into_iter())
+            .filter(|row| !row.trim().is_empty())
+            .collect();
+        assert_eq!(
+            rows,
+            ["› Fix the rounding", "• Rounding now.", "› Anything new?"]
+        );
     }
 
     #[tokio::test]
