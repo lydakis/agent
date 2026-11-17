@@ -103,6 +103,8 @@ pub fn default_tools(
         "send_message",
         "list_agents",
         "pause_agents",
+        "spawn_agent",
+        "close_agent",
     ];
     if search == config::WebSearch::Live {
         // Search is the provider's to offer; the daemon fetches a page
@@ -119,7 +121,7 @@ pub fn default_tools(
 
 /// The socket protocol's version in `ready`. The daemon and its clients ship
 /// together, so a client refuses a daemon of any other version.
-pub const PROTOCOL: u64 = 83;
+pub const PROTOCOL: u64 = 84;
 /// How long the daemon holds a turn on a cause a person can fix before it
 /// fails with it, for a bot that sets no `hold_ms`: five days, as mail is
 /// retried (RFC 5321 suggests four to five) before it is returned.
@@ -599,6 +601,8 @@ mod tests {
                 "send_message",
                 "list_agents",
                 "pause_agents",
+                "spawn_agent",
+                "close_agent",
                 "web_fetch"
             ]
         );
@@ -617,6 +621,8 @@ mod tests {
                 "send_message",
                 "list_agents",
                 "pause_agents",
+                "spawn_agent",
+                "close_agent",
                 "web_search",
                 "web_fetch"
             ]

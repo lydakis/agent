@@ -49,10 +49,11 @@ pub const ATTEMPTS: u32 = 3;
 pub const AUTO_EXPIRE_MS: u64 = DEADLINE_MS + 15_000;
 /// Tools the approval modes never gate: they touch only the bot's own
 /// store records, do what the `agent` in its sandboxed shell may do
-/// ungated, as itself (send a message, list agents, pull the cord), or,
-/// for web search, ask its provider as its model does (Codex never gates
-/// search or its agent tools, and a provider-hosted search can't be).
-pub const UNGATED: [&str; 7] = [
+/// ungated, as itself (send a message, list, make or close agents, pull
+/// the cord), or, for web search, ask its provider as its model does
+/// (Codex never gates search or its agent tools, and a provider-hosted
+/// search can't be).
+pub const UNGATED: [&str; 9] = [
     "history",
     "wait",
     "echo",
@@ -60,11 +61,13 @@ pub const UNGATED: [&str; 7] = [
     "send_message",
     "list_agents",
     "pause_agents",
+    "spawn_agent",
+    "close_agent",
 ];
 /// Tools `auto` also leaves to run unjudged. A read's result goes to the
 /// model provider, so reading a key sends it off the machine, but judging
 /// every read cost a round each for what is nearly always allowed.
-pub const AUTO_UNGATED: [&str; 8] = [
+pub const AUTO_UNGATED: [&str; 10] = [
     "history",
     "wait",
     "echo",
@@ -73,6 +76,8 @@ pub const AUTO_UNGATED: [&str; 8] = [
     "send_message",
     "list_agents",
     "pause_agents",
+    "spawn_agent",
+    "close_agent",
 ];
 /// The breaker, as Codex sets it: denials in a row, or among the turn's
 /// last `WINDOW` judged calls.

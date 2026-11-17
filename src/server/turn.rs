@@ -4956,7 +4956,10 @@ impl Turn {
                     Err(error) => failure(error),
                 },
                 Ok(Prepared::Agents(asked)) => {
-                    match self.agents(&call.call_id, record.bot_id, asked).await {
+                    match self
+                        .agents(&call.call_id, record.bot_id, workspace, asked)
+                        .await
+                    {
                         Ok(outcome) => outcome,
                         Err(error) => failure(error),
                     }
@@ -5848,7 +5851,13 @@ impl Turn {
     /// What the bot asked of the daemon with its own tools, made as the
     /// bot on a session of its own ([`Registry::request`]), so the bot's
     /// own socket's limits hold, and its answer as the call's result.
-    async fn agents(&self, call_id: &str, bot_id: i64, asked: Agents) -> Result<Outcome> {
+    async fn agents(
+        &self,
+        call_id: &str,
+        bot_id: i64,
+        workspace: &std::path::Path,
+        asked: Agents,
+    ) -> Result<Outcome> {
         let request = |request: Value| self.registry.request(bot_id, request);
         let answer = match asked {
             Agents::Send {
@@ -5881,18 +5890,7 @@ impl Turn {
                     // Its own turn, after the one stopped.
                     delivery = "queue";
                 }
-                // The same call made again, after a restart, sends nothing
-                // new: its id is the call's own unless the bot named one,
-                // as a digest of the whole call id, so two calls never share it.
-                let request_id = request_id.unwrap_or_else(|| {
-                    let digest =
-                        aws_lc_rs::digest::digest(&aws_lc_rs::digest::SHA256, call_id.as_bytes());
-                    let call: String = digest.as_ref()[..16]
-                        .iter()
-                        .map(|b| format!("{b:02x}"))
-                        .collect();
-                    format!("tool-{}-{call}", self.turn)
-                });
+                let request_id = request_id.unwrap_or_else(|| self.call_request(call_id));
                 let sent = request(json!({"op":"submit","bot":to,"request_id":request_id,
                     "prompt":message,"delivery":delivery,
                     "from":{"bot":self.bot,"turn":self.turn},
@@ -5921,13 +5919,14 @@ impl Turn {
             Agents::List {
                 name,
                 running,
+                closed,
                 approvals: false,
                 after,
                 limit,
             } => {
                 let name = name.or_else(|| self.project_agents());
                 let page = request(json!({"op":"bots","name":name,"active":running,
-                    "limit":limit,"after":after.as_str()}))
+                    "open":!closed,"limit":limit,"after":after.as_str()}))
                 .await?;
                 let bots: Vec<Value> = (page["bots"].as_array().into_iter().flatten())
                     .map(|bot| {
@@ -5938,6 +5937,7 @@ impl Turn {
                             "last",
                             "workspace",
                             "created_by",
+                            "closed_ms",
                         ] {
                             if !bot[field].is_null() {
                                 row[field] = bot[field].clone();
@@ -5988,8 +5988,291 @@ impl Turn {
                 json!({"approvals":calls,"next_after":page["next_after"]})
             }
             Agents::Pause { reason } => request(json!({"op":"pause","reason":reason})).await?,
+            Agents::Spawn {
+                name,
+                message,
+                instructions,
+                agents,
+                profile,
+                model,
+                effort,
+                fork,
+                made,
+                settings,
+                quotes,
+                turn_budget_tokens,
+                request_id,
+            } => {
+                let name = self.spawned_name(&name);
+                // One key for the making and the first message, so the
+                // same call made again makes and sends nothing new.
+                let request_id = request_id.unwrap_or_else(|| self.call_request(call_id));
+                if fork {
+                    let mut copy = json!({"op":"fork","source":self.bot,"bot":name,
+                        "request_id":request_id});
+                    for (key, value) in made {
+                        copy[key] = value;
+                    }
+                    request(copy).await?;
+                } else {
+                    // Its record, at this turn's own model and effort.
+                    let mut me = request(json!({"op":"inspect","bot":self.bot})).await?;
+                    let (bot, turn) = (self.bot.clone(), self.turn);
+                    let (_, context) = (self.store)
+                        .op("context", move |db| db.running_context(&bot, turn))
+                        .await?;
+                    if let Some((provider, model)) = context.model.split_once('/') {
+                        me["provider"] = json!(provider);
+                        me["model"] = json!(model);
+                    }
+                    me["effort"] = json!(context.effort);
+                    // What the call set itself, which a resend must match;
+                    // the rest the daemon derives, from files that may change.
+                    let mut asked: Vec<String> = made.keys().cloned().collect();
+                    for (field, given) in [
+                        ("instructions", instructions.is_some()),
+                        ("model", model.is_some()),
+                        ("effort", effort.is_some()),
+                        ("settings", settings.is_some()),
+                    ] {
+                        if given {
+                            asked.push(field.to_owned());
+                        }
+                    }
+                    // The folder asked for, else this turn's.
+                    let folder = (made.get("workspace"))
+                        .and_then(Value::as_str)
+                        .map_or_else(|| workspace.to_path_buf(), std::path::PathBuf::from);
+                    let mut create = self
+                        .spawned(
+                            &me,
+                            &folder,
+                            &name,
+                            (instructions, agents, profile),
+                            model,
+                            effort,
+                        )
+                        .await?;
+                    // What it asked for over what it would inherit: the
+                    // daemon keeps each no looser than this agent's.
+                    for (key, value) in made {
+                        create[key.as_str()] = match value {
+                            Value::String(text)
+                                if key == "compaction_instructions" && text.is_empty() =>
+                            {
+                                Value::Null
+                            }
+                            value => value,
+                        };
+                    }
+                    if let (Some(over), Some(own)) = (settings, create["settings"].as_object_mut())
+                    {
+                        own.extend(over);
+                    }
+                    // A caller kept to some of its tools (a fork's `allow`)
+                    // makes agents kept to them too: `create` takes no
+                    // `allow`, so their tools are those it may call.
+                    if let Some(allowed) = me["allowed"].as_array() {
+                        let tools: Vec<Value> = (create["tools"].as_array().into_iter().flatten())
+                            .filter(|tool| allowed.contains(tool))
+                            .cloned()
+                            .collect();
+                        create["tools"] = json!(tools);
+                    }
+                    create["op"] = json!("create");
+                    create["request_id"] = json!(request_id);
+                    // This call made again, after its folder's files or this
+                    // turn changed only what the daemon derives: the agent it
+                    // made the first time stands, and its first message is
+                    // sent once. A field the call set itself that differs is
+                    // another request, refused as one.
+                    match request(create).await {
+                        Err(error)
+                            if error.code == "idempotency_conflict"
+                                && (error.facts.as_ref())
+                                    .and_then(|facts| facts["field"].as_str())
+                                    .is_some_and(|field| {
+                                        field != "workspace" && !asked.iter().any(|a| a == field)
+                                    }) => {}
+                        made => {
+                            made?;
+                        }
+                    }
+                }
+                let sent = request(json!({"op":"submit","bot":name,"request_id":request_id,
+                    "prompt":message,"delivery":"queue",
+                    "from":{"bot":self.bot,"turn":self.turn},
+                    "quotes":(!quotes.is_empty()).then_some(quotes),
+                    "budget_tokens":turn_budget_tokens}))
+                .await?;
+                let mut answer = json!({"name":name,"status":sent["status"]});
+                if let Some(message) = sent["message"].as_i64() {
+                    answer["handle"] = json!(format!("{name}/{message}"));
+                }
+                if sent["duplicate"] == true {
+                    answer["duplicate"] = json!(true);
+                }
+                answer
+            }
+            Agents::Close { name } => {
+                // Its own record says whether this bot made it, before the
+                // daemon marks it.
+                let target = request(json!({"op":"inspect","bot":name})).await?;
+                if target["created_by_id"].as_i64() != Some(bot_id) {
+                    return Err(Error::with(
+                        "not_permitted",
+                        format!("{name} was not made by this bot, so this bot may not close it"),
+                    ));
+                }
+                let closed = request(json!({"op":"close","bot":name,
+                    "bot_id":target["bot_id"]}))
+                .await?;
+                let mut answer = json!({"name":name,"was_open":closed["was_open"]});
+                // The turn it ran as it was marked: one that starts after
+                // opens it again.
+                if let Some(turn) = closed["running_turn"].as_i64() {
+                    // A turn that ended meanwhile answers how it ended.
+                    let stopped = request(json!({"op":"interrupt","bot":name,"turn":turn})).await?;
+                    if stopped["interrupt_requested"] == true {
+                        answer["stopped_turn"] = json!(turn);
+                    }
+                }
+                answer
+            }
         };
         Ok(Outcome::text(self.registry.redact_text(answer.to_string())))
+    }
+
+    /// The id a call's request to the daemon goes with when the bot named
+    /// none: the call's own, as a digest of the whole call id, so the same
+    /// call made again after a restart does nothing new and two calls never
+    /// share one.
+    fn call_request(&self, call_id: &str) -> String {
+        let digest = aws_lc_rs::digest::digest(&aws_lc_rs::digest::SHA256, call_id.as_bytes());
+        let call: String = digest.as_ref()[..16]
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        format!("tool-{}-{call}", self.turn)
+    }
+
+    /// The whole name of an agent this one makes named `name`: a name
+    /// with no dot is in this one's project, the part of its name before
+    /// the first dot; one with a dot is whole already. A bot whose name
+    /// has no dot has no project.
+    fn spawned_name(&self, name: &str) -> String {
+        match self.bot.split_once('.') {
+            Some((project, _)) if !name.contains('.') => format!("{project}.{name}"),
+            _ => name.to_owned(),
+        }
+    }
+
+    /// What `create` makes a fresh agent with, made by this one (`me`, its
+    /// record) in `workspace`, the folder this turn works in: its settings
+    /// and compaction; the model and effort asked for, the profile's model,
+    /// or its own; instructions as `run --new` gives them (the text given,
+    /// the preamble, or with `agents` or a profile, those a client composes
+    /// for the folder, in the profile's role); the role's tools or its own,
+    /// search kept to a model that has it.
+    async fn spawned(
+        &self,
+        me: &Value,
+        workspace: &std::path::Path,
+        name: &str,
+        (given, agents, profile): (Option<String>, bool, Option<String>),
+        model: Option<String>,
+        effort: Option<String>,
+    ) -> Result<Value> {
+        // The folder this turn works in, which may be its own for the turn.
+        let Some(workspace) = workspace.to_str().map(str::to_owned) else {
+            return Err(Error::with(
+                "no_workspace",
+                "this agent's folder is not a name the daemon can pass on",
+            ));
+        };
+        // As `run --new`: the text given, the preamble alone, or, asked
+        // for, the folder's composed in a role or none. Composing reads
+        // the folder's files: off the runtime thread.
+        let (role, instructions) = match (given, agents || profile.is_some()) {
+            (Some(text), _) => (None, text),
+            (None, false) => (None, agent_client::policy::PREAMBLE.to_owned()),
+            (None, true) => {
+                let folder = workspace.clone();
+                tokio::task::spawn_blocking(move || {
+                    let folder = std::path::Path::new(&folder);
+                    let failed = |error: agent_client::policy::Failure| {
+                        Error::with(error.code(), error.to_string())
+                    };
+                    let role = match profile.as_deref() {
+                        None => None,
+                        Some(name) => Some(
+                            agent_client::policy::profile(folder, name)
+                                .map_err(failed)?
+                                .ok_or_else(|| {
+                                    Error::with(
+                                        "profile_not_found",
+                                        format!(
+                                            "no .agents/agents/{name}.md in the folder or ~/.agents/agents"
+                                        ),
+                                    )
+                                })?,
+                        ),
+                    };
+                    let memory = agent_client::policy::memory_indexes(folder).map_err(failed)?;
+                    let composed =
+                        agent_client::policy::instructions(folder, role.as_ref(), &memory)
+                            .map_err(failed)?;
+                    Ok::<_, Error>((role, composed.text))
+                })
+                .await
+                .map_err(|_| Error::new("profile_unreadable"))??
+            }
+        };
+        let own = format!(
+            "{}/{}",
+            me["provider"].as_str().unwrap_or_default(),
+            me["model"].as_str().unwrap_or_default()
+        );
+        let chosen = model.or_else(|| role.as_ref().and_then(|role| role.model.clone()));
+        // The effort asked for; else, on this one's model, its effort too,
+        // and on a model chosen for it, the model's own.
+        let effort = match &chosen {
+            None => effort.or_else(|| me["effort"].as_str().map(str::to_owned)),
+            Some(_) => effort,
+        };
+        // A summarizer speaks its bot's family: this one's only on its model.
+        let compaction_model = match &chosen {
+            None => me["compaction_model"].clone(),
+            Some(_) => Value::Null,
+        };
+        let model = chosen.unwrap_or(own);
+        let (provider, model_name) = model.split_once('/').unwrap_or((model.as_str(), ""));
+        // Its own tools, the very names its gates hold, so every gate it
+        // inherits covers them; a grammar tool reaches a family without
+        // grammars as a function taking its text. Search goes where the
+        // model has none.
+        let tools: Vec<String> = match role.and_then(|role| role.tools) {
+            Some(tools) => tools,
+            None => {
+                let searches = (self.providers.get(provider))
+                    .is_some_and(|p| p.search(model_name) != agent_runtime::provider::Search::None);
+                (me["tools"].as_array().into_iter().flatten())
+                    .filter_map(Value::as_str)
+                    .filter(|tool| *tool != "web_search" || searches)
+                    .map(str::to_owned)
+                    .collect()
+            }
+        };
+        let settings = (self.settings.get())
+            .map(serde_json::to_value)
+            .transpose()?
+            .unwrap_or_else(|| json!({}));
+        Ok(
+            json!({"bot":name,"workspace":workspace,"model":model,"effort":effort,
+            "instructions":instructions,"tools":tools,"settings":settings,
+            "compaction_instructions":me["compaction_instructions"],
+            "compaction_model":compaction_model}),
+        )
     }
 
     /// This bot's project's agents, as a name pattern: those named as it

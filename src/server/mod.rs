@@ -379,6 +379,15 @@ enum Command {
         /// An idempotency key, as on `create`.
         request_id: Option<String>,
     },
+    /// Close a bot, done with: it is listed only when closed bots are
+    /// asked for, its history kept whole, until a turn of its starts. Only
+    /// the mark: a turn it is running runs on unless interrupted, and the
+    /// answer names that turn, read as the mark is made.
+    Close {
+        bot: String,
+        /// The identity `bot` must hold; another is `bot_not_found`.
+        bot_id: Option<i64>,
+    },
     /// Remove an idle bot and everything only it owns.
     Delete {
         bot: String,
@@ -710,6 +719,9 @@ enum Command {
         #[serde(default)]
         active: bool,
         created_by_id: Option<i64>,
+        /// Only bots not closed.
+        #[serde(default)]
+        open: bool,
     },
     /// Stop the daemon. With `grace_ms`, it first drains for up to that
     /// long: nothing starts, and each running turn parks at its next
@@ -885,6 +897,7 @@ impl Command {
             Command::Configure { .. } => "configure",
             Command::Compact { .. } => "compact",
             Command::Fork { .. } => "fork",
+            Command::Close { .. } => "close",
             Command::Delete { .. } => "delete",
             Command::Prune { .. } => "prune",
             Command::Audit { .. } => "audit",
@@ -2038,6 +2051,31 @@ fn key_unset(provider: &str, env: &str) -> Error {
         .facts(json!({"provider": provider, "key": env, "keys_file": file}))
 }
 
+/// The most of the person's models spawn_agent's model parameter names.
+const SPAWN_MODELS_BYTES: usize = 2048;
+
+/// The models in the person's `~/.agent/models`, one line each with the
+/// note they wrote on it, for spawn_agent's model parameter: their own
+/// lines only, as many as fit, none of discovery's catalog. Empty where
+/// they listed none.
+fn spawn_models() -> String {
+    let listed = agent_client::models::path()
+        .and_then(|path| agent_client::models::mine(&path).ok())
+        .unwrap_or_default();
+    let mut said = String::new();
+    for model in &listed {
+        let line = match &model.note {
+            Some(note) => format!("- {}: {note}\n", model.id),
+            None => format!("- {}\n", model.id),
+        };
+        if said.len() + line.len() > SPAWN_MODELS_BYTES {
+            break;
+        }
+        said.push_str(&line);
+    }
+    said.trim_end().to_owned()
+}
+
 pub async fn run(config: Configuration) -> Result<()> {
     // From the start: the replaced daemon's drain began before this one.
     let owner_until = (config.await_owner)
@@ -2047,7 +2085,12 @@ pub async fn run(config: Configuration) -> Result<()> {
     let stall_timeout = config
         .stall_timeout
         .map_or(agent_runtime::provider::STALL_TIMEOUT, Duration::from_secs);
-    let registry = Registry::all()?;
+    // The person's models, which spawn_agent names: read off the runtime
+    // thread, as files are.
+    let models = tokio::task::spawn_blocking(spawn_models)
+        .await
+        .unwrap_or_default();
+    let registry = Registry::all()?.with_spawn_models(&models);
     let mut providers = HashMap::new();
     let aws_start = agent_runtime::provider::aws::Start::new();
     let credentials = agent_runtime::tools::Credentials::default();
@@ -3147,12 +3190,10 @@ fn own_requests(
                     if line["id"] != 1 {
                         continue;
                     }
-                    let Some(code) = line["error"].as_str() else {
-                        return Ok(line["result"].take());
+                    return match Error::reported(&line) {
+                        Some(error) => Err(error),
+                        None => Ok(line["result"].take()),
                     };
-                    let mut error = Error::new(code);
-                    error.detail = line["detail"].as_str().map(str::to_owned);
-                    return Err(error);
                 }
                 Err(gone())
             }
@@ -3413,6 +3454,7 @@ impl Service {
                 }
             }
             Command::Delete { bot, .. }
+            | Command::Close { bot, .. }
             | Command::Prune { bot, .. }
             | Command::Compact { bot, .. }
             | Command::Interrupt { bot, .. }
@@ -5089,6 +5131,24 @@ impl Service {
                     .await
                 })
             }
+            Command::Close { bot, bot_id } => {
+                let at = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_or(0, |d| d.as_millis() as i64);
+                let name = bot.clone();
+                let (before, running) = store
+                    .op("close", move |db| {
+                        if bot_id.is_some() {
+                            db.identity(&name, bot_id)?;
+                        }
+                        db.close(&name, at)
+                    })
+                    .await?;
+                Ok(
+                    json!({"bot":bot,"was_open":before.is_none(),"closed_ms":before.unwrap_or(at),
+                    "running_turn":running}),
+                )
+            }
             Command::Delete { bot, bot_id } => {
                 if let Some(id) = bot_id {
                     let name = bot.clone();
@@ -6114,6 +6174,7 @@ impl Service {
                 name,
                 active,
                 created_by_id,
+                open,
             } => {
                 let reader = store.reader();
                 self.observe(session, output, id, async move {
@@ -6124,6 +6185,7 @@ impl Service {
                             name.as_deref(),
                             active,
                             created_by_id,
+                            open,
                         )
                     }))
                     .await
