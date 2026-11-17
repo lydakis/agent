@@ -1477,10 +1477,16 @@ async fn a_terminal_takes_typed_input_and_reports_its_end() {
         json!({"command":"cat","tty":true,"timeout_ms":5}),
         json!({"command":"cat","tty":true,"sandbox_permissions":"require_escalated"}),
         json!({"command":"cat","yield_time_ms":5}),
+        // Codex's reusable prefix rides only on a request to escalate.
+        json!({"command":"git pull","prefix_rule":["git","pull"]}),
+        json!({"command":"git pull","sandbox_permissions":"use_default","prefix_rule":["git"]}),
     ] {
         let error = tools.prepare("shell", &args.to_string()).err().unwrap();
         assert_eq!(error.code, "invalid_shell_arguments", "{args}");
     }
+    let escalated = json!({"command":"git pull","sandbox_permissions":"require_escalated",
+        "justification":"Do you want to pull?","prefix_rule":["git","pull"]});
+    assert!(tools.prepare("shell", &escalated.to_string()).is_ok());
     for args in [
         json!({"handle":"turn:a/1"}),
         json!({"handle":"proc:01"}),
