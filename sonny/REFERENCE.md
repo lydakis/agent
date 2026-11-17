@@ -415,7 +415,7 @@ while the Rex lead opens its tasks' tabs as before. With every window closed, th
 project whose lead is in no multiplexer gets none, and its agents get no
 layout skill. A tab asked for stays until you or an agent close it, or the
 task is marked done; one opened only because the task needed you closes once
-its work is taken, unless you went to it since. With `task_tabs = "every"`, a task's window
+its work is taken, unless you went to it or typed in it since. With `task_tabs = "every"`, a task's window
 closes once its work is taken: its turn completed and the lead (or the task
 that started it) waited on it. One that failed, was interrupted or waits on you stays
 open, and a task given more work opens again; ask the lead to show one, or
