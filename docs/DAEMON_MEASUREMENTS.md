@@ -10662,3 +10662,63 @@ Every daemon measure is within 3.4% of the base, or better, and the gate
 passed. The screen's Sonny rows moved both ways (lookout CPU per 1k deltas
 +25% at 10x1, -4.9% at 100x10; quiet window CPU -27%) on code this change
 does not touch, which is run-to-run noise.
+
+## Release 0.10.1 against 0.10.0
+
+Every change since 0.10.0 measured together: v0.10.0 (45825a3) against the
+release tree, which is main with steers that join (#1132) merged in. This is
+the Perf workflow's screen (admission and completion bursts, footprint,
+lifecycle at 32 agents, and Sonny's screen), run locally on Linux 6.18 with
+4 cores and Rust 1.100.0, base and head alternating, two rounds each.
+
+The screen ran twice. The first run was against main at 17cf1e2, before
+#1130, #1132 and #1133. The second was against the release tree.
+
+| Bench | Measure | 0.10.0 | 0.10.1 (1st) | 0.10.1 (2nd) |
+| --- | --- | ---: | ---: | ---: |
+| admission | lone submit CPU, ms | 34.7 / 38.8 | 36.0 (+3.9%) | 41.5 (+6.9%) |
+| admission | burst submit p99, ms | 4.17 / 4.88 | 4.42 (+5.9%) | 4.77 (-2.3%) |
+| completion | release to terminal p99, ms | 10.7 / 11.0 | 11.2 (+4.7%) | 12.4 (+12.4%) |
+| footprint | idle RSS, MiB | 16.7 / 16.8 | 17.0 (+1.5%) | 17.2 (+2.5%) |
+| footprint | per idle bot, KiB | 2.04 / 2.10 | 1.82 (-10.5%) | 1.93 (-8.1%) |
+| footprint | RSS after a turn each, MiB | 31.3 / 33.9 | 32.0 (+2.4%) | 38.2 (+12.8%) |
+| footprint | CPU per turn, ms | 0.83 / 0.96 | 0.89 (+7.4%) | 1.01 (+4.3%) |
+| lifecycle | CPU, s | 0.56 / 0.63 | 0.57 (+1.8%) | 0.64 (+1.6%) |
+| lifecycle | p95 turn, ms | 580 / 587 | 584 (+0.7%) | 587 (+0.1%) |
+| lifecycle | peak RSS, MiB | 25.5 / 25.5 | 26.0 (+2.2%) | 26.3 (+3.1%) |
+| sonny | quiet window CPU, ms/s | 1.36 / 1.57 | 1.16 (-14.8%) | 1.52 (-3.2%) |
+| sonny | quiet window peak RSS, MiB | 25.2 / 25.3 | 31.6 (+25.4%) | 31.4 (+24.2%) |
+| sonny | sky replay CPU per 1k lines, ms | 11.5 / 12.4 | 12.1 (+5.0%) | 12.0 (-3.6%) |
+| sonny | sky replay RSS, MiB | 81.8 / 89.8 | 85.9 (+5.1%) | 76.7 (-14.6%) |
+| sonny | lookout note p95 at 100x10, ms | 2405 / 2414 | 2318 (-3.6%) | 2291 (-5.1%) |
+
+The 0.10.0 column gives that run's base for each run, and each change is
+against its own run's base.
+
+What the daemon rows say:
+
+- **The daemon holds even.** Every daemon row's per-run values overlap
+  between 0.10.0 and 0.10.1. Two examples from the second run:
+  - Completion p99 ran 9.8 to 16.0 ms on 0.10.0 and 9.7 to 17.1 ms on 0.10.1.
+  - RSS after a turn each ran 30.4 to 40.6 MiB on 0.10.0 and 32.8 to 44.9 MiB
+    on 0.10.1. That row is the allocator's high-water mark, which #1124 also
+    found wide.
+- **No row moves the same way past the noise in both runs.** Store work per
+  turn is unchanged at 6.0 jobs.
+- **Idle bots cost less.** An idle bot costs about 8 to 10% less memory in
+  both runs.
+
+What the Sonny rows say:
+
+- **A quiet window's peak memory is 6 MiB higher, once per store.** It went
+  from 25 to 31 MiB in both runs. Bisecting put the change at #1119:
+  - The window now runs the two one-time migrations that need a whole
+    listing of the agents (`upgrade::from_listing`), which the lookout ran
+    before.
+  - The screen's store is new, so the window lists all 1,000 agents once.
+  - The same tree with that one call left out measured 25.6 and 25.7 MiB.
+  - Each migration records itself as done, so a store already upgraded by
+    0.10.0's lookout pays nothing.
+- **Lookout CPU at 10x1** read 37.5 against 50 ms per 1,000 deltas in the
+  second run (equal in the first). That is 30 against 40 ms in total, one
+  10 ms clock tick of the process's CPU time.
