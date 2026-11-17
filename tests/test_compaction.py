@@ -53,40 +53,6 @@ class AnthropicCompactionTests(ModelFixture):
         self.assertIsNotNone(client.request('inspect', bot='Bob')['result']['compaction'])
         self.assertFalse(any(m.get('event') == 'compaction_failed' for m in client.saved))
 
-    def test_a_refusal_over_the_window_summarizes_and_sends_again_once(self):
-        # The daemon's estimate lets the view through; the provider counts
-        # more than its window and refuses. As Pi: summarize, send again.
-        client = Client(self.binary, self.path / 'state.sqlite', self.url,
-                        tools='echo,shell', provider='anthropic', family='anthropic',
-                        model='synthetic-claude', key_env='ANTHROPIC_TEST_KEY',
-                        env={**clean_env(), 'ANTHROPIC_TEST_KEY': 'synthetic-anthropic-key'},
-                        settings={'context_bytes': 65536})
-        self.addCleanup(client.close)
-        self.assertIn('result', client.request('create', bot='Bob', workspace=str(self.path),
-                                               compaction_instructions='Summarize.'))
-        for n in range(3):
-            turn = client.request('submit', bot='Bob', request_id=str(n), prompt=f'{n}:' + 'x' * 500)['result']['message']
-            self.assertEqual(client.finished(turn)['data']['status'], 'completed')
-        while not self.model.requests.empty():
-            self.model.requests.get()
-        self.model.unreadable_any = True
-        self.model.unreadable_error = (400, 'prompt is too long: 300000 tokens > 200000 maximum')
-        self.model.unreadable_failures = 2
-        turn = client.request('submit', bot='Bob', request_id='3', prompt='next')['result']['message']
-        self.assertEqual(client.finished(turn)['data']['status'], 'completed')
-        requests = []
-        while not self.model.requests.empty():
-            requests.append(self.model.requests.get())
-        # Its replayed thinking goes first, as after any 400; refused again,
-        # it is summarized and sent once more.
-        self.assertEqual([is_summary(r) for r in requests], [False, False, True, False])
-        self.assertIsNotNone(client.request('inspect', bot='Bob')['result']['compaction'])
-        # Refused again after its summary, the turn fails with the refusal.
-        self.model.unreadable_failures = None
-        turn = client.request('submit', bot='Bob', request_id='4', prompt='again')['result']['message']
-        finished = client.finished(turn)['data']
-        self.assertEqual((finished['status'], finished['error']), ('failed', 'provider_http_400'))
-
     def refusing_client(self, **create):
         """A bot whose summaries the classifier declines on its own model."""
         self.model.refuse_summaries = {'synthetic-claude'}

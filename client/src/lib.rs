@@ -119,36 +119,9 @@ pub fn default_tools(
     tools
 }
 
-/// Whether `text` shows nothing: only whitespace, or characters that
-/// draw nothing (zero-width spaces and joiners, word joiners, direction
-/// marks, a byte order mark, a soft hyphen, fillers). Anthropic refuses
-/// a request holding a text block of only whitespace, and models asked
-/// for an empty reply often answer with one zero-width space, so such a
-/// block is no text at all.
-pub fn blank(text: &str) -> bool {
-    text.chars().all(|c| {
-        c.is_whitespace()
-            || matches!(
-                c,
-                '\u{00AD}'
-                    | '\u{034F}'
-                    | '\u{115F}'
-                    | '\u{1160}'
-                    | '\u{180E}'
-                    | '\u{200B}'..='\u{200F}'
-                    | '\u{202A}'..='\u{202E}'
-                    | '\u{2060}'..='\u{2064}'
-                    | '\u{2066}'..='\u{2069}'
-                    | '\u{3164}'
-                    | '\u{FEFF}'
-                    | '\u{FFA0}'
-            )
-    })
-}
-
 /// The socket protocol's version in `ready`. The daemon and its clients ship
 /// together, so a client refuses a daemon of any other version.
-pub const PROTOCOL: u64 = 86;
+pub const PROTOCOL: u64 = 85;
 static PROGRAM: std::sync::OnceLock<&'static str> = std::sync::OnceLock::new();
 /// Name this process's connections as `program` (such as `window` or
 /// `reviewer`): each later [`Client::connect`] says it in its first line,

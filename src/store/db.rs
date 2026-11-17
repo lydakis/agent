@@ -7756,13 +7756,10 @@ impl Database {
             )
             .optional()?;
         if let Some((turn, mut saved, status, saved_options, node, saved_images, opened)) = prior {
-            // Words of 4 KiB or more live only in the node they became,
-            // blank ones there as the placeholder Anthropic is sent.
-            let mut placed = false;
+            // Words of 4 KiB or more live only in the node they became.
             if saved.is_empty()
                 && let Some(node) = node
             {
-                placed = true;
                 saved = self.conn.prepare_cached(
                     "SELECT json_extract(CAST(COALESCE((SELECT item FROM declined WHERE node=?1),item) AS TEXT),
                         '$.content[0].text') FROM nodes WHERE id=?1"
@@ -7800,11 +7797,7 @@ impl Database {
             } = &saved_options;
             let images = saved_images.map(|kept| pictures_digest(&kept));
             let differs = [
-                (
-                    "prompt",
-                    saved != prompt
-                        && !(placed && saved == crate::codec::EMPTY && crate::codec::blank(prompt)),
-                ),
+                ("prompt", saved != prompt),
                 ("workspace", *workspace != same.workspace),
                 ("model", *model != same.model),
                 ("effort", *effort != same.effort),
@@ -8857,113 +8850,6 @@ impl Database {
     }
     /// What the bot's last call sent, in bytes, and the input tokens the
     /// provider counted for it.
-    /// Take the text blocks that show nothing ([`crate::codec::blank`])
-    /// out of the Anthropic items among `nodes`, which Messages refuses in
-    /// any request. A node keeps its size, padded with JSON whitespace,
-    /// so no total along the history moves; one left with nothing reads
-    /// `<empty>`. Each node repaired and the blank text it held.
-    pub fn repair_blank(&mut self, nodes: &[i64]) -> Result<Vec<Value>> {
-        let mut repaired = Vec::new();
-        for &node in nodes {
-            let read: Option<(Vec<u8>, i64, Option<Vec<u8>>)> = self
-                .conn
-                .prepare_cached(
-                    "SELECT n.item,n.thinking,s.item FROM nodes n
-                     LEFT JOIN stubs s ON s.node=n.id WHERE n.id=?",
-                )?
-                .query_row([node], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
-                .optional()?;
-            let Some((item, was, stub)) = read else {
-                continue;
-            };
-            let fixed = unblanked(&item);
-            let stub_fixed = stub.as_deref().and_then(unblanked);
-            if fixed.is_none() && stub_fixed.is_none() {
-                continue;
-            }
-            // A stub quotes its node, so what it held blank the node held.
-            let (fixed, removed) = match fixed {
-                Some(fixed) => fixed,
-                None => (
-                    item.clone(),
-                    stub_fixed
-                        .as_ref()
-                        .map(|(_, r)| r.clone())
-                        .unwrap_or_default(),
-                ),
-            };
-            // What a request without thinking sends of it changes with it:
-            // its thinking bytes, and every later node's running total.
-            // A prompt grown by its placeholder grows every later total.
-            // One sent as its stub saves what it grew less what its stub
-            // grew, so what is sent of it, and every elision version past
-            // it, stays true.
-            let thinking = super::thinking_bytes(&fixed) as i64;
-            let grown = fixed.len() as i64 - item.len() as i64;
-            let saves = match (&stub, &stub_fixed) {
-                (Some(stub), Some((repaired, _))) => {
-                    grown - (repaired.len() as i64 - stub.len() as i64)
-                }
-                (Some(_), None) => grown,
-                (None, _) => 0,
-            };
-            let tx = self.conn.transaction()?;
-            tx.prepare_cached("UPDATE nodes SET item=?,thinking=?,elided=elided+? WHERE id=?")?
-                .execute(params![fixed, thinking, saves, node])?;
-            if let Some((repaired, _)) = &stub_fixed {
-                tx.prepare_cached("UPDATE stubs SET item=? WHERE node=?")?
-                    .execute(params![repaired, node])?;
-            }
-            if thinking != was || grown != 0 || saves != 0 {
-                tx.prepare_cached(
-                    "WITH RECURSIVE chain(id) AS (
-                        SELECT ?1 UNION ALL SELECT n.id FROM nodes n JOIN chain c ON n.parent=c.id)
-                     UPDATE nodes SET total_thinking=total_thinking+?2,
-                        total_bytes=total_bytes+?3,total_elided=total_elided+?4
-                     WHERE id IN (SELECT id FROM chain)",
-                )?
-                .execute(params![node, thinking - was, grown, saves])?;
-            }
-            if saves != 0 {
-                tx.prepare_cached(
-                    // A version is made at a head at or below its floor,
-                    // so one whose floor is below the node is found by its
-                    // own node.
-                    "WITH RECURSIVE chain(id) AS (
-                        SELECT ?1 UNION ALL SELECT n.id FROM nodes n JOIN chain c ON n.parent=c.id)
-                     UPDATE elisions SET saved=saved+?2
-                     WHERE node IN (SELECT id FROM chain) AND through IN (SELECT id FROM chain)",
-                )?
-                .execute(params![node, saves])?;
-            }
-            tx.commit()?;
-            repaired.push(json!({"node": node, "removed": removed}));
-        }
-        Ok(repaired)
-    }
-    /// The nodes of `name`'s history, newest first, when it speaks
-    /// Anthropic; none for a Responses bot, whose provider takes blank text.
-    pub fn anthropic_history(&self, name: &str) -> Result<Vec<i64>> {
-        let (head, family): (Option<i64>, String) = self
-            .conn
-            .prepare_cached("SELECT head,family FROM bots WHERE name=?")?
-            .query_row([name], |r| Ok((r.get(0)?, r.get(1)?)))
-            .optional()?
-            .ok_or(Error::new("bot_not_found"))?;
-        if Family::parse(&family) != Some(Family::Anthropic) {
-            return Ok(Vec::new());
-        }
-        let mut statement = self.conn.prepare_cached(
-            "WITH RECURSIVE chain(id,parent) AS (
-                SELECT id,parent FROM nodes WHERE id=?1
-                UNION ALL SELECT n.id,n.parent FROM nodes n JOIN chain c ON n.id=c.parent)
-             SELECT id FROM chain",
-        )?;
-        let ids = statement
-            .query_map([head], |r| r.get(0))?
-            .collect::<rusqlite::Result<Vec<i64>>>()?;
-        Ok(ids)
-    }
     pub fn record_sent(&mut self, name: &str, bytes: u64, tokens: u64) -> Result<()> {
         self.conn
             .prepare_cached("UPDATE bots SET sent_bytes=?,sent_tokens=? WHERE name=?")?
@@ -20408,67 +20294,6 @@ impl Pictured {
         })
     }
 }
-/// `item` without the text blocks that show nothing, in its content and
-/// in its tool results' content, and the text each held; `None` when it
-/// has none. It keeps its size, padded with JSON whitespace after its
-/// opening brace; content left with nothing is the text `<empty>`, which
-/// Messages takes as a string and is shorter than any block it replaces.
-fn unblanked(item: &[u8]) -> Option<(Vec<u8>, Vec<String>)> {
-    use crate::codec::{EMPTY, blank_text};
-    // Only an item holding a text block can hold a blank one.
-    const TEXT: &[u8] = br#""type":"text"}"#;
-    if !item.windows(TEXT.len()).any(|w| w == TEXT) {
-        return None;
-    }
-    let mut value: Value = serde_json::from_slice(item).ok()?;
-    let mut removed = Vec::new();
-    let mut take = |parts: &mut Vec<Value>| {
-        parts.retain(|part| {
-            let blank = blank_text(part);
-            if blank {
-                removed.push(part["text"].as_str().unwrap_or_default().to_owned());
-            }
-            !blank
-        })
-    };
-    let content = value.get_mut("content")?.as_array_mut()?;
-    for part in content.iter_mut() {
-        if part["type"] == "tool_result"
-            && let Some(parts) = part.get_mut("content").and_then(Value::as_array_mut)
-        {
-            take(parts);
-            if parts.is_empty() {
-                part["content"] = json!(EMPTY);
-            }
-        }
-    }
-    // A prompt's parts keep their places, where its quotes find theirs:
-    // a blank one reads `<empty>` there, as a new prompt's does.
-    let user = value["role"] == "user";
-    let content = value.get_mut("content")?.as_array_mut()?;
-    match user {
-        true => {
-            for part in content.iter_mut().filter(|part| blank_text(part)) {
-                removed.push(part["text"].as_str().unwrap_or_default().to_owned());
-                part["text"] = json!(EMPTY);
-            }
-        }
-        false => take(content),
-    }
-    if removed.is_empty() {
-        return None;
-    }
-    if content.is_empty() {
-        value["content"] = json!(EMPTY);
-    }
-    let mut fixed = serde_json::to_vec(&value).ok()?;
-    // As long as it was where it can be: what it lost is at least a block,
-    // and serde writes it as it was written. A placeholder can make a
-    // prompt longer.
-    let pad = item.len().saturating_sub(fixed.len());
-    fixed.splice(1..1, std::iter::repeat_n(b' ', pad));
-    Some((fixed, removed))
-}
 /// A prompt's user item, its pictures, and, when it has any, the stub it
 /// goes as below the elision floor.
 fn prompt_item(
@@ -20795,167 +20620,6 @@ impl Database {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn a_repair_takes_blank_text_out_and_keeps_every_total() {
-        let mut db = Database::initialize(Connection::open_in_memory().unwrap()).unwrap();
-        let items: [&[u8]; 7] = [
-            // A reply of one zero-width space: content left with nothing.
-            br#"{"content":[{"text":"\u200b","type":"text"}],"role":"assistant"}"#,
-            // Blank text beside a call: the call stays.
-            br#"{"content":[{"text":"\n\n","type":"text"},{"id":"t1","input":{},"name":"shell","type":"tool_use"}],"role":"assistant"}"#,
-            // A result whose only part is blank.
-            br#"{"content":[{"content":[{"text":" ","type":"text"}],"tool_use_id":"t1","type":"tool_result"}],"role":"user"}"#,
-            // Words: nothing to take.
-            br#"{"content":[{"text":"done","type":"text"}],"role":"assistant"}"#,
-            // Blank text beside thinking: thinking is all it keeps.
-            br#"{"content":[{"signature":"s","thinking":"","type":"thinking"},{"text":"\u200b","type":"text"}],"role":"assistant"}"#,
-            // A blank prompt that quotes: its quotes stay in their places.
-            br#"{"content":[{"text":"","type":"text"},{"text":"quoted","type":"text"},{"text":" ","type":"text"}],"role":"user"}"#,
-            // After it, words.
-            br#"{"content":[{"text":"next","type":"text"}],"role":"user"}"#,
-        ];
-        let (mut total, mut thought, mut saved) = (0, 0, 0);
-        for (id, item) in (1..).zip(items) {
-            total += item.len() as i64;
-            let thinking = super::super::thinking_bytes(item) as i64;
-            thought += thinking;
-            // The quoting prompt goes as a stub 10 bytes shorter.
-            let elided = if id == 6 { 10 } else { 0 };
-            saved += elided;
-            db.connection()
-                .execute(
-                    "INSERT INTO nodes(id,parent,item,total_bytes,depth,thinking,total_thinking,
-                        elided,total_elided)
-                     VALUES(?,?,?,?,?,?,?,?,?)",
-                    params![
-                        id,
-                        (id > 1).then_some(id - 1),
-                        item,
-                        total,
-                        id,
-                        thinking,
-                        thought,
-                        elided,
-                        saved
-                    ],
-                )
-                .unwrap();
-        }
-        db.connection()
-            .execute(
-                "INSERT INTO elisions(node,previous,through,saved) VALUES(7,NULL,7,10)",
-                [],
-            )
-            .unwrap();
-        // Its stub quotes its blank quote as well.
-        let stub = br#"{"content":[{"text":"\n[1 picture(s) sent with this message, elided from this request]","type":"text"},{"text":"quoted","type":"text"},{"text":" ","type":"text"}],"role":"user"}"#;
-        db.connection()
-            .execute("INSERT INTO stubs(node,item) VALUES(6,?)", [&stub[..]])
-            .unwrap();
-        // What goes when elided, before the repair.
-        let sent = |db: &Database| -> Vec<i64> {
-            (1..=7)
-                .map(|id| {
-                    db.conn
-                        .query_row(
-                            "SELECT total_bytes-total_elided FROM nodes WHERE id=?",
-                            [id],
-                            |r| r.get(0),
-                        )
-                        .unwrap()
-                })
-                .collect()
-        };
-        let before = sent(&db);
-        let all = [1, 2, 3, 4, 5, 6, 7];
-        let repaired = db.repair_blank(&all).unwrap();
-        assert_eq!(
-            repaired,
-            [
-                json!({"node":1,"removed":["\u{200b}"]}),
-                json!({"node":2,"removed":["\n\n"]}),
-                json!({"node":3,"removed":[" "]}),
-                json!({"node":5,"removed":["\u{200b}"]}),
-                json!({"node":6,"removed":["", " "]}),
-            ]
-        );
-        // Each node's thinking bytes are what it loses without thinking now,
-        // and the running totals add them and the items' sizes up.
-        let (mut thought, mut size) = (0, 0);
-        for id in all {
-            let (item, thinking, total, bytes): (Vec<u8>, i64, i64, i64) = db
-                .conn
-                .query_row(
-                    "SELECT item,thinking,total_thinking,total_bytes FROM nodes WHERE id=?",
-                    [id],
-                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
-                )
-                .unwrap();
-            size += item.len() as i64;
-            assert_eq!(bytes, size, "node {id}");
-            assert_eq!(
-                thinking,
-                super::super::thinking_bytes(&item) as i64,
-                "node {id}"
-            );
-            thought += thinking;
-            assert_eq!(total, thought, "node {id}");
-        }
-        let item = |id: i64| -> Vec<u8> {
-            db.conn
-                .query_row("SELECT item FROM nodes WHERE id=?", [id], |r| r.get(0))
-                .unwrap()
-        };
-        for (id, was) in (1..).zip(items) {
-            let now = item(id);
-            // Only the placeholder makes one longer.
-            if id != 6 {
-                assert_eq!(now.len(), was.len(), "node {id} keeps its size");
-            }
-            let value: Value = serde_json::from_slice(&now).unwrap();
-            let text = String::from_utf8_lossy(&now);
-            assert!(!text.contains(r"\u200b") && !text.contains('\u{200b}'));
-            match id {
-                1 => assert_eq!(value["content"], "<empty>"),
-                2 => assert_eq!(value["content"][0]["type"], "tool_use"),
-                3 => assert_eq!(value["content"][0]["content"], "<empty>"),
-                5 => assert_eq!(value["content"][0]["type"], "thinking"),
-                6 => assert_eq!(
-                    value["content"],
-                    json!([
-                        {"text": "<empty>", "type": "text"},
-                        {"text": "quoted", "type": "text"},
-                        {"text": "<empty>", "type": "text"}
-                    ])
-                ),
-                _ => assert_eq!(now, was),
-            }
-        }
-        // The stub reads `<empty>` in its quote's place too, and grows by
-        // it: what goes elided grows by as much from node 6 on, and the
-        // elision version past it saves what the prompt grew past that.
-        let repaired: Vec<u8> = db
-            .conn
-            .query_row("SELECT item FROM stubs WHERE node=6", [], |r| r.get(0))
-            .unwrap();
-        let value: Value = serde_json::from_slice(&repaired).unwrap();
-        assert_eq!(value["content"][2]["text"], "<empty>");
-        let stub_grew = repaired.len() as i64 - stub.len() as i64;
-        assert_eq!(stub_grew, "<empty>".len() as i64 - 1);
-        let after: Vec<i64> = (before.iter().zip(1..))
-            .map(|(&was, id)| if id >= 6 { was + stub_grew } else { was })
-            .collect();
-        assert_eq!(sent(&db), after);
-        let version: i64 = db
-            .conn
-            .query_row("SELECT saved FROM elisions WHERE node=7", [], |r| r.get(0))
-            .unwrap();
-        let grew = "<empty>".len() as i64 + "<empty>".len() as i64 - 1;
-        assert_eq!(version, 10 + grew - stub_grew);
-        // Repaired once, nothing is left to take.
-        assert!(db.repair_blank(&all).unwrap().is_empty());
-    }
 
     #[test]
     fn one_bots_approvals_read_only_its_own_running_commands() {

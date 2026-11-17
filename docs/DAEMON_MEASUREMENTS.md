@@ -10619,36 +10619,3 @@ A yield is one commit, and a yielded call that waits holds nothing a
 reader can measure beside one that was answered. The reply times are a
 burst's: 10,000 yields queue behind each other and behind the 10,000
 turns they start again; a script yields once every 30 s at most.
-
-## Blank text and a body held to its length (#1128)
-
-Three changes reach the hot path. An Anthropic reply's finish checks each
-text block for text that shows nothing, a prompt's or tool result's parts
-are checked as they are encoded, and a request body counts the bytes its
-items yield against its Content-Length (one addition per chunk) so a
-history changed under it ends as `history_changed`. The 16 MiB bound moves
-from a whole response to each event, a comparison per event as before.
-Nothing is stored per turn that was not before, and store jobs a turn are
-unchanged: the Perf workflow fails the check when they rise.
-
-CI's matched screen (`perf` workflow, run 44027295710, base main against
-head 76facc5, GitHub's Linux runner, 2026-11-17), the daemon rows:
-
-| Bench | Measure | Base | Head | Change |
-| --- | --- | ---: | ---: | ---: |
-| admission | lone submit CPU, ms | 35.503 | 35.776 | +0.8% |
-| admission | burst submit p99, ms | 4.418 | 4.445 | +0.6% |
-| completion | release to terminal p99, ms | 11.764 | 11.624 | -1.2% |
-| footprint | idle RSS, MiB | 16.928 | 17.107 | +1.1% |
-| footprint | per idle bot, KiB | 1.934 | 1.676 | -13.3% |
-| footprint | RSS after a turn each, MiB | 41.354 | 42.637 | +3.1% |
-| footprint | CPU per turn, ms | 1.041 | 1.05 | +0.8% |
-| lifecycle | CPU, s | 0.565 | 0.56 | -0.9% |
-| lifecycle | p95 turn, ms | 577.523 | 578.309 | +0.1% |
-| lifecycle | peak RSS, MiB | 25.441 | 25.867 | +1.7% |
-
-Every row is within what one run against another moves on that runner
-(the footprint rows move by as much between base runs of other pull
-requests). The Sonny rows of the same screen move by at most 4%, the sky
-replay's RSS the most, and Sonny's change here only filters a reply that
-shows nothing.

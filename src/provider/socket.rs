@@ -4,7 +4,7 @@
 //! `previous_response_id`. The store stays the only history: the cached
 //! response is an optimization the runtime may lose at any time, and every
 //! call that is not an exact extension sends the full input.
-use super::{Delta, Frame, MAX_EVENT, responses};
+use super::{Delta, Frame, MAX_RESPONSE, responses};
 use crate::{Error, Result};
 use futures_util::{SinkExt, StreamExt};
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
@@ -225,8 +225,8 @@ impl Sockets {
                 io,
                 Some(
                     WebSocketConfig::default()
-                        .max_message_size(Some(MAX_EVENT))
-                        .max_frame_size(Some(MAX_EVENT)),
+                        .max_message_size(Some(MAX_RESPONSE))
+                        .max_frame_size(Some(MAX_RESPONSE)),
                 ),
             ),
         )
@@ -330,6 +330,7 @@ impl Session {
         }
         let deadline = tokio::time::sleep(stall);
         tokio::pin!(deadline);
+        let mut total = 0usize;
         while !parser.done() {
             let message = tokio::select! {
                 message = self.socket.next() => message,
@@ -350,6 +351,10 @@ impl Session {
                     return Err(Failure::transport(Error::new("provider_stream_failed")));
                 }
             };
+            total += text.len();
+            if total > MAX_RESPONSE {
+                return Err(Failure::transport(Error::new("provider_response_limit")));
+            }
             match parser.frame(text.as_bytes()) {
                 Ok(Frame::Delta(part)) => delta(part).await.map_err(Failure::call)?,
                 Ok(Frame::Quiet | Frame::Keepalive) => {}

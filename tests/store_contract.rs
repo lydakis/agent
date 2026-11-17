@@ -13409,19 +13409,6 @@ fn fork_prompt_views_survive_source_deletion_and_reopen() {
                 db.append(turn, vec![item], &[], None).unwrap();
                 db.finish(turn, None).unwrap();
             }
-            // The blank prompt sent again is the same request, though a
-            // Claude bot's item holds the placeholder in its place.
-            let again = db
-                .begin(
-                    "Bob",
-                    "2",
-                    "",
-                    true,
-                    &TurnOptions::default(),
-                    allow_provider,
-                )
-                .unwrap();
-            assert!(!again.fresh);
             let plan = compaction_plan(&db, "Bob", 1, 4096, 256).unwrap().unwrap();
             assert_eq!(plan.covered, (1, 3));
             expected = prompts[..3]
@@ -13486,12 +13473,7 @@ fn fork_prompt_views_survive_source_deletion_and_reopen() {
                 serde_json::from_slice(&[b"[", &raw[..], b"]"].concat()).unwrap();
             assert_eq!(items.len(), 6);
             for (item, prompt) in items.iter().step_by(2).zip(prompts) {
-                // Anthropic refuses blank text: blank words read `<empty>`.
-                let words = match family {
-                    Family::Anthropic if prompt.is_empty() => agent_runtime::codec::EMPTY,
-                    _ => prompt,
-                };
-                assert_eq!(item["content"][0]["text"], words);
+                assert_eq!(item["content"][0]["text"], prompt);
             }
         }
         std::fs::remove_file(path).unwrap();

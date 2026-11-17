@@ -190,14 +190,8 @@ impl Family {
             Family::Responses => json!({"type":"input_text","text":text}),
             Family::Anthropic => json!({"type":"text","text":text}),
         };
-        // Anthropic refuses a blank part: blank words read `<empty>`
-        // there, each part kept in its place, where quotes find theirs.
-        let words = |text: &str| match self {
-            Family::Anthropic if blank(text) => EMPTY.to_owned(),
-            _ => text.to_owned(),
-        };
-        let mut content = vec![part(&words(text))];
-        content.extend(after.iter().map(|text| part(&words(text))));
+        let mut content = vec![part(text)];
+        content.extend(after.iter().map(|text| part(text)));
         content.extend(images.iter().map(|image| self.image(image)));
         Ok(serde_json::to_vec(
             &json!({"role":"user","content":content}),
@@ -224,14 +218,12 @@ impl Family {
             [] => json!(output),
             _ => Value::Array(
                 // Words before the first picture lead, when there are any.
-                // A blank part is left out, as Anthropic refuses one.
-                (!blank(output))
+                (!output.is_empty())
                     .then(|| text(output))
                     .into_iter()
-                    .chain(parts.iter().filter_map(|part| match part {
-                        Part::Text { text: words } if blank(words) => None,
-                        Part::Text { text: words } => Some(text(words)),
-                        Part::Image(image) => Some(self.image(image)),
+                    .chain(parts.iter().map(|part| match part {
+                        Part::Text { text: words } => text(words),
+                        Part::Image(image) => self.image(image),
                     }))
                     .collect(),
             ),
@@ -300,22 +292,6 @@ impl Family {
             .collect();
         Value::Array(encoded)
     }
-}
-
-/// What blank words of a prompt read as: Anthropic refuses a blank text
-/// block, and a prompt's item keeps its words first.
-pub const EMPTY: &str = "<empty>";
-
-/// Whether text shows nothing, the rule clients share: see
-/// [`agent_client::blank`].
-pub use agent_client::blank;
-
-/// Whether an item part is a text block that shows nothing ([`blank`]).
-pub fn blank_text(part: &Value) -> bool {
-    matches!(
-        part["type"].as_str(),
-        Some("text" | "input_text" | "output_text")
-    ) && part["text"].as_str().is_some_and(blank)
 }
 
 /// Split `provider/model-id` at the first slash. Model IDs may contain slashes.
@@ -631,39 +607,6 @@ mod tests {
         assert!(split_model("/model").is_err());
         assert!(split_model("bad name/model").is_err());
     }
-    #[test]
-    fn a_blank_part_reads_empty_for_claude_in_its_place() {
-        let after = ["  ".to_owned(), "quoted".to_owned()];
-        let item = |family: Family| -> Value {
-            serde_json::from_slice(&family.user_item_from("\u{200b}", &after, &[]).unwrap())
-                .unwrap()
-        };
-        let texts = |item: Value| -> Vec<String> {
-            (item["content"].as_array().unwrap().iter())
-                .map(|part| part["text"].as_str().unwrap().to_owned())
-                .collect()
-        };
-        assert_eq!(texts(item(Family::Anthropic)), [EMPTY, EMPTY, "quoted"]);
-        assert_eq!(texts(item(Family::Responses)), ["\u{200b}", "  ", "quoted"]);
-    }
-
-    #[test]
-    fn text_of_only_whitespace_or_invisible_characters_is_blank() {
-        for text in [
-            "",
-            " ",
-            "\n\n",
-            "\u{200B}",
-            "\u{FEFF}",
-            " \u{200D}\u{2060}\t",
-        ] {
-            assert!(blank(text), "{text:?}");
-        }
-        for text in ["a", " .", "\u{200B}x", "\u{1F600}"] {
-            assert!(!blank(text), "{text:?}");
-        }
-    }
-
     #[test]
     fn families_encode_the_same_facts_differently() {
         let responses: Value = serde_json::from_slice(

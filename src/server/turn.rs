@@ -3206,9 +3206,6 @@ impl Turn {
         // Replies in a row the model's own output cap cut short, kept on
         // the turn so a park or a restart counts on.
         let mut drops = context.drops;
-        // Whether the provider refused a call's view as over its window
-        // and the view was summarized for it: once a run of the rounds.
-        let mut refused_full = false;
         // Whether this task has made a call, whose cache a summary beside
         // the next one reads.
         let mut sent_here = false;
@@ -3588,50 +3585,6 @@ impl Turn {
                 Ok(Some(response)) => {
                     drops = 0;
                     response
-                }
-                // The provider refused the view as over the model's window,
-                // which the daemon's own estimate let through: summarize as
-                // an overflow does and send again, once, as Pi compacts and
-                // retries once. A second refusal fails the turn.
-                Err(error)
-                    if !refused_full
-                        && agent_runtime::provider::over_window(&error)
-                        && record.compaction_instructions.is_some() =>
-                {
-                    refused_full = true;
-                    self.join_summary(
-                        running,
-                        landed,
-                        Some(&mut record),
-                        &mut model_rounds,
-                        accounting,
-                    )
-                    .await?;
-                    // Stubs alone would pass the estimate that admitted the
-                    // refused request, so the retry gets a summary as well,
-                    // with stubs when the bot elides.
-                    if elides {
-                        self.elide(0, true, 0).await?;
-                    }
-                    match self
-                        .overflow(
-                            &mut record,
-                            &mut model_rounds,
-                            turn,
-                            accounting,
-                            &tools,
-                            false,
-                            (&mut last, model),
-                        )
-                        .await?
-                    {
-                        Overflow::Fits(_) => {
-                            resume_window = resuming;
-                            continue;
-                        }
-                        Overflow::Parked(until) => return Ok(Round::Paced(until)),
-                        Overflow::Stuck => return Err(error),
-                    }
                 }
                 // The model's own output cap cut its reply short. The reply
                 // is dropped, nothing of it recorded, so no partial call can
@@ -4380,50 +4333,6 @@ impl Turn {
             } else {
                 MAX_ATTEMPTS
             };
-            // A history holding a text block that shows nothing is refused
-            // whole, every request alike: take those blocks out of the
-            // nodes this view sent and read it again, at once. A second
-            // refusal finds nothing to take and fails as any other.
-            if let Body::Window(context) = body
-                && capped.is_none()
-                && let Some(window) = context.window.as_ref()
-                && window.family == agent_runtime::codec::Family::Anthropic
-                && blank_refused(&error)
-            {
-                let ids = window.ids.clone();
-                let repaired = self
-                    .store
-                    .op("repair_blank", move |db| db.repair_blank(&ids))
-                    .await?;
-                if !repaired.is_empty() {
-                    self.retried(json!({"attempt":attempt,"error":error.code,
-                        "detail":error.detail,"delay_ms":0,"parked":true,
-                        "repaired":repaired}))
-                        .await?;
-                    accounting.call_attempts = attempt;
-                    accounting.call_spent_ms = spent.as_millis() as u64;
-                    accounting.call_fallback = fallback.as_ref().map(Fallback::parked);
-                    accounting.parked_until = now_ms();
-                    accounting.blocked = None;
-                    accounting.backing_off = Some(error.code.clone());
-                    return Ok(None);
-                }
-            }
-            // The history it read changed while it went, as a repair of a
-            // history another bot shares changes it: read it again and send
-            // it at once.
-            if error.code == agent_runtime::provider::HISTORY_CHANGED && capped.is_none() {
-                self.retried(json!({"attempt":attempt,"error":error.code,
-                    "detail":error.detail,"delay_ms":0,"parked":true}))
-                    .await?;
-                accounting.call_attempts = attempt;
-                accounting.call_spent_ms = spent.as_millis() as u64;
-                accounting.call_fallback = fallback.as_ref().map(Fallback::parked);
-                accounting.parked_until = now_ms();
-                accounting.blocked = None;
-                accounting.backing_off = Some(error.code.clone());
-                return Ok(None);
-            }
             // Sent again at once, without the thinking or on the fallback
             // model, within the same attempt and time limits as any retry.
             if resend && capped.is_none() && attempt < cap && spent < RETRY_BUDGET {
@@ -7467,17 +7376,6 @@ async fn learn_links(
 /// item the provider never kept. The call sends the body once more without
 /// that thinking, and the bot keeps it out only once a request without it
 /// is accepted. Server errors are retried with the body unchanged.
-/// Anthropic's refusal of a request holding a text block that shows
-/// nothing: "text content blocks must contain non-whitespace text", or
-/// "must be non-empty" for one with no text at all.
-fn blank_refused(error: &Error) -> bool {
-    error.code == "provider_http_400"
-        && error
-            .detail
-            .as_deref()
-            .is_some_and(|detail| detail.contains("text content blocks must"))
-}
-
 fn withhold_thinking(context: &Context, error: &Error) -> Option<Strip> {
     let window = context.window.as_ref()?;
     let replayed = match window.family {
@@ -8671,28 +8569,6 @@ fn priced_at(
 
 #[cfg(test)]
 mod tests {
-    #[test]
-    fn only_anthropic_s_refusal_of_blank_text_repairs_the_history() {
-        use agent_runtime::Error;
-        let refused = |code: &str, detail: &str| super::blank_refused(&Error::with(code, detail));
-        assert!(refused(
-            "provider_http_400",
-            "messages.5.content.0: text content blocks must contain non-whitespace text"
-        ));
-        assert!(refused(
-            "provider_http_400",
-            "messages.2.content.1: text content blocks must be non-empty"
-        ));
-        assert!(!refused(
-            "provider_http_400",
-            "Invalid `signature` in `thinking` block."
-        ));
-        assert!(!refused(
-            "provider_http_500",
-            "text content blocks must be non-empty"
-        ));
-    }
-
     #[test]
     fn approvals_match_names_as_the_bot_listing_does() {
         for (pattern, name) in [

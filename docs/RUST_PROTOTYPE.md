@@ -1171,9 +1171,9 @@ the daemon's own on one reply (the model's own output cap bounds it; see
 tool call id without NUL, unique within its turn (a longer one, one with a
 NUL, or one an earlier call of the response or turn used fails the response
 with `invalid_tool_call_id`, so every gated call can be listed and answered
-by a command naming it alone), 16 MiB for one event of a response, an SSE
-frame or a socket message (an endpoint whose event never ends; no model
-writes that much in one), and the configurable
+by a command naming it alone), a 16 MiB response stream, over HTTP or a
+socket, which also bounds one SSE frame (an endpoint that never stops; no
+model writes that much), and the configurable
 active-turn, process, and connection-startup bounds below. Provider startup
 admission, when bounded, has a 60-second timeout and releases its permit when
 response headers arrive. Both live providers hold headers until the first
@@ -1419,7 +1419,6 @@ own path from the turn. Example requests:
 {"id":30,"op":"usage","name":"project.*","since_ms":1793000000000,"bucket_ms":21600000,"limit":64}
 {"id":14,"op":"prune","bot":"Bob","keep_turns":8}
 {"id":29,"op":"compact","bot":"Bob","bot_id":1}
-{"id":33,"op":"repair","bot":"Bob","bot_id":1}
 {"id":15,"op":"delete","bot":"Bob","bot_id":1}
 {"id":16,"op":"follow","bot":"*","after":0}
 {"id":32,"op":"follow","bot":"*","since_ms":1793000000000,"kinds":["accepted","message"]}
@@ -2440,10 +2439,7 @@ call, which reads it. The cap cutting `max_drops` replies of a turn in a row
 facts on its `turn_finished`, since each can cost a whole reply's output. The
 turn keeps the count, so a park or a restart counts on; a reply it keeps sets
 it back to none. The daemon puts
-no bound of its own on a reply, nor on a whole response stream, as Codex
-sets none (Bedrock's Responses endpoint streamed 16 MiB around a reply of
-under a thousand tokens, which the old 16 MiB stream bound failed on every
-turn): events carry
+no bound of its own on a reply under the 16 MiB response stream: events carry
 previews of calls (2 KiB of arguments), text streams live in pieces of at most
 128 KiB, and a history read answers `item_too_large` for one item past a line.
 
@@ -3128,7 +3124,7 @@ command reaches another bot's. A request on it:
 | `audit_trim` | `not_permitted`: the audit trail is the person's record of what agents did |
 | `create`, `fork` | Made by the caller, whatever `created_by` names (another is `not_permitted`), so the bot inherits its sandbox; its workspace and `writable` folders, and a fork's source's, must be ones the caller may write. A fork with `allow: []`, which only answers, may be of any bot |
 | `submit` | Reads as the caller's: `from` its turn when the request names it (the CLI does, from `AGENT_TURN`), else with its name as `origin`; `from` naming another bot is `not_permitted`. A workspace for a sandboxed bot must be one the caller may write |
-| `delete`, `prune`, `compact`, `repair`, `interrupt`, `stop_process`, `process_output` | The caller itself, or a bot it made; another is `not_permitted` |
+| `delete`, `prune`, `compact`, `interrupt`, `stop_process`, `process_output` | The caller itself, or a bot it made; another is `not_permitted` |
 | Everything else | As on the daemon's socket |
 
 The folder of these sockets stays read-only in every root, so no bot can
@@ -4195,35 +4191,6 @@ for its binding check, which would keep that thinking; it is family-specific
 and has not been compared with elision (item 35). Admission for
 `history` results and notes counts the current turn's stubs rather than
 its raw results.
-
-### Text that shows nothing
-
-Anthropic refuses a whole request whose history holds a text block of only
-whitespace ("text content blocks must contain non-whitespace text"), so
-one such block refuses every later call of the bot. A text block is blank
-when it shows nothing: whitespace, or characters that draw nothing (zero-width
-spaces and joiners, word joiners, direction marks, a byte order mark, a
-soft hyphen, fillers), the lone zero-width space being what models often
-send for an empty reply. A Claude reply keeps no blank text block, so a
-reply of only one is the empty reply it meant; a tool result's blank text
-parts are left out, and a prompt's blank parts read `<empty>` in their
-places, where its quotes find theirs, as Pi writes Bedrock's required text.
-A refusal of the kind still repairs the nodes its request sent: a reply's or
-result's blank block goes, the item padded with JSON whitespace to its size
-(content left with nothing is the text `<empty>`), and a prompt's blank part
-reads `<empty>`, in the prompt's stub too; what a request without thinking
-saves, and any size a placeholder adds to the prompt or its stub, move every
-later node's totals and elision savings with it. The call goes again at
-once, its `retry` event listing each node and what it held under
-`repaired`. `repair` (protocol 86; `agent repair --bot NAME`) does the same
-to the bot's whole history and answers the same list; it answers `bot_busy`
-while the bot runs a turn. A request whose items read to another length
-than it was weighed at, or, for a body Bedrock Runtime signs, to other
-bytes than it was signed with, as when a repair changes history a fork
-shares while the fork's request goes, ends as `history_changed` before its
-body disagrees with its Content-Length or signature, and the turn reads its
-window again and sends at once. Responses providers
-take blank text, so a Responses bot's history is left as it is.
 
 ### Compaction
 

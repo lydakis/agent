@@ -11607,11 +11607,8 @@ impl App {
                     self.replay = None;
                 }
                 self.said.push_str(delta);
-                // Words that show nothing yet, such as the zero-width space
-                // a model sends for an empty reply, draw no reply.
-                if !self.live.as_ref().is_some_and(|live| !live.closed)
-                    && agent_client::blank(delta)
-                {
+                // Only whitespace so far draws no reply.
+                if !self.live.as_ref().is_some_and(|live| !live.closed) && blank(delta) {
                     self.unseen.push_str(delta);
                     return;
                 }
@@ -20264,6 +20261,12 @@ fn quiet_message(text: &str) -> bool {
 /// A message item's text: a prompt's own words, without the line the
 /// daemon adds after them naming who sent it and when, or the `[Sent …]`
 /// line an older Sonny stored with them.
+/// Whether `words` are only whitespace, as Codex draws no such reply, or
+/// zero-width spaces, which models send for an empty reply.
+fn blank(words: &str) -> bool {
+    words.chars().all(|c| c.is_whitespace() || c == '\u{200B}')
+}
+
 fn text(item: &Value) -> String {
     match (&item["role"], &item["content"]) {
         (role, Value::Array(parts)) if role == "user" => (parts.iter())
@@ -20271,10 +20274,9 @@ fn text(item: &Value) -> String {
             .map(stamp::unstamped)
             .unwrap_or_default()
             .to_owned(),
-        // A reply that shows nothing, as a lone zero-width space for an
-        // empty reply, is no reply.
+        // A reply of only whitespace is no reply.
         (_, content) => Some(joined(content))
-            .filter(|words| !agent_client::blank(words))
+            .filter(|words| !blank(words))
             .unwrap_or_default(),
     }
 }
@@ -23341,7 +23343,7 @@ mod tests {
             (6, 2, reply),
             // A turn of the person's, with no task row, answered the same.
             (8, 3, say("user", "Anything new?")),
-            (9, 3, say("assistant", "\u{200b}")),
+            (9, 3, say("assistant", " ")),
         ];
         let client = daemon_answering(move |asked| match asked["op"].as_str() {
             Some("history_nodes") => json!({"nodes": items.iter().rev()
