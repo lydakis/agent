@@ -92,6 +92,15 @@ it keeps these, and says in its PR how:
   its base this way (`bench/perf_gate.py`): more store work per turn fails
   it, and CPU, latency or memory past 15% with no overlap warns.
 
+## The lookout has one job
+
+Sonny's lookout (`sonny/src/lookout`) has exactly one job: sources go in, it
+passes their events on, dumb and fast, and subscribers get them. It runs no
+migrations, cleanups or backfills, and no logic for one source: what a
+source needs lives in the source, one-time upgrade work in `upgrade.rs`
+(run at Sonny's start), and anything else wherever it belongs, never the
+lookout (George, 11-17).
+
 ## Working rules
 
 - A pull request that adds, changes or removes a Sonny feature updates its
