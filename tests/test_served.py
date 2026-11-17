@@ -131,7 +131,7 @@ class ServedToolTests(ModelFixture):
         (self.path / '.agent/config.toml').write_text('[sonny]\ncode_mode = false\n')
         self.daemon.request('create', bot='calc.lead', workspace=str(self.path), model='openai/synthetic-model',
                             instructions='Lead.', settings={'sandbox': 'workspace-write'},
-                            declare=[declared('show_agent')], approve=['shell', 'exec'], approver='manual')
+                            declare=[declared('show_agent')], approve=['shell'], approver='manual')
         self.host()
 
         def ruled(word):
