@@ -5589,6 +5589,10 @@ fn schema_42_backfills_absorbed_effort_or_rolls_back_when_history_is_missing() {
                 3
             );
             db.finish(running, None).unwrap();
+            // The daemon takes what the steer kept at the turn's end; let
+            // go here, the bot's default stays.
+            let id = db.inspect("Bob").unwrap().bot_id;
+            db.taken_configure(id, false).unwrap();
             // A source without an override is known too: its bot's default applies.
             let default = db
                 .begin(
@@ -6605,7 +6609,7 @@ fn a_turn_runs_at_its_own_effort_or_its_bots() {
         )
         .unwrap();
     assert_eq!(joined.outcomes.len(), 2);
-    // A steer at another level waits for a turn at its own.
+    // A steer at another level joins as well; the turn goes on at its own.
     db.begin(
         "Bob",
         "s1",
@@ -6628,7 +6632,8 @@ fn a_turn_runs_at_its_own_effort_or_its_bots() {
             true,
         )
         .unwrap();
-    assert!(absorbed.outcomes.is_empty());
+    assert_eq!(absorbed.outcomes.len(), 2);
+    assert_eq!(db.context(low.turn).unwrap().effort.as_deref(), Some("low"));
     db.finish(low.turn, None).unwrap();
     // Work that names none runs at Bob's own.
     let plain = db
@@ -6652,7 +6657,8 @@ fn a_turn_runs_at_its_own_effort_or_its_bots() {
         .iter()
         .map(|m| &m["effort"])
         .collect();
-    assert_eq!(levels, ["low", "low", "low", "xhigh", "high", "high"]);
+    // Each records the level it ran at: the steers the turn's own.
+    assert_eq!(levels, ["low", "low", "low", "low", "low", "high"]);
 }
 
 #[test]
@@ -6882,7 +6888,7 @@ fn turn_options_are_recorded_and_part_of_idempotency() {
     let after = db
         .begin("Bob", "r5", "after", true, &queue, allow_provider)
         .unwrap();
-    // A steer's folder never moves the bot, whether or not the steer runs.
+    // A steer's folder becomes the bot's own, as a queued turn's does.
     let steer = TurnOptions {
         workspace: Some("/synthetic/steer".into()),
         delivery: Delivery::Steer,
@@ -6892,7 +6898,7 @@ fn turn_options_are_recorded_and_part_of_idempotency() {
         .unwrap();
     assert_eq!(
         db.inspect("Bob").unwrap().workspace.as_deref(),
-        Some("/synthetic/third")
+        Some("/synthetic/steer")
     );
     for (turn, folder) in [
         (plain.turn, None),
@@ -10773,7 +10779,148 @@ fn retention_preserves_unfinished_turns_and_their_completed_prefix() {
 }
 
 #[test]
-fn steers_preserve_explicit_overrides_and_do_not_overtake_a_deferred_steer() {
+fn a_steer_s_model_and_effort_are_kept_for_the_bot_s_next_turn() {
+    let mut db = db();
+    let at_high = || Binding {
+        effort: Some("high"),
+        ..binding()
+    };
+    db.create("Bob", Some("/synthetic"), at_high()).unwrap();
+    let running = db
+        .begin(
+            "Bob",
+            "r0",
+            "work",
+            true,
+            &TurnOptions::default(),
+            allow_provider,
+        )
+        .unwrap();
+    let steer = |model: Option<&str>, effort: Option<&str>| TurnOptions {
+        model: model.map(Into::into),
+        effort: effort.map(Into::into),
+        delivery: Delivery::Steer,
+        ..TurnOptions::default()
+    };
+    // An effort alone keeps the bot's model with it.
+    let raised = db
+        .begin(
+            "Bob",
+            "s1",
+            "harder",
+            true,
+            &steer(None, Some("xhigh")),
+            allow_provider,
+        )
+        .unwrap();
+    assert!(raised.carried);
+    // The steer's own event says so.
+    assert_eq!(raised.entry.unwrap()["data"]["carried"], true);
+    let kept = |db: &Database| db.inspect("Bob").unwrap().configure_pending;
+    assert_eq!(
+        kept(&db),
+        Some(json!({"model": "openai/synthetic-model", "effort": "xhigh"}))
+    );
+    // A model alone keeps the effort already kept with it.
+    db.begin(
+        "Bob",
+        "s2",
+        "other",
+        true,
+        &steer(Some("openai/other"), None),
+        allow_provider,
+    )
+    .unwrap();
+    assert_eq!(
+        kept(&db),
+        Some(json!({"model": "openai/other", "effort": "xhigh"}))
+    );
+    // A steer that names neither keeps nothing more; a retry keeps nothing.
+    let plain = db
+        .begin(
+            "Bob",
+            "s3",
+            "go on",
+            true,
+            &steer(None, None),
+            allow_provider,
+        )
+        .unwrap();
+    assert!(!plain.carried);
+    assert!(
+        !db.begin(
+            "Bob",
+            "s1",
+            "harder",
+            true,
+            &steer(None, Some("xhigh")),
+            allow_provider
+        )
+        .unwrap()
+        .carried
+    );
+    // The turn goes on with its own, the steers in it.
+    let absorbed = db
+        .absorb(
+            running.turn,
+            None,
+            8 << 20,
+            4096,
+            ContextUsage::default(),
+            false,
+            true,
+        )
+        .unwrap();
+    assert_eq!(absorbed.outcomes.len(), 3);
+    let context = db.context(running.turn).unwrap();
+    assert_eq!(
+        (context.model.as_str(), context.effort.as_deref()),
+        ("openai/synthetic-model", Some("high"))
+    );
+    // A model alone on a bot with nothing kept keeps the bot's effort.
+    db.create("Ann", Some("/synthetic"), at_high()).unwrap();
+    db.begin(
+        "Ann",
+        "r0",
+        "work",
+        true,
+        &TurnOptions::default(),
+        allow_provider,
+    )
+    .unwrap();
+    db.begin(
+        "Ann",
+        "s1",
+        "other",
+        true,
+        &steer(Some("openai/other"), None),
+        allow_provider,
+    )
+    .unwrap();
+    assert_eq!(
+        db.inspect("Ann").unwrap().configure_pending,
+        Some(json!({"model": "openai/other", "effort": "high"}))
+    );
+    // A steer to a bot at rest starts a turn on its own model, as any
+    // turn does, and keeps nothing.
+    db.create("Cid", Some("/synthetic"), binding()).unwrap();
+    let started = db
+        .begin(
+            "Cid",
+            "s1",
+            "work",
+            true,
+            &steer(Some("openai/other"), Some("low")),
+            allow_provider,
+        )
+        .unwrap();
+    assert_eq!(started.status, "running");
+    assert!(!started.carried);
+    assert_eq!(db.inspect("Cid").unwrap().configure_pending, None);
+}
+
+#[test]
+fn every_steer_joins_the_running_turn_which_keeps_its_own_folder_and_model() {
     let mut db = db();
     db.create("Bob", Some("/default"), binding()).unwrap();
     let active = TurnOptions {
@@ -10807,6 +10954,11 @@ fn steers_preserve_explicit_overrides_and_do_not_overtake_a_deferred_steer() {
         )
         .unwrap()
         .turn;
+    // Its folder is the bot's own at once, for the turns after this one.
+    assert_eq!(
+        db.inspect("Bob").unwrap().workspace.as_deref(),
+        Some("/elsewhere")
+    );
     let changed = db
         .begin(
             "Bob",
@@ -10835,6 +10987,8 @@ fn steers_preserve_explicit_overrides_and_do_not_overtake_a_deferred_steer() {
         )
         .unwrap()
         .turn;
+    // Every steer joins the running turn in order, whatever folder or model
+    // it names, as Codex steers any input into its running turn.
     let result = db
         .absorb(
             first,
@@ -10852,71 +11006,21 @@ fn steers_preserve_explicit_overrides_and_do_not_overtake_a_deferred_steer() {
             .iter()
             .map(|(id, _)| *id)
             .collect::<Vec<_>>(),
-        [matched]
-    );
-    assert!(
-        db.absorb(
-            first,
-            None,
-            8 << 20,
-            4096,
-            ContextUsage::default(),
-            false,
-            true
-        )
-        .unwrap()
-        .outcomes
-        .is_empty()
-    );
-    assert!(db.steers_waiting("Bob").unwrap());
-    db.finish(first, None).unwrap();
-    db.start(moved, allow_provider).unwrap();
-    assert_eq!(db.context(moved).unwrap().workspace, "/elsewhere");
-    assert!(
-        db.absorb(
-            moved,
-            None,
-            8 << 20,
-            4096,
-            ContextUsage::default(),
-            false,
-            true
-        )
-        .unwrap()
-        .outcomes
-        .is_empty()
-    );
-    db.finish(moved, None).unwrap();
-    db.start(changed, allow_provider).unwrap();
-    assert_eq!(db.context(changed).unwrap().model, "openai/other");
-    assert_eq!(
-        db.absorb(
-            changed,
-            None,
-            8 << 20,
-            4096,
-            ContextUsage::default(),
-            false,
-            true
-        )
-        .unwrap()
-        .outcomes[0]
-            .0,
-        inherited
-    );
-    // The steer named neither, so it ran with its turn's model and folder.
-    let listed = db.turns("Bob", 0, None, 10, false).unwrap();
-    let row = listed["turns"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|t| t["turn"] == changed)
-        .unwrap();
-    assert_eq!(
-        (&row["model"], &row["workspace"]),
-        (&json!("openai/other"), &json!("/active"))
+        [matched, moved, changed, inherited]
     );
     assert!(!db.steers_waiting("Bob").unwrap());
+    // The turn goes on in its own folder and on its own model; the last
+    // folder a steer named, /active again, is the bot's.
+    let context = db.context(first).unwrap();
+    assert_eq!(
+        (context.workspace.as_str(), context.model.as_str()),
+        ("/active", "openai/active")
+    );
+    assert_eq!(
+        db.inspect("Bob").unwrap().workspace.as_deref(),
+        Some("/active")
+    );
+    db.finish(first, None).unwrap();
 }
 
 #[test]
@@ -19957,7 +20061,7 @@ fn a_message_sent_again_keeps_who_sent_it_and_what_it_quoted() {
 }
 
 #[test]
-fn a_cut_reply_s_note_reaches_its_turn_past_a_steer_that_waits_for_its_own() {
+fn a_cut_reply_s_note_reaches_its_turn_with_a_steer_for_another_folder_before_it() {
     let mut db = db();
     db.create("Bob", Some("/synthetic"), binding()).unwrap();
     let turn = db
@@ -19971,8 +20075,7 @@ fn a_cut_reply_s_note_reaches_its_turn_past_a_steer_that_waits_for_its_own() {
         )
         .unwrap()
         .turn;
-    // A steer for another folder waits for a turn of its own, and an
-    // ordinary one behind it waits behind it.
+    // A steer for another folder joins the turn as an ordinary one does.
     let elsewhere = TurnOptions {
         delivery: Delivery::Steer,
         workspace: Some("/elsewhere".into()),
@@ -20003,9 +20106,9 @@ fn a_cut_reply_s_note_reaches_its_turn_past_a_steer_that_waits_for_its_own() {
         .filter(|e| e["event"] == "steered")
         .map(|e| &e["data"]["origin"])
         .collect();
-    // The two others stay queued, in order.
-    assert_eq!(taken, [&json!("limit")]);
-    assert_eq!(absorbed.outcomes.len(), 1);
+    // All three, in the order they came.
+    assert_eq!(taken, [&Value::Null, &Value::Null, &json!("limit")]);
+    assert_eq!(absorbed.outcomes.len(), 3);
 }
 
 /// The audit trail, read newest first with no filter.

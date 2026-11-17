@@ -46,7 +46,7 @@ class QueryPlanTests(unittest.TestCase):
         query = next(q for q in statements(source) if q.startswith('SELECT s.id,s.text,length('))
         conn = sqlite3.connect(':memory:')
         conn.executescript(ddl)
-        steps = [row[3] for row in conn.execute('EXPLAIN QUERY PLAN ' + query, ('Bob', 1, 8, 9, 1, 'limit'))]
+        steps = [row[3] for row in conn.execute('EXPLAIN QUERY PLAN ' + query, ('Bob', 1, 8, 9, 1))]
         searches = [s for s in steps if s.startswith('SEARCH messages USING')]
         self.assertEqual(sorted(searches), ['SEARCH messages USING INDEX messages_attached (bot=? AND id<?)',
                                             'SEARCH messages USING INDEX messages_steers (bot=? AND id<?)'], steps)
