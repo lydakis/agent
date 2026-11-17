@@ -176,6 +176,40 @@ pub const PROTECTED_EXISTING: [&str; 1] = [".aws"];
 /// file the copy holds.
 pub const OWN_COPIES: [&str; 2] = ["/etc/ssh/ssh_config.d", "/etc/crypto-policies/back-ends"];
 
+/// The person's ssh config, `~/.ssh/config`, which a Linux sandbox shows
+/// from a copy with [`SSH_CONFIG_FIRST`] before it (`--own-copy-file`):
+/// with `ControlMaster auto` and no master open, ssh would make its socket
+/// in `~/.ssh`, read-only to every sandboxed command, and fail, so would
+/// every git push and fetch over ssh.
+pub fn ssh_config() -> Option<std::path::PathBuf> {
+    std::env::var_os("HOME").map(|home| std::path::PathBuf::from(home).join(".ssh/config"))
+}
+
+/// What a sandbox's copy of the person's ssh config says before the
+/// config. ssh takes the first value it reads for each option, so this
+/// one stands for every host: with `ControlMaster auto`, ssh with no
+/// master open makes its control socket at `ControlPath`, usually in
+/// `~/.ssh`, and exits 255 when it can't (`unix_listener: cannot bind ...
+/// Read-only file system`). With `no`, it joins a master the person has
+/// open there, and connects on its own when none is.
+pub const SSH_CONFIG_FIRST: &str = "\
+# The agent sandbox shows this copy of the ssh config: ssh in a sandboxed
+# command joins a master the person has open and connects on its own when
+# none is, as its control socket would go in a folder it can't write.
+ControlMaster no
+
+";
+
+/// The files a daemon this CLI starts shows in every Linux sandbox from a
+/// copy with text before it (`--own-copy-file FILE=FIRST`): the person's
+/// ssh config, with [`SSH_CONFIG_FIRST`].
+pub fn own_copy_files() -> Vec<(std::path::PathBuf, String)> {
+    ssh_config()
+        .map(|config| (config, SSH_CONFIG_FIRST.to_owned()))
+        .into_iter()
+        .collect()
+}
+
 /// Start `command` in a session of its own, for a service that outlives the
 /// terminal it was started from: closing a Herdr pane, or stopping Herdr,
 /// ends every process in the pane's session, not only its foreground job.

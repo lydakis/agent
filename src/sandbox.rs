@@ -186,7 +186,13 @@ impl Policy {
                     })
                     .cloned()
                     .collect::<Vec<_>>(),
-            ),
+            )
+            .into_iter()
+            .chain(
+                (daemon.copied_files.iter())
+                    .filter_map(|(place, first)| file_copy(place, first, &daemon.unreadable)),
+            )
+            .collect(),
             daemons,
             // One under another is masked with it: a mask under one
             // already closed would have nowhere to go.
@@ -768,6 +774,13 @@ pub struct Daemon {
     /// overflow user's. Each is shown from a read-only copy the person
     /// owns (`--own-copy`). The client starting the daemon names them.
     pub owned: Vec<PathBuf>,
+    /// Files of the person's a Linux sandbox shows from a read-only copy
+    /// the person owns, kept in step with the file, with the text given
+    /// before it ([`file_copy`]): a setting that stands for the whole file
+    /// where its program takes the first value it reads
+    /// (`--own-copy-file FILE=FIRST`). The client starting the daemon
+    /// names them.
+    pub copied_files: Vec<(PathBuf, String)>,
     /// Folders no sandboxed command reads, nor writes, links to or renames,
     /// nor anything in them, and the `read` tool doesn't read for a
     /// sandboxed bot (`--unreadable`), as Codex's `deny_read`: the person's
@@ -1773,6 +1786,126 @@ fn copy_files(place: &Path, copy: &Path, files: &Stamp) -> std::io::Result<()> {
         }
     }
     Ok(())
+}
+
+/// A file of the person's, `place`, as every Linux sandbox shows it
+/// ([`Daemon::copied_files`]), a link followed (bubblewrap binds over no
+/// link): `(copy, file)`, a read-only copy the person owns that says
+/// `first` before the file, kept in step with it, bound over the file.
+/// `None` when there is none and on another system than Linux, whose
+/// sandbox binds nothing. One kept unreadable is not shown, and a copy
+/// made before it was is removed: under `~/.agent`, which sandboxes read,
+/// it would show what the folder now hides.
+fn file_copy(place: &Path, first: &str, unreadable: &[PathBuf]) -> Option<(PathBuf, PathBuf)> {
+    if !cfg!(target_os = "linux") {
+        return None;
+    }
+    copied_in(copies()?, place, first, unreadable)
+}
+
+/// [`file_copy`], its copy kept under `copies`.
+fn copied_in(
+    copies: &Path,
+    place: &Path,
+    first: &str,
+    unreadable: &[PathBuf],
+) -> Option<(PathBuf, PathBuf)> {
+    // Named by the text too: another daemon that puts other text first
+    // keeps its own copy rather than writing over this one's.
+    let copy_of = |file: &Path| {
+        let mut named = copies.join(file.strip_prefix("/").ok()?).into_os_string();
+        named.push(format!(".{:016x}", fnv(first.as_bytes())));
+        Some(PathBuf::from(named))
+    };
+    let file = std::fs::canonicalize(place).ok();
+    let hidden = |path: &Path| unreadable.iter().any(|hidden| path.starts_with(hidden));
+    if hidden(place) || file.as_deref().is_some_and(hidden) {
+        for kept in [Some(place), file.as_deref()].into_iter().flatten() {
+            if let Some(copy) = copy_of(kept) {
+                let _ = locked(&copy, || match std::fs::remove_file(&copy) {
+                    Err(error) if error.kind() != std::io::ErrorKind::NotFound => Err(error),
+                    _ => Ok(()),
+                });
+            }
+        }
+        return None;
+    }
+    let file = file?;
+    let copy = copy_of(&file)?;
+    copied_file(&file, first, &copy).then_some((copy, file))
+}
+
+/// FNV-1a over `bytes`: the same in every build, as a name kept on disk
+/// between daemons must be.
+fn fnv(bytes: &[u8]) -> u64 {
+    (bytes.iter()).fold(0xcbf2_9ce4_8422_2325, |hash, byte| {
+        (hash ^ u64::from(*byte)).wrapping_mul(0x0100_0000_01b3)
+    })
+}
+
+/// Whether `copy` holds `file` now, `first` before it, writing it again
+/// when the file changed since this daemon last did, or the copy is gone.
+/// Written beside its name and renamed over it, as [`copied`] writes a
+/// folder's files.
+fn copied_file(file: &Path, first: &str, copy: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    type FileStamp = (u64, i64, i64, u64);
+    static STAMPS: std::sync::Mutex<Vec<(PathBuf, FileStamp, String)>> =
+        std::sync::Mutex::new(Vec::new());
+    let Ok(found) = std::fs::metadata(file) else {
+        return false;
+    };
+    if !found.is_file() {
+        return false;
+    }
+    let now = (found.len(), found.ctime(), found.ctime_nsec(), found.ino());
+    let mut stamps = STAMPS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let kept = stamps.iter().position(|(kept, ..)| kept == file);
+    let fresh = kept.is_some_and(|at| stamps[at].1 == now && stamps[at].2 == first)
+        && std::fs::symlink_metadata(copy).is_ok_and(|found| found.is_file());
+    if fresh {
+        return true;
+    }
+    if locked(copy, || copy_file(file, first, copy)).is_err() {
+        return false;
+    }
+    match kept {
+        Some(at) => stamps[at] = (file.to_owned(), now, first.to_owned()),
+        None => stamps.push((file.to_owned(), now, first.to_owned())),
+    }
+    true
+}
+
+/// `file` into `copy`, owner-only, `first` before it.
+fn copy_file(file: &Path, first: &str, copy: &Path) -> std::io::Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    let content = std::fs::read(file)?;
+    let (Some(folder), Some(name)) = (copy.parent(), copy.file_name()) else {
+        return Err(std::io::ErrorKind::InvalidInput.into());
+    };
+    let mut part = std::ffi::OsString::from(".");
+    part.push(name);
+    part.push(".part");
+    let part = folder.join(part);
+    let _ = std::fs::remove_file(&part);
+    let mut written = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(&part)?;
+    written.write_all(first.as_bytes())?;
+    written.write_all(&content)?;
+    // Never over a link or a folder: bubblewrap would bind wherever it
+    // points, or refuse every command binding a folder over a file.
+    if std::fs::symlink_metadata(copy).is_ok_and(|found| !found.is_file()) {
+        let _ = std::fs::remove_file(&part);
+        return Err(std::io::ErrorKind::AlreadyExists.into());
+    }
+    std::fs::rename(&part, copy)
 }
 
 /// Whether `path`, a name kept from being made, holds only a placeholder:
@@ -2818,6 +2951,97 @@ mod tests {
         std::fs::remove_dir_all(&base).unwrap();
     }
 
+    /// The person's ssh config is copied with `ControlMaster no` before
+    /// it, kept in step with it, and bound in its place; one kept
+    /// unreadable is left alone.
+    #[test]
+    fn the_ssh_config_is_shown_from_a_copy_that_makes_no_control_socket() {
+        const FIRST: &str = agent_client::SSH_CONFIG_FIRST;
+        let base =
+            std::env::temp_dir().join(format!("agent-sandbox-ssh-copy-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(base.join("home/.ssh")).unwrap();
+        // By its real path, as the copy is named: macOS's temp is a link.
+        let base = std::fs::canonicalize(&base).unwrap();
+        let file = base.join("home/.ssh/config");
+        let copy = base.join("copies/home/.ssh/config");
+        std::fs::write(&file, "Host *\n  ControlMaster auto\n").unwrap();
+        assert!(copied_file(&file, FIRST, &copy));
+        let read = || std::fs::read_to_string(&copy).unwrap();
+        assert_eq!(read(), format!("{FIRST}Host *\n  ControlMaster auto\n"));
+        // First of all, so it stands for every host whatever the config says.
+        let first = (read().lines())
+            .find(|line| !line.starts_with('#') && !line.is_empty())
+            .map(str::to_owned);
+        assert_eq!(first.as_deref(), Some("ControlMaster no"));
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&copy).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600);
+        }
+        // Edited: copied again. Taken away: made again.
+        std::fs::write(&file, "Host box\n  User me\n").unwrap();
+        assert!(copied_file(&file, FIRST, &copy));
+        assert_eq!(read(), format!("{FIRST}Host box\n  User me\n"));
+        std::fs::remove_file(&copy).unwrap();
+        assert!(copied_file(&file, FIRST, &copy));
+        assert!(read().ends_with("Host box\n  User me\n"));
+        // None there, none copied.
+        assert!(!copied_file(
+            &base.join("gone"),
+            FIRST,
+            &base.join("copies/gone")
+        ));
+        // Shown by its real path, a link followed, as bubblewrap binds,
+        // its copy kept under that path.
+        let copies = base.join("copies");
+        let keyed = PathBuf::from(format!(
+            "{}.{:016x}",
+            copies.join(file.strip_prefix("/").unwrap()).display(),
+            fnv(FIRST.as_bytes())
+        ));
+        let link = base.join("home/.ssh/linked");
+        std::os::unix::fs::symlink(&file, &link).unwrap();
+        let shown = copied_in(&copies, &link, FIRST, &[]).unwrap();
+        assert_eq!(shown, (keyed.clone(), file.clone()));
+        assert!(std::fs::read_to_string(&keyed).unwrap().starts_with(FIRST));
+        // Kept unreadable, by the folder it is in: not shown, and the copy
+        // made before, which sandboxes could read under ~/.agent, removed.
+        let hidden = [base.join("home/.ssh")];
+        assert_eq!(copied_in(&copies, &link, FIRST, &hidden), None);
+        assert!(!keyed.exists());
+        assert!(copied_in(&copies, &file, FIRST, &[]).is_some());
+        assert_eq!(copied_in(&copies, &file, FIRST, &hidden), None);
+        assert!(!keyed.exists());
+        // Other text first, as another daemon may put: a copy of its own.
+        let (mine, other) = (
+            copied_in(&copies, &file, FIRST, &[]).unwrap(),
+            copied_in(&copies, &file, "Other yes\n", &[]).unwrap(),
+        );
+        assert_ne!(mine.0, other.0);
+        assert!(std::fs::read_to_string(&mine.0).unwrap().starts_with(FIRST));
+        assert!(
+            std::fs::read_to_string(&other.0)
+                .unwrap()
+                .starts_with("Other yes\n")
+        );
+        assert!(copied_file(&file, FIRST, &copy));
+        #[cfg(target_os = "linux")]
+        {
+            let policy = Policy {
+                owned: vec![(copy.clone(), file.clone())],
+                ..Policy::new(Some(Mode::ReadOnly), None, &[], false, &Daemon::default())
+                    .unwrap()
+                    .unwrap()
+            };
+            let args = linux::args(&policy, false);
+            assert!(args.windows(3).any(|w| w[0] == "--ro-bind"
+                && w[1] == copy.to_string_lossy()
+                && w[2] == file.to_string_lossy()));
+        }
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
     /// The crypto-policies back-ends, links into the active policy's own
     /// files elsewhere, are copied as the files they point at, and copied
     /// again when the person switches policy, which points them anew.
@@ -3496,6 +3720,218 @@ mod tests {
             held.release();
             assert!(!git.exists(), "removed once the sandbox is gone");
         }
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// A git push over ssh, in a sandbox with the network on, through a
+    /// real sshd, as the person's config says `ControlMaster auto` with
+    /// its `ControlPath` in a folder the sandbox keeps read-only: ssh can't
+    /// make its socket there and fails the push, until the sandbox shows
+    /// the config from its copy, when the push and a plain ssh both go
+    /// through, and join a master the person has open. Needs sshd, ssh and
+    /// git; AGENT_TEST_SSH makes one missing a failure.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn a_push_over_ssh_goes_through_with_a_control_master_config() {
+        let needed = [
+            "/usr/sbin/sshd",
+            "/usr/bin/ssh",
+            "/usr/bin/ssh-keygen",
+            "/usr/bin/git",
+        ];
+        let missing: Vec<_> = needed
+            .iter()
+            .filter(|program| !Path::new(program).is_file())
+            .collect();
+        if !missing.is_empty() || available().is_err() {
+            assert!(
+                std::env::var_os("AGENT_TEST_SSH").is_none(),
+                "missing {missing:?} or no sandbox: {:?}",
+                available()
+            );
+            return;
+        }
+        let base = std::env::temp_dir().join(format!("agent-sandbox-ssh-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(base.join("ssh")).unwrap();
+        let base = std::fs::canonicalize(&base).unwrap();
+        let ssh = base.join("ssh");
+        let run = |program: &str, args: &[&str]| {
+            let output = std::process::Command::new(program)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{program} {args:?}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            String::from_utf8_lossy(&output.stdout).into_owned()
+        };
+        let at = |name: &str| ssh.join(name).to_string_lossy().into_owned();
+        for key in ["host", "id"] {
+            run(
+                "/usr/bin/ssh-keygen",
+                &["-q", "-t", "ed25519", "-N", "", "-f", &at(key)],
+            );
+        }
+        std::fs::copy(ssh.join("id.pub"), ssh.join("authorized_keys")).unwrap();
+        let port = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        std::fs::write(
+            ssh.join("sshd_config"),
+            format!(
+                "Port {port}\nListenAddress 127.0.0.1\nHostKey {}\nAuthorizedKeysFile {}\n\
+                 PasswordAuthentication no\nKbdInteractiveAuthentication no\nUsePAM no\n\
+                 StrictModes no\nPidFile none\nPermitRootLogin prohibit-password\n",
+                at("host"),
+                at("authorized_keys")
+            ),
+        )
+        .unwrap();
+        // The person's config, its control socket beside it, as on the
+        // machine that found this.
+        std::fs::write(
+            ssh.join("config"),
+            format!(
+                "Host *\n  ControlMaster auto\n  ControlPath {}/control-%r@%h:%p\n  \
+                 ControlPersist 1m\n  IdentityFile {}\n  IdentitiesOnly yes\n  \
+                 StrictHostKeyChecking no\n  UserKnownHostsFile /dev/null\n  LogLevel ERROR\n",
+                ssh.display(),
+                at("id")
+            ),
+        )
+        .unwrap();
+        let mut sshd = std::process::Command::new("/usr/sbin/sshd")
+            .args(["-D", "-e", "-f", &at("sshd_config")])
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let ssh_command = format!("ssh -F {} -p {port}", at("config"));
+        let remote = base.join("remote.git");
+        let work = base.join("work");
+        run(
+            "/usr/bin/git",
+            &["init", "-q", "--bare", &remote.to_string_lossy()],
+        );
+        run("/usr/bin/git", &["init", "-q", &work.to_string_lossy()]);
+        let git = |args: &[&str]| {
+            let mut all = vec!["-C", work.to_str().unwrap()];
+            all.extend(args);
+            run("/usr/bin/git", &all)
+        };
+        git(&[
+            "-c",
+            "user.name=a",
+            "-c",
+            "user.email=a@a",
+            "commit",
+            "-q",
+            "--allow-empty",
+            "-m",
+            "one",
+        ]);
+        git(&[
+            "remote",
+            "add",
+            "origin",
+            &format!("ssh://127.0.0.1{}", remote.display()),
+        ]);
+        // sshd takes a moment to listen.
+        for _ in 0..50 {
+            if std::net::TcpStream::connect(("127.0.0.1", port)).is_ok() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        // The agent's folder is the checkout; the person's ssh folder stays
+        // read-only, as their home does, though it is under a temporary
+        // folder a sandbox may write.
+        let daemon = Daemon {
+            protected_paths: vec![ssh.clone()],
+            ..protecting()
+        };
+        let mut policy = Policy::new(Some(Mode::WorkspaceWrite), Some(&work), &[], true, &daemon)
+            .unwrap()
+            .unwrap();
+        let sandboxed = |policy: &Policy, program: &str, args: &[&str]| {
+            let (mut command, _ended) = command(policy, program, args, false).unwrap();
+            command
+                .current_dir(&work)
+                .env("GIT_SSH_COMMAND", &ssh_command)
+                .output()
+        };
+        let push = ["push", "-q", "origin", "HEAD:main"];
+        // As it was: ssh, with no master open, can't make its socket.
+        let refused = sandboxed(&policy, "git", &push).await.unwrap();
+        let said = String::from_utf8_lossy(&refused.stderr).into_owned();
+        assert!(!refused.status.success(), "pushed without the copy");
+        assert!(said.contains("Read-only file system"), "{said}");
+        // Shown from the person's copy, which makes no control socket.
+        let copy = base.join("copies/ssh/config");
+        assert!(copied_file(
+            &ssh.join("config"),
+            agent_client::SSH_CONFIG_FIRST,
+            &copy
+        ));
+        policy.owned.push((copy, ssh.join("config")));
+        let pushed = sandboxed(&policy, "git", &push).await.unwrap();
+        assert!(
+            pushed.status.success(),
+            "{}",
+            String::from_utf8_lossy(&pushed.stderr)
+        );
+        let head = git(&["rev-parse", "HEAD"]);
+        let main = run(
+            "/usr/bin/git",
+            &["-C", &remote.to_string_lossy(), "rev-parse", "main"],
+        );
+        assert_eq!(head, main);
+        let plain = [
+            "-F",
+            &at("config"),
+            "-p",
+            &port.to_string(),
+            "127.0.0.1",
+            "echo",
+            "reached",
+        ];
+        let reached = sandboxed(&policy, "ssh", &plain).await.unwrap();
+        assert_eq!(String::from_utf8_lossy(&reached.stdout), "reached\n");
+        // A master the person opened, outside any sandbox, is joined.
+        run(
+            "/usr/bin/ssh",
+            &[
+                "-F",
+                &at("config"),
+                "-p",
+                &port.to_string(),
+                "-fN",
+                "127.0.0.1",
+            ],
+        );
+        let mut verbose = vec!["-v"];
+        verbose.extend(plain);
+        let joined = sandboxed(&policy, "ssh", &verbose).await.unwrap();
+        let said = String::from_utf8_lossy(&joined.stderr).into_owned();
+        assert!(joined.status.success(), "{said}");
+        assert!(said.contains("mux_client_request_session"), "{said}");
+        let _ = std::process::Command::new("/usr/bin/ssh")
+            .args([
+                "-F",
+                &at("config"),
+                "-p",
+                &port.to_string(),
+                "-O",
+                "exit",
+                "127.0.0.1",
+            ])
+            .output();
+        let _ = sshd.kill();
+        let _ = sshd.wait();
         let _ = std::fs::remove_dir_all(&base);
     }
 
