@@ -153,6 +153,16 @@ class AgentToolsTests(ModelFixture):
                                **{'from': {'bot': 'shop.lead', 'turn': turn}})
         self.assertTrue(again['result']['duplicate'], again)
 
+    def test_a_whole_name_stays_whole_and_an_effort_asked_for_is_kept(self):
+        client = self.client(TOOLS)
+        client.request('create', bot='shop.lead', workspace=str(self.path))
+        self.run_calls(client, 'shop.lead', 'go',
+                       ('spawn_agent', {'name': 'other.look', 'message': 'q', 'effort': 'low'}))
+        made = json.loads(self.output(client, 'shop.lead', 'spawn_agent-1'))
+        self.assertEqual(made['name'], 'other.look', made)
+        look = client.request('inspect', bot='other.look')['result']
+        self.assertEqual((look['created_by'], look.get('effort')), ('shop.lead', 'low'), look)
+
     def test_a_fork_takes_no_profile_and_a_missing_profile_is_refused(self):
         client = self.client(TOOLS)
         client.request('create', bot='shop.lead', workspace=str(self.path))
