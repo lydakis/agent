@@ -12348,8 +12348,9 @@ impl App {
             self.notice = Some("no HOME, so no commons".into());
             return;
         };
+        let project = self.scope().project;
         self.watch = Some(Watch {
-            project: self.scope().project,
+            project: project.clone(),
             rows: Vec::new(),
             read: Instant::now(),
             alerts: Vec::new(),
@@ -12357,7 +12358,7 @@ impl App {
             background: None,
             usage: None,
             audit: None,
-            commons: Some(commons::View::open(&home)),
+            commons: Some(commons::View::open(&home, project)),
             memory: None,
             sky: None,
             picked: None,

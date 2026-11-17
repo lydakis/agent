@@ -947,6 +947,18 @@ impl Service {
         subs::goals_gone(&self.store);
         if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
             crate::commons::woken_gone(&home);
+            // Old commons posts name their authors' projects, once, from
+            // a whole listing, off the loop: each thread is rewritten.
+            if complete {
+                let records: HashMap<String, Value> = (self.records.iter())
+                    .map(|(name, bot)| {
+                        let kept = json!({"name": name, "bot_id": bot["bot_id"],
+                            "created_by": bot["created_by"], "created_by_id": bot["created_by_id"]});
+                        (name.clone(), kept)
+                    })
+                    .collect();
+                tokio::task::spawn_blocking(move || crate::commons::projects(&home, &records));
+            }
         }
         crate::git::drop_snapshot_indexes(&self.store);
         let revisions = subs::revisions(&self.store);
@@ -5627,7 +5639,7 @@ mod tests {
                 store: root.join("state.sqlite"),
             };
             let post = |by: &str, arguments: Value| {
-                crate::commons::call(&crash.home, by, None, by, None, &arguments).unwrap()
+                crate::commons::call(&crash.home, by, None, by, None, None, &arguments).unwrap()
             };
             post(
                 "calc.lead",
