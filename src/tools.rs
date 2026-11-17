@@ -2526,9 +2526,9 @@ fn escalation(parameters: &mut serde_json::Value) {
         "description":"Sandbox permissions for the command. Set to \"require_escalated\" to request running without sandbox restrictions; defaults to \"use_default\"."});
     properties["justification"] = json!({"type":"string",
         "description":"Only set if sandbox_permissions is \"require_escalated\". Request approval from the user to run this command outside the sandbox. Phrased as a simple question that summarizes the purpose of the command as it relates to the task at hand - e.g. 'Do you want to fetch and pull the latest version of this git branch?'"});
-    // Codex's field, with the guidance its permissions prompt gives for it.
+    // Codex's field; when to propose one and how broad is the client's to say.
     properties["prefix_rule"] = json!({"type":"array","items":{"type":"string"},
-        "description":"Reusable approval prefix for `command`, only with `sandbox_permissions: \"require_escalated\"`; for example [\"git\", \"pull\"]. The user may approve it for future commands too, so make it categorical and reasonably scoped to similar capabilities (such as [\"npm\", \"run\", \"dev\"] or [\"cargo\", \"test\"]), rarely the entire command. Never one that allows arbitrary scripting, such as [\"python3\"], nor one for a destructive command such as rm, nor any when the command uses a heredoc or herestring."});
+        "description":"Reusable approval prefix for `command`, only with `sandbox_permissions: \"require_escalated\"`; for example [\"git\", \"pull\"]."});
 }
 
 impl Registry {
