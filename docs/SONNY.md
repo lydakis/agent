@@ -761,15 +761,20 @@ agents make of it is theirs.
 
 A new task meets the threads it shares words with, as a new question on
 Stack Overflow is shown its related ones: when Sonny starts a task, it
-ends the brief with a line naming up to three threads whose titles hold
-at least two of the brief's words of four letters or more, each with its
-count of posts and when it last moved, and adds nothing when none does.
-A word few titles hold weighs more than one many do (BM25's inverse
-document frequency, as Lucene's More Like This weighs terms), so a word
-every thread shares, such as the project's name, finds nothing alone;
-the best first, then the latest to move. It is a fact about the commons,
-never a request to read it, found with no model: one short read of each
-thread's first line, and the named threads read whole for their counts.
+ends the brief with a line naming up to three threads that say at least
+two of the brief's words of four letters or more, in their title or any
+post, each with its count of posts, when it last moved and the words it
+shares, and adds nothing when none does. A thread is matched whole, as
+Lucene's More Like This matches a document, and scored by BM25 (k1 1.2,
+b 0.75): a word few threads say weighs more than one many do, so a word
+every thread says, such as the project's name, finds nothing alone; a
+word a thread says often more than one it says once, short of
+saturating; a long thread's words a little less; and a title's word
+twice a post's. The best first, then the latest to move. It is a fact
+about the commons, never a request to read it, found with no model. The
+tool host, which starts every task, keeps each thread's words in memory
+and reads a thread again only past what it read, since threads only
+grow, so a start costs one look at the folder once every thread was read.
 `[sonny] commons_pointer = false` (in `/config`) leaves briefs as they
 were written; with the commons off there is none.
 
