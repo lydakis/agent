@@ -2158,6 +2158,99 @@ fn a_parked_call_says_who_holds_it_and_since_when() {
 }
 
 #[test]
+fn a_verdict_that_leaves_a_call_waiting_says_who_holds_it_now() {
+    let mut db = db();
+    let tools = ["shell".to_owned()];
+    let gate = |tag: &str| Gate {
+        tag: tag.into(),
+        tools: vec!["shell".into()],
+        expire_ms: None,
+    };
+    let (first, second) = (gate("first"), gate("second"));
+    let ann = db
+        .create(
+            "Ann",
+            Some("/synthetic"),
+            Binding {
+                tools: &tools,
+                gate: Some(&first),
+                ..binding()
+            },
+        )
+        .unwrap()
+        .0;
+    db.create(
+        "Bob",
+        Some("/synthetic"),
+        Binding {
+            tools: &tools,
+            gate: Some(&second),
+            created_by: Some(ann.name.as_str()),
+            created_by_id: Some(ann.bot_id),
+            ..binding()
+        },
+    )
+    .unwrap();
+    let turn = db
+        .begin(
+            "Bob",
+            "request",
+            "work",
+            true,
+            &TurnOptions::default(),
+            allow_provider,
+        )
+        .unwrap()
+        .turn;
+    let (item, call) = shell_call("fc_0", "s0", "git push");
+    db.append(turn, vec![item], std::slice::from_ref(&call), None)
+        .unwrap();
+    let listed = db.approvals(Some("Bob"), None, 0, None, 64).unwrap();
+    let announced = listed["approvals"][0]["announced_ms"].as_i64().unwrap();
+    let holds = |db: &Database| {
+        let view = db.turn_view("Bob", turn).unwrap()["waiting_on"].clone();
+        let bot = serde_json::to_value(db.inspect("Bob").unwrap().waiting_on).unwrap();
+        assert_eq!(view, bot, "the bot says what its turn does");
+        (view["holder"].clone(), view["since_ms"].as_i64().unwrap())
+    };
+    let served = ["first".to_owned(), "second".to_owned()];
+    db.suspend_approval(
+        turn,
+        std::slice::from_ref(&call),
+        epoch_now(),
+        None,
+        None,
+        &served,
+    )
+    .unwrap();
+    assert_eq!(holds(&db), (json!("reviewer"), announced));
+    // The first gate's reviewer hands it to a person.
+    let decision = |tag, allow| Decision {
+        bot: "Bob",
+        turn,
+        call_id: "s0",
+        request: 1,
+        tag: Some(tag),
+        allow,
+        unreviewed: false,
+        reason: None,
+        by: Some("test"),
+        leased: false,
+    };
+    db.ask(decision("first", false)).unwrap();
+    let asked =
+        db.approvals(Some("Bob"), None, 0, None, 64).unwrap()["approvals"][0]["asked"][0]["at_ms"]
+            .as_i64()
+            .unwrap();
+    assert_eq!(holds(&db), (json!("person"), asked));
+    // The person allows it: the second gate's reviewer holds the call
+    // again, from its announcement.
+    let answered = db.answer(decision("first", true)).unwrap();
+    assert!(!answered.resume);
+    assert_eq!(holds(&db), (json!("reviewer"), announced));
+}
+
+#[test]
 fn schema_104_says_who_holds_a_call_parked_before_it() {
     let path = std::env::temp_dir().join(format!("agent-holder-{}.sqlite", std::process::id()));
     let _ = std::fs::remove_file(&path);

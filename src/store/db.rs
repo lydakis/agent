@@ -1755,6 +1755,11 @@ pub struct Waiting {
     /// first `ask` of a gate still open.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub since_ms: Option<i64>,
+    /// The gate tags sessions served as the turn parked: who holds the
+    /// call is read from them again when a verdict or an ask changes the
+    /// gates still open.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub served: Vec<String>,
     /// Parked on the answer to `call_id`, which has started, from the
     /// client this tag names; `deadline_ms` is when the call stops waiting.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -9325,6 +9330,7 @@ impl Database {
             approval: true,
             holder: Some(holder.to_owned()),
             since_ms: Some(since_ms),
+            served: served.to_vec(),
             answer: None,
             copied: None,
             summary_retry_ms,
@@ -9393,6 +9399,7 @@ impl Database {
             approval: false,
             holder: None,
             since_ms: None,
+            served: Vec::new(),
             answer: None,
             copied: None,
             summary_retry_ms,
@@ -9559,6 +9566,7 @@ impl Database {
             approval: false,
             holder: None,
             since_ms: None,
+            served: Vec::new(),
             answer: Some(tag.clone()),
             copied: None,
             summary_retry_ms,
@@ -10794,6 +10802,24 @@ impl Database {
         }
         Ok((status, request, tag, at_ms))
     }
+    /// Who holds `request`'s call now, and since when, where its turn is
+    /// parked on it and that changed: read from its gates still open and
+    /// the tags served as the turn parked, as the park read them.
+    fn holds(
+        &self,
+        answer: &Decision<'_>,
+        request: &Request,
+    ) -> Result<Option<(&'static str, i64)>> {
+        let Some(waiting) = self.waiting(answer.turn)? else {
+            return Ok(None);
+        };
+        if request.step_of.is_some() || !waiting.approval || waiting.call_id != answer.call_id {
+            return Ok(None);
+        }
+        let (holder, since_ms) = request.holder(&waiting.served);
+        let same = waiting.holder.as_deref() == Some(holder) && waiting.since_ms == Some(since_ms);
+        Ok((!same).then_some((holder, since_ms)))
+    }
     /// Hand a planned call to a person: `answer.tag`'s gate stays open, the
     /// call keeps waiting, and the reason goes with it in listings and in an
     /// `approval_asked` event. Only a gate with no expiry can wait on one.
@@ -10817,29 +10843,14 @@ impl Database {
         };
         request.asked.retain(|other| other.tag != tag);
         request.asked.push(asked.clone());
+        let held = self.holds(&answer, &request)?;
         let tx = self.conn.savepoint()?;
         tx.prepare_cached("UPDATE approvals SET asked=? WHERE id=?")?
             .execute(params![serde_json::to_string(&request.asked)?, request.id])?;
-        // A turn parked on the call now waits on a person, from now: its
-        // own `waiting_on` and its bot's say so. One that has not parked
-        // reads the ask when it does.
-        if request.step_of.is_none()
-            && tx
-                .prepare_cached(
-                    "UPDATE turns SET waiting=json_set(waiting,'$.holder','person','$.since_ms',?3)
-                     WHERE id=?1 AND status='waiting' AND json_extract(waiting,'$.approval')=1
-                      AND json_extract(waiting,'$.call_id')=?2
-                      AND json_extract(waiting,'$.holder') IS NOT 'person'",
-                )?
-                .execute(params![answer.turn, answer.call_id, at_ms])?
-                > 0
-        {
-            tx.prepare_cached(
-                "UPDATE bots SET waiting_on=json_set(waiting_on,'$.holder','person','$.since_ms',?3)
-                 WHERE name=?1 AND running_turn=?2 AND status='waiting'",
-            )?
-            .execute(params![answer.bot, answer.turn, at_ms])?;
-        }
+        // A turn parked on the call now waits on a person: its own
+        // `waiting_on` and its bot's say so. One that has not parked reads
+        // the ask when it does.
+        rehold(&tx, held, answer.bot, answer.turn)?;
         event(
             &tx,
             answer.bot,
@@ -10923,6 +10934,12 @@ impl Database {
                 lifted: None,
             });
         }
+        // A verdict that leaves the call waiting on other gates may change
+        // who holds it, as the turn parked on it says.
+        let held = match status == "waiting" && request.process.is_none() && !request.decided() {
+            true => self.holds(&answer, &request)?,
+            false => None,
+        };
         let tx = self.conn.savepoint()?;
         tx.prepare_cached("UPDATE approvals SET verdicts=? WHERE id=?")?
             .execute(params![
@@ -10930,6 +10947,7 @@ impl Database {
                 request.id
             ])?;
         untag_answered(&tx, request.id, std::slice::from_ref(&verdict))?;
+        rehold(&tx, held, answer.bot, answer.turn)?;
         tx.commit()?;
         let resume = status == "waiting"
             && request.process.is_none()
@@ -12451,6 +12469,7 @@ impl Database {
             approval: false,
             holder: None,
             since_ms: None,
+            served: Vec::new(),
             answer: None,
             copied: None,
             summary_retry_ms,
@@ -12527,6 +12546,7 @@ impl Database {
             approval: false,
             holder: None,
             since_ms: None,
+            served: Vec::new(),
             answer: None,
             copied,
             summary_retry_ms,
@@ -12621,6 +12641,7 @@ impl Database {
             approval: false,
             holder: None,
             since_ms: None,
+            served: Vec::new(),
             answer: None,
             copied: None,
             summary_retry_ms: None,
@@ -16874,6 +16895,24 @@ fn flush(tx: &Connection, turn: i64, live: Option<&Live>) -> Result<()> {
 fn parked(tx: &Connection, bot: &str, status: &str, on: &Value) -> Result<()> {
     tx.prepare_cached("UPDATE bots SET status=?2,waiting_on=?3 WHERE name=?1")?
         .execute(params![bot, status, on.to_string()])?;
+    Ok(())
+}
+/// Write who holds the call a parked turn waits on, `held` by
+/// [`Database::holds`], on the turn's `waiting` and its bot's `waiting_on`.
+fn rehold(tx: &Connection, held: Option<(&str, i64)>, bot: &str, turn: i64) -> Result<()> {
+    let Some((holder, since_ms)) = held else {
+        return Ok(());
+    };
+    tx.prepare_cached(
+        "UPDATE turns SET waiting=json_set(waiting,'$.holder',?2,'$.since_ms',?3)
+         WHERE id=?1 AND status='waiting'",
+    )?
+    .execute(params![turn, holder, since_ms])?;
+    tx.prepare_cached(
+        "UPDATE bots SET waiting_on=json_set(waiting_on,'$.holder',?3,'$.since_ms',?4)
+         WHERE name=?1 AND running_turn=?2 AND status='waiting'",
+    )?
+    .execute(params![bot, turn, holder, since_ms])?;
     Ok(())
 }
 /// Keep how `turn` ended as its bot's last, unless a later turn of the bot

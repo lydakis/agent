@@ -466,7 +466,7 @@ view's own name where the two meet, so `turns` shows it after retention drops
 the turn's events.
 `waiting_on` is what a parked turn waits for, as its `turn_waiting` or
 `turn_paced` event said (`call_id` and `approval` with `holder` and
-`since_ms`, as an `ask` rewrites them, `load` or `handles`, or
+`since_ms`, as an `ask` or a verdict rewrites them, `load` or `handles`, or
 `resume_at_ms` with `blocked` or `retrying` when either parked it, null with
 `paused: true` for a turn the pull cord parked), and
 null otherwise. A `wait` result is the view, plus the
@@ -3694,8 +3694,10 @@ gate's holder hands it over with `ask`, from that first ask of a gate
 still open, or when a gate no session serves is open, from the
 announcement, since only an answer with no lease decides such a gate. These
 are the audit's names for who decided a call. The holder is written as the
-turn parks, from the tags served then, and an `ask` rewrites it on the
-parked turn and its bot in the commit that records the ask. A tag a
+turn parks, from the tags served then, and an `ask`, or a verdict that
+leaves the call waiting on another gate, rewrites it on the parked turn and
+its bot in the commit that records it, read again from the gates still open
+and the tags served as the turn parked. A tag a
 session starts or stops serving after the park leaves it as it was: a
 reviewer that comes back decides the call or asks, and either moves the
 turn on. Schema 104 writes both for turns parked on a verdict when the
