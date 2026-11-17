@@ -3,8 +3,8 @@
 //! the composition, so a bot created from Sonny or the CLI with `--agents`
 //! reads the same way.
 //!
-//! Layers, in this order: the harness preamble (how to delegate and collect
-//! results through this runtime), every AGENTS.md and `.agents/AGENTS.md`
+//! Layers, in this order: the harness preamble (that other agents are
+//! reached through the bot's tools), every AGENTS.md and `.agents/AGENTS.md`
 //! from the workspace up to the filesystem root plus the user's global one,
 //! an index of skills the bot can open with its `read` tool and of profiles
 //! it can start peers in, the memory indexes the client names, and the
@@ -17,49 +17,14 @@ use std::path::{Path, PathBuf};
 /// for the prompt cache to matter.
 pub const MAX_INSTRUCTIONS: usize = 60 * 1024;
 
-/// The command a bot's shell reaches the daemon's CLI by, as the client
-/// that made the bot says: `AGENT_CLI` when a client that wraps the CLI
-/// sets it (Sonny sets its own `"PATH/sonny" agent`), else `"$AGENT_BIN"`,
-/// the binary the daemon gives every shell.
-pub fn cli() -> String {
-    std::env::var("AGENT_CLI")
-        .ok()
-        .filter(|cli| !cli.trim().is_empty())
-        .unwrap_or_else(|| "\"$AGENT_BIN\"".into())
-}
-
-/// `text` with each `"$AGENT_BIN"` naming the CLI the way `cli` says, as
-/// the preamble and a role are written.
-pub fn with_cli(text: &str) -> String {
-    naming(text, &cli())
-}
-
-fn naming(text: &str, cli: &str) -> String {
-    text.replace("\"$AGENT_BIN\"", cli)
-}
-
-/// `PREAMBLE`, naming the CLI the way `cli` says.
-pub fn preamble() -> String {
-    with_cli(PREAMBLE)
-}
-
-pub const PREAMBLE: &str = "To delegate a subtask to another agent with its own conversation, run \
-\"$AGENT_BIN\" run --detach --new --bot NAME -- TASK from the shell; it prints a turn handle immediately. \
-Add --agents to give it this folder's AGENTS.md, skills and memory. \
-Add --model PROVIDER/MODEL to give it one of the models \"$AGENT_BIN\" models lists; without it, it gets yours. \
-Continue an existing agent with \"$AGENT_BIN\" run --detach --bot NAME -- TASK. \
-To tell an agent something that needs no reply, such as a change of scope it should take into account, \
-add --delivery attach: the message joins its next model call, mid-turn or in its next turn, without starting a turn of its own. \
-Collect results with the wait tool on that handle; it returns the peer's status and final text. \
-Blocking run/follow inside a shell tool is rejected. \
-Use \"$AGENT_BIN\" fork --source NAME --bot NEW to branch an agent from where it is now, mid-turn included; --checkpoint N branches from an earlier point in its history. \
-To ask an agent something without disturbing it, mid-turn included, run \
-\"$AGENT_BIN\" run --detach --fork NAME --bot NEW --allow '' --expires 15m -- QUESTION and wait on its handle: \
-a copy of NAME answers from its history without acting, and is deleted once it has been idle 15 minutes. \
-$AGENT_BOT and $AGENT_BOT_ID identify you; $AGENT_PARENT and $AGENT_PARENT_ID, when set, identify the agent that created you. \
-To contact that creator, run \
-\"$AGENT_BIN\" run --detach --bot \"$AGENT_PARENT\" --bot-id \"$AGENT_PARENT_ID\" -- TASK; \
-the identity check refuses a deleted creator or a replacement with the same name. \
+/// What every bot a human-facing client makes is told first: that other
+/// agents are reached through its tools. The tools' own descriptions carry
+/// the rest; no command line or program path is taught.
+pub const PREAMBLE: &str = "Other agents on this machine are reached through your tools. \
+list_agents finds them by name and says what each is doing and which agent made it. \
+send_message gives one a message by its whole name and returns a handle; wait on that handle returns the turn's status and final text. \
+history reads an agent's turns, a running one included. \
+$AGENT_BOT in your shell is your own name, and $AGENT_PARENT, when set, names the agent that created you, which send_message reaches. \
 Your final reply reaches whoever waits on your turn.";
 
 /// The prompt-cache lifetime human-facing clients make a bot with: an hour
@@ -512,10 +477,7 @@ impl Kind {
                 "\n\n# Skills\n\nRead a skill file with the read tool when its subject comes up.\n"
                     .into()
             }
-            Kind::Profiles => format!(
-                "\n\n# Profiles\n\nStart an agent in one of these roles with {} run --detach --new --profile ROLE --bot NAME -- TASK.\n",
-                cli()
-            ),
+            Kind::Profiles => "\n\n# Profiles\n\nThe roles a new agent can be started in.\n".into(),
         }
     }
     /// The name an entry of this directory would index under. Only a name
@@ -1479,13 +1441,13 @@ fn compose(
     memory: &[PathBuf],
     mut leave: Leave,
 ) -> Result<Instructions, Failure> {
-    let mut text = preamble();
+    let mut text = PREAMBLE.to_owned();
     let mut sources = Vec::new();
     // The role is no file to leave out: when files are, they leave it its
     // room, so one that fits only without the role is the one left out.
     let role_block = role
         .filter(|r| !r.body.is_empty())
-        .map(|role| format!("{ROLE_HEADING}{}\n\n{}", role.name, with_cli(&role.body)));
+        .map(|role| format!("{ROLE_HEADING}{}\n\n{}", role.name, role.body));
     let reserve = match leave {
         Leave::Refuse => 0,
         Leave::Out(_) => role_block.as_ref().map_or(0, String::len),
@@ -1573,14 +1535,23 @@ mod tests {
     }
 
     #[test]
-    fn a_client_that_wraps_the_cli_names_its_own_way_in() {
-        let sonny = "\"/opt/homebrew/opt/sonny/bin/sonny\" agent";
-        let text = naming(PREAMBLE, sonny);
-        assert!(!text.contains("AGENT_BIN"), "{text}");
-        assert!(text.contains(&format!("{sonny} run --detach --new --bot NAME -- TASK")));
-        assert!(text.contains(&format!("{sonny} run --detach --bot \"$AGENT_PARENT\"")));
-        // Without one, the binary the daemon gives every shell.
-        assert_eq!(naming(PREAMBLE, "\"$AGENT_BIN\""), PREAMBLE);
+    fn agents_are_taught_tools_not_a_command_line() {
+        for tool in ["list_agents", "send_message", "wait", "history"] {
+            assert!(PREAMBLE.contains(tool), "{tool}: {PREAMBLE}");
+        }
+        let profiles = Kind::Profiles.header();
+        for text in [PREAMBLE, profiles.as_str()] {
+            for cli in [
+                "AGENT_BIN",
+                "agent run",
+                " run --",
+                "--detach",
+                "--bot",
+                "fork",
+            ] {
+                assert!(!text.contains(cli), "{cli}: {text}");
+            }
+        }
     }
 
     fn temp(name: &str) -> PathBuf {
@@ -2605,8 +2576,7 @@ mod tests {
     fn a_file_that_fits_only_without_the_role_is_the_one_left_out() {
         let root = temp("leaving-room");
         let role = Profile::parse("lead", None, &"You lead. ".repeat(100));
-        let room =
-            MAX_INSTRUCTIONS - preamble().len() - agents_header(&root.join("AGENTS.md")).len();
+        let room = MAX_INSTRUCTIONS - PREAMBLE.len() - agents_header(&root.join("AGENTS.md")).len();
         std::fs::write(root.join("AGENTS.md"), "x".repeat(room - 10)).unwrap();
         // It fits alone; with the role, a caller that refuses fails on the role.
         assert!(instructions(&root, None, &[]).is_ok());

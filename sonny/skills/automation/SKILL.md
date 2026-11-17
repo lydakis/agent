@@ -12,17 +12,15 @@ the job keeps its state in files in its folder and reads them each run.
 
 ## Setting one up
 
-Give the job its own agent and folder, created with `--agents` so it reads
-the folder's rules and skills. Make the folder in your state folder,
+Give the job its own agent and folder. Make the folder in your state folder,
 `"$SONNY_STATE"/jobs/NAME`: you, your tasks and the agents you make write
 it in every permissions row, and it outlives them. Then add an automation for it with the
-automations tool: `add` with `agent` NAME, `cron` 'MIN HOUR DAY MONTH WEEKDAY'
-and `message` MESSAGE. Automations need the system's scheduler to keep the time:
-launchd on macOS, systemd's user manager on Linux. Without one `add` is
-refused with `automations_unsupported`, so say so rather than presenting a job
-as set up. Without the automations tool, outside
-Sonny, `"$HOME/.agent/automation" add` takes the same fields as flags
-(`--agent NAME --cron '...' -- MESSAGE`).
+automations tool: `add` with `start` (`name` NAME and `model`), which makes
+the agent at the first run with your folder's rules and skills, `cron`
+'MIN HOUR DAY MONTH WEEKDAY' and `message` MESSAGE. Automations need the
+system's scheduler to keep the time: launchd on macOS, systemd's user manager
+on Linux. Without one `add` is refused with `automations_unsupported`, so say
+so rather than presenting a job as set up.
 
 MESSAGE names the folder and says to read and follow this file by its
 path, so every run follows the current text even if the agent's skill
@@ -122,7 +120,7 @@ the lead sets it up and handles what it reports. Its `preferences.md` names
 the lead as the destination and, when the person wants one, a destination
 for urgent items, such as a direct message to the person.
 
-Run it often and gate each run: `add` with `agent` NAME, `every` `10m`,
+Run it often and gate each run: `add` with `start` as above, `every` `10m`,
 `if` `cd "$SONNY_STATE"/jobs/NAME && ! ./quiet` and `message` MESSAGE. The
 `if` command runs in your own folder, hence the `cd`, and as your own
 commands do: in your sandbox, with your variables.
@@ -262,10 +260,12 @@ one.
 
 A lead keeps one automation for itself that wakes it to look over what it
 holds, named with its name and `.next`, such as `web.lead.next` for
-`web.lead`. It repeats: `every` set to how long until the lead would next
-look, or `cron` for a set hour such as the person's morning, never `at` or
-`in`. Give it this `if`, which skips the look while the person wrote in the
-last twenty minutes:
-`~/.agent/memory said $(( $(date +%s) * 1000 - 1200000 )) | grep -qF '"said":[]'`.
+`web.lead`. It repeats with `every`, set to how long until the lead would
+next look, never `at`, `in` or a `cron` that fires once a day: the `if`
+below skips a run while the person is writing, and a person busy at that
+one minute would lose the whole day's look. Give it this `if`, which skips
+the look while the person wrote in the last twenty minutes, and fails,
+rather than skipping, when it cannot read what they wrote:
+`said=$(~/.agent/memory said $(( $(date +%s) * 1000 - 1200000 ))) || exit 2; case "$said" in *'"said":[]'*) exit 0;; *'"said":'*) exit 1;; *) exit 2;; esac`.
 Each look ends by setting it again with `replace`, at the time of the next
 look, or by removing it once nothing is open.
