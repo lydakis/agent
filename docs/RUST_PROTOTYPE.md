@@ -4180,12 +4180,14 @@ when it shows nothing: whitespace, or characters that draw nothing (zero-width
 spaces and joiners, word joiners, direction marks, a byte order mark, a
 soft hyphen, fillers), the lone zero-width space being what models often
 send for an empty reply. A Claude reply keeps no blank text block, so a
-reply of only one is the empty reply it meant; a prompt's blank parts after
-its words, and a tool result's blank text parts, are left out, and a
-prompt's blank words read `<empty>`, as Pi writes Bedrock's required text.
-A refusal of the kind still repairs the nodes its request sent: each blank
-block goes, the item padded with JSON whitespace to its size so no total
-moves (content left with nothing is the text `<empty>`), and the call goes
+reply of only one is the empty reply it meant; a tool result's blank text
+parts are left out, and a prompt's blank parts read `<empty>` in their
+places, where its quotes find theirs, as Pi writes Bedrock's required text.
+A refusal of the kind still repairs the nodes its request sent: a reply's or
+result's blank block goes, the item padded with JSON whitespace to its size
+(content left with nothing is the text `<empty>`), and a prompt's blank part
+reads `<empty>`; what a request without thinking saves, and any size a
+placeholder adds, move every later node's totals with it. The call goes
 again at once, its `retry` event listing each node and what it held under
 `repaired`. `repair` (protocol 86; `agent repair --bot NAME`) does the same
 to the bot's whole history and answers the same list. Responses providers

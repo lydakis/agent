@@ -8875,18 +8875,20 @@ impl Database {
             };
             // What a request without thinking sends of it changes with it:
             // its thinking bytes, and every later node's running total.
+            // A prompt grown by its placeholder grows every later total.
             let thinking = super::thinking_bytes(&fixed) as i64;
+            let grown = fixed.len() as i64 - item.len() as i64;
             let tx = self.conn.transaction()?;
             tx.prepare_cached("UPDATE nodes SET item=?,thinking=? WHERE id=?")?
                 .execute(params![fixed, thinking, node])?;
-            if thinking != was {
+            if thinking != was || grown != 0 {
                 tx.prepare_cached(
                     "WITH RECURSIVE below(id) AS (
                         SELECT ?1 UNION ALL SELECT n.id FROM nodes n JOIN below b ON n.parent=b.id)
-                     UPDATE nodes SET total_thinking=total_thinking+?2
+                     UPDATE nodes SET total_thinking=total_thinking+?2,total_bytes=total_bytes+?3
                      WHERE id IN (SELECT id FROM below)",
                 )?
-                .execute(params![node, thinking - was])?;
+                .execute(params![node, thinking - was, grown])?;
             }
             tx.commit()?;
             repaired.push(json!({"node": node, "removed": removed}));
@@ -20234,7 +20236,19 @@ fn unblanked(item: &[u8]) -> Option<(Vec<u8>, Vec<String>)> {
             }
         }
     }
-    take(content);
+    // A prompt's parts keep their places, where its quotes find theirs:
+    // a blank one reads `<empty>` there, as a new prompt's does.
+    let user = value["role"] == "user";
+    let content = value.get_mut("content")?.as_array_mut()?;
+    match user {
+        true => {
+            for part in content.iter_mut().filter(|part| blank_text(part)) {
+                removed.push(part["text"].as_str().unwrap_or_default().to_owned());
+                part["text"] = json!(EMPTY);
+            }
+        }
+        false => take(content),
+    }
     if removed.is_empty() {
         return None;
     }
@@ -20242,9 +20256,10 @@ fn unblanked(item: &[u8]) -> Option<(Vec<u8>, Vec<String>)> {
         value["content"] = json!(EMPTY);
     }
     let mut fixed = serde_json::to_vec(&value).ok()?;
-    // Never longer: what it lost is at least a block, and serde writes it
-    // as it was written.
-    let pad = item.len().checked_sub(fixed.len())?;
+    // As long as it was where it can be: what it lost is at least a block,
+    // and serde writes it as it was written. A placeholder can make a
+    // prompt longer.
+    let pad = item.len().saturating_sub(fixed.len());
     fixed.splice(1..1, std::iter::repeat_n(b' ', pad));
     Some((fixed, removed))
 }
@@ -20576,9 +20591,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_repair_takes_blank_text_out_and_keeps_every_size() {
+    fn a_repair_takes_blank_text_out_and_keeps_every_total() {
         let mut db = Database::initialize(Connection::open_in_memory().unwrap()).unwrap();
-        let items: [&[u8]; 6] = [
+        let items: [&[u8]; 7] = [
             // A reply of one zero-width space: content left with nothing.
             br#"{"content":[{"text":"\u200b","type":"text"}],"role":"assistant"}"#,
             // Blank text beside a call: the call stays.
@@ -20589,6 +20604,8 @@ mod tests {
             br#"{"content":[{"text":"done","type":"text"}],"role":"assistant"}"#,
             // Blank text beside thinking: thinking is all it keeps.
             br#"{"content":[{"signature":"s","thinking":"","type":"thinking"},{"text":"\u200b","type":"text"}],"role":"assistant"}"#,
+            // A blank prompt that quotes: its quote stays in its place.
+            br#"{"content":[{"text":"","type":"text"},{"text":"quoted","type":"text"}],"role":"user"}"#,
             // After it, words.
             br#"{"content":[{"text":"next","type":"text"}],"role":"user"}"#,
         ];
@@ -20613,7 +20630,7 @@ mod tests {
                 )
                 .unwrap();
         }
-        let all = [1, 2, 3, 4, 5, 6];
+        let all = [1, 2, 3, 4, 5, 6, 7];
         let repaired = db.repair_blank(&all).unwrap();
         assert_eq!(
             repaired,
@@ -20622,20 +20639,23 @@ mod tests {
                 json!({"node":2,"removed":["\n\n"]}),
                 json!({"node":3,"removed":[" "]}),
                 json!({"node":5,"removed":["\u{200b}"]}),
+                json!({"node":6,"removed":[""]}),
             ]
         );
         // Each node's thinking bytes are what it loses without thinking now,
-        // and the running totals add them up.
-        let mut thought = 0;
+        // and the running totals add them and the items' sizes up.
+        let (mut thought, mut size) = (0, 0);
         for id in all {
-            let (item, thinking, total): (Vec<u8>, i64, i64) = db
+            let (item, thinking, total, bytes): (Vec<u8>, i64, i64, i64) = db
                 .conn
                 .query_row(
-                    "SELECT item,thinking,total_thinking FROM nodes WHERE id=?",
+                    "SELECT item,thinking,total_thinking,total_bytes FROM nodes WHERE id=?",
                     [id],
-                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
                 )
                 .unwrap();
+            size += item.len() as i64;
+            assert_eq!(bytes, size, "node {id}");
             assert_eq!(
                 thinking,
                 super::super::thinking_bytes(&item) as i64,
@@ -20651,7 +20671,10 @@ mod tests {
         };
         for (id, was) in (1..).zip(items) {
             let now = item(id);
-            assert_eq!(now.len(), was.len(), "node {id} keeps its size");
+            // Only the placeholder makes one longer.
+            if id != 6 {
+                assert_eq!(now.len(), was.len(), "node {id} keeps its size");
+            }
             let value: Value = serde_json::from_slice(&now).unwrap();
             let text = String::from_utf8_lossy(&now);
             assert!(!text.contains(r"\u200b") && !text.contains('\u{200b}'));
@@ -20660,6 +20683,13 @@ mod tests {
                 2 => assert_eq!(value["content"][0]["type"], "tool_use"),
                 3 => assert_eq!(value["content"][0]["content"], "<empty>"),
                 5 => assert_eq!(value["content"][0]["type"], "thinking"),
+                6 => assert_eq!(
+                    value["content"],
+                    json!([
+                        {"text": "<empty>", "type": "text"},
+                        {"text": "quoted", "type": "text"}
+                    ])
+                ),
                 _ => assert_eq!(now, was),
             }
         }
