@@ -1739,7 +1739,7 @@ has each lead follow its tasks. As things happen, it tells the lead every
 message someone else wrote in its tasks, each turn's end with the task's
 reply, a question or approval waiting on you, and a margin note, in one
 note at a time beside what the sources it follows said, each event under
-a `[source · topic · from]` line, as a steer: the note joins the lead's
+a `[source · topic · from · time]` line, as a steer: the note joins the lead's
 running turn, or starts one, and the lead decides what matters. A turn a note started that ends with
 nothing to say stays folded under the note, with no sound. Any agent can
 follow more with its `follows` tool (other agents' tasks, bots
@@ -2199,7 +2199,7 @@ whatever link or path leads there), `modified('state.json')` (when it
 last changed, none while it is not there, refused as `file()` is), `tasks()` and `task('NAME')`
 (where its tasks stand, as `/status` reads them), `now()`, and `| ago`
 and `| time` for a time in seconds; Jinja's own filters, such as
-`selectattr`, `sort` and `tojson`, work as well, and so do Python's
+`selectattr`, `sort`, `truncate` and `tojson`, work as well, and so do Python's
 methods on strings, lists and maps, such as `file('x.py').splitlines()`
 to pick out the lines that matter. A blank never runs a command or reaches the network, so an agent
 that wants something no source covers writes it to a file from its own
