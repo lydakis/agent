@@ -119,6 +119,23 @@ pub fn declare(record: &Value, role: Role) -> Option<Value> {
     fits(&declared).then_some(Value::Array(declared))
 }
 
+/// `declared`, a bot's tools, with Sonny's `exec` as an agent held by
+/// `settings` is shown it: with `tools.shell`'s fields for leaving the
+/// sandbox when they put it in one. `None` when it has that one already,
+/// or no `exec` of Sonny's.
+pub fn held(declared: &Value, settings: &Value) -> Option<Value> {
+    let tools = declared.as_array()?;
+    let at = (tools.iter()).position(|tool| {
+        tool["name"] == crate::served::EXEC && tool["answered_by"] == crate::served::TAG
+    })?;
+    let exec = kinded(crate::exec::tool(Role::TASK.within(settings).escalates)?);
+    (tools[at] != exec).then(|| {
+        let mut tools = tools.clone();
+        tools[at] = exec;
+        Value::Array(tools)
+    })
+}
+
 /// Why the bot `record` describes cannot take this build's tools in
 /// `role`: its own beside Sonny's are past what the daemon takes. `None`
 /// when they fit, or it has them already.
@@ -137,7 +154,7 @@ pub fn too_many(record: &Value, role: Role) -> Option<String> {
 /// `role`, fitting or not; `None` when it has them already.
 fn wanted(record: &Value, role: Role) -> Option<Vec<Value>> {
     let mut declared = record["declared"].as_array().cloned().unwrap_or_default();
-    let mut ours = tools(role);
+    let mut ours = tools(role.within(&record["settings"]));
     // A task resolves itself, as its lead resolves it.
     if !role.lead && !role.worker && resolves(record) {
         ours.push(kinded(crate::resolved::tool()));
@@ -256,15 +273,51 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    /// A lead, and any other agent: a task of it, or a task of that task's.
+    /// A lead, and any other agent: a task of it, or a task of that task's,
+    /// as a record with no sandbox in its settings holds them.
     fn a_lead() -> Role {
-        Role::LEAD
+        Role::LEAD.within(&Value::Null)
     }
     fn a_task() -> Role {
-        Role::TASK
+        Role::TASK.within(&Value::Null)
     }
     fn a_helper() -> Role {
-        Role::TASK
+        Role::TASK.within(&Value::Null)
+    }
+
+    /// An agent's `exec` shows the shell's fields for leaving a sandbox
+    /// while its row puts it in one, and loses them when a row lets it
+    /// out, as its daemon declares the shell to it.
+    #[test]
+    fn exec_shows_the_shell_s_way_out_only_while_its_agent_is_in_a_sandbox() {
+        let (confined, free) = (
+            json!({"sandbox": "workspace-write"}),
+            json!({"sandbox": "danger-full-access"}),
+        );
+        assert!(Role::TASK.within(&confined).escalates);
+        assert!(
+            Role::TASK
+                .within(&json!({"sandbox": "read-only"}))
+                .escalates
+        );
+        assert!(!Role::TASK.within(&free).escalates);
+        let exec = |tools: &Value| -> String {
+            let tools = tools.as_array().unwrap();
+            let exec = tools
+                .iter()
+                .find(|tool| tool["name"] == crate::served::EXEC);
+            exec.unwrap()["description"].as_str().unwrap().to_owned()
+        };
+        let declared = json!(tools(Role::TASK.within(&confined)));
+        assert!(exec(&declared).contains("sandbox_permissions?"));
+        assert_eq!(held(&declared, &confined), None);
+        let out = held(&declared, &free).unwrap();
+        assert!(!exec(&out).contains("sandbox_permissions"));
+        assert_eq!(out, json!(tools(Role::TASK.within(&free))));
+        assert_eq!(held(&out, &confined), Some(declared.clone()));
+        // Opened under a row that lets it out, it is declared that way.
+        let record = json!({"declared": declared, "settings": free});
+        assert!(!exec(&declare(&record, Role::TASK).unwrap()).contains("sandbox_permissions"));
     }
 
     #[test]
@@ -293,9 +346,9 @@ mod tests {
         }
         assert_eq!(
             declared_role(&[json!({"name": crate::served::PROJECT})]),
-            a_lead()
+            Role::LEAD
         );
-        assert_eq!(declared_role(&[]), a_task());
+        assert_eq!(declared_role(&[]), Role::TASK);
     }
 
     #[test]
@@ -325,12 +378,12 @@ mod tests {
         // A lead made it, yet it marks nothing done, and a refresh keeps it
         // a worker.
         let record = json!({"name": "shop.wf-1a2b3c4d-0a1b2c3d4e5f", "created_by": "shop.lead",
-            "declared": tools(Role::WORKER)});
+            "declared": tools(Role::WORKER.within(&Value::Null))});
         assert_eq!(role(&record), Role::WORKER);
         assert_eq!(declare(&record, Role::WORKER), None);
-        assert!(
-            refresh(&record).is_none_or(|fields| fields["declare"] == json!(tools(Role::WORKER)))
-        );
+        assert!(refresh(&record).is_none_or(
+            |fields| fields["declare"] == json!(tools(Role::WORKER.within(&Value::Null)))
+        ));
     }
 
     #[test]

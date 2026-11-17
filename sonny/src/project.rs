@@ -1028,8 +1028,6 @@ async fn make(
             .collect()
         }
     };
-    let declare = json!(crate::declared::tools(crate::served::Role::LEAD));
-    let gate = crate::approvals::gate(mode, &crate::approvals::gateable(&tools, &declare));
     // Writing its own state folder, by the name it is made under.
     let lead = (bot.map(str::to_owned)).or_else(|| {
         let info = read(dir).ok()?;
@@ -1037,6 +1035,9 @@ async fn make(
     });
     let state = lead.as_deref().and_then(crate::state::folder);
     let mut settings = crate::approvals::sandbox(mode, dir, state.as_deref());
+    let held = crate::served::Role::LEAD.within(&json!(settings));
+    let declare = json!(crate::declared::tools(held));
+    let gate = crate::approvals::gate(mode, &crate::approvals::gateable(&tools, &declare));
     if let Some(state) = &state {
         settings.insert("env".into(), json!({crate::state::VAR: state}));
     }

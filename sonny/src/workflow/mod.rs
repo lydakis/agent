@@ -1357,7 +1357,7 @@ impl Attempt {
             }
             let create = json!({"bot": worker, "workspace": dir, "model": model,
                 "instructions": told.instructions, "effort": effort, "tools": tools,
-                "declare": crate::declared::tools(crate::served::Role::WORKER),
+                "declare": crate::declared::tools(crate::served::Role::WORKER.within(&json!(settings))),
                 "created_by": plan.caller, "created_by_id": plan.caller_id,
                 "compaction_instructions": agent_client::policy::DEFAULT_COMPACTION_INSTRUCTIONS,
                 "settings": settings,
