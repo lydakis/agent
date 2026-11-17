@@ -359,6 +359,13 @@ LIVE = [
 
 DAYS = {'full': STEPS, 'small': SMALL, 'burst': BURST, 'automation': AUTOMATION, 'live': LIVE}
 DAY, DAY_NAME = STEPS, ''  # the day a run plays, set by --day
+# More `[sonny]` settings for a run's config, such as `code_mode`, so two
+# arms of one build can differ in a setting alone.
+SETTINGS = {}
+# Whether a run records every agent's turns and usage (`events.jsonl`) and
+# its processes' peak memory and CPU (`resources.json`), as the burst always
+# does.
+RECORD = False
 
 SOURCE = r'''import json, sys
 from pathlib import Path
@@ -418,7 +425,7 @@ model = "{model}"
 task_effort = "high"
 suggest = false
 default_permissions = "eval"
-
+{''.join(f'{key} = {json.dumps(value)}{chr(10)}' for key, value in SETTINGS.items())}
 # What the day's work writes beside the repository (the backup S1 asks
 # for, pushes to origin) written without asking, the network off so no
 # Unix socket is reached (Docker's would write anywhere), and every call
@@ -858,7 +865,7 @@ def run(arm, n, bins, model, spec=None):
     # The burst's evidence, kept as it comes: tasks deleted before the end
     # still count, with what they cost.
     recorder = sampler = None
-    if DAY is BURST:
+    if DAY is BURST or RECORD:
         recorder = burst_ledger.Recorder(agent, env, out / 'events.jsonl')
         sampler = burst_ledger.Sampler(home, roots=lambda: [acp.p.pid] if acp else [])
     landed = {}
@@ -937,6 +944,8 @@ def run(arm, n, bins, model, spec=None):
         bots = subprocess.run([str(agent), 'ls'], env=env, capture_output=True, text=True)
         (out / 'bots.txt').write_text(bots.stdout)
         resources = sampler.close() if sampler else None
+        if resources:
+            (out / 'resources.json').write_text(json.dumps(resources))
         if recorder:
             recorder.close()
         if acp:
