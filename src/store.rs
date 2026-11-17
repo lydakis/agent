@@ -355,6 +355,45 @@ pub struct Counters {
 struct Inner {
     operations: std::collections::HashMap<&'static str, Operation>,
     groups: Groups,
+    /// The last [`SLOW_KEPT`] operations that took [`SLOW_NS`] or more,
+    /// oldest first.
+    slow: std::collections::VecDeque<Slow>,
+}
+/// An operation slow enough to name, for `stats`: what it was, where it
+/// ran (a store job, a commit, or the service loop's hold on a request or
+/// a chore of its own), the program whose request it was, when it ended
+/// and how long it took.
+#[derive(Clone)]
+struct Slow {
+    at_ms: u64,
+    op: &'static str,
+    kind: &'static str,
+    program: Option<String>,
+    ns: u64,
+}
+/// What counts as slow: a second.
+pub const SLOW_NS: u64 = 1_000_000_000;
+/// How many slow operations are kept.
+const SLOW_KEPT: usize = 100;
+impl Inner {
+    fn slow(&mut self, op: &'static str, kind: &'static str, program: Option<&str>, ns: u64) {
+        if ns < SLOW_NS {
+            return;
+        }
+        if self.slow.len() == SLOW_KEPT {
+            self.slow.pop_front();
+        }
+        let at_ms = (std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH))
+            .map_or(0, |since| since.as_millis() as u64);
+        let program = program.map(str::to_owned);
+        self.slow.push_back(Slow {
+            at_ms,
+            op,
+            kind,
+            program,
+            ns,
+        });
+    }
 }
 /// Upper bounds of the latency buckets, in microseconds; the last bucket is
 /// everything above the last bound. Log-spaced, so a histogram of fourteen
@@ -428,6 +467,28 @@ impl Counters {
             queued.elapsed().as_nanos() as u64,
             storage_error,
         );
+        inner.slow(label, "store", None, ran_ns);
+    }
+    /// A hold of the service loop, by a request from `program` or by the
+    /// loop's own chore: kept when it is slow.
+    pub fn held(&self, op: &'static str, program: Option<&str>, ns: u64) {
+        if ns >= SLOW_NS {
+            self.inner.lock().unwrap().slow(op, "loop", program, ns);
+        }
+    }
+    /// The slow operations kept, newest first.
+    pub fn slow(&self) -> serde_json::Value {
+        let slow = self.inner.lock().unwrap().slow.clone();
+        (slow.iter().rev())
+            .map(|slow| {
+                let mut row = serde_json::json!({"at_ms": slow.at_ms, "op": slow.op,
+                    "kind": slow.kind, "ms": slow.ns / 1_000_000});
+                if let Some(program) = &slow.program {
+                    row["program"] = program.as_str().into();
+                }
+                row
+            })
+            .collect()
     }
     /// A group whose callers are answered once this lock is released, with
     /// its COMMIT time when it began.
@@ -450,6 +511,7 @@ impl Counters {
                 residence,
                 job.storage_error,
             );
+            inner.slow(job.label, "store", None, ran_ns);
         }
         if let Some(commit_ns) = commit_ns {
             inner
@@ -457,6 +519,7 @@ impl Counters {
                 .entry("commit")
                 .or_default()
                 .add(0, commit_ns, commit_ns, false);
+            inner.slow("commit", "store", None, commit_ns);
         }
         let groups = &mut inner.groups;
         groups.count += 1;
@@ -911,6 +974,11 @@ impl Store {
         ))
     }
 
+    /// The store's own counters, which the service loop adds its slow
+    /// holds to.
+    pub fn counters(&self) -> std::sync::Arc<Counters> {
+        self.counters.clone()
+    }
     /// Worker counters and on-disk size, for `stats`.
     pub fn stats(&self) -> serde_json::Value {
         let size = |suffix: &str| {
