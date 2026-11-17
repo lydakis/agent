@@ -20,14 +20,18 @@
 //! theirs. No command starts while the load gate holds new commands back.
 //! Past the line's bounds a step is refused, and asking again is the only
 //! way back in.
-use super::{Service, Stepping, turn};
+use super::{
+    Service, Stepping,
+    handles::{Completion, Waiter},
+    turn,
+};
 use agent_runtime::{
     Error, Result,
     codec::Part,
     fail_with,
     output::{self, Output},
     store::{ArtifactLines, Capture, ProcessKind, Resumed, StepAsk, StepOpened, Stepped, Store},
-    tools::{Outcome, Prepared, ReadSource, Slot},
+    tools::{Outcome, POLL_YIELD_MS, Prepared, ReadSource, Slot},
 };
 use serde_json::{Value, json};
 use std::{
@@ -121,6 +125,8 @@ pub(super) struct Steps {
     /// Steps counted since start, for `stats`.
     pub(super) ran: u64,
     pub(super) refused: u64,
+    /// Steps whose terminal polls are parked, by their waiters.
+    parked: HashMap<Waiter, (Key, u64)>,
 }
 
 /// One step, from its asking to its reply.
@@ -158,6 +164,14 @@ enum State {
         stop: Option<oneshot::Sender<&'static str>>,
         command: bool,
     },
+    /// A poll of `owner`'s terminal `handle` past its hold, parked as a
+    /// turn's is: no task, no timer of its own, its deadline and the
+    /// terminal's end on the handles' schedule under `waiter`.
+    Parked {
+        waiter: Waiter,
+        owner: i64,
+        handle: i64,
+    },
     /// Its end is with the store.
     Ending,
 }
@@ -166,6 +180,15 @@ enum State {
 pub(super) enum Done {
     Opened(Result<StepOpened>),
     Ran(Result<Outcome>),
+    /// A poll of `owner`'s terminal past its hold, to park until
+    /// `deadline_ms` or the terminal's end.
+    Polls {
+        owner: i64,
+        handle: i64,
+        deadline_ms: u64,
+    },
+    /// A parked poll's waiter registered; let go if its step went meanwhile.
+    Attached(Waiter),
     /// Its end recorded, with its call's time running again when it was
     /// the last step that stopped it.
     Closed(Result<Value>, Option<Resumed>),
@@ -430,6 +453,12 @@ impl Service {
 
     /// What a step's job brought back.
     pub(super) fn step_done(&mut self, key: Key, serial: u64, done: Done) {
+        if let Done::Attached(waiter) = done {
+            if !self.steps.parked.contains_key(&waiter) {
+                self.handles.forget(waiter);
+            }
+            return;
+        }
         if let Done::Slot(slot) = done {
             self.steps.waiter = None;
             // A closed semaphore starts nothing more: no waiter again.
@@ -448,6 +477,11 @@ impl Service {
         match done {
             Done::Opened(opened) => self.step_opened(key, opened),
             Done::Ran(ran) => self.step_ran(key, ran),
+            Done::Polls {
+                owner,
+                handle,
+                deadline_ms,
+            } => self.step_parks(key, owner, handle, deadline_ms),
             Done::Closed(closed, resumed) => {
                 if let Some(resumed) = resumed {
                     self.call_resumed(key.0, resumed);
@@ -462,7 +496,7 @@ impl Service {
                 self.pump_steps();
             }
             // Taken up above, under no call's key.
-            Done::Slot(_) => {}
+            Done::Slot(_) | Done::Attached(_) => {}
         }
     }
 
@@ -749,8 +783,20 @@ impl Service {
         };
         let (registry, serial) = (self.registry.clone(), flight.serial);
         self.steps.jobs.spawn(async move {
-            let ran = run(registry, running, stopping).await;
-            (key, serial, Done::Ran(ran))
+            let done = match run(registry, running, stopping).await {
+                Ok(Ran::Polls {
+                    owner,
+                    handle,
+                    deadline_ms,
+                }) => Done::Polls {
+                    owner,
+                    handle,
+                    deadline_ms,
+                },
+                Ok(Ran::Ended(outcome)) => Done::Ran(Ok(outcome)),
+                Err(error) => Done::Ran(Err(error)),
+            };
+            (key, serial, done)
         });
     }
 
@@ -763,6 +809,75 @@ impl Service {
         let slot = self.registry.slot();
         self.steps.waiter =
             Some((self.steps.jobs).spawn(async move { (waiter_key(), 0, Done::Slot(slot.await)) }));
+    }
+
+    /// A step's terminal poll past its hold parks, as a turn's does: its
+    /// task gone, until the terminal ends or the poll's time runs out. One
+    /// stopped meanwhile ends so.
+    fn step_parks(&mut self, key: Key, owner: i64, handle: i64, deadline_ms: u64) {
+        let flight = self.steps.flights.get_mut(&key).expect("a flight");
+        if let Some((why, _)) = flight.stopped {
+            flight.state = State::Ending;
+            self.close_step(key, Err(stopped(why)));
+            return;
+        }
+        let waiter = self.handles.request_waiter();
+        flight.state = State::Parked {
+            waiter,
+            owner,
+            handle,
+        };
+        let serial = flight.serial;
+        self.steps.parked.insert(waiter, (key, serial));
+        let (handles, store) = (self.handles.clone(), self.store.clone());
+        self.steps.jobs.spawn(async move {
+            let polled = [format!("proc:{handle}")];
+            (handles)
+                .attach(
+                    &store,
+                    waiter,
+                    &polled,
+                    Some(deadline_ms),
+                    true,
+                    Completion::Step,
+                )
+                .await;
+            (waiter_key(), 0, Done::Attached(waiter))
+        });
+    }
+
+    /// The parked polls that ended: each answered with what its terminal
+    /// wrote meanwhile, or how it ended, as a turn's parked poll is.
+    pub(super) fn steps_polled(&mut self) {
+        for (waiter, results) in self.handles.take_polled() {
+            let Some((key, serial)) = self.steps.parked.remove(&waiter) else {
+                continue;
+            };
+            let Some(flight) = (self.steps.flights.get_mut(&key)).filter(|f| f.serial == serial)
+            else {
+                continue;
+            };
+            let State::Parked { owner, handle, .. } = flight.state else {
+                continue;
+            };
+            flight.state = State::Running {
+                stop: None,
+                command: false,
+            };
+            let ended = results.values().next().cloned();
+            let polled = self.registry.poll_end(owner, handle, ended.as_deref());
+            let seen = (polled.as_ref().ok()).and_then(|outcome| turn::Turn::seen(handle, outcome));
+            let store = self.store.clone();
+            self.steps.jobs.spawn(async move {
+                let ran = match seen {
+                    Some(seen) => {
+                        (store.op("saw_end", move |db| db.saw_end(seen)).await).and(polled)
+                    }
+                    None => polled,
+                };
+                (key, serial, Done::Ran(ran))
+            });
+        }
     }
 
     fn step_ran(&mut self, key: Key, ran: Result<Outcome>) {
@@ -886,6 +1001,14 @@ impl Service {
                     let _ = stop.send(why);
                 }
             }
+            // Parked, it holds nothing but its waiter: let go, and ended.
+            State::Parked { waiter, .. } => {
+                let waiter = *waiter;
+                flight.state = State::Ending;
+                self.steps.parked.remove(&waiter);
+                self.handles.forget(waiter);
+                self.close_step(key.clone(), Err(stopped(why)));
+            }
             // Its decision, or its end, comes back and finds it stopped;
             // a gate's step its call's end or its asker's leaving ends.
             State::Deciding | State::Gated { .. } | State::Ending => {}
@@ -930,7 +1053,9 @@ impl Service {
         let flights = &self.steps.flights;
         let running = flights
             .iter()
-            .filter(|(_, flight)| matches!(flight.state, State::Running { .. }))
+            .filter(|(_, flight)| {
+                matches!(flight.state, State::Running { .. } | State::Parked { .. })
+            })
             .map(|(key, _)| key.clone());
         let lined: Vec<Key> = (self.steps.asking.entries.iter())
             .filter(|entry| Steps::asked(flights, entry))
@@ -1032,11 +1157,21 @@ fn handles_now() -> u64 {
 /// Run a step's tool: in the bot's sandbox when confined, in its turn's
 /// folder, with what the turn's commands get in their environment, until
 /// it ends, is stopped, or the pause or the daemon's stop pulls the cord.
+/// How a step's run came out: ended, or a terminal poll to park.
+enum Ran {
+    Ended(Outcome),
+    Polls {
+        owner: i64,
+        handle: i64,
+        deadline_ms: u64,
+    },
+}
+
 async fn run(
     registry: agent_runtime::tools::Registry,
     running: Running,
     stopping: oneshot::Receiver<&'static str>,
-) -> Result<Outcome> {
+) -> Result<Ran> {
     let Running {
         capture,
         confined,
@@ -1098,6 +1233,57 @@ async fn run(
         bot.created_by.as_deref().zip(bot.created_by_id),
     );
     let held = cord.clone();
+    // A poll past the bot's hold waits only that long here, then parks
+    // as a turn's does, holding no task or timer until the terminal ends
+    // or the poll's time runs out.
+    if let Prepared::WriteStdin {
+        handle,
+        ref chars,
+        yield_ms,
+        kill: false,
+    } = prepared
+        && chars.is_empty()
+    {
+        let yield_ms = yield_ms.unwrap_or(POLL_YIELD_MS);
+        let hold_ms = bot.settings.approval_hold_ms();
+        if yield_ms > hold_ms {
+            let deadline_ms = handles_now() + yield_ms;
+            let held = registry.poll_hold(bot.bot_id, handle, hold_ms, sandbox);
+            let held = tokio::select! {
+                biased;
+                Ok(why) = &mut stopping => return Err(stopped(why)),
+                held = cord.until_pulled(held) => held,
+            };
+            let outcome = match held {
+                Ok(Some(outcome)) => outcome,
+                Ok(None) => {
+                    let owner = bot.bot_id;
+                    return Ok(Ran::Polls {
+                        owner,
+                        handle,
+                        deadline_ms,
+                    });
+                }
+                Err(error) if error.code == "terminal_not_running" => {
+                    turn::not_a_terminal(
+                        &store,
+                        &registry,
+                        &lifts.handles,
+                        &bot.name,
+                        handle,
+                        false,
+                        error,
+                    )
+                    .await??
+                }
+                Err(error) => return Err(error),
+            };
+            if let Some(seen) = turn::Turn::seen(handle, &outcome) {
+                store.op("saw_end", move |db| db.saw_end(seen)).await?;
+            }
+            return Ok(Ran::Ended(outcome));
+        }
+    }
     let work = async {
         match prepared {
             Prepared::Shell {
@@ -1383,12 +1569,12 @@ async fn run(
         }
     };
     if lasting {
-        return work.await;
+        return work.await.map(Ran::Ended);
     }
     tokio::select! {
         biased;
         Ok(why) = &mut stopping => Err(stopped(why)),
-        ran = cord.until_pulled(work) => ran,
+        ran = cord.until_pulled(work) => ran.map(Ran::Ended),
     }
 }
 

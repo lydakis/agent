@@ -460,6 +460,46 @@ class DaemonStepTests(ModelFixture):
         self.assertEqual(client.finished(turn)['data']['status'], 'completed')
         self.assertEqual(client.request('processes', bot='Lead')['result']['processes'], [])
 
+    def test_a_terminal_poll_step_past_the_hold_parks_until_the_terminal_ends_or_its_time_runs_out(self):
+        # As a turn's poll: past the bot's hold it holds no task and no
+        # timer, only a waiter on the handles' schedule, and is answered
+        # by the terminal's end or the poll's time.
+        client, turn = self.script(tools='echo,shell,write_stdin', settings={'approval_hold_ms': 100})
+        started = json.loads(self.step(client, turn, name='shell', arguments={
+            'command': 'printf ready; while [ ! -f release ]; do sleep .01; done; printf done',
+            'tty': True, 'yield_time_ms': 1000})['result']['output'])
+        self.assertEqual((started['output'], started['running']), ('ready', True), started)
+        handle = started['handle']
+        request = self.ask(client, turn, step='2', name='write_stdin',
+                           arguments={'handle': handle, 'yield_time_ms': 30000})
+        deadline = time.monotonic() + 5
+        while client.request('stats')['result']['handles']['waiters'] == 0:
+            self.assertLess(time.monotonic(), deadline, 'the poll never parked')
+            time.sleep(.01)
+        # Parked, it holds no process slot.
+        self.assertEqual(client.request('stats')['result']['steps']['commands'], 0)
+        (self.path / 'release').touch()
+        ended = json.loads(self.reply(client, request, timeout=10)['result']['output'])
+        self.assertEqual((ended['output'], ended['exit_code'], ended['handle']), ('done', 0, handle), ended)
+        self.assertEqual(client.request('stats')['result']['handles']['waiters'], 0)
+        # One whose time runs out reports the terminal still running.
+        handle = json.loads(self.step(client, turn, step='3', name='shell', arguments={
+            'command': 'sleep 600', 'tty': True, 'yield_time_ms': 0})['result']['output'])['handle']
+        lapsed = json.loads(self.step(client, turn, step='4', name='write_stdin',
+                                      arguments={'handle': handle, 'yield_time_ms': 400})['result']['output'])
+        self.assertEqual((lapsed['output'], lapsed['running'], lapsed['handle']), ('', True, handle), lapsed)
+        # A parked one is stopped with its call, its waiter let go.
+        request = self.ask(client, turn, step='5', name='write_stdin',
+                           arguments={'handle': handle, 'yield_time_ms': 30000})
+        deadline = time.monotonic() + 5
+        while client.request('stats')['result']['handles']['waiters'] == 0:
+            self.assertLess(time.monotonic(), deadline, 'the poll never parked')
+            time.sleep(.01)
+        self.answer(client, turn)
+        self.assertEqual(self.reply(client, request)['error'], 'step_stopped')
+        self.assertEqual(client.request('stats')['result']['handles']['waiters'], 0)
+        self.assertEqual(client.request('stats')['result']['steps']['in_flight'], 0)
+
     def test_a_detached_step_outlives_its_call_on_a_handle_of_the_bot_s(self):
         client, turn = self.script()
         ran = self.step(client, turn, name='shell',

@@ -3739,7 +3739,11 @@ A detached command or a terminal holds one of the daemon's lasting slots
 (`lasting_limit`) as a direct call's does, and neither it nor
 `write_stdin` takes a process slot or a place in the steps' line. A stop
 of the step drops its wait for output: what was typed stays typed, and the
-terminal runs on. A
+terminal runs on. A `write_stdin` step that only reads, for longer than the
+bot's `approval_hold_ms`, parks after that hold as a turn's poll does: its
+task goes, and a waiter on the handles' schedule answers it when the
+terminal ends or the poll's time runs out, with what the terminal wrote
+meanwhile; a stop lets the waiter go. A
 picture a `read` step finds is answered with its line and the picture in
 `parts`, as `tool_result` takes them; one past what a reply's 1 MiB holds
 is kept whole as the step's output `picture-N` (its base64, read with

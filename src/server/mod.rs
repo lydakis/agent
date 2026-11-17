@@ -2858,6 +2858,7 @@ pub async fn run(config: Configuration) -> Result<()> {
                     let lifted = service.handles.take_lifted();
                     service.check_lifted(lifted);
                     service.calls_ended();
+                    service.steps_polled();
                 }
                 Some(done) = service.steps.jobs.join_next(), if !service.steps.jobs.is_empty() => {
                     let (key, serial, done) = done.map_err(|_| Error::new("step_task_failed"))?;

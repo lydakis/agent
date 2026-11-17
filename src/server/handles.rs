@@ -86,6 +86,9 @@ pub enum Completion {
         request: Value,
         reader: Reader,
     },
+    /// Hand a daemon step's terminal poll, parked as a turn's is, back to
+    /// the run loop with what came of it.
+    Step,
 }
 
 /// The waiters on one handle, or of one session: in the order they were
@@ -154,6 +157,11 @@ struct Inner {
     /// Answered calls that ended, by turn and id, for the run loop to stop
     /// their daemon steps.
     ended: Vec<(i64, String)>,
+    /// Steps' parked polls that ended, each with its results, for the run
+    /// loop to answer.
+    polled: Vec<(Waiter, BTreeMap<String, Arc<Value>>)>,
+    /// The run loop's sleep, told when a parked poll ends.
+    sooner: Arc<tokio::sync::Notify>,
 }
 
 #[derive(Clone)]
@@ -170,10 +178,15 @@ pub struct Handles {
 
 impl Handles {
     pub fn new(resume: mpsc::UnboundedSender<(String, i64)>) -> Self {
+        let sooner: Arc<tokio::sync::Notify> = Default::default();
+        let inner = Inner {
+            sooner: sooner.clone(),
+            ..Inner::default()
+        };
         Self {
-            inner: Arc::new(Mutex::new(Inner::default())),
+            inner: Arc::new(Mutex::new(inner)),
             resume,
-            sooner: Default::default(),
+            sooner,
             ready: Default::default(),
         }
     }
@@ -261,13 +274,20 @@ impl Handles {
         std::mem::take(&mut self.inner.lock().unwrap().ended)
     }
 
+    /// The steps' parked polls that ended since the last look, each with
+    /// its results.
+    pub fn take_polled(&self) -> Vec<(Waiter, BTreeMap<String, Arc<Value>>)> {
+        std::mem::take(&mut self.inner.lock().unwrap().polled)
+    }
+
     /// Until something on the schedule comes due, a step was stepped or a
     /// call ended: the run loop's one sleep for every deadline here.
     pub async fn due(&self) {
         loop {
             let next = {
                 let inner = self.inner.lock().unwrap();
-                if !inner.stepped.is_empty() || !inner.ended.is_empty() {
+                if !inner.stepped.is_empty() || !inner.ended.is_empty() || !inner.polled.is_empty()
+                {
                     return;
                 }
                 inner.schedule.first().map(|&(at, _)| at)
@@ -414,6 +434,15 @@ impl Handles {
         match completion {
             Completion::Resume { bot, turn } => {
                 let _ = resume.send((bot, turn));
+            }
+            // Consumed by its answer, as a request is.
+            Completion::Step => {
+                Self::detach_locked(inner, waiter);
+                let results = Self::remove_locked(inner, waiter)
+                    .map(|mut w| std::mem::take(&mut w.results))
+                    .unwrap_or_default();
+                inner.polled.push((waiter, results));
+                inner.sooner.notify_one();
             }
             Completion::Respond {
                 output,
@@ -728,6 +757,7 @@ impl Handles {
         inner.schedule.clear();
         inner.lapses.clear();
         inner.stepped.clear();
+        inner.polled.clear();
         inner.by_turn.clear();
         inner.by_process.clear();
         inner.by_session.clear();
