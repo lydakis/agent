@@ -571,6 +571,9 @@ impl Handles {
 
     /// A handle's result if it has one: retained here, or found in the
     /// store, where a result is durable before it reaches this registry.
+    /// Read on a reader, which sees every commit made before the read: one
+    /// told here before the waiter was registered is in it, and one told
+    /// after reaches the waiter, so the writer's queue is never waited on.
     /// The flag says whether it is durable rather than an error reading it.
     async fn settled(
         &self,
@@ -592,7 +595,7 @@ impl Handles {
             Err(error) => Some((failed(&error), false)),
             Ok(Handle::Message { bot, message: turn }) => {
                 match store
-                    .op("turn_answer", move |db| db.turn_answer(&bot, turn))
+                    .read("turn_answer", move |db| db.turn_answer(&bot, turn))
                     .await
                 {
                     Ok(answer) if answer["pending"] == true => None,
@@ -605,7 +608,7 @@ impl Handles {
             }
             Ok(Handle::Process(id)) => {
                 match store
-                    .op("process_result", move |db| db.process_result(id))
+                    .read("process_result", move |db| db.process_result(id))
                     .await
                 {
                     Ok(None) => Some((

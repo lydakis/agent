@@ -716,7 +716,11 @@ class ApprovalTests(ModelFixture):
         client = self.gated(settings={'approval_hold_ms': 100})
         turn = client.request('submit', bot='Bob', request_id='t', prompt='shell:printf late')['result']['message']
         waiting = client.receive(lambda m: m.get('event') == 'turn_waiting' and m.get('turn') == turn)
-        self.assertEqual(waiting['data'], {'call_id': 'shell-1', 'approval': True, 'deadline_ms': None})
+        # No session serves the gate, so only a person can answer it: the
+        # call is theirs from its announcement.
+        [listed] = client.request('approvals')['result']['approvals']
+        self.assertEqual(waiting['data'], {'call_id': 'shell-1', 'approval': True, 'deadline_ms': None,
+                                           'holder': 'person', 'since_ms': listed['announced_ms']})
         # turn_waiting commits as the turn parks; its slot is let go as its
         # task ends, just after.
         deadline = time.monotonic() + 5

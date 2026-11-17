@@ -168,6 +168,15 @@ pub const SETTINGS: &[Setting] = &[
         default: "task",
     },
     Setting {
+        key: "sonny.task_worktrees",
+        group: "Agents",
+        name: "task worktrees",
+        label: "task folders kept; past it a new task removes the least active",
+        about: "task folders kept in ~/.agent/worktrees, as Codex's app keeps its newest worktrees: past it, a new task's start removes the least recently active, as remove_task does (marked done, branch kept while it has commits not merged, agent and history kept), never one working, needing you, with uncommitted changes or submodules, of its own, or another daemon's; at least 1",
+        values: &[],
+        default: "15",
+    },
+    Setting {
         key: "sonny.side_chat",
         group: "Agents",
         name: "side chat",
@@ -1372,7 +1381,7 @@ mod tests {
                 assert!(!setting.name.contains(['_', '.']), "{}", setting.name);
             }
         }
-        assert_eq!(listed().len(), 35);
+        assert_eq!(listed().len(), 36);
         // What only tunes stays in the file, and in the reference.
         for key in [
             "sonny.sky_haiku_daily",

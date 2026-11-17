@@ -8,7 +8,7 @@
 //! a workspace, reading the lead's folder where it is. A task that could
 //! not start leaves no folder behind, and the `remove_task` tool takes away
 //! one that is done.
-use serde_json::Value;
+use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
@@ -513,6 +513,24 @@ pub fn start(here: &Path, project: &str, starter: &str, start: &Start) -> Result
     {
         let _ = record_store(name, store);
     }
+    // Room for the folder it made, as `[sonny] task_worktrees` keeps the
+    // newest, once it started, so a start that fails takes nothing away;
+    // one in a folder already there makes none.
+    let keep = config.sonny.task_worktrees;
+    let made = matches!(place.undo, Undo::Worktree { .. } | Undo::Folder { .. });
+    let removed = match (&store, home_dir()) {
+        (Some(store), Ok(home)) if made && place.dir.starts_with(home.join(".agent/worktrees")) => {
+            let socket = env_of(start, "AGENT_SOCKET").map(PathBuf::from);
+            match crate::daemon_paths(Some(store.clone()), socket) {
+                Ok((store, socket)) => {
+                    let call = std::env::var("AGENT_CALL").unwrap_or_default();
+                    make_room(name, (&store, &socket), keep, &call)
+                }
+                Err(_) => Vec::new(),
+            }
+        }
+        _ => Vec::new(),
+    };
     let profile = (start.profile.clone()).or_else(|| crate::project::task_profile(&info).ok());
     if let Some(store) = &store {
         match profile {
@@ -527,6 +545,13 @@ pub fn start(here: &Path, project: &str, starter: &str, start: &Start) -> Result
         String::from_utf8_lossy(&output.stdout).trim()
     )];
     said.extend(place.note.clone());
+    if !removed.is_empty() {
+        said.push(format!(
+            "Past [sonny] task_worktrees ({keep}), removed the worktrees of the least recently \
+             active tasks, as remove_task does: {}.",
+            removed.join(", ")
+        ));
+    }
     if let (Some((from, to)), 1..) = (&place.copy, moved) {
         said.push(format!(
             "The brief named {} {moved} time{}; it names the task's copy {} instead.",
@@ -1920,49 +1945,13 @@ pub fn remove(
         }
     };
     // What would be lost, checked before anything changes.
-    let kept = || -> Result<(), String> {
-        if !discard
-            && let Some((_, path)) = &worktree
-            && !confined(
-                path,
-                &[
-                    "--no-optional-locks",
-                    "status",
-                    "--porcelain",
-                    "--untracked-files=all",
-                    "--ignore-submodules=none",
-                ],
-                &[],
-            )?
-            .is_empty()
-        {
-            return Err(format!(
-                "{name}'s worktree has uncommitted changes; commit them, or with discard, it is \
-                 removed anyway"
-            ));
-        }
-        if !discard
-            && let Some((_, path)) = &worktree
-            && has_submodules(path)?
-        {
-            return Err(format!(
-                "{name}'s worktree has submodules checked out, whose repositories go with it; \
-                 push their work, then with discard it is removed anyway"
-            ));
-        }
-        // What the task made there, Sonny cannot check without running it:
-        // a repository's own settings name programs git runs as the person,
-        // outside the task's sandbox. So the task says, not Sonny.
-        if !discard && folder.is_some() {
-            return Err(format!(
-                "{name}'s folder holds what it made, which Sonny cannot check for work not \
-                 committed or pushed without running it; ask {name} whether its work is pushed, \
-                 then remove it with discard"
-            ));
-        }
-        Ok(())
-    };
-    kept()?;
+    if !discard {
+        kept(
+            name,
+            worktree.as_ref().map(|(_, path)| path.as_path()),
+            folder.is_some(),
+        )?;
+    }
     // Its newest turns while it is there: one not finished, running or
     // waiting to, keeps the task as it is.
     let bot = listing(&agent, (store, socket), name)?;
@@ -2049,6 +2038,333 @@ pub fn remove(
         Some(_) => Ok(format!("Marked {name} done.")),
         None => Err(format!("no task or folder of a task is named {name}")),
     }
+}
+
+/// Why `name`'s folder is kept from a removal without `discard`: a
+/// worktree at `worktree` with uncommitted changes or submodules checked
+/// out, or a `folder` of its own, which Sonny cannot check.
+fn kept(name: &str, worktree: Option<&Path>, folder: bool) -> Result<(), String> {
+    if let Some(path) = worktree
+        && !confined(
+            path,
+            &[
+                "--no-optional-locks",
+                "status",
+                "--porcelain",
+                "--untracked-files=all",
+                "--ignore-submodules=none",
+            ],
+            &[],
+        )?
+        .is_empty()
+    {
+        return Err(format!(
+            "{name}'s worktree has uncommitted changes; commit them, or with discard, it is \
+             removed anyway"
+        ));
+    }
+    if let Some(path) = worktree
+        && has_submodules(path)?
+    {
+        return Err(format!(
+            "{name}'s worktree has submodules checked out, whose repositories go with it; \
+             push their work, then with discard it is removed anyway"
+        ));
+    }
+    // What the task made there, Sonny cannot check without running it:
+    // a repository's own settings name programs git runs as the person,
+    // outside the task's sandbox. So the task says, not Sonny.
+    if folder {
+        return Err(format!(
+            "{name}'s folder holds what it made, which Sonny cannot check for work not \
+             committed or pushed without running it; ask {name} whether its work is pushed, \
+             then remove it with discard"
+        ));
+    }
+    Ok(())
+}
+
+/// One of a store's task folders, as a start weighs it against
+/// `[sonny] task_worktrees`.
+struct Found {
+    name: String,
+    /// The task as the daemon lists it: none once it is gone.
+    bot: Option<Value>,
+    /// A folder of the task's own, which only `discard` removes.
+    own: bool,
+    /// An agent works in it now: a turn or a command of its own task's
+    /// or another's, as a side chat's or one started in place there.
+    used: bool,
+}
+
+impl Found {
+    /// When it was last active: its last turn's end, or never.
+    fn last(&self) -> i64 {
+        (self.bot.as_ref())
+            .and_then(|bot| bot["last"]["finished_ms"].as_i64())
+            .unwrap_or(0)
+    }
+
+    /// Working, worked in, or a folder of its own: kept before anything
+    /// is read.
+    fn held(&self) -> bool {
+        self.own
+            || self.used
+            || (self.bot.as_ref())
+                .is_some_and(|bot| !bot["running_turn"].is_null() || !bot["waiting_on"].is_null())
+    }
+}
+
+/// The folders of `store`'s tasks in `home`'s `~/.agent/worktrees`, but
+/// `new`'s: each by name, and whether a record says it is `store`'s (one
+/// made before records were kept has none). Read from the folder and
+/// its records alone, so the count is cheap however many agents the
+/// store holds. A workflow's workers are its run's, and another daemon's
+/// folders that daemon's.
+fn task_folders(home: &Path, store: &Path, new: &str) -> Vec<(String, bool)> {
+    let folders = home.join(".agent/worktrees");
+    let mut found = Vec::new();
+    for entry in std::fs::read_dir(&folders).into_iter().flatten().flatten() {
+        let Ok(name) = entry.file_name().into_string() else {
+            continue;
+        };
+        if name.starts_with('.')
+            || name == new
+            || crate::workflow::is_worker(&name)
+            || !entry.file_type().is_ok_and(|kind| kind.is_dir())
+            || other_store_in(home, &name, Some(store)).is_some()
+        {
+            continue;
+        }
+        let recorded = store_record_in(home, &name).exists();
+        found.push((name, recorded));
+    }
+    found.sort();
+    found
+}
+
+/// The repository checked out where the worktree at `path` was made: its
+/// `.git` file names the worktree's folder inside that repository's git
+/// folder, read without running git. `remove` checks it is that
+/// repository's worktree before taking anything.
+fn repository_of_worktree(path: &Path) -> Option<PathBuf> {
+    let text = std::fs::read_to_string(path.join(".git")).ok()?;
+    let gitdir = PathBuf::from(text.strip_prefix("gitdir: ")?.trim_end());
+    let common = gitdir.parent()?.parent()?;
+    (common.file_name()? == ".git").then(|| common.parent().map(Path::to_owned))?
+}
+
+/// Of `found`, the least recently active removed until `room` are left,
+/// those held, needing the person (`asks`) or that `remove` refuses
+/// passed over for the next: the names removed, oldest first. With none
+/// to remove, none is.
+fn prune(
+    mut found: Vec<Found>,
+    room: usize,
+    asks: &mut dyn FnMut(&Found) -> bool,
+    remove: &mut dyn FnMut(&Found) -> Result<(), String>,
+) -> Vec<String> {
+    let Some(need) = found.len().checked_sub(room).filter(|need| *need > 0) else {
+        return Vec::new();
+    };
+    found.sort_by(|one, other| (one.last(), &one.name).cmp(&(other.last(), &other.name)));
+    let mut removed = Vec::new();
+    for task in &found {
+        if removed.len() == need {
+            break;
+        }
+        if task.held() || asks(task) || remove(task).is_err() {
+            continue;
+        }
+        removed.push(task.name.clone());
+    }
+    removed
+}
+
+/// Room for the folder Sonny just made the task `new`, as Codex's app
+/// keeps its newest worktrees: past `keep` task folders on the daemon at
+/// `store` and `socket`, the least recently active are removed as
+/// `remove_task` removes them, made by the call `call`, until `keep` are
+/// left with `new`'s. Never one working, with a call waiting on its
+/// verdict or a question open, with uncommitted
+/// changes or submodules, of its own, or another daemon's: the next is
+/// taken instead, and with none, nothing is. The names removed.
+fn make_room(new: &str, (store, socket): (&Path, &Path), keep: u64, call: &str) -> Vec<String> {
+    let Ok(home) = home_dir() else {
+        return Vec::new();
+    };
+    let room = usize::try_from(keep.saturating_sub(1)).unwrap_or(usize::MAX);
+    let folders = task_folders(&home, store, new);
+    if folders.len() <= room {
+        return Vec::new();
+    }
+    // Its own thread, whose runtime reads the daemon whether or not the
+    // start runs in one.
+    std::thread::scope(|scope| {
+        scope
+            .spawn(|| {
+                let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                else {
+                    return Vec::new();
+                };
+                let Ok((client, _events)) = runtime.block_on(agent_client::Client::connect(socket))
+                else {
+                    return Vec::new();
+                };
+                let mut found = Vec::new();
+                for (name, recorded) in folders {
+                    let asked = json!({"name": name, "limit": 1});
+                    let Ok(page) = runtime.block_on(client.request("bots", asked)) else {
+                        runtime.block_on(client.close());
+                        return Vec::new();
+                    };
+                    let bot = (page["bots"].as_array().into_iter().flatten())
+                        .find(|bot| bot["name"] == name.as_str())
+                        .cloned();
+                    // Unrecorded and not on this daemon: maybe another's,
+                    // from before records were kept.
+                    if bot.is_none() && !recorded {
+                        continue;
+                    }
+                    let own = recorded_own(&name);
+                    found.push(Found {
+                        name,
+                        bot,
+                        own,
+                        used: false,
+                    });
+                }
+                // The folders the agents at work now work in, whichever
+                // agent's they are.
+                let Some(used) = runtime.block_on(at_work(&client)) else {
+                    runtime.block_on(client.close());
+                    return Vec::new();
+                };
+                let worktrees = home.join(".agent/worktrees");
+                let real = |path: &Path| std::fs::canonicalize(path).ok();
+                for task in &mut found {
+                    let folder = real(&worktrees.join(&task.name));
+                    task.used = (used.iter()).any(|dir| {
+                        dir.starts_with(worktrees.join(&task.name))
+                            || folder.as_ref().is_some_and(|folder| {
+                                real(dir).is_some_and(|dir| dir.starts_with(folder))
+                            })
+                    });
+                }
+                let mut asks = |task: &Found| {
+                    let Some(bot) = &task.bot else {
+                        return false;
+                    };
+                    // A call still waiting on its verdict, as a lifted one
+                    // does past its turn, would run in the folder taken.
+                    let asked = json!({"bot": task.name, "limit": 1});
+                    match runtime.block_on(client.request("approvals", asked)) {
+                        Ok(page) if page["approvals"].as_array().is_some_and(Vec::is_empty) => {}
+                        _ => return true,
+                    }
+                    let last = bot["last"]["turn"].as_i64();
+                    match runtime.block_on(crate::needs::scan(&client, &task.name, last)) {
+                        Some(seen) => seen.open(store, &task.name, false).is_some(),
+                        // Unread, it may be waiting on the person.
+                        None => true,
+                    }
+                };
+                let mut take = |task: &Found| {
+                    let path = home.join(".agent/worktrees").join(&task.name);
+                    let here = (source_of(&task.name))
+                        .or_else(|| repository_of_worktree(&path))
+                        .ok_or_else(|| format!("{}: no repository", task.name))?;
+                    remove(&here, &task.name, false, (store, socket, call)).map(drop)
+                };
+                let removed = prune(found, room, &mut asks, &mut take);
+                runtime.block_on(client.close());
+                removed
+            })
+            .join()
+            .unwrap_or_default()
+    })
+}
+
+/// The folders the daemon's agents at work now work in, every page of
+/// them: those with a turn running, and those with a command still
+/// running after its turn ended, as one started in the background does.
+/// A few, however many agents the store holds; none when they can't be
+/// read.
+async fn at_work(client: &agent_client::Client) -> Option<Vec<PathBuf>> {
+    let (mut dirs, mut after) = (Vec::new(), Value::Null);
+    // Each turn at work, by its agent: the folder it works in is its own.
+    let mut running = std::collections::BTreeSet::new();
+    let workspace = |bot: &Value| {
+        (bot["workspace"].as_str())
+            .filter(|dir| !dir.is_empty())
+            .map(PathBuf::from)
+    };
+    loop {
+        let mut asked = json!({"active": true, "limit": 256});
+        if !after.is_null() {
+            asked["after"] = after;
+        }
+        let page = client.request("bots", asked).await.ok()?;
+        for bot in page["bots"].as_array().into_iter().flatten() {
+            dirs.extend(workspace(bot));
+            // Its running turn's own, which a message naming another
+            // folder, queued meanwhile, leaves as it is.
+            if let (Some(name), Some(turn)) = (bot["name"].as_str(), bot["running_turn"].as_i64()) {
+                running.insert((name.to_owned(), turn));
+            }
+        }
+        after = page["next_after"].clone();
+        if after.is_null() {
+            break;
+        }
+    }
+    // Each command by its agent and the turn that started it, which
+    // names the folder it runs in, whatever the agent works in since.
+    loop {
+        let mut asked = json!({});
+        if !after.is_null() {
+            asked["after"] = after;
+        }
+        let page = client.request("processes", asked).await.ok()?;
+        running.extend(
+            (page["processes"].as_array().into_iter().flatten()).filter_map(|process| {
+                Some((
+                    process["bot"].as_str()?.to_owned(),
+                    process["turn"].as_i64()?,
+                ))
+            }),
+        );
+        after = page["next_after"].clone();
+        if after.is_null() {
+            break;
+        }
+    }
+    let mut bots = std::collections::BTreeSet::new();
+    for (bot, turn) in running {
+        let asked = json!({"bot": bot, "turn": turn, "bytes": 1});
+        let read = client.request("prompts", asked).await.ok()?;
+        dirs.extend(workspace(&read));
+        bots.insert(bot);
+    }
+    for bot in bots {
+        let page = (client
+            .request("bots", json!({"name": bot, "limit": 1}))
+            .await)
+            .ok()?;
+        dirs.extend(
+            (page["bots"].as_array().into_iter().flatten())
+                .filter(|listed| listed["name"] == bot.as_str())
+                .filter_map(workspace),
+        );
+    }
+    Some(dirs)
+}
+
+/// Whether Sonny made `name` a folder of its own.
+fn recorded_own(name: &str) -> bool {
+    recorded(name).is_some_and(|(_, made)| made == Made::Own)
 }
 
 pub fn capitalized(word: &str) -> String {
@@ -2274,6 +2590,145 @@ mod tests {
         let said = another_store("shop.fix", &side);
         assert!(said.contains("another name"), "{said}");
         std::fs::remove_dir_all(home).unwrap();
+    }
+
+    fn found(name: &str, last: Option<i64>, running: bool, own: bool) -> Found {
+        let bot = last.map(|last| {
+            json!({"name": name, "running_turn": if running { json!(9) } else { Value::Null },
+                "waiting_on": null, "last": {"turn": 1, "finished_ms": last}})
+        });
+        Found {
+            name: name.into(),
+            bot,
+            own,
+            used: false,
+        }
+    }
+
+    #[test]
+    fn past_the_limit_the_least_recently_active_folders_go_and_the_rest_are_passed_over() {
+        let tasks = || {
+            vec![
+                found("shop.fresh", Some(200), false, false),
+                found("shop.idle", Some(100), false, false),
+                found("shop.working", Some(50), true, false),
+                found("shop.dirty", Some(30), false, false),
+                found("shop.asking", Some(20), false, false),
+                found("shop.own", Some(10), false, true),
+                found("shop.gone", None, false, false),
+            ]
+        };
+        let mut asked = Vec::new();
+        let mut asks = |task: &Found| {
+            asked.push(task.name.clone());
+            task.name == "shop.asking"
+        };
+        let mut tried = Vec::new();
+        let mut remove = |task: &Found| {
+            tried.push(task.name.clone());
+            match task.name.as_str() {
+                "shop.dirty" => Err("shop.dirty's worktree has uncommitted changes".into()),
+                _ => Ok(()),
+            }
+        };
+        // Least recently active first, by the last turn's end: one gone
+        // first; one working, of its own, asking or refused passed over.
+        assert_eq!(
+            prune(tasks(), 5, &mut asks, &mut remove),
+            ["shop.gone", "shop.idle"]
+        );
+        // Neither the working one nor the one of its own is read or tried.
+        assert_eq!(
+            asked,
+            ["shop.gone", "shop.asking", "shop.dirty", "shop.idle"]
+        );
+        assert_eq!(tried, ["shop.gone", "shop.dirty", "shop.idle"]);
+        // As many as qualify, never one held, when fewer than past it do.
+        assert_eq!(
+            prune(
+                tasks(),
+                0,
+                &mut |_| false,
+                &mut |task| match task.name.as_str() {
+                    "shop.dirty" => Err(String::new()),
+                    _ => Ok(()),
+                }
+            ),
+            ["shop.gone", "shop.asking", "shop.idle", "shop.fresh"]
+        );
+        // Within the limit, nothing is read or taken.
+        let mut none = |_: &Found| -> Result<(), String> { panic!("taken") };
+        assert!(prune(tasks(), 7, &mut |_| panic!("read"), &mut none).is_empty());
+        // With none to take, none is, and the start goes on: one another
+        // agent works in is held as its own agent at work is.
+        let held = vec![
+            found("shop.working", Some(1), true, false),
+            found("shop.own", Some(1), false, true),
+            Found {
+                used: true,
+                ..found("shop.shared", Some(1), false, false)
+            },
+        ];
+        assert!(prune(held, 0, &mut |_| false, &mut |_| Ok(())).is_empty());
+    }
+
+    #[test]
+    fn a_store_s_task_folders_are_counted_from_its_folder_and_records() {
+        let home = std::env::temp_dir().join(format!("sonny-keep-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        let folders = home.join(".agent/worktrees");
+        for name in [
+            "shop.old",
+            "shop.ours",
+            "shop.theirs",
+            "shop.new",
+            "shop.wf-run-key",
+        ] {
+            std::fs::create_dir_all(folders.join(name)).unwrap();
+        }
+        std::fs::create_dir_all(folders.join(".folders")).unwrap();
+        std::fs::write(folders.join("shop.file"), "").unwrap();
+        let (main, side) = (home.join("main.sqlite"), home.join("side.sqlite"));
+        record_store_in(&home, "shop.ours", &main).unwrap();
+        record_store_in(&home, "shop.theirs", &side).unwrap();
+        // The new task's own, a workflow's worker, another daemon's, a
+        // file and Sonny's records are not counted.
+        assert_eq!(
+            task_folders(&home, &main, "shop.new"),
+            [
+                ("shop.old".to_owned(), false),
+                ("shop.ours".to_owned(), true)
+            ]
+        );
+        std::fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn a_worktree_with_work_not_committed_is_kept_and_names_its_repository() {
+        let dir = std::env::temp_dir().join(format!("sonny-kept-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let repo = repository(&dir);
+        let tree = dir.join("tree");
+        let target = tree.to_string_lossy();
+        git(
+            &repo,
+            &["worktree", "add", "-q", "-b", "agent/shop.fix", &target],
+        )
+        .unwrap();
+        let real = |path: &Path| std::fs::canonicalize(path).unwrap();
+        assert_eq!(
+            repository_of_worktree(&tree).map(|repo| real(&repo)),
+            Some(real(&repo))
+        );
+        // The repository's own checkout is no worktree of another.
+        assert_eq!(repository_of_worktree(&repo), None);
+        assert_eq!(kept("shop.fix", Some(&tree), false), Ok(()));
+        std::fs::write(tree.join("new.txt"), "new\n").unwrap();
+        let said = kept("shop.fix", Some(&tree), false).unwrap_err();
+        assert!(said.contains("uncommitted changes"), "{said}");
+        let said = kept("shop.own", None, true).unwrap_err();
+        assert!(said.contains("with discard"), "{said}");
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

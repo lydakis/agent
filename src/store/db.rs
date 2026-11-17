@@ -1745,6 +1745,21 @@ pub struct Waiting {
     /// and has not started; `deadline_ms` is its gates' expiry, if any.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub approval: bool,
+    /// Who holds a verdict park's call: `reviewer` while every gate still
+    /// open is served by a session and none was handed to a person,
+    /// `person` once a gate's reviewer asked one or when a gate no session
+    /// serves is open, as the audit names who decided.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub holder: Option<String>,
+    /// Since when `holder` has had the call: its announcement, or the
+    /// first `ask` of a gate still open.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub since_ms: Option<i64>,
+    /// Which of the call's own gate tags sessions served as the turn
+    /// parked: who holds the call is read from them again when a verdict
+    /// or an ask changes the gates still open.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub served: Vec<String>,
     /// Parked on the answer to `call_id`, which has started, from the
     /// client this tag names; `deadline_ms` is when the call stops waiting.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1978,6 +1993,26 @@ impl Request {
     }
     fn decided(&self) -> bool {
         self.denial().is_some() || self.unanswered().next().is_none()
+    }
+    /// Who holds the call while it waits, and since when, given the gate
+    /// tags sessions serve now: a person once a gate still open was handed
+    /// to one, from that first `ask`; else its reviewers, from its
+    /// announcement, while a session serves each gate still open; else a
+    /// person, as only an answer with no lease can decide a gate no session
+    /// serves, from its announcement.
+    fn holder(&self, served: &[String]) -> (&'static str, i64) {
+        let open = |tag: &str| self.unanswered().any(|g| g.tag == tag);
+        let asked = (self.asked.iter())
+            .filter(|asked| open(&asked.tag))
+            .map(|asked| asked.at_ms)
+            .min();
+        match asked {
+            Some(at_ms) => ("person", at_ms),
+            None if self.unanswered().all(|g| served.contains(&g.tag)) => {
+                ("reviewer", self.announced_ms)
+            }
+            None => ("person", self.announced_ms),
+        }
     }
     /// When the earliest unanswered gate with an expiry lapses.
     fn expires_ms(&self) -> Option<u64> {
@@ -2555,6 +2590,12 @@ pub struct TurnContext {
 /// again. Every `prepare_cached` site fits, at a few KiB of SQLite memory
 /// each for the ones in use.
 const STATEMENTS: usize = 256;
+/// The bytes of write-ahead log kept once a checkpoint has copied it all
+/// back: SQLite reuses the file from its start rather than shrinking it,
+/// so one busy hour's log would otherwise keep its size on disk for good.
+/// Well above what a checkpoint every 1,000 pages leaves, so a steady log
+/// is never cut.
+const WAL_KEPT: i64 = 16 * 1024 * 1024;
 /// Plans that don't depend on bound values: SQLite's query planner
 /// stability guarantee. The store never runs ANALYZE, so no statistics
 /// could make a plan better for one value than another. Without it, SQLite
@@ -2602,6 +2643,10 @@ pub struct Database {
     pending_stale: bool,
     /// Per running turn with a gated call: verdicts not yet written.
     live: HashMap<i64, Live>,
+    /// What it shares with the readers and the service; see `Shared`.
+    shared: Arc<Shared>,
+    /// A reader: held verdicts are the shared copy, not `live`.
+    reading: bool,
     /// Each turn's `live` entry as it was before the current group changed
     /// it, so a group that fails to commit puts held verdicts back.
     live_before: HashMap<i64, Option<Live>>,
@@ -2628,6 +2673,175 @@ pub struct Database {
 /// Told each answered call that ended, by turn and id, from the storage
 /// worker, before any job of the group that ended it is answered.
 pub type CallEnds = Box<dyn Fn(i64, String) + Send>;
+
+/// What the storage worker shares with the readers and the service: the
+/// verdicts it holds for running turns as of its last commit, so a reader
+/// lists approvals as the worker would, and the identities a bot's own
+/// requests are held to, kept until a commit changes them.
+#[derive(Default)]
+pub struct Shared {
+    held: std::sync::Mutex<Arc<HashMap<i64, Held>>>,
+    identities: std::sync::Mutex<Identities>,
+}
+/// One running turn's verdicts the worker holds, as `Live` keeps them.
+#[derive(Clone, Default)]
+struct Held {
+    answered: HashMap<i64, Vec<String>>,
+    verdicts: HashMap<String, Vec<Verdict>>,
+}
+#[derive(Default)]
+struct Identities {
+    known: HashMap<i64, Arc<Identity>>,
+    /// Bots whose identity the group in progress changed, forgotten once
+    /// it commits or is abandoned.
+    changed: Vec<i64>,
+    /// Counts the times `known` lost entries: an identity read before a
+    /// change is not kept after it.
+    generation: u64,
+}
+/// The most identities kept: a few hundred bytes each. Past it they are
+/// read again, which is what every request did before.
+const IDENTITIES: usize = 8192;
+impl Shared {
+    /// The verdicts held as of the last commit.
+    fn held(&self) -> Arc<HashMap<i64, Held>> {
+        self.held.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+    /// A commit wrote `turns`' held verdicts as `live` has them now.
+    fn commit_held<'a>(&self, live: &HashMap<i64, Live>, turns: impl Iterator<Item = &'a i64>) {
+        let mut shared = self.held.lock().unwrap_or_else(|e| e.into_inner());
+        let held = Arc::make_mut(&mut shared);
+        for turn in turns {
+            match live.get(turn) {
+                Some(live) if !live.answered.is_empty() || !live.verdicts.is_empty() => {
+                    held.insert(
+                        *turn,
+                        Held {
+                            answered: live.answered.clone(),
+                            verdicts: live.verdicts.clone(),
+                        },
+                    );
+                }
+                _ => {
+                    held.remove(turn);
+                }
+            }
+        }
+    }
+    fn identities(&self) -> std::sync::MutexGuard<'_, Identities> {
+        self.identities.lock().unwrap_or_else(|e| e.into_inner())
+    }
+    /// Bot `id`'s identity if kept, or the generation to keep a fresh read
+    /// of it under.
+    pub fn identity(&self, id: i64) -> std::result::Result<Arc<Identity>, u64> {
+        let identities = self.identities();
+        identities
+            .known
+            .get(&id)
+            .cloned()
+            .ok_or(identities.generation)
+    }
+    /// Keep `identity`, read under `generation`, unless a change committed
+    /// since may have outdated it.
+    pub fn know(&self, generation: u64, identity: Arc<Identity>) {
+        let mut identities = self.identities();
+        if identities.generation != generation {
+            return;
+        }
+        if identities.known.len() >= IDENTITIES {
+            identities.known.clear();
+        }
+        identities.known.insert(identity.bot_id, identity);
+    }
+    /// The group in progress changed bot `id`'s identity or deleted it.
+    fn identity_changed(&self, id: i64) {
+        self.identities().changed.push(id);
+    }
+    /// The group committed or was abandoned: what it changed is read again.
+    fn forget_changed(&self) {
+        let mut identities = self.identities();
+        if identities.changed.is_empty() {
+            return;
+        }
+        let changed = std::mem::take(&mut identities.changed);
+        for id in changed {
+            identities.known.remove(&id);
+        }
+        identities.generation += 1;
+    }
+}
+/// What a bot's own requests are held to: who it is, its tools, and where
+/// it may write.
+#[derive(Debug)]
+pub struct Identity {
+    pub name: String,
+    pub bot_id: i64,
+    pub workspace: Option<String>,
+    pub allowed: Option<Vec<String>>,
+    pub declared: Holding,
+    pub settings: Settings,
+}
+impl From<Bot> for Identity {
+    fn from(bot: Bot) -> Self {
+        Identity {
+            name: bot.name,
+            bot_id: bot.bot_id,
+            workspace: bot.workspace,
+            allowed: bot.allowed,
+            declared: bot.declared,
+            settings: bot.settings,
+        }
+    }
+}
+impl Identity {
+    /// Whether the bot's commands run in a sandbox.
+    pub fn sandboxed(&self) -> bool {
+        use crate::sandbox::Mode;
+        matches!(
+            self.settings.sandbox,
+            Some(Mode::ReadOnly | Mode::WorkspaceWrite)
+        )
+    }
+}
+/// The bots columns an `Identity` is read from: a change to any of them,
+/// or the bot's deletion, makes its kept identity stale.
+const IDENTITY_TRIGGERS: &str = "
+    CREATE TEMP TRIGGER identity_updated AFTER UPDATE OF name,id,workspace,allowed,declared,settings
+        ON main.bots BEGIN SELECT agent_identity_changed(OLD.id); END;
+    CREATE TEMP TRIGGER identity_deleted AFTER DELETE ON main.bots
+        BEGIN SELECT agent_identity_changed(OLD.id); END;";
+/// Held verdicts as a listing sees them: the worker's own, in the group in
+/// progress, or the copy of its last commit's, on a reader.
+enum HeldView<'a> {
+    Live(&'a HashMap<i64, Live>),
+    Shared(Arc<HashMap<i64, Held>>),
+}
+impl HeldView<'_> {
+    fn answered(&self, turn: i64, approval: i64) -> Option<&[String]> {
+        match self {
+            HeldView::Live(live) => live.get(&turn)?.answered.get(&approval),
+            HeldView::Shared(held) => held.get(&turn)?.answered.get(&approval),
+        }
+        .map(Vec::as_slice)
+    }
+    /// The verdicts held for approval row `approval`, call `call_id`. A
+    /// reader's copy is from the writer's last commit, which its rows may
+    /// be past: a call announced again since has a new row, which no copied
+    /// verdict answers.
+    fn verdicts(&self, turn: i64, approval: i64, call_id: &str) -> Option<&[Verdict]> {
+        match self {
+            HeldView::Live(live) => live.get(&turn)?.verdicts.get(call_id),
+            HeldView::Shared(held) => {
+                let held = held.get(&turn)?;
+                if !held.answered.contains_key(&approval) {
+                    return None;
+                }
+                held.verdicts.get(call_id)
+            }
+        }
+        .map(Vec::as_slice)
+    }
+}
 
 /// A pause as clients read it, from its columns in the order
 /// `id,reason,pulled_by,at_ms,parked,resumed_by,resumed_ms`: `parked` holds the agents whose running turns
@@ -2658,11 +2872,12 @@ const TURN_VIEW: &str = "m.id,m.bot,b.id,m.request_id,COALESCE(t.status,m.status
     json_extract(t.waiting,'$.deadline_ms'),json_extract(t.waiting,'$.answer'),
     json_extract(t.waiting,'$.halt'),json_extract(t.waiting,'$.load'),
     json_extract(t.waiting,'$.blocked'),m.held,m.due_ms,COALESCE(t.work,0),t.limited,m.turn,
-    t.error,json_extract(t.waiting,'$.retrying')";
+    t.error,json_extract(t.waiting,'$.retrying'),json_extract(t.waiting,'$.holder'),
+    json_extract(t.waiting,'$.since_ms')";
 /// Where `TURN_VIEW` reads: the message, its bot, and the turn it opened.
 const MESSAGE_FROM: &str = "messages m JOIN bots b ON b.name=m.bot LEFT JOIN turns t ON t.id=m.id";
 /// Columns `TURN_VIEW` takes, for queries that select more after it.
-const TURN_VIEW_COLUMNS: usize = 29;
+const TURN_VIEW_COLUMNS: usize = 31;
 /// A message's words, from `messages m` joined by `MESSAGE_NODE`: kept on
 /// the message, or once 4 KiB or more were taken in, read from its node.
 const MESSAGE_TEXT: &str = "CASE WHEN n.id IS NULL THEN m.text
@@ -2716,7 +2931,8 @@ fn turn_view(r: &rusqlite::Row) -> rusqlite::Result<Value> {
             json!({"call_id":call_id,"answer":answer,"deadline_ms":deadline_ms})
         }
         "waiting" if r.get::<_, Option<i64>>(14)? == Some(1) => {
-            json!({"call_id":call_id,"approval":true,"deadline_ms":deadline_ms})
+            json!({"call_id":call_id,"approval":true,"deadline_ms":deadline_ms,
+                "holder":r.get::<_, Option<String>>(29)?,"since_ms":r.get::<_, Option<i64>>(30)?})
         }
         "waiting" if r.get::<_, Option<i64>>(20)? == Some(1) => {
             json!({"call_id":call_id,"load":true,"deadline_ms":deadline_ms})
@@ -3138,7 +3354,7 @@ impl Database {
     /// before versioning, stores at versions 1 to 5 and stores from newer
     /// binaries are rejected; an older store from version 6 on is migrated
     /// forward, one version at a time, at open.
-    pub const SCHEMA: i32 = 102;
+    pub const SCHEMA: i32 = 104;
     /// The person's messages a compaction keeps verbatim, newest first:
     /// per-message text, and the total text plus `(ordinal, String)` entry
     /// metadata. Empty entries cost space too, so the retained list cannot
@@ -3161,12 +3377,13 @@ impl Database {
     /// job is answered and never takes the write lock. It can still run the
     /// checkpoint SQLite makes when the last connection closes, so it syncs
     /// checkpoints the way the writer does.
-    pub fn reader(conn: Connection) -> Result<Self> {
+    pub fn reader(conn: Connection, shared: Arc<Shared>) -> Result<Self> {
         conn.set_prepared_statement_cache_capacity(STATEMENTS);
         plan_stably(&conn)?;
-        conn.execute_batch(
-            "PRAGMA query_only=ON; PRAGMA cache_size=-2048; PRAGMA checkpoint_fullfsync=ON;",
-        )?;
+        conn.execute_batch(&format!(
+            "PRAGMA query_only=ON; PRAGMA cache_size=-2048; PRAGMA checkpoint_fullfsync=ON;
+            PRAGMA journal_size_limit={WAL_KEPT};"
+        ))?;
         Ok(Self {
             conn,
             pending_limits: (0, 0),
@@ -3176,6 +3393,8 @@ impl Database {
             outcomes: Vec::new(),
             pending_stale: false,
             live: HashMap::new(),
+            shared,
+            reading: true,
             live_before: HashMap::new(),
             served: Vec::new(),
             steps: HashMap::new(),
@@ -3218,6 +3437,7 @@ impl Database {
             PRAGMA fullfsync=OFF; PRAGMA checkpoint_fullfsync=ON;
             PRAGMA foreign_keys=ON; PRAGMA cache_size=-2048; PRAGMA temp_store=MEMORY;",
         )?;
+        conn.execute_batch(&format!("PRAGMA journal_size_limit={WAL_KEPT};"))?;
         let version: i32 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
         let has_tables: bool = conn.query_row(
             "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='bots')",
@@ -3505,6 +3725,8 @@ impl Database {
             outcomes: Vec::new(),
             pending_stale: false,
             live: HashMap::new(),
+            shared: Arc::default(),
+            reading: false,
             live_before: HashMap::new(),
             served: Vec::new(),
             steps: HashMap::new(),
@@ -3558,7 +3780,24 @@ impl Database {
             db.tell_finished(&bot)?;
         }
         db.recount_pending()?;
+        // Told of every change to an identity a bot's requests are held to,
+        // whichever job makes it.
+        let shared = db.shared.clone();
+        db.conn.create_scalar_function(
+            "agent_identity_changed",
+            1,
+            rusqlite::functions::FunctionFlags::SQLITE_UTF8,
+            move |context| {
+                shared.identity_changed(context.get(0)?);
+                Ok(0)
+            },
+        )?;
+        db.conn.execute_batch(IDENTITY_TRIGGERS)?;
         Ok(db)
+    }
+    /// What the worker shares with the readers and the service.
+    pub fn shared(&self) -> Arc<Shared> {
+        self.shared.clone()
     }
     /// Count the waiting turns from their rows: one pass over the queued
     /// and ready rows, through their partial indexes. The announced calls
@@ -3639,6 +3878,13 @@ impl Database {
             return fail("storage_group_rolled_back");
         }
         self.conn.prepare_cached("COMMIT")?.execute([])?;
+        // Readers list approvals with the verdicts held now, and read again
+        // the identities the group changed, before any of its jobs is
+        // answered.
+        if !self.live_before.is_empty() {
+            self.shared.commit_held(&self.live, self.live_before.keys());
+        }
+        self.shared.forget_changed();
         self.live_before.clear();
         self.steps_gone.clear();
         artifact::remove(&std::mem::take(&mut self.files_gone));
@@ -3694,6 +3940,7 @@ impl Database {
     /// open, drop the outcomes its jobs announced, and recount the waiting
     /// turns they counted.
     pub fn abandon_group(&mut self) -> Result<()> {
+        self.shared.forget_changed();
         self.outcomes.clear();
         self.served.clear();
         self.stepped.clear();
@@ -4119,6 +4366,16 @@ impl Database {
                 .and_then(|read| self.with_tools(read))
         })
     }
+    /// `inspect`, first checking that `name` still holds identity
+    /// `bot_id`, both in one snapshot.
+    pub fn inspect_held(&self, name: &str, bot_id: Option<i64>) -> Result<Bot> {
+        // Read only; dropping it ends it.
+        let _snapshot = self.conn.unchecked_transaction()?;
+        if bot_id.is_some() {
+            self.identity(name, bot_id)?;
+        }
+        self.inspect(name)
+    }
     pub fn inspect(&self, name: &str) -> Result<Bot> {
         self.with_snapshot(|| {
             // Cached: parsing this many columns costs more than the read.
@@ -4134,6 +4391,16 @@ impl Database {
     /// and read from memory; when it is read from the store, a configure
     /// between the two reads may have let it go, so a list not found
     /// outside a transaction is read again with the bot, in one snapshot.
+    /// `read` in one snapshot: its own read transaction outside a group,
+    /// the group's inside one.
+    fn snapshot<T>(&self, read: impl FnOnce() -> Result<T>) -> Result<T> {
+        if !self.conn.is_autocommit() {
+            return read();
+        }
+        // Read only; dropping it ends it.
+        let _snapshot = self.conn.unchecked_transaction()?;
+        read()
+    }
     fn with_snapshot(&self, read: impl Fn() -> Result<Bot>) -> Result<Bot> {
         match read() {
             Err(error) if error.code == "tool_list_unknown" && self.conn.is_autocommit() => {
@@ -9249,7 +9516,8 @@ impl Database {
     /// Park a running turn on a gated call's verdict: its task ends and it
     /// holds no slot. The verdicts the worker holds are written with the
     /// park. A verdict that landed as the hold ran out is taken instead:
-    /// `None` means the call is decided and the turn goes on.
+    /// `None` means the call is decided and the turn goes on. `served` are
+    /// the gate tags sessions serve now, which say who holds the call.
     pub fn suspend_approval(
         &mut self,
         turn: i64,
@@ -9257,6 +9525,7 @@ impl Database {
         now_ms: u64,
         route: Option<&str>,
         summary_retry_ms: Option<u64>,
+        served: &[String],
     ) -> Result<Option<Option<u64>>> {
         let bot = self.active(turn)?;
         let call = pending.first().ok_or(Error::new("invalid_tool_state"))?;
@@ -9274,6 +9543,7 @@ impl Database {
         if deadline_ms.is_some_and(|at| now_ms >= at) {
             return Ok(None);
         }
+        let (holder, since_ms) = request.holder(served);
         let waiting = Waiting {
             turn,
             bot: bot.name.clone(),
@@ -9288,6 +9558,12 @@ impl Database {
             compaction: false,
             route: route.map(str::to_owned),
             approval: true,
+            holder: Some(holder.to_owned()),
+            since_ms: Some(since_ms),
+            served: (served.iter())
+                .filter(|tag| request.gates.iter().any(|g| &g.tag == *tag))
+                .cloned()
+                .collect(),
             answer: None,
             copied: None,
             summary_retry_ms,
@@ -9306,7 +9582,8 @@ impl Database {
             "UPDATE turns SET status='waiting',waiting=? WHERE id=?",
             params![serde_json::to_string(&waiting)?, turn],
         )?;
-        let data = json!({"call_id":call.call_id,"approval":true,"deadline_ms":deadline_ms});
+        let data = json!({"call_id":call.call_id,"approval":true,"deadline_ms":deadline_ms,
+            "holder":holder,"since_ms":since_ms});
         parked(&tx, &bot.name, "waiting", &data)?;
         event(&tx, &bot.name, Some(turn), "turn_waiting", data)?;
         tx.commit()?;
@@ -9353,6 +9630,9 @@ impl Database {
             compaction: false,
             route: route.map(str::to_owned),
             approval: false,
+            holder: None,
+            since_ms: None,
+            served: Vec::new(),
             answer: None,
             copied: None,
             summary_retry_ms,
@@ -9517,6 +9797,9 @@ impl Database {
             compaction: false,
             route: route.map(str::to_owned),
             approval: false,
+            holder: None,
+            since_ms: None,
+            served: Vec::new(),
             answer: Some(tag.clone()),
             copied: None,
             summary_retry_ms,
@@ -10752,6 +11035,44 @@ impl Database {
         }
         Ok((status, request, tag, at_ms))
     }
+    /// Who holds `request`'s call now, and since when, where its turn is
+    /// parked on it and that changed: read from its gates still open and
+    /// the tags served as the turn parked, as the park read them.
+    fn holds(
+        &self,
+        answer: &Decision<'_>,
+        request: &Request,
+    ) -> Result<Option<(&'static str, i64)>> {
+        if request.step_of.is_some() {
+            return Ok(None);
+        }
+        // Only the few fields the holder needs, never the parked round's
+        // calls and their arguments.
+        let parked = (self.conn.prepare_cached(
+            "SELECT json_extract(waiting,'$.served'),json_extract(waiting,'$.holder'),
+                json_extract(waiting,'$.since_ms') FROM turns
+            WHERE id=? AND status='waiting' AND json_extract(waiting,'$.approval')=1
+                AND json_extract(waiting,'$.call_id')=?",
+        )?)
+        .query_row(params![answer.turn, answer.call_id], |r| {
+            Ok((
+                r.get::<_, Option<String>>(0)?,
+                r.get::<_, Option<String>>(1)?,
+                r.get::<_, Option<i64>>(2)?,
+            ))
+        })
+        .optional()?;
+        let Some((served, was, was_since_ms)) = parked else {
+            return Ok(None);
+        };
+        let served: Vec<String> = match served {
+            Some(served) => serde_json::from_str(&served)?,
+            None => Vec::new(),
+        };
+        let (holder, since_ms) = request.holder(&served);
+        let same = was.as_deref() == Some(holder) && was_since_ms == Some(since_ms);
+        Ok((!same).then_some((holder, since_ms)))
+    }
     /// Hand a planned call to a person: `answer.tag`'s gate stays open, the
     /// call keeps waiting, and the reason goes with it in listings and in an
     /// `approval_asked` event. Only a gate with no expiry can wait on one.
@@ -10775,9 +11096,14 @@ impl Database {
         };
         request.asked.retain(|other| other.tag != tag);
         request.asked.push(asked.clone());
+        let held = self.holds(&answer, &request)?;
         let tx = self.conn.savepoint()?;
         tx.prepare_cached("UPDATE approvals SET asked=? WHERE id=?")?
             .execute(params![serde_json::to_string(&request.asked)?, request.id])?;
+        // A turn parked on the call now waits on a person: its own
+        // `waiting_on` and its bot's say so. One that has not parked reads
+        // the ask when it does.
+        rehold(&tx, held, answer.bot, answer.turn)?;
         event(
             &tx,
             answer.bot,
@@ -10861,6 +11187,12 @@ impl Database {
                 lifted: None,
             });
         }
+        // A verdict that leaves the call waiting on other gates may change
+        // who holds it, as the turn parked on it says.
+        let held = match status == "waiting" && request.process.is_none() && !request.decided() {
+            true => self.holds(&answer, &request)?,
+            false => None,
+        };
         let tx = self.conn.savepoint()?;
         tx.prepare_cached("UPDATE approvals SET verdicts=? WHERE id=?")?
             .execute(params![
@@ -10868,6 +11200,7 @@ impl Database {
                 request.id
             ])?;
         untag_answered(&tx, request.id, std::slice::from_ref(&verdict))?;
+        rehold(&tx, held, answer.bot, answer.turn)?;
         tx.commit()?;
         let resume = status == "waiting"
             && request.process.is_none()
@@ -10904,6 +11237,9 @@ impl Database {
             );
         }
         let through = through.unwrap_or(i64::MAX);
+        // Taken before the rows are read: a verdict held now is in it, and
+        // one written since is in the rows.
+        let held = self.held_view();
         let mut page = ApprovalPage {
             listed: Vec::new(),
             bytes: 0,
@@ -10932,15 +11268,13 @@ impl Database {
                 {
                     read += 1;
                     let (id, turn): (i64, i64) = (r.get(0)?, r.get(1)?);
-                    let held = self
-                        .live
-                        .get(&turn)
-                        .and_then(|live| live.answered.get(&id))
+                    let answered = held
+                        .answered(turn, id)
                         .is_some_and(|tags| tags.iter().any(|t| t == tag));
-                    let entry = match held {
+                    let entry = match answered {
                         true => None,
                         false => match call.query([id])?.next()? {
-                            Some(row) => self.waiting_call(row, Some(tag))?,
+                            Some(row) => waiting_call(&held, row, Some(tag))?,
                             None => None,
                         },
                     };
@@ -10968,7 +11302,7 @@ impl Database {
                 while let Some(r) = rows.next()? {
                     read += 1;
                     let id: i64 = r.get(0)?;
-                    let entry = self.waiting_call(r, tag)?;
+                    let entry = waiting_call(&held, r, tag)?;
                     if !page.add(id, entry)? {
                         break;
                     }
@@ -10978,61 +11312,70 @@ impl Database {
         let more = page.more || read == READ;
         Ok(json!({"approvals":page.listed,"next_after":more.then_some(page.last)}))
     }
-    /// A listed call's entry, or `None` when no gate (or not `tag`) still
-    /// waits on it.
-    fn waiting_call(&self, r: &rusqlite::Row<'_>, tag: Option<&str>) -> Result<Option<Value>> {
-        let (id, turn, call_id): (i64, i64, String) = (r.get(0)?, r.get(2)?, r.get(3)?);
-        let mut request = Request {
-            id,
-            request: r.get(6)?,
-            announced_ms: r.get(7)?,
-            gates: serde_json::from_str(&r.get::<_, String>(8)?)?,
-            verdicts: r
-                .get::<_, Option<String>>(9)?
-                .map(|v| serde_json::from_str(&v))
-                .transpose()?
-                .unwrap_or_default(),
-            asked: r
-                .get::<_, Option<String>>(12)?
-                .map(|a| serde_json::from_str(&a))
-                .transpose()?
-                .unwrap_or_default(),
-            step_of: r.get(13)?,
-            process: r.get(14)?,
-        };
-        if let Some(held) = self
-            .live
-            .get(&turn)
-            .and_then(|live| live.verdicts.get(&call_id))
-        {
-            request.verdicts.extend(held.iter().cloned());
+    /// The verdicts held for running turns, as this connection sees them.
+    fn held_view(&self) -> HeldView<'_> {
+        match self.reading {
+            true => HeldView::Shared(self.shared.held()),
+            false => HeldView::Live(&self.live),
         }
-        if request.denial().is_some()
-            || request
-                .unanswered()
-                .all(|g| tag.is_some_and(|tag| g.tag != tag))
-        {
-            return Ok(None);
-        }
-        let denials: BTreeMap<String, Denials> = r
-            .get::<_, Option<String>>(11)?
-            .map(|d| serde_json::from_str(&d))
-            .transpose()?
-            .unwrap_or_default();
-        Ok(Some(pending_call(
-            &r.get::<_, String>(1)?,
-            turn,
-            &call_id,
-            &Request {
-                gates: request.unanswered().cloned().collect(),
-                ..request
-            },
-            &r.get::<_, String>(4)?,
-            r.get(5)?,
-            serde_json::from_str(&r.get::<_, String>(10)?)?,
-            &denials,
-        )))
     }
+}
+/// A listed call's entry, or `None` when no gate (or not `tag`) still
+/// waits on it.
+fn waiting_call(
+    held: &HeldView<'_>,
+    r: &rusqlite::Row<'_>,
+    tag: Option<&str>,
+) -> Result<Option<Value>> {
+    let (id, turn, call_id): (i64, i64, String) = (r.get(0)?, r.get(2)?, r.get(3)?);
+    let mut request = Request {
+        id,
+        request: r.get(6)?,
+        announced_ms: r.get(7)?,
+        gates: serde_json::from_str(&r.get::<_, String>(8)?)?,
+        verdicts: r
+            .get::<_, Option<String>>(9)?
+            .map(|v| serde_json::from_str(&v))
+            .transpose()?
+            .unwrap_or_default(),
+        asked: r
+            .get::<_, Option<String>>(12)?
+            .map(|a| serde_json::from_str(&a))
+            .transpose()?
+            .unwrap_or_default(),
+        step_of: r.get(13)?,
+        process: r.get(14)?,
+    };
+    if let Some(held) = held.verdicts(turn, id, &call_id) {
+        request.verdicts.extend(held.iter().cloned());
+    }
+    if request.denial().is_some()
+        || request
+            .unanswered()
+            .all(|g| tag.is_some_and(|tag| g.tag != tag))
+    {
+        return Ok(None);
+    }
+    let denials: BTreeMap<String, Denials> = r
+        .get::<_, Option<String>>(11)?
+        .map(|d| serde_json::from_str(&d))
+        .transpose()?
+        .unwrap_or_default();
+    Ok(Some(pending_call(
+        &r.get::<_, String>(1)?,
+        turn,
+        &call_id,
+        &Request {
+            gates: request.unanswered().cloned().collect(),
+            ..request
+        },
+        &r.get::<_, String>(4)?,
+        r.get(5)?,
+        serde_json::from_str(&r.get::<_, String>(10)?)?,
+        &denials,
+    )))
+}
+impl Database {
     /// Begin serving `tag`: the newest event id assigned so far, which the
     /// cursor of every later announcement passes, with the first page of
     /// the calls waiting on the tag now and `through`, the newest request
@@ -12387,6 +12730,9 @@ impl Database {
             compaction: false,
             route: route.map(str::to_owned),
             approval: false,
+            holder: None,
+            since_ms: None,
+            served: Vec::new(),
             answer: None,
             copied: None,
             summary_retry_ms,
@@ -12461,6 +12807,9 @@ impl Database {
             compaction,
             route: route.map(str::to_owned),
             approval: false,
+            holder: None,
+            since_ms: None,
+            served: Vec::new(),
             answer: None,
             copied,
             summary_retry_ms,
@@ -12553,6 +12902,9 @@ impl Database {
             compaction: true,
             route: route.map(str::to_owned),
             approval: false,
+            holder: None,
+            since_ms: None,
+            served: Vec::new(),
             answer: None,
             copied: None,
             summary_retry_ms: None,
@@ -12876,6 +13228,11 @@ impl Database {
     /// `pruned` once retention removed how it ended. A failed turn keeps the
     /// error its row saved; any other says `turn_result_pruned`.
     pub fn turn_answer(&self, name: &str, turn: i64) -> Result<Value> {
+        // Its view and its outcome are read in one snapshot: on a reader, a
+        // commit between them must not pair a turn's state with another's.
+        self.snapshot(|| self.turn_answer_now(name, turn))
+    }
+    fn turn_answer_now(&self, name: &str, turn: i64) -> Result<Value> {
         let mut view = self.turn_view(name, turn)?;
         match self.outcome_of(view.clone(), turn) {
             Ok(Some(outcome)) => Ok(outcome),
@@ -16808,6 +17165,24 @@ fn parked(tx: &Connection, bot: &str, status: &str, on: &Value) -> Result<()> {
         .execute(params![bot, status, on.to_string()])?;
     Ok(())
 }
+/// Write who holds the call a parked turn waits on, `held` by
+/// [`Database::holds`], on the turn's `waiting` and its bot's `waiting_on`.
+fn rehold(tx: &Connection, held: Option<(&str, i64)>, bot: &str, turn: i64) -> Result<()> {
+    let Some((holder, since_ms)) = held else {
+        return Ok(());
+    };
+    tx.prepare_cached(
+        "UPDATE turns SET waiting=json_set(waiting,'$.holder',?2,'$.since_ms',?3)
+         WHERE id=?1 AND status='waiting'",
+    )?
+    .execute(params![turn, holder, since_ms])?;
+    tx.prepare_cached(
+        "UPDATE bots SET waiting_on=json_set(waiting_on,'$.holder',?3,'$.since_ms',?4)
+         WHERE name=?1 AND running_turn=?2 AND status='waiting'",
+    )?
+    .execute(params![bot, turn, holder, since_ms])?;
+    Ok(())
+}
 /// Keep how `turn` ended as its bot's last, unless a later turn of the bot
 /// ended already: a message that failed in line while this turn ran.
 fn record_ended(
@@ -18873,6 +19248,72 @@ fn migrate_since_73(conn: &Connection, from: i32) -> Result<()> {
     // Schema 102: daemon steps under way, in `steps`, which the schema
     // makes; nothing older holds any.
 
+    if from < 104 {
+        migrate_approval_holders(conn)?;
+    }
+
+    Ok(())
+}
+/// 103 -> 104: a turn parked on a call's verdict says who holds the call
+/// and since when. No session serves a tag while the store opens, so a
+/// call a reviewer did not hand to a person is a person's from its
+/// announcement, as a park reads it then.
+fn migrate_approval_holders(conn: &Connection) -> Result<()> {
+    let parked: Vec<(i64, String)> = conn
+        .prepare(
+            "SELECT id,json_extract(waiting,'$.call_id') FROM turns
+             WHERE status='waiting' AND json_extract(waiting,'$.approval')=1",
+        )?
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+        .collect::<rusqlite::Result<_>>()?;
+    for (turn, call_id) in parked {
+        let row = conn
+            .query_row(
+                "SELECT id,request,announced_ms,gates,verdicts,asked FROM approvals
+                 WHERE turn=? AND call_id=?",
+                params![turn, call_id],
+                |r| {
+                    Ok((
+                        r.get::<_, i64>(0)?,
+                        r.get::<_, i64>(1)?,
+                        r.get::<_, i64>(2)?,
+                        r.get::<_, String>(3)?,
+                        r.get::<_, Option<String>>(4)?,
+                        r.get::<_, Option<String>>(5)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let Some((id, request, announced_ms, gates, verdicts, asked)) = row else {
+            continue;
+        };
+        let request = Request {
+            id,
+            request,
+            announced_ms,
+            gates: serde_json::from_str(&gates)?,
+            verdicts: verdicts
+                .map(|v| serde_json::from_str(&v))
+                .transpose()?
+                .unwrap_or_default(),
+            asked: asked
+                .map(|a| serde_json::from_str(&a))
+                .transpose()?
+                .unwrap_or_default(),
+            step_of: None,
+            process: None,
+        };
+        let (holder, since_ms) = request.holder(&[]);
+        conn.execute(
+            "UPDATE turns SET waiting=json_set(waiting,'$.holder',?2,'$.since_ms',?3) WHERE id=?1",
+            params![turn, holder, since_ms],
+        )?;
+        conn.execute(
+            "UPDATE bots SET waiting_on=json_set(waiting_on,'$.holder',?2,'$.since_ms',?3)
+             WHERE running_turn=?1 AND status='waiting'",
+            params![turn, holder, since_ms],
+        )?;
+    }
     Ok(())
 }
 /// 100 -> 101: every bot's declared tools moved to `tool_lists`, one row
@@ -19234,7 +19675,7 @@ fn migrate_bot_status(conn: &Connection) -> Result<()> {
             json_extract(t.waiting,'$.handles'),json_extract(t.waiting,'$.any'),
             json_extract(t.waiting,'$.deadline_ms'),json_extract(t.waiting,'$.answer'),
             json_extract(t.waiting,'$.halt'),json_extract(t.waiting,'$.load'),
-            json_extract(t.waiting,'$.blocked'),t.held,t.due_ms,0,NULL,t.id,NULL,NULL
+            json_extract(t.waiting,'$.blocked'),t.held,t.due_ms,0,NULL,t.id,NULL,NULL,NULL,NULL
          FROM turns t JOIN bots b ON b.name=t.bot WHERE t.id=?",
     )?;
     let mut update = conn.prepare("UPDATE bots SET waiting_on=? WHERE name=?")?;
@@ -20102,13 +20543,86 @@ mod tests {
     }
 
     #[test]
+    fn a_readers_copied_verdicts_answer_only_the_rows_they_were_given_for() {
+        let verdict: Verdict =
+            serde_json::from_value(json!({"tag":"manual","allow":true,"at_ms":1})).unwrap();
+        let held = HeldView::Shared(Arc::new(HashMap::from([(
+            7,
+            Held {
+                answered: HashMap::from([(1, vec!["manual".to_owned()])]),
+                verdicts: HashMap::from([("call".to_owned(), vec![verdict])]),
+            },
+        )])));
+        assert_eq!(held.verdicts(7, 1, "call").map(<[_]>::len), Some(1));
+        // The call announced again since, under a new row: unanswered.
+        assert!(held.verdicts(7, 2, "call").is_none());
+    }
+
+    #[test]
+    fn a_kept_identity_lasts_until_a_commit_changes_what_it_holds() {
+        let mut db = Database::initialize(Connection::open_in_memory().unwrap()).unwrap();
+        let shared = db.shared();
+        db.conn
+            .execute_batch(
+                "INSERT INTO bots(name,id,status,provider,family,model,instructions)
+                 VALUES ('Bob',7,'idle','openai','responses','m','')",
+            )
+            .unwrap();
+        let read = |db: &Database| Arc::new(Identity::from(db.inspect_id(7).unwrap()));
+        let generation = shared.identity(7).unwrap_err();
+        shared.know(generation, read(&db));
+        let kept = shared.identity(7).unwrap();
+        assert!(!kept.sandboxed());
+        let commit = |db: &mut Database, sql: &str| {
+            db.begin_group().unwrap();
+            db.conn.execute_batch(sql).unwrap();
+            db.commit_group().unwrap();
+        };
+        // A turn's bookkeeping changes nothing a request is held to.
+        commit(
+            &mut db,
+            "UPDATE bots SET tokens_used=5, status='running' WHERE id=7",
+        );
+        assert!(Arc::ptr_eq(&kept, &shared.identity(7).unwrap()));
+        // A read taken before a change commits is not kept after it.
+        db.begin_group().unwrap();
+        db.conn
+            .execute_batch(r#"UPDATE bots SET settings='{"sandbox":"read-only"}' WHERE id=7"#)
+            .unwrap();
+        assert!(
+            Arc::ptr_eq(&kept, &shared.identity(7).unwrap()),
+            "until it commits"
+        );
+        let before = read(&db);
+        db.commit_group().unwrap();
+        let generation = shared.identity(7).unwrap_err();
+        shared.know(generation - 1, before);
+        assert!(shared.identity(7).is_err());
+        shared.know(generation, read(&db));
+        assert!(shared.identity(7).unwrap().sandboxed());
+        // An abandoned group's change is read again too, and so is a bot
+        // gone.
+        db.begin_group().unwrap();
+        db.conn
+            .execute_batch("UPDATE bots SET workspace='/elsewhere' WHERE id=7")
+            .unwrap();
+        db.abandon_group().unwrap();
+        let generation = shared.identity(7).unwrap_err();
+        shared.know(generation, read(&db));
+        commit(&mut db, "DELETE FROM bots WHERE id=7");
+        assert!(shared.identity(7).is_err());
+        assert_eq!(db.inspect_id(7).unwrap_err().code, "bot_not_found");
+    }
+
+    #[test]
     fn a_cached_statement_is_not_planned_again_when_reused() {
         let dir = std::env::temp_dir().join(format!("agent-plans-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("state.sqlite");
         let mut writer = Database::initialize(Connection::open(&path).unwrap()).unwrap();
-        let mut reader = Database::reader(Connection::open(&path).unwrap()).unwrap();
+        let mut reader =
+            Database::reader(Connection::open(&path).unwrap(), writer.shared()).unwrap();
         for db in [&mut writer, &mut reader] {
             let conn = db.connection();
             // A join with a bound value, as `history_items` reads an item.
