@@ -10641,3 +10641,25 @@ release build, 20,000 checks a run against a 40-line config:
 
 So a sandboxed command pays about 2.7 µs more before its sandbox starts,
 the first run cold. The bubblewrap launch that follows takes about 12 ms.
+
+The Perf workflow's matched screen on this change (GitHub runner, 4 CPUs,
+base and head built and screened alternately; a Linux runner with no
+`~/.ssh/config`, so the copy check finds no file and binds nothing):
+
+| Bench | Measure | Base | Head | Change |
+| --- | --- | ---: | ---: | ---: |
+| admission | lone submit CPU, ms | 29.789 | 28.81 | -3.3% |
+| admission | burst submit p99, ms | 3.184 | 3.074 | -3.4% |
+| completion | release to terminal p99, ms | 8.368 | 8.615 | +2.9% |
+| footprint | idle RSS, MiB | 17.148 | 17.223 | +0.4% |
+| footprint | per idle bot, KiB | 1.828 | 1.842 | +0.8% |
+| footprint | RSS after a turn each, MiB | 35.842 | 35.898 | +0.2% |
+| footprint | CPU per turn, ms | 0.733 | 0.738 | +0.7% |
+| lifecycle | CPU, s | 0.405 | 0.4 | -1.2% |
+| lifecycle | p95 turn, ms | 732.785 | 629.097 | -14.1% |
+| lifecycle | peak RSS, MiB | 26.113 | 26.504 | +1.5% |
+
+Every daemon measure is within 3.4% of the base, or better, and the gate
+passed. The screen's Sonny rows moved both ways (lookout CPU per 1k deltas
++25% at 10x1, -4.9% at 100x10; quiet window CPU -27%) on code this change
+does not touch, which is run-to-run noise.
