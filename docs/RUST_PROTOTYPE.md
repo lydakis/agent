@@ -2879,8 +2879,9 @@ names the turn it runs, read in the same store job, which the tool
 interrupts; `list_agents` leaves it out unless asked with `closed` (the
 `bots` request's `open` filter). Nothing of its history goes; the next turn
 it starts, from a message sent later or one already in line, opens it
-again. A store from
-before schema 105 gives the two to every bot that has `send_message`.
+again. Both arrive in protocol version 84 (the `close` request, the
+`bots` request's `open` filter); a store from before schema 105 gives the
+two to every bot that has `send_message`.
 
 `shell` runs a noninteractive command with `/bin/bash -c` (`/bin/sh` where
 bash is not installed) in the bot workspace, or in `workdir` when the call
