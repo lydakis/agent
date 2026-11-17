@@ -2459,6 +2459,8 @@ async fn run() -> Result<(), String> {
     update::note_started();
     let options = parse()?;
     SIDE.store(options.side.is_some(), std::sync::atomic::Ordering::Relaxed);
+    // Before the daemon and its companions start on this build.
+    upgrade::at_start(&options.store);
     // Before any lead is made, so its instructions list the skills.
     skills::install_own();
     trigger::at_start();
@@ -2482,6 +2484,7 @@ async fn run() -> Result<(), String> {
         }
     };
     trigger::restamp_at_start(client.identity(), client.store());
+    upgrade::from_listing(client.clone(), &options.store);
     // A lead made just now starts in the row new leads start in.
     let mut fresh = false;
     // A lead moved elsewhere, and the folder it comes back to.
