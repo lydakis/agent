@@ -94,6 +94,18 @@ FIRST = ("Before we start, a note for later: the release codename is HERON-7731,
 QUOTED = "the rollback owner is whoever is on call that Thursday"
 
 
+def weekdays_at_nine(cron):
+    """Whether a cron schedule runs at 09:00 on Monday to Friday and no
+    other time: minute 0, hour 9, every day of the month and month,
+    weekdays 1-5."""
+    fields = cron.split()
+    if len(fields) != 5:
+        return False
+    minute, hour, day, month, weekdays = fields
+    return (minute in ('0', '00') and hour in ('9', '09') and day == '*' and month == '*'
+            and weekdays.upper() in ('1-5', 'MON-FRI', '1,2,3,4,5', 'MON,TUE,WED,THU,FRI'))
+
+
 def check(name, fn, needs=None):
     return {'name': name, 'fn': fn, 'needs': needs}
 
@@ -223,8 +235,7 @@ CASES = [
      ],
      'checks': [
          check('sets an automation', lambda v: bool(v.automation('add'))),
-         check('on weekdays at 9', lambda v: any(re.search(r'\b0?9\b', a) and re.search(r'1-5|week ?day|mon', a, re.I)
-                                                for a in v.automation('add'))),
+         check('on weekdays at 9', lambda v: any(weekdays_at_nine(cron) for cron in v.crons())),
          check('takes it off', lambda v: bool(v.automation('remove')) and v.automations_left() == []),
      ]},
 ]
@@ -424,6 +435,16 @@ class View:
         found += [r['preview'] for r in self.lead_rows if r['outcome'] == 'completed'
                   and re.search(rf'\.agent/automation\s+{script}\b', r['preview'] or '')]
         return found
+
+    def crons(self):
+        """The cron schedules of the lead's completed additions, by the tool
+        or by the script's `--cron`."""
+        found = [a['add'].get('cron') for a in self.completed('automations')
+                 if isinstance(a, dict) and isinstance(a.get('add'), dict)]
+        found += [m.group(2) for r in self.lead_rows if r['outcome'] == 'completed'
+                  for m in [re.search(r'\.agent/automation\s+add\b.*?--cron\s+([\'"])(.*?)\1', r['preview'] or '')]
+                  if m]
+        return [cron for cron in found if isinstance(cron, str)]
 
     def automations_left(self):
         """The automations still set when the run ended, or None when the

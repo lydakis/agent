@@ -177,6 +177,21 @@ class ScoreTests(unittest.TestCase):
             checks = self.score('recover-context', view)
             self.assertEqual(list(checks.values()), [False, False, False])
 
+    def test_the_schedule_is_read_from_its_cron_fields(self):
+        for cron, ok in [('0 9 * * 1-5', True), ('00 09 * * MON-FRI', True), ('9 0 * * 1-5', False),
+                         ('0 9 * * *', False), ('0 9 * * 1-5 x', False), ('0 9 1 * 1-5', False)]:
+            self.assertEqual(golden_eval.weekdays_at_nine(cron), ok, cron)
+        with tempfile.TemporaryDirectory() as tmp:
+            # A weekday word in the message is no weekday schedule.
+            add = {'add': {'cron': '0 9 * * *', 'name': 'weekday-branches'}}
+            acp = self.acp(('automations', add, 'completed'))
+            view = run_dir(tmp, [part('person', 'Set.')], files={'acp.jsonl': acp})
+            self.assertFalse(self.score('schedule', view)['on weekdays at 9'])
+        with tempfile.TemporaryDirectory() as tmp:
+            view = run_dir(tmp, [part('person', 'Set.')], [row(
+                'shell', step='s', preview='~/.agent/automation add --name b --cron "0 9 * * 1-5" -- look')])
+            self.assertTrue(self.score('schedule', view)['on weekdays at 9'])
+
     def test_memory_and_main_come_from_the_run(self):
         with tempfile.TemporaryDirectory() as tmp:
             view = run_dir(tmp, [part('person', 'Saved.')],
