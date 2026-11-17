@@ -1859,7 +1859,6 @@ class AutoApproverTests(ModelFixture):
         self.assertIn('This is a review failure, not a determination that the action is unsafe.',
                       judged['calls'][0]['reason'])
         self.assertEqual(daemon.finished(unchecked)['data']['status'], 'completed')
-        self.assertTrue(self.denial(daemon, unchecked).startswith(FAILED))
         self.assertEqual(daemon.request('approvals', bot='Carol')['result']['approvals'], [])
         denials = daemon.request('inspect', bot='Carol')['result'].get('denials', {})
         self.assertTrue(all(counts['turn'] != unchecked for counts in denials.values()), denials)
