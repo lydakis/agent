@@ -1810,7 +1810,13 @@ fn copied_in(
     first: &str,
     unreadable: &[PathBuf],
 ) -> Option<(PathBuf, PathBuf)> {
-    let copy_of = |file: &Path| Some(copies.join(file.strip_prefix("/").ok()?));
+    // Named by the text too: another daemon that puts other text first
+    // keeps its own copy rather than writing over this one's.
+    let copy_of = |file: &Path| {
+        let mut named = copies.join(file.strip_prefix("/").ok()?).into_os_string();
+        named.push(format!(".{:016x}", fnv(first.as_bytes())));
+        Some(PathBuf::from(named))
+    };
     let file = std::fs::canonicalize(place).ok();
     let hidden = |path: &Path| unreadable.iter().any(|hidden| path.starts_with(hidden));
     if hidden(place) || file.as_deref().is_some_and(hidden) {
@@ -1827,6 +1833,14 @@ fn copied_in(
     let file = file?;
     let copy = copy_of(&file)?;
     copied_file(&file, first, &copy).then_some((copy, file))
+}
+
+/// FNV-1a over `bytes`: the same in every build, as a name kept on disk
+/// between daemons must be.
+fn fnv(bytes: &[u8]) -> u64 {
+    (bytes.iter()).fold(0xcbf2_9ce4_8422_2325, |hash, byte| {
+        (hash ^ u64::from(*byte)).wrapping_mul(0x0100_0000_01b3)
+    })
 }
 
 /// Whether `copy` holds `file` now, `first` before it, writing it again
@@ -2979,7 +2993,11 @@ mod tests {
         // Shown by its real path, a link followed, as bubblewrap binds,
         // its copy kept under that path.
         let copies = base.join("copies");
-        let keyed = copies.join(file.strip_prefix("/").unwrap());
+        let keyed = PathBuf::from(format!(
+            "{}.{:016x}",
+            copies.join(file.strip_prefix("/").unwrap()).display(),
+            fnv(FIRST.as_bytes())
+        ));
         let link = base.join("home/.ssh/linked");
         std::os::unix::fs::symlink(&file, &link).unwrap();
         let shown = copied_in(&copies, &link, FIRST, &[]).unwrap();
@@ -2993,6 +3011,18 @@ mod tests {
         assert!(copied_in(&copies, &file, FIRST, &[]).is_some());
         assert_eq!(copied_in(&copies, &file, FIRST, &hidden), None);
         assert!(!keyed.exists());
+        // Other text first, as another daemon may put: a copy of its own.
+        let (mine, other) = (
+            copied_in(&copies, &file, FIRST, &[]).unwrap(),
+            copied_in(&copies, &file, "Other yes\n", &[]).unwrap(),
+        );
+        assert_ne!(mine.0, other.0);
+        assert!(std::fs::read_to_string(&mine.0).unwrap().starts_with(FIRST));
+        assert!(
+            std::fs::read_to_string(&other.0)
+                .unwrap()
+                .starts_with("Other yes\n")
+        );
         assert!(copied_file(&file, FIRST, &copy));
         #[cfg(target_os = "linux")]
         {

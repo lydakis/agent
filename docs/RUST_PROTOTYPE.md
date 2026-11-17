@@ -3238,8 +3238,9 @@ which the namespace maps as itself, binds nothing.
 
 Each file the daemon was started with as `serve --own-copy-file
 FILE=FIRST` is shown on Linux from a copy the person owns under
-`~/.agent/copies`, by the file's real path, a link followed, with the text
-`FIRST` before the file, kept in step with it; the daemon knows nothing of
+`~/.agent/copies`, by the file's real path, a link followed, and a hash of
+the text (so a daemon that puts other text first keeps its own copy), with
+the text `FIRST` before the file, kept in step with it; the daemon knows nothing of
 what the file is. One kept unreadable is not shown, and a copy made before
 it was is removed, since sandboxes read `~/.agent`. The CLI passes the
 person's `~/.ssh/config` with `ControlMaster no` first
