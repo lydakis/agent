@@ -2109,7 +2109,10 @@ fn main() -> std::process::ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let result = match args.split_first() {
         // The tool host runs this for each call of a tool Sonny answers.
-        Some((tool, rest)) if tool == "tool" => served::answer_here(rest),
+        Some((tool, rest)) if tool == "tool" => {
+            agent_client::name_program("tool_host");
+            served::answer_here(rest)
+        }
         // `~/.agent/memory` runs this, from agents' shells.
         Some((verb, rest)) if verb == "memory" => {
             // The person's words are read from the daemon, which only
@@ -2155,21 +2158,35 @@ fn main() -> std::process::ExitCode {
         }
         // Sonny's scheduler runs this for a trigger's fire.
         Some((flag, rest)) if flag == trigger::FIRE_FLAG => {
+            agent_client::name_program("scheduler");
             return std::process::ExitCode::from(trigger::fire_cli(rest) as u8);
         }
         // Unlisted: the one job Sonny gives the system, which fires triggers.
         Some((verb, [])) if verb == scheduler::VERB => {
+            agent_client::name_program("scheduler");
             return std::process::ExitCode::from(scheduler::run() as u8);
         }
-        Some((lookout, rest)) if lookout == "lookout" => lookout::run(rest),
-        Some((verb, rest)) if verb == tool_host::NAME => tool_host::run(rest),
-        Some((verb, rest)) if verb == "reviewer" => reviewer::run(rest),
+        Some((lookout, rest)) if lookout == "lookout" => {
+            agent_client::name_program("lookout");
+            lookout::run(rest)
+        }
+        Some((verb, rest)) if verb == tool_host::NAME => {
+            agent_client::name_program("tool_host");
+            tool_host::run(rest)
+        }
+        Some((verb, rest)) if verb == "reviewer" => {
+            agent_client::name_program("reviewer");
+            reviewer::run(rest)
+        }
         Some((verb, rest)) if verb == "mcp" => mcp::cli(rest),
         Some((verb, rest)) if verb == "link" => link::cli(rest),
         Some((verb, rest)) if verb == "rules" => {
             return std::process::ExitCode::from(rules::cli(rest) as u8);
         }
-        Some((verb, rest)) if verb == "sky" => sky_cli(rest),
+        Some((verb, rest)) if verb == "sky" => {
+            agent_client::name_program("sky");
+            sky_cli(rest)
+        }
         Some((verb, rest)) if verb == "status" => status_cli(rest),
         // The person runs this, from a terminal of their own.
         Some((verb, rest)) if verb == "upgrade" => update::cli(rest),
@@ -2223,12 +2240,15 @@ fn main() -> std::process::ExitCode {
         Some((agent, rest)) if agent == "agent" => pass_to_agent(rest),
         // T3 Code runs this as a provider, a process for each thread.
         Some((verb, rest)) if verb == acp::VERB => acp::run(rest),
-        _ => tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(2)
-            .enable_all()
-            .build()
-            .map_err(|e| e.to_string())
-            .and_then(|runtime| runtime.block_on(run())),
+        _ => {
+            agent_client::name_program("window");
+            tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
+                .enable_all()
+                .build()
+                .map_err(|e| e.to_string())
+                .and_then(|runtime| runtime.block_on(run()))
+        }
     };
     match result {
         Ok(()) => std::process::ExitCode::SUCCESS,
@@ -2987,7 +3007,13 @@ pub(crate) fn made(
     state: Option<&str>,
 ) -> Result<(), String> {
     let config = agent_client::config::load()?;
-    let declare = json!(declared::tools(served::Role::TASK));
+    // Confined from the start, as the row it is made in confines it, and
+    // writing `state`, the state folder of the agent that makes it, or its
+    // own.
+    let mode = approvals::default();
+    let mut settings = approvals::sandbox(mode, workspace, state);
+    let role = served::Role::TASK.within(&json!(settings));
+    let declare = json!(declared::tools(role));
     let tools = agent_client::default_tools(
         client.providers(),
         model,
@@ -2997,11 +3023,6 @@ pub(crate) fn made(
     asked["tools"] = json!(tools);
     asked["declare"] = declare.clone();
     asked["compaction_instructions"] = json!(agent_client::policy::DEFAULT_COMPACTION_INSTRUCTIONS);
-    // Confined from the start, as the row it is made in confines it, and
-    // writing `state`, the state folder of the agent that makes it, or its
-    // own.
-    let mode = approvals::default();
-    let mut settings = approvals::sandbox(mode, workspace, state);
     // Named in its shell too; one another bot makes takes its maker's.
     if let Some(state) = &state {
         settings.insert("env".into(), json!({state::VAR: state}));
@@ -7154,6 +7175,19 @@ impl App {
             .as_ref()
             .and(self.mode)
             .filter(|mode| *mode != "full"));
+        // An agent's sandbox goes with its row, a lead's, a task's or
+        // a side chat's, which the daemon holds within its agent's.
+        let workspace = std::path::Path::new(&self.workspace);
+        let confined =
+            gating.map(|mode| approvals::sandbox(mode, workspace, self.state.as_deref()));
+        // Its `exec` shows the shell's fields for leaving a sandbox only
+        // while its row puts it in one.
+        if let Some(confined) = &confined
+            && let Some(held) =
+                declared::held(declare.as_ref().unwrap_or(&self.declared), &json!(confined))
+        {
+            declare = Some(held);
+        }
         let mut asked = json!({"bot": self.bot});
         if let Some(text) = &text {
             asked["instructions"] = json!(text);
@@ -7182,11 +7216,8 @@ impl App {
                 mode,
                 &approvals::gateable(&self.tools, declared),
             ));
-            // An agent's sandbox goes with its row, a lead's, a task's or
-            // a side chat's, which the daemon holds within its agent's.
-            let workspace = std::path::Path::new(&self.workspace);
-            settings.extend(approvals::sandbox(mode, workspace, self.state.as_deref()));
         }
+        settings.extend(confined.into_iter().flatten());
         if !settings.is_empty() {
             asked["settings"] = Value::Object(settings);
         }
@@ -9313,11 +9344,23 @@ impl App {
     }
 
     /// A `margin` call applied as it starts, so a note shows while the
-    /// agent works, and the margin scrolled to it.
-    fn note_call(&mut self, call: &str, arguments: &Value, turn: Option<i64>) {
+    /// agent works, and the margin scrolled to it: written at `written`,
+    /// as the history dates its output, or now, heard live.
+    fn note_call(
+        &mut self,
+        call: &str,
+        arguments: &Value,
+        turn: Option<i64>,
+        written: Option<i64>,
+    ) {
         let after = self.answering.as_ref().map(|(.., node)| *node);
+        let written = written.unwrap_or_else(|| {
+            (std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH))
+                .map_or(0, |since| since.as_millis() as i64)
+        });
         if let Some(margin::Change::Posted(id) | margin::Change::Updated(id)) =
-            self.margin.apply(call, arguments, after, turn)
+            self.margin
+                .apply(call, arguments, after, turn, Some(written))
         {
             self.margin_focus = self.margin.note(&id).map(|note| margin::anchor(&note.call));
         }
@@ -10528,7 +10571,8 @@ impl App {
                             && denial(&item).is_none()
                             && !reactions::refused(&item)
                         {
-                            self.margin.apply(&id, &arguments, None, None);
+                            let written = item["written_ms"].as_i64();
+                            self.margin.apply(&id, &arguments, None, None, written);
                         }
                     }
                     _ => {}
@@ -10781,7 +10825,8 @@ impl App {
                                 && denial(&item).is_none()
                                 && !reactions::refused(&item)
                             {
-                                self.note_call(id, &arguments, turns.get(&node).copied());
+                                let written = item["written_ms"].as_i64();
+                                self.note_call(id, &arguments, turns.get(&node).copied(), written);
                             }
                             unpaired.push((node, item));
                             continue;
@@ -10796,7 +10841,8 @@ impl App {
                             && denial(&item).is_none()
                             && !reactions::refused(&item)
                         {
-                            self.note_call(id, &arguments, turns.get(&node).copied());
+                            let written = item["written_ms"].as_i64();
+                            self.note_call(id, &arguments, turns.get(&node).copied(), written);
                         }
                         match denial(&item) {
                             Some(reason) => {
@@ -11841,7 +11887,7 @@ impl App {
                 } else {
                     // Taken: the margin shows it, once.
                     if name == margin::TOOL && !shown.1 {
-                        self.note_call(id, &arguments, turn);
+                        self.note_call(id, &arguments, turn, None);
                     }
                     self.commit_call(id, turn, &name, &arguments, &shown.0, shown.1);
                 }
@@ -20902,7 +20948,7 @@ mod tests {
         app.read_sources_from(none);
         let post = json!({"kind": "follows", "id": "ci", "live": true,
             "markdown": "CI is {{ source('ci').latest.text }}"});
-        app.margin.apply("c1", &post, None, None);
+        app.margin.apply("c1", &post, None, None, None);
         let shown = |app: &mut App| {
             app.margin.set_blanks(app.blanks.clone());
             let (lines, _) = app.margin.lines(60, usize::MAX, Path::new("/"), None);
@@ -26677,7 +26723,8 @@ mod tests {
         assert!(app.configure().await);
         let sent = asked.lock().unwrap()[0].clone();
         assert_eq!(sent["op"], "configure");
-        assert_eq!(sent["declare"], json!(declared::tools(served::Role::TASK)));
+        let unconfined = served::Role::TASK.within(&Value::Null);
+        assert_eq!(sent["declare"], json!(declared::tools(unconfined)));
         assert!(app.declare.is_none());
     }
 
@@ -27794,6 +27841,7 @@ mod tests {
             "c1",
             &json!({"kind": "pinned", "id": "flow", "from": "calc.add/flow"}),
             None,
+            None,
         );
         let shown = |app: &App| match &app.margin.note("flow").unwrap().body {
             margin::Body::From { shown, .. } => shown.as_deref().cloned(),
@@ -27871,6 +27919,7 @@ mod tests {
                 "c1",
                 &json!({"kind": "pinned", "id": "flow", "from": "calc.add/flow"}),
                 None,
+                None,
             );
             app.read_references().await;
             assert_eq!(shown(&app), Some(margin::Body::Markdown("deep".into())));
@@ -27914,6 +27963,7 @@ mod tests {
         app.note_call(
             "c1",
             &json!({"kind": "pinned", "id": "flow", "from": "calc.add/flow"}),
+            None,
             None,
         );
         let shown = |app: &App| match &app.margin.note("flow").unwrap().body {
@@ -27982,6 +28032,7 @@ mod tests {
             "c1",
             &json!({"kind": "pinned", "id": "flow", "from": "calc.add/flow"}),
             None,
+            None,
         );
         let shown = |app: &App| match &app.margin.note("flow").unwrap().body {
             margin::Body::From { shown, .. } => shown.as_deref().cloned(),
@@ -28007,7 +28058,7 @@ mod tests {
         // Given its own title here, it keeps it.
         let titled =
             json!({"kind": "pinned", "id": "flow", "title": "Mine", "from": "calc.add/flow"});
-        app.note_call("c2", &titled, None);
+        app.note_call("c2", &titled, None, None);
         app.references_read = None;
         app.read_references().await;
         assert_eq!(shown(&app), Some(margin::Body::Markdown("d".into())));
@@ -31365,7 +31416,7 @@ mod tests {
         app.failed = 1;
         for id in ["findings", "repro"] {
             let post = json!({"kind": "pinned", "id": id, "title": id, "markdown": "x"});
-            app.margin.apply(id, &post, None, None);
+            app.margin.apply(id, &post, None, None, None);
         }
         app.context = Some(126_000);
         app.window = Some(200_000);
@@ -32466,19 +32517,24 @@ mod tests {
         app.margin_back();
         assert!(!margin(&app));
         let post = json!({"kind": "pinned", "id": "repro", "title": "Repro", "markdown": "x"});
-        app.margin.apply("m1", &post, None, None);
+        app.margin.apply("m1", &post, None, None, None);
         app.margin_back();
         assert!(margin(&app));
         // Its last note taken away, it stays, as one opened empty does.
-        app.margin
-            .apply("m2", &json!({"id": "repro", "remove": true}), None, None);
+        app.margin.apply(
+            "m2",
+            &json!({"id": "repro", "remove": true}),
+            None,
+            None,
+            None,
+        );
         app.margin_back();
         assert!(margin(&app) && !app.margin.closed());
         // Closed by the person, a note opens it again by default.
         app.close_pane(true);
         app.margin_back();
         assert!(!margin(&app) && app.margin.closed());
-        app.margin.apply("m3", &post, None, None);
+        app.margin.apply("m3", &post, None, None, None);
         app.margin_back();
         assert!(margin(&app) && !app.margin.closed());
         // Under what is open, to go back to; emptied there, it is still
@@ -32488,18 +32544,23 @@ mod tests {
         app.close_pane(true);
         app.open_pane(pane::Pane::card("status", STATUS_KEYS));
         let change = json!({"kind": "pinned", "id": "repro", "markdown": "y"});
-        app.margin.apply("m4", &change, None, None);
+        app.margin.apply("m4", &change, None, None, None);
         app.margin_back();
         assert!(app.under.is_some() && app.pane.as_ref().unwrap().over);
-        app.margin
-            .apply("m5", &json!({"id": "repro", "remove": true}), None, None);
+        app.margin.apply(
+            "m5",
+            &json!({"id": "repro", "remove": true}),
+            None,
+            None,
+            None,
+        );
         app.margin_back();
         app.close_pane(true);
         assert!(margin(&app));
         // Unless closed: a note leaves it closed until /margin.
         app.margin_opens = MarginOpens::UnlessClosed;
         app.close_pane(true);
-        app.margin.apply("m6", &post, None, None);
+        app.margin.apply("m6", &post, None, None, None);
         app.margin_back();
         assert!(!margin(&app) && app.margin.closed());
         app.toggle_margin();
@@ -32508,13 +32569,13 @@ mod tests {
         app.margin_opens = MarginOpens::Never;
         app.pane = None;
         app.pane_keys = false;
-        app.margin.apply("m7", &change, None, None);
+        app.margin.apply("m7", &change, None, None, None);
         app.margin_back();
         assert!(!margin(&app) && !app.margin.closed());
         app.toggle_margin();
         assert!(margin(&app) && app.pane_keys);
         app.pane_keys = false;
-        app.margin.apply("m8", &post, None, None);
+        app.margin.apply("m8", &post, None, None, None);
         app.margin_back();
         assert!(margin(&app));
     }
@@ -32523,7 +32584,7 @@ mod tests {
     async fn what_opens_lays_over_the_margin_and_esc_steps_back_to_it() {
         let mut app = app(daemon_with(json!([])).await);
         let post = json!({"kind": "pinned", "id": "repro", "title": "Repro", "markdown": "x"});
-        app.margin.apply("m1", &post, None, None);
+        app.margin.apply("m1", &post, None, None, None);
         app.margin_back();
         assert!(app.pane.as_ref().is_some_and(pane::Pane::is_margin));
         app.open_pane(pane::Pane::card("status", STATUS_KEYS));
@@ -32615,7 +32676,7 @@ mod tests {
     async fn back_from_what_is_over_the_margin_is_the_margin_and_forward_lays_it_over_again() {
         let mut app = app(daemon_with(json!([])).await);
         let post = json!({"kind": "pinned", "id": "repro", "title": "Repro", "markdown": "x"});
-        app.margin.apply("m1", &post, None, None);
+        app.margin.apply("m1", &post, None, None, None);
         app.margin_back();
         app.open_pane(pane::Pane::card("status", STATUS_KEYS));
         assert!(app.step_pane(true));
@@ -32634,7 +32695,7 @@ mod tests {
         std::fs::write(dir.join("a.md"), "# A\n").unwrap();
         let mut app = app(daemon_with(json!([])).await);
         let post = json!({"kind": "pinned", "id": "repro", "title": "Repro", "markdown": "x"});
-        app.margin.apply("m1", &post, None, None);
+        app.margin.apply("m1", &post, None, None, None);
         app.margin_back();
         app.follow(&format!("file://{}", dir.join("a.md").display()));
         assert!(app.pane.as_ref().is_some_and(|p| !p.is_margin() && p.over));
@@ -33192,7 +33253,7 @@ mod tests {
     async fn the_margin_shows_by_itself_only_where_the_conversation_keeps_its_width() {
         let mut app = app(daemon_with(json!([])).await);
         let post = json!({"kind": "pinned", "id": "repro", "title": "Repro", "markdown": "x"});
-        app.margin.apply("m1", &post, None, None);
+        app.margin.apply("m1", &post, None, None, None);
         app.margin_back();
         let (chat, margin) = app.split(Rect::new(0, 0, 170, 40));
         // The conversation's 100 two columns in, a gutter each side of the
@@ -33249,7 +33310,7 @@ mod tests {
         .await;
         let mut app = app(client);
         let post = json!({"kind": "pinned", "id": "repro", "title": "Repro", "markdown": "x"});
-        app.margin.apply("m1", &post, None, None);
+        app.margin.apply("m1", &post, None, None, None);
         app.daemon(turn_event("steered", 4, json!({"node": 7})))
             .await;
         assert!(app.margin.note("repro").is_none());
@@ -33326,8 +33387,8 @@ mod tests {
         .await;
         let mut app = app(client);
         let post = |id: &str| json!({"kind": "pinned", "id": id, "title": id, "markdown": "old"});
-        app.margin.apply("c1", &post("kept"), None, None);
-        app.margin.apply("c2", &post("gone"), None, None);
+        app.margin.apply("c1", &post("kept"), None, None, None);
+        app.margin.apply("c2", &post("gone"), None, None, None);
         app.margin.advance(2);
         app.history().await;
         let kept = app.margin.note("kept").expect("kept");
@@ -33400,14 +33461,14 @@ mod tests {
         .await;
         let mut app = app(client);
         let post = json!({"kind": "pinned", "id": "repro", "title": "Repro", "markdown": "x"});
-        app.margin.apply("c1", &post, None, None);
+        app.margin.apply("c1", &post, None, None, None);
         // Taken away here; its message lands in a turn already running,
         // after which the agent puts the note back.
         app.margin.remove("repro", None);
         app.closing.insert("repro".into());
         assert!(app.note_closed(7, &told));
         let again = json!({"kind": "pinned", "id": "repro", "title": "Repro", "markdown": "again"});
-        app.margin.apply("c9", &again, None, None);
+        app.margin.apply("c9", &again, None, None, None);
         app.history().await;
         assert!(app.margin.note("repro").is_some());
     }
@@ -33425,7 +33486,7 @@ mod tests {
         .await;
         let mut app = app(client);
         let post = json!({"kind": "pinned", "id": "repro", "title": "Repro", "markdown": "x"});
-        app.margin.apply("m1", &post, None, None);
+        app.margin.apply("m1", &post, None, None, None);
         app.follow("sonny:close/repro");
         for what in std::mem::take(&mut app.pressed) {
             app.press(&what).await;
@@ -33444,7 +33505,7 @@ mod tests {
         let client = daemon_answering(|_| json!({"error": "bot_busy", "detail": "busy"})).await;
         let mut app = app(client);
         let post = json!({"kind": "pinned", "id": "repro", "title": "Repro", "markdown": "x"});
-        app.margin.apply("m1", &post, None, None);
+        app.margin.apply("m1", &post, None, None, None);
         app.follow("sonny:close/repro");
         for what in std::mem::take(&mut app.pressed) {
             app.press(&what).await;

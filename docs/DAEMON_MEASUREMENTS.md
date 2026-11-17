@@ -10492,6 +10492,88 @@ to 14.3). A completion holds no verdicts and changes no bot's identity
 columns, so neither the shared verdict copy nor the identity trigger runs
 in it.
 
+## A running command step stops its call's clock (#1115)
+
+A command step now pauses its `exec` call's expiry while it runs, and
+the step's close resumes it: one keyed `UPDATE` inside the transaction
+`step_close` already opens, so store jobs a step stay at 2.0.
+`bench.steps_fleet` at 10,000 bots, 5 steps each (50,000 steps), main
+(2872f1b) against the head, three alternating runs each, release build,
+synthetic model, 4-core Linux container, 2026-11-17. Ranges are the three
+runs; the median is in parentheses.
+
+| | Main | Head |
+| --- | ---: | ---: |
+| Steps finished / refused | 50,000 / 0 | 50,000 / 0 |
+| Store jobs a step | 2.0 | 2.0 |
+| One step alone, p50 | 0.93 to 1.07 ms (1.06) | 0.88 to 1.34 ms (1.21) |
+| One step alone, p99 | 2.09 to 2.53 ms (2.35) | 1.66 to 5.34 ms (3.59) |
+| Every call stepping at once, step p99 | 1,688 to 1,808 ms (1,782) | 1,705 to 1,810 ms (1,783) |
+| Other bots' turn p99 while the fleet steps | 131 to 148 ms (136) | 132 to 137 ms (136) |
+| Daemon RSS at the end | 242 to 345 MB (294) | 307 to 411 MB (308) |
+
+The fleet numbers are the same within the runs' spread. The step alone
+moves by more than the runs agree with each other (one head run at 0.88 ms
+p50 was the fastest of all six), so no change shows above the noise, and
+memory spreads 100 MB run to run on both sides.
+
+CI's matched screen (`perf` workflow, run 44009613119, base main against
+this head, GitHub's Linux runner, 2026-11-17), the daemon rows:
+
+| Bench | Measure | Base | Head | Change |
+| --- | --- | ---: | ---: | ---: |
+| admission | lone submit CPU, ms | 27.871 | 27.770 | -0.4% |
+| admission | burst submit p99, ms | 2.989 | 3.142 | +5.1% |
+| completion | release to terminal p99, ms | 8.286 | 8.230 | -0.7% |
+| footprint | idle RSS, MiB | 16.98 | 16.89 | -0.5% |
+| footprint | per idle bot, KiB | 1.786 | 1.948 | +9.1% |
+| footprint | RSS after a turn each, MiB | 40.40 | 41.82 | +3.5% |
+| footprint | CPU per turn, ms | 0.701 | 0.741 | +5.8% |
+| lifecycle | CPU, s | 0.39 | 0.40 | +2.6% |
+| lifecycle | p95 turn, ms | 854.7 | 582.9 | -31.8% |
+| lifecycle | peak RSS, MiB | 26.25 | 25.79 | -1.8% |
+
+The change adds nothing to an idle bot or a turn that runs no step: the
+pause is one statement in a step's own commit. The footprint and burst
+rows move within what one run against another moves on that runner (the
+same rows move by as much between base runs of other pull requests), and
+lifecycle's p95 is faster, which the change cannot cause either.
+
+## Requests and slow operations by program (`stats`)
+
+2026-11-17, Linux x86_64 cloud VM, 4 CPUs, Python 3 and the bench venv.
+Main is `d329db7`; the change adds `hello`, the `programs` split and the
+`slow` list. Both are local release builds with the same locked
+dependencies. The hot-path screens, as the Perf workflow runs them
+(`bench/perf_gate.py`), two alternating rounds:
+
+| Bench | Measure | Main | Change | Change % |
+| --- | --- | ---: | ---: | ---: |
+| admission | lone submit CPU, ms | 33.759 | 33.93 | +0.5% |
+| admission | burst submit p99, ms | 4.407 | 4.41 | +0.1% |
+| completion | release to terminal p99, ms | 11.287 | 10.736 | -4.9% |
+| footprint | idle RSS, MiB | 16.693 | 16.82 | +0.8% |
+| footprint | per idle bot, KiB | 1.778 | 1.884 | +6.0% |
+| footprint | RSS after a turn each, MiB | 32.303 | 36.783 | +13.9% |
+| footprint | CPU per turn, ms | 0.838 | 0.853 | +1.8% |
+| lifecycle | CPU, s | 0.575 | 0.555 | -3.5% |
+| lifecycle | p95 turn, ms | 595.637 | 581.01 | -2.5% |
+| lifecycle | peak RSS, MiB | 25.85 | 24.85 | -3.9% |
+
+Store work per turn is the same on both. Per request the loop adds three
+additions to a fixed array; per delivered event, one relaxed atomic
+increment; per store job, one comparison against a second. Nothing is
+allocated per turn or per request, and the slow list stays empty in these
+runs. The footprint's RSS after a turn is the allocator's high-water mark
+from 1,000 concurrent turns, and it moved the most, so three more
+alternating rounds of the footprint alone were run. Over all ten measured
+runs of each, main ranged 30.2 to 40.5 MiB (median 32.7) and the change 31.5 to
+40.7 MiB (median 38.6): the ranges overlap whole, but the medians differ by
+more than the change could hold, as it keeps nothing per turn;
+idle RSS was the same (15.0 to 17.0 MiB on both) and per idle bot 1.61 to
+1.88 KiB on main against 1.71 to 2.16 KiB on the change, which adds one
+16-byte shared program slot per session, not per bot.
+
 ## ssh in a sandbox from a copy of the person's config that makes no control socket
 
 What a turn pays, on each path:

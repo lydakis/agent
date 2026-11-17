@@ -358,7 +358,18 @@ One map entry per op the daemon has seen, touched only by the loop, so no
 lock. `loop` reports the same holds for the loop's own work between
 requests: `reap` (a turn's task ended), `start_ready`, `resume`, `wake`,
 `admission` (a queued admission answered), `lapse`, `holds`, `expire` and
-`reload`. `runtime` reports the async runtime's `workers`, `busy_ms` (time
+`reload`. `programs` splits the requests by the program each session
+named in its first line, `{"op":"hello","program":NAME}` (1 to 32 of
+`a-z`, `0-9` and `_`; a client library sends it unanswered, under an id no
+request takes): each program's `count`, `held_ms`, `waited_ms`, and the
+live and durable events `delivered` to its sessions. A bot's own socket is
+`agent`, which its `hello` cannot change; a session that sent none is
+`unnamed`; the daemon keeps places for 13 names as first heard and counts
+any past those as `other`. `slow` lists the last 100 operations that took a
+second or more, newest first: a store job's or a commit's run (`kind`
+`store`) or the loop's hold on a request or a chore (`loop`, with the
+request's `program`), each with `at_ms` (when it ended), `op` and `ms`.
+`runtime` reports the async runtime's `workers`, `busy_ms` (time
 they ran rather than parked), `parks`, `alive_tasks` and `queued_tasks`,
 kept by tokio as it runs. `hub` counts the events published (`durable`,
 `live`), the copies `delivered` to followers' queues (replayed ones too),
@@ -1413,6 +1424,7 @@ own path from the turn. Example requests:
 {"id":32,"op":"follow","bot":"*","since_ms":1793000000000,"kinds":["accepted","message"]}
 {"id":17,"op":"wait","handles":["Bob/1","Alice/3"],"any":true,"timeout_ms":60000}
 {"id":18,"op":"stats"}
+{"id":33,"op":"hello","program":"window"}
 {"id":19,"op":"provider_models"}
 {"id":21,"op":"create","bot":"Carol","workspace":"/workspaces/project","model":"openai/gpt-6-luna","instructions":"...","tools":["shell","read","write","edit","wait","history"],"approve":["shell","write","edit","read"],"approver":"manual","settings":{"context_bytes":1048576,"keep_turns":16}}
 {"id":22,"op":"approvals","bot":"Carol","limit":64}
@@ -2888,14 +2900,26 @@ bash is not installed) in the bot workspace, or in `workdir` when the call
 names one, read against the workspace unless absolute, as Codex's
 `workdir` is (a `workdir` that is not there fails the call with
 `path_not_found`), with
-`timeout_ms` (default 120 s, maximum 600 s), which bounds the command's
-running time, not any time spent in line for a process slot. A background
-command holds no turn while it runs, so it has no timeout unless its call
-names one, of up to a day: as Codex's unified exec runs a command, it runs
-until it exits, `write_stdin` with `kill: true` on its handle stops it, or
-the daemon stops, and only a `timeout_ms` it was given ends it with
-`timed_out`. A command a steer moves to the background keeps the timeout it
-started with. No bot has a share of its own: once the daemon's background
+`timeout_ms` (default 120 s, up to a day), how long a foreground command
+holds its turn, counted from when it starts running, not from any time
+spent in line for a process slot. No clock kills a foreground command: past
+its `timeout_ms` it moves to the background and keeps running, as Codex's
+unified exec yields a command, and the call's result is its `proc:N` handle
+with `yielded: true` and its last 20 lines of output so far, as a steer
+moves one (`steered: true`). A background command holds no turn while it
+runs, so it has no timeout unless its call names one, of up to a day: as
+Codex's unified exec runs a command, it runs until it exits, `write_stdin`
+with `kill: true` on its handle stops it, or the daemon stops, and only a
+`timeout_ms` it was given ends it with `timed_out`. A command a steer or
+its timeout moves to the background has no timeout from then on. A
+command a script runs as a daemon step (`run_step`) has no timeout unless
+its arguments name one, which then ends it with `timed_out`, since a step
+cannot be handed back as a handle; its call's time stops while it runs, as
+it stops while a step waits on its gates. A step with `background: true`
+starts a background command as a turn's call does, under `CALL:STEP`: it is
+the bot's, not the call's, so the step answers at once with its `proc:N`
+handle, which outlives the call for the model to `wait` on, and its end is
+told as any background command's. No bot has a share of its own: once the daemon's background
 commands, steered ones included, are past `--max-processes` (64 a CPU by
 default), starting one more kills a command of the bot holding the most,
 the one it started or waited on least recently, never one of its 8 most
@@ -2930,7 +2954,7 @@ over 64 KiB is redacted on a blocking thread rather than the runtime's (a
 MiB takes under 1 ms), and those threads work on at most two of the largest
 results per logical CPU at once. Results include separate output, exit code, and
 success status. Nonzero exit is a recorded tool result. A command's return,
-timeout, or overflow kills its owned process group, so a process it started
+the timeout of a background command or a step, or overflow kills its owned process group, so a process it started
 with `&` does not outlive it; the tool description tells the model so. A
 timeout is a result, not an error: the output written before the kill, with
 `timed_out: true` and no exit code, since a long command's partial output is

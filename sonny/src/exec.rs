@@ -95,10 +95,10 @@ Use `await tools.tool_search({query: "...", limit: 8})` for BM25-ranked discover
 /// here: the daemon runs each call as a step of the `exec` call, decided
 /// and recorded as the same call from the model would be.
 const DAEMON_TOOLS: &str = r#"# This agent's own tools
-Your shell and file tools are on `tools` too, and only there: `tools.shell`, `tools.read`, `tools.write`, `tools.edit`, `tools.apply_patch` and `tools.web_fetch`, as far as you have them. Each runs as its own call would, in your folder, under the same rules, sandbox and approvals, and resolves to a `CallToolResult` whose text is what the tool returns (`tools.shell`'s is JSON with `stdout`, `stderr` and `exit_code`); one that fails resolves with `isError: true`. A command runs in the foreground: no `background`, `detach` or `tty`. One runs at a time. `ALL_TOOLS` has their full declarations and descriptions.
+Your shell and file tools are on `tools` too, and only there: `tools.shell`, `tools.read`, `tools.write`, `tools.edit`, `tools.apply_patch` and `tools.web_fetch`, as far as you have them. Each runs as its own call would, in your folder, under the same rules, sandbox and approvals, and resolves to a `CallToolResult` whose text is what the tool returns (`tools.shell`'s is JSON with `stdout`, `stderr` and `exit_code`); one that fails resolves with `isError: true`. A command runs until it exits, unless its `timeout_ms` ends it, and the script's time stops meanwhile; with `background: true` it starts apart and resolves at once to its `proc:N` handle, which you `wait` on as a direct call's: hand the handle back with `text()`. No `detach` or `tty`. One runs at a time. `ALL_TOOLS` has their full declarations and descriptions.
 ```ts
 declare const tools: {
-  shell(args: { command: string; workdir?: string; timeout_ms?: number }): Promise<CallToolResult>;
+  {SHELL}
   read(args: { path: string; offset?: number; limit?: number }): Promise<CallToolResult>;
   write(args: { path: string; content: string }): Promise<CallToolResult>;
   edit(args: { path: string; old: string; new: string; replace_all?: boolean }): Promise<CallToolResult>;
@@ -106,6 +106,26 @@ declare const tools: {
   web_fetch(args: { url: string }): Promise<CallToolResult>;
 };
 ```"#;
+
+/// `tools.shell` in [`DAEMON_TOOLS`], for an agent that works in a sandbox
+/// and one that doesn't.
+const SHELL: &str = "shell(args: { command: string; workdir?: string; timeout_ms?: number; background?: boolean }): Promise<CallToolResult>;";
+
+/// `tools.shell` for an agent in a sandbox, with the fields that ask to
+/// leave it, in Codex's words, as its daemon declares them on the same
+/// call made directly.
+const SHELL_ESCALATING: &str = r#"shell(args: {
+    command: string;
+    workdir?: string;
+    timeout_ms?: number;
+    background?: boolean;
+    // Sandbox permissions for the command. Set to "require_escalated" to request running without sandbox restrictions; defaults to "use_default".
+    sandbox_permissions?: "use_default" | "require_escalated";
+    // Only set if sandbox_permissions is "require_escalated". Request approval from the user to run this command outside the sandbox. Phrased as a simple question that summarizes the purpose of the command as it relates to the task at hand - e.g. 'Do you want to fetch and pull the latest version of this git branch?'
+    justification?: string;
+    // Reusable approval prefix for `command`, only with `sandbox_permissions: "require_escalated"`; for example ["git", "pull"].
+    prefix_rule?: string[];
+  }): Promise<CallToolResult>;"#;
 
 /// Whether code mode is on: the agents' own tools reached only through
 /// `exec` (`[sonny] code_mode`, on unless the config says otherwise).
@@ -142,7 +162,9 @@ type CallToolResult<TStructured = { [key: string]: unknown }> = {
 
 /// `exec`, declared for every agent while the person has servers on, or
 /// `None`: its description lists them, with the tools they last listed.
-pub fn tool() -> Option<Value> {
+/// An agent that `escalates`, one in a sandbox, is shown `tools.shell`'s
+/// fields for leaving it, as its daemon shows them on a direct call.
+pub fn tool(escalates: bool) -> Option<Value> {
     let servers = agent_client::config::load().ok()?.sonny.mcp_servers;
     let servers: Servers = servers.into_iter().filter(|(_, s)| s.enabled).collect();
     // The machines linked here that lend servers of their own.
@@ -165,7 +187,7 @@ pub fn tool() -> Option<Value> {
         .collect();
     Some(json!({
         "name": NAME,
-        "description": description(&servers, &known, &machines, code_mode),
+        "description": description(&servers, &known, &machines, code_mode, escalates),
         "parameters": {
             "type": "object",
             "properties": {"input": {"type": "string",
@@ -191,10 +213,15 @@ fn description(
     known: &BTreeMap<String, Known>,
     machines: &[crate::link::Machine],
     code_mode: bool,
+    escalates: bool,
 ) -> String {
     let mut sections = vec![DESCRIPTION.to_owned(), TYPES.to_owned()];
     if code_mode {
-        sections.push(DAEMON_TOOLS.to_owned());
+        let shell = match escalates {
+            true => SHELL_ESCALATING,
+            false => SHELL,
+        };
+        sections.push(DAEMON_TOOLS.replace("{SHELL}", shell));
     }
     let mut left = DECLARATIONS;
     let mut omitted = 0;
@@ -2446,7 +2473,7 @@ mod tests {
             },
         )]
         .into();
-        let text = description(&servers, &known, &[], false);
+        let text = description(&servers, &known, &[], false, false);
         assert!(text.contains("## test\nTest tools"));
         assert!(text.contains("declare const tools: { mcp__test__tool0(args: { [key: string]: unknown; }): Promise<CallToolResult>; };"));
         let declared = text.matches("### `mcp__test__").count();
@@ -2454,7 +2481,29 @@ mod tests {
         assert!(text.ends_with(&format!("{} more tools are in `ALL_TOOLS`.", 40 - declared)));
         // A server not listed yet is still named.
         let unlisted: BTreeMap<String, Known> = [("test".to_owned(), Known::default())].into();
-        assert!(description(&servers, &unlisted, &[], false).contains("once it starts"));
+        assert!(description(&servers, &unlisted, &[], false, false).contains("once it starts"));
+    }
+
+    /// In code mode, `tools.shell` shows the fields for leaving the
+    /// sandbox, in Codex's words as the daemon gives them on a direct
+    /// call, to an agent in a sandbox, and none to one in none.
+    #[test]
+    fn only_an_agent_in_a_sandbox_is_shown_the_shell_s_fields_for_leaving_it() {
+        let none = (Servers::new(), BTreeMap::new());
+        let confined = description(&none.0, &none.1, &[], true, true);
+        assert!(confined.contains(r#"sandbox_permissions?: "use_default" | "require_escalated";"#));
+        assert!(confined.contains("// Sandbox permissions for the command. Set to \"require_escalated\" to request running without sandbox restrictions; defaults to \"use_default\"."));
+        assert!(confined.contains("justification?: string;"));
+        assert!(confined.contains("// Only set if sandbox_permissions is \"require_escalated\". Request approval from the user to run this command outside the sandbox."));
+        assert!(confined.contains("prefix_rule?: string[];"));
+        assert!(confined.contains("// Reusable approval prefix for `command`, only with `sandbox_permissions: \"require_escalated\"`; for example [\"git\", \"pull\"]."));
+        let free = description(&none.0, &none.1, &[], true, false);
+        assert!(free.contains("shell(args: { command: string; workdir?: string; timeout_ms?: number; background?: boolean }): Promise<CallToolResult>;"));
+        for field in ["sandbox_permissions", "justification", "prefix_rule"] {
+            assert!(!free.contains(field), "{field}");
+        }
+        // Out of code mode, no agent's tools are declared there at all.
+        assert!(!description(&none.0, &none.1, &[], false, true).contains("tools.shell"));
     }
 
     #[test]
@@ -2489,7 +2538,7 @@ mod tests {
         )]
         .into();
         let known: BTreeMap<String, Known> = [("notes".to_owned(), Known::default())].into();
-        let text = description(&own, &known, std::slice::from_ref(&machine), false);
+        let text = description(&own, &known, std::slice::from_ref(&machine), false, false);
         let fixed = DESCRIPTION.len() + TYPES.len();
         // Headers and the machine's own paragraph are small and fixed.
         assert!(text.len() <= fixed + DECLARATIONS + 2_000, "{}", text.len());
@@ -3232,7 +3281,7 @@ text(ALL_TOOLS.map(t => t.name).join(","));"#,
                 )
             })
             .collect();
-        let described = description(&servers, &known, &[], false);
+        let described = description(&servers, &known, &[], false, false);
         assert!(
             !described.contains("### `mcp__my_server__echo`"),
             "{described}"

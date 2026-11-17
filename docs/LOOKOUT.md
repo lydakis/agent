@@ -264,8 +264,10 @@ where no agent can write: they run as the person, outside any sandbox.
 A source whose last 3 runs failed (exited other than 0, or did not start)
 is down: every follow of it, whatever its topic or filter, hears so
 from the lookout itself, with why the last run failed and its last 5
-lines of stderr, and again each day it stays down; once a run works, they
-hear it works again. Its line in the note reads `- slack, said by the
+lines of stderr, and again each day it stays down; once a run works, or
+the source prints an event, they hear it works again, before the event. A
+source that runs one long command never ends a run, so its first event is
+what says it is back; it also starts the count of failed runs again. Its line in the note reads `- slack, said by the
 lookout (for your eng): "The source slack is down: …"`, and like any
 event from the source it waits for the source's digest. A source no
 longer needs code of its own to say that its reads fail. The lookout keeps
@@ -614,7 +616,7 @@ late. The `follows` tool says so. The person sets a source's own
 
 One message, steered, with the origin `lookout`, so the reviewer reads its
 words as asking for nothing: each event's header and text, in the order
-they came, and nothing around them. The person's words in a task are not
+they came, then the trailer. The person's words in a task are not
 retyped: the note quotes their turns (`quotes`), and the daemon copies
 each in after the note with a line naming the turn and who wrote it, so
 the lead reads the person's own words, never a retelling. The reviewer
@@ -633,6 +635,8 @@ Look at the schema before you change the route.
 Fixed avg: it skips empty lists now, with a test.
 [ci · main]
 deploy failed on prod
+[lookout]
+This note is news for you, unseen by the person. Reply when it bears on what the person is doing now or is urgent; otherwise end your turn with an empty reply.
 
 [Message calc.lead/41, sent by lookout.]
 
@@ -649,6 +653,15 @@ at a time: what comes while one is under way waits for its answer, then
 goes. A note the daemon refuses goes again after 2 minutes; one lost with
 the connection goes again at once. The note reports what happened; what
 the lead tells the person is its role's call (lead.md).
+
+Every note ends with the trailer, under a `[lookout]` header: one setting,
+`[sonny] lookout_trailer`, the same for every follower and every source,
+read as each note goes, and `""` for none. By default it says when to
+reply: when the news bears on what the person is doing now or is urgent,
+and otherwise with an empty reply, so the person sees nothing. Agents
+forget what their role says when news comes in a turn of its own (George,
+11-17), so it comes with every note. The lookout adds nothing else: the
+events stay as their sources said them.
 
 Sonny shows it folded, one quiet row named by what it tells: `↳ Lookout ·
 calc.fix completed · you wrote in calc.docs · ▲ ci`, each task's event in

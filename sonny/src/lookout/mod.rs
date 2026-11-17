@@ -73,6 +73,23 @@ fn waiting() -> usize {
     usize::try_from(sonny.lookout_waiting).unwrap_or(usize::MAX)
 }
 
+/// What `sonny.lookout_trailer` says now, read as each note goes: what
+/// ends every note, the same for every subscriber and every source.
+fn trailer() -> String {
+    match crate::kept::config() {
+        Ok(config) => config.sonny.lookout_trailer,
+        Err(_) => agent_client::config::LOOKOUT_TRAILER.to_owned(),
+    }
+}
+
+/// `note` with `trailer` under it, as a `[lookout]` line: none when empty.
+fn trailed(note: String, trailer: &str) -> String {
+    match trailer.trim() {
+        "" => note,
+        trailer => format!("{note}\n[lookout]\n{trailer}"),
+    }
+}
+
 /// Events from sources a subscriber's full lookout did not keep: how many,
 /// from where and when, for its next note to say.
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -2790,6 +2807,7 @@ impl Lookout {
         sent: Vec<sources::Heard>,
         prompt: String,
     ) {
+        let prompt = trailed(prompt, &trailer());
         let key = note_key(&sent);
         let request_id = format!("lookout-{}", digest(&key.join(",")));
         let mut asked = json!({"bot": self.lead, "bot_id": self.lead_id, "prompt": prompt,
@@ -3416,6 +3434,33 @@ fn told_commons(lead: &str, sent: &[sources::Heard]) {
 mod tests {
     use super::*;
 
+    #[test]
+    fn every_note_ends_with_the_trailer_the_config_names_and_none_when_empty() {
+        assert_eq!(
+            trailed("[slack · ana]\nlunch?".into(), "Reply when it is urgent."),
+            "[slack · ana]\nlunch?\n[lookout]\nReply when it is urgent."
+        );
+        assert_eq!(
+            trailed("[slack · ana]\nlunch?".into(), ""),
+            "[slack · ana]\nlunch?"
+        );
+        assert_eq!(
+            trailed("[slack · ana]\nlunch?".into(), " \n"),
+            "[slack · ana]\nlunch?"
+        );
+    }
+
+    /// `prompt` untimed, without the trailer that ends every note, which
+    /// it checks is there.
+    fn told(prompt: &str) -> String {
+        let untimed = sources::untimed(prompt);
+        let trailer = format!("\n[lookout]\n{}", agent_client::config::LOOKOUT_TRAILER);
+        match untimed.strip_suffix(&trailer) {
+            Some(note) => note.to_owned(),
+            None => panic!("no trailer: {untimed}"),
+        }
+    }
+
     #[tokio::test]
     async fn a_long_margin_call_is_read_whole_for_its_note_s_id() {
         // The id after a long text, as a model may write it.
@@ -4000,7 +4045,7 @@ mod tests {
         lookout.wake(&client, &woken);
         let prompt = got.recv().await.unwrap()["prompt"].clone();
         assert_eq!(
-            sources::untimed(prompt.as_str().unwrap()),
+            told(prompt.as_str().unwrap()),
             "[tasks · calc.fix · calc.docs]\nlook at this\n\
              [tasks · calc.fix · calc.fix replied, completed]\ndone"
         );
@@ -4332,7 +4377,7 @@ mod tests {
         lookout.wake(&client, &woken);
         let prompt = got.recv().await.unwrap()["prompt"].clone();
         assert_eq!(
-            sources::untimed(prompt.as_str().unwrap()),
+            told(prompt.as_str().unwrap()),
             "[tasks · calc.fix · calc.fix replied, completed]\ndone 1"
         );
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -4398,7 +4443,7 @@ mod tests {
         // The person's words only as the daemon quotes them; an agent's as
         // it wrote them.
         assert_eq!(
-            sources::untimed(submit["prompt"].as_str().unwrap()),
+            told(submit["prompt"].as_str().unwrap()),
             "[tasks · calc.fix · the person]\n\
              (their words are quoted below, from calc.fix/5)\n\
              [tasks · calc.fix · calc.docs]\nship it"
@@ -4423,7 +4468,7 @@ mod tests {
         let submit = got.recv().await.unwrap();
         assert!(submit.get("quotes").is_none());
         assert_eq!(
-            sources::untimed(submit["prompt"].as_str().unwrap()),
+            told(submit["prompt"].as_str().unwrap()),
             "[tasks · calc.fix · the person]\n\
              (their words are in calc.fix/5, which could not be quoted)"
         );
@@ -5169,7 +5214,7 @@ mod tests {
         lookout.heard_from(&slack("one", false));
         lookout.wake(&client, &woken);
         assert_eq!(
-            sources::untimed(got.recv().await.unwrap()["prompt"].as_str().unwrap()),
+            told(got.recv().await.unwrap()["prompt"].as_str().unwrap()),
             "[slack · ana]\none"
         );
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -5185,7 +5230,7 @@ mod tests {
         lookout.wake(&client, &woken);
         let prompt = got.recv().await.unwrap()["prompt"].clone();
         assert_eq!(
-            sources::untimed(prompt.as_str().unwrap()),
+            told(prompt.as_str().unwrap()),
             "[slack · ana]\ntwo\n[slack · ana]\nthree\n[slack · ana]\ndown"
         );
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -5198,7 +5243,7 @@ mod tests {
         lookout.sent_ms -= GROUP_INTERVAL.as_millis();
         lookout.wake(&client, &woken);
         assert_eq!(
-            sources::untimed(got.recv().await.unwrap()["prompt"].as_str().unwrap()),
+            told(got.recv().await.unwrap()["prompt"].as_str().unwrap()),
             "[slack · ana]\nfour"
         );
     }
@@ -5232,7 +5277,7 @@ mod tests {
         // What is urgent does not, and the held one waits on.
         lookout.heard_from(&digested("down", true));
         wake(&mut lookout, &client).await;
-        let prompt = sources::untimed(got.recv().await.unwrap()["prompt"].as_str().unwrap());
+        let prompt = told(got.recv().await.unwrap()["prompt"].as_str().unwrap());
         assert!(
             prompt.contains("down") && !prompt.contains("two"),
             "{prompt}"
@@ -5388,7 +5433,7 @@ mod tests {
         // The next note says it, once.
         let (client, mut got) = submits().await;
         wake(&mut lookout, &client).await;
-        let prompt = sources::untimed(got.recv().await.unwrap()["prompt"].as_str().unwrap());
+        let prompt = told(got.recv().await.unwrap()["prompt"].as_str().unwrap());
         assert!(prompt.starts_with("[slack · ana]\none\n"), "{prompt}");
         assert!(
             prompt.ends_with(
@@ -5420,7 +5465,7 @@ mod tests {
         lookout.restore(path.clone());
         assert_eq!((lookout.resend.len(), lookout.unkept.count), (2, 0));
         wake(&mut lookout, &client).await;
-        let prompt = sources::untimed(got.recv().await.unwrap()["prompt"].as_str().unwrap());
+        let prompt = told(got.recv().await.unwrap()["prompt"].as_str().unwrap());
         assert!(prompt.starts_with("[slack · ana]\nfive\n"), "{prompt}");
         assert!(
             prompt.contains("[lookout]\n1 more event from slack came"),
@@ -5460,9 +5505,9 @@ mod tests {
                 .unwrap()
                 .starts_with("lookout-")
         );
-        // Only the events, each under its header: no words around them.
+        // The events, each under its header, and the trailer: no other words.
         assert_eq!(
-            sources::untimed(submit["prompt"].as_str().unwrap()),
+            told(submit["prompt"].as_str().unwrap()),
             "[slack · ana]\nlunch?"
         );
         assert!(lookout.heard.is_empty());
@@ -5473,7 +5518,7 @@ mod tests {
             lookout.heard_from(&slack(&long, true));
         }
         wake(&mut lookout, &client).await;
-        let prompt = sources::untimed(got.recv().await.unwrap()["prompt"].as_str().unwrap());
+        let prompt = told(got.recv().await.unwrap()["prompt"].as_str().unwrap());
         assert!(prompt.len() <= sources::NOTE_BYTES, "{}", prompt.len());
         let told = prompt.matches("[slack · ana]").count();
         assert!(told > 0 && lookout.heard.len() == 12 - told, "{told}");
