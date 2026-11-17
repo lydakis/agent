@@ -9288,7 +9288,8 @@ impl App {
                 .map_or(0, |since| since.as_millis() as i64)
         });
         if let Some(margin::Change::Posted(id) | margin::Change::Updated(id)) =
-            self.margin.apply(call, arguments, after, turn, Some(written))
+            self.margin
+                .apply(call, arguments, after, turn, Some(written))
         {
             self.margin_focus = self.margin.note(&id).map(|note| margin::anchor(&note.call));
         }
@@ -32108,8 +32109,13 @@ mod tests {
         app.margin_back();
         assert!(margin(&app));
         // Its last note taken away, it stays, as one opened empty does.
-        app.margin
-            .apply("m2", &json!({"id": "repro", "remove": true}), None, None, None);
+        app.margin.apply(
+            "m2",
+            &json!({"id": "repro", "remove": true}),
+            None,
+            None,
+            None,
+        );
         app.margin_back();
         assert!(margin(&app) && !app.margin.closed());
         // Closed by the person, a note opens it again by default.
@@ -32129,8 +32135,13 @@ mod tests {
         app.margin.apply("m4", &change, None, None, None);
         app.margin_back();
         assert!(app.under.is_some() && app.pane.as_ref().unwrap().over);
-        app.margin
-            .apply("m5", &json!({"id": "repro", "remove": true}), None, None, None);
+        app.margin.apply(
+            "m5",
+            &json!({"id": "repro", "remove": true}),
+            None,
+            None,
+            None,
+        );
         app.margin_back();
         app.close_pane(true);
         assert!(margin(&app));
