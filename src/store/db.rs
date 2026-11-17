@@ -10813,14 +10813,34 @@ impl Database {
         answer: &Decision<'_>,
         request: &Request,
     ) -> Result<Option<(&'static str, i64)>> {
-        let Some(waiting) = self.waiting(answer.turn)? else {
-            return Ok(None);
-        };
-        if request.step_of.is_some() || !waiting.approval || waiting.call_id != answer.call_id {
+        if request.step_of.is_some() {
             return Ok(None);
         }
-        let (holder, since_ms) = request.holder(&waiting.served);
-        let same = waiting.holder.as_deref() == Some(holder) && waiting.since_ms == Some(since_ms);
+        // Only the few fields the holder needs, never the parked round's
+        // calls and their arguments.
+        let parked = (self.conn.prepare_cached(
+            "SELECT json_extract(waiting,'$.served'),json_extract(waiting,'$.holder'),
+                json_extract(waiting,'$.since_ms') FROM turns
+            WHERE id=? AND status='waiting' AND json_extract(waiting,'$.approval')=1
+                AND json_extract(waiting,'$.call_id')=?",
+        )?)
+        .query_row(params![answer.turn, answer.call_id], |r| {
+            Ok((
+                r.get::<_, Option<String>>(0)?,
+                r.get::<_, Option<String>>(1)?,
+                r.get::<_, Option<i64>>(2)?,
+            ))
+        })
+        .optional()?;
+        let Some((served, was, was_since_ms)) = parked else {
+            return Ok(None);
+        };
+        let served: Vec<String> = match served {
+            Some(served) => serde_json::from_str(&served)?,
+            None => Vec::new(),
+        };
+        let (holder, since_ms) = request.holder(&served);
+        let same = was.as_deref() == Some(holder) && was_since_ms == Some(since_ms);
         Ok((!same).then_some((holder, since_ms)))
     }
     /// Hand a planned call to a person: `answer.tag`'s gate stays open, the
