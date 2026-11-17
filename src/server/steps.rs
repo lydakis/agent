@@ -1135,34 +1135,47 @@ async fn run(
                 };
                 let listed = command.clone();
                 let (owner, started) = (bot.name.clone(), named.clone());
-                let process = store
-                    .op("process_start", move |db| {
-                        db.process_start(
-                            turn,
-                            &started,
-                            agent_runtime::store::ProcessKind::Background,
-                            &listed,
-                        )
-                    })
-                    .await?;
                 let outputs = turn::Outputs::of(bot, root.clone(), registry.daemon());
-                let spill = (outputs.clone()).map(|outputs| outputs.spill(turn, &named));
-                let (sender, receiver) = oneshot::channel();
-                registry.background(
-                    registry.stopper(process),
-                    bot.bot_id,
-                    command,
-                    Prepared::folder(&workspace, workdir.as_deref()),
-                    timeout_ms,
-                    environment,
-                    sandbox,
-                    queued,
-                    sender,
-                    spill,
-                );
-                lifts.collect(
-                    &owner, turn, process, &named, receiver, outputs, None, false,
-                );
+                let folder = Prepared::folder(&workspace, workdir.as_deref());
+                let (store, registry, lifts, owner_id) =
+                    (store.clone(), registry.clone(), lifts.clone(), bot.bot_id);
+                // Its row, its command and its collector are made whole on
+                // their own task: a step dropped meanwhile (its session
+                // gone, its call answered, the daemon pausing) leaves no
+                // row running that nothing collects or stops.
+                let registered = tokio::spawn(async move {
+                    let process = store
+                        .op("process_start", move |db| {
+                            db.process_start(
+                                turn,
+                                &started,
+                                agent_runtime::store::ProcessKind::Background,
+                                &listed,
+                            )
+                        })
+                        .await?;
+                    let spill = (outputs.clone()).map(|outputs| outputs.spill(turn, &named));
+                    let (sender, receiver) = oneshot::channel();
+                    registry.background(
+                        registry.stopper(process),
+                        owner_id,
+                        command,
+                        folder,
+                        timeout_ms,
+                        environment,
+                        sandbox,
+                        queued,
+                        sender,
+                        spill,
+                    );
+                    lifts.collect(
+                        &owner, turn, process, &named, receiver, outputs, None, false,
+                    );
+                    Ok::<_, Error>(process)
+                });
+                let process = registered
+                    .await
+                    .map_err(|_| Error::new("storage_error"))??;
                 Ok(Outcome::text(
                     json!({"handle":format!("proc:{process}"),"background":true}).to_string(),
                 ))
