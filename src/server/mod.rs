@@ -621,6 +621,17 @@ enum Command {
         output: Option<ToolOutput>,
         error: Option<ToolError>,
     },
+    /// Hand a declared call this client answers, of a tool declared
+    /// `lift`, back to the model while the client still runs it, with
+    /// `output` so far, bounded as an answer is: the call moves to the
+    /// background as a message moves it, and its answer, given later with
+    /// `tool_result`, is its command's.
+    YieldCall {
+        bot: String,
+        turn: i64,
+        call_id: String,
+        output: ToolOutput,
+    },
     /// Take a declared call this client answers, to run it: refused with
     /// `call_taken` once any client took it, so it never runs twice.
     TakeCall {
@@ -1020,6 +1031,7 @@ impl Command {
             Command::Answer { .. } => "answer",
             Command::ToolResult { .. } => "tool_result",
             Command::TakeCall { .. } => "take_call",
+            Command::YieldCall { .. } => "yield_call",
             Command::ApproveStep { .. } => "approve_step",
             Command::StepResult { .. } => "step_result",
             Command::RunStep { .. } => "run_step",
@@ -3361,6 +3373,7 @@ impl Service {
             }
             Command::ToolResult { .. } => return refuse("answer a declared tool call"),
             Command::TakeCall { .. } => return refuse("take a declared tool call"),
+            Command::YieldCall { .. } => return refuse("yield a declared tool call"),
             Command::ApproveStep { .. } => return refuse("put a declared call's step to a gate"),
             Command::RunStep { .. } => return refuse("run a declared call's step"),
             Command::StepResult { .. } => return refuse("record a declared call's step"),
@@ -4196,6 +4209,63 @@ impl Service {
     }
     /// Check the calls a message lifted, by their commands: see
     /// [`turn::Lifts::check`].
+    /// A client's output for a call it answers, as the model reads it:
+    /// bounded as an answer is, its pictures checked, its words redacted.
+    async fn answer_output(&self, output: ToolOutput) -> Result<Outcome> {
+        use agent_runtime::codec::Part;
+        Ok(match output {
+            ToolOutput::Text(output) if output.len() > ANSWER_BYTES => {
+                return fail_with(
+                    "tool_output_limit",
+                    format!("output may be up to {ANSWER_BYTES} bytes"),
+                );
+            }
+            ToolOutput::Text(output) => Outcome::text(self.registry.redact_text(output)),
+            ToolOutput::Parts(parts) => {
+                let words: usize = parts
+                    .iter()
+                    .map(|part| match part {
+                        Part::Text { text } => text.len(),
+                        Part::Image(_) => 0,
+                    })
+                    .sum();
+                if words > ANSWER_BYTES {
+                    return fail_with(
+                        "tool_output_limit",
+                        format!("output's text may be up to {ANSWER_BYTES} bytes"),
+                    );
+                }
+                let parts = images_checked(
+                    parts,
+                    |parts| parts.iter().filter_map(Part::image).collect(),
+                    "a tool result",
+                )
+                .await?;
+                let mut parts: Vec<Part> = parts
+                    .into_iter()
+                    .map(|part| match part {
+                        Part::Text { text } => Part::Text {
+                            text: self.registry.redact_text(text),
+                        },
+                        image => image,
+                    })
+                    .collect();
+                // Words before the first picture are the output.
+                let output = match parts.first_mut() {
+                    Some(Part::Text { text }) => {
+                        let text = std::mem::take(text);
+                        parts.remove(0);
+                        text
+                    }
+                    _ => String::new(),
+                };
+                Outcome {
+                    parts,
+                    ..Outcome::text(output)
+                }
+            }
+        })
+    }
     fn check_lifted(&self, processes: Vec<i64>) {
         let lifts = turn::Lifts {
             store: self.store.clone(),
@@ -5905,60 +5975,8 @@ impl Service {
                 output,
                 error,
             } => {
-                use agent_runtime::codec::Part;
                 let outcome = match (output, error) {
-                    (Some(ToolOutput::Text(output)), None) if output.len() > ANSWER_BYTES => {
-                        return fail_with(
-                            "tool_output_limit",
-                            format!("output may be up to {ANSWER_BYTES} bytes"),
-                        );
-                    }
-                    (Some(ToolOutput::Text(output)), None) => {
-                        Outcome::text(self.registry.redact_text(output))
-                    }
-                    (Some(ToolOutput::Parts(parts)), None) => {
-                        let words: usize = parts
-                            .iter()
-                            .map(|part| match part {
-                                Part::Text { text } => text.len(),
-                                Part::Image(_) => 0,
-                            })
-                            .sum();
-                        if words > ANSWER_BYTES {
-                            return fail_with(
-                                "tool_output_limit",
-                                format!("output's text may be up to {ANSWER_BYTES} bytes"),
-                            );
-                        }
-                        let parts = images_checked(
-                            parts,
-                            |parts| parts.iter().filter_map(Part::image).collect(),
-                            "a tool result",
-                        )
-                        .await?;
-                        let mut parts: Vec<Part> = parts
-                            .into_iter()
-                            .map(|part| match part {
-                                Part::Text { text } => Part::Text {
-                                    text: self.registry.redact_text(text),
-                                },
-                                image => image,
-                            })
-                            .collect();
-                        // Words before the first picture are the output.
-                        let output = match parts.first_mut() {
-                            Some(Part::Text { text }) => {
-                                let text = std::mem::take(text);
-                                parts.remove(0);
-                                text
-                            }
-                            _ => String::new(),
-                        };
-                        Outcome {
-                            parts,
-                            ..Outcome::text(output)
-                        }
-                    }
+                    (Some(output), None) => self.answer_output(output).await?,
                     (None, Some(ToolError { code, detail })) => {
                         let coded = !code.is_empty()
                             && code.len() <= 64
@@ -6010,6 +6028,30 @@ impl Service {
                 }
                 self.check_lifted(answered.lifted.into_iter().collect());
                 Ok(answered.reply)
+            }
+            Command::YieldCall {
+                bot,
+                turn,
+                call_id,
+                output,
+            } => {
+                let so_far = self.answer_output(output).await?;
+                let name = bot.clone();
+                let yielded = self
+                    .store
+                    .op("yield_call", move |db| {
+                        db.yield_call(&name, turn, &call_id, &so_far, now_ms())
+                    })
+                    .await?;
+                // Its handle answers the call by now; only then does the
+                // turn look.
+                if let Some(notify) = yielded.notify {
+                    notify.notify_one();
+                }
+                if yielded.resume {
+                    self.handles.wake(bot, turn);
+                }
+                Ok(yielded.reply)
             }
             Command::ApproveStep {
                 bot,

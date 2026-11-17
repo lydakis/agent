@@ -239,7 +239,10 @@ class Model(http.server.BaseHTTPRequestHandler):
                 # A test's own model: calls as [[name, arguments], ...], or
                 # an answer in words.
                 text = '' if isinstance(said, list) else said
-                output = ([{'type': 'function_call', 'name': name, 'call_id': f'{name}-{n + 1}',
+                # Text arguments make a custom tool's call.
+                output = ([{'type': 'custom_tool_call', 'name': name, 'call_id': f'{name}-{n + 1}',
+                            'input': arguments} if isinstance(arguments, str) else
+                           {'type': 'function_call', 'name': name, 'call_id': f'{name}-{n + 1}',
                             'arguments': json.dumps(arguments)} for n, (name, arguments) in enumerate(said)]
                           if isinstance(said, list) else
                           [{'type': 'message', 'role': 'assistant', 'content': [{'type': 'output_text', 'text': said}]}])

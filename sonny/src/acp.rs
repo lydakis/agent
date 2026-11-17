@@ -2507,7 +2507,7 @@ async fn services(
     if let Some(project) = project {
         lookout::subscribe_lead(&agent.options.store, bot, project)?;
     }
-    crate::start_companions(client).await?;
+    crate::start_companions(client, crate::Companions::Add).await?;
     if approvals::reviews(approvals::mode(&record)) {
         let model = format!(
             "{}/{}",
@@ -2628,7 +2628,7 @@ async fn setup_lead(
         }
     }
     lookout::subscribe_lead(&agent.options.store, &lead.bot, &lead.project)?;
-    crate::start_companions(client).await?;
+    crate::start_companions(client, crate::Companions::Add).await?;
     if approvals::reviews(gating.or(mode)) {
         let model = format!(
             "{}/{}",
