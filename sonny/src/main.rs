@@ -2109,7 +2109,10 @@ fn main() -> std::process::ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let result = match args.split_first() {
         // The tool host runs this for each call of a tool Sonny answers.
-        Some((tool, rest)) if tool == "tool" => served::answer_here(rest),
+        Some((tool, rest)) if tool == "tool" => {
+            agent_client::name_program("tool_host");
+            served::answer_here(rest)
+        }
         // `~/.agent/memory` runs this, from agents' shells.
         Some((verb, rest)) if verb == "memory" => {
             // The person's words are read from the daemon, which only
@@ -2155,21 +2158,35 @@ fn main() -> std::process::ExitCode {
         }
         // Sonny's scheduler runs this for a trigger's fire.
         Some((flag, rest)) if flag == trigger::FIRE_FLAG => {
+            agent_client::name_program("scheduler");
             return std::process::ExitCode::from(trigger::fire_cli(rest) as u8);
         }
         // Unlisted: the one job Sonny gives the system, which fires triggers.
         Some((verb, [])) if verb == scheduler::VERB => {
+            agent_client::name_program("scheduler");
             return std::process::ExitCode::from(scheduler::run() as u8);
         }
-        Some((lookout, rest)) if lookout == "lookout" => lookout::run(rest),
-        Some((verb, rest)) if verb == tool_host::NAME => tool_host::run(rest),
-        Some((verb, rest)) if verb == "reviewer" => reviewer::run(rest),
+        Some((lookout, rest)) if lookout == "lookout" => {
+            agent_client::name_program("lookout");
+            lookout::run(rest)
+        }
+        Some((verb, rest)) if verb == tool_host::NAME => {
+            agent_client::name_program("tool_host");
+            tool_host::run(rest)
+        }
+        Some((verb, rest)) if verb == "reviewer" => {
+            agent_client::name_program("reviewer");
+            reviewer::run(rest)
+        }
         Some((verb, rest)) if verb == "mcp" => mcp::cli(rest),
         Some((verb, rest)) if verb == "link" => link::cli(rest),
         Some((verb, rest)) if verb == "rules" => {
             return std::process::ExitCode::from(rules::cli(rest) as u8);
         }
-        Some((verb, rest)) if verb == "sky" => sky_cli(rest),
+        Some((verb, rest)) if verb == "sky" => {
+            agent_client::name_program("sky");
+            sky_cli(rest)
+        }
         Some((verb, rest)) if verb == "status" => status_cli(rest),
         // The person runs this, from a terminal of their own.
         Some((verb, rest)) if verb == "upgrade" => update::cli(rest),
@@ -2223,12 +2240,15 @@ fn main() -> std::process::ExitCode {
         Some((agent, rest)) if agent == "agent" => pass_to_agent(rest),
         // T3 Code runs this as a provider, a process for each thread.
         Some((verb, rest)) if verb == acp::VERB => acp::run(rest),
-        _ => tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(2)
-            .enable_all()
-            .build()
-            .map_err(|e| e.to_string())
-            .and_then(|runtime| runtime.block_on(run())),
+        _ => {
+            agent_client::name_program("window");
+            tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
+                .enable_all()
+                .build()
+                .map_err(|e| e.to_string())
+                .and_then(|runtime| runtime.block_on(run()))
+        }
     };
     match result {
         Ok(()) => std::process::ExitCode::SUCCESS,
