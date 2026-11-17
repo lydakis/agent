@@ -6048,6 +6048,16 @@ impl Turn {
                     {
                         own.extend(over);
                     }
+                    // A caller kept to some of its tools (a fork's `allow`)
+                    // makes agents kept to them too: `create` takes no
+                    // `allow`, so their tools are those it may call.
+                    if let Some(allowed) = me["allowed"].as_array() {
+                        let tools: Vec<Value> = (create["tools"].as_array().into_iter().flatten())
+                            .filter(|tool| allowed.contains(tool))
+                            .cloned()
+                            .collect();
+                        create["tools"] = json!(tools);
+                    }
                     create["op"] = json!("create");
                     create["request_id"] = json!(request_id);
                     // This call made again, after its folder's files or this

@@ -216,6 +216,17 @@ class AgentToolsTests(ModelFixture):
         look = client.request('inspect', bot='shop.look')['result']
         self.assertEqual(look.get('effort'), 'high', look)
 
+    def test_a_caller_kept_to_some_tools_makes_agents_kept_to_them(self):
+        client = self.client(TOOLS)
+        client.request('create', bot='shop.lead', workspace=str(self.path))
+        client.request('fork', source='shop.lead', bot='shop.narrow', allow=['echo', 'spawn_agent'])
+        self.run_calls(client, 'shop.narrow', 'go',
+                       ('spawn_agent', {'name': 'helper', 'message': 'q'}),
+                       ('spawn_agent', {'name': 'asked', 'message': 'q', 'tools': ['echo', 'send_message']}))
+        helper = client.request('inspect', bot='shop.helper')['result']
+        asked = client.request('inspect', bot='shop.asked')['result']
+        self.assertEqual((helper['tools'], asked['tools']), (['echo', 'spawn_agent'], ['echo']))
+
     def test_a_fork_takes_no_profile_and_a_missing_profile_is_refused(self):
         client = self.client(TOOLS)
         client.request('create', bot='shop.lead', workspace=str(self.path))
