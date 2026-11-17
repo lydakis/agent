@@ -1282,6 +1282,9 @@ pub struct Configuration {
     pub unreadable: Vec<PathBuf>,
     /// System folders every Linux sandbox shows from the person's copy.
     pub own_copies: Vec<PathBuf>,
+    /// Files every Linux sandbox shows from the person's copy, with text
+    /// before each.
+    pub own_copy_files: Vec<(PathBuf, String)>,
     /// The context windows the person set, by model path.
     pub context_windows: Arc<agent_runtime::provider::Windows>,
     /// The tiers faster than standard the person says models serve, by
@@ -2352,6 +2355,7 @@ pub async fn run(config: Configuration) -> Result<()> {
         walled,
         unreadable,
         owned: config.own_copies.clone(),
+        copied_files: config.own_copy_files.clone(),
         known: agent_client::config::daemons(),
     };
     // Listed with the person's other daemons, so each keeps this one's

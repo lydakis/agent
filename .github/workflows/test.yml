@@ -32,6 +32,8 @@ jobs:
       CARGO_TERM_COLOR: never
       # Sandbox tests fail here, rather than skip, when no sandbox runs.
       AGENT_TEST_SANDBOX: "1"
+      # And the push over ssh through a sandbox, when sshd is missing.
+      AGENT_TEST_SSH: "1"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -42,9 +44,10 @@ jobs:
         run: cargo clippy --locked --workspace --all-targets -- -D warnings
       - name: Rust tests
         run: |
-          # Sandboxed commands run in bubblewrap.
+          # Sandboxed commands run in bubblewrap; a test pushes over ssh
+          # through one, to an sshd of its own.
           sudo apt-get update
-          sudo apt-get install -y bubblewrap
+          sudo apt-get install -y bubblewrap openssh-server openssh-client
           # Ubuntu 24.04 keeps the unprivileged user namespaces bubblewrap
           # needs behind AppArmor.
           sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
