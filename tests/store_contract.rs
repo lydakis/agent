@@ -1444,7 +1444,7 @@ fn a_turn_parked_on_one_verdict_ends_when_a_later_call_lapses_first() {
     };
     // Parked on the first call, the turn wakes when the second one lapses.
     assert_eq!(
-        db.suspend_approval(turn, &round, epoch_now(), None, None)
+        db.suspend_approval(turn, &round, epoch_now(), None, None, &[])
             .unwrap(),
         Some(Some(lapse))
     );
@@ -1493,7 +1493,7 @@ fn every_parked_turns_lapse_is_read_at_once() {
     let next = db.next_lapse(turn).unwrap().expect("w1 lapses");
     // A running turn's lapse is its task's to watch.
     assert!(db.lapses().unwrap().is_empty());
-    db.suspend_approval(turn, &round, epoch_now(), None, None)
+    db.suspend_approval(turn, &round, epoch_now(), None, None, &[])
         .unwrap();
     assert_eq!(db.lapses().unwrap(), [(turn, next)].into());
     // An allow decides the only call that can lapse.
@@ -1666,7 +1666,7 @@ fn a_tag_listing_reads_no_call_that_tag_answered() {
     assert_eq!(rest["next_after"], Value::Null);
     // They leave the index when the turn parks.
     assert_eq!(
-        db.suspend_approval(turn, &round, epoch_now(), None, None)
+        db.suspend_approval(turn, &round, epoch_now(), None, None, &[])
             .unwrap(),
         Some(None)
     );
@@ -1964,7 +1964,7 @@ fn the_announced_call_count_follows_the_rows() {
     ));
     assert_eq!((db.approval_requests(), rows()), (1, 1));
     // A parked turn's call is counted again when the store opens.
-    db.suspend_approval(turn, &round[2..], epoch_now(), None, None)
+    db.suspend_approval(turn, &round[2..], epoch_now(), None, None, &[])
         .unwrap();
     drop(db);
     let mut db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
@@ -2134,6 +2134,232 @@ fn served_announcements_carry_each_call_and_the_denials_so_far() {
         json!({"manual":{"in_row":0,"recent":0}}),
         "a denial in an earlier turn is none in this one"
     );
+}
+
+#[test]
+fn a_parked_call_says_who_holds_it_and_since_when() {
+    let mut db = db();
+    let turn = gated_turn(&mut db, None);
+    let (item, call) = shell_call("fc_0", "s0", "git push");
+    db.append(turn, vec![item], std::slice::from_ref(&call), None)
+        .unwrap();
+    let announced =
+        db.approvals(Some("Bob"), None, 0, None, 64).unwrap()["approvals"][0]["announced_ms"]
+            .as_i64()
+            .unwrap();
+    let waiting_on = |db: &Database| {
+        let view = db.turn_view("Bob", turn).unwrap()["waiting_on"].clone();
+        let bot = serde_json::to_value(db.inspect("Bob").unwrap().waiting_on).unwrap();
+        assert_eq!(view, bot, "the bot says what its turn does");
+        view
+    };
+    // A session serves the gate: its reviewer holds the call from its
+    // announcement.
+    let served = ["manual".to_owned()];
+    db.suspend_approval(
+        turn,
+        std::slice::from_ref(&call),
+        epoch_now(),
+        None,
+        None,
+        &served,
+    )
+    .unwrap();
+    assert_eq!(
+        waiting_on(&db),
+        json!({"call_id":"s0","approval":true,"deadline_ms":null,"holder":"reviewer",
+            "since_ms":announced})
+    );
+    // Handed to a person, it waits on them from then.
+    db.ask(Decision {
+        bot: "Bob",
+        turn,
+        call_id: "s0",
+        request: 1,
+        tag: None,
+        allow: false,
+        unreviewed: false,
+        reason: Some("not reviewed: the call is too long to show"),
+        by: Some("approver"),
+        leased: true,
+    })
+    .unwrap();
+    let asked =
+        db.approvals(Some("Bob"), None, 0, None, 64).unwrap()["approvals"][0]["asked"][0]["at_ms"]
+            .as_i64()
+            .unwrap();
+    assert_eq!(
+        waiting_on(&db),
+        json!({"call_id":"s0","approval":true,"deadline_ms":null,"holder":"person",
+            "since_ms":asked})
+    );
+    // A gate no session serves is a person's from its announcement, as
+    // only an answer with no lease decides it.
+    let mut db = self::db();
+    let turn = gated_turn(&mut db, None);
+    let (item, call) = shell_call("fc_1", "s1", "git push");
+    db.append(turn, vec![item], std::slice::from_ref(&call), None)
+        .unwrap();
+    db.suspend_approval(
+        turn,
+        std::slice::from_ref(&call),
+        epoch_now(),
+        None,
+        None,
+        &[],
+    )
+    .unwrap();
+    let view = db.turn_view("Bob", turn).unwrap()["waiting_on"].clone();
+    assert_eq!(view["holder"], "person");
+    assert_eq!(
+        view["since_ms"],
+        db.approvals(Some("Bob"), None, 0, None, 64).unwrap()["approvals"][0]["announced_ms"]
+    );
+}
+
+#[test]
+fn a_verdict_that_leaves_a_call_waiting_says_who_holds_it_now() {
+    let mut db = db();
+    let tools = ["shell".to_owned()];
+    let gate = |tag: &str| Gate {
+        tag: tag.into(),
+        tools: vec!["shell".into()],
+        expire_ms: None,
+    };
+    let (first, second) = (gate("first"), gate("second"));
+    let ann = db
+        .create(
+            "Ann",
+            Some("/synthetic"),
+            Binding {
+                tools: &tools,
+                gate: Some(&first),
+                ..binding()
+            },
+        )
+        .unwrap()
+        .0;
+    db.create(
+        "Bob",
+        Some("/synthetic"),
+        Binding {
+            tools: &tools,
+            gate: Some(&second),
+            created_by: Some(ann.name.as_str()),
+            created_by_id: Some(ann.bot_id),
+            ..binding()
+        },
+    )
+    .unwrap();
+    let turn = db
+        .begin(
+            "Bob",
+            "request",
+            "work",
+            true,
+            &TurnOptions::default(),
+            allow_provider,
+        )
+        .unwrap()
+        .turn;
+    let (item, call) = shell_call("fc_0", "s0", "git push");
+    db.append(turn, vec![item], std::slice::from_ref(&call), None)
+        .unwrap();
+    let listed = db.approvals(Some("Bob"), None, 0, None, 64).unwrap();
+    let announced = listed["approvals"][0]["announced_ms"].as_i64().unwrap();
+    let holds = |db: &Database| {
+        let view = db.turn_view("Bob", turn).unwrap()["waiting_on"].clone();
+        let bot = serde_json::to_value(db.inspect("Bob").unwrap().waiting_on).unwrap();
+        assert_eq!(view, bot, "the bot says what its turn does");
+        (view["holder"].clone(), view["since_ms"].as_i64().unwrap())
+    };
+    let served = ["first".to_owned(), "second".to_owned()];
+    db.suspend_approval(
+        turn,
+        std::slice::from_ref(&call),
+        epoch_now(),
+        None,
+        None,
+        &served,
+    )
+    .unwrap();
+    assert_eq!(holds(&db), (json!("reviewer"), announced));
+    // The first gate's reviewer hands it to a person.
+    let decision = |tag, allow| Decision {
+        bot: "Bob",
+        turn,
+        call_id: "s0",
+        request: 1,
+        tag: Some(tag),
+        allow,
+        unreviewed: false,
+        reason: None,
+        by: Some("test"),
+        leased: false,
+    };
+    db.ask(decision("first", false)).unwrap();
+    let asked =
+        db.approvals(Some("Bob"), None, 0, None, 64).unwrap()["approvals"][0]["asked"][0]["at_ms"]
+            .as_i64()
+            .unwrap();
+    assert_eq!(holds(&db), (json!("person"), asked));
+    // The person allows it: the second gate's reviewer holds the call
+    // again, from its announcement.
+    let answered = db.answer(decision("first", true)).unwrap();
+    assert!(!answered.resume);
+    assert_eq!(holds(&db), (json!("reviewer"), announced));
+}
+
+#[test]
+fn schema_104_says_who_holds_a_call_parked_before_it() {
+    let path = std::env::temp_dir().join(format!("agent-holder-{}.sqlite", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+    let (turn, announced) = {
+        let mut db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
+        let turn = gated_turn(&mut db, None);
+        let (item, call) = shell_call("fc_0", "s0", "git push");
+        db.append(turn, vec![item], std::slice::from_ref(&call), None)
+            .unwrap();
+        let served = ["manual".to_owned()];
+        db.suspend_approval(
+            turn,
+            std::slice::from_ref(&call),
+            epoch_now(),
+            None,
+            None,
+            &served,
+        )
+        .unwrap();
+        let announced =
+            db.approvals(Some("Bob"), None, 0, None, 64).unwrap()["approvals"][0]["announced_ms"]
+                .clone();
+        (turn, announced)
+    };
+    // An earlier daemon parked it before the holder was recorded.
+    Connection::open(&path)
+        .unwrap()
+        .execute_batch(
+            "UPDATE turns SET waiting=json_remove(waiting,'$.holder','$.since_ms');
+             UPDATE bots SET waiting_on=json_remove(waiting_on,'$.holder','$.since_ms');
+             PRAGMA user_version=102;",
+        )
+        .unwrap();
+    let db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
+    // No session serves the gate while the store opens: a person holds it
+    // from its announcement, on the turn and its bot alike.
+    let view = db.turn_view("Bob", turn).unwrap()["waiting_on"].clone();
+    assert_eq!(
+        view,
+        json!({"call_id":"s0","approval":true,"deadline_ms":null,"holder":"person",
+            "since_ms":announced})
+    );
+    assert_eq!(
+        serde_json::to_value(db.inspect("Bob").unwrap().waiting_on).unwrap(),
+        view
+    );
+    drop(db);
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_file(path.with_extension("sqlite.schema-102.backup"));
 }
 
 #[test]
@@ -18550,7 +18776,7 @@ fn a_planned_call_keeps_what_the_rules_made_of_it() {
     assert!(announced.contains(&json!("c2")));
     // Parked on the prompt one and resumed, the park reads them back with
     // no rules at all, as after a restart that changed them.
-    db.suspend_approval(turn, &calls[1..], 0, None, None)
+    db.suspend_approval(turn, &calls[1..], 0, None, None, &[])
         .unwrap()
         .expect("parked");
     let (waiting, _, _) = db.resume(turn).unwrap();
@@ -21644,7 +21870,7 @@ fn a_message_for_the_turn_wakes_a_verdict_park() {
         .unwrap();
     let now = epoch_now();
     assert!(
-        db.suspend_approval(turn, std::slice::from_ref(&call), now, None, None)
+        db.suspend_approval(turn, std::slice::from_ref(&call), now, None, None, &[])
             .unwrap()
             .is_some()
     );
