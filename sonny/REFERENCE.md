@@ -365,10 +365,9 @@ labelled with the project's name), in Herdr or cmux a workspace, chosen the
 same way. A task the lead (or one of its tasks) starts gets a window there
 (a Herdr tab; in cmux a tab in the lead's pane) running Sonny on that task,
 without taking focus, its block (pane, cmux tab) labelled with the task's
-name, when someone asks for one: its starter, which asks when it judges you
-will want to watch it or talk to it (`start_task`'s `tab`, within
-`most_task_tabs` as any task's tab), an agent that shows it, you, from `/status` or a click on its name, or the task itself
-coming to need you. The others, such as reviewers and a lead's own helpers,
+name, when someone asks for one: an agent that shows it (`show_agent`),
+only when you asked, you, from `/status` or a click on its name, or the task
+itself coming to need you. The others, such as reviewers and a lead's own helpers,
 work without one; `/status` and the footer count them. With `[sonny]
 task_tabs = "every"`, each task gets its window as a turn of its starts. In Rex, each window reports OSC 7501 status, so Rex
 shows which task is working, waiting on you (an approval, or a question it
@@ -415,7 +414,9 @@ first's calls open nothing anywhere and say nothing opened would be seen,
 while the Rex lead opens its tasks' tabs as before. With every window closed, the last one used still names the place. A
 project whose lead is in no multiplexer gets none, and its agents get no
 layout skill. A tab asked for stays until you or an agent close it, or the
-task is marked done. With `task_tabs = "every"`, a task's window
+task is marked done; one opened only because the task needed you closes once
+its work is taken, unless you went to it or typed in it since, or an agent
+showed it again. With `task_tabs = "every"`, a task's window
 closes once its work is taken: its turn completed and the lead (or the task
 that started it) waited on it. One that failed, was interrupted or waits on you stays
 open, and a task given more work opens again; ask the lead to show one, or
