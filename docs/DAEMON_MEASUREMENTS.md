@@ -10755,3 +10755,29 @@ What the Sonny rows say:
 - **Lookout CPU at 10x1** read 37.5 against 50 ms per 1,000 deltas in the
   second run (equal in the first). That is 30 against 40 ms in total, one
   10 ms clock tick of the process's CPU time.
+
+## Every tool a step unless Codex keeps it direct (#1135)
+
+Detached and terminal commands and `write_stdin` now run as daemon steps,
+and a step's terminal poll past the bot's hold parks on the handles'
+schedule as a turn's does. No turn's path changes: a step that is none of
+these runs as before, and the new ones take no process slot and no place in
+the steps' line. Matched screen from the CI Perf job (`bench/perf_gate.py`),
+main (1ea0ed5) against the head (1fbdd3d), release build, synthetic model,
+the CI runner, 2026-11-17:
+
+| Screen | Row | Main | Head | Change |
+| --- | --- | ---: | ---: | ---: |
+| `bench.admission_burst` | Lone submit CPU | 23.605 ms | 23.249 ms | -1.5% |
+| `bench.admission_burst` | Burst submit p99 | 2.366 ms | 2.372 ms | +0.2% |
+| `bench.completion_burst` | Release to terminal p99 | 6.188 ms | 5.988 ms | -3.2% |
+| `bench.footprint` | Idle RSS | 17.346 MiB | 17.139 MiB | -1.2% |
+| `bench.footprint` | Per idle bot | 1.740 KiB | 1.774 KiB | +2.0% |
+| `bench.footprint` | RSS after a turn each | 52.160 MiB | 53.393 MiB | +2.4% |
+| `bench.footprint` | CPU per turn | 0.579 ms | 0.567 ms | -2.1% |
+| `bench.lifecycle` | Daemon CPU | 0.31 s | 0.29 s | -6.5% |
+| `bench.lifecycle` | Turn p95 | 575.042 ms | 573.371 ms | -0.3% |
+| `bench.lifecycle` | Peak RSS | 26.131 MiB | 25.730 MiB | -1.5% |
+
+Store jobs a turn are unchanged on every screen: the gate fails on any
+increase, and it passed. Every row is within the runner's spread.
