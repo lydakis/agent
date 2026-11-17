@@ -32,10 +32,16 @@ SOURCE: /[\s\S]+/
 
 const PRAGMA: &str = "// @exec:";
 
-/// A script's memory, and its time unless its options line or its call's
-/// expiry say less.
+/// A script's memory, and the time its JavaScript may run unless its
+/// options line says less.
 const MEMORY: usize = 256 << 20;
 pub const TIMEOUT: Duration = Duration::from_secs(600);
+/// How long a script runs before `exec` hands it back still running,
+/// unless its options line says otherwise: Codex's
+/// `DEFAULT_CODE_MODE_EXEC_YIELD_TIME_MS`.
+const YIELD_TIME: Duration = Duration::from_secs(30);
+/// Past any call's own time: a bound on one that has none.
+const CALL_BOUND: Duration = Duration::from_secs(24 * 3600);
 /// Scripts that run at once in the tool host; the rest wait their turn.
 const SCRIPTS: usize = 4;
 static RUNNING: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(SCRIPTS);
@@ -74,9 +80,11 @@ const DESCRIPTION: &str = r#"Run JavaScript code to orchestrate/compose MCP tool
 - Runs raw JavaScript -- no Node, no file system, no network access, no console, no timers.
 - Accepts raw JavaScript source text, not JSON, quoted strings, or markdown code fences.
 - Only what the script passes to `text()` and `image()` is returned to you.
-- You may optionally start the tool input with a first-line pragma like `// @exec: {"max_output_tokens": 1000, "timeout_ms": 60000}`.
+- You may optionally start the tool input with a first-line pragma like `// @exec: {"yield_time_ms": 10000, "max_output_tokens": 1000}`.
+- `yield_time_ms` asks `exec` to yield early if the script is still running. Defaults to 30000 ms.
 - `max_output_tokens` sets the token budget for `exec` results. Defaults to 10000 tokens; longer output keeps its start and end, and is saved whole to a file the result names. Print data you want on disk, then decode or move that file with the shell.
-- `timeout_ms` ends the script after that many milliseconds. Defaults to 600000, the most it may run.
+- `timeout_ms` ends the script once its JavaScript has run that many milliseconds; time spent awaiting a tool does not count. Defaults to 600000, the most it may run.
+- A script still running when it yields answers with its `proc:N` handle and its output so far, and runs on. `wait` on the handle for its whole result when it ends, work on something else meanwhile, or `wait` with `terminate: true` to stop it.
 - When the JS code is fully evaluated, its context ends and unawaited promises are silently discarded.
 
 - Global helpers:
@@ -86,6 +94,7 @@ const DESCRIPTION: &str = r#"Run JavaScript code to orchestrate/compose MCP tool
 - `store(key: string, value: any)`: stores a serializable value under a string key for later `exec` calls by the same agent.
 - `load(key: string)`: returns the stored value for a string key, or `undefined` if it is missing.
 - `ALL_TOOLS`: metadata for the enabled nested tools as `{ name, description }` entries.
+- `yield_control()`: yields the accumulated output to the model immediately while the script keeps running.
 
 Some nested tools may be omitted from this description. They are still available on the global `tools` object and listed in `ALL_TOOLS`.
 
@@ -572,18 +581,18 @@ pub struct Script {
     pub code: String,
     pub max_output_tokens: Option<usize>,
     pub timeout_ms: Option<u64>,
+    pub yield_time_ms: Option<u64>,
     /// The machine it runs on, over a link, when not this one.
     pub machine: Option<String>,
 }
 
 /// The source of an `exec` call, with its options line read off, as
-/// Codex reads it; `yield_time_ms`, which asks Codex to hand back a script
-/// still running, is taken and ignored, since a script here runs to its end.
+/// Codex reads it.
 pub fn parse(input: &str) -> Result<Script, String> {
     if input.trim().is_empty() {
         return Err(
             "exec expects raw JavaScript source text (non-empty). Provide JS only, \
-            optionally with first-line `// @exec: {\"max_output_tokens\": 1000}`."
+            optionally with first-line `// @exec: {\"yield_time_ms\": 10000, \"max_output_tokens\": 1000}`."
                 .into(),
         );
     }
@@ -593,13 +602,15 @@ pub fn parse(input: &str) -> Result<Script, String> {
             code: input.to_owned(),
             max_output_tokens: None,
             timeout_ms: None,
+            yield_time_ms: None,
             machine: None,
         });
     };
     if rest.trim().is_empty() {
         return Err("exec pragma must be followed by JavaScript source on subsequent lines".into());
     }
-    let fields = "supported fields `max_output_tokens`, `timeout_ms` and `machine`";
+    let fields =
+        "supported fields `yield_time_ms`, `max_output_tokens`, `timeout_ms` and `machine`";
     let options: Value = serde_json::from_str(options.trim())
         .map_err(|e| format!("exec pragma must be valid JSON with {fields}: {e}"))?;
     let options = options
@@ -609,6 +620,7 @@ pub fn parse(input: &str) -> Result<Script, String> {
         code: rest.to_owned(),
         max_output_tokens: None,
         timeout_ms: None,
+        yield_time_ms: None,
         machine: None,
     };
     for (key, value) in options {
@@ -620,9 +632,7 @@ pub fn parse(input: &str) -> Result<Script, String> {
         match key.as_str() {
             "max_output_tokens" => script.max_output_tokens = Some(number()? as usize),
             "timeout_ms" => script.timeout_ms = Some(number()?),
-            "yield_time_ms" => {
-                number()?;
-            }
+            "yield_time_ms" => script.yield_time_ms = Some(number()?),
             "machine" => {
                 let machine = value
                     .as_str()
@@ -880,6 +890,30 @@ impl Steps {
         Ok(crate::mcp::Called { json, is_error })
     }
 
+    /// Hand the call back to the agent's model with `output`, what the
+    /// script said so far, while the script runs on: its daemon answers
+    /// the call with a handle the model can `wait` on, and the script's
+    /// answer, once it ends, is its result. Only a call of this machine's
+    /// daemon yields. Whether the daemon took it.
+    pub async fn yield_call(&self, output: Value) -> bool {
+        let Via::Daemon {
+            client,
+            bot,
+            turn,
+            call_id,
+        } = &self.via
+        else {
+            return false;
+        };
+        let asked = json!({"bot": bot, "turn": turn, "call_id": call_id, "output": output});
+        client.request("yield_call", asked).await.is_ok()
+    }
+
+    /// Whether a script answering this call can yield it.
+    fn yields(&self) -> bool {
+        matches!(self.via, Via::Daemon { .. })
+    }
+
     /// Tell the agent how an allowed step ended, so its judge counts it
     /// among the calls done. Its turn may be gone by then: nothing to tell.
     pub async fn ran(&self, step: String, failed: bool) {
@@ -994,14 +1028,13 @@ async fn run_keeping(
 ) -> Result<Value, String> {
     let script = parse(input)?;
     let started = Instant::now();
-    // One deadline from here: waiting for a place and listing the servers'
-    // tools spend the script's time as its JavaScript does.
+    // Its own time and its call's from here: waiting for a place and
+    // listing the servers' tools spend them as its JavaScript does.
     let timeout = script
         .timeout_ms
         .map_or(TIMEOUT, Duration::from_millis)
-        .min(TIMEOUT)
-        .min(left);
-    let deadline = started + timeout;
+        .min(TIMEOUT);
+    let deadline = started + timeout.min(left);
     let readied = tokio::time::timeout_at(deadline.into(), async {
         let alive = ALIVE.acquire().await.map_err(|e| e.to_string())?;
         let running = RUNNING.acquire().await.map_err(|e| e.to_string())?;
@@ -1047,8 +1080,37 @@ async fn run_keeping(
         calls: Arc::default(),
         halt: Arc::default(),
         steps: steps.map(Arc::new),
-        clock: Clock::new(deadline, running),
+        clock: Clock::new(started + timeout, started + left.min(CALL_BOUND), running),
+        yielding: Arc::default(),
     };
+    // Still running at its yield time, or once it calls `yield_control()`,
+    // the script hands its call back with what it said so far, as Codex's
+    // `exec` yields, and runs on to its answer.
+    let yielder = (run.steps.clone())
+        .filter(|steps| steps.yields())
+        .map(|steps| {
+            let at = started
+                + script
+                    .yield_time_ms
+                    .map_or(YIELD_TIME, Duration::from_millis);
+            let (said, pictures) = (Arc::clone(&run.said), Arc::clone(&run.pictures));
+            let (clock, now) = (Arc::clone(&run.clock), Arc::clone(&run.yielding));
+            Abort(tokio::spawn(async move {
+                tokio::select! {
+                    _ = tokio::time::sleep_until(at.into()) => {}
+                    _ = now.notified() => {}
+                }
+                let head = format!(
+                    "Script running\nWall time {:.1} seconds\nOutput:\n",
+                    started.elapsed().as_secs_f64()
+                );
+                let text = head + &said.lock().unwrap().so_far();
+                let pictures = pictures.lock().unwrap().clone();
+                if steps.yield_call(parts(text, pictures)).await {
+                    clock.yielded();
+                }
+            }))
+        });
     let _stop = Stop(Arc::clone(&run.halt));
     let (output, calls, pictures) = (
         Arc::clone(&run.said),
@@ -1076,6 +1138,7 @@ async fn run_keeping(
     })
     .await
     .map_err(|e| e.to_string())??;
+    drop(yielder);
     if let (Whole::Sent(_, cut), Some(sent)) = (whole, sent) {
         *cut.lock().unwrap() = Some(sent);
     }
@@ -1096,6 +1159,7 @@ pub const PICTURES: usize = 20;
 pub const PICTURE_BYTES: usize = crate::attach::MOST_BYTES;
 
 /// A picture a script passed to `image()`, as the daemon takes it.
+#[derive(Clone)]
 struct Picture {
     media_type: &'static str,
     /// Base64.
@@ -1513,6 +1577,18 @@ impl Output {
         }
     }
 
+    /// What the model is shown of the output so far, while the script
+    /// runs: the bytes cut from between its halves counted.
+    fn so_far(&self) -> String {
+        if self.total as usize == self.head.len() {
+            return self.head.clone();
+        }
+        let half = self.window / 2;
+        let tail = &self.tail[ceil(&self.tail, self.tail.len().saturating_sub(half))..];
+        let cut = (self.total - (self.head.len() + tail.len()) as u64).div_ceil(4);
+        format!("{}\n…{cut} tokens truncated…\n{tail}", self.head)
+    }
+
     /// What the model is shown, the bytes cut from between its halves
     /// counted and where the whole of it is named, and the whole to hand
     /// back over a link, once it passed the window.
@@ -1674,14 +1750,18 @@ struct Run {
     halt: Arc<Halt>,
     steps: Option<Arc<Steps>>,
     clock: Arc<Clock>,
+    /// Woken by `yield_control()`.
+    yielding: Arc<tokio::sync::Notify>,
 }
 
-/// A script's time, which stops while any of its calls waits for the
-/// agent's gate, as the time of its `exec` call does in the daemon, and its
-/// place among the scripts running, which it gives up meanwhile: a verdict
-/// can take a person hours, and four scripts waiting on theirs would hold
-/// back every other agent's. JavaScript that runs meanwhile, beside the
-/// calls waiting, still spends the time.
+/// A script's two times. Its own, which only its JavaScript spends: it
+/// stops while any of its calls waits, for a server, a step or a gate.
+/// Its call's, as the daemon counts the call's time: it stops only while a
+/// step runs or a call waits for the agent's gate, and it ends once the
+/// call yields, since a yielded call has no deadline. While a step or a
+/// gate holds it, the script gives up its place among the scripts
+/// running: a verdict can take a person hours, and four scripts waiting
+/// on theirs would hold back every other agent's.
 struct Clock {
     times: Mutex<Times>,
     resumed: tokio::sync::Notify,
@@ -1691,34 +1771,98 @@ struct Clock {
 }
 
 struct Times {
+    script: Meter,
+    /// None once the call yielded.
+    call: Option<Meter>,
+}
+
+/// One of a script's times: its deadline, moved later by as long as it
+/// was stopped less the JavaScript that ran meanwhile.
+struct Meter {
     deadline: Instant,
-    /// The calls waiting, since when, and how long JavaScript has run since.
+    /// The calls holding it, since when, and how long JavaScript has run
+    /// since.
     waiting: usize,
     since: Instant,
     ran: Duration,
-    /// The last interrupt check while calls wait.
+    /// The last interrupt check while calls hold it.
     checked: Option<Instant>,
 }
 
-impl Times {
+impl Meter {
+    fn new(deadline: Instant) -> Self {
+        Meter {
+            deadline,
+            waiting: 0,
+            since: Instant::now(),
+            ran: Duration::ZERO,
+            checked: None,
+        }
+    }
+
     fn out(&self, now: Instant) -> bool {
         match self.waiting {
             0 => now >= self.deadline,
             _ => self.ran >= self.deadline.saturating_duration_since(self.since),
         }
     }
+
+    /// An interrupt check, which comes only while JavaScript runs: checks
+    /// close together while calls hold the time are a stretch of it, and
+    /// spend the time they span.
+    fn check(&mut self, now: Instant) {
+        if self.waiting == 0 {
+            return;
+        }
+        if let Some(checked) = self.checked
+            && now - checked <= RUNNING_GAP
+        {
+            self.ran += now - checked;
+        }
+        self.checked = Some(now);
+    }
+
+    fn stop(&mut self) {
+        if self.waiting == 0 {
+            self.since = Instant::now();
+            self.ran = Duration::ZERO;
+            self.checked = None;
+        }
+        self.waiting += 1;
+    }
+
+    /// Whether it runs again.
+    fn resume(&mut self) -> bool {
+        self.waiting -= 1;
+        if self.waiting > 0 {
+            return false;
+        }
+        self.deadline += self.since.elapsed().saturating_sub(self.ran);
+        true
+    }
+
+    /// When it runs out, while nothing holds it.
+    fn running_until(&self) -> Option<Instant> {
+        (self.waiting == 0).then_some(self.deadline)
+    }
+}
+
+impl Times {
+    fn out(&self, now: Instant) -> bool {
+        self.script.out(now) || self.call.as_ref().is_some_and(|call| call.out(now))
+    }
 }
 
 impl Clock {
-    fn new(deadline: Instant, place: tokio::sync::SemaphorePermit<'static>) -> Arc<Self> {
-        let now = Instant::now();
+    fn new(
+        script: Instant,
+        call: Instant,
+        place: tokio::sync::SemaphorePermit<'static>,
+    ) -> Arc<Self> {
         Arc::new(Self {
             times: Mutex::new(Times {
-                deadline,
-                waiting: 0,
-                since: now,
-                ran: Duration::ZERO,
-                checked: None,
+                script: Meter::new(script),
+                call: Some(Meter::new(call)),
             }),
             resumed: tokio::sync::Notify::new(),
             place: Mutex::new(Some(place)),
@@ -1741,21 +1885,14 @@ impl Clock {
         self.times.lock().unwrap().out(Instant::now())
     }
 
-    /// Whether the time ran out, from the script's interrupt checks, which
-    /// come only while JavaScript runs: checks close together while calls
-    /// wait are a stretch of it, and spend the time they span.
+    /// Whether the time ran out, from the script's interrupt checks.
     fn check(&self) -> bool {
         let now = Instant::now();
         let mut times = self.times.lock().unwrap();
-        if times.waiting == 0 {
-            return times.out(now);
+        times.script.check(now);
+        if let Some(call) = &mut times.call {
+            call.check(now);
         }
-        if let Some(checked) = times.checked
-            && now - checked <= RUNNING_GAP
-        {
-            times.ran += now - checked;
-        }
-        times.checked = Some(now);
         let out = times.out(now);
         drop(times);
         if out {
@@ -1764,18 +1901,31 @@ impl Clock {
         out
     }
 
-    /// Stop the clock until the guard is dropped, and give up the place,
-    /// even one a call that waited beside this one took back meanwhile.
+    /// Stop the script's own time until the guard is dropped, while a
+    /// server's tool runs.
+    fn wait(self: &Arc<Self>) -> Stopped {
+        self.times.lock().unwrap().script.stop();
+        Stopped(Arc::clone(self), false)
+    }
+
+    /// Stop both times until the guard is dropped, while a step runs or a
+    /// call waits on the agent's gate, and give up the place, even one a
+    /// call that waited beside this one took back meanwhile.
     fn stop(self: &Arc<Self>) -> Stopped {
         let mut times = self.times.lock().unwrap();
-        if times.waiting == 0 {
-            times.since = Instant::now();
-            times.ran = Duration::ZERO;
-            times.checked = None;
+        times.script.stop();
+        if let Some(call) = &mut times.call {
+            call.stop();
         }
         self.place.lock().unwrap().take();
-        times.waiting += 1;
-        Stopped(Arc::clone(self))
+        Stopped(Arc::clone(self), true)
+    }
+
+    /// The call yielded: it has no deadline now, so only the script's own
+    /// time bounds it.
+    fn yielded(&self) {
+        self.times.lock().unwrap().call = None;
+        self.resumed.notify_waiters();
     }
 
     /// Once the time has run out.
@@ -1784,34 +1934,43 @@ impl Clock {
             let resumed = self.resumed.notified();
             tokio::pin!(resumed);
             resumed.as_mut().enable();
-            let (deadline, waiting) = {
+            let until = {
                 let times = self.times.lock().unwrap();
                 if times.out(Instant::now()) {
                     return;
                 }
-                (times.deadline, times.waiting)
+                let call = times.call.as_ref().and_then(Meter::running_until);
+                match (times.script.running_until(), call) {
+                    (Some(script), Some(call)) => Some(script.min(call)),
+                    (script, call) => script.or(call),
+                }
             };
-            if waiting > 0 {
-                resumed.await;
-                continue;
+            match until {
+                Some(until) => tokio::select! {
+                    _ = tokio::time::sleep_until(until.into()) => {}
+                    _ = resumed => {}
+                },
+                None => resumed.await,
             }
-            tokio::time::sleep_until(deadline.into()).await;
         }
     }
 }
 
-/// A stopped clock, which runs again once no call waits, later by as long
-/// as it was stopped less the JavaScript that ran meanwhile.
-struct Stopped(Arc<Clock>);
+/// A stopped time, which runs again once no call holds it; the call's too
+/// when it `stops` that.
+struct Stopped(Arc<Clock>, bool);
 
 impl Drop for Stopped {
     fn drop(&mut self) {
         let mut times = self.0.times.lock().unwrap();
-        times.waiting -= 1;
-        if times.waiting == 0 {
-            let stopped = times.since.elapsed().saturating_sub(times.ran);
-            times.deadline += stopped;
-            drop(times);
+        let mut resumed = times.script.resume();
+        if self.1
+            && let Some(call) = &mut times.call
+        {
+            resumed |= call.resume();
+        }
+        drop(times);
+        if resumed {
             self.0.resumed.notify_waiters();
         }
     }
@@ -1819,8 +1978,8 @@ impl Drop for Stopped {
 
 /// The globals the script sees, made from the host's `__` functions.
 const PRELUDE: &str = r#"(() => {
-  const host = { call: __call, search: __search, text: __text, image: __image, store: __store, load: __load };
-  for (const name of ["__call", "__search", "__text", "__image", "__store", "__load", "__tools"]) delete globalThis[name];
+  const host = { call: __call, search: __search, text: __text, image: __image, store: __store, load: __load, yield: __yield };
+  for (const name of ["__call", "__search", "__text", "__image", "__store", "__load", "__yield", "__tools"]) delete globalThis[name];
   const EXIT = globalThis.__exit;
   delete globalThis.__exit;
   const said = (raw) => { const said = JSON.parse(raw); if ("error" in said) throw new Error(said.error); return said.ok; };
@@ -1840,6 +1999,7 @@ const PRELUDE: &str = r#"(() => {
   globalThis.store = (key, value) => { said(host.store(String(key), JSON.stringify(value) ?? "null")); };
   globalThis.load = (key) => { const kept = host.load(String(key)); return kept == null ? undefined : JSON.parse(kept); };
   globalThis.exit = () => { throw EXIT; };
+  globalThis.yield_control = () => { host.yield(); };
   globalThis.__ended = (e) => e === EXIT ? null : (e instanceof Error ? `${e}${e.stack ? "\n" + e.stack.trimEnd() : ""}` : show(e));
 })();"#;
 
@@ -1987,6 +2147,11 @@ impl Run {
                 )
             })?,
         )?;
+        let yielding = Arc::clone(&self.yielding);
+        globals.set(
+            "__yield",
+            Function::new(ctx.clone(), move || yielding.notify_one())?,
+        )?;
         let store = self.store.clone();
         globals.set(
             "__load",
@@ -2116,6 +2281,9 @@ impl Caller {
             .entry(nested.server.clone())
             .or_default() += 1;
         let hub = self.hub.clone();
+        // The server's own `tool_timeout_sec` bounds it, and the script's
+        // own time stops meanwhile: only its JavaScript spends that.
+        let waiting = self.clock.wait();
         let call = Abort(
             self.host
                 .spawn(async move { hub.call(&nested.server, &nested.tool, arguments).await }),
@@ -2124,6 +2292,7 @@ impl Caller {
             .await
             .map_err(|e| e.to_string())
             .and_then(|called| called);
+        drop(waiting);
         if let Some((steps, step)) = allowed {
             let failed = !matches!(&result, Ok(called) if !called.is_error);
             self.host
@@ -2400,6 +2569,7 @@ mod tests {
                 code: "text(1)".into(),
                 max_output_tokens: Some(5),
                 timeout_ms: Some(9),
+                yield_time_ms: Some(10),
                 machine: None,
             }
         );
@@ -3028,7 +3198,7 @@ text("done");"#;
     #[tokio::test]
     async fn every_wait_gives_up_the_place_however_the_waits_overlap() {
         let place = RUNNING.acquire().await.unwrap();
-        let clock = Clock::new(Instant::now() + TIMEOUT, place);
+        let clock = Clock::new(Instant::now() + TIMEOUT, Instant::now() + TIMEOUT, place);
         let (first, second) = (clock.stop(), clock.stop());
         assert!(clock.place.lock().unwrap().is_none());
         // The first's verdict comes: it takes a place back and runs on,
@@ -3158,7 +3328,7 @@ text(ALL_TOOLS.map(t => t.name).join(","));"#,
     }
 
     #[tokio::test]
-    async fn a_script_ends_on_its_time_its_memory_or_its_turn() {
+    async fn a_script_ends_on_its_javascript_s_time_its_memory_or_its_turn() {
         let dir = scratch("limits");
         let hub = hub(&dir).await;
         // A script's time counts from its call, so starting the test server
@@ -3177,14 +3347,16 @@ text(ALL_TOOLS.map(t => t.name).join(","));"#,
             "{spun}"
         );
         assert!(spun.ends_with("Output:\nx"), "{spun}");
+        // Awaiting a server's tool spends none of its time: only its
+        // JavaScript does.
         let waited = ran(
             &hub,
             &dir,
-            "// @exec: {\"timeout_ms\": 200}\nawait tools.mcp__test__slow({ms: 5000});",
+            "// @exec: {\"timeout_ms\": 200}\nawait tools.mcp__test__slow({ms: 600}); text('waited');",
         )
         .await;
         assert!(
-            waited.starts_with("Script terminated: it ran out of time"),
+            waited.starts_with("Script completed") && waited.ends_with("Output:\nwaited"),
             "{waited}"
         );
         let grew = ran(
