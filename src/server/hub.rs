@@ -223,6 +223,16 @@ struct Counts {
     live: AtomicU64,
     delivered: AtomicU64,
     dropped: AtomicU64,
+    /// Delivered, by the program of the session it went to.
+    delivered_to: [AtomicU64; agent_runtime::output::PROGRAMS],
+}
+impl Counts {
+    fn delivered(&self, output: &Output) {
+        self.delivered.fetch_add(1, Ordering::Relaxed);
+        if let Some(count) = self.delivered_to.get(output.program()) {
+            count.fetch_add(1, Ordering::Relaxed);
+        }
+    }
 }
 impl Default for Hub {
     fn default() -> Self {
@@ -661,9 +671,13 @@ impl Hub {
                 self.close_session(session);
                 output.close();
             } else {
-                self.counts.delivered.fetch_add(1, Ordering::Relaxed);
+                self.counts.delivered(&output);
             }
         }
+    }
+    /// Events delivered, by the program of the session each went to.
+    pub fn delivered_to(&self, program: usize) -> u64 {
+        (self.counts.delivered_to.get(program)).map_or(0, |n| n.load(Ordering::Relaxed))
     }
     /// What the hub carried, for `stats`.
     pub fn stats(&self) -> Value {
@@ -685,7 +699,7 @@ impl Hub {
             if sent.is_err() {
                 break;
             }
-            self.counts.delivered.fetch_add(1, Ordering::Relaxed);
+            self.counts.delivered(&output);
         }
         if let Some(cursor) = cursor {
             self.published_to(cursor);
@@ -718,7 +732,7 @@ impl Hub {
         self.fan_out(bot, &event, None);
         for output in self.firehose() {
             output.send(event.clone()).await?;
-            self.counts.delivered.fetch_add(1, Ordering::Relaxed);
+            self.counts.delivered(&output);
         }
         Ok(())
     }
@@ -876,7 +890,7 @@ pub async fn replay(store: Store, hub: Hub, bot: String, sub: Sub) -> Result<()>
                 hub.unsubscribe(&bot, session);
                 return Ok(());
             }
-            hub.counts.delivered.fetch_add(1, Ordering::Relaxed);
+            hub.counts.delivered(&output);
         }
     }
 }
