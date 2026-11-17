@@ -57,7 +57,7 @@ class DeliveryTests(ModelFixture):
         self.model.release_headers.set()
         client.finished(first)
 
-    def test_steer_with_another_workspace_runs_there_as_its_own_turn(self):
+    def test_a_steer_for_another_folder_joins_the_turn_and_moves_the_bot_after_it(self):
         original, requested = self.path / 'original', self.path / 'requested'
         original.mkdir()
         requested.mkdir()
@@ -67,46 +67,56 @@ class DeliveryTests(ModelFixture):
         client.receive(lambda m: m.get('event') == 'tool_started' and m.get('turn') == first)
         steer = client.request('submit', bot='Bob', request_id='b', prompt='bg:pwd',
                                workspace=str(requested), delivery='steer')['result']['message']
+        self.assertEqual(client.finished(steer)['data']['status'], 'taken')
         self.assertEqual(client.finished(first)['data']['status'], 'completed')
-        self.assertEqual(client.finished(steer)['data']['status'], 'completed')
-        text = poll(client, 'Bob', steer)['result']['text']
-        handle = json.loads(text.removeprefix('echo:'))['handle']
-        output = client.request('wait', handles=[handle])['result']['results'][handle]['stdout']
-        self.assertEqual(output.strip(), str(requested))
 
-    def test_cancelling_a_blocker_rechecks_pending_steers_at_the_next_boundary(self):
-        elsewhere = self.path / 'elsewhere'
-        elsewhere.mkdir()
+        def ran_in(turn):
+            text = poll(client, 'Bob', turn)['result']['text']
+            handle = json.loads(text.removeprefix('echo:'))['handle']
+            return client.request('wait', handles=[handle])['result']['results'][handle]['stdout'].strip()
+        # The turn goes on in its own folder; the bot's next one runs in
+        # the steer's.
+        self.assertEqual(ran_in(first), str(original))
+        self.assertEqual(client.request('inspect', bot='Bob')['result']['workspace'], str(requested))
+        after = client.request('submit', bot='Bob', request_id='c', prompt='bg:pwd',
+                               delivery='queue')['result']['message']
+        client.finished(after)
+        self.assertEqual(ran_in(after), str(requested))
+
+    def test_a_steer_on_another_model_or_effort_joins_the_turn_and_is_the_bot_s_after_it(self):
         client = self.client(extra=('--provider', f'other=responses,{self.url}'))
-        for bot, override in [('Workspace', {'workspace': str(elsewhere)}),
-                              ('Model', {'model': 'other/synthetic-model'})]:
+        for bot, override, kept in [('Model', {'model': 'other/synthetic-model'}, ('other', 'synthetic-model', None)),
+                                    ('Effort', {'effort': 'high'}, ('openai', 'synthetic-model', 'high'))]:
             with self.subTest(override=bot):
-                first_gate, final_gate = threading.Event(), threading.Event()
-                self.addCleanup(first_gate.set)
-                self.addCleanup(final_gate.set)
+                gate = threading.Event()
+                self.addCleanup(gate.set)
                 self.model.request_gates = queue.Queue()
-                self.model.request_gates.put(first_gate)
-                self.model.request_gates.put(final_gate)
+                self.model.request_gates.put(gate)
                 client.request('create', bot=bot, workspace=str(self.path))
                 turn = client.request('submit', bot=bot, request_id='active', prompt='tool:hello')['result']['message']
                 self.model.requests.get(timeout=3)
-                blocker = client.request('submit', bot=bot, request_id='blocker', prompt='not here',
-                                         delivery='steer', **override)['result']['message']
+                steer = client.request('submit', bot=bot, request_id='steer', prompt='other ask',
+                                       delivery='steer', **override)['result']['message']
                 correction = client.request('submit', bot=bot, request_id='correction', prompt='corrected',
                                             delivery='steer', expected_turn=turn)['result']['message']
-                first_gate.set()
-                # The post-tool boundary encountered the incompatible head.
-                # The final response stays held until that blocker is gone.
+                gate.set()
+                # Both join at the next boundary, in order, and the turn
+                # goes on as it began.
                 second = self.model.requests.get(timeout=3)
-                self.assertEqual(second['input'][-1]['type'], 'function_call_output')
-                self.assertEqual(client.request('interrupt', bot=bot, turn=blocker)['result']['status'], 'withdrawn')
-                final_gate.set()
-                outcome = client.finished(correction)['data']
-                self.assertEqual((outcome['status'], outcome.get('turn')), ('taken', turn))
+                said = [item['content'][0]['text'] for item in second['input'][-2:]]
+                self.assertEqual(said, ['other ask', 'corrected'])
+                self.assertNotIn('reasoning', second)
+                for message in (steer, correction):
+                    outcome = client.finished(message)['data']
+                    self.assertEqual((outcome['status'], outcome.get('turn')), ('taken', turn))
                 self.assertEqual(client.finished(turn)['data']['status'], 'completed')
-                third = self.model.requests.get(timeout=3)
-                self.assertEqual(third['input'][-1]['content'][0]['text'], 'corrected')
                 self.assertEqual(poll(client, bot, turn)['result']['text'], 'reply:corrected')
+                # What the steer asked for is the bot's own from its next turn.
+                deadline = time.monotonic() + 5
+                while (record := client.request('inspect', bot=bot)['result']).get('configure_pending'):
+                    self.assertLess(time.monotonic(), deadline)
+                    time.sleep(.02)
+                self.assertEqual((record['provider'], record['model'], record.get('effort')), kept)
 
     def test_inherited_steers_validate_the_active_model_and_recheck_before_start(self):
         import threading

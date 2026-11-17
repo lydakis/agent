@@ -1462,6 +1462,9 @@ pub struct Started {
     /// For such a steer, the bot's turn parked on a `wait`, which it
     /// wakes, and the newest queued steer.
     pub parked: Option<(i64, i64)>,
+    /// A fresh steer's model or effort, kept as a `configure` for the
+    /// bot's next turn.
+    pub carried: bool,
 }
 /// Per-turn overrides of the bot's defaults, recorded with the turn.
 #[derive(Default, Clone, Debug, PartialEq, Eq)]
@@ -4083,23 +4086,19 @@ impl Database {
         )?)
     }
     /// Whether the bot's running turn takes a steer at its next boundary:
-    /// the oldest one for it is queued and fits the turn, as `absorb` reads
-    /// them. Delivery steer only.
+    /// one is queued for it, as `absorb` reads them, whatever folder, model
+    /// or effort it names, as Codex steers any input into its running turn.
+    /// Delivery steer only.
     pub fn joining_steer(&self, name: &str) -> Result<bool> {
         Ok(self
             .conn
             .prepare_cached(
-                "SELECT (s.workspace IS NULL OR s.workspace=COALESCE(t.workspace,b.workspace))
-                    AND (s.model IS NULL OR s.model=COALESCE(t.model,b.provider||'/'||b.model))
-                    AND (s.reasoning IS NULL OR s.reasoning IS COALESCE(t.reasoning,b.reasoning))
-                 FROM bots b JOIN turns t ON t.id=b.running_turn JOIN messages s ON s.bot=b.name
-                 WHERE b.name=? AND s.status='queued' AND s.delivery='steer'
-                   AND (s.expected_turn IS NULL OR s.expected_turn=t.id)
-                 ORDER BY s.id LIMIT 1",
+                "SELECT EXISTS(SELECT 1 FROM bots b JOIN messages s ON s.bot=b.name
+                 WHERE b.name=? AND b.running_turn IS NOT NULL
+                   AND s.status='queued' AND s.delivery='steer'
+                   AND (s.expected_turn IS NULL OR s.expected_turn=b.running_turn))",
             )?
-            .query_row([name], |r| r.get(0))
-            .optional()?
-            .unwrap_or(false))
+            .query_row([name], |r| r.get(0))?)
     }
 
     /// The bot's turn parked on a wait of its own while a steer waits for
@@ -7834,6 +7833,7 @@ impl Database {
                 entry: None,
                 joins: false,
                 parked: None,
+                carried: false,
             });
         }
         let reject = options.delivery == Delivery::Reject;
@@ -7945,10 +7945,9 @@ impl Database {
         if workspace.is_none() && !attach {
             return Err(Error::new("workspace_required"));
         }
-        // A steer's folder is for that message alone: it may never run.
-        let moved = options.workspace.is_some()
-            && options.delivery != Delivery::Steer
-            && bot.workspace != workspace;
+        // A steer's folder becomes the bot's own too, as Codex keeps a
+        // turn's settings: the running turn goes on in its own.
+        let moved = options.workspace.is_some() && bot.workspace != workspace;
         // Only the head of a bot's line is ready; the rest wait behind it.
         // A `configure` kept for the last turn's end is taken before the
         // next starts: a start admitted here, before the daemon took it,
@@ -8017,6 +8016,11 @@ impl Database {
                 (status == "running").then_some(turn), (status == "running").then_some(now)],
         )?;
         if moved {
+            // A running turn that named no folder keeps the one it began in.
+            if let Some(running) = bot.running_turn {
+                tx.prepare_cached("UPDATE turns SET workspace=? WHERE id=? AND workspace IS NULL")?
+                    .execute(params![bot.workspace, running])?;
+            }
             tx.prepare_cached("UPDATE bots SET workspace=? WHERE name=?")?
                 .execute(params![workspace, name])?;
         }
@@ -8051,6 +8055,49 @@ impl Database {
         // The message's own event; one that opened a turn names it too.
         let opened = (status == "running").then_some(turn);
         let cursor = message_event(&tx, name, opened, Some(turn), kind, data.clone())?;
+        // A steer that joins a running turn on another model or effort
+        // makes them the bot's own, as Codex keeps a turn's settings:
+        // kept as a `configure` sent now would be, so the turn running
+        // goes on with its own and the next one takes them. Whichever it
+        // does not name stays as the bot has it, or as a `configure` kept
+        // before has it. One that starts a turn runs on its own, as any
+        // turn does.
+        let carried = options.delivery == Delivery::Steer
+            && status == "queued"
+            && bot.running_turn.is_some()
+            && (options.model.is_some() || options.effort.is_some());
+        if carried {
+            let mut pending = bot.configure_pending.clone().unwrap_or_else(|| json!({}));
+            let effort = match (&options.effort, pending.get("model")) {
+                (Some(effort), _) => Some(json!(effort)),
+                (None, Some(_)) => pending.get("effort").cloned(),
+                (None, None) => bot.effort.as_ref().map(|effort| json!(effort)),
+            };
+            if let Some(model) = &options.model {
+                pending["model"] = json!(model);
+            } else if pending.get("model").is_none() {
+                pending["model"] = json!(format!("{}/{}", bot.provider, bot.model));
+            }
+            match (effort, pending.as_object_mut()) {
+                (Some(effort), Some(fields)) => {
+                    fields.insert("effort".into(), effort);
+                }
+                (None, Some(fields)) => {
+                    fields.remove("effort");
+                }
+                _ => {}
+            }
+            tx.prepare_cached("UPDATE bots SET configure_pending=? WHERE id=?")?
+                .execute(params![pending.to_string(), bot.bot_id])?;
+            event(
+                &tx,
+                name,
+                None,
+                "configure_pending",
+                json!({"bot_id":bot.bot_id,"running_turn":bot.running_turn,
+                    "configure_pending":pending}),
+            )?;
+        }
         tx.commit()?;
         if status != "running" && !attach {
             self.pending.0 += 1;
@@ -8073,6 +8120,7 @@ impl Database {
             entry: Some(message_entry(cursor, name, opened, turn, kind, data)),
             joins,
             parked,
+            carried,
         })
     }
     /// Start a queued or ready turn on an idle bot: its user item joins the
@@ -8414,9 +8462,9 @@ impl Database {
     /// Deliver a bounded prefix of queued steers into the running turn,
     /// and attached messages with them unless `attached` is false (a reply
     /// that ended the turn's calls, which an attached message never
-    /// extends). Stop at an incompatible explicit override; it and later
-    /// steers stay queued, so a later message cannot overtake the deferred
-    /// steer.
+    /// extends). A steer that names another folder, model or effort joins
+    /// as well, the turn going on with its own, as Codex steers any input
+    /// into its running turn.
     #[allow(clippy::too_many_arguments)]
     pub fn absorb(
         &mut self,
@@ -8495,19 +8543,14 @@ impl Database {
             // Each partial index skips ordinary queued and finished work. Read at most one
             // candidate beyond the byte budget, without copying its prompt.
             let mut statement = self.conn.prepare_cached(
-                "SELECT s.id,s.text,length(CAST(s.text AS BLOB)),
-                    (s.workspace IS NULL OR s.workspace=COALESCE(t.workspace,b.workspace))
-                    AND (s.model IS NULL OR s.model=COALESCE(t.model,b.provider||'/'||b.model))
-                    AND (s.reasoning IS NULL OR s.reasoning IS COALESCE(t.reasoning,b.reasoning)),
-                    s.status='attached',length(s.images),
-                    length(CAST(s.text AS BLOB))+COALESCE(length(CAST(s.quotes AS BLOB)),0),
-                    s.expected_turn IS ?2 AND s.origin IS ?6
+                "SELECT s.id,s.text,length(CAST(s.text AS BLOB)),s.status='attached',length(s.images),
+                    length(CAST(s.text AS BLOB))+COALESCE(length(CAST(s.quotes AS BLOB)),0)
                  FROM (SELECT id FROM messages WHERE bot=?1 AND status='queued' AND delivery='steer'
                          AND id<=?4 AND (expected_turn IS NULL OR expected_turn=?2)
                        UNION ALL SELECT id FROM messages WHERE ?5 AND bot=?1 AND status='attached'
                          AND id<=?4 AND (expected_turn IS NULL OR expected_turn=?2)
                        ORDER BY id LIMIT ?3) c
-                 JOIN messages s ON s.id=c.id JOIN turns t ON t.id=?2 JOIN bots b ON b.name=s.bot
+                 JOIN messages s ON s.id=c.id
                  ORDER BY c.id",
             )?;
             let mut rows = statement.query(params![
@@ -8515,26 +8558,13 @@ impl Database {
                 turn,
                 STEER_BATCH_ITEMS as i64,
                 through,
-                attached,
-                LIMIT_ORIGIN
+                attached
             ])?;
             let (mut bytes, mut picture_bytes) = (0, 0);
-            // Whether a steer for another folder, model or effort waits for
-            // a turn of its own: those after it wait behind it, in order,
-            // but for the daemon's note of a reply this turn dropped, a
-            // fact of this turn's own rounds, which has no later turn.
-            let mut waiting_behind = false;
             while let Some(row) = rows.next()? {
                 let size = row.get::<_, i64>(2)? as usize;
                 // Its words with the words it quotes, which it takes in too.
-                let held = row.get::<_, i64>(6)? as usize;
-                if !row.get::<_, bool>(3)? {
-                    waiting_behind = true;
-                    continue;
-                }
-                if waiting_behind && !row.get::<_, bool>(7)? {
-                    continue;
-                }
+                let held = row.get::<_, i64>(5)? as usize;
                 if size > STEER_BATCH_BYTES.saturating_sub(bytes) {
                     // An oversized store-level prompt must not spin forever.
                     // Protocol prompts are already capped at this same limit.
@@ -8550,7 +8580,7 @@ impl Database {
                 // Pictures are read only once they fit their own budget,
                 // which the first steer's always do; the rest wait for the
                 // next batch.
-                let pictured_size = row.get::<_, Option<i64>>(5)?.unwrap_or(0) as usize;
+                let pictured_size = row.get::<_, Option<i64>>(4)?.unwrap_or(0) as usize;
                 if !steers.is_empty() && pictured_size > STEER_BATCH_PICTURE_BYTES - picture_bytes {
                     more = true;
                     break;
@@ -8579,7 +8609,7 @@ impl Database {
                 }
                 room_bytes -= weight + 1;
                 room_items -= 1;
-                let waiting = (!row.get::<_, bool>(4)?).then_some(held);
+                let waiting = (!row.get::<_, bool>(3)?).then_some(held);
                 steers.push((id, prompted, size, waiting, images, quotes));
             }
         }

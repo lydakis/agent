@@ -3844,6 +3844,11 @@ impl Service {
         {
             self.wake_for_steer(bot.clone(), parked, steer);
         }
+        // A steer's model or effort, kept in its commit for the bot's
+        // next turn, is taken as a `configure` kept then would be.
+        if started.fresh && started.carried {
+            self.kept.insert(bot.clone());
+        }
         if started.status == "ready" {
             self.ready_hint = true;
         }

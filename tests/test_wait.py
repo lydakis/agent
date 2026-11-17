@@ -480,18 +480,22 @@ class WaitTests(ModelFixture):
         self.assertEqual(client.finished(turn)['data']['status'], 'completed')
         self.assertEqual(self.tool_output(client, 'Bob', 'lift-1')['stdout'], 'quick')
 
-    def test_a_steer_that_runs_as_its_own_turn_leaves_the_command_running(self):
+    def test_a_steer_for_another_folder_moves_the_command_to_the_background_too(self):
         other = self.path / 'other'
         other.mkdir()
         client = self.client('echo,shell,wait')
         client.request('create', bot='Bob', workspace=str(self.path))
-        turn = client.request('submit', bot='Bob', request_id='l', prompt='liftwait:sleep .8; printf done')['result']['message']
+        turn = client.request('submit', bot='Bob', request_id='l', prompt='liftwait:sleep 3; printf done')['result']['message']
         client.receive(lambda m: m.get('event') == 'tool_started' and m.get('turn') == turn)
-        steer = client.request('submit', bot='Bob', request_id='s', prompt='elsewhere',
+        steer = client.request('submit', bot='Bob', request_id='s', prompt='steer:look',
                                workspace=str(other), delivery='steer')['result']['message']
+        # It joins the turn as any steer does, so the command goes on in
+        # the background rather than being waited out.
+        done = client.finished(steer)['data']
+        self.assertEqual((done['status'], done['turn']), ('taken', turn))
+        lifted = self.tool_output(client, 'Bob', 'lift-1')
+        self.assertEqual((lifted['background'], lifted['steered']), (True, True))
         self.assertEqual(client.finished(turn)['data']['status'], 'completed')
-        self.assertEqual(self.tool_output(client, 'Bob', 'lift-1')['stdout'], 'done')
-        self.assertEqual(client.finished(steer)['data']['status'], 'completed')
 
     def test_a_steer_leaves_a_command_waiting_for_a_slot_in_line(self):
         client = self.client('echo,shell,wait', extra=('--max-processes', '1'))

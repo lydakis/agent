@@ -168,9 +168,10 @@ A bot keeps its folder but is not bound to it. A new bot starts in the
 directory `run` was invoked from (or `--workspace`), and later turns run there
 wherever `run` is invoked. A submission that names a workspace runs there and
 moves the bot, so the same conversation can continue in a new checkout,
-worktree, or snapshot. Work already queued keeps the folder it was sent to; a
-steer that names none joins the running turn wherever it runs, and a steer's
-folder never moves the bot. A fork starts in
+worktree, or snapshot. Work already queued keeps the folder it was sent to. A
+steer joins the running turn wherever it runs, and a steer's folder moves the
+bot as any submission's does: the turn running goes on in its own, and the
+bot's next turn runs in the steer's. A fork starts in
 its source's folder unless `fork` names another. A bot without a folder rejects
 a submission that names none with `workspace_required`. The conversation does not know about
 filesystem state; the caller is responsible for the workspace matching what the
@@ -2044,10 +2045,17 @@ the message's number and handle at once, and `wait`, `messages`, and
   ordinary turn when its place in the line comes, as does a steer on an idle
   bot. Waiting on a steer's handle resolves at absorption; wait on its `turn`
   for the answer. Rounds spent on steers count toward the turn's round limit.
-  An explicit workspace or model must match the running turn's effective
-  value; omitted overrides inherit that running turn for absorption. A
-  mismatching steer stays queued for its own turn with its requested values,
-  and later steers cannot overtake it. The snapshot is drained in batches of
+  A steer joins whatever workspace, model or effort it names, as Codex
+  steers any input into its running turn: the turn goes on with its own,
+  and each message records the effort it ran at. What the steer named
+  becomes the bot's own for its next turn, as Codex keeps a turn's
+  settings. Its workspace moves the bot at once, as any submission's does;
+  its model and effort are kept as a `configure` sent while the turn runs
+  is (`configure_pending`), whichever of the two it does not name staying
+  as the bot, or a `configure` kept before, has it, and the daemon takes
+  them when the turn ends. A steer that starts a turn of its own, on a bot
+  at rest, runs with what it names as any turn does and keeps nothing. The
+  snapshot is drained in batches of
   at most 32 steers and 256 KiB of UTF-8 prompt bytes, releasing each batch
   before another storage call. Batching adds no model calls; arrivals beyond
   the snapshot wait for the next boundary. An interrupt completes any in-flight
