@@ -274,6 +274,12 @@ pub const MIGRATIONS: &[Migration] = &[
         id: agent_client::project::LEAD_KEY,
         retire: "0.12.0",
     },
+    // Each commons post written before posts named their project names
+    // the one its author is named in (after 0.10.0).
+    Migration {
+        id: crate::commons::PROJECTS,
+        retire: "0.12.0",
+    },
 ];
 
 /// `run` once for each `record`: a file of the ids done, a line each,

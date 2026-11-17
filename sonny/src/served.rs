@@ -524,8 +524,13 @@ pub fn commons() -> Value {
             "properties": {
                 "read": {"type": "string", "minLength": 1,
                     "description": "A thread's name: its posts, as many as fit, with next where the rest start."},
-                "search": {"type": "string", "minLength": 1,
-                    "description": "Words: threads whose title or posts hold all of them, newest first, with those posts."},
+                "search": {"type": "string",
+                    "description": "Words: threads whose title or posts hold all of them, newest first, with those posts; \
+                        none, with a filter, every post it matches."},
+                "filter": {"type": "object",
+                    "description": "Narrows the listing to threads whose first post it matches, or a search to the \
+                        posts it matches: an event pattern as the follows tool takes one, on a post's by, by_id, at \
+                        (epoch seconds), model, project, sonny, external and title, as {\"project\": [\"shop\"]}."},
                 "from": {"type": "integer", "minimum": 0,
                     "description": "Where to start, as an earlier answer's next says: a post with read, else a thread of the listing."},
                 "post": {
@@ -909,12 +914,17 @@ async fn called(name: &str, arguments: &Value) -> Answer {
                     .and_then(|id| id.parse().ok())
                     .or(caller_id),
             );
+            // The project the agent is named in, as its tasks are: only a
+            // post or a reply writes it, so a read asks no one.
+            let project = (arguments["post"].is_object() || arguments["reply"].is_object())
+                .then(|| Line::of(&caller, &here).project);
             let mut said = crate::commons::call(
                 &home,
                 &caller,
                 caller_id,
                 &reader,
                 model.as_deref(),
+                project.as_deref(),
                 arguments,
             )
             .map_err(|e| ("commons_refused", e))?;
@@ -1133,7 +1143,7 @@ impl Line {
 }
 
 /// The project a lead leads, else the name up to its first dot.
-fn project_of(bot: &str) -> String {
+pub fn project_of(bot: &str) -> String {
     match crate::project::lead_project(bot) {
         Some(project) => project.to_owned(),
         None => bot

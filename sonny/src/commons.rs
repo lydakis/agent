@@ -190,7 +190,8 @@ pub fn dir(home: &Path) -> PathBuf {
 }
 
 /// The commons tool's answer, for `author`, the agent the daemon knows
-/// as `author_id`, writing with `model`.
+/// as `author_id`, writing with `model` for `project`, the one its name is
+/// made in.
 ///
 /// `reader` is whom `.shown` counts what the answer shows for: the
 /// conversation it reaches, as `who` names it. That is the author but for a
@@ -201,15 +202,17 @@ pub fn call(
     author_id: Option<i64>,
     reader: &str,
     model: Option<&str>,
+    project: Option<&str>,
     arguments: &Value,
 ) -> Result<Value, String> {
     let dir = dir(home);
     let from = arguments["from"].as_u64().unwrap_or(0) as usize;
+    let filter = filter(arguments)?;
     if let Some(name) = arguments["read"].as_str() {
         return read(&dir, name, author, reader, from);
     }
     if let Some(words) = arguments["search"].as_str() {
-        return search(&dir, words, author, reader, from, LIST_BYTES);
+        return search(&dir, words, filter, author, reader, from, LIST_BYTES);
     }
     if arguments["post"].is_object() {
         let post = &arguments["post"];
@@ -222,7 +225,7 @@ pub fn call(
             &dir,
             name,
             title,
-            &entry(author, author_id, model, text, post)?,
+            &entry(author, author_id, model, project, text, post)?,
             reader,
         );
     }
@@ -233,11 +236,56 @@ pub fn call(
         return add(
             &dir,
             thread,
-            &entry(author, author_id, model, text, reply)?,
+            &entry(author, author_id, model, project, text, reply)?,
             reader,
         );
     }
-    list(&dir, from, LIST_BYTES, &mut Summaries::new(), &sent(&dir))
+    list(
+        &dir,
+        from,
+        LIST_BYTES,
+        &mut Summaries::new(),
+        &sent(&dir),
+        filter,
+    )
+}
+
+/// What a post holds that a filter matches: all Sonny wrote of it.
+const FIELDS: [&str; 8] = [
+    "by", "by_id", "at", "model", "project", "sonny", "external", "title",
+];
+
+/// A call's `filter`, an event pattern as the follows tool takes one,
+/// held to what one may say and to the fields a post has; only a listing
+/// or a search takes one.
+fn filter(arguments: &Value) -> Result<Option<&Value>, String> {
+    let Some(filter) = arguments.get("filter").filter(|f| !f.is_null()) else {
+        return Ok(None);
+    };
+    if !arguments["read"].is_null() || !arguments["post"].is_null() || !arguments["reply"].is_null()
+    {
+        return Err("commons_invalid: a filter narrows the listing or a search".into());
+    }
+    crate::lookout::pattern::check(filter).map_err(|e| format!("commons_invalid: {e}"))?;
+    let missing = crate::lookout::pattern::missing(filter, &|field| FIELDS.contains(&field));
+    if !missing.is_empty() {
+        return Err(format!(
+            "commons_invalid: no post has {}; a post has {}",
+            missing.join(", "),
+            FIELDS.join(", ")
+        ));
+    }
+    Ok(Some(filter))
+}
+
+/// `post` as a filter sees it: its fields but its text.
+fn matched(filter: Option<&Value>, post: &Value) -> bool {
+    let Some(filter) = filter else { return true };
+    let fields: serde_json::Map<String, Value> = (post.as_object().into_iter().flatten())
+        .filter(|(key, _)| key.as_str() != "text")
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect();
+    crate::lookout::pattern::matches(filter, &Value::Object(fields))
 }
 
 fn valid_name(name: &str) -> Result<(), String> {
@@ -253,11 +301,13 @@ fn valid_name(name: &str) -> Result<(), String> {
 
 /// A post as its line holds it. Its author's id keeps a reply's note
 /// from reaching a later agent that took a removed poster's name; the
-/// model it was written with is kept as the daemon named it.
+/// model it was written with is kept as the daemon named it, and the
+/// project as Sonny named the author in it.
 fn entry(
     author: &str,
     author_id: Option<i64>,
     model: Option<&str>,
+    project: Option<&str>,
     text: &str,
     given: &Value,
 ) -> Result<Value, String> {
@@ -280,6 +330,9 @@ fn entry(
     }
     if let Some(model) = model.filter(|model| !model.is_empty()) {
         post["model"] = json!(model);
+    }
+    if let Some(project) = project.filter(|project| !project.is_empty()) {
+        post["project"] = json!(project);
     }
     // The Sonny that wrote it, so a reader can tell a finding about a
     // release since changed from one about its own.
@@ -919,7 +972,7 @@ fn thread(dir: &Path, name: &str) -> Result<Value, String> {
             if post["external"] == true {
                 shown["external"] = json!(true);
             }
-            for key in ["model", "sonny"] {
+            for key in ["model", "project", "sonny"] {
                 if post[key].is_string() {
                     shown[key] = post[key].clone();
                 }
@@ -1007,6 +1060,9 @@ fn count_reads(dir: &Path, names: &[&str]) {
 /// time it was read at: a listing reads again only a thread that changed.
 type Summaries = HashMap<String, (u64, std::time::SystemTime, Value)>;
 
+/// Where a summary keeps its first post's fields, for a filter.
+const OPENING: &str = "opening";
+
 /// A thread's line in a listing, from its first and last posts and its
 /// count of lines, decoding no post between them.
 fn summary(name: &str, path: &Path) -> Option<Value> {
@@ -1023,25 +1079,37 @@ fn summary(name: &str, path: &Path) -> Option<Value> {
         Some(line) => serde_json::from_slice(line).ok()?,
         None => first.clone(),
     };
-    Some(json!({
+    let mut summary = json!({
         "thread": name,
         "title": first["title"],
         "started_by": first["by"],
         "posts": count,
         "last_by": last["by"],
         "at": last["at"],
-    }))
+    });
+    // A thread is the project's its first post was written in.
+    if first["project"].is_string() {
+        summary["project"] = first["project"].clone();
+    }
+    // Its first post but its text, which a filter on the listing matches
+    // and the listing leaves out.
+    let mut opening = first;
+    opening.as_object_mut().map(|post| post.remove("text"));
+    summary[OPENING] = opening;
+    Some(summary)
 }
 
 /// The threads from the `from`th newest, as many as `bytes` holds, with
 /// `next` where the rest start; `known` keeps what each read found, and
-/// `sent` is the week's invites, read once by the caller.
+/// `sent` is the week's invites, read once by the caller. With `filter`,
+/// only the threads whose first post it matches.
 fn list(
     dir: &Path,
     from: usize,
     bytes: usize,
     known: &mut Summaries,
     sent: &[Value],
+    filter: Option<&Value>,
 ) -> Result<Value, String> {
     let entries = match std::fs::read_dir(dir) {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -1072,6 +1140,10 @@ fn list(
                 None => continue,
             },
         };
+        let opening = (thread.as_object_mut()).and_then(|t| t.remove(OPENING));
+        if !matched(filter, opening.as_ref().unwrap_or(&Value::Null)) {
+            continue;
+        }
         thread["reads"] = counts.get(name).map_or(json!(0), |r| r["count"].clone());
         threads.push(thread);
     }
@@ -1127,14 +1199,15 @@ fn search_words(text: &str) -> Vec<String> {
 fn search(
     dir: &Path,
     text: &str,
+    filter: Option<&Value>,
     author: &str,
     who: &str,
     from: usize,
     bytes: usize,
 ) -> Result<Value, String> {
     let words = search_words(text);
-    if words.is_empty() {
-        return Err("commons_invalid: search names at least one word".into());
+    if words.is_empty() && filter.is_none() {
+        return Err("commons_invalid: search names at least one word, or takes a filter".into());
     }
     let entries = match std::fs::read_dir(dir) {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -1181,7 +1254,8 @@ fn search(
         // more there are and the post to read from.
         let (mut matches, mut held, mut more) = (Vec::new(), 0, None);
         let hits = (posts.iter().enumerate())
-            .filter(|(_, post)| every || holds(post["text"].as_str().unwrap_or_default()));
+            .filter(|(_, post)| every || holds(post["text"].as_str().unwrap_or_default()))
+            .filter(|(_, post)| matched(filter, post));
         for (n, post) in hits {
             if let Some((count, _)) = &mut more {
                 *count += 1;
@@ -1191,8 +1265,10 @@ fn search(
             let cut = snippet(text);
             let mut shown = json!({"post": n, "by": post["by"],
                 "when": when(post["at"].as_i64().unwrap_or(0)), "text": cut});
-            if post["sonny"].is_string() {
-                shown["sonny"] = post["sonny"].clone();
+            for key in ["project", "sonny"] {
+                if post[key].is_string() {
+                    shown[key] = post[key].clone();
+                }
             }
             // As `read` marks it: written after reading outside content.
             if post["external"] == true {
@@ -1580,11 +1656,94 @@ pub fn woken_gone(home: &Path) {
     });
 }
 
+/// Each post written before posts named their project names it (after
+/// 0.10.0).
+pub const PROJECTS: &str = "commons-projects";
+
+/// Every post in `~/.agents/commons` that names no project names the one
+/// its author is named in, once for this HOME, from `records`, a whole
+/// listing of the daemon's agents by name. Whether it is done: a thread
+/// that would not be written is tried again next time.
+pub fn projects(home: &Path, records: &HashMap<String, Value>) -> bool {
+    crate::upgrade::once(&home.join(".agent/sonny/migrated"), PROJECTS, || {
+        name_projects(&dir(home), records)
+    })
+}
+
+fn name_projects(dir: &Path, records: &HashMap<String, Value>) -> bool {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(e) => return e.kind() == std::io::ErrorKind::NotFound,
+    };
+    let Ok(_lock) = lock(dir) else { return false };
+    // Each author's once, by name and id: a thread's authors are few.
+    let mut known: HashMap<(String, Option<i64>), String> = HashMap::new();
+    let mut done = true;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !(path.file_name().and_then(|n| n.to_str()))
+            .and_then(|n| n.strip_suffix(".jsonl"))
+            .is_some_and(|n| valid_name(n).is_ok())
+        {
+            continue;
+        }
+        // A thread that will not read is left as it is, for read to name.
+        let Ok(mut posts) = posts(&path) else {
+            continue;
+        };
+        let mut named = false;
+        for post in &mut posts {
+            if post["project"].is_string() {
+                continue;
+            }
+            let Some(by) = post["by"].as_str() else {
+                continue;
+            };
+            let author = (by.to_owned(), post["by_id"].as_i64());
+            let project = (known.entry(author))
+                .or_insert_with_key(|(by, id)| author_project(by, *id, records))
+                .clone();
+            post["project"] = json!(project);
+            named = true;
+        }
+        if named {
+            let text: String = posts.iter().map(|post| format!("{post}\n")).collect();
+            done &= agent_client::files::replace_mode(&path, text.as_bytes(), 0o600).is_ok();
+        }
+    }
+    done
+}
+
+/// The project `by` is named in, as a post it wrote now names it: an
+/// agent still there by the lead its line runs from, as its tasks are
+/// named; one gone, or another agent that took its name since, by the
+/// longest start of its name that a lead there is named for; else its
+/// name up to its first dot.
+fn author_project(by: &str, id: Option<i64>, records: &HashMap<String, Value>) -> String {
+    if let Some(record) = records.get(by)
+        && (id.is_none() || record["bot_id"].as_i64().is_none_or(|bot| Some(bot) == id))
+    {
+        let lead = crate::declared::lead_by(record, |at| {
+            records.get(at["created_by"].as_str()?).cloned()
+        });
+        let named = lead.as_ref().and_then(|lead| lead["name"].as_str());
+        return crate::served::project_of(named.unwrap_or(by));
+    }
+    let starts = by.match_indices('.').map(|(at, _)| &by[..at]);
+    let mut led = starts.filter(|start| records.contains_key(&format!("{start}.lead")));
+    led.next_back()
+        .map_or_else(|| crate::served::project_of(by), str::to_owned)
+}
+
 /// `/commons` in the pane: the threads, newest first, and one opened to
 /// its posts, read from the folder with no model or daemon call. The
 /// person's reading here is not counted as an agent's.
 pub struct View {
     dir: PathBuf,
+    /// The window's project, which `a` narrows the threads to.
+    project: String,
+    /// `a`: only the threads started in `project`. Every project's open.
+    this: bool,
     threads: Vec<Value>,
     /// What the week's invites came to, as the listing says.
     invites: Value,
@@ -1608,9 +1767,11 @@ pub enum Key {
 }
 
 impl View {
-    pub fn open(home: &Path) -> Self {
+    pub fn open(home: &Path, project: String) -> Self {
         let mut view = Self {
             dir: dir(home),
+            project,
+            this: false,
             threads: Vec::new(),
             invites: Value::Null,
             selected: 0,
@@ -1630,9 +1791,13 @@ impl View {
         // The invites file is read once for the budget and the golden
         // tickets both.
         let sent = sent(&self.dir);
-        match list(&self.dir, 0, usize::MAX, &mut self.known, &sent) {
+        match list(&self.dir, 0, usize::MAX, &mut self.known, &sent, None) {
             Ok(listed) => {
                 self.threads = listed["threads"].as_array().cloned().unwrap_or_default();
+                if self.this {
+                    let project = self.project.as_str();
+                    self.threads.retain(|thread| thread["project"] == project);
+                }
                 self.invites = listed["invites"].clone();
                 self.golden = (sent.iter())
                     .filter(|invite| !invite["bot"].is_null() && invite["golden"] == true)
@@ -1689,6 +1854,10 @@ impl View {
             }
             KeyCode::Down | KeyCode::Char('j') if !opened => {
                 self.selected = (self.selected + 1).min(self.threads.len().saturating_sub(1));
+            }
+            KeyCode::Char('a') if !opened => {
+                self.this = !self.this;
+                self.reload();
             }
             KeyCode::Enter | KeyCode::Right if !opened => {
                 if let Some(name) = self.picked().map(str::to_owned) {
@@ -1754,8 +1923,12 @@ impl View {
         // Numbers, read as numbers: a listing short of one says 0, never null.
         let invites = |key: &str| self.invites[key].as_u64().unwrap_or(0);
         // Whose it is, every project's agents sharing here, then what it holds.
+        let whose = match self.this {
+            true => self.project.clone(),
+            false => "every project".to_owned(),
+        };
         let mut out = vec![Line::from(vec![
-            Span::raw("every project").bold(),
+            Span::raw(whose).bold(),
             Span::raw(format!(
                 " · {count} thread{} · {} of {} invited today, {} invites each · {} of {} answered this week · {} golden ticket{}",
                 if count == 1 { "" } else { "s" },
@@ -1771,7 +1944,10 @@ impl View {
         ])];
         if self.threads.is_empty() {
             out.push(Line::default());
-            out.push(Line::from("No thread yet."));
+            out.push(Line::from(match self.this {
+                true => "No thread started in this project yet.",
+                false => "No thread yet.",
+            }));
             out.push(
                 Line::from("Agents start one with their commons tool when they have something to share or ask.")
                     .dim(),
@@ -1878,11 +2054,19 @@ impl View {
     /// What the keys do, as the pane's title says it.
     pub fn keys(&self) -> String {
         use crate::hint::{Enter, Esc, Keys};
+        let whose = match self.this {
+            true => "every project",
+            false => "this project",
+        };
         match (&self.open, self.threads.len()) {
             (Some(_), _) => Keys::new().key("↑↓", "scroll").esc(Esc::Back),
-            (None, 0) => Keys::new().esc(Esc::Close),
-            (None, 1) => Keys::new().enter(Enter::Open).esc(Esc::Close),
-            (None, _) => Keys::new().pick().enter(Enter::Open).esc(Esc::Close),
+            (None, 0) => Keys::new().key("a", whose).esc(Esc::Close),
+            (None, 1) => (Keys::new().enter(Enter::Open))
+                .key("a", whose)
+                .esc(Esc::Close),
+            (None, _) => (Keys::new().pick().enter(Enter::Open))
+                .key("a", whose)
+                .esc(Esc::Close),
         }
         .text()
     }
@@ -1906,7 +2090,7 @@ mod tests {
         {
             told(home, by, thread, &(0..posts.len()).collect::<Vec<_>>());
         }
-        super::call(home, by, id, &who(by, id), model, arguments)
+        super::call(home, by, id, &who(by, id), model, None, arguments)
     }
 
     /// A home of its own for one test.
@@ -1951,7 +2135,8 @@ mod tests {
     #[test]
     fn a_reply_after_posts_its_author_missed_waits_once_and_shows_them() {
         let home = home("missed");
-        let send = |by: &str, arguments: Value| super::call(&home, by, None, by, None, &arguments);
+        let send =
+            |by: &str, arguments: Value| super::call(&home, by, None, by, None, None, &arguments);
         send(
             "a.x",
             json!({"post": {"name": "t", "title": "T", "text": "Seen it?"}}),
@@ -2010,6 +2195,7 @@ mod tests {
                 Some(id),
                 &who("b.y", Some(id)),
                 None,
+                None,
                 &arguments,
             )
             .unwrap()
@@ -2033,7 +2219,7 @@ mod tests {
         // The agent a.x is #1; its side chat a.x-side is #2 and signs as a.x.
         let (agent, side) = (who("a.x", Some(1)), who("a.x-side", Some(2)));
         let send = |reader: &str, arguments: Value| {
-            super::call(&home, "a.x", Some(1), reader, None, &arguments).unwrap()
+            super::call(&home, "a.x", Some(1), reader, None, None, &arguments).unwrap()
         };
         let other = |arguments: Value| caught_up(&home, "b.y", None, None, &arguments).unwrap();
         send(
@@ -2058,7 +2244,8 @@ mod tests {
     #[test]
     fn a_later_page_read_alone_leaves_the_posts_before_it_unshown() {
         let home = home("missed-page");
-        let send = |by: &str, arguments: Value| super::call(&home, by, None, by, None, &arguments);
+        let send =
+            |by: &str, arguments: Value| super::call(&home, by, None, by, None, None, &arguments);
         send(
             "a.x",
             json!({"post": {"name": "t", "title": "T", "text": "one"}}),
@@ -2573,7 +2760,7 @@ mod tests {
             &json!({"post": {"name": "t", "title": "T", "text": "hi"}}),
         )
         .unwrap();
-        let mut view = View::open(home);
+        let mut view = View::open(home, "a".into());
         view.key(KeyEvent::from(KeyCode::Enter));
         assert!(view.reading());
         assert_eq!(
@@ -2645,7 +2832,7 @@ mod tests {
         let edge = format!("needle {}", "x".repeat(SNIPPET_CHARS - 4));
         let post = json!({"post": {"name": "edge", "title": "E", "text": edge}});
         caught_up(home, "a.x", None, None, &post).unwrap();
-        search(&dir(home), "needle", "d.w", "d.w", 0, LIST_BYTES).unwrap();
+        search(&dir(home), "needle", None, "d.w", "d.w", 0, LIST_BYTES).unwrap();
         let listed = caught_up(home, "e.v", None, None, &json!({})).unwrap();
         assert_eq!(listed["threads"][0]["reads"], 0);
         std::fs::remove_file(dir(home).join("edge.jsonl")).unwrap();
@@ -2654,12 +2841,12 @@ mod tests {
             let post = json!({"post": {"name": format!("t{n}"), "title": "T", "text": long}});
             caught_up(home, "a.x", None, None, &post).unwrap();
         }
-        let found = search(&dir(home), "needle", "d.w", "d.w", 0, 1).unwrap();
+        let found = search(&dir(home), "needle", None, "d.w", "d.w", 0, 1).unwrap();
         assert_eq!(found["next"], 1);
         let text = found["threads"][0]["matches"][0]["text"].as_str().unwrap();
         assert_eq!(text.chars().count(), SNIPPET_CHARS + 1);
         assert!(text.ends_with('…'));
-        let rest = search(&dir(home), "needle", "d.w", "d.w", 1, LIST_BYTES).unwrap();
+        let rest = search(&dir(home), "needle", None, "d.w", "d.w", 1, LIST_BYTES).unwrap();
         assert_eq!(rest["threads"].as_array().unwrap().len(), 2);
         assert!(rest.get("next").is_none());
         // One thread's matches past a page: how many more, and where to
@@ -2668,7 +2855,16 @@ mod tests {
             let reply = json!({"reply": {"thread": "t0", "text": long, "external": external}});
             caught_up(home, "b.y", None, None, &reply).unwrap();
         }
-        let many = search(&dir(home), "needle", "d.w", "d.w", 0, 3 * SNIPPET_CHARS).unwrap();
+        let many = search(
+            &dir(home),
+            "needle",
+            None,
+            "d.w",
+            "d.w",
+            0,
+            3 * SNIPPET_CHARS,
+        )
+        .unwrap();
         let thread = &many["threads"][0];
         assert_eq!(thread["thread"], "t0");
         assert_eq!(thread["matches"].as_array().unwrap().len(), 2);
@@ -2715,7 +2911,7 @@ mod tests {
     #[test]
     fn the_view_lists_threads_newest_first_and_opens_one() {
         let home = &home("view");
-        let mut view = View::open(home);
+        let mut view = View::open(home, "a".into());
         let text = |lines: Vec<Line<'static>>| -> Vec<String> {
             lines
                 .iter()
@@ -2751,7 +2947,10 @@ mod tests {
         let listed = text(view.card(60).0);
         let at = |needle: &str| listed.iter().position(|l| l.contains(needle)).unwrap();
         assert!(at("New one") < at("Old one"), "{listed:?}");
-        assert_eq!(view.keys(), "↑↓ pick · enter open · esc close");
+        assert_eq!(
+            view.keys(),
+            "↑↓ pick · enter open · a this project · esc close"
+        );
         assert_eq!(view.footer(), None);
         view.key(KeyEvent::from(KeyCode::Down));
         view.key(KeyEvent::from(KeyCode::Enter));
@@ -2781,7 +2980,7 @@ mod tests {
             &json!({"post": {"name": "long", "title": title, "text": "first"}}),
         )
         .unwrap();
-        let view = View::open(home);
+        let view = View::open(home, "a".into());
         for width in 30..=80 {
             let (lines, at) = view.card(width);
             for line in &lines[at..] {
@@ -2831,7 +3030,7 @@ mod tests {
             json!({"thread": "u", "at": now(), "golden": true, "reach": 3}),
         ];
         assert!(keep(&dir, &sent, 2));
-        let view = View::open(home);
+        let view = View::open(home, "a".into());
         let head: String = (view.card(200).0[0].spans.iter())
             .map(|span| span.content.as_ref())
             .collect();
@@ -2992,7 +3191,7 @@ mod tests {
         let home = &home("reads_again");
         let post = json!({"post": {"name": "t", "title": "T", "text": "one"}});
         caught_up(home, "a.x", None, None, &post).unwrap();
-        let mut view = View::open(home);
+        let mut view = View::open(home, "a".into());
         assert_eq!(view.threads[0]["posts"], 1);
         // A summary kept for a file as it was is used again.
         view.known.get_mut("t").unwrap().2["title"] = json!("kept");
@@ -3006,5 +3205,214 @@ mod tests {
             (&view.threads[0]["posts"], &view.threads[0]["last_by"]),
             (&json!(2), &json!("b.y"))
         );
+    }
+
+    /// `call` as the tool host makes it, for `by` named in `project`.
+    fn in_project(home: &Path, by: &str, project: &str, arguments: &Value) -> Value {
+        if let Some(thread) = arguments["reply"]["thread"].as_str()
+            && let Ok(posts) = posts(&dir(home).join(format!("{thread}.jsonl")))
+        {
+            told(home, by, thread, &(0..posts.len()).collect::<Vec<_>>());
+        }
+        super::call(
+            home,
+            by,
+            None,
+            by,
+            Some("openai/gpt-5"),
+            Some(project),
+            arguments,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn a_post_names_its_project_and_a_thread_is_its_first_post_s() {
+        let home = &home("projects");
+        let post = |by: &str, project: &str, name: &str| {
+            let post = json!({"post": {"name": name, "title": name, "text": "wal"}});
+            in_project(home, by, project, &post)
+        };
+        post("shop.web.fix", "shop.web", "slow-builds");
+        post("calc.lead", "calc", "flaky-timers");
+        // A reply from another project leaves the thread its starter's.
+        let reply = json!({"reply": {"thread": "slow-builds", "text": "wal too"}});
+        in_project(home, "calc.lead", "calc", &reply);
+
+        let listed = caught_up(home, "a.x", None, None, &json!({})).unwrap();
+        let projects: Vec<_> = (listed["threads"].as_array().unwrap().iter())
+            .map(|t| (t["thread"].clone(), t["project"].clone()))
+            .collect();
+        assert!(projects.contains(&(json!("slow-builds"), json!("shop.web"))));
+        assert!(projects.contains(&(json!("flaky-timers"), json!("calc"))));
+        // Only what the listing always said, and the project.
+        assert!(listed["threads"][0].get(OPENING).is_none());
+
+        let read = caught_up(home, "a.x", None, None, &json!({"read": "slow-builds"})).unwrap();
+        assert_eq!(read["posts"][0]["project"], "shop.web");
+        assert_eq!(read["posts"][1]["project"], "calc");
+        let found = caught_up(home, "a.x", None, None, &json!({"search": "wal"})).unwrap();
+        let matches = &found["threads"][0]["matches"];
+        assert!(matches[0]["project"].is_string());
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn a_filter_narrows_the_listing_by_first_posts_and_a_search_by_posts() {
+        let home = &home("filters");
+        let post = |by: &str, project: &str, name: &str| {
+            let post = json!({"post": {"name": name, "title": name, "text": "wal"}});
+            in_project(home, by, project, &post)
+        };
+        post("shop.lead", "shop", "slow-builds");
+        post("calc.lead", "calc", "flaky-timers");
+        let reply = json!({"reply": {"thread": "flaky-timers", "text": "wal here too"}});
+        in_project(home, "shop.lead", "shop", &reply);
+        let call = |arguments: Value| caught_up(home, "a.x", None, None, &arguments);
+        let names = |said: &Value| -> Vec<String> {
+            (said["threads"].as_array().unwrap().iter())
+                .map(|t| t["thread"].as_str().unwrap().to_owned())
+                .collect()
+        };
+
+        let shop = call(json!({"filter": {"project": ["shop"]}})).unwrap();
+        assert_eq!(names(&shop), ["slow-builds"]);
+        let by = call(json!({"filter": {"by": [{"prefix": "calc."}]}})).unwrap();
+        assert_eq!(names(&by), ["flaky-timers"]);
+        // A search with no words but a filter: every post it matches,
+        // replies in other projects' threads too.
+        let shop_posts = call(json!({"search": "", "filter": {"project": ["shop"]}})).unwrap();
+        let mut found = names(&shop_posts);
+        found.sort();
+        assert_eq!(found, ["flaky-timers", "slow-builds"]);
+        let in_calc_thread = &shop_posts["threads"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|t| t["thread"] == "flaky-timers")
+            .unwrap()["matches"];
+        assert_eq!(in_calc_thread.as_array().unwrap().len(), 1);
+        assert_eq!(in_calc_thread[0]["by"], "shop.lead");
+        // Words and a filter both hold.
+        let both = call(json!({"search": "here", "filter": {"project": ["calc"]}})).unwrap();
+        assert!(names(&both).is_empty());
+        // Numbers as numbers: every post is after 0.
+        let after = call(json!({"filter": {"at": [{"numeric": [">", 0]}]}})).unwrap();
+        assert_eq!(names(&after).len(), 2);
+
+        // A field no post has, a pattern that is no pattern, and a filter
+        // on a read are refused.
+        let wrong = call(json!({"filter": {"projekt": ["shop"]}})).unwrap_err();
+        assert!(wrong.contains("no post has projekt"), "{wrong}");
+        assert!(call(json!({"filter": {"project": "shop"}})).is_err());
+        assert!(call(json!({"read": "slow-builds", "filter": {"project": ["shop"]}})).is_err());
+        assert!(call(json!({"search": ""})).is_err());
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn old_posts_name_their_authors_projects_once() {
+        let home = &home("backfill");
+        let dir = dir(home);
+        std::fs::create_dir_all(&dir).unwrap();
+        let line = |post: Value| format!("{post}\n");
+        // Posts as an older Sonny wrote them: no project.
+        let old = [
+            json!({"by": "shop.web.fix", "by_id": 7, "at": 1, "text": "a", "title": "T"}),
+            // Gone, but a lead of a dotted project is there.
+            json!({"by": "shop.web.gone", "at": 2, "text": "b"}),
+            // Gone, with no lead of its name's starts.
+            json!({"by": "lone.helper", "at": 3, "text": "c"}),
+            // Its name taken since by another agent: by its name's start.
+            json!({"by": "calc.helper", "by_id": 1, "at": 4, "text": "d"}),
+            // Named already.
+            json!({"by": "calc.lead", "at": 5, "text": "e", "project": "calc"}),
+        ];
+        std::fs::write(
+            dir.join("t.jsonl"),
+            old.iter().cloned().map(line).collect::<String>(),
+        )
+        .unwrap();
+        // A lead's task made by a task: its project is its lead's.
+        let records: HashMap<String, Value> = [
+            json!({"name": "shop.web.lead", "bot_id": 1}),
+            json!({"name": "shop.web.fix", "bot_id": 7, "created_by": "shop.web.mid", "created_by_id": 5}),
+            json!({"name": "shop.web.mid", "bot_id": 5, "created_by": "shop.web.lead", "created_by_id": 1}),
+            json!({"name": "calc.helper", "bot_id": 2}),
+        ]
+        .into_iter()
+        .map(|record| (record["name"].as_str().unwrap().to_owned(), record))
+        .collect();
+        assert!(projects(home, &records));
+        let posts = posts(&dir.join("t.jsonl")).unwrap();
+        let named: Vec<_> = posts.iter().map(|post| post["project"].clone()).collect();
+        assert_eq!(
+            named,
+            [
+                json!("shop.web"),
+                json!("shop.web"),
+                json!("lone"),
+                json!("calc"),
+                json!("calc")
+            ]
+        );
+        // All else as it was.
+        for (post, was) in posts.iter().zip(&old) {
+            let mut post = post.clone();
+            if was["project"].is_null() {
+                post.as_object_mut().unwrap().remove("project");
+            }
+            assert_eq!(&post, was);
+        }
+        // Once: a post written as an old Sonny would after it stays so.
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(dir.join("t.jsonl"))
+            .unwrap();
+        file.write_all(line(json!({"by": "x.y", "at": 6, "text": "f"})).as_bytes())
+            .unwrap();
+        assert!(projects(home, &records));
+        assert!(super::posts(&dir.join("t.jsonl")).unwrap()[5]["project"].is_null());
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn a_narrows_commons_to_threads_started_in_this_project() {
+        let home = &home("view-scope");
+        let post = |by: &str, project: &str, name: &str| {
+            let post = json!({"post": {"name": name, "title": name, "text": "?"}});
+            in_project(home, by, project, &post)
+        };
+        post("shop.lead", "shop", "ours");
+        post("calc.lead", "calc", "theirs");
+        let mut view = View::open(home, "shop".into());
+        let head = |view: &View| line_text(&view.card(80).0[0]);
+        // Every project's, as it opens.
+        assert_eq!(view.threads.len(), 2);
+        assert!(head(&view).starts_with("every project · 2 threads"));
+        assert!(view.keys().contains("a this project"), "{}", view.keys());
+        view.key(KeyEvent::from(KeyCode::Char('a')));
+        assert_eq!(view.threads.len(), 1);
+        assert_eq!(view.threads[0]["thread"], "ours");
+        assert!(head(&view).starts_with("shop · 1 thread "));
+        assert!(view.keys().contains("a every project"), "{}", view.keys());
+        // None started here: says so.
+        let mut none = View::open(home, "web".into());
+        none.key(KeyEvent::from(KeyCode::Char('a')));
+        let lines: Vec<String> = none.card(80).0.iter().map(line_text).collect();
+        assert!(
+            lines.contains(&"No thread started in this project yet.".to_owned()),
+            "{lines:?}"
+        );
+        view.key(KeyEvent::from(KeyCode::Char('a')));
+        assert_eq!(view.threads.len(), 2);
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    fn line_text(line: &Line) -> String {
+        line.spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect()
     }
 }
