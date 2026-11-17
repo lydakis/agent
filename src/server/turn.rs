@@ -6007,7 +6007,17 @@ impl Turn {
                     }
                     request(copy).await?;
                 } else {
-                    let me = request(json!({"op":"inspect","bot":self.bot})).await?;
+                    // Its record, at this turn's own model and effort.
+                    let mut me = request(json!({"op":"inspect","bot":self.bot})).await?;
+                    let (bot, turn) = (self.bot.clone(), self.turn);
+                    let (_, context) = (self.store)
+                        .op("context", move |db| db.running_context(&bot, turn))
+                        .await?;
+                    if let Some((provider, model)) = context.model.split_once('/') {
+                        me["provider"] = json!(provider);
+                        me["model"] = json!(model);
+                    }
+                    me["effort"] = json!(context.effort);
                     // The folder asked for, else this turn's.
                     let folder = (made.get("workspace"))
                         .and_then(Value::as_str)
@@ -6040,7 +6050,15 @@ impl Turn {
                     }
                     create["op"] = json!("create");
                     create["request_id"] = json!(request_id);
-                    request(create).await?;
+                    // This call made again, after its folder's files or this
+                    // turn changed what it composes: the agent it made the
+                    // first time stands, and its first message is sent once.
+                    match request(create).await {
+                        Err(error) if error.code == "idempotency_conflict" => {}
+                        made => {
+                            made?;
+                        }
+                    }
                 }
                 let sent = request(json!({"op":"submit","bot":name,"request_id":request_id,
                     "prompt":message,"delivery":"queue",

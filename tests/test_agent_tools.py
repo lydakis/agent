@@ -189,6 +189,33 @@ class AgentToolsTests(ModelFixture):
         copy = client.request('inspect', bot='shop.copy')['result']
         self.assertEqual(copy['allowed'], ['echo'], copy)
 
+    def test_a_spawn_sent_again_after_its_folder_changed_keeps_the_agent_it_made(self):
+        (self.path / 'AGENTS.md').write_text('First rule.\n')
+        client = self.client(TOOLS)
+        client.request('create', bot='shop.lead', workspace=str(self.path))
+        spawn = ('spawn_agent', {'name': 'look', 'message': 'q', 'agents': True, 'request_id': 'once'})
+        self.run_calls(client, 'shop.lead', 'go', spawn)
+        (self.path / 'AGENTS.md').write_text('Second rule.\n')
+        # Sent again from another turn: the agent the first call made stands
+        # though its folder now composes otherwise; only the message, from
+        # another turn, is refused as a different request.
+        self.run_calls(client, 'shop.lead', 'again', spawn)
+        events = client.request('events', bot='shop.lead', after=0, limit=256)['result']['events']
+        node = [e for e in events if e['event'] == 'tool_completed'][-1]['data']['node']
+        again = node_item(client, 'shop.lead', node)['result']['output']
+        self.assertIn('from differs from the request that sent message', again)
+        look = client.request('inspect', bot='shop.look')['result']
+        self.assertIn('First rule.', look['instructions'])
+
+    def test_a_new_agent_takes_the_running_turns_own_effort(self):
+        client = self.client(TOOLS)
+        client.request('create', bot='shop.lead', workspace=str(self.path), effort='low')
+        turn = client.request('submit', bot='shop.lead', request_id='go', effort='high',
+                              prompt=calls(('spawn_agent', {'name': 'look', 'message': 'q'})))['result']['message']
+        self.assertEqual(client.finished(turn)['data']['status'], 'completed')
+        look = client.request('inspect', bot='shop.look')['result']
+        self.assertEqual(look.get('effort'), 'high', look)
+
     def test_a_fork_takes_no_profile_and_a_missing_profile_is_refused(self):
         client = self.client(TOOLS)
         client.request('create', bot='shop.lead', workspace=str(self.path))
