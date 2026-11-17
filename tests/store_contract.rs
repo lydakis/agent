@@ -10814,6 +10814,8 @@ fn a_steer_s_model_and_effort_are_kept_for_the_bot_s_next_turn() {
         )
         .unwrap();
     assert!(raised.carried);
+    // The steer's own event says so.
+    assert_eq!(raised.entry.unwrap()["data"]["carried"], true);
     let kept = |db: &Database| db.inspect("Bob").unwrap().configure_pending;
     assert_eq!(
         kept(&db),

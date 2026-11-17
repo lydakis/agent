@@ -2053,7 +2053,8 @@ the message's number and handle at once, and `wait`, `messages`, and
   its model and effort are kept as a `configure` sent while the turn runs
   is (`configure_pending`), whichever of the two it does not name staying
   as the bot, or a `configure` kept before, has it, and the daemon takes
-  them when the turn ends. A steer that starts a turn of its own, on a bot
+  them when the turn ends. The steer's `queued` event says so with
+  `carried: true`. A steer that starts a turn of its own, on a bot
   at rest, runs with what it names as any turn does and keeps nothing. The
   snapshot is drained in batches of
   at most 32 steers and 256 KiB of UTF-8 prompt bytes, releasing each batch

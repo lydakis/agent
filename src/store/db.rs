@@ -8029,7 +8029,7 @@ impl Database {
             .clone()
             .unwrap_or_else(|| format!("{}/{}", bot.provider, bot.model));
         let effort = options.effort.as_ref().or(bot.effort.as_ref());
-        let (kind, data) = if status == "running" {
+        let (kind, mut data) = if status == "running" {
             let mut data = json!({"request_id":request_id,"workspace":workspace,"model":model,
                 "effort":effort});
             start_locked(&tx, &bot, turn, prompt, &mut data, true)?;
@@ -8052,9 +8052,6 @@ impl Database {
             );
             (if attach { "attached" } else { "queued" }, data)
         };
-        // The message's own event; one that opened a turn names it too.
-        let opened = (status == "running").then_some(turn);
-        let cursor = message_event(&tx, name, opened, Some(turn), kind, data.clone())?;
         // A steer that joins a running turn on another model or effort
         // makes them the bot's own, as Codex keeps a turn's settings:
         // kept as a `configure` sent now would be, so the turn running
@@ -8089,15 +8086,13 @@ impl Database {
             }
             tx.prepare_cached("UPDATE bots SET configure_pending=? WHERE id=?")?
                 .execute(params![pending.to_string(), bot.bot_id])?;
-            event(
-                &tx,
-                name,
-                None,
-                "configure_pending",
-                json!({"bot_id":bot.bot_id,"running_turn":bot.running_turn,
-                    "configure_pending":pending}),
-            )?;
+            // Said by the steer's own event, so a pipelined steer
+            // publishes no more than any submission does.
+            data["carried"] = json!(true);
         }
+        // The message's own event; one that opened a turn names it too.
+        let opened = (status == "running").then_some(turn);
+        let cursor = message_event(&tx, name, opened, Some(turn), kind, data.clone())?;
         tx.commit()?;
         if status != "running" && !attach {
             self.pending.0 += 1;
