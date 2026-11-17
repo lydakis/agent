@@ -91,6 +91,16 @@ fn age(ms: i64) -> String {
 
 /// A command on one line: how long it has run, its agent and kind, a
 /// detached one's pid, and the start of its command, cut to `width`.
+/// The column [`line`] starts an agent's name at: after the age and
+/// its pad.
+pub fn name_column(row: &Value, now_ms: i64) -> u16 {
+    let ran = match row["started_ms"].as_i64() {
+        Some(started) => age(now_ms - started),
+        None => "?".into(),
+    };
+    (1 + 4usize.saturating_sub(ran.width()) + ran.width() + 1) as u16
+}
+
 pub fn line(
     row: &Value,
     name: &str,
