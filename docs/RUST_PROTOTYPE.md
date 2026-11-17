@@ -3236,6 +3236,30 @@ again only when one changed, each written beside its name and renamed over
 it, so a running sandbox reads a whole file. A daemon running as root,
 which the namespace maps as itself, binds nothing.
 
+Each file the daemon was started with as `serve --own-copy-file
+FILE=FIRST` is shown on Linux from a copy the person owns under
+`~/.agent/copies`, by the file's real path, a link followed, and a hash of
+the text (so a daemon that puts other text first keeps its own copy), with
+the text `FIRST` before the file, kept in step with it; the daemon knows nothing of
+what the file is. One kept unreadable is not shown, and a copy made before
+it was is removed, since sandboxes read `~/.agent`. The CLI passes the
+person's `~/.ssh/config` with `ControlMaster no` first
+(`agent_client::SSH_CONFIG_FIRST`). With
+`ControlMaster auto` and no master open, ssh makes its control socket at
+`ControlPath`, usually in `~/.ssh`, which no sandboxed command may write;
+it can't bind it (`unix_listener: cannot bind ... Read-only file system`)
+and exits 255, so every git fetch and push over ssh failed in the sandbox
+unless the person happened to have a master open, which ssh joins. ssh
+takes the first value it reads for each option, so the line stands for
+every host: ssh in a sandbox joins a master the person has open at the
+config's `ControlPath` and otherwise connects on its own, every ssh alike
+(git, scp, rsync, a tool that runs ssh itself), with nothing in the
+command's environment or the agent's words. A config that isn't there
+costs one failed `stat`; one unchanged since costs a `realpath` and a
+`stat` (about 2.7 µs). The daemon running as root binds it too: a
+read-only mount is read-only to root. A config in a folder kept unreadable
+is not shown. macOS's Seatbelt binds nothing, so this is Linux's alone.
+
 `agent sandbox [--writable PATH]... -- COMMAND [ARGS...]` runs one command
 in the same sandbox, with no daemon, as Codex's `codex sandbox` does:
 read-only with no `--writable`, else writing the folders named, `$TMPDIR` and
