@@ -5,7 +5,7 @@
 //! lookout judges none of it: it matches each subscription's filter,
 //! drops what it holds already, and delivers each event to its
 //! subscriber at once, as a steer, or at the subscription's digest. Each
-//! note says each event under its header, `[source · topic · from]`; the
+//! note says each event under its header, `[source · topic · from · time]`; the
 //! person's words in a task go as the daemon quotes them, never as the
 //! lookout says them.
 //!
@@ -2764,7 +2764,7 @@ impl Lookout {
         let sent = std::mem::take(&mut self.resend);
         if !sent.is_empty() {
             let unkept = self.unkept_sent.line(self.waiting, epoch_ms() as u64);
-            let prompt = sources::note(&sent, self.heard.len(), unkept.as_deref());
+            let prompt = sources::note(&sent, &self.heard, unkept.as_deref());
             return self.send_note(client, woken, sent, prompt);
         }
         // What is ready goes at once, unless a note went less than
@@ -2801,7 +2801,7 @@ impl Lookout {
         // What did not fit is told with it, and again if it is refused.
         self.unkept_sent = std::mem::take(&mut self.unkept);
         let unkept = self.unkept_sent.line(self.waiting, epoch_ms() as u64);
-        let prompt = sources::note(&sent, self.heard.len(), unkept.as_deref());
+        let prompt = sources::note(&sent, &self.heard, unkept.as_deref());
         self.send_note(client, woken, sent, prompt);
     }
 
@@ -4025,7 +4025,7 @@ mod tests {
         lookout.wake(&client, &woken);
         let prompt = got.recv().await.unwrap()["prompt"].clone();
         assert_eq!(
-            prompt,
+            sources::untimed(prompt.as_str().unwrap()),
             "[tasks · calc.fix · calc.docs]\nlook at this\n\
              [tasks · calc.fix · calc.fix replied, completed]\ndone"
         );
@@ -4357,7 +4357,7 @@ mod tests {
         lookout.wake(&client, &woken);
         let prompt = got.recv().await.unwrap()["prompt"].clone();
         assert_eq!(
-            prompt.as_str().unwrap(),
+            sources::untimed(prompt.as_str().unwrap()),
             "[tasks · calc.fix · calc.fix replied, completed]\ndone 1"
         );
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -4423,7 +4423,7 @@ mod tests {
         // The person's words only as the daemon quotes them; an agent's as
         // it wrote them.
         assert_eq!(
-            submit["prompt"].as_str().unwrap(),
+            sources::untimed(submit["prompt"].as_str().unwrap()),
             "[tasks · calc.fix · the person]\n\
              (their words are quoted below, from calc.fix/5)\n\
              [tasks · calc.fix · calc.docs]\nship it"
@@ -4448,7 +4448,7 @@ mod tests {
         let submit = got.recv().await.unwrap();
         assert!(submit.get("quotes").is_none());
         assert_eq!(
-            submit["prompt"].as_str().unwrap(),
+            sources::untimed(submit["prompt"].as_str().unwrap()),
             "[tasks · calc.fix · the person]\n\
              (their words are in calc.fix/5, which could not be quoted)"
         );
@@ -4925,7 +4925,10 @@ mod tests {
         let down = &lookout.heard[1];
         assert!(down.event.steer && lookout.ready(down, now));
         assert_eq!(down.event.steer_by.as_deref(), Some("chat"));
-        assert_eq!(sources::line(down), "[slack · ana]\ndown: prod");
+        assert_eq!(
+            sources::untimed(&sources::line(down)),
+            "[slack · ana]\ndown: prod"
+        );
     }
 
     #[test]
@@ -4987,7 +4990,7 @@ mod tests {
         // under the same request.
         let mut sending = made();
         sending.heard_from(&slack("two", false));
-        let asked = sources::note(&sending.heard, 0, None);
+        let asked = sources::note(&sending.heard, &[], None);
         let sent = std::mem::take(&mut sending.heard);
         sending.sending = Some((sent, vec!["k".into()]));
         sending.heard_from(&slack("three", false));
@@ -5000,7 +5003,7 @@ mod tests {
         assert_eq!(back.resend.len(), 1);
         assert_eq!(back.resend[0].event.text, "two");
         assert_eq!(back.heard.len(), 1);
-        assert_eq!(sources::note(&back.resend, 0, None), asked);
+        assert_eq!(sources::note(&back.resend, &[], None), asked);
         // Another bot of the name hears none of it.
         let mut other = Lookout::new("calc.lead");
         other.subs.push(hears("chat"));
@@ -5190,7 +5193,10 @@ mod tests {
         // None went lately: the first goes as it comes.
         lookout.heard_from(&slack("one", false));
         lookout.wake(&client, &woken);
-        assert_eq!(got.recv().await.unwrap()["prompt"], "[slack · ana]\none");
+        assert_eq!(
+            sources::untimed(got.recv().await.unwrap()["prompt"].as_str().unwrap()),
+            "[slack · ana]\none"
+        );
         tokio::time::sleep(Duration::from_millis(50)).await;
         answer(&mut lookout, &mut woke);
         // What comes within the group interval waits for it to end, together.
@@ -5204,7 +5210,7 @@ mod tests {
         lookout.wake(&client, &woken);
         let prompt = got.recv().await.unwrap()["prompt"].clone();
         assert_eq!(
-            prompt,
+            sources::untimed(prompt.as_str().unwrap()),
             "[slack · ana]\ntwo\n[slack · ana]\nthree\n[slack · ana]\ndown"
         );
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -5216,7 +5222,10 @@ mod tests {
         // Once the group interval has passed it goes.
         lookout.sent_ms -= GROUP_INTERVAL.as_millis();
         lookout.wake(&client, &woken);
-        assert_eq!(got.recv().await.unwrap()["prompt"], "[slack · ana]\nfour");
+        assert_eq!(
+            sources::untimed(got.recv().await.unwrap()["prompt"].as_str().unwrap()),
+            "[slack · ana]\nfour"
+        );
     }
 
     #[tokio::test]
@@ -5248,10 +5257,7 @@ mod tests {
         // What is urgent does not, and the held one waits on.
         lookout.heard_from(&digested("down", true));
         wake(&mut lookout, &client).await;
-        let prompt = got.recv().await.unwrap()["prompt"]
-            .as_str()
-            .unwrap()
-            .to_owned();
+        let prompt = sources::untimed(got.recv().await.unwrap()["prompt"].as_str().unwrap());
         assert!(
             prompt.contains("down") && !prompt.contains("two"),
             "{prompt}"
@@ -5407,10 +5413,7 @@ mod tests {
         // The next note says it, once.
         let (client, mut got) = submits().await;
         wake(&mut lookout, &client).await;
-        let prompt = got.recv().await.unwrap()["prompt"]
-            .as_str()
-            .unwrap()
-            .to_owned();
+        let prompt = sources::untimed(got.recv().await.unwrap()["prompt"].as_str().unwrap());
         assert!(prompt.starts_with("[slack · ana]\none\n"), "{prompt}");
         assert!(
             prompt.ends_with(
@@ -5442,10 +5445,7 @@ mod tests {
         lookout.restore(path.clone());
         assert_eq!((lookout.resend.len(), lookout.unkept.count), (2, 0));
         wake(&mut lookout, &client).await;
-        let prompt = got.recv().await.unwrap()["prompt"]
-            .as_str()
-            .unwrap()
-            .to_owned();
+        let prompt = sources::untimed(got.recv().await.unwrap()["prompt"].as_str().unwrap());
         assert!(prompt.starts_with("[slack · ana]\nfive\n"), "{prompt}");
         assert!(
             prompt.contains("[lookout]\n1 more event from slack came"),
@@ -5486,7 +5486,10 @@ mod tests {
                 .starts_with("lookout-")
         );
         // Only the events, each under its header: no words around them.
-        assert_eq!(submit["prompt"], "[slack · ana]\nlunch?");
+        assert_eq!(
+            sources::untimed(submit["prompt"].as_str().unwrap()),
+            "[slack · ana]\nlunch?"
+        );
         assert!(lookout.heard.is_empty());
         // A note stays under its bytes however long the text; the rest
         // waits for the next, and the note says so.
@@ -5495,16 +5498,13 @@ mod tests {
             lookout.heard_from(&slack(&long, true));
         }
         wake(&mut lookout, &client).await;
-        let prompt = got.recv().await.unwrap()["prompt"]
-            .as_str()
-            .unwrap()
-            .to_owned();
+        let prompt = sources::untimed(got.recv().await.unwrap()["prompt"].as_str().unwrap());
         assert!(prompt.len() <= sources::NOTE_BYTES, "{}", prompt.len());
         let told = prompt.matches("[slack · ana]").count();
         assert!(told > 0 && lookout.heard.len() == 12 - told, "{told}");
         assert!(
-            prompt.ends_with(&format!(
-                "[lookout]\n{} more events wait for the next note",
+            prompt.contains(&format!(
+                "[lookout]\n{} more events wait for the next note, the first heard ",
                 12 - told
             )),
             "{prompt}"
