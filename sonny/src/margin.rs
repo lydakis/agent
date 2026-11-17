@@ -357,7 +357,14 @@ fn filled(template: &str, data: &crate::template::Data) -> Result<String, (&'sta
     }
     crate::template::refusal(template, data, crate::template::To::Window)
         .map_err(|why| (crate::template::REFUSED, why))?;
-    match crate::template::render(template, data).0 {
+    let (filled, reads) = crate::template::render(template, data);
+    match filled {
+        // The host does not know where the tasks stand: what it filled
+        // from none would tell the agent a count the window never shows,
+        // as a live block's answer says ([`crate::live::answer`]).
+        _ if reads.tasks => Ok("In the margin, filled as it changes; it reads the tasks, \
+            which only the window knows, so it does not fill here."
+            .to_owned()),
         Err(why) => Ok(format!("In the margin; it does not fill here yet ({why}).")),
         Ok(text) if rows(&text) > most_lines() => Err((
             "margin_note_too_long",
@@ -2180,11 +2187,17 @@ mod tests {
             filled("{{ 1 + 1 }} done", &data).unwrap(),
             "In the margin, filled as it changes. It shows now:\n2 done"
         );
-        // A task the host cannot see is filled in the window.
-        let later = filled("{{ task('calc.add').state }}", &data).unwrap();
-        assert!(
-            later.starts_with("In the margin; it does not fill here yet"),
-            "{later}"
+        // The tasks, which the host cannot see, are filled in the window:
+        // never a count of none.
+        let tasks = "In the margin, filled as it changes; it reads the tasks, \
+            which only the window knows, so it does not fill here.";
+        assert_eq!(
+            filled("{{ task('calc.add').state }}", &data).unwrap(),
+            tasks
+        );
+        assert_eq!(
+            filled("{{ tasks() | length }} tasks", &data).unwrap(),
+            tasks
         );
     }
 

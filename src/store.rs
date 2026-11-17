@@ -20,12 +20,12 @@ pub use db::{
     Absorbed, AfterTurn, Answered, ApprovalPolicy, ArtifactLines, Binding, Blocked, Bot, CacheTtl,
     CallAnswer, Capture, CatchUp, Charge, CompactionPlan, CompactionView, CopiedCall, Counts,
     DENIAL_WINDOW, Database, Decision, Delivery, DetachedRow, ENV_JSON, EVENT_PAGE_KINDS,
-    ElisionPlan, FOLDERS_JSON, Fork, Gate, Gated, Halt, Halted, Kept, Lapsed, Lifted, LiftedRun,
-    Limit, MAX_GATES, NEVER_ASKS, PROCESSES_PAGE, ParkedFallback, Plan, Planning, ProcessKind,
-    ProcessesPage, Publication, QuoteRef, RULES_JSON, Room, SANDBOX, SETTINGS, Served, Settings,
-    Spend, Started, Step, StepAsk, StepOpened, Stepped, Strip, TRAILER, TURN_VIEW_ACCOUNTING,
-    Trailer, TurnBudget, TurnOptions, Waiting, Wake, Window, Work, cache_hit, listed_command,
-    share, unserved,
+    ElisionPlan, FOLDERS_JSON, Fork, Gate, Gated, Halt, Halted, Identity, Kept, Lapsed, Lifted,
+    LiftedRun, Limit, MAX_GATES, NEVER_ASKS, PROCESSES_PAGE, ParkedFallback, Plan, Planning,
+    ProcessKind, ProcessesPage, Publication, QuoteRef, RULES_JSON, Room, SANDBOX, SETTINGS, Served,
+    Settings, Shared, Spend, Started, Step, StepAsk, StepOpened, Stepped, Strip, TRAILER,
+    TURN_VIEW_ACCOUNTING, Trailer, TurnBudget, TurnOptions, Waiting, Wake, Window, Work, cache_hit,
+    listed_command, share, unserved,
 };
 
 type ReadJob = Box<dyn FnOnce(&Database) + Send>;
@@ -89,6 +89,8 @@ const READER_CACHE_KIB: usize = 2048;
 /// free for it, up to `most`, and closes after `idle` without a read.
 struct Pool {
     path: std::path::PathBuf,
+    /// What the worker shares with every reader.
+    shared: std::sync::Arc<Shared>,
     most: usize,
     idle: std::time::Duration,
     state: std::sync::Mutex<Readers>,
@@ -131,7 +133,7 @@ impl Pool {
                 .spawn(move || {
                     match Connection::open(&pool.path)
                         .map_err(Error::from)
-                        .and_then(Database::reader)
+                        .and_then(|conn| Database::reader(conn, pool.shared.clone()))
                     {
                         Ok(db) => pool.serve(db, false),
                         // The read stays queued for the readers already open.
@@ -245,6 +247,7 @@ impl ReadQueue {
     fn unread() -> Self {
         Self(std::sync::Arc::new(Pool {
             path: std::path::PathBuf::new(),
+            shared: std::sync::Arc::default(),
             most: 1,
             idle: READER_IDLE,
             state: std::sync::Mutex::new(Readers {
@@ -556,6 +559,7 @@ impl Slot<'_> {
 pub struct Store {
     sender: mpsc::Sender<Box<dyn Job>>,
     reader: std::sync::Arc<ReadQueue>,
+    shared: std::sync::Arc<Shared>,
     path: std::sync::Arc<std::path::PathBuf>,
     counters: std::sync::Arc<Counters>,
 }
@@ -738,7 +742,7 @@ impl Store {
                                 return;
                             }
                         };
-                        let _ = ready.send(Ok(path));
+                        let _ = ready.send(Ok((path, db.shared())));
                         let mut group: Vec<Box<dyn Job>> = Vec::with_capacity(GROUP_JOBS);
                         let mut deferred = None;
                         while let Some(job) = deferred.take().or_else(|| receiver.blocking_recv()) {
@@ -844,7 +848,7 @@ impl Store {
                 format!("its owner did not let it go within {}s", wait.as_secs()),
             );
         }
-        let store_path = opened
+        let (store_path, shared) = opened
             .await
             .map_err(|_| Error::new("storage_worker_failed"))??;
         // Reader connections, each on its own thread, for reads that carry
@@ -859,6 +863,7 @@ impl Store {
         let most = readers.max(1);
         let pool = std::sync::Arc::new(Pool {
             path: store_path.clone(),
+            shared: shared.clone(),
             most,
             idle,
             state: std::sync::Mutex::new(Readers {
@@ -879,7 +884,7 @@ impl Store {
             .spawn(move || {
                 match Connection::open(&serving.path)
                     .map_err(Error::from)
-                    .and_then(Database::reader)
+                    .and_then(|conn| Database::reader(conn, serving.shared.clone()))
                 {
                     Ok(db) => {
                         let _ = ready.send(Ok(()));
@@ -898,6 +903,7 @@ impl Store {
             Self {
                 sender,
                 reader,
+                shared,
                 path: std::sync::Arc::new(store_path),
                 counters,
             },
@@ -1015,6 +1021,20 @@ impl Store {
             reader: self.reader.clone(),
             counters: self.counters.clone(),
         }
+    }
+    /// Bot `id`'s identity, as its own requests are held to it: kept in
+    /// memory once read, until a commit changes it or deletes the bot.
+    pub async fn identity(&self, id: i64) -> Result<std::sync::Arc<Identity>> {
+        let generation = match self.shared.identity(id) {
+            Ok(known) => return Ok(known),
+            Err(generation) => generation,
+        };
+        let identity = std::sync::Arc::new(
+            self.read("identity", move |db| Ok(Identity::from(db.inspect_id(id)?)))
+                .await?,
+        );
+        self.shared.know(generation, identity.clone());
+        Ok(identity)
     }
     /// A job without a named operation, counted as `other`.
     pub async fn call<T: Send + 'static>(
@@ -1960,6 +1980,7 @@ mod tests {
         let store = Store {
             sender,
             reader: Arc::new(ReadQueue::unread()),
+            shared: Arc::default(),
             path: Arc::new(std::path::PathBuf::new()),
             counters: Arc::default(),
         };
@@ -1985,6 +2006,7 @@ mod tests {
         let store = Store {
             sender,
             reader: Arc::new(ReadQueue::unread()),
+            shared: Arc::default(),
             path: Arc::new(std::path::PathBuf::new()),
             counters: Arc::default(),
         };
