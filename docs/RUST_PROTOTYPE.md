@@ -358,7 +358,18 @@ One map entry per op the daemon has seen, touched only by the loop, so no
 lock. `loop` reports the same holds for the loop's own work between
 requests: `reap` (a turn's task ended), `start_ready`, `resume`, `wake`,
 `admission` (a queued admission answered), `lapse`, `holds`, `expire` and
-`reload`. `runtime` reports the async runtime's `workers`, `busy_ms` (time
+`reload`. `programs` splits the requests by the program each session
+named in its first line, `{"op":"hello","program":NAME}` (1 to 32 of
+`a-z`, `0-9` and `_`; a client library sends it unanswered, under an id no
+request takes): each program's `count`, `held_ms`, `waited_ms`, and the
+live and durable events `delivered` to its sessions. A bot's own socket is
+`agent`, which its `hello` cannot change; a session that sent none is
+`unnamed`; the daemon keeps places for 13 names as first heard and counts
+any past those as `other`. `slow` lists the last 100 operations that took a
+second or more, newest first: a store job's or a commit's run (`kind`
+`store`) or the loop's hold on a request or a chore (`loop`, with the
+request's `program`), each with `at_ms` (when it ended), `op` and `ms`.
+`runtime` reports the async runtime's `workers`, `busy_ms` (time
 they ran rather than parked), `parks`, `alive_tasks` and `queued_tasks`,
 kept by tokio as it runs. `hub` counts the events published (`durable`,
 `live`), the copies `delivered` to followers' queues (replayed ones too),
@@ -1413,6 +1424,7 @@ own path from the turn. Example requests:
 {"id":32,"op":"follow","bot":"*","since_ms":1793000000000,"kinds":["accepted","message"]}
 {"id":17,"op":"wait","handles":["Bob/1","Alice/3"],"any":true,"timeout_ms":60000}
 {"id":18,"op":"stats"}
+{"id":33,"op":"hello","program":"window"}
 {"id":19,"op":"provider_models"}
 {"id":21,"op":"create","bot":"Carol","workspace":"/workspaces/project","model":"openai/gpt-6-luna","instructions":"...","tools":["shell","read","write","edit","wait","history"],"approve":["shell","write","edit","read"],"approver":"manual","settings":{"context_bytes":1048576,"keep_turns":16}}
 {"id":22,"op":"approvals","bot":"Carol","limit":64}
