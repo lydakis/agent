@@ -338,7 +338,7 @@ at its model's own effort (`AGENT_EFFORT` when its model is
 | Whether agents have the commons | `[sonny] commons` (true, the default, or false) | |
 | When a note opens the margin | `[sonny] margin_opens` (`always`, the default, `unless-closed` or `never`) | |
 | The most notes a margin holds | `[sonny] margin_notes` (6 by default, at least 1; past it the agent's new note is refused, and it is told which notes are there) | |
-| The most rows a margin note draws | `[sonny] margin_note_lines` (6 by default, at least 1; the key keeps its name and counts rows drawn at the margin's own width, 38 columns, pictures as the rows they draw, so the count is the same in every window; a longer note or live fill is refused, and the agent told that a note is state and anything longer goes in its reply or a file the reply names; a file or a task's note folds at it) | |
+| The most rows a margin note draws | `[sonny] margin_note_lines` (40 by default, at least 1; the key keeps its name and counts rows drawn at the margin's own width, 38 columns, pictures as the rows they draw, so the count is the same in every window; a longer note or live fill is refused, and the agent told that a note is state and anything longer goes in its reply or a file the reply names; a file or a task's note folds at it) | |
 | Margin notes of your own, filled as their blanks change | `[sonny.notes.NAME] markdown`, `live`, `title` | |
 | Where a click on an agent's name goes | `[sonny] agent_opens` (`tab`, the default, or `beside`) | |
 | Which tasks open in a tab | `[sonny] task_tabs` (`asked`, the default, or `every`) | |
