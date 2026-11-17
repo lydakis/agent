@@ -300,7 +300,7 @@ pub const SETTINGS: &[Setting] = &[
         label: "the most rows a margin note draws",
         about: "the most rows a margin note draws, counted at the margin's own width, so the same in every window; a longer note is refused, and a file or a task's note folds at it",
         values: &[],
-        default: "6",
+        default: "40",
     },
     Setting {
         key: "sonny.agent_opens",
