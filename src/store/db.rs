@@ -10149,7 +10149,7 @@ impl Database {
         let call: Option<(String, bool, Option<String>, i64, bool, bool)> = self
             .conn
             .prepare_cached(
-                "SELECT a.name,a.output IS NOT NULL,t.status,a.expires_ms,a.paused_ms IS NOT NULL,
+                "SELECT a.name,a.output IS NOT NULL,t.status,a.expires_ms,a.paused_ms IS NOT NULL OR a.yielded,
                     a.process IS NOT NULL
                  FROM answers a LEFT JOIN tools t ON t.turn=a.turn AND t.call_id=a.call_id
                  WHERE a.turn=? AND a.call_id=?",
@@ -10165,7 +10165,7 @@ impl Database {
                 ))
             })
             .optional()?;
-        let Some((parent, answered, status, expires_ms, paused, lifted)) = call else {
+        let Some((parent, answered, status, expires_ms, untimed, lifted)) = call else {
             return fail("no_pending_call");
         };
         // A running turn's answer is held, or taken by the turn, and not
@@ -10180,7 +10180,9 @@ impl Database {
         if status.as_deref() != Some("executing") && !lifted {
             return fail_with("no_pending_call", "the call ended unanswered");
         }
-        if !paused && now_ms >= expires_ms.max(0) as u64 {
+        // A step waiting on a gate stops the call's time; a yielded call
+        // has none.
+        if !untimed && now_ms >= expires_ms.max(0) as u64 {
             return fail_with("no_pending_call", "the call ran out of time");
         }
         if !bot.declared(&parent).is_some_and(|tool| tool.steps) {
@@ -10517,7 +10519,7 @@ impl Database {
         let call: Option<(String, bool, Option<String>, i64, bool, bool)> = self
             .conn
             .prepare_cached(
-                "SELECT a.name,a.output IS NOT NULL,t.status,a.expires_ms,a.paused_ms IS NOT NULL,
+                "SELECT a.name,a.output IS NOT NULL,t.status,a.expires_ms,a.paused_ms IS NOT NULL OR a.yielded,
                     a.process IS NOT NULL
                  FROM answers a LEFT JOIN tools t ON t.turn=a.turn AND t.call_id=a.call_id
                  WHERE a.turn=? AND a.call_id=?",
@@ -10533,7 +10535,7 @@ impl Database {
                 ))
             })
             .optional()?;
-        let Some((parent, answered, status, expires_ms, paused, lifted)) = call else {
+        let Some((parent, answered, status, expires_ms, untimed, lifted)) = call else {
             return fail("no_pending_call");
         };
         // A running turn's answer is held, or taken by the turn, and not
@@ -10548,7 +10550,9 @@ impl Database {
         if status.as_deref() != Some("executing") && !lifted {
             return fail_with("no_pending_call", "the call ended unanswered");
         }
-        if !paused && now_ms >= expires_ms.max(0) as u64 {
+        // A step waiting on a gate stops the call's time; a yielded call
+        // has none.
+        if !untimed && now_ms >= expires_ms.max(0) as u64 {
             return fail_with("no_pending_call", "the call ran out of time");
         }
         let capture = match captured {

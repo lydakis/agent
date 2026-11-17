@@ -165,10 +165,15 @@ class YieldedCalls(Calls):
         self.assertFalse(read.get('failed'), read)
         self.assertIn('30000', read['output'])
 
-    def test_wait_returns_a_yielded_call_s_answer_whole_with_no_deadline_on_it(self):
+    def test_a_yielded_call_steps_and_is_answered_past_its_tool_s_time(self):
         client, turn = self.script(tool=dict(YIELDING, expire_ms=1000))
         handle = self.yielded(client, turn)
         time.sleep(1.5)
+        # Past the tool's own second its steps still run.
+        stepped = client.request('run_step', bot='Lead', turn=turn, call_id='script-0', step='1', name='shell',
+                                 arguments={'command': 'echo late'})
+        self.assertIn('result', stepped, stepped)
+        self.assertEqual(json.loads(stepped['result']['output'])['stdout'], 'late\n')
         answered = client.request('tool_result', bot='Lead', turn=turn, call_id='script-0',
                                   output=[{'type': 'text', 'text': 'all 9 built'}, dict(image(), type='image')])
         self.assertIn('result', answered, answered)
