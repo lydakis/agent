@@ -5462,7 +5462,13 @@ impl Turn {
                 .chain(calls.as_slice().iter().cloned())
                 .collect();
             let route = route.map(str::to_owned);
-            let served = self.hub.served();
+            // Only this call's own gates: a park never copies the tags
+            // other bots' reviewers serve.
+            let served = self.hub.serving(
+                (record.gates.iter())
+                    .filter(|gate| gate.tools.contains(&call.name))
+                    .map(|gate| gate.tag.as_str()),
+            );
             let parked = self
                 .store
                 .op("suspend_approval", move |db| {

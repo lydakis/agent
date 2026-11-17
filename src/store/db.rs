@@ -1755,9 +1755,9 @@ pub struct Waiting {
     /// first `ask` of a gate still open.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub since_ms: Option<i64>,
-    /// The gate tags sessions served as the turn parked: who holds the
-    /// call is read from them again when a verdict or an ask changes the
-    /// gates still open.
+    /// Which of the call's own gate tags sessions served as the turn
+    /// parked: who holds the call is read from them again when a verdict
+    /// or an ask changes the gates still open.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub served: Vec<String>,
     /// Parked on the answer to `call_id`, which has started, from the
@@ -9330,7 +9330,10 @@ impl Database {
             approval: true,
             holder: Some(holder.to_owned()),
             since_ms: Some(since_ms),
-            served: served.to_vec(),
+            served: (served.iter())
+                .filter(|tag| request.gates.iter().any(|g| &g.tag == *tag))
+                .cloned()
+                .collect(),
             answer: None,
             copied: None,
             summary_retry_ms,
