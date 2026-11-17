@@ -912,6 +912,14 @@ impl Layout {
         (self.aside.clone(), self.kept.clone())
     }
 
+    /// The block labelled `bot` in this home now, as the multiplexer lists
+    /// it: another once something placed `bot` again.
+    pub fn block_of(&mut self, bot: &str) -> Option<String> {
+        (self.listed().into_iter())
+            .find(|block| block.label == bot)
+            .map(|block| block.id)
+    }
+
     /// Whether the task's window was closed for room.
     pub fn aside(&self, bot: &str) -> bool {
         self.aside.contains(bot) || self.kept.as_ref().is_some_and(|kept| (kept.was)(bot))
