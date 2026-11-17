@@ -206,6 +206,14 @@ class AgentToolsTests(ModelFixture):
         self.assertIn('from differs from the request that sent message', again)
         look = client.request('inspect', bot='shop.look')['result']
         self.assertIn('First rule.', look['instructions'])
+        # One that sets differently what it set itself is another request.
+        self.run_calls(client, 'shop.lead', 'other',
+                       ('spawn_agent', {'name': 'look', 'message': 'q', 'agents': True,
+                                        'request_id': 'once', 'budget_tokens': 9000}))
+        events = client.request('events', bot='shop.lead', after=0, limit=256)['result']['events']
+        node = [e for e in events if e['event'] == 'tool_completed'][-1]['data']['node']
+        other = node_item(client, 'shop.lead', node)['result']['output']
+        self.assertIn('budget_tokens differs from the request that made shop.look', other)
 
     def test_a_new_agent_takes_the_running_turns_own_effort(self):
         client = self.client(TOOLS)

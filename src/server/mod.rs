@@ -3166,12 +3166,10 @@ fn own_requests(
                     if line["id"] != 1 {
                         continue;
                     }
-                    let Some(code) = line["error"].as_str() else {
-                        return Ok(line["result"].take());
+                    return match Error::reported(&line) {
+                        Some(error) => Err(error),
+                        None => Ok(line["result"].take()),
                     };
-                    let mut error = Error::new(code);
-                    error.detail = line["detail"].as_str().map(str::to_owned);
-                    return Err(error);
                 }
                 Err(gone())
             }

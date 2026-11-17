@@ -6018,6 +6018,19 @@ impl Turn {
                         me["model"] = json!(model);
                     }
                     me["effort"] = json!(context.effort);
+                    // What the call set itself, which a resend must match;
+                    // the rest the daemon derives, from files that may change.
+                    let mut asked: Vec<String> = made.keys().cloned().collect();
+                    for (field, given) in [
+                        ("instructions", instructions.is_some()),
+                        ("model", model.is_some()),
+                        ("effort", effort.is_some()),
+                        ("settings", settings.is_some()),
+                    ] {
+                        if given {
+                            asked.push(field.to_owned());
+                        }
+                    }
                     // The folder asked for, else this turn's.
                     let folder = (made.get("workspace"))
                         .and_then(Value::as_str)
@@ -6061,10 +6074,18 @@ impl Turn {
                     create["op"] = json!("create");
                     create["request_id"] = json!(request_id);
                     // This call made again, after its folder's files or this
-                    // turn changed what it composes: the agent it made the
-                    // first time stands, and its first message is sent once.
+                    // turn changed only what the daemon derives: the agent it
+                    // made the first time stands, and its first message is
+                    // sent once. A field the call set itself that differs is
+                    // another request, refused as one.
                     match request(create).await {
-                        Err(error) if error.code == "idempotency_conflict" => {}
+                        Err(error)
+                            if error.code == "idempotency_conflict"
+                                && (error.facts.as_ref())
+                                    .and_then(|facts| facts["field"].as_str())
+                                    .is_some_and(|field| {
+                                        field != "workspace" && !asked.iter().any(|a| a == field)
+                                    }) => {}
                         made => {
                             made?;
                         }
