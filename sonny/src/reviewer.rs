@@ -5,9 +5,11 @@
 //! `agent_client::judge`; this is the loop. Sonny keeps it as the daemon's
 //! companion, the daemon's approver for the tag; the daemon holds only the
 //! gates it serves.
-//! As in Codex, a denial goes back to the model at once. A round the
-//! reviewer never assessed is handed to a person, as a doubt is; where the
-//! gate lapses nobody can be asked, and both are denied.
+//! As in Codex, a denial goes back to the model at once, and so does a
+//! round the reviewer never assessed (it failed or ran out of time),
+//! labeled as a review failure. Only a call too long to show the reviewer
+//! is handed to a person; where the gate lapses nobody can be asked, and
+//! it is denied too.
 use agent_client::Error;
 use agent_client::{
     Client,
@@ -635,20 +637,23 @@ fn logged_reply(redactor: &Redactor, reply: &str) -> String {
 
 /// The daemon's answer to a call given `verdict`: its decision, its
 /// reason, and whether it is a denial nobody assessed, which never counts
-/// toward the breaker, as in Codex. A round the review never assessed is
-/// no verdict: it goes to the person, as a doubt does, the call waiting as
-/// it is. Where the gate `lapses` nobody can be asked: a doubt is denied,
-/// and an unassessed call is denied with what the agent is told of it. A
-/// call a rule forbids is denied, unassessed, wherever it is.
+/// toward the breaker, as in Codex. A round the review never assessed
+/// (failed, or out of time) is denied back to the agent with what failed,
+/// as Codex fails closed: it is no verdict that the call is unsafe, and no
+/// person is left holding it. Only a doubt, a call too long to show the
+/// reviewer, goes to the person, as Codex asks the person when a review's
+/// input is over its budget; where the gate `lapses` nobody can be asked,
+/// and it is denied. A call a rule forbids is denied, unassessed, wherever
+/// it is.
 fn decide(verdict: &Verdict, lapses: bool) -> (&'static str, Option<String>, bool) {
     match verdict {
         Verdict::Allow => ("allow", None, false),
         Verdict::Deny(reason) => ("deny", Some(reason.clone()), false),
         Verdict::Doubt(reason) if lapses => ("deny", Some(reason.clone()), false),
         Verdict::Doubt(reason) => ("ask", Some(reason.clone()), false),
-        Verdict::Unreviewed(reason) if lapses => ("deny", Some(reason.clone()), true),
-        Verdict::Unreviewed(reason) => ("ask", Some(policy::handed_over(reason)), false),
-        Verdict::Forbidden(reason) => ("deny", Some(reason.clone()), true),
+        Verdict::Unreviewed(reason) | Verdict::Forbidden(reason) => {
+            ("deny", Some(reason.clone()), true)
+        }
     }
 }
 
@@ -2152,32 +2157,34 @@ mod tests {
     }
 
     #[test]
-    fn a_review_that_failed_hands_the_call_to_the_person_as_it_is() {
-        let failed = policy::not_reviewed("the reviewer's answer did not parse");
-        let (decision, reason, unreviewed) = decide(&failed, false);
-        assert_eq!(decision, "ask");
-        assert!(!unreviewed);
-        assert_eq!(
-            reason.as_deref(),
-            Some(
-                "Automatic approval review failed: the reviewer's answer did not parse, \
-                 so this waits for you."
-            )
-        );
-        assert_eq!(decide(&policy::timed_out(), false).0, "ask");
-        // Where nobody can be asked, the agent is told the review failed,
-        // and the breaker doesn't count it.
-        let Verdict::Unreviewed(told) = &failed else {
-            unreachable!()
-        };
-        assert_eq!(decide(&failed, true), ("deny", Some(told.clone()), true));
+    fn a_review_that_failed_is_denied_back_to_the_agent_as_codex_does() {
+        // Failed or out of time, wherever the gate is: the agent is told
+        // the review failed, and the breaker doesn't count it.
+        for failed in [
+            policy::not_reviewed("the reviewer's answer did not parse"),
+            policy::timed_out(),
+        ] {
+            let Verdict::Unreviewed(told) = &failed else {
+                unreachable!()
+            };
+            for lapses in [false, true] {
+                assert_eq!(decide(&failed, lapses), ("deny", Some(told.clone()), true));
+            }
+        }
         // A verdict stays one.
         let denied = Verdict::Deny("no".into());
         assert_eq!(decide(&denied, false), ("deny", Some("no".into()), false));
         assert_eq!(decide(&Verdict::Allow, false), ("allow", None, false));
+        // Only a call too long to show goes to the person, where one can
+        // be asked.
         let doubt = Verdict::Doubt("long".into());
-        assert_eq!(decide(&doubt, false).0, "ask");
+        assert_eq!(decide(&doubt, false), ("ask", Some("long".into()), false));
         assert_eq!(decide(&doubt, true), ("deny", Some("long".into()), false));
+        let forbidden = Verdict::Forbidden("rule".into());
+        assert_eq!(
+            decide(&forbidden, false),
+            ("deny", Some("rule".into()), true)
+        );
     }
 
     #[test]

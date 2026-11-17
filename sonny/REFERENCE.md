@@ -329,7 +329,7 @@ at its model's own effort (`AGENT_EFFORT` when its model is
 | Each new task's effort | `[sonny] task_effort` | `task_effort` |
 | Each new task's speed (`standard`, `fast` or `ultrafast`) | `[sonny] task_speed` | `task_speed` |
 | The reviewer's model, for agents in Auto ([REVIEWER.md](REVIEWER.md)) | `[reviewer] model`, `effort` | |
-| How long a call in Auto waits for the reviewer's verdict before it goes to you | `[reviewer] timeout_ms` (90000 by default, as Codex's; 0 for as long as it takes) | |
+| How long a call in Auto waits for the reviewer's verdict before it is denied as not reviewed | `[reviewer] timeout_ms` (90000 by default, as Codex's; 0 for as long as it takes) | |
 | What `/side`'s copy may do | `[sonny] side_chat` (`work`, the default, or `answer`) | |
 | The chime, and what the conversation shows | `[sonny] chime` (true or false), `view` (`words`, the default, `steps` or `verbose`) | |
 | The widest the conversation is written | `[sonny] text_width` (100 by default, at least 40, 0 for the window's whole width) | |
