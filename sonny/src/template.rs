@@ -404,7 +404,42 @@ fn environment() -> Environment<'static> {
     // Python's methods on what a blank gives, such as a file's
     // `.splitlines()` or a string's `.startswith()`: what a model writes.
     env.set_unknown_method_callback(minijinja_contrib::pycompat::unknown_method_callback);
+    env.add_filter("truncate", truncate);
     env
+}
+
+/// Jinja's own `truncate`, as Jinja2 takes it: `truncate(length=255,
+/// killwords=False, end='...', leeway=5)`, each by place or by name.
+/// minijinja-contrib's does the work, which takes them by name alone.
+fn truncate(
+    state: &mut minijinja::State,
+    value: &Value,
+    args: minijinja::value::Rest<minijinja::value::ValueOrKwargs>,
+) -> Result<Value, Error> {
+    const NAMES: [&str; 4] = ["length", "killwords", "end", "leeway"];
+    let args = args.into_values();
+    let (given, named) =
+        minijinja::value::from_args::<(&[Value], minijinja::value::Kwargs)>(&args)?;
+    if given.len() > NAMES.len() {
+        return Err(Error::new(
+            ErrorKind::TooManyArguments,
+            format!("truncate takes at most {} arguments", NAMES.len()),
+        ));
+    }
+    let mut all = Vec::with_capacity(NAMES.len());
+    for (name, value) in NAMES.iter().zip(given) {
+        if named.has(name) {
+            return Err(Error::new(
+                ErrorKind::TooManyArguments,
+                format!("truncate got {name} twice"),
+            ));
+        }
+        all.push((name.to_string(), value.clone()));
+    }
+    for name in named.args() {
+        all.push((name.to_owned(), named.peek::<Value>(name)?));
+    }
+    minijinja_contrib::filters::truncate(state, value, all.into_iter().collect())
 }
 
 /// The blanks a template may use, each noting what it read in `reads`.
@@ -724,6 +759,70 @@ mod tests {
             ]),
             now: 1_000_000,
         }
+    }
+
+    #[test]
+    fn a_namespace_keeps_what_a_loop_sets_on_it() {
+        let data = data(Path::new("/"));
+        let counted = "{% set ns = namespace(n=0, names=[]) %}\
+            {% for t in tasks() %}{% set ns.n = ns.n + 1 %}\
+            {% set ns.names = ns.names + [t.name] %}{% endfor %}\
+            {{ ns.n }} {{ ns.names | join(',') }}";
+        assert_eq!(render(counted, &data).0, Ok("2 calc.add,calc.sub".into()));
+        let named = "{% set ns = namespace() %}{% for t in tasks() %}\
+            {% set ns.last = t.name %}{% endfor %}{{ ns.last }}";
+        assert_eq!(render(named, &data).0, Ok("calc.sub".into()));
+        // Set on the loop's own scope, a plain name is gone after it, as
+        // in Jinja: what a namespace is for.
+        let plain = "{% set n = 0 %}{% for t in tasks() %}{% set n = n + 1 %}{% endfor %}{{ n }}";
+        assert_eq!(render(plain, &data).0, Ok("0".into()));
+    }
+
+    #[test]
+    fn truncate_takes_jinja_s_own_arguments_by_place_or_by_name() {
+        let data = data(Path::new("/"));
+        let said = |template: &str| render(template, &data).0;
+        let long = "{% set s = 'The quick brown fox jumps over the lazy dog' %}";
+        // Jinja's defaults: 255 long, whole words, `...`, a leeway of 5.
+        assert_eq!(
+            said(&format!("{long}{{{{ s | truncate }}}}")),
+            Ok("The quick brown fox jumps over the lazy dog".into())
+        );
+        assert_eq!(
+            said(&format!("{long}{{{{ s | truncate(40) }}}}")),
+            Ok("The quick brown fox jumps over the lazy dog".into()),
+            "within the leeway of the length, left whole"
+        );
+        assert_eq!(
+            said(&format!("{long}{{{{ s | truncate(15) }}}}")),
+            Ok("The quick...".into())
+        );
+        assert_eq!(
+            said(&format!("{long}{{{{ s | truncate(15, True) }}}}")),
+            Ok("The quick br...".into())
+        );
+        assert_eq!(
+            said(&format!("{long}{{{{ s | truncate(15, True, '…', 0) }}}}")),
+            Ok("The quick brow…".into())
+        );
+        assert_eq!(
+            said(&format!(
+                "{long}{{{{ s | truncate(length=15, killwords=True, end='~', leeway=0) }}}}"
+            )),
+            Ok("The quick brow~".into())
+        );
+        assert_eq!(
+            said(&format!("{long}{{{{ s | truncate(15, end='') }}}}")),
+            Ok("The quick".into())
+        );
+        // Given twice, or a name Jinja's takes none of, is an error.
+        let twice = said(&format!("{long}{{{{ s | truncate(15, length=9) }}}}"));
+        assert!(
+            twice.as_ref().is_err_and(|e| e.contains("length")),
+            "{twice:?}"
+        );
+        let unknown = said(&format!("{long}{{{{ s | truncate(15, width=9) }}}}"));
+        assert!(unknown.is_err(), "{unknown:?}");
     }
 
     #[test]

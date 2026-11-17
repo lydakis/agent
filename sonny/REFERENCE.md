@@ -2187,7 +2187,7 @@ whatever link or path leads there), `modified('state.json')` (when it
 last changed, none while it is not there, refused as `file()` is), `tasks()` and `task('NAME')`
 (where its tasks stand, as `/status` reads them), `now()`, and `| ago`
 and `| time` for a time in seconds; Jinja's own filters, such as
-`selectattr`, `sort` and `tojson`, work as well, and so do Python's
+`selectattr`, `sort`, `truncate` and `tojson`, work as well, and so do Python's
 methods on strings, lists and maps, such as `file('x.py').splitlines()`
 to pick out the lines that matter. A blank never runs a command or reaches the network, so an agent
 that wants something no source covers writes it to a file from its own
