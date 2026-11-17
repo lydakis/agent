@@ -2569,7 +2569,9 @@ mod tests {
 
     #[test]
     fn an_event_s_time_is_the_time_of_day_after_the_day_when_not_today() {
-        let now = crate::lookout::epoch_ms();
+        // Noon on 17 June 2026 in UTC: midyear, so a week back is the same
+        // year and 400 days back the year before, in every zone.
+        let now: u128 = 1_781_697_600_000;
         let today = heard_at(now, now);
         assert!(is_heard_at(&today) && today.len() == 5, "{today}");
         let days = |n: u128| now - n * 24 * 3600 * 1000;
