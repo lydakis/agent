@@ -4378,6 +4378,9 @@ struct App {
     needs_pulse: std::cell::Cell<look::Pulse>,
     /// The reply text the current model call has streamed.
     said: String,
+    /// Words streamed that show nothing yet, held until visible words
+    /// follow them, which they lead.
+    unseen: String,
     /// Prompts sent and not in the conversation yet, by their turn: a
     /// steer until the running turn takes it in, a prompt until its turn
     /// starts. Drawn above the status row until they land.
@@ -6331,6 +6334,7 @@ impl App {
             sounds: sound::Sounds::new(false),
             needs_pulse: std::cell::Cell::default(),
             said: String::new(),
+            unseen: String::new(),
             staged: Vec::new(),
             staged_drawn: std::cell::RefCell::default(),
             queued: Vec::new(),
@@ -7682,6 +7686,7 @@ impl App {
         self.live_item = None;
         self.ahead.clear();
         self.said.clear();
+        self.unseen.clear();
         self.replay = None;
         // The phase says it, until it is back; a notice of before
         // happened before it.
@@ -11167,6 +11172,7 @@ impl App {
         }
         self.ahead.push_back(item);
         self.said.clear();
+        self.unseen.clear();
         self.replay = None;
         self.streamed = false;
     }
@@ -11404,6 +11410,7 @@ impl App {
                 self.live_item = None;
                 self.ahead.clear();
                 self.said.clear();
+                self.unseen.clear();
                 self.thought.clear();
                 self.replay = None;
                 self.running = Some(Running {
@@ -11546,8 +11553,11 @@ impl App {
                 if !self.live.as_ref().is_some_and(|live| !live.closed)
                     && agent_client::blank(delta)
                 {
+                    self.unseen.push_str(delta);
                     return;
                 }
+                // Those held lead the words that show, as indentation does.
+                let held = std::mem::take(&mut self.unseen);
                 self.streamed = true;
                 if let Some(running) = &mut self.running {
                     running.phase = "Working".into();
@@ -11565,7 +11575,10 @@ impl App {
                 // Only the new words are searched for a line's end, and an
                 // ended line leaves whole: a long line streamed in small
                 // pieces costs its length once.
-                for piece in delta.split_inclusive('\n') {
+                for piece in held
+                    .split_inclusive('\n')
+                    .chain(delta.split_inclusive('\n'))
+                {
                     live.partial.push_str(piece);
                     if piece.ends_with('\n') {
                         let line = std::mem::take(&mut live.partial);
@@ -11620,6 +11633,7 @@ impl App {
                     return;
                 }
                 let said = std::mem::take(&mut self.said);
+                self.unseen.clear();
                 self.replay = None;
                 if self.streamed {
                     self.streamed = false;
@@ -11710,6 +11724,7 @@ impl App {
                 self.ahead.clear();
                 self.streamed = false;
                 self.said.clear();
+                self.unseen.clear();
                 self.replay = None;
                 self.notice = Some(match data["in"].as_str() {
                     Some(what) => format!(
@@ -11732,10 +11747,12 @@ impl App {
                     self.ahead.clear();
                     self.streamed = false;
                     self.said.clear();
+                    self.unseen.clear();
                     self.notice = Some("the model retried; its reply may repeat".into());
                 }
                 if !self.said.is_empty() {
                     self.replay = Some((std::mem::take(&mut self.said), 0));
+                    self.unseen.clear();
                 }
                 if let Some(running) = &mut self.running {
                     running.phase = "Retrying".into();
@@ -11775,6 +11792,7 @@ impl App {
             }
             "tool_started" => {
                 self.said.clear();
+                self.unseen.clear();
                 self.thought.clear();
                 self.end_live(Words::Step);
                 let name = data["name"].as_str().unwrap_or("tool").to_owned();
@@ -23224,6 +23242,22 @@ mod tests {
             "text": "Done."}))
             .await;
         assert!(app.live.is_some() && app.streamed);
+        // Blank words held before visible ones still lead them: indented,
+        // a line is code, live as replayed.
+        app.daemon(turn_event("accepted", 3, json!({"node": 7})))
+            .await;
+        for text in ["    ", "example()\n"] {
+            app.daemon(json!({"event": "text_delta", "bot": "b", "turn": 3, "text": text}))
+                .await;
+        }
+        let live: Vec<String> = (app.live.as_ref().unwrap().rows.iter())
+            .map(|row| row.to_string())
+            .collect();
+        let replayed: Vec<String> = transcript::reply("    example()\n", 100, Path::new(""))
+            .iter()
+            .map(|row| row.to_string())
+            .collect();
+        assert_eq!(live, replayed);
     }
 
     #[tokio::test]

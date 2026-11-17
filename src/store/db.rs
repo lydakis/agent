@@ -8855,17 +8855,33 @@ impl Database {
     pub fn repair_blank(&mut self, nodes: &[i64]) -> Result<Vec<Value>> {
         let mut repaired = Vec::new();
         for &node in nodes {
-            let item: Option<Vec<u8>> = self
+            let read: Option<(Vec<u8>, i64)> = self
                 .conn
-                .prepare_cached("SELECT item FROM nodes WHERE id=?")?
-                .query_row([node], |r| r.get(0))
+                .prepare_cached("SELECT item,thinking FROM nodes WHERE id=?")?
+                .query_row([node], |r| Ok((r.get(0)?, r.get(1)?)))
                 .optional()?;
-            let Some((fixed, removed)) = item.as_deref().and_then(unblanked) else {
+            let Some((item, was)) = read else {
                 continue;
             };
-            self.conn
-                .prepare_cached("UPDATE nodes SET item=? WHERE id=?")?
-                .execute(params![fixed, node])?;
+            let Some((fixed, removed)) = unblanked(&item) else {
+                continue;
+            };
+            // What a request without thinking sends of it changes with it:
+            // its thinking bytes, and every later node's running total.
+            let thinking = super::thinking_bytes(&fixed) as i64;
+            let tx = self.conn.transaction()?;
+            tx.prepare_cached("UPDATE nodes SET item=?,thinking=? WHERE id=?")?
+                .execute(params![fixed, thinking, node])?;
+            if thinking != was {
+                tx.prepare_cached(
+                    "WITH RECURSIVE below(id) AS (
+                        SELECT ?1 UNION ALL SELECT n.id FROM nodes n JOIN below b ON n.parent=b.id)
+                     UPDATE nodes SET total_thinking=total_thinking+?2
+                     WHERE id IN (SELECT id FROM below)",
+                )?
+                .execute(params![node, thinking - was])?;
+            }
+            tx.commit()?;
             repaired.push(json!({"node": node, "removed": removed}));
         }
         Ok(repaired)
@@ -20555,7 +20571,7 @@ mod tests {
     #[test]
     fn a_repair_takes_blank_text_out_and_keeps_every_size() {
         let mut db = Database::initialize(Connection::open_in_memory().unwrap()).unwrap();
-        let items: [&[u8]; 4] = [
+        let items: [&[u8]; 6] = [
             // A reply of one zero-width space: content left with nothing.
             br#"{"content":[{"text":"\u200b","type":"text"}],"role":"assistant"}"#,
             // Blank text beside a call: the call stays.
@@ -20564,26 +20580,63 @@ mod tests {
             br#"{"content":[{"content":[{"text":" ","type":"text"}],"tool_use_id":"t1","type":"tool_result"}],"role":"user"}"#,
             // Words: nothing to take.
             br#"{"content":[{"text":"done","type":"text"}],"role":"assistant"}"#,
+            // Blank text beside thinking: thinking is all it keeps.
+            br#"{"content":[{"signature":"s","thinking":"","type":"thinking"},{"text":"\u200b","type":"text"}],"role":"assistant"}"#,
+            // After it, words.
+            br#"{"content":[{"text":"next","type":"text"}],"role":"user"}"#,
         ];
-        let mut total = 0;
+        let (mut total, mut thought) = (0, 0);
         for (id, item) in (1..).zip(items) {
             total += item.len() as i64;
+            let thinking = super::super::thinking_bytes(item) as i64;
+            thought += thinking;
             db.connection()
                 .execute(
-                    "INSERT INTO nodes(id,parent,item,total_bytes,depth) VALUES(?,?,?,?,?)",
-                    params![id, (id > 1).then_some(id - 1), item, total, id],
+                    "INSERT INTO nodes(id,parent,item,total_bytes,depth,thinking,total_thinking)
+                     VALUES(?,?,?,?,?,?,?)",
+                    params![
+                        id,
+                        (id > 1).then_some(id - 1),
+                        item,
+                        total,
+                        id,
+                        thinking,
+                        thought
+                    ],
                 )
                 .unwrap();
         }
-        let repaired = db.repair_blank(&[1, 2, 3, 4]).unwrap();
+        let all = [1, 2, 3, 4, 5, 6];
+        let repaired = db.repair_blank(&all).unwrap();
         assert_eq!(
             repaired,
             [
                 json!({"node":1,"removed":["\u{200b}"]}),
                 json!({"node":2,"removed":["\n\n"]}),
                 json!({"node":3,"removed":[" "]}),
+                json!({"node":5,"removed":["\u{200b}"]}),
             ]
         );
+        // Each node's thinking bytes are what it loses without thinking now,
+        // and the running totals add them up.
+        let mut thought = 0;
+        for id in all {
+            let (item, thinking, total): (Vec<u8>, i64, i64) = db
+                .conn
+                .query_row(
+                    "SELECT item,thinking,total_thinking FROM nodes WHERE id=?",
+                    [id],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                )
+                .unwrap();
+            assert_eq!(
+                thinking,
+                super::super::thinking_bytes(&item) as i64,
+                "node {id}"
+            );
+            thought += thinking;
+            assert_eq!(total, thought, "node {id}");
+        }
         let item = |id: i64| -> Vec<u8> {
             db.conn
                 .query_row("SELECT item FROM nodes WHERE id=?", [id], |r| r.get(0))
@@ -20599,11 +20652,12 @@ mod tests {
                 1 => assert_eq!(value["content"], "<empty>"),
                 2 => assert_eq!(value["content"][0]["type"], "tool_use"),
                 3 => assert_eq!(value["content"][0]["content"], "<empty>"),
+                5 => assert_eq!(value["content"][0]["type"], "thinking"),
                 _ => assert_eq!(now, was),
             }
         }
         // Repaired once, nothing is left to take.
-        assert!(db.repair_blank(&[1, 2, 3, 4]).unwrap().is_empty());
+        assert!(db.repair_blank(&all).unwrap().is_empty());
     }
 
     #[test]

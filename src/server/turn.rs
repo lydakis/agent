@@ -3604,6 +3604,12 @@ impl Turn {
                         accounting,
                     )
                     .await?;
+                    // Stubs alone would pass the estimate that admitted the
+                    // refused request, so the retry gets a summary as well,
+                    // with stubs when the bot elides.
+                    if elides {
+                        self.elide(0, true, 0).await?;
+                    }
                     match self
                         .overflow(
                             &mut record,
@@ -3611,7 +3617,7 @@ impl Turn {
                             turn,
                             accounting,
                             &tools,
-                            elides,
+                            false,
                             (&mut last, model),
                         )
                         .await?
