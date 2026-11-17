@@ -1676,6 +1676,11 @@ fn name_projects(dir: &Path, records: &HashMap<String, Value>) -> bool {
         Err(e) => return e.kind() == std::io::ErrorKind::NotFound,
     };
     let Ok(_lock) = lock(dir) else { return false };
+    // The projects a lead is there for, first or named: a gone author's
+    // name is matched against them.
+    let led: std::collections::HashSet<&str> = (records.keys())
+        .filter_map(|name| crate::project::lead_project(name))
+        .collect();
     // Each author's once, by name and id: a thread's authors are few.
     let mut known: HashMap<(String, Option<i64>), String> = HashMap::new();
     let mut done = true;
@@ -1701,14 +1706,22 @@ fn name_projects(dir: &Path, records: &HashMap<String, Value>) -> bool {
             };
             let author = (by.to_owned(), post["by_id"].as_i64());
             let project = (known.entry(author))
-                .or_insert_with_key(|(by, id)| author_project(by, *id, records))
+                .or_insert_with_key(|(by, id)| author_project(by, *id, records, &led))
                 .clone();
             post["project"] = json!(project);
             named = true;
         }
         if named {
+            // Its time kept: a search orders threads by it, as their last
+            // post's.
+            let modified = (entry.metadata()).and_then(|meta| meta.modified()).ok();
             let text: String = posts.iter().map(|post| format!("{post}\n")).collect();
             done &= agent_client::files::replace_mode(&path, text.as_bytes(), 0o600).is_ok();
+            if let Some(modified) = modified
+                && let Ok(file) = std::fs::File::options().write(true).open(&path)
+            {
+                let _ = file.set_modified(modified);
+            }
         }
     }
     done
@@ -1717,9 +1730,14 @@ fn name_projects(dir: &Path, records: &HashMap<String, Value>) -> bool {
 /// The project `by` is named in, as a post it wrote now names it: an
 /// agent still there by the lead its line runs from, as its tasks are
 /// named; one gone, or another agent that took its name since, by the
-/// longest start of its name that a lead there is named for; else its
-/// name up to its first dot.
-fn author_project(by: &str, id: Option<i64>, records: &HashMap<String, Value>) -> String {
+/// longest start of its name that one of `led`, the projects a lead is
+/// there for, is; else its name up to its first dot.
+fn author_project(
+    by: &str,
+    id: Option<i64>,
+    records: &HashMap<String, Value>,
+    led: &std::collections::HashSet<&str>,
+) -> String {
     if let Some(record) = records.get(by)
         && (id.is_none() || record["bot_id"].as_i64().is_none_or(|bot| Some(bot) == id))
     {
@@ -1730,8 +1748,9 @@ fn author_project(by: &str, id: Option<i64>, records: &HashMap<String, Value>) -
         return crate::served::project_of(named.unwrap_or(by));
     }
     let starts = by.match_indices('.').map(|(at, _)| &by[..at]);
-    let mut led = starts.filter(|start| records.contains_key(&format!("{start}.lead")));
-    led.next_back()
+    let mut starts = starts.filter(|start| led.contains(start));
+    starts
+        .next_back()
         .map_or_else(|| crate::served::project_of(by), str::to_owned)
 }
 
@@ -3325,6 +3344,8 @@ mod tests {
             json!({"by": "lone.helper", "at": 3, "text": "c"}),
             // Its name taken since by another agent: by its name's start.
             json!({"by": "calc.helper", "by_id": 1, "at": 4, "text": "d"}),
+            // Gone, its project's only lead a named one.
+            json!({"by": "mail.eu.gone", "at": 5, "text": "g"}),
             // Named already.
             json!({"by": "calc.lead", "at": 5, "text": "e", "project": "calc"}),
         ];
@@ -3339,11 +3360,25 @@ mod tests {
             json!({"name": "shop.web.fix", "bot_id": 7, "created_by": "shop.web.mid", "created_by_id": 5}),
             json!({"name": "shop.web.mid", "bot_id": 5, "created_by": "shop.web.lead", "created_by_id": 1}),
             json!({"name": "calc.helper", "bot_id": 2}),
+            json!({"name": "mail.eu.lead.billing", "bot_id": 3}),
         ]
         .into_iter()
         .map(|record| (record["name"].as_str().unwrap().to_owned(), record))
         .collect();
+        // An hour old: the thread keeps its time, which a search orders by.
+        let then = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
+        (std::fs::File::options()
+            .write(true)
+            .open(dir.join("t.jsonl"))
+            .unwrap())
+        .set_modified(then)
+        .unwrap();
         assert!(projects(home, &records));
+        let modified = std::fs::metadata(dir.join("t.jsonl"))
+            .unwrap()
+            .modified()
+            .unwrap();
+        assert_eq!(modified, then);
         let posts = posts(&dir.join("t.jsonl")).unwrap();
         let named: Vec<_> = posts.iter().map(|post| post["project"].clone()).collect();
         assert_eq!(
@@ -3353,6 +3388,7 @@ mod tests {
                 json!("shop.web"),
                 json!("lone"),
                 json!("calc"),
+                json!("mail.eu"),
                 json!("calc")
             ]
         );
@@ -3372,7 +3408,7 @@ mod tests {
         file.write_all(line(json!({"by": "x.y", "at": 6, "text": "f"})).as_bytes())
             .unwrap();
         assert!(projects(home, &records));
-        assert!(super::posts(&dir.join("t.jsonl")).unwrap()[5]["project"].is_null());
+        assert!(super::posts(&dir.join("t.jsonl")).unwrap()[6]["project"].is_null());
         let _ = std::fs::remove_dir_all(home);
     }
 
