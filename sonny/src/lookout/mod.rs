@@ -936,31 +936,6 @@ impl Service {
             .filter_map(|b| Some((b["name"].as_str()?.to_owned(), b.clone())))
             .collect();
         self.made = Made::of(&self.records);
-        // Files renamed before anything rewrites them: a writer reads a
-        // file as `Sub` and would drop a key not yet renamed.
-        subs::agents_files(&self.store);
-        // What Sonny's walk of the repositories inside agents' folders gave
-        // them leaves their sandboxes, once, from a whole listing.
-        if complete {
-            crate::approvals::nested_gone(client.clone(), &bots, &self.store);
-        }
-        subs::goals_gone(&self.store);
-        if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
-            crate::commons::woken_gone(&home);
-            // Old commons posts name their authors' projects, once, from
-            // a whole listing, off the loop: each thread is rewritten.
-            if complete {
-                let records: HashMap<String, Value> = (self.records.iter())
-                    .map(|(name, bot)| {
-                        let kept = json!({"name": name, "bot_id": bot["bot_id"],
-                            "created_by": bot["created_by"], "created_by_id": bot["created_by_id"]});
-                        (name.clone(), kept)
-                    })
-                    .collect();
-                tokio::task::spawn_blocking(move || crate::commons::projects(&home, &records));
-            }
-        }
-        crate::git::drop_snapshot_indexes(&self.store);
         let revisions = subs::revisions(&self.store);
         self.subscribers = subs::all(&self.store).into_iter().collect();
         // Bots deleted while it was away: their subscriptions end now, as
@@ -2090,7 +2065,7 @@ pub(crate) async fn all_bots(client: &Client) -> Vec<Value> {
 
 /// Every bot the daemon lists, and whether every page came: a request
 /// that fails leaves the ones before it.
-async fn listed(client: &Client) -> (Vec<Value>, bool) {
+pub(crate) async fn listed(client: &Client) -> (Vec<Value>, bool) {
     let mut bots = Vec::new();
     let mut after = Value::Null;
     loop {

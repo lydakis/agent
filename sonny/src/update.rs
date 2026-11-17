@@ -519,6 +519,9 @@ fn finish(last: Last, store: &Path, socket: &Path) -> Result<(), String> {
     // A build just installed is the daemon's to run even when it names the
     // same version: a nightly's next commit does.
     let installed = matches!(last, Last::From(_));
+    // Sonny's own files migrated before the daemon and its companions
+    // start on this build.
+    crate::upgrade::at_start(store);
     let replaced = runtime.block_on(switch_daemon(store, socket, installed))?;
     // Sonny's own agent-browser and agent-desktop at the versions this
     // build's tools list, before the skills they serve are written again.
