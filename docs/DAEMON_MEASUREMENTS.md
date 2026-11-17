@@ -10643,8 +10643,7 @@ So a sandboxed command pays about 2.7 µs more before its sandbox starts,
 the first run cold. The bubblewrap launch that follows takes about 12 ms.
 
 The Perf workflow's matched screen on this change (GitHub runner, 4 CPUs,
-base and head built and screened alternately; a Linux runner with no
-`~/.ssh/config`, so the copy check finds no file and binds nothing):
+base and head built and screened alternately):
 
 | Bench | Measure | Base | Head | Change |
 | --- | --- | ---: | ---: | ---: |
