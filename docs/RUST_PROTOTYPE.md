@@ -2852,27 +2852,37 @@ gate instead. A store from before schema 100 gives the three to every bot
 that has `wait` and `history`; the approval modes never gate them.
 
 `spawn_agent` and `close_agent` make and close agents the same way, as
-Codex's `spawn_agent` and `close_agent` do. `spawn_agent` makes an agent
-with the caller as its creator, so it works in the caller's folder, in its
+Codex's `spawn_agent` and `close_agent` do, and `spawn_agent` takes what
+`run --new` and `fork` take, so nothing the CLI could make is lost.
+`spawn_agent` makes an agent with the caller as its creator, so it works in
+the caller's folder (this turn's, or the `workspace` it names), in its
 sandbox and under its gates, never more loosely (see `Settings::under`),
-with the caller's tools and settings (its speed among them), and sends it `message` as its first.
-A `name` with no dot is put in the caller's project (`review` from
-`shop.lead` is `shop.review`). It starts fresh, with the instructions a
-client composes for that folder (its `AGENTS.md` files, skills and memory,
-as `run --agents` composes them), or in the role `profile` names (as `run
---profile`); `model` and `effort` default to the caller's, or the profile's
-model, and the file editor and `web_search` follow the model's provider.
-With `fork` it starts instead from a copy of the caller's conversation
-(the `fork` request), taking no profile, model or effort. One `request_id`,
-the call's own unless the model names one, keys both the making and the
-message, so a call made again makes and sends nothing new. The models the
-person lists in `~/.agent/models`, with their notes, are named in its
-`model` parameter, read as the daemon starts. `close_agent` closes an agent
-the caller made: the `close` request marks it (`closed_ms` on its record,
-kept first), the tool interrupts a turn it is running, and `list_agents`
-leaves it out unless asked with `closed` (the `bots` request's `open`
-filter). Nothing of its history goes; the next turn it starts, from a
-message sent later or one already in line, opens it again. A store from
+with the caller's tools and settings (its speed among them) unless `tools`
+and `settings` name others, and sends it `message` as its first, with
+`quote` and `turn_budget_tokens` as `submit` takes them. A `name` with no
+dot is put in the caller's project (`review` from `shop.lead` is
+`shop.review`). Its instructions are those `run --new` gives: the preamble
+alone; with `agents`, those a client composes for the folder (its
+`AGENTS.md` files, skills and memory); with `profile`, those in that role,
+with its model and tools; or `instructions`, exactly as given, which takes
+neither of the others. `model` and `effort` default to the caller's, or the
+profile's model. `budget_tokens`, `budget_counts`,
+`compaction_instructions` (empty: it never compacts), `compaction_model`,
+`fallback` and a gate (`approve`, `approver`, `approve_expire_ms`) are
+`create`'s. With `fork` it starts instead from a copy of the caller's
+conversation (the `fork` request, with its `checkpoint`, `allow` and
+`expire_ms`), taking no instructions, profile, model, effort, tools,
+settings or compaction. One `request_id`, the call's own unless the model
+names one, keys both the making and the message, so a call made again
+makes and sends nothing new. The models the person lists in
+`~/.agent/models`, with their notes, are named in its `model` parameter,
+read as the daemon starts. `close_agent` closes an agent the caller made:
+the `close` request marks it (`closed_ms` on its record, kept first) and
+names the turn it runs, read in the same store job, which the tool
+interrupts; `list_agents` leaves it out unless asked with `closed` (the
+`bots` request's `open` filter). Nothing of its history goes; the next turn
+it starts, from a message sent later or one already in line, opens it
+again. A store from
 before schema 103 gives the two to every bot that has `send_message`.
 
 `shell` runs a noninteractive command with `/bin/bash -c` (`/bin/sh` where

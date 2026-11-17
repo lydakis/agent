@@ -163,6 +163,32 @@ class AgentToolsTests(ModelFixture):
         look = client.request('inspect', bot='other.look')['result']
         self.assertEqual((look['created_by'], look.get('effort')), ('shop.lead', 'low'), look)
 
+    def test_a_new_agent_takes_what_run_new_takes(self):
+        (self.path / 'AGENTS.md').write_text('Folder rule: tabs.\n')
+        client = self.client(TOOLS)
+        client.request('create', bot='shop.lead', workspace=str(self.path), tools=TOOLS.split(','))
+        self.run_calls(client, 'shop.lead', 'go',
+                       ('spawn_agent', {'name': 'plain', 'message': 'q'}),
+                       ('spawn_agent', {'name': 'told', 'message': 'q', 'agents': True}),
+                       ('spawn_agent', {'name': 'set', 'message': 'q', 'instructions': 'Only this.',
+                                        'tools': ['echo', 'wait'], 'settings': {'max_rounds': 3},
+                                        'budget_tokens': 50000}),
+                       ('spawn_agent', {'name': 'both', 'message': 'q', 'instructions': 'x', 'agents': True}),
+                       ('spawn_agent', {'name': 'copy', 'message': 'q', 'fork': True, 'tools': ['echo']}),
+                       ('spawn_agent', {'name': 'copy', 'message': 'q', 'fork': True, 'allow': ['echo']}))
+        plain = client.request('inspect', bot='shop.plain')['result']
+        told = client.request('inspect', bot='shop.told')['result']
+        self.assertNotIn('Folder rule', plain['instructions'])
+        self.assertIn('Folder rule: tabs.', told['instructions'])
+        self.assertTrue(told['instructions'].startswith(plain['instructions'][:40]), told['instructions'][:200])
+        kept = client.request('inspect', bot='shop.set')['result']
+        self.assertEqual((kept['instructions'], kept['tools'], kept['settings']['max_rounds'], kept['budget_tokens']),
+                         ('Only this.', ['echo', 'wait'], 3, 50000))
+        self.assertIn('instructions sets them', self.output(client, 'shop.lead', 'spawn_agent-4'))
+        self.assertIn('give it allow', self.output(client, 'shop.lead', 'spawn_agent-5'))
+        copy = client.request('inspect', bot='shop.copy')['result']
+        self.assertEqual(copy['allowed'], ['echo'], copy)
+
     def test_a_fork_takes_no_profile_and_a_missing_profile_is_refused(self):
         client = self.client(TOOLS)
         client.request('create', bot='shop.lead', workspace=str(self.path))

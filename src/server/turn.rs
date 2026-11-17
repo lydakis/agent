@@ -5983,10 +5983,16 @@ impl Turn {
             Agents::Spawn {
                 name,
                 message,
+                instructions,
+                agents,
                 profile,
                 model,
                 effort,
                 fork,
+                made,
+                settings,
+                quotes,
+                turn_budget_tokens,
                 request_id,
             } => {
                 let name = self.spawned_name(&name);
@@ -5994,21 +6000,53 @@ impl Turn {
                 // same call made again makes and sends nothing new.
                 let request_id = request_id.unwrap_or_else(|| self.call_request(call_id));
                 if fork {
-                    request(json!({"op":"fork","source":self.bot,"bot":name,
-                        "request_id":request_id}))
-                    .await?;
+                    let mut copy = json!({"op":"fork","source":self.bot,"bot":name,
+                        "request_id":request_id});
+                    for (key, value) in made {
+                        copy[key] = value;
+                    }
+                    request(copy).await?;
                 } else {
                     let me = request(json!({"op":"inspect","bot":self.bot})).await?;
+                    // The folder asked for, else this turn's.
+                    let folder = (made.get("workspace"))
+                        .and_then(Value::as_str)
+                        .map_or_else(|| workspace.to_path_buf(), std::path::PathBuf::from);
                     let mut create = self
-                        .spawned(&me, workspace, &name, profile, model, effort)
+                        .spawned(
+                            &me,
+                            &folder,
+                            &name,
+                            (instructions, agents, profile),
+                            model,
+                            effort,
+                        )
                         .await?;
+                    // What it asked for over what it would inherit: the
+                    // daemon keeps each no looser than this agent's.
+                    for (key, value) in made {
+                        create[key.as_str()] = match value {
+                            Value::String(text)
+                                if key == "compaction_instructions" && text.is_empty() =>
+                            {
+                                Value::Null
+                            }
+                            value => value,
+                        };
+                    }
+                    if let (Some(over), Some(own)) = (settings, create["settings"].as_object_mut())
+                    {
+                        own.extend(over);
+                    }
                     create["op"] = json!("create");
                     create["request_id"] = json!(request_id);
                     request(create).await?;
                 }
                 let sent = request(json!({"op":"submit","bot":name,"request_id":request_id,
                     "prompt":message,"delivery":"queue",
-                    "from":{"bot":self.bot,"turn":self.turn}}))
+                    "from":{"bot":self.bot,"turn":self.turn},
+                    "quotes":(!quotes.is_empty()).then_some(quotes),
+                    "budget_tokens":turn_budget_tokens}))
                 .await?;
                 let mut answer = json!({"name":name,"status":sent["status"]});
                 if let Some(message) = sent["message"].as_i64() {
@@ -6075,15 +6113,16 @@ impl Turn {
     /// What `create` makes a fresh agent with, made by this one (`me`, its
     /// record) in `workspace`, the folder this turn works in: its settings
     /// and compaction; the model and effort asked for, the profile's model,
-    /// or its own; and the instructions a client composes for the folder,
-    /// in `profile`'s role when one is named, with the role's tools or its
-    /// own, search kept to a model that has it.
+    /// or its own; instructions as `run --new` gives them (the text given,
+    /// the preamble, or with `agents` or a profile, those a client composes
+    /// for the folder, in the profile's role); the role's tools or its own,
+    /// search kept to a model that has it.
     async fn spawned(
         &self,
         me: &Value,
         workspace: &std::path::Path,
         name: &str,
-        profile: Option<String>,
+        (given, agents, profile): (Option<String>, bool, Option<String>),
         model: Option<String>,
         effort: Option<String>,
     ) -> Result<Value> {
@@ -6094,35 +6133,44 @@ impl Turn {
                 "this agent's folder is not a name the daemon can pass on",
             ));
         };
-        // Reading the role and the folder's files touches the filesystem:
-        // off the runtime thread.
-        let folder = workspace.clone();
-        let (role, instructions) = tokio::task::spawn_blocking(move || {
-            let folder = std::path::Path::new(&folder);
-            let failed =
-                |error: agent_client::policy::Failure| Error::with(error.code(), error.to_string());
-            let role = match profile.as_deref() {
-                None => None,
-                Some(name) => Some(
-                    agent_client::policy::profile(folder, name)
-                        .map_err(failed)?
-                        .ok_or_else(|| {
-                            Error::with(
-                                "profile_not_found",
-                                format!(
-                                    "no .agents/agents/{name}.md in the folder or ~/.agents/agents"
-                                ),
-                            )
-                        })?,
-                ),
-            };
-            let memory = agent_client::policy::memory_indexes(folder).map_err(failed)?;
-            let composed = agent_client::policy::instructions(folder, role.as_ref(), &memory)
-                .map_err(failed)?;
-            Ok::<_, Error>((role, composed.text))
-        })
-        .await
-        .map_err(|_| Error::new("profile_unreadable"))??;
+        // As `run --new`: the text given, the preamble alone, or, asked
+        // for, the folder's composed in a role or none. Composing reads
+        // the folder's files: off the runtime thread.
+        let (role, instructions) = match (given, agents || profile.is_some()) {
+            (Some(text), _) => (None, text),
+            (None, false) => (None, agent_client::policy::PREAMBLE.to_owned()),
+            (None, true) => {
+                let folder = workspace.clone();
+                tokio::task::spawn_blocking(move || {
+                    let folder = std::path::Path::new(&folder);
+                    let failed = |error: agent_client::policy::Failure| {
+                        Error::with(error.code(), error.to_string())
+                    };
+                    let role = match profile.as_deref() {
+                        None => None,
+                        Some(name) => Some(
+                            agent_client::policy::profile(folder, name)
+                                .map_err(failed)?
+                                .ok_or_else(|| {
+                                    Error::with(
+                                        "profile_not_found",
+                                        format!(
+                                            "no .agents/agents/{name}.md in the folder or ~/.agents/agents"
+                                        ),
+                                    )
+                                })?,
+                        ),
+                    };
+                    let memory = agent_client::policy::memory_indexes(folder).map_err(failed)?;
+                    let composed =
+                        agent_client::policy::instructions(folder, role.as_ref(), &memory)
+                            .map_err(failed)?;
+                    Ok::<_, Error>((role, composed.text))
+                })
+                .await
+                .map_err(|_| Error::new("profile_unreadable"))??
+            }
+        };
         let own = format!(
             "{}/{}",
             me["provider"].as_str().unwrap_or_default(),

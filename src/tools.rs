@@ -248,14 +248,32 @@ impl Tool {
                 "required":["reason"],"additionalProperties":false}),
             ),
             Tool::SpawnAgent => (
-                "Start a new agent, made by this one, on work of its own: it works in this agent's folder, in its sandbox and under its approval gates, never more loosely, with this agent's tools, and the message is its first. name is the new agent's whole name, or, with no dot, a name in this agent's project, the part of this agent's name before its first dot: review from shop.lead names shop.review. It starts fresh, told the folder's AGENTS.md files, skills and memory, or with profile, the role its file .agents/agents/PROFILE.md describes, in the folder or the home folder. model (PROVIDER/MODEL) and effort default to this agent's, or to the profile's model. With fork=true it starts instead from a copy of this agent's conversation so far, with its instructions, tools and model, and takes no profile, model or effort. A request_id sent again starts nothing new; without one, the call's own is used. Returns the new agent's name and the handle of its first message, BOT/N, which wait and history take; close it with close_agent once its work is done.",
+                "Start a new agent, made by this one, on work of its own: it works in this agent's folder, in its sandbox and under its approval gates, never more loosely, with this agent's tools, and the message is its first. name is the new agent's whole name, or, with no dot, a name in this agent's project, the part of this agent's name before its first dot: review from shop.lead names shop.review. It starts fresh, told the preamble every new agent is told; with agents=true, also the folder's AGENTS.md files, skills and memory; with profile, those in the role its file .agents/agents/PROFILE.md describes, in the folder or the home folder, with the role's model and tools; or with instructions, exactly that text instead, which takes neither agents nor profile. model (PROVIDER/MODEL) and effort default to this agent's, or to the profile's model. With fork=true it starts instead from a copy of this agent's conversation so far, with its instructions, tools and model, and takes no instructions, agents, profile, model or effort. A request_id sent again starts nothing new; without one, the call's own is used. Returns the new agent's name and the handle of its first message, BOT/N, which wait and history take; close it with close_agent once its work is done.",
                 json!({"type":"object","properties":{
                 "name":{"type":"string","minLength":1,"maxLength":128},
                 "message":{"type":"string","minLength":1},
+                "instructions":{"type":"string","minLength":1},
+                "agents":{"type":"boolean"},
                 "profile":{"type":"string","minLength":1,"maxLength":128},
                 "model":{"type":"string","minLength":1,"maxLength":256},
                 "effort":{"type":"string","minLength":1,"maxLength":32},
                 "fork":{"type":"boolean"},
+                "checkpoint":{"type":"integer","minimum":1,"description":"With fork: copy the conversation up to this node, not all of it"},
+                "allow":{"type":"array","items":{"type":"string"},"maxItems":64,"description":"With fork: the tools the copy may call, within this agent's; [] allows none"},
+                "expire_ms":{"type":"integer","minimum":1000,"maximum":604800000,"description":"With fork: delete the copy once idle this long"},
+                "workspace":{"type":"string","minLength":1,"description":"Its folder, within what this agent may reach; default this turn's folder"},
+                "tools":{"type":"array","items":{"type":"string"},"maxItems":64,"description":"Its tools, within this agent's; default this agent's, or the profile's"},
+                "settings":{"type":"object","description":"Its settings over this agent's own, never looser: sandbox, writable, network, unix_sockets, approval_policy, speed, cache_ttl, context_bytes, context_items, note_turns, compact_at, compact_keep, compact_tokens, post_turn_compact_percent, keep_turns, max_rounds, max_drops, max_output_tokens, approval_hold_ms, hold_ms, outputs, trailer, quiet_background, rules, env"},
+                "budget_tokens":{"type":"integer","minimum":1,"description":"Its lifetime token budget"},
+                "budget_counts":{"type":"string","enum":["tokens","work"]},
+                "turn_budget_tokens":{"type":"integer","minimum":1,"description":"The first message's turn's token cap"},
+                "compaction_instructions":{"type":"string","description":"How it summarizes when it compacts; empty: it never compacts"},
+                "compaction_model":{"type":"string","minLength":1,"maxLength":256},
+                "fallback":{"type":"string","minLength":1,"maxLength":256,"description":"PROVIDER/MODEL answering a request a safety classifier declined"},
+                "approve":{"type":"array","items":{"type":"string"},"maxItems":64,"description":"Tools whose calls wait for approver's verdict, beside the gates it keeps from this agent"},
+                "approver":{"type":"string","minLength":1,"maxLength":128},
+                "approve_expire_ms":{"type":"integer","minimum":1,"maximum":86400000},
+                "quote":{"type":"array","items":{"type":"string","minLength":3,"maxLength":256},"maxItems":16,"description":"Messages copied after the first message, as send_message's quote"},
                 "request_id":{"type":"string","minLength":1,"maxLength":128}},
                 "required":["name","message"],"additionalProperties":false}),
             ),
@@ -2262,11 +2280,26 @@ pub enum Agents {
     Spawn {
         name: String,
         message: String,
+        /// Its instructions, as given; else composed, or the preamble.
+        instructions: Option<String>,
+        /// Composed: the preamble, the folder's AGENTS.md files, skills
+        /// and memory.
+        agents: bool,
+        /// Composed as `agents`, in this role.
         profile: Option<String>,
         model: Option<String>,
         effort: Option<String>,
         /// From a copy of this agent's conversation, rather than fresh.
         fork: bool,
+        /// The rest of what `create` (or, with `fork`, `fork`) takes, by
+        /// its names, as the model gave them: the daemon checks each.
+        made: serde_json::Map<String, serde_json::Value>,
+        /// Settings over this agent's own.
+        settings: Option<serde_json::Map<String, serde_json::Value>>,
+        /// Copied after the first message.
+        quotes: Vec<serde_json::Value>,
+        /// The first turn's token cap.
+        turn_budget_tokens: Option<u64>,
         request_id: Option<String>,
     },
     /// Close an agent this one made.
@@ -3466,11 +3499,31 @@ impl Registry {
                 struct Spawn {
                     name: String,
                     message: String,
+                    instructions: Option<String>,
+                    #[serde(default)]
+                    agents: bool,
                     profile: Option<String>,
                     model: Option<String>,
                     effort: Option<String>,
                     #[serde(default)]
                     fork: bool,
+                    checkpoint: Option<i64>,
+                    allow: Option<Vec<String>>,
+                    expire_ms: Option<u64>,
+                    workspace: Option<String>,
+                    tools: Option<Vec<String>>,
+                    settings: Option<serde_json::Map<String, serde_json::Value>>,
+                    budget_tokens: Option<u64>,
+                    budget_counts: Option<String>,
+                    turn_budget_tokens: Option<u64>,
+                    compaction_instructions: Option<String>,
+                    compaction_model: Option<String>,
+                    fallback: Option<String>,
+                    approve: Option<Vec<String>>,
+                    approver: Option<String>,
+                    approve_expire_ms: Option<u64>,
+                    #[serde(default)]
+                    quote: Vec<String>,
                     request_id: Option<String>,
                 }
                 let args: Spawn = serde_json::from_str(args).map_err(invalid)?;
@@ -3481,21 +3534,87 @@ impl Registry {
                         "name (up to 128 bytes) and message are needed",
                     );
                 }
+                let instructions = args.instructions.filter(|i| !i.trim().is_empty());
+                let profile = args.profile.filter(|p| !p.trim().is_empty());
                 if args.fork
-                    && (args.profile.is_some() || args.model.is_some() || args.effort.is_some())
+                    && (instructions.is_some()
+                        || args.agents
+                        || profile.is_some()
+                        || args.model.is_some()
+                        || args.effort.is_some())
                 {
                     return fail_with(
                         "invalid_tool_arguments",
-                        "a fork keeps this agent's instructions, model and effort: give it no profile, model or effort",
+                        "a fork keeps this agent's instructions, model and effort: give it no instructions, agents, profile, model or effort",
                     );
                 }
+                if instructions.is_some() && (args.agents || profile.is_some()) {
+                    return fail_with(
+                        "invalid_tool_arguments",
+                        "agents and profile compose instructions; instructions sets them",
+                    );
+                }
+                // A fork keeps its source's tools, settings and compaction;
+                // a fresh agent has no conversation to copy part of.
+                let fresh_only = args.tools.is_some()
+                    || args.settings.is_some()
+                    || args.compaction_instructions.is_some()
+                    || args.compaction_model.is_some()
+                    || args.fallback.is_some();
+                if args.fork && fresh_only {
+                    return fail_with(
+                        "invalid_tool_arguments",
+                        "a fork keeps this agent's tools, settings and compaction: give it allow for its tools instead",
+                    );
+                }
+                if !args.fork
+                    && (args.checkpoint.is_some()
+                        || args.allow.is_some()
+                        || args.expire_ms.is_some())
+                {
+                    return fail_with(
+                        "invalid_tool_arguments",
+                        "checkpoint, allow and expire_ms are for a fork",
+                    );
+                }
+                if args.quote.len() > 16 {
+                    return fail_with("invalid_tool_arguments", "at most 16 quotes");
+                }
+                let mut made = serde_json::Map::new();
+                let mut put = |key: &str, value: serde_json::Value| {
+                    if !value.is_null() {
+                        made.insert(key.to_owned(), value);
+                    }
+                };
+                put("checkpoint", json!(args.checkpoint));
+                put("allow", json!(args.allow));
+                put("expire_ms", json!(args.expire_ms));
+                put("workspace", json!(args.workspace));
+                put("tools", json!(args.tools));
+                put("budget_tokens", json!(args.budget_tokens));
+                put("budget_counts", json!(args.budget_counts));
+                put(
+                    "compaction_instructions",
+                    json!(args.compaction_instructions),
+                );
+                put("compaction_model", json!(args.compaction_model));
+                put("fallback", json!(args.fallback));
+                put("approve", json!(args.approve));
+                put("approver", json!(args.approver));
+                put("approve_expire_ms", json!(args.approve_expire_ms));
                 Prepared::Agents(Agents::Spawn {
                     name,
                     message: args.message,
-                    profile: args.profile.filter(|p| !p.trim().is_empty()),
+                    instructions,
+                    agents: args.agents,
+                    profile,
                     model: args.model.filter(|m| !m.trim().is_empty()),
                     effort: args.effort.filter(|e| !e.trim().is_empty()),
                     fork: args.fork,
+                    made,
+                    settings: args.settings,
+                    quotes: args.quote.iter().map(|q| quote(q)).collect::<Result<_>>()?,
+                    turn_budget_tokens: args.turn_budget_tokens,
                     request_id: args.request_id,
                 })
             }
