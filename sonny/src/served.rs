@@ -162,8 +162,8 @@ fn start() -> Value {
                         for work that makes its own copy of what it changes, such as a checkout of another \
                         branch made with this folder's tooling, or that must not touch this folder."},
                 "tab": {"type": "boolean",
-                    "description": "A tab of its own, for a task the person will want to watch or talk to, \
-                        asked or not."},
+                    "description": "A tab of its own, only when the person asked to watch or talk to this \
+                        task; Sonny opens one when it needs them."},
                 "setup": {"type": "boolean",
                     "description": "Run the folder's .agents/setup in the copy first: true for a task \
                         that will change files, false for one that only reads."},
@@ -559,7 +559,7 @@ pub fn commons() -> Value {
 fn show() -> Value {
     json!({
         "name": SHOW,
-        "description": "Put an agent's window where the person asks, or where they should watch it now: a tab \
+        "description": "Put an agent's window where the person asks: a tab \
             of its own, the default, a split beside yours or the agent beside names, or floating over that \
             window where the terminal can float it. Another project's lead (PROJECT.lead) opens in its \
             project's own home, the workspace or session named for that project (made if there is none, \
