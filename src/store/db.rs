@@ -8914,20 +8914,26 @@ impl Database {
                 tx.prepare_cached("UPDATE stubs SET item=? WHERE node=?")?
                     .execute(params![repaired, node])?;
             }
-            const BELOW: &str = "WITH RECURSIVE below(id) AS (
-                SELECT ?1 UNION ALL SELECT n.id FROM nodes n JOIN below b ON n.parent=b.id)";
             if thinking != was || grown != 0 || saves != 0 {
-                tx.prepare_cached(&format!(
-                    "{BELOW} UPDATE nodes SET total_thinking=total_thinking+?2,
+                tx.prepare_cached(
+                    "WITH RECURSIVE chain(id) AS (
+                        SELECT ?1 UNION ALL SELECT n.id FROM nodes n JOIN chain c ON n.parent=c.id)
+                     UPDATE nodes SET total_thinking=total_thinking+?2,
                         total_bytes=total_bytes+?3,total_elided=total_elided+?4
-                     WHERE id IN (SELECT id FROM below)"
-                ))?
+                     WHERE id IN (SELECT id FROM chain)",
+                )?
                 .execute(params![node, thinking - was, grown, saves])?;
             }
             if saves != 0 {
-                tx.prepare_cached(&format!(
-                    "{BELOW} UPDATE elisions SET saved=saved+?2 WHERE through IN (SELECT id FROM below)"
-                ))?
+                tx.prepare_cached(
+                    // A version is made at a head at or below its floor,
+                    // so one whose floor is below the node is found by its
+                    // own node.
+                    "WITH RECURSIVE chain(id) AS (
+                        SELECT ?1 UNION ALL SELECT n.id FROM nodes n JOIN chain c ON n.parent=c.id)
+                     UPDATE elisions SET saved=saved+?2
+                     WHERE node IN (SELECT id FROM chain) AND through IN (SELECT id FROM chain)",
+                )?
                 .execute(params![node, saves])?;
             }
             tx.commit()?;
