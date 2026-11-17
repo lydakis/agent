@@ -132,7 +132,7 @@ pub fn as_task(dir: &Path, info: &Value, text: &str) -> Result<String, String> {
     let task = profile(dir, &task_profile(info)?)?;
     Ok(match task.body.as_str() {
         "" => text.to_owned(),
-        body => format!("{text}\n\n{}", agent_client::policy::with_cli(body)),
+        body => format!("{text}\n\n{body}"),
     })
 }
 

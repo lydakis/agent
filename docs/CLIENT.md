@@ -10,16 +10,15 @@ Implemented 2026-09-19.
 
 ## Layers
 
-1. **The harness preamble.** How to delegate through this runtime: `agent
-   run --detach --new --bot NAME` from the shell tool, with `--model` one of
-   those `agent models` lists (named as a command, so the text stays one
-   cached prefix whatever the list holds), collect with `wait`,
-   and that `AGENT_BOT`/`AGENT_BOT_ID` identify the bot itself
-   and `AGENT_PARENT`/`AGENT_PARENT_ID` its creator. Calls to that creator use
-   `--bot-id` so a reused name cannot receive the work, and are for questions, not
-   results: `wait` already hands the creator the bot's final reply. The tool descriptions the daemon sends
-   carry the rest. It gives the bot no role and no way of working; a caller
-   that wants one passes it. This is the CLI's default and only instruction text.
+1. **The harness preamble.** That other agents are reached through the
+   bot's tools: `list_agents` finds them, `send_message` gives one a message
+   and returns a handle, `wait` on it returns the reply, and `history` reads
+   an agent's turns; that `AGENT_BOT` names the bot and `AGENT_PARENT` its
+   creator, which `send_message` reaches; and that its final reply reaches
+   whoever waits on its turn. No command line or program path is taught:
+   the tool descriptions the daemon sends carry the rest. It gives the bot no role and no way of
+   working; a caller that wants one passes it. This is the CLI's default and
+   only instruction text.
 2. **AGENTS.md files.** `~/.agents/AGENTS.md` first, then, in each folder
    from the filesystem root down to the workspace, its `AGENTS.md` and then
    its `.agents/AGENTS.md`, so the nearest file is read last and wins where
@@ -34,8 +33,8 @@ Implemented 2026-09-19.
    path. The bot opens a skill with its `read` tool when the subject comes
    up; nothing else is sent, so an unused skill costs one line.
 4. **Profiles.** Files `<role>.md` in `<workspace>/.agents/agents` and
-   `~/.agents/agents` become a second index, with the command that starts a
-   peer in a role. A profile is markdown with optional YAML front matter:
+   `~/.agents/agents` become a second index of the roles a new agent can be
+   started in (Sonny's `start_task` takes one by name). A profile is markdown with optional YAML front matter:
    `description`, `model`, and `tools` (a list of this runtime's tool
    names) are read, any other key is ignored, so an agent file written for
    another harness loads as it is. The body is the role. Sonny's own
