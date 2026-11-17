@@ -767,7 +767,8 @@ fn modified(path: &Path) -> Option<std::time::SystemTime> {
 
 /// Whether a source works, run by run: after `DOWN_AFTER` failed runs in
 /// a row its subscribers hear it is down, again each `DOWN_AGAIN` while it
-/// stays so, and that it works again once a run does.
+/// stays so, and that it works again once a run ends well or prints an
+/// event.
 #[derive(Debug, Default)]
 struct Health {
     failed: u32,
@@ -845,7 +846,8 @@ async fn run(
     loop {
         let _ = super::make_dir(&dir);
         let stderr = Arc::new(Mutex::new(VecDeque::new()));
-        let ran = once(&source, &dir, &sent, &mut seen, &mut shape, &stderr).await;
+        let judged = (&*health, health_file.as_path());
+        let ran = once(&source, &dir, &sent, &mut seen, &mut shape, &stderr, judged).await;
         shape.flush();
         if sent.is_closed() {
             return;
@@ -876,27 +878,63 @@ async fn run(
         let Ok(place) = sent.reserve().await else {
             return;
         };
-        let told = (health.lock().ok()).and_then(|mut health| {
-            let told = health.after(&source, failed, stderr, std::time::Instant::now())?;
-            Some((told, health.since_ms))
-        });
-        match told {
-            Some((told, since_ms)) => {
-                // Kept beside what it printed, so a note that shows the
-                // source says it is down, and since when.
-                if let Some(file) = shape.keeps.clone() {
-                    shapes::append(file, lookout_line(&told, since_ms));
-                }
-                // And on its own, so a view knows it is down without
-                // reading what it printed.
-                shapes::write(health_file.clone(), health_word(&told, since_ms));
-                place.send(Said::Event(Box::new(told)))
-            }
-            // Given back before it sleeps, so it holds no place meanwhile.
-            None => drop(place),
-        }
+        let keeps = shape.keeps.as_deref();
+        tell(place, judged, keeps, &source, (failed, stderr));
         tokio::time::sleep(every).await;
     }
+}
+
+/// A command source's health: its runs as they went, and its health file.
+type Judged<'a> = (&'a Mutex<Health>, &'a Path);
+
+/// Judge a source by a run that failed (why, with its stderr's last
+/// lines) or not, or by an event it printed, and tell what that changes,
+/// if anything, through `place`, kept beside what it printed in `keeps`.
+fn tell(
+    place: tokio::sync::mpsc::Permit<'_, Said>,
+    (health, health_file): Judged<'_>,
+    keeps: Option<&Path>,
+    source: &Source,
+    (failed, stderr): (Option<String>, Vec<String>),
+) {
+    let told = (health.lock().ok()).and_then(|mut health| {
+        let told = health.after(source, failed, stderr, std::time::Instant::now())?;
+        Some((told, health.since_ms))
+    });
+    let Some((told, since_ms)) = told else {
+        // Given back at once, so it holds no place meanwhile.
+        return drop(place);
+    };
+    // Kept beside what it printed, so a note that shows the source says
+    // it is down, and since when.
+    if let Some(file) = keeps {
+        shapes::append(file.to_path_buf(), lookout_line(&told, since_ms));
+    }
+    // And on its own, so a view knows it is down without reading what it
+    // printed.
+    shapes::write(health_file.to_path_buf(), health_word(&told, since_ms));
+    place.send(Said::Event(Box::new(told)));
+}
+
+/// A command source printed an event, so it works, as a heartbeat says a
+/// job is alive: the first after a failed run starts its count of failed
+/// runs again, and says it works again if it was told down, before the
+/// event. A source that runs one long command never ends a run well, so
+/// only this hears it come back. False once the lookout stopped.
+async fn printed(
+    judged: Judged<'_>,
+    keeps: Option<&Path>,
+    source: &Source,
+    sent: &Sender<Said>,
+) -> bool {
+    if !(judged.0.lock()).is_ok_and(|health| health.failed > 0) {
+        return true;
+    }
+    let Ok(place) = sent.reserve().await else {
+        return false;
+    };
+    tell(place, judged, keeps, source, (None, Vec::new()));
+    true
 }
 
 /// What one look at a source of Sonny's own found: its lines, and its
@@ -967,7 +1005,7 @@ async fn own(
             .await
             .unwrap_or_default();
         for line in &news.lines {
-            if !emit(&source, line, &mut seen, &mut shape, &sent).await {
+            if !emit(&source, line, &mut seen, &mut shape, &sent, None).await {
                 return;
             }
         }
@@ -1004,14 +1042,16 @@ async fn own(
     }
 }
 
-/// Send what a source printed, unless its ID was news lately: false once
-/// the lookout stopped.
+/// Send what a source printed, unless its ID was news lately, after
+/// what it says of a command source's health (`judged`): false once the
+/// lookout stopped.
 async fn emit(
     source: &Source,
     line: &str,
     seen: &mut Seen,
     shape: &mut Shape,
     sent: &Sender<Said>,
+    judged: Option<Judged<'_>>,
 ) -> bool {
     let Some(mut event) = Event::parse(&source.name, line, super::epoch_ms()) else {
         // A clear tells no one: it says nothing, and only ends a topic's
@@ -1030,6 +1070,12 @@ async fn emit(
         }
         return true;
     };
+    // Even one it sent lately says it works.
+    if let Some(judged) = judged
+        && !printed(judged, shape.keeps.as_deref(), source, sent).await
+    {
+        return false;
+    }
     if event.id.as_deref().is_some_and(|id| seen.ids.contains(id)) {
         return true;
     }
@@ -1082,7 +1128,8 @@ impl Seen {
 }
 
 /// One run of a source's command, in a process group of its own, with
-/// `SONNY_SOURCE` and `SONNY_SOURCE_DIR` set.
+/// `SONNY_SOURCE` and `SONNY_SOURCE_DIR` set; each event it prints is
+/// judged in its health (`judged`) as it comes.
 async fn once(
     source: &Source,
     dir: &Path,
@@ -1090,6 +1137,7 @@ async fn once(
     seen: &mut Seen,
     shape: &mut Shape,
     tail: &Arc<Mutex<VecDeque<String>>>,
+    judged: Judged<'_>,
 ) -> Result<std::process::ExitStatus, String> {
     let mut command = tokio::process::Command::new("sh");
     // Only a source with `wants` is told where they are.
@@ -1164,7 +1212,7 @@ async fn once(
         }
         let text = String::from_utf8_lossy(&line);
         // The lookout is stopping: the command stops with it.
-        if !emit(source, &text, seen, shape, sent).await {
+        if !emit(source, &text, seen, shape, sent, Some(judged)).await {
             return Err("the lookout stopped".into());
         }
     }
@@ -2065,7 +2113,7 @@ mod tests {
             r#"{"text": "lunch?", "from": "ana"}"#,
             r#"{"text": "call me", "from": "boss"}"#,
         ] {
-            assert!(emit(&marked, line, &mut seen, &mut shape, &sent).await);
+            assert!(emit(&marked, line, &mut seen, &mut shape, &sent, None).await);
         }
         let mut events = Vec::new();
         for _ in 0..2 {
@@ -2855,6 +2903,50 @@ mod tests {
         assert!(texts.iter().any(|t| t.contains("works again")), "{texts:?}");
         shapes::written();
         assert_eq!(read_down(&health), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn a_long_running_source_down_is_heard_to_work_again_at_its_first_event() {
+        let dir = std::env::temp_dir().join(format!("lookout-long-back-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let health = health_file(&dir.join("state"), "poll");
+        std::fs::create_dir_all(health.parent().unwrap()).unwrap();
+        let down = json!({"down": true, "since_ms": 5000, "at_ms": 9000,
+            "failed": "signal: 9 (SIGKILL)", "stderr": []});
+        std::fs::write(&health, down.to_string()).unwrap();
+        let (sent, mut got) = tokio::sync::mpsc::channel(16);
+        let mut runner = Runner::new(dir.join("state"), sent);
+        // One long run that prints and never ends.
+        let source = Source {
+            name: "poll".into(),
+            command: "echo '{\"text\": \"fresh\"}'; exec sleep 3600".into(),
+            every: Some("1h".into()),
+            digest: None,
+            steer: None,
+            watch: Vec::new(),
+            icon: None,
+            wants: None,
+        };
+        runner.set(vec![source]);
+        let back = next_event(&mut got).await;
+        assert!(back.text.contains("works again"), "{}", back.text);
+        assert_eq!(next_event(&mut got).await.text, "fresh");
+        shapes::written();
+        assert_eq!(read_down(&health), None);
+        let kept = std::fs::read_to_string(recent_file(&dir.join("state"), "poll")).unwrap();
+        let ids: Vec<String> = (kept.lines())
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .map(|line| line["id"].as_str().unwrap_or("").to_owned())
+            .collect();
+        assert!(ids[0].starts_with("lookout.back."), "{kept}");
+        let health = runner.lasting["poll"].health.lock().unwrap();
+        assert_eq!(
+            (health.failed, health.since_ms, health.told),
+            (0, None, None)
+        );
+        drop(health);
+        drop(runner);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
