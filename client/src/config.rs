@@ -53,7 +53,7 @@
 //! text_width = 0                # the widest the conversation is written, 100 by default; 0 the window's whole width
 //! margin_opens = "never"         # "always", the default, or "unless-closed"
 //! margin_notes = 8              # the most notes a margin holds, 6 by default; past it a new one is refused
-//! margin_note_lines = 10         # the most rows a note draws, at the margin's own width, 6 by default; past it the note is refused
+//! margin_note_lines = 20         # the most rows a note draws, at the margin's own width, 40 by default; past it the note is refused
 //! agent_opens = "beside"        # a click on an agent's name: "tab", the default, or "beside"
 //! suggest = false               # no guess at the next message, on by default
 //! suggest_ideas = false         # a guess never offers an idea or a tip in its place, on by default
@@ -840,7 +840,7 @@ pub const MARGIN_NOTES: u64 = 6;
 /// The most rows a note draws unless `margin_note_lines` says otherwise:
 /// state to glance at beside the conversation, so a whole margin fits in
 /// one look; anything longer goes in the reply or a file it names.
-pub const MARGIN_NOTE_LINES: u64 = 6;
+pub const MARGIN_NOTE_LINES: u64 = 40;
 
 /// The narrowest `text_width` other than 0, the margin's own least width:
 /// a narrower column wraps a path or a line of code at every turn.

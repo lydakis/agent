@@ -495,67 +495,6 @@ async fn show(
     Ok(json!({"bot": bot, "in": layout.home()}))
 }
 
-/// A tab for `bot`, a task `caller` just started asking for one: placed
-/// as a task's window is, within `[sonny] most_task_tabs`, closing the
-/// lead's least recently used task tabs for room, never one the person has
-/// not looked at yet nor one that holds its place. What to tell `caller`
-/// beside the start, if anything.
-async fn task_tab(caller: &str, bot: &str) -> Result<String, String> {
-    let (socket, project, chain) = agents_project(caller).await?;
-    let me = named::me().map_err(|e| e.to_string())?;
-    let mut layout = mux::for_agent(&socket, &project, &chain, None)?;
-    // What it closes or holds back for room, the lead's own layout reads.
-    layout.keep_aside(used::aside());
-    let client = Client::connect(&socket).await.map_err(|e| e.to_string())?.0;
-    let mut bots = Vec::new();
-    let mut after = Value::Null;
-    loop {
-        let asked = json!({"name": format!("{project}.*"), "limit": 256, "after": after});
-        let page = client
-            .request("bots", asked)
-            .await
-            .map_err(|e| e.to_string())?;
-        bots.extend(page["bots"].as_array().cloned().unwrap_or_default());
-        after = page["next_after"].clone();
-        if after.is_null() {
-            break;
-        }
-    }
-    let lead = (chain.last())
-        .filter(|lead| project::is_lead(lead))
-        .cloned()
-        .unwrap_or_else(|| format!("{project}.lead"));
-    let lineage = lineage_of(&bots, &lead, lead == format!("{project}.lead"));
-    let mut room = room_for(&project, &lineage, &HashMap::new(), Arc::new(used::held));
-    room.most = agent_client::config::load().map_or(0, |c| c.sonny.most_task_tabs as usize);
-    let command = [
-        me.to_string_lossy().into_owned(),
-        "--socket".into(),
-        socket.to_string_lossy().into_owned(),
-        "--no-sound".into(),
-        "--window-place".into(),
-        mux::Place::encode(&Some(layout.kept())),
-        "--agent".into(),
-        bot.to_owned(),
-    ];
-    let short = bot.strip_prefix(&format!("{project}.")).unwrap_or(bot);
-    Ok(
-        match layout.show_task(bot, short, &command, &room, false)? {
-            mux::Shown::Had => String::new(),
-            mux::Shown::Opened(closed) if closed.is_empty() => String::new(),
-            mux::Shown::Opened(closed) => format!(
-                "\n\nIts tab opened; {}.",
-                made_room(&closed, &project, room.most)
-            ),
-            mux::Shown::Aside | mux::Shown::NoRoom => format!(
-                "\n\nNo tab opened for it yet: the project's {} task tabs are all ones the person \
-             has not looked at. It opens once they go to it, or once it needs them.",
-                room.most
-            ),
-        },
-    )
-}
-
 /// A failed `turn` with why it failed, which `turns` leaves out, as
 /// `wait` has it: a model that said nothing is no failure.
 async fn with_error(client: &Client, mut turn: Value) -> Value {
@@ -4536,8 +4475,16 @@ struct App {
     replay: Option<(String, usize)>,
     /// How to reach the daemon again when the connection drops.
     options: Options,
-    /// The lead's connection dropped.
-    down: bool,
+    /// When the lead's connection dropped, while it is down: the status
+    /// row's phase until it is back.
+    down: Option<Instant>,
+    /// This agent's messages waiting for a turn of their own, by number:
+    /// while no turn runs, its turn has not started, the `Queued` phase.
+    in_line: Vec<i64>,
+    /// Since when no turn has run with a message in line.
+    in_line_since: Option<Instant>,
+    /// A compaction asked for and not yet run, which the footer says.
+    compact_next: bool,
     /// The background switched, or the view did: the conversation is
     /// drawn again once idle.
     repaint: bool,
@@ -4964,6 +4911,13 @@ struct Fleet {
     ended: HashMap<String, i64>,
     /// Calls running in the project that may wait on tasks, by bot and call.
     waits: std::collections::HashSet<(String, String)>,
+    /// Tasks whose tab opened here only because they came to need the
+    /// person, with `task_tabs = "asked"`, with when and the block it
+    /// opened: it closes once their result is taken, as every task's does
+    /// with `"every"`, unless the person went to it or used it since, or
+    /// an agent showed the task again in another block. Read and written
+    /// on the layout's worker, in order with the windows it opens.
+    for_need: Arc<std::sync::Mutex<HashMap<String, (std::time::SystemTime, String)>>>,
     /// Finished calls that may have waited, to read for the turns they
     /// returned: the bot, the output's node, and the call.
     returned: Vec<(String, i64, String)>,
@@ -5447,6 +5401,7 @@ impl Fleet {
             zen: false,
             ended: HashMap::new(),
             waits: Default::default(),
+            for_need: Default::default(),
             returned: Vec::new(),
             resolving: Default::default(),
             began: HashMap::new(),
@@ -5498,6 +5453,7 @@ impl Fleet {
             zen: false,
             ended: HashMap::new(),
             waits: Default::default(),
+            for_need: Default::default(),
             returned: Vec::new(),
             resolving: Default::default(),
             began: HashMap::new(),
@@ -5848,7 +5804,7 @@ impl Fleet {
 
     /// A task that came to need the person, its window set aside for
     /// room or, as `task_tabs = "asked"` has it, never opened, has it open
-    /// now, as what needs them keeps its window: it
+    /// now, until its result is taken, as what needs them keeps its window: it
     /// closes the window they used least recently for room, never one
     /// they have not looked at yet nor one that needs them, and with no
     /// other passes the limit. The person's focus stays where it is.
@@ -5858,6 +5814,7 @@ impl Fleet {
         let (bot, told) = (bot.to_owned(), self.tell.clone());
         let (socket, project) = (self.socket.clone(), self.project.clone());
         let (place, lead) = (self.place.clone(), self.lead.clone());
+        let for_need = self.for_need.clone();
         self.layout.send(move |layout| {
             let every = windows.lock().is_ok_and(|mut windows| windows.every());
             if (every && !layout.aside(&bot)) || !mux::mine(&socket, &project, &lead, &place) {
@@ -5865,8 +5822,17 @@ impl Fleet {
             }
             room.most = windows.lock().map_or(0, |mut windows| windows.most());
             match layout.show_task(&bot, &name, &command, &room, true) {
-                Ok(mux::Shown::Opened(closed)) if !closed.is_empty() => {
-                    let _ = told.send(Told::Notice(made_room(&closed, &room.project, room.most)));
+                Ok(mux::Shown::Opened(closed)) => {
+                    if !every
+                        && let Some(block) = layout.block_of(&bot)
+                        && let Ok(mut for_need) = for_need.lock()
+                    {
+                        for_need.insert(bot.clone(), (std::time::SystemTime::now(), block));
+                    }
+                    if !closed.is_empty() {
+                        let _ =
+                            told.send(Told::Notice(made_room(&closed, &room.project, room.most)));
+                    }
                 }
                 Ok(_) => {}
                 Err(error) => {
@@ -5886,8 +5852,13 @@ impl Fleet {
         let (command, name) = self.window(bot, doing);
         let (windows, mut room) = self.room();
         let task = bot != self.lead && self.lineage.contains(bot);
+        let for_need = self.for_need.clone();
         let (bot, told) = (bot.to_owned(), self.tell.clone());
         self.layout.send(move |layout| {
+            // Asked for now, it stays once taken.
+            if let Ok(mut for_need) = for_need.lock() {
+                for_need.remove(&bot);
+            }
             let every = windows.lock().is_ok_and(|mut windows| windows.every());
             if layout.aside(&bot) || (task && !every) {
                 room.most = windows.lock().map_or(0, |mut windows| windows.most());
@@ -5971,9 +5942,10 @@ impl Fleet {
     }
 
     /// Close the windows of the tasks whose completed turns the finished
-    /// waits returned: with `task_tabs = "every"`, as each task opened one;
-    /// a tab asked for stays until the person or an agent closes it, or
-    /// the task is resolved.
+    /// waits returned: with `task_tabs = "every"`, as each task opened one,
+    /// and with `"asked"`, a tab opened only because the task needed the
+    /// person, which they have not used since; a tab asked for stays until
+    /// the person or an agent closes it, or the task is resolved.
     async fn close_taken(&mut self) {
         let every = self.windows.lock().is_ok_and(|mut windows| windows.every());
         for (bot, node, call) in std::mem::take(&mut self.returned) {
@@ -5998,8 +5970,9 @@ impl Fleet {
                     && !self.needs.waits(&task)
                 {
                     self.ended.remove(&task);
-                    if every {
-                        self.close(&task);
+                    match every {
+                        true => self.close(&task),
+                        false => self.close_for_need(&task),
                     }
                     self.doing.remove(&task);
                     self.activity.remove(&task);
@@ -6007,6 +5980,25 @@ impl Fleet {
                 }
             }
         }
+    }
+
+    /// Close the task's tab if it opened only because the task needed the
+    /// person, they have not used it since, and it is still the block
+    /// opened then, not one an agent showed since. Decided on the layout's
+    /// worker, after the windows asked for before it opened.
+    fn close_for_need(&self, task: &str) {
+        let (for_need, used_when) = (self.for_need.clone(), self.used_when);
+        let task = task.to_owned();
+        self.layout.send(move |layout| {
+            let Some((at, block)) =
+                (for_need.lock().ok()).and_then(|mut for_need| for_need.remove(&task))
+            else {
+                return;
+            };
+            if layout.block_of(&task) == Some(block) && !used::since(used_when(&task), at) {
+                layout.close(&task);
+            }
+        });
     }
 
     /// A task resolved, by the lead or itself: its window closes, unless
@@ -6387,7 +6379,10 @@ impl App {
             thought: String::new(),
             replay: None,
             options,
-            down: false,
+            down: None,
+            in_line: Vec::new(),
+            in_line_since: None,
+            compact_next: record["compaction_requested"] == true,
             repaint: false,
             stale: false,
             links_written: screen::Written::default(),
@@ -6707,7 +6702,7 @@ impl App {
                 continue;
             }
             tokio::select! {
-                event = events.recv(), if !self.down => {
+                event = events.recv(), if self.down.is_none() => {
                     changed = true;
                     heard = Instant::now();
                     match event {
@@ -7376,6 +7371,7 @@ impl App {
     /// What the footer and pickers show of the bot, from its record.
     /// A changed model replaces the one this window's turns run on.
     fn refresh(&mut self, record: &Value, model: bool) {
+        self.compact_next = record["compaction_requested"] == true;
         if model
             && let (Some(provider), Some(model)) =
                 (record["provider"].as_str(), record["model"].as_str())
@@ -7706,8 +7702,10 @@ impl App {
         self.ahead.clear();
         self.said.clear();
         self.replay = None;
-        self.notice = Some("reconnecting to the daemon".into());
-        self.down = true;
+        // The phase says it, until it is back; a notice of before
+        // happened before it.
+        self.notice = None;
+        self.down.get_or_insert_with(Instant::now);
         self.retry.get_or_insert_with(Instant::now);
     }
 
@@ -7740,7 +7738,7 @@ impl App {
                 .map_err(|e| e.to_string())?;
             Ok::<_, String>((client, fresh, record, caught, companions))
         };
-        if self.down {
+        if self.down.is_some() {
             let (client, fresh, record, caught, companions) = match lead.await {
                 Ok(back) => back,
                 Err(error) if error == UPGRADED => {
@@ -7750,7 +7748,7 @@ impl App {
                     return;
                 }
                 Err(error) => {
-                    self.notice = Some(format!("reconnecting to the daemon: {error}"));
+                    self.notice = Some(format!("the daemon did not answer: {error}"));
                     self.retry = Some(Instant::now() + Duration::from_secs(2));
                     return;
                 }
@@ -7758,8 +7756,11 @@ impl App {
             self.paused = caught.paused(&client);
             self.client = client;
             *events = fresh;
-            self.down = false;
+            self.down = None;
             self.notice = None;
+            // A compaction asked for may have run, or been asked for, while
+            // away: the record says which.
+            self.compact_next = record["compaction_requested"] == true;
             // What happened while away is not known turn by turn: a kept
             // done window stays open from here on, as any other.
             self.kept.showing = false;
@@ -9894,6 +9895,7 @@ impl App {
             Some((came, buttons)) => {
                 self.commit(vec![came]);
                 self.mark_last(screen::Mark::Buttons(buttons));
+                self.mark_last(screen::Mark::Over);
                 self.commit_after(lines, false);
             }
             None => self.commit(lines),
@@ -10886,6 +10888,17 @@ impl App {
                 None => break,
             }
         }
+        // What waits for a turn of its own, as the daemon has it now: one
+        // taken or ended while this window was away is gone from it.
+        self.in_line = (waiting.iter())
+            .filter(|row| matches!(row["status"].as_str(), Some("queued" | "ready")))
+            .filter_map(|row| row["message"].as_i64())
+            .collect();
+        if self.in_line.is_empty() {
+            self.in_line_since = None;
+        } else if self.running.is_none() {
+            self.in_line_since.get_or_insert_with(Instant::now);
+        }
         let mut staged = Vec::new();
         for row in &waiting {
             let Some(message) = row["message"].as_i64() else {
@@ -11192,6 +11205,7 @@ impl App {
             self.marks
                 .push((self.pending.len(), screen::Mark::Buttons(buttons)));
             self.pending.push(came);
+            self.mark_last(screen::Mark::Over);
         }
     }
 
@@ -11221,6 +11235,39 @@ impl App {
             self.rows_drawn += live.rows.len();
             self.pending.append(&mut live.rows);
             self.any_history = true;
+        }
+    }
+
+    /// This agent's messages that wait for a turn of their own, kept from
+    /// its events: in line from `queued`, out once a turn takes one
+    /// (`accepted`, `steered`) or it ends unrun (`message_ended`). While
+    /// no turn runs and one waits, the agent is queued.
+    fn keep_line(&mut self, kind: &str, event: &Value) {
+        let message = event["message"].as_i64();
+        match kind {
+            "queued" if matches!(event["data"]["status"].as_str(), Some("queued" | "ready")) => {
+                if let Some(message) = message
+                    && !self.in_line.contains(&message)
+                {
+                    self.in_line.push(message);
+                }
+            }
+            "accepted" | "message_ended" => {
+                let taken = message.or(event["turn"].as_i64());
+                self.in_line.retain(|waits| Some(*waits) != taken);
+            }
+            "steered" => {
+                let taken = event["data"]["message"].as_i64();
+                self.in_line.retain(|waits| Some(*waits) != taken);
+            }
+            // What waits behind the turn that ended waits from now.
+            "turn_finished" => self.in_line_since = Some(Instant::now()),
+            _ => {}
+        }
+        if self.in_line.is_empty() {
+            self.in_line_since = None;
+        } else if self.running.is_none() {
+            self.in_line_since.get_or_insert_with(Instant::now);
         }
     }
 
@@ -11259,6 +11306,9 @@ impl App {
             self.staged
                 .retain(|(staged, _)| Some(*staged) != data["message"].as_i64());
         }
+        // So is a message waiting for its own turn: the line is kept
+        // whether or not the node is drawn again.
+        self.keep_line(kind, &event);
         if drawn && matches!(kind, "steered" | "message" | "tool_completed") {
             return;
         }
@@ -11321,10 +11371,6 @@ impl App {
             }
             "accepted" => {
                 self.staged.retain(|(staged, _)| Some(*staged) != turn);
-                // What waited in line is running now.
-                if self.notice.as_deref() == Some("queued") {
-                    self.notice = None;
-                }
                 self.end_live(Words::Reply);
                 self.live_item = None;
                 self.ahead.clear();
@@ -11414,14 +11460,12 @@ impl App {
                     self.answered(&text(item), item["from"].as_str());
                 }
             }
-            // An attached note whose wait ran out goes as a steer: the
-            // sender's, nothing the person put in line.
-            "queued" if data["lapsed"] == true => {}
-            // A steer behind the running turn joins it at its next call,
-            // the person's own marked `↪` where it waits: only a message
-            // waiting for a turn of its own says so, until one starts.
-            "queued" if data["status"] == "queued" && data["delivery"] == "steer" => {}
-            "queued" => self.notice = Some("queued".to_owned()),
+            // A message in line says nothing on the status row, which is
+            // about the turn: the person's own waits drawn above it, `›⋯`
+            // or `›↪`, and anyone else's is named by `↳` once its turn
+            // starts. A turn that has not started is the phase, `Queued`
+            // ([`App::keep_line`]).
+            "queued" => {}
             // Nothing until a call takes it in: it asks nothing of the
             // person, so nothing says it waits.
             "attached" => {}
@@ -11595,12 +11639,19 @@ impl App {
                 if let Some(running) = &mut self.running {
                     running.phase = "Compacting".into();
                 }
+                // The phase says it now: what was asked for runs.
+                self.compact_next = false;
             }
+            // Asked from another window or the CLI: the footer says so here
+            // too, until it runs.
+            "compaction_requested" => self.compact_next = true,
             "compacted" => {
+                self.compact_next = false;
                 self.compacted = Some(data.clone());
                 self.notice = Some("compacted the conversation".into());
             }
             "compaction_failed" => {
+                self.compact_next = false;
                 self.notice = Some(format!(
                     "compaction failed: {}",
                     data["error"]
@@ -12390,8 +12441,9 @@ impl App {
             self.notice = Some("no HOME, so no commons".into());
             return;
         };
+        let project = self.scope().project;
         self.watch = Some(Watch {
-            project: self.scope().project,
+            project: project.clone(),
             rows: Vec::new(),
             read: Instant::now(),
             alerts: Vec::new(),
@@ -12399,7 +12451,7 @@ impl App {
             background: None,
             usage: None,
             audit: None,
-            commons: Some(commons::View::open(&home)),
+            commons: Some(commons::View::open(&home, project)),
             memory: None,
             sky: None,
             picked: None,
@@ -12892,6 +12944,7 @@ impl App {
             .collect();
         for call in &mut self.approvals {
             whole_arguments(&self.client, &self.bot, call).await;
+            approvals::offer(call);
         }
         if let Some(running) = &mut self.running {
             if (self.approvals.iter()).any(|call| call["handle"].is_null()) {
@@ -12985,6 +13038,7 @@ impl App {
                     }
                     let mut call = call.clone();
                     whole_arguments(&self.client, bot, &mut call).await;
+                    approvals::offer(&mut call);
                     self.names.get_mut().learn(bot.to_owned(), true);
                     self.raised.push(call);
                     self.raised_read.insert(read);
@@ -13120,12 +13174,13 @@ impl App {
     /// now, outside every agent's sandbox, as Codex's "don't ask again"
     /// keeps a prefix rule: an allow rule in `~/.agent/rules`, which every
     /// agent's next turn reads.
-    async fn always(&mut self, prefix: &str) {
+    async fn always(&mut self, prefix: &[String]) {
+        let shown = approvals::shown(prefix);
         if let Err(error) = approvals::allow_always(prefix) {
-            self.notice = Some(format!("couldn't keep {prefix}: {error}"));
+            self.notice = Some(format!("couldn't keep {shown}: {error}"));
             return;
         }
-        self.answer("allow", Some(prefix)).await;
+        self.answer("allow", Some(&shown)).await;
     }
 
     /// `/compact`, once the person said yes.
@@ -13144,18 +13199,17 @@ impl App {
         });
     }
 
+    /// `/compact`, once the person said yes: until it runs, the footer
+    /// says it waits, a state the notice would lose to the next one.
     async fn compact(&mut self) {
-        self.notice = Some(
-            match self
-                .client
-                .request("compact", json!({"bot": self.bot}))
-                .await
-            {
-                Ok(_) if self.running.is_some() => "compacts at its next step".into(),
-                Ok(_) => "compacts before its next reply".into(),
-                Err(error) => format!("compact: {error}"),
-            },
-        );
+        match self
+            .client
+            .request("compact", json!({"bot": self.bot}))
+            .await
+        {
+            Ok(_) => self.compact_next = true,
+            Err(error) => self.notice = Some(format!("compact: {error}")),
+        }
     }
 
     /// The slash commands the input could be, while it is one word that
@@ -18376,7 +18430,7 @@ impl App {
             linked.extend(self.screen.link_cells(frame.buffer_mut()));
             let [live, status, gap, composer, pad, footer] = areas(view, live_rows);
             frame.render_widget(Paragraph::new(open_rows.clone()), live);
-            let status_line = self.status_line();
+            let status_line = self.status_row(status.width as usize);
             // The agents it names open them, as their names do anywhere.
             let parked: Vec<(String, String)> = (self.paused.as_ref())
                 .and_then(|pause| pause["parked"]["bots"].as_array())
@@ -19050,7 +19104,30 @@ impl App {
         (rows, (row, col))
     }
 
+    #[cfg(test)]
     fn status_line(&self) -> Line<'static> {
+        self.status_row(usize::MAX)
+    }
+
+    /// The status row, `width` wide: what happens now, the first that
+    /// applies of a pause, an approval, the agent's turn or its phase
+    /// without one, and a notice.
+    fn status_row(&self, width: usize) -> Line<'static> {
+        // Upgraded under it, the window reconnects no more: reopening it
+        // is all there is to do, and the row says so alone.
+        if self.upgraded {
+            return Line::from(Span::raw(UPGRADED));
+        }
+        // The connection is the phase until it is back: what the window
+        // knows of the turn, a pause or an approval is from before.
+        if let Some(down) = self.down {
+            let phase = Phase {
+                said: "Reconnecting to the daemon".into(),
+                since: down,
+                running: false,
+            };
+            return self.running_row(phase, Vec::new(), width);
+        }
         // A pause holds every approved call too, so it is shown first, and
         // the approval keys wait for the resume.
         if let Some(pause) = &self.paused {
@@ -19107,8 +19184,13 @@ impl App {
                 Span::raw(" allow once · ").dim(),
             ];
             if let Some(prefix) = approvals::always(call) {
+                // Cut to leave the row's other keys in view: a whole
+                // command offered can run long.
+                const KEYS: &str = "  ⏸ y allow once · a always allow  · n deny · esc set aside";
+                let room = self.width.saturating_sub(KEYS.width()).max(8);
+                let shown = transcript::cut(&approvals::shown(&prefix), room);
                 line.push(Span::raw("a"));
-                line.push(Span::raw(format!(" always allow {prefix} · ")).dim());
+                line.push(Span::raw(format!(" always allow {shown} · ")).dim());
             }
             line.extend([Span::raw("n"), Span::raw(" deny · ").dim()]);
             line.extend([Span::raw("esc"), Span::raw(" set aside").dim()]);
@@ -19128,36 +19210,27 @@ impl App {
             ],
         };
         if let Some(running) = self.running.as_ref().filter(|_| !self.zen_hides()) {
-            let mut spans = vec![Span::raw("• ").dim()];
             // In zen, what it runs or calls stays out of view, as its calls do.
-            let phase = match running.phase.split_once(' ') {
+            let said = match running.phase.split_once(' ') {
                 Some(("Running" | "Calling", _)) if self.zen.is_some() => "Working",
                 _ => running.phase.as_str(),
             };
-            spans.extend(shimmer(phase, self.started.elapsed()));
-            // What is written steers it on Enter; Tab keeps it for after.
-            let queues = match self.input.trim().is_empty() {
-                true => "",
-                false => " • tab to queue",
+            let phase = Phase {
+                said: said.to_owned(),
+                since: running.started,
+                running: true,
             };
-            spans.push(
-                Span::raw(format!(
-                    " ({} • esc to interrupt{queues})",
-                    transcript::elapsed(running.started.elapsed().as_secs())
-                ))
-                .dim(),
-            );
-            if !aside.is_empty() {
-                spans.push(Span::raw(" · ").dim());
-                spans.extend(aside);
-            }
-            // What the turn said meanwhile (a retry, the round limit, a
-            // steer that failed), which its end clears.
-            if let Some(notice) = &self.notice {
-                spans.push(Span::raw(" · ").dim());
-                spans.push(Span::raw(notice.clone()));
-            }
-            return Line::from(spans);
+            return self.running_row(phase, aside, width);
+        }
+        // No turn runs and a message waits for one of its own: its turn
+        // has not started, the agent's state `queued`.
+        if let Some(since) = self.in_line_since.filter(|_| !self.in_line.is_empty()) {
+            let phase = Phase {
+                said: "Queued".into(),
+                since,
+                running: false,
+            };
+            return self.running_row(phase, aside, width);
         }
         if !aside.is_empty() {
             return Line::from(aside);
@@ -19166,6 +19239,59 @@ impl App {
             Some(notice) => Line::from(Span::raw(notice.clone())),
             None => Line::default(),
         }
+    }
+
+    /// The running row, `width` wide, in its four parts and only those:
+    /// the phase, the time and keys in brackets, what the person set
+    /// aside, one notice. Too long, the notice goes first, then
+    /// `tab to queue`, then the command after `Running` is cut at a word;
+    /// the time and `esc to interrupt` stay.
+    fn running_row(&self, phase: Phase, aside: Vec<Span<'static>>, width: usize) -> Line<'static> {
+        let time = transcript::elapsed(phase.since.elapsed().as_secs());
+        // What is written steers it on Enter; Tab keeps it for after.
+        let mut queues = phase.running && !self.input.trim().is_empty();
+        let mut notice = self.notice.clone();
+        let keys = |queues: bool| match (phase.running, queues) {
+            (false, _) => format!(" ({time})"),
+            (true, false) => format!(" ({time} • esc to interrupt)"),
+            (true, true) => format!(" ({time} • esc to interrupt • tab to queue)"),
+        };
+        let aside_width: usize = match aside.is_empty() {
+            true => 0,
+            false => 3 + aside.iter().map(|span| span.width()).sum::<usize>(),
+        };
+        let rest = |queues: bool, notice: &Option<String>| {
+            2 + keys(queues).width()
+                + aside_width
+                + notice.as_ref().map_or(0, |notice| 3 + notice.width())
+        };
+        let mut said = phase.said.clone();
+        if rest(queues, &notice) + said.width() > width {
+            notice = None;
+        }
+        if rest(queues, &notice) + said.width() > width {
+            queues = false;
+        }
+        if let Some(command) = said.strip_prefix("Running ")
+            && rest(queues, &notice) + said.width() > width
+        {
+            let room = width.saturating_sub(rest(queues, &notice) + "Running ".len());
+            said = format!("Running {}", cut_at_word(command, room));
+        }
+        let mut spans = vec![Span::raw("• ").dim()];
+        spans.extend(shimmer(&said, self.started.elapsed()));
+        spans.push(Span::raw(keys(queues)).dim());
+        if !aside.is_empty() {
+            spans.push(Span::raw(" · ").dim());
+            spans.extend(aside);
+        }
+        // What happened in the turn meanwhile (a retry, the round limit, a
+        // steer that failed), which its end clears.
+        if let Some(notice) = notice {
+            spans.push(Span::raw(" · ").dim());
+            spans.push(Span::raw(notice));
+        }
+        Line::from(spans)
     }
 
     /// A message quoted before what the person is writing, as a mail or a
@@ -19292,14 +19418,35 @@ impl App {
         if let Some(speed) = self.pace {
             waits.push(format!("{speed} speed"));
         }
-        if !waits.is_empty() {
-            let waits = waits.join(" · ");
+        // A compaction asked for waits for the agent's next model call,
+        // in a turn or the next one.
+        let compacts = match self.running.is_some() {
+            true => "compacts at its next step",
+            false => "compacts before its next reply",
+        };
+        let forms = match (waits.is_empty(), self.compact_next) {
+            (true, false) => Vec::new(),
+            (true, true) => vec![compacts.to_owned(), "compacts next".to_owned()],
+            (false, compact) => {
+                let waits = waits.join(" · ");
+                let then = |more: &str| match compact {
+                    true => format!("{more} · {compacts}"),
+                    false => more.to_owned(),
+                };
+                let short = match compact {
+                    true => format!("{waits} · compacts next"),
+                    false => waits.clone(),
+                };
+                vec![then(&format!("{waits} when idle")), short]
+            }
+        };
+        if !forms.is_empty() {
             items.push(Item::new(
                 Slot::Pending,
-                vec![
-                    vec![Span::raw(format!("{waits} when idle")).dim()],
-                    vec![Span::raw(waits).dim()],
-                ],
+                forms
+                    .into_iter()
+                    .map(|form| vec![Span::raw(form).dim()])
+                    .collect(),
             ));
         }
         // A lead or task told more than its seat's own role says so.
@@ -19766,6 +19913,31 @@ fn status_keys(watch: &Watch, folding: bool) -> String {
 }
 
 /// Codex's sweep: a brighter band moving across the phase every two seconds.
+/// What the running row names: the phase in words, since when, and
+/// whether a turn runs, which `esc` interrupts.
+struct Phase {
+    said: String,
+    since: Instant,
+    running: bool,
+}
+
+/// `text` cut to `room` columns at a word, with `…` after it; whole when
+/// it fits, and `…` alone when not one word does.
+fn cut_at_word(text: &str, room: usize) -> String {
+    if text.width() <= room {
+        return text.to_owned();
+    }
+    let room = room.saturating_sub(1);
+    let mut kept = String::new();
+    for word in text.split_inclusive(' ') {
+        if (kept.clone() + word).trim_end().width() > room {
+            break;
+        }
+        kept.push_str(word);
+    }
+    format!("{}…", kept.trim_end())
+}
+
 fn shimmer(text: &str, since: Duration) -> Vec<Span<'static>> {
     let chars: Vec<char> = text.chars().collect();
     let period = chars.len() as f32 + 20.0;
@@ -22915,6 +23087,10 @@ mod tests {
         assert_eq!(rows[calc], (Some(1), "• calc.neg is done.".into()));
         assert_eq!(rows[calc - 1], (Some(1), "↳ calc.neg".into()));
         assert_eq!(rows[calc - 2], (None, String::new()));
+        // Each `↳` row hangs over its reply: the reply's time goes over it.
+        let overs = app.screen.overs();
+        assert!(overs[shop - 1] && overs[calc - 1]);
+        assert_eq!(overs.iter().filter(|over| **over).count(), 2);
         // Off, nothing is barred.
         let mut app = super::tests::app(zen_daemon().await);
         app.width = 100;
@@ -24189,11 +24365,25 @@ mod tests {
             (8, "d".into()),
         ];
         app.queued = vec![7, 8];
+        app.in_line = vec![5, 8];
         app.restage().await;
         // Its words as this window kept them; a note the lookout sent is
         // not the person's, so it is not staged.
         assert_eq!(app.staged, [(7, "c".to_owned())]);
         assert_eq!(app.queued, [7]);
+        // What waits for a turn of its own is what waits now, anyone's:
+        // no turn runs, so its turn has not started.
+        assert_eq!(app.in_line, [7, 9]);
+        assert!(app.status_line().to_string().starts_with("• Queued ("));
+    }
+
+    #[tokio::test]
+    async fn a_window_upgraded_under_it_says_to_reopen_it_and_nothing_else() {
+        let mut app = app(daemon_with(json!([])).await);
+        app.dropped();
+        app.notice = Some(UPGRADED.to_owned());
+        app.upgraded = true;
+        assert_eq!(app.status_row(40).to_string(), UPGRADED);
     }
 
     #[tokio::test]
@@ -24286,9 +24476,12 @@ mod tests {
         app.daemon(queued(6, json!({"status": "queued", "delivery": "steer"})))
             .await;
         assert_eq!(app.staged.len(), 1);
+        assert!(app.in_line.contains(&6));
         app.daemon(turn_event("steered", 1, json!({"message": 6, "node": 12})))
             .await;
         assert!(app.staged.is_empty());
+        // Nor waiting in line, so the row never says `Queued` for it.
+        assert!(!app.in_line.contains(&6));
     }
 
     #[tokio::test]
@@ -24803,6 +24996,9 @@ mod tests {
                 "└ started ◌ readme · sent to ● fix · ● reviewer",
             ]
         );
+        // The `↳` hangs over the reply: its time goes over it.
+        let over = app.pending.len() - 3;
+        assert!((app.marks.iter()).any(|(row, mark)| *row == over && *mark == screen::Mark::Over));
         // Right above and under the reply, and each name opens its agent.
         let at = app.pending.len() - 1;
         let buttons = (app.marks.iter())
@@ -25579,59 +25775,157 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_steer_into_the_running_turn_says_nothing_on_its_line() {
+    async fn the_row_never_says_queued_for_a_message_and_a_turn_not_started_is_the_phase() {
         let client = daemon_with(json!([])).await;
         let mut app = app(client);
-        app.daemon(turn_event("accepted", 1, json!({}))).await;
-        // A task's update, a lookout note, the person's own Enter: each
-        // joins the turn at its next call, and the turn takes it in.
-        app.daemon(turn_event(
-            "queued",
-            2,
-            json!({"status": "queued", "delivery": "steer", "from": "b.task"}),
-        ))
-        .await;
+        let queued = |message: i64, data: Value| json!({"event": "queued", "bot": "b", "turn": null, "message": message, "data": data});
+        app.daemon(json!({"event": "accepted", "bot": "b", "turn": 1, "message": 1, "data": {}}))
+            .await;
+        // A task's update, a lookout note, the person's own Enter or Tab,
+        // an automation's run: none says `queued` while a turn runs.
+        for (message, data) in [
+            (
+                2,
+                json!({"status": "queued", "delivery": "steer", "from": "b.task"}),
+            ),
+            (
+                3,
+                json!({"status": "queued", "delivery": "queue", "origin": "automation"}),
+            ),
+            (4, json!({"status": "queued", "delivery": "queue"})),
+        ] {
+            app.daemon(queued(message, data)).await;
+            assert_eq!(app.notice, None);
+            let row = app.status_line().to_string();
+            assert!(row.starts_with("• Working ("), "{row}");
+            assert!(!row.contains("queued") && !row.contains("Queued"), "{row}");
+        }
+        // The steer joins the turn; two wait for turns of their own.
         app.daemon(turn_event(
             "steered",
             1,
             json!({"message": 2, "node": null}),
         ))
         .await;
-        assert_eq!(app.notice, None, "nothing waits for a turn of its own");
-        assert!(!app.status_line().to_string().contains("queued"));
-        // A turn of its own after this one says it waits, until it starts.
-        app.daemon(turn_event(
-            "queued",
-            3,
-            json!({"status": "queued", "delivery": "queue", "origin": "automation"}),
-        ))
-        .await;
-        assert!(app.status_line().to_string().ends_with(" · queued"));
+        assert_eq!(app.in_line, [3, 4]);
         app.daemon(turn_event(
             "turn_finished",
             1,
             json!({"status": "completed"}),
         ))
         .await;
-        app.daemon(turn_event("accepted", 3, json!({}))).await;
-        assert!(!app.status_line().to_string().contains("queued"));
-        // At rest, a message waiting for a slot says so too, and its
-        // turn's start lets it go.
+        // No turn runs and one waits: its turn has not started.
+        let row = app.status_line().to_string();
+        assert!(row.starts_with("• Queued (") && row.ends_with(')'), "{row}");
+        assert!(
+            !row.contains("esc to interrupt"),
+            "nothing runs to interrupt"
+        );
+        app.daemon(json!({"event": "accepted", "bot": "b", "turn": 3, "message": 3, "data": {}}))
+            .await;
+        assert!(app.status_line().to_string().starts_with("• Working ("));
         app.daemon(turn_event(
             "turn_finished",
             3,
             json!({"status": "completed"}),
         ))
         .await;
-        app.daemon(turn_event(
-            "queued",
-            4,
-            json!({"status": "ready", "delivery": "steer"}),
-        ))
+        assert!(app.status_line().to_string().starts_with("• Queued ("));
+        // One that ends unrun leaves the line.
+        app.daemon(
+            json!({"event": "message_ended", "bot": "b", "turn": null, "message": 4,
+            "data": {"status": "failed"}}),
+        )
         .await;
-        assert_eq!(app.notice.as_deref(), Some("queued"));
-        app.daemon(turn_event("accepted", 4, json!({}))).await;
+        assert_eq!(app.status_line().to_string(), "");
+        // At rest, waiting for a slot, it is the phase from the start.
+        app.daemon(queued(5, json!({"status": "ready", "delivery": "steer"})))
+            .await;
         assert_eq!(app.notice, None);
+        assert!(app.status_line().to_string().starts_with("• Queued ("));
+    }
+
+    #[tokio::test]
+    async fn a_compaction_asked_for_waits_in_the_footer_not_the_notice() {
+        let client = daemon_answering(|_| json!({"duplicate": false})).await;
+        let mut app = app(client);
+        app.compact().await;
+        assert_eq!(app.notice, None);
+        let footer = app.footer_line(200).to_string();
+        assert!(
+            footer.contains("compacts before its next reply"),
+            "{footer}"
+        );
+        // A notice after it leaves it where it is, as it still waits.
+        app.notice = Some("copied".into());
+        assert!(
+            app.footer_line(200)
+                .to_string()
+                .contains("compacts before its next reply")
+        );
+        app.daemon(turn_event("compacted", 2, json!({}))).await;
+        assert!(!app.footer_line(200).to_string().contains("compacts"));
+        assert_eq!(app.notice.as_deref(), Some("compacted the conversation"));
+        // Asked from elsewhere, said here too.
+        app.daemon(json!({"event": "compaction_requested", "bot": "b", "running_turn": null}))
+            .await;
+        assert!(
+            app.footer_line(200)
+                .to_string()
+                .contains("compacts before its next reply")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_dropped_connection_is_the_phase_until_it_is_back() {
+        let mut app = app(daemon_with(json!([])).await);
+        app.notice = Some("copied".into());
+        app.dropped();
+        assert_eq!(app.notice, None);
+        let row = app.status_line().to_string();
+        assert!(
+            row.starts_with("• Reconnecting to the daemon (") && row.ends_with(')'),
+            "{row}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_running_row_too_long_drops_the_notice_then_tab_then_cuts_the_command() {
+        let mut app = app(daemon_with(json!([])).await);
+        app.running = Some(Running {
+            turn: 1,
+            started: Instant::now(),
+            phase: "Running cargo test --workspace --all-features".into(),
+            note: false,
+            effort: None,
+            acted: false,
+        });
+        app.input.set("also the docs");
+        app.notice = Some("the model retried; its reply may repeat".into());
+        let row = |app: &App, width: usize| app.status_row(width).to_string();
+        let whole = row(&app, usize::MAX);
+        assert_eq!(
+            whole,
+            "• Running cargo test --workspace --all-features (0s • esc to interrupt \
+             • tab to queue) · the model retried; its reply may repeat"
+        );
+        // The notice goes first.
+        assert_eq!(
+            row(&app, whole.width() - 1),
+            "• Running cargo test --workspace --all-features (0s • esc to interrupt • tab to queue)"
+        );
+        // Then `tab to queue`.
+        assert_eq!(
+            row(&app, 80),
+            "• Running cargo test --workspace --all-features (0s • esc to interrupt)"
+        );
+        // Then the command, at a word; the time and esc stay.
+        assert_eq!(
+            row(&app, 60),
+            "• Running cargo test --workspace… (0s • esc to interrupt)"
+        );
+        assert_eq!(row(&app, 44), "• Running cargo… (0s • esc to interrupt)");
+        assert_eq!(row(&app, 30), "• Running … (0s • esc to interrupt)");
     }
 
     #[tokio::test]
@@ -29858,11 +30152,16 @@ mod tests {
     }
 
     /// As `task_tabs = "asked"` has it, a task's turn opens no tab: one
-    /// opens once the task needs the person, or they go to it, and stays
-    /// once its result is taken.
+    /// opens once the task needs the person, and closes once its result
+    /// is taken, or they go to it, and it stays.
     #[tokio::test]
     async fn a_task_opens_a_tab_only_once_it_needs_you_or_you_go_to_it() {
-        let (client, events) = daemon_with_events(json!({}), |asked| {
+        // The lead's wait that took both tasks' results.
+        let waited = json!({"results": {
+            "calc.a/1": {"status": "completed"},
+            "calc.b/1": {"status": "completed"},
+        }});
+        let (client, events) = daemon_with_events(json!({}), move |asked| {
             match asked["op"].as_str().unwrap_or("") {
                 "bots" => json!({"bots": [
                     {"name": "calc.lead", "bot_id": 1, "head": 1},
@@ -29874,7 +30173,10 @@ mod tests {
                 "approvals" => json!({"approvals": []}),
                 "turns" => json!({"turns": []}),
                 "history_nodes" => json!({"nodes": []}),
-                "history_items" => json!({"items": []}),
+                "history_items" => json!({"items": [{"item": {
+                    "type": "function_call_output", "call_id": "w1",
+                    "output": waited.to_string(),
+                }}]}),
                 _ => json!({}),
             }
         })
@@ -29920,6 +30222,240 @@ mod tests {
         fleet.go_to("calc.b", true);
         fleet.layout.settle();
         assert!(windowed(&fleet).contains(&"calc.b".to_owned()));
+        // The person approves; both finish and the lead's wait takes them.
+        fleet.event(&event(
+            "calc.a",
+            "tool_started",
+            json!({"call_id": "c1", "name": "shell"}),
+        ));
+        assert_eq!(fleet.doing["calc.a"], "working");
+        for bot in ["calc.a", "calc.b"] {
+            fleet.event(&event(bot, "turn_finished", json!({"status": "completed"})));
+        }
+        fleet.event(&event(
+            "calc.lead",
+            "tool_started",
+            json!({"call_id": "w1", "name": "wait"}),
+        ));
+        fleet.event(&event(
+            "calc.lead",
+            "tool_completed",
+            json!({"call_id": "w1", "node": 9}),
+        ));
+        fleet.close_taken().await;
+        fleet.layout.settle();
+        // The tab opened only for what needed the person closes; the one
+        // the person went to stays.
+        let shown = windowed(&fleet);
+        assert!(!shown.contains(&"calc.a".to_owned()), "{shown:?}");
+        assert!(shown.contains(&"calc.b".to_owned()), "{shown:?}");
+    }
+
+    /// A tab opened only because its task needed the person, which an
+    /// agent showed again since (`show_agent` places a new block), stays
+    /// once the result is taken.
+    #[tokio::test]
+    async fn a_tab_opened_for_a_need_an_agent_showed_again_stays_once_taken() {
+        // The lead's wait that took both tasks' results.
+        let waited = json!({"results": {
+            "calc.a/1": {"status": "completed"},
+            "calc.b/1": {"status": "completed"},
+        }});
+        let (client, events) = daemon_with_events(json!({}), move |asked| {
+            match asked["op"].as_str().unwrap_or("") {
+                "bots" => json!({"bots": [
+                    {"name": "calc.lead", "bot_id": 1, "head": 1},
+                    {"name": "calc.a", "bot_id": 2, "created_by": "calc.lead",
+                        "running_turn": 1, "head": 2},
+                    {"name": "calc.b", "bot_id": 3, "created_by": "calc.lead",
+                        "running_turn": 1, "head": 3},
+                ], "next_after": null}),
+                "approvals" => json!({"approvals": []}),
+                "turns" => json!({"turns": []}),
+                "history_nodes" => json!({"nodes": []}),
+                "history_items" => json!({"items": [{"item": {
+                    "type": "function_call_output", "call_id": "w1",
+                    "output": waited.to_string(),
+                }}]}),
+                _ => json!({}),
+            }
+        })
+        .await;
+        let mut fleet = Fleet::in_memory(client.clone(), events, "calc", "calc.lead");
+        let read = (agent_client::config::path().as_ref())
+            .and_then(|path| std::fs::metadata(path).ok())
+            .and_then(|file| file.modified().ok());
+        fleet.windows = Arc::new(std::sync::Mutex::new(TaskWindows {
+            read: Some(read),
+            most: 32,
+            tabs: agent_client::config::TaskTabs::Asked,
+        }));
+        let event = |bot: &str, kind: &str, data: Value| json!({"event": kind, "bot": bot, "turn": 1, "data": data});
+        let windowed = |fleet: &Fleet| {
+            let (sent, got) = std::sync::mpsc::channel();
+            fleet.layout.send(move |layout| {
+                let labels: Vec<String> = (layout.windows().into_iter())
+                    .flat_map(|(_, labels)| labels)
+                    .collect();
+                let _ = sent.send(labels);
+            });
+            got.recv().unwrap()
+        };
+        for bot in ["calc.a", "calc.b"] {
+            fleet.lineage.insert(bot.into());
+            fleet.event(&event(bot, "accepted", json!({})));
+        }
+        fleet.layout.settle();
+        let shown = windowed(&fleet);
+        assert!(
+            !shown.iter().any(|label| label.starts_with("calc.")),
+            "{shown:?}"
+        );
+        assert_eq!(fleet.doing["calc.a"], "working");
+        // A call of its held for the person opens its tab.
+        fleet.event(&event("calc.a", "approval_asked", json!({"call_id": "c1"})));
+        assert_eq!(fleet.doing["calc.a"], "needs you");
+        fleet.layout.settle();
+        assert!(windowed(&fleet).contains(&"calc.a".to_owned()));
+        assert!(!windowed(&fleet).contains(&"calc.b".to_owned()));
+        // The person goes to the other: its tab opens.
+        fleet.go_to("calc.b", true);
+        fleet.layout.settle();
+        assert!(windowed(&fleet).contains(&"calc.b".to_owned()));
+        // An agent shows calc.a again, as show_agent does: a new block.
+        fleet.layout.send(|layout| {
+            let command = ["sonny".to_owned(), "--agent".into(), "calc.a".into()];
+            layout
+                .place("calc.a", "a", &command, &mux::Placement::Window)
+                .unwrap();
+        });
+        fleet.layout.settle();
+        // The person approves; both finish and the lead's wait takes them.
+        fleet.event(&event(
+            "calc.a",
+            "tool_started",
+            json!({"call_id": "c1", "name": "shell"}),
+        ));
+        assert_eq!(fleet.doing["calc.a"], "working");
+        for bot in ["calc.a", "calc.b"] {
+            fleet.event(&event(bot, "turn_finished", json!({"status": "completed"})));
+        }
+        fleet.event(&event(
+            "calc.lead",
+            "tool_started",
+            json!({"call_id": "w1", "name": "wait"}),
+        ));
+        fleet.event(&event(
+            "calc.lead",
+            "tool_completed",
+            json!({"call_id": "w1", "node": 9}),
+        ));
+        fleet.close_taken().await;
+        fleet.layout.settle();
+        // Both stay: calc.a's is the one the agent showed.
+        let shown = windowed(&fleet);
+        assert!(shown.contains(&"calc.a".to_owned()), "{shown:?}");
+        assert!(shown.contains(&"calc.b".to_owned()), "{shown:?}");
+    }
+
+    /// A tab opened only because its task needed the person, used by them
+    /// since, as when they answer in it, stays once the result is taken.
+    #[tokio::test]
+    async fn a_tab_opened_for_a_need_the_person_used_stays_once_taken() {
+        // The lead's wait that took both tasks' results.
+        let waited = json!({"results": {
+            "calc.a/1": {"status": "completed"},
+            "calc.b/1": {"status": "completed"},
+        }});
+        let (client, events) = daemon_with_events(json!({}), move |asked| {
+            match asked["op"].as_str().unwrap_or("") {
+                "bots" => json!({"bots": [
+                    {"name": "calc.lead", "bot_id": 1, "head": 1},
+                    {"name": "calc.a", "bot_id": 2, "created_by": "calc.lead",
+                        "running_turn": 1, "head": 2},
+                    {"name": "calc.b", "bot_id": 3, "created_by": "calc.lead",
+                        "running_turn": 1, "head": 3},
+                ], "next_after": null}),
+                "approvals" => json!({"approvals": []}),
+                "turns" => json!({"turns": []}),
+                "history_nodes" => json!({"nodes": []}),
+                "history_items" => json!({"items": [{"item": {
+                    "type": "function_call_output", "call_id": "w1",
+                    "output": waited.to_string(),
+                }}]}),
+                _ => json!({}),
+            }
+        })
+        .await;
+        let mut fleet = Fleet::in_memory(client.clone(), events, "calc", "calc.lead");
+        // The person types in calc.a's tab.
+        fleet.used_when = |bot| (bot == "calc.a").then(std::time::SystemTime::now);
+        let read = (agent_client::config::path().as_ref())
+            .and_then(|path| std::fs::metadata(path).ok())
+            .and_then(|file| file.modified().ok());
+        fleet.windows = Arc::new(std::sync::Mutex::new(TaskWindows {
+            read: Some(read),
+            most: 32,
+            tabs: agent_client::config::TaskTabs::Asked,
+        }));
+        let event = |bot: &str, kind: &str, data: Value| json!({"event": kind, "bot": bot, "turn": 1, "data": data});
+        let windowed = |fleet: &Fleet| {
+            let (sent, got) = std::sync::mpsc::channel();
+            fleet.layout.send(move |layout| {
+                let labels: Vec<String> = (layout.windows().into_iter())
+                    .flat_map(|(_, labels)| labels)
+                    .collect();
+                let _ = sent.send(labels);
+            });
+            got.recv().unwrap()
+        };
+        for bot in ["calc.a", "calc.b"] {
+            fleet.lineage.insert(bot.into());
+            fleet.event(&event(bot, "accepted", json!({})));
+        }
+        fleet.layout.settle();
+        let shown = windowed(&fleet);
+        assert!(
+            !shown.iter().any(|label| label.starts_with("calc.")),
+            "{shown:?}"
+        );
+        assert_eq!(fleet.doing["calc.a"], "working");
+        // A call of its held for the person opens its tab.
+        fleet.event(&event("calc.a", "approval_asked", json!({"call_id": "c1"})));
+        assert_eq!(fleet.doing["calc.a"], "needs you");
+        fleet.layout.settle();
+        assert!(windowed(&fleet).contains(&"calc.a".to_owned()));
+        assert!(!windowed(&fleet).contains(&"calc.b".to_owned()));
+        // The person goes to the other: its tab opens.
+        fleet.go_to("calc.b", true);
+        fleet.layout.settle();
+        assert!(windowed(&fleet).contains(&"calc.b".to_owned()));
+        // The person approves; both finish and the lead's wait takes them.
+        fleet.event(&event(
+            "calc.a",
+            "tool_started",
+            json!({"call_id": "c1", "name": "shell"}),
+        ));
+        assert_eq!(fleet.doing["calc.a"], "working");
+        for bot in ["calc.a", "calc.b"] {
+            fleet.event(&event(bot, "turn_finished", json!({"status": "completed"})));
+        }
+        fleet.event(&event(
+            "calc.lead",
+            "tool_started",
+            json!({"call_id": "w1", "name": "wait"}),
+        ));
+        fleet.event(&event(
+            "calc.lead",
+            "tool_completed",
+            json!({"call_id": "w1", "node": 9}),
+        ));
+        fleet.close_taken().await;
+        fleet.layout.settle();
+        // Both stay: the person used the one opened for a need.
+        let shown = windowed(&fleet);
+        assert!(shown.contains(&"calc.a".to_owned()), "{shown:?}");
+        assert!(shown.contains(&"calc.b".to_owned()), "{shown:?}");
     }
 
     #[tokio::test]

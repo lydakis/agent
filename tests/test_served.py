@@ -16,6 +16,7 @@ from bench.runtime_client import node_item
 from bench.socket_client import SocketClient
 from bench.targets import clean_env
 from tests.test_images import image
+from tests.test_lookout import untimed
 from tests.test_runtime import ModelFixture
 
 
@@ -907,8 +908,10 @@ for (let i = 0; ; i++) await agent(`say ${i}`)
         self.assertNotIn('told', replied)
         thread = (self.path / '.agents/commons/fake-home.jsonl').read_text().splitlines()
         self.assertEqual([json.loads(line)['by'] for line in thread], ['calc.a', 'shop.b'])
+        # Each post names the project its author is named in.
+        self.assertEqual([json.loads(line)['project'] for line in thread], ['calc', 'shop'])
         # The lookout tells calc.a of the reply, and shop.b nothing of its own.
-        note = self.note_for('calc.a', 'Confirmed here too.')
+        note = untimed(self.note_for('calc.a', 'Confirmed here too.'))
         self.assertIn('[commons · fake-home · shop.b]\nreply in fake-home, "Live tests want a fake HOME": '
                       'Confirmed here too.', note)
         for t in self.daemon.request('turns', bot='shop.b')['result']['turns']:
@@ -920,6 +923,12 @@ for (let i = 0; ; i++) await agent(`say ${i}`)
         found = turn('shop.b', {'search': 'confirmed HERE'})
         self.assertEqual([(t['thread'], [m['by'] for m in t['matches']]) for t in found['threads']],
                          [('fake-home', ['shop.b'])], found)
+        # A filter on what Sonny wrote of each post: a thread is its first post's project's.
+        listed = turn('shop.b', {'filter': {'project': ['calc']}})
+        self.assertEqual([(t['thread'], t['project']) for t in listed['threads']], [('fake-home', 'calc')])
+        self.assertEqual(turn('shop.b', {'filter': {'project': ['shop']}})['threads'], [])
+        found = turn('shop.b', {'search': '', 'filter': {'project': ['shop']}})
+        self.assertEqual([[m['by'] for m in t['matches']] for t in found['threads']], [['shop.b']], found)
 
     def test_a_new_thread_invites_an_agent_whose_turns_touch_it(self):
         for bot in ('calc.a', 'shop.b', 'mail.c'):
