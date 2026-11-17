@@ -1954,13 +1954,22 @@ fn told(text: &str, from: Option<&str>) -> Option<Vec<String>> {
 }
 
 /// A line of the lookout's note that heads an event, `[source · topic ·
-/// from]`, as its parts.
+/// from · time]`, as its parts, the time when the lookout heard it left
+/// out.
 fn header(line: &str) -> Option<Vec<&str>> {
     let inside = line.strip_prefix('[')?.strip_suffix(']')?;
     if inside.is_empty() || inside.contains(['[', ']']) {
         return None;
     }
-    Some(inside.split(" · ").collect())
+    let mut parts: Vec<&str> = inside.split(" · ").collect();
+    if parts.len() > 1
+        && parts
+            .last()
+            .is_some_and(|at| crate::lookout::sources::is_heard_at(at))
+    {
+        parts.pop();
+    }
+    Some(parts)
 }
 
 /// What the lookout's note tells, by its headers: a few words for each

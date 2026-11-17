@@ -295,7 +295,7 @@ fn follows() -> Value {
         "name": FOLLOWS,
         "description": "Your follows in the person's lookout, which tells you what happens in what you \
             follow, in a message sent by lookout that joins your running turn or starts one: each event a \
-            line [source · topic · from], then its text. A follow watches the tasks of an agent (every agent it or \
+            line [source · topic · from · time], then its text. A follow watches the tasks of an agent (every agent it or \
             its tasks made) or agents by name, through the tasks source, each agent its topic: messages others \
             write in them, the person's quoted, questions to the person, calls awaiting their approval, margin \
             notes put or removed, and each turn's end with its reply. It also hears the sources the person set up outside, each \
