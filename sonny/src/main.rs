@@ -11292,6 +11292,9 @@ impl App {
             self.staged
                 .retain(|(staged, _)| Some(*staged) != data["message"].as_i64());
         }
+        // So is a message waiting for its own turn: the line is kept
+        // whether or not the node is drawn again.
+        self.keep_line(kind, &event);
         if drawn && matches!(kind, "steered" | "message" | "tool_completed") {
             return;
         }
@@ -11314,7 +11317,6 @@ impl App {
         if kind == "queued" {
             self.stage_sent_elsewhere(&event).await;
         }
-        self.keep_line(kind, &event);
         match kind {
             // Changed by this or another client: the footer and the
             // pickers read the bot again.
@@ -24447,9 +24449,12 @@ mod tests {
         app.daemon(queued(6, json!({"status": "queued", "delivery": "steer"})))
             .await;
         assert_eq!(app.staged.len(), 1);
+        assert!(app.in_line.contains(&6));
         app.daemon(turn_event("steered", 1, json!({"message": 6, "node": 12})))
             .await;
         assert!(app.staged.is_empty());
+        // Nor waiting in line, so the row never says `Queued` for it.
+        assert!(!app.in_line.contains(&6));
     }
 
     #[tokio::test]
