@@ -544,11 +544,7 @@ batches on blocking workers, so the runtime's thread never waits on the disk
 and a quiet stream holds no worker; a full line makes the command wait, and a
 command that has ended is waited for while its streams wait on the disk. The
 writer redacts as it goes, exactly as the whole would be redacted however the
-stream is cut: each pass (credentials, then secret PEM blocks, then secret
-fields' values) reads the stream byte by byte as it reads a whole text, holding
-only what may still be redacted: the end that may begin a credential, a value
-not yet known to be secret (past 1 MiB it is told as redacted). A secret
-block's body and a secret value are dropped as they come. A stream stops being written at
+stream is cut, holding only the end that may begin a credential. A stream stops being written at
 1 GiB, and its result says how many bytes the file holds and how many it does
 not. A stream within 1 MiB never reaches the writer: its file is written once,
 after the command, as below.
@@ -2891,14 +2887,11 @@ is stored as an artifact retrievable through the `artifact` operation. A bot wit
 an `outputs` folder keeps the whole stream there instead, written as the command
 runs, up to 1 GiB (see [retained outputs](#retained-outputs)). Output is redacted before it is stored or sent,
 artifacts included, as every tool's result is: each credential the daemon
-holds, wherever it appears; the value printed after a field name ending in
-one the daemon was started with (`--redact-field`, any case, with or without
-`_` or `-`, as `NAME=`, `NAME:` or `"NAME":`), when it is at least 8 bytes and
-mixes letters and digits; and the body of a PEM block whose header names a
-`--redact-block` label. Which names count as secrets is the client's
-judgement: the CLI passes `agent_client::SECRET_FIELDS` and `PRIVATE KEY`. A command's or a fetched page's output
+holds, wherever it appears, becomes `[redacted by agent]`. Nothing else is:
+as in Codex, no field name or key block is guessed at, so a value a program
+masked itself is the program's own masking. A command's or a fetched page's output
 over 64 KiB is redacted on a blocking thread rather than the runtime's (a
-MiB takes about 8 ms), and those threads work on at most two of the largest
+MiB takes under 1 ms), and those threads work on at most two of the largest
 results per logical CPU at once. Results include separate output, exit code, and
 success status. Nonzero exit is a recorded tool result. A command's return,
 timeout, or overflow kills its owned process group, so a process it started
@@ -2958,10 +2951,8 @@ read live. Output merges stdout and stderr, as a terminal
 does, keeps its last 64 KiB unread, counting what it drops, and is redacted
 as one stream across its reads, exactly as the whole would be however the
 reads cut it, as a [retained output's](#retained-outputs) file is: what may
-still be redacted (the end that may begin a credential, a value not yet
-known to be secret) waits for the next read, while a field's name and
-separator are shown at once, so a prompt such as `Password: ` reaches the
-bot. A
+still be redacted (the end that may begin a credential) waits for the next
+read. A
 terminal takes no process slot and no timeout: it runs until
 it exits or is killed, across turns, and `wait` on its handle reports how it
 ended, with what no write read. It takes a `--max-lasting` slot before it
@@ -4502,7 +4493,7 @@ judges it, since the URL it is given leaves the machine.
 
 Shell children inherit the service environment except the provider key
 variables, plus the CLI location/context variables described above. Exact occurrences of provider key
-values in tool results are replaced with `[REDACTED]` before serialization and
+values in tool results are replaced with `[redacted by agent]` before serialization and
 persistence. This handles known tool output text, not arbitrary encodings or
 credentials elsewhere on the host. A command that escapes its process group, or
 a hard kill of the whole service, needs external process isolation/cleanup. A

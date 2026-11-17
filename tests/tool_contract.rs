@@ -175,7 +175,7 @@ async fn known_credential_text_is_redacted_before_tool_result_serialization() {
             .await
             .unwrap()
             .output
-            == "[REDACTED]"
+            == "[redacted by agent]"
     );
     let shell = tools.prepare("shell", &json!({"command": "printf '%s' 'synthetic-\"test-value'; printf '%s' 'synthetic-\"test-value' >&2"}).to_string()).unwrap();
     let output = tools
@@ -184,8 +184,8 @@ async fn known_credential_text_is_redacted_before_tool_result_serialization() {
         .unwrap()
         .output;
     let result: Value = serde_json::from_str(&output).unwrap();
-    assert!(result["stdout"] == "[REDACTED]");
-    assert!(result["stderr"] == "[REDACTED]");
+    assert!(result["stdout"] == "[redacted by agent]");
+    assert!(result["stderr"] == "[redacted by agent]");
     let binary = tools
         .prepare(
             "shell",
@@ -197,7 +197,7 @@ async fn known_credential_text_is_redacted_before_tool_result_serialization() {
         .await
         .unwrap();
     let result: Value = serde_json::from_str(&outcome.output).unwrap();
-    assert_eq!(result["stdout"], "\u{fffd}[REDACTED]");
+    assert_eq!(result["stdout"], "\u{fffd}[redacted by agent]");
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -225,8 +225,8 @@ async fn large_output_is_redacted_off_the_runtime_whole() {
         .iter()
         .map(|(name, bytes)| (*name, String::from_utf8(bytes.clone()).unwrap()))
         .collect();
-    assert!(streams["stdout"].ends_with(" [REDACTED]"));
-    assert!(streams["stderr"].starts_with("[REDACTED] "));
+    assert!(streams["stdout"].ends_with(" [redacted by agent]"));
+    assert!(streams["stderr"].starts_with("[redacted by agent] "));
     for text in streams.values().chain([&outcome.output]) {
         assert!(!text.contains("synthetic-large-value"));
     }
@@ -253,7 +253,7 @@ async fn rotated_overlapping_credentials_are_fully_redacted() {
             .await
             .unwrap()
             .output,
-        "[REDACTED]"
+        "[redacted by agent]"
     );
     assert_eq!(
         credentials.names(),

@@ -10401,3 +10401,36 @@ Each row is within the runs' spread but the model request, a fifth
 smaller, since the model is shown the script tool alone. Code mode stays
 ahead of 0.9.5 on every row (0.9.5 direct: turn p50 2.5 and 13.0 s,
 processor time 5.5 and 8.2 ms a turn, peak memory 62 and 191 MB).
+
+## Tool output redacts only the daemon's own credentials
+
+Tool output no longer has values after secret-looking field names or the
+bodies of `PRIVATE KEY` blocks redacted (`--redact-field` and
+`--redact-block` are gone, and no client passes them); each credential the
+daemon holds is still replaced. Every CLI- and Sonny-started daemon ran
+both heuristic passes over every tool output, so this is the path every
+command result took.
+
+The redaction path itself, `Credentials::redact` over 64 KiB pieces
+(whole) and `Redacting` fed 8 KiB pieces (stream), two provider keys held,
+release builds, best of 15, three alternating rounds, minimum over the
+rounds. 2026-11-17, Linux 6.18 cloud VM, 4 CPUs. Base is main `2872f1b`
+with the CLI's twelve fields and `PRIVATE KEY`; head is this change.
+
+| Text | Path | Base ms | Head ms | Change |
+| --- | --- | ---: | ---: | ---: |
+| code, 4 MiB | whole | 11.36 | 1.29 | -89% |
+| code, 4 MiB | stream | 9.31 | 0.53 | -94% |
+| log lines, 4 MiB | whole | 10.21 | 1.38 | -86% |
+| log lines, 4 MiB | stream | 10.73 | 0.64 | -94% |
+| rules and tables, 4 MiB | whole | 25.93 | 3.76 | -85% |
+| rules and tables, 4 MiB | stream | 24.51 | 2.69 | -89% |
+| certificates, 4 MiB | whole | 13.98 | 1.32 | -91% |
+| certificates, 4 MiB | stream | 14.21 | 0.56 | -96% |
+| env and config fields, 4 MiB | whole | 9.78 | 1.58 | -84% |
+| env and config fields, 4 MiB | stream | 16.96 | 0.81 | -95% |
+
+Head matches base run without the two passes (code 1.34 / 0.57 ms, rules
+4.27 / 3.17 ms), so what is left is the credentials' own scan. Nothing here
+grows with bots, turns or history: the fleet screens do not reach it, and
+each daemon's credential set holds two fewer empty lists.
