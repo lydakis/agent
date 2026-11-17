@@ -29,14 +29,25 @@ pub const PROGRAM: &str = "SONNY_PROGRAM";
 /// any other process is the program it was started from.
 pub fn me() -> std::io::Result<PathBuf> {
     let exe = std::env::current_exe()?;
-    if exe.parent() == Some(dir().as_path())
-        && let Some(program) = std::env::var_os(PROGRAM).map(PathBuf::from)
-        && program.is_absolute()
-        && program.is_file()
-    {
-        return Ok(program);
+    Ok(program_of(exe, &dir(), std::env::var_os(PROGRAM)))
+}
+
+/// The program a process started from `exe` is: `program` when `exe` is
+/// a name in `names` and `program` names a file, else `exe`. The folders
+/// are compared as the file system resolves them: the running program's
+/// path is resolved (Linux reads it from `/proc`), while `names` is spelled
+/// from `HOME`, which may reach the same folder through a link, such as a
+/// `/home` that links to `/local/home`.
+fn program_of(exe: PathBuf, names: &Path, program: Option<std::ffi::OsString>) -> PathBuf {
+    let named = exe.parent().is_some_and(|parent| {
+        parent == names
+            || std::fs::canonicalize(parent)
+                .is_ok_and(|parent| std::fs::canonicalize(names).is_ok_and(|names| parent == names))
+    });
+    match program.map(PathBuf::from) {
+        Some(program) if named && program.is_absolute() && program.is_file() => program,
+        _ => exe,
     }
-    Ok(exe)
 }
 
 /// `program` by `name`: its link in the names folder, made or made again
@@ -262,6 +273,34 @@ mod tests {
         assert!(!same(&names.join(LOOKOUT), &sonny));
         named_in(&names, &sonny, LOOKOUT).unwrap();
         assert!(same(&names.join(LOOKOUT), &sonny));
+    }
+
+    #[test]
+    fn a_name_is_known_however_home_spells_the_names_folder() {
+        let root = temp();
+        let real = root.join("local/home/me");
+        let names = real.join(".agent/sonny/programs/names");
+        std::fs::create_dir_all(&names).unwrap();
+        let sonny = program(&root, "sonny", "#!/bin/sh\n");
+        let host = named_in(&names, &sonny, TOOL_HOST).unwrap();
+        // HOME reaches the same folder through a link, as `/home` linked
+        // to `/local/home` does, while the running program's path is
+        // resolved.
+        std::fs::create_dir_all(root.join("home")).unwrap();
+        std::os::unix::fs::symlink(&real, root.join("home/me")).unwrap();
+        let spelled = root.join("home/me/.agent/sonny/programs/names");
+        let given = Some(sonny.clone().into_os_string());
+        assert_eq!(program_of(host.clone(), &spelled, given.clone()), sonny);
+        assert_eq!(program_of(host.clone(), &names, given.clone()), sonny);
+        // A program outside the names folder is itself, whatever it is given.
+        assert_eq!(program_of(sonny.clone(), &spelled, given.clone()), sonny);
+        let other = program(&root, "other", "#!/bin/sh\n");
+        let other_given = Some(other.into_os_string());
+        assert_eq!(program_of(sonny.clone(), &spelled, other_given), sonny);
+        // A name given no program, or one that is no file, is itself.
+        assert_eq!(program_of(host.clone(), &spelled, None), host);
+        let gone = Some(root.join("gone").into_os_string());
+        assert_eq!(program_of(host.clone(), &spelled, gone), host);
     }
 
     #[test]
