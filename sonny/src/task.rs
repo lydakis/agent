@@ -2092,8 +2092,8 @@ struct Found {
     bot: Option<Value>,
     /// A folder of the task's own, which only `discard` removes.
     own: bool,
-    /// Another agent's turn runs in it, as a side chat's or one started
-    /// in place there does.
+    /// An agent works in it now: a turn or a command of its own task's
+    /// or another's, as a side chat's or one started in place there.
     used: bool,
 }
 
@@ -2237,7 +2237,7 @@ fn make_room(new: &str, (store, socket): (&Path, &Path), keep: u64, call: &str) 
                     });
                 }
                 // The folders the agents at work now work in, whichever
-                // agent's they are: a few, however many the store holds.
+                // agent's they are.
                 let Some(used) = runtime.block_on(at_work(&client)) else {
                     runtime.block_on(client.close());
                     return Vec::new();
@@ -2287,27 +2287,58 @@ fn make_room(new: &str, (store, socket): (&Path, &Path), keep: u64, call: &str) 
     })
 }
 
-/// The folders the daemon's agents with a turn running work in, every
-/// page of them: none when they can't be read.
+/// The folders the daemon's agents at work now work in, every page of
+/// them: those with a turn running, and those with a command still
+/// running after its turn ended, as one started in the background does.
+/// A few, however many agents the store holds; none when they can't be
+/// read.
 async fn at_work(client: &agent_client::Client) -> Option<Vec<PathBuf>> {
     let (mut dirs, mut after) = (Vec::new(), Value::Null);
+    let workspace = |bot: &Value| {
+        (bot["workspace"].as_str())
+            .filter(|dir| !dir.is_empty())
+            .map(PathBuf::from)
+    };
     loop {
         let mut asked = json!({"active": true, "limit": 256});
         if !after.is_null() {
             asked["after"] = after;
         }
         let page = client.request("bots", asked).await.ok()?;
-        dirs.extend(
-            (page["bots"].as_array().into_iter().flatten())
-                .filter_map(|bot| bot["workspace"].as_str())
-                .filter(|dir| !dir.is_empty())
-                .map(PathBuf::from),
+        dirs.extend((page["bots"].as_array().into_iter().flatten()).filter_map(workspace));
+        after = page["next_after"].clone();
+        if after.is_null() {
+            break;
+        }
+    }
+    let mut running = std::collections::BTreeSet::new();
+    loop {
+        let mut asked = json!({});
+        if !after.is_null() {
+            asked["after"] = after;
+        }
+        let page = client.request("processes", asked).await.ok()?;
+        running.extend(
+            (page["processes"].as_array().into_iter().flatten())
+                .filter_map(|process| process["bot"].as_str().map(str::to_owned)),
         );
         after = page["next_after"].clone();
         if after.is_null() {
-            return Some(dirs);
+            break;
         }
     }
+    for bot in running {
+        let page = (client
+            .request("bots", json!({"name": bot, "limit": 1}))
+            .await)
+            .ok()?;
+        dirs.extend(
+            (page["bots"].as_array().into_iter().flatten())
+                .filter(|listed| listed["name"] == bot.as_str())
+                .filter_map(workspace),
+        );
+    }
+    Some(dirs)
 }
 
 /// Whether Sonny made `name` a folder of its own.
