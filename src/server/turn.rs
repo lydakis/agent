@@ -5462,6 +5462,7 @@ impl Turn {
                 .chain(calls.as_slice().iter().cloned())
                 .collect();
             let route = route.map(str::to_owned);
+            let served = self.hub.served();
             let parked = self
                 .store
                 .op("suspend_approval", move |db| {
@@ -5471,6 +5472,7 @@ impl Turn {
                         now_ms(),
                         route.as_deref(),
                         summary_retry_ms,
+                        &served,
                     )
                 })
                 .await?;

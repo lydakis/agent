@@ -465,7 +465,8 @@ such as a refusal's `category`, `explanation`, `provider_request_id`,
 view's own name where the two meet, so `turns` shows it after retention drops
 the turn's events.
 `waiting_on` is what a parked turn waits for, as its `turn_waiting` or
-`turn_paced` event said (`call_id` and `approval`, `load` or `handles`, or
+`turn_paced` event said (`call_id` and `approval` with `holder` and
+`since_ms`, as an `ask` rewrites them, `load` or `handles`, or
 `resume_at_ms` with `blocked` or `retrying` when either parked it, null with
 `paused: true` for a turn the pull cord parked), and
 null otherwise. A `wait` result is the view, plus the
@@ -3684,6 +3685,22 @@ it as a daemon step: `{"tools":[{"name","description","parameters",
 "grammar"?,"step"}]}`. The settings change no stored shape; no schema
 change.
 
+Protocol version 82 says who holds a call a turn parked on, and since when.
+A verdict park's `waiting_on` (its `turn_waiting` event, the turn's view and
+its bot's row) adds `holder` and `since_ms`: `reviewer` while every gate
+still open on the call is served by a session (`serve_approvals`) and none
+was handed to a person, from the call's announcement; `person` once a
+gate's holder hands it over with `ask`, from that first ask of a gate
+still open, or when a gate no session serves is open, from the
+announcement, since only an answer with no lease decides such a gate. These
+are the audit's names for who decided a call. The holder is written as the
+turn parks, from the tags served then, and an `ask` rewrites it on the
+parked turn and its bot in the commit that records the ask. A tag a
+session starts or stops serving after the park leaves it as it was: a
+reviewer that comes back decides the call or asks, and either moves the
+turn on. Schema 103 writes both for turns parked on a verdict when the
+store opens, where no session serves yet.
+
 ### Tool approval
 
 A bot may be created with a gate (one no bot made, which a client
@@ -3983,7 +4000,7 @@ says what every agent is doing and a client asks no agent for its turns.
 | `status` | `idle` (never ran), `running`, `waiting`, `paced`, `held` (the turn at the front of its line, refused at its start for a cause a person can fix, keeps its place and is tried again), `completed`, `failed`, `interrupted` (how its newest turn that counts ended), or `deleting` |
 | `running_turn` | The turn running or parked, `null` when none |
 | `started_ms` | When the running turn started, `null` when none runs |
-| `waiting_on` | For `waiting`, `paced` and `held`: what that turn's own `waiting_on` says (its call, approval, answer, load, `resume_at_ms`, `blocked`, `retrying`); `null` otherwise |
+| `waiting_on` | For `waiting`, `paced` and `held`: what that turn's own `waiting_on` says (its call, approval with its `holder` and `since_ms`, answer, load, `resume_at_ms`, `blocked`, `retrying`); `null` otherwise |
 | `last` | `{turn, status, started_ms, finished_ms, error}` for the bot's newest turn that ran, or that failed before it started (`started_ms` null, `error` its code); `null` before any |
 
 A message steered into a running turn, one riding the next call, and one

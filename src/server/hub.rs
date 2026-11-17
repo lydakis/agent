@@ -438,7 +438,7 @@ impl Hub {
         drop(held);
         Ok(serving)
     }
-    /// The tags served now, for `stats`.
+    /// The tags served now, for `stats` and for who holds a parked call.
     pub fn served(&self) -> Vec<String> {
         let now = Instant::now();
         let inner = self.inner.lock().unwrap();
