@@ -2562,14 +2562,14 @@ fn sanitize_error(mut error: Error, key: Option<&str>) -> Error {
     if let Some(mut detail) = error.detail.take() {
         if let Some(key) = key.filter(|key| !key.is_empty()) {
             if detail.contains(key) {
-                detail = detail.replace(key, "[REDACTED]");
+                detail = detail.replace(key, crate::tools::REDACTED);
             }
             // Plain-text and decoded provider messages may themselves quote
             // the standard JSON representation of a credential.
             if let Ok(encoded) = serde_json::to_string(key) {
                 let escaped = &encoded[1..encoded.len() - 1];
                 if escaped != key && detail.contains(escaped) {
-                    detail = detail.replace(escaped, "[REDACTED]");
+                    detail = detail.replace(escaped, crate::tools::REDACTED);
                 }
             }
         }
@@ -4339,7 +4339,7 @@ mod tests {
         assert_eq!(completion.items.len(), 1);
         assert_eq!(
             credentials.redact("stale fresh".into()),
-            "[REDACTED] [REDACTED]"
+            "[redacted by agent] [redacted by agent]"
         );
         assert!(
             Provider::new(Transport::new(0, 1).unwrap(), Family::Anthropic, &url, None)
