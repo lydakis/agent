@@ -77,20 +77,27 @@ this replaced:
   until now a reviewed-risky call waited for the person under Sonny's
   gate, which never lapses. The person's go-ahead in a message still
   authorizes the retry, as before and as in Codex.
-- **A review that fails goes to the person, and is labeled.** A round is
-  sent up to 3 times within a 90 s budget (Codex's attempts and timeout).
-  Still unassessed, it is no verdict, so since 2026-11-04 (#669) its
-  calls wait for the person as a doubted call does ("Automatic approval
-  review failed: WHY, so this waits for you"), the call kept as it is so
-  the agent doesn't make it again. Codex denies here; the trade-off is a
-  turn that waits on the person against ordinary work (ending a hung
-  window, removing an automation mid-incident) refused for the reviewer's
-  own fault. Where the gate lapses and nobody can be asked, it is denied
-  as "Automatic approval review failed: WHY", saying it is a review
-  failure, not a verdict that the call is unsafe; one that ran out of
-  time says the model may retry once. Both answer with `unreviewed`, so
-  they count toward no breaker. A reviewer reply that could not be read is
-  logged, its first 2 KB redacted, with the failure. A call too long to show the reviewer is
+- **A review that fails is denied back to the agent, and labeled.** A
+  round is sent up to 3 times within a 90 s budget (Codex's attempts and
+  timeout). Still unassessed, its calls are denied at once, as Codex fails
+  closed (openai/codex main 885a1df,
+  `ext/guardian-reviewer/src/completion.rs`), with Codex's words: a
+  failure as "Automatic approval review failed: WHY", then "The action
+  was not executed because automatic approval review could not be
+  completed. This is a review failure, not a determination that the
+  action is unsafe. Do not bypass the approval check; resolve the error or
+  ask your caller for guidance."; one that ran out of time as "The
+  automatic permission approval review did not finish before its
+  deadline. Do not assume the action is unsafe based on the timeout
+  alone. You may retry once, or ask your caller for guidance or explicit
+  approval." Both answer with `unreviewed`, so they count toward no
+  breaker. From 2026-11-04 (#669) such a call waited for the person
+  instead, and Sonny's gate never lapses: at night agents' calls sat for
+  hours on a person who was asleep, each holding its agent's turn. Since
+  2026-11-17 nobody holds a call the reviewer could not assess: the agent
+  retries, takes another way, or asks its caller in words. A reviewer
+  reply that could not be read is logged, its first 2 KB redacted, with
+  the failure. A call too long to show the reviewer is the one call
   still handed to the person, where one can answer, as Codex asks the
   person when a review's input is over its budget. The CLI's `auto` gate
   lapses at 105 s to fit the longer budget.
