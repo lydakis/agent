@@ -3,6 +3,7 @@ and how each turn ends, as a steer: joining its running turn, or starting
 one, once the news settles, and at once when the person writes in a task."""
 import json
 import os
+import re
 import subprocess
 import threading
 import time
@@ -12,6 +13,16 @@ from bench.runtime_client import node_item
 from bench.socket_client import SocketClient
 from bench.targets import clean_env
 from tests.test_runtime import ModelFixture
+
+# The time the lookout heard an event, last in its header: `10:39`, or
+# `Sat 14 Nov 10:39`, or `Sat 14 Nov 2025 10:39`.
+HEARD_AT = re.compile(r' · (?:\w{3} \d{1,2} \w{3} (?:\d{4} )?)?\d{2}:\d{2}\]$', re.M)
+
+
+def untimed(text):
+    """A note with the time left out of each event's header, so a test
+    reads it the same at any hour."""
+    return HEARD_AT.sub(']', text)
 
 
 @unittest.skipUnless(os.environ.get('AGENT_TEST_RUNTIME') == '1', 'set AGENT_TEST_RUNTIME=1 after a Rust release build')
@@ -120,7 +131,7 @@ class LookoutTests(ModelFixture):
         for message in self.daemon.request('messages', bot=bot, after=0)['result']['messages']:
             prompt = self.daemon.request('prompts', bot=bot, turn=message['message'])['result']['prompts'][0]
             if prompt.get('origin') == 'lookout':
-                notes.append(prompt['text'])
+                notes.append(untimed(prompt['text']))
         return notes
 
     def prompt_for(self, bot, timeout=30, having='', starting='', origin='lookout'):
@@ -130,9 +141,10 @@ class LookoutTests(ModelFixture):
             # own words come first in what `prompts` reads for it.
             for message in self.daemon.request('messages', bot=bot, after=0)['result']['messages']:
                 text = self.daemon.request('prompts', bot=bot, turn=message['message'])['result']['prompts']
-                if (text and text[0]['text'].startswith(starting) and having in text[0]['text']
+                said = text and untimed(text[0]['text'])
+                if (text and said.startswith(starting) and having in said
                         and (origin is None or text[0].get('origin') == origin)):
-                    return text[0]
+                    return {**text[0], 'text': said, 'timed': text[0]['text']}
             time.sleep(.2)
         return None
 
@@ -437,6 +449,8 @@ class LookoutTests(ModelFixture):
         # Not the person's words: the approver reads the origin.
         self.assertEqual(prompt['origin'], 'lookout')
         self.assertIn('[chat · ci]\ndeploy failed on prod', prompt['text'])
+        # Each event's header ends with when the lookout heard it.
+        self.assertRegex(prompt['timed'], r'\[chat · ci · [^\]]*\d\d:\d\d\]\ndeploy failed on prod')
         self.assertIsNotNone(self.note_for('reviewer', having='[chat]\nlunch?'))
         # An event printed again by its ID is told once.
         time.sleep(3)

@@ -175,7 +175,7 @@ async fn known_credential_text_is_redacted_before_tool_result_serialization() {
             .await
             .unwrap()
             .output
-            == "[REDACTED]"
+            == "[redacted by agent]"
     );
     let shell = tools.prepare("shell", &json!({"command": "printf '%s' 'synthetic-\"test-value'; printf '%s' 'synthetic-\"test-value' >&2"}).to_string()).unwrap();
     let output = tools
@@ -184,8 +184,8 @@ async fn known_credential_text_is_redacted_before_tool_result_serialization() {
         .unwrap()
         .output;
     let result: Value = serde_json::from_str(&output).unwrap();
-    assert!(result["stdout"] == "[REDACTED]");
-    assert!(result["stderr"] == "[REDACTED]");
+    assert!(result["stdout"] == "[redacted by agent]");
+    assert!(result["stderr"] == "[redacted by agent]");
     let binary = tools
         .prepare(
             "shell",
@@ -197,7 +197,7 @@ async fn known_credential_text_is_redacted_before_tool_result_serialization() {
         .await
         .unwrap();
     let result: Value = serde_json::from_str(&outcome.output).unwrap();
-    assert_eq!(result["stdout"], "\u{fffd}[REDACTED]");
+    assert_eq!(result["stdout"], "\u{fffd}[redacted by agent]");
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -225,8 +225,8 @@ async fn large_output_is_redacted_off_the_runtime_whole() {
         .iter()
         .map(|(name, bytes)| (*name, String::from_utf8(bytes.clone()).unwrap()))
         .collect();
-    assert!(streams["stdout"].ends_with(" [REDACTED]"));
-    assert!(streams["stderr"].starts_with("[REDACTED] "));
+    assert!(streams["stdout"].ends_with(" [redacted by agent]"));
+    assert!(streams["stderr"].starts_with("[redacted by agent] "));
     for text in streams.values().chain([&outcome.output]) {
         assert!(!text.contains("synthetic-large-value"));
     }
@@ -253,7 +253,7 @@ async fn rotated_overlapping_credentials_are_fully_redacted() {
             .await
             .unwrap()
             .output,
-        "[REDACTED]"
+        "[redacted by agent]"
     );
     assert_eq!(
         credentials.names(),
@@ -1477,10 +1477,16 @@ async fn a_terminal_takes_typed_input_and_reports_its_end() {
         json!({"command":"cat","tty":true,"timeout_ms":5}),
         json!({"command":"cat","tty":true,"sandbox_permissions":"require_escalated"}),
         json!({"command":"cat","yield_time_ms":5}),
+        // Codex's reusable prefix rides only on a request to escalate.
+        json!({"command":"git pull","prefix_rule":["git","pull"]}),
+        json!({"command":"git pull","sandbox_permissions":"use_default","prefix_rule":["git"]}),
     ] {
         let error = tools.prepare("shell", &args.to_string()).err().unwrap();
         assert_eq!(error.code, "invalid_shell_arguments", "{args}");
     }
+    let escalated = json!({"command":"git pull","sandbox_permissions":"require_escalated",
+        "justification":"Do you want to pull?","prefix_rule":["git","pull"]});
+    assert!(tools.prepare("shell", &escalated.to_string()).is_ok());
     for args in [
         json!({"handle":"turn:a/1"}),
         json!({"handle":"proc:01"}),

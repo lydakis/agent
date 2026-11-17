@@ -498,67 +498,6 @@ async fn show(
     Ok(json!({"bot": bot, "in": layout.home()}))
 }
 
-/// A tab for `bot`, a task `caller` just started asking for one: placed
-/// as a task's window is, within `[sonny] most_task_tabs`, closing the
-/// lead's least recently used task tabs for room, never one the person has
-/// not looked at yet nor one that holds its place. What to tell `caller`
-/// beside the start, if anything.
-async fn task_tab(caller: &str, bot: &str) -> Result<String, String> {
-    let (socket, project, chain) = agents_project(caller).await?;
-    let me = named::me().map_err(|e| e.to_string())?;
-    let mut layout = mux::for_agent(&socket, &project, &chain, None)?;
-    // What it closes or holds back for room, the lead's own layout reads.
-    layout.keep_aside(used::aside());
-    let client = Client::connect(&socket).await.map_err(|e| e.to_string())?.0;
-    let mut bots = Vec::new();
-    let mut after = Value::Null;
-    loop {
-        let asked = json!({"name": format!("{project}.*"), "limit": 256, "after": after});
-        let page = client
-            .request("bots", asked)
-            .await
-            .map_err(|e| e.to_string())?;
-        bots.extend(page["bots"].as_array().cloned().unwrap_or_default());
-        after = page["next_after"].clone();
-        if after.is_null() {
-            break;
-        }
-    }
-    let lead = (chain.last())
-        .filter(|lead| project::is_lead(lead))
-        .cloned()
-        .unwrap_or_else(|| format!("{project}.lead"));
-    let lineage = lineage_of(&bots, &lead, lead == format!("{project}.lead"));
-    let mut room = room_for(&project, &lineage, &HashMap::new(), Arc::new(used::held));
-    room.most = agent_client::config::load().map_or(0, |c| c.sonny.most_task_tabs as usize);
-    let command = [
-        me.to_string_lossy().into_owned(),
-        "--socket".into(),
-        socket.to_string_lossy().into_owned(),
-        "--no-sound".into(),
-        "--window-place".into(),
-        mux::Place::encode(&Some(layout.kept())),
-        "--agent".into(),
-        bot.to_owned(),
-    ];
-    let short = bot.strip_prefix(&format!("{project}.")).unwrap_or(bot);
-    Ok(
-        match layout.show_task(bot, short, &command, &room, false)? {
-            mux::Shown::Had => String::new(),
-            mux::Shown::Opened(closed) if closed.is_empty() => String::new(),
-            mux::Shown::Opened(closed) => format!(
-                "\n\nIts tab opened; {}.",
-                made_room(&closed, &project, room.most)
-            ),
-            mux::Shown::Aside | mux::Shown::NoRoom => format!(
-                "\n\nNo tab opened for it yet: the project's {} task tabs are all ones the person \
-             has not looked at. It opens once they go to it, or once it needs them.",
-                room.most
-            ),
-        },
-    )
-}
-
 /// A failed `turn` with why it failed, which `turns` leaves out, as
 /// `wait` has it: a model that said nothing is no failure.
 async fn with_error(client: &Client, mut turn: Value) -> Value {
@@ -3519,7 +3458,8 @@ impl Live {
 struct TurnHints {
     /// The turn they are of: only its end draws them.
     turn: Option<i64>,
-    came: Vec<String>,
+    /// Each by the name drawn, with the bot it opens when it is an agent.
+    came: Vec<(String, Option<String>)>,
     set: Vec<started::SetGoing>,
     /// The workflow runs it started, by id, the newest last.
     runs: Vec<String>,
@@ -4940,6 +4880,13 @@ struct Fleet {
     ended: HashMap<String, i64>,
     /// Calls running in the project that may wait on tasks, by bot and call.
     waits: std::collections::HashSet<(String, String)>,
+    /// Tasks whose tab opened here only because they came to need the
+    /// person, with `task_tabs = "asked"`, with when and the block it
+    /// opened: it closes once their result is taken, as every task's does
+    /// with `"every"`, unless the person went to it or used it since, or
+    /// an agent showed the task again in another block. Read and written
+    /// on the layout's worker, in order with the windows it opens.
+    for_need: Arc<std::sync::Mutex<HashMap<String, (std::time::SystemTime, String)>>>,
     /// Finished calls that may have waited, to read for the turns they
     /// returned: the bot, the output's node, and the call.
     returned: Vec<(String, i64, String)>,
@@ -5423,6 +5370,7 @@ impl Fleet {
             zen: false,
             ended: HashMap::new(),
             waits: Default::default(),
+            for_need: Default::default(),
             returned: Vec::new(),
             resolving: Default::default(),
             began: HashMap::new(),
@@ -5474,6 +5422,7 @@ impl Fleet {
             zen: false,
             ended: HashMap::new(),
             waits: Default::default(),
+            for_need: Default::default(),
             returned: Vec::new(),
             resolving: Default::default(),
             began: HashMap::new(),
@@ -5824,7 +5773,7 @@ impl Fleet {
 
     /// A task that came to need the person, its window set aside for
     /// room or, as `task_tabs = "asked"` has it, never opened, has it open
-    /// now, as what needs them keeps its window: it
+    /// now, until its result is taken, as what needs them keeps its window: it
     /// closes the window they used least recently for room, never one
     /// they have not looked at yet nor one that needs them, and with no
     /// other passes the limit. The person's focus stays where it is.
@@ -5834,6 +5783,7 @@ impl Fleet {
         let (bot, told) = (bot.to_owned(), self.tell.clone());
         let (socket, project) = (self.socket.clone(), self.project.clone());
         let (place, lead) = (self.place.clone(), self.lead.clone());
+        let for_need = self.for_need.clone();
         self.layout.send(move |layout| {
             let every = windows.lock().is_ok_and(|mut windows| windows.every());
             if (every && !layout.aside(&bot)) || !mux::mine(&socket, &project, &lead, &place) {
@@ -5841,8 +5791,17 @@ impl Fleet {
             }
             room.most = windows.lock().map_or(0, |mut windows| windows.most());
             match layout.show_task(&bot, &name, &command, &room, true) {
-                Ok(mux::Shown::Opened(closed)) if !closed.is_empty() => {
-                    let _ = told.send(Told::Notice(made_room(&closed, &room.project, room.most)));
+                Ok(mux::Shown::Opened(closed)) => {
+                    if !every
+                        && let Some(block) = layout.block_of(&bot)
+                        && let Ok(mut for_need) = for_need.lock()
+                    {
+                        for_need.insert(bot.clone(), (std::time::SystemTime::now(), block));
+                    }
+                    if !closed.is_empty() {
+                        let _ =
+                            told.send(Told::Notice(made_room(&closed, &room.project, room.most)));
+                    }
                 }
                 Ok(_) => {}
                 Err(error) => {
@@ -5862,8 +5821,13 @@ impl Fleet {
         let (command, name) = self.window(bot, doing);
         let (windows, mut room) = self.room();
         let task = bot != self.lead && self.lineage.contains(bot);
+        let for_need = self.for_need.clone();
         let (bot, told) = (bot.to_owned(), self.tell.clone());
         self.layout.send(move |layout| {
+            // Asked for now, it stays once taken.
+            if let Ok(mut for_need) = for_need.lock() {
+                for_need.remove(&bot);
+            }
             let every = windows.lock().is_ok_and(|mut windows| windows.every());
             if layout.aside(&bot) || (task && !every) {
                 room.most = windows.lock().map_or(0, |mut windows| windows.most());
@@ -5947,9 +5911,10 @@ impl Fleet {
     }
 
     /// Close the windows of the tasks whose completed turns the finished
-    /// waits returned: with `task_tabs = "every"`, as each task opened one;
-    /// a tab asked for stays until the person or an agent closes it, or
-    /// the task is resolved.
+    /// waits returned: with `task_tabs = "every"`, as each task opened one,
+    /// and with `"asked"`, a tab opened only because the task needed the
+    /// person, which they have not used since; a tab asked for stays until
+    /// the person or an agent closes it, or the task is resolved.
     async fn close_taken(&mut self) {
         let every = self.windows.lock().is_ok_and(|mut windows| windows.every());
         for (bot, node, call) in std::mem::take(&mut self.returned) {
@@ -5974,8 +5939,9 @@ impl Fleet {
                     && !self.needs.waits(&task)
                 {
                     self.ended.remove(&task);
-                    if every {
-                        self.close(&task);
+                    match every {
+                        true => self.close(&task),
+                        false => self.close_for_need(&task),
                     }
                     self.doing.remove(&task);
                     self.activity.remove(&task);
@@ -5983,6 +5949,25 @@ impl Fleet {
                 }
             }
         }
+    }
+
+    /// Close the task's tab if it opened only because the task needed the
+    /// person, they have not used it since, and it is still the block
+    /// opened then, not one an agent showed since. Decided on the layout's
+    /// worker, after the windows asked for before it opened.
+    fn close_for_need(&self, task: &str) {
+        let (for_need, used_when) = (self.for_need.clone(), self.used_when);
+        let task = task.to_owned();
+        self.layout.send(move |layout| {
+            let Some((at, block)) =
+                (for_need.lock().ok()).and_then(|mut for_need| for_need.remove(&task))
+            else {
+                return;
+            };
+            if layout.block_of(&task) == Some(block) && !used::since(used_when(&task), at) {
+                layout.close(&task);
+            }
+        });
     }
 
     /// A task resolved, by the lead or itself: its window closes, unless
@@ -7825,6 +7810,11 @@ impl App {
         output: &str,
         failed: bool,
     ) {
+        // A workflow it started has its `└` row under the reply in every
+        // view: steps draws no row for the call.
+        if !self.words() && name == workflow::NAME && !failed {
+            self.set_going(name, arguments, output);
+        }
         // Words only, the agent's questions are all of its calls drawn,
         // and its plan is the margin's alone.
         if self.words() && name != asks::TOOL && name != live::TOOL {
@@ -8064,11 +8054,13 @@ impl App {
             .unwrap_or_else(|| name.to_owned())
     }
 
-    /// An agent's name as the words view's hints say it: short in its own
-    /// project, `halves` for `calc.halves`, else whole.
+    /// An agent's name as the hints say it: short in its own project,
+    /// `halves` for `calc.halves`, else whole. A task's window is in its
+    /// project too: `lead` for `calc.lead` there.
     fn hint_name(&self, bot: &str) -> String {
-        (self.project.as_deref())
-            .and_then(|project| bot.strip_prefix(project)?.strip_prefix('.'))
+        let home = (self.project.as_deref())
+            .or_else(|| self.bot.rsplit_once('.').map(|(project, _)| project));
+        home.and_then(|project| bot.strip_prefix(project)?.strip_prefix('.'))
             .filter(|name| !name.is_empty())
             .unwrap_or(bot)
             .to_owned()
@@ -8154,10 +8146,13 @@ impl App {
     /// nothing.
     fn end_hints(&mut self) {
         let hints = std::mem::take(&mut self.turn_hints);
-        if !self.words() || !hints.replied {
+        if !hints.replied {
             return;
         }
-        if !hints.set.is_empty() {
+        // Steps draws what the turn set going as it went; a workflow's
+        // row, which nothing else there draws, is under the reply in
+        // every view.
+        if self.words() && !hints.set.is_empty() {
             let at = self.group();
             self.set_rows.insert(at, hints.set);
             let (line, buttons) = self.set_row(at);
@@ -8225,10 +8220,143 @@ impl App {
     /// The `↳` row above the first words of a turn the person did not
     /// start, naming who started it, words only; none once drawn, and
     /// none for the person's own. Its words are said from here on.
-    fn came_row(&mut self) -> Option<Line<'static>> {
+    fn came_row(&mut self) -> Option<(Line<'static>, screen::Buttons)> {
         self.turn_hints.replied = true;
         let came = std::mem::take(&mut self.turn_hints.came);
-        (self.words() && !came.is_empty()).then(|| transcript::came_row(&came, self.prose()))
+        (self.words() && !came.is_empty()).then(|| {
+            let (line, links) = transcript::came_row(&came, self.prose());
+            let buttons = (links.into_iter())
+                .map(|(from, to, bot)| (from, to, format!("{}task/{bot}", screen::BUTTON)))
+                .collect();
+            (line, buttons)
+        })
+    }
+
+    /// Who started the turn `text` from `from` opens, for its `↳` row: an
+    /// agent by its name in the project, which opens it.
+    fn came_from(&mut self, text: &str, from: Option<&str>, agent: bool) {
+        self.turn_hints.came = (transcript::came_names(text, from, agent).into_iter())
+            .map(|(name, agent)| {
+                let opens = agent && self.links_to(&name);
+                (self.hint_name(&name), opens.then_some(name))
+            })
+            .collect();
+    }
+
+    /// Whether `bot`, named in a row Sonny writes, is a link: an agent of
+    /// the project that is there, as its last count found, and not this
+    /// window's own, which is plain words. One of another project is
+    /// written whole, and links as any whole name does once the daemon
+    /// says it is there.
+    fn links_to(&self, bot: &str) -> bool {
+        bot != self.bot
+            && self.hint_name(bot) != bot
+            && (self.status_bots.is_empty() || self.status_bots.contains(bot))
+    }
+
+    /// The project's agents as a count found them. Rows of what went on
+    /// between agents drawn before it, as a window's replay draws them,
+    /// are drawn again once it finds others: their names, short now, link.
+    fn status_counted(&mut self, bots: std::collections::HashSet<String>) {
+        if bots == self.status_bots {
+            return;
+        }
+        let new = bots.iter().any(|bot| !self.status_bots.contains(bot));
+        self.status_bots = bots;
+        if new && !self.words() {
+            let clusters: Vec<usize> = self.clusters.keys().copied().collect();
+            for at in clusters {
+                self.draw_cluster(at);
+            }
+        }
+    }
+
+    /// Whether `word`, in a row Sonny writes, is an agent of the project
+    /// known to be there, to be written short and linked: one its last
+    /// count found, or a task this window tracks. Never this window's own.
+    fn names_here(&self, word: &str) -> bool {
+        word != self.bot
+            && self.hint_name(word) != word
+            && (self.status_bots.contains(word)
+                || (self.tasks.values().flatten()).any(|task| task.bot == word))
+    }
+
+    /// `text`, written after `before`, with each agent of the project it
+    /// names where a name is told (`From fix`, `sent to fix`, as
+    /// [`transcript::names_follow`] says) written short, as
+    /// [`App::names_here`] finds them, each put in `named` with its bot.
+    fn shorten_named(&self, text: &str, before: &str, named: &mut Vec<(String, String)>) -> String {
+        let mut out = String::with_capacity(text.len());
+        let mut word = String::new();
+        let mut put = |word: &mut String, out: &mut String| {
+            // A sentence's dot is no part of a name.
+            let trimmed = word.trim_end_matches('.');
+            let dots = &word[trimmed.len()..];
+            let told = transcript::names_follow(&format!("{before}{out}"));
+            match told && self.names_here(trimmed) {
+                true => {
+                    let short = self.hint_name(trimmed);
+                    if !named.iter().any(|(_, bot)| bot == trimmed) {
+                        named.push((short.clone(), trimmed.to_owned()));
+                    }
+                    out.push_str(&short);
+                    out.push_str(dots);
+                }
+                false => out.push_str(word),
+            }
+            word.clear();
+        };
+        for c in text.chars() {
+            match c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-') {
+                true => word.push(c),
+                false => {
+                    put(&mut word, &mut out);
+                    out.push(c);
+                }
+            }
+        }
+        put(&mut word, &mut out);
+        out
+    }
+
+    /// Quiet rows Sonny writes (a gap's, a message's shut row), with each
+    /// agent of the project their first row names written short, in the
+    /// agents' color, and the buttons on that row that open them.
+    fn named_short(
+        &self,
+        lines: Vec<Line<'static>>,
+    ) -> (Vec<Line<'static>>, Option<screen::Buttons>) {
+        self.named_short_with(lines, Vec::new())
+    }
+
+    /// [`App::named_short`], with `named` written short already.
+    fn named_short_with(
+        &self,
+        mut lines: Vec<Line<'static>>,
+        mut named: Vec<(String, String)>,
+    ) -> (Vec<Line<'static>>, Option<screen::Buttons>) {
+        let Some(first) = lines.first_mut() else {
+            return (lines, None);
+        };
+        let mut before = String::new();
+        for span in &mut first.spans {
+            let short = self.shorten_named(&span.content, &before, &mut named);
+            before.push_str(&short);
+            if short != span.content {
+                span.content = short.into();
+            }
+        }
+        if named.is_empty() {
+            return (lines, None);
+        }
+        let shown: Vec<&str> = named.iter().map(|(name, _)| name.as_str()).collect();
+        let first = lines.remove(0);
+        let mut drawn = links::name_agents(vec![first], &shown, transcript::names_follow);
+        let buttons = (links::agents_on(&drawn, &named).into_iter())
+            .map(|(_, from, to, bot)| (from, to, format!("{}{bot}", links::AGENT)))
+            .collect();
+        lines.insert(0, drawn.remove(0));
+        (lines, Some(buttons))
     }
 
     /// The rows of the tasks started together as `at`, and the buttons
@@ -9419,8 +9547,10 @@ impl App {
         let entries: Vec<&Gathered> = cluster.all().collect();
         match entries.as_slice() {
             [Gathered::Message(message)] => {
-                let lines = self.relayed_lines(message.node, width);
-                return (lines, vec![(0, said_button(message.node))]);
+                let (lines, buttons) = self.named_short(self.relayed_lines(message.node, width));
+                let mut marks = vec![(0, said_button(message.node))];
+                marks.extend(buttons.map(|buttons| (0, screen::Mark::Buttons(buttons))));
+                return (lines, marks);
             }
             [Gathered::Plan(plan)] => return (self.plan_rows(*plan, width), Vec::new()),
             _ => {}
@@ -9439,17 +9569,18 @@ impl App {
         let alike =
             calls.len() == entries.len() && did.windows(2).all(|pair| pair[0].0 == pair[1].0);
         if let (true, Some((verb, _))) = (alike, did.first()) {
-            let lines = transcript::quiet(transcript::folded(
+            let (lines, buttons) = self.named_short(transcript::quiet(transcript::folded(
                 verb,
                 &whats,
                 &calls,
                 cluster.open,
                 width,
-            ));
-            let marks = match transcript::unfolds(&whats, &calls) {
+            )));
+            let mut marks = match transcript::unfolds(&whats, &calls) {
                 true => vec![(0, fold())],
                 false => Vec::new(),
             };
+            marks.extend(buttons.map(|buttons| (0, screen::Mark::Buttons(buttons))));
             return (lines, marks);
         }
         let kinds: Vec<&str> = cluster.messages().map(|m| m.kind).collect();
@@ -9463,7 +9594,16 @@ impl App {
         let plan = (cluster.plans().last())
             .and_then(|at| self.plans.get(&at))
             .map(|steps| transcript::plan_progress(steps));
-        let mut lines = match cluster.attached() {
+        // Agents of the project by their short names, so the row fits as
+        // it will be drawn.
+        let mut named = Vec::new();
+        let names: Vec<String> = (names.iter())
+            .map(|name| self.shorten_named(name, "· ", &mut named))
+            .collect();
+        let did: Vec<(String, String)> = (did.into_iter())
+            .map(|(verb, what)| (verb, self.shorten_named(&what, "· ", &mut named)))
+            .collect();
+        let lines = match cluster.attached() {
             true => transcript::attached(vec![transcript::gathered(
                 &kinds,
                 &names,
@@ -9479,7 +9619,9 @@ impl App {
                 width,
             )],
         };
+        let (mut lines, buttons) = self.named_short_with(lines, named);
         let mut marks = vec![(0, fold())];
+        marks.extend(buttons.map(|buttons| (0, screen::Mark::Buttons(buttons))));
         let inner = width.saturating_sub(2);
         for entry in entries {
             let rows = match entry {
@@ -9712,8 +9854,10 @@ impl App {
     fn commit_words(&mut self, node: i64, lines: Vec<Line<'static>>, reply: bool) {
         let count = lines.len();
         match reply.then(|| self.came_row()).flatten() {
-            Some(came) => {
+            Some((came, buttons)) => {
                 self.commit(vec![came]);
+                self.mark_last(screen::Mark::Buttons(buttons));
+                self.mark_last(screen::Mark::Over);
                 self.commit_after(lines, false);
             }
             None => self.commit(lines),
@@ -9806,15 +9950,12 @@ impl App {
     /// none when nothing did: what was written before it keeps the bar it
     /// was written with, and what follows wears the project's whose agents
     /// alone sent it, if one followed project's did.
-    fn bar_turn(&mut self, woke: Option<(&str, Option<&str>)>) {
+    fn bar_turn(&mut self, woke: Option<(&str, Option<&str>)>, agent: bool) {
         self.end_hints();
         if let Some((text, from)) = woke
             && transcript::relays(text, from)
         {
-            let came = transcript::came_names(text, from);
-            self.turn_hints.came = (came.into_iter())
-                .map(|name| self.hint_name(&name))
-                .collect();
+            self.came_from(text, from, agent);
         }
         let names = match woke {
             Some((text, from)) if transcript::relays(text, from) => {
@@ -10027,7 +10168,7 @@ impl App {
             }
             if let Some(((counts, bots), (latest, seen))) = counted.read {
                 self.counts = Some(counts);
-                self.status_bots = bots;
+                self.status_counted(bots);
                 self.status_read = latest;
                 self.asks_seen = seen;
             }
@@ -10441,14 +10582,14 @@ impl App {
             let heard = kept.heard();
             // Its first message, before the page, says what the turn is
             // about; the steers the page holds say the rest.
+            let agent = prompts
+                .first()
+                .is_some_and(|prompt| prompt["from"]["bot"].is_string());
             if colored && let Some((text, from)) = prompts.first().map(said) {
-                self.bar_turn(Some((&text, from.as_deref())));
+                self.bar_turn(Some((&text, from.as_deref())), agent);
             } else if let Some((text, from)) = prompts.first().map(said) {
                 if transcript::relays(&text, from.as_deref()) {
-                    let came = transcript::came_names(&text, from.as_deref());
-                    self.turn_hints.came = (came.into_iter())
-                        .map(|name| self.hint_name(&name))
-                        .collect();
+                    self.came_from(&text, from.as_deref(), agent);
                 }
                 // The page may start at that message itself: it still
                 // begins the turn, and a later one steers it.
@@ -10514,7 +10655,7 @@ impl App {
                         }
                         match first {
                             true => {
-                                self.bar_turn(Some((&said, from)));
+                                self.bar_turn(Some((&said, from)), item["agent"] == true);
                                 self.turn_hints.turn = turn;
                             }
                             false => self.bar_steered(&said, from),
@@ -11029,9 +11170,12 @@ impl App {
     /// The `↳` row, when the words about to be written have one, right
     /// above them.
     fn came_above(&mut self) {
-        if let Some(came) = self.came_row() {
+        if let Some((came, buttons)) = self.came_row() {
             self.rows_drawn += 1;
+            self.marks
+                .push((self.pending.len(), screen::Mark::Buttons(buttons)));
             self.pending.push(came);
+            self.mark_last(screen::Mark::Over);
         }
     }
 
@@ -11201,10 +11345,14 @@ impl App {
                     _ => None,
                 };
                 if !drawn {
+                    let agent = woke.as_ref().is_some_and(|item| item["agent"] == true);
                     let woke = woke
                         .as_ref()
                         .map(|item| (text(item), item["from"].as_str()));
-                    self.bar_turn(woke.as_ref().map(|(said, from)| (said.as_str(), *from)));
+                    self.bar_turn(
+                        woke.as_ref().map(|(said, from)| (said.as_str(), *from)),
+                        agent,
+                    );
                     self.turn_hints.turn = turn;
                 }
                 if let Some(node) = data["node"].as_i64()
@@ -12226,8 +12374,9 @@ impl App {
             self.notice = Some("no HOME, so no commons".into());
             return;
         };
+        let project = self.scope().project;
         self.watch = Some(Watch {
-            project: self.scope().project,
+            project: project.clone(),
             rows: Vec::new(),
             read: Instant::now(),
             alerts: Vec::new(),
@@ -12235,7 +12384,7 @@ impl App {
             background: None,
             usage: None,
             audit: None,
-            commons: Some(commons::View::open(&home)),
+            commons: Some(commons::View::open(&home, project)),
             memory: None,
             sky: None,
             picked: None,
@@ -12496,7 +12645,7 @@ impl App {
         )
         .await?;
         self.counts = Some(status::counts(&read.rows));
-        self.status_bots = status::bots(&read.rows);
+        self.status_counted(status::bots(&read.rows));
         self.tasks_read(status::tasks(&read.rows));
         // The windows' names and the footer say what this read, as it is
         // newer than what they had. A running agent's question is read
@@ -12728,6 +12877,7 @@ impl App {
             .collect();
         for call in &mut self.approvals {
             whole_arguments(&self.client, &self.bot, call).await;
+            approvals::offer(call);
         }
         if let Some(running) = &mut self.running {
             if (self.approvals.iter()).any(|call| call["handle"].is_null()) {
@@ -12821,6 +12971,7 @@ impl App {
                     }
                     let mut call = call.clone();
                     whole_arguments(&self.client, bot, &mut call).await;
+                    approvals::offer(&mut call);
                     self.names.get_mut().learn(bot.to_owned(), true);
                     self.raised.push(call);
                     self.raised_read.insert(read);
@@ -12956,12 +13107,13 @@ impl App {
     /// now, outside every agent's sandbox, as Codex's "don't ask again"
     /// keeps a prefix rule: an allow rule in `~/.agent/rules`, which every
     /// agent's next turn reads.
-    async fn always(&mut self, prefix: &str) {
+    async fn always(&mut self, prefix: &[String]) {
+        let shown = approvals::shown(prefix);
         if let Err(error) = approvals::allow_always(prefix) {
-            self.notice = Some(format!("couldn't keep {prefix}: {error}"));
+            self.notice = Some(format!("couldn't keep {shown}: {error}"));
             return;
         }
-        self.answer("allow", Some(prefix)).await;
+        self.answer("allow", Some(&shown)).await;
     }
 
     /// `/compact`, once the person said yes.
@@ -16012,16 +16164,19 @@ impl App {
         open: bool,
     ) -> (Vec<Line<'static>>, Vec<(usize, screen::Mark)>) {
         let mut rows = Vec::new();
-        // By the task's whole name, as words from another agent are, which
-        // opens it as any agent's name drawn does.
+        let mut marks = Vec::new();
+        // By the task's name, as words from another agent are: short in
+        // this project, and a link that opens it.
         if let Some(task) = &ask.task {
-            rows.push(Line::from(format!("↳ From {}", task.bot)).dim());
+            let head = vec![Line::from(format!("↳ From {}", task.bot)).dim()];
+            let (head, buttons) = self.named_short(head);
+            rows.extend(head);
+            marks.extend(buttons.map(|buttons| (0, screen::Mark::Buttons(buttons))));
         }
         let card = asks::card(ask, state, !open, self.width);
         let from = rows.len();
         rows.extend(card.rows);
         let key = ask.key();
-        let mut marks = Vec::new();
         let link = |button: String| screen::Mark::Link(format!("{}{button}", screen::BUTTON));
         if state.takes_a_pick() {
             marks.extend(
@@ -16322,13 +16477,13 @@ impl App {
 
     /// The question in focus that sending `typed` answers: any words but
     /// a command, a line for the shell, or nothing; and a line for the
-    /// shell when the question is a step to run here ([`asks::runs_here`]).
+    /// shell when the question is a step to run here ([`asks::runs_here`]),
+    /// from its `!` on, as words are from their first letter.
     fn answers(&self, typed: &str) -> Option<&asks::Ask> {
         let typed = typed.trim_start();
         let ask = self.asking()?;
         let words = !typed.trim().is_empty() && !typed.starts_with(['/', '!']);
-        let runs = (typed.strip_prefix('!')).is_some_and(|command| !command.trim().is_empty())
-            && asks::runs_here(ask);
+        let runs = typed.starts_with('!') && asks::runs_here(ask);
         (words || runs).then_some(ask)
     }
 
@@ -17405,8 +17560,8 @@ impl App {
         // What it will do, in words: never a function's name and JSON.
         let asked = transcript::asked(&name, arguments, &self.workspace);
         let mut lines = Vec::new();
-        // By the agent's whole name, as a task's question is, which opens
-        // it as any agent's name drawn does.
+        // By the agent's name, as a task's question is: short in this
+        // project, and a link that opens it.
         if let Some(bot) = call["bot"].as_str().filter(|bot| *bot != self.bot) {
             lines.push(Line::from(format!("↳ From {bot}")).dim());
         }
@@ -17470,9 +17625,18 @@ impl App {
         self.written_count += 1;
         let gap = self.any_history;
         let at = self.pending.len();
-        self.commit(lines.clone());
+        let (shown, buttons) = match from.is_some() {
+            true => self.named_short(lines.clone()),
+            false => (lines.clone(), None),
+        };
+        let count = shown.len();
+        self.commit(shown);
         let mark = screen::Mark::Tag(screen::Tag::Request(tag));
         (self.marks).extend((at..self.pending.len()).map(|row| (row, mark.clone())));
+        if let Some(buttons) = buttons {
+            let head = self.pending.len() - count;
+            self.marks.push((head, screen::Mark::Buttons(buttons)));
+        }
         self.written.insert(
             key,
             Written {
@@ -17537,14 +17701,24 @@ impl App {
             rows.push(Line::default());
         }
         let at = rows.len();
-        rows.push(line);
-        if written.open {
-            rows.extend(written.rows.iter().cloned());
-        }
         let link = screen::Mark::Link(format!("{}request/{}", screen::BUTTON, written.tag));
+        let mut marks = vec![(at, link)];
+        // Whose it is, short in this project and a link, there and on
+        // the rows it opens to.
+        let (line, buttons) = self.named_short(vec![line]);
+        rows.extend(line);
+        marks.extend(buttons.map(|buttons| (at, screen::Mark::Buttons(buttons))));
+        if written.open {
+            let (open, buttons) = match written.from.is_some() {
+                true => self.named_short(written.rows.clone()),
+                false => (written.rows.clone(), None),
+            };
+            marks.extend(buttons.map(|buttons| (rows.len(), screen::Mark::Buttons(buttons))));
+            rows.extend(open);
+        }
         let tag = screen::Tag::Request(written.tag);
         self.flush();
-        if !self.screen.replace_tagged(tag, rows, vec![(at, link)]) {
+        if !self.screen.replace_tagged(tag, rows, marks) {
             // Trimmed away: nothing of it is left to fold.
             self.written.remove(key);
         }
@@ -17896,8 +18070,9 @@ impl App {
                 let (card, at, marks) = match view.on_page() {
                     true => view.page_lines(width),
                     false => {
-                        let (card, at, starts) = view.card_rows(width);
-                        let marks = row_marks(&card, &starts);
+                        let (card, at, starts, links) = view.card_linked(width);
+                        let mut marks = row_marks(&card, &starts);
+                        marks.extend(agent_marks(links));
                         (card, at, marks)
                     }
                 };
@@ -17984,7 +18159,8 @@ impl App {
                         Line::from(spans).style(line.style)
                     })
                     .collect();
-                let marks = row_marks(&lines, &view.starts());
+                let mut marks = row_marks(&lines, &view.starts());
+                marks.extend(agent_marks(view.agents()));
                 pane.set_card_marked(lines, marks, &view.keys());
                 pane.foot = None;
                 // A new pick is scrolled to, with the two rows under it.
@@ -17995,8 +18171,9 @@ impl App {
                     pane.screen.keep_in_view(at, 2);
                 }
             } else if let Some(view) = &watch.usage {
-                let lines = view
-                    .card(width)
+                // Each agent a row is named for opens it.
+                let (card, named) = view.card_linked(width, &self.bot);
+                let lines = card
                     .into_iter()
                     .map(|line| {
                         let mut spans = vec![Span::raw(" ")];
@@ -18004,7 +18181,7 @@ impl App {
                         Line::from(spans).style(line.style)
                     })
                     .collect();
-                pane.set_card(lines, &view.keys());
+                pane.set_card_marked(lines, agent_marks(named), &view.keys());
                 pane.foot = None;
             } else if let Some(live) = (watch.run.as_deref())
                 .and_then(|run| run_of(watch, run))
@@ -18187,7 +18364,43 @@ impl App {
             linked.extend(self.screen.link_cells(frame.buffer_mut()));
             let [live, status, gap, composer, pad, footer] = areas(view, live_rows);
             frame.render_widget(Paragraph::new(open_rows.clone()), live);
-            frame.render_widget(Paragraph::new(self.status_line()), status);
+            let status_line = self.status_line();
+            // The agents it names open them, as their names do anywhere.
+            let parked: Vec<(String, String)> = (self.paused.as_ref())
+                .and_then(|pause| pause["parked"]["bots"].as_array())
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_str)
+                .map(|bot| (self.hint_name(bot), bot.to_owned()))
+                .collect();
+            for (_, from, to, bot) in links::agents_on(std::slice::from_ref(&status_line), &parked)
+            {
+                let columns = (status.x + from)..(status.x + to).min(status.right());
+                opens_at.push((status.y, columns, format!("{}{bot}", links::AGENT)));
+            }
+            // A whole name it says (a notice's), as the conversation finds
+            // them: not this window's own.
+            let said = status_line.to_string();
+            let mut whole = Vec::new();
+            let mut column = 0u16;
+            for word in said.split_inclusive(|c: char| !links::name_char(c)) {
+                let name = word.trim_end_matches(|c: char| !links::name_char(c));
+                let name = name.trim_end_matches('.');
+                if name != self.bot
+                    && let Some(link) = self.names.borrow_mut().link(name)
+                {
+                    let from = status.x + column;
+                    whole.push((from..(from + name.width() as u16).min(status.right()), link));
+                }
+                column += word.width() as u16;
+            }
+            frame.render_widget(Paragraph::new(status_line), status);
+            for (columns, link) in whole {
+                for x in columns.clone() {
+                    frame.buffer_mut()[(x, status.y)].set_fg(Color::Blue);
+                }
+                opens_at.push((status.y, columns, link));
+            }
             let menu = self.menu();
             if !menu.is_empty() {
                 let pick = self.pick.min(menu.len() - 1);
@@ -18534,6 +18747,24 @@ impl App {
                     let y = composer.y + heading.is_some() as u16;
                     Some((y, x..(x + name.width() as u16).min(composer.right()), link))
                 });
+            // The task whose question its hint answers opens, as an
+            // agent's name does anywhere (`from fix`). This window's own
+            // (`Steer shop lead`) stays plain words.
+            if self.input.is_empty()
+                && let Some(task) = self.asking().and_then(|ask| ask.task.as_ref())
+                && task.bot != self.bot
+            {
+                let names = [(task.name.clone(), task.bot.clone())];
+                let found;
+                (composer_rows, found) = hint_agents(composer_rows, &names);
+                for (row, from, to, bot) in found {
+                    let y = composer.y + row as u16;
+                    let columns = (composer.x + from)..(composer.x + to).min(composer.right());
+                    if y < composer.bottom() {
+                        opens_at.push((y, columns, format!("{}{bot}", links::AGENT)));
+                    }
+                }
+            }
             frame.render_widget(Paragraph::new(composer_rows), composer);
             if let Some((y, columns, link)) = cue
                 && y < composer.bottom()
@@ -18828,15 +19059,20 @@ impl App {
                 let total = pause["parked"]["total"]
                     .as_u64()
                     .unwrap_or(parked.len() as u64);
-                let shown = parked
-                    .iter()
-                    .take(3)
-                    .copied()
-                    .collect::<Vec<_>>()
-                    .join(", ");
                 let more = total.saturating_sub(parked.len().min(3) as u64);
                 line.push(Span::raw(" · parked ").dim());
-                line.push(Span::raw(shown));
+                // Each by its name, short in this project and a link;
+                // this window's own is plain words.
+                for (at, bot) in parked.iter().take(3).enumerate() {
+                    if at > 0 {
+                        line.push(Span::raw(", "));
+                    }
+                    let name = Span::raw(self.hint_name(bot));
+                    line.push(match *bot == self.bot {
+                        true => name,
+                        false => name.fg(Color::Blue),
+                    });
+                }
                 if more > 0 {
                     line.push(Span::raw(format!(" +{more}")).dim());
                 }
@@ -18859,8 +19095,13 @@ impl App {
                 Span::raw(" allow once · ").dim(),
             ];
             if let Some(prefix) = approvals::always(call) {
+                // Cut to leave the row's other keys in view: a whole
+                // command offered can run long.
+                const KEYS: &str = "  ⏸ y allow once · a always allow  · n deny · esc set aside";
+                let room = self.width.saturating_sub(KEYS.width()).max(8);
+                let shown = transcript::cut(&approvals::shown(&prefix), room);
                 line.push(Span::raw("a"));
-                line.push(Span::raw(format!(" always allow {prefix} · ")).dim());
+                line.push(Span::raw(format!(" always allow {shown} · ")).dim());
             }
             line.extend([Span::raw("n"), Span::raw(" deny · ").dim()]);
             line.extend([Span::raw("esc"), Span::raw(" set aside").dim()]);
@@ -19340,6 +19581,14 @@ fn watch_card(
     }
     let added = above.len();
     card.splice(1..1, above);
+    // Each agent a row names, a row waits on or a window sits beside,
+    // opens it as its name does anywhere.
+    let names: Vec<(String, String)> = (rows.iter())
+        .map(|row| (row.name.clone(), row.bot.clone()))
+        .collect();
+    let shown: Vec<&str> = names.iter().map(|(name, _)| name.as_str()).collect();
+    card = links::name_agents(card, &shown, status_named_after);
+    let named_agents = agent_marks(links::agents_on(&card, &names));
     let below = |at: usize| at + if at >= 1 { added } else { 0 };
     // The rows the keys pick first, in the order they are drawn: each
     // agent, and each heading that opens and folds its group.
@@ -19352,6 +19601,7 @@ fn watch_card(
         let link = format!("{}helpers/{bot}", screen::BUTTON);
         (below(at), screen::Mark::Link(link))
     }));
+    marks.extend(named_agents);
     let lines = card
         .into_iter()
         .map(|line| {
@@ -19361,6 +19611,55 @@ fn watch_card(
         })
         .collect();
     (lines, folding, marks)
+}
+
+/// The composer's hint `rows` with the task whose question it answers,
+/// named after `from`, in the agents' color, and where. This window's
+/// own agent, after `Steer` or `Message`, is plain words.
+fn hint_agents(
+    rows: Vec<Line<'static>>,
+    names: &[(String, String)],
+) -> (Vec<Line<'static>>, links::Agents) {
+    let shown: Vec<&str> = names.iter().map(|(name, _)| name.as_str()).collect();
+    let after = |said: &str| said.ends_with(" from ");
+    let rows = links::name_agents(rows, &shown, after);
+    let found = links::agents_on(&rows, names);
+    (rows, found)
+}
+
+/// Whether `said` on a `/status` row leads to an agent: `waiting on fix,
+/// docs`, and the window a task's sits beside, `tab 2, right of fix`.
+fn status_named_after(said: &str) -> bool {
+    let sides = ["waiting on ", "right of ", "left of ", "above ", "below "];
+    if sides.iter().any(|side| said.ends_with(side)) {
+        return true;
+    }
+    // A name after another the row waits on.
+    said.rfind("waiting on ").is_some_and(|at| {
+        let list = &said[at + "waiting on ".len()..];
+        list.ends_with(", ")
+            && (list.split(", ").filter(|name| !name.is_empty())).all(|name| {
+                name.chars()
+                    .all(|c| c.is_ascii_alphanumeric() || ".-_ ".contains(c))
+            })
+    })
+}
+
+/// Each agent a card's rows name, a button that opens it as its name
+/// does anywhere, a column in from the line between, as the card is
+/// drawn.
+fn agent_marks(links: links::Agents) -> Vec<(usize, screen::Mark)> {
+    let mut rows: Vec<(usize, screen::Buttons)> = Vec::new();
+    for (row, from, to, bot) in links {
+        let button = (from + 1, to + 1, format!("{}{bot}", links::AGENT));
+        match rows.last_mut() {
+            Some((at, buttons)) if *at == row => buttons.push(button),
+            _ => rows.push((row, vec![button])),
+        }
+    }
+    (rows.into_iter())
+        .map(|(row, buttons)| (row, screen::Mark::Buttons(buttons)))
+        .collect()
 }
 
 /// The marks that make each row of a list in the pane a button: a click
@@ -22655,6 +22954,10 @@ mod tests {
         assert_eq!(rows[calc], (Some(1), "• calc.neg is done.".into()));
         assert_eq!(rows[calc - 1], (Some(1), "↳ calc.neg".into()));
         assert_eq!(rows[calc - 2], (None, String::new()));
+        // Each `↳` row hangs over its reply: the reply's time goes over it.
+        let overs = app.screen.overs();
+        assert!(overs[shop - 1] && overs[calc - 1]);
+        assert_eq!(overs.iter().filter(|over| **over).count(), 2);
         // Off, nothing is barred.
         let mut app = super::tests::app(zen_daemon().await);
         app.width = 100;
@@ -23574,9 +23877,14 @@ mod tests {
         app.asks = vec![pick.clone()];
         app.input.set("!ls");
         assert!(app.answering_over(80).is_none());
-        // With a step to run in focus, it is that step, named over it as
-        // typed words are.
+        // With a step to run in focus, it is that step, named over it from
+        // the `!` on, as typed words are from their first letter.
         app.asks = vec![step.clone(), pick.clone()];
+        app.input.set("!");
+        assert_eq!(
+            app.answering_over(80).unwrap().to_string(),
+            "  answering “Sign in to the registry?” (1 of 2)"
+        );
         app.input.set("!echo signed in");
         assert_eq!(
             app.answering_over(80).unwrap().to_string(),
@@ -24485,7 +24793,12 @@ mod tests {
                     "content": [{"type": "output_text", "text": "Two tasks check the rest."}]}),
                 _ => return json!({}),
             };
-            json!({"items": [{"node": asked["nodes"][0], "item": item}]})
+            // The task's message, as the daemon says an agent sent it.
+            let from = match asked["nodes"][0].as_i64() {
+                Some(7) => json!({"bot": "calc.halves"}),
+                _ => Value::Null,
+            };
+            json!({"items": [{"node": asked["nodes"][0], "item": item, "from": from}]})
         })
         .await;
         let mut app = app(client);
@@ -24533,6 +24846,9 @@ mod tests {
                 "└ started ◌ readme · sent to ● fix · ● reviewer",
             ]
         );
+        // The `↳` hangs over the reply: its time goes over it.
+        let over = app.pending.len() - 3;
+        assert!((app.marks.iter()).any(|(row, mark)| *row == over && *mark == screen::Mark::Over));
         // Right above and under the reply, and each name opens its agent.
         let at = app.pending.len() - 1;
         let buttons = (app.marks.iter())
@@ -24550,6 +24866,15 @@ mod tests {
                 "sonny:task/reviewer"
             ]
         );
+        // The agent that started it, above, opens too, by its name.
+        let came = app.pending.len() - 3;
+        let buttons = (app.marks.iter())
+            .find_map(|(row, mark)| match mark {
+                screen::Mark::Buttons(buttons) if *row == came => Some(buttons.clone()),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(buttons, [(2, 8, "sonny:task/calc.halves".to_owned())]);
         // A turn that says nothing draws nothing, whatever it started.
         app.daemon(turn_event("accepted", 2, json!({}))).await;
         let start = json!({"name": "quiet", "brief": "Nothing"});
@@ -24651,6 +24976,90 @@ mod tests {
             ..Default::default()
         };
         assert!(ran.heard());
+    }
+
+    #[tokio::test]
+    async fn steps_draws_the_row_of_a_workflow_a_turn_ran_and_names_one_that_ended() {
+        // The turn is woken by an earlier run's end: the ↳ names it.
+        let client = daemon_answering(|asked| match asked["nodes"][0].as_i64() {
+            Some(7) => json!({"items": [{"node": 7, "item": {"type": "message",
+                "role": "user", "from": "a workflow",
+                "content": [{"type": "input_text",
+                    "text": "Workflow find-cases (run run0) completed in 9s: 3 agents."}]}}]}),
+            _ => json!({}),
+        })
+        .await;
+        let mut app = app(client);
+        let dir = std::env::temp_dir().join(format!("sonny-wf-steps-{}", std::process::id()));
+        let store = dir.join("state.sqlite");
+        std::fs::create_dir_all(&dir).unwrap();
+        workflow::view::plant(
+            &store,
+            "run1",
+            "calc.lead",
+            "blind-role-eval-score",
+            &[
+                json!({"t": "asking", "key": "a", "phase": "Find"}),
+                json!({"t": "agent", "key": "a", "phase": "Find", "value": 1}),
+                json!({"t": "asking", "key": "b", "phase": "Score"}),
+                json!({"t": "asking", "key": "c", "phase": "Score"}),
+            ],
+        );
+        app.options.store = store.clone();
+        app.words_only = false;
+        app.any_history = true;
+        app.width = 120;
+        app.project = Some("calc".into());
+        let rows = |app: &App| -> Vec<String> {
+            (app.pending.iter())
+                .map(|line| line.to_string())
+                .filter(|row| !row.trim().is_empty())
+                .collect()
+        };
+        app.daemon(turn_event("accepted", 1, json!({"node": 7})))
+            .await;
+        let said = json!({"event": "text_delta", "bot": "b", "turn": 1, "text": "Scoring now."});
+        app.daemon(said).await;
+        let started = json!({"name": "send_message", "call_id": "m1"});
+        app.daemon(turn_event("tool_started", 1, started)).await;
+        let send = json!({"to": "calc.fix", "message": "Check div too."});
+        app.commit_call("m1", Some(1), "send_message", &send, "{}", false);
+        let output = "\"Started workflow blind-role-eval-score as run run1. You hear back once.\"";
+        let args = json!({"name": "blind-role-eval-score"});
+        app.commit_call("w1", Some(1), workflow::NAME, &args, output, false);
+        // A stop names no run it started.
+        let stop = json!({"stop": "run1"});
+        app.commit_call(
+            "w2",
+            Some(1),
+            workflow::NAME,
+            &stop,
+            "\"Stopping workflow\"",
+            false,
+        );
+        let said = json!({"event": "text_delta", "bot": "b", "turn": 1,
+            "text": "A workflow scores them."});
+        app.daemon(said).await;
+        app.daemon(turn_event(
+            "turn_finished",
+            1,
+            json!({"status": "completed"}),
+        ))
+        .await;
+        let drawn = rows(&app);
+        // The run that woke it, by its name; the reply's row, under it.
+        assert!(
+            drawn.contains(&"↳ From find-cases ▸".to_owned()),
+            "{drawn:?}"
+        );
+        let ran = (drawn.iter())
+            .position(|row| row.starts_with("└ runs blind-role-eval-score  "))
+            .unwrap_or_else(|| panic!("{drawn:?}"));
+        let reply = (drawn.iter())
+            .position(|row| row == "• A workflow scores them.")
+            .unwrap();
+        assert_eq!(ran, reply + 1, "{drawn:?}");
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[tokio::test]
@@ -29468,11 +29877,16 @@ mod tests {
     }
 
     /// As `task_tabs = "asked"` has it, a task's turn opens no tab: one
-    /// opens once the task needs the person, or they go to it, and stays
-    /// once its result is taken.
+    /// opens once the task needs the person, and closes once its result
+    /// is taken, or they go to it, and it stays.
     #[tokio::test]
     async fn a_task_opens_a_tab_only_once_it_needs_you_or_you_go_to_it() {
-        let (client, events) = daemon_with_events(json!({}), |asked| {
+        // The lead's wait that took both tasks' results.
+        let waited = json!({"results": {
+            "calc.a/1": {"status": "completed"},
+            "calc.b/1": {"status": "completed"},
+        }});
+        let (client, events) = daemon_with_events(json!({}), move |asked| {
             match asked["op"].as_str().unwrap_or("") {
                 "bots" => json!({"bots": [
                     {"name": "calc.lead", "bot_id": 1, "head": 1},
@@ -29484,7 +29898,10 @@ mod tests {
                 "approvals" => json!({"approvals": []}),
                 "turns" => json!({"turns": []}),
                 "history_nodes" => json!({"nodes": []}),
-                "history_items" => json!({"items": []}),
+                "history_items" => json!({"items": [{"item": {
+                    "type": "function_call_output", "call_id": "w1",
+                    "output": waited.to_string(),
+                }}]}),
                 _ => json!({}),
             }
         })
@@ -29530,6 +29947,240 @@ mod tests {
         fleet.go_to("calc.b", true);
         fleet.layout.settle();
         assert!(windowed(&fleet).contains(&"calc.b".to_owned()));
+        // The person approves; both finish and the lead's wait takes them.
+        fleet.event(&event(
+            "calc.a",
+            "tool_started",
+            json!({"call_id": "c1", "name": "shell"}),
+        ));
+        assert_eq!(fleet.doing["calc.a"], "working");
+        for bot in ["calc.a", "calc.b"] {
+            fleet.event(&event(bot, "turn_finished", json!({"status": "completed"})));
+        }
+        fleet.event(&event(
+            "calc.lead",
+            "tool_started",
+            json!({"call_id": "w1", "name": "wait"}),
+        ));
+        fleet.event(&event(
+            "calc.lead",
+            "tool_completed",
+            json!({"call_id": "w1", "node": 9}),
+        ));
+        fleet.close_taken().await;
+        fleet.layout.settle();
+        // The tab opened only for what needed the person closes; the one
+        // the person went to stays.
+        let shown = windowed(&fleet);
+        assert!(!shown.contains(&"calc.a".to_owned()), "{shown:?}");
+        assert!(shown.contains(&"calc.b".to_owned()), "{shown:?}");
+    }
+
+    /// A tab opened only because its task needed the person, which an
+    /// agent showed again since (`show_agent` places a new block), stays
+    /// once the result is taken.
+    #[tokio::test]
+    async fn a_tab_opened_for_a_need_an_agent_showed_again_stays_once_taken() {
+        // The lead's wait that took both tasks' results.
+        let waited = json!({"results": {
+            "calc.a/1": {"status": "completed"},
+            "calc.b/1": {"status": "completed"},
+        }});
+        let (client, events) = daemon_with_events(json!({}), move |asked| {
+            match asked["op"].as_str().unwrap_or("") {
+                "bots" => json!({"bots": [
+                    {"name": "calc.lead", "bot_id": 1, "head": 1},
+                    {"name": "calc.a", "bot_id": 2, "created_by": "calc.lead",
+                        "running_turn": 1, "head": 2},
+                    {"name": "calc.b", "bot_id": 3, "created_by": "calc.lead",
+                        "running_turn": 1, "head": 3},
+                ], "next_after": null}),
+                "approvals" => json!({"approvals": []}),
+                "turns" => json!({"turns": []}),
+                "history_nodes" => json!({"nodes": []}),
+                "history_items" => json!({"items": [{"item": {
+                    "type": "function_call_output", "call_id": "w1",
+                    "output": waited.to_string(),
+                }}]}),
+                _ => json!({}),
+            }
+        })
+        .await;
+        let mut fleet = Fleet::in_memory(client.clone(), events, "calc", "calc.lead");
+        let read = (agent_client::config::path().as_ref())
+            .and_then(|path| std::fs::metadata(path).ok())
+            .and_then(|file| file.modified().ok());
+        fleet.windows = Arc::new(std::sync::Mutex::new(TaskWindows {
+            read: Some(read),
+            most: 32,
+            tabs: agent_client::config::TaskTabs::Asked,
+        }));
+        let event = |bot: &str, kind: &str, data: Value| json!({"event": kind, "bot": bot, "turn": 1, "data": data});
+        let windowed = |fleet: &Fleet| {
+            let (sent, got) = std::sync::mpsc::channel();
+            fleet.layout.send(move |layout| {
+                let labels: Vec<String> = (layout.windows().into_iter())
+                    .flat_map(|(_, labels)| labels)
+                    .collect();
+                let _ = sent.send(labels);
+            });
+            got.recv().unwrap()
+        };
+        for bot in ["calc.a", "calc.b"] {
+            fleet.lineage.insert(bot.into());
+            fleet.event(&event(bot, "accepted", json!({})));
+        }
+        fleet.layout.settle();
+        let shown = windowed(&fleet);
+        assert!(
+            !shown.iter().any(|label| label.starts_with("calc.")),
+            "{shown:?}"
+        );
+        assert_eq!(fleet.doing["calc.a"], "working");
+        // A call of its held for the person opens its tab.
+        fleet.event(&event("calc.a", "approval_asked", json!({"call_id": "c1"})));
+        assert_eq!(fleet.doing["calc.a"], "needs you");
+        fleet.layout.settle();
+        assert!(windowed(&fleet).contains(&"calc.a".to_owned()));
+        assert!(!windowed(&fleet).contains(&"calc.b".to_owned()));
+        // The person goes to the other: its tab opens.
+        fleet.go_to("calc.b", true);
+        fleet.layout.settle();
+        assert!(windowed(&fleet).contains(&"calc.b".to_owned()));
+        // An agent shows calc.a again, as show_agent does: a new block.
+        fleet.layout.send(|layout| {
+            let command = ["sonny".to_owned(), "--agent".into(), "calc.a".into()];
+            layout
+                .place("calc.a", "a", &command, &mux::Placement::Window)
+                .unwrap();
+        });
+        fleet.layout.settle();
+        // The person approves; both finish and the lead's wait takes them.
+        fleet.event(&event(
+            "calc.a",
+            "tool_started",
+            json!({"call_id": "c1", "name": "shell"}),
+        ));
+        assert_eq!(fleet.doing["calc.a"], "working");
+        for bot in ["calc.a", "calc.b"] {
+            fleet.event(&event(bot, "turn_finished", json!({"status": "completed"})));
+        }
+        fleet.event(&event(
+            "calc.lead",
+            "tool_started",
+            json!({"call_id": "w1", "name": "wait"}),
+        ));
+        fleet.event(&event(
+            "calc.lead",
+            "tool_completed",
+            json!({"call_id": "w1", "node": 9}),
+        ));
+        fleet.close_taken().await;
+        fleet.layout.settle();
+        // Both stay: calc.a's is the one the agent showed.
+        let shown = windowed(&fleet);
+        assert!(shown.contains(&"calc.a".to_owned()), "{shown:?}");
+        assert!(shown.contains(&"calc.b".to_owned()), "{shown:?}");
+    }
+
+    /// A tab opened only because its task needed the person, used by them
+    /// since, as when they answer in it, stays once the result is taken.
+    #[tokio::test]
+    async fn a_tab_opened_for_a_need_the_person_used_stays_once_taken() {
+        // The lead's wait that took both tasks' results.
+        let waited = json!({"results": {
+            "calc.a/1": {"status": "completed"},
+            "calc.b/1": {"status": "completed"},
+        }});
+        let (client, events) = daemon_with_events(json!({}), move |asked| {
+            match asked["op"].as_str().unwrap_or("") {
+                "bots" => json!({"bots": [
+                    {"name": "calc.lead", "bot_id": 1, "head": 1},
+                    {"name": "calc.a", "bot_id": 2, "created_by": "calc.lead",
+                        "running_turn": 1, "head": 2},
+                    {"name": "calc.b", "bot_id": 3, "created_by": "calc.lead",
+                        "running_turn": 1, "head": 3},
+                ], "next_after": null}),
+                "approvals" => json!({"approvals": []}),
+                "turns" => json!({"turns": []}),
+                "history_nodes" => json!({"nodes": []}),
+                "history_items" => json!({"items": [{"item": {
+                    "type": "function_call_output", "call_id": "w1",
+                    "output": waited.to_string(),
+                }}]}),
+                _ => json!({}),
+            }
+        })
+        .await;
+        let mut fleet = Fleet::in_memory(client.clone(), events, "calc", "calc.lead");
+        // The person types in calc.a's tab.
+        fleet.used_when = |bot| (bot == "calc.a").then(std::time::SystemTime::now);
+        let read = (agent_client::config::path().as_ref())
+            .and_then(|path| std::fs::metadata(path).ok())
+            .and_then(|file| file.modified().ok());
+        fleet.windows = Arc::new(std::sync::Mutex::new(TaskWindows {
+            read: Some(read),
+            most: 32,
+            tabs: agent_client::config::TaskTabs::Asked,
+        }));
+        let event = |bot: &str, kind: &str, data: Value| json!({"event": kind, "bot": bot, "turn": 1, "data": data});
+        let windowed = |fleet: &Fleet| {
+            let (sent, got) = std::sync::mpsc::channel();
+            fleet.layout.send(move |layout| {
+                let labels: Vec<String> = (layout.windows().into_iter())
+                    .flat_map(|(_, labels)| labels)
+                    .collect();
+                let _ = sent.send(labels);
+            });
+            got.recv().unwrap()
+        };
+        for bot in ["calc.a", "calc.b"] {
+            fleet.lineage.insert(bot.into());
+            fleet.event(&event(bot, "accepted", json!({})));
+        }
+        fleet.layout.settle();
+        let shown = windowed(&fleet);
+        assert!(
+            !shown.iter().any(|label| label.starts_with("calc.")),
+            "{shown:?}"
+        );
+        assert_eq!(fleet.doing["calc.a"], "working");
+        // A call of its held for the person opens its tab.
+        fleet.event(&event("calc.a", "approval_asked", json!({"call_id": "c1"})));
+        assert_eq!(fleet.doing["calc.a"], "needs you");
+        fleet.layout.settle();
+        assert!(windowed(&fleet).contains(&"calc.a".to_owned()));
+        assert!(!windowed(&fleet).contains(&"calc.b".to_owned()));
+        // The person goes to the other: its tab opens.
+        fleet.go_to("calc.b", true);
+        fleet.layout.settle();
+        assert!(windowed(&fleet).contains(&"calc.b".to_owned()));
+        // The person approves; both finish and the lead's wait takes them.
+        fleet.event(&event(
+            "calc.a",
+            "tool_started",
+            json!({"call_id": "c1", "name": "shell"}),
+        ));
+        assert_eq!(fleet.doing["calc.a"], "working");
+        for bot in ["calc.a", "calc.b"] {
+            fleet.event(&event(bot, "turn_finished", json!({"status": "completed"})));
+        }
+        fleet.event(&event(
+            "calc.lead",
+            "tool_started",
+            json!({"call_id": "w1", "name": "wait"}),
+        ));
+        fleet.event(&event(
+            "calc.lead",
+            "tool_completed",
+            json!({"call_id": "w1", "node": 9}),
+        ));
+        fleet.close_taken().await;
+        fleet.layout.settle();
+        // Both stay: the person used the one opened for a need.
+        let shown = windowed(&fleet);
+        assert!(shown.contains(&"calc.a".to_owned()), "{shown:?}");
+        assert!(shown.contains(&"calc.b".to_owned()), "{shown:?}");
     }
 
     #[tokio::test]
@@ -30027,6 +30678,29 @@ mod tests {
     }
 
     #[test]
+    fn the_composers_hint_links_the_task_it_answers() {
+        let names = [
+            ("shop lead".to_owned(), "shop.lead".to_owned()),
+            ("fix".to_owned(), "shop.fix".to_owned()),
+        ];
+        let hint = |text: &str| {
+            vec![Line::from(vec![
+                Span::raw("› ").bold(),
+                Span::raw(text.to_owned()).dim(),
+            ])]
+        };
+        // This window's own agent is plain words.
+        let (rows, found) = hint_agents(hint("Steer shop lead"), &names);
+        assert_eq!(rows[0].to_string(), "› Steer shop lead");
+        assert!(found.is_empty());
+        let (_, found) = hint_agents(hint("Answer “Ship it?” from fix: type or ↑↓ pick"), &names);
+        assert_eq!(found, [(0, 25, 28, "shop.fix".to_owned())]);
+        // A word that only looks like one is words.
+        let (_, found) = hint_agents(hint("A message of your own · esc answer"), &names);
+        assert!(found.is_empty());
+    }
+
+    #[test]
     fn status_links_each_agent_to_open_it_this_one_too() {
         let row = |name: &str, bot: &str, group| status::Row {
             name: name.into(),
@@ -30097,6 +30771,36 @@ mod tests {
             )))
         );
         assert_eq!(marks.len(), 3);
+        // An agent a row waits on opens too, each one named.
+        let mut watch = watch;
+        watch.rows[2].state = "waiting on lead, first lead".into();
+        let (lines, _, marks) = watch_card(&watch, 80);
+        let neg = (lines.iter())
+            .position(|line| line.to_string().contains("neg waiting on"))
+            .unwrap();
+        let buttons = (marks.iter())
+            .find_map(|(at, mark)| match mark {
+                screen::Mark::Buttons(buttons) if *at == neg => Some(buttons.clone()),
+                _ => None,
+            })
+            .unwrap();
+        let text = lines[neg].to_string();
+        let named: Vec<(String, &str)> = (buttons.iter())
+            .map(|(from, to, link)| {
+                let name: String = (text.chars())
+                    .skip(usize::from(*from))
+                    .take(usize::from(to - from))
+                    .collect();
+                (name, link.as_str())
+            })
+            .collect();
+        assert_eq!(
+            named,
+            [
+                ("lead".to_owned(), "sonny:agent/calc.lead.review"),
+                ("first lead".to_owned(), "sonny:agent/calc.lead")
+            ]
+        );
     }
 
     #[tokio::test]
@@ -31806,6 +32510,97 @@ mod tests {
         app.fold_live();
         assert!(app.blocks.is_empty());
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_tasks_hint_writes_its_lead_short_and_its_own_name_plain() {
+        let mut app = app(daemon_with(json!([])).await);
+        app.bot = "calc.halves".into();
+        let came = |app: &mut App, from: &str| {
+            app.came_from("Check this.", Some(from), true);
+            std::mem::take(&mut app.turn_hints.came)
+        };
+        // Its own project's lead, short, and a link.
+        assert_eq!(
+            came(&mut app, "calc.lead"),
+            [("lead".to_owned(), Some("calc.lead".to_owned()))]
+        );
+        // Another project's agent whole.
+        assert_eq!(came(&mut app, "shop.lead")[0].0, "shop.lead");
+        // This window's own agent is plain words.
+        assert_eq!(came(&mut app, "calc.halves"), [("halves".to_owned(), None)]);
+        // One that is not there is plain words.
+        app.status_bots = ["calc.halves".to_owned()].into();
+        assert_eq!(came(&mut app, "calc.lead"), [("lead".to_owned(), None)]);
+    }
+
+    #[tokio::test]
+    async fn steps_writes_the_projects_agents_short_and_each_opens() {
+        let mut app = app(daemon_with(json!([])).await);
+        app.bot = "calc.lead".into();
+        app.project = Some("calc".into());
+        app.status_bots = ["calc.neg", "calc.readme"].map(String::from).into();
+        app.any_history = true;
+        app.width = 120;
+        app.commit(vec![Line::from("› check on the tasks")]);
+        let note = "[tasks · calc.readme · calc.readme replied, completed]\ndone";
+        app.land(5, (note, ""), (Some("the lookout"), false), false);
+        let steer = json!({"command":
+            r#""$AGENT_BIN" run --detach --delivery steer --bot calc.neg -- 'Check div too.'"#});
+        app.commit_call("c1", Some(1), "shell", &steer, "calc.neg/4", false);
+        app.commit(vec![Line::from("• On it.")]);
+        app.flush();
+        let texts = app.screen.texts();
+        let at = (texts.iter())
+            .position(|row| row.trim_start().starts_with("↳"))
+            .unwrap();
+        assert_eq!(
+            texts[at].trim(),
+            "↳ 1 lookout note · readme · sent to neg ▸"
+        );
+        let opens: Vec<String> = (app.screen.buttons()[at].iter())
+            .map(|(from, to, url)| {
+                let name: String = (texts[at].chars())
+                    .skip(usize::from(*from))
+                    .take(usize::from(to - from))
+                    .collect();
+                format!("{name} {url}")
+            })
+            .collect();
+        assert_eq!(
+            opens,
+            ["readme sonny:agent/calc.readme", "neg sonny:agent/calc.neg"]
+        );
+        // One alone: its shut row by its short name, which opens it.
+        app.commit(vec![Line::from("› and now?")]);
+        app.land(9, ("Look at div.", ""), (Some("calc.neg"), false), false);
+        app.commit(vec![Line::from("• Looking.")]);
+        app.flush();
+        let texts = app.screen.texts();
+        let at = (texts.iter())
+            .rposition(|row| row.contains("From neg"))
+            .unwrap();
+        assert_eq!(texts[at].trim(), "↳ From neg ▸");
+        assert_eq!(app.screen.buttons()[at].len(), 1);
+        // One not known to be there is written whole, as any name is.
+        app.status_bots.clear();
+        app.commit(vec![Line::from("› and div?")]);
+        app.land(11, ("Div too.", ""), (Some("calc.div"), false), false);
+        app.flush();
+        assert!(
+            app.screen
+                .texts()
+                .iter()
+                .any(|row| row.trim() == "↳ From calc.div ▸")
+        );
+        // Found by the next count, it is drawn again short, as a link.
+        app.status_counted(["calc.div".to_owned()].into());
+        app.flush();
+        let texts = app.screen.texts();
+        let at = (texts.iter())
+            .position(|row| row.trim() == "↳ From div ▸")
+            .unwrap();
+        assert_eq!(app.screen.buttons()[at].len(), 1);
     }
 
     #[tokio::test]

@@ -7,9 +7,11 @@
 //! those cells are written again.
 use ratatui::{
     buffer::{Buffer, Cell},
-    style::Modifier,
+    style::{Color, Modifier},
+    text::{Line, Span},
 };
 use std::path::Path;
+use unicode_width::UnicodeWidthStr;
 
 /// Where a link shows: its row, and its first column and the one after its
 /// last.
@@ -242,6 +244,101 @@ impl Names {
     }
 }
 
+/// Whether `c` may be part of an agent's name.
+pub fn name_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-')
+}
+
+/// Each agent a card's rows name: its row, the columns it runs over, and
+/// the bot it opens.
+pub type Agents = Vec<(usize, u16, u16, String)>;
+
+/// `rows` with each of `names` drawn in the agents' color where the words
+/// before it, on its row or ending the row before, are ones `after` says
+/// lead to an agent, as a link draws it: [`agents_on`] finds them there.
+pub fn name_agents(
+    rows: Vec<Line<'static>>,
+    names: &[&str],
+    after: impl Fn(&str) -> bool,
+) -> Vec<Line<'static>> {
+    let mut before = String::new();
+    let mut out = Vec::new();
+    for row in rows {
+        let mut said = before.clone();
+        let mut spans = Vec::new();
+        let (style, alignment) = (row.style, row.alignment);
+        for span in row.spans {
+            // An empty span is the row's own (a wrap's lead): kept.
+            if span.content.is_empty() {
+                spans.push(span);
+                continue;
+            }
+            let style = span.style;
+            let text = span.content.into_owned();
+            let mut from = 0;
+            let mut at = 0;
+            while at < text.len() {
+                // The longest name that fits: `lead review` over `lead`.
+                let found = (names.iter())
+                    .filter(|name| !name.is_empty() && text[at..].starts_with(**name))
+                    .filter(|name| !text[at + name.len()..].starts_with(name_char))
+                    .filter(|_| !text[..at].ends_with(name_char))
+                    .filter(|_| {
+                        let context = format!("{said}{}", &text[..at]);
+                        after(&format!("{} ", context.trim_end()))
+                    })
+                    .max_by_key(|name| name.len());
+                match found {
+                    Some(name) => {
+                        if from < at {
+                            spans.push(Span::styled(text[from..at].to_owned(), style));
+                        }
+                        let blue = style.fg(Color::Blue).remove_modifier(Modifier::DIM);
+                        spans.push(Span::styled((*name).to_owned(), blue));
+                        at += name.len();
+                        from = at;
+                    }
+                    None => at += text[at..].chars().next().map_or(1, char::len_utf8),
+                }
+            }
+            if from < text.len() {
+                spans.push(Span::styled(text[from..].to_owned(), style));
+            }
+            said.push_str(&text);
+        }
+        // A row's last words may lead to a name the next row starts with.
+        before = format!("{} ", said.trim_end());
+        let mut line = Line::from(spans).style(style);
+        line.alignment = alignment;
+        out.push(line);
+    }
+    out
+}
+
+/// Where [`name_agents`] drew each of `names` (as drawn, with its bot)
+/// on `rows`.
+pub fn agents_on(rows: &[Line<'static>], names: &[(String, String)]) -> Agents {
+    let mut links = Agents::new();
+    for (y, row) in rows.iter().enumerate() {
+        let mut column = 0;
+        for span in &row.spans {
+            let wide = span.content.width();
+            // A row's own name, bold, is its row's link already; one
+            // [`name_agents`] drew, which takes away the row's mute, is a
+            // name it leads to, bold or not (`question from lead`).
+            if span.style.fg == Some(Color::Blue)
+                && (!span.style.add_modifier.contains(Modifier::BOLD)
+                    || span.style.sub_modifier.contains(Modifier::DIM))
+                && let Some((_, bot)) = names.iter().find(|(name, _)| *name == span.content)
+            {
+                links.push((y, column as u16, (column + wide) as u16, bot.clone()));
+            }
+            column += wide;
+        }
+    }
+    links
+}
+
 /// Where a web address starts in `word`, if one does: not inside a word,
 /// as in `xhttps://`.
 fn web(word: &str) -> Option<usize> {
@@ -414,6 +511,39 @@ fn trim(url: &str) -> String {
 mod tests {
     use super::*;
     use ratatui::{layout::Rect, text::Line, widgets::Paragraph, widgets::Widget};
+
+    #[test]
+    fn a_rows_names_link_the_longest_bold_too_and_keep_the_row_as_it_was() {
+        use ratatui::style::Stylize;
+        let names = [
+            ("lead".to_owned(), "calc.lead".to_owned()),
+            ("lead review".to_owned(), "calc.lead.review".to_owned()),
+        ];
+        let shown = ["lead", "lead review"];
+        let after = |said: &str| said.ends_with("on ") || said.ends_with("from ");
+        // The longest name that fits, not the first that starts there.
+        let rows = name_agents(vec![Line::from("waiting on lead review")], &shown, after);
+        assert_eq!(
+            agents_on(&rows, &names),
+            [(0, 11, 22, "calc.lead.review".to_owned())]
+        );
+        // A bold name a row leads to opens; the row's own bold name does not.
+        let row = Line::from(vec![
+            Span::raw("lead").fg(Color::Blue).bold(),
+            Span::raw(" · question from "),
+            Span::raw("lead").bold(),
+        ]);
+        let rows = name_agents(vec![row], &shown, after);
+        assert_eq!(
+            agents_on(&rows, &names),
+            [(0, 21, 25, "calc.lead".to_owned())]
+        );
+        // An empty span and the row's alignment are kept.
+        let row = Line::from(vec![Span::raw(""), Span::raw("• from lead")]).centered();
+        let rows = name_agents(vec![row], &shown, after);
+        assert_eq!(rows[0].spans[0].content, "");
+        assert_eq!(rows[0].alignment, Some(ratatui::layout::Alignment::Center));
+    }
 
     fn drawn(rows: &[&str], width: u16) -> Buffer {
         draw(
