@@ -10516,3 +10516,25 @@ The fleet numbers are the same within the runs' spread. The step alone
 moves by more than the runs agree with each other (one head run at 0.88 ms
 p50 was the fastest of all six), so no change shows above the noise, and
 memory spreads 100 MB run to run on both sides.
+
+CI's matched screen (`perf` workflow, run 44009613119, base main against
+this head, GitHub's Linux runner, 2026-11-17), the daemon rows:
+
+| Bench | Measure | Base | Head | Change |
+| --- | --- | ---: | ---: | ---: |
+| admission | lone submit CPU, ms | 27.871 | 27.770 | -0.4% |
+| admission | burst submit p99, ms | 2.989 | 3.142 | +5.1% |
+| completion | release to terminal p99, ms | 8.286 | 8.230 | -0.7% |
+| footprint | idle RSS, MiB | 16.98 | 16.89 | -0.5% |
+| footprint | per idle bot, KiB | 1.786 | 1.948 | +9.1% |
+| footprint | RSS after a turn each, MiB | 40.40 | 41.82 | +3.5% |
+| footprint | CPU per turn, ms | 0.701 | 0.741 | +5.8% |
+| lifecycle | CPU, s | 0.39 | 0.40 | +2.6% |
+| lifecycle | p95 turn, ms | 854.7 | 582.9 | -31.8% |
+| lifecycle | peak RSS, MiB | 26.25 | 25.79 | -1.8% |
+
+The change adds nothing to an idle bot or a turn that runs no step: the
+pause is one statement in a step's own commit. The footprint and burst
+rows move within what one run against another moves on that runner (the
+same rows move by as much between base runs of other pull requests), and
+lifecycle's p95 is faster, which the change cannot cause either.
