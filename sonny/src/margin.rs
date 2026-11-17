@@ -263,7 +263,8 @@ pub async fn answer(
                     if let Some((_, _, arguments)) = calls.remove(&call)
                         && answered(&item)
                     {
-                        margin.apply(&call, &arguments, None, None, None);
+                        let written = item["written_ms"].as_i64();
+                        margin.apply(&call, &arguments, None, None, written);
                     }
                 }
                 _ => {}
