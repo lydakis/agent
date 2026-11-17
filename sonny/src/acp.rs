@@ -2550,10 +2550,7 @@ async fn setup_lead(
             asked["instructions"] = json!(text);
         }
     }
-    let declare = declared::declare(&record, crate::served::Role::LEAD);
-    if let Some(declare) = &declare {
-        asked["declare"] = declare.clone();
-    }
+    let mut declare = declared::declare(&record, crate::served::Role::LEAD);
     let mode = approvals::mode(&record);
     let state = crate::state::of(&record, &lead.bot);
     let sandbox = |mode| approvals::sandbox(mode, Path::new(&workspace), state.as_deref());
@@ -2565,6 +2562,19 @@ async fn setup_lead(
         gating = Some(mode);
     }
     let gating = gating.or(declare.as_ref().and(mode).filter(|mode| *mode != "full"));
+    // Its `exec` shows the shell's fields for leaving a sandbox only while
+    // its row puts it in one.
+    if let Some(mode) = gating
+        && let Some(held) = declared::held(
+            declare.as_ref().unwrap_or(&record["declared"]),
+            &json!(sandbox(mode)),
+        )
+    {
+        declare = Some(held);
+    }
+    if let Some(declare) = &declare {
+        asked["declare"] = declare.clone();
+    }
     if let (Some(mode), Value::Object(fields)) = (gating, &mut asked) {
         let tools: Vec<String> = record["tools"]
             .as_array()
