@@ -10538,3 +10538,49 @@ pause is one statement in a step's own commit. The footprint and burst
 rows move within what one run against another moves on that runner (the
 same rows move by as much between base runs of other pull requests), and
 lifecycle's p95 is faster, which the change cannot cause either.
+
+## A client yields a running call (code mode slice Y)
+
+`yield_call` lifts a waiting call of a `lift` tool with its output so far,
+and a yielded call has no deadline. Nothing it adds runs while no call is
+yielded but one more column read on rows already read by key, so the
+fleet that never yields should not move. `bench.steps_fleet` at 10,000
+bots, 5 steps each (50,000 steps), main (5239406) against the head, four
+alternating runs each, release build, synthetic model, 4-core Linux
+container, 2026-11-17. Ranges are the four runs; the median is in
+parentheses.
+
+| | Main | Head |
+| --- | ---: | ---: |
+| Steps finished / refused | 50,000 / 0 | 50,000 / 0 |
+| Store jobs a step | 2.0 | 2.0 |
+| One step alone, p50 | 0.62 to 0.70 ms (0.68) | 0.66 to 0.72 ms (0.68) |
+| One step alone, p99 | 1.51 to 2.88 ms (1.55) | 1.36 to 2.47 ms (1.78) |
+| Every call stepping at once, steps a second | 7,480 to 8,025 (7,931) | 7,093 to 7,927 (7,514) |
+| Every call stepping at once, step p99 | 1,318 to 1,425 ms (1,386) | 1,328 to 1,519 ms (1,434) |
+| Other bots' turn p99 while the fleet steps | 101 to 114 ms (111) | 110 to 121 ms (117) |
+| 10,000 turns to their waiting calls | 16.1 to 23.2 s (17.5) | 18.1 to 36.8 s (20.1) |
+| Daemon RSS, every call waiting | 356 to 414 MB (386) | 377 to 402 MB (385) |
+| Daemon RSS at the end | 387 to 444 MB (414) | 407 to 431 MB (415) |
+
+The head's medians sit a few percent behind on the fleet rows, inside the
+spread of main's own runs, and memory is the same. The head's slowest
+start (36.8 s) was its first run, straight after a build; its other three
+were 18.1 to 20.7 s.
+
+With `YIELD=1` the same fleet's client then yields all 10,000 calls at
+once, in batches of 2,000, each with its output so far, and every turn
+goes on and ends while its call waits on its answer:
+
+| | Head |
+| --- | ---: |
+| Yields replied / refused | 10,000 / 0 |
+| Store jobs a yield | 1.0 |
+| Sent to reply, p50 / p99 | 3,632 / 5,661 ms |
+| Daemon RSS, every call yielded and waiting | 401 MB |
+| Daemon RSS once every call is answered | 401 MB |
+
+A yield is one commit, and a yielded call that waits holds nothing a
+reader can measure beside one that was answered. The reply times are a
+burst's: 10,000 yields queue behind each other and behind the 10,000
+turns they start again; a script yields once every 30 s at most.
