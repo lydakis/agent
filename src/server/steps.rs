@@ -26,7 +26,7 @@ use agent_runtime::{
     codec::Part,
     fail_with,
     output::{self, Output},
-    store::{ArtifactLines, Capture, Resumed, StepAsk, StepOpened, Stepped, Store},
+    store::{ArtifactLines, Capture, ProcessKind, Resumed, StepAsk, StepOpened, Stepped, Store},
     tools::{Outcome, Prepared, ReadSource, Slot},
 };
 use serde_json::{Value, json};
@@ -1016,6 +1016,15 @@ async fn learn_links(capture: &Capture, ask: &mut StepAsk) {
     }
 }
 
+/// The name a step's command runs under beside its step's: `CALL:STEP`,
+/// so what it keeps outlives the call's answer.
+fn step_name(id: &str) -> String {
+    match id.split_once('/') {
+        Some((call, step)) => format!("{call}:{step}"),
+        None => id.to_owned(),
+    }
+}
+
 fn handles_now() -> u64 {
     super::handles::now_ms()
 }
@@ -1126,10 +1135,7 @@ async fn run(
                 workdir,
             } => {
                 let queued = registry.queue()?;
-                let named = match id.split_once('/') {
-                    Some((call, step)) => format!("{call}:{step}"),
-                    None => id.clone(),
-                };
+                let named = step_name(&id);
                 let listed = command.clone();
                 let (owner, started) = (bot.name.clone(), named.clone());
                 let outputs = turn::Outputs::of(bot, root.clone(), registry.daemon());
@@ -1150,12 +1156,7 @@ async fn run(
                 let registered = tokio::spawn(async move {
                     let process = store
                         .op("process_start", move |db| {
-                            db.process_start(
-                                turn,
-                                &started,
-                                agent_runtime::store::ProcessKind::Background,
-                                &listed,
-                            )
+                            db.process_start(turn, &started, ProcessKind::Background, &listed)
                         })
                         .await?;
                     let spill = (outputs.clone()).map(|outputs| outputs.spill(turn, &named));
@@ -1184,6 +1185,158 @@ async fn run(
                 Ok(Outcome::text(
                     json!({"handle":format!("proc:{process}"),"background":true}).to_string(),
                 ))
+            }
+            // As a turn's detached command: on a handle of the bot's that
+            // outlives the script, its turn and the daemon, started under
+            // the step's own name as a background step's is, and made
+            // whole on its own task for the same reason.
+            Prepared::Detach { command, workdir } => {
+                let named = step_name(&id);
+                let listed = turn::listed(&command);
+                let folder = Prepared::folder(&workspace, workdir.as_deref());
+                let (store, registry, lifts, owner, cord) = (
+                    store.clone(),
+                    registry.clone(),
+                    lifts.clone(),
+                    bot.name.clone(),
+                    held.clone(),
+                );
+                let started = tokio::spawn(async move {
+                    let (started, kind) = (named.clone(), ProcessKind::Detached);
+                    let process = store
+                        .op("process_start", move |db| {
+                            db.process_start(turn, &started, kind, &listed)
+                        })
+                        .await?;
+                    let (sender, receiver) = oneshot::channel();
+                    // Its end, a start that failed too, is recorded as it comes.
+                    lifts.collect(&owner, turn, process, &named, receiver, None, None, true);
+                    let sandboxed = sandbox.is_some();
+                    let started = registry
+                        .detached(
+                            cord,
+                            registry.stopper(process),
+                            &command,
+                            &folder,
+                            &environment,
+                            sandbox,
+                            sender,
+                        )
+                        .await;
+                    let detached = match started {
+                        Ok(detached) => detached,
+                        Err(error) => {
+                            // The step says it failed: nothing tells it again.
+                            store.op("saw_end", move |db| db.saw_end(process)).await?;
+                            return Err(error);
+                        }
+                    };
+                    store
+                        .op("process_detached", move |db| {
+                            db.process_detached(process, detached, sandboxed, "")
+                        })
+                        .await?;
+                    Ok(Outcome::text(
+                        json!({"handle":format!("proc:{process}"),"detached":true,"pid":detached.pid})
+                            .to_string(),
+                    ))
+                });
+                started.await.map_err(|_| Error::new("storage_error"))?
+            }
+            // As a turn's terminal: the bot's, on a handle that outlives the
+            // script, answered with what it wrote within its yield. It is
+            // made whole on its own task, as a background step is; a pull
+            // as it starts ends it.
+            Prepared::Terminal {
+                command,
+                yield_ms,
+                workdir,
+            } => {
+                let named = step_name(&id);
+                let listed = command.clone();
+                let folder = Prepared::folder(&workspace, workdir.as_deref());
+                let outputs = turn::Outputs::of(bot, root.clone(), registry.daemon());
+                let (store, registry, lifts, owner, owner_id, cord) = (
+                    store.clone(),
+                    registry.clone(),
+                    lifts.clone(),
+                    bot.name.clone(),
+                    bot.bot_id,
+                    held.clone(),
+                );
+                let started = tokio::spawn(async move {
+                    let (started, kind) = (named.clone(), ProcessKind::Terminal);
+                    let process = store
+                        .op("process_start", move |db| {
+                            db.process_start(turn, &started, kind, &listed)
+                        })
+                        .await?;
+                    let (sender, receiver) = oneshot::channel();
+                    let terminal = Some(registry.clone());
+                    lifts.collect(
+                        &owner, turn, process, &named, receiver, outputs, terminal, false,
+                    );
+                    let stopper = registry.stopper(process);
+                    let started = registry
+                        .terminal(
+                            owner_id,
+                            process,
+                            command,
+                            folder,
+                            Some(yield_ms),
+                            environment,
+                            sandbox,
+                            Some((cord.clone(), stopper)),
+                            sender,
+                        )
+                        .await;
+                    // A pull after it started, before it was registered,
+                    // found no terminal to end.
+                    if cord.pulled() {
+                        registry.end_terminal(process);
+                    }
+                    // A start that failed is its end, and the step says so.
+                    let seen = match &started {
+                        Ok(outcome) => turn::Turn::seen(process, outcome),
+                        Err(_) => Some(process),
+                    };
+                    if let Some(seen) = seen {
+                        store.op("saw_end", move |db| db.saw_end(seen)).await?;
+                    }
+                    started
+                });
+                started.await.map_err(|_| Error::new("storage_error"))?
+            }
+            // As a turn's: typed into, polled or killed, the bot's own
+            // terminal answers with what it wrote within the write's yield.
+            Prepared::WriteStdin {
+                handle,
+                chars,
+                yield_ms,
+                kill,
+            } => {
+                let typed = registry
+                    .write_stdin(bot.bot_id, handle, &chars, yield_ms, kill, sandbox)
+                    .await;
+                let typed = match typed {
+                    Err(error) if error.code == "terminal_not_running" => {
+                        let handles = &lifts.handles;
+                        turn::not_a_terminal(
+                            &store, &registry, handles, &bot.name, handle, kill, error,
+                        )
+                        .await
+                        .flatten()
+                    }
+                    typed => typed,
+                };
+                if let Some(seen) = typed
+                    .as_ref()
+                    .ok()
+                    .and_then(|o| turn::Turn::seen(handle, o))
+                {
+                    store.op("saw_end", move |db| db.saw_end(seen)).await?;
+                }
+                typed
             }
             // A command's output kept past its result, paged as the
             // turn's own read pages it, from any of the bot's turns.

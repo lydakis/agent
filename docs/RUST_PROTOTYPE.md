@@ -3711,10 +3711,14 @@ host would otherwise run the bot's own tools on its behalf:
 `{"op":"run_step","bot","turn","call_id","step","name","arguments"}`,
 beside `approve_step`, with the same `step` and `arguments` rules and the
 same call checks. `name` is one of the daemon's tools that may run as a
-step: `shell` (foreground only), `read` (of a file, or of a command's
+step: `shell`, `write_stdin`, `read` (of a file, or of a command's
 kept output by its `TURN/CALL/STREAM` reference, paged in lines as the
-model's own read pages it; not a recorded result), `write`, `edit`, `apply_patch`, `web_fetch`, and `echo`
-(`invalid_step` otherwise, or for `background`, `detach` or `tty`), and
+model's own read pages it; not a recorded result), `write`, `edit`, `apply_patch`, `web_fetch`, and `echo`.
+Since protocol 86 every daemon tool is a step but those Codex keeps out of
+its scripts, each refused `invalid_step` with its class: `wait`, the script
+tool's second half; `history`, a history reader; `web_search`, which its
+provider runs inside the model call; and the agent tools, `send_message`,
+`list_agents`, `pause_agents`, `spawn_agent` and `close_agent`. It must be
 one the bot may call (`tool_not_available`, as `web_fetch` is for a bot its
 sandbox keeps off the network); the call's tool must take steps, and the
 bot must have a workspace. A command, and a confined change to files
@@ -3723,7 +3727,19 @@ in hand; a read or a fetch takes none. A change to files (`write`,
 `edit`, `apply_patch`) runs to its end once begun, whatever stops its step:
 cut off, a file could be left half written; until its sandbox is ready,
 nothing of it has begun and a stop ends it. Its asker is told
-`step_stopped`, and its `step_completed` records how it really ended. A
+`step_stopped`, and its `step_completed` records how it really ended.
+A `shell` step with `background`, `detach` or `tty`, and a `write_stdin`
+step, run as their direct calls: the command is the bot's, on a `proc:N`
+handle that outlives the script, listed, stopped, waited on and told as a
+turn's. A background step answers at once with its handle; a detached one
+with its handle and `pid`; a terminal one with what it wrote within
+`yield_time_ms` and, while it runs, its handle; `write_stdin` with what
+the terminal wrote within its yield (at most 30 s), or the kill's answer.
+A detached command or a terminal holds one of the daemon's lasting slots
+(`lasting_limit`) as a direct call's does, and neither it nor
+`write_stdin` takes a process slot or a place in the steps' line. A stop
+of the step drops its wait for output: what was typed stays typed, and the
+terminal runs on. A
 picture a `read` step finds is answered with its line and the picture in
 `parts`, as `tool_result` takes them; one past what a reply's 1 MiB holds
 is kept whole as the step's output `picture-N` (its base64, read with
@@ -3755,7 +3771,8 @@ call ends.
 A step waits for its decision, and then, when it takes a process slot,
 for its place, in daemon-wide lines, first come first served, holding its
 request and no task or timer. One that takes none (`echo`, `read`,
-`web_fetch`, an unconfined change to files) starts once allowed, never
+`web_fetch`, an unconfined change to files, a background, detached or
+terminal command, `write_stdin`) starts once allowed, never
 behind a command waiting for a slot. At most 64 steps' store jobs are under way at once, so a fleet's
 steps share the store with other bots' turns rather than fill its queue.
 A step that needs a process slot takes one from the semaphore the

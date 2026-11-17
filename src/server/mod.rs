@@ -6160,8 +6160,14 @@ impl Service {
                     code: "invalid_step".into(),
                     ..e
                 })?;
-                // The daemon's tools a step may run: those whose place in
-                // line and whose stop are specified.
+                // Every daemon tool is a step but those Codex keeps out of
+                // its scripts, each for its class.
+                if let Some(why) = agent_runtime::tools::direct_only(&tool) {
+                    return fail_with(
+                        "invalid_step",
+                        format!("{tool} runs only as a direct call: {why}"),
+                    );
+                }
                 if !agent_runtime::tools::STEP_TOOLS.contains(&tool.as_str()) {
                     return fail_with(
                         "invalid_step",
@@ -6185,9 +6191,8 @@ impl Service {
                         format!("arguments may be up to {ANSWER_BYTES} bytes"),
                     );
                 }
-                // Read as the call would be: a step that would not run as
-                // a foreground command, or that reads anything but a file,
-                // is refused before anything is recorded.
+                // Read as the call would be: a step that reads anything but
+                // a file is refused before anything is recorded.
                 let mut prepared = self.registry.prepare(&tool, &arguments)?;
                 if let Prepared::Shell {
                     timeout_ms,
@@ -6198,23 +6203,15 @@ impl Service {
                 {
                     *timeout_ms = None;
                 }
-                match prepared {
-                    Prepared::Detach { .. } | Prepared::Terminal { .. } => {
-                        return fail_with(
-                            "invalid_step",
-                            "a daemon step runs a command in the foreground or the background: no detach or tty",
-                        );
-                    }
-                    Prepared::Read {
-                        source: agent_runtime::tools::ReadSource::Result { .. },
-                        ..
-                    } => {
-                        return fail_with(
-                            "invalid_step",
-                            "a daemon step reads a file or a command's kept output, not a recorded result",
-                        );
-                    }
-                    _ => {}
+                if let Prepared::Read {
+                    source: agent_runtime::tools::ReadSource::Result { .. },
+                    ..
+                } = prepared
+                {
+                    return fail_with(
+                        "invalid_step",
+                        "a daemon step reads a file or a command's kept output, not a recorded result",
+                    );
                 }
                 let ask = agent_runtime::store::StepAsk {
                     bot,
