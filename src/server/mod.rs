@@ -354,6 +354,14 @@ enum Command {
         /// The identity `bot` must hold; another is `bot_not_found`.
         bot_id: Option<i64>,
     },
+    /// Take the text blocks that show nothing out of a bot's history,
+    /// which Anthropic refuses in any request; each node repaired and
+    /// what it held.
+    Repair {
+        bot: String,
+        /// The identity `bot` must hold; another is `bot_not_found`.
+        bot_id: Option<i64>,
+    },
     Fork {
         source: String,
         /// A node id from the source's history; defaults to its head when it
@@ -896,6 +904,7 @@ impl Command {
             Command::Inspect { .. } => "inspect",
             Command::Configure { .. } => "configure",
             Command::Compact { .. } => "compact",
+            Command::Repair { .. } => "repair",
             Command::Fork { .. } => "fork",
             Command::Close { .. } => "close",
             Command::Delete { .. } => "delete",
@@ -3457,6 +3466,7 @@ impl Service {
             | Command::Close { bot, .. }
             | Command::Prune { bot, .. }
             | Command::Compact { bot, .. }
+            | Command::Repair { bot, .. }
             | Command::Interrupt { bot, .. }
             | Command::StopProcess { bot, .. }
             | Command::ProcessOutput { bot, .. } => {
@@ -5262,6 +5272,17 @@ impl Service {
                     compaction_model,
                 };
                 self.configure(bot, bot_id, change).await
+            }
+            Command::Repair { bot, bot_id } => {
+                let name = bot.clone();
+                store
+                    .op("repair_blank", move |db| {
+                        let id = db.identity(&name, bot_id)?;
+                        let nodes = db.anthropic_history(&name)?;
+                        let repaired = db.repair_blank(&nodes)?;
+                        Ok(json!({"bot":name,"bot_id":id,"repaired":repaired}))
+                    })
+                    .await
             }
             Command::Compact { bot, bot_id } => {
                 let name = bot.clone();

@@ -1714,6 +1714,7 @@ pub fn main(args: Vec<String>) -> Result<i32> {
         "rm" => remove(&options),
         "prune" => prune(&options),
         "compact" => compact(&options),
+        "repair" => repair(&options),
         "approvals" => approvals(&options),
         "audit" => audit(&options),
         "answer" => answer(&options),
@@ -2572,6 +2573,20 @@ fn compact(options: &Options) -> Result<i32> {
     let mut connection = ensure_existing_daemon(options)?;
     print_json(
         &connection.request("compact", json!({"bot":bot,"bot_id":options.bot_id}))?,
+        options.pretty,
+    )?;
+    Ok(0)
+}
+
+/// Take the text blocks that show nothing out of a bot's history.
+fn repair(options: &Options) -> Result<i32> {
+    let bot = options
+        .bot
+        .clone()
+        .ok_or(Error::with("usage", "repair needs --bot"))?;
+    let mut connection = ensure_existing_daemon(options)?;
+    print_json(
+        &connection.request("repair", json!({"bot":bot,"bot_id":options.bot_id}))?,
         options.pretty,
     )?;
     Ok(0)

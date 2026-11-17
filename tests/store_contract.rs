@@ -13473,7 +13473,12 @@ fn fork_prompt_views_survive_source_deletion_and_reopen() {
                 serde_json::from_slice(&[b"[", &raw[..], b"]"].concat()).unwrap();
             assert_eq!(items.len(), 6);
             for (item, prompt) in items.iter().step_by(2).zip(prompts) {
-                assert_eq!(item["content"][0]["text"], prompt);
+                // Anthropic refuses blank text: blank words read `<empty>`.
+                let words = match family {
+                    Family::Anthropic if prompt.is_empty() => agent_runtime::codec::EMPTY,
+                    _ => prompt,
+                };
+                assert_eq!(item["content"][0]["text"], words);
             }
         }
         std::fs::remove_file(path).unwrap();

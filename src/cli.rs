@@ -130,6 +130,14 @@ const COMMANDS: &[Command] = &[
         startup: true,
     },
     Command {
+        name: "repair",
+        about: "Take the text blocks that show nothing out of a bot's history; prints each node repaired",
+        usage: "repair --bot NAME [--bot-id N]",
+        flags: "--bot --bot-id --pretty --no-spawn",
+        settings: "",
+        startup: true,
+    },
+    Command {
         name: "prune",
         about: "Drop a bot's older turns' operational records, keeping the newest N",
         usage: "prune --bot NAME --keep-turns N",

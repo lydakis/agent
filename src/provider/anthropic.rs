@@ -429,19 +429,21 @@ impl State {
         let mut content = Vec::with_capacity(self.blocks.len());
         let mut calls: Vec<ToolCall> = Vec::new();
         // A model that declined partway through leaves its partial output
-        // before the last fallback block. Its text stays (an empty block
-        // would be rejected); its thinking and tool calls are not sent back,
-        // and its calls never run.
+        // before the last fallback block. Its text stays; its thinking and
+        // tool calls are not sent back, and its calls never run.
         let switch = self
             .blocks
             .iter()
             .rposition(|block| matches!(block, Block::Fallback(_)))
             .unwrap_or(0);
         for (index, block) in self.blocks.into_iter().enumerate() {
-            if index < switch
-                && !matches!(&block, Block::Text { text, .. } if !text.is_empty())
-                && !matches!(block, Block::Fallback(_))
-            {
+            // A text block that shows nothing, such as the lone zero-width
+            // space a model sends for an empty reply, is no text: Messages
+            // refuses every later request that carries it.
+            if matches!(&block, Block::Text { text, .. } if crate::codec::blank(text)) {
+                continue;
+            }
+            if index < switch && !matches!(block, Block::Text { .. } | Block::Fallback(_)) {
                 continue;
             }
             content.push(match block {
@@ -545,6 +547,42 @@ mod tests {
             );
             assert_eq!(state.finish().err().map(|e| e.code).as_deref(), code);
         }
+    }
+    #[test]
+    fn a_text_block_that_shows_nothing_is_not_kept() {
+        let start = r#"{"type":"message_start","message":{"usage":{"input_tokens":1}}}"#;
+        let stop = r#"{"type":"message_stop"}"#;
+        // A reply of one zero-width space is the empty reply it was meant
+        // to be: no item, so no later request carries a blank block.
+        let mut state = State::default();
+        feed(
+            &mut state,
+            &[
+                start,
+                r#"{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}"#,
+                r#"{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"\u200b"}}"#,
+                r#"{"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":1}}"#,
+                stop,
+            ],
+        );
+        assert!(state.finish().unwrap().items.is_empty());
+        // Blank text beside a call goes; the call stays.
+        let mut state = State::default();
+        feed(
+            &mut state,
+            &[
+                start,
+                r#"{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}"#,
+                r#"{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"\n\n"}}"#,
+                r#"{"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"t1","name":"shell","input":{}}}"#,
+                r#"{"type":"message_delta","delta":{"stop_reason":"tool_use"},"usage":{"output_tokens":1}}"#,
+                stop,
+            ],
+        );
+        let completion = state.finish().unwrap();
+        let item: Value = serde_json::from_slice(&completion.items[0]).unwrap();
+        assert_eq!(item["content"].as_array().unwrap().len(), 1);
+        assert_eq!(item["content"][0]["type"], "tool_use");
     }
     #[test]
     fn thinking_text_and_tool_use_become_one_native_assistant_item() {

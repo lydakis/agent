@@ -25,13 +25,16 @@ pub use search::{RUN_NAME, RUN_NAMESPACE, Search};
 pub use pace::Report;
 pub use socket::Sockets;
 
-/// Bytes one response may deliver, over HTTP or a socket: a bound against
-/// an endpoint that never stops, far past what any model writes. The model's
-/// own output cap is what bounds a reply; a cut one comes back as
-/// [`cut_short`] says. Nothing downstream needs a reply in one event: events
-/// carry previews of calls, and a history read answers `item_too_large` for
-/// an item past a line.
-pub const MAX_RESPONSE: usize = 16 * 1024 * 1024;
+/// Bytes one event of a response may hold, an SSE frame or a socket
+/// message: a bound against an endpoint whose event never ends, far past
+/// what any model writes. A whole response has no bound of its own, as
+/// Codex sets none: how much a stream carries besides the reply is the
+/// provider's (Bedrock's Responses endpoint streamed 16 MiB around a reply
+/// of under a thousand tokens), and the model's own output cap is what
+/// bounds the reply; a cut one comes back as [`cut_short`] says. Nothing
+/// downstream needs a reply in one event: events carry previews of calls,
+/// and a history read answers `item_too_large` for an item past a line.
+pub const MAX_EVENT: usize = 16 * 1024 * 1024;
 
 /// What an output item writes, as a cut reply names it: `text`, `reasoning`,
 /// or the tool it calls. A few fields of the item's opening, read once.
@@ -727,7 +730,6 @@ where
 {
     let mut stream = std::pin::pin!(stream);
     let mut decoder = Decoder::default();
-    let mut total = 0usize;
     // Only a content frame renews the stall deadline. The client's read
     // timeout restarts on any byte, so pings alone never trip it.
     let stall = tokio::time::sleep(stall_timeout);
@@ -739,10 +741,6 @@ where
         };
         let Some(chunk) = chunk else { break };
         let chunk = chunk.map_err(|_| Error::new("provider_stream_failed"))?;
-        total += chunk.len();
-        if total > MAX_RESPONSE {
-            return fail("provider_response_limit");
-        }
         if unnamed && *frames == 0 && preview.len() < 4096 {
             let room = 4096 - preview.len();
             preview.extend_from_slice(&chunk[..chunk.len().min(room)]);
@@ -2037,6 +2035,29 @@ fn with_request(mut error: Error, id: Option<&reqwest::header::HeaderValue>) -> 
     error
 }
 
+/// A provider's refusal of a request as over the model's context window,
+/// in each provider's words as Pi reads them (pi-ai `utils/overflow.ts`):
+/// Anthropic's "prompt is too long" and its 413 `request_too_large`,
+/// Bedrock's "input is too long for requested model", OpenAI's "exceeds
+/// the context window" and `context_length_exceeded`, and gateways'
+/// "maximum context length".
+pub fn over_window(error: &Error) -> bool {
+    const WORDS: [&str; 7] = [
+        "prompt is too long",
+        "request_too_large",
+        "input is too long for requested model",
+        "exceeds the context window",
+        "context_length_exceeded",
+        "context length exceeded",
+        "maximum context length",
+    ];
+    error.code == "provider_http_413"
+        || error.detail.as_deref().is_some_and(|detail| {
+            let detail = detail.to_ascii_lowercase();
+            WORDS.iter().any(|words| detail.contains(words))
+        })
+}
+
 /// Whether a paced refusal is an overload rather than a rate limit.
 pub fn overload(code: &str) -> bool {
     matches!(code, "provider_overloaded" | "provider_http_529")
@@ -2616,6 +2637,37 @@ mod tests {
         Transport::new(0, 64).unwrap();
         let tls = tls_config(&[b"h2", b"http/1.1"]).unwrap();
         assert_eq!(tls.alpn_protocols, [b"h2".to_vec(), b"http/1.1".to_vec()]);
+    }
+
+    #[test]
+    fn a_refusal_over_the_window_is_read_in_each_provider_s_words() {
+        for (code, detail) in [
+            (
+                "provider_http_400",
+                "prompt is too long: 213462 tokens > 200000 maximum",
+            ),
+            (
+                "provider_http_400",
+                "Input is too long for requested model.",
+            ),
+            (
+                "provider_incomplete",
+                "Your input exceeds the context window of this model.",
+            ),
+            (
+                "provider_http_400",
+                "This model's maximum context length is 400000 tokens.",
+            ),
+            ("provider_http_413", "Request exceeds the maximum size"),
+        ] {
+            assert!(over_window(&Error::with(code, detail)), "{detail}");
+        }
+        for (code, detail) in [
+            ("provider_http_400", "text content blocks must be non-empty"),
+            ("provider_http_429", "slow down"),
+        ] {
+            assert!(!over_window(&Error::with(code, detail)), "{detail}");
+        }
     }
 
     #[test]

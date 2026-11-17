@@ -8847,6 +8847,52 @@ impl Database {
     }
     /// What the bot's last call sent, in bytes, and the input tokens the
     /// provider counted for it.
+    /// Take the text blocks that show nothing ([`crate::codec::blank`])
+    /// out of the Anthropic items among `nodes`, which Messages refuses in
+    /// any request. A node keeps its size, padded with JSON whitespace,
+    /// so no total along the history moves; one left with nothing reads
+    /// `<empty>`. Each node repaired and the blank text it held.
+    pub fn repair_blank(&mut self, nodes: &[i64]) -> Result<Vec<Value>> {
+        let mut repaired = Vec::new();
+        for &node in nodes {
+            let item: Option<Vec<u8>> = self
+                .conn
+                .prepare_cached("SELECT item FROM nodes WHERE id=?")?
+                .query_row([node], |r| r.get(0))
+                .optional()?;
+            let Some((fixed, removed)) = item.as_deref().and_then(unblanked) else {
+                continue;
+            };
+            self.conn
+                .prepare_cached("UPDATE nodes SET item=? WHERE id=?")?
+                .execute(params![fixed, node])?;
+            repaired.push(json!({"node": node, "removed": removed}));
+        }
+        Ok(repaired)
+    }
+    /// The nodes of `name`'s history, newest first, when it speaks
+    /// Anthropic; none for a Responses bot, whose provider takes blank text.
+    pub fn anthropic_history(&self, name: &str) -> Result<Vec<i64>> {
+        let (head, family): (Option<i64>, String) = self
+            .conn
+            .prepare_cached("SELECT head,family FROM bots WHERE name=?")?
+            .query_row([name], |r| Ok((r.get(0)?, r.get(1)?)))
+            .optional()?
+            .ok_or(Error::new("bot_not_found"))?;
+        if Family::parse(&family) != Some(Family::Anthropic) {
+            return Ok(Vec::new());
+        }
+        let mut statement = self.conn.prepare_cached(
+            "WITH RECURSIVE chain(id,parent) AS (
+                SELECT id,parent FROM nodes WHERE id=?1
+                UNION ALL SELECT n.id,n.parent FROM nodes n JOIN chain c ON n.id=c.parent)
+             SELECT id FROM chain",
+        )?;
+        let ids = statement
+            .query_map([head], |r| r.get(0))?
+            .collect::<rusqlite::Result<Vec<i64>>>()?;
+        Ok(ids)
+    }
     pub fn record_sent(&mut self, name: &str, bytes: u64, tokens: u64) -> Result<()> {
         self.conn
             .prepare_cached("UPDATE bots SET sent_bytes=?,sent_tokens=? WHERE name=?")?
@@ -20131,6 +20177,54 @@ impl Pictured {
         })
     }
 }
+/// `item` without the text blocks that show nothing, in its content and
+/// in its tool results' content, and the text each held; `None` when it
+/// has none. It keeps its size, padded with JSON whitespace after its
+/// opening brace; content left with nothing is the text `<empty>`, which
+/// Messages takes as a string and is shorter than any block it replaces.
+fn unblanked(item: &[u8]) -> Option<(Vec<u8>, Vec<String>)> {
+    use crate::codec::{EMPTY, blank_text};
+    // Only an item holding a text block can hold a blank one.
+    const TEXT: &[u8] = br#""type":"text"}"#;
+    if !item.windows(TEXT.len()).any(|w| w == TEXT) {
+        return None;
+    }
+    let mut value: Value = serde_json::from_slice(item).ok()?;
+    let mut removed = Vec::new();
+    let mut take = |parts: &mut Vec<Value>| {
+        parts.retain(|part| {
+            let blank = blank_text(part);
+            if blank {
+                removed.push(part["text"].as_str().unwrap_or_default().to_owned());
+            }
+            !blank
+        })
+    };
+    let content = value.get_mut("content")?.as_array_mut()?;
+    for part in content.iter_mut() {
+        if part["type"] == "tool_result"
+            && let Some(parts) = part.get_mut("content").and_then(Value::as_array_mut)
+        {
+            take(parts);
+            if parts.is_empty() {
+                part["content"] = json!(EMPTY);
+            }
+        }
+    }
+    take(content);
+    if removed.is_empty() {
+        return None;
+    }
+    if content.is_empty() {
+        value["content"] = json!(EMPTY);
+    }
+    let mut fixed = serde_json::to_vec(&value).ok()?;
+    // Never longer: what it lost is at least a block, and serde writes it
+    // as it was written.
+    let pad = item.len().checked_sub(fixed.len())?;
+    fixed.splice(1..1, std::iter::repeat_n(b' ', pad));
+    Some((fixed, removed))
+}
 /// A prompt's user item, its pictures, and, when it has any, the stub it
 /// goes as below the elision floor.
 fn prompt_item(
@@ -20457,6 +20551,60 @@ impl Database {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_repair_takes_blank_text_out_and_keeps_every_size() {
+        let mut db = Database::initialize(Connection::open_in_memory().unwrap()).unwrap();
+        let items: [&[u8]; 4] = [
+            // A reply of one zero-width space: content left with nothing.
+            br#"{"content":[{"text":"\u200b","type":"text"}],"role":"assistant"}"#,
+            // Blank text beside a call: the call stays.
+            br#"{"content":[{"text":"\n\n","type":"text"},{"id":"t1","input":{},"name":"shell","type":"tool_use"}],"role":"assistant"}"#,
+            // A result whose only part is blank.
+            br#"{"content":[{"content":[{"text":" ","type":"text"}],"tool_use_id":"t1","type":"tool_result"}],"role":"user"}"#,
+            // Words: nothing to take.
+            br#"{"content":[{"text":"done","type":"text"}],"role":"assistant"}"#,
+        ];
+        let mut total = 0;
+        for (id, item) in (1..).zip(items) {
+            total += item.len() as i64;
+            db.connection()
+                .execute(
+                    "INSERT INTO nodes(id,parent,item,total_bytes,depth) VALUES(?,?,?,?,?)",
+                    params![id, (id > 1).then_some(id - 1), item, total, id],
+                )
+                .unwrap();
+        }
+        let repaired = db.repair_blank(&[1, 2, 3, 4]).unwrap();
+        assert_eq!(
+            repaired,
+            [
+                json!({"node":1,"removed":["\u{200b}"]}),
+                json!({"node":2,"removed":["\n\n"]}),
+                json!({"node":3,"removed":[" "]}),
+            ]
+        );
+        let item = |id: i64| -> Vec<u8> {
+            db.conn
+                .query_row("SELECT item FROM nodes WHERE id=?", [id], |r| r.get(0))
+                .unwrap()
+        };
+        for (id, was) in (1..).zip(items) {
+            let now = item(id);
+            assert_eq!(now.len(), was.len(), "node {id} keeps its size");
+            let value: Value = serde_json::from_slice(&now).unwrap();
+            let text = String::from_utf8_lossy(&now);
+            assert!(!text.contains(r"\u200b") && !text.contains('\u{200b}'));
+            match id {
+                1 => assert_eq!(value["content"], "<empty>"),
+                2 => assert_eq!(value["content"][0]["type"], "tool_use"),
+                3 => assert_eq!(value["content"][0]["content"], "<empty>"),
+                _ => assert_eq!(now, was),
+            }
+        }
+        // Repaired once, nothing is left to take.
+        assert!(db.repair_blank(&[1, 2, 3, 4]).unwrap().is_empty());
+    }
 
     #[test]
     fn one_bots_approvals_read_only_its_own_running_commands() {

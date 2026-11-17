@@ -190,8 +190,19 @@ impl Family {
             Family::Responses => json!({"type":"input_text","text":text}),
             Family::Anthropic => json!({"type":"text","text":text}),
         };
-        let mut content = vec![part(text)];
-        content.extend(after.iter().map(|text| part(text)));
+        // A blank part is left out, as Anthropic refuses one; blank words
+        // read `<empty>` there, so the item still has its first part.
+        let words = match self {
+            Family::Anthropic if blank(text) => EMPTY,
+            _ => text,
+        };
+        let mut content = vec![part(words)];
+        content.extend(
+            after
+                .iter()
+                .filter(|text| !blank(text))
+                .map(|text| part(text)),
+        );
         content.extend(images.iter().map(|image| self.image(image)));
         Ok(serde_json::to_vec(
             &json!({"role":"user","content":content}),
@@ -218,12 +229,14 @@ impl Family {
             [] => json!(output),
             _ => Value::Array(
                 // Words before the first picture lead, when there are any.
-                (!output.is_empty())
+                // A blank part is left out, as Anthropic refuses one.
+                (!blank(output))
                     .then(|| text(output))
                     .into_iter()
-                    .chain(parts.iter().map(|part| match part {
-                        Part::Text { text: words } => text(words),
-                        Part::Image(image) => self.image(image),
+                    .chain(parts.iter().filter_map(|part| match part {
+                        Part::Text { text: words } if blank(words) => None,
+                        Part::Text { text: words } => Some(text(words)),
+                        Part::Image(image) => Some(self.image(image)),
                     }))
                     .collect(),
             ),
@@ -292,6 +305,22 @@ impl Family {
             .collect();
         Value::Array(encoded)
     }
+}
+
+/// What blank words of a prompt read as: Anthropic refuses a blank text
+/// block, and a prompt's item keeps its words first.
+pub const EMPTY: &str = "<empty>";
+
+/// Whether text shows nothing, the rule clients share: see
+/// [`agent_client::blank`].
+pub use agent_client::blank;
+
+/// Whether an item part is a text block that shows nothing ([`blank`]).
+pub fn blank_text(part: &Value) -> bool {
+    matches!(
+        part["type"].as_str(),
+        Some("text" | "input_text" | "output_text")
+    ) && part["text"].as_str().is_some_and(blank)
 }
 
 /// Split `provider/model-id` at the first slash. Model IDs may contain slashes.
@@ -607,6 +636,23 @@ mod tests {
         assert!(split_model("/model").is_err());
         assert!(split_model("bad name/model").is_err());
     }
+    #[test]
+    fn text_of_only_whitespace_or_invisible_characters_is_blank() {
+        for text in [
+            "",
+            " ",
+            "\n\n",
+            "\u{200B}",
+            "\u{FEFF}",
+            " \u{200D}\u{2060}\t",
+        ] {
+            assert!(blank(text), "{text:?}");
+        }
+        for text in ["a", " .", "\u{200B}x", "\u{1F600}"] {
+            assert!(!blank(text), "{text:?}");
+        }
+    }
+
     #[test]
     fn families_encode_the_same_facts_differently() {
         let responses: Value = serde_json::from_slice(
