@@ -20,7 +20,9 @@ class QueryPlanTests(unittest.TestCase):
         self.assertIn("DELETE FROM processes WHERE turn=? AND status!='running'", queries)
         # Every filter and direction of a listing is planned.
         bots = [q for q in queries if q.startswith('SELECT name,head,') and ' FROM bots WHERE name ' in q]
-        self.assertEqual(len(bots), 8)
+        self.assertEqual(len(bots), 16)
+        self.assertTrue(any('running_turn IS NOT NULL AND closed_ms IS NULL ORDER BY name' in q
+                            for q in bots))
         self.assertTrue(any('name GLOB ?3 AND running_turn IS NOT NULL ORDER BY name' in q for q in bots))
         self.assertTrue(any('name GLOB ?3 AND created_by_id = ?4 AND running_turn IS NOT NULL' in q
                             for q in bots))

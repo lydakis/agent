@@ -359,6 +359,16 @@ LIVE = [
 
 DAYS = {'full': STEPS, 'small': SMALL, 'burst': BURST, 'automation': AUTOMATION, 'live': LIVE}
 DAY, DAY_NAME = STEPS, ''  # the day a run plays, set by --day
+# More `[sonny]` settings for a run's config, such as `code_mode`, so two
+# arms of one build can differ in a setting alone.
+SETTINGS = {}
+# More of a run's config after the rest, such as a `[context_windows]` table
+# that makes a lead's context fill sooner.
+CONFIG = ''
+# Whether a run records every agent's turns and usage (`events.jsonl`) and
+# its processes' peak memory and CPU (`resources.json`), as the burst always
+# does.
+RECORD = False
 
 SOURCE = r'''import json, sys
 from pathlib import Path
@@ -408,6 +418,8 @@ def setup(root, bin_dir, model, spec=None):
     # Builds before 0.9.1 named the reviewer's table [judge], and each
     # build refuses the other's, so an arm of one still compares.
     reviewer = 'reviewer' if b'[reviewer]' in (own / 'sonny').read_bytes() else 'judge'
+    # The run's own settings, each once, an arm's over the defaults.
+    sonny = {'task_effort': 'high', 'suggest': False, 'default_permissions': 'eval', **SETTINGS}
     (home / '.agent/config.toml').write_text(f'''model = "{model}"
 provider = "{spec or provider}"
 
@@ -415,10 +427,7 @@ provider = "{spec or provider}"
 model = "{model}"
 
 [sonny]
-task_effort = "high"
-suggest = false
-default_permissions = "eval"
-
+{''.join(f'{key} = {json.dumps(value)}{chr(10)}' for key, value in sonny.items())}
 # What the day's work writes beside the repository (the backup S1 asks
 # for, pushes to origin) written without asking, the network off so no
 # Unix socket is reached (Docker's would write anywhere), and every call
@@ -442,7 +451,7 @@ every = "15s"
 [sonny.sources.ci]
 command = "{py} {root}/source.py {root} ci"
 every = "15s"
-''')
+''' + CONFIG)
     env = {
         'HOME': str(home), 'PATH': f'{bin_dir}:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin',
         'AGENT_CHATGPT_LOGIN': str(LOGIN), 'GIT_CONFIG_GLOBAL': str(root / 'gitconfig'),
@@ -858,7 +867,7 @@ def run(arm, n, bins, model, spec=None):
     # The burst's evidence, kept as it comes: tasks deleted before the end
     # still count, with what they cost.
     recorder = sampler = None
-    if DAY is BURST:
+    if DAY is BURST or RECORD:
         recorder = burst_ledger.Recorder(agent, env, out / 'events.jsonl')
         sampler = burst_ledger.Sampler(home, roots=lambda: [acp.p.pid] if acp else [])
     landed = {}
@@ -937,6 +946,8 @@ def run(arm, n, bins, model, spec=None):
         bots = subprocess.run([str(agent), 'ls'], env=env, capture_output=True, text=True)
         (out / 'bots.txt').write_text(bots.stdout)
         resources = sampler.close() if sampler else None
+        if resources:
+            (out / 'resources.json').write_text(json.dumps(resources))
         if recorder:
             recorder.close()
         if acp:
@@ -949,6 +960,8 @@ def run(arm, n, bins, model, spec=None):
         for verb, key in (('automation', 'automations'), ('trigger', 'triggers')):
             listed = subprocess.run([str(sonny), verb, 'ls'], env=env, capture_output=True, text=True)
             if listed.returncode == 0:
+                # What was still set at the end, before it goes.
+                (out / 'automations.json').write_text(listed.stdout or '{}')
                 for t in json.loads(listed.stdout or '{}').get(key, []):
                     subprocess.run([str(sonny), verb, 'rm', t['name']], env=env, capture_output=True)
                 break

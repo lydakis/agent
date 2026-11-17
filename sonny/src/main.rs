@@ -175,6 +175,9 @@ const DRAW_EVERY: Duration = Duration::from_millis(33);
 /// clocks count seconds, and what it reads now and then (counts, tasks,
 /// the margin's files) shows within one.
 const IDLE_FRAME: Duration = Duration::from_secs(1);
+/// How often at most the window looks at the config for the sources a
+/// template's blanks read: a margin's file poll's pace.
+const SOURCES_FRESH: Duration = Duration::from_secs(1);
 /// How often a window looks round (its jobs' answers, what it reads now
 /// and then, what moves) while something on it moves or it heard from the
 /// person or the daemon within [`LIVELY_FOR`]; otherwise once a frame, so
@@ -4561,6 +4564,8 @@ struct App {
     /// What template notes are filled from: the tasks that read found,
     /// the store, the person's sources and notes.
     blanks: margin::Blanks,
+    /// When the sources in `blanks` were last read from the config.
+    sources_read: Option<Instant>,
     /// The agents that read gave a row, which its counts count already.
     status_bots: std::collections::HashSet<String>,
     /// The footer's own read of them, under way, and when the last began.
@@ -6395,6 +6400,7 @@ impl App {
             references_read: None,
             counts: None,
             blanks: margin::Blanks::default(),
+            sources_read: None,
             status_bots: std::collections::HashSet::new(),
             counting: None,
             counted_at: None,
@@ -8101,6 +8107,19 @@ impl App {
                 self.started_bot(arguments, output),
                 arguments["brief"].as_str().unwrap_or(""),
             ),
+            "spawn_agent" => {
+                // One the daemon refused started nothing.
+                if serde_json::from_str::<Value>(output)
+                    .is_ok_and(|reply| reply["error"].is_string())
+                {
+                    return;
+                }
+                (
+                    started::STARTED,
+                    self.started_bot(arguments, output),
+                    arguments["message"].as_str().unwrap_or(""),
+                )
+            }
             "send_message" => {
                 // One the daemon refused (no such agent) sent nothing.
                 if serde_json::from_str::<Value>(output)
@@ -9087,6 +9106,7 @@ impl App {
         self.live_count += 1;
         let folder = std::path::PathBuf::from(&self.workspace);
         let key = at.to_string();
+        self.read_sources();
         (self.live_watch).fill(&key, (template, &folder), &self.blanks, None);
         let lines = live::block(self.live_watch.get(&key), self.prose(), &folder);
         let from = self.pending.len() + usize::from(self.any_history);
@@ -10113,22 +10133,41 @@ impl App {
         }
     }
 
-    /// The person's own notes and sources as the config has them now.
+    /// The person's own notes as the config has them now.
     fn set_template_settings(&mut self, settings: &settings::Settings) {
         let notes = std::sync::Arc::new(settings.notes.clone());
         if *self.blanks.notes != *notes {
             self.blanks.notes = notes;
         }
+    }
+
+    /// The sources a blank may read as the config has them now, read as
+    /// the tool host reads them for each call, so a source added after
+    /// the window opened fills here as the host told the agent it does:
+    /// looked at no more than once a [`SOURCES_FRESH`], the config itself
+    /// read again only once it changed ([`kept::config`]).
+    fn read_sources(&mut self) {
+        self.read_sources_from(crate::template::configured_sources);
+    }
+
+    /// [`App::read_sources`], the sources as `read` gives them.
+    fn read_sources_from(&mut self, read: impl FnOnce() -> std::sync::Arc<Vec<String>>) {
+        if (self.sources_read).is_some_and(|at| at.elapsed() < SOURCES_FRESH) {
+            return;
+        }
+        self.sources_read = Some(Instant::now());
         // Kept as it was when the same, so notes fill again only once one
         // is added or taken away.
-        if *self.blanks.sources != settings.sources {
-            self.blanks.sources = std::sync::Arc::new(settings.sources.clone());
+        let sources = read();
+        if *self.blanks.sources != *sources {
+            self.blanks.sources = sources;
         }
     }
 
     /// What template notes are filled from, handed to the margin before
     /// it is drawn or looked at: it may have been loaded again since.
     fn margin_blanks(&mut self) {
+        self.read_sources();
         self.margin.set_blanks(self.blanks.clone());
     }
 
@@ -20856,6 +20895,52 @@ mod tests {
             reopened: false,
         };
         App::new(client, "b", &json!({"name": "b"}), options)
+    }
+
+    #[tokio::test]
+    async fn a_source_added_to_the_config_after_the_window_opened_fills_its_notes() {
+        let store = std::env::temp_dir()
+            .join(format!("sonny-window-sources-{}", std::process::id()))
+            .join("store.sqlite");
+        let dir = crate::lookout::beside(&store, ".sources").join(".recent");
+        std::fs::create_dir_all(&dir).unwrap();
+        let line = json!({"source": "ci", "text": "green", "at_ms": 1000, "seq": 1});
+        std::fs::write(dir.join("ci.jsonl"), format!("{line}\n")).unwrap();
+        let mut app = app(daemon_answering(|_| json!({})).await);
+        app.blanks.store = Some(store.clone());
+        let none = || Arc::new(Vec::<String>::new());
+        let ci = || Arc::new(vec!["ci".to_owned()]);
+        app.read_sources_from(none);
+        let post = json!({"kind": "follows", "id": "ci", "live": true,
+            "markdown": "CI is {{ source('ci').latest.text }}"});
+        app.margin.apply("c1", &post, None, None);
+        let shown = |app: &mut App| {
+            app.margin.set_blanks(app.blanks.clone());
+            let (lines, _) = app.margin.lines(60, usize::MAX, Path::new("/"), None);
+            (lines.iter().map(|line| line.to_string()))
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        assert!(shown(&mut app).contains("no source named ci"));
+        // Added to the config: looked at no more than once a second, then
+        // read as the tool host reads it for every call, and the note
+        // fills as the host told the agent it did.
+        app.read_sources_from(ci);
+        assert!(app.blanks.sources.is_empty());
+        app.sources_read = Instant::now().checked_sub(SOURCES_FRESH);
+        app.read_sources_from(ci);
+        app.margin.later();
+        let rows = shown(&mut app);
+        assert!(
+            rows.contains("CI is green") && !rows.contains("no source"),
+            "{rows}"
+        );
+        // The same list read again is the same list: nothing fills again.
+        let sources = app.blanks.sources.clone();
+        app.sources_read = Instant::now().checked_sub(SOURCES_FRESH);
+        app.read_sources_from(ci);
+        assert!(Arc::ptr_eq(&sources, &app.blanks.sources));
+        let _ = std::fs::remove_dir_all(store.parent().unwrap());
     }
 
     /// What the conversation holds, the lines still waiting written in.
