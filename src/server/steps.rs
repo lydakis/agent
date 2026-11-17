@@ -785,11 +785,7 @@ impl Service {
             + agent_runtime::output::encoded_len(&flight.request).unwrap_or(usize::MAX / 2);
         let capture = self.steps.captured.get(&key).cloned();
         let outputs = capture.as_ref().and_then(|capture| {
-            let root = PathBuf::from(
-                (capture.bot.workspace.as_deref())
-                    .or(capture.workspace.as_deref())
-                    .unwrap_or_default(),
-            );
+            let root = PathBuf::from(capture.workspace.as_deref().unwrap_or_default());
             turn::Outputs::of(&capture.bot, root, self.registry.daemon())
         });
         let store = self.store.clone();
@@ -1046,7 +1042,7 @@ async fn run(
     let mut stopping = futures_util::FutureExt::fuse(stopping);
     let bot = &capture.bot;
     let workspace = PathBuf::from(capture.workspace.as_deref().unwrap_or_default());
-    let root = (bot.workspace.as_ref()).map_or_else(|| workspace.clone(), PathBuf::from);
+    let root = workspace.clone();
     // A change to files runs to its end once begun, a stop or not: cut
     // off, it could be half made. Its end is recorded as it happened.
     // Until its sandbox is ready, nothing of it has begun.
