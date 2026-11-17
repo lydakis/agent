@@ -7746,6 +7746,9 @@ impl App {
             *events = fresh;
             self.down = None;
             self.notice = None;
+            // A compaction asked for may have run, or been asked for, while
+            // away: the record says which.
+            self.compact_next = record["compaction_requested"] == true;
             // What happened while away is not known turn by turn: a kept
             // done window stays open from here on, as any other.
             self.kept.showing = false;
@@ -10871,6 +10874,17 @@ impl App {
                 Some(next) => after = next,
                 None => break,
             }
+        }
+        // What waits for a turn of its own, as the daemon has it now: one
+        // taken or ended while this window was away is gone from it.
+        self.in_line = (waiting.iter())
+            .filter(|row| matches!(row["status"].as_str(), Some("queued" | "ready")))
+            .filter_map(|row| row["message"].as_i64())
+            .collect();
+        if self.in_line.is_empty() {
+            self.in_line_since = None;
+        } else if self.running.is_none() {
+            self.in_line_since.get_or_insert_with(Instant::now);
         }
         let mut staged = Vec::new();
         for row in &waiting {
@@ -19079,6 +19093,11 @@ impl App {
     /// applies of a pause, an approval, the agent's turn or its phase
     /// without one, and a notice.
     fn status_row(&self, width: usize) -> Line<'static> {
+        // Upgraded under it, the window reconnects no more: reopening it
+        // is all there is to do, and the row says so alone.
+        if self.upgraded {
+            return Line::from(Span::raw(UPGRADED));
+        }
         // The connection is the phase until it is back: what the window
         // knows of the turn, a pause or an approval is from before.
         if let Some(down) = self.down {
@@ -24317,11 +24336,25 @@ mod tests {
             (8, "d".into()),
         ];
         app.queued = vec![7, 8];
+        app.in_line = vec![5, 8];
         app.restage().await;
         // Its words as this window kept them; a note the lookout sent is
         // not the person's, so it is not staged.
         assert_eq!(app.staged, [(7, "c".to_owned())]);
         assert_eq!(app.queued, [7]);
+        // What waits for a turn of its own is what waits now, anyone's:
+        // no turn runs, so its turn has not started.
+        assert_eq!(app.in_line, [7, 9]);
+        assert!(app.status_line().to_string().starts_with("• Queued ("));
+    }
+
+    #[tokio::test]
+    async fn a_window_upgraded_under_it_says_to_reopen_it_and_nothing_else() {
+        let mut app = app(daemon_with(json!([])).await);
+        app.dropped();
+        app.notice = Some(UPGRADED.to_owned());
+        app.upgraded = true;
+        assert_eq!(app.status_row(40).to_string(), UPGRADED);
     }
 
     #[tokio::test]
