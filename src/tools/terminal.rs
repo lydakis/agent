@@ -213,8 +213,8 @@ fn report(handle: Option<i64>, text: String, dropped: u64, end: Option<Value>) -
 /// What was read, redacted, keeping for the next read the carriage
 /// returns at its end, which a newline may follow; a terminal's line ends
 /// read as plain newlines before they are redacted, as a program wrote
-/// them. The stream holds what more output may still redact: a character,
-/// a credential, or a secret field's value.
+/// them. The stream holds what more output may still redact: a character
+/// or a credential.
 fn text(unread: &mut Vec<u8>, redacting: &mut Redacting) -> String {
     let mut whole = unread.len();
     while whole > 0 && unread[whole - 1] == b'\r' {
@@ -837,49 +837,21 @@ mod tests {
         credentials.set("KEY", "sk-secret-1234");
         let mut reads = Reads::new(&credentials);
         assert_eq!(reads.read(b"key: sk-sec"), "key: ");
-        assert_eq!(reads.read(b"ret-1234\r\n> "), "[REDACTED]\n> ");
+        assert_eq!(reads.read(b"ret-1234\r\n> "), "[redacted by agent]\n> ");
         // A whole credential that ends with another's start waits for what
         // follows, which may finish the other.
         credentials.set("OTHER", "sk-example-s");
         let mut reads = Reads::new(&credentials);
         assert_eq!(reads.read(b"sk-example-s"), "");
-        assert_eq!(reads.read(b"\n> "), "[REDACTED]\n> ");
+        assert_eq!(reads.read(b"\n> "), "[redacted by agent]\n> ");
         // A command's end holds nothing back.
         assert_eq!(Reads::new(&credentials).end(b"sk-"), "sk-");
-    }
-
-    #[test]
-    fn a_secret_field_split_across_reads_is_redacted_whole() {
-        let credentials = Credentials::default();
-        credentials.redact_also(&["password".to_owned(), "api_key".to_owned()], &[]);
-        let mut reads = Reads::new(&credentials);
-        // The name and separator are shown at once, as a prompt to answer
-        // is; the value waits until it is known to be secret or not.
-        assert_eq!(reads.read(b"login ok\nPassword: "), "login ok\nPassword: ");
-        assert_eq!(reads.read(b"fake9fa"), "");
-        assert_eq!(reads.read(b"ke9fake9\n> "), "[REDACTED]\n> ");
-        assert_eq!(reads.read(b"password="), "password=");
-        assert_eq!(reads.read(b"fake9fake9fake9\n"), "[REDACTED]\n");
-        // So is a name cut anywhere inside.
-        assert_eq!(reads.read(b"export MY_PASS"), "export MY_PASS");
-        assert_eq!(reads.read(b"WORD=abcd1234efgh\n"), "WORD=[REDACTED]\n");
-        assert_eq!(reads.read(b"export pas"), "export pas");
-        assert_eq!(reads.read(b"sword=abcd1234efgh\n"), "sword=[REDACTED]\n");
-        // Other words, and values that are not secret, go out as typed.
-        assert_eq!(reads.read(b"ls -la\n> "), "ls -la\n> ");
-        assert_eq!(reads.read(b"api_key: set\n"), "api_key: set\n");
-        assert_eq!(reads.read(b"password: "), "password: ");
-        assert!(reads.unread.is_empty());
-        // A command's end holds nothing back, and still redacts a value
-        // after a name the last read showed.
-        assert_eq!(reads.end(b"abcd1234efgh"), "[REDACTED]");
     }
 
     #[test]
     fn reads_cut_anywhere_redact_as_the_whole() {
         let credentials = Credentials::default();
         credentials.set("KEY", "sk-secret-1234");
-        credentials.redact_also(&["password".to_owned(), "token".to_owned()], &[]);
         let typed = "$ export MY_PASSWORD=abcd1234efgh\r\n$ echo $KEY\r\nsk-secret-1234\r\n\
             {\"token\": \"zz9zz9zz9zz9\"}\r\nPassword: hunter22x\r\n$ ";
         let typed_lines = String::from_utf8(lines(typed.as_bytes())).unwrap();
@@ -898,22 +870,9 @@ mod tests {
     }
 
     #[test]
-    fn a_value_continued_past_a_terminal_line_end_is_redacted_whole() {
-        let credentials = Credentials::default();
-        credentials.redact_also(&["password".to_owned()], &[]);
-        let typed = b"password=\"abc123\\\r\ndef456\"\r\n";
-        let mut reads = Reads::new(&credentials);
-        assert_eq!(reads.read(typed), "password=\"[REDACTED]\"\n");
-        let mut reads = Reads::new(&credentials);
-        let (head, tail) = typed.split_at(17);
-        let shown = reads.read(head) + &reads.end(tail);
-        assert_eq!(shown, "password=\"[REDACTED]\"\n");
-    }
-
-    #[test]
     fn output_after_a_gap_is_redacted_afresh() {
         let credentials = Credentials::default();
-        credentials.redact_also(&["password".to_owned()], &[]);
+        credentials.set("KEY", "sk-secret-1234");
         let mut state = super::State {
             unread: Vec::new(),
             redacting: Redacting::new(credentials.clone()),
@@ -921,25 +880,16 @@ mod tests {
             end: None,
             used: tokio::time::Instant::now(),
         };
-        // A value that is not secret, left open at the read's end.
-        assert!(!state.push(b"password=\"$"));
-        assert_eq!(
-            text(&mut state.unread, &mut state.redacting),
-            "password=\"$"
-        );
-        // Its end is dropped with what came after it: what is kept reads
-        // as a text of its own, not as more of that value.
+        // A credential's start, held at the read's end.
+        assert!(!state.push(b"key sk-sec"));
+        assert_eq!(text(&mut state.unread, &mut state.redacting), "key ");
+        // It is dropped with the gap: what is kept reads as a text of its
+        // own, and a whole credential in it is still redacted.
         assert!(!state.push(&vec![b'x'; super::PREVIEW_BYTES]));
-        assert!(state.push(b"_password=abc123def456\n"));
+        assert!(state.push(b"sk-secret-1234\n"));
         let shown = text(&mut state.unread, &mut state.redacting);
-        assert!(shown.ends_with("x_password=[REDACTED]\n"), "{shown}");
-    }
-
-    #[test]
-    fn a_field_name_in_any_script_is_matched_without_a_panic() {
-        let credentials = Credentials::default();
-        credentials.redact_also(&["密码".to_owned()], &[]);
-        assert_eq!(Reads::new(&credentials).read(b"pass"), "pass");
+        assert!(!shown.starts_with("sk-sec"), "{shown}");
+        assert!(shown.ends_with("x[redacted by agent]\n"), "{shown}");
     }
 
     #[test]
