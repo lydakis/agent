@@ -10434,3 +10434,27 @@ turns on both sides with no window polling; with it, 300 to 330 against
 main's 330 to 360, in steps of one turn per bot over the run, while the
 window read ten times as often. The WAL ended near 4 MiB on both, under the
 16 MiB the writer now keeps after a checkpoint.
+
+The hot-path screens, as the Perf workflow runs them (`bench/perf_gate.py`),
+main (2872f1b) against this change (f109155), two alternating rounds on the
+same Linux x86_64 host, 2026-11-17. Store work per turn is the same on both.
+
+| Bench | Measure | Main | Change | Change % |
+| --- | --- | ---: | ---: | ---: |
+| admission | lone submit CPU, ms | 35.816 | 36.788 | +2.7% |
+| admission | burst submit p99, ms | 4.554 | 4.718 | +3.6% |
+| completion | release to terminal p99, ms | 10.762 | 12.275 | +14.1% |
+| footprint | idle RSS, MiB | 16.848 | 16.773 | -0.4% |
+| footprint | per idle bot, KiB | 1.788 | 1.74 | -2.7% |
+| footprint | RSS after a turn each, MiB | 32.953 | 33.037 | +0.3% |
+| footprint | CPU per turn, ms | 0.893 | 0.847 | -5.2% |
+| lifecycle | CPU, s | 0.6 | 0.565 | -5.8% |
+| lifecycle | p95 turn, ms | 596.605 | 581.321 | -2.6% |
+| lifecycle | peak RSS, MiB | 25.301 | 25.354 | +0.2% |
+
+The completion p99 overlapped across runs (main 9.4 to 14.8 ms, the change
+9.8 to 15.1 ms); three more alternating rounds of it alone put the change
+below main: median p99 11.3 ms against 11.9 ms (ranges 9.6 to 14.9 and 10.4
+to 14.3). A completion holds no verdicts and changes no bot's identity
+columns, so neither the shared verdict copy nor the identity trigger runs
+in it.
