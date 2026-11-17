@@ -2070,13 +2070,15 @@ fn lookout_news(text: &str, icons: &std::collections::HashMap<String, String>) -
         };
         match head.as_slice() {
             // "[lookout]" then "12 more events wait for the next note", or
-            // what was not kept.
+            // what was not kept; the trailer that ends every note says no
+            // count, and the row leaves it out.
             ["lookout"] => {
                 let said = lines.next().unwrap_or_default();
                 let count = said.split(' ').next().unwrap_or_default();
-                match said.contains(" not kept") {
-                    true => parts.push(format!("{count} not kept")),
-                    false => parts.push(format!("+{count} more")),
+                match (count.parse::<u64>().is_ok(), said.contains(" not kept")) {
+                    (false, _) => {}
+                    (true, true) => parts.push(format!("{count} not kept")),
+                    (true, false) => parts.push(format!("+{count} more")),
                 }
             }
             [crate::lookout::activity::SOURCE, task, from] => parts.push(task_news(task, from)),
@@ -4500,7 +4502,9 @@ mod tests {
              [lookout]\n\
              2 more events wait for the next note\n\
              [lookout]\n\
-             40 more events from chat came 1 minute ago, and they were not kept";
+             40 more events from chat came 1 minute ago, and they were not kept\n\
+             [lookout]\n\
+             This note is news for you, unseen by the person.";
         let icons = [("slack".to_owned(), "▲".to_owned())].into();
         assert_eq!(
             super::lookout_news(note, &icons).join(" · "),

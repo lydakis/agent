@@ -455,6 +455,15 @@ pub const SETTINGS: &[Setting] = &[
         values: &[],
         default: "1024",
     },
+    Setting {
+        key: "sonny.lookout_trailer",
+        group: "Agents",
+        name: "lookout trailer",
+        label: "what ends every lookout note: when to reply to it",
+        about: "what ends every note the lookout sends an agent, under a `[lookout]` header, read as each note goes; by default when to reply: when the news bears on what the person is doing now or is urgent, and otherwise an empty reply; empty for none",
+        values: &[],
+        default: "when to reply",
+    },
 ];
 
 /// The migration that moves `[sonny] task_depth` to `[daemon] depth`.
@@ -1372,7 +1381,7 @@ mod tests {
                 assert!(!setting.name.contains(['_', '.']), "{}", setting.name);
             }
         }
-        assert_eq!(listed().len(), 35);
+        assert_eq!(listed().len(), 36);
         // What only tunes stays in the file, and in the reference.
         for key in [
             "sonny.sky_haiku_daily",
