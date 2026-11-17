@@ -264,8 +264,10 @@ where no agent can write: they run as the person, outside any sandbox.
 A source whose last 3 runs failed (exited other than 0, or did not start)
 is down: every follow of it, whatever its topic or filter, hears so
 from the lookout itself, with why the last run failed and its last 5
-lines of stderr, and again each day it stays down; once a run works, they
-hear it works again. Its line in the note reads `- slack, said by the
+lines of stderr, and again each day it stays down; once a run works, or
+the source prints an event, they hear it works again, before the event. A
+source that runs one long command never ends a run, so its first event is
+what says it is back; it also starts the count of failed runs again. Its line in the note reads `- slack, said by the
 lookout (for your eng): "The source slack is down: …"`, and like any
 event from the source it waits for the source's digest. A source no
 longer needs code of its own to say that its reads fail. The lookout keeps
