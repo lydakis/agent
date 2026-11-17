@@ -306,6 +306,42 @@ impl View {
         Key::Stay
     }
 
+    /// The card at `width`, each agent a row is named for (not `own`,
+    /// this window's) in the agents' color, and where, to open it.
+    pub fn card_linked(
+        &self,
+        width: usize,
+        own: &str,
+    ) -> (Vec<Line<'static>>, crate::links::Agents) {
+        let mut card = self.card(width);
+        let mut links = crate::links::Agents::new();
+        let Some(read) = self.read.as_ref().filter(|_| !self.all) else {
+            return (card, links);
+        };
+        let names: Vec<(String, String)> = (read.usage["bots"].as_array().into_iter().flatten())
+            .filter_map(|bot| bot["bot"].as_str())
+            .filter(|bot| *bot != own)
+            .map(|bot| (self.scope.short(bot), bot.to_owned()))
+            .collect();
+        for (at, line) in card.iter_mut().enumerate() {
+            // A row of a bar or a time is named by its first words.
+            let Some(first) = line.spans.first() else {
+                continue;
+            };
+            let name = first.content.trim_end();
+            let Some((_, bot)) = names.iter().find(|(short, _)| short == name) else {
+                continue;
+            };
+            let pad = first.content[name.len()..].to_owned();
+            let wide = name.width() as u16;
+            let style = first.style;
+            let name = Span::styled(name.to_owned(), style.fg(Color::Blue));
+            line.spans.splice(0..1, [name, Span::styled(pad, style)]);
+            links.push((at, 0, wide, bot.clone()));
+        }
+        (card, links)
+    }
+
     /// The card at `width`.
     pub fn card(&self, width: usize) -> Vec<Line<'static>> {
         let whose = match self.all {
@@ -1155,6 +1191,37 @@ mod tests {
         // With room, the provider stays beside the model.
         let card = text(&view.card(100));
         assert!(card.contains("bedrock"), "{card}");
+    }
+
+    #[test]
+    fn each_agent_a_row_is_named_for_opens_it_but_this_windows_own() {
+        let mut view = View::new(scope());
+        let (_, window) = view.query(1_800_000_000_000);
+        let bot = |bot: &str| {
+            json!({"bot": bot, "turns": 1, "input_tokens": 1000,
+            "cached_input_tokens": 500, "output_tokens": 100})
+        };
+        view.loaded(
+            window,
+            Ok(json!({
+                "turns": 2, "input_tokens": 2000, "cached_input_tokens": 1000, "output_tokens": 200,
+                "bots": [bot("p.fix"), bot("p.lead")],
+                "other_bots": null, "models": [], "origins": [], "series": [],
+            })),
+            prices(""),
+        );
+        let (card, links) = view.card_linked(80, "p.lead");
+        assert!(!links.is_empty());
+        for (row, from, to, bot) in &links {
+            assert_eq!(bot, "p.fix");
+            let named: String = text(std::slice::from_ref(&card[*row]))
+                .chars()
+                .skip(usize::from(*from))
+                .take(usize::from(to - from))
+                .collect();
+            assert_eq!(named, "fix");
+            assert_eq!(card[*row].spans[0].style.fg, Some(Color::Blue));
+        }
     }
 
     #[test]

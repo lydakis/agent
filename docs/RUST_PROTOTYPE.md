@@ -3136,7 +3136,11 @@ slot of the daemon's process budget as a command does.
 
 To leave the sandbox, a shell call sets
 `sandbox_permissions: "require_escalated"` with a `justification`, which a
-sandboxed bot's `shell` schema shows with Codex's descriptions; a `write` or
+sandboxed bot's `shell` schema shows with Codex's descriptions, and may
+propose a `prefix_rule`, Codex's reusable approval prefix: the words its
+approver could allow for good as a [command rule](#command-rules). The
+daemon only keeps it in the call's arguments, where an approver reads it;
+it takes it only with `require_escalated`. A `write` or
 `edit` leaves it by naming a path outside its writable folders. Only such an
 escape is gated: a confined call runs without a verdict even under a gate,
 and an escape waits on the bot's gate as any gated call does

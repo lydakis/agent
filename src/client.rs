@@ -1437,7 +1437,7 @@ fn composed_instructions(
     // What a new bot is told when the caller gives no instructions: the
     // harness preamble every client shares. `--agents` layers AGENTS.md
     // files and skills on top; a program that wants that asks for it.
-    Ok(agent_client::policy::preamble())
+    Ok(agent_client::policy::PREAMBLE.to_owned())
 }
 
 /// The role a new bot is started in, which must exist.

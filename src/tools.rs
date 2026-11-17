@@ -2569,6 +2569,9 @@ fn escalation(parameters: &mut serde_json::Value) {
         "description":"Sandbox permissions for the command. Set to \"require_escalated\" to request running without sandbox restrictions; defaults to \"use_default\"."});
     properties["justification"] = json!({"type":"string",
         "description":"Only set if sandbox_permissions is \"require_escalated\". Request approval from the user to run this command outside the sandbox. Phrased as a simple question that summarizes the purpose of the command as it relates to the task at hand - e.g. 'Do you want to fetch and pull the latest version of this git branch?'"});
+    // Codex's field; when to propose one and how broad is the client's to say.
+    properties["prefix_rule"] = json!({"type":"array","items":{"type":"string"},
+        "description":"Reusable approval prefix for `command`, only with `sandbox_permissions: \"require_escalated\"`; for example [\"git\", \"pull\"]."});
 }
 
 impl Registry {
@@ -3050,6 +3053,9 @@ impl Registry {
             /// decided before the call runs, through its gate.
             sandbox_permissions: Option<String>,
             justification: Option<String>,
+            /// The command prefix the bot proposes its approver allow for
+            /// good, as Codex's: the daemon only keeps it with the call.
+            prefix_rule: Option<Vec<String>>,
         }
         #[derive(Deserialize)]
         #[serde(deny_unknown_fields)]
@@ -3196,6 +3202,10 @@ impl Registry {
                         "justification is only for sandbox_permissions require_escalated"
                             .to_owned(),
                     )
+                } else if args.prefix_rule.is_some()
+                    && args.sandbox_permissions.as_deref() != Some("require_escalated")
+                {
+                    Some("prefix_rule is only for sandbox_permissions require_escalated".to_owned())
                 } else {
                     None
                 };
@@ -6096,6 +6106,21 @@ async fn shell(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_sandboxed_shell_offers_codexs_escalation_fields() {
+        let mut parameters = Tool::Shell.schema().parameters;
+        assert!(parameters["properties"]["prefix_rule"].is_null());
+        super::escalation(&mut parameters);
+        let properties = &parameters["properties"];
+        assert_eq!(
+            properties["sandbox_permissions"]["enum"],
+            serde_json::json!(["use_default", "require_escalated"])
+        );
+        assert!(properties["justification"]["description"].is_string());
+        assert_eq!(properties["prefix_rule"]["type"], "array");
+        assert_eq!(properties["prefix_rule"]["items"]["type"], "string");
+    }
+
     #[test]
     fn a_commands_peek_keeps_its_newest_lines_plain_and_redacted() {
         let credentials = Credentials::default();

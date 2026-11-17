@@ -1642,6 +1642,13 @@ fn quote_line(line: &str) -> Option<&str> {
 pub fn relayed_head(text: &str, from: Option<&str>) -> String {
     match (told(text, from), from) {
         (Some(parts), _) => cut(parts.join(" · ").trim(), GLANCE + 16),
+        // A workflow that ended by its name, as the words view's row says it.
+        (None, Some(WORKFLOW)) => {
+            format!(
+                "From {}",
+                crate::workflow::ended_name(text).unwrap_or(WORKFLOW)
+            )
+        }
         (None, Some(from)) => format!("From {from}"),
         (None, None) => cut(text.lines().next().unwrap_or("").trim(), GLANCE),
     }
@@ -1715,11 +1722,13 @@ pub fn relayed_names(text: &str, from: Option<&str>) -> Vec<String> {
 /// Who started a turn the person did not, for the words view's `↳` row
 /// above its reply: the agent that sent it by its whole name, each task
 /// and source a lookout's note is about (a source by its icon and name),
-/// an automation by `↻`, or what else sent it.
-pub fn came_names(text: &str, from: Option<&str>) -> Vec<String> {
+/// an automation by `↻`, or what else sent it. Each is `true` when it
+/// names an agent, whose name opens it: a task a note is about, or the
+/// sender when `agent` sent it.
+pub fn came_names(text: &str, from: Option<&str>, agent: bool) -> Vec<(String, bool)> {
     if from == Some(LOOKOUT) {
         let icons = crate::background::source_icons();
-        return crate::calls::once(text.lines().filter_map(header).filter_map(|parts| {
+        let names = crate::calls::once(text.lines().filter_map(header).filter_map(|parts| {
             match parts.as_slice() {
                 ["lookout", ..] | [] => None,
                 [crate::lookout::activity::SOURCE, task, ..] => Some(task.to_string()),
@@ -1729,20 +1738,41 @@ pub fn came_names(text: &str, from: Option<&str>) -> Vec<String> {
                 }),
             }
         }));
+        let tasks: Vec<&str> = (text.lines().filter_map(header))
+            .filter_map(|parts| match parts.as_slice() {
+                [crate::lookout::activity::SOURCE, task, ..] => Some(*task),
+                _ => None,
+            })
+            .collect();
+        return (names.into_iter())
+            .map(|name| {
+                let task = tasks.contains(&name.as_str());
+                (name, task)
+            })
+            .collect();
     }
     // News Sonny brings (an upgrade) by what it is.
     if let Some(parts) = news(text) {
-        return parts.into_iter().take(1).collect();
+        return parts
+            .into_iter()
+            .take(1)
+            .map(|part| (part, false))
+            .collect();
     }
     match from {
-        Some(AUTOMATION) => vec!["↻ automation".to_owned()],
+        // An automation by its name, as its prompt's first line says it.
+        Some(AUTOMATION) => vec![(
+            format!("↻ {}", automation_name(text).unwrap_or("automation")),
+            false,
+        )],
         // A workflow that ended, by its name.
-        Some(WORKFLOW) => vec![
+        Some(WORKFLOW) => vec![(
             crate::workflow::ended_name(text)
                 .unwrap_or(WORKFLOW)
                 .to_owned(),
-        ],
-        Some(from) => vec![from.to_owned()],
+            false,
+        )],
+        Some(from) => vec![(from.to_owned(), agent)],
         None => Vec::new(),
     }
 }
@@ -1750,14 +1780,28 @@ pub fn came_names(text: &str, from: Option<&str>) -> Vec<String> {
 /// What sends an automation's prompts, as [`from_outside`] names it.
 const AUTOMATION: &str = "an automation";
 
+/// The name of the automation whose prompt `text` is, as its first line
+/// says it: `[automation nightly · 15:02 · …]`.
+fn automation_name(text: &str) -> Option<&str> {
+    let head = header(text.lines().next()?)?;
+    let name = head.first()?.strip_prefix("automation ")?.trim();
+    (!name.is_empty()).then_some(name)
+}
+
 /// What tells a workflow's caller it ended, as [`from_outside`] names it.
 const WORKFLOW: &str = "a workflow";
 
 /// The words view's `↳` row: who started the turn its reply answers,
-/// muted; names give way to `+N` before it passes `width`.
-pub fn came_row(names: &[String], width: usize) -> Line<'static> {
+/// muted, each agent's name in the agents' color with where it runs on
+/// the row and the bot it opens, as the `└` row's are; names give way to
+/// `+N` before it passes `width`.
+pub fn came_row(
+    names: &[(String, Option<String>)],
+    width: usize,
+) -> (Line<'static>, Vec<(u16, u16, String)>) {
     let mut row = "↳".to_owned();
-    for (at, name) in names.iter().enumerate() {
+    let mut shown = names.len();
+    for (at, (name, _)) in names.iter().enumerate() {
         let next = format!("{row}{}{name}", if at == 0 { " " } else { ", " });
         let left = names.len() - at - 1;
         let more = if left > 0 {
@@ -1766,12 +1810,39 @@ pub fn came_row(names: &[String], width: usize) -> Line<'static> {
             0
         };
         if at > 0 && next.width() + more > width {
-            row.push_str(&format!(" +{}", names.len() - at));
-            return Line::from(row).dim();
+            shown = at;
+            break;
         }
         row = next;
     }
-    Line::from(cut(&row, width)).dim()
+    // Drawn as `row` reads, an agent's name in the agents' color and a
+    // button that opens it; a row cut at the edge links what still shows.
+    let mut spans = vec![Span::raw("↳").dim()];
+    let mut buttons = Vec::new();
+    let mut column = 1;
+    for (at, (name, bot)) in names[..shown].iter().enumerate() {
+        let gap = if at == 0 { " " } else { ", " };
+        spans.push(Span::raw(gap).dim());
+        column += gap.width();
+        let room = width.saturating_sub(column);
+        let name = match shown == 1 {
+            true => cut(name, room),
+            false => name.clone(),
+        };
+        let wide = name.width();
+        match bot {
+            Some(bot) if wide > 0 => {
+                buttons.push((column as u16, (column + wide) as u16, bot.clone()));
+                spans.push(Span::raw(name).fg(Color::Blue));
+            }
+            _ => spans.push(Span::raw(name).dim()),
+        }
+        column += wide;
+    }
+    if shown < names.len() {
+        spans.push(Span::raw(format!(" +{}", names.len() - shown)).dim());
+    }
+    (Line::from(spans), buttons)
 }
 
 /// The row that gathers messages between agents that came one after
@@ -1801,6 +1872,20 @@ pub fn gathered(kinds: &[&str], names: &[String], open: bool, width: usize) -> L
         head.push_str(&format!(" · {}", cut(&names, left).replace(",…", "…")));
     }
     Line::from(format!("{head} {}", if open { "▾" } else { "▸" })).dim()
+}
+
+/// Whether an agent's name may follow `said` on a quiet row Sonny writes:
+/// after a separator, `From`, or what a call did to it (`sent to`,
+/// `followed`), so a count's word (`1 lookout note`) is never taken for
+/// one.
+pub fn names_follow(said: &str) -> bool {
+    ["· ", ", ", "From ", " to ", " and ", "↳ ", "📎 "]
+        .iter()
+        .any(|before| said.ends_with(before))
+        || FOLDS.iter().any(|verb| {
+            said.ends_with(&format!("{verb} "))
+                || said.ends_with(&format!("{} ", lower_first(verb)))
+        })
 }
 
 /// Calls that send another agent words: what the row gathering them says
@@ -4455,9 +4540,36 @@ mod tests {
     }
 
     #[test]
+    fn the_came_row_links_each_agent_it_names() {
+        let names = [
+            ("halves".to_owned(), Some("calc.halves".to_owned())),
+            ("↻ automation".to_owned(), None),
+            ("fix".to_owned(), Some("calc.fix".to_owned())),
+        ];
+        let (line, links) = came_row(&names, 80);
+        assert_eq!(line.to_string(), "↳ halves, ↻ automation, fix");
+        assert_eq!(
+            links,
+            [
+                (2, 8, "calc.halves".to_owned()),
+                (24, 27, "calc.fix".to_owned())
+            ]
+        );
+        assert_eq!(line.spans[2].style.fg, Some(Color::Blue));
+        assert_eq!(line.spans[4].style.fg, None);
+        // Names that give way to `+N` take their links with them.
+        let (line, links) = came_row(&names, 14);
+        assert_eq!(line.to_string(), "↳ halves +2");
+        assert_eq!(links, [(2, 8, "calc.halves".to_owned())]);
+    }
+
+    #[test]
     fn messages_in_a_row_are_counted_by_kind() {
         let note = "[tasks · a.b · a.b replied, completed]\ndone";
-        assert_eq!(came_names(note, Some(LOOKOUT)), ["a.b"]);
+        assert_eq!(
+            came_names(note, Some(LOOKOUT), false),
+            [("a.b".into(), true)]
+        );
         let lookout = Some("the lookout");
         assert_eq!(relayed_kind(note, lookout), "lookout note");
         assert_eq!(relayed_kind("Look at this", Some("a.b")), "message");
@@ -4469,23 +4581,52 @@ mod tests {
         ];
         assert_eq!(relayed_names(note, lookout), ["a.b"]);
         assert_eq!(relayed_names("Look at this", Some("a.c")), ["a.c"]);
-        assert_eq!(came_names("Look at this", Some("a.c")), ["a.c"]);
         assert_eq!(
-            came_names("Run the check", Some("an automation")),
-            ["↻ automation"]
+            came_names("Look at this", Some("a.c"), true),
+            [("a.c".into(), true)]
         );
-        assert_eq!(came_names("hi", None), Vec::<String>::new());
+        // A person who wrote it is no agent.
+        assert_eq!(
+            came_names("Look at this", Some("dana"), false),
+            [("dana".into(), false)]
+        );
+        // An automation by its name, from its prompt's first line.
+        assert_eq!(
+            came_names(
+                "[automation nightly · 15:02 · its time]\nRun the check",
+                Some("an automation"),
+                false
+            ),
+            [("↻ nightly".into(), false)]
+        );
+        assert_eq!(
+            came_names("Run the check", Some("an automation"), false),
+            [("↻ automation".into(), false)]
+        );
+        assert_eq!(came_names("hi", None, false), Vec::<(String, bool)>::new());
         // A workflow that ended, by its name.
         let from = from_outside(Some("workflow"));
         assert_eq!(
             came_names(
                 "Workflow blind-role-eval-score (run ab12cd34) completed in 42s",
+                Some(from),
+                false
+            ),
+            [("blind-role-eval-score".into(), false)]
+        );
+        // Steps names it too.
+        assert_eq!(
+            relayed_head(
+                "Workflow blind-role-eval-score (run ab12cd34) completed in 42s",
                 Some(from)
             ),
-            ["blind-role-eval-score"]
+            "From blind-role-eval-score"
         );
         let upgraded = format!("{}\n- set up backup: on", crate::skills::UPGRADED);
-        assert_eq!(came_names(&upgraded, Some("outside")), ["Sonny upgraded"]);
+        assert_eq!(
+            came_names(&upgraded, Some("outside"), false),
+            [("Sonny upgraded".into(), false)]
+        );
         let names = ["a.b", "a.c", "a.b", "a.d"].map(String::from);
         assert_eq!(
             gathered(&kinds, &names, false, 80).to_string(),
