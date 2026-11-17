@@ -2188,7 +2188,10 @@ file opens the task). Each note is pinned where the agent first put it: a quiet 
 margin` row there scrolls the margin to it when clicked, and the note's
 `↑` scrolls the conversation back there, drawing older messages again
 when it is further back. Its `×` takes the note away and tells the agent
-with its next call. Posting a note's id again changes it in place, so a
+with its next call. A note under the mouse says when the agent last put
+it up or changed it, as a message says when it was written: muted, at
+the right end of the empty row over its title (`Sat 7 Nov 09:13`), and
+nowhere when that row is not empty. Posting a note's id again changes it in place, so a
 live note stays one note. A lead can show a task's note as
 `from: "task/id"`, which lookout names when the task puts one up: it
 shows as the task keeps it, follows the task's title until the lead gives
