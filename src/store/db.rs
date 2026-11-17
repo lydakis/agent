@@ -2789,10 +2789,20 @@ impl HeldView<'_> {
         }
         .map(Vec::as_slice)
     }
-    fn verdicts(&self, turn: i64, call_id: &str) -> Option<&[Verdict]> {
+    /// The verdicts held for approval row `approval`, call `call_id`. A
+    /// reader's copy is from the writer's last commit, which its rows may
+    /// be past: a call announced again since has a new row, which no copied
+    /// verdict answers.
+    fn verdicts(&self, turn: i64, approval: i64, call_id: &str) -> Option<&[Verdict]> {
         match self {
             HeldView::Live(live) => live.get(&turn)?.verdicts.get(call_id),
-            HeldView::Shared(held) => held.get(&turn)?.verdicts.get(call_id),
+            HeldView::Shared(held) => {
+                let held = held.get(&turn)?;
+                if !held.answered.contains_key(&approval) {
+                    return None;
+                }
+                held.verdicts.get(call_id)
+            }
         }
         .map(Vec::as_slice)
     }
@@ -11233,7 +11243,7 @@ fn waiting_call(
         step_of: r.get(13)?,
         process: r.get(14)?,
     };
-    if let Some(held) = held.verdicts(turn, &call_id) {
+    if let Some(held) = held.verdicts(turn, id, &call_id) {
         request.verdicts.extend(held.iter().cloned());
     }
     if request.denial().is_some()
@@ -20334,6 +20344,22 @@ mod tests {
         let mut shown: Vec<String> = resolved.into_iter().map(|(k, _)| k).collect();
         shown.sort();
         assert_eq!(shown, listed);
+    }
+
+    #[test]
+    fn a_readers_copied_verdicts_answer_only_the_rows_they_were_given_for() {
+        let verdict: Verdict =
+            serde_json::from_value(json!({"tag":"manual","allow":true,"at_ms":1})).unwrap();
+        let held = HeldView::Shared(Arc::new(HashMap::from([(
+            7,
+            Held {
+                answered: HashMap::from([(1, vec!["manual".to_owned()])]),
+                verdicts: HashMap::from([("call".to_owned(), vec![verdict])]),
+            },
+        )])));
+        assert_eq!(held.verdicts(7, 1, "call").map(<[_]>::len), Some(1));
+        // The call announced again since, under a new row: unanswered.
+        assert!(held.verdicts(7, 2, "call").is_none());
     }
 
     #[test]

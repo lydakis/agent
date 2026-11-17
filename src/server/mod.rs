@@ -3180,10 +3180,10 @@ impl Drop for Closing {
 }
 
 impl Service {
-    /// Bot `name` as a check that guards a write must see it: read beside
-    /// the writer, and, when not there, read again behind the writer's
-    /// queue, so a creation queued ahead of this request is seen, as the
-    /// write it guards will see it.
+    /// Bot `name` as a check of what never changes about it (its id, who
+    /// made it) must see it: read beside the writer, and, when not there,
+    /// read again behind the writer's queue, so a creation queued ahead of
+    /// this request is seen, as the write it guards will see it.
     async fn inspect_ordered(&self, name: &str) -> Result<Bot> {
         let read = name.to_owned();
         match self
@@ -3333,7 +3333,15 @@ impl Service {
                 claim(created_by, created_by_id)?;
                 // A fork that may call nothing touches nothing: an ask.
                 if !matches!(allow, Some(Some(tools)) if tools.is_empty()) {
-                    let source = match self.inspect_ordered(source).await {
+                    // Read behind the writer's queue, never beside it: a
+                    // submit queued ahead may move the source's folder,
+                    // which the fork inherits.
+                    let source = source.clone();
+                    let source = match self
+                        .store
+                        .op("inspect", move |db| db.inspect(&source))
+                        .await
+                    {
                         Ok(source) => Some(source),
                         // A resent fork whose source is gone since answers
                         // as its duplicate; a new one finds no source.
@@ -3388,7 +3396,10 @@ impl Service {
                 // A turn's folder is the sandboxed bot's to write, and stays
                 // its folder: one the caller gives it must be the caller's.
                 if let Some(workspace) = workspace {
-                    let target = self.inspect_ordered(bot).await?;
+                    // Behind the writer's queue: a change queued ahead may
+                    // sandbox it.
+                    let bot = bot.clone();
+                    let target = self.store.op("inspect", move |db| db.inspect(&bot)).await?;
                     if target.sandboxed() {
                         folders.push(workspace.clone());
                     }
