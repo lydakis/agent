@@ -161,9 +161,6 @@ fn start() -> Value {
                     "description": "An empty folder of the task's own instead of a worktree or this folder: \
                         for work that makes its own copy of what it changes, such as a checkout of another \
                         branch made with this folder's tooling, or that must not touch this folder."},
-                "tab": {"type": "boolean",
-                    "description": "A tab of its own, only when the person asked to watch or talk to this \
-                        task; Sonny opens one when it needs them."},
                 "setup": {"type": "boolean",
                     "description": "Run the folder's .agents/setup in the copy first: true for a task \
                         that will change files, false for one that only reads."},
@@ -210,25 +207,6 @@ fn noted_models() -> String {
         true => " \"$AGENT_BIN\" models lists the models there are.".to_owned(),
         false => format!(" The person's notes on their models:{said}"),
     }
-}
-
-/// Open the task `name` just started in a tab of its own, as its starter
-/// asked: said after the start's result only when it could not. With
-/// `task_tabs = "every"`, the lead's Sonny opens it as its turn starts.
-async fn tab(caller: &str, project: &str, name: &str) -> String {
-    let every = agent_client::config::load()
-        .is_ok_and(|c| c.sonny.task_tabs == agent_client::config::TaskTabs::Every);
-    if every {
-        return String::new();
-    }
-    let name = name.trim();
-    let bot = match name.strip_prefix(&format!("{project}.")) {
-        Some(_) => name.to_owned(),
-        None => format!("{project}.{name}"),
-    };
-    crate::task_tab(caller, &bot)
-        .await
-        .unwrap_or_else(|error| format!("\n\nNo tab opened for it: {error}"))
 }
 
 fn remove() -> Value {
@@ -709,13 +687,6 @@ async fn called(name: &str, arguments: &Value) -> Answer {
             };
             let started = crate::task::start(&line.folder, &line.project, &caller, &start)
                 .map_err(|e| ("task_not_started", e))?;
-            let started = match arguments["tab"] == true {
-                true => format!(
-                    "{started}{}",
-                    tab(&caller, &line.project, &start.name).await
-                ),
-                false => started,
-            };
             // What the lead's gone tasks left, which only it can clear.
             let left = match line.lead {
                 true => crate::task::left_behind(&line.folder, &line.project),

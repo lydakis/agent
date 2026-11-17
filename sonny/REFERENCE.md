@@ -365,10 +365,9 @@ labelled with the project's name), in Herdr or cmux a workspace, chosen the
 same way. A task the lead (or one of its tasks) starts gets a window there
 (a Herdr tab; in cmux a tab in the lead's pane) running Sonny on that task,
 without taking focus, its block (pane, cmux tab) labelled with the task's
-name, when someone asks for one: its starter, only when you asked to watch
-it or talk to it (`start_task`'s `tab`, within
-`most_task_tabs` as any task's tab), an agent that shows it, you, from `/status` or a click on its name, or the task itself
-coming to need you. The others, such as reviewers and a lead's own helpers,
+name, when someone asks for one: an agent that shows it (`show_agent`),
+only when you asked, you, from `/status` or a click on its name, or the task
+itself coming to need you. The others, such as reviewers and a lead's own helpers,
 work without one; `/status` and the footer count them. With `[sonny]
 task_tabs = "every"`, each task gets its window as a turn of its starts. In Rex, each window reports OSC 7501 status, so Rex
 shows which task is working, waiting on you (an approval, or a question it

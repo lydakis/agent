@@ -495,67 +495,6 @@ async fn show(
     Ok(json!({"bot": bot, "in": layout.home()}))
 }
 
-/// A tab for `bot`, a task `caller` just started asking for one: placed
-/// as a task's window is, within `[sonny] most_task_tabs`, closing the
-/// lead's least recently used task tabs for room, never one the person has
-/// not looked at yet nor one that holds its place. What to tell `caller`
-/// beside the start, if anything.
-async fn task_tab(caller: &str, bot: &str) -> Result<String, String> {
-    let (socket, project, chain) = agents_project(caller).await?;
-    let me = named::me().map_err(|e| e.to_string())?;
-    let mut layout = mux::for_agent(&socket, &project, &chain, None)?;
-    // What it closes or holds back for room, the lead's own layout reads.
-    layout.keep_aside(used::aside());
-    let client = Client::connect(&socket).await.map_err(|e| e.to_string())?.0;
-    let mut bots = Vec::new();
-    let mut after = Value::Null;
-    loop {
-        let asked = json!({"name": format!("{project}.*"), "limit": 256, "after": after});
-        let page = client
-            .request("bots", asked)
-            .await
-            .map_err(|e| e.to_string())?;
-        bots.extend(page["bots"].as_array().cloned().unwrap_or_default());
-        after = page["next_after"].clone();
-        if after.is_null() {
-            break;
-        }
-    }
-    let lead = (chain.last())
-        .filter(|lead| project::is_lead(lead))
-        .cloned()
-        .unwrap_or_else(|| format!("{project}.lead"));
-    let lineage = lineage_of(&bots, &lead, lead == format!("{project}.lead"));
-    let mut room = room_for(&project, &lineage, &HashMap::new(), Arc::new(used::held));
-    room.most = agent_client::config::load().map_or(0, |c| c.sonny.most_task_tabs as usize);
-    let command = [
-        me.to_string_lossy().into_owned(),
-        "--socket".into(),
-        socket.to_string_lossy().into_owned(),
-        "--no-sound".into(),
-        "--window-place".into(),
-        mux::Place::encode(&Some(layout.kept())),
-        "--agent".into(),
-        bot.to_owned(),
-    ];
-    let short = bot.strip_prefix(&format!("{project}.")).unwrap_or(bot);
-    Ok(
-        match layout.show_task(bot, short, &command, &room, false)? {
-            mux::Shown::Had => String::new(),
-            mux::Shown::Opened(closed) if closed.is_empty() => String::new(),
-            mux::Shown::Opened(closed) => format!(
-                "\n\nIts tab opened; {}.",
-                made_room(&closed, &project, room.most)
-            ),
-            mux::Shown::Aside | mux::Shown::NoRoom => format!(
-                "\n\nNo tab opened for it yet: the project's {} task tabs are all ones the person \
-             has not looked at. It opens once they go to it, or once it needs them.",
-                room.most
-            ),
-        },
-    )
-}
-
 /// A failed `turn` with why it failed, which `turns` leaves out, as
 /// `wait` has it: a model that said nothing is no failure.
 async fn with_error(client: &Client, mut turn: Value) -> Value {
