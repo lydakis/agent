@@ -10491,3 +10491,25 @@ below main: median p99 11.3 ms against 11.9 ms (ranges 9.6 to 14.9 and 10.4
 to 14.3). A completion holds no verdicts and changes no bot's identity
 columns, so neither the shared verdict copy nor the identity trigger runs
 in it.
+
+## ssh in a sandbox from a copy of the person's config that makes no control socket
+
+What a turn pays, on each path:
+
+- **A sandboxed command, from a daemon started with `--ssh-config`** (the
+  CLI's, on Linux): `Policy::new`, which already runs off the runtime
+  thread, resolves the config's real path and `stat`s it, and writes the
+  copy again only when the file changed or the copy is gone, under a lock
+  file beside it. One more read-only bind for bubblewrap.
+- No store jobs, protocol or schema change, or state per bot.
+
+Mean cost per policy, measured as root on a 4-CPU Linux cloud container,
+release build, 20,000 checks a run against a 40-line config:
+
+| Measure | Run 1 | Run 2 | Run 3 |
+| --- | ---: | ---: | ---: |
+| Copy check, config unchanged, µs | 1.84 | 0.97 | 0.99 |
+| With the real path resolved, µs | 4.91 | 2.62 | 2.67 |
+
+So a sandboxed command pays about 2.7 µs more before its sandbox starts,
+the first run cold. The bubblewrap launch that follows takes about 12 ms.

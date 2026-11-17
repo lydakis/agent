@@ -1176,6 +1176,9 @@ pub struct Configuration {
     pub unreadable: Vec<PathBuf>,
     /// System folders every Linux sandbox shows from the person's copy.
     pub own_copies: Vec<PathBuf>,
+    /// The person's ssh config, which every Linux sandbox shows from a copy
+    /// that makes no control socket.
+    pub ssh_config: Option<PathBuf>,
     /// The context windows the person set, by model path.
     pub context_windows: Arc<agent_runtime::provider::Windows>,
     /// The tiers faster than standard the person says models serve, by
@@ -2246,6 +2249,7 @@ pub async fn run(config: Configuration) -> Result<()> {
         walled,
         unreadable,
         owned: config.own_copies.clone(),
+        ssh_config: config.ssh_config.clone(),
         known: agent_client::config::daemons(),
     };
     // Listed with the person's other daemons, so each keeps this one's

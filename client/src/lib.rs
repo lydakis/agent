@@ -166,6 +166,15 @@ pub const PROTECTED_EXISTING: [&str; 1] = [".aws"];
 /// file the copy holds.
 pub const OWN_COPIES: [&str; 2] = ["/etc/ssh/ssh_config.d", "/etc/crypto-policies/back-ends"];
 
+/// The person's ssh config, `~/.ssh/config`, which a Linux sandbox shows
+/// from a copy that makes no control socket (`--ssh-config`): with
+/// `ControlMaster auto` and no master open, ssh would make its socket in
+/// `~/.ssh`, read-only to every sandboxed command, and fail, so would
+/// every git push and fetch over ssh.
+pub fn ssh_config() -> Option<std::path::PathBuf> {
+    std::env::var_os("HOME").map(|home| std::path::PathBuf::from(home).join(".ssh/config"))
+}
+
 /// Start `command` in a session of its own, for a service that outlives the
 /// terminal it was started from: closing a Herdr pane, or stopping Herdr,
 /// ends every process in the pane's session, not only its foreground job.

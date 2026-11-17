@@ -287,6 +287,7 @@ fn sandboxed(args: &[String]) -> Result<i32> {
         owned: agent_client::OWN_COPIES
             .map(std::path::PathBuf::from)
             .to_vec(),
+        ssh_config: agent_client::ssh_config(),
         // And reaches no daemon's socket and writes no daemon's store.
         known: agent_client::config::daemons(),
         ..Daemon::default()
@@ -391,6 +392,7 @@ fn configuration(args: &[String]) -> Result<server::Configuration> {
     let mut walled = Vec::new();
     let mut unreadable = Vec::new();
     let mut own_copies = Vec::new();
+    let mut ssh_config = None;
     let mut windows = Vec::new();
     let mut speeds = Vec::new();
     let mut fallbacks = Vec::new();
@@ -422,6 +424,10 @@ fn configuration(args: &[String]) -> Result<server::Configuration> {
                 return fail_with("usage", "--own-copy needs an absolute folder");
             }
             "--own-copy" => own_copies.push(value.into()),
+            "--ssh-config" if !std::path::Path::new(value).is_absolute() => {
+                return fail_with("usage", "--ssh-config needs an absolute file");
+            }
+            "--ssh-config" => ssh_config = Some(value.into()),
             "--context-window" => windows.push(value.as_str()),
             "--speeds" => speeds.push(value.as_str()),
             "--fallbacks" => fallbacks.push(value.as_str()),
@@ -503,6 +509,7 @@ fn configuration(args: &[String]) -> Result<server::Configuration> {
         walled,
         unreadable,
         own_copies,
+        ssh_config,
         context_windows: std::sync::Arc::new(agent_runtime::provider::Windows::parse(windows)?),
         speeds: std::sync::Arc::new(agent_runtime::provider::Speeds::parse(speeds)?),
         fallbacks: std::sync::Arc::new(agent_runtime::provider::Fallbacks::parse(fallbacks)?),
