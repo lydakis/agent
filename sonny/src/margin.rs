@@ -1321,6 +1321,12 @@ impl Margin {
     /// change; only those are kept read.
     /// What template notes are filled from now. The person's own notes
     /// differing, by one added, taken away or retitled, is a change.
+    /// Every template note looked at again as if a while had passed.
+    #[cfg(test)]
+    pub fn later(&mut self) {
+        self.watch.later();
+    }
+
     pub fn set_blanks(&mut self, blanks: Blanks) {
         if !Arc::ptr_eq(&self.blanks.notes, &blanks.notes) && self.blanks.notes != blanks.notes {
             self.changes += 1;
