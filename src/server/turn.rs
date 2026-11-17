@@ -3029,6 +3029,8 @@ impl Turn {
                     };
                     let outcome = match take().await? {
                         CallAnswer::Given(outcome) => Some(outcome),
+                        // Woken by its client's yield: the handle answers it.
+                        CallAnswer::Yielded => None,
                         // Woken by a message for the turn: the call is
                         // lifted to the background, unless its answer came
                         // or its time ran out meanwhile.
@@ -3040,6 +3042,7 @@ impl Turn {
                         }
                         CallAnswer::Pending { .. } if self.lift.is_armed() => match take().await? {
                             CallAnswer::Given(outcome) => Some(outcome),
+                            CallAnswer::Yielded => None,
                             CallAnswer::Pending { .. } => {
                                 return fail("invalid_tool_state");
                             }
@@ -4777,6 +4780,7 @@ impl Turn {
                     handles,
                     timeout_ms,
                     any,
+                    terminate,
                 }) => {
                     match self
                         .park(
@@ -4784,6 +4788,7 @@ impl Turn {
                             handles,
                             timeout_ms,
                             any,
+                            terminate,
                             &mut calls,
                             route,
                             summary_retry_ms,
@@ -5639,7 +5644,7 @@ impl Turn {
         let lifted = self
             .store
             .op("lift", move |db| {
-                db.lift(turn, &id, call.as_ref(), now_ms())
+                db.lift(turn, &id, call.as_ref(), None, now_ms())
             })
             .await?;
         // Its time goes on the schedule now: the turn's own no longer
@@ -5683,6 +5688,8 @@ impl Turn {
                 // Answered or out of time: the store told its daemon
                 // steps as it gave the answer.
                 CallAnswer::Given(outcome) => return Ok(ControlFlow::Continue(Some(outcome))),
+                // Its client yielded it: the handle answers it already.
+                CallAnswer::Yielded => return Ok(ControlFlow::Continue(None)),
                 CallAnswer::Pending { notify, expires_ms } => (notify, expires_ms),
             };
             // No deadline while a step of the call waits on a gate: it
@@ -6386,6 +6393,7 @@ impl Turn {
         handles: Vec<String>,
         timeout_ms: Option<u64>,
         any: bool,
+        terminate: bool,
         calls: &mut std::vec::IntoIter<ToolCall>,
         route: Option<&str>,
         summary_retry_ms: Option<u64>,
@@ -6394,6 +6402,13 @@ impl Turn {
         for text in &handles {
             match Handle::parse(text) {
                 Err(error) => return Ok(ControlFlow::Continue(failure(error))),
+                // A message's turn is its bot's: wait stops only commands.
+                Ok(Handle::Message { .. }) if terminate => {
+                    return Ok(ControlFlow::Continue(failure(Error::with(
+                        "invalid_handle",
+                        format!("{text}: terminate stops only proc:N handles"),
+                    ))));
+                }
                 Ok(Handle::Message { bot, message: turn })
                     if bot == self.bot && turn == self.turn =>
                 {
@@ -6420,6 +6435,20 @@ impl Turn {
             }
             // Waited on, as Codex counts a poll: the last its bot prunes.
             self.registry.used(&processes);
+        }
+        // Each stopped as a kill stops it; the wait then collects how it
+        // ended, as any end of a command it waits on.
+        if terminate {
+            for &process in &processes {
+                stop_handle(
+                    &self.store,
+                    &self.registry,
+                    &self.handles,
+                    &self.bot,
+                    process,
+                )
+                .await?;
+            }
         }
         // A steer waiting for the next boundary makes the wait a poll: it
         // reports what resolved, and the rest pending.

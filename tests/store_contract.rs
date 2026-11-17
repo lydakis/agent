@@ -21342,11 +21342,11 @@ fn a_lifted_call_waits_on_past_its_turn_and_its_verdict_runs_or_ends_it() {
     )
     .unwrap();
     let now = epoch_now();
-    let (p1, lapse) = db.lift(turn, "s1", Some(&s1), now).unwrap().unwrap();
+    let (p1, lapse) = db.lift(turn, "s1", Some(&s1), None, now).unwrap().unwrap();
     // No gate runs it out, so nothing goes on the schedule.
     assert_eq!(lapse, None);
-    let (p2, _) = db.lift(turn, "s2", Some(&s2), now).unwrap().unwrap();
-    let (p3, _) = db.lift(turn, "s3", Some(&s3), now).unwrap().unwrap();
+    let (p2, _) = db.lift(turn, "s2", Some(&s2), None, now).unwrap().unwrap();
+    let (p3, _) = db.lift(turn, "s3", Some(&s3), None, now).unwrap().unwrap();
     // Each call is answered with its handle, so the round is closed and
     // the turn can end.
     let events = db.events("Bob", 0, 256).unwrap()["events"].clone();
@@ -21524,8 +21524,8 @@ fn a_lifted_calls_verdict_leaves_a_later_turns_denials_be() {
     db.append(turn, vec![first, second], &[s1.clone(), s2.clone()], None)
         .unwrap();
     let now = epoch_now();
-    let (p1, _) = db.lift(turn, "s1", Some(&s1), now).unwrap().unwrap();
-    let (p2, _) = db.lift(turn, "s2", Some(&s2), now).unwrap().unwrap();
+    let (p1, _) = db.lift(turn, "s1", Some(&s1), None, now).unwrap().unwrap();
+    let (p2, _) = db.lift(turn, "s2", Some(&s2), None, now).unwrap().unwrap();
     db.append(turn, vec![assistant("done")], &[], None).unwrap();
     db.finish(turn, None).unwrap();
     // A later turn has a denial of its own under the same gate.
@@ -21642,9 +21642,9 @@ fn a_lifted_answered_call_takes_its_answer_or_is_stopped_and_outlives_a_restart(
             db.tool_start(turn, call, false, false).unwrap();
         }
         let now = epoch_now();
-        let (p1, _) = db.lift(turn, "c1", None, now).unwrap().unwrap();
-        let (p2, _) = db.lift(turn, "c2", None, now).unwrap().unwrap();
-        let (p3, _) = db.lift(turn, "c3", None, now).unwrap().unwrap();
+        let (p1, _) = db.lift(turn, "c1", None, None, now).unwrap().unwrap();
+        let (p2, _) = db.lift(turn, "c2", None, None, now).unwrap().unwrap();
+        let (p3, _) = db.lift(turn, "c3", None, None, now).unwrap().unwrap();
         db.append(turn, vec![assistant("done")], &[], None).unwrap();
         db.finish(turn, None).unwrap();
         (turn, p1, p2, p3)
@@ -21754,7 +21754,7 @@ fn a_lifted_answered_call_keeps_its_time_steps_listing_and_audit_row() {
         .unwrap();
     db.tool_start(turn, &call, false, false).unwrap();
     let now = epoch_now();
-    let (process, lapse) = db.lift(turn, "c1", None, now).unwrap().unwrap();
+    let (process, lapse) = db.lift(turn, "c1", None, None, now).unwrap().unwrap();
     let Some(lapse) = lapse else {
         panic!("a lifted call with a time of its own was not scheduled");
     };
@@ -22404,5 +22404,133 @@ fn schema_105_bots_that_message_with_tools_make_and_close_agents_too() {
     assert_eq!(db.close("Carol", 5).unwrap(), (None, None));
     assert_eq!(db.inspect("Carol").unwrap().closed_ms, Some(5));
     drop(db);
+    std::fs::remove_file(path).unwrap();
+}
+
+/// A call its client yields is lifted with its output so far, and waits on
+/// its answer with no deadline: past its tool's own time it still waits,
+/// its answer is taken, and it ends answered, the turn still reading the
+/// yield after its answer is collected. A tool not declared `lift` does not
+/// yield.
+#[test]
+fn a_yielded_call_waits_on_its_answer_with_no_deadline() {
+    let mut db = db();
+    let exec = Declared {
+        name: "exec".into(),
+        description: "Run.".into(),
+        parameters: json!({"type":"object"}),
+        result: "ok".into(),
+        answered_by: Some("sonny".into()),
+        expire_ms: Some(1_000),
+        grammar: None,
+        steps: true,
+        gate_daemon_steps: false,
+        lift: true,
+        inherit: Inherit::All,
+        kind: None,
+    };
+    let quick = Declared {
+        name: "note".into(),
+        lift: false,
+        steps: false,
+        ..exec.clone()
+    };
+    db.create(
+        "Lead",
+        Some("/synthetic"),
+        Binding {
+            declared: Some(&ToolList::new(vec![exec, quick]).unwrap()),
+            ..binding()
+        },
+    )
+    .unwrap();
+    let turn = db
+        .begin(
+            "Lead",
+            "request",
+            "work",
+            true,
+            &TurnOptions::default(),
+            allow_provider,
+        )
+        .unwrap()
+        .turn;
+    let calls: Vec<ToolCall> = ["exec", "note"]
+        .iter()
+        .map(|name| ToolCall {
+            name: (*name).into(),
+            call_id: format!("{name}-1"),
+            arguments: "{}".into(),
+            custom: false,
+            links: Default::default(),
+        })
+        .collect();
+    db.append(turn, vec![], &calls, None).unwrap();
+    for call in &calls {
+        db.tool_start(turn, call, false, false).unwrap();
+    }
+    let now = epoch_now();
+    let Err(refused) = db.yield_call("Lead", turn, "note-1", &result("so far"), now) else {
+        panic!("a call of a tool that does not lift yielded");
+    };
+    assert_eq!(refused.code, "call_not_liftable");
+    let yielded = db
+        .yield_call("Lead", turn, "exec-1", &result("built 3 of 9"), now)
+        .unwrap();
+    let handle = yielded.reply["handle"].as_str().unwrap().to_owned();
+    let process: i64 = handle.strip_prefix("proc:").unwrap().parse().unwrap();
+    let Err(again) = db.yield_call("Lead", turn, "exec-1", &result("x"), now) else {
+        panic!("a call yielded twice");
+    };
+    assert_eq!(again.code, "no_pending_call");
+    // Past the tool's own second: still waiting, with no time to schedule.
+    let Lifted::Waiting(None) = db.lifted_check(process, now + 60_000, false).unwrap() else {
+        panic!("a yielded call ran out of time");
+    };
+    db.answer_call("Lead", turn, "exec-1", result("all 9 built"), now + 60_000)
+        .unwrap();
+    let Lifted::Ended { result: ended, .. } =
+        db.lifted_check(process, now + 60_001, false).unwrap()
+    else {
+        panic!("a yielded call's answer did not end it");
+    };
+    assert_eq!(ended["answer"], "all 9 built", "{ended}");
+    // Answered and collected before the turn took it: its handle still
+    // answers the call, and the turn goes on rather than failing.
+    assert!(matches!(
+        db.answer_take(turn, "exec-1", now + 60_002).unwrap(),
+        agent_runtime::store::CallAnswer::Yielded
+    ));
+    assert_eq!(
+        db.suspend_answer(turn, "exec-1", &[], now + 60_002, None, None)
+            .unwrap(),
+        None
+    );
+}
+
+/// Schema 106 marks a yielded call's row; calls waiting when a store
+/// upgrades were never yielded.
+#[test]
+fn schema_106_adds_the_yield_mark() {
+    let path = std::env::temp_dir().join(format!(
+        "agent-schema106-yielded-{}.sqlite",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&path);
+    drop(Database::initialize(Connection::open(&path).unwrap()).unwrap());
+    Connection::open(&path)
+        .unwrap()
+        .execute_batch("ALTER TABLE answers DROP COLUMN yielded; PRAGMA user_version=105;")
+        .unwrap();
+    drop(Database::initialize(Connection::open(&path).unwrap()).unwrap());
+    let has: bool = Connection::open(&path)
+        .unwrap()
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('answers') WHERE name='yielded')",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert!(has);
     std::fs::remove_file(path).unwrap();
 }
