@@ -3237,7 +3237,19 @@ impl Service {
             Command::Companions { .. } => return refuse("manage the daemon's companions"),
             _ => {}
         }
-        let me = self.store.identity(caller).await?;
+        // A read is held to the identity kept in memory, beside the writer;
+        // a change is held to the one its write will meet, read behind the
+        // writer's queue, where a submit queued ahead may have moved the
+        // caller's own folder.
+        let me = if command.observes() || matches!(command, Command::Wait { .. }) {
+            self.store.identity(caller).await?
+        } else {
+            std::sync::Arc::new(agent_runtime::store::Identity::from(
+                self.store
+                    .op("inspect", move |db| db.inspect_id(caller))
+                    .await?,
+            ))
+        };
         // Any agent may pull the cord, as itself.
         if let Command::Pause { by, .. } = command {
             *by = Some(me.name.clone());
@@ -9408,6 +9420,14 @@ mod tests {
         }
         let reads = || store.stats()["operations"]["identity"]["count"].as_u64();
         assert_eq!(reads(), Some(1), "read once, then kept");
+        // A change is held to the identity its write will meet: behind the
+        // writer, after the submit queued ahead of it.
+        let mut change = submit("A", "r2");
+        let ordered = tokio::time::timeout(
+            Duration::from_millis(200),
+            service.capped(bot_id, &mut change),
+        );
+        assert!(ordered.await.is_err(), "waits for the held writer");
         gate.send(()).unwrap();
         held.await.unwrap();
         while !service.admissions.is_empty() {
