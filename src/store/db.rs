@@ -3358,7 +3358,7 @@ impl Database {
     /// before versioning, stores at versions 1 to 5 and stores from newer
     /// binaries are rejected; an older store from version 6 on is migrated
     /// forward, one version at a time, at open.
-    pub const SCHEMA: i32 = 104;
+    pub const SCHEMA: i32 = 105;
     /// The person's messages a compaction keeps verbatim, newest first:
     /// per-message text, and the total text plus `(ordinal, String)` entry
     /// metadata. Empty entries cost space too, so the retained list cannot
@@ -19282,10 +19282,14 @@ fn migrate_since_73(conn: &Connection, from: i32) -> Result<()> {
     // Schema 102: daemon steps under way, in `steps`, which the schema
     // makes; nothing older holds any.
 
-    // Schema 103: an agent closes an agent it made, which then says when;
+    if from < 104 {
+        migrate_approval_holders(conn)?;
+    }
+
+    // Schema 105: an agent closes an agent it made, which then says when;
     // and every bot that sends messages with a tool of its own makes and
     // closes agents with tools too.
-    if from < 103 {
+    if from < 105 {
         let has: bool = conn.query_row(
             "SELECT EXISTS(SELECT 1 FROM pragma_table_info('bots') WHERE name='closed_ms')",
             [],
@@ -19300,10 +19304,6 @@ fn migrate_since_73(conn: &Connection, from: i32) -> Result<()> {
                  AND ','||tools||',' NOT LIKE '%,spawn_agent,%'",
             [],
         )?;
-    }
-
-    if from < 104 {
-        migrate_approval_holders(conn)?;
     }
 
     Ok(())

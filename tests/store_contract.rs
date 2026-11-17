@@ -22366,8 +22366,8 @@ fn a_closed_bot_is_listed_only_when_asked_until_a_turn_of_its_starts() {
 }
 
 #[test]
-fn schema_103_bots_that_message_with_tools_make_and_close_agents_too() {
-    let path = std::env::temp_dir().join(format!("agent-schema103-{}.sqlite", std::process::id()));
+fn schema_105_bots_that_message_with_tools_make_and_close_agents_too() {
+    let path = std::env::temp_dir().join(format!("agent-schema105-{}.sqlite", std::process::id()));
     let _ = std::fs::remove_file(&path);
     {
         let mut db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
@@ -22375,13 +22375,14 @@ fn schema_103_bots_that_message_with_tools_make_and_close_agents_too() {
             db.create(name, Some("/synthetic"), binding()).unwrap();
         }
     }
-    // Before 103 no bot was closed, and none made or closed agents.
+    // Before 105 no bot was closed, and none made or closed agents, though
+    // the store was already at 104.
     let old = Connection::open(&path).unwrap();
     old.execute_batch(
         "ALTER TABLE bots DROP COLUMN closed_ms;
          UPDATE bots SET tools='shell,wait,history,send_message,list_agents,pause_agents' WHERE name='Bob';
          UPDATE bots SET tools='shell,read' WHERE name='Carol';
-         PRAGMA user_version=102;",
+         PRAGMA user_version=104;",
     )
     .unwrap();
     drop(old);
