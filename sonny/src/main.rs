@@ -23292,7 +23292,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_turn_a_task_started_that_said_nothing_draws_no_reply() {
+    async fn a_turn_that_said_nothing_draws_no_reply_with_or_without_a_task_row() {
         let say = |role: &str, text: &str| {
             let kind = if role == "user" {
                 "input_text"
@@ -23311,12 +23311,16 @@ mod tests {
             (2, 1, say("assistant", "Rounding now.")),
             (5, 2, say("user", "The release build broke.")),
             (6, 2, reply),
+            // A turn of the person's, with no task row, answered the same.
+            (8, 3, say("user", "Anything new?")),
+            (9, 3, say("assistant", "\u{200b}")),
         ];
         let client = daemon_answering(move |asked| match asked["op"].as_str() {
             Some("history_nodes") => json!({"nodes": items.iter().rev()
                 .map(|(node, turn, _)| json!({"node": node, "turn": turn}))
                 .collect::<Vec<_>>(), "next_from": null}),
-            Some("prompts") => json!({"prompts": [{"turn": 1, "text": "Fix the rounding"}]}),
+            Some("prompts") => json!({"prompts": [{"turn": 1, "text": "Fix the rounding"},
+                {"turn": 3, "text": "Anything new?"}]}),
             Some("history_items") => json!({"items": asked["nodes"].as_array().into_iter()
                 .flatten()
                 .filter_map(|node| items.iter().find(|(n, _, _)| Some(*n) == node.as_i64()))
@@ -23336,7 +23340,10 @@ mod tests {
         let rows: Vec<String> = (app.screen.texts().into_iter())
             .filter(|row| !row.trim().is_empty())
             .collect();
-        assert_eq!(rows, ["› Fix the rounding", "• Rounding now."]);
+        assert_eq!(
+            rows,
+            ["› Fix the rounding", "• Rounding now.", "› Anything new?"]
+        );
     }
 
     #[tokio::test]

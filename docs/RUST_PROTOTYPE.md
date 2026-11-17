@@ -4192,7 +4192,11 @@ later node's totals and elision savings with it. The call goes again at
 once, its `retry` event listing each node and what it held under
 `repaired`. `repair` (protocol 86; `agent repair --bot NAME`) does the same
 to the bot's whole history and answers the same list; it answers `bot_busy`
-while the bot runs a turn. Responses providers
+while the bot runs a turn. A request whose items read to another length
+than it was weighed at, as when a repair changes history a fork shares while
+the fork's request goes, ends as `history_changed` before its body
+disagrees with its Content-Length, and the turn reads its window again and
+sends at once. Responses providers
 take blank text, so a Responses bot's history is left as it is.
 
 ### Compaction

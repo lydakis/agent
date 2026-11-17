@@ -2118,11 +2118,44 @@ fn framed(
     prefix: Bytes,
     items: &Items,
 ) -> impl Stream<Item = std::io::Result<Bytes>> + Send + 'static {
+    // The body's length was promised before its items were read: one that
+    // reads otherwise ends in an error rather than a body that lies.
+    let expected = prefix.len() + items.bytes + 2;
+    let counted = Arc::new(AtomicUsize::new(0));
+    let read = counted.clone();
+    let close = stream::once(async move {
+        match read.load(Ordering::Relaxed) + 2 == expected {
+            true => Ok(Bytes::from_static(b"]}")),
+            false => Err(std::io::Error::other(HistoryChanged)),
+        }
+    });
     stream::iter([Ok(prefix)])
         .chain(items.stream())
-        .chain(stream::iter([Ok(Bytes::from_static(b"]}"))]))
+        .map(move |chunk| {
+            let bytes = chunk?;
+            let total = counted.fetch_add(bytes.len(), Ordering::Relaxed);
+            match total + bytes.len() + 2 > expected {
+                true => Err(std::io::Error::other(HistoryChanged)),
+                false => Ok(bytes),
+            }
+        })
+        .chain(close)
         .filter(|chunk| std::future::ready(!matches!(chunk, Ok(bytes) if bytes.is_empty())))
 }
+
+/// A request's items read to another length than they were weighed at: a
+/// node they hold changed after the request was weighed, as a repair of a
+/// history another bot shares changes it. The request goes again, weighed
+/// anew.
+#[derive(Debug)]
+pub struct HistoryChanged;
+impl std::fmt::Display for HistoryChanged {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(HISTORY_CHANGED)
+    }
+}
+impl std::error::Error for HistoryChanged {}
+pub const HISTORY_CHANGED: &str = "history_changed";
 
 /// A `response.create` event: the request fields, the continuation if any,
 /// and the input. A socket message is whole, so the input is assembled here.
@@ -2435,6 +2468,12 @@ fn connection_error(error: reqwest::Error) -> Error {
     let mut os_code = None;
     let mut source = std::error::Error::source(&error);
     while let Some(cause) = source {
+        let io = cause
+            .downcast_ref::<std::io::Error>()
+            .and_then(|e| e.get_ref());
+        if cause.is::<HistoryChanged>() || io.is_some_and(|e| e.is::<HistoryChanged>()) {
+            return Error::new(HISTORY_CHANGED);
+        }
         chain.push_str(": ");
         chain.push_str(&cause.to_string());
         if os_code.is_none() {
@@ -4645,12 +4684,64 @@ mod tests {
         assert_eq!(len, prefix.len() + joined + 2);
     }
 
+    /// Items that read to another length than they were weighed at end
+    /// the request as `history_changed`, longer or shorter, before a body
+    /// goes that disagrees with its Content-Length.
+    #[tokio::test]
+    async fn items_read_to_another_length_end_the_request_as_history_changed() {
+        use tokio::io::AsyncReadExt;
+        let read = |claimed: usize| {
+            Items::new(claimed, || {
+                stream::iter([Ok(Bytes::from_static(b"{\"a\":1}"))]).boxed()
+            })
+        };
+        for claimed in [3, 12] {
+            let chunks: Vec<std::io::Result<Bytes>> =
+                framed(Bytes::from_static(b"{\"input\":["), &read(claimed))
+                    .collect()
+                    .await;
+            let error = chunks.into_iter().find_map(std::io::Result::err).unwrap();
+            assert_eq!(error.to_string(), HISTORY_CHANGED, "{claimed}");
+        }
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut sink = [0; 4096];
+            while socket.read(&mut sink).await.is_ok_and(|n| n > 0) {}
+        });
+        let provider =
+            Provider::new(Transport::new(0, 1).unwrap(), Family::Responses, &url, None).unwrap();
+        let tools = none();
+        let request = Request {
+            model: "m",
+            instructions: "",
+            reasoning: None,
+            tools: &tools,
+            allow_tool_calls: true,
+            output_schema: None,
+            web_search: false,
+            fallback_credit: None,
+            asker: Asker::Waits,
+            items: read(12),
+            chain: None,
+            route: None,
+            sent: None,
+            cache_key: None,
+        };
+        let error = provider
+            .complete(request, |_| async { Ok(()) })
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, HISTORY_CHANGED);
+    }
+
     /// An empty chunk would go out as an empty HTTP/2 DATA frame, which
     /// Bedrock answers by closing the connection. Every stream of the same
     /// items reads the same bytes, so a digest matches the body sent.
     #[tokio::test]
     async fn bodies_carry_no_empty_chunk_and_read_the_same_every_time() {
-        let items = Items::new(9, || {
+        let items = Items::new(8, || {
             stream::iter(
                 ["", "{\"a\":1}", "", ",", ""].map(|c| Ok(Bytes::from_static(c.as_bytes()))),
             )
@@ -4888,7 +4979,7 @@ mod tests {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://{}/v1", listener.local_addr().unwrap());
-        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let calls = Arc::new(AtomicUsize::new(0));
         let counted = calls.clone();
         tokio::spawn(async move {
             loop {

@@ -4406,6 +4406,21 @@ impl Turn {
                     return Ok(None);
                 }
             }
+            // The history it read changed while it went, as a repair of a
+            // history another bot shares changes it: read it again and send
+            // it at once.
+            if error.code == agent_runtime::provider::HISTORY_CHANGED && capped.is_none() {
+                self.retried(json!({"attempt":attempt,"error":error.code,
+                    "detail":error.detail,"delay_ms":0,"parked":true}))
+                    .await?;
+                accounting.call_attempts = attempt;
+                accounting.call_spent_ms = spent.as_millis() as u64;
+                accounting.call_fallback = fallback.as_ref().map(Fallback::parked);
+                accounting.parked_until = now_ms();
+                accounting.blocked = None;
+                accounting.backing_off = Some(error.code.clone());
+                return Ok(None);
+            }
             // Sent again at once, without the thinking or on the fallback
             // model, within the same attempt and time limits as any retry.
             if resend && capped.is_none() && attempt < cap && spent < RETRY_BUDGET {
