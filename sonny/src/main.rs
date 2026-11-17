@@ -16509,13 +16509,13 @@ impl App {
 
     /// The question in focus that sending `typed` answers: any words but
     /// a command, a line for the shell, or nothing; and a line for the
-    /// shell when the question is a step to run here ([`asks::runs_here`]).
+    /// shell when the question is a step to run here ([`asks::runs_here`]),
+    /// from its `!` on, as words are from their first letter.
     fn answers(&self, typed: &str) -> Option<&asks::Ask> {
         let typed = typed.trim_start();
         let ask = self.asking()?;
         let words = !typed.trim().is_empty() && !typed.starts_with(['/', '!']);
-        let runs = (typed.strip_prefix('!')).is_some_and(|command| !command.trim().is_empty())
-            && asks::runs_here(ask);
+        let runs = typed.starts_with('!') && asks::runs_here(ask);
         (words || runs).then_some(ask)
     }
 
@@ -23962,9 +23962,14 @@ mod tests {
         app.asks = vec![pick.clone()];
         app.input.set("!ls");
         assert!(app.answering_over(80).is_none());
-        // With a step to run in focus, it is that step, named over it as
-        // typed words are.
+        // With a step to run in focus, it is that step, named over it from
+        // the `!` on, as typed words are from their first letter.
         app.asks = vec![step.clone(), pick.clone()];
+        app.input.set("!");
+        assert_eq!(
+            app.answering_over(80).unwrap().to_string(),
+            "  answering “Sign in to the registry?” (1 of 2)"
+        );
         app.input.set("!echo signed in");
         assert_eq!(
             app.answering_over(80).unwrap().to_string(),

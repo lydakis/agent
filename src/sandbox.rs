@@ -639,69 +639,6 @@ fn judgeable(path: &str) -> bool {
     path.len() <= 4096 && !path.contains('\0')
 }
 
-/// The words of each command in a plain script, as bash reads them; `None`
-/// for anything else.
-pub(crate) fn commands(script: &str) -> Option<Vec<Vec<String>>> {
-    let mut commands = Vec::new();
-    let mut words = Vec::new();
-    let mut word: Option<String> = None;
-    let mut chars = script.chars().peekable();
-    while let Some(c) = chars.next() {
-        match c {
-            ' ' | '\t' => words.extend(word.take()),
-            '\n' | ';' | '&' | '|' => {
-                match c {
-                    // Alone, `&` puts a command in the background.
-                    '&' if chars.next_if_eq(&'&').is_none() => return None,
-                    '|' => drop(chars.next_if_eq(&'|')),
-                    _ => {}
-                }
-                words.extend(word.take());
-                if !words.is_empty() {
-                    commands.push(std::mem::take(&mut words));
-                }
-            }
-            '\'' => {
-                let word = word.get_or_insert_default();
-                loop {
-                    match chars.next()? {
-                        '\'' => break,
-                        c => word.push(c),
-                    }
-                }
-            }
-            '"' => {
-                let word = word.get_or_insert_default();
-                loop {
-                    match chars.next()? {
-                        '"' => break,
-                        '$' | '`' => return None,
-                        '\\' => match chars.next()? {
-                            '\n' => {}
-                            c @ ('"' | '\\' | '$' | '`') => word.push(c),
-                            c => word.extend(['\\', c]),
-                        },
-                        c => word.push(c),
-                    }
-                }
-            }
-            '\\' => match chars.next()? {
-                '\n' => {}
-                c => word.get_or_insert_default().push(c),
-            },
-            // A comment, which could hide what a reader of the call misses.
-            '#' if word.is_none() => return None,
-            '$' | '`' | '<' | '>' | '(' | ')' => return None,
-            c => word.get_or_insert_default().push(c),
-        }
-    }
-    words.extend(word);
-    if !words.is_empty() {
-        commands.push(words);
-    }
-    Some(commands)
-}
-
 /// Whether a path, `named` as spelled and `target` with links followed,
 /// lies outside every folder a bot in `mode` may write.
 fn outside(mode: Mode, writable: &[PathBuf], named: &Path, target: &Path) -> bool {
