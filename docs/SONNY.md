@@ -887,6 +887,17 @@ the agents listed with each one's status, the calls awaiting approval.
 
 ![The steps view: messages sent with send_message folded into one row, list_agents with each agent's status, and a check of approvals](sonny/agent-tools-verbose.png)
 
+They make and close agents with the daemon too: `spawn_agent` starts a
+plain agent in the caller's folder and project, with its first message,
+for a look, a review or a question asked in parallel, and `close_agent`
+closes one it made once its work is done, its history kept. Sonny draws
+`Started` with the agent's name and its first message under it, and
+`Closed`; an agent `spawn_agent` started is named on the `└` row under the
+reply, as a task is. A task that will change files still starts with
+`start_task`, which gives it a worktree of its own.
+
+![The steps view: a lead starting a reviewer with spawn_agent, then closing it with close_agent once its work is done](sonny/spawn-close-agent.png)
+
 ## Upgrading
 
 `sonny upgrade` brings Sonny and its daemon to the latest release, the way

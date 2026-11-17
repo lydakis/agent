@@ -36,6 +36,7 @@ pub fn attempted(verb: &str) -> String {
         "Checked" => "check",
         "Cleaned" => "clean",
         "Cleared" => "clear",
+        "Closed" => "close",
         "Discarded" => "discard",
         "Edited" => "edit",
         "Followed" => "follow",
@@ -1248,7 +1249,8 @@ pub fn declared(name: &str, arguments: &Value, failed: bool) -> Option<Said> {
 
 /// A call of the daemon's tools for other agents, said as the `agent` verbs
 /// they stand for are: the message sent and how it landed, the agents
-/// listed with each one's status, or the cord pulled and why.
+/// listed with each one's status, the cord pulled and why, or the agent
+/// started, with its first message, or closed.
 pub fn agents(name: &str, arguments: &Value, output: Option<&str>, failed: bool) -> Option<Said> {
     let reply: Option<Value> = output.and_then(|o| serde_json::from_str(o.trim()).ok());
     let mut said = Said {
@@ -1324,6 +1326,27 @@ pub fn agents(name: &str, arguments: &Value, output: Option<&str>, failed: bool)
                     Span::raw(format!(" {status}")).dim(),
                 ]));
             }
+        }
+        "spawn_agent" => {
+            said.verb = "Started".into();
+            // Its whole name, as the daemon made it.
+            said.what = reply
+                .as_ref()
+                .and_then(|r| r["name"].as_str())
+                .or_else(|| arguments["name"].as_str())?
+                .trim()
+                .to_owned();
+            if let Some(message) = arguments["message"]
+                .as_str()
+                .filter(|m| !m.trim().is_empty())
+            {
+                said.under
+                    .push(Line::from(first_line(message)).italic().dim());
+            }
+        }
+        "close_agent" => {
+            said.verb = "Closed".into();
+            said.what = arguments["name"].as_str()?.trim().to_owned();
         }
         "pause_agents" => {
             said.verb = "Paused every agent".into();
@@ -1815,6 +1838,31 @@ Keep the rest.'"#,
             ("Paused every agent", "emails going out")
         );
         assert_eq!(attempted(&said.verb), "Couldn't pause every agent");
+
+        // An agent started by its whole name, as the daemon made it, with
+        // its first message under it; one closed by the name given.
+        let made = json!({"name": "shop.review", "handle": "shop.review/1"}).to_string();
+        let said = agents(
+            "spawn_agent",
+            &json!({"name": "review", "message": "Look over the diff\nthen say"}),
+            Some(&made),
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            (
+                said.verb.as_str(),
+                said.what.as_str(),
+                text(&said.under[0]).as_str()
+            ),
+            ("Started", "shop.review", "Look over the diff")
+        );
+        let said = agents("close_agent", &json!({"name": "shop.review"}), None, false).unwrap();
+        assert_eq!(
+            (said.verb.as_str(), said.what.as_str(), said.under.len()),
+            ("Closed", "shop.review", 0)
+        );
+        assert_eq!(attempted(&said.verb), "Couldn't close");
         assert!(agents("wait", &json!({}), None, false).is_none());
     }
 
