@@ -95,10 +95,10 @@ Use `await tools.tool_search({query: "...", limit: 8})` for BM25-ranked discover
 /// here: the daemon runs each call as a step of the `exec` call, decided
 /// and recorded as the same call from the model would be.
 const DAEMON_TOOLS: &str = r#"# This agent's own tools
-Your shell and file tools are on `tools` too, and only there: `tools.shell`, `tools.read`, `tools.write`, `tools.edit`, `tools.apply_patch` and `tools.web_fetch`, as far as you have them. Each runs as its own call would, in your folder, under the same rules, sandbox and approvals, and resolves to a `CallToolResult` whose text is what the tool returns (`tools.shell`'s is JSON with `stdout`, `stderr` and `exit_code`); one that fails resolves with `isError: true`. A command runs in the foreground: no `background`, `detach` or `tty`. One runs at a time. `ALL_TOOLS` has their full declarations and descriptions.
+Your shell and file tools are on `tools` too, and only there: `tools.shell`, `tools.read`, `tools.write`, `tools.edit`, `tools.apply_patch` and `tools.web_fetch`, as far as you have them. Each runs as its own call would, in your folder, under the same rules, sandbox and approvals, and resolves to a `CallToolResult` whose text is what the tool returns (`tools.shell`'s is JSON with `stdout`, `stderr` and `exit_code`); one that fails resolves with `isError: true`. A command runs until it exits, unless its `timeout_ms` ends it, and the script's time stops meanwhile; with `background: true` it starts apart and resolves at once to its `proc:N` handle, which you `wait` on as a direct call's: hand the handle back with `text()`. No `detach` or `tty`. One runs at a time. `ALL_TOOLS` has their full declarations and descriptions.
 ```ts
 declare const tools: {
-  shell(args: { command: string; workdir?: string; timeout_ms?: number }): Promise<CallToolResult>;
+  shell(args: { command: string; workdir?: string; timeout_ms?: number; background?: boolean }): Promise<CallToolResult>;
   read(args: { path: string; offset?: number; limit?: number }): Promise<CallToolResult>;
   write(args: { path: string; content: string }): Promise<CallToolResult>;
   edit(args: { path: string; old: string; new: string; replace_all?: boolean }): Promise<CallToolResult>;

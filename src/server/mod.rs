@@ -5986,6 +5986,10 @@ impl Service {
                 if !arguments.is_object() {
                     return fail_with("invalid_step", "arguments must be an object");
                 }
+                // A script's command has no time of its own unless it names
+                // one: it cannot be handed back as a handle, and its call's
+                // time stops while it runs, so no clock kills it.
+                let bounded = arguments.get("timeout_ms").is_some();
                 let arguments = serde_json::to_string(&arguments)?;
                 if arguments.len() > ANSWER_BYTES {
                     return fail_with(
@@ -5996,16 +6000,21 @@ impl Service {
                 // Read as the call would be: a step that would not run as
                 // a foreground command, or that reads anything but a file,
                 // is refused before anything is recorded.
-                let prepared = self.registry.prepare(&tool, &arguments)?;
+                let mut prepared = self.registry.prepare(&tool, &arguments)?;
+                if let Prepared::Shell {
+                    timeout_ms,
+                    background: false,
+                    ..
+                } = &mut prepared
+                    && !bounded
+                {
+                    *timeout_ms = None;
+                }
                 match prepared {
-                    Prepared::Shell {
-                        background: true, ..
-                    }
-                    | Prepared::Detach { .. }
-                    | Prepared::Terminal { .. } => {
+                    Prepared::Detach { .. } | Prepared::Terminal { .. } => {
                         return fail_with(
                             "invalid_step",
-                            "a daemon step runs a command in the foreground: no background, detach or tty",
+                            "a daemon step runs a command in the foreground or the background: no detach or tty",
                         );
                     }
                     Prepared::Read {
