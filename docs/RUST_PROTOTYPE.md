@@ -3073,7 +3073,7 @@ command reaches another bot's. A request on it:
 
 | Request | On a bot's own socket |
 |---|---|
-| `configure`, `answer`, `tool_result`, `take_call`, `approve_step`, `step_result`, `serve_approvals`, `renew_approvals`, `lend`, `resume`, `retry_held`, `companions`, `shutdown` | `not_permitted`: any of them would let a confined command undo its confinement |
+| `configure`, `answer`, `tool_result`, `take_call`, `yield_call`, `approve_step`, `step_result`, `serve_approvals`, `renew_approvals`, `lend`, `resume`, `retry_held`, `companions`, `shutdown` | `not_permitted`: any of them would let a confined command undo its confinement |
 | `audit_trim` | `not_permitted`: the audit trail is the person's record of what agents did |
 | `create`, `fork` | Made by the caller, whatever `created_by` names (another is `not_permitted`), so the bot inherits its sandbox; its workspace and `writable` folders, and a fork's source's, must be ones the caller may write. A fork with `allow: []`, which only answers, may be of any bot |
 | `submit` | Reads as the caller's: `from` its turn when the request names it (the CLI does, from `AGENT_TURN`), else with its name as `origin`; `from` naming another bot is `not_permitted`. A workspace for a sandboxed bot must be one the caller may write |
@@ -3504,6 +3504,31 @@ than parked and woken again; parked, a steer resumes the turn only when the call
 lifts, and a step that starts waiting on a gate while a steer waits wakes
 it (or the live turn) then. Calls waiting for their approval, and `shell`
 commands, are lifted as before.
+
+Protocol version 84 lets the client hand such a call back itself, as
+Codex's `exec` yields a script still running at its `yield_time_ms`:
+`{"op":"yield_call","bot","turn","call_id","output"}`, `output` being what
+the call wrote so far, text or parts and bounded as a `tool_result`'s. The
+daemon lifts the call exactly as a message lifts it, in one commit, and the
+model reads `{"handle":"proc:N","background":true,"yielded":true,"output":
+TEXT}`, with the output's pictures after it; `call_lifted` says
+`"yielded":true`, and the reply names the handle. The turn goes on at once,
+live or parked. The daemon gains no timer: when to yield is the client's
+policy. A yielded call has no deadline (schema 105 marks its row `yielded`),
+so no `expires_ms` ends it: its answer, given later with `tool_result`,
+ends it and is told and collected as a lifted call's, pictures included;
+`wait` with `terminate`, or `write_stdin` with `kill`, stops it, and
+`lifted_ended` with `outcome: "stopped"` tells its client to stop the
+work. Its daemon steps run on, and what they kept stays readable until the
+call ends; a lifted call's steps keep theirs the same way. Only a waiting
+call of a tool declared `lift` yields: any other tool's is
+`call_not_liftable`, and one answered, lifted or out of time already is
+`no_pending_call`.
+
+Protocol version 84 also gives `wait` `terminate: true`: each handle,
+every one a `proc:N` (a `BOT/N` is `invalid_handle`), is stopped first as
+`write_stdin` with `kill` stops it, and the wait returns how each ended, as
+Codex's `wait` takes `terminate`.
 
 Protocol version 22 lets a declared tool take free-form text, as
 `apply_patch` does: a tool declared with `grammar`, a Lark grammar its

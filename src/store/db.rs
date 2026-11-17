@@ -2243,6 +2243,9 @@ pub enum CallAnswer {
         notify: Arc<Notify>,
         expires_ms: Option<u64>,
     },
+    /// Its client yielded it: its handle answers it, recorded by the
+    /// yield, and the call waits on as that command.
+    Yielded,
 }
 /// What a call a message lifted comes to, as [`Database::lifted_check`]
 /// finds it.
@@ -3362,7 +3365,7 @@ impl Database {
     /// before versioning, stores at versions 1 to 5 and stores from newer
     /// binaries are rejected; an older store from version 6 on is migrated
     /// forward, one version at a time, at open.
-    pub const SCHEMA: i32 = 104;
+    pub const SCHEMA: i32 = 105;
     /// The person's messages a compaction keeps verbatim, newest first:
     /// per-message text, and the total text plus `(ordinal, String)` entry
     /// metadata. Empty entries cost space too, so the retained list cannot
@@ -3650,7 +3653,7 @@ impl Database {
             CREATE TABLE IF NOT EXISTS answers(id INTEGER PRIMARY KEY AUTOINCREMENT, turn INTEGER NOT NULL REFERENCES turns(id),
                 call_id TEXT NOT NULL, tag TEXT NOT NULL, name TEXT NOT NULL, arguments TEXT NOT NULL,
                 expires_ms INTEGER NOT NULL, output TEXT, failed INTEGER NOT NULL DEFAULT 0, paused_ms INTEGER,
-                parts TEXT, taken_ms INTEGER, process INTEGER);
+                parts TEXT, taken_ms INTEGER, process INTEGER, yielded INTEGER NOT NULL DEFAULT 0);
             CREATE UNIQUE INDEX IF NOT EXISTS answers_call ON answers(turn,call_id);
             CREATE INDEX IF NOT EXISTS answers_waiting ON answers(tag,id) WHERE output IS NULL;
             CREATE INDEX IF NOT EXISTS answers_paused ON answers(turn) WHERE paused_ms IS NOT NULL;
@@ -9145,25 +9148,34 @@ impl Database {
     ) -> Result<(Bytes, Value)> {
         let bot = self.active(turn)?;
         let family = bot.family()?;
-        let (custom, name): (bool, Option<String>) = self
+        let (custom, name, lifted): (bool, Option<String>, bool) = self
             .conn
             .query_row(
-                "SELECT t.custom,a.name FROM tools t
+                "SELECT t.custom,a.name,a.process IS NOT NULL FROM tools t
                  LEFT JOIN answers a ON a.turn=t.turn AND a.call_id=t.call_id
                  WHERE t.turn=? AND t.call_id=?",
                 params![turn, call_id],
-                |r| Ok((r.get(0)?, r.get(1)?)),
+                |r| {
+                    Ok((
+                        r.get(0)?,
+                        r.get(1)?,
+                        r.get::<_, Option<bool>>(2)?.unwrap_or(false),
+                    ))
+                },
             )
             .optional()?
-            .unwrap_or((false, None));
+            .unwrap_or((false, None, false));
         let item =
             family.tool_result_item_with(call_id, custom, &outcome.output, &outcome.parts)?;
         // A call that takes steps lets its daemon steps' kept outputs go
-        // with its answer: the model never saw them.
-        let stepped = name
-            .as_deref()
-            .and_then(|name| bot.declared(name))
-            .is_some_and(|tool| tool.steps);
+        // with its answer: the model never saw them. A lifted call's handle
+        // is no answer: its script runs on and may page them, and they go
+        // when the call ends.
+        let stepped = !lifted
+            && name
+                .as_deref()
+                .and_then(|name| bot.declared(name))
+                .is_some_and(|tool| tool.steps);
         // Verdicts are for the round as planned: after a failure the gated
         // calls still to run are announced again, in this same commit.
         // Unless one of them lapsed while this call ran: a new request would
@@ -9692,18 +9704,19 @@ impl Database {
             return Ok(CallAnswer::Given(given));
         }
         #[allow(clippy::type_complexity)]
-        let (tag, expires_ms, output, failed, paused, parts): (
+        let (tag, expires_ms, output, failed, paused, parts, yielded): (
             String,
             i64,
             Option<String>,
             bool,
             bool,
             Option<String>,
+            bool,
         ) = self
             .conn
             .prepare_cached(
-                "SELECT tag,expires_ms,output,failed,paused_ms IS NOT NULL,parts FROM answers
-                 WHERE turn=? AND call_id=?",
+                "SELECT tag,expires_ms,output,failed,paused_ms IS NOT NULL,parts,yielded
+                 FROM answers WHERE turn=? AND call_id=?",
             )?
             .query_row(params![turn, call_id], |r| {
                 Ok((
@@ -9713,10 +9726,15 @@ impl Database {
                     r.get(3)?,
                     r.get(4)?,
                     r.get(5)?,
+                    r.get(6)?,
                 ))
             })
             .optional()?
             .ok_or(Error::new("invalid_tool_state"))?;
+        // Its answer, when it comes, is its command's.
+        if yielded {
+            return Ok(CallAnswer::Yielded);
+        }
         // A step waiting on a gate stops the call's time.
         let expires_ms = (!paused).then_some(expires_ms.max(0) as u64);
         Ok(match output {
@@ -9771,17 +9789,21 @@ impl Database {
         {
             return Ok(None);
         }
-        let (tag, expires_ms, paused): (String, i64, bool) = self
+        let (tag, expires_ms, paused, yielded): (String, i64, bool, bool) = self
             .conn
             .prepare_cached(
-                "SELECT tag,expires_ms,paused_ms IS NOT NULL FROM answers
+                "SELECT tag,expires_ms,paused_ms IS NOT NULL,yielded FROM answers
                  WHERE turn=? AND call_id=? AND output IS NULL",
             )?
             .query_row(params![turn, call_id], |r| {
-                Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
             })
             .optional()?
             .ok_or(Error::new("invalid_tool_state"))?;
+        // Yielded as the hold ran out: the turn goes on.
+        if yielded {
+            return Ok(None);
+        }
         // A step waiting on a gate stops the call's time: no deadline.
         let deadline_ms = (!paused).then_some(expires_ms.max(0) as u64);
         let wake_at = match (self.next_lapse(turn)?, deadline_ms) {
@@ -9848,6 +9870,77 @@ impl Database {
         self.call_ended(turn, call_id);
         Ok(answered)
     }
+    /// Hand `bot`'s answered call `call_id` of `turn` back to the model
+    /// while its client still runs it, with what it wrote so far: lifted
+    /// as a message lifts it ([`Database::lift`]), so the model reads its
+    /// handle, `yielded`, and `so_far`, and the call waits on its answer,
+    /// with no deadline, as that command. Only a call of a tool declared
+    /// `lift`. The handle answers the call with the yield: the reply names
+    /// it, and the turn waiting on the call is woken by `notify` while it
+    /// runs and by `resume` while it is parked.
+    pub fn yield_call(
+        &mut self,
+        bot: &str,
+        turn: i64,
+        call_id: &str,
+        so_far: &Outcome,
+        now_ms: u64,
+    ) -> Result<Answered> {
+        let owner: Option<(String, String)> = self
+            .conn
+            .query_row("SELECT bot,status FROM turns WHERE id=?", [turn], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+            .optional()?;
+        let Some((_, status)) = owner.filter(|(owner, _)| owner == bot) else {
+            return fail("turn_not_found");
+        };
+        if !matches!(status.as_str(), "running" | "waiting") {
+            return Err(Error::with(
+                "stale_turn",
+                format!("turn {turn} is {status}"),
+            ));
+        }
+        let name: Option<String> = self
+            .conn
+            .prepare_cached("SELECT name FROM answers WHERE turn=? AND call_id=?")?
+            .query_row(params![turn, call_id], |r| r.get(0))
+            .optional()?;
+        let Some(name) = name else {
+            return fail("no_pending_call");
+        };
+        let lifts = self
+            .inspect(bot)?
+            .declared(&name)
+            .is_some_and(|tool| tool.lift);
+        if !lifts {
+            return fail_with(
+                "call_not_liftable",
+                format!("{name} is not declared lift: only its answer ends the call"),
+            );
+        }
+        let Some((process, _)) = self.lift(turn, call_id, None, Some(so_far), now_ms)? else {
+            return fail_with(
+                "no_pending_call",
+                "the call was answered, moved to the background or ran out of time",
+            );
+        };
+        let notify = match status.as_str() {
+            "running" => self.live.get(&turn).map(|live| live.notify.clone()),
+            _ => None,
+        };
+        let resume = status == "waiting"
+            && self
+                .waiting(turn)?
+                .is_some_and(|w| w.answer.is_some() && w.call_id == call_id);
+        Ok(Answered {
+            reply: json!({"bot":bot,"turn":turn,"call_id":call_id,
+                "handle":format!("proc:{process}")}),
+            notify,
+            resume,
+            lifted: None,
+        })
+    }
     fn record_answer(
         &mut self,
         bot: &str,
@@ -9865,19 +9958,20 @@ impl Database {
         let Some((_, status)) = owner.filter(|(owner, _)| owner == bot) else {
             return fail("turn_not_found");
         };
-        type Call = (bool, Option<String>, i64, bool, Option<i64>);
+        type Call = (bool, Option<String>, i64, bool, Option<i64>, bool);
         let call: Option<Call> = self
             .conn
             .prepare_cached(
-                "SELECT a.output IS NOT NULL,t.status,a.expires_ms,a.paused_ms IS NOT NULL,a.process
+                "SELECT a.output IS NOT NULL,t.status,a.expires_ms,a.paused_ms IS NOT NULL,a.process,
+                     a.yielded
                  FROM answers a LEFT JOIN tools t ON t.turn=a.turn AND t.call_id=a.call_id
                  WHERE a.turn=? AND a.call_id=?",
             )?
             .query_row(params![turn, call_id], |r| {
-                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?))
             })
             .optional()?;
-        let Some((stored, tool, expires_ms, paused, process)) = call else {
+        let Some((stored, tool, expires_ms, paused, process, yielded)) = call else {
             if !matches!(status.as_str(), "running" | "waiting") {
                 return Err(Error::with(
                     "stale_turn",
@@ -9898,8 +9992,8 @@ impl Database {
             return fail_with("no_pending_call", "the call ended unanswered");
         }
         // Out of time is unserved, whenever the turn gets to say so. A step
-        // waiting on a gate stops the call's time.
-        if !paused && now_ms >= expires_ms.max(0) as u64 {
+        // waiting on a gate stops the call's time; a yielded call has none.
+        if !paused && !yielded && now_ms >= expires_ms.max(0) as u64 {
             return fail_with("no_pending_call", "the call ran out of time");
         }
         // The answer ends the call, and with it any step still waiting.
@@ -13081,14 +13175,14 @@ impl Database {
             .query_row(params![name, turn], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
             .optional()?;
         let now = epoch_ms().max(0) as u64;
-        // Parked on an answer: the answer, its deadline, or a later gated
-        // call's lapse resumes it.
+        // Parked on an answer: the answer, its client's yield, its
+        // deadline, or a later gated call's lapse resumes it.
         if let Some((_, status, Some(call_id))) = parked {
             let answer: Option<(String, bool, i64, bool)> = self
                 .conn
                 .prepare_cached(
-                    "SELECT name,output IS NOT NULL,expires_ms,paused_ms IS NOT NULL FROM answers
-                     WHERE turn=? AND call_id=?",
+                    "SELECT name,output IS NOT NULL OR yielded,expires_ms,paused_ms IS NOT NULL
+                     FROM answers WHERE turn=? AND call_id=?",
                 )?
                 .query_row(params![turn, call_id], |r| {
                     Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
@@ -13792,12 +13886,17 @@ impl Database {
     /// background command `proc:N`, which waits on past the turn, and its
     /// call is answered with that handle, in one commit. Verdicts the worker
     /// holds for it are written with it. `None` when it is decided or
-    /// answered already, or its time ran out: the turn takes it as it is.
+    /// answered already, lifted already, or its time ran out: the turn takes
+    /// it as it is. With `yielded`, its client's output so far, the client
+    /// yields an answered call the same way ([`Database::yield_call`]): the
+    /// handle says so and carries that output, and the call waits on its
+    /// answer with no deadline.
     pub fn lift(
         &mut self,
         turn: i64,
         call_id: &str,
         call: Option<&ToolCall>,
+        yielded: Option<&Outcome>,
         now_ms: u64,
     ) -> Result<Option<(i64, Option<u64>)>> {
         let bot = self.active(turn)?;
@@ -13806,6 +13905,8 @@ impl Database {
         }
         let request = self.request(turn, call_id)?;
         let (waits_for, lapse) = match &request {
+            // Only a call its client holds is its client's to yield.
+            Some(_) if yielded.is_some() => return Ok(None),
             Some(request)
                 if request.decided() || request.expires_ms().is_some_and(|at| now_ms >= at) =>
             {
@@ -13816,8 +13917,8 @@ impl Database {
                 let answer: Option<(bool, i64, bool)> = self
                     .conn
                     .prepare_cached(
-                        "SELECT output IS NULL,expires_ms,paused_ms IS NOT NULL FROM answers
-                         WHERE turn=? AND call_id=?",
+                        "SELECT output IS NULL AND process IS NULL,expires_ms,paused_ms IS NOT NULL
+                         FROM answers WHERE turn=? AND call_id=?",
                     )?
                     .query_row(params![turn, call_id], |r| {
                         Ok((r.get(0)?, r.get(1)?, r.get(2)?))
@@ -13827,7 +13928,9 @@ impl Database {
                     Some((true, expires_ms, paused))
                         if paused || now_ms < expires_ms.max(0) as u64 =>
                     {
-                        ("answer", (!paused).then_some(expires_ms.max(0) as u64))
+                        let lapse =
+                            (!paused && yielded.is_none()).then_some(expires_ms.max(0) as u64);
+                        ("answer", lapse)
                     }
                     Some(_) => return Ok(None),
                     None => return fail("invalid_tool_state"),
@@ -13875,16 +13978,17 @@ impl Database {
                 }
             } else {
                 self.conn
-                    .prepare_cached("UPDATE answers SET process=? WHERE turn=? AND call_id=?")?
-                    .execute(params![process, turn, call_id])?;
+                    .prepare_cached(
+                        "UPDATE answers SET process=?,yielded=? WHERE turn=? AND call_id=?",
+                    )?
+                    .execute(params![process, yielded.is_some(), turn, call_id])?;
             }
-            event(
-                &self.conn,
-                &bot.name,
-                Some(turn),
-                "call_lifted",
-                json!({"call_id":call_id,"handle":handle_of(process),"waits_for":waits_for}),
-            )?;
+            let mut lifted =
+                json!({"call_id":call_id,"handle":handle_of(process),"waits_for":waits_for});
+            if yielded.is_some() {
+                lifted["yielded"] = true.into();
+            }
+            event(&self.conn, &bot.name, Some(turn), "call_lifted", lifted)?;
             // The call's row in the audit trail ends with the command, not
             // with the handle that answers it now.
             let audit: Option<i64> = self
@@ -13894,11 +13998,23 @@ impl Database {
             self.conn
                 .prepare_cached("UPDATE tools SET audit=NULL WHERE turn=? AND call_id=?")?
                 .execute(params![turn, call_id])?;
-            let outcome = Outcome::text(
-                json!({"handle":handle_of(process),"background":true,"steered":true,
-                    "waits_for":waits_for})
-                .to_string(),
-            );
+            let outcome = match yielded {
+                None => Outcome::text(
+                    json!({"handle":handle_of(process),"background":true,"steered":true,
+                        "waits_for":waits_for})
+                    .to_string(),
+                ),
+                // What the client wrote so far, pictures too, as an answer
+                // carries them.
+                Some(so_far) => Outcome {
+                    parts: so_far.parts.clone(),
+                    ..Outcome::text(
+                        json!({"handle":handle_of(process),"background":true,"yielded":true,
+                            "output":so_far.output})
+                        .to_string(),
+                    )
+                },
+            };
             self.tool_finish(turn, call_id, &outcome)?;
             self.conn
                 .prepare_cached("UPDATE tools SET audit=? WHERE turn=? AND call_id=?")?
@@ -13952,7 +14068,8 @@ impl Database {
         )> = self
             .conn
             .prepare_cached(
-                "SELECT turn,call_id,tag,expires_ms,output,failed,paused_ms IS NOT NULL,parts
+                "SELECT turn,call_id,tag,expires_ms,output,failed,paused_ms IS NOT NULL OR yielded,
+                     parts
                  FROM answers INDEXED BY answers_lifted WHERE process=?",
             )?
             .query_row([process], |r| {
@@ -13968,7 +14085,9 @@ impl Database {
                 ))
             })
             .optional()?;
-        let Some((turn, call_id, tag, expires_ms, output, failed, paused, parts)) = answer else {
+        // No deadline while a step waits on a gate, or once its client
+        // yielded it.
+        let Some((turn, call_id, tag, expires_ms, output, failed, untimed, parts)) = answer else {
             return Ok(Lifted::Gone);
         };
         let (result, failed, outcome) = match output {
@@ -13981,14 +14100,14 @@ impl Database {
                 }
                 (answer, failed, "answered")
             }
-            None if !paused && now_ms >= expires_ms.max(0) as u64 => (
+            None if !untimed && now_ms >= expires_ms.max(0) as u64 => (
                 json!({"error":"tool_unserved","detail":format!("no answer from {tag} in time")}),
                 true,
                 "unserved",
             ),
             None => {
                 return Ok(Lifted::Waiting(
-                    (!paused).then_some(expires_ms.max(0) as u64),
+                    (!untimed).then_some(expires_ms.max(0) as u64),
                 ));
             }
         };
@@ -19307,6 +19426,23 @@ fn migrate_since_73(conn: &Connection, from: i32) -> Result<()> {
 
     if from < 104 {
         migrate_approval_holders(conn)?;
+    }
+
+    // Schema 105: a call its client yielded waits on its answer with no
+    // deadline.
+    // A store from before `answers` existed gets the column with the table.
+    if from < 105 {
+        let has: (bool, bool) = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='answers'),
+                    EXISTS(SELECT 1 FROM pragma_table_info('answers') WHERE name='yielded')",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?;
+        if has == (true, false) {
+            conn.execute_batch(
+                "ALTER TABLE answers ADD COLUMN yielded INTEGER NOT NULL DEFAULT 0;",
+            )?;
+        }
     }
 
     Ok(())

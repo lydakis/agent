@@ -244,9 +244,9 @@ impl Tool {
             ),
             Tool::Wait => (
                 "Suspend until every handle resolves, without holding any execution capacity. Handles are 'BOT/N' (a message sent to a peer agent, numbered as run gives it) or 'proc:N' (a background or detached shell, or a call a message moved to the background). Each result reports the outcome: for a message that opened a turn, that turn's status and final text, with before_steer, the last text it wrote before it was steered, when it ended on a reply to a steer; for one another turn took in, status taken and that turn's number, to wait on in turn; or a process's output and exit code.
- With timeout_ms, unresolved handles are reported as pending and stay valid for a later wait; 0 polls without waiting. With any: true, the first resolved handle ends the wait and the rest are reported pending. A steer ends the wait at once with steered=true: unresolved handles are reported pending and stay valid, so wait again to keep waiting.",
+ With timeout_ms, unresolved handles are reported as pending and stay valid for a later wait; 0 polls without waiting. With any: true, the first resolved handle ends the wait and the rest are reported pending. With terminate: true, every handle, each a proc:N, is stopped first, as write_stdin with kill=true stops it, and the wait returns how each ended. A steer ends the wait at once with steered=true: unresolved handles are reported pending and stay valid, so wait again to keep waiting.",
                 json!({"type":"object","properties":{"handles":{"type":"array","items":{"type":"string"},"minItems":1,"maxItems":64},
-                "timeout_ms":{"type":"integer","minimum":0,"maximum":MAX_WAIT_TIMEOUT_MS},"any":{"type":"boolean"}},
+                "timeout_ms":{"type":"integer","minimum":0,"maximum":MAX_WAIT_TIMEOUT_MS},"any":{"type":"boolean"},"terminate":{"type":"boolean"}},
                 "required":["handles"],"additionalProperties":false}),
             ),
         };
@@ -312,7 +312,9 @@ pub struct Declared {
     /// script say, or wait on a person. Left out, the call is answered
     /// first and the steer is taken at the next boundary, as Codex takes a
     /// message once the running tool returns. A call one of whose steps
-    /// waits on a gate is lifted either way, as a gated call is.
+    /// waits on a gate is lifted either way, as a gated call is. Its
+    /// client may also hand such a call back itself, with its output so
+    /// far (`yield_call`), as Codex's exec yields.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub lift: bool,
     /// What kind of tool it is, one of the audit trail's kinds, which its
@@ -1261,6 +1263,9 @@ pub enum Prepared {
         handles: Vec<String>,
         timeout_ms: Option<u64>,
         any: bool,
+        /// Each `proc:N` handle is stopped first, as `write_stdin` with
+        /// `kill` stops it, and the wait returns how it ended.
+        terminate: bool,
     },
     /// A page the daemon fetches.
     WebFetch(reqwest::Url),
@@ -1970,6 +1975,8 @@ impl Registry {
             timeout_ms: Option<u64>,
             #[serde(default)]
             any: bool,
+            #[serde(default)]
+            terminate: bool,
         }
         #[derive(Deserialize)]
         #[serde(deny_unknown_fields)]
@@ -2344,6 +2351,7 @@ impl Registry {
                     handles: args.handles,
                     timeout_ms: args.timeout_ms,
                     any: args.any,
+                    terminate: args.terminate,
                 }
             }
             Tool::Read => {
