@@ -7753,10 +7753,13 @@ impl Database {
             )
             .optional()?;
         if let Some((turn, mut saved, status, saved_options, node, saved_images, opened)) = prior {
-            // Words of 4 KiB or more live only in the node they became.
+            // Words of 4 KiB or more live only in the node they became,
+            // blank ones there as the placeholder Anthropic is sent.
+            let mut placed = false;
             if saved.is_empty()
                 && let Some(node) = node
             {
+                placed = true;
                 saved = self.conn.prepare_cached(
                     "SELECT json_extract(CAST(COALESCE((SELECT item FROM declined WHERE node=?1),item) AS TEXT),
                         '$.content[0].text') FROM nodes WHERE id=?1"
@@ -7794,7 +7797,11 @@ impl Database {
             } = &saved_options;
             let images = saved_images.map(|kept| pictures_digest(&kept));
             let differs = [
-                ("prompt", saved != prompt),
+                (
+                    "prompt",
+                    saved != prompt
+                        && !(placed && saved == crate::codec::EMPTY && crate::codec::blank(prompt)),
+                ),
                 ("workspace", *workspace != same.workspace),
                 ("model", *model != same.model),
                 ("effort", *effort != same.effort),

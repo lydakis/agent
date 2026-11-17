@@ -190,19 +190,14 @@ impl Family {
             Family::Responses => json!({"type":"input_text","text":text}),
             Family::Anthropic => json!({"type":"text","text":text}),
         };
-        // A blank part is left out, as Anthropic refuses one; blank words
-        // read `<empty>` there, so the item still has its first part.
-        let words = match self {
-            Family::Anthropic if blank(text) => EMPTY,
-            _ => text,
+        // Anthropic refuses a blank part: blank words read `<empty>`
+        // there, each part kept in its place, where quotes find theirs.
+        let words = |text: &str| match self {
+            Family::Anthropic if blank(text) => EMPTY.to_owned(),
+            _ => text.to_owned(),
         };
-        let mut content = vec![part(words)];
-        content.extend(
-            after
-                .iter()
-                .filter(|text| !blank(text))
-                .map(|text| part(text)),
-        );
+        let mut content = vec![part(&words(text))];
+        content.extend(after.iter().map(|text| part(&words(text))));
         content.extend(images.iter().map(|image| self.image(image)));
         Ok(serde_json::to_vec(
             &json!({"role":"user","content":content}),
@@ -636,6 +631,22 @@ mod tests {
         assert!(split_model("/model").is_err());
         assert!(split_model("bad name/model").is_err());
     }
+    #[test]
+    fn a_blank_part_reads_empty_for_claude_in_its_place() {
+        let after = ["  ".to_owned(), "quoted".to_owned()];
+        let item = |family: Family| -> Value {
+            serde_json::from_slice(&family.user_item_from("\u{200b}", &after, &[]).unwrap())
+                .unwrap()
+        };
+        let texts = |item: Value| -> Vec<String> {
+            (item["content"].as_array().unwrap().iter())
+                .map(|part| part["text"].as_str().unwrap().to_owned())
+                .collect()
+        };
+        assert_eq!(texts(item(Family::Anthropic)), [EMPTY, EMPTY, "quoted"]);
+        assert_eq!(texts(item(Family::Responses)), ["\u{200b}", "  ", "quoted"]);
+    }
+
     #[test]
     fn text_of_only_whitespace_or_invisible_characters_is_blank() {
         for text in [

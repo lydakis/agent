@@ -13409,6 +13409,19 @@ fn fork_prompt_views_survive_source_deletion_and_reopen() {
                 db.append(turn, vec![item], &[], None).unwrap();
                 db.finish(turn, None).unwrap();
             }
+            // The blank prompt sent again is the same request, though a
+            // Claude bot's item holds the placeholder in its place.
+            let again = db
+                .begin(
+                    "Bob",
+                    "2",
+                    "",
+                    true,
+                    &TurnOptions::default(),
+                    allow_provider,
+                )
+                .unwrap();
+            assert!(!again.fresh);
             let plan = compaction_plan(&db, "Bob", 1, 4096, 256).unwrap().unwrap();
             assert_eq!(plan.covered, (1, 3));
             expected = prompts[..3]
