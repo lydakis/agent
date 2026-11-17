@@ -16,6 +16,7 @@ from bench.runtime_client import node_item
 from bench.socket_client import SocketClient
 from bench.targets import clean_env
 from tests.test_images import image
+from tests.test_lookout import untimed
 from tests.test_runtime import ModelFixture
 
 
@@ -758,7 +759,7 @@ for (let i = 0; ; i++) await agent(`say ${i}`)
         # Each post names the project its author is named in.
         self.assertEqual([json.loads(line)['project'] for line in thread], ['calc', 'shop'])
         # The lookout tells calc.a of the reply, and shop.b nothing of its own.
-        note = self.note_for('calc.a', 'Confirmed here too.')
+        note = untimed(self.note_for('calc.a', 'Confirmed here too.'))
         self.assertIn('[commons · fake-home · shop.b]\nreply in fake-home, "Live tests want a fake HOME": '
                       'Confirmed here too.', note)
         for t in self.daemon.request('turns', bot='shop.b')['result']['turns']:

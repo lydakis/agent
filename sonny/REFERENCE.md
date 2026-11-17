@@ -1739,7 +1739,7 @@ has each lead follow its tasks. As things happen, it tells the lead every
 message someone else wrote in its tasks, each turn's end with the task's
 reply, a question or approval waiting on you, and a margin note, in one
 note at a time beside what the sources it follows said, each event under
-a `[source · topic · from]` line, as a steer: the note joins the lead's
+a `[source · topic · from · time]` line, as a steer: the note joins the lead's
 running turn, or starts one, and the lead decides what matters. A turn a note started that ends with
 nothing to say stays folded under the note, with no sound. Any agent can
 follow more with its `follows` tool (other agents' tasks, bots
