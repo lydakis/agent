@@ -654,7 +654,7 @@ pub(crate) mod tests {
         // Hidden from every tool already, though no call has taken it yet.
         assert_eq!(
             credentials.redact("second refresh-second".into()),
-            "[REDACTED] [REDACTED]"
+            "[redacted by agent] [redacted by agent]"
         );
         // The next use takes it from the file, with no second exchange.
         assert_eq!(login.current(&client).await.unwrap().token, "second");
@@ -700,7 +700,7 @@ pub(crate) mod tests {
         assert!(saved.expires() > SystemTime::now() + Duration::from_secs(3000));
         assert_eq!(
             credentials.redact("first second refresh-second".into()),
-            "[REDACTED] [REDACTED] [REDACTED]"
+            "[redacted by agent] [redacted by agent] [redacted by agent]"
         );
         std::fs::remove_dir_all(dir).unwrap();
     }
