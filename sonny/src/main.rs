@@ -4450,8 +4450,16 @@ struct App {
     replay: Option<(String, usize)>,
     /// How to reach the daemon again when the connection drops.
     options: Options,
-    /// The lead's connection dropped.
-    down: bool,
+    /// When the lead's connection dropped, while it is down: the status
+    /// row's phase until it is back.
+    down: Option<Instant>,
+    /// This agent's messages waiting for a turn of their own, by number:
+    /// while no turn runs, its turn has not started, the `Queued` phase.
+    in_line: Vec<i64>,
+    /// Since when no turn has run with a message in line.
+    in_line_since: Option<Instant>,
+    /// A compaction asked for and not yet run, which the footer says.
+    compact_next: bool,
     /// The background switched, or the view did: the conversation is
     /// drawn again once idle.
     repaint: bool,
@@ -6348,7 +6356,10 @@ impl App {
             thought: String::new(),
             replay: None,
             options,
-            down: false,
+            down: None,
+            in_line: Vec::new(),
+            in_line_since: None,
+            compact_next: record["compaction_requested"] == true,
             repaint: false,
             stale: false,
             links_written: screen::Written::default(),
@@ -6669,7 +6680,7 @@ impl App {
                 continue;
             }
             tokio::select! {
-                event = events.recv(), if !self.down => {
+                event = events.recv(), if self.down.is_none() => {
                     changed = true;
                     heard = Instant::now();
                     match event {
@@ -7338,6 +7349,7 @@ impl App {
     /// What the footer and pickers show of the bot, from its record.
     /// A changed model replaces the one this window's turns run on.
     fn refresh(&mut self, record: &Value, model: bool) {
+        self.compact_next = record["compaction_requested"] == true;
         if model
             && let (Some(provider), Some(model)) =
                 (record["provider"].as_str(), record["model"].as_str())
@@ -7668,8 +7680,10 @@ impl App {
         self.ahead.clear();
         self.said.clear();
         self.replay = None;
-        self.notice = Some("reconnecting to the daemon".into());
-        self.down = true;
+        // The phase says it, until it is back; a notice of before
+        // happened before it.
+        self.notice = None;
+        self.down.get_or_insert_with(Instant::now);
         self.retry.get_or_insert_with(Instant::now);
     }
 
@@ -7702,7 +7716,7 @@ impl App {
                 .map_err(|e| e.to_string())?;
             Ok::<_, String>((client, fresh, record, caught))
         };
-        if self.down {
+        if self.down.is_some() {
             let (client, fresh, record, caught) = match lead.await {
                 Ok(back) => back,
                 Err(error) if error == UPGRADED => {
@@ -7712,7 +7726,7 @@ impl App {
                     return;
                 }
                 Err(error) => {
-                    self.notice = Some(format!("reconnecting to the daemon: {error}"));
+                    self.notice = Some(format!("the daemon did not answer: {error}"));
                     self.retry = Some(Instant::now() + Duration::from_secs(2));
                     return;
                 }
@@ -7720,8 +7734,11 @@ impl App {
             self.paused = caught.paused(&client);
             self.client = client;
             *events = fresh;
-            self.down = false;
+            self.down = None;
             self.notice = None;
+            // A compaction asked for may have run, or been asked for, while
+            // away: the record says which.
+            self.compact_next = record["compaction_requested"] == true;
             // What happened while away is not known turn by turn: a kept
             // done window stays open from here on, as any other.
             self.kept.showing = false;
@@ -10869,6 +10886,17 @@ impl App {
                 None => break,
             }
         }
+        // What waits for a turn of its own, as the daemon has it now: one
+        // taken or ended while this window was away is gone from it.
+        self.in_line = (waiting.iter())
+            .filter(|row| matches!(row["status"].as_str(), Some("queued" | "ready")))
+            .filter_map(|row| row["message"].as_i64())
+            .collect();
+        if self.in_line.is_empty() {
+            self.in_line_since = None;
+        } else if self.running.is_none() {
+            self.in_line_since.get_or_insert_with(Instant::now);
+        }
         let mut staged = Vec::new();
         for row in &waiting {
             let Some(message) = row["message"].as_i64() else {
@@ -11208,6 +11236,39 @@ impl App {
         }
     }
 
+    /// This agent's messages that wait for a turn of their own, kept from
+    /// its events: in line from `queued`, out once a turn takes one
+    /// (`accepted`, `steered`) or it ends unrun (`message_ended`). While
+    /// no turn runs and one waits, the agent is queued.
+    fn keep_line(&mut self, kind: &str, event: &Value) {
+        let message = event["message"].as_i64();
+        match kind {
+            "queued" if matches!(event["data"]["status"].as_str(), Some("queued" | "ready")) => {
+                if let Some(message) = message
+                    && !self.in_line.contains(&message)
+                {
+                    self.in_line.push(message);
+                }
+            }
+            "accepted" | "message_ended" => {
+                let taken = message.or(event["turn"].as_i64());
+                self.in_line.retain(|waits| Some(*waits) != taken);
+            }
+            "steered" => {
+                let taken = event["data"]["message"].as_i64();
+                self.in_line.retain(|waits| Some(*waits) != taken);
+            }
+            // What waits behind the turn that ended waits from now.
+            "turn_finished" => self.in_line_since = Some(Instant::now()),
+            _ => {}
+        }
+        if self.in_line.is_empty() {
+            self.in_line_since = None;
+        } else if self.running.is_none() {
+            self.in_line_since.get_or_insert_with(Instant::now);
+        }
+    }
+
     async fn daemon(&mut self, event: Value) {
         let kind = event["event"].as_str().unwrap_or("");
         // Every agent's, not this one's: told to every client.
@@ -11243,6 +11304,9 @@ impl App {
             self.staged
                 .retain(|(staged, _)| Some(*staged) != data["message"].as_i64());
         }
+        // So is a message waiting for its own turn: the line is kept
+        // whether or not the node is drawn again.
+        self.keep_line(kind, &event);
         if drawn && matches!(kind, "steered" | "message" | "tool_completed") {
             return;
         }
@@ -11305,10 +11369,6 @@ impl App {
             }
             "accepted" => {
                 self.staged.retain(|(staged, _)| Some(*staged) != turn);
-                // What waited in line is running now.
-                if self.notice.as_deref() == Some("queued") {
-                    self.notice = None;
-                }
                 self.end_live(Words::Reply);
                 self.live_item = None;
                 self.ahead.clear();
@@ -11398,14 +11458,12 @@ impl App {
                     self.answered(&text(item), item["from"].as_str());
                 }
             }
-            // An attached note whose wait ran out goes as a steer: the
-            // sender's, nothing the person put in line.
-            "queued" if data["lapsed"] == true => {}
-            // A steer behind the running turn joins it at its next call,
-            // the person's own marked `↪` where it waits: only a message
-            // waiting for a turn of its own says so, until one starts.
-            "queued" if data["status"] == "queued" && data["delivery"] == "steer" => {}
-            "queued" => self.notice = Some("queued".to_owned()),
+            // A message in line says nothing on the status row, which is
+            // about the turn: the person's own waits drawn above it, `›⋯`
+            // or `›↪`, and anyone else's is named by `↳` once its turn
+            // starts. A turn that has not started is the phase, `Queued`
+            // ([`App::keep_line`]).
+            "queued" => {}
             // Nothing until a call takes it in: it asks nothing of the
             // person, so nothing says it waits.
             "attached" => {}
@@ -11579,12 +11637,19 @@ impl App {
                 if let Some(running) = &mut self.running {
                     running.phase = "Compacting".into();
                 }
+                // The phase says it now: what was asked for runs.
+                self.compact_next = false;
             }
+            // Asked from another window or the CLI: the footer says so here
+            // too, until it runs.
+            "compaction_requested" => self.compact_next = true,
             "compacted" => {
+                self.compact_next = false;
                 self.compacted = Some(data.clone());
                 self.notice = Some("compacted the conversation".into());
             }
             "compaction_failed" => {
+                self.compact_next = false;
                 self.notice = Some(format!(
                     "compaction failed: {}",
                     data["error"]
@@ -13132,18 +13197,17 @@ impl App {
         });
     }
 
+    /// `/compact`, once the person said yes: until it runs, the footer
+    /// says it waits, a state the notice would lose to the next one.
     async fn compact(&mut self) {
-        self.notice = Some(
-            match self
-                .client
-                .request("compact", json!({"bot": self.bot}))
-                .await
-            {
-                Ok(_) if self.running.is_some() => "compacts at its next step".into(),
-                Ok(_) => "compacts before its next reply".into(),
-                Err(error) => format!("compact: {error}"),
-            },
-        );
+        match self
+            .client
+            .request("compact", json!({"bot": self.bot}))
+            .await
+        {
+            Ok(_) => self.compact_next = true,
+            Err(error) => self.notice = Some(format!("compact: {error}")),
+        }
     }
 
     /// The slash commands the input could be, while it is one word that
@@ -18364,7 +18428,7 @@ impl App {
             linked.extend(self.screen.link_cells(frame.buffer_mut()));
             let [live, status, gap, composer, pad, footer] = areas(view, live_rows);
             frame.render_widget(Paragraph::new(open_rows.clone()), live);
-            let status_line = self.status_line();
+            let status_line = self.status_row(status.width as usize);
             // The agents it names open them, as their names do anywhere.
             let parked: Vec<(String, String)> = (self.paused.as_ref())
                 .and_then(|pause| pause["parked"]["bots"].as_array())
@@ -19038,7 +19102,30 @@ impl App {
         (rows, (row, col))
     }
 
+    #[cfg(test)]
     fn status_line(&self) -> Line<'static> {
+        self.status_row(usize::MAX)
+    }
+
+    /// The status row, `width` wide: what happens now, the first that
+    /// applies of a pause, an approval, the agent's turn or its phase
+    /// without one, and a notice.
+    fn status_row(&self, width: usize) -> Line<'static> {
+        // Upgraded under it, the window reconnects no more: reopening it
+        // is all there is to do, and the row says so alone.
+        if self.upgraded {
+            return Line::from(Span::raw(UPGRADED));
+        }
+        // The connection is the phase until it is back: what the window
+        // knows of the turn, a pause or an approval is from before.
+        if let Some(down) = self.down {
+            let phase = Phase {
+                said: "Reconnecting to the daemon".into(),
+                since: down,
+                running: false,
+            };
+            return self.running_row(phase, Vec::new(), width);
+        }
         // A pause holds every approved call too, so it is shown first, and
         // the approval keys wait for the resume.
         if let Some(pause) = &self.paused {
@@ -19121,36 +19208,27 @@ impl App {
             ],
         };
         if let Some(running) = self.running.as_ref().filter(|_| !self.zen_hides()) {
-            let mut spans = vec![Span::raw("• ").dim()];
             // In zen, what it runs or calls stays out of view, as its calls do.
-            let phase = match running.phase.split_once(' ') {
+            let said = match running.phase.split_once(' ') {
                 Some(("Running" | "Calling", _)) if self.zen.is_some() => "Working",
                 _ => running.phase.as_str(),
             };
-            spans.extend(shimmer(phase, self.started.elapsed()));
-            // What is written steers it on Enter; Tab keeps it for after.
-            let queues = match self.input.trim().is_empty() {
-                true => "",
-                false => " • tab to queue",
+            let phase = Phase {
+                said: said.to_owned(),
+                since: running.started,
+                running: true,
             };
-            spans.push(
-                Span::raw(format!(
-                    " ({} • esc to interrupt{queues})",
-                    transcript::elapsed(running.started.elapsed().as_secs())
-                ))
-                .dim(),
-            );
-            if !aside.is_empty() {
-                spans.push(Span::raw(" · ").dim());
-                spans.extend(aside);
-            }
-            // What the turn said meanwhile (a retry, the round limit, a
-            // steer that failed), which its end clears.
-            if let Some(notice) = &self.notice {
-                spans.push(Span::raw(" · ").dim());
-                spans.push(Span::raw(notice.clone()));
-            }
-            return Line::from(spans);
+            return self.running_row(phase, aside, width);
+        }
+        // No turn runs and a message waits for one of its own: its turn
+        // has not started, the agent's state `queued`.
+        if let Some(since) = self.in_line_since.filter(|_| !self.in_line.is_empty()) {
+            let phase = Phase {
+                said: "Queued".into(),
+                since,
+                running: false,
+            };
+            return self.running_row(phase, aside, width);
         }
         if !aside.is_empty() {
             return Line::from(aside);
@@ -19159,6 +19237,59 @@ impl App {
             Some(notice) => Line::from(Span::raw(notice.clone())),
             None => Line::default(),
         }
+    }
+
+    /// The running row, `width` wide, in its four parts and only those:
+    /// the phase, the time and keys in brackets, what the person set
+    /// aside, one notice. Too long, the notice goes first, then
+    /// `tab to queue`, then the command after `Running` is cut at a word;
+    /// the time and `esc to interrupt` stay.
+    fn running_row(&self, phase: Phase, aside: Vec<Span<'static>>, width: usize) -> Line<'static> {
+        let time = transcript::elapsed(phase.since.elapsed().as_secs());
+        // What is written steers it on Enter; Tab keeps it for after.
+        let mut queues = phase.running && !self.input.trim().is_empty();
+        let mut notice = self.notice.clone();
+        let keys = |queues: bool| match (phase.running, queues) {
+            (false, _) => format!(" ({time})"),
+            (true, false) => format!(" ({time} • esc to interrupt)"),
+            (true, true) => format!(" ({time} • esc to interrupt • tab to queue)"),
+        };
+        let aside_width: usize = match aside.is_empty() {
+            true => 0,
+            false => 3 + aside.iter().map(|span| span.width()).sum::<usize>(),
+        };
+        let rest = |queues: bool, notice: &Option<String>| {
+            2 + keys(queues).width()
+                + aside_width
+                + notice.as_ref().map_or(0, |notice| 3 + notice.width())
+        };
+        let mut said = phase.said.clone();
+        if rest(queues, &notice) + said.width() > width {
+            notice = None;
+        }
+        if rest(queues, &notice) + said.width() > width {
+            queues = false;
+        }
+        if let Some(command) = said.strip_prefix("Running ")
+            && rest(queues, &notice) + said.width() > width
+        {
+            let room = width.saturating_sub(rest(queues, &notice) + "Running ".len());
+            said = format!("Running {}", cut_at_word(command, room));
+        }
+        let mut spans = vec![Span::raw("• ").dim()];
+        spans.extend(shimmer(&said, self.started.elapsed()));
+        spans.push(Span::raw(keys(queues)).dim());
+        if !aside.is_empty() {
+            spans.push(Span::raw(" · ").dim());
+            spans.extend(aside);
+        }
+        // What happened in the turn meanwhile (a retry, the round limit, a
+        // steer that failed), which its end clears.
+        if let Some(notice) = notice {
+            spans.push(Span::raw(" · ").dim());
+            spans.push(Span::raw(notice));
+        }
+        Line::from(spans)
     }
 
     /// A message quoted before what the person is writing, as a mail or a
@@ -19285,14 +19416,35 @@ impl App {
         if let Some(speed) = self.pace {
             waits.push(format!("{speed} speed"));
         }
-        if !waits.is_empty() {
-            let waits = waits.join(" · ");
+        // A compaction asked for waits for the agent's next model call,
+        // in a turn or the next one.
+        let compacts = match self.running.is_some() {
+            true => "compacts at its next step",
+            false => "compacts before its next reply",
+        };
+        let forms = match (waits.is_empty(), self.compact_next) {
+            (true, false) => Vec::new(),
+            (true, true) => vec![compacts.to_owned(), "compacts next".to_owned()],
+            (false, compact) => {
+                let waits = waits.join(" · ");
+                let then = |more: &str| match compact {
+                    true => format!("{more} · {compacts}"),
+                    false => more.to_owned(),
+                };
+                let short = match compact {
+                    true => format!("{waits} · compacts next"),
+                    false => waits.clone(),
+                };
+                vec![then(&format!("{waits} when idle")), short]
+            }
+        };
+        if !forms.is_empty() {
             items.push(Item::new(
                 Slot::Pending,
-                vec![
-                    vec![Span::raw(format!("{waits} when idle")).dim()],
-                    vec![Span::raw(waits).dim()],
-                ],
+                forms
+                    .into_iter()
+                    .map(|form| vec![Span::raw(form).dim()])
+                    .collect(),
             ));
         }
         // A lead or task told more than its seat's own role says so.
@@ -19759,6 +19911,31 @@ fn status_keys(watch: &Watch, folding: bool) -> String {
 }
 
 /// Codex's sweep: a brighter band moving across the phase every two seconds.
+/// What the running row names: the phase in words, since when, and
+/// whether a turn runs, which `esc` interrupts.
+struct Phase {
+    said: String,
+    since: Instant,
+    running: bool,
+}
+
+/// `text` cut to `room` columns at a word, with `…` after it; whole when
+/// it fits, and `…` alone when not one word does.
+fn cut_at_word(text: &str, room: usize) -> String {
+    if text.width() <= room {
+        return text.to_owned();
+    }
+    let room = room.saturating_sub(1);
+    let mut kept = String::new();
+    for word in text.split_inclusive(' ') {
+        if (kept.clone() + word).trim_end().width() > room {
+            break;
+        }
+        kept.push_str(word);
+    }
+    format!("{}…", kept.trim_end())
+}
+
 fn shimmer(text: &str, since: Duration) -> Vec<Span<'static>> {
     let chars: Vec<char> = text.chars().collect();
     let period = chars.len() as f32 + 20.0;
@@ -24232,11 +24409,25 @@ mod tests {
             (8, "d".into()),
         ];
         app.queued = vec![7, 8];
+        app.in_line = vec![5, 8];
         app.restage().await;
         // Its words as this window kept them; a note the lookout sent is
         // not the person's, so it is not staged.
         assert_eq!(app.staged, [(7, "c".to_owned())]);
         assert_eq!(app.queued, [7]);
+        // What waits for a turn of its own is what waits now, anyone's:
+        // no turn runs, so its turn has not started.
+        assert_eq!(app.in_line, [7, 9]);
+        assert!(app.status_line().to_string().starts_with("• Queued ("));
+    }
+
+    #[tokio::test]
+    async fn a_window_upgraded_under_it_says_to_reopen_it_and_nothing_else() {
+        let mut app = app(daemon_with(json!([])).await);
+        app.dropped();
+        app.notice = Some(UPGRADED.to_owned());
+        app.upgraded = true;
+        assert_eq!(app.status_row(40).to_string(), UPGRADED);
     }
 
     #[tokio::test]
@@ -24329,9 +24520,12 @@ mod tests {
         app.daemon(queued(6, json!({"status": "queued", "delivery": "steer"})))
             .await;
         assert_eq!(app.staged.len(), 1);
+        assert!(app.in_line.contains(&6));
         app.daemon(turn_event("steered", 1, json!({"message": 6, "node": 12})))
             .await;
         assert!(app.staged.is_empty());
+        // Nor waiting in line, so the row never says `Queued` for it.
+        assert!(!app.in_line.contains(&6));
     }
 
     #[tokio::test]
@@ -25625,59 +25819,157 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_steer_into_the_running_turn_says_nothing_on_its_line() {
+    async fn the_row_never_says_queued_for_a_message_and_a_turn_not_started_is_the_phase() {
         let client = daemon_with(json!([])).await;
         let mut app = app(client);
-        app.daemon(turn_event("accepted", 1, json!({}))).await;
-        // A task's update, a lookout note, the person's own Enter: each
-        // joins the turn at its next call, and the turn takes it in.
-        app.daemon(turn_event(
-            "queued",
-            2,
-            json!({"status": "queued", "delivery": "steer", "from": "b.task"}),
-        ))
-        .await;
+        let queued = |message: i64, data: Value| json!({"event": "queued", "bot": "b", "turn": null, "message": message, "data": data});
+        app.daemon(json!({"event": "accepted", "bot": "b", "turn": 1, "message": 1, "data": {}}))
+            .await;
+        // A task's update, a lookout note, the person's own Enter or Tab,
+        // an automation's run: none says `queued` while a turn runs.
+        for (message, data) in [
+            (
+                2,
+                json!({"status": "queued", "delivery": "steer", "from": "b.task"}),
+            ),
+            (
+                3,
+                json!({"status": "queued", "delivery": "queue", "origin": "automation"}),
+            ),
+            (4, json!({"status": "queued", "delivery": "queue"})),
+        ] {
+            app.daemon(queued(message, data)).await;
+            assert_eq!(app.notice, None);
+            let row = app.status_line().to_string();
+            assert!(row.starts_with("• Working ("), "{row}");
+            assert!(!row.contains("queued") && !row.contains("Queued"), "{row}");
+        }
+        // The steer joins the turn; two wait for turns of their own.
         app.daemon(turn_event(
             "steered",
             1,
             json!({"message": 2, "node": null}),
         ))
         .await;
-        assert_eq!(app.notice, None, "nothing waits for a turn of its own");
-        assert!(!app.status_line().to_string().contains("queued"));
-        // A turn of its own after this one says it waits, until it starts.
-        app.daemon(turn_event(
-            "queued",
-            3,
-            json!({"status": "queued", "delivery": "queue", "origin": "automation"}),
-        ))
-        .await;
-        assert!(app.status_line().to_string().ends_with(" · queued"));
+        assert_eq!(app.in_line, [3, 4]);
         app.daemon(turn_event(
             "turn_finished",
             1,
             json!({"status": "completed"}),
         ))
         .await;
-        app.daemon(turn_event("accepted", 3, json!({}))).await;
-        assert!(!app.status_line().to_string().contains("queued"));
-        // At rest, a message waiting for a slot says so too, and its
-        // turn's start lets it go.
+        // No turn runs and one waits: its turn has not started.
+        let row = app.status_line().to_string();
+        assert!(row.starts_with("• Queued (") && row.ends_with(')'), "{row}");
+        assert!(
+            !row.contains("esc to interrupt"),
+            "nothing runs to interrupt"
+        );
+        app.daemon(json!({"event": "accepted", "bot": "b", "turn": 3, "message": 3, "data": {}}))
+            .await;
+        assert!(app.status_line().to_string().starts_with("• Working ("));
         app.daemon(turn_event(
             "turn_finished",
             3,
             json!({"status": "completed"}),
         ))
         .await;
-        app.daemon(turn_event(
-            "queued",
-            4,
-            json!({"status": "ready", "delivery": "steer"}),
-        ))
+        assert!(app.status_line().to_string().starts_with("• Queued ("));
+        // One that ends unrun leaves the line.
+        app.daemon(
+            json!({"event": "message_ended", "bot": "b", "turn": null, "message": 4,
+            "data": {"status": "failed"}}),
+        )
         .await;
-        assert_eq!(app.notice.as_deref(), Some("queued"));
-        app.daemon(turn_event("accepted", 4, json!({}))).await;
+        assert_eq!(app.status_line().to_string(), "");
+        // At rest, waiting for a slot, it is the phase from the start.
+        app.daemon(queued(5, json!({"status": "ready", "delivery": "steer"})))
+            .await;
         assert_eq!(app.notice, None);
+        assert!(app.status_line().to_string().starts_with("• Queued ("));
+    }
+
+    #[tokio::test]
+    async fn a_compaction_asked_for_waits_in_the_footer_not_the_notice() {
+        let client = daemon_answering(|_| json!({"duplicate": false})).await;
+        let mut app = app(client);
+        app.compact().await;
+        assert_eq!(app.notice, None);
+        let footer = app.footer_line(200).to_string();
+        assert!(
+            footer.contains("compacts before its next reply"),
+            "{footer}"
+        );
+        // A notice after it leaves it where it is, as it still waits.
+        app.notice = Some("copied".into());
+        assert!(
+            app.footer_line(200)
+                .to_string()
+                .contains("compacts before its next reply")
+        );
+        app.daemon(turn_event("compacted", 2, json!({}))).await;
+        assert!(!app.footer_line(200).to_string().contains("compacts"));
+        assert_eq!(app.notice.as_deref(), Some("compacted the conversation"));
+        // Asked from elsewhere, said here too.
+        app.daemon(json!({"event": "compaction_requested", "bot": "b", "running_turn": null}))
+            .await;
+        assert!(
+            app.footer_line(200)
+                .to_string()
+                .contains("compacts before its next reply")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_dropped_connection_is_the_phase_until_it_is_back() {
+        let mut app = app(daemon_with(json!([])).await);
+        app.notice = Some("copied".into());
+        app.dropped();
+        assert_eq!(app.notice, None);
+        let row = app.status_line().to_string();
+        assert!(
+            row.starts_with("• Reconnecting to the daemon (") && row.ends_with(')'),
+            "{row}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_running_row_too_long_drops_the_notice_then_tab_then_cuts_the_command() {
+        let mut app = app(daemon_with(json!([])).await);
+        app.running = Some(Running {
+            turn: 1,
+            started: Instant::now(),
+            phase: "Running cargo test --workspace --all-features".into(),
+            note: false,
+            effort: None,
+            acted: false,
+        });
+        app.input.set("also the docs");
+        app.notice = Some("the model retried; its reply may repeat".into());
+        let row = |app: &App, width: usize| app.status_row(width).to_string();
+        let whole = row(&app, usize::MAX);
+        assert_eq!(
+            whole,
+            "• Running cargo test --workspace --all-features (0s • esc to interrupt \
+             • tab to queue) · the model retried; its reply may repeat"
+        );
+        // The notice goes first.
+        assert_eq!(
+            row(&app, whole.width() - 1),
+            "• Running cargo test --workspace --all-features (0s • esc to interrupt • tab to queue)"
+        );
+        // Then `tab to queue`.
+        assert_eq!(
+            row(&app, 80),
+            "• Running cargo test --workspace --all-features (0s • esc to interrupt)"
+        );
+        // Then the command, at a word; the time and esc stay.
+        assert_eq!(
+            row(&app, 60),
+            "• Running cargo test --workspace… (0s • esc to interrupt)"
+        );
+        assert_eq!(row(&app, 44), "• Running cargo… (0s • esc to interrupt)");
+        assert_eq!(row(&app, 30), "• Running … (0s • esc to interrupt)");
     }
 
     #[tokio::test]

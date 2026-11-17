@@ -5463,7 +5463,7 @@ fn fire(places: &Places, trigger: &Trigger, ask: Option<&Asked>) {
         if durable["last"]["ask"] == ask.name() {
             return;
         }
-        let outcome = with_daemon(trigger, async |client| {
+        let outcome = with_daemon_after(trigger, &CONNECT_AGAIN, async |client| {
             deliver(client, places, trigger, &mut kept, RUN_NOW, Some(ask)).await
         });
         let (Ok(outcome) | Err(outcome)) = outcome;
@@ -5624,10 +5624,18 @@ fn fire(places: &Places, trigger: &Trigger, ask: Option<&Asked>) {
     if ended(self::now()) {
         return ends_now(&kept);
     }
-    let outcome = with_daemon(trigger, async |client| {
-        deliver(client, places, trigger, &mut kept, &why, ask).await
+    // Asked again once connected: the connects tried again may have waited
+    // past its `--until`.
+    let outcome = with_daemon_after(trigger, &CONNECT_AGAIN, async |client| {
+        if ended(self::now()) {
+            return None;
+        }
+        Some(deliver(client, places, trigger, &mut kept, &why, ask).await)
     });
-    let (Ok(outcome) | Err(outcome)) = outcome;
+    let outcome = match outcome {
+        Ok(None) => return ends_now(&kept),
+        Ok(Some(outcome)) | Err(outcome) => outcome,
+    };
     settle(places, trigger, &named(outcome), &kept);
 }
 
@@ -5765,14 +5773,61 @@ fn until_resumed(trigger: &Trigger) {
     }
 }
 
+/// How long a fire waits before each further connect to a daemon that was
+/// busy or not up yet ([`busy`]): about half a minute in all, so a fire at
+/// the top of the hour, when the daemon is briefly busy, still goes out.
+const CONNECT_AGAIN: [std::time::Duration; 3] = [
+    std::time::Duration::from_secs(5),
+    std::time::Duration::from_secs(10),
+    std::time::Duration::from_secs(15),
+];
+
+/// Whether a connect failed on a daemon that is busy or not up yet, which
+/// a later connect may reach.
+fn busy(error: &str) -> bool {
+    let code = error.split_once(": ").map_or(error, |(code, _)| code);
+    matches!(
+        code,
+        "daemon_ready_timeout" | "daemon_connect_timeout" | "daemon_unavailable"
+    )
+}
+
+/// `attempt`, again after each of `waits` while it fails as [`busy`]; its
+/// last failure as it came.
+async fn patiently<T>(
+    waits: &[std::time::Duration],
+    mut attempt: impl AsyncFnMut() -> Result<T, String>,
+) -> Result<T, String> {
+    for wait in waits {
+        match attempt().await {
+            Err(error) if busy(&error) => tokio::time::sleep(*wait).await,
+            done => return done,
+        }
+    }
+    attempt().await
+}
+
 /// `f` with the trigger's daemon; why not, as a failed outcome, when it
 /// cannot be reached or serves another store.
 fn with_daemon<T>(trigger: &Trigger, f: impl AsyncFnOnce(&Client) -> T) -> Result<T, Value> {
+    with_daemon_after(trigger, &[], f)
+}
+
+/// [`with_daemon`], connecting again after each of `waits` while the
+/// daemon is [`busy`]. Only the connect is tried again: `f`, which may
+/// send, runs once.
+fn with_daemon_after<T>(
+    trigger: &Trigger,
+    waits: &[std::time::Duration],
+    f: impl AsyncFnOnce(&Client) -> T,
+) -> Result<T, Value> {
     let failed = |detail: String| json!({"outcome": "failed", "detail": detail});
     let runtime = runtime().map_err(failed)?;
     runtime.block_on(async {
         let socket = trigger.daemon.socket().map_err(failed)?;
-        let client = connect(&socket, &trigger.daemon).await.map_err(failed)?;
+        let client = patiently(waits, async || connect(&socket, &trigger.daemon).await)
+            .await
+            .map_err(failed)?;
         // The socket may now be another store's daemon's; its bot ids are its own.
         if client.store() != Some(trigger.store_id.as_str()) {
             client.close().await;
@@ -5861,6 +5916,100 @@ pub(crate) mod tests {
         let prompt = submit["prompt"].as_str().unwrap();
         assert!(prompt.starts_with("[automation (ended) · "), "{prompt}");
         assert!(prompt.ends_with(" · turn 4 it sent calc.lead failed: provider_error]"));
+    }
+
+    #[test]
+    fn a_fire_connects_again_while_its_daemon_is_busy() {
+        // About half a minute in all, in longer waits.
+        let total: std::time::Duration = CONNECT_AGAIN.iter().sum();
+        assert_eq!(total, std::time::Duration::from_secs(30));
+        assert!(CONNECT_AGAIN.is_sorted());
+        let waits = [std::time::Duration::ZERO; 3];
+        let runtime = runtime().unwrap();
+        // Busy twice, then up: the third connect is the one the fire uses.
+        let mut tries = 0;
+        let connected = runtime.block_on(patiently(&waits, async || {
+            tries += 1;
+            match tries {
+                1 => Err("daemon_ready_timeout: ".to_owned()),
+                2 => Err("daemon_connect_timeout: ".to_owned()),
+                _ => Ok(tries),
+            }
+        }));
+        assert_eq!(connected, Ok(3));
+        // Busy every time: four connects, and the last failure is the fire's.
+        let mut tries = 0;
+        let failed = runtime.block_on(patiently(&waits, async || {
+            tries += 1;
+            Err::<(), _>(format!("daemon_unavailable: try {tries}"))
+        }));
+        assert_eq!(failed, Err("daemon_unavailable: try 4".to_owned()));
+        // Any other failure is not tried again.
+        let mut tries = 0;
+        let failed = runtime.block_on(patiently(&waits, async || {
+            tries += 1;
+            Err::<(), _>("daemon_protocol_mismatch: newer".to_owned())
+        }));
+        assert_eq!((failed.is_err(), tries), (true, 1));
+    }
+
+    #[test]
+    fn a_fire_whose_daemon_stays_unreachable_fails_as_before_and_one_that_sent_is_not_sent_again() {
+        use std::io::{BufRead, Write};
+        let dir = std::env::temp_dir().join(format!("sonny-busy-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let socket = dir.join("agent.sock");
+        let s = Trigger {
+            daemon: Daemon {
+                store: None,
+                socket: Some(socket.clone()),
+            },
+            ..trigger()
+        };
+        let waits = [std::time::Duration::ZERO; 3];
+        // No daemon at all: the failure is recorded as it was, and nothing ran.
+        let mut ran = false;
+        let outcome = with_daemon_after(&s, &waits, async |_| ran = true).unwrap_err();
+        assert_eq!(outcome["outcome"], "failed");
+        let detail = outcome["detail"].as_str().unwrap();
+        assert!(detail.starts_with("daemon_unavailable: "), "{detail}");
+        assert!(!ran);
+        // A daemon that takes the send and then fails it with a busy code:
+        // one connect, one send, and the failure is the fire's.
+        let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        let counts = std::sync::Arc::new((
+            std::sync::atomic::AtomicUsize::new(0),
+            std::sync::atomic::AtomicUsize::new(0),
+        ));
+        let seen = counts.clone();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let stream = stream.unwrap();
+                seen.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let mut write = stream.try_clone().unwrap();
+                let ready = json!({"event": "ready", "protocol": agent_client::PROTOCOL,
+                    "store": {"lineage": "00ab"}});
+                writeln!(write, "{ready}").unwrap();
+                for line in std::io::BufReader::new(stream).lines() {
+                    let asked: Value = serde_json::from_str(&line.unwrap()).unwrap();
+                    seen.1.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    let answer = json!({"id": asked["id"], "error": "daemon_ready_timeout"});
+                    writeln!(write, "{answer}").unwrap();
+                }
+            }
+        });
+        let sent = with_daemon_after(&s, &waits, async |client| {
+            client
+                .request("submit", json!({"bot": "p.fix-login"}))
+                .await
+        })
+        .unwrap();
+        assert_eq!(sent.unwrap_err().code, "daemon_ready_timeout");
+        let connects = counts.0.load(std::sync::atomic::Ordering::SeqCst);
+        let sends = counts.1.load(std::sync::atomic::Ordering::SeqCst);
+        assert_eq!((connects, sends), (1, 1));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
