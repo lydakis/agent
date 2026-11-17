@@ -2,7 +2,7 @@
 //! them as its `rules` setting, Codex's execpolicy as data
 //! ([`agent_client::rules`]); reading rules files, and in which language,
 //! is the client's. A script's commands are read as bash reads them
-//! ([`crate::sandbox::commands`]): each plain command on its own, and
+//! ([`agent_client::rules::commands`]): each plain command on its own, and
 //! anything else matches no rule.
 use crate::Error;
 pub use agent_client::rules::{Decision, Matched, Policy, Verdict};
@@ -10,7 +10,7 @@ pub use agent_client::rules::{Decision, Matched, Policy, Verdict};
 /// What `policy` says of `script`, a shell call's command. A script that
 /// isn't plain matches nothing.
 pub fn check(policy: &Policy, script: &str) -> Verdict {
-    match crate::sandbox::commands(script).filter(|c| !c.is_empty()) {
+    match agent_client::rules::commands(script).filter(|c| !c.is_empty()) {
         Some(commands) => policy.verdict(&commands),
         None => Verdict::default(),
     }

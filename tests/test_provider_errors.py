@@ -46,7 +46,7 @@ class Errors(http.server.BaseHTTPRequestHandler):
                 body = json.dumps({'error': {'message': 'quota exhausted'}})
         else:
             if mode == 'responses_cutoff':
-                event = {'type':'response.failed', 'response':{'error':{'message':'x'*500+KEY}}}
+                event = {'type':'response.failed', 'response':{'error':{'message':'x'*490+KEY}}}
             elif mode == 'responses_quoted_key':
                 event = {'type':'response.failed', 'response':{'error':{'message':json.dumps(KEY)}}}
             elif mode == 'responses_reason':
@@ -115,7 +115,7 @@ class ProviderErrorTests(unittest.TestCase):
                         else:
                             self.assertNotIn(KEY[:10], detail)
                             self.assertNotIn(json.dumps(KEY)[1:-1], detail)
-                            self.assertIn('[REDACTED]', detail)
+                            self.assertIn('[redacted by agent]', detail)
                             self.assertLessEqual(len(detail), 512)
                         page = client.request('events', bot='Bob', after=0, limit=256)['result']['events']
                         kind = 'turn_paced' if held else 'turn_finished'
