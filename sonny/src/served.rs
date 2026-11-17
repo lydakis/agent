@@ -273,7 +273,7 @@ fn follows() -> Value {
         "name": FOLLOWS,
         "description": "Your follows in the person's lookout, which tells you what happens in what you \
             follow, in a message sent by lookout that joins your running turn or starts one: each event a \
-            line [source · topic · from], then its text. A follow watches the tasks of an agent (every agent it or \
+            line [source · topic · from · time], then its text. A follow watches the tasks of an agent (every agent it or \
             its tasks made) or agents by name, through the tasks source, each agent its topic: messages others \
             write in them, the person's quoted, questions to the person, calls awaiting their approval, margin \
             notes put or removed, and each turn's end with its reply. It also hears the sources the person set up outside, each \
@@ -502,8 +502,13 @@ pub fn commons() -> Value {
             "properties": {
                 "read": {"type": "string", "minLength": 1,
                     "description": "A thread's name: its posts, as many as fit, with next where the rest start."},
-                "search": {"type": "string", "minLength": 1,
-                    "description": "Words: threads whose title or posts hold all of them, newest first, with those posts."},
+                "search": {"type": "string",
+                    "description": "Words: threads whose title or posts hold all of them, newest first, with those posts; \
+                        none, with a filter, every post it matches."},
+                "filter": {"type": "object",
+                    "description": "Narrows the listing to threads whose first post it matches, or a search to the \
+                        posts it matches: an event pattern as the follows tool takes one, on a post's by, by_id, at \
+                        (epoch seconds), model, project, sonny, external and title, as {\"project\": [\"shop\"]}."},
                 "from": {"type": "integer", "minimum": 0,
                     "description": "Where to start, as an earlier answer's next says: a post with read, else a thread of the listing."},
                 "post": {
@@ -880,12 +885,17 @@ async fn called(name: &str, arguments: &Value) -> Answer {
                     .and_then(|id| id.parse().ok())
                     .or(caller_id),
             );
+            // The project the agent is named in, as its tasks are: only a
+            // post or a reply writes it, so a read asks no one.
+            let project = (arguments["post"].is_object() || arguments["reply"].is_object())
+                .then(|| Line::of(&caller, &here).project);
             let mut said = crate::commons::call(
                 &home,
                 &caller,
                 caller_id,
                 &reader,
                 model.as_deref(),
+                project.as_deref(),
                 arguments,
             )
             .map_err(|e| ("commons_refused", e))?;
@@ -1104,7 +1114,7 @@ impl Line {
 }
 
 /// The project a lead leads, else the name up to its first dot.
-fn project_of(bot: &str) -> String {
+pub fn project_of(bot: &str) -> String {
     match crate::project::lead_project(bot) {
         Some(project) => project.to_owned(),
         None => bot

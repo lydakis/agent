@@ -120,6 +120,10 @@ pub enum Mark {
     /// The first row of a message, whatever its lead: a reply that opens
     /// with a heading has no bullet to say so.
     Opens,
+    /// A hint hung over a message, right above its first row: the words
+    /// view's `↳` naming who started its turn. The message's time goes on
+    /// the empty row over it, as over a message without one.
+    Over,
     /// The lead the row's rows past its first start with when it is
     /// wrapped narrower than it was written, as [`Screen::push_hanging`]
     /// gives one: a bar down a card's side goes on down its rows.
@@ -160,6 +164,8 @@ struct Row {
     buttons: Buttons,
     /// It is a message's first row.
     opens: bool,
+    /// It is a hint over the message under it ([`Mark::Over`]).
+    over: bool,
     /// The project bar down its first column, by slot.
     bar: Option<u8>,
 }
@@ -173,6 +179,7 @@ impl Row {
             tag: None,
             buttons: Vec::new(),
             opens: false,
+            over: false,
             bar: None,
         }
     }
@@ -183,6 +190,7 @@ impl Row {
             Mark::Link(url) => self.link = Some(url),
             Mark::Buttons(buttons) => self.buttons = buttons,
             Mark::Opens => self.opens = true,
+            Mark::Over => self.over = true,
             Mark::Hangs(rest) => self.rest = Some(rest),
             Mark::Bar(slot) => self.bar = Some(slot),
         }
@@ -302,6 +310,9 @@ pub const REACT: &str = "☺";
 struct Hovered {
     /// Its first row in `shown`.
     first: usize,
+    /// The first row in `shown` of the hint hung over it, the `↳`, when
+    /// it has one; else its first row.
+    top: usize,
     /// Its node.
     node: i64,
     /// Its last row in `rows`, the one tagged [`Tag::End`].
@@ -795,6 +806,12 @@ impl Screen {
         self.rows.iter().map(|row| row.bar).collect()
     }
 
+    /// Whether each row is a hint hung over the message under it.
+    #[cfg(test)]
+    pub fn overs(&self) -> Vec<bool> {
+        self.rows.iter().map(|row| row.over).collect()
+    }
+
     /// Where each row's link goes, if it has one.
     #[cfg(test)]
     pub fn links(&self) -> Vec<Option<String>> {
@@ -1068,6 +1085,7 @@ impl Screen {
             tag: None,
             buttons: Vec::new(),
             opens: false,
+            over: false,
             bar: None,
         });
         self.swap(0, rows.collect());
@@ -1238,6 +1256,7 @@ impl Screen {
                     tag: None,
                     buttons: Vec::new(),
                     opens: false,
+                    over: false,
                     bar: None,
                 }),
             );
@@ -1875,7 +1894,10 @@ impl Screen {
         self.react = None;
         let hovered = self.hovered();
         if let Some(Hovered {
-            first: at, node, ..
+            first: at,
+            top: over,
+            node,
+            ..
         }) = hovered
             && (top..bottom).contains(&at)
         {
@@ -1885,12 +1907,13 @@ impl Screen {
                 .set_style(Style::new().add_modifier(Modifier::DIM));
             self.reply = Some((y, area.x, node));
             // Its handle and when it was written, muted, at the top right
-            // edge of the message: the right end of the row over it, only
-            // a row on screen with nothing on it, the gap over an agent's
-            // words or the band's over the person's, so the mark never
-            // covers anything and no row is made wider.
-            if at > top
-                && self.shown[at - 1].line.width() == 0
+            // edge of the message: the right end of the row over it, and
+            // over the `↳` hung over it when it has one, only a row on
+            // screen with nothing on it, the gap over an agent's words or
+            // the band's over the person's, so the mark never covers
+            // anything and no row is made wider.
+            if over > top
+                && self.shown[over - 1].line.width() == 0
                 && let Some(written) = self.dates.get(&node)
             {
                 let when = (written.handle.iter().cloned())
@@ -1902,7 +1925,7 @@ impl Screen {
                 if area.width > 2 * GUTTER + wide {
                     buf.set_string(
                         area.x + area.width - GUTTER - wide,
-                        y - 1,
+                        area.y + (over - 1 - top) as u16,
                         when,
                         Style::new().add_modifier(Modifier::DIM),
                     );
@@ -1998,8 +2021,15 @@ impl Screen {
         if start > row {
             return None;
         }
+        let first = *firsts.get(start)?;
+        // A hint hung over it is its too: its time goes over the hint.
+        let top = match start.checked_sub(1) {
+            Some(over) if self.rows[over].over => *firsts.get(over)?,
+            _ => first,
+        };
         Some(Hovered {
-            first: *firsts.get(start)?,
+            first,
+            top,
             node,
             end,
             mine: lead(&self.rows[start]) == "› ",
@@ -2886,6 +2916,64 @@ mod tests {
             row(&buf, 1),
             format!("{:>38}  ", format!("calc.fix/48 · {when}"))
         );
+    }
+
+    #[test]
+    fn a_message_with_its_hints_shows_its_time_on_the_empty_row_over_its_arrow_row() {
+        let mut screen = Screen::default();
+        screen.push(vec![Line::from("› fix it")]);
+        screen.mark_last(Mark::Tag(Tag::End(4)));
+        // Who started its turn over it, what it set going under it.
+        screen.push(vec![Line::default(), Line::from("↳ calc.fix")]);
+        screen.mark_last(Mark::Over);
+        screen.push(vec![Line::from("• Fixed the rounding.")]);
+        screen.mark_last(Mark::Opens);
+        screen.push(vec![Line::from("  Both cases pass.")]);
+        screen.mark_last(Mark::Tag(Tag::End(5)));
+        screen.push(vec![Line::from("└ started ◌ readme")]);
+        screen.mark_last(Mark::Tag(Tag::SetGoing(0)));
+        screen.push(vec![Line::default(), Line::from("› thanks")]);
+        screen.mark_last(Mark::Tag(Tag::End(6)));
+        let ms = 1_794_042_780_000;
+        for node in [4, 5, 6] {
+            screen.date(node, ms);
+        }
+        let when = crate::stamp::written(ms);
+        let draw = |screen: &mut Screen, area: Rect| {
+            let mut buf = Buffer::empty(area);
+            screen.render(area, &mut buf, |_| None);
+            buf
+        };
+        let area = Rect::new(0, 0, 40, 8);
+        // Over the reply, on either of its rows: its time on the blank row
+        // over its `↳`, the arrow row and its words left as they are.
+        for y in [3, 4] {
+            screen.mouse(mouse(MouseEventKind::Moved, 6, y));
+            let buf = draw(&mut screen, area);
+            assert_eq!(row(&buf, 1), format!("{when:>38}  "), "at {y}");
+            assert!(buf[(37, 1)].modifier.contains(Modifier::DIM));
+            assert_eq!(row(&buf, 2).trim_end(), "↳ calc.fix");
+            assert!(row(&buf, 3).starts_with("↩ Fixed the rounding."));
+            assert_eq!(row(&buf, 5).trim_end(), "└ started ◌ readme");
+            assert!(
+                (0..8)
+                    .filter(|&y| y != 1)
+                    .all(|y| !row(&buf, y).contains(&when))
+            );
+        }
+        // The message under the `└` row keeps its own over it.
+        screen.mouse(mouse(MouseEventKind::Moved, 6, 7));
+        let buf = draw(&mut screen, area);
+        assert_eq!(row(&buf, 6), format!("{when:>38}  "));
+        assert_eq!(row(&buf, 5).trim_end(), "└ started ◌ readme");
+        // Scrolled so the `↳` row is the first on screen: nothing over it
+        // is shown, so no time, and none on the arrow row.
+        let area = Rect::new(0, 0, 40, 6);
+        screen.mouse(mouse(MouseEventKind::Moved, 6, 1));
+        let buf = draw(&mut screen, area);
+        assert_eq!(row(&buf, 0).trim_end(), "↳ calc.fix");
+        assert!(row(&buf, 1).starts_with("↩ Fixed the rounding."));
+        assert!((0..6).all(|y| !row(&buf, y).contains(&when)));
     }
 
     #[test]

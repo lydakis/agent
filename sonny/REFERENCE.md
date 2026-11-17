@@ -776,7 +776,8 @@ copy of the quote is its words alone.
 ![Two replies quoted and sent: both fold onto the one bar over the words](../docs/sonny/reply-quote-fold-several.png)
 
 The message under the mouse also says when it was written, muted, at
-its top right edge, the right end of the empty row over it:
+its top right edge, the right end of the empty row over it (over the
+`↳` row naming who started its turn, when it has one):
 `Sat 7 Nov 09:13`, the
 year too when it is not this one, on the 12-hour clock where your
 locale's time format (`LC_TIME`) reads that way, `Sat 7 Nov 9:13 AM`.
@@ -786,6 +787,8 @@ rest, no line is made wider for it, and where the row over the words
 has something on it, or is off the screen, no time shows.
 
 ![When a message was written, over it under the mouse](../docs/sonny/message-time.png)
+
+![A reply's time over the ↳ row naming who started its turn](../docs/sonny/message-time-over-came-row.png)
 
 ## Commands
 
@@ -944,13 +947,19 @@ has something on it, or is off the screen, no time shows.
   name stays in the sandbox, as the name's `allow` rules never let it out); Codex's
   `network_rule` is refused, since a sandbox's network is on or off. A
   file that doesn't read keeps the rules last read, or, with none read
-  yet, has every command refused with where it went wrong. When you
-  approve a plain command that asked to leave, `a` (always allow `cargo test`) adds the rule, and every agent
-  takes it from its next turn: Sonny reads the folder again when a file
-  in it changes. The rules hold for every folder, so a
-  program named from the folder it runs in (`./build.sh`) is never
-  offered, nor, as in Codex, a shell, an interpreter or a wrapper
-  (`bash`, `python3`, `timeout`), which runs whatever follows it. Agents
+  yet, has every command refused with where it went wrong. When a
+  command asks to leave, `a` always allows the prefix its agent proposed
+  with it (`prefix_rule`, as Codex's agents do), such as `a always allow
+  cargo test`, when that prefix allows every command of the call and no
+  rule names any of them yet; else, as in Codex, the call's first command
+  no rule names, whole. It adds the rule, and every agent takes it from
+  its next turn: Sonny reads the folder again when a file in it changes.
+  As in Codex, none is offered while a rule asks about the call, nor
+  Codex's banned suggestions (a shell or an interpreter alone, such as
+  `bash` or `python3`, or `git` or `rm` alone), nor for a script that
+  isn't plain, which no rule matches. The rules hold for every folder, so
+  a program named from the folder it runs in (`./build.sh`) is never
+  offered either. Agents
   can't write the rules folder from their sandbox, and
   an agent another made goes by its maker's rules.
 
@@ -1026,9 +1035,11 @@ has something on it, or is off the screen, no time shows.
 
   ![The same approval set aside with Esc: the composer types again and the row says it still waits](../docs/sonny/approval-aside.png)
 
-  ![An approval prompt offering to always allow cargo test](../docs/sonny/permissions-always.png)
+  ![An approval offering a always allow gh pr checks, the prefix the agent proposed for gh pr checks 12 --json 'name,state'](../docs/sonny/permissions-always.png)
 
-  ![The call allowed, and cargo test outside the sandbox from now on](../docs/sonny/permissions-allowed.png)
+  ![The call allowed, and gh pr checks outside the sandbox from now on](../docs/sonny/permissions-allowed.png)
+
+  ![With no prefix proposed for an install and a test run, the first command whole: a always allow python3 -m pip install -q 'pytest>=8'](../docs/sonny/permissions-always-first.png)
 - `/retry` lists the calls the reviewer denied while Sonny watched, with
   the reason for each. Enter writes the call out whole and asks once
   (`Allow one retry of shell? It can't be undone.`); Enter again sends
@@ -1728,7 +1739,7 @@ has each lead follow its tasks. As things happen, it tells the lead every
 message someone else wrote in its tasks, each turn's end with the task's
 reply, a question or approval waiting on you, and a margin note, in one
 note at a time beside what the sources it follows said, each event under
-a `[source · topic · from]` line, as a steer: the note joins the lead's
+a `[source · topic · from · time]` line, as a steer: the note joins the lead's
 running turn, or starts one, and the lead decides what matters. A turn a note started that ends with
 nothing to say stays folded under the note, with no sound. Any agent can
 follow more with its `follows` tool (other agents' tasks, bots
@@ -2188,7 +2199,7 @@ whatever link or path leads there), `modified('state.json')` (when it
 last changed, none while it is not there, refused as `file()` is), `tasks()` and `task('NAME')`
 (where its tasks stand, as `/status` reads them), `now()`, and `| ago`
 and `| time` for a time in seconds; Jinja's own filters, such as
-`selectattr`, `sort` and `tojson`, work as well, and so do Python's
+`selectattr`, `sort`, `truncate` and `tojson`, work as well, and so do Python's
 methods on strings, lists and maps, such as `file('x.py').splitlines()`
 to pick out the lines that matter. A blank never runs a command or reaches the network, so an agent
 that wants something no source covers writes it to a file from its own
