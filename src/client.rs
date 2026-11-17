@@ -1271,8 +1271,11 @@ fn spawn_daemon(
     for folder in agent_client::OWN_COPIES {
         command.arg("--own-copy").arg(folder);
     }
-    if let Some(config) = agent_client::ssh_config() {
-        command.arg("--ssh-config").arg(config);
+    for (file, first) in agent_client::own_copy_files() {
+        let mut value = file.into_os_string();
+        value.push("=");
+        value.push(first);
+        command.arg("--own-copy-file").arg(value);
     }
     // Sonny reads its bots' command rules from here.
     if let Some(rules) = agent_client::config::rules() {

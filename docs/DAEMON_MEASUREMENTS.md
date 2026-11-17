@@ -10578,8 +10578,8 @@ idle RSS was the same (15.0 to 17.0 MiB on both) and per idle bot 1.61 to
 
 What a turn pays, on each path:
 
-- **A sandboxed command, from a daemon started with `--ssh-config`** (the
-  CLI's, on Linux): `Policy::new`, which already runs off the runtime
+- **A sandboxed command, from a daemon started with `--own-copy-file`** (the
+  CLI's, on Linux, for `~/.ssh/config`): `Policy::new`, which already runs off the runtime
   thread, resolves the config's real path and `stat`s it, and writes the
   copy again only when the file changed or the copy is gone, under a lock
   file beside it. One more read-only bind for bubblewrap.

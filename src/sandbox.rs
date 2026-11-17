@@ -189,8 +189,8 @@ impl Policy {
             )
             .into_iter()
             .chain(
-                (daemon.ssh_config.as_deref())
-                    .and_then(|config| ssh_config(config, &daemon.unreadable)),
+                (daemon.copied_files.iter())
+                    .filter_map(|(place, first)| file_copy(place, first, &daemon.unreadable)),
             )
             .collect(),
             daemons,
@@ -774,10 +774,13 @@ pub struct Daemon {
     /// overflow user's. Each is shown from a read-only copy the person
     /// owns (`--own-copy`). The client starting the daemon names them.
     pub owned: Vec<PathBuf>,
-    /// The person's ssh config (`--ssh-config`), which a Linux sandbox
-    /// shows from a read-only copy the person owns with `ControlMaster no`
-    /// first ([`ssh_config`]). The client starting the daemon names it.
-    pub ssh_config: Option<PathBuf>,
+    /// Files of the person's a Linux sandbox shows from a read-only copy
+    /// the person owns, kept in step with the file, with the text given
+    /// before it ([`file_copy`]): a setting that stands for the whole file
+    /// where its program takes the first value it reads
+    /// (`--own-copy-file FILE=FIRST`). The client starting the daemon
+    /// names them.
+    pub copied_files: Vec<(PathBuf, String)>,
     /// Folders no sandboxed command reads, nor writes, links to or renames,
     /// nor anything in them, and the `read` tool doesn't read for a
     /// sandboxed bot (`--unreadable`), as Codex's `deny_read`: the person's
@@ -1785,48 +1788,56 @@ fn copy_files(place: &Path, copy: &Path, files: &Stamp) -> std::io::Result<()> {
     Ok(())
 }
 
-/// What a sandbox's copy of the person's ssh config says before the
-/// config itself. ssh takes the first value it reads for each option, so
-/// this one stands for every host: with `ControlMaster auto`, ssh with no
-/// master open makes its control socket beside the config, in `~/.ssh`,
-/// which no sandboxed command may write, and exits 255 when it can't
-/// (`unix_listener: cannot bind ... Read-only file system`), git's pushes
-/// and fetches with it. With `no`, it joins a master the person has open
-/// at the config's `ControlPath`, and connects on its own when none is.
-const SSH_CONFIG_FIRST: &str = "\
-# The agent sandbox shows this copy of the ssh config: ssh in a sandboxed
-# command joins a master the person has open and connects on its own when
-# none is, as its control socket would go in a folder it can't write.
-ControlMaster no
-
-";
-
-/// The person's ssh config, `place`, as every Linux sandbox shows it, a
-/// link followed (bubblewrap binds over no link): `(copy, file)`, a
-/// read-only copy the person owns that says [`SSH_CONFIG_FIRST`] before
-/// the config, kept in step with it, bound over the file. `None` when
-/// there is none, where it is kept unreadable, and on another system than
-/// Linux, whose sandbox binds nothing.
-fn ssh_config(place: &Path, unreadable: &[PathBuf]) -> Option<(PathBuf, PathBuf)> {
+/// A file of the person's, `place`, as every Linux sandbox shows it
+/// ([`Daemon::copied_files`]), a link followed (bubblewrap binds over no
+/// link): `(copy, file)`, a read-only copy the person owns that says
+/// `first` before the file, kept in step with it, bound over the file.
+/// `None` when there is none and on another system than Linux, whose
+/// sandbox binds nothing. One kept unreadable is not shown, and a copy
+/// made before it was is removed: under `~/.agent`, which sandboxes read,
+/// it would show what the folder now hides.
+fn file_copy(place: &Path, first: &str, unreadable: &[PathBuf]) -> Option<(PathBuf, PathBuf)> {
     if !cfg!(target_os = "linux") {
         return None;
     }
-    let file = std::fs::canonicalize(place).ok()?;
-    if (unreadable.iter()).any(|hidden| file.starts_with(hidden) || place.starts_with(hidden)) {
-        return None;
-    }
-    let copy = copies()?.join(file.strip_prefix("/").ok()?);
-    copied_config(&file, &copy).then_some((copy, file))
+    copied_in(copies()?, place, first, unreadable)
 }
 
-/// Whether `copy` holds the ssh config `file` now, [`SSH_CONFIG_FIRST`]
-/// before it, writing it again when the file changed since this daemon
-/// last did, or the copy is gone. Written beside its name and renamed over
-/// it, as [`copied`] writes a folder's files.
-fn copied_config(file: &Path, copy: &Path) -> bool {
+/// [`file_copy`], its copy kept under `copies`.
+fn copied_in(
+    copies: &Path,
+    place: &Path,
+    first: &str,
+    unreadable: &[PathBuf],
+) -> Option<(PathBuf, PathBuf)> {
+    let copy_of = |file: &Path| Some(copies.join(file.strip_prefix("/").ok()?));
+    let file = std::fs::canonicalize(place).ok();
+    let hidden = |path: &Path| unreadable.iter().any(|hidden| path.starts_with(hidden));
+    if hidden(place) || file.as_deref().is_some_and(hidden) {
+        for kept in [Some(place), file.as_deref()].into_iter().flatten() {
+            if let Some(copy) = copy_of(kept) {
+                let _ = locked(&copy, || match std::fs::remove_file(&copy) {
+                    Err(error) if error.kind() != std::io::ErrorKind::NotFound => Err(error),
+                    _ => Ok(()),
+                });
+            }
+        }
+        return None;
+    }
+    let file = file?;
+    let copy = copy_of(&file)?;
+    copied_file(&file, first, &copy).then_some((copy, file))
+}
+
+/// Whether `copy` holds `file` now, `first` before it, writing it again
+/// when the file changed since this daemon last did, or the copy is gone.
+/// Written beside its name and renamed over it, as [`copied`] writes a
+/// folder's files.
+fn copied_file(file: &Path, first: &str, copy: &Path) -> bool {
     use std::os::unix::fs::MetadataExt;
     type FileStamp = (u64, i64, i64, u64);
-    static STAMPS: std::sync::Mutex<Vec<(PathBuf, FileStamp)>> = std::sync::Mutex::new(Vec::new());
+    static STAMPS: std::sync::Mutex<Vec<(PathBuf, FileStamp, String)>> =
+        std::sync::Mutex::new(Vec::new());
     let Ok(found) = std::fs::metadata(file) else {
         return false;
     };
@@ -1837,25 +1848,24 @@ fn copied_config(file: &Path, copy: &Path) -> bool {
     let mut stamps = STAMPS
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let kept = stamps.iter().position(|(kept, _)| kept == file);
-    let fresh = kept.is_some_and(|at| stamps[at].1 == now)
+    let kept = stamps.iter().position(|(kept, ..)| kept == file);
+    let fresh = kept.is_some_and(|at| stamps[at].1 == now && stamps[at].2 == first)
         && std::fs::symlink_metadata(copy).is_ok_and(|found| found.is_file());
     if fresh {
         return true;
     }
-    if locked(copy, || copy_config(file, copy)).is_err() {
+    if locked(copy, || copy_file(file, first, copy)).is_err() {
         return false;
     }
     match kept {
-        Some(at) => stamps[at].1 = now,
-        None => stamps.push((file.to_owned(), now)),
+        Some(at) => stamps[at] = (file.to_owned(), now, first.to_owned()),
+        None => stamps.push((file.to_owned(), now, first.to_owned())),
     }
     true
 }
 
-/// The ssh config `file` into `copy`, owner-only, [`SSH_CONFIG_FIRST`]
-/// before it.
-fn copy_config(file: &Path, copy: &Path) -> std::io::Result<()> {
+/// `file` into `copy`, owner-only, `first` before it.
+fn copy_file(file: &Path, first: &str, copy: &Path) -> std::io::Result<()> {
     use std::io::Write;
     use std::os::unix::fs::OpenOptionsExt;
     let content = std::fs::read(file)?;
@@ -1873,7 +1883,7 @@ fn copy_config(file: &Path, copy: &Path) -> std::io::Result<()> {
         .mode(0o600)
         .custom_flags(libc::O_NOFOLLOW)
         .open(&part)?;
-    written.write_all(SSH_CONFIG_FIRST.as_bytes())?;
+    written.write_all(first.as_bytes())?;
     written.write_all(&content)?;
     // Never over a link or a folder: bubblewrap would bind wherever it
     // points, or refuse every command binding a folder over a file.
@@ -2932,6 +2942,7 @@ mod tests {
     /// unreadable is left alone.
     #[test]
     fn the_ssh_config_is_shown_from_a_copy_that_makes_no_control_socket() {
+        const FIRST: &str = agent_client::SSH_CONFIG_FIRST;
         let base =
             std::env::temp_dir().join(format!("agent-sandbox-ssh-copy-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&base);
@@ -2939,12 +2950,9 @@ mod tests {
         let file = base.join("home/.ssh/config");
         let copy = base.join("copies/home/.ssh/config");
         std::fs::write(&file, "Host *\n  ControlMaster auto\n").unwrap();
-        assert!(copied_config(&file, &copy));
+        assert!(copied_file(&file, FIRST, &copy));
         let read = || std::fs::read_to_string(&copy).unwrap();
-        assert_eq!(
-            read(),
-            format!("{SSH_CONFIG_FIRST}Host *\n  ControlMaster auto\n")
-        );
+        assert_eq!(read(), format!("{FIRST}Host *\n  ControlMaster auto\n"));
         // First of all, so it stands for every host whatever the config says.
         let first = (read().lines())
             .find(|line| !line.starts_with('#') && !line.is_empty())
@@ -2957,18 +2965,35 @@ mod tests {
         }
         // Edited: copied again. Taken away: made again.
         std::fs::write(&file, "Host box\n  User me\n").unwrap();
-        assert!(copied_config(&file, &copy));
-        assert_eq!(read(), format!("{SSH_CONFIG_FIRST}Host box\n  User me\n"));
+        assert!(copied_file(&file, FIRST, &copy));
+        assert_eq!(read(), format!("{FIRST}Host box\n  User me\n"));
         std::fs::remove_file(&copy).unwrap();
-        assert!(copied_config(&file, &copy));
+        assert!(copied_file(&file, FIRST, &copy));
         assert!(read().ends_with("Host box\n  User me\n"));
         // None there, none copied.
-        assert!(!copied_config(
+        assert!(!copied_file(
             &base.join("gone"),
+            FIRST,
             &base.join("copies/gone")
         ));
-        // Kept unreadable, by the folder it is in: not shown at all.
-        assert_eq!(ssh_config(&file, &[base.join("home/.ssh")]), None);
+        // Shown by its real path, a link followed, as bubblewrap binds,
+        // its copy kept under that path.
+        let copies = base.join("copies");
+        let keyed = copies.join(file.strip_prefix("/").unwrap());
+        let link = base.join("home/.ssh/linked");
+        std::os::unix::fs::symlink(&file, &link).unwrap();
+        let shown = copied_in(&copies, &link, FIRST, &[]).unwrap();
+        assert_eq!(shown, (keyed.clone(), file.clone()));
+        assert!(std::fs::read_to_string(&keyed).unwrap().starts_with(FIRST));
+        // Kept unreadable, by the folder it is in: not shown, and the copy
+        // made before, which sandboxes could read under ~/.agent, removed.
+        let hidden = [base.join("home/.ssh")];
+        assert_eq!(copied_in(&copies, &link, FIRST, &hidden), None);
+        assert!(!keyed.exists());
+        assert!(copied_in(&copies, &file, FIRST, &[]).is_some());
+        assert_eq!(copied_in(&copies, &file, FIRST, &hidden), None);
+        assert!(!keyed.exists());
+        assert!(copied_file(&file, FIRST, &copy));
         #[cfg(target_os = "linux")]
         {
             let policy = Policy {
@@ -3815,7 +3840,11 @@ mod tests {
         assert!(said.contains("Read-only file system"), "{said}");
         // Shown from the person's copy, which makes no control socket.
         let copy = base.join("copies/ssh/config");
-        assert!(copied_config(&ssh.join("config"), &copy));
+        assert!(copied_file(
+            &ssh.join("config"),
+            agent_client::SSH_CONFIG_FIRST,
+            &copy
+        ));
         policy.owned.push((copy, ssh.join("config")));
         let pushed = sandboxed(&policy, "git", &push).await.unwrap();
         assert!(

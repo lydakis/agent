@@ -3236,10 +3236,14 @@ again only when one changed, each written beside its name and renamed over
 it, so a running sandbox reads a whole file. A daemon running as root,
 which the namespace maps as itself, binds nothing.
 
-The person's own ssh config, which the daemon was started with as `serve
---ssh-config FILE` (the CLI passes `~/.ssh/config`), is shown on Linux from
-a copy the person owns under `~/.agent/copies`, by the file's real path, a
-link followed, that says `ControlMaster no` before the config. With
+Each file the daemon was started with as `serve --own-copy-file
+FILE=FIRST` is shown on Linux from a copy the person owns under
+`~/.agent/copies`, by the file's real path, a link followed, with the text
+`FIRST` before the file, kept in step with it; the daemon knows nothing of
+what the file is. One kept unreadable is not shown, and a copy made before
+it was is removed, since sandboxes read `~/.agent`. The CLI passes the
+person's `~/.ssh/config` with `ControlMaster no` first
+(`agent_client::SSH_CONFIG_FIRST`). With
 `ControlMaster auto` and no master open, ssh makes its control socket at
 `ControlPath`, usually in `~/.ssh`, which no sandboxed command may write;
 it can't bind it (`unix_listener: cannot bind ... Read-only file system`)

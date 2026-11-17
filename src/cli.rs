@@ -261,7 +261,7 @@ const COMMANDS: &[Command] = &[
         name: "serve",
         about: "Run the daemon in the foreground; other commands start it for you",
         usage: "serve --store PATH --provider SPEC... [OPTIONS]",
-        flags: "--shell-exclude --protect --protect-existing --protect-path --wall --unreadable --own-copy --ssh-config --context-window --speeds --fallbacks --models --provider-config --await-owner",
+        flags: "--shell-exclude --protect --protect-existing --protect-path --wall --unreadable --own-copy --own-copy-file --context-window --speeds --fallbacks --models --provider-config --await-owner",
         settings: "",
         startup: true,
     },
@@ -500,9 +500,9 @@ fn print_flags(flags: &str) {
                 "FOLDER",
                 "On Linux, show the system folder FOLDER in every sandbox from a read-only copy the person owns, kept in step with it, for files a program takes only from root or the person; repeatable",
             ),
-            "--ssh-config" => (
-                "FILE",
-                "On Linux, show the person's ssh config FILE in every sandbox from a read-only copy the person owns, kept in step with it, that sets ControlMaster no before it: ssh joins a master the person has open and makes no control socket of its own, which would go in a folder sandboxed commands can't write; the CLI passes ~/.ssh/config",
+            "--own-copy-file" => (
+                "FILE=FIRST",
+                "On Linux, show FILE, absolute, in every sandbox from a read-only copy the person owns, kept in step with it, with the text FIRST before it, by its real path; for a setting that stands for the whole file where its program takes the first value it reads; the CLI passes ~/.ssh/config with ControlMaster no; repeatable",
             ),
             "--protect" => (
                 "NAME",
@@ -806,7 +806,7 @@ pub fn prepare(args: Vec<String>) -> Result<Option<Vec<String>>> {
                     | "--wall"
                     | "--unreadable"
                     | "--own-copy"
-                    | "--ssh-config"
+                    | "--own-copy-file"
                     | "--context-window"
                     | "--speeds"
                     | "--fallbacks"
