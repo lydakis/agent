@@ -1525,11 +1525,39 @@ fn index(dir: &Path, index: &mut HashMap<PathBuf, Indexed>) {
 /// costs one look at the folder once each thread was read. A fact about
 /// the commons, never a request to read it.
 pub fn pointed(home: &Path, brief: &str) -> String {
-    match pointer(&dir(home), brief) {
+    pointed_with(home, brief, std::env::var(POINTER_ENV).ok())
+}
+
+/// [`pointed`], with the line the host `handed` when it ran the start.
+fn pointed_with(home: &Path, brief: &str, handed: Option<String>) -> String {
+    let line = match handed {
+        Some(line) => (!line.is_empty()).then_some(line),
+        None => pointer(&dir(home), brief),
+    };
+    match line {
         Some(line) => format!("{brief}\n\n{line}"),
         None => brief.to_owned(),
     }
 }
+
+/// Where the tool host hands a `start_task` it runs the pointer it found,
+/// empty for none: the words it keeps live in the host, which lives
+/// across tasks, while each call runs in a process of its own.
+pub const POINTER_ENV: &str = "SONNY_COMMONS_POINTER";
+
+/// The pointer line for `brief` as [`pointed`] puts it under the brief,
+/// empty for none or when the pointer is off, as the config says now.
+pub fn pointer_line(home: &Path, brief: &str) -> String {
+    let wanted = on() && crate::kept::config().map_or(true, |config| config.sonny.commons_pointer);
+    match wanted {
+        true => pointer(&dir(home), brief).unwrap_or_default(),
+        false => String::new(),
+    }
+}
+
+/// A thread the pointer found: its score, when it last moved, its name,
+/// what it keeps of it, and the words it shares with their scores.
+type Found<'a> = (f64, i64, &'a str, &'a Indexed, Vec<(f64, &'a str)>);
 
 fn pointer(dir: &Path, brief: &str) -> Option<String> {
     let briefed = match_words(brief);
@@ -1553,7 +1581,7 @@ fn pointer(dir: &Path, brief: &str) -> Option<String> {
             (1.0 + (count - held + 0.5) / (held + 0.5)).ln()
         })
         .collect();
-    let mut found: Vec<(f64, i64, &str, &Indexed, Vec<(f64, &str)>)> = Vec::new();
+    let mut found: Vec<Found> = Vec::new();
     for (path, thread) in &threads {
         let norm = BM25_K1 * (1.0 - BM25_B + BM25_B * thread.length as f64 / average.max(1.0));
         let mut shared: Vec<(f64, &str)> = (briefed.iter().zip(&weight))
@@ -2572,6 +2600,21 @@ mod tests {
             println!("{count:>5} threads: cold {cold:?}, warm {warm:?}");
             let _ = std::fs::remove_dir_all(&home);
         }
+    }
+
+    #[test]
+    fn a_start_the_tool_host_runs_takes_the_pointer_the_host_found() {
+        let home = home("pointer-handed");
+        let line = "[The commons has threads that share words with this brief:\n- t \"T\"]";
+        assert_eq!(
+            pointed_with(&home, "Fix the sandbox cache.", Some(line.into())),
+            format!("Fix the sandbox cache.\n\n{line}")
+        );
+        assert_eq!(
+            pointed_with(&home, "Fix the sandbox cache.", Some(String::new())),
+            "Fix the sandbox cache."
+        );
+        let _ = std::fs::remove_dir_all(&home);
     }
 
     #[test]
