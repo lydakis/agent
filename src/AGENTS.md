@@ -12,7 +12,10 @@ here, check it against these, and discuss any daemon change with George first:
 - No fixed limit that decides how a bot works (rounds, what counts as a
   secret, what to keep); capacity bounds that protect the daemon are fine.
 - Known exceptions, chosen: the line after a prompt (`trailer`), provider-key
-  stripping and redaction, Codex's `[shell_environment_policy]`.
+  stripping and redaction, Codex's `[shell_environment_policy]`, and
+  `spawn_agent` composing a fresh bot's instructions (and a profile's) as
+  the CLI's `run --agents` and `--profile` do, the tool that replaced
+  them; Codex's core composes AGENTS.md for its agents too.
 
 ## Words
 

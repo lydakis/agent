@@ -7260,13 +7260,13 @@ fn bot_pages_obey_byte_budget_without_loading_instructions() {
         db.create(&format!("bot-{n:03}"), Some(&workspace), config)
             .unwrap();
     }
-    let page = db.list(None, 256, None, false, None).unwrap();
+    let page = db.list(None, 256, None, false, None, false).unwrap();
     let bots = page["bots"].as_array().unwrap();
     assert!(!bots.is_empty() && bots.len() < 140);
     assert!(serde_json::to_vec(&page).unwrap().len() < 524288);
     assert!(bots.iter().all(|b| b.get("instructions").is_none()));
     let rest = db
-        .list(page["next_after"].as_str(), 256, None, false, None)
+        .list(page["next_after"].as_str(), 256, None, false, None, false)
         .unwrap();
     assert_eq!(bots.len() + rest["bots"].as_array().unwrap().len(), 140);
     assert!(rest["next_after"].is_null());
@@ -7305,64 +7305,105 @@ fn bot_pages_filter_by_name_pattern_and_activity() {
             .collect()
     };
     assert_eq!(
-        names(db.list(None, 64, Some("alpha.*"), false, None).unwrap()),
+        names(
+            db.list(None, 64, Some("alpha.*"), false, None, false)
+                .unwrap()
+        ),
         ["alpha.lead", "alpha.worker"]
     );
     assert_eq!(
-        names(db.list(None, 64, Some("*.lead"), false, None).unwrap()),
+        names(
+            db.list(None, 64, Some("*.lead"), false, None, false)
+                .unwrap()
+        ),
         ["alpha.lead", "beta.lead"]
     );
     assert_eq!(
-        names(db.list(None, 64, None, true, None).unwrap()),
+        names(db.list(None, 64, None, true, None, false).unwrap()),
         ["alpha.worker", "beta.lead"]
     );
     assert_eq!(
-        names(db.list(None, 64, Some("beta.*"), true, None).unwrap()),
+        names(
+            db.list(None, 64, Some("beta.*"), true, None, false)
+                .unwrap()
+        ),
         ["beta.lead"]
     );
     // Filtered pages continue from their cursor like any other.
-    let page = db.list(None, 1, Some("*.lead"), false, None).unwrap();
+    let page = db
+        .list(None, 1, Some("*.lead"), false, None, false)
+        .unwrap();
     assert_eq!(page["next_after"], "alpha.lead");
     let rest = db
-        .list(page["next_after"].as_str(), 1, Some("*.lead"), false, None)
+        .list(
+            page["next_after"].as_str(),
+            1,
+            Some("*.lead"),
+            false,
+            None,
+            false,
+        )
         .unwrap();
     assert_eq!(names(rest.clone()), ["beta.lead"]);
     assert!(rest["next_after"].is_null());
     // GLOB is case-sensitive, like names.
-    assert!(names(db.list(None, 64, Some("ALPHA.*"), false, None).unwrap()).is_empty());
+    assert!(
+        names(
+            db.list(None, 64, Some("ALPHA.*"), false, None, false)
+                .unwrap()
+        )
+        .is_empty()
+    );
     // A pattern's literal prefix bounds the page, as written out in the
     // query: a name that is the whole prefix matches, and a cursor before,
     // inside or past the prefix's range starts where it should.
     assert_eq!(
-        names(db.list(None, 64, Some("alpha.lead"), false, None).unwrap()),
+        names(
+            db.list(None, 64, Some("alpha.lead"), false, None, false)
+                .unwrap()
+        ),
         ["alpha.lead"]
     );
     assert_eq!(
-        names(db.list(None, 64, Some("alpha.lead*"), false, None).unwrap()),
+        names(
+            db.list(None, 64, Some("alpha.lead*"), false, None, false)
+                .unwrap()
+        ),
         ["alpha.lead"]
     );
     assert_eq!(
-        names(db.list(Some("a"), 64, Some("beta.*"), false, None).unwrap()),
+        names(
+            db.list(Some("a"), 64, Some("beta.*"), false, None, false)
+                .unwrap()
+        ),
         ["beta.lead", "beta.worker"]
     );
     assert_eq!(
         names(
-            db.list(Some("beta.lead"), 64, Some("beta.*"), false, None)
+            db.list(Some("beta.lead"), 64, Some("beta.*"), false, None, false)
                 .unwrap()
         ),
         ["beta.worker"]
     );
-    assert!(names(db.list(Some("c"), 64, Some("beta.*"), false, None).unwrap()).is_empty());
+    assert!(
+        names(
+            db.list(Some("c"), 64, Some("beta.*"), false, None, false)
+                .unwrap()
+        )
+        .is_empty()
+    );
     assert_eq!(
         names(
-            db.list(None, 64, Some("[ab]*.worker"), false, None)
+            db.list(None, 64, Some("[ab]*.worker"), false, None, false)
                 .unwrap()
         ),
         ["alpha.worker", "beta.worker"]
     );
     for bad in ["", &"*".repeat(257)] {
         assert_eq!(
-            db.list(None, 64, Some(bad), false, None).unwrap_err().code,
+            db.list(None, 64, Some(bad), false, None, false)
+                .unwrap_err()
+                .code,
             "invalid_bot_filter"
         );
     }
@@ -7423,34 +7464,50 @@ fn bot_pages_filter_by_maker_from_its_own_index() {
             .collect()
     };
     assert_eq!(
-        names(db.list(None, 64, None, false, Some(lead)).unwrap()),
+        names(db.list(None, 64, None, false, Some(lead), false).unwrap()),
         ["a.task", "c.task"]
     );
     assert_eq!(
-        names(db.list(None, 64, None, true, Some(lead)).unwrap()),
+        names(db.list(None, 64, None, true, Some(lead), false).unwrap()),
         ["c.task"]
     );
     assert_eq!(
-        names(db.list(None, 64, Some("b.*"), false, Some(lead)).unwrap()),
+        names(
+            db.list(None, 64, Some("b.*"), false, Some(lead), false)
+                .unwrap()
+        ),
         Vec::<String>::new()
     );
     assert_eq!(
         names(
-            db.list(None, 64, Some("*.task"), false, Some(other))
+            db.list(None, 64, Some("*.task"), false, Some(other), false)
                 .unwrap()
         ),
         ["b.task"]
     );
     // Pages by maker continue from their cursor like any other.
-    let page = db.list(None, 1, None, false, Some(lead)).unwrap();
+    let page = db.list(None, 1, None, false, Some(lead), false).unwrap();
     assert_eq!(page["next_after"], "a.task");
     let rest = db
-        .list(page["next_after"].as_str(), 1, None, false, Some(lead))
+        .list(
+            page["next_after"].as_str(),
+            1,
+            None,
+            false,
+            Some(lead),
+            false,
+        )
         .unwrap();
     assert_eq!(names(rest.clone()), ["c.task"]);
     assert!(rest["next_after"].is_null());
     // A maker reused by name is another id, and sees none of the first's.
-    assert!(names(db.list(None, 64, None, false, Some(lead + 1000)).unwrap()).is_empty());
+    assert!(
+        names(
+            db.list(None, 64, None, false, Some(lead + 1000), false)
+                .unwrap()
+        )
+        .is_empty()
+    );
     // The maker filter reads its own index, with or without activity.
     let path = std::env::temp_dir().join(format!("agent-maker-{}.sqlite", std::process::id()));
     let _ = std::fs::remove_file(&path);
@@ -8070,7 +8127,7 @@ fn creation_and_fork_reject_incomplete_deleted_and_reused_creator_identities() {
             (Some("Creator"), None, "creator_identity_required"),
             (None, Some(creator.bot_id), "creator_identity_required"),
         ] {
-            let before = db.list(None, 64, None, false, None).unwrap();
+            let before = db.list(None, 64, None, false, None, false).unwrap();
             let mut b = binding();
             b.created_by = name;
             b.created_by_id = id;
@@ -8092,7 +8149,7 @@ fn creation_and_fork_reject_incomplete_deleted_and_reused_creator_identities() {
                 .code,
                 code
             );
-            assert_eq!(db.list(None, 64, None, false, None).unwrap(), before);
+            assert_eq!(db.list(None, 64, None, false, None, false).unwrap(), before);
         }
         if !reused {
             db.create("Creator", Some("/synthetic"), binding()).unwrap();
@@ -8129,7 +8186,7 @@ fn a_bot_is_made_no_deeper_below_the_start_of_its_line_than_the_bound() {
         .unwrap();
     assert_eq!((task.depth, helper.depth), (1, 2));
     // Past the bound, a typed refusal with the facts, and nothing made.
-    let before = db.list(None, 64, None, false, None).unwrap();
+    let before = db.list(None, 64, None, false, None, false).unwrap();
     let refused = db
         .create("Deeper", Some("/synthetic"), by("Helper", &helper))
         .unwrap_err();
@@ -8143,7 +8200,7 @@ fn a_bot_is_made_no_deeper_below_the_start_of_its_line_than_the_bound() {
         (&facts["depth"], &facts["max_depth"]),
         (&json!(3), &json!(2))
     );
-    assert_eq!(db.list(None, 64, None, false, None).unwrap(), before);
+    assert_eq!(db.list(None, 64, None, false, None, false).unwrap(), before);
     // A fork another makes is one below its maker, wherever its source is:
     // a bot at the bound can't fork its way back up.
     let refused = db
@@ -8171,7 +8228,7 @@ fn a_bot_is_made_no_deeper_below_the_start_of_its_line_than_the_bound() {
     db.create("Below", Some("/synthetic"), by("Fresh", &fresh))
         .unwrap();
     // Listed and inspected with it.
-    let listed = db.list(None, 64, None, false, None).unwrap();
+    let listed = db.list(None, 64, None, false, None, false).unwrap();
     let depth_of = |name: &str| {
         (listed["bots"].as_array().unwrap().iter())
             .find(|bot| bot["name"] == name)
@@ -8227,7 +8284,7 @@ fn lineage_pins_the_creator_identity_so_a_reused_name_is_a_stranger() {
         Some(first_a.bot_id),
         "B still names the A that made it"
     );
-    let page = db.list(None, 64, None, false, None).unwrap();
+    let page = db.list(None, 64, None, false, None, false).unwrap();
     let listed = page["bots"].as_array().unwrap();
     let b_row = listed.iter().find(|r| r["name"] == "B").unwrap();
     assert_eq!(b_row["created_by_id"], first_a.bot_id);
@@ -8386,7 +8443,7 @@ fn forks_keep_the_binding_and_instructions_and_record_a_creator() {
     );
     assert_eq!(db.inspect("Bob").unwrap().instructions, "first text");
     // Listing carries the creator; a fork keeps the model and tools.
-    let page = db.list(None, 64, None, false, None).unwrap();
+    let page = db.list(None, 64, None, false, None, false).unwrap();
     let listed: Vec<(&str, Option<&str>)> = page["bots"]
         .as_array()
         .unwrap()
@@ -11259,7 +11316,7 @@ fn cached_input_tokens_are_kept_per_turn_and_per_bot_with_their_ratio() {
         (400, 240, 0.6)
     );
     assert_eq!(bot.tokens_used, 420);
-    let page = db.list(None, 10, None, false, None).unwrap();
+    let page = db.list(None, 10, None, false, None, false).unwrap();
     assert_eq!(page["bots"][0]["cache_hit"], 0.6);
     assert_eq!(agent_runtime::store::cache_hit(0, 0), 0.0);
     assert_eq!(agent_runtime::store::cache_hit(1, 3), 0.333);
@@ -11618,7 +11675,7 @@ fn a_declared_list_is_stored_once_and_let_go_when_no_bot_holds_it() {
     let record = serde_json::to_value(&a).unwrap();
     assert_eq!(record["declared_digest"], json!(digest));
     assert_eq!(record["declared"].as_array().unwrap().len(), 8);
-    let listed = db.list(None, 64, None, false, None).unwrap();
+    let listed = db.list(None, 64, None, false, None, false).unwrap();
     assert!(
         (listed["bots"].as_array().unwrap())
             .iter()
@@ -11918,7 +11975,7 @@ fn bot_identities_are_assigned_in_creation_order_and_never_reused() {
         let db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
         assert_eq!(db.inspect("New").unwrap().bot_id, 3);
         assert_eq!(
-            db.list(None, 8, None, false, None).unwrap()["bots"][0]["bot_id"],
+            db.list(None, 8, None, false, None, false).unwrap()["bots"][0]["bot_id"],
             1
         );
     }
@@ -16611,7 +16668,7 @@ fn a_fork_narrows_what_it_may_call_and_never_widens() {
         .collect();
     assert_eq!(announced.len(), 1);
     assert_eq!(announced[0]["name"], "read");
-    let listed = db.list(None, 16, None, false, None).unwrap();
+    let listed = db.list(None, 16, None, false, None, false).unwrap();
     let reader = listed["bots"]
         .as_array()
         .unwrap()
@@ -17273,7 +17330,7 @@ fn an_expiring_fork_is_due_once_idle_that_long_and_never_while_a_turn_runs() {
     let at = side.expires_at.unwrap();
     assert!(at >= before + 900_000, "{at} from {before}");
     // Records show it; a source that never asked for one shows none.
-    let listed = db.list(None, 10, None, false, None).unwrap();
+    let listed = db.list(None, 10, None, false, None, false).unwrap();
     assert_eq!(listed["bots"][0]["name"], "Bob");
     assert!(listed["bots"][0].get("expires_at").is_none());
     assert_eq!(listed["bots"][1]["expires_at"], at);
@@ -20540,7 +20597,7 @@ fn a_gated_step_is_told_done_once_even_when_its_row_was_trimmed() {
 
 /// Bob as a `bots` page lists him, with the page's cursor.
 fn listed(db: &Database) -> (Value, i64) {
-    let page = db.list(None, 64, None, false, None).unwrap();
+    let page = db.list(None, 64, None, false, None, false).unwrap();
     let bob = (page["bots"].as_array().unwrap().iter())
         .find(|bot| bot["name"] == "Bob")
         .unwrap()
@@ -20833,7 +20890,7 @@ fn a_store_before_bot_status_reads_each_bots_status_from_its_turns() {
         )
         .unwrap();
     let db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
-    let page = db.list(None, 64, None, false, None).unwrap();
+    let page = db.list(None, 64, None, false, None, false).unwrap();
     let (ann, bob) = (&page["bots"][0], &page["bots"][1]);
     assert_eq!(ann["status"], "failed");
     assert_eq!(ann["last"]["turn"], failed);
@@ -22235,6 +22292,121 @@ fn an_answered_call_s_end_is_told_once_its_group_commits() {
     assert_eq!(heard(&mut db), vec![(halted, "c1".to_owned())]);
 }
 
+#[test]
+fn a_closed_bot_is_listed_only_when_asked_until_a_turn_of_its_starts() {
+    let mut db = Database::initialize(Connection::open_in_memory().unwrap()).unwrap();
+    for name in ["shop.lead", "shop.fix", "shop.look"] {
+        db.create(name, Some("/synthetic"), binding()).unwrap();
+    }
+    let names = |page: Value| -> Vec<String> {
+        page["bots"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|b| b["name"].as_str().unwrap().to_owned())
+            .collect()
+    };
+    assert_eq!(db.close("shop.fix", 1_000).unwrap(), (None, None));
+    // Closed again, it keeps the first time it was.
+    assert_eq!(db.close("shop.fix", 2_000).unwrap(), (Some(1_000), None));
+    assert_eq!(db.inspect("shop.fix").unwrap().closed_ms, Some(1_000));
+    assert_eq!(db.inspect("shop.look").unwrap().closed_ms, None);
+    assert_eq!(
+        names(
+            db.list(None, 64, Some("shop.*"), false, None, true)
+                .unwrap()
+        ),
+        ["shop.lead", "shop.look"]
+    );
+    let all = db
+        .list(None, 64, Some("shop.*"), false, None, false)
+        .unwrap();
+    assert_eq!(names(all.clone()), ["shop.fix", "shop.lead", "shop.look"]);
+    assert_eq!(all["bots"][0]["closed_ms"], 1_000);
+    assert!(all["bots"][1].get("closed_ms").is_none());
+    assert_eq!(
+        db.close("shop.gone", 1_000).unwrap_err().code,
+        "bot_not_found"
+    );
+    // A turn of its own opens it again.
+    let turn = db
+        .begin(
+            "shop.fix",
+            "r1",
+            "more work",
+            true,
+            &TurnOptions::default(),
+            allow_provider,
+        )
+        .unwrap()
+        .turn;
+    assert_eq!(db.inspect("shop.fix").unwrap().closed_ms, None);
+    db.finish(turn, None).unwrap();
+    assert_eq!(
+        names(
+            db.list(None, 64, Some("shop.*"), false, None, true)
+                .unwrap()
+        ),
+        ["shop.fix", "shop.lead", "shop.look"]
+    );
+    // Closed while it runs, the close names the turn it is running.
+    let running = db
+        .begin(
+            "shop.look",
+            "r2",
+            "look again",
+            true,
+            &TurnOptions::default(),
+            allow_provider,
+        )
+        .unwrap()
+        .turn;
+    assert_eq!(db.close("shop.look", 4_000).unwrap(), (None, Some(running)));
+    db.finish(running, None).unwrap();
+}
+
+#[test]
+fn schema_105_bots_that_message_with_tools_make_and_close_agents_too() {
+    let path = std::env::temp_dir().join(format!("agent-schema105-{}.sqlite", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+    {
+        let mut db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
+        for name in ["Bob", "Carol"] {
+            db.create(name, Some("/synthetic"), binding()).unwrap();
+        }
+    }
+    // Before 105 no bot was closed, and none made or closed agents, though
+    // the store was already at 104.
+    let old = Connection::open(&path).unwrap();
+    old.execute_batch(
+        "ALTER TABLE bots DROP COLUMN closed_ms;
+         UPDATE bots SET tools='shell,wait,history,send_message,list_agents,pause_agents' WHERE name='Bob';
+         UPDATE bots SET tools='shell,read' WHERE name='Carol';
+         PRAGMA user_version=104;",
+    )
+    .unwrap();
+    drop(old);
+    let db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
+    assert_eq!(
+        db.inspect("Bob").unwrap().tools,
+        [
+            "shell",
+            "wait",
+            "history",
+            "send_message",
+            "list_agents",
+            "pause_agents",
+            "spawn_agent",
+            "close_agent"
+        ]
+    );
+    assert_eq!(db.inspect("Carol").unwrap().tools, ["shell", "read"]);
+    assert_eq!(db.close("Carol", 5).unwrap(), (None, None));
+    assert_eq!(db.inspect("Carol").unwrap().closed_ms, Some(5));
+    drop(db);
+    std::fs::remove_file(path).unwrap();
+}
+
 /// A call its client yields is lifted with its output so far, and waits on
 /// its answer with no deadline: past its tool's own time it still waits,
 /// its answer is taken, and it ends answered. A tool not declared `lift`
@@ -22324,19 +22496,19 @@ fn a_yielded_call_waits_on_its_answer_with_no_deadline() {
     assert_eq!(ended["answer"], "all 9 built", "{ended}");
 }
 
-/// Schema 105 marks a yielded call's row; calls waiting when a store
+/// Schema 106 marks a yielded call's row; calls waiting when a store
 /// upgrades were never yielded.
 #[test]
-fn schema_105_adds_the_yield_mark() {
+fn schema_106_adds_the_yield_mark() {
     let path = std::env::temp_dir().join(format!(
-        "agent-schema105-yielded-{}.sqlite",
+        "agent-schema106-yielded-{}.sqlite",
         std::process::id()
     ));
     let _ = std::fs::remove_file(&path);
     drop(Database::initialize(Connection::open(&path).unwrap()).unwrap());
     Connection::open(&path)
         .unwrap()
-        .execute_batch("ALTER TABLE answers DROP COLUMN yielded; PRAGMA user_version=104;")
+        .execute_batch("ALTER TABLE answers DROP COLUMN yielded; PRAGMA user_version=105;")
         .unwrap();
     drop(Database::initialize(Connection::open(&path).unwrap()).unwrap());
     let has: bool = Connection::open(&path)

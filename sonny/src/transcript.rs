@@ -2070,13 +2070,15 @@ fn lookout_news(text: &str, icons: &std::collections::HashMap<String, String>) -
         };
         match head.as_slice() {
             // "[lookout]" then "12 more events wait for the next note", or
-            // what was not kept.
+            // what was not kept; the trailer that ends every note says no
+            // count, and the row leaves it out.
             ["lookout"] => {
                 let said = lines.next().unwrap_or_default();
                 let count = said.split(' ').next().unwrap_or_default();
-                match said.contains(" not kept") {
-                    true => parts.push(format!("{count} not kept")),
-                    false => parts.push(format!("+{count} more")),
+                match (count.parse::<u64>().is_ok(), said.contains(" not kept")) {
+                    (false, _) => {}
+                    (true, true) => parts.push(format!("{count} not kept")),
+                    (true, false) => parts.push(format!("+{count} more")),
                 }
             }
             [crate::lookout::activity::SOURCE, task, from] => parts.push(task_news(task, from)),
@@ -2842,7 +2844,7 @@ pub fn clean(
 }
 
 /// What the clean view keeps, by what Sonny says a call did.
-const KEPT: [&str; 29] = [
+const KEPT: [&str; 30] = [
     "Started",
     "Started a turn for",
     "Steered",
@@ -2850,6 +2852,7 @@ const KEPT: [&str; 29] = [
     "Left a note for",
     "Forked",
     "Interrupted",
+    "Closed",
     "Removed",
     "Cleaned up",
     "Waited for",
@@ -2882,7 +2885,7 @@ fn kept(said: &crate::calls::Said) -> bool {
 /// and folded into one when several come in a row: those that start,
 /// message, wait for or change agents and what runs for them, which a
 /// lead often makes a few of at once. What they said opens on a click.
-const FOLDS: [&str; 24] = [
+const FOLDS: [&str; 25] = [
     "Started",
     "Started a turn for",
     "Steered",
@@ -2891,6 +2894,7 @@ const FOLDS: [&str; 24] = [
     "Waited for",
     "Forked",
     "Interrupted",
+    "Closed",
     "Removed",
     "Cleaned up",
     "Discarded",
@@ -2932,7 +2936,7 @@ pub fn folds(
     }
     let said = match name {
         "shell" => crate::calls::said(arguments["command"].as_str()?, output.unwrap_or(""), false)?,
-        "send_message" | "list_agents" | "pause_agents" => {
+        "send_message" | "list_agents" | "pause_agents" | "spawn_agent" | "close_agent" => {
             crate::calls::agents(name, arguments, output, false)?
         }
         _ => crate::calls::declared(name, arguments, false)?,
@@ -4500,7 +4504,9 @@ mod tests {
              [lookout]\n\
              2 more events wait for the next note\n\
              [lookout]\n\
-             40 more events from chat came 1 minute ago, and they were not kept";
+             40 more events from chat came 1 minute ago, and they were not kept\n\
+             [lookout]\n\
+             This note is news for you, unseen by the person.";
         let icons = [("slack".to_owned(), "▲".to_owned())].into();
         assert_eq!(
             super::lookout_news(note, &icons).join(" · "),
@@ -5366,6 +5372,19 @@ mod tests {
             "Started calc.fix: {\"handle\":\"calc.fix/3\"}",
         );
         assert_eq!(task, ["• Started fix", "  └ Fix the tests."]);
+        // An agent a lead makes, and closes when its work is done.
+        let made = clean(
+            "spawn_agent",
+            serde_json::json!({"name": "review", "message": "Look over the diff."}),
+            r#"{"name":"calc.review","status":"running","handle":"calc.review/1"}"#,
+        );
+        assert_eq!(made, ["• Started calc.review", "  └ Look over the diff."]);
+        let closed = clean(
+            "close_agent",
+            serde_json::json!({"name": "calc.review"}),
+            r#"{"name":"calc.review","was_open":true}"#,
+        );
+        assert_eq!(closed, ["• Closed calc.review"]);
         // One that failed says what it tried, and why first.
         let shown = text(&super::clean(
             "show_agent",

@@ -88,7 +88,7 @@ It supplies no agent behavior: `create` names the bot's model, instructions,
 and tools, the bot keeps all three, a fork inherits them, and a later
 client's environment changes nothing about an existing bot. The CLI resolves
 `--model` or `AGENT_MODEL`, `--instructions` or its built-in text, and
-`--tools` or `shell,write_stdin,read,write,wait,history,send_message,list_agents,pause_agents` with `apply_patch` for a
+`--tools` or `shell,write_stdin,read,write,wait,history,send_message,list_agents,pause_agents,spawn_agent,close_agent` with `apply_patch` for a
 Responses model and `edit` otherwise, plus `web_search` where the provider
 offers it and `web_fetch` for any, unless `web_search = "disabled"` in `~/.agent/config.toml`, before it asks. A bot's
 tools are what the model is shown and what dispatch allows: a call to any
@@ -119,7 +119,7 @@ of the well-known key variables (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`,
 `OPENROUTER_API_KEY`) are set. Like `AGENT_MODEL`, `AGENT_PROVIDER` is a default
 for starting a daemon: a running daemon is not checked against it, since every
 bot's shell inherits the daemon's environment. No other credential discovery happens. `--no-spawn` refuses to start a
-daemon. Default tools are `shell,write_stdin,read,write,wait,history,send_message,list_agents,pause_agents` and the file editor
+daemon. Default tools are `shell,write_stdin,read,write,wait,history,send_message,list_agents,pause_agents,spawn_agent,close_agent` and the file editor
 the model's family is trained on, `apply_patch` (Responses) or `edit`, and
 `web_search` where the provider offers it, and `web_fetch`.
 
@@ -2824,7 +2824,7 @@ deleting the bot.
 
 The daemon registers `echo`, `shell`, `read`, `write`, `edit`, `apply_patch`,
 `wait`, `history`, `web_search`, `web_fetch`, `write_stdin`, `send_message`,
-`list_agents` and `pause_agents`; each bot is created with the subset it may call (`run --tools`),
+`list_agents`, `pause_agents`, `spawn_agent` and `close_agent`; each bot is created with the subset it may call (`run --tools`),
 which is what its model is shown and what dispatch allows. The
 registry validates tool names and arguments before execution; a tool that fails
 (unknown tool, invalid arguments, missing file, ambiguous edit, output
@@ -2847,6 +2847,41 @@ new. `list_agents` lists the caller's project's bots by default (its name up
 to the first dot, then `*`), and with `approvals` the calls waiting on a
 gate instead. A store from before schema 100 gives the three to every bot
 that has `wait` and `history`; the approval modes never gate them.
+
+`spawn_agent` and `close_agent` make and close agents the same way, as
+Codex's `spawn_agent` and `close_agent` do, and `spawn_agent` takes what
+`run --new` and `fork` take, so nothing the CLI could make is lost.
+`spawn_agent` makes an agent with the caller as its creator, so it works in
+the caller's folder (this turn's, or the `workspace` it names), in its
+sandbox and under its gates, never more loosely (see `Settings::under`),
+with the caller's tools and settings (its speed among them) unless `tools`
+and `settings` name others, and sends it `message` as its first, with
+`quote` and `turn_budget_tokens` as `submit` takes them. A `name` with no
+dot is put in the caller's project (`review` from `shop.lead` is
+`shop.review`). Its instructions are those `run --new` gives: the preamble
+alone; with `agents`, those a client composes for the folder (its
+`AGENTS.md` files, skills and memory); with `profile`, those in that role,
+with its model and tools; or `instructions`, exactly as given, which takes
+neither of the others. `model` and `effort` default to the caller's, or the
+profile's model. `budget_tokens`, `budget_counts`,
+`compaction_instructions` (empty: it never compacts), `compaction_model`,
+`fallback` and a gate (`approve`, `approver`, `approve_expire_ms`) are
+`create`'s. With `fork` it starts instead from a copy of the caller's
+conversation (the `fork` request, with its `checkpoint`, `allow` and
+`expire_ms`), taking no instructions, profile, model, effort, tools,
+settings or compaction. One `request_id`, the call's own unless the model
+names one, keys both the making and the message, so a call made again
+makes and sends nothing new. The models the person lists in
+`~/.agent/models`, with their notes, are named in its `model` parameter,
+read as the daemon starts. `close_agent` closes an agent the caller made:
+the `close` request marks it (`closed_ms` on its record, kept first) and
+names the turn it runs, read in the same store job, which the tool
+interrupts; `list_agents` leaves it out unless asked with `closed` (the
+`bots` request's `open` filter). Nothing of its history goes; the next turn
+it starts, from a message sent later or one already in line, opens it
+again. Both arrive in protocol version 84 (the `close` request, the
+`bots` request's `open` filter); a store from before schema 105 gives the
+two to every bot that has `send_message`.
 
 `shell` runs a noninteractive command with `/bin/bash -c` (`/bin/sh` where
 bash is not installed) in the bot workspace, or in `workdir` when the call
@@ -3505,7 +3540,7 @@ lifts, and a step that starts waiting on a gate while a steer waits wakes
 it (or the live turn) then. Calls waiting for their approval, and `shell`
 commands, are lifted as before.
 
-Protocol version 84 lets the client hand such a call back itself, as
+Protocol version 85 lets the client hand such a call back itself, as
 Codex's `exec` yields a script still running at its `yield_time_ms`:
 `{"op":"yield_call","bot","turn","call_id","output"}`, `output` being what
 the call wrote so far, text or parts and bounded as a `tool_result`'s. The
@@ -3514,7 +3549,7 @@ model reads `{"handle":"proc:N","background":true,"yielded":true,"output":
 TEXT}`, with the output's pictures after it; `call_lifted` says
 `"yielded":true`, and the reply names the handle. The turn goes on at once,
 live or parked. The daemon gains no timer: when to yield is the client's
-policy. A yielded call has no deadline (schema 105 marks its row `yielded`),
+policy. A yielded call has no deadline (schema 106 marks its row `yielded`),
 so no `expires_ms` ends it: its answer, given later with `tool_result`,
 ends it and is told and collected as a lifted call's, pictures included;
 `wait` with `terminate`, or `write_stdin` with `kill`, stops it, and
@@ -3525,7 +3560,7 @@ call of a tool declared `lift` yields: any other tool's is
 `call_not_liftable`, and one answered, lifted or out of time already is
 `no_pending_call`.
 
-Protocol version 84 also gives `wait` `terminate: true`: each handle,
+Protocol version 85 also gives `wait` `terminate: true`: each handle,
 every one a `proc:N` (a `BOT/N` is `invalid_handle`), is stopped first as
 `write_stdin` with `kill` stops it, and the wait returns how each ended, as
 Codex's `wait` takes `terminate`.

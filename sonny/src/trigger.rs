@@ -4507,8 +4507,16 @@ const SHADOW_TAG: &str = "shadow";
 /// `.shadow-` and six hex digits after it, the daemon's 128 bytes.
 const SHADOW_SOURCE_MAX: usize = 128 - ".shadow-".len() - 6;
 /// The daemon's tools a shadow copy goes without: a shell and its input,
-/// and the tools that message or pause other agents. Listing them stays.
-const SHADOW_WITHHELD: [&str; 4] = ["shell", "write_stdin", "send_message", "pause_agents"];
+/// and the tools that message, pause, make or close other agents. Listing
+/// them stays.
+const SHADOW_WITHHELD: [&str; 6] = [
+    "shell",
+    "write_stdin",
+    "send_message",
+    "pause_agents",
+    "spawn_agent",
+    "close_agent",
+];
 /// How long a call on that gate waits before it lapses.
 const SHADOW_LAPSE_MS: u64 = 60_000;
 /// How long a shadow copy left idle stays, should its fire stop before it
@@ -9048,7 +9056,8 @@ pub(crate) mod tests {
         // the daemon's socket, and the tools that message or pause other
         // agents, and of Sonny's only exec, within what it may call.
         let record = json!({"tools": ["shell", "write_stdin", "read", "write", "web_search",
-                "wait", "history", "send_message", "list_agents", "pause_agents"],
+                "wait", "history", "send_message", "list_agents", "pause_agents",
+                "spawn_agent", "close_agent"],
             "declared": [{"name": "ask"}, {"name": "exec"}, {"name": "memory"}]});
         assert_eq!(
             shadow_tools(&record),

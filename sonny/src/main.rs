@@ -175,6 +175,9 @@ const DRAW_EVERY: Duration = Duration::from_millis(33);
 /// clocks count seconds, and what it reads now and then (counts, tasks,
 /// the margin's files) shows within one.
 const IDLE_FRAME: Duration = Duration::from_secs(1);
+/// How often at most the window looks at the config for the sources a
+/// template's blanks read: a margin's file poll's pace.
+const SOURCES_FRESH: Duration = Duration::from_secs(1);
 /// How often a window looks round (its jobs' answers, what it reads now
 /// and then, what moves) while something on it moves or it heard from the
 /// person or the daemon within [`LIVELY_FOR`]; otherwise once a frame, so
@@ -4560,6 +4563,8 @@ struct App {
     /// What template notes are filled from: the tasks that read found,
     /// the store, the person's sources and notes.
     blanks: margin::Blanks,
+    /// When the sources in `blanks` were last read from the config.
+    sources_read: Option<Instant>,
     /// The agents that read gave a row, which its counts count already.
     status_bots: std::collections::HashSet<String>,
     /// The footer's own read of them, under way, and when the last began.
@@ -6394,6 +6399,7 @@ impl App {
             references_read: None,
             counts: None,
             blanks: margin::Blanks::default(),
+            sources_read: None,
             status_bots: std::collections::HashSet::new(),
             counting: None,
             counted_at: None,
@@ -8090,6 +8096,19 @@ impl App {
                 self.started_bot(arguments, output),
                 arguments["brief"].as_str().unwrap_or(""),
             ),
+            "spawn_agent" => {
+                // One the daemon refused started nothing.
+                if serde_json::from_str::<Value>(output)
+                    .is_ok_and(|reply| reply["error"].is_string())
+                {
+                    return;
+                }
+                (
+                    started::STARTED,
+                    self.started_bot(arguments, output),
+                    arguments["message"].as_str().unwrap_or(""),
+                )
+            }
             "send_message" => {
                 // One the daemon refused (no such agent) sent nothing.
                 if serde_json::from_str::<Value>(output)
@@ -9076,6 +9095,7 @@ impl App {
         self.live_count += 1;
         let folder = std::path::PathBuf::from(&self.workspace);
         let key = at.to_string();
+        self.read_sources();
         (self.live_watch).fill(&key, (template, &folder), &self.blanks, None);
         let lines = live::block(self.live_watch.get(&key), self.prose(), &folder);
         let from = self.pending.len() + usize::from(self.any_history);
@@ -9293,11 +9313,23 @@ impl App {
     }
 
     /// A `margin` call applied as it starts, so a note shows while the
-    /// agent works, and the margin scrolled to it.
-    fn note_call(&mut self, call: &str, arguments: &Value, turn: Option<i64>) {
+    /// agent works, and the margin scrolled to it: written at `written`,
+    /// as the history dates its output, or now, heard live.
+    fn note_call(
+        &mut self,
+        call: &str,
+        arguments: &Value,
+        turn: Option<i64>,
+        written: Option<i64>,
+    ) {
         let after = self.answering.as_ref().map(|(.., node)| *node);
+        let written = written.unwrap_or_else(|| {
+            (std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH))
+                .map_or(0, |since| since.as_millis() as i64)
+        });
         if let Some(margin::Change::Posted(id) | margin::Change::Updated(id)) =
-            self.margin.apply(call, arguments, after, turn)
+            self.margin
+                .apply(call, arguments, after, turn, Some(written))
         {
             self.margin_focus = self.margin.note(&id).map(|note| margin::anchor(&note.call));
         }
@@ -10102,22 +10134,41 @@ impl App {
         }
     }
 
-    /// The person's own notes and sources as the config has them now.
+    /// The person's own notes as the config has them now.
     fn set_template_settings(&mut self, settings: &settings::Settings) {
         let notes = std::sync::Arc::new(settings.notes.clone());
         if *self.blanks.notes != *notes {
             self.blanks.notes = notes;
         }
+    }
+
+    /// The sources a blank may read as the config has them now, read as
+    /// the tool host reads them for each call, so a source added after
+    /// the window opened fills here as the host told the agent it does:
+    /// looked at no more than once a [`SOURCES_FRESH`], the config itself
+    /// read again only once it changed ([`kept::config`]).
+    fn read_sources(&mut self) {
+        self.read_sources_from(crate::template::configured_sources);
+    }
+
+    /// [`App::read_sources`], the sources as `read` gives them.
+    fn read_sources_from(&mut self, read: impl FnOnce() -> std::sync::Arc<Vec<String>>) {
+        if (self.sources_read).is_some_and(|at| at.elapsed() < SOURCES_FRESH) {
+            return;
+        }
+        self.sources_read = Some(Instant::now());
         // Kept as it was when the same, so notes fill again only once one
         // is added or taken away.
-        if *self.blanks.sources != settings.sources {
-            self.blanks.sources = std::sync::Arc::new(settings.sources.clone());
+        let sources = read();
+        if *self.blanks.sources != *sources {
+            self.blanks.sources = sources;
         }
     }
 
     /// What template notes are filled from, handed to the margin before
     /// it is drawn or looked at: it may have been loaded again since.
     fn margin_blanks(&mut self) {
+        self.read_sources();
         self.margin.set_blanks(self.blanks.clone());
     }
 
@@ -10489,7 +10540,8 @@ impl App {
                             && denial(&item).is_none()
                             && !reactions::refused(&item)
                         {
-                            self.margin.apply(&id, &arguments, None, None);
+                            let written = item["written_ms"].as_i64();
+                            self.margin.apply(&id, &arguments, None, None, written);
                         }
                     }
                     _ => {}
@@ -10742,7 +10794,8 @@ impl App {
                                 && denial(&item).is_none()
                                 && !reactions::refused(&item)
                             {
-                                self.note_call(id, &arguments, turns.get(&node).copied());
+                                let written = item["written_ms"].as_i64();
+                                self.note_call(id, &arguments, turns.get(&node).copied(), written);
                             }
                             unpaired.push((node, item));
                             continue;
@@ -10757,7 +10810,8 @@ impl App {
                             && denial(&item).is_none()
                             && !reactions::refused(&item)
                         {
-                            self.note_call(id, &arguments, turns.get(&node).copied());
+                            let written = item["written_ms"].as_i64();
+                            self.note_call(id, &arguments, turns.get(&node).copied(), written);
                         }
                         match denial(&item) {
                             Some(reason) => {
@@ -11802,7 +11856,7 @@ impl App {
                 } else {
                     // Taken: the margin shows it, once.
                     if name == margin::TOOL && !shown.1 {
-                        self.note_call(id, &arguments, turn);
+                        self.note_call(id, &arguments, turn, None);
                     }
                     self.commit_call(id, turn, &name, &arguments, &shown.0, shown.1);
                 }
@@ -20847,6 +20901,52 @@ mod tests {
         App::new(client, "b", &json!({"name": "b"}), options)
     }
 
+    #[tokio::test]
+    async fn a_source_added_to_the_config_after_the_window_opened_fills_its_notes() {
+        let store = std::env::temp_dir()
+            .join(format!("sonny-window-sources-{}", std::process::id()))
+            .join("store.sqlite");
+        let dir = crate::lookout::beside(&store, ".sources").join(".recent");
+        std::fs::create_dir_all(&dir).unwrap();
+        let line = json!({"source": "ci", "text": "green", "at_ms": 1000, "seq": 1});
+        std::fs::write(dir.join("ci.jsonl"), format!("{line}\n")).unwrap();
+        let mut app = app(daemon_answering(|_| json!({})).await);
+        app.blanks.store = Some(store.clone());
+        let none = || Arc::new(Vec::<String>::new());
+        let ci = || Arc::new(vec!["ci".to_owned()]);
+        app.read_sources_from(none);
+        let post = json!({"kind": "follows", "id": "ci", "live": true,
+            "markdown": "CI is {{ source('ci').latest.text }}"});
+        app.margin.apply("c1", &post, None, None, None);
+        let shown = |app: &mut App| {
+            app.margin.set_blanks(app.blanks.clone());
+            let (lines, _) = app.margin.lines(60, usize::MAX, Path::new("/"), None);
+            (lines.iter().map(|line| line.to_string()))
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        assert!(shown(&mut app).contains("no source named ci"));
+        // Added to the config: looked at no more than once a second, then
+        // read as the tool host reads it for every call, and the note
+        // fills as the host told the agent it did.
+        app.read_sources_from(ci);
+        assert!(app.blanks.sources.is_empty());
+        app.sources_read = Instant::now().checked_sub(SOURCES_FRESH);
+        app.read_sources_from(ci);
+        app.margin.later();
+        let rows = shown(&mut app);
+        assert!(
+            rows.contains("CI is green") && !rows.contains("no source"),
+            "{rows}"
+        );
+        // The same list read again is the same list: nothing fills again.
+        let sources = app.blanks.sources.clone();
+        app.sources_read = Instant::now().checked_sub(SOURCES_FRESH);
+        app.read_sources_from(ci);
+        assert!(Arc::ptr_eq(&sources, &app.blanks.sources));
+        let _ = std::fs::remove_dir_all(store.parent().unwrap());
+    }
+
     /// What the conversation holds, the lines still waiting written in.
     fn drawn(app: &mut App) -> Vec<String> {
         app.flush();
@@ -27709,6 +27809,7 @@ mod tests {
             "c1",
             &json!({"kind": "pinned", "id": "flow", "from": "calc.add/flow"}),
             None,
+            None,
         );
         let shown = |app: &App| match &app.margin.note("flow").unwrap().body {
             margin::Body::From { shown, .. } => shown.as_deref().cloned(),
@@ -27786,6 +27887,7 @@ mod tests {
                 "c1",
                 &json!({"kind": "pinned", "id": "flow", "from": "calc.add/flow"}),
                 None,
+                None,
             );
             app.read_references().await;
             assert_eq!(shown(&app), Some(margin::Body::Markdown("deep".into())));
@@ -27829,6 +27931,7 @@ mod tests {
         app.note_call(
             "c1",
             &json!({"kind": "pinned", "id": "flow", "from": "calc.add/flow"}),
+            None,
             None,
         );
         let shown = |app: &App| match &app.margin.note("flow").unwrap().body {
@@ -27897,6 +28000,7 @@ mod tests {
             "c1",
             &json!({"kind": "pinned", "id": "flow", "from": "calc.add/flow"}),
             None,
+            None,
         );
         let shown = |app: &App| match &app.margin.note("flow").unwrap().body {
             margin::Body::From { shown, .. } => shown.as_deref().cloned(),
@@ -27922,7 +28026,7 @@ mod tests {
         // Given its own title here, it keeps it.
         let titled =
             json!({"kind": "pinned", "id": "flow", "title": "Mine", "from": "calc.add/flow"});
-        app.note_call("c2", &titled, None);
+        app.note_call("c2", &titled, None, None);
         app.references_read = None;
         app.read_references().await;
         assert_eq!(shown(&app), Some(margin::Body::Markdown("d".into())));
@@ -31280,7 +31384,7 @@ mod tests {
         app.failed = 1;
         for id in ["findings", "repro"] {
             let post = json!({"kind": "pinned", "id": id, "title": id, "markdown": "x"});
-            app.margin.apply(id, &post, None, None);
+            app.margin.apply(id, &post, None, None, None);
         }
         app.context = Some(126_000);
         app.window = Some(200_000);
@@ -32381,19 +32485,24 @@ mod tests {
         app.margin_back();
         assert!(!margin(&app));
         let post = json!({"kind": "pinned", "id": "repro", "title": "Repro", "markdown": "x"});
-        app.margin.apply("m1", &post, None, None);
+        app.margin.apply("m1", &post, None, None, None);
         app.margin_back();
         assert!(margin(&app));
         // Its last note taken away, it stays, as one opened empty does.
-        app.margin
-            .apply("m2", &json!({"id": "repro", "remove": true}), None, None);
+        app.margin.apply(
+            "m2",
+            &json!({"id": "repro", "remove": true}),
+            None,
+            None,
+            None,
+        );
         app.margin_back();
         assert!(margin(&app) && !app.margin.closed());
         // Closed by the person, a note opens it again by default.
         app.close_pane(true);
         app.margin_back();
         assert!(!margin(&app) && app.margin.closed());
-        app.margin.apply("m3", &post, None, None);
+        app.margin.apply("m3", &post, None, None, None);
         app.margin_back();
         assert!(margin(&app) && !app.margin.closed());
         // Under what is open, to go back to; emptied there, it is still
@@ -32403,18 +32512,23 @@ mod tests {
         app.close_pane(true);
         app.open_pane(pane::Pane::card("status", STATUS_KEYS));
         let change = json!({"kind": "pinned", "id": "repro", "markdown": "y"});
-        app.margin.apply("m4", &change, None, None);
+        app.margin.apply("m4", &change, None, None, None);
         app.margin_back();
         assert!(app.under.is_some() && app.pane.as_ref().unwrap().over);
-        app.margin
-            .apply("m5", &json!({"id": "repro", "remove": true}), None, None);
+        app.margin.apply(
+            "m5",
+            &json!({"id": "repro", "remove": true}),
+            None,
+            None,
+            None,
+        );
         app.margin_back();
         app.close_pane(true);
         assert!(margin(&app));
         // Unless closed: a note leaves it closed until /margin.
         app.margin_opens = MarginOpens::UnlessClosed;
         app.close_pane(true);
-        app.margin.apply("m6", &post, None, None);
+        app.margin.apply("m6", &post, None, None, None);
         app.margin_back();
         assert!(!margin(&app) && app.margin.closed());
         app.toggle_margin();
@@ -32423,13 +32537,13 @@ mod tests {
         app.margin_opens = MarginOpens::Never;
         app.pane = None;
         app.pane_keys = false;
-        app.margin.apply("m7", &change, None, None);
+        app.margin.apply("m7", &change, None, None, None);
         app.margin_back();
         assert!(!margin(&app) && !app.margin.closed());
         app.toggle_margin();
         assert!(margin(&app) && app.pane_keys);
         app.pane_keys = false;
-        app.margin.apply("m8", &post, None, None);
+        app.margin.apply("m8", &post, None, None, None);
         app.margin_back();
         assert!(margin(&app));
     }
@@ -32438,7 +32552,7 @@ mod tests {
     async fn what_opens_lays_over_the_margin_and_esc_steps_back_to_it() {
         let mut app = app(daemon_with(json!([])).await);
         let post = json!({"kind": "pinned", "id": "repro", "title": "Repro", "markdown": "x"});
-        app.margin.apply("m1", &post, None, None);
+        app.margin.apply("m1", &post, None, None, None);
         app.margin_back();
         assert!(app.pane.as_ref().is_some_and(pane::Pane::is_margin));
         app.open_pane(pane::Pane::card("status", STATUS_KEYS));
@@ -32530,7 +32644,7 @@ mod tests {
     async fn back_from_what_is_over_the_margin_is_the_margin_and_forward_lays_it_over_again() {
         let mut app = app(daemon_with(json!([])).await);
         let post = json!({"kind": "pinned", "id": "repro", "title": "Repro", "markdown": "x"});
-        app.margin.apply("m1", &post, None, None);
+        app.margin.apply("m1", &post, None, None, None);
         app.margin_back();
         app.open_pane(pane::Pane::card("status", STATUS_KEYS));
         assert!(app.step_pane(true));
@@ -32549,7 +32663,7 @@ mod tests {
         std::fs::write(dir.join("a.md"), "# A\n").unwrap();
         let mut app = app(daemon_with(json!([])).await);
         let post = json!({"kind": "pinned", "id": "repro", "title": "Repro", "markdown": "x"});
-        app.margin.apply("m1", &post, None, None);
+        app.margin.apply("m1", &post, None, None, None);
         app.margin_back();
         app.follow(&format!("file://{}", dir.join("a.md").display()));
         assert!(app.pane.as_ref().is_some_and(|p| !p.is_margin() && p.over));
@@ -33107,7 +33221,7 @@ mod tests {
     async fn the_margin_shows_by_itself_only_where_the_conversation_keeps_its_width() {
         let mut app = app(daemon_with(json!([])).await);
         let post = json!({"kind": "pinned", "id": "repro", "title": "Repro", "markdown": "x"});
-        app.margin.apply("m1", &post, None, None);
+        app.margin.apply("m1", &post, None, None, None);
         app.margin_back();
         let (chat, margin) = app.split(Rect::new(0, 0, 170, 40));
         // The conversation's 100 two columns in, a gutter each side of the
@@ -33164,7 +33278,7 @@ mod tests {
         .await;
         let mut app = app(client);
         let post = json!({"kind": "pinned", "id": "repro", "title": "Repro", "markdown": "x"});
-        app.margin.apply("m1", &post, None, None);
+        app.margin.apply("m1", &post, None, None, None);
         app.daemon(turn_event("steered", 4, json!({"node": 7})))
             .await;
         assert!(app.margin.note("repro").is_none());
@@ -33241,8 +33355,8 @@ mod tests {
         .await;
         let mut app = app(client);
         let post = |id: &str| json!({"kind": "pinned", "id": id, "title": id, "markdown": "old"});
-        app.margin.apply("c1", &post("kept"), None, None);
-        app.margin.apply("c2", &post("gone"), None, None);
+        app.margin.apply("c1", &post("kept"), None, None, None);
+        app.margin.apply("c2", &post("gone"), None, None, None);
         app.margin.advance(2);
         app.history().await;
         let kept = app.margin.note("kept").expect("kept");
@@ -33315,14 +33429,14 @@ mod tests {
         .await;
         let mut app = app(client);
         let post = json!({"kind": "pinned", "id": "repro", "title": "Repro", "markdown": "x"});
-        app.margin.apply("c1", &post, None, None);
+        app.margin.apply("c1", &post, None, None, None);
         // Taken away here; its message lands in a turn already running,
         // after which the agent puts the note back.
         app.margin.remove("repro", None);
         app.closing.insert("repro".into());
         assert!(app.note_closed(7, &told));
         let again = json!({"kind": "pinned", "id": "repro", "title": "Repro", "markdown": "again"});
-        app.margin.apply("c9", &again, None, None);
+        app.margin.apply("c9", &again, None, None, None);
         app.history().await;
         assert!(app.margin.note("repro").is_some());
     }
@@ -33340,7 +33454,7 @@ mod tests {
         .await;
         let mut app = app(client);
         let post = json!({"kind": "pinned", "id": "repro", "title": "Repro", "markdown": "x"});
-        app.margin.apply("m1", &post, None, None);
+        app.margin.apply("m1", &post, None, None, None);
         app.follow("sonny:close/repro");
         for what in std::mem::take(&mut app.pressed) {
             app.press(&what).await;
@@ -33359,7 +33473,7 @@ mod tests {
         let client = daemon_answering(|_| json!({"error": "bot_busy", "detail": "busy"})).await;
         let mut app = app(client);
         let post = json!({"kind": "pinned", "id": "repro", "title": "Repro", "markdown": "x"});
-        app.margin.apply("m1", &post, None, None);
+        app.margin.apply("m1", &post, None, None, None);
         app.follow("sonny:close/repro");
         for what in std::mem::take(&mut app.pressed) {
             app.press(&what).await;
