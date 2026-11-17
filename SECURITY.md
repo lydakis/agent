@@ -202,11 +202,12 @@ vulnerability, whether or not the code's own documentation agrees.
   exists; its tokens are never read out. Bedrock uses static `AWS_*`
   variables or `aws configure export-credentials`. No keychain is read.
 - A bot's shell gets the daemon's environment without the keys its
-  providers use, and the provider keys and ChatGPT tokens are redacted
-  from what tools return, as are values after fields named like
-  `password`, `api_key` or `secret_access_key` and the bodies of PEM
-  private-key blocks. Redaction matches the exact value in tool output
-  only; an encoded copy, or a secret in model text, is not caught.
+  providers use, and the provider keys and ChatGPT tokens are replaced
+  with `[redacted by agent]` in what tools return. Redaction matches the
+  exact value in tool output only; an encoded copy, or a secret in model
+  text, is not caught. Nothing else is redacted from tool output, as in
+  Codex: a password or private key a command prints reaches the model as
+  printed (the reviewer still redacts what it shows its judge).
 - Other secrets in the daemon's environment reach a bot's shell unless
   `[shell_environment_policy]` in `config.toml` leaves them out: as in
   Codex, `*KEY*`, `*SECRET*` and `*TOKEN*` are withheld only with
