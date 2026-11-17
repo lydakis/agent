@@ -1671,7 +1671,7 @@ showed.
 ## Skills and background services
 
 At each start Sonny writes what every agent leans on: the
-`memory`, `memory-cleanup`, `plan` and `automation` skills, as normal skills
+`memory`, `memory-cleanup`, `plan`, `margin` and `automation` skills, as normal skills
 in `~/.agents/skills` (replacing links the Agent app left there), and
 `~/.agent/memory` and `~/.agent/automation`, scripts that run this Sonny as
 `sonny memory ...` (facts saved for later agents, in `~/.agents/memory`;
