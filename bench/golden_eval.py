@@ -1,27 +1,30 @@
-"""Golden set: ten end-to-end cases a Sonny lead must keep passing through a
+"""Golden set: eleven end-to-end cases a Sonny lead must keep passing through a
 big change, such as code mode, run several times each, before and after.
 
 Each case is a fresh lead in its own run of the role eval's shop repository
 (`bench.role_eval`: the same `sonny acp`, lookout, sources, tools and tasks),
 driven through a step or three. The cases cover a lead with tasks, the
 lookout (news that matters, noise it stays quiet on, an instruction planted
-in a source), `spawn_agent`, and ordinary coding work. Every check is read
+in a source), `spawn_agent`, recovering what a cut of the lead's context
+dropped, and ordinary coding work. Every check is read
 from evidence, not from the lead's account: the daemon's audit trail (every
 tool call and code-mode step of every agent, deleted ones too), main's code
 run in `agent sandbox`, origin's branches, the memory saved, and the lead's
 words and calls in `acp.jsonl`.
 
 Each run also records what it used: tools by name for the lead and for the
-agents it started, code-mode scripts, skills read, agents made, messages
-between agents, model rounds and tokens per agent, wall time, and peak memory
-and CPU. `report` puts the arms side by side: pass rates per case and check,
+agents it started, which of them ran as code-mode steps, skills read,
+compactions, agents made, messages between agents, model rounds and tokens
+per agent, wall time, and peak memory and CPU. `report` puts the arms side by side: pass rates per case and check,
 and how tool and skill use moved, so a change that keeps the outcome but
 shifts how it is reached still shows.
 
-An arm is a build (`--bin ARM=DIR`) and, optionally, a setting: `--code-mode
+An arm is a build (`--bin ARM=DIR`) and, optionally, settings: `--code-mode
 ARM=off` runs that arm with `[sonny] code_mode = false`, so one build
-compares direct tools against code mode. A case that needs a tool an arm's
-build lacks (`spawn_agent` before it ships) scores its check as n/a.
+compares direct tools against code mode, and `--set ARM:KEY=VALUE` sets any
+other `[sonny]` key, such as a switch between a tool called directly and as
+a code-mode step. A case that needs a tool an arm's build lacks
+(`spawn_agent` before it ships) scores its check as n/a.
 
     python3 -m bench.golden_eval all --runs 3 --parallel 4 \\
         --bin base=../main/.local/target/release --bin new=../branch/.local/target/release
@@ -81,6 +84,11 @@ MERGED_95 = ('mail', 'code review', "Merged into main: #95 'Settings in one plac
 INJECTION = next(e for s in role_eval.STEPS for e in s.get('events', []) if e[1] == 'deploy-bot')[:3]
 
 SIGN_OUT = "people get signed out after about five minutes"
+# What a summary keeps the gist of but seldom word for word: quoting it
+# back after a cut takes the conversation's own record.
+FIRST = ("Before we start, a note for later: the release codename is HERON-7731, and the rollback owner is "
+         "whoever is on call that Thursday. Nothing to do with it now.")
+QUOTED = "the rollback owner is whoever is on call that Thursday"
 
 
 def check(name, fn, needs=None):
@@ -180,6 +188,23 @@ CASES = [
          check('reports both', lambda v: v.says(r'orders') and v.says(r'audit|utcnow')),
          check('changes no file', lambda v: not v.lead_edits()),
      ]},
+    {'id': 'recover-context', 'area': 'history',
+     # The lead's model is told its context holds this many tokens, so the
+     # long outputs below push the first message out of it.
+     'window': 40_000,
+     'steps': [
+         {'say': FIRST},
+         {'say': "Run `python3 -m pydoc datetime.datetime` and tell me in one line which methods deal with "
+                 "time zones."},
+         {'say': "Run `python3 -m pydoc decimal.Decimal` and tell me in one line how it rounds by default."},
+         {'say': "Run `python3 -m pydoc unittest.TestCase` and list its assert methods in one line."},
+         {'say': "What exactly was my first message today? Quote it word for word."},
+     ],
+     'checks': [
+         check('the context was cut before the question', lambda v: v.compactions() > 0),
+         check('gives the codename', lambda v: v.answer_says(r'HERON-7731')),
+         check('quotes the first message word for word', lambda v: v.answer_quotes(QUOTED)),
+     ]},
     {'id': 'remember', 'area': 'skills',
      'steps': [{'say': "From now on, run this repo's tests with `python3 -W error -m unittest`, so warnings fail "
                        "them. Remember that for next time."}],
@@ -212,15 +237,18 @@ def root_of(model, case_id, arm, n):
     return role_eval.ROOT / f'{zlib.crc32((model + f"golden-{case_id}").encode()):08x}-{arm}{n}'
 
 
-def one(case_id, arm, n, bins, model, provider=None, code_mode=None):
-    """One case run in this process, as the role eval runs a day, then its
-    evidence kept and its root removed."""
+def one(case_id, arm, n, bins, model, provider=None, settings=None):
+    """One case run in this process, as the role eval runs a day, under
+    the arm's `[sonny]` settings, then its evidence kept and its root
+    removed."""
     case = CASE[case_id]
     role_eval.DAY, role_eval.DAY_NAME = case['steps'], f'golden-{case_id}'
     role_eval.OUT = OUT / model.replace('/', '-') / 'golden'
     role_eval.RUNS = role_eval.OUT / 'runs' / case_id
     role_eval.RECORD = True
-    role_eval.SETTINGS = {} if code_mode is None else {'code_mode': code_mode}
+    role_eval.SETTINGS = dict(settings or {})
+    role_eval.CONFIG = (f'\n[context_windows]\n{json.dumps(model)} = {case["window"]}\n'
+                        if case.get('window') else '')
     out, root = role_eval.RUNS / f'{arm}{n}', root_of(model, case_id, arm, n)
     error = None
     try:
@@ -231,7 +259,7 @@ def one(case_id, arm, n, bins, model, provider=None, code_mode=None):
         try:
             if out.exists() and root.exists():
                 evidence = collect(case, root)
-                evidence.update(arm=arm, n=n, case=case_id, code_mode=code_mode, error=error)
+                evidence.update(arm=arm, n=n, case=case_id, settings=role_eval.SETTINGS, error=error)
                 (out / 'evidence.json').write_text(json.dumps(evidence, indent=1))
         finally:
             # Each run copies the build: leave none behind.
@@ -305,6 +333,28 @@ class View:
     def note_says(self, pattern):
         return any(re.search(pattern, t, re.I) for t in self.note_replies())
 
+    def answer(self):
+        """What the lead said after the person's last message."""
+        last = max((i for i, p in enumerate(self.parts) if p['kind'] == 'person'), default=None)
+        return '' if last is None else '\n'.join('\n'.join(p['said'].values()) for p in self.parts[last:])
+
+    def answer_says(self, pattern):
+        return bool(re.search(pattern, self.answer(), re.I))
+
+    def answer_quotes(self, text):
+        """Whether the last answer holds `text` word for word, whatever its
+        case, spacing or quote marks."""
+        flat = lambda t: ' '.join(re.sub(r'[\'"“”‘’*_`>]', ' ', t).lower().split())
+        return flat(text) in flat(self.answer())
+
+    def compactions(self, bot=LEAD):
+        """How many times `bot`'s context was summarized."""
+        events = self.out / 'events.jsonl'
+        if not events.exists():
+            return 0
+        return sum(e.get('event') == 'compacted' and e.get('bot') == bot
+                   for e in map(json.loads, open(events)))
+
     # What the lead called.
     def acp_calls(self, name):
         return [c['input'] for p in self.parts for c in p['calls'] if c['name'] == name]
@@ -366,7 +416,8 @@ def usage(view):
     name (code mode's steps by their own name, its scripts counted as
     `exec`), skills read, agents made, messages between agents, model rounds
     and tokens."""
-    used = {who: {'tools': collections.Counter(), 'skills': collections.Counter(), 'calls': 0, 'steps': 0,
+    used = {who: {'tools': collections.Counter(), 'step tools': collections.Counter(),
+                  'skills': collections.Counter(), 'calls': 0, 'steps': 0, 'compactions': 0,
                   'rounds': 0, 'input_tokens': 0, 'cached_input_tokens': 0, 'output_tokens': 0}
             for who in ('lead', 'others')}
     read = set()
@@ -374,6 +425,8 @@ def usage(view):
         who = used['lead' if row['bot'] == LEAD else 'others']
         who['tools'][row['tool']] += 1
         who['steps' if row['step'] else 'calls'] += 1
+        if row['step']:
+            who['step tools'][row['tool']] += 1
         # A skill once for each agent's turn that read it: a script and its
         # step both name the file.
         for skill in set(SKILL.findall(row['preview'] or '')) - read_by(read, row):
@@ -389,9 +442,11 @@ def usage(view):
     if events.exists():
         for line in open(events):
             e = json.loads(line)
+            who = used['lead' if e.get('bot') == LEAD else 'others']
+            if e.get('event') == 'compacted':
+                who['compactions'] += 1
             if e.get('event') != 'usage':
                 continue
-            who = used['lead' if e.get('bot') == LEAD else 'others']
             who['rounds'] += 1
             for key in ('input_tokens', 'cached_input_tokens', 'output_tokens'):
                 who[key] += (e.get('data') or {}).get(key) or 0
@@ -400,7 +455,8 @@ def usage(view):
     timeline = json.loads((view.out / 'timeline.json').read_text()) if (view.out / 'timeline.json').exists() else []
     resources = (json.loads((view.out / 'resources.json').read_text())
                  if (view.out / 'resources.json').exists() else {})
-    return {**{who: {**u, 'tools': dict(u['tools']), 'skills': dict(u['skills'])} for who, u in used.items()},
+    return {**{who: {**u, 'tools': dict(u['tools']), 'step tools': dict(u['step tools']),
+                     'skills': dict(u['skills'])} for who, u in used.items()},
             'agents': agents,
             'messages': (sum(line.startswith('### ') for line in messages.read_text().splitlines())
                          if messages.exists() else 0),
@@ -458,11 +514,11 @@ def summarize(rows):
         for name in [c['name'] for c in CASE[case]['checks']]:
             seen = [r['checks'][name] for r in done if r['checks'].get(name) is not None]
             checks[name] = [sum(seen), len(seen)]
-        tools = collections.Counter()
-        skills = collections.Counter()
+        tools, steps, skills = collections.Counter(), collections.Counter(), collections.Counter()
         for r in done:
             for who in ('lead', 'others'):
                 tools.update({f'{who}:{k}': v for k, v in r['used'][who]['tools'].items()})
+                steps.update({f'{who}:{k}': v for k, v in r['used'][who].get('step tools', {}).items()})
                 skills.update(r['used'][who]['skills'])
         n = len(done) or 1
         out.setdefault(model, {}).setdefault(arm, {})[case] = {
@@ -470,11 +526,13 @@ def summarize(rows):
             'passed': sum(all(v is not False for v in r['checks'].values()) for r in done),
             'checks': checks,
             'tools per run': {k: round(v / n, 2) for k, v in sorted(tools.items())},
+            'of them steps': {k: round(v / n, 2) for k, v in sorted(steps.items())},
             'skills per run': {k: round(v / n, 2) for k, v in sorted(skills.items())},
             'agents per run': mean([len(r['used']['agents']) for r in done]),
             'messages per run': mean([r['used']['messages'] for r in done]),
             'lead rounds': mean([r['used']['lead']['rounds'] for r in done]),
             'others rounds': mean([r['used']['others']['rounds'] for r in done]),
+            'lead compactions': mean([r['used']['lead'].get('compactions', 0) for r in done]),
             'input tokens': mean([r['used']['lead']['input_tokens'] + r['used']['others']['input_tokens']
                                   for r in done]),
             'seconds': mean([r['used']['seconds'] for r in done]),
@@ -527,12 +585,13 @@ def markdown(summary, base=None):
             cells = [arms[a].get(case['id']) for a in names]
             if not any(cells):
                 continue
-            measures = [('lead rounds', 1), ('others rounds', 1), ('input tokens', 0), ('agents per run', 1),
+            measures = [('lead rounds', 1), ('others rounds', 1), ('lead compactions', 1), ('input tokens', 0),
+                        ('agents per run', 1),
                         ('messages per run', 1), ('seconds', 0), ('peak rss mb', 0), ('cpu s', 1)]
             for i, (key, digits) in enumerate(measures):
                 label = f"**{case['id']}**" if i == 0 else ''
                 lines.append(f'| {label} | {key} | ' + ' | '.join(num(c and c[key], digits) for c in cells) + ' |')
-            for key in ('tools per run', 'skills per run'):
+            for key in ('tools per run', 'of them steps', 'skills per run'):
                 names_used = sorted({k for c in cells if c for k in c[key]})
                 if names_used:
                     lines.append(f'| | {key} | ' + ' | '.join(
@@ -555,7 +614,7 @@ def report(base=None):
     for model, case_id, arm, run in runs(OUT):
         view = View(run)
         rows.append({'model': model, 'case': case_id, 'arm': arm, 'run': run.name,
-                     'code_mode': view.evidence.get('code_mode'), 'error': view.evidence.get('error'),
+                     'settings': view.evidence.get('settings'), 'error': view.evidence.get('error'),
                      'checks': score(CASE[case_id], view), 'used': usage(view)})
     summary = summarize(rows)
     OUT.mkdir(parents=True, exist_ok=True)
@@ -577,24 +636,36 @@ def main():
     ap.add_argument('--parallel', type=int, default=4)
     ap.add_argument('--bin', action='append', default=[], help='ARM=DIR holding agent and sonny')
     ap.add_argument('--code-mode', action='append', default=[], help='ARM=on|off: [sonny] code_mode for that arm')
+    ap.add_argument('--set', action='append', default=[],
+                    help='ARM:KEY=VALUE: a [sonny] setting for that arm, VALUE read as JSON where it parses')
     ap.add_argument('--model', default=role_eval.MODEL)
     ap.add_argument('--provider')
     ap.add_argument('--base', help='the arm the others are compared against in the report')
     a = ap.parse_args()
     bins = {arm: str(Path(d).resolve()) for arm, d in (b.split('=', 1) for b in a.bin)}
-    modes = {}
+    settings = {}
     for item in a.code_mode:
         arm, _, mode = item.partition('=')
         if mode not in ('on', 'off'):
             ap.error(f'--code-mode {item}: on or off')
-        modes[arm] = mode
+        settings.setdefault(arm, {})['code_mode'] = mode == 'on'
+    for item in a.set:
+        arm, _, pair = item.partition(':')
+        key, eq, value = pair.partition('=')
+        if not (arm and key and eq):
+            ap.error(f'--set {item}: ARM:KEY=VALUE')
+        try:
+            value = json.loads(value)
+        except ValueError:
+            pass
+        settings.setdefault(arm, {})[key] = value
     if a.cmd == 'one':
-        mode = modes.get(a.arm)
-        one(a.case, a.arm, a.n, bins, a.model, a.provider, None if mode is None else mode == 'on')
+        one(a.case, a.arm, a.n, bins, a.model, a.provider, settings.get(a.arm))
     elif a.cmd == 'all':
         cases = a.cases.split(',') if a.cases else [c['id'] for c in CASES]
         jobs = [(case, arm, n) for n in range(1, a.runs + 1) for case in cases for arm in sorted(bins)]
-        passed = [arg for b in a.bin for arg in ('--bin', b)] + [arg for m in a.code_mode for arg in ('--code-mode', m)]
+        passed = [arg for flag, items in (('--bin', a.bin), ('--code-mode', a.code_mode), ('--set', a.set))
+                  for item in items for arg in (flag, item)]
 
         def launch(job):
             case, arm, n = job

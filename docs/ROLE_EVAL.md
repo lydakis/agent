@@ -153,7 +153,7 @@ a note.
 ## The golden set
 
 `bench/golden_eval.py` is the check to run before and after a big change,
-code mode first: ten cases a lead must keep passing, each run several times
+code mode first: eleven cases a lead must keep passing, each run several times
 on every arm, with the outcome read from evidence and what each run used
 recorded beside it. Each case is a fresh lead in its own run of the shop
 repository above, through a step or three, with the role eval's sources,
@@ -168,8 +168,11 @@ python3 -m bench.golden_eval report --base base
 ```
 
 An arm is a build, and `--code-mode ARM=on|off` sets `[sonny] code_mode`
-for it, so one build compares direct tools with code mode. A check that
-needs a tool the arm's build lacks (`spawn_agent` before it ships) is n/a.
+for it, so one build compares direct tools with code mode. `--set
+ARM:KEY=VALUE` sets any other `[sonny]` key for an arm, such as a switch
+that runs a tool like `history` as a code-mode step instead of a direct
+call. A check that needs a tool the arm's build lacks (`spawn_agent` before
+it ships) is n/a.
 
 | Case | Area | Checks |
 | --- | --- | --- |
@@ -202,6 +205,9 @@ needs a tool the arm's build lacks (`spawn_agent` before it ships) is n/a.
 | | | with spawn_agent (needs `spawn_agent`) |
 | | | reports both |
 | | | changes no file |
+| recover-context | history | the context was cut before the question |
+| | | gives the codename |
+| | | quotes the first message word for word |
 | remember | skills | saves it to memory |
 | | | starts no agent |
 | schedule | skills | sets an automation |
@@ -216,12 +222,21 @@ calls in `acp.jsonl`. The lookout checks read only the lead's turns a note
 started: `lookout-quiet` passes when every one of them ends with an empty
 reply, as lead.md asks of news not worth interrupting the person for.
 
+`recover-context` tells the lead's model its context holds 40,000 tokens
+(`[context_windows]` in the run's config), gives it a codename and a
+sentence, then three asks with long command output, then asks for the first
+message word for word. A summary keeps the gist, so quoting the sentence
+back takes the conversation's own record, which `history` reads. Its first
+check says whether the context was cut at all: when it was not, the window
+is too large for the model and the case tested nothing.
+
 Each run also records what it used, for the lead and for the agents it
 started: tools by name (a code-mode script counted as `exec`, each of its
-steps under its own tool's name), skills read (a `skills/NAME/SKILL.md`
-in a call's arguments, once per agent turn), agents made, messages between
-agents, model rounds and tokens (`events.jsonl`), the steps' wall time,
-and the run's peak memory and CPU (`resources.json`).
+steps under its own tool's name, and which tools ran as steps), skills read
+(a `skills/NAME/SKILL.md` in a call's arguments, once per agent turn),
+agents made, messages between agents, compactions of the lead's context,
+model rounds and tokens (`events.jsonl`), the steps' wall time, and the
+run's peak memory and CPU (`resources.json`).
 
 Runs sit under `.local/role-eval/<model>/golden/runs/<case>/<arm><n>/`,
 with the role eval's files and `evidence.json`, which holds what only the

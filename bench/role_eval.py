@@ -362,6 +362,9 @@ DAY, DAY_NAME = STEPS, ''  # the day a run plays, set by --day
 # More `[sonny]` settings for a run's config, such as `code_mode`, so two
 # arms of one build can differ in a setting alone.
 SETTINGS = {}
+# More of a run's config after the rest, such as a `[context_windows]` table
+# that makes a lead's context fill sooner.
+CONFIG = ''
 # Whether a run records every agent's turns and usage (`events.jsonl`) and
 # its processes' peak memory and CPU (`resources.json`), as the burst always
 # does.
@@ -449,7 +452,7 @@ every = "15s"
 [sonny.sources.ci]
 command = "{py} {root}/source.py {root} ci"
 every = "15s"
-''')
+''' + CONFIG)
     env = {
         'HOME': str(home), 'PATH': f'{bin_dir}:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin',
         'AGENT_CHATGPT_LOGIN': str(LOGIN), 'GIT_CONFIG_GLOBAL': str(root / 'gitconfig'),

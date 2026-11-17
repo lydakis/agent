@@ -32,10 +32,10 @@ def run_dir(tmp, parts, audit=(), main=None, suite=True, origin=('refs/heads/mai
 
 
 class CaseTests(unittest.TestCase):
-    def test_ten_cases_over_every_area_and_every_check_in_the_docs(self):
-        self.assertEqual(len(golden_eval.CASES), 10)
+    def test_eleven_cases_over_every_area_and_every_check_in_the_docs(self):
+        self.assertEqual(len(golden_eval.CASES), 11)
         self.assertEqual({c['area'] for c in golden_eval.CASES},
-                         {'lead', 'coding', 'tasks', 'lookout', 'spawn_agent', 'skills'})
+                         {'lead', 'coding', 'tasks', 'lookout', 'spawn_agent', 'history', 'skills'})
         doc = (Path(__file__).resolve().parents[1] / 'docs/ROLE_EVAL.md').read_text()
         for case in golden_eval.CASES:
             self.assertIn(f"| {case['id']} |", doc)
@@ -119,6 +119,23 @@ class ScoreTests(unittest.TestCase):
                            [row('shell', step='s', preview='~/.agent/automation rm branches')])
             self.assertEqual(set(self.score('schedule', view).values()), {True})
 
+    def test_context_is_recovered_only_by_quoting_after_a_cut(self):
+        quote = ("You wrote: \u201cBefore we start, a note for later: the release codename is HERON-7731, and "
+                 "the rollback owner is\n whoever is on call that Thursday.\u201d")
+        cut = json.dumps({'event': 'compacted', 'bot': 'shop.lead', 'data': {}})
+        with tempfile.TemporaryDirectory() as tmp:
+            view = run_dir(tmp, [part('person', 'Noted.'), part('person', 'tz methods'),
+                                 part('person', quote, [('history', {'turn': 1})])],
+                           files={'events.jsonl': cut})
+            self.assertEqual(set(self.score('recover-context', view).values()), {True})
+            self.assertEqual(golden_eval.usage(view)['lead']['compactions'], 1)
+        with tempfile.TemporaryDirectory() as tmp:
+            # The gist, from a summary, and the codename said only early on.
+            view = run_dir(tmp, [part('person', 'Noted HERON-7731.'),
+                                 part('person', 'You gave a codename and said someone on call owns rollback.')])
+            checks = self.score('recover-context', view)
+            self.assertEqual(list(checks.values()), [False, False, False])
+
     def test_memory_and_main_come_from_the_run(self):
         with tempfile.TemporaryDirectory() as tmp:
             view = run_dir(tmp, [part('person', 'Saved.')],
@@ -141,14 +158,16 @@ class UsageTests(unittest.TestCase):
             view = run_dir(tmp, [part('person', 'ok', [('exec', {}), ('start_task', {})])], [
                 row('exec', preview='await tools.read({path: "~/.agents/skills/memory/SKILL.md"})'),
                 row('read', step='s1', preview='{"path":"/h/.agents/skills/memory/SKILL.md"}'),
-                row('shell', bot='shop.fix', step='s1'), row('exec', bot='shop.fix')],
+                row('shell', bot='shop.fix', step='s1'), row('exec', bot='shop.fix'),
+                row('history', step='s2', turn=2)],
                 files={'events.jsonl': events, 'messages.md': '### shop.lead/1 -> shop.fix\n\nhi\n\n### b\n\nx\n',
                        'timeline.json': json.dumps([{'took': 30}, {'took': -60}]),
                        'resources.json': json.dumps({'peak_rss_mb': 80.5, 'cpu_s': 3.2})})
             used = golden_eval.usage(view)
             # start_task only `sonny acp` saw still counts.
-            self.assertEqual(used['lead']['tools'], {'exec': 1, 'read': 1, 'start_task': 1})
-            self.assertEqual((used['lead']['calls'], used['lead']['steps']), (2, 1))
+            self.assertEqual(used['lead']['tools'], {'exec': 1, 'read': 1, 'history': 1, 'start_task': 1})
+            self.assertEqual(used['lead']['step tools'], {'read': 1, 'history': 1})
+            self.assertEqual((used['lead']['calls'], used['lead']['steps']), (2, 2))
             self.assertEqual(used['lead']['skills'], {'memory': 1})
             self.assertEqual((used['lead']['rounds'], used['lead']['input_tokens']), (2, 220))
             self.assertEqual((used['others']['rounds'], used['others']['tools']), (1, {'shell': 1, 'exec': 1}))
@@ -188,6 +207,31 @@ class SetupTests(unittest.TestCase):
                           'code_mode = false\n', config)
             home, *_ = role_eval.setup(Path(tmp) / 'A2', bins, 'chatgpt/gpt-6.1-sol')
             self.assertNotIn('code_mode', (home / '.agent/config.toml').read_text())
+
+    def test_a_case_s_window_and_an_arm_s_settings_reach_its_config(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            bins = Path(tmp) / 'build'
+            bins.mkdir()
+            for name in ('agent', 'sonny'):
+                (bins / name).write_text('#!/bin/sh\n')
+            seen = {}
+
+            def run(arm, n, bins_, model, provider):
+                home, *_ = role_eval.setup(Path(tmp) / 'root', Path(bins_[arm]), model)
+                seen['config'] = (home / '.agent/config.toml').read_text()
+                raise RuntimeError('stop here')
+
+            # `one` runs in a process of its own: keep the role eval's
+            # globals as they were for the other tests.
+            kept = {name: getattr(role_eval, name) for name in
+                    ('DAY', 'DAY_NAME', 'OUT', 'RUNS', 'RECORD', 'SETTINGS', 'CONFIG')}
+            with mock.patch.object(role_eval, 'run', run), mock.patch.object(golden_eval, 'collect', dict), \
+                    mock.patch.object(golden_eval, 'OUT', Path(tmp) / 'out'), mock.patch.multiple(role_eval, **kept):
+                with self.assertRaises(SystemExit):
+                    golden_eval.one('recover-context', 'A', 1, {'A': str(bins)}, 'chatgpt/gpt-6.1-sol',
+                                    settings={'code_mode': True, 'history_step': True})
+            self.assertIn('code_mode = true\nhistory_step = true\n', seen['config'])
+            self.assertTrue(seen['config'].endswith('\n[context_windows]\n"chatgpt/gpt-6.1-sol" = 40000\n'))
 
     def test_each_case_has_its_own_root(self):
         roots = {golden_eval.root_of('m', c['id'], 'A', 1) for c in golden_eval.CASES}
