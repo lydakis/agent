@@ -610,6 +610,45 @@ class DaemonStepTests(ModelFixture):
         self.assertIn('result', daemon.request('tool_result', bot='Lead', turn=turn, call_id='script-0', output='ok'))
         self.assertEqual(daemon.finished(turn)['data']['status'], 'completed')
 
+    def test_a_terminal_step_stopped_in_its_yield_leaves_what_it_wrote_for_a_later_read(self):
+        daemon = SocketClient(self.binary, self.path / 'state.sqlite', self.url, 'echo,shell,write_stdin')
+        self.addCleanup(daemon.close)
+        daemon.request('create', bot='Lead', workspace=str(self.path), declare=[EXEC])
+        self.model.call_script = [('exec', {'code': 'run()'})]
+        turn = daemon.request('submit', bot='Lead', request_id='t', prompt='script')['result']['message']
+        deadline = time.monotonic() + 5
+        while not daemon.request('tool_calls', tag='sonny')['result']['calls']:
+            self.assertLess(time.monotonic(), deadline)
+            time.sleep(.01)
+        asker = Connection(daemon.socket_path)
+        asker.socket.sendall((json.dumps(dict(id=1, op='run_step', bot='Lead', turn=turn, call_id='script-0',
+                                              step='1', name='shell',
+                                              arguments={'command': 'printf ready; exec sleep 600', 'tty': True,
+                                                         'yield_time_ms': 1500})) + '\n').encode())
+
+        def listed():
+            return daemon.request('processes', bot='Lead')['result']['processes']
+        while not listed():
+            self.assertLess(time.monotonic(), deadline, 'the terminal never started')
+            time.sleep(.01)
+        [terminal] = listed()
+        time.sleep(.3)
+        # Its asker leaves during the yield: the step stops, the terminal
+        # runs on, and what it wrote waits for the next read.
+        asker.close()
+        self.assertEqual(self.ended(daemon, turn, 'script-0/1')['error'], 'step_stopped')
+        # Past the yield it was stopped in, nothing has read it meanwhile.
+        time.sleep(2)
+        read = daemon.request('run_step', bot='Lead', turn=turn, call_id='script-0', step='2', name='write_stdin',
+                              arguments={'handle': terminal['handle'], 'yield_time_ms': 0})['result']
+        said = json.loads(read['output'])
+        self.assertEqual((said['output'], said['running']), ('ready', True), said)
+        killed = daemon.request('run_step', bot='Lead', turn=turn, call_id='script-0', step='3', name='write_stdin',
+                                arguments={'handle': terminal['handle'], 'kill': True})['result']
+        self.assertIn('exit_code', json.loads(killed['output']))
+        self.assertIn('result', daemon.request('tool_result', bot='Lead', turn=turn, call_id='script-0', output='ok'))
+        self.assertEqual(daemon.finished(turn)['data']['status'], 'completed')
+
     def test_a_step_command_waits_in_line_while_a_turn_s_command_holds_the_slot(self):
         client = self.client('echo,shell', extra=('--max-processes', '1'))
 
