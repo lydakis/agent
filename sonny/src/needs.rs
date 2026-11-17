@@ -338,6 +338,10 @@ pub async fn items(client: &Client, bot: &str, nodes: &[i64]) -> (Vec<(i64, Valu
                         if entry["person"].is_string() && entry["from"].is_null() {
                             item["person"] = json!(true);
                         }
+                        // An agent sent it: its name opens it.
+                        if entry["from"]["bot"].is_string() {
+                            item["agent"] = json!(true);
+                        }
                     }
                     // It rode along on a call rather than coming as a message.
                     if entry["attached"] == true && item["role"] == "user" {
