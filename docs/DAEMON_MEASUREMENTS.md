@@ -10401,3 +10401,36 @@ Each row is within the runs' spread but the model request, a fifth
 smaller, since the model is shown the script tool alone. Code mode stays
 ahead of 0.9.5 on every row (0.9.5 direct: turn p50 2.5 and 13.0 s,
 processor time 5.5 and 8.2 ms a turn, peak memory 62 and 191 MB).
+
+## Window reads beside a slow commit, at 6, 424, 2,000 and 5,000 bots
+
+A commit a saturated disk holds for seconds froze every window: the service
+loop awaited the storage writer for `approvals`, `inspect` and the identity a
+bot's own requests are held to, and a `wait` or read waited for every
+session's queued admissions. Measured with `bench.held_reads` on Linux
+x86_64, 2026-11-17: a preloaded shim (`bench/held/slow_sync.c`) makes every
+sync take 300 ms while 30 bots run turns back to back and 5 gated calls
+wait; a window polls `approvals` (tag), `inspect` and a page of `bots` one
+after another, and a new connection opens every second. 20 s a run, two
+alternating rounds of main (45825a3) and this change; milliseconds, p50 /
+most across both rounds.
+
+| Bots | Side | Window cycles | `approvals` | `inspect` | `bots` | New connection's `ready` |
+| ---: | --- | ---: | ---: | ---: | ---: | ---: |
+| 6 | main | 22 to 24 | 560 to 587 / 889 | 2 to 301 / 908 | 2 to 304 / 909 | 262 to 264 / 795 |
+| 6 | change | 277 | 0.9 to 1.0 / 2.1 | 0.6 / 3.1 | 0.6 / 3.2 | 0.6 / 1.7 |
+| 424 | main | 22 to 24 | 577 / 1,485 | 305 / 1,522 | 4 to 154 / 317 | 526 to 572 / 1,481 |
+| 424 | change | 271 | 1.2 / 8.1 | 0.7 / 2.7 | 1.7 to 1.8 / 4.9 | 0.6 / 1.1 |
+| 2,000 | main | 20 to 21 | 575 to 576 / 1,200 | 305 / 2,730 | 303 to 304 / 908 | 571 to 572 / 2,626 |
+| 2,000 | change | 272 | 1.1 to 1.2 / 3.8 | 0.7 / 1.3 | 1.7 / 4.8 | 0.6 to 0.7 / 14 |
+| 5,000 | main | 20 to 22 | 565 to 577 / 2,006 | 305 / 1,521 | 6 to 154 / 311 | 277 to 425 / 1,406 |
+| 5,000 | change | 270 to 271 | 1.2 / 4.2 | 0.7 / 8.7 | 1.7 to 1.8 / 4.3 | 0.6 / 8.1 |
+
+On main the loop was held 6 to 8 s of every 20 by `approvals`, 3 to 4 s by
+`inspect` and up to 1.9 s by `wait`; with the change, under 0.05 s in all.
+The store reads themselves stay small: 270 `approvals` reads ran in 59 to
+69 ms together at 424 and 5,000 bots. The busy bots finished 301 to 302
+turns on both sides with no window polling; with it, 300 to 330 against
+main's 330 to 360, in steps of one turn per bot over the run, while the
+window read ten times as often. The WAL ended near 4 MiB on both, under the
+16 MiB the writer now keeps after a checkpoint.

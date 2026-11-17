@@ -2795,9 +2795,17 @@ pub async fn run(config: Configuration) -> Result<()> {
                             let bound = request.as_ref().map_or(Bound::default(), |r| service.admission_sends(&r.command, &r.id, id));
                             // Everything but an admission with room waits for the
                             // admissions already queued, keeping request order.
+                            let settling = std::time::Instant::now();
+                            let mut settled = false;
                             while service.must_settle(request.as_ref().ok().map(|r| &r.command), id, &output, bound) {
                                 let (session, output, id, result) = service.settle().await;
                                 reply(&mut service, &mut sessions, stdio_owner, session, &output, id, result).await?;
+                                settled = true;
+                            }
+                            // Counted as the loop's own work: no request
+                            // is taken meanwhile.
+                            if settled {
+                                service.chores.count("settle", None, settling);
                             }
                             // Even with none queued, an admission waits for the events
                             // of those answered before it when they and it would not
@@ -2807,7 +2815,9 @@ pub async fn run(config: Configuration) -> Result<()> {
                             if !(id == 0 && stdio_owner)
                                 && let Some(cursor) = service.awaits_publication(request.as_ref().ok().map(|r| &r.command), id, &output, bound)
                             {
+                                let publishing = std::time::Instant::now();
                                 service.hub.published_through(cursor).await;
+                                service.chores.count("publication", None, publishing);
                                 if *output.subscribe_closed().borrow() { continue; }
                             }
                             let (request_id, result, shutdown, serving) = match request {
@@ -3501,11 +3511,12 @@ impl Service {
                         && self.reserved > 0
                         && self.active.holding() + self.reserved >= self.limit_active)
             }
-            // A read waits only for its own session's admissions, to be
-            // answered after them. Another session's are not answered yet,
-            // so a read that misses them misses nothing anyone was told,
-            // and one session's admissions never hold another's reads.
-            Some(command) if command.observes() => self
+            // A read, or a wait, waits only for its own session's
+            // admissions, to be answered after them. Another session's are
+            // not answered yet, so one that misses them misses nothing
+            // anyone was told, and one session's admissions never hold
+            // another's reads.
+            Some(command) if command.observes() || matches!(command, Command::Wait { .. }) => self
                 .admissions
                 .iter()
                 .any(|admission| admission.session == session),
@@ -9337,6 +9348,13 @@ mod tests {
             service.must_settle(Some(&approvals()), 0, &output, Bound::default()),
             "a read is answered after its own session's admissions"
         );
+        let wait = || Command::Wait {
+            handles: vec!["A/1".into()],
+            timeout_ms: Some(0),
+            any: false,
+        };
+        assert!(!service.must_settle(Some(&wait()), 1, &output, Bound::default()));
+        assert!(service.must_settle(Some(&wait()), 0, &output, Bound::default()));
         let inspect = Command::Inspect {
             bot: "A".into(),
             bot_id: Some(bot_id),
@@ -9352,6 +9370,14 @@ mod tests {
                 .unwrap();
             assert_eq!((asker.session, sent), (1, true));
         }
+        // A wait's first look at its handles reads without the writer too.
+        let deferred = tokio::time::timeout(
+            Duration::from_secs(5),
+            service.dispatch(wait(), 1, &output, json!("w"), Bound::default()),
+        )
+        .await
+        .expect("a wait looks beside the held writer");
+        assert_eq!(deferred.unwrap_err().code, "deferred");
         // A bot's own request is held to its identity, read without the
         // writer, then from memory.
         for _ in 0..2 {

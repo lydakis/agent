@@ -75,6 +75,7 @@ def main():
     parser.add_argument('--gated', type=int, default=5)
     parser.add_argument('--sync-ms', type=int, default=300)
     parser.add_argument('--seconds', type=float, default=20)
+    parser.add_argument('--window', action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument('--out', required=True)
     args = parser.parse_args()
     server, url = start()
@@ -140,7 +141,8 @@ def main():
 
         threads = [threading.Thread(target=busy, args=(n,)) for n in range(args.busy)]
         time.sleep(1)
-        threads += [threading.Thread(target=window), threading.Thread(target=connects)]
+        threads += [threading.Thread(target=window)] if args.window else []
+        threads += [threading.Thread(target=connects)]
         for thread in threads:
             thread.start()
         time.sleep(args.seconds)
@@ -152,6 +154,13 @@ def main():
         result = {'agents': args.agents, 'busy': args.busy, 'sync_ms': args.sync_ms,
                   'seconds': args.seconds, 'turns_finished': finished[0],
                   **{op: summary(w) for op, w in waits.items()},
+                  'loop_held_ms': {op: [row['held_ms'], row['slowest_ms']]
+                                   for part in ('commands', 'loop')
+                                   for op, row in stats.get(part, {}).get('ops', {}).items()
+                                   if row['held_ms']},
+                  'reads': {op: {k: row[k] for k in ('count', 'queued_ms', 'ran_ms', 'slowest_ms')}
+                            for op, row in storage.get('operations', {}).items()
+                            if op in ('approvals', 'inspect', 'list', 'identity', 'turn_answer')},
                   'groups': storage.get('groups', {}).get('count'),
                   'wal_bytes': storage.get('wal_bytes')}
         stop(process, control)
