@@ -418,6 +418,8 @@ def setup(root, bin_dir, model, spec=None):
     # Builds before 0.9.1 named the reviewer's table [judge], and each
     # build refuses the other's, so an arm of one still compares.
     reviewer = 'reviewer' if b'[reviewer]' in (own / 'sonny').read_bytes() else 'judge'
+    # The run's own settings, each once, an arm's over the defaults.
+    sonny = {'task_effort': 'high', 'suggest': False, 'default_permissions': 'eval', **SETTINGS}
     (home / '.agent/config.toml').write_text(f'''model = "{model}"
 provider = "{spec or provider}"
 
@@ -425,10 +427,7 @@ provider = "{spec or provider}"
 model = "{model}"
 
 [sonny]
-task_effort = "high"
-suggest = false
-default_permissions = "eval"
-{''.join(f'{key} = {json.dumps(value)}{chr(10)}' for key, value in SETTINGS.items())}
+{''.join(f'{key} = {json.dumps(value)}{chr(10)}' for key, value in sonny.items())}
 # What the day's work writes beside the repository (the backup S1 asks
 # for, pushes to origin) written without asking, the network off so no
 # Unix socket is reached (Docker's would write anywhere), and every call
