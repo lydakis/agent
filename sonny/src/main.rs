@@ -11573,7 +11573,11 @@ impl App {
                 // Each item the bot streams is a message of its own, as
                 // Codex draws them.
                 if let Some(item) = event["item"].as_u64() {
-                    if self.live_item.is_some_and(|live| live != item) && self.streamed {
+                    // An item of only whitespace drew nothing, yet ends there
+                    // too, so its message does not take the next one's words.
+                    if self.live_item.is_some_and(|live| live != item)
+                        && (self.streamed || !self.said.is_empty())
+                    {
                         self.stream_ahead(self.live_item.unwrap_or(item));
                     }
                     self.live_item = Some(item);
@@ -11680,9 +11684,10 @@ impl App {
                         self.dated(node, item);
                     }
                 }
-                // Words written when the next item began are this message.
+                // Words written when the next item began are this message,
+                // drawn or, of only whitespace, not.
                 if let (Some(item), Some(node)) = (&item, data["node"].as_i64())
-                    && !text(item).is_empty()
+                    && !joined(&item["content"]).is_empty()
                     && let Some(streamed) = self.ahead.pop_front()
                 {
                     self.streamed_at(streamed, node);
@@ -11806,9 +11811,13 @@ impl App {
                     self.unseen.clear();
                     self.notice = Some("the model retried; its reply may repeat".into());
                 }
-                if !self.said.is_empty() {
-                    self.replay = Some((std::mem::take(&mut self.said), 0));
-                    self.unseen.clear();
+                // Only what was drawn is skipped when it comes again: held
+                // whitespace was not, and still leads the words after it.
+                let mut said = std::mem::take(&mut self.said);
+                said.truncate(said.len() - self.unseen.len());
+                self.unseen.clear();
+                if !said.is_empty() {
+                    self.replay = Some((said, 0));
                 }
                 if let Some(running) = &mut self.running {
                     running.phase = "Retrying".into();
@@ -23310,6 +23319,74 @@ mod tests {
         for text in ["    ", "example()\n"] {
             app.daemon(json!({"event": "text_delta", "bot": "b", "turn": 3, "text": text}))
                 .await;
+        }
+        let live: Vec<String> = (app.live.as_ref().unwrap().rows.iter())
+            .map(|row| row.to_string())
+            .collect();
+        let replayed: Vec<String> = transcript::reply("    example()\n", 100, Path::new(""))
+            .iter()
+            .map(|row| row.to_string())
+            .collect();
+        assert_eq!(live, replayed);
+    }
+
+    #[tokio::test]
+    async fn an_item_of_only_whitespace_keeps_to_itself() {
+        // One call streams a zero-width item, then a reply of its own.
+        let client = daemon_answering(|asked| {
+            let say = |text: &str| {
+                json!({"type": "message", "role": "assistant",
+                "content": [{"type": "output_text", "text": text}]})
+            };
+            let items = [(4, say("\u{200b}")), (5, say("First.\nSecond."))];
+            json!({"items": asked["nodes"].as_array().into_iter().flatten()
+                .filter_map(|node| items.iter().find(|(n, _)| Some(*n) == node.as_i64()))
+                .map(|(node, item)| json!({"node": node, "item": item}))
+                .collect::<Vec<_>>()})
+        })
+        .await;
+        let mut app = app(client);
+        app.width = 100;
+        app.daemon(turn_event("accepted", 1, json!({}))).await;
+        for (item, text) in [(0, "\u{200b}"), (1, "First.\nSecond.")] {
+            app.daemon(json!({"event": "text_delta", "bot": "b", "turn": 1,
+                "item": item, "text": text}))
+                .await;
+        }
+        for node in [4, 5] {
+            app.daemon(turn_event("message", 1, json!({"node": node})))
+                .await;
+        }
+        app.daemon(turn_event(
+            "turn_finished",
+            1,
+            json!({"status": "completed"}),
+        ))
+        .await;
+        let shown: Vec<String> = (app.pending.iter())
+            .map(|line| line.to_string())
+            .filter(|row| !row.trim().is_empty())
+            .collect();
+        assert_eq!(
+            shown.iter().filter(|row| row.contains("First.")).count(),
+            1,
+            "{shown:?}"
+        );
+        assert!(shown.iter().all(|row| row.trim() != "•"), "{shown:?}");
+    }
+
+    #[tokio::test]
+    async fn held_whitespace_still_leads_after_a_retry() {
+        let mut app = app(zen_daemon().await);
+        app.width = 100;
+        app.daemon(turn_event("accepted", 2, json!({"node": 5})))
+            .await;
+        let said = |text: &str| json!({"event": "text_delta", "bot": "b", "turn": 2, "text": text});
+        app.daemon(said("    ")).await;
+        app.daemon(turn_event("retry", 2, json!({}))).await;
+        assert!(app.replay.is_none() && app.unseen.is_empty());
+        for text in ["    ", "example()\n"] {
+            app.daemon(said(text)).await;
         }
         let live: Vec<String> = (app.live.as_ref().unwrap().rows.iter())
             .map(|row| row.to_string())
