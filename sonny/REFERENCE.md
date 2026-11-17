@@ -51,11 +51,9 @@ With `cargo install`, build both (`--path .` for `agent` and
 `--path sonny`) and set `AGENT_BIN` to that `agent`; Sonny never takes an
 `agent` from `PATH`, which may be another program. `sonny agent ARGS` runs
 the one Sonny uses, whatever else is called
-`agent` on your `PATH`. It is also the one way in agents are told about:
-Sonny sets `AGENT_CLI` to its own `sonny agent`, so the instructions it
-composes, those the CLI composes for agents started through it, and the
-skills it writes name `"…/sonny" agent` wherever they would say
-`"$AGENT_BIN"`.
+`agent` on your `PATH`. Agents are told of no command line: they reach
+each other and the daemon through their tools (`send_message`, `wait`,
+`history`, `list_agents`, `pause_agents`, and Sonny's own).
 
 ## Projects and leads
 

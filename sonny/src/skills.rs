@@ -22,10 +22,7 @@ pub fn install_own() {
     install("zen", crate::zen::SKILL);
     // The lead loads it whole; it names the commons as roles do.
     let coordination = crate::commons::role(crate::project::COORDINATION);
-    install(
-        "coordination",
-        &agent_client::policy::with_cli(&coordination),
-    );
+    install("coordination", &coordination);
     // `[sonny] commons = false`: agents go without it.
     if crate::commons::on() {
         install("commons", include_str!("../skills/commons/SKILL.md"));
@@ -41,9 +38,7 @@ pub fn install_own() {
     install("sonny-setup", crate::setup::SKILL);
     install("sonny-config", &crate::config::skill());
     install_programs();
-    // A job reaches the daemon the way every agent Sonny runs does.
-    let automation = include_str!("../skills/automation/SKILL.md");
-    install("automation", &agent_client::policy::with_cli(automation));
+    install("automation", include_str!("../skills/automation/SKILL.md"));
     if let Some(home) = std::env::var_os("HOME") {
         queue_news(
             &PathBuf::from(home),
