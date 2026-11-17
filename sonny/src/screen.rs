@@ -2171,7 +2171,8 @@ impl Screen {
                 x += width;
             }
         }
-        // Buttons on parts of a row, over whatever else is there.
+        // Buttons on parts of a row, over whatever else is there: a link
+        // under a button keeps the columns on either side of it.
         for (y, shown) in self.shown[top..bottom].iter().enumerate() {
             let y = drawn.y + y as u16;
             for (from, to, url) in &shown.buttons {
@@ -2180,7 +2181,20 @@ impl Screen {
                     continue;
                 }
                 let (from, to) = (drawn.x + from, drawn.x + to);
-                links.retain(|link| link.0 != y || link.2 <= from || link.1 >= to);
+                let mut kept = Vec::with_capacity(links.len() + 1);
+                for link in links.drain(..) {
+                    if link.0 != y || link.2 <= from || link.1 >= to {
+                        kept.push(link);
+                        continue;
+                    }
+                    if link.1 < from {
+                        kept.push((y, link.1, from, link.3.clone()));
+                    }
+                    if to < link.2 {
+                        kept.push((y, to, link.2, link.3));
+                    }
+                }
+                links = kept;
                 links.push((y, from, to, url.clone()));
             }
         }
@@ -2955,6 +2969,28 @@ mod tests {
             screen.mouse(mouse(MouseEventKind::Up(MouseButton::Left), 3, 1)),
             Some(Action::Open(format!("{BUTTON}unreact/5/👍")))
         );
+    }
+
+    #[test]
+    fn a_button_on_a_linked_row_keeps_the_rows_link_on_either_side() {
+        let mut screen = Screen::default();
+        screen.push(vec![Line::from("↳ From neg ▸")]);
+        screen.mark_last(Mark::Link(format!("{BUTTON}fold/1")));
+        screen.mark_last(Mark::Buttons(vec![(7, 10, format!("{BUTTON}agent/neg"))]));
+        let area = Rect::new(0, 0, 30, 2);
+        let mut buf = Buffer::empty(area);
+        screen.render(area, &mut buf, |_| None);
+        let click = |screen: &mut Screen, x: u16| {
+            screen.mouse(mouse(MouseEventKind::Down(MouseButton::Left), x, 0));
+            screen.mouse(mouse(MouseEventKind::Up(MouseButton::Left), x, 0))
+        };
+        let fold = Some(Action::Open(format!("{BUTTON}fold/1")));
+        assert_eq!(click(&mut screen, 2), fold);
+        assert_eq!(
+            click(&mut screen, 8),
+            Some(Action::Open(format!("{BUTTON}agent/neg")))
+        );
+        assert_eq!(click(&mut screen, 11), fold, "the arrow still folds");
     }
 
     #[test]
