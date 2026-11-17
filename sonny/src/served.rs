@@ -161,9 +161,6 @@ fn start() -> Value {
                     "description": "An empty folder of the task's own instead of a worktree or this folder: \
                         for work that makes its own copy of what it changes, such as a checkout of another \
                         branch made with this folder's tooling, or that must not touch this folder."},
-                "tab": {"type": "boolean",
-                    "description": "A tab of its own, for a task the person will want to watch or talk to, \
-                        asked or not."},
                 "setup": {"type": "boolean",
                     "description": "Run the folder's .agents/setup in the copy first: true for a task \
                         that will change files, false for one that only reads."},
@@ -210,25 +207,6 @@ fn noted_models() -> String {
         true => " \"$AGENT_BIN\" models lists the models there are.".to_owned(),
         false => format!(" The person's notes on their models:{said}"),
     }
-}
-
-/// Open the task `name` just started in a tab of its own, as its starter
-/// asked: said after the start's result only when it could not. With
-/// `task_tabs = "every"`, the lead's Sonny opens it as its turn starts.
-async fn tab(caller: &str, project: &str, name: &str) -> String {
-    let every = agent_client::config::load()
-        .is_ok_and(|c| c.sonny.task_tabs == agent_client::config::TaskTabs::Every);
-    if every {
-        return String::new();
-    }
-    let name = name.trim();
-    let bot = match name.strip_prefix(&format!("{project}.")) {
-        Some(_) => name.to_owned(),
-        None => format!("{project}.{name}"),
-    };
-    crate::task_tab(caller, &bot)
-        .await
-        .unwrap_or_else(|error| format!("\n\nNo tab opened for it: {error}"))
 }
 
 fn remove() -> Value {
@@ -524,8 +502,13 @@ pub fn commons() -> Value {
             "properties": {
                 "read": {"type": "string", "minLength": 1,
                     "description": "A thread's name: its posts, as many as fit, with next where the rest start."},
-                "search": {"type": "string", "minLength": 1,
-                    "description": "Words: threads whose title or posts hold all of them, newest first, with those posts."},
+                "search": {"type": "string",
+                    "description": "Words: threads whose title or posts hold all of them, newest first, with those posts; \
+                        none, with a filter, every post it matches."},
+                "filter": {"type": "object",
+                    "description": "Narrows the listing to threads whose first post it matches, or a search to the \
+                        posts it matches: an event pattern as the follows tool takes one, on a post's by, by_id, at \
+                        (epoch seconds), model, project, sonny, external and title, as {\"project\": [\"shop\"]}."},
                 "from": {"type": "integer", "minimum": 0,
                     "description": "Where to start, as an earlier answer's next says: a post with read, else a thread of the listing."},
                 "post": {
@@ -559,7 +542,7 @@ pub fn commons() -> Value {
 fn show() -> Value {
     json!({
         "name": SHOW,
-        "description": "Put an agent's window where the person asks, or where they should watch it now: a tab \
+        "description": "Put an agent's window where the person asks: a tab \
             of its own, the default, a split beside yours or the agent beside names, or floating over that \
             window where the terminal can float it. Another project's lead (PROJECT.lead) opens in its \
             project's own home, the workspace or session named for that project (made if there is none, \
@@ -709,13 +692,6 @@ async fn called(name: &str, arguments: &Value) -> Answer {
             };
             let started = crate::task::start(&line.folder, &line.project, &caller, &start)
                 .map_err(|e| ("task_not_started", e))?;
-            let started = match arguments["tab"] == true {
-                true => format!(
-                    "{started}{}",
-                    tab(&caller, &line.project, &start.name).await
-                ),
-                false => started,
-            };
             // What the lead's gone tasks left, which only it can clear.
             let left = match line.lead {
                 true => crate::task::left_behind(&line.folder, &line.project),
@@ -909,12 +885,17 @@ async fn called(name: &str, arguments: &Value) -> Answer {
                     .and_then(|id| id.parse().ok())
                     .or(caller_id),
             );
+            // The project the agent is named in, as its tasks are: only a
+            // post or a reply writes it, so a read asks no one.
+            let project = (arguments["post"].is_object() || arguments["reply"].is_object())
+                .then(|| Line::of(&caller, &here).project);
             let mut said = crate::commons::call(
                 &home,
                 &caller,
                 caller_id,
                 &reader,
                 model.as_deref(),
+                project.as_deref(),
                 arguments,
             )
             .map_err(|e| ("commons_refused", e))?;
@@ -1133,7 +1114,7 @@ impl Line {
 }
 
 /// The project a lead leads, else the name up to its first dot.
-fn project_of(bot: &str) -> String {
+pub fn project_of(bot: &str) -> String {
     match crate::project::lead_project(bot) {
         Some(project) => project.to_owned(),
         None => bot

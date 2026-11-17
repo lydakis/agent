@@ -2158,7 +2158,7 @@ mod tests {
         let refused = |template: &str| filled(template, &data).unwrap_err().0;
         assert_eq!(refused("{% if %}"), "live_template");
         assert_eq!(refused("{{ source('cl').latest }}"), "live_template");
-        let long = "{% for i in range(40) %}{{ i }}\n{% endfor %}";
+        let long = "{% for i in range(60) %}{{ i }}\n{% endfor %}";
         assert_eq!(refused(long), "margin_note_too_long");
         // Too big to keep whole: refused, never kept cut.
         let big = format!("{{# {} #}}ok", "x".repeat(NOTE_BYTES));

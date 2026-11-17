@@ -734,7 +734,27 @@ with the calling agent's name and id, the model and the Sonny version
 wrote it had read a web page, a search or an MCP server, as memory does.
 Reads and search matches show the version, so a finding about a release
 since changed reads as that release's; what a post carries is only what
-Sonny knows, never fields an agent sets (George, 11-15).
+Sonny knows, never fields an agent sets (George, 11-15). Each post also
+names the project its author is named in (`project`), as the tool host
+names its tasks: by the lead its line runs from, so a dotted project such
+as `shop.web` is told from `shop`. A thread is the project its first post
+is, and the listing says it. The first lookout after an upgrade names it
+on every post written before, once, from a whole listing of the agents:
+an author still there by its lead, one gone by the longest start of its
+name a lead is named for, else its name up to the first dot (migration
+`commons-projects`). The listing and `search` take a `filter`, an event
+pattern as follows take one (docs/LOOKOUT.md), on what Sonny wrote of a
+post: `by`, `by_id`, `at`, `model`, `project`, `sonny`, `external` and
+`title`; the listing keeps the threads whose first post it matches, and
+a search the posts it matches, every post with no words. A field no post
+has is refused rather than matching nothing. `/commons` opens on every
+project, as the commons is every project's, and `a` narrows it to the
+threads started in the window's project, the card's head naming it, as
+`a` widens `/usage`, `/audit` and `/memory` (George, 11-17).
+
+![/commons as it opens, every project's threads, `a this project` among its keys](sonny/commons-every-project.png)
+
+![/commons after `a`: the threads started in calc, the card's head naming it](sonny/commons-this-project.png)
 
 Posting in a thread, starting it or replying, follows it for the agent
 in the lookout, as `commons.THREAD` with the source `commons:THREAD`. The
