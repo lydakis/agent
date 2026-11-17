@@ -12848,6 +12848,7 @@ impl App {
             .collect();
         for call in &mut self.approvals {
             whole_arguments(&self.client, &self.bot, call).await;
+            approvals::offer(call);
         }
         if let Some(running) = &mut self.running {
             if (self.approvals.iter()).any(|call| call["handle"].is_null()) {
@@ -12941,6 +12942,7 @@ impl App {
                     }
                     let mut call = call.clone();
                     whole_arguments(&self.client, bot, &mut call).await;
+                    approvals::offer(&mut call);
                     self.names.get_mut().learn(bot.to_owned(), true);
                     self.raised.push(call);
                     self.raised_read.insert(read);
@@ -13076,12 +13078,13 @@ impl App {
     /// now, outside every agent's sandbox, as Codex's "don't ask again"
     /// keeps a prefix rule: an allow rule in `~/.agent/rules`, which every
     /// agent's next turn reads.
-    async fn always(&mut self, prefix: &str) {
+    async fn always(&mut self, prefix: &[String]) {
+        let shown = approvals::shown(prefix);
         if let Err(error) = approvals::allow_always(prefix) {
-            self.notice = Some(format!("couldn't keep {prefix}: {error}"));
+            self.notice = Some(format!("couldn't keep {shown}: {error}"));
             return;
         }
-        self.answer("allow", Some(prefix)).await;
+        self.answer("allow", Some(&shown)).await;
     }
 
     /// `/compact`, once the person said yes.
@@ -19063,8 +19066,13 @@ impl App {
                 Span::raw(" allow once · ").dim(),
             ];
             if let Some(prefix) = approvals::always(call) {
+                // Cut to leave the row's other keys in view: a whole
+                // command offered can run long.
+                const KEYS: &str = "  ⏸ y allow once · a always allow  · n deny · esc set aside";
+                let room = self.width.saturating_sub(KEYS.width()).max(8);
+                let shown = transcript::cut(&approvals::shown(&prefix), room);
                 line.push(Span::raw("a"));
-                line.push(Span::raw(format!(" always allow {prefix} · ")).dim());
+                line.push(Span::raw(format!(" always allow {shown} · ")).dim());
             }
             line.extend([Span::raw("n"), Span::raw(" deny · ").dim()]);
             line.extend([Span::raw("esc"), Span::raw(" set aside").dim()]);
