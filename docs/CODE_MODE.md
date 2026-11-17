@@ -591,11 +591,11 @@ things are specified for them: their place under the coordinator's bound
 itself; src/tools.rs:3290, src/tools.rs:3351), and what stopping one
 means. A step's `read` also needs a rule for paging, which a turn takes
 from its context budget (src/tools.rs:3313). Not planned: a tool that
-takes steps (no script inside a script), `wait`, `write_stdin` and
-terminals, whose handles outlive a call; background `shell` runs as a
-step since 2026-11-16, its command the bot's as a turn's is, not the
-call's; `history` and
-the tools about other bots. Never: `web_search`, which the provider runs.
+takes steps (no script inside a script), `wait`, `history` and the
+tools about other bots. Never: `web_search`, which the provider runs.
+Background `shell` runs as a step since 2026-11-16, and detached and
+terminal `shell` and `write_stdin` since protocol 86, each command the
+bot's as a turn's is, not the call's.
 
 **The reply** is what the model would have read. Output past the preview
 is an artifact under `CALL/STEP`, read in pages with `artifact`, or by a
@@ -787,6 +787,21 @@ client when it lands:
    the answer collected whole past the tool's `expire_ms`; `terminate`
    stopping the call and its running step, and a background command; a
    steer ending a wait on it at once.
+8. **Every tool a step (slice A), built in protocol 86.** Every daemon
+   tool runs as a step but those Codex keeps out of its scripts, each
+   refused with its class: `wait`, the script tool's second half;
+   `history`, a history reader; `web_search`, hosted; and the agent
+   tools. One exhaustive match names each tool's class
+   (src/tools.rs, `Tool::direct_only`), and the `tools` op's `step`
+   follows it. `shell` with `detach` or `tty`, and `write_stdin`, run as
+   their direct calls: the command is the bot's, on a handle that
+   outlives the script; they take no process slot and no place in line,
+   and a detached command or a terminal holds a lasting slot as a direct
+   call's does. Tested with a plain socket client (tests/test_steps.py):
+   a terminal started, typed into and ended by steps, and one killed; a
+   background command's handle refused as a terminal and killed; a
+   detached command listed and stopped past its call; the `tools` op's
+   marks.
 
 Each is a hot-path change and carries the matched screens against main
 that [AGENTS.md](../AGENTS.md) names. Not on the list, on purpose: an
@@ -815,6 +830,8 @@ Sonny's changes, each after the one of Agent's it uses:
   (tests/test_served.py): handed back at its yield time and collected
   whole by `wait`; handed back at once by `yield_control()`; a script
   that ends first answered as it ends.
+- **After 8, built:** `exec` offers `tools.write_stdin`, and `tools.shell`
+  takes `detach`, `tty` and `yield_time_ms`.
 
 ## Gates and screens
 

@@ -6536,7 +6536,7 @@ impl Turn {
     /// Terminal `id`, when what its write, poll or start returned says how
     /// it ended: its bot sees that in this result, so nothing tells it
     /// later. Recorded with the result, in its commit.
-    fn seen(id: i64, outcome: &Outcome) -> Option<i64> {
+    pub(super) fn seen(id: i64, outcome: &Outcome) -> Option<i64> {
         serde_json::from_str::<Value>(&outcome.output)
             .is_ok_and(|output| output.get("exit_code").is_some())
             .then_some(id)
@@ -7222,7 +7222,7 @@ impl Lifts {
 }
 
 /// The start of `command` its process row lists it by, copied.
-fn listed(command: &str) -> String {
+pub(super) fn listed(command: &str) -> String {
     listed_command(command).to_owned()
 }
 
@@ -7297,7 +7297,7 @@ async fn no_terminal(store: &Store, bot: &str, handle: i64, error: Error) -> Res
 /// What a `write_stdin` of `bot`'s that found no terminal `handle` comes
 /// to: with `kill`, a command of the bot's without one is stopped all the
 /// same; otherwise why there was none.
-async fn not_a_terminal(
+pub(super) async fn not_a_terminal(
     store: &Store,
     registry: &Registry,
     handles: &Handles,

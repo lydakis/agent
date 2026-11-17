@@ -104,10 +104,11 @@ Use `await tools.tool_search({query: "...", limit: 8})` for BM25-ranked discover
 /// here: the daemon runs each call as a step of the `exec` call, decided
 /// and recorded as the same call from the model would be.
 const DAEMON_TOOLS: &str = r#"# This agent's own tools
-Your shell and file tools are on `tools` too, and only there: `tools.shell`, `tools.read`, `tools.write`, `tools.edit`, `tools.apply_patch` and `tools.web_fetch`, as far as you have them. Each runs as its own call would, in your folder, under the same rules, sandbox and approvals, and resolves to a `CallToolResult` whose text is what the tool returns (`tools.shell`'s is JSON with `stdout`, `stderr` and `exit_code`); one that fails resolves with `isError: true`. A command runs until it exits, unless its `timeout_ms` ends it, and the script's time stops meanwhile; with `background: true` it starts apart and resolves at once to its `proc:N` handle, which you `wait` on as a direct call's: hand the handle back with `text()`. No `detach` or `tty`. One runs at a time. `ALL_TOOLS` has their full declarations and descriptions.
+Your shell and file tools are on `tools` too, and only there: `tools.shell`, `tools.write_stdin`, `tools.read`, `tools.write`, `tools.edit`, `tools.apply_patch` and `tools.web_fetch`, as far as you have them. Each runs as its own call would, in your folder, under the same rules, sandbox and approvals, and resolves to a `CallToolResult` whose text is what the tool returns (`tools.shell`'s is JSON with `stdout`, `stderr` and `exit_code`); one that fails resolves with `isError: true`. A command runs until it exits, unless its `timeout_ms` ends it, and the script's time stops meanwhile; one runs at a time. With `background: true` it starts apart and resolves at once to its `proc:N` handle, which you `wait` on as a direct call's: hand the handle back with `text()`. With `detach: true` it resolves at once to its handle and `pid`, and outlives your turn. With `tty: true` it runs in a terminal and resolves to what it wrote within `yield_time_ms`, with its handle while it runs, which `tools.write_stdin` types into, reads or kills. `ALL_TOOLS` has their full declarations and descriptions.
 ```ts
 declare const tools: {
   {SHELL}
+  write_stdin(args: { handle: string; chars?: string; yield_time_ms?: number; kill?: boolean }): Promise<CallToolResult>;
   read(args: { path: string; offset?: number; limit?: number }): Promise<CallToolResult>;
   write(args: { path: string; content: string }): Promise<CallToolResult>;
   edit(args: { path: string; old: string; new: string; replace_all?: boolean }): Promise<CallToolResult>;
@@ -118,7 +119,7 @@ declare const tools: {
 
 /// `tools.shell` in [`DAEMON_TOOLS`], for an agent that works in a sandbox
 /// and one that doesn't.
-const SHELL: &str = "shell(args: { command: string; workdir?: string; timeout_ms?: number; background?: boolean }): Promise<CallToolResult>;";
+const SHELL: &str = "shell(args: { command: string; workdir?: string; timeout_ms?: number; background?: boolean; detach?: boolean; tty?: boolean; yield_time_ms?: number }): Promise<CallToolResult>;";
 
 /// `tools.shell` for an agent in a sandbox, with the fields that ask to
 /// leave it, in Codex's words, as its daemon declares them on the same
@@ -128,6 +129,9 @@ const SHELL_ESCALATING: &str = r#"shell(args: {
     workdir?: string;
     timeout_ms?: number;
     background?: boolean;
+    detach?: boolean;
+    tty?: boolean;
+    yield_time_ms?: number;
     // Sandbox permissions for the command. Set to "require_escalated" to request running without sandbox restrictions; defaults to "use_default".
     sandbox_permissions?: "use_default" | "require_escalated";
     // Only set if sandbox_permissions is "require_escalated". Request approval from the user to run this command outside the sandbox. Phrased as a simple question that summarizes the purpose of the command as it relates to the task at hand - e.g. 'Do you want to fetch and pull the latest version of this git branch?'
@@ -2668,7 +2672,8 @@ mod tests {
         assert!(confined.contains("prefix_rule?: string[];"));
         assert!(confined.contains("// Reusable approval prefix for `command`, only with `sandbox_permissions: \"require_escalated\"`; for example [\"git\", \"pull\"]."));
         let free = description(&none.0, &none.1, &[], true, false);
-        assert!(free.contains("shell(args: { command: string; workdir?: string; timeout_ms?: number; background?: boolean }): Promise<CallToolResult>;"));
+        assert!(free.contains("shell(args: { command: string; workdir?: string; timeout_ms?: number; background?: boolean; detach?: boolean; tty?: boolean; yield_time_ms?: number }): Promise<CallToolResult>;"));
+        assert!(free.contains("write_stdin(args: { handle: string; chars?: string; yield_time_ms?: number; kill?: boolean }): Promise<CallToolResult>;"));
         for field in ["sandbox_permissions", "justification", "prefix_rule"] {
             assert!(!free.contains(field), "{field}");
         }

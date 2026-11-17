@@ -268,7 +268,7 @@ class DaemonStepTests(ModelFixture):
         for change, error in [({'step': 'a b'}, 'invalid_step'), ({'name': 'wait'}, 'invalid_step'), ({'name': 'read'}, 'invalid_tool_arguments'),
                               ({'name': 'mcp__x__y'}, 'invalid_step'), ({'arguments': []}, 'invalid_step'),
                               ({'arguments': {'nope': 1}}, 'invalid_tool_arguments'),
-                              ({'name': 'shell', 'arguments': {'command': 'x', 'detach': True}}, 'invalid_step'),
+                              ({'name': 'history'}, 'invalid_step'),
                               ({'arguments': {'text': 'x' * 65537}}, 'step_arguments_limit'),
                               ({'call_id': 'nope'}, 'no_pending_call'), ({'bot': 'Other'}, 'turn_not_found'),
                               ({'call_id': ''}, 'invalid_call_id')]:
@@ -414,6 +414,128 @@ class DaemonStepTests(ModelFixture):
                               and m.get('data', {}).get('origin') == 'background', 10)
         self.assertEqual(client.finished(told['message'])['data']['status'], 'completed')
 
+    def test_a_terminal_step_is_the_bot_s_and_takes_input_from_later_steps_as_its_direct_call(self):
+        # Started by one step, typed into by the next, ended on its handle:
+        # each decided and recorded as its direct call, by its own name.
+        client, turn = self.script(tools='echo,shell,write_stdin,wait')
+        started = self.step(client, turn, name='shell',
+                            arguments={'command': "read -p 'name? ' n; echo \"hi $n\"", 'tty': True,
+                                       'yield_time_ms': 1000})['result']
+        said = json.loads(started['output'])
+        self.assertEqual((said['running'], said['output']), (True, 'name? '), said)
+        handle = said['handle']
+        typed = self.step(client, turn, step='2', name='write_stdin',
+                          arguments={'handle': handle, 'chars': 'bob\n', 'yield_time_ms': 5000})['result']
+        said = json.loads(typed['output'])
+        self.assertEqual((said['output'], said['exit_code']), ('bob\nhi bob\n', 0), said)
+        decided = [(d['call_id'], d['name'], d['decision']) for d in self.events(client, turn, 'step_decided')]
+        self.assertEqual(decided, [('script-0/1', 'shell', 'allow'), ('script-0/2', 'write_stdin', 'allow')])
+        self.ended(client, turn, 'script-0/2')
+        rows = client.request('audit', bot='Lead')['result']['rows']
+        self.assertEqual(sorted((r['step'], r['tool'], r['outcome']) for r in rows if r['step']),
+                         [('1', 'shell', 'completed'), ('2', 'write_stdin', 'completed')])
+        # Its end was seen in the step's result: a wait reads it, and the
+        # bot is told nothing more of it.
+        ended = client.request('wait', handles=[handle], timeout_ms=5000)['result']['results'][handle]
+        self.assertEqual(ended['exit_code'], 0, ended)
+        # One still running is killed by a later step as by a direct call.
+        long = json.loads(self.step(client, turn, step='3', name='shell',
+                                    arguments={'command': 'sleep 600', 'tty': True,
+                                               'yield_time_ms': 0})['result']['output'])
+        self.assertTrue(long['running'], long)
+        killed = json.loads(self.step(client, turn, step='4', name='write_stdin',
+                                      arguments={'handle': long['handle'], 'kill': True})['result']['output'])
+        self.assertIn('exit_code', killed)
+        # A background command has no terminal: a step says so as the
+        # direct call does, and kills it all the same.
+        background = json.loads(self.step(client, turn, step='5', name='shell',
+                                          arguments={'command': 'sleep 600', 'background': True})
+                                ['result']['output'])['handle']
+        refused = self.step(client, turn, step='6', name='write_stdin', arguments={'handle': background})['result']
+        self.assertIn('not_a_terminal', refused['output'])
+        stopped = self.step(client, turn, step='7', name='write_stdin',
+                            arguments={'handle': background, 'kill': True})['result']
+        self.assertIn('"stopped":true', stopped['output'])
+        self.answer(client, turn)
+        self.assertEqual(client.finished(turn)['data']['status'], 'completed')
+        self.assertEqual(client.request('processes', bot='Lead')['result']['processes'], [])
+
+    def test_a_terminal_poll_step_past_the_hold_parks_until_the_terminal_ends_or_its_time_runs_out(self):
+        # As a turn's poll: past the bot's hold it holds no task and no
+        # timer, only a waiter on the handles' schedule, and is answered
+        # by the terminal's end or the poll's time.
+        client, turn = self.script(tools='echo,shell,write_stdin', settings={'approval_hold_ms': 100})
+        started = json.loads(self.step(client, turn, name='shell', arguments={
+            'command': 'printf ready; while [ ! -f release ]; do sleep .01; done; printf done',
+            'tty': True, 'yield_time_ms': 1000})['result']['output'])
+        self.assertEqual((started['output'], started['running']), ('ready', True), started)
+        handle = started['handle']
+        request = self.ask(client, turn, step='2', name='write_stdin',
+                           arguments={'handle': handle, 'yield_time_ms': 30000})
+        deadline = time.monotonic() + 5
+        while client.request('stats')['result']['handles']['waiters'] == 0:
+            self.assertLess(time.monotonic(), deadline, 'the poll never parked')
+            time.sleep(.01)
+        # Parked, it holds no process slot.
+        self.assertEqual(client.request('stats')['result']['steps']['commands'], 0)
+        (self.path / 'release').touch()
+        ended = json.loads(self.reply(client, request, timeout=10)['result']['output'])
+        self.assertEqual((ended['output'], ended['exit_code'], ended['handle']), ('done', 0, handle), ended)
+        self.assertEqual(client.request('stats')['result']['handles']['waiters'], 0)
+        # One whose time runs out reports the terminal still running.
+        handle = json.loads(self.step(client, turn, step='3', name='shell', arguments={
+            'command': 'sleep 600', 'tty': True, 'yield_time_ms': 0})['result']['output'])['handle']
+        lapsed = json.loads(self.step(client, turn, step='4', name='write_stdin',
+                                      arguments={'handle': handle, 'yield_time_ms': 400})['result']['output'])
+        self.assertEqual((lapsed['output'], lapsed['running'], lapsed['handle']), ('', True, handle), lapsed)
+        # A parked one is stopped with its call, its waiter let go.
+        request = self.ask(client, turn, step='5', name='write_stdin',
+                           arguments={'handle': handle, 'yield_time_ms': 30000})
+        deadline = time.monotonic() + 5
+        while client.request('stats')['result']['handles']['waiters'] == 0:
+            self.assertLess(time.monotonic(), deadline, 'the poll never parked')
+            time.sleep(.01)
+        self.answer(client, turn)
+        self.assertEqual(self.reply(client, request)['error'], 'step_stopped')
+        self.assertEqual(client.request('stats')['result']['handles']['waiters'], 0)
+        self.assertEqual(client.request('stats')['result']['steps']['in_flight'], 0)
+
+    def test_a_detached_step_outlives_its_call_on_a_handle_of_the_bot_s(self):
+        client, turn = self.script()
+        ran = self.step(client, turn, name='shell',
+                        arguments={'command': 'exec sleep 30', 'detach': True})['result']
+        said = json.loads(ran['output'])
+        self.assertEqual(said['detached'], True, said)
+        self.addCleanup(lambda: os.kill(said['pid'], 9) if self.alive(said['pid']) else None)
+        self.answer(client, turn)
+        self.assertEqual(client.finished(turn)['data']['status'], 'completed')
+        # Listed as the bot's, under its own name, past its call's answer.
+        [listed] = client.request('processes', bot='Lead')['result']['processes']
+        self.assertEqual((listed['handle'], listed['kind'], listed['command'], listed['pid']),
+                         (said['handle'], 'detached', 'exec sleep 30', said['pid']))
+        self.assertTrue(self.alive(said['pid']))
+        stopped = client.request('stop_process', bot='Lead', handle=said['handle'])['result']
+        self.assertEqual(stopped['stopped'], True)
+        waited = client.request('wait', handles=[said['handle']], timeout_ms=5000)['result']
+        self.assertEqual(waited['results'][said['handle']]['error'], 'stopped')
+
+    @staticmethod
+    def alive(pid):
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return False
+        return True
+
+    def test_the_tools_op_marks_every_tool_a_step_but_those_kept_direct(self):
+        client = self.client('echo,shell')
+        listed = {t['name']: t['step'] for t in client.request('tools')['result']['tools']}
+        direct = {'wait', 'history', 'web_search', 'send_message', 'list_agents', 'pause_agents',
+                  'spawn_agent', 'close_agent'}
+        self.assertEqual({name for name, step in listed.items() if not step}, direct)
+        self.assertIn('write_stdin', {name for name, step in listed.items() if step})
+        client.close()
+
     def test_a_command_step_that_names_a_timeout_ends_at_it(self):
         # A step cannot be handed back as a handle, so a timeout its
         # script names ends the command, with what it wrote so far.
@@ -485,6 +607,45 @@ class DaemonStepTests(ModelFixture):
         done = self.ended(daemon, turn, 'script-0/1')
         self.assertEqual(done['error'], 'step_stopped')
         self.assertEqual(daemon.request('stats')['result']['steps']['in_flight'], 0)
+        self.assertIn('result', daemon.request('tool_result', bot='Lead', turn=turn, call_id='script-0', output='ok'))
+        self.assertEqual(daemon.finished(turn)['data']['status'], 'completed')
+
+    def test_a_terminal_step_stopped_in_its_yield_leaves_what_it_wrote_for_a_later_read(self):
+        daemon = SocketClient(self.binary, self.path / 'state.sqlite', self.url, 'echo,shell,write_stdin')
+        self.addCleanup(daemon.close)
+        daemon.request('create', bot='Lead', workspace=str(self.path), declare=[EXEC])
+        self.model.call_script = [('exec', {'code': 'run()'})]
+        turn = daemon.request('submit', bot='Lead', request_id='t', prompt='script')['result']['message']
+        deadline = time.monotonic() + 5
+        while not daemon.request('tool_calls', tag='sonny')['result']['calls']:
+            self.assertLess(time.monotonic(), deadline)
+            time.sleep(.01)
+        asker = Connection(daemon.socket_path)
+        asker.socket.sendall((json.dumps(dict(id=1, op='run_step', bot='Lead', turn=turn, call_id='script-0',
+                                              step='1', name='shell',
+                                              arguments={'command': 'printf ready; exec sleep 600', 'tty': True,
+                                                         'yield_time_ms': 1500})) + '\n').encode())
+
+        def listed():
+            return daemon.request('processes', bot='Lead')['result']['processes']
+        while not listed():
+            self.assertLess(time.monotonic(), deadline, 'the terminal never started')
+            time.sleep(.01)
+        [terminal] = listed()
+        time.sleep(.3)
+        # Its asker leaves during the yield: the step stops, the terminal
+        # runs on, and what it wrote waits for the next read.
+        asker.close()
+        self.assertEqual(self.ended(daemon, turn, 'script-0/1')['error'], 'step_stopped')
+        # Past the yield it was stopped in, nothing has read it meanwhile.
+        time.sleep(2)
+        read = daemon.request('run_step', bot='Lead', turn=turn, call_id='script-0', step='2', name='write_stdin',
+                              arguments={'handle': terminal['handle'], 'yield_time_ms': 0})['result']
+        said = json.loads(read['output'])
+        self.assertEqual((said['output'], said['running']), ('ready', True), said)
+        killed = daemon.request('run_step', bot='Lead', turn=turn, call_id='script-0', step='3', name='write_stdin',
+                                arguments={'handle': terminal['handle'], 'kill': True})['result']
+        self.assertIn('exit_code', json.loads(killed['output']))
         self.assertIn('result', daemon.request('tool_result', bot='Lead', turn=turn, call_id='script-0', output='ok'))
         self.assertEqual(daemon.finished(turn)['data']['status'], 'completed')
 

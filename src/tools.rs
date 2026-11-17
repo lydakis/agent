@@ -29,10 +29,10 @@ mod picture;
 mod terminal;
 use files::read_bounded;
 pub use patch::Patch;
-/// The daemon's tools a script may run as daemon steps (`run_step`): those
-/// whose place in line and whose stop are specified. A bot's `steps_only`
-/// entry `"*"` stands for these.
-pub const STEP_TOOLS: [&str; 7] = [
+/// The daemon's tools a script may run as daemon steps (`run_step`): every
+/// one but those [`Tool::direct_only`] keeps for the model's own calls. A
+/// bot's `steps_only` entry `"*"` stands for these.
+pub const STEP_TOOLS: [&str; 8] = [
     "shell",
     "echo",
     "read",
@@ -40,6 +40,7 @@ pub const STEP_TOOLS: [&str; 7] = [
     "edit",
     "apply_patch",
     "web_fetch",
+    "write_stdin",
 ];
 #[cfg(unix)]
 pub use terminal::POLL_YIELD_MS;
@@ -89,6 +90,12 @@ const MAX_YIELD_MS: u64 = 30_000;
 /// The most a write to a terminal may type at once.
 const INPUT_BYTES: usize = 16 * 1024;
 
+/// Why `name`, one of the daemon's tools, runs only as a direct call and
+/// never as a step of a script; `None` for a step or a name that is none.
+pub fn direct_only(name: &str) -> Option<&'static str> {
+    Tool::parse(name).and_then(Tool::direct_only)
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Tool {
     Echo,
@@ -109,6 +116,31 @@ enum Tool {
     CloseAgent,
 }
 impl Tool {
+    /// Why the tool is a direct call only and never a step of a script: the
+    /// class Codex keeps out of its scripts (`ToolExposure`,
+    /// codex-rs/tools/src/tool_executor.rs). Every other tool is a step.
+    fn direct_only(self) -> Option<&'static str> {
+        match self {
+            Tool::Wait => {
+                Some("the script tool's second half: it collects what a script hands back")
+            }
+            Tool::History => Some("a history reader, as Codex keeps its own out of scripts"),
+            Tool::WebSearch => Some("hosted: its provider runs it inside the model call"),
+            Tool::SendMessage
+            | Tool::ListAgents
+            | Tool::PauseAgents
+            | Tool::SpawnAgent
+            | Tool::CloseAgent => Some("an agent tool, as Codex's agents namespace"),
+            Tool::Echo
+            | Tool::Shell
+            | Tool::Read
+            | Tool::Write
+            | Tool::Edit
+            | Tool::ApplyPatch
+            | Tool::WebFetch
+            | Tool::WriteStdin => None,
+        }
+    }
     fn parse(name: &str) -> Option<Tool> {
         Some(match name {
             "echo" => Tool::Echo,
@@ -5170,6 +5202,22 @@ async fn shell(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn every_tool_is_a_step_unless_kept_direct_for_its_class() {
+        // Every tool the daemon has: a tool new to it is a step or kept
+        // direct, since `direct_only` names each one.
+        let every = Registry::all().unwrap().tools;
+        for tool in every {
+            assert_eq!(
+                STEP_TOOLS.contains(&tool.name()),
+                tool.direct_only().is_none(),
+                "{}",
+                tool.name()
+            );
+        }
+        assert!(STEP_TOOLS.iter().all(|name| Tool::parse(name).is_some()));
+    }
+
     #[test]
     fn a_sandboxed_shell_offers_codexs_escalation_fields() {
         let mut parameters = Tool::Shell.schema().parameters;
