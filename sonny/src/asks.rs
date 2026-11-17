@@ -325,7 +325,7 @@ pub fn tool() -> Value {
                 "question": {"type": "string",
                     "description": "The question, verb first, in the person's own words, in about twelve words."},
                 "why": {"type": "string",
-                    "description": "What the answer decides and what the person needs to know to choose, in a sentence or three."},
+                    "description": "What the answer decides and the facts the person needs to choose, written here in a sentence or three: they may see only this card, so never point to a file, a path or the margin instead."},
                 "options": {"type": "array",
                     "description": "2 to 4 options, each a different way forward; none with command.",
                     "items": {
