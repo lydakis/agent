@@ -10538,3 +10538,38 @@ pause is one statement in a step's own commit. The footprint and burst
 rows move within what one run against another moves on that runner (the
 same rows move by as much between base runs of other pull requests), and
 lifecycle's p95 is faster, which the change cannot cause either.
+
+## Requests and slow operations by program (`stats`)
+
+2026-11-17, Linux x86_64 cloud VM, 4 CPUs, Python 3 and the bench venv.
+Main is `d329db7`; the change adds `hello`, the `programs` split and the
+`slow` list. Both are local release builds with the same locked
+dependencies. The hot-path screens, as the Perf workflow runs them
+(`bench/perf_gate.py`), two alternating rounds:
+
+| Bench | Measure | Main | Change | Change % |
+| --- | --- | ---: | ---: | ---: |
+| admission | lone submit CPU, ms | 33.759 | 33.93 | +0.5% |
+| admission | burst submit p99, ms | 4.407 | 4.41 | +0.1% |
+| completion | release to terminal p99, ms | 11.287 | 10.736 | -4.9% |
+| footprint | idle RSS, MiB | 16.693 | 16.82 | +0.8% |
+| footprint | per idle bot, KiB | 1.778 | 1.884 | +6.0% |
+| footprint | RSS after a turn each, MiB | 32.303 | 36.783 | +13.9% |
+| footprint | CPU per turn, ms | 0.838 | 0.853 | +1.8% |
+| lifecycle | CPU, s | 0.575 | 0.555 | -3.5% |
+| lifecycle | p95 turn, ms | 595.637 | 581.01 | -2.5% |
+| lifecycle | peak RSS, MiB | 25.85 | 24.85 | -3.9% |
+
+Store work per turn is the same on both. Per request the loop adds three
+additions to a fixed array; per delivered event, one relaxed atomic
+increment; per store job, one comparison against a second. Nothing is
+allocated per turn or per request, and the slow list stays empty in these
+runs. The footprint's RSS after a turn is the allocator's high-water mark
+from 1,000 concurrent turns, and it moved the most, so three more
+alternating rounds of the footprint alone were run. Over all ten measured
+runs of each, main ranged 30.2 to 40.5 MiB (median 32.7) and the change 31.5 to
+40.7 MiB (median 38.6): the ranges overlap whole, but the medians differ by
+more than the change could hold, as it keeps nothing per turn;
+idle RSS was the same (15.0 to 17.0 MiB on both) and per idle bot 1.61 to
+1.88 KiB on main against 1.71 to 2.16 KiB on the change, which adds one
+16-byte shared program slot per session, not per bot.

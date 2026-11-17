@@ -122,6 +122,16 @@ pub fn default_tools(
 /// The socket protocol's version in `ready`. The daemon and its clients ship
 /// together, so a client refuses a daemon of any other version.
 pub const PROTOCOL: u64 = 84;
+static PROGRAM: std::sync::OnceLock<&'static str> = std::sync::OnceLock::new();
+/// Name this process's connections as `program` (such as `window` or
+/// `reviewer`): each later [`Client::connect`] says it in its first line,
+/// and the daemon's `stats` counts its requests under it. The first name
+/// set stays.
+pub fn name_program(program: &'static str) {
+    let _ = PROGRAM.set(program);
+}
+/// The id of a connection's `hello`, whose answer no one waits for.
+const HELLO: u64 = u64::MAX;
 /// How long the daemon holds a turn on a cause a person can fix before it
 /// fails with it, for a bot that sets no `hold_ms`: five days, as mail is
 /// retried (RFC 5321 suggests four to five) before it is returned.
@@ -310,7 +320,7 @@ impl Client {
                 .map_err(|_| Error::new("daemon_connect_timeout"))?
                 .map_err(unavailable)?,
         };
-        let (read, write) = stream.into_split();
+        let (read, mut write) = stream.into_split();
         let mut lines = BufReader::new(read).lines();
         // A daemon opening its store says it starts, every few seconds,
         // until it is ready: each line gives it the wait again.
@@ -348,6 +358,17 @@ impl Client {
                 .filter_map(|key| Some((key.to_owned(), ready.get(key)?.clone())));
             error.facts = Some(Box::new(facts.collect()));
             return Err(error);
+        }
+        // Named before its first request, unanswered: the reader drops the
+        // reply, as no request waits under its id.
+        if let Some(program) = PROGRAM.get() {
+            let hello = json!({"id": HELLO, "op": "hello", "program": program});
+            let mut line = hello.to_string();
+            line.push('\n');
+            write
+                .write_all(line.as_bytes())
+                .await
+                .map_err(|_| Error::new("daemon_disconnected"))?;
         }
         let store = ready["store"]["lineage"].as_str().map(str::to_owned);
         let identity = ready["store"]["identity"].as_str().map(str::to_owned);
