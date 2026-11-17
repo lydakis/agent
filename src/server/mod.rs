@@ -857,6 +857,25 @@ impl Commands {
 }
 
 impl Command {
+    /// A read the observation lane answers from the store's readers: it
+    /// sees what was committed and decides nothing.
+    fn observes(&self) -> bool {
+        matches!(
+            self,
+            Command::Inspect { .. }
+                | Command::Approvals { .. }
+                | Command::Bots { .. }
+                | Command::Turns { .. }
+                | Command::Messages { .. }
+                | Command::Usage { .. }
+                | Command::Events { .. }
+                | Command::HistoryNodes { .. }
+                | Command::HistoryItems { .. }
+                | Command::HistorySearch { .. }
+                | Command::Audit { .. }
+                | Command::Prompts { .. }
+        )
+    }
     /// The request's `op`, as `stats` counts it.
     fn op(&self) -> &'static str {
         match self {
@@ -3190,10 +3209,7 @@ impl Service {
             Command::Companions { .. } => return refuse("manage the daemon's companions"),
             _ => {}
         }
-        let me = self
-            .store
-            .op("inspect", move |db| db.inspect_id(caller))
-            .await?;
+        let me = self.store.identity(caller).await?;
         // Any agent may pull the cord, as itself.
         if let Command::Pause { by, .. } = command {
             *by = Some(me.name.clone());
@@ -3292,7 +3308,7 @@ impl Service {
                     let source = source.clone();
                     let source = match self
                         .store
-                        .op("inspect", move |db| db.inspect(&source))
+                        .read("inspect", move |db| db.inspect(&source))
                         .await
                     {
                         Ok(source) => Some(source),
@@ -3350,7 +3366,10 @@ impl Service {
                 // its folder: one the caller gives it must be the caller's.
                 if let Some(workspace) = workspace {
                     let bot = bot.clone();
-                    let target = self.store.op("inspect", move |db| db.inspect(&bot)).await?;
+                    let target = self
+                        .store
+                        .read("inspect", move |db| db.inspect(&bot))
+                        .await?;
                     if target.sandboxed() {
                         folders.push(workspace.clone());
                     }
@@ -3363,7 +3382,7 @@ impl Service {
             | Command::StopProcess { bot, .. }
             | Command::ProcessOutput { bot, .. } => {
                 let bot = bot.clone();
-                match self.store.op("inspect", move |db| db.inspect(&bot)).await {
+                match self.store.read("inspect", move |db| db.inspect(&bot)).await {
                     Ok(target)
                         if target.bot_id != me.bot_id
                             && target.created_by_id != Some(me.bot_id) =>
@@ -3482,6 +3501,14 @@ impl Service {
                         && self.reserved > 0
                         && self.active.holding() + self.reserved >= self.limit_active)
             }
+            // A read waits only for its own session's admissions, to be
+            // answered after them. Another session's are not answered yet,
+            // so a read that misses them misses nothing anyone was told,
+            // and one session's admissions never hold another's reads.
+            Some(command) if command.observes() => self
+                .admissions
+                .iter()
+                .any(|admission| admission.session == session),
             _ => true,
         }
     }
@@ -5179,12 +5206,7 @@ impl Service {
             }
             Command::Lend { bot, bot_id } => {
                 let record = store
-                    .op("inspect", move |db| {
-                        if bot_id.is_some() {
-                            db.identity(&bot, bot_id)?;
-                        }
-                        db.inspect(&bot)
-                    })
+                    .read("inspect", move |db| db.inspect_held(&bot, bot_id))
                     .await?;
                 let id = record.bot_id;
                 // As its turns' commands get them, past what only a turn has.
@@ -5225,14 +5247,13 @@ impl Service {
                 Ok(json!({"bot": record.name, "bot_id": id, "policy": policy, "env": env}))
             }
             Command::Inspect { bot, bot_id } => {
-                store
-                    .op("inspect", move |db| {
-                        if bot_id.is_some() {
-                            db.identity(&bot, bot_id)?;
-                        }
-                        Ok(serde_json::to_value(db.inspect(&bot)?)?)
-                    })
+                let reader = store.reader();
+                self.observe(session, output, id, async move {
+                    (reader.read("inspect", move |db| {
+                        Ok(serde_json::to_value(db.inspect_held(&bot, bot_id)?)?)
+                    }))
                     .await
+                })
             }
             Command::Tools => {
                 let tools: Vec<Value> = (self.registry.schemas().into_iter())
@@ -5957,8 +5978,9 @@ impl Service {
                 through,
                 limit,
             } => {
-                store
-                    .op("approvals", move |db| {
+                let reader = store.reader();
+                self.observe(session, output, id, async move {
+                    (reader.read("approvals", move |db| {
                         db.approvals(
                             bot.as_deref(),
                             tag.as_deref(),
@@ -5966,8 +5988,9 @@ impl Service {
                             through,
                             limit.unwrap_or(64),
                         )
-                    })
+                    }))
                     .await
+                })
             }
             Command::ServeApprovals {
                 tag,
@@ -6323,7 +6346,7 @@ impl Service {
                 // `*` follows every bot from a store-wide cursor.
                 if bot != hub::ALL {
                     let check = bot.clone();
-                    store.op("inspect", move |db| db.inspect(&check)).await?;
+                    store.read("inspect", move |db| db.inspect(&check)).await?;
                 }
                 let after = match since_ms {
                     Some(since_ms) => {
@@ -9275,6 +9298,77 @@ mod tests {
             "one turn started per fresh submission"
         );
         assert_eq!(service.reserved, 0);
+        drop(service);
+        drop(store);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn reads_and_a_bots_identity_are_answered_while_the_writer_is_held() {
+        let dir = scratch("held-reads");
+        let (store, _publications) = Store::open(&dir.join("state.sqlite")).await.unwrap();
+        let mut service = admitting(&store, 1024);
+        let (output, _writer) = Output::stdout();
+        requests(&mut service, vec![create("A", &dir)], &output).await;
+        let bot_id = (store.read("inspect", |db| db.inspect("A")).await)
+            .unwrap()
+            .bot_id;
+        // A commit that takes seconds, as on a saturated disk, with an
+        // admission from session 0 queued behind it.
+        let (held, gate) = hold(&store).await;
+        let command = submit("A", "r1");
+        let bound = service.admission_sends(&command, &json!("s"), 0);
+        let deferred = service
+            .dispatch(command, 0, &output, json!("s"), bound)
+            .await;
+        assert_eq!(deferred.unwrap_err().code, "deferred");
+        let approvals = || Command::Approvals {
+            bot: None,
+            tag: Some("manual".into()),
+            after: 0,
+            through: None,
+            limit: None,
+        };
+        assert!(
+            !service.must_settle(Some(&approvals()), 1, &output, Bound::default()),
+            "another session's admission holds no read"
+        );
+        assert!(
+            service.must_settle(Some(&approvals()), 0, &output, Bound::default()),
+            "a read is answered after its own session's admissions"
+        );
+        let inspect = Command::Inspect {
+            bot: "A".into(),
+            bot_id: Some(bot_id),
+        };
+        for command in [approvals(), inspect] {
+            let deferred = (service.dispatch(command, 1, &output, json!("r"), Bound::default()))
+                .await
+                .unwrap_err();
+            assert_eq!(deferred.code, "deferred");
+            let (asker, sent) = tokio::time::timeout(Duration::from_secs(5), service.lane.next())
+                .await
+                .expect("answered beside the held writer")
+                .unwrap();
+            assert_eq!((asker.session, sent), (1, true));
+        }
+        // A bot's own request is held to its identity, read without the
+        // writer, then from memory.
+        for _ in 0..2 {
+            let mut command = approvals();
+            tokio::time::timeout(Duration::from_secs(5), service.capped(bot_id, &mut command))
+                .await
+                .expect("held to its identity beside the held writer")
+                .unwrap();
+        }
+        let reads = || store.stats()["operations"]["identity"]["count"].as_u64();
+        assert_eq!(reads(), Some(1), "read once, then kept");
+        gate.send(()).unwrap();
+        held.await.unwrap();
+        while !service.admissions.is_empty() {
+            let (_, _, _, started) = service.settle().await;
+            started.unwrap();
+        }
         drop(service);
         drop(store);
         std::fs::remove_dir_all(dir).unwrap();
