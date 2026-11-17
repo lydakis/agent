@@ -1864,10 +1864,7 @@ enum Asking {
 /// The daemon, started the way the CLI starts it when it is not running.
 /// At start, with no provider set anywhere, the person is asked for one
 /// first, and a first model list is written once it runs.
-async fn connect(
-    options: &Options,
-    asking: Asking,
-) -> Result<Connected, String> {
+async fn connect(options: &Options, asking: Asking) -> Result<Connected, String> {
     let start = || start_daemon(&options.store, &options.socket, false);
     connect_starting(&options.socket, asking, start).await
 }
