@@ -164,12 +164,14 @@ class ScoreTests(unittest.TestCase):
 
     @staticmethod
     def answer(text):
-        """`acp.jsonl` with an early prompt, the last one at 10 and `text`
-        said at 20."""
+        """`acp.jsonl` with an early prompt answered with the codename at 2,
+        the last prompt at 10 and `text` said at 20."""
         prompt = lambda t: json.dumps({'t': t, 'sent': {'method': 'session/prompt', 'params': {}}})
-        chunk = {'sessionUpdate': 'agent_message_chunk', 'content': {'type': 'text', 'text': text}}
-        said = json.dumps({'t': 20, 'm': {'method': 'session/update', 'params': {'update': chunk}}})
-        return '\n'.join([prompt(1), prompt(10), said]) + '\n'
+
+        def said(t, words):
+            chunk = {'sessionUpdate': 'agent_message_chunk', 'content': {'type': 'text', 'text': words}}
+            return json.dumps({'t': t, 'm': {'method': 'session/update', 'params': {'update': chunk}}})
+        return '\n'.join([prompt(1), said(2, 'Noted HERON-7731.'), prompt(10), said(20, text)]) + '\n'
 
     def test_context_is_recovered_only_by_quoting_after_a_cut(self):
         quote = ("You wrote: \u201cBefore we start, a note for later: the release codename is HERON-7731, and "
@@ -218,19 +220,30 @@ class ScoreTests(unittest.TestCase):
             view = run_dir(tmp, [part('person', 'Set.')], steps, files={'automations.json': '{"automations": []}'})
             self.assertFalse(self.score('schedule', view)['sets an automation'])
 
+    def test_the_warning_check_needs_utcnow_gone(self):
+        fixed = role_eval.FILES['shop/audit.py'].replace(
+            'from datetime import datetime', 'from datetime import datetime, timezone').replace(
+            'datetime.utcnow()', 'datetime.now(timezone.utc)')
+        for code, ok in [(role_eval.FILES['shop/audit.py'], False), (fixed, True)]:
+            self.assertEqual(self.passes(golden_eval.NO_WARNING, {'shop/audit.py': code}), ok)
+
+    @staticmethod
+    def passes(check, files):
+        """Whether `check` passes at the root of the fixture with `files`."""
+        with tempfile.TemporaryDirectory() as tmp:
+            for name, text in {**role_eval.FILES, **files}.items():
+                (Path(tmp) / name).parent.mkdir(parents=True, exist_ok=True)
+                (Path(tmp) / name).write_text(text)
+            code = f'import sys; sys.path.insert(0, ".")\n{check}'
+            return subprocess.run([sys.executable, '-I', '-c', code], cwd=tmp, capture_output=True).returncode == 0
+
     def test_the_export_check_reads_the_rows(self):
         good = ("import csv\n\ndef export(orders, out):\n    w = csv.writer(out)\n"
                 "    w.writerow(['id', 'total', 'created_at'])\n"
                 "    for o in orders:\n        w.writerow([o.id, o.total, o.created_at.isoformat()])\n")
         header = "def export(orders):\n    return 'id,total,created_at\\n'\n"
         for code, ok in [(good, True), (header, False)]:
-            with tempfile.TemporaryDirectory() as tmp:
-                for name, text in {**role_eval.FILES, 'shop/export.py': code}.items():
-                    (Path(tmp) / name).parent.mkdir(parents=True, exist_ok=True)
-                    (Path(tmp) / name).write_text(text)
-                code = f'import sys; sys.path.insert(0, ".")\n{golden_eval.EXPORT}'
-                run = subprocess.run([sys.executable, '-I', '-c', code], cwd=tmp, capture_output=True)
-                self.assertEqual(run.returncode == 0, ok, run.stderr)
+            self.assertEqual(self.passes(golden_eval.EXPORT, {'shop/export.py': code}), ok)
 
     def test_memory_and_main_come_from_the_run(self):
         with tempfile.TemporaryDirectory() as tmp:

@@ -92,7 +92,12 @@ for name, f in vars(e).items():
             continue
         ok = ok or right(r if isinstance(r, str) else args[1].getvalue() if len(args) > 1 else '')
 assert ok"""
-NO_WARNING = "import warnings\nwarnings.simplefilter('error')\nfrom shop.audit import stamp\nstamp()"
+# No call of the deprecated `utcnow` is left, so no Python warns, and
+# stamp() still gives a time: Python before 3.12 does not warn, so the
+# warning alone would pass the untouched fixture there.
+NO_WARNING = ("import inspect, warnings\nfrom datetime import datetime\nwarnings.simplefilter('error')\n"
+              "import shop.audit\nassert 'utcnow' not in inspect.getsource(shop.audit)\n"
+              "datetime.fromisoformat(shop.audit.stamp())")
 CONFIG = ("from datetime import timedelta\nfrom shop.config import SESSION_TIMEOUT\n"
           "assert SESSION_TIMEOUT == timedelta(hours=5)")
 
@@ -415,14 +420,12 @@ class View:
         """When the lead's answer to the person's last message first
         matched `pattern`, by the clock of `acp.jsonl`, or None."""
         log = self.out / 'acp.jsonl'
-        said, last = '', False
-        for line in open(log) if log.exists() else []:
-            row = json.loads(line)
-            if (row.get('sent') or {}).get('method') == 'session/prompt':
-                said, last = '', True
-                continue
+        rows = [json.loads(line) for line in open(log)] if log.exists() else []
+        prompts = [i for i, r in enumerate(rows) if (r.get('sent') or {}).get('method') == 'session/prompt']
+        said = ''
+        for row in rows[prompts[-1] + 1:] if prompts else []:
             u = ((row.get('m') or {}).get('params') or {}).get('update') or {}
-            if last and u.get('sessionUpdate') == 'agent_message_chunk':
+            if u.get('sessionUpdate') == 'agent_message_chunk':
                 said += (u.get('content') or {}).get('text', '')
                 if re.search(pattern, said, re.I):
                     return row['t']
