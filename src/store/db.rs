@@ -8862,12 +8862,12 @@ impl Database {
     pub fn repair_blank(&mut self, nodes: &[i64]) -> Result<Vec<Value>> {
         let mut repaired = Vec::new();
         for &node in nodes {
-            let read: Option<(Vec<u8>, i64)> = self
+            let read: Option<(Vec<u8>, i64, i64)> = self
                 .conn
-                .prepare_cached("SELECT item,thinking FROM nodes WHERE id=?")?
-                .query_row([node], |r| Ok((r.get(0)?, r.get(1)?)))
+                .prepare_cached("SELECT item,thinking,elided FROM nodes WHERE id=?")?
+                .query_row([node], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
                 .optional()?;
-            let Some((item, was)) = read else {
+            let Some((item, was, elided)) = read else {
                 continue;
             };
             let Some((fixed, removed)) = unblanked(&item) else {
@@ -8875,20 +8875,30 @@ impl Database {
             };
             // What a request without thinking sends of it changes with it:
             // its thinking bytes, and every later node's running total.
-            // A prompt grown by its placeholder grows every later total.
+            // A prompt grown by its placeholder grows every later total;
+            // one sent as its stub saves as much more, so what is sent of
+            // it, and every elision version past it, stays as it was.
             let thinking = super::thinking_bytes(&fixed) as i64;
             let grown = fixed.len() as i64 - item.len() as i64;
+            let saves = if elided > 0 { grown } else { 0 };
             let tx = self.conn.transaction()?;
-            tx.prepare_cached("UPDATE nodes SET item=?,thinking=? WHERE id=?")?
-                .execute(params![fixed, thinking, node])?;
+            tx.prepare_cached("UPDATE nodes SET item=?,thinking=?,elided=elided+? WHERE id=?")?
+                .execute(params![fixed, thinking, saves, node])?;
+            const BELOW: &str = "WITH RECURSIVE below(id) AS (
+                SELECT ?1 UNION ALL SELECT n.id FROM nodes n JOIN below b ON n.parent=b.id)";
             if thinking != was || grown != 0 {
-                tx.prepare_cached(
-                    "WITH RECURSIVE below(id) AS (
-                        SELECT ?1 UNION ALL SELECT n.id FROM nodes n JOIN below b ON n.parent=b.id)
-                     UPDATE nodes SET total_thinking=total_thinking+?2,total_bytes=total_bytes+?3
-                     WHERE id IN (SELECT id FROM below)",
-                )?
-                .execute(params![node, thinking - was, grown])?;
+                tx.prepare_cached(&format!(
+                    "{BELOW} UPDATE nodes SET total_thinking=total_thinking+?2,
+                        total_bytes=total_bytes+?3,total_elided=total_elided+?4
+                     WHERE id IN (SELECT id FROM below)"
+                ))?
+                .execute(params![node, thinking - was, grown, saves])?;
+            }
+            if saves != 0 {
+                tx.prepare_cached(&format!(
+                    "{BELOW} UPDATE elisions SET saved=saved+?2 WHERE through IN (SELECT id FROM below)"
+                ))?
+                .execute(params![node, saves])?;
             }
             tx.commit()?;
             repaired.push(json!({"node": node, "removed": removed}));
@@ -20609,15 +20619,19 @@ mod tests {
             // After it, words.
             br#"{"content":[{"text":"next","type":"text"}],"role":"user"}"#,
         ];
-        let (mut total, mut thought) = (0, 0);
+        let (mut total, mut thought, mut saved) = (0, 0, 0);
         for (id, item) in (1..).zip(items) {
             total += item.len() as i64;
             let thinking = super::super::thinking_bytes(item) as i64;
             thought += thinking;
+            // The quoting prompt goes as a stub 10 bytes shorter.
+            let elided = if id == 6 { 10 } else { 0 };
+            saved += elided;
             db.connection()
                 .execute(
-                    "INSERT INTO nodes(id,parent,item,total_bytes,depth,thinking,total_thinking)
-                     VALUES(?,?,?,?,?,?,?)",
+                    "INSERT INTO nodes(id,parent,item,total_bytes,depth,thinking,total_thinking,
+                        elided,total_elided)
+                     VALUES(?,?,?,?,?,?,?,?,?)",
                     params![
                         id,
                         (id > 1).then_some(id - 1),
@@ -20625,11 +20639,34 @@ mod tests {
                         total,
                         id,
                         thinking,
-                        thought
+                        thought,
+                        elided,
+                        saved
                     ],
                 )
                 .unwrap();
         }
+        db.connection()
+            .execute(
+                "INSERT INTO elisions(node,previous,through,saved) VALUES(7,NULL,7,10)",
+                [],
+            )
+            .unwrap();
+        // What goes when elided, before the repair.
+        let sent = |db: &Database| -> Vec<i64> {
+            (1..=7)
+                .map(|id| {
+                    db.conn
+                        .query_row(
+                            "SELECT total_bytes-total_elided FROM nodes WHERE id=?",
+                            [id],
+                            |r| r.get(0),
+                        )
+                        .unwrap()
+                })
+                .collect()
+        };
+        let before = sent(&db);
         let all = [1, 2, 3, 4, 5, 6, 7];
         let repaired = db.repair_blank(&all).unwrap();
         assert_eq!(
@@ -20693,6 +20730,14 @@ mod tests {
                 _ => assert_eq!(now, was),
             }
         }
+        // The stub saves the placeholder's bytes too: what goes elided is
+        // as it was, and the elision version past it saved as much more.
+        assert_eq!(sent(&db), before);
+        let version: i64 = db
+            .conn
+            .query_row("SELECT saved FROM elisions WHERE node=7", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(version, 10 + "<empty>".len() as i64);
         // Repaired once, nothing is left to take.
         assert!(db.repair_blank(&all).unwrap().is_empty());
     }
