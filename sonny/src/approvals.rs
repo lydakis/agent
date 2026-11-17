@@ -893,8 +893,8 @@ pub const NESTED_GONE: &str = "nested-repositories-gone";
 /// each `.git` it found below an agent's folder as a folder of its own to
 /// write until 0.9.2, and the agent kept those until its permissions were
 /// picked again, so a gone or emptied one gave a placeholder inside a
-/// placeholder, or failed every command. Run by the lookout, from a whole
-/// listing, beside its start rather than before it: once done, it costs a
+/// placeholder, or failed every command. Run at a window's start, from a
+/// whole listing ([`crate::upgrade::from_listing`]): once done, it costs a
 /// read of the record. One that can't be read or changed now is tried
 /// again next time.
 pub fn nested_gone(
@@ -936,10 +936,8 @@ pub fn nested_gone(
             match client.request("configure", Value::Object(asked)).await {
                 Ok(_) => {}
                 Err(error) if error.code == "bot_not_found" => {}
-                Err(error) => {
-                    eprintln!("sonny: {NESTED_GONE} waits on {name}: {error}");
-                    all = false;
-                }
+                // Said nowhere: a window's screen is up.
+                Err(_) => all = false,
             }
         }
         if all {

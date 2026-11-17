@@ -448,6 +448,21 @@ impl Hub {
         drop(held);
         Ok(serving)
     }
+    /// Which of `tags` sessions serve now, for who holds a parked call:
+    /// one lookup per tag, never a scan of every tag served.
+    pub fn serving<'a>(&self, tags: impl IntoIterator<Item = &'a str>) -> Vec<String> {
+        let now = Instant::now();
+        let inner = self.inner.lock().unwrap();
+        tags.into_iter()
+            .filter(|tag| {
+                inner.approvers.get(*tag).is_some_and(|held| {
+                    let held = held.lock().unwrap();
+                    held.started && !held.expired(now)
+                })
+            })
+            .map(str::to_owned)
+            .collect()
+    }
     /// The tags served now, for `stats`.
     pub fn served(&self) -> Vec<String> {
         let now = Instant::now();
@@ -1057,6 +1072,7 @@ mod tests {
         }
         assert!(!*output.subscribe_closed().borrow());
         assert_eq!(hub.served(), ["auto"]);
+        assert_eq!(hub.serving(["manual", "auto"]), ["auto"]);
     }
 
     /// Serve `auto` on a session whose reader is not reading yet, and push
@@ -1229,6 +1245,7 @@ mod tests {
         hub.serve("other", 2, Output::writer(tokio::io::sink()), 100)
             .unwrap();
         assert!(hub.served().iter().all(|tag| tag != "auto"), "not started");
+        assert!(hub.serving(["auto"]).is_empty(), "not started");
         assert!(
             hub.inner.lock().unwrap().approvers.contains_key("auto"),
             "not ended"

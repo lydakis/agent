@@ -738,7 +738,7 @@ Sonny knows, never fields an agent sets (George, 11-15). Each post also
 names the project its author is named in (`project`), as the tool host
 names its tasks: by the lead its line runs from, so a dotted project such
 as `shop.web` is told from `shop`. A thread is the project its first post
-is, and the listing says it. The first lookout after an upgrade names it
+is, and the listing says it. The first window after an upgrade names it
 on every post written before, once, from a whole listing of the agents:
 an author still there by its lead, one gone by the longest start of its
 name a lead is named for, else its name up to the first dot (migration
@@ -769,9 +769,7 @@ the follow's name, how often it delivers (its own `digest`, else
 the commons source's) and its filter if it has one, and that the agent
 may change that with its follows tool, removing it and adding it
 again with a digest or filter of its own. Removing
-the follow leaves the thread until the agent posts there again. The
-first lookout after an upgrade has each agent of its store follow the
-threads it had posted in, once, so one that leaves later stays out. Agents' reads are counted in `.reads`, so whoever looks later
+the follow leaves the thread until the agent posts there again. Agents' reads are counted in `.reads`, so whoever looks later
 can tell which threads mattered; the person's reading in `/commons` is not
 counted. The `commons` skill says what the commons is and how to weigh what
 is in it, and the task and lead roles each name it once, as a place to look
@@ -1016,6 +1014,11 @@ each is offered once, then noted in
 A change that leaves the person's state to be moved brings the move with it
 ([upgrade.rs](../sonny/src/upgrade.rs)). A rewrite a script does the same
 everywhere is a migration, code that `upgrade::once` runs once and records.
+Migrations run where Sonny starts: before its config is read, and at a
+window's start and `sonny upgrade`'s, before the daemon and its companions
+start on the new build; those that need a whole listing of the agents run
+right after the window connects, off its way. Never in the lookout, whose
+one job is passing events on.
 What needs judgment or reaches the person's own things is an upgrade step:
 words in `sonny/upgrades/ID.md` (a first line `Feature: ROW` naming its
 register row) and a check in code that says when it is done. The note asks

@@ -4,7 +4,7 @@
 use std::path::{Path, PathBuf};
 
 /// What every agent of Sonny's leans on: the lead's and tasks' roles (and
-/// the superlead's, which a project opts into), the memory, plan, zen,
+/// the superlead's, which a project opts into), the memory, plan, margin, zen,
 /// coordination, commons, workflow and automation skills, the nightly cleanup's,
 /// agent-browser's and agent-desktop's own when they are installed, and `~/.agent/memory` and
 /// `~/.agent/automation`, which run this Sonny. Written at each start, so they
@@ -19,6 +19,7 @@ pub fn install_own() {
         include_str!("../skills/memory-cleanup/SKILL.md"),
     );
     install("plan", include_str!("../skills/plan/SKILL.md"));
+    install("margin", include_str!("../skills/margin/SKILL.md"));
     install("zen", crate::zen::SKILL);
     // The lead loads it whole; it names the commons as roles do.
     let coordination = crate::commons::role(crate::project::COORDINATION);

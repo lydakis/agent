@@ -343,6 +343,7 @@ at its model's own effort (`AGENT_EFFORT` when its model is
 | Where a click on an agent's name goes | `[sonny] agent_opens` (`tab`, the default, or `beside`) | |
 | Which tasks open in a tab | `[sonny] task_tabs` (`asked`, the default, or `every`) | |
 | Task tabs a lead keeps open | `[sonny] most_task_tabs` (32 by default, 0 for no limit) | |
+| Task folders kept in `~/.agent/worktrees` | `[sonny] task_worktrees` (15 by default, as Codex's app keeps worktrees; at least 1) | |
 | The daemon started with the machine | `[sonny] start_at_boot` (true or false, the default) | |
 | News from outside for the lookout | `[sonny.sources.NAME] command`, `every` | |
 
@@ -1484,7 +1485,14 @@ has something on it, or is off the screen, no time shows.
   its worktree, refusing while the task is working or the worktree has
   uncommitted changes. Its branch is kept unless it is merged. The agent
   and its history stay, so a message reopens it; only the person deletes
-  an agent, with `agent rm`.
+  an agent, with `agent rm`. A store keeps `[sonny] task_worktrees` task
+  folders, 15 by default, as Codex's app keeps its newest worktrees: past
+  it, a start that made a folder removes the least recently active tasks'
+  (by their last turn's end) as `remove_task` does, never one working or
+  another agent or a running command works in, with a call waiting on its verdict or a question open, with uncommitted
+  changes or submodules, a folder of its own or another daemon's, and its
+  answer names those it removed. A start in a folder already there makes
+  room for none.
 - **Tasks that start their own:** every agent has `start_task` and
   `remove_task`, for help inside its own brief, such as a review or a
   watch on something; separate work still goes to its lead. How deep a
@@ -1663,7 +1671,7 @@ showed.
 ## Skills and background services
 
 At each start Sonny writes what every agent leans on: the
-`memory`, `memory-cleanup`, `plan` and `automation` skills, as normal skills
+`memory`, `memory-cleanup`, `plan`, `margin` and `automation` skills, as normal skills
 in `~/.agents/skills` (replacing links the Agent app left there), and
 `~/.agent/memory` and `~/.agent/automation`, scripts that run this Sonny as
 `sonny memory ...` (facts saved for later agents, in `~/.agents/memory`;

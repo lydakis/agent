@@ -134,9 +134,9 @@ const NOTE_ROWS: usize = 600;
 const SEEN: usize = 1024;
 
 /// What the tool says to the bot: that a note is state with an exit, of
-/// one of three kinds, and that the reply stands alone. A bot a lead makes
-/// takes the lead's tools as declared, so what only a lead needs to hear
-/// is in its role, not here.
+/// one of three kinds, and that the reply stands alone. How to keep the
+/// margin, such as one needs-you note, is in the `margin` skill, not here
+/// or in a role.
 const DESCRIPTION: &str = "Keep state beside the conversation, in the margin the person sees next to your \
          replies. Your reply reads whole on its own: a note never holds part of an answer, and a \
          reply never points to a note for content. A note is state that can become false or \
@@ -2552,13 +2552,19 @@ mod tests {
     }
 
     #[test]
-    fn only_a_lead_hears_that_the_person_sees_its_margin_not_its_tasks() {
-        // A task takes its lead's declared tools, so the lead's line sits
-        // in its role, which the task does not take.
-        let said = |text: &str| text.contains("not your tasks'");
-        assert!(said(crate::project::LEAD));
-        assert!(!said(DESCRIPTION));
-        assert!(!said(include_str!("../agents/task.md")));
+    fn how_to_keep_the_margin_is_in_its_skill_not_the_roles_or_the_tool() {
+        // George, 11-17: a skill is the place for the how-to, so the roles
+        // never name the margin and the tool text stays as it is.
+        let skill = include_str!("../skills/margin/SKILL.md");
+        assert!(skill.contains("one needs-you note"));
+        assert!(!DESCRIPTION.contains("needs-you"));
+        for role in [
+            crate::project::LEAD,
+            include_str!("../agents/task.md"),
+            include_str!("../agents/superlead.md"),
+        ] {
+            assert!(!role.to_lowercase().contains("margin"));
+        }
     }
 
     #[test]

@@ -10660,7 +10660,7 @@ mod tests {
                 "call_id":call.call_id,"arguments":call.arguments}))?
                 .into();
                 db.append(turn, vec![item], std::slice::from_ref(&call), None)?;
-                db.suspend_approval(turn, std::slice::from_ref(&call), now_ms(), None, None)?;
+                db.suspend_approval(turn, std::slice::from_ref(&call), now_ms(), None, None, &[])?;
                 let answered = db.answer(agent_runtime::store::Decision {
                     bot: "Bob",
                     turn,
