@@ -2311,6 +2311,8 @@ async fn at_work(client: &agent_client::Client) -> Option<Vec<PathBuf>> {
             break;
         }
     }
+    // Each command by its agent and the turn that started it, which
+    // names the folder it runs in, whatever the agent works in since.
     let mut running = std::collections::BTreeSet::new();
     loop {
         let mut asked = json!({});
@@ -2319,15 +2321,26 @@ async fn at_work(client: &agent_client::Client) -> Option<Vec<PathBuf>> {
         }
         let page = client.request("processes", asked).await.ok()?;
         running.extend(
-            (page["processes"].as_array().into_iter().flatten())
-                .filter_map(|process| process["bot"].as_str().map(str::to_owned)),
+            (page["processes"].as_array().into_iter().flatten()).filter_map(|process| {
+                Some((
+                    process["bot"].as_str()?.to_owned(),
+                    process["turn"].as_i64()?,
+                ))
+            }),
         );
         after = page["next_after"].clone();
         if after.is_null() {
             break;
         }
     }
-    for bot in running {
+    let mut bots = std::collections::BTreeSet::new();
+    for (bot, turn) in running {
+        let asked = json!({"bot": bot, "turn": turn, "bytes": 1});
+        let read = client.request("prompts", asked).await.ok()?;
+        dirs.extend(workspace(&read));
+        bots.insert(bot);
+    }
+    for bot in bots {
         let page = (client
             .request("bots", json!({"name": bot, "limit": 1}))
             .await)
