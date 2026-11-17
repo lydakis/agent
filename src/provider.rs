@@ -1355,9 +1355,14 @@ impl Provider {
 
     /// Content-Length avoids requiring provider support for chunked uploads;
     /// the items stream through without a whole-body copy.
-    fn body(&self, prefix: Bytes, items: &Items) -> (reqwest::Body, usize) {
+    /// A signed body is checked against the digest it was signed with as
+    /// it streams, as its items are read a second time.
+    fn body(&self, prefix: Bytes, items: &Items, signed: Option<&str>) -> (reqwest::Body, usize) {
         let len = prefix.len() + items.bytes + 2;
-        (reqwest::Body::wrap_stream(framed(prefix, items)), len)
+        (
+            reqwest::Body::wrap_stream(framed(prefix, items, signed)),
+            len,
+        )
     }
 
     /// The input a request of `bytes` reserves beside `output`: about a
@@ -1509,7 +1514,7 @@ impl Provider {
         // already covers sending the body, so the extra read is bounded too.
         let payload = match &self.aws {
             Some(aws) if aws.signs_payload() => {
-                Some(aws::payload(framed(prefix.clone(), &request.items)).await?)
+                Some(aws::payload(framed(prefix.clone(), &request.items, None)).await?)
             }
             _ => None,
         };
@@ -1532,7 +1537,7 @@ impl Provider {
                 .await;
         }
         let (cache_key, route, sent) = (request.cache_key, request.route, request.sent);
-        let (body, len) = self.body(prefix, &request.items);
+        let (body, len) = self.body(prefix, &request.items, payload.as_deref());
         // The lease lives until this function returns, stream included.
         let (client, _lease) = self.transport.lease();
         // A token can expire while pacing or waiting for admission. Read it
@@ -2117,15 +2122,32 @@ fn limit(pace: &pace::Pace, failure: &socket::Failure) {
 fn framed(
     prefix: Bytes,
     items: &Items,
+    signed: Option<&str>,
 ) -> impl Stream<Item = std::io::Result<Bytes>> + Send + 'static {
-    // The body's length was promised before its items were read: one that
-    // reads otherwise ends in an error rather than a body that lies.
+    // The body's length was promised before its items were read, and for a
+    // signed body its digest too: one that reads otherwise ends in an error
+    // before its last bytes, rather than a body that lies.
     let expected = prefix.len() + items.bytes + 2;
     let counted = Arc::new(AtomicUsize::new(0));
     let read = counted.clone();
+    let digest = Arc::new(std::sync::Mutex::new(
+        signed.map(|_| aws::Payload::default()),
+    ));
+    let hashed = digest.clone();
+    let hashing = signed.is_some();
+    let signed = signed.map(str::to_owned);
     let close = stream::once(async move {
-        match read.load(Ordering::Relaxed) + 2 == expected {
-            true => Ok(Bytes::from_static(b"]}")),
+        let close = Bytes::from_static(b"]}");
+        let taken = hashed.lock().ok().and_then(|mut digest| digest.take());
+        let same = match (taken, signed) {
+            (Some(mut digest), Some(signed)) => {
+                digest.update(&close);
+                digest.finish() == signed
+            }
+            _ => true,
+        };
+        match read.load(Ordering::Relaxed) + 2 == expected && same {
+            true => Ok(close),
             false => Err(std::io::Error::other(HistoryChanged)),
         }
     });
@@ -2134,6 +2156,12 @@ fn framed(
         .map(move |chunk| {
             let bytes = chunk?;
             let total = counted.fetch_add(bytes.len(), Ordering::Relaxed);
+            if hashing
+                && let Ok(mut digest) = digest.lock()
+                && let Some(digest) = digest.as_mut()
+            {
+                digest.update(&bytes);
+            }
             match total + bytes.len() + 2 > expected {
                 true => Err(std::io::Error::other(HistoryChanged)),
                 false => Ok(bytes),
@@ -4680,13 +4708,15 @@ mod tests {
         let (_, len) = provider.body(
             prefix.clone(),
             &Items::new(joined, || stream::empty().boxed()),
+            None,
         );
         assert_eq!(len, prefix.len() + joined + 2);
     }
 
-    /// Items that read to another length than they were weighed at end
-    /// the request as `history_changed`, longer or shorter, before a body
-    /// goes that disagrees with its Content-Length.
+    /// Items that read to another length than they were weighed at, or to
+    /// other bytes than a signed body's digest, end the request as
+    /// `history_changed` before a body goes that disagrees with its
+    /// Content-Length or its signature.
     #[tokio::test]
     async fn items_read_to_another_length_end_the_request_as_history_changed() {
         use tokio::io::AsyncReadExt;
@@ -4697,12 +4727,40 @@ mod tests {
         };
         for claimed in [3, 12] {
             let chunks: Vec<std::io::Result<Bytes>> =
-                framed(Bytes::from_static(b"{\"input\":["), &read(claimed))
+                framed(Bytes::from_static(b"{\"input\":["), &read(claimed), None)
                     .collect()
                     .await;
             let error = chunks.into_iter().find_map(std::io::Result::err).unwrap();
             assert_eq!(error.to_string(), HISTORY_CHANGED, "{claimed}");
         }
+        // A signed body read again to the same length but other bytes, as a
+        // repair that keeps an item's size leaves it, fails its digest
+        // before its close goes; the same bytes pass.
+        let opened = Arc::new(AtomicUsize::new(0));
+        let counter = opened.clone();
+        let changing = Items::new(7, move || {
+            let item: &'static [u8] = match counter.fetch_add(1, Ordering::Relaxed) {
+                0 => b"{\"a\":1}",
+                _ => b"{\"a\":2}",
+            };
+            stream::iter([Ok(Bytes::from_static(item))]).boxed()
+        });
+        let prefix = Bytes::from_static(b"{\"input\":[");
+        let signed = aws::payload(framed(prefix.clone(), &changing, None))
+            .await
+            .unwrap();
+        let chunks: Vec<std::io::Result<Bytes>> = framed(prefix.clone(), &changing, Some(&signed))
+            .collect()
+            .await;
+        let error = chunks.into_iter().find_map(std::io::Result::err).unwrap();
+        assert_eq!(error.to_string(), HISTORY_CHANGED);
+        let same = read(7);
+        let signed = aws::payload(framed(prefix.clone(), &same, None))
+            .await
+            .unwrap();
+        let chunks: Vec<std::io::Result<Bytes>> =
+            framed(prefix, &same, Some(&signed)).collect().await;
+        assert!(chunks.iter().all(std::io::Result::is_ok));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
         tokio::spawn(async move {
@@ -4748,14 +4806,14 @@ mod tests {
             .boxed()
         });
         for _ in 0..2 {
-            let chunks: Vec<Bytes> = framed(Bytes::from_static(b"{\"input\":["), &items)
+            let chunks: Vec<Bytes> = framed(Bytes::from_static(b"{\"input\":["), &items, None)
                 .map(|chunk| chunk.unwrap())
                 .collect()
                 .await;
             assert!(chunks.iter().all(|c| !c.is_empty()), "{chunks:?}");
             assert_eq!(chunks.concat(), b"{\"input\":[{\"a\":1},]}");
         }
-        let chunks: Vec<Bytes> = framed(Bytes::new(), &Items::empty())
+        let chunks: Vec<Bytes> = framed(Bytes::new(), &Items::empty(), None)
             .map(|chunk| chunk.unwrap())
             .collect()
             .await;

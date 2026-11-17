@@ -539,14 +539,32 @@ fn due(last: Option<Instant>) -> bool {
     last.is_none_or(|at| at.elapsed() >= RELOAD_INTERVAL)
 }
 
+/// A body's SHA-256 taken as it streams, to compare with the digest it was
+/// signed with.
+pub struct Payload(digest::Context);
+impl Default for Payload {
+    fn default() -> Payload {
+        Payload(digest::Context::new(&digest::SHA256))
+    }
+}
+impl Payload {
+    pub fn update(&mut self, bytes: &[u8]) {
+        self.0.update(bytes);
+    }
+    /// Its hex digest, as [`payload`] gives it.
+    pub fn finish(self) -> String {
+        hex(self.0.finish().as_ref())
+    }
+}
+
 /// The hex SHA-256 of a body, read chunk by chunk as it streams.
 pub async fn payload(body: impl Stream<Item = std::io::Result<Bytes>>) -> Result<String> {
     let mut body = std::pin::pin!(body);
-    let mut context = digest::Context::new(&digest::SHA256);
+    let mut digest = Payload::default();
     while let Some(chunk) = body.next().await {
-        context.update(&chunk.map_err(|error| Error::new(&error.to_string()))?);
+        digest.update(&chunk.map_err(|error| Error::new(&error.to_string()))?);
     }
-    Ok(hex(context.finish().as_ref()))
+    Ok(digest.finish())
 }
 
 /// Run the AWS CLI's credential export. Its stdout holds the secret, so it
