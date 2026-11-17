@@ -9738,7 +9738,7 @@ impl Database {
             return Ok(CallAnswer::Given(given));
         }
         #[allow(clippy::type_complexity)]
-        let (tag, expires_ms, output, failed, paused, parts, yielded): (
+        let Some((tag, expires_ms, output, failed, paused, parts, yielded)): Option<(
             String,
             i64,
             Option<String>,
@@ -9746,7 +9746,7 @@ impl Database {
             bool,
             Option<String>,
             bool,
-        ) = self
+        )> = self
             .conn
             .prepare_cached(
                 "SELECT tag,expires_ms,output,failed,paused_ms IS NOT NULL,parts,yielded
@@ -9764,7 +9764,14 @@ impl Database {
                 ))
             })
             .optional()?
-            .ok_or(Error::new("invalid_tool_state"))?;
+        else {
+            // Yielded, then answered and collected before the turn
+            // looked: its handle answers it still.
+            return match self.moved_to_background(turn, call_id)? {
+                true => Ok(CallAnswer::Yielded),
+                false => fail("invalid_tool_state"),
+            };
+        };
         // Its answer, when it comes, is its command's.
         if yielded {
             return Ok(CallAnswer::Yielded);
@@ -9796,6 +9803,15 @@ impl Database {
             },
         })
     }
+    /// Whether a call of the turn was moved to the background: its
+    /// process row stays while the turn's rows are kept, after its answers
+    /// row is gone.
+    fn moved_to_background(&self, turn: i64, call_id: &str) -> Result<bool> {
+        Ok(self
+            .conn
+            .prepare_cached("SELECT EXISTS(SELECT 1 FROM processes WHERE turn=? AND call_id=?)")?
+            .query_row(params![turn, call_id], |r| r.get(0))?)
+    }
     /// Park a running turn on an answered call: its task ends and it holds
     /// no slot. The verdicts the worker holds are written with the park.
     /// An answer that landed as the hold ran out is taken instead: `None`
@@ -9823,7 +9839,7 @@ impl Database {
         {
             return Ok(None);
         }
-        let (tag, expires_ms, paused, yielded): (String, i64, bool, bool) = self
+        let Some((tag, expires_ms, paused, yielded)): Option<(String, i64, bool, bool)> = self
             .conn
             .prepare_cached(
                 "SELECT tag,expires_ms,paused_ms IS NOT NULL,yielded FROM answers
@@ -9833,7 +9849,14 @@ impl Database {
                 Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
             })
             .optional()?
-            .ok_or(Error::new("invalid_tool_state"))?;
+        else {
+            // Yielded, then answered before the hold ran out: the turn
+            // goes on, its handle answering the call.
+            return match self.moved_to_background(turn, call_id)? {
+                true => Ok(None),
+                false => fail("invalid_tool_state"),
+            };
+        };
         // Yielded as the hold ran out: the turn goes on.
         if yielded {
             return Ok(None);

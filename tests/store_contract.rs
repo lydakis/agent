@@ -22409,8 +22409,9 @@ fn schema_105_bots_that_message_with_tools_make_and_close_agents_too() {
 
 /// A call its client yields is lifted with its output so far, and waits on
 /// its answer with no deadline: past its tool's own time it still waits,
-/// its answer is taken, and it ends answered. A tool not declared `lift`
-/// does not yield.
+/// its answer is taken, and it ends answered, the turn still reading the
+/// yield after its answer is collected. A tool not declared `lift` does not
+/// yield.
 #[test]
 fn a_yielded_call_waits_on_its_answer_with_no_deadline() {
     let mut db = db();
@@ -22494,6 +22495,17 @@ fn a_yielded_call_waits_on_its_answer_with_no_deadline() {
         panic!("a yielded call's answer did not end it");
     };
     assert_eq!(ended["answer"], "all 9 built", "{ended}");
+    // Answered and collected before the turn took it: its handle still
+    // answers the call, and the turn goes on rather than failing.
+    assert!(matches!(
+        db.answer_take(turn, "exec-1", now + 60_002).unwrap(),
+        agent_runtime::store::CallAnswer::Yielded
+    ));
+    assert_eq!(
+        db.suspend_answer(turn, "exec-1", &[], now + 60_002, None, None)
+            .unwrap(),
+        None
+    );
 }
 
 /// Schema 106 marks a yielded call's row; calls waiting when a store
