@@ -5624,10 +5624,18 @@ fn fire(places: &Places, trigger: &Trigger, ask: Option<&Asked>) {
     if ended(self::now()) {
         return ends_now(&kept);
     }
+    // Asked again once connected: the connects tried again may have waited
+    // past its `--until`.
     let outcome = with_daemon_after(trigger, &CONNECT_AGAIN, async |client| {
-        deliver(client, places, trigger, &mut kept, &why, ask).await
+        if ended(self::now()) {
+            return None;
+        }
+        Some(deliver(client, places, trigger, &mut kept, &why, ask).await)
     });
-    let (Ok(outcome) | Err(outcome)) = outcome;
+    let outcome = match outcome {
+        Ok(None) => return ends_now(&kept),
+        Ok(Some(outcome)) | Err(outcome) => outcome,
+    };
     settle(places, trigger, &named(outcome), &kept);
 }
 

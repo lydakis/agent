@@ -4344,6 +4344,16 @@ impl Database {
     /// and read from memory; when it is read from the store, a configure
     /// between the two reads may have let it go, so a list not found
     /// outside a transaction is read again with the bot, in one snapshot.
+    /// `read` in one snapshot: its own read transaction outside a group,
+    /// the group's inside one.
+    fn snapshot<T>(&self, read: impl FnOnce() -> Result<T>) -> Result<T> {
+        if !self.conn.is_autocommit() {
+            return read();
+        }
+        // Read only; dropping it ends it.
+        let _snapshot = self.conn.unchecked_transaction()?;
+        read()
+    }
     fn with_snapshot(&self, read: impl Fn() -> Result<Bot>) -> Result<Bot> {
         match read() {
             Err(error) if error.code == "tool_list_unknown" && self.conn.is_autocommit() => {
@@ -13096,6 +13106,11 @@ impl Database {
     /// `pruned` once retention removed how it ended. A failed turn keeps the
     /// error its row saved; any other says `turn_result_pruned`.
     pub fn turn_answer(&self, name: &str, turn: i64) -> Result<Value> {
+        // Its view and its outcome are read in one snapshot: on a reader, a
+        // commit between them must not pair a turn's state with another's.
+        self.snapshot(|| self.turn_answer_now(name, turn))
+    }
+    fn turn_answer_now(&self, name: &str, turn: i64) -> Result<Value> {
         let mut view = self.turn_view(name, turn)?;
         match self.outcome_of(view.clone(), turn) {
             Ok(Some(outcome)) => Ok(outcome),

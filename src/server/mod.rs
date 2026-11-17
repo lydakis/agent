@@ -3180,6 +3180,24 @@ impl Drop for Closing {
 }
 
 impl Service {
+    /// Bot `name` as a check that guards a write must see it: read beside
+    /// the writer, and, when not there, read again behind the writer's
+    /// queue, so a creation queued ahead of this request is seen, as the
+    /// write it guards will see it.
+    async fn inspect_ordered(&self, name: &str) -> Result<Bot> {
+        let read = name.to_owned();
+        match self
+            .store
+            .read("inspect", move |db| db.inspect(&read))
+            .await
+        {
+            Err(error) if error.code == "bot_not_found" => {
+                let name = name.to_owned();
+                self.store.op("inspect", move |db| db.inspect(&name)).await
+            }
+            done => done,
+        }
+    }
     /// Hold a request that came in on sandboxed bot `caller`'s own socket to
     /// what that bot may do: use and read bots, and make bots that inherit
     /// its sandbox and stay inside the folders it may write. Never answer a
@@ -3315,12 +3333,7 @@ impl Service {
                 claim(created_by, created_by_id)?;
                 // A fork that may call nothing touches nothing: an ask.
                 if !matches!(allow, Some(Some(tools)) if tools.is_empty()) {
-                    let source = source.clone();
-                    let source = match self
-                        .store
-                        .read("inspect", move |db| db.inspect(&source))
-                        .await
-                    {
+                    let source = match self.inspect_ordered(source).await {
                         Ok(source) => Some(source),
                         // A resent fork whose source is gone since answers
                         // as its duplicate; a new one finds no source.
@@ -3375,11 +3388,7 @@ impl Service {
                 // A turn's folder is the sandboxed bot's to write, and stays
                 // its folder: one the caller gives it must be the caller's.
                 if let Some(workspace) = workspace {
-                    let bot = bot.clone();
-                    let target = self
-                        .store
-                        .read("inspect", move |db| db.inspect(&bot))
-                        .await?;
+                    let target = self.inspect_ordered(bot).await?;
                     if target.sandboxed() {
                         folders.push(workspace.clone());
                     }
@@ -3391,8 +3400,7 @@ impl Service {
             | Command::Interrupt { bot, .. }
             | Command::StopProcess { bot, .. }
             | Command::ProcessOutput { bot, .. } => {
-                let bot = bot.clone();
-                match self.store.read("inspect", move |db| db.inspect(&bot)).await {
+                match self.inspect_ordered(bot).await {
                     Ok(target)
                         if target.bot_id != me.bot_id
                             && target.created_by_id != Some(me.bot_id) =>
@@ -9391,6 +9399,41 @@ mod tests {
         assert_eq!(reads(), Some(1), "read once, then kept");
         gate.send(()).unwrap();
         held.await.unwrap();
+        while !service.admissions.is_empty() {
+            let (_, _, _, started) = service.settle().await;
+            started.unwrap();
+        }
+        drop(service);
+        drop(store);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_check_guarding_a_write_sees_a_bot_whose_creation_is_queued() {
+        let dir = scratch("ordered-inspect");
+        let (store, _publications) = Store::open(&dir.join("state.sqlite")).await.unwrap();
+        let mut service = admitting(&store, 1024);
+        let (output, _writer) = Output::stdout();
+        // B's creation is admitted behind a held commit: queued, not yet
+        // seen by a reader.
+        let (held, gate) = hold(&store).await;
+        let command = create("B", &dir);
+        let bound = service.admission_sends(&command, &json!("c"), 0);
+        let deferred = service
+            .dispatch(command, 0, &output, json!("c"), bound)
+            .await;
+        assert_eq!(deferred.unwrap_err().code, "deferred");
+        let unseen = store.read("inspect", |db| db.inspect("B")).await;
+        assert_eq!(unseen.unwrap_err().code, "bot_not_found");
+        // A check that guards a write reads behind the queued creation.
+        let (seen, released) = tokio::join!(service.inspect_ordered("B"), async {
+            // Its reader's look comes first, while the commit is held.
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            gate.send(()).unwrap();
+            held.await
+        });
+        released.unwrap();
+        assert_eq!(seen.unwrap().name, "B");
         while !service.admissions.is_empty() {
             let (_, _, _, started) = service.settle().await;
             started.unwrap();
