@@ -1745,6 +1745,21 @@ pub struct Waiting {
     /// and has not started; `deadline_ms` is its gates' expiry, if any.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub approval: bool,
+    /// Who holds a verdict park's call: `reviewer` while every gate still
+    /// open is served by a session and none was handed to a person,
+    /// `person` once a gate's reviewer asked one or when a gate no session
+    /// serves is open, as the audit names who decided.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub holder: Option<String>,
+    /// Since when `holder` has had the call: its announcement, or the
+    /// first `ask` of a gate still open.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub since_ms: Option<i64>,
+    /// Which of the call's own gate tags sessions served as the turn
+    /// parked: who holds the call is read from them again when a verdict
+    /// or an ask changes the gates still open.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub served: Vec<String>,
     /// Parked on the answer to `call_id`, which has started, from the
     /// client this tag names; `deadline_ms` is when the call stops waiting.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1978,6 +1993,26 @@ impl Request {
     }
     fn decided(&self) -> bool {
         self.denial().is_some() || self.unanswered().next().is_none()
+    }
+    /// Who holds the call while it waits, and since when, given the gate
+    /// tags sessions serve now: a person once a gate still open was handed
+    /// to one, from that first `ask`; else its reviewers, from its
+    /// announcement, while a session serves each gate still open; else a
+    /// person, as only an answer with no lease can decide a gate no session
+    /// serves, from its announcement.
+    fn holder(&self, served: &[String]) -> (&'static str, i64) {
+        let open = |tag: &str| self.unanswered().any(|g| g.tag == tag);
+        let asked = (self.asked.iter())
+            .filter(|asked| open(&asked.tag))
+            .map(|asked| asked.at_ms)
+            .min();
+        match asked {
+            Some(at_ms) => ("person", at_ms),
+            None if self.unanswered().all(|g| served.contains(&g.tag)) => {
+                ("reviewer", self.announced_ms)
+            }
+            None => ("person", self.announced_ms),
+        }
     }
     /// When the earliest unanswered gate with an expiry lapses.
     fn expires_ms(&self) -> Option<u64> {
@@ -2845,11 +2880,12 @@ const TURN_VIEW: &str = "m.id,m.bot,b.id,m.request_id,COALESCE(t.status,m.status
     json_extract(t.waiting,'$.deadline_ms'),json_extract(t.waiting,'$.answer'),
     json_extract(t.waiting,'$.halt'),json_extract(t.waiting,'$.load'),
     json_extract(t.waiting,'$.blocked'),m.held,m.due_ms,COALESCE(t.work,0),t.limited,m.turn,
-    t.error,json_extract(t.waiting,'$.retrying')";
+    t.error,json_extract(t.waiting,'$.retrying'),json_extract(t.waiting,'$.holder'),
+    json_extract(t.waiting,'$.since_ms')";
 /// Where `TURN_VIEW` reads: the message, its bot, and the turn it opened.
 const MESSAGE_FROM: &str = "messages m JOIN bots b ON b.name=m.bot LEFT JOIN turns t ON t.id=m.id";
 /// Columns `TURN_VIEW` takes, for queries that select more after it.
-const TURN_VIEW_COLUMNS: usize = 29;
+const TURN_VIEW_COLUMNS: usize = 31;
 /// A message's words, from `messages m` joined by `MESSAGE_NODE`: kept on
 /// the message, or once 4 KiB or more were taken in, read from its node.
 const MESSAGE_TEXT: &str = "CASE WHEN n.id IS NULL THEN m.text
@@ -2903,7 +2939,8 @@ fn turn_view(r: &rusqlite::Row) -> rusqlite::Result<Value> {
             json!({"call_id":call_id,"answer":answer,"deadline_ms":deadline_ms})
         }
         "waiting" if r.get::<_, Option<i64>>(14)? == Some(1) => {
-            json!({"call_id":call_id,"approval":true,"deadline_ms":deadline_ms})
+            json!({"call_id":call_id,"approval":true,"deadline_ms":deadline_ms,
+                "holder":r.get::<_, Option<String>>(29)?,"since_ms":r.get::<_, Option<i64>>(30)?})
         }
         "waiting" if r.get::<_, Option<i64>>(20)? == Some(1) => {
             json!({"call_id":call_id,"load":true,"deadline_ms":deadline_ms})
@@ -3325,7 +3362,7 @@ impl Database {
     /// before versioning, stores at versions 1 to 5 and stores from newer
     /// binaries are rejected; an older store from version 6 on is migrated
     /// forward, one version at a time, at open.
-    pub const SCHEMA: i32 = 102;
+    pub const SCHEMA: i32 = 104;
     /// The person's messages a compaction keeps verbatim, newest first:
     /// per-message text, and the total text plus `(ordinal, String)` entry
     /// metadata. Empty entries cost space too, so the retained list cannot
@@ -9487,7 +9524,8 @@ impl Database {
     /// Park a running turn on a gated call's verdict: its task ends and it
     /// holds no slot. The verdicts the worker holds are written with the
     /// park. A verdict that landed as the hold ran out is taken instead:
-    /// `None` means the call is decided and the turn goes on.
+    /// `None` means the call is decided and the turn goes on. `served` are
+    /// the gate tags sessions serve now, which say who holds the call.
     pub fn suspend_approval(
         &mut self,
         turn: i64,
@@ -9495,6 +9533,7 @@ impl Database {
         now_ms: u64,
         route: Option<&str>,
         summary_retry_ms: Option<u64>,
+        served: &[String],
     ) -> Result<Option<Option<u64>>> {
         let bot = self.active(turn)?;
         let call = pending.first().ok_or(Error::new("invalid_tool_state"))?;
@@ -9512,6 +9551,7 @@ impl Database {
         if deadline_ms.is_some_and(|at| now_ms >= at) {
             return Ok(None);
         }
+        let (holder, since_ms) = request.holder(served);
         let waiting = Waiting {
             turn,
             bot: bot.name.clone(),
@@ -9526,6 +9566,12 @@ impl Database {
             compaction: false,
             route: route.map(str::to_owned),
             approval: true,
+            holder: Some(holder.to_owned()),
+            since_ms: Some(since_ms),
+            served: (served.iter())
+                .filter(|tag| request.gates.iter().any(|g| &g.tag == *tag))
+                .cloned()
+                .collect(),
             answer: None,
             copied: None,
             summary_retry_ms,
@@ -9544,7 +9590,8 @@ impl Database {
             "UPDATE turns SET status='waiting',waiting=? WHERE id=?",
             params![serde_json::to_string(&waiting)?, turn],
         )?;
-        let data = json!({"call_id":call.call_id,"approval":true,"deadline_ms":deadline_ms});
+        let data = json!({"call_id":call.call_id,"approval":true,"deadline_ms":deadline_ms,
+            "holder":holder,"since_ms":since_ms});
         parked(&tx, &bot.name, "waiting", &data)?;
         event(&tx, &bot.name, Some(turn), "turn_waiting", data)?;
         tx.commit()?;
@@ -9591,6 +9638,9 @@ impl Database {
             compaction: false,
             route: route.map(str::to_owned),
             approval: false,
+            holder: None,
+            since_ms: None,
+            served: Vec::new(),
             answer: None,
             copied: None,
             summary_retry_ms,
@@ -9755,6 +9805,9 @@ impl Database {
             compaction: false,
             route: route.map(str::to_owned),
             approval: false,
+            holder: None,
+            since_ms: None,
+            served: Vec::new(),
             answer: Some(tag.clone()),
             copied: None,
             summary_retry_ms,
@@ -11018,6 +11071,44 @@ impl Database {
         }
         Ok((status, request, tag, at_ms))
     }
+    /// Who holds `request`'s call now, and since when, where its turn is
+    /// parked on it and that changed: read from its gates still open and
+    /// the tags served as the turn parked, as the park read them.
+    fn holds(
+        &self,
+        answer: &Decision<'_>,
+        request: &Request,
+    ) -> Result<Option<(&'static str, i64)>> {
+        if request.step_of.is_some() {
+            return Ok(None);
+        }
+        // Only the few fields the holder needs, never the parked round's
+        // calls and their arguments.
+        let parked = (self.conn.prepare_cached(
+            "SELECT json_extract(waiting,'$.served'),json_extract(waiting,'$.holder'),
+                json_extract(waiting,'$.since_ms') FROM turns
+            WHERE id=? AND status='waiting' AND json_extract(waiting,'$.approval')=1
+                AND json_extract(waiting,'$.call_id')=?",
+        )?)
+        .query_row(params![answer.turn, answer.call_id], |r| {
+            Ok((
+                r.get::<_, Option<String>>(0)?,
+                r.get::<_, Option<String>>(1)?,
+                r.get::<_, Option<i64>>(2)?,
+            ))
+        })
+        .optional()?;
+        let Some((served, was, was_since_ms)) = parked else {
+            return Ok(None);
+        };
+        let served: Vec<String> = match served {
+            Some(served) => serde_json::from_str(&served)?,
+            None => Vec::new(),
+        };
+        let (holder, since_ms) = request.holder(&served);
+        let same = was.as_deref() == Some(holder) && was_since_ms == Some(since_ms);
+        Ok((!same).then_some((holder, since_ms)))
+    }
     /// Hand a planned call to a person: `answer.tag`'s gate stays open, the
     /// call keeps waiting, and the reason goes with it in listings and in an
     /// `approval_asked` event. Only a gate with no expiry can wait on one.
@@ -11041,9 +11132,14 @@ impl Database {
         };
         request.asked.retain(|other| other.tag != tag);
         request.asked.push(asked.clone());
+        let held = self.holds(&answer, &request)?;
         let tx = self.conn.savepoint()?;
         tx.prepare_cached("UPDATE approvals SET asked=? WHERE id=?")?
             .execute(params![serde_json::to_string(&request.asked)?, request.id])?;
+        // A turn parked on the call now waits on a person: its own
+        // `waiting_on` and its bot's say so. One that has not parked reads
+        // the ask when it does.
+        rehold(&tx, held, answer.bot, answer.turn)?;
         event(
             &tx,
             answer.bot,
@@ -11127,6 +11223,12 @@ impl Database {
                 lifted: None,
             });
         }
+        // A verdict that leaves the call waiting on other gates may change
+        // who holds it, as the turn parked on it says.
+        let held = match status == "waiting" && request.process.is_none() && !request.decided() {
+            true => self.holds(&answer, &request)?,
+            false => None,
+        };
         let tx = self.conn.savepoint()?;
         tx.prepare_cached("UPDATE approvals SET verdicts=? WHERE id=?")?
             .execute(params![
@@ -11134,6 +11236,7 @@ impl Database {
                 request.id
             ])?;
         untag_answered(&tx, request.id, std::slice::from_ref(&verdict))?;
+        rehold(&tx, held, answer.bot, answer.turn)?;
         tx.commit()?;
         let resume = status == "waiting"
             && request.process.is_none()
@@ -12663,6 +12766,9 @@ impl Database {
             compaction: false,
             route: route.map(str::to_owned),
             approval: false,
+            holder: None,
+            since_ms: None,
+            served: Vec::new(),
             answer: None,
             copied: None,
             summary_retry_ms,
@@ -12737,6 +12843,9 @@ impl Database {
             compaction,
             route: route.map(str::to_owned),
             approval: false,
+            holder: None,
+            since_ms: None,
+            served: Vec::new(),
             answer: None,
             copied,
             summary_retry_ms,
@@ -12829,6 +12938,9 @@ impl Database {
             compaction: true,
             route: route.map(str::to_owned),
             approval: false,
+            holder: None,
+            since_ms: None,
+            served: Vec::new(),
             answer: None,
             copied: None,
             summary_retry_ms: None,
@@ -17110,6 +17222,24 @@ fn parked(tx: &Connection, bot: &str, status: &str, on: &Value) -> Result<()> {
         .execute(params![bot, status, on.to_string()])?;
     Ok(())
 }
+/// Write who holds the call a parked turn waits on, `held` by
+/// [`Database::holds`], on the turn's `waiting` and its bot's `waiting_on`.
+fn rehold(tx: &Connection, held: Option<(&str, i64)>, bot: &str, turn: i64) -> Result<()> {
+    let Some((holder, since_ms)) = held else {
+        return Ok(());
+    };
+    tx.prepare_cached(
+        "UPDATE turns SET waiting=json_set(waiting,'$.holder',?2,'$.since_ms',?3)
+         WHERE id=?1 AND status='waiting'",
+    )?
+    .execute(params![turn, holder, since_ms])?;
+    tx.prepare_cached(
+        "UPDATE bots SET waiting_on=json_set(waiting_on,'$.holder',?3,'$.since_ms',?4)
+         WHERE name=?1 AND running_turn=?2 AND status='waiting'",
+    )?
+    .execute(params![bot, turn, holder, since_ms])?;
+    Ok(())
+}
 /// Keep how `turn` ended as its bot's last, unless a later turn of the bot
 /// ended already: a message that failed in line while this turn ran.
 fn record_ended(
@@ -19175,6 +19305,72 @@ fn migrate_since_73(conn: &Connection, from: i32) -> Result<()> {
     // Schema 102: daemon steps under way, in `steps`, which the schema
     // makes; nothing older holds any.
 
+    if from < 104 {
+        migrate_approval_holders(conn)?;
+    }
+
+    Ok(())
+}
+/// 103 -> 104: a turn parked on a call's verdict says who holds the call
+/// and since when. No session serves a tag while the store opens, so a
+/// call a reviewer did not hand to a person is a person's from its
+/// announcement, as a park reads it then.
+fn migrate_approval_holders(conn: &Connection) -> Result<()> {
+    let parked: Vec<(i64, String)> = conn
+        .prepare(
+            "SELECT id,json_extract(waiting,'$.call_id') FROM turns
+             WHERE status='waiting' AND json_extract(waiting,'$.approval')=1",
+        )?
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+        .collect::<rusqlite::Result<_>>()?;
+    for (turn, call_id) in parked {
+        let row = conn
+            .query_row(
+                "SELECT id,request,announced_ms,gates,verdicts,asked FROM approvals
+                 WHERE turn=? AND call_id=?",
+                params![turn, call_id],
+                |r| {
+                    Ok((
+                        r.get::<_, i64>(0)?,
+                        r.get::<_, i64>(1)?,
+                        r.get::<_, i64>(2)?,
+                        r.get::<_, String>(3)?,
+                        r.get::<_, Option<String>>(4)?,
+                        r.get::<_, Option<String>>(5)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let Some((id, request, announced_ms, gates, verdicts, asked)) = row else {
+            continue;
+        };
+        let request = Request {
+            id,
+            request,
+            announced_ms,
+            gates: serde_json::from_str(&gates)?,
+            verdicts: verdicts
+                .map(|v| serde_json::from_str(&v))
+                .transpose()?
+                .unwrap_or_default(),
+            asked: asked
+                .map(|a| serde_json::from_str(&a))
+                .transpose()?
+                .unwrap_or_default(),
+            step_of: None,
+            process: None,
+        };
+        let (holder, since_ms) = request.holder(&[]);
+        conn.execute(
+            "UPDATE turns SET waiting=json_set(waiting,'$.holder',?2,'$.since_ms',?3) WHERE id=?1",
+            params![turn, holder, since_ms],
+        )?;
+        conn.execute(
+            "UPDATE bots SET waiting_on=json_set(waiting_on,'$.holder',?2,'$.since_ms',?3)
+             WHERE running_turn=?1 AND status='waiting'",
+            params![turn, holder, since_ms],
+        )?;
+    }
     Ok(())
 }
 /// 100 -> 101: every bot's declared tools moved to `tool_lists`, one row
@@ -19536,7 +19732,7 @@ fn migrate_bot_status(conn: &Connection) -> Result<()> {
             json_extract(t.waiting,'$.handles'),json_extract(t.waiting,'$.any'),
             json_extract(t.waiting,'$.deadline_ms'),json_extract(t.waiting,'$.answer'),
             json_extract(t.waiting,'$.halt'),json_extract(t.waiting,'$.load'),
-            json_extract(t.waiting,'$.blocked'),t.held,t.due_ms,0,NULL,t.id,NULL,NULL
+            json_extract(t.waiting,'$.blocked'),t.held,t.due_ms,0,NULL,t.id,NULL,NULL,NULL,NULL
          FROM turns t JOIN bots b ON b.name=t.bot WHERE t.id=?",
     )?;
     let mut update = conn.prepare("UPDATE bots SET waiting_on=? WHERE name=?")?;
