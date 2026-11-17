@@ -8271,6 +8271,23 @@ impl App {
             && (self.status_bots.is_empty() || self.status_bots.contains(bot))
     }
 
+    /// The project's agents as a count found them. Rows of what went on
+    /// between agents drawn before it, as a window's replay draws them,
+    /// are drawn again once it finds others: their names, short now, link.
+    fn status_counted(&mut self, bots: std::collections::HashSet<String>) {
+        if bots == self.status_bots {
+            return;
+        }
+        let new = bots.iter().any(|bot| !self.status_bots.contains(bot));
+        self.status_bots = bots;
+        if new && !self.words() {
+            let clusters: Vec<usize> = self.clusters.keys().copied().collect();
+            for at in clusters {
+                self.draw_cluster(at);
+            }
+        }
+    }
+
     /// Whether `word`, in a row Sonny writes, is an agent of the project
     /// known to be there, to be written short and linked: one its last
     /// count found, or a task this window tracks. Never this window's own.
@@ -10147,7 +10164,7 @@ impl App {
             }
             if let Some(((counts, bots), (latest, seen))) = counted.read {
                 self.counts = Some(counts);
-                self.status_bots = bots;
+                self.status_counted(bots);
                 self.status_read = latest;
                 self.asks_seen = seen;
             }
@@ -12622,7 +12639,7 @@ impl App {
         )
         .await?;
         self.counts = Some(status::counts(&read.rows));
-        self.status_bots = status::bots(&read.rows);
+        self.status_counted(status::bots(&read.rows));
         self.tasks_read(status::tasks(&read.rows));
         // The windows' names and the footer say what this read, as it is
         // newer than what they had. A running agent's question is read
@@ -32262,6 +32279,14 @@ mod tests {
                 .iter()
                 .any(|row| row.trim() == "↳ From calc.div ▸")
         );
+        // Found by the next count, it is drawn again short, as a link.
+        app.status_counted(["calc.div".to_owned()].into());
+        app.flush();
+        let texts = app.screen.texts();
+        let at = (texts.iter())
+            .position(|row| row.trim() == "↳ From div ▸")
+            .unwrap();
+        assert_eq!(app.screen.buttons()[at].len(), 1);
     }
 
     #[tokio::test]
