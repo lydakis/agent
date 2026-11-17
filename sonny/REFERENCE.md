@@ -1477,8 +1477,10 @@ has something on it, or is off the screen, no time shows.
   folders, 15 by default, as Codex's app keeps its newest worktrees: past
   it, a start that made a folder removes the least recently active tasks'
   (by their last turn's end) as `remove_task` does, never one working,
-  needing the person, with uncommitted changes or submodules, a folder of
-  its own or another daemon's, and its answer names those it removed.
+  with a call waiting on its verdict or a question open, with uncommitted
+  changes or submodules, a folder of its own or another daemon's, and its
+  answer names those it removed. A start in a folder already there makes
+  room for none.
 - **Tasks that start their own:** every agent has `start_task` and
   `remove_task`, for help inside its own brief, such as a review or a
   watch on something; separate work still goes to its lead. How deep a

@@ -513,11 +513,13 @@ pub fn start(here: &Path, project: &str, starter: &str, start: &Start) -> Result
     {
         let _ = record_store(name, store);
     }
-    // Room for it, as `[sonny] task_worktrees` keeps the newest folders,
-    // once it started, so a start that fails takes nothing away.
+    // Room for the folder it made, as `[sonny] task_worktrees` keeps the
+    // newest, once it started, so a start that fails takes nothing away;
+    // one in a folder already there makes none.
     let keep = config.sonny.task_worktrees;
+    let made = matches!(place.undo, Undo::Worktree { .. } | Undo::Folder { .. });
     let removed = match (&store, home_dir()) {
-        (Some(store), Ok(home)) if place.dir.starts_with(home.join(".agent/worktrees")) => {
+        (Some(store), Ok(home)) if made && place.dir.starts_with(home.join(".agent/worktrees")) => {
             let socket = env_of(start, "AGENT_SOCKET").map(PathBuf::from);
             match crate::daemon_paths(Some(store.clone()), socket) {
                 Ok((store, socket)) => {
@@ -2174,11 +2176,12 @@ fn prune(
     removed
 }
 
-/// Room for the task `new` just started, as Codex's app keeps its
-/// newest worktrees: past `keep` task folders on the daemon at `store`
-/// and `socket`, the least recently active are removed as `remove_task`
-/// removes them, made by the call `call`, until `keep` are left with
-/// `new`'s. Never one working, needing the person, with uncommitted
+/// Room for the folder Sonny just made the task `new`, as Codex's app
+/// keeps its newest worktrees: past `keep` task folders on the daemon at
+/// `store` and `socket`, the least recently active are removed as
+/// `remove_task` removes them, made by the call `call`, until `keep` are
+/// left with `new`'s. Never one working, with a call waiting on its
+/// verdict or a question open, with uncommitted
 /// changes or submodules, of its own, or another daemon's: the next is
 /// taken instead, and with none, nothing is. The names removed.
 fn make_room(new: &str, (store, socket): (&Path, &Path), keep: u64, call: &str) -> Vec<String> {
@@ -2227,6 +2230,13 @@ fn make_room(new: &str, (store, socket): (&Path, &Path), keep: u64, call: &str) 
                     let Some(bot) = &task.bot else {
                         return false;
                     };
+                    // A call still waiting on its verdict, as a lifted one
+                    // does past its turn, would run in the folder taken.
+                    let asked = json!({"bot": task.name, "limit": 1});
+                    match runtime.block_on(client.request("approvals", asked)) {
+                        Ok(page) if page["approvals"].as_array().is_some_and(Vec::is_empty) => {}
+                        _ => return true,
+                    }
                     let last = bot["last"]["turn"].as_i64();
                     match runtime.block_on(crate::needs::scan(&client, &task.name, last)) {
                         Some(seen) => seen.open(store, &task.name, false).is_some(),
