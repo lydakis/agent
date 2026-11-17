@@ -4770,7 +4770,7 @@ impl Turn {
                     };
                     match self.run_tool(search, None).await? {
                         Ran::Done(Ok(outcome)) => {
-                            self.kept(outcome, record, workspace, &call.call_id).await
+                            self.kept(outcome, workspace, &call.call_id).await
                         }
                         Ran::Done(Err(error)) => failure(error),
                         Ran::Lifted(..) => unreachable!("only a command moves to the background"),
@@ -4816,7 +4816,7 @@ impl Turn {
                             timeout_ms,
                             environment.to_vec(),
                             sandbox,
-                            self.outputs(record, workspace),
+                            self.outputs(workspace),
                         )
                         .await
                     {
@@ -4843,7 +4843,7 @@ impl Turn {
                         id,
                         &call.call_id,
                         receiver,
-                        self.outputs(record, workspace),
+                        self.outputs(workspace),
                         Some(self.registry.clone()),
                     );
                     let start = self.registry.terminal(
@@ -5034,7 +5034,7 @@ impl Turn {
                     let place = self.registry.place();
                     // What lists it, should it move to the background.
                     let listed = listed(&command);
-                    let spill = (self.outputs(record, workspace))
+                    let spill = (self.outputs(workspace))
                         .map(|outputs| outputs.spill(self.turn, &call.call_id));
                     // Its timeout yields it, never kills it: no clock of
                     // its own, it runs until it exits or is stopped.
@@ -5053,14 +5053,14 @@ impl Turn {
                         .await?
                     {
                         Ran::Done(Ok(outcome)) => {
-                            self.kept(outcome, record, workspace, &call.call_id).await
+                            self.kept(outcome, workspace, &call.call_id).await
                         }
                         Ran::Done(Err(error)) if error.code == "tool_scheduler_closed" => {
                             return Err(error);
                         }
                         Ran::Done(Err(error)) => failure(error),
                         Ran::Lifted(run, moved) => {
-                            let outputs = self.outputs(record, workspace);
+                            let outputs = self.outputs(workspace);
                             let owner = record.bot_id;
                             self.lift_shell(
                                 &call.call_id,
@@ -5096,9 +5096,7 @@ impl Turn {
                     )
                     .await?
                 {
-                    Ran::Done(Ok(outcome)) => {
-                        self.kept(outcome, record, workspace, &call.call_id).await
-                    }
+                    Ran::Done(Ok(outcome)) => self.kept(outcome, workspace, &call.call_id).await,
                     Ran::Done(Err(error)) if error.code == "tool_scheduler_closed" => {
                         return Err(error);
                     }
@@ -5303,8 +5301,8 @@ impl Turn {
                 let (started, running) = oneshot::channel();
                 let place = self.registry.place();
                 let listed = listed(&command);
-                let spill = (self.outputs(record, workspace))
-                    .map(|outputs| outputs.spill(self.turn, &call_id));
+                let spill =
+                    (self.outputs(workspace)).map(|outputs| outputs.spill(self.turn, &call_id));
                 // Its timeout yields it, never kills it.
                 let mut run = Box::pin(self.registry.foreground(
                     command,
@@ -5331,7 +5329,7 @@ impl Turn {
                 match finished {
                     Ok(result) => result,
                     Err(moved) => {
-                        let outputs = self.outputs(record, workspace);
+                        let outputs = self.outputs(workspace);
                         return (
                             call_id.clone(),
                             self.lift_shell(
@@ -5355,7 +5353,7 @@ impl Turn {
             }
         };
         let outcome = match ran {
-            Ok(outcome) => Ok(self.kept(outcome, record, workspace, &call_id).await),
+            Ok(outcome) => Ok(self.kept(outcome, workspace, &call_id).await),
             Err(error) if error.code == "tool_scheduler_closed" => Err(error),
             Err(error) => Ok(failure(error)),
         };
@@ -5364,31 +5362,22 @@ impl Turn {
 
     /// Where the bot's cut outputs go whole, when its settings name a
     /// folder.
-    fn outputs(&self, record: &Bot, workspace: &std::path::Path) -> Option<Outputs> {
+    fn outputs(&self, workspace: &std::path::Path) -> Option<Outputs> {
         let settings = self.settings();
         Some(Outputs {
             folder: PathBuf::from(settings.outputs.as_ref()?),
             settings: settings.clone(),
-            root: record
-                .workspace
-                .as_ref()
-                .map_or_else(|| workspace.to_owned(), PathBuf::from),
+            root: workspace.to_owned(),
             daemon: self.registry.daemon().clone(),
         })
     }
 
     /// A call's outcome as the model and the store take it: its cut
     /// streams in the bot's outputs folder where it has one, then named.
-    async fn kept(
-        &self,
-        outcome: Outcome,
-        record: &Bot,
-        workspace: &std::path::Path,
-        call_id: &str,
-    ) -> Outcome {
+    async fn kept(&self, outcome: Outcome, workspace: &std::path::Path, call_id: &str) -> Outcome {
         let outcome = match outcome.artifacts.is_empty() {
             true => outcome,
-            false => match self.outputs(record, workspace) {
+            false => match self.outputs(workspace) {
                 Some(outputs) => outputs.keep(outcome, self.turn, call_id).await,
                 None => outcome,
             },
@@ -5409,10 +5398,9 @@ impl Turn {
             self.registry.daemon().clone(),
             record.bot_id,
         );
-        let root = record
-            .workspace
-            .as_ref()
-            .map_or_else(|| workspace.to_owned(), PathBuf::from);
+        // The folder its turn runs in: a steer that moved the bot since
+        // leaves the turn its own, as it leaves its working directory.
+        let root = workspace.to_owned();
         tokio::task::spawn_blocking(move || bot_sandbox(&settings, &root, bot, &daemon))
             .await
             .map_err(|_| Error::new("sandbox_unavailable"))
@@ -6852,7 +6840,7 @@ impl Lifts {
             effort.as_deref(),
             bot.created_by.as_deref().zip(bot.created_by_id),
         );
-        let root = (bot.workspace.as_ref()).map_or_else(|| workspace.clone(), PathBuf::from);
+        let root = workspace.clone();
         let outputs = Outputs::of(&bot, root.clone(), self.registry.daemon());
         // As its turn would prepare it, its gates having allowed it: the
         // command rules as its round was announced still refuse a

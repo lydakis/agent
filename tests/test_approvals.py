@@ -13,7 +13,7 @@ import time
 import unittest
 from pathlib import Path
 
-from bench.runtime_client import node_item
+from bench.runtime_client import node_item, poll
 from bench.socket_client import Connection, SocketClient
 from bench.targets import clean_env
 from tests.test_elision import drain, encoded
@@ -156,6 +156,26 @@ class ApprovalTests(ModelFixture):
         self.assertTrue((self.path / 'inside').exists())
         self.assertNotEqual(self.tool_output(client, 'shell-1')[1]['exit_code'], 0)
         self.assertEqual(sorted(p.name for p in outside.iterdir()), ['escaped', 'written'])
+        self.assertTrue((self.path / 'notes.md').exists())
+
+    @unittest.skipUnless(shutil.which('bwrap') or sys.platform == 'darwin', 'sandboxes need bubblewrap')
+    def test_a_write_in_its_turn_s_folder_stays_confined_after_a_steer_moves_the_bot(self):
+        other = self.path / 'other'
+        other.mkdir()
+        client = self.gated(tools='shell,write,wait', approve=['write'],
+                            settings={'sandbox': 'workspace-write'})
+        started = client.request('submit', bot='Bob', request_id='bg', prompt='bg:sleep 5')['result']['message']
+        client.finished(started)
+        handle = json.loads(poll(client, 'Bob', started)['result']['text'].removeprefix('echo:'))['handle']
+        # Parked on a wait, the turn wakes for a steer that moves the bot;
+        # a write in the turn's own folder still needs no verdict.
+        turn = client.request('submit', bot='Bob', request_id='w', prompt='rewait:' + handle)['result']['message']
+        client.receive(lambda m: m.get('event') == 'turn_waiting' and m.get('turn') == turn)
+        write = 'calls:' + json.dumps([['write', {'path': 'notes.md', 'content': 'x'}]])
+        client.request('submit', bot='Bob', request_id='s', prompt=write,
+                       workspace=str(other), delivery='steer')
+        self.assertEqual(client.finished(turn)['data']['status'], 'completed')
+        self.assertEqual(self.events(client, turn, 'approval_requested'), [])
         self.assertTrue((self.path / 'notes.md').exists())
 
     @unittest.skipUnless(shutil.which('bwrap') or sys.platform == 'darwin', 'sandboxes need bubblewrap')

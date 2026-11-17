@@ -10663,13 +10663,46 @@ passed. The screen's Sonny rows moved both ways (lookout CPU per 1k deltas
 +25% at 10x1, -4.9% at 100x10; quiet window CPU -27%) on code this change
 does not touch, which is run-to-run noise.
 
+## Every steer joins its running turn (#1132)
+
+A steer now joins the running turn whatever folder, model or effort it
+names, and a steer that joins keeps its model and effort for the bot's
+next turn in the same commit that queues it. A steer for the same folder
+and settings runs the same statements as before; one that names another
+model or effort writes one more column in its own commit. The server looks
+at the store for a kept configuration only once the bot has no running
+turn. Matched screen from the CI Perf job (`bench/perf_gate.py`), main
+(8e295f3) against the head (dab188d), release build, synthetic model, the
+CI runner, 2026-11-17:
+
+| Screen | Row | Main | Head | Change |
+| --- | --- | ---: | ---: | ---: |
+| `bench.admission_burst` | Lone submit CPU | 24.384 ms | 24.522 ms | +0.6% |
+| `bench.admission_burst` | Burst submit p99 | 2.773 ms | 2.599 ms | -6.3% |
+| `bench.completion_burst` | Release to terminal p99 | 6.947 ms | 6.619 ms | -4.7% |
+| `bench.footprint` | Idle RSS | 16.803 MiB | 17.035 MiB | +1.4% |
+| `bench.footprint` | Per idle bot | 1.810 KiB | 1.762 KiB | -2.7% |
+| `bench.footprint` | RSS after a turn each | 57.510 MiB | 52.791 MiB | -8.2% |
+| `bench.footprint` | CPU per turn | 0.700 ms | 0.695 ms | -0.8% |
+| `bench.lifecycle` | Daemon CPU | 0.32 s | 0.35 s | +9.4% |
+| `bench.lifecycle` | Turn p95 | 575.542 ms | 574.675 ms | -0.2% |
+| `bench.lifecycle` | Peak RSS | 25.986 MiB | 25.664 MiB | -1.2% |
+
+Store jobs a turn are unchanged on every screen: the gate fails on any
+increase, and it passed. The lifecycle CPU row is 30 ms on a run of a few
+hundred turns, inside the spread of the runner's own repeats, with the
+turn p95 and memory unchanged.
+
 ## Release 0.10.1 against 0.10.0
 
-Every change since 0.10.0 measured together: v0.10.0 (45825a3) against the
-release tree, which is main with steers that join (#1132) merged in. This is
-the Perf workflow's screen (admission and completion bursts, footprint,
-lifecycle at 32 agents, and Sonny's screen), run locally on Linux 6.18 with
-4 cores and Rust 1.100.0, base and head alternating, two rounds each.
+This measures every change since 0.10.0 together: v0.10.0 (45825a3) against
+the release tree. The release tree here is main with #1132 merged in, taken
+before #1132's last fix. That fix only moves a sandbox root for daemon steps.
+
+The benchmark is the Perf workflow's screen: admission and completion
+bursts, footprint, lifecycle at 32 agents, and Sonny's screen. It ran
+locally on Linux 6.18 with 4 cores and Rust 1.100.0, base and head
+alternating, two rounds each.
 
 The screen ran twice. The first run was against main at 17cf1e2, before
 #1130, #1132 and #1133. The second was against the release tree.

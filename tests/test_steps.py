@@ -222,6 +222,24 @@ class DaemonStepTests(ModelFixture):
         self.assertEqual(client.finished(turn)['data']['status'], 'completed')
 
     @unittest.skipUnless(shutil.which('bwrap') or sys.platform == 'darwin', 'sandboxes need bubblewrap')
+    def test_a_sandboxed_turn_s_steps_keep_writing_its_own_folder_after_a_steer_moves_the_bot(self):
+        client, turn = self.script(tools='echo,shell,write', settings={'sandbox': 'workspace-write'})
+        elsewhere = self.path.parent / f'{self.path.name}-elsewhere'
+        elsewhere.mkdir()
+        self.addCleanup(shutil.rmtree, elsewhere, True)
+        steered = client.request('submit', bot='Lead', request_id='s', prompt='over there',
+                                 delivery='steer', expected_turn=turn, workspace=str(elsewhere))
+        self.assertEqual(steered['result']['status'], 'queued', steered)
+        ran = self.step(client, turn, name='write', arguments={'path': 'here.txt', 'content': 'ok'})['result']
+        self.assertFalse(ran['failed'], ran)
+        self.assertEqual((self.path / 'here.txt').read_text(), 'ok')
+        ran = self.step(client, turn, step='2', name='shell', arguments={'command': 'touch made'})['result']
+        self.assertFalse(ran['failed'], ran)
+        self.assertTrue((self.path / 'made').exists())
+        self.assertFalse((elsewhere / 'here.txt').exists())
+        self.answer(client, turn)
+
+    @unittest.skipUnless(shutil.which('bwrap') or sys.platform == 'darwin', 'sandboxes need bubblewrap')
     def test_a_file_step_through_a_link_into_the_workspace_is_judged_where_it_leads(self):
         outside = self.path.parent / f'{self.path.name}-links'
         outside.mkdir()
