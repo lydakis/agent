@@ -168,6 +168,15 @@ pub const SETTINGS: &[Setting] = &[
         default: "task",
     },
     Setting {
+        key: "sonny.task_worktrees",
+        group: "Agents",
+        name: "task worktrees",
+        label: "task folders kept; past it a new task removes the least active",
+        about: "task folders kept in ~/.agent/worktrees, as Codex's app keeps its newest worktrees: past it, a new task's start removes the least recently active, as remove_task does (marked done, branch kept while it has commits not merged, agent and history kept), never one working, needing you, with uncommitted changes or submodules, of its own, or another daemon's; at least 1",
+        values: &[],
+        default: "15",
+    },
+    Setting {
         key: "sonny.side_chat",
         group: "Agents",
         name: "side chat",

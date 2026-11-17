@@ -47,6 +47,7 @@
 //! task_speed = "fast"          # each new task's speed where its model serves it; else its starter's on the same model
 //! lead_profile = "my-lead"      # the role a new lead starts in, not lead
 //! task_profile = "worker"       # what every other agent is told, not task
+//! task_worktrees = 30           # task folders kept, 15 by default; past it a new task removes the least recently active, as remove_task does
 //! side_chat = "answer"          # calls no tool; "work", the default, may do anything its agent may
 //! chime = true                  # rings when work ends or waits; quiet by default
 //! view = "steps"               # "words", the default: your words and the agent's; "steps" adds what it did between; "verbose" every tool call
@@ -643,6 +644,11 @@ pub struct Sonny {
     pub ask_wait_minutes: u64,
     /// Which tasks open in a tab of their own in the lead's multiplexer.
     pub task_tabs: TaskTabs,
+    /// How many task folders a store keeps in `~/.agent/worktrees`, as
+    /// Codex's app keeps its newest worktrees: past it, a new task's start
+    /// removes the least recently active, as `remove_task` does, never one
+    /// working, needing the person or holding uncommitted work. At least 1.
+    pub task_worktrees: u64,
     /// How many of its tasks' tabs a lead keeps open in its
     /// multiplexer: past it, a new one closes the tab the person used
     /// least recently, never one they have not looked at yet; 0 for no
@@ -841,6 +847,10 @@ pub const TEXT_WIDTH: u64 = 100;
 /// list are, not an archive.
 pub const MARGIN_NOTES: u64 = 6;
 
+/// The task folders a store keeps unless `task_worktrees` says otherwise:
+/// as many as Codex's app keeps worktrees (`DEFAULT_WORKTREE_KEEP_COUNT`).
+pub const TASK_WORKTREES: u64 = 15;
+
 /// The most rows a note draws unless `margin_note_lines` says otherwise:
 /// state to glance at beside the conversation, so a whole margin fits in
 /// one look; anything longer goes in the reply or a file it names.
@@ -924,6 +934,7 @@ impl Default for Sonny {
             own_sources: OWN_SOURCES.iter().map(|name| own_source(name)).collect(),
             ask_wait_minutes: 60,
             task_tabs: TaskTabs::default(),
+            task_worktrees: TASK_WORKTREES,
             most_task_tabs: 32,
             sky_haikus: true,
             sky_haiku_daily: 0,
@@ -1747,6 +1758,7 @@ fn parse(text: &str) -> Result<Config, String> {
                 "commons_pointer",
                 "ask_wait_minutes",
                 "task_tabs",
+                "task_worktrees",
                 "most_task_tabs",
                 "sky_haikus",
                 "sky_haiku_daily",
@@ -1870,6 +1882,7 @@ fn parse(text: &str) -> Result<Config, String> {
                 "commons_invite_tokens" => Some(&mut config.sonny.commons_invite_tokens),
                 "ask_wait_minutes" => Some(&mut config.sonny.ask_wait_minutes),
                 "most_task_tabs" => Some(&mut config.sonny.most_task_tabs),
+                "task_worktrees" => Some(&mut config.sonny.task_worktrees),
                 "sky_haiku_daily" => Some(&mut config.sonny.sky_haiku_daily),
                 "sky_haiku_keep" => Some(&mut config.sonny.sky_haiku_keep),
                 "sky_haiku_window" => Some(&mut config.sonny.sky_haiku_window),
@@ -1895,6 +1908,11 @@ fn parse(text: &str) -> Result<Config, String> {
                 if key == "margin_notes" && config.sonny.margin_notes == 0 {
                     return Err(format!(
                         "{name}.{key} is the most notes a margin holds, at least 1, not 0"
+                    ));
+                }
+                if key == "task_worktrees" && config.sonny.task_worktrees == 0 {
+                    return Err(format!(
+                        "{name}.{key} is the most task folders kept, at least 1, not 0"
                     ));
                 }
                 if key == "margin_note_lines" && config.sonny.margin_note_lines == 0 {
@@ -2910,6 +2928,14 @@ mod tests {
             )
         );
         assert!(text_width("[sonny]\ntext_width = -1").is_err());
+        let kept = |text: &str| parse(text).map(|config| config.sonny.task_worktrees);
+        assert_eq!(kept(""), Ok(15));
+        assert_eq!(kept("[sonny]\ntask_worktrees = 40"), Ok(40));
+        assert_eq!(
+            kept("[sonny]\ntask_worktrees = 0"),
+            Err("sonny.task_worktrees is the most task folders kept, at least 1, not 0".into())
+        );
+        assert!(kept("[sonny]\ntask_worktrees = -1").is_err());
         let notes = |text: &str| parse(text).map(|config| config.sonny.margin_notes);
         assert_eq!(notes(""), Ok(MARGIN_NOTES));
         assert_eq!(notes("[sonny]\nmargin_notes = 40"), Ok(40));

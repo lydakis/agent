@@ -232,6 +232,74 @@ pub const MIGRATIONS: &[Migration] = &[
     },
 ];
 
+/// The migrations of Sonny's own files beside `store` and in this HOME,
+/// at a window's start and `sonny upgrade`'s, before either starts the
+/// daemon or its companions on this build. Once done, each costs a read
+/// of its record.
+pub fn at_start(store: &Path) {
+    store_files(store);
+    if let Some(home) = std::env::var_os("HOME").map(std::path::PathBuf::from) {
+        crate::commons::woken_gone(&home);
+    }
+}
+
+/// [`at_start`]'s migrations of the files beside `store`.
+fn store_files(store: &Path) {
+    crate::lookout::subs::agents_files(store);
+    crate::lookout::subs::goals_gone(store);
+    crate::git::drop_snapshot_indexes(store);
+}
+
+/// The migrations that need a whole listing of the store's agents, at a
+/// window's start, off its way: none listed once each is done.
+pub fn from_listing(client: std::sync::Arc<agent_client::Client>, store: &Path) {
+    let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
+    let record = beside(store);
+    let nested = !done(&record, crate::approvals::NESTED_GONE);
+    let migrated = home.as_ref().map(|home| home.join(".agent/sonny/migrated"));
+    let projects = (migrated.as_ref()).is_some_and(|it| !done(it, crate::commons::PROJECTS));
+    if !nested && !projects {
+        return;
+    }
+    let store = store.to_path_buf();
+    tokio::spawn(async move {
+        let (bots, whole) = crate::lookout::listed(&client).await;
+        if !whole {
+            return;
+        }
+        // What Sonny's walk of the repositories inside agents' folders
+        // gave them leaves their sandboxes.
+        if nested {
+            crate::approvals::nested_gone(client.clone(), &bots, &store);
+        }
+        // Old commons posts name their authors' projects: each thread is
+        // rewritten, off the loop.
+        if let Some(home) = home.filter(|_| projects) {
+            let records: std::collections::HashMap<String, serde_json::Value> = (bots.iter())
+                .filter_map(|bot| {
+                    let name = bot["name"].as_str()?.to_owned();
+                    let kept = serde_json::json!({"name": name, "bot_id": bot["bot_id"],
+                        "created_by": bot["created_by"], "created_by_id": bot["created_by_id"]});
+                    Some((name, kept))
+                })
+                .collect();
+            tokio::task::spawn_blocking(move || crate::commons::projects(&home, &records));
+        }
+    });
+}
+
+/// The record beside `store` of what was done once for it.
+fn beside(store: &Path) -> std::path::PathBuf {
+    let mut record = store.as_os_str().to_owned();
+    record.push(".migrated");
+    record.into()
+}
+
+/// Whether `record` says `id` is done.
+fn done(record: &Path, id: &str) -> bool {
+    lines(record).iter().any(|line| line == id)
+}
+
 /// `run` once for each `record`: a file of the ids done, a line each,
 /// beside the state they changed (`~/.agent/sonny/migrated`, or one
 /// beside a store for what is the store's). What fails, `run` answering
@@ -255,7 +323,7 @@ pub fn once_for(record: &Path, id: &str, what: &str, run: impl FnOnce() -> bool)
 }
 
 fn run_once(record: &Path, id: &str, run: impl FnOnce() -> bool) -> bool {
-    if lines(record).iter().any(|line| line == id) {
+    if done(record, id) {
         return true;
     }
     if !run() {
@@ -317,6 +385,58 @@ fn overdue(now: &str, steps: &[Step], migrations: &[Migration]) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The lookout passes events on and does nothing else (AGENTS.md): no
+    /// migration runs in it, nor any of the work they do.
+    #[test]
+    fn the_lookout_runs_no_migration() {
+        let files = [
+            ("mod.rs", include_str!("lookout/mod.rs")),
+            ("sources.rs", include_str!("lookout/sources.rs")),
+            ("activity.rs", include_str!("lookout/activity.rs")),
+            ("memory.rs", include_str!("lookout/memory.rs")),
+            ("pattern.rs", include_str!("lookout/pattern.rs")),
+        ];
+        let named = [
+            "upgrade::",
+            "agents_files",
+            "goals_gone",
+            "nested_gone",
+            "woken_gone",
+            "commons::projects",
+            "drop_snapshot_indexes",
+        ];
+        for (file, text) in files {
+            for name in named {
+                assert!(!text.contains(name), "lookout/{file} runs {name}");
+            }
+        }
+    }
+
+    /// The store's file migrations run at Sonny's start, once each.
+    #[test]
+    fn the_store_s_files_migrate_at_start() {
+        let store = std::env::temp_dir().join(format!("sonny-at-start-{}", std::process::id()));
+        let record = beside(&store);
+        let mut indexes = store.as_os_str().to_owned();
+        indexes.push(".snapshot-indexes");
+        let goals = crate::lookout::subs::dir(&store).join("goals");
+        std::fs::create_dir_all(&goals).unwrap();
+        std::fs::create_dir_all(&indexes).unwrap();
+        let _ = std::fs::remove_file(&record);
+        store_files(&store);
+        assert!(!goals.exists());
+        assert!(!Path::new(&indexes).exists());
+        for id in [
+            crate::lookout::subs::AGENTS,
+            crate::lookout::subs::GOALS_GONE,
+            crate::git::NO_SNAPSHOTS,
+        ] {
+            assert!(done(&record, id), "{id}");
+        }
+        let _ = std::fs::remove_dir_all(crate::lookout::subs::dir(&store));
+        let _ = std::fs::remove_file(&record);
+    }
 
     #[test]
     fn a_judge_set_in_the_env_file_is_a_step_until_it_goes() {
