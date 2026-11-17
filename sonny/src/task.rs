@@ -2294,6 +2294,8 @@ fn make_room(new: &str, (store, socket): (&Path, &Path), keep: u64, call: &str) 
 /// read.
 async fn at_work(client: &agent_client::Client) -> Option<Vec<PathBuf>> {
     let (mut dirs, mut after) = (Vec::new(), Value::Null);
+    // Each turn at work, by its agent: the folder it works in is its own.
+    let mut running = std::collections::BTreeSet::new();
     let workspace = |bot: &Value| {
         (bot["workspace"].as_str())
             .filter(|dir| !dir.is_empty())
@@ -2305,7 +2307,14 @@ async fn at_work(client: &agent_client::Client) -> Option<Vec<PathBuf>> {
             asked["after"] = after;
         }
         let page = client.request("bots", asked).await.ok()?;
-        dirs.extend((page["bots"].as_array().into_iter().flatten()).filter_map(workspace));
+        for bot in page["bots"].as_array().into_iter().flatten() {
+            dirs.extend(workspace(bot));
+            // Its running turn's own, which a message naming another
+            // folder, queued meanwhile, leaves as it is.
+            if let (Some(name), Some(turn)) = (bot["name"].as_str(), bot["running_turn"].as_i64()) {
+                running.insert((name.to_owned(), turn));
+            }
+        }
         after = page["next_after"].clone();
         if after.is_null() {
             break;
@@ -2313,7 +2322,6 @@ async fn at_work(client: &agent_client::Client) -> Option<Vec<PathBuf>> {
     }
     // Each command by its agent and the turn that started it, which
     // names the folder it runs in, whatever the agent works in since.
-    let mut running = std::collections::BTreeSet::new();
     loop {
         let mut asked = json!({});
         if !after.is_null() {
