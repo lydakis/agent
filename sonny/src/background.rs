@@ -1712,14 +1712,23 @@ impl View {
 
     /// [`View::card`], and the row each item starts on, by its place
     /// among the items.
+    #[cfg(test)]
     pub fn card_rows(&self, width: usize) -> (Vec<Line<'static>>, usize, Vec<usize>) {
+        let (out, at, starts, _) = self.card_linked(width);
+        (out, at, starts)
+    }
+
+    /// [`View::card_rows`], and each agent the rows name: its row, the
+    /// columns it runs over and the bot it opens.
+    pub fn card_linked(&self, width: usize) -> (Vec<Line<'static>>, usize, Vec<usize>, Links) {
         self.card_at(width, now_ms() as i64)
     }
 
     /// [`View::card_rows`] as of `now_ms`, which the commands' ages count
     /// to.
-    fn card_at(&self, width: usize, now_ms: i64) -> (Vec<Line<'static>>, usize, Vec<usize>) {
+    fn card_at(&self, width: usize, now_ms: i64) -> (Vec<Line<'static>>, usize, Vec<usize>, Links) {
         let mut starts = vec![0; self.rows()];
+        let mut links = Links::new();
         let mut out = vec![Line::from(self.scope.project.clone()).bold()];
         if !self.lookout.is_empty() {
             out.push(Line::from(self.lookout.clone()).dim());
@@ -1728,7 +1737,7 @@ impl View {
         // Said empty once the commands are read too, a moment after it
         // opens.
         if self.rows() == 0 && !self.commands.read() {
-            return (out, 0, Vec::new());
+            return (out, 0, Vec::new(), links);
         }
         if self.rows() == 0 && self.commands.error.is_none() {
             out.push(Line::default());
@@ -1744,7 +1753,7 @@ impl View {
             out.push(
                 Line::from("A command an agent leaves running shows here until it ends.").dim(),
             );
-            return (out, 0, Vec::new());
+            return (out, 0, Vec::new(), links);
         }
         // What failed first, whatever it is; then the rest by kind.
         let section = |item: &Item| match (&item.failed, item.kind) {
@@ -1771,7 +1780,19 @@ impl View {
                     at = out.len();
                 }
                 starts[index] = out.len();
-                out.extend(self.item_lines(item, index == self.selected, width));
+                let lines = self.item_lines(item, index == self.selected, width);
+                // The pick draws its row over the agents' color: where
+                // they are is read from the row as drawn unpicked.
+                let names = self.item_names(item);
+                let found = match index == self.selected {
+                    true => crate::links::agents_on(&self.item_lines(item, false, width), &names),
+                    false => crate::links::agents_on(&lines, &names),
+                };
+                let top = out.len();
+                links.extend(
+                    (found.into_iter()).map(|(row, from, to, bot)| (top + row, from, to, bot)),
+                );
+                out.extend(lines);
             }
         }
         if let Some(error) = &self.commands.error {
@@ -1797,10 +1818,17 @@ impl View {
                 }
                 starts[index] = out.len();
                 let picked = index == self.selected;
+                // Its agent, after the age, opens it; this window's own
+                // is plain words.
+                if let Some(bot) = row["bot"].as_str().filter(|bot| *bot != self.bot) {
+                    let from = commands::name_column(row, now_ms);
+                    let shown = name.width().min(name_width);
+                    links.push((out.len(), from, from + shown as u16, bot.to_owned()));
+                }
                 out.push(commands::line(row, name, name_width, width, now_ms, picked));
             }
         }
-        (out, at, starts)
+        (out, at, starts, links)
     }
 
     /// The page of the picked row's thing at `width`: its name, then the
@@ -2620,7 +2648,32 @@ impl View {
         rows
     }
 
+    /// The agents a row of `item` names, each by the name it is drawn
+    /// with and its bot. This window's own is plain words.
+    fn item_names(&self, item: &Item) -> Vec<(String, String)> {
+        let mut bots = vec![item.bot.clone()];
+        bots.extend(item.reply_to.clone());
+        bots.extend(
+            item.reminder
+                .as_ref()
+                .map(|reminder| reminder.asker.clone()),
+        );
+        if let Some(sub) = &item.sub {
+            bots.extend(sub.tasks_of.iter().cloned());
+        }
+        (bots.into_iter())
+            .filter(|bot| !bot.is_empty() && *bot != self.bot)
+            .map(|bot| (self.scope.short(&bot), bot))
+            .collect()
+    }
+
     fn item_lines(&self, item: &Item, picked: bool, width: usize) -> Vec<Line<'static>> {
+        let names = self.item_names(item);
+        let names: Vec<&str> = names.iter().map(|(name, _)| name.as_str()).collect();
+        crate::links::name_agents(self.item_rows(item, picked, width), &names, named_after)
+    }
+
+    fn item_rows(&self, item: &Item, picked: bool, width: usize) -> Vec<Line<'static>> {
         let mut out = Vec::new();
         // The pick has a column of its own, as the composer's `› ` does,
         // so it never touches the row's mark; what follows lines up under
@@ -2933,6 +2986,25 @@ fn coming(at: i64, now: i64) -> String {
 
 /// Rows wrapped from parts a ` · ` apart, with no row that ends or starts
 /// in a `·`: where a row breaks at one, it goes.
+/// Each agent a card's rows name: its row, the columns it runs over, and
+/// the bot it opens.
+pub type Links = crate::links::Agents;
+
+/// The words a row names an agent after: `→ lead`, `for lead`, `answers
+/// go to lead`, `tasks of lead`, `question from lead`.
+const NAMED_AFTER: [&str; 5] = [
+    "→ ",
+    "for ",
+    "answers go to ",
+    "tasks of ",
+    "question from ",
+];
+
+/// Whether a card's row names an agent where `said` leads to it.
+fn named_after(said: &str) -> bool {
+    NAMED_AFTER.iter().any(|lead| said.ends_with(lead))
+}
+
 fn undotted(rows: Vec<Line<'static>>) -> Vec<Line<'static>> {
     (rows.into_iter())
         .map(|mut row| {
@@ -4589,6 +4661,68 @@ mod tests {
         press(&mut view, KeyCode::Char('x'));
         assert_eq!(view.confirm, None);
         assert!(view.notice.as_deref().unwrap().contains("reads again"));
+    }
+
+    #[test]
+    fn every_agent_a_lists_row_names_opens_it() {
+        let row = json!({"name": "deploy", "bot": "calc.fix", "when": trigger::ON_DEMAND,
+            "message": "Ship it.", "sent": 0, "last": null, "reply_to": "calc.lead"});
+        let mut view = view_of(
+            std::env::temp_dir().join("background-links.sqlite"),
+            vec![trigger_item(&row, vec!["calc.fix".into()])],
+        );
+        // This window's own agent is plain words: only `fix` opens.
+        let (_, _, _, links) = view.card_at(100, 0);
+        let bots: Vec<&str> = links.iter().map(|(.., bot)| bot.as_str()).collect();
+        assert_eq!(bots, ["calc.fix"]);
+        view.bot = "calc.review".into();
+        let (card, _, _, links) = view.card_at(100, 0);
+        let text = |row: usize| -> String {
+            (card[row].spans.iter())
+                .map(|span| span.content.as_ref())
+                .collect()
+        };
+        let named: Vec<(String, String)> = (links.iter())
+            .map(|(row, from, to, bot)| {
+                let name: String = text(*row)
+                    .chars()
+                    .skip(usize::from(*from))
+                    .take(usize::from(to - from))
+                    .collect();
+                (name, bot.clone())
+            })
+            .collect();
+        assert_eq!(
+            named,
+            [
+                ("fix".to_owned(), "calc.fix".to_owned()),
+                ("lead".to_owned(), "calc.lead".to_owned())
+            ],
+            "{card:#?}"
+        );
+        // Drawn as a link is, in the agents' color, the row picked too.
+        let picked = &card[links[0].0];
+        assert!((picked.spans.iter()).any(|span| span.content == "fix"));
+        // A name nothing leads to is no link: `fix` in a fact is words.
+        let lines = crate::links::name_agents(
+            vec![Line::from("fix the build → fix")],
+            &["fix"],
+            named_after,
+        );
+        assert_eq!(
+            crate::links::agents_on(&lines, &[("fix".into(), "calc.fix".into())]),
+            [(0, 16, 19, "calc.fix".to_owned())]
+        );
+        // One the row before leads to, at the next row's start.
+        let lines = crate::links::name_agents(
+            vec![Line::from("answers go to"), Line::from("    lead · sent 0")],
+            &["lead"],
+            named_after,
+        );
+        assert_eq!(
+            crate::links::agents_on(&lines, &[("lead".into(), "calc.lead".into())]),
+            [(1, 4, 8, "calc.lead".to_owned())]
+        );
     }
 
     #[test]

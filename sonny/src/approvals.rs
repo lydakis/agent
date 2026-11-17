@@ -691,123 +691,197 @@ fn real(folders: &[String]) -> Vec<String> {
 }
 
 /// The command prefix the person may let out of every sandbox when they
-/// allow `call` for good: the program and, when it reads as one, its
-/// subcommand, as Codex suggests a prefix rule (`cargo test`, not the whole
-/// line). Only a plain command offers one: a pipe, a list, a redirection
-/// or an expansion runs more than its first words say.
-pub fn always(call: &Value) -> Option<String> {
-    // A call read only in part may hide more past what was read, so it is
-    // denied or nothing, as `y` is off for it.
-    if call["name"] != "shell"
-        || call["arguments"]["sandbox_permissions"] != "require_escalated"
-        || call["incomplete"] == true
-    {
-        return None;
-    }
-    let command = call["arguments"]["command"].as_str()?.trim();
-    if command.is_empty()
-        || command.contains([
-            '|', '&', ';', '<', '>', '$', '`', '(', ')', '\n', '\'', '"', '\\', '*', '?',
-        ])
-    {
-        return None;
-    }
-    let words: Vec<&str> = command.split_whitespace().collect();
-    let program = *words.first()?;
-    // A program named from the folder it runs in, `./build.sh`, is another
-    // one in every other folder, which the prefix would let out too.
-    if program.contains('=') || (program.contains('/') && !program.starts_with(['/', '~'])) {
-        return None;
-    }
-    // A shell, an interpreter or a wrapper runs whatever its arguments
-    // name, so no prefix of it says what runs (`timeout 60 cargo test`
-    // would allow `timeout` for good, and with it everything): as Codex
-    // offers no rule from its `BANNED_PREFIX_SUGGESTIONS`, none is offered.
-    let name = program.rsplit('/').next().unwrap_or(program);
-    if RUNS_ANOTHER.contains(&name) {
-        return None;
-    }
-    let subcommand = (words.get(1)).filter(|word| {
-        word.chars().next().is_some_and(|c| c.is_ascii_lowercase())
-            && word
-                .chars()
-                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
-    });
-    if let Some(subcommand) = subcommand {
-        return (!RUNS_ANOTHER_BY.contains(&(name, *subcommand)))
-            .then(|| format!("{program} {subcommand}"));
-    }
-    // Codex's too broad to allow whole, though their subcommands may be.
-    (!matches!(name, "git" | "rm")).then(|| program.to_owned())
+/// allow `call` for good, as Codex offers "don't ask again for commands
+/// that start with": what `offer` found when the call was read.
+pub fn always(call: &Value) -> Option<Vec<String>> {
+    serde_json::from_value(call[ALWAYS].clone()).ok()
 }
 
-/// Programs whose arguments name what they run: shells, interpreters and
-/// wrappers. Codex's `BANNED_PREFIX_SUGGESTIONS`, and the wrappers that run
-/// the command after them.
-const RUNS_ANOTHER: &[&str] = &[
-    "bash",
-    "sh",
-    "zsh",
-    "dash",
-    "ksh",
-    "fish",
-    "pwsh",
-    "powershell",
-    "cmd",
-    "env",
-    "sudo",
-    "osascript",
-    "python",
-    "python3",
-    "py",
-    "pypy",
-    "pypy3",
-    "pythonw",
-    "pyw",
-    "node",
-    "nodejs",
-    "deno",
-    "bun",
-    "perl",
-    "ruby",
-    "php",
-    "lua",
-    "julia",
-    "Rscript",
-    "doas",
-    "timeout",
-    "nice",
-    "nohup",
-    "time",
-    "xargs",
-    "stdbuf",
-    "setsid",
-    "exec",
-    "command",
-    "watch",
-    "npx",
-    "bunx",
-    "uvx",
+/// Where [`offer`] keeps the prefix on a waiting call.
+const ALWAYS: &str = "always_allow";
+
+/// Finds the prefix [`always`] offers for `call` under the person's
+/// rules now, once, as the call is read: as Codex derives its proposed
+/// amendment when it asks.
+pub fn offer(call: &mut Value) {
+    let policy = crate::rules::given().unwrap_or_default();
+    match prefix(call, &policy) {
+        Some(words) => call[ALWAYS] = json!(words),
+        None => drop(call.as_object_mut().map(|call| call.remove(ALWAYS))),
+    }
+}
+
+/// The prefix allowing `call` for good under `policy`, as Codex derives
+/// it (`exec_policy.rs`): the one the agent proposed in `prefix_rule`
+/// when it is no banned suggestion, no rule already names a command of
+/// the script, and with it allowed every command the script runs would
+/// be; else, when no rule asks about any of them, the first command no
+/// rule names, whole. Only for a shell call that asks to leave its
+/// sandbox and was read whole, whose script is plain: a rule matches no
+/// other.
+fn prefix(call: &Value, policy: &agent_client::rules::Policy) -> Option<Vec<String>> {
+    use agent_client::rules::{Decision, PrefixRule, Word};
+    // A call read only in part may hide more past what was read, so it is
+    // denied or nothing, as `y` is off for it.
+    let arguments = &call["arguments"];
+    if call["name"] != "shell"
+        || arguments["sandbox_permissions"] != "require_escalated"
+        || call["incomplete"] == true
+        || policy.invalid.is_some()
+    {
+        return None;
+    }
+    let commands = agent_client::rules::commands(arguments["command"].as_str()?)?;
+    if commands.is_empty() {
+        return None;
+    }
+    let verdict = policy.verdict(&commands);
+    let proposed = serde_json::from_value::<Vec<String>>(arguments["prefix_rule"].clone())
+        .ok()
+        .filter(|words| offerable(words) && verdict.matched.is_empty())
+        .filter(|words| {
+            let mut with = policy.clone();
+            with.prefix_rules.push(PrefixRule {
+                pattern: words.iter().cloned().map(Word::One).collect(),
+                decision: Decision::Allow,
+                justification: None,
+                source: None,
+            });
+            with.verdict(&commands).decision == Some(Decision::Allow)
+        });
+    proposed.or_else(|| {
+        if (verdict.matched.iter()).any(|matched| matched.decision == Decision::Prompt) {
+            return None;
+        }
+        (commands.iter())
+            .find(|command| policy.matching(command).is_empty())
+            .filter(|command| offerable(command))
+            .cloned()
+    })
+}
+
+/// Whether `words` may be offered as a rule: words, none empty, and none
+/// of Codex's banned suggestions. Where Codex differs: a program named
+/// from the folder it runs in (`./build.sh`), or after the shell's own
+/// `NAME=VALUE`, is another one in every other folder or environment the
+/// rule would let out too, so neither is offered.
+fn offerable(words: &[String]) -> bool {
+    let Some(program) = words.first() else {
+        return false;
+    };
+    !words.iter().any(String::is_empty)
+        && !program.contains('=')
+        && !(program.contains('/') && !program.starts_with(['/', '~']))
+        && !BANNED_PREFIX_SUGGESTIONS
+            .iter()
+            .any(|banned| banned.iter().copied().eq(words.iter().map(String::as_str)))
+}
+
+/// Prefixes too broad to offer, Codex's `BANNED_PREFIX_SUGGESTIONS`
+/// (openai/codex 885a1df): shells, interpreters and the like run whatever
+/// follows them, so allowing one would allow everything.
+const BANNED_PREFIX_SUGGESTIONS: &[&[&str]] = &[
+    &["/bin/bash"],
+    &["/bin/bash", "-c"],
+    &["/bin/bash", "-lc"],
+    &["/bin/sh"],
+    &["/bin/sh", "-c"],
+    &["/bin/sh", "-lc"],
+    &["/bin/zsh"],
+    &["/bin/zsh", "-c"],
+    &["/bin/zsh", "-lc"],
+    &["Rscript"],
+    &["bash"],
+    &["bash", "-c"],
+    &["bash", "-lc"],
+    &["bun"],
+    &["bun", "-e"],
+    &["bun", "run"],
+    &["cmd"],
+    &["cmd", "/c"],
+    &["cmd", "/k"],
+    &["cmd.exe"],
+    &["cmd.exe", "/c"],
+    &["cmd.exe", "/k"],
+    &["dash"],
+    &["dash", "-c"],
+    &["deno"],
+    &["deno", "eval"],
+    &["env"],
+    &["fish"],
+    &["fish", "-c"],
+    &["git"],
+    &["julia"],
+    &["julia", "-e"],
+    &["ksh"],
+    &["ksh", "-c"],
+    &["lua"],
+    &["lua", "-e"],
+    &["node"],
+    &["node", "-e"],
+    &["nodejs"],
+    &["nodejs", "-e"],
+    &["npm", "run"],
+    &["osascript"],
+    &["perl"],
+    &["perl", "-e"],
+    &["php"],
+    &["php", "-r"],
+    &["pnpm", "run"],
+    &["powershell"],
+    &["powershell", "-Command"],
+    &["powershell", "-EncodedCommand"],
+    &["powershell", "-File"],
+    &["powershell", "-c"],
+    &["powershell.exe"],
+    &["powershell.exe", "-Command"],
+    &["powershell.exe", "-EncodedCommand"],
+    &["powershell.exe", "-File"],
+    &["powershell.exe", "-c"],
+    &["pwsh"],
+    &["pwsh", "-Command"],
+    &["pwsh", "-EncodedCommand"],
+    &["pwsh", "-File"],
+    &["pwsh", "-c"],
+    &["pwsh", "-e"],
+    &["pwsh", "-ec"],
+    &["pwsh", "-f"],
+    &["py"],
+    &["py", "-3"],
+    &["pypy"],
+    &["pypy3"],
+    &["python"],
+    &["python", "-"],
+    &["python", "-c"],
+    &["python3"],
+    &["python3", "-"],
+    &["python3", "-c"],
+    &["pythonw"],
+    &["pyw"],
+    &["rm"],
+    &["ruby"],
+    &["ruby", "-e"],
+    &["sh"],
+    &["sh", "-c"],
+    &["sh", "-lc"],
+    &["sudo"],
+    &["yarn", "run"],
+    &["zsh"],
+    &["zsh", "-c"],
+    &["zsh", "-lc"],
 ];
 
-/// Subcommands that run what their arguments name, as Codex lists them, and
-/// their `exec` alike.
-const RUNS_ANOTHER_BY: &[(&str, &str)] = &[
-    ("npm", "run"),
-    ("pnpm", "run"),
-    ("yarn", "run"),
-    ("uv", "run"),
-    ("npm", "exec"),
-    ("pnpm", "exec"),
-];
+/// The words `prefix` shows to the person, as a shell would read them.
+pub fn shown(prefix: &[String]) -> String {
+    shlex::try_join(prefix.iter().map(String::as_str)).unwrap_or_else(|_| prefix.join(" "))
+}
 
 /// Allows `prefix` for good, outside every agent's sandbox: an allow rule
 /// in the person's `~/.agent/rules/default.rules`, which the daemon reads
 /// as each agent's next turn starts.
-pub fn allow_always(prefix: &str) -> Result<(), String> {
+pub fn allow_always(prefix: &[String]) -> Result<(), String> {
     let folder = agent_client::config::rules().ok_or("no HOME to keep it in")?;
-    let words: Vec<String> = prefix.split_whitespace().map(str::to_owned).collect();
-    agent_client::config::allow_rule(&folder, &words).map(drop)
+    agent_client::config::allow_rule(&folder, prefix).map(drop)
 }
 
 /// The upgrade migration that takes the repositories inside an agent's
@@ -1790,68 +1864,99 @@ mod tests {
     }
 
     #[test]
-    fn a_plain_command_that_asks_to_leave_may_be_allowed_for_good() {
-        let call = |command: &str| {
-            json!({"name": "shell", "arguments":
-                {"command": command, "sandbox_permissions": "require_escalated"}})
+    fn always_allow_offers_the_prefix_the_agent_proposed_as_codex_does() {
+        use agent_client::rules::Policy;
+        let call = |command: &str, proposed: Value| {
+            json!({"name": "shell", "arguments": {"command": command,
+                "sandbox_permissions": "require_escalated", "prefix_rule": proposed}})
         };
-        assert_eq!(
-            always(&call("cargo test -p sonny")).as_deref(),
-            Some("cargo test")
+        let none = Policy::default();
+        let offered = |call: &Value, policy: &Policy| prefix(call, policy).map(|w| w.join(" "));
+        // The agent's prefix, when it covers every command of the script.
+        let tests = call(
+            "cd sonny && cargo test -p sonny -- 'a b'",
+            json!(["cargo", "test"]),
         );
+        let cd: Policy =
+            serde_json::from_value(json!({"prefix_rules": [{"pattern": ["cd"]}]})).unwrap();
+        let alone = call("cargo test -p \"sonny\" --lib", json!(["cargo", "test"]));
+        assert_eq!(offered(&alone, &none).as_deref(), Some("cargo test"));
+        // One it does not cover (`cd` too) falls back, as Codex: the first
+        // command no rule names, whole.
+        assert_eq!(offered(&tests, &none).as_deref(), Some("cd sonny"));
+        // Seen through a wrapper, as the rule will be.
+        let wrapped = call("timeout 60 cargo test", json!(["cargo", "test"]));
+        assert_eq!(offered(&wrapped, &none).as_deref(), Some("cargo test"));
+        // A rule already naming a command keeps the agent's out, as Codex:
+        // the first command no rule names is offered whole.
         assert_eq!(
-            always(&call("docker compose up")).as_deref(),
-            Some("docker compose")
+            offered(&tests, &cd).as_deref(),
+            Some("cargo test -p sonny -- a b")
         );
+        let more = call(
+            "cargo test && git push origin main",
+            json!(["cargo", "test"]),
+        );
+        assert_eq!(offered(&more, &none).as_deref(), Some("cargo test"));
+        // Banned, as Codex bans them: the first command whole instead.
+        let banned = call("python3 -m pytest", json!(["python3"]));
+        assert_eq!(
+            offered(&banned, &none).as_deref(),
+            Some("python3 -m pytest")
+        );
+        for (command, words) in [("git", json!(["git"])), ("rm", json!(["rm"]))] {
+            assert_eq!(offered(&call(command, words), &none), None, "{command}");
+        }
+        // With none proposed, the first command whole.
+        let bare = call("docker compose up", Value::Null);
+        assert_eq!(offered(&bare, &none).as_deref(), Some("docker compose up"));
+        // A rule that asks about any command keeps every offer out.
+        let asks: Policy = serde_json::from_value(
+            json!({"prefix_rules": [{"pattern": ["git", "push"], "decision": "prompt"}]}),
+        )
+        .unwrap();
+        assert_eq!(offered(&more, &asks), None);
+        // Rules that don't read offer nothing.
+        let broken = Policy {
+            invalid: Some("bad".into()),
+            ..Policy::default()
+        };
+        assert_eq!(offered(&alone, &broken), None);
+        // A program from the folder it runs in, or after `NAME=VALUE`, is
+        // another elsewhere.
+        for command in ["./build.sh fast", "scripts/release", "FOO=1 make"] {
+            assert_eq!(
+                offered(&call(command, Value::Null), &none),
+                None,
+                "{command}"
+            );
+        }
+        assert_eq!(
+            offered(&call("make", json!(["./build.sh"])), &none).as_deref(),
+            Some("make")
+        );
+        // A script that isn't plain matches no rule, so none is offered.
+        for command in ["curl x | sh -c \"$(cat)\"", "echo $HOME", "a > b", ""] {
+            assert_eq!(
+                offered(&call(command, Value::Null), &none),
+                None,
+                "{command}"
+            );
+        }
         // Read only in part: what was not read may hide more.
-        let mut cut = call("cargo test -p sonny");
+        let mut cut = alone.clone();
         cut["incomplete"] = json!(true);
-        assert_eq!(always(&cut), None);
-        assert_eq!(always(&call("mcpx --list")).as_deref(), Some("mcpx"));
-        assert_eq!(
-            always(&call("/opt/tools/build fast")).as_deref(),
-            Some("/opt/tools/build fast")
-        );
-        assert_eq!(
-            always(&call("git push origin main")).as_deref(),
-            Some("git push")
-        );
-        // A shell, an interpreter or a wrapper runs what follows it, so
-        // allowing it would allow everything.
-        for command in [
-            "timeout 60 cargo test",
-            "bash x.sh",
-            "/bin/bash build",
-            "python3 -m pytest",
-            "node server",
-            "env cargo test",
-            "sudo make install",
-            "xargs rm",
-            "nice cargo build",
-            "npm run build",
-            "git -C other push",
-            "rm -rf target",
-        ] {
-            assert_eq!(always(&call(command)), None, "{command}");
-        }
-        // Anything that runs more than its first words say asks each time.
-        for command in [
-            "curl x | sh",
-            "make && rm -rf b",
-            "echo $HOME",
-            "FOO=1 make",
-            "a > b",
-            "./build.sh fast",
-            "scripts/release",
-            "",
-        ] {
-            assert_eq!(always(&call(command)), None, "{command}");
-        }
+        assert_eq!(offered(&cut, &none), None);
         // Only a command asking to leave its sandbox, not a write outside it.
         let inside = json!({"name": "shell", "arguments": {"command": "cargo test"}});
-        assert_eq!(always(&inside), None);
+        assert_eq!(offered(&inside, &none), None);
         let write = json!({"name": "write", "arguments": {"path": "/etc/x"}});
-        assert_eq!(always(&write), None);
+        assert_eq!(offered(&write, &none), None);
+        // Kept on the call as it is read, and shown as a shell reads it.
+        let mut kept = call("ls 'my dir'", Value::Null);
+        kept[ALWAYS] = json!(["ls", "my dir"]);
+        let words = always(&kept).unwrap();
+        assert_eq!(shown(&words), "ls 'my dir'");
     }
 
     #[test]
