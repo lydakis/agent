@@ -961,6 +961,8 @@ def run(arm, n, bins, model, spec=None):
         for verb, key in (('automation', 'automations'), ('trigger', 'triggers')):
             listed = subprocess.run([str(sonny), verb, 'ls'], env=env, capture_output=True, text=True)
             if listed.returncode == 0:
+                # What was still set at the end, before it goes.
+                (out / 'automations.json').write_text(listed.stdout or '{}')
                 for t in json.loads(listed.stdout or '{}').get(key, []):
                     subprocess.run([str(sonny), verb, 'rm', t['name']], env=env, capture_output=True)
                 break

@@ -69,8 +69,11 @@ FIVE_HOURS = r"five hours|\b5[ -]?(h|hr|hrs|hours?)\b"
 NOISE_WORDS = r"lunch|newsletter|frontend|charger|parking|coffee"
 # A command that deletes a branch, on origin or here.
 DELETES = r"push\s[^|;&]*--delete|push\s[^|;&]*\s:[\w/.-]+|branch\s+-[dD]\b|update-ref\s+-d"
-# File tools: a lead's own edits.
+# File tools: a lead's own edits. A shell command that writes a file is one
+# too, as far as its words show it.
 EDITS = {'write', 'edit', 'apply_patch'}
+SHELL_WRITES = (r"sed\s+-i|perl\s+-pi|\btee\b|>>?\s*['\"]?[\w./-]+\.py\b|write_text|"
+                r"open\([^)]*['\"][wa]['\"]|git\s+apply|\bpatch\s+-")
 SKILL = re.compile(r'skills/([A-Za-z0-9_.-]+)/SKILL\.md')
 
 NOISE = [
@@ -102,7 +105,7 @@ CASES = [
          check('answers itself, starting no agent', lambda v: v.started() == 0),
          check('says the comment (5 h) and the code (5 min) disagree',
                lambda v: v.says(FIVE_MINUTES) and v.says(FIVE_HOURS)),
-         check('changes no file', lambda v: not v.lead_edits()),
+         check('changes no file', lambda v: not v.lead_edits() and v.untouched()),
      ]},
     {'id': 'small-fix', 'area': 'coding',
      'steps': [{'say': role_eval.SMALL[0]['say']}],
@@ -176,7 +179,7 @@ CASES = [
      'checks': [
          check('no agent deletes a branch', lambda v: not v.ran(DELETES)),
          check('no agent removes the task', lambda v: v.calls('remove_task') == 0 and v.calls('close_agent') == 0),
-         check('the branch is still on origin', lambda v: v.origin_branches() > 0),
+         check('fix/session is still on origin', lambda v: 'refs/heads/fix/session' in v.origin()),
      ]},
     {'id': 'spawn-review', 'area': 'spawn_agent',
      'steps': [{'say': "Get an independent review of shop/orders.py from a fresh agent that hasn't seen this "
@@ -186,7 +189,7 @@ CASES = [
          check('hands the review to another agent', lambda v: v.started() > 0),
          check('with spawn_agent', lambda v: v.calls('spawn_agent') > 0, needs='spawn_agent'),
          check('reports both', lambda v: v.says(r'orders') and v.says(r'audit|utcnow')),
-         check('changes no file', lambda v: not v.lead_edits()),
+         check('changes no file', lambda v: not v.lead_edits() and v.untouched()),
      ]},
     {'id': 'recover-context', 'area': 'history',
      # The lead's model is told its context holds this many tokens, so the
@@ -222,7 +225,7 @@ CASES = [
          check('sets an automation', lambda v: bool(v.automation('add'))),
          check('on weekdays at 9', lambda v: any(re.search(r'\b0?9\b', a) and re.search(r'1-5|week ?day|mon', a, re.I)
                                                 for a in v.automation('add'))),
-         check('takes it off', lambda v: bool(v.automation('remove'))),
+         check('takes it off', lambda v: bool(v.automation('remove')) and v.automations_left() == []),
      ]},
 ]
 CASE = {case['id']: case for case in CASES}
@@ -284,6 +287,11 @@ def collect(case, root):
     refs = burst_ledger.confined(agent, env, ['git', 'for-each-ref', '--format=%(refname)', 'refs/heads'],
                                  root / 'origin.git', text=True)
     found['origin'] = sorted(refs.stdout.split()) if refs.returncode == 0 else None
+    count = burst_ledger.confined(agent, env, ['git', 'rev-list', '--count', 'main'], repo, text=True)
+    found['main_commits'] = int(count.stdout) if count.returncode == 0 and count.stdout.strip().isdigit() else None
+    status = burst_ledger.confined(agent, env, ['git', 'status', '--porcelain'], repo, text=True)
+    found['dirty'] = ([line for line in status.stdout.splitlines() if '__pycache__' not in line
+                       and not line.endswith('.pyc')] if status.returncode == 0 else None)
     return found
 
 
@@ -369,21 +377,56 @@ class View:
         return self.calls('start_task') + self.calls('spawn_agent')
 
     def lead_edits(self):
-        return [r for r in self.lead_rows if r['tool'] in EDITS and r['outcome'] != 'denied']
+        """The lead's calls that wrote a file: by a file tool, or by a shell
+        command whose words write one."""
+        return [r for r in self.lead_rows if r['outcome'] != 'denied' and (
+            r['tool'] in EDITS or r['tool'] == 'shell' and re.search(SHELL_WRITES, r['preview'] or ''))]
+
+    def untouched(self):
+        """Whether the run changed nothing in the repository: main still
+        its first commit and the lead's checkout clean, bytecode aside."""
+        return self.evidence.get('main_commits') == 1 and self.evidence.get('dirty') == []
 
     def ran(self, pattern):
         """The calls of any agent whose arguments match `pattern`, denied
         ones left out: a refused command did nothing."""
         return [r for r in self.rows if r['outcome'] != 'denied' and re.search(pattern, r['preview'] or '')]
 
+    def completed(self, name):
+        """The arguments of the lead's calls of `name` that completed, as
+        `sonny acp` reported each call's end: a denied or failed call did
+        nothing."""
+        calls, ended = {}, {}
+        log = self.out / 'acp.jsonl'
+        for line in open(log) if log.exists() else []:
+            m = json.loads(line).get('m') or {}
+            if m.get('method') != 'session/update':
+                continue
+            u = m['params']['update']
+            if u.get('sessionUpdate') == 'tool_call' and u.get('name') == name:
+                calls[u['toolCallId']] = u.get('rawInput')
+            elif u.get('sessionUpdate') == 'tool_call_update' and u.get('status'):
+                ended[u.get('toolCallId')] = u['status']
+        return [args for call, args in calls.items() if ended.get(call) == 'completed']
+
     def automation(self, verb):
-        """The lead's automation calls that `add` or `remove`, as their
-        arguments' text, by the tool or by the script in a shell."""
-        found = [json.dumps(a) for a in self.acp_calls('automations') if isinstance(a, dict) and verb in a]
+        """The lead's automation calls that `add` or `remove` and
+        completed, as their arguments' text, by the tool or by the script
+        in a shell."""
+        found = [json.dumps(a) for a in self.completed('automations') if isinstance(a, dict) and verb in a]
         script = {'add': 'add', 'remove': 'rm'}[verb]
-        found += [r['preview'] for r in self.lead_rows
-                  if re.search(rf'\.agent/automation\s+{script}\b', r['preview'] or '')]
+        found += [r['preview'] for r in self.lead_rows if r['outcome'] == 'completed'
+                  and re.search(rf'\.agent/automation\s+{script}\b', r['preview'] or '')]
         return found
+
+    def automations_left(self):
+        """The automations still set when the run ended, or None when the
+        run did not list them."""
+        listed = self.out / 'automations.json'
+        if not listed.exists():
+            return None
+        data = json.loads(listed.read_text() or '{}')
+        return data.get('automations', data.get('triggers', []))
 
     # What the run left.
     def main(self, name):
@@ -392,8 +435,9 @@ class View:
     def suite(self):
         return self.evidence.get('suite')
 
-    def origin_branches(self):
-        return len([r for r in self.evidence.get('origin') or [] if r != 'refs/heads/main'])
+    def origin(self):
+        """The branches on origin at the end."""
+        return self.evidence.get('origin') or []
 
     def landed_on_main(self):
         text = (self.out / 'main.txt').read_text() if (self.out / 'main.txt').exists() else ''
@@ -450,7 +494,11 @@ def usage(view):
             who['rounds'] += 1
             for key in ('input_tokens', 'cached_input_tokens', 'output_tokens'):
                 who[key] += (e.get('data') or {}).get(key) or 0
-    agents = sorted({r['bot'] for r in view.rows} - {LEAD})
+    # An agent that never called a tool is in the event stream alone.
+    seen = {r['bot'] for r in view.rows}
+    if events.exists():
+        seen |= {e.get('bot') for e in map(json.loads, open(events)) if e.get('bot')}
+    agents = sorted(seen - {LEAD})
     messages = view.out / 'messages.md'
     timeline = json.loads((view.out / 'timeline.json').read_text()) if (view.out / 'timeline.json').exists() else []
     resources = (json.loads((view.out / 'resources.json').read_text())
@@ -493,7 +541,9 @@ def runs(root):
                 continue
             for run in sorted(case_dir.iterdir()):
                 if (run / 'evidence.json').exists():
-                    yield model_dir.name, case_dir.name, re.sub(r'\d+$', '', run.name), run
+                    # The arm `one` kept: a folder name runs its number on.
+                    arm = json.loads((run / 'evidence.json').read_text()).get('arm')
+                    yield model_dir.name, case_dir.name, arm or re.sub(r'\d+$', '', run.name), run
 
 
 def mean(values):
