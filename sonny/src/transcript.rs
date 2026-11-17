@@ -2748,7 +2748,7 @@ pub fn clean(
 }
 
 /// What the clean view keeps, by what Sonny says a call did.
-const KEPT: [&str; 29] = [
+const KEPT: [&str; 30] = [
     "Started",
     "Started a turn for",
     "Steered",
@@ -2756,6 +2756,7 @@ const KEPT: [&str; 29] = [
     "Left a note for",
     "Forked",
     "Interrupted",
+    "Closed",
     "Removed",
     "Cleaned up",
     "Waited for",
@@ -2788,7 +2789,7 @@ fn kept(said: &crate::calls::Said) -> bool {
 /// and folded into one when several come in a row: those that start,
 /// message, wait for or change agents and what runs for them, which a
 /// lead often makes a few of at once. What they said opens on a click.
-const FOLDS: [&str; 24] = [
+const FOLDS: [&str; 25] = [
     "Started",
     "Started a turn for",
     "Steered",
@@ -2797,6 +2798,7 @@ const FOLDS: [&str; 24] = [
     "Waited for",
     "Forked",
     "Interrupted",
+    "Closed",
     "Removed",
     "Cleaned up",
     "Discarded",
@@ -2838,7 +2840,7 @@ pub fn folds(
     }
     let said = match name {
         "shell" => crate::calls::said(arguments["command"].as_str()?, output.unwrap_or(""), false)?,
-        "send_message" | "list_agents" | "pause_agents" => {
+        "send_message" | "list_agents" | "pause_agents" | "spawn_agent" | "close_agent" => {
             crate::calls::agents(name, arguments, output, false)?
         }
         _ => crate::calls::declared(name, arguments, false)?,
@@ -5216,6 +5218,19 @@ mod tests {
             "Started calc.fix: {\"handle\":\"calc.fix/3\"}",
         );
         assert_eq!(task, ["• Started fix", "  └ Fix the tests."]);
+        // An agent a lead makes, and closes when its work is done.
+        let made = clean(
+            "spawn_agent",
+            serde_json::json!({"name": "review", "message": "Look over the diff."}),
+            r#"{"name":"calc.review","status":"running","handle":"calc.review/1"}"#,
+        );
+        assert_eq!(made, ["• Started calc.review", "  └ Look over the diff."]);
+        let closed = clean(
+            "close_agent",
+            serde_json::json!({"name": "calc.review"}),
+            r#"{"name":"calc.review","was_open":true}"#,
+        );
+        assert_eq!(closed, ["• Closed calc.review"]);
         // One that failed says what it tried, and why first.
         let shown = text(&super::clean(
             "show_agent",

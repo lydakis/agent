@@ -5873,18 +5873,7 @@ impl Turn {
                     // Its own turn, after the one stopped.
                     delivery = "queue";
                 }
-                // The same call made again, after a restart, sends nothing
-                // new: its id is the call's own unless the bot named one,
-                // as a digest of the whole call id, so two calls never share it.
-                let request_id = request_id.unwrap_or_else(|| {
-                    let digest =
-                        aws_lc_rs::digest::digest(&aws_lc_rs::digest::SHA256, call_id.as_bytes());
-                    let call: String = digest.as_ref()[..16]
-                        .iter()
-                        .map(|b| format!("{b:02x}"))
-                        .collect();
-                    format!("tool-{}-{call}", self.turn)
-                });
+                let request_id = request_id.unwrap_or_else(|| self.call_request(call_id));
                 let sent = request(json!({"op":"submit","bot":to,"request_id":request_id,
                     "prompt":message,"delivery":delivery,
                     "from":{"bot":self.bot,"turn":self.turn},
@@ -5913,13 +5902,14 @@ impl Turn {
             Agents::List {
                 name,
                 running,
+                closed,
                 approvals: false,
                 after,
                 limit,
             } => {
                 let name = name.or_else(|| self.project_agents());
                 let page = request(json!({"op":"bots","name":name,"active":running,
-                    "limit":limit,"after":after.as_str()}))
+                    "open":!closed,"limit":limit,"after":after.as_str()}))
                 .await?;
                 let bots: Vec<Value> = (page["bots"].as_array().into_iter().flatten())
                     .map(|bot| {
@@ -5930,6 +5920,7 @@ impl Turn {
                             "last",
                             "workspace",
                             "created_by",
+                            "closed_ms",
                         ] {
                             if !bot[field].is_null() {
                                 row[field] = bot[field].clone();
@@ -5980,8 +5971,198 @@ impl Turn {
                 json!({"approvals":calls,"next_after":page["next_after"]})
             }
             Agents::Pause { reason } => request(json!({"op":"pause","reason":reason})).await?,
+            Agents::Spawn {
+                name,
+                message,
+                profile,
+                model,
+                effort,
+                fork,
+                request_id,
+            } => {
+                let name = self.spawned_name(&name);
+                // One key for the making and the first message, so the
+                // same call made again makes and sends nothing new.
+                let request_id = request_id.unwrap_or_else(|| self.call_request(call_id));
+                if fork {
+                    request(json!({"op":"fork","source":self.bot,"bot":name,
+                        "request_id":request_id}))
+                    .await?;
+                } else {
+                    let me = request(json!({"op":"inspect","bot":self.bot})).await?;
+                    let mut create = self.spawned(&me, &name, profile, model, effort).await?;
+                    create["op"] = json!("create");
+                    create["request_id"] = json!(request_id);
+                    request(create).await?;
+                }
+                let sent = request(json!({"op":"submit","bot":name,"request_id":request_id,
+                    "prompt":message,"delivery":"queue",
+                    "from":{"bot":self.bot,"turn":self.turn}}))
+                .await?;
+                let mut answer = json!({"name":name,"status":sent["status"]});
+                if let Some(message) = sent["message"].as_i64() {
+                    answer["handle"] = json!(format!("{name}/{message}"));
+                }
+                if sent["duplicate"] == true {
+                    answer["duplicate"] = json!(true);
+                }
+                answer
+            }
+            Agents::Close { name } => {
+                // Its own record says whether this bot made it, before the
+                // daemon marks it, and which turn to stop.
+                let target = request(json!({"op":"inspect","bot":name})).await?;
+                if target["created_by_id"].as_i64() != Some(bot_id) {
+                    return Err(Error::with(
+                        "not_permitted",
+                        format!("{name} was not made by this bot, so this bot may not close it"),
+                    ));
+                }
+                let closed = request(json!({"op":"close","bot":name,
+                    "bot_id":target["bot_id"]}))
+                .await?;
+                let mut answer = json!({"name":name,"was_open":closed["was_open"]});
+                if let Some(turn) = target["running_turn"].as_i64() {
+                    // A turn that ended meanwhile answers how it ended.
+                    let stopped = request(json!({"op":"interrupt","bot":name,"turn":turn})).await?;
+                    if stopped["interrupt_requested"] == true {
+                        answer["stopped_turn"] = json!(turn);
+                    }
+                }
+                answer
+            }
         };
         Ok(Outcome::text(self.registry.redact_text(answer.to_string())))
+    }
+
+    /// The id a call's request to the daemon goes with when the bot named
+    /// none: the call's own, as a digest of the whole call id, so the same
+    /// call made again after a restart does nothing new and two calls never
+    /// share one.
+    fn call_request(&self, call_id: &str) -> String {
+        let digest = aws_lc_rs::digest::digest(&aws_lc_rs::digest::SHA256, call_id.as_bytes());
+        let call: String = digest.as_ref()[..16]
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        format!("tool-{}-{call}", self.turn)
+    }
+
+    /// The whole name of an agent this one makes named `name`: in this
+    /// one's project, the part of its name before the first dot, unless
+    /// `name` names it already. A bot whose name has no dot has no project.
+    fn spawned_name(&self, name: &str) -> String {
+        match self.bot.split_once('.') {
+            Some((project, _)) if !name.starts_with(&format!("{project}.")) => {
+                format!("{project}.{name}")
+            }
+            _ => name.to_owned(),
+        }
+    }
+
+    /// What `create` makes a fresh agent with, made by this one (`me`, its
+    /// record): its folder, settings and compaction; the model and effort
+    /// asked for, the profile's model, or its own; and the instructions a
+    /// client composes for the folder, in `profile`'s role when one is
+    /// named, with the role's tools or its own, the editor and search
+    /// fitted to the model's provider.
+    async fn spawned(
+        &self,
+        me: &Value,
+        name: &str,
+        profile: Option<String>,
+        model: Option<String>,
+        effort: Option<String>,
+    ) -> Result<Value> {
+        let Some(workspace) = me["workspace"].as_str().map(str::to_owned) else {
+            return Err(Error::with(
+                "no_workspace",
+                "this agent has no folder for an agent it makes to work in",
+            ));
+        };
+        // Reading the role and the folder's files touches the filesystem:
+        // off the runtime thread.
+        let folder = workspace.clone();
+        let (role, instructions) = tokio::task::spawn_blocking(move || {
+            let folder = std::path::Path::new(&folder);
+            let failed =
+                |error: agent_client::policy::Failure| Error::with(error.code(), error.to_string());
+            let role = match profile.as_deref() {
+                None => None,
+                Some(name) => Some(
+                    agent_client::policy::profile(folder, name)
+                        .map_err(failed)?
+                        .ok_or_else(|| {
+                            Error::with(
+                                "profile_not_found",
+                                format!(
+                                    "no .agents/agents/{name}.md in the folder or ~/.agents/agents"
+                                ),
+                            )
+                        })?,
+                ),
+            };
+            let memory = agent_client::policy::memory_indexes(folder).map_err(failed)?;
+            let composed = agent_client::policy::instructions(folder, role.as_ref(), &memory)
+                .map_err(failed)?;
+            Ok::<_, Error>((role, composed.text))
+        })
+        .await
+        .map_err(|_| Error::new("profile_unreadable"))??;
+        let own = format!(
+            "{}/{}",
+            me["provider"].as_str().unwrap_or_default(),
+            me["model"].as_str().unwrap_or_default()
+        );
+        let chosen = model.or_else(|| role.as_ref().and_then(|role| role.model.clone()));
+        // An agent on this one's model takes its effort too; one on a model
+        // chosen for it, its own or none.
+        let effort = match &chosen {
+            None => me["effort"].as_str().map(str::to_owned),
+            Some(_) => effort,
+        };
+        // A summarizer speaks its bot's family: this one's only on its model.
+        let compaction_model = match &chosen {
+            None => me["compaction_model"].clone(),
+            Some(_) => Value::Null,
+        };
+        let model = chosen.unwrap_or(own);
+        let (provider, model_name) = model.split_once('/').unwrap_or((model.as_str(), ""));
+        let tools: Vec<String> = match role.and_then(|role| role.tools) {
+            Some(tools) => tools,
+            None => {
+                let served = self.providers.get(provider);
+                let editor = match served.map(|p| p.family().name()) {
+                    Some("responses") => "apply_patch",
+                    _ => "edit",
+                };
+                let searches = served
+                    .is_some_and(|p| p.search(model_name) != agent_runtime::provider::Search::None);
+                (me["tools"].as_array().into_iter().flatten())
+                    .filter_map(Value::as_str)
+                    .filter(|tool| *tool != "web_search" || searches)
+                    .map(|tool| match tool {
+                        "edit" | "apply_patch" => editor,
+                        tool => tool,
+                    })
+                    .fold(Vec::new(), |mut tools: Vec<String>, tool| {
+                        if !tools.iter().any(|have| have == tool) {
+                            tools.push(tool.to_owned());
+                        }
+                        tools
+                    })
+            }
+        };
+        let settings = (self.settings.get())
+            .map(serde_json::to_value)
+            .transpose()?
+            .unwrap_or_else(|| json!({}));
+        Ok(
+            json!({"bot":name,"workspace":workspace,"model":model,"effort":effort,
+            "instructions":instructions,"tools":tools,"settings":settings,
+            "compaction_instructions":me["compaction_instructions"],
+            "compaction_model":compaction_model}),
+        )
     }
 
     /// This bot's project's agents, as a name pattern: those named as it
