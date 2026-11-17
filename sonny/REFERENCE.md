@@ -1476,8 +1476,8 @@ has something on it, or is off the screen, no time shows.
   an agent, with `agent rm`. A store keeps `[sonny] task_worktrees` task
   folders, 15 by default, as Codex's app keeps its newest worktrees: past
   it, a start that made a folder removes the least recently active tasks'
-  (by their last turn's end) as `remove_task` does, never one working,
-  with a call waiting on its verdict or a question open, with uncommitted
+  (by their last turn's end) as `remove_task` does, never one working or
+  another agent works in, with a call waiting on its verdict or a question open, with uncommitted
   changes or submodules, a folder of its own or another daemon's, and its
   answer names those it removed. A start in a folder already there makes
   room for none.

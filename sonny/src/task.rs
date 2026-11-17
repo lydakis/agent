@@ -2092,6 +2092,9 @@ struct Found {
     bot: Option<Value>,
     /// A folder of the task's own, which only `discard` removes.
     own: bool,
+    /// Another agent's turn runs in it, as a side chat's or one started
+    /// in place there does.
+    used: bool,
 }
 
 impl Found {
@@ -2102,9 +2105,11 @@ impl Found {
             .unwrap_or(0)
     }
 
-    /// Working, or a folder of its own: kept before anything is read.
+    /// Working, worked in, or a folder of its own: kept before anything
+    /// is read.
     fn held(&self) -> bool {
         self.own
+            || self.used
             || (self.bot.as_ref())
                 .is_some_and(|bot| !bot["running_turn"].is_null() || !bot["waiting_on"].is_null())
     }
@@ -2224,7 +2229,29 @@ fn make_room(new: &str, (store, socket): (&Path, &Path), keep: u64, call: &str) 
                         continue;
                     }
                     let own = recorded_own(&name);
-                    found.push(Found { name, bot, own });
+                    found.push(Found {
+                        name,
+                        bot,
+                        own,
+                        used: false,
+                    });
+                }
+                // The folders the agents at work now work in, whichever
+                // agent's they are: a few, however many the store holds.
+                let Some(used) = runtime.block_on(at_work(&client)) else {
+                    runtime.block_on(client.close());
+                    return Vec::new();
+                };
+                let worktrees = home.join(".agent/worktrees");
+                let real = |path: &Path| std::fs::canonicalize(path).ok();
+                for task in &mut found {
+                    let folder = real(&worktrees.join(&task.name));
+                    task.used = (used.iter()).any(|dir| {
+                        dir.starts_with(worktrees.join(&task.name))
+                            || folder.as_ref().is_some_and(|folder| {
+                                real(dir).is_some_and(|dir| dir.starts_with(folder))
+                            })
+                    });
                 }
                 let mut asks = |task: &Found| {
                     let Some(bot) = &task.bot else {
@@ -2258,6 +2285,29 @@ fn make_room(new: &str, (store, socket): (&Path, &Path), keep: u64, call: &str) 
             .join()
             .unwrap_or_default()
     })
+}
+
+/// The folders the daemon's agents with a turn running work in, every
+/// page of them: none when they can't be read.
+async fn at_work(client: &agent_client::Client) -> Option<Vec<PathBuf>> {
+    let (mut dirs, mut after) = (Vec::new(), Value::Null);
+    loop {
+        let mut asked = json!({"active": true, "limit": 256});
+        if !after.is_null() {
+            asked["after"] = after;
+        }
+        let page = client.request("bots", asked).await.ok()?;
+        dirs.extend(
+            (page["bots"].as_array().into_iter().flatten())
+                .filter_map(|bot| bot["workspace"].as_str())
+                .filter(|dir| !dir.is_empty())
+                .map(PathBuf::from),
+        );
+        after = page["next_after"].clone();
+        if after.is_null() {
+            return Some(dirs);
+        }
+    }
 }
 
 /// Whether Sonny made `name` a folder of its own.
@@ -2499,6 +2549,7 @@ mod tests {
             name: name.into(),
             bot,
             own,
+            used: false,
         }
     }
 
@@ -2556,10 +2607,15 @@ mod tests {
         // Within the limit, nothing is read or taken.
         let mut none = |_: &Found| -> Result<(), String> { panic!("taken") };
         assert!(prune(tasks(), 7, &mut |_| panic!("read"), &mut none).is_empty());
-        // With none to take, none is, and the start goes on.
+        // With none to take, none is, and the start goes on: one another
+        // agent works in is held as its own agent at work is.
         let held = vec![
             found("shop.working", Some(1), true, false),
             found("shop.own", Some(1), false, true),
+            Found {
+                used: true,
+                ..found("shop.shared", Some(1), false, false)
+            },
         ];
         assert!(prune(held, 0, &mut |_| false, &mut |_| Ok(())).is_empty());
     }
