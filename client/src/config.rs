@@ -73,6 +73,7 @@
 //! sky_haiku_hold = 10           # minutes the title is held before it can pass
 //! tool_processes = 8            # processes Sonny runs for agents' tool calls at once in all; 0, the default, four times the CPUs
 //! lookout_waiting = 4096        # events from sources that wait for one agent, 1024 by default; past it newer ones are not kept, and its next note says so; 0 no limit
+//! lookout_trailer = "Reply only when it is urgent."  # what ends every lookout note, under a [lookout] header; by default when to reply; "" none
 //! default_permissions = "strict"   # the /permissions row a new lead starts in, auto by default
 //! browser_confirm = ["eval"]    # agent-browser actions the agent's gate approves; eval, download, upload and state by default
 //! project_colors = true         # experimental: a lead's reply about one followed project wears its color; /colors toggles it, off by default
@@ -675,6 +676,9 @@ pub struct Sonny {
     /// newer ones are not kept, and its next note says how many, from
     /// where and when. 0 for no limit.
     pub lookout_waiting: u64,
+    /// What ends every note the lookout sends, under a `[lookout]` header:
+    /// by default when to reply to it ([`LOOKOUT_TRAILER`]); empty for none.
+    pub lookout_trailer: String,
     /// What the lookout runs for news from outside, by name.
     pub sources: Vec<Source>,
     /// The person's own margin notes, `[sonny.notes.NAME]`, shown over
@@ -852,6 +856,12 @@ pub const TASK_WORKTREES: u64 = 15;
 /// one look; anything longer goes in the reply or a file it names.
 pub const MARGIN_NOTE_LINES: u64 = 40;
 
+/// What ends every lookout note unless `lookout_trailer` says otherwise:
+/// when to reply to it, since an agent hears the person's news in its own
+/// turn, which the person sees only if it replies.
+pub const LOOKOUT_TRAILER: &str = "This note is news for you, unseen by the person. Reply when it bears on \
+     what the person is doing now or is urgent; otherwise end your turn with an empty reply.";
+
 /// The narrowest `text_width` other than 0, the margin's own least width:
 /// a narrower column wraps a path or a line of code at every turn.
 pub const TEXT_WIDTH_LEAST: u64 = 40;
@@ -934,6 +944,7 @@ impl Default for Sonny {
             sky_haiku_hold: 10,
             tool_processes: 0,
             lookout_waiting: 1024,
+            lookout_trailer: LOOKOUT_TRAILER.to_owned(),
             chime: false,
             view: View::default(),
             text_width: TEXT_WIDTH,
@@ -1757,6 +1768,7 @@ fn parse(text: &str) -> Result<Config, String> {
                 "sky_haiku_hold",
                 "tool_processes",
                 "lookout_waiting",
+                "lookout_trailer",
                 "default_permissions",
                 "browser_confirm",
                 "project_colors",
@@ -1927,6 +1939,12 @@ fn parse(text: &str) -> Result<Config, String> {
                         _ => Err(invalid()),
                     })
                     .collect::<Result<_, _>>()?;
+                continue;
+            }
+            if key == "lookout_trailer" {
+                config.sonny.lookout_trailer = (value.as_str())
+                    .ok_or("sonny.lookout_trailer is a string, \"\" for none")?
+                    .to_owned();
                 continue;
             }
             let value = string(&format!("{name}.{key}"), value)?;
@@ -2977,6 +2995,17 @@ mod tests {
         let every = parse("[sonny]\ntask_tabs = \"every\"").unwrap();
         assert_eq!(every.sonny.task_tabs, TaskTabs::Every);
         assert!(parse("[sonny]\ntask_tabs = \"all\"").is_err());
+        assert_eq!(config.sonny.lookout_trailer, LOOKOUT_TRAILER);
+        let trailer = parse("[sonny]\nlookout_trailer = \"Say it all.\"").unwrap();
+        assert_eq!(trailer.sonny.lookout_trailer, "Say it all.");
+        assert_eq!(
+            parse("[sonny]\nlookout_trailer = \"\"")
+                .unwrap()
+                .sonny
+                .lookout_trailer,
+            ""
+        );
+        assert!(parse("[sonny]\nlookout_trailer = 1").is_err());
         let closed = parse("[sonny]\nmargin_opens = \"unless-closed\"").unwrap();
         assert_eq!(closed.sonny.margin_opens, MarginOpens::UnlessClosed);
         assert!(!config.sonny.chime);

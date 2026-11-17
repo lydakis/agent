@@ -346,6 +346,7 @@ at its model's own effort (`AGENT_EFFORT` when its model is
 | Task folders kept in `~/.agent/worktrees` | `[sonny] task_worktrees` (15 by default, as Codex's app keeps worktrees; at least 1) | |
 | The daemon started with the machine | `[sonny] start_at_boot` (true or false, the default) | |
 | News from outside for the lookout | `[sonny.sources.NAME] command`, `every` | |
+| What ends every lookout note | `[sonny] lookout_trailer` (by default when to reply: when the news bears on what the person is doing now or is urgent, and otherwise with an empty reply; `""` for none, typed as `none` in `/config`) | |
 
 `start_task` applies them in code, so the lead's prompt says nothing about
 effort; the lead names a `model` or `effort` only for one the person asks
