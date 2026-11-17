@@ -5374,10 +5374,23 @@ impl Service {
                 self.configure(bot, bot_id, change).await
             }
             Command::Repair { bot, bot_id } => {
+                // A running turn holds its window in memory and stores what
+                // follows it, so the repair waits for the turn to end.
+                if let Some(turn) = self.active.get(&bot).and_then(Active::running) {
+                    return Err(Error::with(
+                        "bot_busy",
+                        format!("turn {turn} of {bot} is running"),
+                    )
+                    .facts(json!({"running_turn":turn})));
+                }
                 let name = bot.clone();
                 store
                     .op("repair_blank", move |db| {
                         let id = db.identity(&name, bot_id)?;
+                        if let Some(turn) = db.inspect(&name)?.running_turn {
+                            return Err(Error::with("bot_busy", format!("turn {turn} is running"))
+                                .facts(json!({"running_turn":turn})));
+                        }
                         let nodes = db.anthropic_history(&name)?;
                         let repaired = db.repair_blank(&nodes)?;
                         Ok(json!({"bot":name,"bot_id":id,"repaired":repaired}))
@@ -8767,6 +8780,35 @@ mod tests {
             Some(json!({"model": "openai/other", "instructions": "new"}))
         );
         assert!(service.kept.contains("Bob"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn a_repair_waits_for_the_running_turn() {
+        let dir = std::env::temp_dir().join(format!("agent-repair-busy-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let (store, _publications) = Store::open(&dir.join("state.sqlite")).await.unwrap();
+        let turn = running(&store, &["Bob".into()]).await[0].1;
+        let mut service = bare_service(&store);
+        let output = Output::writer(tokio::io::sink());
+        let repair = || Command::Repair {
+            bot: "Bob".into(),
+            bot_id: None,
+        };
+        let busy = service
+            .dispatch(repair(), 0, &output, Value::Null, Bound::default())
+            .await
+            .unwrap_err();
+        assert_eq!(busy.code, "bot_busy");
+        store
+            .op("finish", move |db| db.finish(turn, None))
+            .await
+            .unwrap();
+        let answer = service
+            .dispatch(repair(), 0, &output, Value::Null, Bound::default())
+            .await
+            .unwrap();
+        assert_eq!(answer["repaired"], json!([]));
         let _ = std::fs::remove_dir_all(dir);
     }
 

@@ -4186,11 +4186,13 @@ places, where its quotes find theirs, as Pi writes Bedrock's required text.
 A refusal of the kind still repairs the nodes its request sent: a reply's or
 result's blank block goes, the item padded with JSON whitespace to its size
 (content left with nothing is the text `<empty>`), and a prompt's blank part
-reads `<empty>`; what a request without thinking saves, and any size a
-placeholder adds, move every later node's totals with it. The call goes
-again at once, its `retry` event listing each node and what it held under
+reads `<empty>`, in the prompt's stub too; what a request without thinking
+saves, and any size a placeholder adds to the prompt or its stub, move every
+later node's totals and elision savings with it. The call goes again at
+once, its `retry` event listing each node and what it held under
 `repaired`. `repair` (protocol 86; `agent repair --bot NAME`) does the same
-to the bot's whole history and answers the same list. Responses providers
+to the bot's whole history and answers the same list; it answers `bot_busy`
+while the bot runs a turn. Responses providers
 take blank text, so a Responses bot's history is left as it is.
 
 ### Compaction

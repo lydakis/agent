@@ -8862,31 +8862,58 @@ impl Database {
     pub fn repair_blank(&mut self, nodes: &[i64]) -> Result<Vec<Value>> {
         let mut repaired = Vec::new();
         for &node in nodes {
-            let read: Option<(Vec<u8>, i64, i64)> = self
+            let read: Option<(Vec<u8>, i64, Option<Vec<u8>>)> = self
                 .conn
-                .prepare_cached("SELECT item,thinking,elided FROM nodes WHERE id=?")?
+                .prepare_cached(
+                    "SELECT n.item,n.thinking,s.item FROM nodes n
+                     LEFT JOIN stubs s ON s.node=n.id WHERE n.id=?",
+                )?
                 .query_row([node], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
                 .optional()?;
-            let Some((item, was, elided)) = read else {
+            let Some((item, was, stub)) = read else {
                 continue;
             };
-            let Some((fixed, removed)) = unblanked(&item) else {
+            let fixed = unblanked(&item);
+            let stub_fixed = stub.as_deref().and_then(unblanked);
+            if fixed.is_none() && stub_fixed.is_none() {
                 continue;
+            }
+            // A stub quotes its node, so what it held blank the node held.
+            let (fixed, removed) = match fixed {
+                Some(fixed) => fixed,
+                None => (
+                    item.clone(),
+                    stub_fixed
+                        .as_ref()
+                        .map(|(_, r)| r.clone())
+                        .unwrap_or_default(),
+                ),
             };
             // What a request without thinking sends of it changes with it:
             // its thinking bytes, and every later node's running total.
-            // A prompt grown by its placeholder grows every later total;
-            // one sent as its stub saves as much more, so what is sent of
-            // it, and every elision version past it, stays as it was.
+            // A prompt grown by its placeholder grows every later total.
+            // One sent as its stub saves what it grew less what its stub
+            // grew, so what is sent of it, and every elision version past
+            // it, stays true.
             let thinking = super::thinking_bytes(&fixed) as i64;
             let grown = fixed.len() as i64 - item.len() as i64;
-            let saves = if elided > 0 { grown } else { 0 };
+            let saves = match (&stub, &stub_fixed) {
+                (Some(stub), Some((repaired, _))) => {
+                    grown - (repaired.len() as i64 - stub.len() as i64)
+                }
+                (Some(_), None) => grown,
+                (None, _) => 0,
+            };
             let tx = self.conn.transaction()?;
             tx.prepare_cached("UPDATE nodes SET item=?,thinking=?,elided=elided+? WHERE id=?")?
                 .execute(params![fixed, thinking, saves, node])?;
+            if let Some((repaired, _)) = &stub_fixed {
+                tx.prepare_cached("UPDATE stubs SET item=? WHERE node=?")?
+                    .execute(params![repaired, node])?;
+            }
             const BELOW: &str = "WITH RECURSIVE below(id) AS (
                 SELECT ?1 UNION ALL SELECT n.id FROM nodes n JOIN below b ON n.parent=b.id)";
-            if thinking != was || grown != 0 {
+            if thinking != was || grown != 0 || saves != 0 {
                 tx.prepare_cached(&format!(
                     "{BELOW} UPDATE nodes SET total_thinking=total_thinking+?2,
                         total_bytes=total_bytes+?3,total_elided=total_elided+?4
@@ -20614,8 +20641,8 @@ mod tests {
             br#"{"content":[{"text":"done","type":"text"}],"role":"assistant"}"#,
             // Blank text beside thinking: thinking is all it keeps.
             br#"{"content":[{"signature":"s","thinking":"","type":"thinking"},{"text":"\u200b","type":"text"}],"role":"assistant"}"#,
-            // A blank prompt that quotes: its quote stays in its place.
-            br#"{"content":[{"text":"","type":"text"},{"text":"quoted","type":"text"}],"role":"user"}"#,
+            // A blank prompt that quotes: its quotes stay in their places.
+            br#"{"content":[{"text":"","type":"text"},{"text":"quoted","type":"text"},{"text":" ","type":"text"}],"role":"user"}"#,
             // After it, words.
             br#"{"content":[{"text":"next","type":"text"}],"role":"user"}"#,
         ];
@@ -20652,6 +20679,11 @@ mod tests {
                 [],
             )
             .unwrap();
+        // Its stub quotes its blank quote as well.
+        let stub = br#"{"content":[{"text":"\n[1 picture(s) sent with this message, elided from this request]","type":"text"},{"text":"quoted","type":"text"},{"text":" ","type":"text"}],"role":"user"}"#;
+        db.connection()
+            .execute("INSERT INTO stubs(node,item) VALUES(6,?)", [&stub[..]])
+            .unwrap();
         // What goes when elided, before the repair.
         let sent = |db: &Database| -> Vec<i64> {
             (1..=7)
@@ -20676,7 +20708,7 @@ mod tests {
                 json!({"node":2,"removed":["\n\n"]}),
                 json!({"node":3,"removed":[" "]}),
                 json!({"node":5,"removed":["\u{200b}"]}),
-                json!({"node":6,"removed":[""]}),
+                json!({"node":6,"removed":["", " "]}),
             ]
         );
         // Each node's thinking bytes are what it loses without thinking now,
@@ -20724,20 +20756,34 @@ mod tests {
                     value["content"],
                     json!([
                         {"text": "<empty>", "type": "text"},
-                        {"text": "quoted", "type": "text"}
+                        {"text": "quoted", "type": "text"},
+                        {"text": "<empty>", "type": "text"}
                     ])
                 ),
                 _ => assert_eq!(now, was),
             }
         }
-        // The stub saves the placeholder's bytes too: what goes elided is
-        // as it was, and the elision version past it saved as much more.
-        assert_eq!(sent(&db), before);
+        // The stub reads `<empty>` in its quote's place too, and grows by
+        // it: what goes elided grows by as much from node 6 on, and the
+        // elision version past it saves what the prompt grew past that.
+        let repaired: Vec<u8> = db
+            .conn
+            .query_row("SELECT item FROM stubs WHERE node=6", [], |r| r.get(0))
+            .unwrap();
+        let value: Value = serde_json::from_slice(&repaired).unwrap();
+        assert_eq!(value["content"][2]["text"], "<empty>");
+        let stub_grew = repaired.len() as i64 - stub.len() as i64;
+        assert_eq!(stub_grew, "<empty>".len() as i64 - 1);
+        let after: Vec<i64> = (before.iter().zip(1..))
+            .map(|(&was, id)| if id >= 6 { was + stub_grew } else { was })
+            .collect();
+        assert_eq!(sent(&db), after);
         let version: i64 = db
             .conn
             .query_row("SELECT saved FROM elisions WHERE node=7", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 10 + "<empty>".len() as i64);
+        let grew = "<empty>".len() as i64 + "<empty>".len() as i64 - 1;
+        assert_eq!(version, 10 + grew - stub_grew);
         // Repaired once, nothing is left to take.
         assert!(db.repair_blank(&all).unwrap().is_empty());
     }
