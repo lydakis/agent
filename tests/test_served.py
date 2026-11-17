@@ -543,6 +543,62 @@ class ServedToolTests(ModelFixture):
         self.assertIn('ran', got)
         self.assertEqual((self.path / 'made').read_text(), 'done\n')
 
+    def yielding_script(self, code):
+        """A code-mode lead runs `code`, then waits on the handle its call
+        is answered with, if any. Every result the turn's calls got, in
+        order."""
+        script = json.loads(subprocess.run([str(self.sonny), 'mcp', 'tool'], env={**clean_env(), 'HOME': str(self.path)},
+                                           check=True, capture_output=True, text=True).stdout)
+
+        def respond(request, user):
+            outputs = [i['output'] for i in request['input']
+                       if i.get('type') in ('function_call_output', 'custom_tool_call_output')]
+            if not outputs:
+                return [['exec', code]]
+            first = outputs[0] if isinstance(outputs[0], str) else ''.join(p.get('text', '') for p in outputs[0])
+            handle = json.loads(first).get('handle') if first.startswith('{') else None
+            if handle and len(outputs) == 1:
+                return [['wait', {'handles': [handle], 'timeout_ms': 20000}]]
+            return 'done'
+        self.model.respond = respond
+        made = dict(tools=['echo', 'shell', 'wait'], declare=[script], settings={'steps_only': ['*']})
+        self.daemon.request('create', bot='calc.lead', workspace=str(self.path), model='openai/synthetic-model',
+                            instructions='Lead.', **made)
+        self.keeps_its_tools(self.host(), 'calc.lead', **made)
+        turn = self.daemon.request('submit', bot='calc.lead', request_id='go', prompt='go')['result']['message']
+        self.assertEqual(self.daemon.finished(turn, 30)['data']['status'], 'completed')
+        events, after = [], 0
+        while page := self.daemon.request('events', bot='calc.lead', after=after, limit=256)['result']['events']:
+            events, after = events + page, page[-1]['cursor']
+        return [node_item(self.daemon, 'calc.lead', e['data']['node'])['result']['output']
+                for e in events if e['turn'] == turn and e['event'] == 'tool_completed']
+
+    def test_a_script_still_running_at_its_yield_time_hands_back_its_handle_and_wait_its_result(self):
+        results = self.yielding_script('// @exec: {"yield_time_ms": 500}\ntext("started");\n'
+                                       'const r = await tools.shell({command: "sleep 2; echo ran"});\n'
+                                       'text(JSON.parse(r.content[0].text).stdout.trim());')
+        yielded = json.loads(results[0])
+        self.assertTrue(yielded['yielded'], yielded)
+        self.assertTrue(yielded['output'].startswith('Script running\n'), yielded)
+        self.assertTrue(yielded['output'].endswith('Output:\nstarted'), yielded)
+        whole = json.loads(results[1])['results'][yielded['handle']]['answer']
+        self.assertTrue(whole.startswith('Script completed\n') and whole.endswith('Output:\nstarted\nran'), whole)
+
+    def test_a_script_yields_at_once_on_yield_control(self):
+        results = self.yielding_script('text("early"); yield_control();\n'
+                                       'const r = await tools.shell({command: "sleep 1; echo late"});\n'
+                                       'text(JSON.parse(r.content[0].text).stdout.trim());')
+        yielded = json.loads(results[0])
+        self.assertTrue(yielded['yielded'] and yielded['output'].endswith('Output:\nearly'), yielded)
+        whole = json.loads(results[1])['results'][yielded['handle']]['answer']
+        self.assertTrue(whole.endswith('Output:\nearly\nlate'), whole)
+
+    def test_a_script_that_ends_within_its_yield_time_is_answered_as_it_ends(self):
+        results = self.yielding_script('const r = await tools.shell({command: "sleep 1; echo quick"});\n'
+                                       'text(JSON.parse(r.content[0].text).stdout.trim());')
+        self.assertEqual(len(results), 1, results)
+        self.assertTrue(results[0].startswith('Script completed\n') and results[0].endswith('quick'), results)
+
     def test_a_script_s_pictures_reach_the_model_in_order_with_its_text(self):
         server = Path(__file__).with_name('mcp_server.py')
         (self.path / '.agent').mkdir(exist_ok=True)

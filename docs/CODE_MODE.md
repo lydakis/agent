@@ -804,6 +804,17 @@ Sonny's changes, each after the one of Agent's it uses:
 - **After 4:** a default, for all its agents or by model, that it sets on
   the bots it creates to run them code mode only, and the evaluation.
 - **After 6:** the journal, and a second host.
+- **After 7, built:** `exec` yields a script still running at its
+  `yield_time_ms`, 30,000 ms by default as Codex's, with what it said so
+  far headed `Script running`, and at once on `yield_control()`; the
+  model then `wait`s on the handle for the whole result. A script's own
+  time, its `timeout_ms` (600,000 ms at most), counts its JavaScript
+  only: awaiting a server's tool, a step or a gate spends none of it.
+  Until the yield, the call's own time bounds it too. A script run on a
+  linked machine does not yield yet. Tested through the tool host
+  (tests/test_served.py): handed back at its yield time and collected
+  whole by `wait`; handed back at once by `yield_control()`; a script
+  that ends first answered as it ends.
 
 ## Gates and screens
 
