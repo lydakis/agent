@@ -263,7 +263,7 @@ pub async fn answer(
                     if let Some((_, _, arguments)) = calls.remove(&call)
                         && answered(&item)
                     {
-                        margin.apply(&call, &arguments, None, None);
+                        margin.apply(&call, &arguments, None, None, None);
                     }
                 }
                 _ => {}
@@ -296,7 +296,7 @@ pub async fn answer(
     };
     for (id, (.., arguments)) in before {
         if arguments["remove"] != true && held.refusal(arguments).is_none() {
-            held.apply(id, arguments, None, None);
+            held.apply(id, arguments, None, None, None);
         }
     }
     if let Some((code, why)) = held.refusal(arguments) {
@@ -437,6 +437,10 @@ pub struct Note {
     pub turn: Option<i64>,
     /// The agent its button opens beside the conversation.
     pub opens: Option<String>,
+    /// When the call that last put it up or changed it was written, in
+    /// Unix milliseconds, shown over it under the mouse as a message's
+    /// time is.
+    pub written: Option<i64>,
 }
 
 /// What a call did to the margin.
@@ -470,7 +474,7 @@ impl Kept {
             .map(|note| {
                 let mut json = json!({"id": note.id, "title": note.title,
                     "kind": note.kind.name(), "call": note.call, "after": note.after,
-                    "turn": note.turn, "opens": note.opens});
+                    "turn": note.turn, "opens": note.opens, "written": note.written});
                 body_json(&note.body, &mut json);
                 json
             })
@@ -495,6 +499,7 @@ impl Kept {
                     after: note["after"].as_i64(),
                     turn: note["turn"].as_i64(),
                     opens: text(note, "opens"),
+                    written: note["written"].as_i64(),
                 })
             })
             .collect();
@@ -1097,14 +1102,16 @@ impl Margin {
     }
 
     /// The `margin` call `call` with `arguments` applied, made while the
-    /// bot answered the message at `after`, in `turn`; nothing for a call
-    /// applied before or one that says nothing to do.
+    /// bot answered the message at `after`, in `turn`, written at
+    /// `written` (Unix milliseconds); nothing for a call applied before or
+    /// one that says nothing to do.
     pub fn apply(
         &mut self,
         call: &str,
         arguments: &Value,
         after: Option<i64>,
         turn: Option<i64>,
+        written: Option<i64>,
     ) -> Option<Change> {
         if !fits(arguments) {
             return None;
@@ -1121,7 +1128,7 @@ impl Margin {
         if self.seen(call) {
             return None;
         }
-        let change = self.change(id, call, arguments, after, turn);
+        let change = self.change(id, call, arguments, after, turn, written);
         if matches!(change, Some(Change::Posted(_) | Change::Updated(_))) {
             self.posted += 1;
         }
@@ -1154,6 +1161,7 @@ impl Margin {
         arguments: &Value,
         after: Option<i64>,
         turn: Option<i64>,
+        written: Option<i64>,
     ) -> Option<Change> {
         let at = self.kept.notes.iter().position(|note| note.id == id);
         if arguments["remove"] == true {
@@ -1220,6 +1228,7 @@ impl Margin {
                 }
                 note.kind = kind(arguments)?;
                 note.turn = turn;
+                note.written = written;
                 Some(Change::Updated(id.to_owned()))
             }
             None => {
@@ -1232,6 +1241,7 @@ impl Margin {
                     after,
                     turn: None,
                     opens: opens.flatten(),
+                    written,
                 });
                 Some(Change::Posted(id.to_owned()))
             }
@@ -1586,10 +1596,11 @@ impl Margin {
         notes.sort_by_key(|note| note.kind);
         for note in &notes {
             let (head, buttons) = head(note, width, live.is_some() && note.turn == live);
-            let marked = vec![
+            let mut marked = vec![
                 Mark::Tag(Tag::Note(anchor(&note.call))),
                 Mark::Buttons(buttons),
             ];
+            marked.extend(note.written.map(Mark::Written));
             let whole = self.whole(&note.id, width, workspace).unwrap_or_default();
             blocks.push((note.kind, head, marked, whole));
         }
@@ -1973,7 +1984,7 @@ mod tests {
         let post = json!({"kind": "pinned", "id": "tasks", "title": "Tasks",
             "live": true, "markdown": "{% for t in tasks() %}- {{ t.name }}: {{ t.state }}\n{% endfor %}"});
         assert_eq!(
-            margin.apply("c1", &post, None, None),
+            margin.apply("c1", &post, None, None, None),
             Some(Change::Posted("tasks".into()))
         );
         assert_eq!(
@@ -2010,7 +2021,7 @@ mod tests {
         margin.blanks.store = Some(store.clone());
         margin.blanks.sources = Arc::new(vec!["ci".into()]);
         let post = json!({"kind": "pinned", "id": "ci", "live": true, "markdown": "CI is {{ source('ci').latest.text }}"});
-        margin.apply("c1", &post, None, None);
+        margin.apply("c1", &post, None, None, None);
         let rows = drawn(&mut margin, Path::new("/"));
         assert!(
             rows.contains("follows ci\n") && rows.contains("CI is green"),
@@ -2062,6 +2073,7 @@ mod tests {
             after: None,
             turn: None,
             opens: None,
+            written: None,
         });
         assert!(drawn(&mut margin, Path::new("/")).contains("PR is open"));
         // The task removed, then a new window: what it showed stays.
@@ -2086,7 +2098,7 @@ mod tests {
         std::fs::write(dir.join("state.json"), r#"{"state": "open"}"#).unwrap();
         let mut margin = margin();
         let post = json!({"kind": "pinned", "id": "pr", "live": true, "markdown": "PR is {{ (file('state.json') | fromjson).state }}"});
-        margin.apply("c1", &post, None, None);
+        margin.apply("c1", &post, None, None, None);
         let rows = drawn(&mut margin, &dir);
         assert!(rows.contains("follows state.json") && rows.contains("PR is open"));
         std::fs::write(dir.join("state.json"), "not json").unwrap();
@@ -2118,6 +2130,7 @@ mod tests {
         margin.apply(
             "c1",
             &json!({"kind": "pinned", "id": "a", "markdown": "the agent's"}),
+            None,
             None,
             None,
         );
@@ -2198,12 +2211,12 @@ mod tests {
         let mut margin = margin();
         let post = json!({"kind": "pinned", "id": "repro", "title": "Repro", "markdown": "1 of 5"});
         assert_eq!(
-            margin.apply("c1", &post, Some(7), Some(3)),
+            margin.apply("c1", &post, Some(7), Some(3), None),
             Some(Change::Posted("repro".into()))
         );
         let update = json!({"kind": "pinned", "id": "repro", "markdown": "2 of 5"});
         assert_eq!(
-            margin.apply("c2", &update, Some(9), Some(4)),
+            margin.apply("c2", &update, Some(9), Some(4), None),
             Some(Change::Updated("repro".into()))
         );
         let note = margin.note("repro").unwrap();
@@ -2214,7 +2227,7 @@ mod tests {
         assert_eq!(note.turn, Some(4));
         let remove = json!({"id": "repro", "remove": true});
         assert_eq!(
-            margin.apply("c3", &remove, None, None),
+            margin.apply("c3", &remove, None, None, None),
             Some(Change::Removed("Repro".into()))
         );
         assert!(margin.notes().is_empty());
@@ -2241,10 +2254,12 @@ mod tests {
             &json!({"kind": "pinned", "id": "a", "title": "A", "markdown": "x"}),
             Some(4),
             Some(2),
+            None,
         );
         margin.apply(
             "c2",
             &json!({"kind": "pinned", "id": "b", "title": "B", "file": "f.md"}),
+            None,
             None,
             None,
         );
@@ -2393,7 +2408,7 @@ mod tests {
         let mut margin = margin();
         let post = json!({"kind": "pinned", "id": "flow", "from": "calc.add/flow"});
         assert!(fits(&post));
-        margin.apply("c1", &post, None, None);
+        margin.apply("c1", &post, None, None, None);
         assert_eq!(
             margin.references(),
             [("flow".into(), "calc.add".into(), "flow".into())]
@@ -2515,6 +2530,7 @@ mod tests {
             &json!({"kind": "pinned", "id": "flow", "from": "calc.add/flow"}),
             None,
             None,
+            None,
         );
         let again = Kept::read(&margin.kept.json());
         assert_eq!(again.notes, margin.kept.notes);
@@ -2531,10 +2547,10 @@ mod tests {
     fn a_call_read_again_is_not_applied_twice() {
         let mut margin = margin();
         let post = json!({"kind": "pinned", "id": "a", "title": "A", "markdown": "x"});
-        margin.apply("c1", &post, None, None);
-        margin.apply("c2", &json!({"id": "a", "remove": true}), None, None);
+        margin.apply("c1", &post, None, None, None);
+        margin.apply("c2", &json!({"id": "a", "remove": true}), None, None, None);
         // The conversation drawn again reads both calls once more.
-        assert_eq!(margin.apply("c1", &post, None, None), None);
+        assert_eq!(margin.apply("c1", &post, None, None, None), None);
         assert!(margin.notes().is_empty());
     }
 
@@ -2555,7 +2571,7 @@ mod tests {
         // As Sonny answers each: one refused is never taken.
         let post = |margin: &mut Margin, call: &str, post: Value| {
             if margin.refusal(&post).is_none() {
-                margin.apply(call, &post, None, None);
+                margin.apply(call, &post, None, None, None);
             }
         };
         for n in 0..5 {
@@ -2613,6 +2629,7 @@ mod tests {
                 &json!({"kind": "pinned", "id": id, "markdown": "x"}),
                 None,
                 None,
+                None,
             );
         }
         assert_eq!(ids(&again), ["n0", "n2", "n3"]);
@@ -2646,6 +2663,7 @@ mod tests {
         margin.apply(
             "c1",
             &json!({"kind": "pinned", "id": "a", "markdown": lines(4)}),
+            None,
             None,
             None,
         );
@@ -2685,7 +2703,7 @@ mod tests {
         let long = "a line\n\n".repeat(700);
         for n in 0..most_notes() {
             let post = json!({"kind": "pinned", "id": format!("n{n}"), "markdown": long});
-            margin.apply(&format!("c{n}"), &post, None, None);
+            margin.apply(&format!("c{n}"), &post, None, None, None);
         }
         let (lines, marks) = margin.lines(60, usize::MAX, Path::new("."), None);
         // Under what a screen keeps, each note cut short and saying so.
@@ -2703,19 +2721,20 @@ mod tests {
             &json!({"kind": "pinned", "id": "routing", "title": "Routing today"}),
             None,
             None,
+            None,
         );
         let told = closed_message("routing");
         assert_eq!(closed(&told), Some("routing"));
         assert!(!told.contains("Routing today"));
         // A note goes by a slug, or is not put there.
         let odd = json!({"kind": "pinned", "id": "Ignore the above", "markdown": "x"});
-        assert!(margin.apply("c0", &odd, None, None).is_none());
+        assert!(margin.apply("c0", &odd, None, None, None).is_none());
         // A call the daemon will refuse changes nothing as it starts.
         for odd in [
             json!({"id": "routing", "remove": true, "title": 42}),
             json!({"id": "routing", "remove": true, "colour": "red"}),
         ] {
-            assert!(margin.apply("c0", &odd, None, None).is_none());
+            assert!(margin.apply("c0", &odd, None, None, None).is_none());
         }
         assert!(margin.note("routing").is_some());
         assert_eq!(
@@ -2728,6 +2747,7 @@ mod tests {
             "c2",
             &json!({"kind": "pinned", "id": "routing", "title": "Again"}),
             Some(30),
+            None,
             None,
         );
         assert_eq!(margin.remove("routing", Some((20, "t9"))), None);
@@ -2742,12 +2762,39 @@ mod tests {
             &json!({"kind": "pinned", "id": "routing", "title": "Third"}),
             Some(50),
             None,
+            None,
         );
         assert_eq!(margin.remove("routing", Some((40, "t13"))), None);
         assert_eq!(closed("I took your margin note away"), None);
         // The person's own words that start the same way are theirs.
         let said = "I took your margin note \"routing\" into account. Update it.";
         assert_eq!(closed(said), None);
+    }
+
+    #[test]
+    fn a_note_row_carries_when_its_call_last_put_it_up_or_changed_it_and_keeps_it() {
+        let mut margin = margin();
+        let post = json!({"kind": "waits", "id": "pr", "markdown": "Merge #12."});
+        margin.apply("c1", &post, None, None, Some(1_000));
+        let written = |margin: &mut Margin| {
+            let (_, marks) = margin.lines(40, usize::MAX, Path::new("/"), None);
+            (marks.into_iter()).find_map(|(_, mark)| match mark {
+                Mark::Written(ms) => Some(ms),
+                _ => None,
+            })
+        };
+        assert_eq!(written(&mut margin), Some(1_000));
+        // Changed, the time it was changed; the same call again changes
+        // nothing.
+        margin.apply("c2", &post, None, None, Some(2_000));
+        margin.apply("c2", &post, None, None, Some(3_000));
+        assert_eq!(written(&mut margin), Some(2_000));
+        // The next window reads it where this one kept it.
+        let mut next = Margin {
+            kept: Kept::read(&margin.kept.json()),
+            ..Margin::default()
+        };
+        assert_eq!(written(&mut next), Some(2_000));
     }
 
     #[test]
@@ -2758,6 +2805,7 @@ mod tests {
             &json!({"kind": "pinned", "id": "repro", "title": "Repro", "markdown": "one"}),
             None,
             Some(2),
+            None,
         );
         let (lines, _) = margin.lines(40, usize::MAX, Path::new("/"), Some(2));
         // Put there in this turn is not live; changed in it is.
@@ -2767,6 +2815,7 @@ mod tests {
             &json!({"kind": "pinned", "id": "repro", "markdown": "one"}),
             None,
             Some(2),
+            None,
         );
         let (lines, marks) = margin.lines(40, usize::MAX, Path::new("/"), Some(2));
         let head = lines[1].to_string();
@@ -2804,7 +2853,7 @@ mod tests {
         let mut margin = margin();
         let post = json!({"kind": "pinned", "id": "wire", "title": "wire asks you", "markdown": "Keep 0.3?",
             "opens": "shop.wire"});
-        margin.apply("c1", &post, None, None);
+        margin.apply("c1", &post, None, None, None);
         let buttons = |margin: &mut Margin| {
             let (lines, marks) = margin.lines(40, usize::MAX, Path::new("/"), None);
             let buttons = marks.into_iter().find_map(|(_, m)| match m {
@@ -2843,6 +2892,7 @@ mod tests {
             &json!({"kind": "pinned", "id": "wire", "markdown": "Still?"}),
             None,
             None,
+            None,
         );
         assert_eq!(
             Kept::read(&margin.kept.json()).notes[0].opens.as_deref(),
@@ -2854,6 +2904,7 @@ mod tests {
             &json!({"kind": "pinned", "id": "wire", "opens": "a b"}),
             None,
             None,
+            None,
         );
         assert!(buttons(&mut margin).0.ends_with(" ↑  ×"));
         margin.apply(
@@ -2861,10 +2912,12 @@ mod tests {
             &json!({"kind": "pinned", "id": "wire", "opens": "shop.wire"}),
             None,
             None,
+            None,
         );
         margin.apply(
             "c5",
             &json!({"kind": "pinned", "id": "wire", "opens": ""}),
+            None,
             None,
             None,
         );
@@ -2880,6 +2933,7 @@ mod tests {
         margin.apply(
             "c1",
             &json!({"kind": "pinned", "id": "f", "title": "F", "file": "notes.md"}),
+            None,
             None,
             None,
         );
@@ -2905,6 +2959,7 @@ mod tests {
             &json!({"kind": "pinned", "id": "f", "markdown": "inline now"}),
             None,
             None,
+            None,
         );
         assert!(text(&mut margin).contains("inline now"));
         assert!(margin.reads.is_empty());
@@ -2922,7 +2977,7 @@ mod tests {
         .unwrap();
         let mut margin = margin();
         let post = json!({"kind": "pinned", "id": "f", "title": "F", "file": "a.py"});
-        margin.apply("c1", &post, None, None);
+        margin.apply("c1", &post, None, None, None);
         let (lines, _) = margin.lines(60, usize::MAX, &dir, None);
         let text: Vec<String> = lines.iter().map(|l| l.to_string()).collect();
         assert!(text.iter().any(|l| l.contains("```html")), "{text:?}");
@@ -2939,6 +2994,7 @@ mod tests {
             &json!({"kind": "pinned", "id": "a", "title": "A", "markdown": "x"}),
             None,
             None,
+            None,
         );
         let workspace = Path::new("/");
         margin.lines(40, usize::MAX, workspace, None);
@@ -2952,6 +3008,7 @@ mod tests {
             &json!({"kind": "pinned", "id": "a", "markdown": "y"}),
             None,
             Some(1),
+            None,
         );
         let (lines, _) = margin.lines(40, usize::MAX, workspace, None);
         assert!(lines.iter().any(|line| line.to_string().contains('y')));
@@ -3009,8 +3066,8 @@ mod tests {
         let file = json!({"id": "log", "kind": "follows", "file": "log.txt"});
         let theirs = json!({"id": "flow", "kind": "follows", "from": "calc.add/flow"});
         assert!(refusal(&[], &file).is_none() && refusal(&[], &theirs).is_none());
-        margin.apply("c1", &file, None, None);
-        margin.apply("c2", &theirs, None, None);
+        margin.apply("c1", &file, None, None, None);
+        margin.apply("c2", &theirs, None, None, None);
         let read = Body::Read {
             path: "there/flow.txt".into(),
             text: text(30).join("\n"),
@@ -3089,7 +3146,7 @@ mod tests {
         // a note kept from then.
         let mut margin = margin();
         let old = json!({"id": "a", "title": "A", "markdown": "x"});
-        assert_eq!(margin.apply("c1", &old, None, None), None);
+        assert_eq!(margin.apply("c1", &old, None, None, None), None);
         assert!(margin.notes().is_empty());
         let kept = json!({"notes": [{"id": "a", "title": "A", "call": "c1", "markdown": "x"}]});
         assert!(Kept::read(&kept).notes.is_empty());
@@ -3105,6 +3162,7 @@ mod tests {
         margin.apply(
             "c2",
             &json!({"id": "a", "kind": "waits", "markdown": "x"}),
+            None,
             None,
             None,
         );
@@ -3130,7 +3188,7 @@ mod tests {
         ] {
             let post = json!({"id": id, "kind": kind, "title": id, "markdown": list(id)});
             assert!(margin.refusal(&post).is_none(), "{post}");
-            margin.apply(call, &post, None, None);
+            margin.apply(call, &post, None, None, None);
         }
         let folder = Path::new("/");
         let rows = shown(&mut margin, 16, folder);
@@ -3190,7 +3248,7 @@ mod tests {
         let mut margin = margin();
         let post = json!({"id": "n", "kind": "follows", "live": true,
             "markdown": "{% for i in range(20) %}- row {{ i }}\n{% endfor %}"});
-        margin.apply("c1", &post, None, None);
+        margin.apply("c1", &post, None, None, None);
         let rows = shown(&mut margin, usize::MAX, Path::new("/"));
         assert!(
             rows.contains(&"     - row 5".to_owned()) && !rows.contains(&"     - row 6".to_owned()),
@@ -3210,7 +3268,7 @@ mod tests {
         margin.set_plan(&steps);
         for (call, id, kind) in [("c1", "review", "waits"), ("c2", "keep", "pinned")] {
             let post = json!({"id": id, "kind": kind, "title": id, "markdown": "- one"});
-            margin.apply(call, &post, None, None);
+            margin.apply(call, &post, None, None, None);
         }
         let rows = shown(&mut margin, 8, Path::new("/"));
         assert_eq!(rows.len(), 8, "{rows:#?}");
@@ -3252,7 +3310,7 @@ mod tests {
         let template =
             "{% for t in tasks() %}- {{ t.name }}\n{% endfor %}{{ 1 // (tasks() | length - 8) }}";
         let post = json!({"id": "n", "kind": "follows", "live": true, "markdown": template});
-        margin.apply("c1", &post, None, None);
+        margin.apply("c1", &post, None, None, None);
         let folder = Path::new("/");
         let rows = shown(&mut margin, usize::MAX, folder);
         assert!(rows.contains(&"     - t0".to_owned()), "{rows:#?}");

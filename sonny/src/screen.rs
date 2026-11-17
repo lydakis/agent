@@ -127,6 +127,10 @@ pub enum Mark {
     /// A project's bar down the row's first column, in the color at this
     /// slot ([`crate::look::bar`]), however it is wrapped.
     Bar(u8),
+    /// The first row of a margin note, last put up or changed at this
+    /// time, in Unix milliseconds: shown over it under the mouse, as a
+    /// message's time is.
+    Written(i64),
 }
 
 /// A row on the screen: one of the conversation's rows, or the part of
@@ -162,6 +166,8 @@ struct Row {
     opens: bool,
     /// The project bar down its first column, by slot.
     bar: Option<u8>,
+    /// A margin note's first row: when it was last put up or changed.
+    written: Option<i64>,
 }
 
 impl Row {
@@ -174,6 +180,7 @@ impl Row {
             buttons: Vec::new(),
             opens: false,
             bar: None,
+            written: None,
         }
     }
 
@@ -185,6 +192,7 @@ impl Row {
             Mark::Opens => self.opens = true,
             Mark::Hangs(rest) => self.rest = Some(rest),
             Mark::Bar(slot) => self.bar = Some(slot),
+            Mark::Written(ms) => self.written = Some(ms),
         }
     }
 }
@@ -1063,6 +1071,7 @@ impl Screen {
             buttons: Vec::new(),
             opens: false,
             bar: None,
+            written: None,
         });
         self.swap(0, rows.collect());
         self.pages.splice(0..1, pages);
@@ -1233,6 +1242,7 @@ impl Screen {
                     buttons: Vec::new(),
                     opens: false,
                     bar: None,
+                    written: None,
                 }),
             );
             self.shown.splice(
@@ -1903,6 +1913,26 @@ impl Screen {
                 }
             }
         }
+        // A margin note under the mouse shows when it was last put up or
+        // changed where a message shows when it was written: the right
+        // end of the empty row over it, never a row of its own.
+        if hovered.is_none()
+            && let Some((at, ms)) = self.hovered_note()
+            && at > top
+            && at < bottom
+            && self.shown[at - 1].line.width() == 0
+        {
+            let when = crate::stamp::written(ms);
+            let wide = when.width() as u16;
+            if area.width > 2 * GUTTER + wide {
+                buf.set_string(
+                    area.x + area.width - GUTTER - wide,
+                    area.y + (at - 1 - top) as u16,
+                    when,
+                    Style::new().add_modifier(Modifier::DIM),
+                );
+            }
+        }
         // An agent's message under the mouse shows the react mark where
         // its reactions go, after any there, muted as the reply mark is.
         if let Some(hovered) = hovered.filter(|hovered| !hovered.mine)
@@ -1947,6 +1977,33 @@ impl Screen {
     /// call, a note) belongs to no message. The rows right under its end,
     /// its reactions or the blank row after it, are its too, so the mouse
     /// reaches the react mark drawn there.
+    /// The margin note under the mouse: the first shown line of its
+    /// first row, and when it was last put up or changed. Its rows run
+    /// from that first row to the empty row over the next note.
+    fn hovered_note(&self) -> Option<(usize, i64)> {
+        let (column, row) = self.hover?;
+        if !self.area.contains((column, row).into())
+            || self.selection.is_some()
+            || usize::from(row - self.area.y) >= self.drawn
+        {
+            return None;
+        }
+        let (at, _) = self.spot(column, row)?;
+        let firsts: Vec<usize> = (self.shown.iter().enumerate())
+            .filter(|(_, shown)| shown.first)
+            .map(|(at, _)| at)
+            .collect();
+        let row = firsts
+            .partition_point(|&first| first <= at)
+            .checked_sub(1)?;
+        let note = |row: &Row| matches!(row.tag, Some(Tag::Note(_)));
+        if self.rows[row].line.width() == 0 && self.rows.get(row + 1).is_some_and(note) {
+            return None;
+        }
+        let head = (0..=row).rev().find(|&k| note(&self.rows[k]))?;
+        Some((*firsts.get(head)?, self.rows[head].written?))
+    }
+
     fn hovered(&self) -> Option<Hovered> {
         let (column, row) = self.hover?;
         if !self.area.contains((column, row).into()) || self.selection.is_some() {
@@ -2866,6 +2923,60 @@ mod tests {
             row(&buf, 1),
             format!("{:>38}  ", format!("calc.fix/48 · {when}"))
         );
+    }
+
+    #[test]
+    fn a_margin_note_under_the_mouse_shows_when_it_was_last_put_up_as_a_message_does() {
+        let mut screen = Screen::default();
+        let ms = 1_794_042_780_000;
+        let lines = vec![
+            Line::default(),
+            Line::from(" ◆ Waits on you"),
+            Line::from("     Merge #12."),
+            Line::default(),
+            Line::from(" ◆ Kept from before"),
+            Line::from("     No time."),
+            Line::from(" ◆ Tight"),
+            Line::from("     No empty row over it."),
+        ];
+        let marks = vec![
+            (1, Mark::Tag(Tag::Note(1))),
+            (1, Mark::Written(ms)),
+            (4, Mark::Tag(Tag::Note(2))),
+            (6, Mark::Tag(Tag::Note(3))),
+            (6, Mark::Written(ms)),
+        ];
+        screen.replace_marked(lines, marks);
+        let when = crate::stamp::written(ms);
+        let area = Rect::new(0, 0, 40, 10);
+        let draw = |screen: &mut Screen| {
+            let mut buf = Buffer::empty(area);
+            screen.render(area, &mut buf, |_| None);
+            buf
+        };
+        let shows = |buf: &Buffer| (0..10).any(|y| row(buf, y).contains(&when));
+        // Nothing at rest.
+        assert!(!shows(&draw(&mut screen)));
+        // Over a note's words, its time at the right end of the empty row
+        // over its title, muted, as a message's.
+        screen.mouse(mouse(MouseEventKind::Moved, 6, 2));
+        let buf = draw(&mut screen);
+        assert_eq!(row(&buf, 0), format!("{when:>38}  "));
+        assert!(buf[(37, 0)].modifier.contains(Modifier::DIM));
+        // The empty row over the next note is that note's, not this one's.
+        screen.mouse(mouse(MouseEventKind::Moved, 6, 3));
+        assert!(!shows(&draw(&mut screen)));
+        // A note kept from before times shows none, nor the one over it.
+        screen.mouse(mouse(MouseEventKind::Moved, 6, 5));
+        assert!(!shows(&draw(&mut screen)));
+        // No empty row over a note: no time, and no row made for one.
+        screen.mouse(mouse(MouseEventKind::Moved, 6, 7));
+        let buf = draw(&mut screen);
+        assert!(!shows(&buf));
+        assert_eq!(row(&buf, 5).trim_end(), "     No time.");
+        // Under the last row, over nothing: no note.
+        screen.mouse(mouse(MouseEventKind::Moved, 6, 9));
+        assert!(!shows(&draw(&mut screen)));
     }
 
     #[test]
