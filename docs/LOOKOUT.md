@@ -614,7 +614,7 @@ late. The `follows` tool says so. The person sets a source's own
 
 One message, steered, with the origin `lookout`, so the reviewer reads its
 words as asking for nothing: each event's header and text, in the order
-they came, and nothing around them. The person's words in a task are not
+they came, then the trailer. The person's words in a task are not
 retyped: the note quotes their turns (`quotes`), and the daemon copies
 each in after the note with a line naming the turn and who wrote it, so
 the lead reads the person's own words, never a retelling. The reviewer
@@ -633,6 +633,8 @@ Look at the schema before you change the route.
 Fixed avg: it skips empty lists now, with a test.
 [ci · main]
 deploy failed on prod
+[lookout]
+This note is news for you, unseen by the person. Reply when it bears on what the person is doing now or is urgent; otherwise end your turn with an empty reply.
 
 [Message calc.lead/41, sent by lookout.]
 
@@ -649,6 +651,15 @@ at a time: what comes while one is under way waits for its answer, then
 goes. A note the daemon refuses goes again after 2 minutes; one lost with
 the connection goes again at once. The note reports what happened; what
 the lead tells the person is its role's call (lead.md).
+
+Every note ends with the trailer, under a `[lookout]` header: one setting,
+`[sonny] lookout_trailer`, the same for every follower and every source,
+read as each note goes, and `""` for none. By default it says when to
+reply: when the news bears on what the person is doing now or is urgent,
+and otherwise with an empty reply, so the person sees nothing. Agents
+forget what their role says when news comes in a turn of its own (George,
+11-17), so it comes with every note. The lookout adds nothing else: the
+events stay as their sources said them.
 
 Sonny shows it folded, one quiet row named by what it tells: `↳ Lookout ·
 calc.fix completed · you wrote in calc.docs · ▲ ci`, each task's event in

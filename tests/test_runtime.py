@@ -1674,6 +1674,27 @@ class RuntimeTests(ModelFixture):
         ended = client.request('wait', handles=[third['handle']], timeout_ms=0)['result']['results'][third['handle']]
         self.assertEqual((ended['exit_code'], ended['success']), (4, False))
 
+    def test_a_foreground_command_past_its_timeout_yields_and_keeps_running(self):
+        # No clock kills a foreground command: past its timeout_ms it moves
+        # to the background, as a steer moves one, and its result comes on
+        # its handle once it exits.
+        client = self.client('shell')
+        client.request('create', bot='Bob', workspace=str(self.path), tools=['shell'])
+        command = "printf 'started\\n'; sleep 1.5; echo finished > yielded.txt; echo done"
+        prompt = 'calls:' + json.dumps([['shell', {'command': command, 'timeout_ms': 300}]])
+        turn = client.request('submit', bot='Bob', request_id='yield', prompt=prompt)['result']['message']
+        self.assertEqual(client.finished(turn)['data']['status'], 'completed')
+        events = client.request('events', bot='Bob', after=0, limit=256)['result']['events']
+        completed = next(e for e in events if e['turn'] == turn and e['event'] == 'tool_completed')
+        said = json.loads(node_item(client, 'Bob', completed['data']['node'])['result']['output'])
+        self.assertEqual((said['background'], said['yielded']), (True, True), said)
+        self.assertNotIn('steered', said)
+        self.assertNotIn('timed_out', said)
+        self.assertEqual(said['tail'], ['started'])
+        ended = client.request('wait', handles=[said['handle']], timeout_ms=10_000)['result']['results'][said['handle']]
+        self.assertEqual((ended['exit_code'], ended['stdout']), (0, 'started\ndone\n'), ended)
+        self.assertEqual((self.path / 'yielded.txt').read_text(), 'finished\n')
+
     def test_a_running_commands_newest_lines_are_read_while_it_runs(self):
         client = self.client('shell')
         client.request('create', bot='Bob', workspace=str(self.path), tools=['shell'])

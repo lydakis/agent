@@ -2161,6 +2161,14 @@ pub struct Stepped {
     /// now that its step is decided: its caller checks it.
     pub lifted: Option<i64>,
 }
+/// A call whose time runs again now that the step that stopped it ended:
+/// its running turn told through `notify`, its parked turn woken (the
+/// bot named), or, lifted, its background command checked.
+pub struct Resumed {
+    pub notify: Option<Arc<Notify>>,
+    pub wake: Option<String>,
+    pub lifted: Option<i64>,
+}
 /// What a call captured when its first daemon step was asked: its bot as
 /// a round of its turn would read it, the command rules of that bot, and
 /// its turn's folder, model and effort. Every step of the call is decided
@@ -10576,6 +10584,9 @@ impl Database {
             &ask.arguments,
         )?;
         step_started(&tx, &bot.name, turn, &id, call_id, row, now_ms)?;
+        if ask.tool == "shell" {
+            pause_call(&tx, turn, call_id, now_ms)?;
+        }
         decided["decision"] = json!("allow");
         decided["approvals"] = json!([]);
         event(&tx, &bot.name, Some(turn), "step_decided", decided)?;
@@ -10612,6 +10623,10 @@ impl Database {
     /// under `CALL/STEP` while its call still waits for its answer (a step
     /// of a call answered meanwhile keeps nothing). `error` names why the
     /// daemon stopped it, when it did.
+    ///
+    /// The call's time runs again once no other step of it runs or waits:
+    /// then whoever waits on the call is told, as when a gated step is
+    /// decided.
     pub fn step_close(
         &mut self,
         turn: i64,
@@ -10619,12 +10634,12 @@ impl Database {
         outcome: &Outcome,
         error: Option<&str>,
         now_ms: u64,
-    ) -> Result<()> {
+    ) -> Result<Option<Resumed>> {
         let parent = step_parent(id).ok_or(Error::new("invalid_step"))?;
         let tx = self.conn.savepoint()?;
-        if !step_ended(&tx, turn, id, outcome.failed, error, now_ms)? {
-            return Ok(());
-        }
+        let Some(bot) = step_ended(&tx, turn, id, outcome.failed, error, now_ms)? else {
+            return Ok(None);
+        };
         let waiting: bool = tx
             .prepare_cached(
                 "SELECT EXISTS(SELECT 1 FROM answers WHERE turn=? AND call_id=? AND output IS NULL)",
@@ -10642,11 +10657,32 @@ impl Database {
             tx.prepare_cached("DELETE FROM steps WHERE turn=? AND call_id=?")?
                 .execute(params![turn, id])?;
         }
+        // Read only when its time runs again: a step that never stopped
+        // it, such as a file's, costs one keyed update that changes nothing.
+        let resumed = match waiting && resume_call(&tx, turn, parent, now_ms)? {
+            true => tx
+                .prepare_cached(
+                    "SELECT b.status,a.process FROM bots b, answers a
+                     WHERE b.name=?1 AND a.turn=?2 AND a.call_id=?3",
+                )?
+                .query_row(params![bot, turn, parent], |r| {
+                    Ok((r.get::<_, String>(0)?, r.get::<_, Option<i64>>(1)?))
+                })
+                .optional()?,
+            false => None,
+        };
         tx.commit()?;
         if waiting {
             outcome.files.recorded();
         }
-        Ok(())
+        // As a decided step tells it: a call a message lifted waits on as
+        // its command, not its turn.
+        Ok(resumed.map(|(status, lifted)| Resumed {
+            notify: (lifted.is_none() && status == "running")
+                .then(|| self.live.entry(turn).or_default().notify.clone()),
+            wake: (lifted.is_none() && status == "waiting").then_some(bot),
+            lifted,
+        }))
     }
     /// Record how a step its gates allowed ended once its client ran it,
     /// so a judge of a later call sees it among the turn's calls as done.
@@ -16645,6 +16681,9 @@ fn end_step(
     // daemon runs it next.
     if daemon && allowed {
         step_started(tx, &bot.name, turn, &id, parent, row, now_ms)?;
+        if name == "shell" {
+            pause_call(tx, turn, parent, now_ms)?;
+        }
     } else if daemon {
         step_refused(tx, &bot.name, turn, &id, parent, now_ms)?;
     }
@@ -16662,17 +16701,35 @@ fn end_step(
     data["name"] = json!(name);
     data["arguments"] = json!(preview);
     event(tx, bot, Some(turn), "step_decided", data)?;
-    let waiting: bool = tx
-        .prepare_cached("SELECT EXISTS(SELECT 1 FROM approvals WHERE turn=? AND step_of=?)")?
-        .query_row(params![turn, parent], |r| r.get(0))?;
-    Ok(!waiting
-        && tx
-            .prepare_cached(
-                "UPDATE answers SET expires_ms=?+paused_ms,paused_ms=NULL
-                 WHERE turn=? AND call_id=? AND paused_ms IS NOT NULL",
-            )?
-            .execute(params![now_ms as i64, turn, parent])?
-            == 1)
+    resume_call(tx, turn, parent, now_ms)
+}
+/// Stop call `parent`'s time while a command its script runs as a step
+/// runs, as a step waiting on its gates stops it: the script's own clock
+/// stops meanwhile too, so a command runs as long as it takes, and no
+/// clock of its call kills it.
+fn pause_call(tx: &Connection, turn: i64, parent: &str, now_ms: u64) -> Result<()> {
+    tx.prepare_cached(
+        "UPDATE answers SET paused_ms=MAX(expires_ms-?,0)
+         WHERE turn=? AND call_id=? AND paused_ms IS NULL",
+    )?
+    .execute(params![now_ms as i64, turn, parent])?;
+    Ok(())
+}
+/// Run call `parent`'s time again from where it stopped, once no step of
+/// it waits on its gates or runs. True when it did.
+fn resume_call(tx: &Connection, turn: i64, parent: &str, now_ms: u64) -> Result<bool> {
+    // Every step id `CALL/...`, and none other: '0' follows '/'.
+    let (from, to) = (format!("{parent}/"), format!("{parent}0"));
+    Ok(tx
+        .prepare_cached(
+            "UPDATE answers SET expires_ms=?1+paused_ms,paused_ms=NULL
+             WHERE turn=?2 AND call_id=?3 AND paused_ms IS NOT NULL
+               AND NOT EXISTS(SELECT 1 FROM approvals WHERE turn=?2 AND step_of=?3)
+               AND NOT EXISTS(SELECT 1 FROM steps WHERE turn=?2 AND call_id>=?4
+                   AND call_id<?5 AND ended_ms IS NULL)",
+        )?
+        .execute(params![now_ms as i64, turn, parent, from, to])?
+        == 1)
 }
 /// Let go of what call `call_id`'s daemon steps kept, `CALL/STEP`: the
 /// files that held some of it, for removal once this commits.
@@ -16738,7 +16795,7 @@ fn step_ended(
     failed: bool,
     error: Option<&str>,
     now_ms: u64,
-) -> Result<bool> {
+) -> Result<Option<String>> {
     let row: Option<(String, String, Option<i64>, i64)> = tx
         .prepare_cached(
             "UPDATE steps SET ended_ms=?3 WHERE turn=?1 AND call_id=?2 AND ended_ms IS NULL
@@ -16749,7 +16806,7 @@ fn step_ended(
         })
         .optional()?;
     let Some((bot, parent, audit, started_ms)) = row else {
-        return Ok(false);
+        return Ok(None);
     };
     if let Some(audit) = audit {
         audit::finish(tx, audit, now_ms as i64, failed)?;
@@ -16763,7 +16820,7 @@ fn step_ended(
         data["error"] = json!(error);
     }
     event(tx, &bot, Some(turn), "step_completed", data)?;
-    Ok(true)
+    Ok(Some(bot))
 }
 /// Count a denial under each of `tags`, or end their runs of denials when
 /// a call they allowed starts. A denial in a new turn starts both counts

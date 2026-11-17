@@ -464,6 +464,15 @@ pub const SETTINGS: &[Setting] = &[
         values: &[],
         default: "1024",
     },
+    Setting {
+        key: "sonny.lookout_trailer",
+        group: "Agents",
+        name: "lookout trailer",
+        label: "what ends every lookout note: when to reply to it",
+        about: "what ends every note the lookout sends an agent, under a `[lookout]` header, read as each note goes; by default when to reply: when the news bears on what the person is doing now or is urgent, and otherwise an empty reply; `none` for none",
+        values: &[],
+        default: "when to reply",
+    },
 ];
 
 /// The migration that moves `[sonny] task_depth` to `[daemon] depth`.
@@ -932,6 +941,7 @@ impl View {
                     toml::Value::Boolean(on) => Some(on.to_string()),
                     toml::Value::Integer(n) => Some(n.to_string()),
                     toml::Value::Array(list) if list.is_empty() => Some("none".into()),
+                    toml::Value::String(text) if text.is_empty() => Some("none".into()),
                     toml::Value::Array(list) => Some(
                         (list.iter().filter_map(toml::Value::as_str))
                             .collect::<Vec<_>>()
@@ -953,6 +963,11 @@ impl View {
                     .map(|part| toml::Value::String(part.to_owned()))
                     .collect(),
             ),
+            // No lookout trailer is written as an empty one; nothing
+            // typed is the default again.
+            _ if setting.key == "sonny.lookout_trailer" && value == "none" => {
+                toml::Value::String(String::new())
+            }
             (true, _) => toml::Value::Boolean(value == "true"),
             (_, true) => value
                 .parse()
@@ -1381,7 +1396,7 @@ mod tests {
                 assert!(!setting.name.contains(['_', '.']), "{}", setting.name);
             }
         }
-        assert_eq!(listed().len(), 36);
+        assert_eq!(listed().len(), 37);
         // What only tunes stays in the file, and in the reference.
         for key in [
             "sonny.sky_haiku_daily",
@@ -1612,6 +1627,44 @@ mod tests {
             std::fs::read_to_string(&path).unwrap(),
             "[sonny]\ntext_width = 120\n"
         );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_lookout_trailer_typed_none_is_written_empty_and_nothing_typed_is_the_default() {
+        let dir = std::env::temp_dir().join(format!("sonny-config-trailer-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        std::fs::write(&path, "[sonny]\n").unwrap();
+        let mut view = View::at(path.clone());
+        view.values = view.read().unwrap();
+        find(&mut view, "lookout trailer");
+        press(&mut view, KeyCode::Enter);
+        for c in "none".chars() {
+            press(&mut view, KeyCode::Char(c));
+        }
+        press(&mut view, KeyCode::Enter);
+        let at = view.picked().unwrap();
+        assert_eq!(view.values[at].as_deref(), Some("none"));
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "[sonny]\nlookout_trailer = \"\"\n"
+        );
+        let trailer = |path| {
+            agent_client::config::read(path)
+                .unwrap()
+                .sonny
+                .lookout_trailer
+        };
+        assert_eq!(trailer(&path), "");
+        press(&mut view, KeyCode::Enter);
+        for _ in 0.."none".len() {
+            press(&mut view, KeyCode::Backspace);
+        }
+        press(&mut view, KeyCode::Enter);
+        assert_eq!(view.values[at], None);
+        assert_eq!(trailer(&path), agent_client::config::LOOKOUT_TRAILER);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

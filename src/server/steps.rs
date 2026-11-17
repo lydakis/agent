@@ -26,7 +26,7 @@ use agent_runtime::{
     codec::Part,
     fail_with,
     output::{self, Output},
-    store::{ArtifactLines, Capture, StepAsk, StepOpened, Stepped, Store},
+    store::{ArtifactLines, Capture, Resumed, StepAsk, StepOpened, Stepped, Store},
     tools::{Outcome, Prepared, ReadSource, Slot},
 };
 use serde_json::{Value, json};
@@ -166,7 +166,9 @@ enum State {
 pub(super) enum Done {
     Opened(Result<StepOpened>),
     Ran(Result<Outcome>),
-    Closed(Result<Value>),
+    /// Its end recorded, with its call's time running again when it was
+    /// the last step that stopped it.
+    Closed(Result<Value>, Option<Resumed>),
     /// The line's waiter got a process slot, or none, the semaphore closed.
     Slot(Option<Slot>),
 }
@@ -189,6 +191,8 @@ struct Running {
     id: String,
     /// Where a read of the bot's kept output pages it from.
     store: Store,
+    /// What starts a background command and records its end, as a turn's.
+    lifts: turn::Lifts,
 }
 
 impl Steps {
@@ -434,7 +438,7 @@ impl Service {
             self.pump_steps();
             return;
         }
-        if matches!(done, Done::Opened(_) | Done::Closed(_)) {
+        if matches!(done, Done::Opened(_) | Done::Closed(..)) {
             self.steps.storing -= 1;
             self.ask_steps();
         }
@@ -444,7 +448,10 @@ impl Service {
         match done {
             Done::Opened(opened) => self.step_opened(key, opened),
             Done::Ran(ran) => self.step_ran(key, ran),
-            Done::Closed(closed) => {
+            Done::Closed(closed, resumed) => {
+                if let Some(resumed) = resumed {
+                    self.call_resumed(key.0, resumed);
+                }
                 let flight = self.steps.take(&key).expect("a flight");
                 let closed = match flight.stopped {
                     Some((why, _)) if closed.is_ok() => Err(stopped(why)),
@@ -456,6 +463,20 @@ impl Service {
             }
             // Taken up above, under no call's key.
             Done::Slot(_) => {}
+        }
+    }
+
+    /// Call `turn`'s time runs again, its last running step ended: whoever
+    /// waits on it is told, so its deadline is armed again.
+    fn call_resumed(&mut self, turn: i64, resumed: Resumed) {
+        if let Some(notify) = resumed.notify {
+            notify.notify_one();
+        }
+        if let Some(bot) = resumed.wake {
+            self.handles.wake(bot, turn);
+        }
+        if let Some(process) = resumed.lifted {
+            self.check_lifted(vec![process]);
         }
     }
 
@@ -612,7 +633,15 @@ impl Service {
             self.close_step(key, Err(stopped(why)));
             return;
         }
-        let command = matches!(flight.prepared, Some(Prepared::Shell { .. }));
+        // A background command takes its place in the registry's own line
+        // as it starts, as a turn's does, and holds nothing of the step's.
+        let command = matches!(
+            flight.prepared,
+            Some(Prepared::Shell {
+                background: false,
+                ..
+            })
+        );
         // A confined change to files runs its sandbox's helper as a process.
         let writes = matches!(
             flight.prepared,
@@ -711,6 +740,12 @@ impl Service {
             turn: key.0,
             id: flight.ask.id(),
             store: self.store.clone(),
+            lifts: turn::Lifts {
+                store: self.store.clone(),
+                registry: self.registry.clone(),
+                handles: self.handles.clone(),
+                failures: self.background_failures.clone(),
+            },
         };
         let (registry, serial) = (self.registry.clone(), flight.serial);
         self.steps.jobs.spawn(async move {
@@ -780,7 +815,7 @@ impl Service {
             };
             let outcome = match outcome {
                 Ok(outcome) => outcome,
-                Err(error) => return (key, serial, Done::Closed(Err(error))),
+                Err(error) => return (key, serial, Done::Closed(Err(error), None)),
             };
             let outcome = match outputs {
                 Some(outputs) if !outcome.artifacts.is_empty() => {
@@ -808,15 +843,18 @@ impl Service {
             };
             let (outcome, id, reply) = match built {
                 Ok(built) => built,
-                Err(error) => return (key, serial, Done::Closed(Err(error))),
+                Err(error) => return (key, serial, Done::Closed(Err(error), None)),
             };
             let closed = store
                 .op("step_close", move |db| {
                     db.step_close(turn, &id, &outcome, error.as_deref(), handles_now())
                 })
-                .await
-                .map(|()| reply);
-            (key, serial, Done::Closed(closed))
+                .await;
+            let (closed, resumed) = match closed {
+                Ok(resumed) => (Ok(reply), resumed),
+                Err(error) => (Err(error), None),
+            };
+            (key, serial, Done::Closed(closed, resumed))
         });
     }
 
@@ -1003,6 +1041,7 @@ async fn run(
         turn,
         id,
         store,
+        lifts,
     } = running;
     let mut stopping = futures_util::FutureExt::fuse(stopping);
     let bot = &capture.bot;
@@ -1053,6 +1092,7 @@ async fn run(
         capture.effort.as_deref(),
         bot.created_by.as_deref().zip(bot.created_by_id),
     );
+    let held = cord.clone();
     let work = async {
         match prepared {
             Prepared::Shell {
@@ -1077,6 +1117,77 @@ async fn run(
                         slot,
                     )
                     .await
+            }
+            // As a turn's background command: the bot's, not the call's, so
+            // its handle outlives the script, which hands it on for the
+            // model to wait on, and its end is told as any one's. It runs
+            // under its own name beside the step's (`CALL:STEP`), so what
+            // it keeps outlives the call's answer, which lets the step's go.
+            Prepared::Shell {
+                command,
+                timeout_ms,
+                background: true,
+                workdir,
+            } => {
+                let queued = registry.queue()?;
+                let named = match id.split_once('/') {
+                    Some((call, step)) => format!("{call}:{step}"),
+                    None => id.clone(),
+                };
+                let listed = command.clone();
+                let (owner, started) = (bot.name.clone(), named.clone());
+                let outputs = turn::Outputs::of(bot, root.clone(), registry.daemon());
+                let folder = Prepared::folder(&workspace, workdir.as_deref());
+                let (store, registry, lifts, owner_id, cord) = (
+                    store.clone(),
+                    registry.clone(),
+                    lifts.clone(),
+                    bot.bot_id,
+                    held.clone(),
+                );
+                // Its row, its command and its collector are made whole on
+                // their own task: a step dropped meanwhile (its session
+                // gone, its call answered, the daemon pausing) leaves no
+                // row running that nothing collects or stops. The step's
+                // cord goes with it, so a pause meanwhile keeps the command
+                // from starting and its row ends stopped by it.
+                let registered = tokio::spawn(async move {
+                    let process = store
+                        .op("process_start", move |db| {
+                            db.process_start(
+                                turn,
+                                &started,
+                                agent_runtime::store::ProcessKind::Background,
+                                &listed,
+                            )
+                        })
+                        .await?;
+                    let spill = (outputs.clone()).map(|outputs| outputs.spill(turn, &named));
+                    let (sender, receiver) = oneshot::channel();
+                    registry.background(
+                        cord,
+                        registry.stopper(process),
+                        owner_id,
+                        command,
+                        folder,
+                        timeout_ms,
+                        environment,
+                        sandbox,
+                        queued,
+                        sender,
+                        spill,
+                    );
+                    lifts.collect(
+                        &owner, turn, process, &named, receiver, outputs, None, false,
+                    );
+                    Ok::<_, Error>(process)
+                });
+                let process = registered
+                    .await
+                    .map_err(|_| Error::new("storage_error"))??;
+                Ok(Outcome::text(
+                    json!({"handle":format!("proc:{process}"),"background":true}).to_string(),
+                ))
             }
             // A command's output kept past its result, paged as the
             // turn's own read pages it, from any of the bot's turns.
@@ -1409,7 +1520,7 @@ mod tests {
             Phase::Running => service.step_done(key, serial, Done::Ran(Ok(ran()))),
             Phase::Ending => {
                 let reply = json!({"call_id":"c/s","output":"hi","failed":false});
-                service.step_done(key, serial, Done::Closed(Ok(reply)));
+                service.step_done(key, serial, Done::Closed(Ok(reply), None));
             }
         }
     }
