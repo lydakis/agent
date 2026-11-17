@@ -10401,3 +10401,28 @@ Each row is within the runs' spread but the model request, a fifth
 smaller, since the model is shown the script tool alone. Code mode stays
 ahead of 0.9.5 on every row (0.9.5 direct: turn p50 2.5 and 13.0 s,
 processor time 5.5 and 8.2 ms a turn, peak memory 62 and 191 MB).
+
+## A running command step stops its call's clock (#1115)
+
+A command step now pauses its `exec` call's expiry while it runs, and
+the step's close resumes it: one keyed `UPDATE` inside the transaction
+`step_close` already opens, so store jobs a step stay at 2.0.
+`bench.steps_fleet` at 10,000 bots, 5 steps each (50,000 steps), main
+(2872f1b) against the head, three alternating runs each, release build,
+synthetic model, 4-core Linux container, 2026-11-17. Ranges are the three
+runs; the median is in parentheses.
+
+| | Main | Head |
+| --- | ---: | ---: |
+| Steps finished / refused | 50,000 / 0 | 50,000 / 0 |
+| Store jobs a step | 2.0 | 2.0 |
+| One step alone, p50 | 0.93 to 1.07 ms (1.06) | 0.88 to 1.34 ms (1.21) |
+| One step alone, p99 | 2.09 to 2.53 ms (2.35) | 1.66 to 5.34 ms (3.59) |
+| Every call stepping at once, step p99 | 1,688 to 1,808 ms (1,782) | 1,705 to 1,810 ms (1,783) |
+| Other bots' turn p99 while the fleet steps | 131 to 148 ms (136) | 132 to 137 ms (136) |
+| Daemon RSS at the end | 242 to 345 MB (294) | 307 to 411 MB (308) |
+
+The fleet numbers are the same within the runs' spread. The step alone
+moves by more than the runs agree with each other (one head run at 0.88 ms
+p50 was the fastest of all six), so no change shows above the noise, and
+memory spreads 100 MB run to run on both sides.
