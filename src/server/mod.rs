@@ -693,6 +693,12 @@ enum Command {
     /// The daemon's live state for a fleet controller: sessions, turns,
     /// connections, pools, storage worker, and handle registry.
     Stats,
+    /// The program this session is, such as a client's window or its
+    /// reviewer, so `stats` counts its requests under it. A bot's own
+    /// socket is named `agent` by the daemon and keeps that name.
+    Hello {
+        program: String,
+    },
     /// Each provider's own model listing, for a client writing its model
     /// list. Asked when requested and kept five minutes; nothing runs on it.
     ProviderModels,
@@ -800,6 +806,12 @@ pub struct ProcessesAfter {
     bot: String,
     handle: String,
 }
+/// A session that named no program.
+const UNNAMED: usize = 0;
+/// A bot's own socket, which the daemon names.
+const AGENT: usize = 1;
+/// Every program named once the names are all taken.
+const OTHER: usize = agent_runtime::output::PROGRAMS - 1;
 /// How long the service loop held each kind of request: from its
 /// dispatch to its answer or its handoff to a reader, so a request that
 /// holds the loop, and every request queued behind it, shows by name; and
@@ -808,7 +820,22 @@ pub struct ProcessesAfter {
 /// store's latency buckets. Touched only by the loop; no lock, no
 /// allocation once an op has been seen.
 #[derive(Default)]
-struct Commands(HashMap<&'static str, Held>);
+struct Commands {
+    ops: HashMap<&'static str, Held>,
+    /// Requests by the program of the session that sent them, by its
+    /// place: unnamed, agent, then `names`, then other.
+    programs: [Program; agent_runtime::output::PROGRAMS],
+    /// The programs sessions named in `hello`, as first heard.
+    names: Vec<String>,
+    /// Where a hold of a second or more is kept, by name.
+    slow: Option<std::sync::Arc<agent_runtime::store::Counters>>,
+}
+#[derive(Default, Clone, Copy)]
+struct Program {
+    count: u64,
+    held_ns: u64,
+    waited_ns: u64,
+}
 #[derive(Default)]
 struct Held {
     count: u64,
@@ -819,28 +846,94 @@ struct Held {
     waited: [u64; agent_runtime::store::BUCKETS_US.len() + 1],
 }
 impl Commands {
-    /// A request dispatched at `since`, whose line was read at `read`;
-    /// the loop's own work (`Loop`) has no line and no wait.
-    fn count(
+    /// Counting each hold, and keeping those of a second or more in the
+    /// store's list of slow operations.
+    fn noting(slow: std::sync::Arc<agent_runtime::store::Counters>) -> Self {
+        Self {
+            slow: Some(slow),
+            ..Self::default()
+        }
+    }
+    /// The loop's own work, dispatched at `since`: no line, no wait, no
+    /// program.
+    fn count(&mut self, op: &'static str, since: std::time::Instant) {
+        self.hold(op, None, since);
+    }
+    /// A program's place, given it the first time it is heard while
+    /// places are left.
+    fn place(&mut self, program: &str) -> usize {
+        if let Some(at) = self.names.iter().position(|name| name == program) {
+            return at + 2;
+        }
+        if self.names.len() + 2 < OTHER {
+            self.names.push(program.to_owned());
+            return self.names.len() + 1;
+        }
+        OTHER
+    }
+    /// The name of the program at place `at`.
+    fn name(&self, at: usize) -> &str {
+        match at {
+            UNNAMED => "unnamed",
+            AGENT => "agent",
+            _ => self.names.get(at - 2).map_or("other", String::as_str),
+        }
+    }
+    /// A request dispatched at `since`, whose line was read at `read`, from
+    /// a session of the program at place `program`.
+    fn request(
         &mut self,
         op: &'static str,
-        read: Option<std::time::Instant>,
+        program: usize,
+        read: std::time::Instant,
         since: std::time::Instant,
     ) {
+        let ns = self.hold(op, Some(program), since);
+        let waited = since.saturating_duration_since(read).as_nanos() as u64;
+        if let Some(row) = self.programs.get_mut(program) {
+            row.count += 1;
+            row.held_ns += ns;
+            row.waited_ns += waited;
+        }
+        let held = self.ops.entry(op).or_default();
+        held.waited_ns += waited;
+        held.waited[agent_runtime::store::bucket(waited)] += 1;
+    }
+    fn hold(&mut self, op: &'static str, program: Option<usize>, since: std::time::Instant) -> u64 {
         let ns = since.elapsed().as_nanos() as u64;
-        let held = self.0.entry(op).or_default();
+        let held = self.ops.entry(op).or_default();
         held.count += 1;
         held.held_ns += ns;
         held.slowest_ns = held.slowest_ns.max(ns);
         held.held[agent_runtime::store::bucket(ns)] += 1;
-        if let Some(read) = read {
-            let waited = since.saturating_duration_since(read).as_nanos() as u64;
-            held.waited_ns += waited;
-            held.waited[agent_runtime::store::bucket(waited)] += 1;
+        if ns >= agent_runtime::store::SLOW_NS
+            && let Some(slow) = &self.slow
+        {
+            slow.held(op, program.map(|at| self.name(at)), ns);
         }
+        ns
+    }
+    /// Requests by program, for each that sent one, with the events
+    /// delivered to sessions of each.
+    fn programs(&self, delivered: impl Fn(usize) -> u64) -> Value {
+        let rows: serde_json::Map<String, Value> = (self.programs.iter().enumerate())
+            .filter_map(|(at, row)| {
+                let delivered = delivered(at);
+                (row.count > 0 || delivered > 0).then(|| {
+                    (
+                        self.name(at).to_owned(),
+                        json!({"count": row.count,
+                        "held_ms": row.held_ns / 1_000_000,
+                        "waited_ms": row.waited_ns / 1_000_000,
+                        "delivered": delivered}),
+                    )
+                })
+            })
+            .collect();
+        Value::Object(rows)
     }
     fn snapshot(&self, waits: bool) -> Value {
-        let ops: serde_json::Map<String, Value> = (self.0.iter())
+        let ops: serde_json::Map<String, Value> = (self.ops.iter())
             .map(|(op, held)| {
                 let mut row = json!({"count": held.count,
                     "held_ms": held.held_ns / 1_000_000,
@@ -914,6 +1007,7 @@ impl Command {
             Command::RenewApprovals { .. } => "renew_approvals",
             Command::Companions { .. } => "companions",
             Command::Stats => "stats",
+            Command::Hello { .. } => "hello",
             Command::ProviderModels => "provider_models",
             Command::Tools => "tools",
             Command::Bots { .. } => "bots",
@@ -2430,6 +2524,7 @@ pub async fn run(config: Configuration) -> Result<()> {
     for (name, spec) in store.op("companions", |db| db.companions()).await? {
         companions.keep(&name, companions::stored(&name, &spec)?);
     }
+    let slow = store.counters();
     let mut service = Service {
         store,
         stepping: HashMap::new(),
@@ -2460,8 +2555,8 @@ pub async fn run(config: Configuration) -> Result<()> {
         // Queued turns that survived a restart start as capacity allows.
         ready_hint: true,
         tokens: Arc::default(),
-        commands: Commands::default(),
-        chores: Commands::default(),
+        commands: Commands::noting(slow.clone()),
+        chores: Commands::noting(slow),
         wakes,
         steer_wakes,
         pool_woken: Default::default(),
@@ -2588,7 +2683,7 @@ pub async fn run(config: Configuration) -> Result<()> {
                     if let Some(bindings) = service.reloaded(built, &reloaded_sender, config.models.clone()).await? {
                         ready["providers"] = Value::Object(bindings);
                     }
-                    service.chores.count("reload", None, chore);
+                    service.chores.count("reload", chore);
                 }
                 _ = service.retention.join_next(), if !service.retention.is_empty() => {}
                 // A paused daemon makes no calls: dropped, it comes to
@@ -2603,7 +2698,7 @@ pub async fn run(config: Configuration) -> Result<()> {
                     let (bot, turn, task, exit) = joined.unwrap().map_err(|_| Error::new("turn_task_failed"))?;
                     let chore = std::time::Instant::now();
                     service.complete(bot, turn, task, exit).await?;
-                    service.chores.count("reap", None, chore);
+                    service.chores.count("reap", chore);
                 }
                 _ = terminate.recv() => break,
                 _ = interrupt.recv() => break,
@@ -2634,7 +2729,7 @@ pub async fn run(config: Configuration) -> Result<()> {
                 Some((bot, turn)) = resumes.recv(), if service.has_capacity() => {
                     let chore = std::time::Instant::now();
                     service.resume(bot, turn, false).await?;
-                    service.chores.count("resume", None, chore);
+                    service.chores.count("resume", chore);
                 }
                 // One queued turn per iteration, so requests interleave with a
                 // long backlog; resumes hold no slot and are not starved because
@@ -2642,7 +2737,7 @@ pub async fn run(config: Configuration) -> Result<()> {
                 _ = std::future::ready(()), if service.ready_hint && ready_retry.is_none() && service.has_capacity() => {
                     let chore = std::time::Instant::now();
                     service.dispatch_ready().await?;
-                    service.chores.count("start_ready", None, chore);
+                    service.chores.count("start_ready", chore);
                 }
                 // A bot at rest told that its background command ended.
                 () = service.handles.readied() => {
@@ -2656,7 +2751,7 @@ pub async fn run(config: Configuration) -> Result<()> {
                 _ = tokio::time::sleep_until(expiry.unwrap_or_else(tokio::time::Instant::now)), if expiry.is_some() && !service.draining() => {
                     let chore = std::time::Instant::now();
                     service.expire().await?;
-                    service.chores.count("expire", None, chore);
+                    service.chores.count("expire", chore);
                 }
                 // Attached messages that waited as long as they may go as
                 // steers. A drain leaves them for the next daemon.
@@ -2671,7 +2766,7 @@ pub async fn run(config: Configuration) -> Result<()> {
                         }
                         lapsed => lapsed?,
                     }
-                    service.chores.count("lapse", None, chore);
+                    service.chores.count("lapse", chore);
                 }
                 // Turns held in line on a cause are tried again.
                 _ = tokio::time::sleep_until(holds.unwrap_or_else(tokio::time::Instant::now)), if holds.is_some() && !service.draining() => {
@@ -2683,7 +2778,7 @@ pub async fn run(config: Configuration) -> Result<()> {
                         }
                         due => due?,
                     }
-                    service.chores.count("holds", None, chore);
+                    service.chores.count("holds", chore);
                 }
                 // A parked turn's time comes due (a pool reopens, a gate lapses,
                 // a lost wake-up is retried): resume it like any parked turn,
@@ -2693,7 +2788,7 @@ pub async fn run(config: Configuration) -> Result<()> {
                     if let Some((bot, turn, due)) = service.wakes.pop() {
                         let chore = std::time::Instant::now();
                         service.resume(bot, turn, due).await?;
-                        service.chores.count("wake", None, chore);
+                        service.chores.count("wake", chore);
                     }
                 }
                 // A wait's deadline, or a step answered, ended or lapsing:
@@ -2724,7 +2819,7 @@ pub async fn run(config: Configuration) -> Result<()> {
                     let chore = std::time::Instant::now();
                     let (session, output, id, result) = service.settled();
                     reply(&mut service, &mut sessions, stdio_owner, session, &output, id, result).await?;
-                    service.chores.count("admission", None, chore);
+                    service.chores.count("admission", chore);
                 }
                 // A read answered: its session's next request may be taken.
                 Some((asker, sent)) = service.lane.next(), if !service.lane.is_empty() => {
@@ -2750,6 +2845,7 @@ pub async fn run(config: Configuration) -> Result<()> {
                             let mut ready = ready.clone();
                             ready["paused"] = json!(service.paused);
                             let _ = output.try_send(ready);
+                            if caller.is_some() { output.name_program(AGENT); }
                             sessions.insert(id, output);
                             if let Some(caller) = caller { callers.insert(id, caller); }
                             if companion { companion_sessions.insert(id); }
@@ -2800,7 +2896,7 @@ pub async fn run(config: Configuration) -> Result<()> {
                             // Counted as the loop's own work: no request
                             // is taken meanwhile.
                             if settled {
-                                service.chores.count("settle", None, settling);
+                                service.chores.count("settle", settling);
                             }
                             // Even with none queued, an admission waits for the events
                             // of those answered before it when they and it would not
@@ -2812,7 +2908,7 @@ pub async fn run(config: Configuration) -> Result<()> {
                             {
                                 let publishing = std::time::Instant::now();
                                 service.hub.published_through(cursor).await;
-                                service.chores.count("publication", None, publishing);
+                                service.chores.count("publication", publishing);
                                 if *output.subscribe_closed().borrow() { continue; }
                             }
                             let (request_id, result, shutdown, serving) = match request {
@@ -2833,7 +2929,7 @@ pub async fn run(config: Configuration) -> Result<()> {
                                         None => {
                                             let (op, held) = (request.command.op(), std::time::Instant::now());
                                             let result = service.dispatch(request.command, id, &output, request.id.clone(), bound).await;
-                                            service.commands.count(op, Some(read), held);
+                                            service.commands.request(op, output.program(), read, held);
                                             result
                                         }
                                     };
@@ -3230,6 +3326,8 @@ impl Service {
             Command::RetryHeld { .. } => return refuse("retry held turns"),
             // A companion runs as the daemon does, outside any sandbox.
             Command::Companions { .. } => return refuse("manage the daemon's companions"),
+            // Its socket's name is the daemon's: nothing to hold.
+            Command::Hello { .. } => return Ok(()),
             _ => {}
         }
         // A read is held to the identity kept in memory, beside the writer;
@@ -3542,10 +3640,12 @@ impl Service {
             // not answered yet, so one that misses them misses nothing
             // anyone was told, and one session's admissions never hold
             // another's reads.
-            Some(command) if command.observes() || matches!(command, Command::Wait { .. }) => self
-                .admissions
-                .iter()
-                .any(|admission| admission.session == session),
+            Some(command)
+                if command.observes()
+                    || matches!(command, Command::Wait { .. } | Command::Hello { .. }) =>
+            {
+                (self.admissions.iter()).any(|admission| admission.session == session)
+            }
             _ => true,
         }
     }
@@ -5509,6 +5609,24 @@ impl Service {
                 }
                 (None, None) => Ok(json!({"companions": self.companions.listed()})),
             },
+            Command::Hello { program } => {
+                // A short name of its own; the daemon's are its own.
+                let fits = (1..=32).contains(&program.len())
+                    && (program.bytes())
+                        .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
+                    && !["unnamed", "agent", "other"].contains(&program.as_str());
+                if !fits {
+                    return fail_with(
+                        "invalid_program",
+                        "a program is 1 to 32 of a-z, 0-9 and _, and not unnamed, agent or other",
+                    );
+                }
+                // A bot's own socket keeps the daemon's name for it.
+                if output.program() != AGENT {
+                    output.name_program(self.commands.place(&program));
+                }
+                Ok(json!({}))
+            }
             Command::Stats => {
                 let (waiting, running, queued, paced, pending_bytes, approvals) = store
                     .op("counts", |db| {
@@ -5591,6 +5709,13 @@ impl Service {
                     // followers dropped for falling behind.
                     "hub": self.hub.stats(),
                     "commands": self.commands.snapshot(true),
+                    // Requests by the program each session named in its
+                    // `hello` (`agent` for a bot's own socket), and the
+                    // events delivered to sessions of each.
+                    "programs": self.commands.programs(|program| self.hub.delivered_to(program)),
+                    // The last hundred holds of a second or more, of the
+                    // store or of this loop, newest first.
+                    "slow": store.counters().slow(),
                     // The loop's own work between requests: reaping
                     // turns, starting ready ones, resuming parked ones,
                     // answering queued admissions, and its timers.
@@ -9429,6 +9554,93 @@ mod tests {
             let (_, _, _, started) = service.settle().await;
             started.unwrap();
         }
+        drop(service);
+        drop(store);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn stats_name_each_programs_requests_and_keep_slow_holds() {
+        let dir = scratch("programs");
+        let (store, _publications) = Store::open(&dir.join("state.sqlite")).await.unwrap();
+        let mut service = admitting(&store, 1024);
+        let (output, _writer) = Output::stdout();
+        let hello = |program: &str| Command::Hello {
+            program: program.into(),
+        };
+        let named = service.dispatch(hello("window"), 1, &output, json!(1), Bound::default());
+        named.await.unwrap();
+        assert_eq!(service.commands.name(output.program()), "window");
+        // A bot's own socket is the daemon's to name.
+        let refused = service.dispatch(hello("agent"), 1, &output, json!(2), Bound::default());
+        assert_eq!(refused.await.unwrap_err().code, "invalid_program");
+        let (agent, _writer) = Output::stdout();
+        agent.name_program(AGENT);
+        let kept = service.dispatch(hello("sky"), 2, &agent, json!(3), Bound::default());
+        kept.await.unwrap();
+        assert_eq!(service.commands.name(agent.program()), "agent");
+        // Names past the places left count together.
+        for n in 0..20 {
+            let (other, _writer) = Output::stdout();
+            let hello = service.dispatch(
+                hello(&format!("p{n}")),
+                3,
+                &other,
+                json!(4),
+                Bound::default(),
+            );
+            hello.await.unwrap();
+            let expected = if n < OTHER - 3 {
+                format!("p{n}")
+            } else {
+                "other".into()
+            };
+            assert_eq!(service.commands.name(other.program()), expected);
+        }
+        // Requests count under their session's program.
+        let mut commands = Commands::noting(store.counters());
+        commands.place("window");
+        let window = commands.place("window");
+        assert_eq!(window, 2, "a name heard again keeps its place");
+        let now = std::time::Instant::now();
+        commands.request("bots", window, now, now);
+        commands.request("bots", window, now, now);
+        commands.request("inspect", AGENT, now, now);
+        let programs = commands.programs(|program| (program == AGENT) as u64 * 7);
+        assert_eq!(programs["window"]["count"], 2);
+        assert_eq!(programs["agent"]["count"], 1);
+        assert_eq!(programs["agent"]["delivered"], 7);
+        assert!(programs.get("sky").is_none(), "only programs heard from");
+        // A hold of a second or more is kept, newest first, with its program.
+        let counters = store.counters();
+        counters.held("approvals", Some("window"), 2_000_000_000);
+        counters.held("reap", None, 1_500_000_000);
+        counters.held("bots", Some("window"), 999_999_999);
+        let slow = counters.slow();
+        assert_eq!(slow.as_array().unwrap().len(), 2, "{slow}");
+        assert_eq!(slow[0]["op"], "reap");
+        assert_eq!(
+            (
+                &slow[1]["op"],
+                &slow[1]["kind"],
+                &slow[1]["program"],
+                &slow[1]["ms"]
+            ),
+            (
+                &json!("approvals"),
+                &json!("loop"),
+                &json!("window"),
+                &json!(2000)
+            )
+        );
+        for _ in 0..150 {
+            counters.held("wait", None, 1_000_000_000);
+        }
+        assert_eq!(
+            counters.slow().as_array().unwrap().len(),
+            100,
+            "the last hundred"
+        );
         drop(service);
         drop(store);
         std::fs::remove_dir_all(dir).unwrap();

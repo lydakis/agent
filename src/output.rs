@@ -44,7 +44,15 @@ pub struct Output {
     sender: mpsc::UnboundedSender<Packet>,
     budget: Arc<Semaphore>,
     closed: watch::Sender<bool>,
+    /// The program the session names itself as, by its place among the
+    /// names the daemon has heard ([`PROGRAMS`]): 0, unnamed, until it says.
+    program: Arc<std::sync::atomic::AtomicU8>,
 }
+
+/// How many program names the daemon counts sessions under: unnamed, a
+/// bot's own socket, those clients give in `hello` as first heard, and
+/// one for every name past those.
+pub const PROGRAMS: usize = 16;
 
 /// `detail` cut to `DETAIL_LIMIT`, keeping its start and end.
 pub fn bounded(detail: String) -> String {
@@ -73,9 +81,21 @@ impl Output {
                 sender,
                 budget,
                 closed,
+                program: Arc::default(),
             },
             receiver,
         )
+    }
+
+    /// The program the session named itself as, by its place among the
+    /// names the daemon has heard.
+    pub fn program(&self) -> usize {
+        self.program.load(std::sync::atomic::Ordering::Relaxed) as usize
+    }
+    /// Name the session's program, by its place among the names the
+    /// daemon has heard.
+    pub fn name_program(&self, program: usize) {
+        (self.program).store(program as u8, std::sync::atomic::Ordering::Relaxed);
     }
 
     pub fn stdout() -> (Self, std::thread::JoinHandle<Result<()>>) {
