@@ -2831,6 +2831,7 @@ impl Registry {
     #[allow(clippy::too_many_arguments)]
     pub fn background(
         &self,
+        cord: Cord,
         stopper: Stopper,
         owner: i64,
         command: String,
@@ -2844,8 +2845,9 @@ impl Registry {
     ) {
         let registry = self.clone();
         let mut queued = queued;
-        let mut stopping = self.stopping.subscribe();
-        let mut pulls = self.pulls.subscribe();
+        // The cord as it was when the command was asked for: a pause since
+        // then ends it, or keeps it from starting.
+        let Cord(mut pulls, mut stopping) = cord;
         self.own(&stopper, owner);
         let peek = Peek::default();
         self.watch(stopper.listed.id, peek.clone());
@@ -5418,6 +5420,7 @@ mod tests {
         let registry = Registry::new("shell").unwrap().with_process_budget(4);
         let (sender, receiver) = tokio::sync::oneshot::channel();
         registry.background(
+            registry.cord(),
             registry.stopper(1),
             7,
             "sleep 100".to_owned(),
@@ -5451,6 +5454,42 @@ mod tests {
             "{ended:?}"
         );
     }
+    /// A background command asked for before a pause it is handed to the
+    /// registry after never starts: its cord, taken when it was asked for,
+    /// was pulled, so it ends stopped by the pause.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_background_command_asked_for_before_a_pause_never_starts() {
+        let registry = Registry::new("shell").unwrap();
+        let folder =
+            std::env::temp_dir().join(format!("agent-paused-before-{}", std::process::id()));
+        std::fs::create_dir_all(&folder).unwrap();
+        let cord = registry.cord();
+        registry.end_running();
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+        registry.background(
+            cord,
+            registry.stopper(1),
+            7,
+            "touch ran".to_owned(),
+            folder.clone(),
+            None,
+            Vec::new(),
+            None,
+            registry.queue().unwrap(),
+            sender,
+            None,
+        );
+        let ended = tokio::time::timeout(Duration::from_secs(10), receiver)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(ended.code, "daemon_paused", "{ended:?}");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(!folder.join("ran").exists());
+        std::fs::remove_dir_all(&folder).unwrap();
+    }
     /// A background command given no timeout_ms runs until it exits, as
     /// Codex's unified exec runs one: no deadline is armed for it, so a
     /// paused clock, which skips straight to the next deadline whenever the
@@ -5473,6 +5512,7 @@ mod tests {
             };
             let (sender, receiver) = tokio::sync::oneshot::channel();
             registry.background(
+                registry.cord(),
                 registry.stopper(id),
                 1,
                 command,

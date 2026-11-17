@@ -1092,6 +1092,7 @@ async fn run(
         capture.effort.as_deref(),
         bot.created_by.as_deref().zip(bot.created_by_id),
     );
+    let held = cord.clone();
     let work = async {
         match prepared {
             Prepared::Shell {
@@ -1137,12 +1138,19 @@ async fn run(
                 let (owner, started) = (bot.name.clone(), named.clone());
                 let outputs = turn::Outputs::of(bot, root.clone(), registry.daemon());
                 let folder = Prepared::folder(&workspace, workdir.as_deref());
-                let (store, registry, lifts, owner_id) =
-                    (store.clone(), registry.clone(), lifts.clone(), bot.bot_id);
+                let (store, registry, lifts, owner_id, cord) = (
+                    store.clone(),
+                    registry.clone(),
+                    lifts.clone(),
+                    bot.bot_id,
+                    held.clone(),
+                );
                 // Its row, its command and its collector are made whole on
                 // their own task: a step dropped meanwhile (its session
                 // gone, its call answered, the daemon pausing) leaves no
-                // row running that nothing collects or stops.
+                // row running that nothing collects or stops. The step's
+                // cord goes with it, so a pause meanwhile keeps the command
+                // from starting and its row ends stopped by it.
                 let registered = tokio::spawn(async move {
                     let process = store
                         .op("process_start", move |db| {
@@ -1157,6 +1165,7 @@ async fn run(
                     let spill = (outputs.clone()).map(|outputs| outputs.spill(turn, &named));
                     let (sender, receiver) = oneshot::channel();
                     registry.background(
+                        cord,
                         registry.stopper(process),
                         owner_id,
                         command,

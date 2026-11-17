@@ -6260,6 +6260,7 @@ impl Turn {
         let (sender, receiver) = oneshot::channel();
         let spill = (outputs.clone()).map(|outputs| outputs.spill(self.turn, call_id));
         self.registry.background(
+            self.registry.cord(),
             self.registry.stopper(id),
             owner,
             command,
@@ -6618,6 +6619,7 @@ impl Lifts {
                 Ok(queued) => {
                     self.running_as(process, ProcessKind::Background, &command);
                     self.registry.background(
+                        self.registry.cord(),
                         stopper,
                         bot.bot_id,
                         command,
