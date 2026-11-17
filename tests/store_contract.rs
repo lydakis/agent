@@ -2158,7 +2158,7 @@ fn a_parked_call_says_who_holds_it_and_since_when() {
 }
 
 #[test]
-fn schema_103_says_who_holds_a_call_parked_before_it() {
+fn schema_104_says_who_holds_a_call_parked_before_it() {
     let path = std::env::temp_dir().join(format!("agent-holder-{}.sqlite", std::process::id()));
     let _ = std::fs::remove_file(&path);
     let (turn, announced) = {

@@ -383,7 +383,7 @@ pinned the same day (Gemini CLI `2fe7c2d`, goose `04ed836`, OpenHands SDK
   `wait` stays parked; the verdict waits in the store until execution
   reaches its call. The hold keeps model
   verdicts off the park path and keeps a person's wait off the task table.
-- **A parked call says who holds it, and since when** (protocol 82). Its
+- **A parked call says who holds it, and since when** (protocol 83). Its
   `waiting_on` names `holder`: `reviewer` while sessions serve every gate
   still open and none was handed over, from the call's announcement;
   `person` from a gate's first `ask`, or from the announcement when a gate

@@ -3170,7 +3170,7 @@ impl Database {
     /// before versioning, stores at versions 1 to 5 and stores from newer
     /// binaries are rejected; an older store from version 6 on is migrated
     /// forward, one version at a time, at open.
-    pub const SCHEMA: i32 = 103;
+    pub const SCHEMA: i32 = 104;
     /// The person's messages a compaction keeps verbatim, newest first:
     /// per-message text, and the total text plus `(ordinal, String)` entry
     /// metadata. Empty entries cost space too, so the retained list cannot
@@ -18941,13 +18941,13 @@ fn migrate_since_73(conn: &Connection, from: i32) -> Result<()> {
     // Schema 102: daemon steps under way, in `steps`, which the schema
     // makes; nothing older holds any.
 
-    if from < 103 {
+    if from < 104 {
         migrate_approval_holders(conn)?;
     }
 
     Ok(())
 }
-/// 102 -> 103: a turn parked on a call's verdict says who holds the call
+/// 103 -> 104: a turn parked on a call's verdict says who holds the call
 /// and since when. No session serves a tag while the store opens, so a
 /// call a reviewer did not hand to a person is a person's from its
 /// announcement, as a park reads it then.

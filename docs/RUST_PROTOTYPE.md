@@ -3685,7 +3685,7 @@ it as a daemon step: `{"tools":[{"name","description","parameters",
 "grammar"?,"step"}]}`. The settings change no stored shape; no schema
 change.
 
-Protocol version 82 says who holds a call a turn parked on, and since when.
+Protocol version 83 says who holds a call a turn parked on, and since when.
 A verdict park's `waiting_on` (its `turn_waiting` event, the turn's view and
 its bot's row) adds `holder` and `since_ms`: `reviewer` while every gate
 still open on the call is served by a session (`serve_approvals`) and none
@@ -3698,7 +3698,7 @@ turn parks, from the tags served then, and an `ask` rewrites it on the
 parked turn and its bot in the commit that records the ask. A tag a
 session starts or stops serving after the park leaves it as it was: a
 reviewer that comes back decides the call or asks, and either moves the
-turn on. Schema 103 writes both for turns parked on a verdict when the
+turn on. Schema 104 writes both for turns parked on a verdict when the
 store opens, where no session serves yet.
 
 ### Tool approval
