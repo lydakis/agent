@@ -391,6 +391,158 @@ class ServedToolTests(ModelFixture):
         rows = self.daemon.request('audit', bot='calc.lead')['result']['rows']
         self.assertTrue([r for r in rows if r['tool'] == 'shell'], rows)
 
+    def steered_script(self, command, settings=None, steer_after=1.0, waits=True, before=None, after=None,
+                       escalated=False, code=None, calls=1, **made):
+        """A code-mode lead runs `command` as a step of a script, and a
+        message joins its turn `steer_after` seconds in; the model then
+        waits on whatever handle its call was answered with. Every result
+        the turn's calls got, in order, and the turn's status."""
+        script = json.loads(subprocess.run([str(self.sonny), 'mcp', 'tool'], env={**clean_env(), 'HOME': str(self.path)},
+                                           check=True, capture_output=True, text=True).stdout)
+        shell = {'command': command}
+        if escalated:
+            shell.update(sandbox_permissions='require_escalated', justification='outside')
+        code = code or (f'const r = await tools.shell({json.dumps(shell)});\n'
+                        'text(JSON.parse(r.content[0].text).stdout.trim());')
+
+        def respond(request, user):
+            if user.startswith('collect:'):
+                answered = any(i.get('type') == 'function_call_output' for i in request['input'][-1:])
+                return 'collected' if answered else [['wait', {'handles': [user[8:]], 'timeout_ms': 20000}]]
+            if user != 'go':
+                return None
+            outputs = [i['output'] for i in request['input']
+                       if i.get('type') in ('function_call_output', 'custom_tool_call_output')]
+            if not outputs:
+                return [['exec', code.replace('CALL', str(n))] for n in range(calls)]
+            last = outputs[-1] if isinstance(outputs[-1], str) else ''.join(p.get('text', '') for p in outputs[-1])
+            try:
+                said = json.loads(last)
+            except ValueError:
+                said = {}
+            handles = [json.loads(o).get('handle') for o in outputs if isinstance(o, str) and o.startswith('{')]
+            handles = [h for h in handles if h]
+            if calls > 1 and handles and not said.get('results') and waits:
+                return [['wait', {'handles': handles, 'timeout_ms': 20000}]]
+            handle = said.get('handle') or next(iter(said.get('pending', [])), None)
+            if handle and waits and len(outputs) < 6:
+                return [['wait', {'handles': [handle], 'timeout_ms': 20000}]]
+            return 'done'
+        self.model.respond = respond
+        created = self.daemon.request('create', bot='calc.lead', workspace=str(self.path), model='openai/synthetic-model',
+                                      instructions='Lead.', tools=['echo', 'shell', 'wait'], declare=[script],
+                                      settings={'steps_only': ['*'], **(settings or {})}, **made)
+        self.assertIn('result', created, created)
+        self.keeps_its_tools(self.host(), 'calc.lead', tools=['echo', 'shell', 'wait'], declare=[script],
+                             settings={'steps_only': ['*'], **(settings or {})}, **made)
+        turn = self.daemon.request('submit', bot='calc.lead', request_id='go', prompt='go')['result']['message']
+        if before:
+            before(turn)
+        time.sleep(steer_after)
+        self.daemon.request('submit', bot='calc.lead', request_id='steer', prompt='steer:look', delivery='steer')
+        if after:
+            after(turn)
+        status = self.daemon.finished(turn, 30)['data']['status']
+        events, after = [], 0
+        while page := self.daemon.request('events', bot='calc.lead', after=after, limit=256)['result']['events']:
+            events, after = events + page, page[-1]['cursor']
+        results = [(e['data']['call_id'], node_item(self.daemon, 'calc.lead', e['data']['node'])['result']['output'])
+                   for e in events if e['turn'] == turn and e['event'] == 'tool_completed']
+        return results, status
+
+    def test_a_message_during_a_script_s_step_leaves_the_step_running_and_its_call_answerable(self):
+        results, status = self.steered_script('sleep 2; echo done > made; echo ran')
+        self.assertEqual(status, 'completed')
+        self.assertEqual((self.path / 'made').read_text(), 'done\n')
+        self.assertIn('ran', results[-1][1])
+
+    def gate(self, turn, allow=True):
+        """Wait for the step's gate to ask, and answer it."""
+        deadline = time.monotonic() + 10
+        while not (asked := self.daemon.request('approvals', bot='calc.lead')['result']['approvals']):
+            self.assertLess(time.monotonic(), deadline, [
+                (e['event'], json.dumps(e['data'])[:300]) for e in
+                self.daemon.request('events', bot='calc.lead', after=0, limit=200)['result']['events']])
+            time.sleep(.05)
+        if allow is None:
+            return asked[0]
+        call = asked[0]
+        self.daemon.request('answer', bot='calc.lead', turn=call['turn'], call_id=call['call_id'],
+                            request=call.get('request', 1), decision='allow' if allow else 'deny', by='test')
+
+    @unittest.skipUnless(shutil.which('bwrap') or sys.platform == 'darwin', 'sandboxes need bubblewrap')
+    def test_a_message_during_a_sandboxed_step_leaves_it_running(self):
+        results, status = self.steered_script('sleep 2; echo done > made; echo ran',
+                                              settings={'sandbox': 'workspace-write'}, approve=['shell', 'exec'], approver='manual')
+        self.assertEqual(status, 'completed')
+        self.assertIn('ran', results[-1][1])
+
+    @unittest.skipUnless(shutil.which('bwrap') or sys.platform == 'darwin', 'sandboxes need bubblewrap')
+    def test_a_message_while_an_escalated_step_waits_on_its_gate_leaves_it_answerable(self):
+        results, status = self.steered_script('sleep 1; echo done > made; echo ran', escalated=True,
+                                              settings={'sandbox': 'workspace-write'}, approve=['shell'],
+                                              approver='manual', before=lambda turn: self.gate(turn, None),
+                                              after=lambda turn: (time.sleep(1), self.gate(turn)))
+        self.assertEqual(status, 'completed')
+        self.assertIn('ran', results[-1][1])
+
+    @unittest.skipUnless(shutil.which('bwrap') or sys.platform == 'darwin', 'sandboxes need bubblewrap')
+    def test_a_message_while_an_escalated_step_runs_leaves_it_running(self):
+        results, status = self.steered_script('sleep 2; echo done > made; echo ran', escalated=True,
+                                              settings={'sandbox': 'workspace-write'}, approve=['shell'],
+                                              approver='manual', before=self.gate)
+        self.assertEqual(status, 'completed')
+        self.assertIn('ran', results[-1][1])
+
+    def test_a_lifted_script_goes_on_to_its_next_steps(self):
+        code = ('for (let n = 0; n < 5; n++) {\n'
+                '  const r = await tools.shell({command: `sleep 0.5; echo ${n} >> steps`});\n'
+                '  if (r.isError) { text(r.content[0].text); break; }\n'
+                '}\ntext("all");')
+        results, status = self.steered_script('', code=code, waits=False)
+        handle = json.loads(results[0][1])['handle']
+        later = self.daemon.request('submit', bot='calc.lead', request_id='c', prompt='collect:' + handle)['result']['message']
+        self.assertEqual(self.daemon.finished(later, 30)['data']['status'], 'completed')
+        self.assertIn('all', self.output('calc.lead', later))
+        self.assertEqual((self.path / 'steps').read_text(), '0\n1\n2\n3\n4\n')
+
+    def test_a_message_during_two_scripts_of_one_round_leaves_both_running(self):
+        code = ('const r = await tools.shell({command: "sleep 2; echo CALL >> made; echo ran CALL"});\n'
+                'text(JSON.parse(r.content[0].text).stdout.trim());')
+        results, status = self.steered_script('', code=code, calls=2)
+        self.assertEqual(status, 'completed')
+        self.assertEqual(sorted((self.path / 'made').read_text().split()), ['0', '1'])
+
+    def test_a_message_before_a_script_s_first_step_leaves_the_script_answerable(self):
+        code = ('const t = Date.now(); while (Date.now() - t < 1500) {}\n'
+                'const r = await tools.shell({command: "sleep 1; echo ran > made; echo ran"});\n'
+                'text(JSON.parse(r.content[0].text).stdout.trim());')
+        results, status = self.steered_script('', code=code, steer_after=0.3)
+        self.assertEqual(status, 'completed')
+        self.assertIn('ran', results[-1][1])
+
+    @unittest.skipUnless(shutil.which('bwrap') or sys.platform == 'darwin', 'sandboxes need bubblewrap')
+    def test_a_message_before_an_escalated_step_is_asked_leaves_the_script_answerable(self):
+        code = ('const t = Date.now(); while (Date.now() - t < 1500) {}\n'
+                'const r = await tools.shell({command: "sleep 1; echo ran > made; echo ran", '
+                'sandbox_permissions: "require_escalated", justification: "outside"});\n'
+                'text(JSON.parse(r.content[0].text).stdout.trim());')
+        results, status = self.steered_script('', code=code, steer_after=0.3, settings={'sandbox': 'workspace-write'},
+                                              approve=['shell', 'exec'], approver='manual',
+                                              after=lambda turn: self.gate(turn))
+        self.assertEqual(status, 'completed')
+        self.assertIn('ran', results[-1][1])
+
+    def test_a_script_a_message_lifted_outlives_its_turn(self):
+        results, status = self.steered_script('sleep 3; echo done > made; echo ran', waits=False)
+        self.assertEqual(status, 'completed')
+        handle = json.loads(results[0][1])['handle']
+        later = self.daemon.request('submit', bot='calc.lead', request_id='c', prompt='collect:' + handle)['result']['message']
+        self.assertEqual(self.daemon.finished(later, 30)['data']['status'], 'completed')
+        got = self.output('calc.lead', later)
+        self.assertIn('ran', got)
+        self.assertEqual((self.path / 'made').read_text(), 'done\n')
+
     def test_a_script_s_pictures_reach_the_model_in_order_with_its_text(self):
         server = Path(__file__).with_name('mcp_server.py')
         (self.path / '.agent').mkdir(exist_ok=True)

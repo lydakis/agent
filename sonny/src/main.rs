@@ -1647,10 +1647,25 @@ fn env_file_refused_at(file: &std::path::Path) -> Option<String> {
 /// The daemon's companion that answers an `auto` gate: `sonny reviewer`,
 /// reviewing with `model` unless `[reviewer] model` is set, which the
 /// daemon then keeps running for as long as it runs, as it does the
-/// lookout. One kept already keeps the model it was given first, so leads
-/// on other models do not start it again.
+/// lookout. One kept already is left as it is, so leads on other models,
+/// and windows of another build, do not start it again.
 async fn serve_auto(client: &Client, model: &str) -> Result<(), String> {
-    keep_reviewer(client, Some(model)).await
+    let listed = companions(client).await?;
+    keep_reviewer(client, &listed, Some(model), Companions::Add).await
+}
+
+/// What a start of Sonny's companions may do to those the daemon keeps.
+#[derive(Clone, Copy, PartialEq)]
+enum Companions {
+    /// Add those it keeps none of: what a window and an editor's session
+    /// do as they start or the daemon comes back. A window of another
+    /// build or path never replaces what runs, as replacing one stops the
+    /// scripts it runs.
+    Add,
+    /// Replace them with this Sonny's, as `sonny upgrade` does, and as a
+    /// window does that started the daemon itself, whose companions have
+    /// only just started and run nothing yet.
+    Replace,
 }
 
 /// Sonny's companions in the daemon, so they run for as long as it does,
@@ -1658,49 +1673,58 @@ async fn serve_auto(client: &Client, model: &str) -> Result<(), String> {
 /// the lookout, `sonny lookout`, which tells leads what happens in their
 /// tasks, and the tool host, `sonny tool-host`, which answers the tools
 /// Sonny gives its agents; and the reviewer, when one is kept already.
-/// This Sonny's own build replaces another's: the build is part of what
-/// the daemon keeps, so a Sonny upgraded in place has the daemon start the
-/// new ones, the reviewer too, with no window in `auto` needed.
-async fn start_companions(client: &Client) -> Result<(), String> {
+/// The daemon keeps them across its own restarts, so a window only adds
+/// one missing; `sonny upgrade`, and a window that started the daemon,
+/// put their own build in their place ([`Companions::Replace`]).
+async fn start_companions(client: &Client, start: Companions) -> Result<(), String> {
+    let listed = companions(client).await?;
     let me = named::me().map_err(|e| e.to_string())?;
     let build = json!({"SONNY_BUILD": lookout::identity(), named::PROGRAM: me});
-    let lookout = named::named(&me, named::LOOKOUT);
-    keep(
-        client,
-        LOOKOUT,
-        &lookout,
-        daemon_args("lookout"),
-        build.clone(),
-    )
-    .await?;
-    let host = named::named(&me, named::TOOL_HOST);
-    keep(
-        client,
-        TOOL_HOST,
-        &host,
-        daemon_args(tool_host::NAME),
-        build,
-    )
-    .await?;
-    keep_reviewer(client, None).await
+    for (name, program, verb) in [
+        (LOOKOUT, named::LOOKOUT, "lookout"),
+        (TOOL_HOST, named::TOOL_HOST, tool_host::NAME),
+    ] {
+        if start == Companions::Add && kept_companion(&listed, name).is_some() {
+            continue;
+        }
+        let program = named::named(&me, program);
+        keep(client, name, &program, daemon_args(verb), build.clone()).await?;
+    }
+    keep_reviewer(client, &listed, None, start).await
+}
+
+/// The companions the daemon keeps, as it lists them.
+async fn companions(client: &Client) -> Result<Value, String> {
+    (client.request("companions", json!({})).await).map_err(|e| e.to_string())
+}
+
+/// The companion `name` in a daemon's `listed` companions.
+fn kept_companion<'a>(listed: &'a Value, name: &str) -> Option<&'a Value> {
+    (listed["companions"].as_array().into_iter().flatten()).find(|c| c["name"] == name)
 }
 
 /// Keep the reviewer running this Sonny's binary and build: the one kept
 /// already with the model it has, else, given a `model`, a new one
-/// reviewing with it. Without one kept or a model, nothing.
-async fn keep_reviewer(client: &Client, model: Option<&str>) -> Result<(), String> {
+/// reviewing with it. Without one kept or a model, nothing; with one kept,
+/// nothing either, unless `start` replaces it.
+async fn keep_reviewer(
+    client: &Client,
+    listed: &Value,
+    model: Option<&str>,
+    start: Companions,
+) -> Result<(), String> {
+    if start == Companions::Add && kept_companion(listed, REVIEWER).is_some() {
+        return Ok(());
+    }
     let me = named::me().map_err(|e| e.to_string())?;
-    let listed = client
-        .request("companions", json!({}))
-        .await
-        .map_err(|e| e.to_string())?;
-    let kept = |name: &str| {
-        (listed["companions"].as_array().into_iter().flatten()).find(|c| c["name"] == name)
-    };
     // One kept by its name before 0.9.1 is kept again by the reviewer's,
     // with its model, and goes ([`reviewer::RENAMED`]).
-    let old = kept(OLD_REVIEWER);
-    let Some(mut env) = reviewer_env(kept(REVIEWER).or(old), model, &lookout::identity()) else {
+    let old = kept_companion(listed, OLD_REVIEWER);
+    let Some(mut env) = reviewer_env(
+        kept_companion(listed, REVIEWER).or(old),
+        model,
+        &lookout::identity(),
+    ) else {
         return Ok(());
     };
     env[named::PROGRAM] = json!(me);
@@ -1782,10 +1806,7 @@ enum Asking {
 /// The daemon, started the way the CLI starts it when it is not running.
 /// At start, with no provider set anywhere, the person is asked for one
 /// first, and a first model list is written once it runs.
-async fn connect(
-    options: &Options,
-    asking: Asking,
-) -> Result<(Arc<Client>, agent_client::Events), String> {
+async fn connect(options: &Options, asking: Asking) -> Result<Connected, String> {
     let start = || start_daemon(&options.store, &options.socket, false);
     connect_starting(&options.socket, asking, start).await
 }
@@ -1795,9 +1816,9 @@ async fn connect_starting(
     socket: &Path,
     asking: Asking,
     start: impl Fn() -> Result<(), NotStarted>,
-) -> Result<(Arc<Client>, agent_client::Events), String> {
+) -> Result<Connected, String> {
     match Client::connect(socket).await {
-        Ok(connected) => return Ok(connected),
+        Ok((client, events)) => return Ok((client, events, Companions::Add)),
         // What this window would start is its own older build.
         Err(error) if newer_daemon(&error) => return Err(UPGRADED.to_owned()),
         Err(_) => {}
@@ -1824,13 +1845,20 @@ async fn connect_starting(
         Ok(()) => {}
     }
     // The daemon rewrites the model catalog itself, from every start.
-    Client::connect(socket)
-        .await
-        .map_err(|error| match newer_daemon(&error) {
-            true => UPGRADED.to_owned(),
-            false => error.to_string(),
-        })
+    let (client, events) =
+        Client::connect(socket)
+            .await
+            .map_err(|error| match newer_daemon(&error) {
+                true => UPGRADED.to_owned(),
+                false => error.to_string(),
+            })?;
+    Ok((client, events, Companions::Replace))
 }
+
+/// A daemon connected to, and how its companions are kept: put on this
+/// Sonny's build when this Sonny started the daemon, whose companions have
+/// only just started with it, and otherwise only added where missing.
+type Connected = (Arc<Client>, agent_client::Events, Companions);
 
 /// Why a window starts nothing once the daemon speaks a newer protocol
 /// than it: Sonny was upgraded while it was open, and a daemon or
@@ -2490,8 +2518,8 @@ async fn run() -> Result<(), String> {
     std::thread::spawn(image::preload);
     // So are the syntaxes, before the first code is colored.
     std::thread::spawn(highlight::preload);
-    let (client, mut events) = match Client::connect(&options.socket).await {
-        Ok(connected) => connected,
+    let (client, mut events, companions) = match Client::connect(&options.socket).await {
+        Ok((client, events)) => (client, events, Companions::Add),
         Err(error) => {
             // Starting replaces an older daemon, which takes a moment while
             // the new one opens the store; the screen is not up yet to say so.
@@ -2671,7 +2699,7 @@ async fn run() -> Result<(), String> {
         app.warnings.push(format!("the lookout: {error}"));
     }
     // They answer the tools Sonny gives every agent, a lead or not.
-    if let Err(error) = start_companions(&app.client).await {
+    if let Err(error) = start_companions(&app.client, companions).await {
         app.warnings.push(error);
     }
     // The lead told what its folder tells it today (skills and memory added
@@ -7744,7 +7772,7 @@ impl App {
             return;
         }
         let lead = async {
-            let (client, mut fresh) = connect(&self.options, Asking::Never).await?;
+            let (client, mut fresh, companions) = connect(&self.options, Asking::Never).await?;
             follow_bot(&client, &self.bot).await?;
             let caught = caught_up(&mut fresh).await;
             // Read after the replay, so a turn that ends meanwhile arrives
@@ -7753,10 +7781,10 @@ impl App {
                 .request("inspect", json!({"bot": self.bot}))
                 .await
                 .map_err(|e| e.to_string())?;
-            Ok::<_, String>((client, fresh, record, caught))
+            Ok::<_, String>((client, fresh, record, caught, companions))
         };
         if self.down.is_some() {
-            let (client, fresh, record, caught) = match lead.await {
+            let (client, fresh, record, caught, companions) = match lead.await {
                 Ok(back) => back,
                 Err(error) if error == UPGRADED => {
                     self.notice = Some(UPGRADED.to_owned());
@@ -7834,7 +7862,7 @@ impl App {
             self.verdicts_from_audit(unheard).await;
             // A daemon that restarted brings back its companions; one
             // started anew, as by another store's Sonny, gets them now.
-            if let Err(error) = start_companions(&self.client).await {
+            if let Err(error) = start_companions(&self.client, companions).await {
                 self.notice = Some(error);
             }
             if approvals::reviews(self.mode)
@@ -28238,7 +28266,7 @@ mod tests {
 
     /// The companions `start_companions` adds and removes when the daemon
     /// keeps `kept`.
-    async fn companions_kept_from(kept: Value) -> (Vec<Value>, Vec<String>) {
+    async fn companions_kept_from(kept: Value, start: Companions) -> (Vec<Value>, Vec<String>) {
         let added = Arc::new(std::sync::Mutex::new(Vec::new()));
         let removed = Arc::new(std::sync::Mutex::new(Vec::new()));
         let (seen, gone) = (added.clone(), removed.clone());
@@ -28254,18 +28282,20 @@ mod tests {
             json!({"companions": kept})
         })
         .await;
-        start_companions(&client).await.unwrap();
+        start_companions(&client, start).await.unwrap();
         let added = added.lock().unwrap().clone();
         let removed = removed.lock().unwrap().clone();
         (added, removed)
     }
 
     #[tokio::test]
-    async fn every_start_keeps_the_reviewer_again_on_this_binary_with_its_model() {
-        let (added, removed) =
-            companions_kept_from(json!([{"name": REVIEWER, "command": "/gone/sonny",
-                "args": ["reviewer"], "env": {"AGENT_MODEL": "openai/gpt-6"}}]))
-            .await;
+    async fn an_upgrade_puts_every_companion_on_this_binary_and_the_reviewer_keeps_its_model() {
+        let (added, removed) = companions_kept_from(
+            json!([{"name": REVIEWER, "command": "/gone/sonny",
+                "args": ["reviewer"], "env": {"AGENT_MODEL": "openai/gpt-6"}}]),
+            Companions::Replace,
+        )
+        .await;
         let names: Vec<&str> = added.iter().filter_map(|a| a["name"].as_str()).collect();
         assert_eq!(names, [LOOKOUT, TOOL_HOST, REVIEWER]);
         assert!(removed.is_empty());
@@ -28288,10 +28318,12 @@ mod tests {
 
     #[tokio::test]
     async fn the_reviewer_kept_by_its_old_name_moves_to_its_own_with_its_model() {
-        let (added, removed) =
-            companions_kept_from(json!([{"name": OLD_REVIEWER, "command": "/gone/sonny",
-                "args": ["approver"], "env": {"AGENT_MODEL": "openai/gpt-6"}}]))
-            .await;
+        let (added, removed) = companions_kept_from(
+            json!([{"name": OLD_REVIEWER, "command": "/gone/sonny",
+                "args": ["approver"], "env": {"AGENT_MODEL": "openai/gpt-6"}}]),
+            Companions::Add,
+        )
+        .await;
         let names: Vec<&str> = added.iter().filter_map(|a| a["name"].as_str()).collect();
         assert_eq!(names, [LOOKOUT, TOOL_HOST, REVIEWER]);
         assert_eq!(
@@ -28299,6 +28331,29 @@ mod tests {
             (&json!(["reviewer"]), &json!("openai/gpt-6"))
         );
         assert_eq!(removed, [OLD_REVIEWER]);
+    }
+
+    #[tokio::test]
+    async fn a_window_adds_only_the_companions_the_daemon_keeps_none_of() {
+        // Kept by another build: a window of this one leaves them running,
+        // as replacing the tool host stops every script it runs.
+        let other = |name: &str| {
+            json!({"name": name, "command": "/other/sonny", "args": [],
+                "env": {"SONNY_BUILD": "0.9.5 1", named::PROGRAM: "/other/sonny"}})
+        };
+        let (added, removed) = companions_kept_from(
+            json!([other(LOOKOUT), other(TOOL_HOST), other(REVIEWER)]),
+            Companions::Add,
+        )
+        .await;
+        assert!(added.is_empty() && removed.is_empty(), "{added:?}");
+        // The one missing is added, on this binary.
+        let (added, _) =
+            companions_kept_from(json!([other(LOOKOUT), other(REVIEWER)]), Companions::Add).await;
+        let names: Vec<&str> = added.iter().filter_map(|a| a["name"].as_str()).collect();
+        assert_eq!(names, [TOOL_HOST]);
+        let me = std::env::current_exe().unwrap();
+        assert_eq!(added[0]["env"][named::PROGRAM], json!(me));
     }
 
     #[tokio::test]

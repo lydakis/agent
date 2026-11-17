@@ -958,7 +958,12 @@ newest build of VERSION` for a nightly), or `Sonny is up to date
 An update made by hand (`brew upgrade`, install.sh, or a link moved) is
 finished by `sonny update` or by opening a Sonny window: until one runs,
 the daemon, the scripts in `~/.agent`, automations and the scheduler's job
-stay on the old release. A plain `agent start` replaces only the daemon.
+stay on the old release. The companions are the exception: a window puts
+them on its own build only when it starts the daemon itself (none ran, or
+one of an older protocol it replaces), and otherwise adds only one the
+daemon keeps none of, since replacing a running tool host stops the
+scripts it runs; `sonny update` replaces them. A plain `agent start`
+replaces only the daemon.
 
 Each open window notes the program it started from. When it loses the
 daemon and the Sonny installed where it runs from is another program
@@ -1063,7 +1068,10 @@ The tools Sonny gives its agents (`start_task`, `memory`,
 `sonny tool-host --store STORE --socket SOCKET`, the daemon's companion
 `sonny-tool-host` ([tool_host.rs](../sonny/src/tool_host.rs)), which Sonny
 and `sonny acp` add beside the lookout, so the calls are answered with
-every window closed, by the build that declared them. It is the lookout's
+every window closed, by the build that declared them. A window adds it
+only when the daemon keeps none; one already kept is replaced only by
+`sonny update` or by a window that started the daemon, as replacing it
+stops the scripts it runs. It is the lookout's
 sibling, not part of it, as Codex keeps its code-mode host apart from the
 session: a tool that runs long, crashes or holds memory, as an MCP server
 or a browser can, never holds up the news a lead hears, and either can be

@@ -12,6 +12,7 @@ import threading
 import time
 import unittest
 
+from bench.runtime_client import node_item
 from bench.socket_client import SocketClient
 from bench.targets import clean_env
 from tests.test_runtime import ModelFixture
@@ -361,6 +362,47 @@ class AcpTests(ModelFixture):
         [again] = [m for m in back.until(lambda m: m.get('method') == 'session/request_permission')
                    if m.get('method') == 'session/request_permission']
         self.assertEqual(again['params']['toolCall']['toolCallId'], asked['params']['toolCall']['toolCallId'])
+
+    def test_a_thread_that_opens_leaves_the_tool_host_another_build_runs_and_its_scripts(self):
+        """Row 29 of code mode: a client of another build started the tool
+        host; a thread opening on this build adds what is missing and
+        replaces nothing, so the script the host runs goes on to its end."""
+        tool = json.loads(subprocess.run([str(self.sonny), 'mcp', 'tool'], env=self.env, check=True,
+                                         capture_output=True, text=True).stdout)
+        made = dict(workspace=str(self.path), model='openai/synthetic-model', instructions='Task.',
+                    tools=['echo', 'shell'], declare=[tool], settings={'steps_only': ['*']})
+        self.daemon.request('create', bot='calc.task', **made)
+        # As a window of the release before this one kept it.
+        other = {'HOME': str(self.path), 'AGENT_BIN': str(self.binary), 'SONNY_BUILD': '0.9.5 1',
+                 'SONNY_PROGRAM': str(self.sonny)}
+        self.daemon.request('companions', add={'name': 'sonny-tool-host', 'command': str(self.sonny),
+                                               'args': ['tool-host'], 'env': other})
+        log = self.store.parent / f'{self.store.name}.companions' / 'sonny-tool-host.log'
+        deadline = time.monotonic() + 15
+        # The host's first look gives the agent Sonny's tools: back to these.
+        while not (log.exists() and '"tools_refreshed"' in log.read_text()):
+            self.assertLess(time.monotonic(), deadline, 'the tool host never looked')
+            time.sleep(.05)
+        self.daemon.request('configure', bot='calc.task', **{k: v for k, v in made.items() if k != 'workspace'})
+        self.model.call_script = [('exec', 'const r = await tools.shell({command: "sleep 3; echo ran"});\n'
+                                           'text(JSON.parse(r.content[0].text).stdout.trim());')]
+        turn = self.daemon.request('submit', bot='calc.task', request_id='s', prompt='script')['result']['message']
+        while not [c for c in self.daemon.request('tool_calls', tag='sonny')['result']['calls'] if c['taken_ms']]:
+            self.assertLess(time.monotonic(), deadline, 'the script never started')
+            time.sleep(.05)
+        # A thread opens on the folder's lead, which starts Sonny's services.
+        thread, session = self.open(self.repo())
+        self.adopt(thread, session)
+        thread.close()
+        self.assertEqual(self.daemon.finished(turn, 30)['data']['status'], 'completed')
+        events = self.daemon.request('events', bot='calc.task', after=0, limit=256)['result']['events']
+        [done] = [e for e in events if e['turn'] == turn and e['event'] == 'tool_completed']
+        said = node_item(self.daemon, 'calc.task', done['data']['node'])['result']['output']
+        self.assertTrue(said.endswith('Output:\nran'), said)
+        # The thread added the companions missing, on its own build.
+        kept = {c['name']: c for c in self.daemon.request('companions')['result']['companions']}
+        self.assertEqual(kept['sonny-tool-host']['env'], other)
+        self.assertIn('sonny-lookout', kept)
 
     def test_a_turn_the_lead_takes_on_its_own_shows_in_the_thread(self):
         repo = self.repo()

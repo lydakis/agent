@@ -8,7 +8,13 @@ held at its peak, and its memory; and beside the fleet, `SIDE` other bots
 running plain turns, whose turn times are compared with the same turns on
 an idle daemon. Synthetic model, no spend; needs a release build.
 
-    AGENT_TEST_RUNTIME=1 AGENTS=1000,10000 STEPS=5 [BINARY=PATH] \\
+With YIELD=1 the fleet's client then yields every call (`yield_call`)
+before answering it, as a script still running at its yield time is
+handed back: each yield's time, the store jobs a yield takes, and the
+daemon's memory with every call yielded, its turn ended, against the same
+fleet once each answer ended its call.
+
+    AGENT_TEST_RUNTIME=1 AGENTS=1000,10000 STEPS=5 [YIELD=1] [BINARY=PATH] \\
         python3 -m bench.steps_fleet
 """
 import json
@@ -28,10 +34,11 @@ AGENTS = [int(n) for n in os.environ.get('AGENTS', '1000').split(',')]
 STEPS = int(os.environ.get('STEPS', '5'))
 SIDE = int(os.environ.get('SIDE', '32'))
 SIDE_TURNS = int(os.environ.get('SIDE_TURNS', '5'))
+YIELD = os.environ.get('YIELD') == '1'
 EXEC = {'name': 'exec', 'description': 'Run a script.',
         'parameters': {'type': 'object', 'properties': {'code': {'type': 'string'}},
                        'required': ['code'], 'additionalProperties': False},
-        'answered_by': 'bench', 'steps': True}
+        'answered_by': 'bench', 'steps': True, **({'lift': True} if YIELD else {})}
 
 
 class Pipe:
@@ -339,6 +346,7 @@ class StepsFleet(ModelFixture):
             stop.set()
             after = pipe.request('stats')['result']
             ops = {k: v - ops_before.get(k, 0) for k, v in store_ops(after).items() if v - ops_before.get(k, 0)}
+            yielded = self.yield_all(pipe, pid, turns, agents) if YIELD else None
             # Every call answered, every turn ended.
             for start in range(0, agents, 2000):
                 ids, _ = pipe.send_many([('tool_result', dict(bot=f'p.b{b}', turn=turns[b], call_id='script-0',
@@ -352,6 +360,18 @@ class StepsFleet(ModelFixture):
             def finished(turn):
                 return any(e['event'] == 'turn_finished' for _, e in pipe.events.get(turn, []))
             pipe.wait(lambda: all(finished(t) for t in turns.values()), 600)
+            if yielded is not None:
+                # Each answer ends its yielded call, told to its bot in a
+                # turn of its own: those turns end before memory is read.
+                ours = set(turns.values())
+
+                def told():
+                    return sum(1 for t, es in pipe.events.items() if t not in ours
+                               and any(e['event'] == 'turn_finished' for _, e in es))
+                pipe.wait(lambda: told() >= agents, 600)
+                yielded['answered_rss_kib'] = self.settled(pid)
+                yielded['kib_per_yielded_call'] = round(
+                    (yielded['yielded_rss_kib'] - yielded['answered_rss_kib']) / agents, 3)
             kind, side_times = out.get(timeout=300)
             assert kind == 'busy'
             sider.join(timeout=60)
@@ -373,6 +393,7 @@ class StepsFleet(ModelFixture):
                 'side_busy_turns': len(side_times),
                 'daemon_rss_kib': rss_kib(pid),
                 'footprint': footprint,
+                'yielded': yielded,
             }
         finally:
             stop.set()
@@ -383,6 +404,41 @@ class StepsFleet(ModelFixture):
                     sider.kill()
             pipe.close()
             daemon.close()
+
+    @staticmethod
+    def settled(pid):
+        time.sleep(1)
+        return rss_kib(pid)
+
+    def yield_all(self, pipe, pid, turns, agents):
+        """Yield every fleet call at once, as a client whose scripts all
+        ran past their yield time: each yield's time from sent to reply,
+        the store jobs it took, and the daemon's memory once every turn
+        ended with its call yielded and waiting."""
+        before = store_ops(pipe.request('stats')['result'])
+        times, sent_at = [], {}
+        for start in range(0, agents, 2000):
+            bots = list(range(start, min(agents, start + 2000)))
+            ids, sent = pipe.send_many([('yield_call', dict(bot=f'p.b{b}', turn=turns[b], call_id='script-0',
+                                                            output='so far'))
+                                        for b in bots])
+            for request in ids:
+                sent_at[request] = sent
+        pipe.wait(lambda: all(r in pipe.replies for r in sent_at), 600)
+        for request, sent in sent_at.items():
+            at, reply = pipe.take(request)
+            assert 'result' in reply, reply
+            times.append((at - sent) * 1000)
+
+        def finished(turn):
+            return any(e['event'] == 'turn_finished' for _, e in pipe.events.get(turn, []))
+        pipe.wait(lambda: all(finished(t) for t in turns.values()), 600)
+        after = store_ops(pipe.request('stats')['result'])
+        jobs = after.get('yield_call', 0) - before.get('yield_call', 0)
+        return {'yields': len(times), 'yield_ms_p50': round(percentile(times, 50), 3),
+                'yield_ms_p99': round(percentile(times, 99), 3),
+                'yield_jobs_per_call': round(jobs / agents, 3),
+                'yielded_rss_kib': self.settled(pid)}
 
     def footprint(self, pipe, pid, turns, agents):
         """What a step waiting in line holds, measured: the daemon's RSS
