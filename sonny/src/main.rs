@@ -2981,7 +2981,13 @@ pub(crate) fn made(
     state: Option<&str>,
 ) -> Result<(), String> {
     let config = agent_client::config::load()?;
-    let declare = json!(declared::tools(served::Role::TASK));
+    // Confined from the start, as the row it is made in confines it, and
+    // writing `state`, the state folder of the agent that makes it, or its
+    // own.
+    let mode = approvals::default();
+    let mut settings = approvals::sandbox(mode, workspace, state);
+    let role = served::Role::TASK.within(&json!(settings));
+    let declare = json!(declared::tools(role));
     let tools = agent_client::default_tools(
         client.providers(),
         model,
@@ -2991,11 +2997,6 @@ pub(crate) fn made(
     asked["tools"] = json!(tools);
     asked["declare"] = declare.clone();
     asked["compaction_instructions"] = json!(agent_client::policy::DEFAULT_COMPACTION_INSTRUCTIONS);
-    // Confined from the start, as the row it is made in confines it, and
-    // writing `state`, the state folder of the agent that makes it, or its
-    // own.
-    let mode = approvals::default();
-    let mut settings = approvals::sandbox(mode, workspace, state);
     // Named in its shell too; one another bot makes takes its maker's.
     if let Some(state) = &state {
         settings.insert("env".into(), json!({state::VAR: state}));
@@ -7134,6 +7135,19 @@ impl App {
             .as_ref()
             .and(self.mode)
             .filter(|mode| *mode != "full"));
+        // An agent's sandbox goes with its row, a lead's, a task's or
+        // a side chat's, which the daemon holds within its agent's.
+        let workspace = std::path::Path::new(&self.workspace);
+        let confined =
+            gating.map(|mode| approvals::sandbox(mode, workspace, self.state.as_deref()));
+        // Its `exec` shows the shell's fields for leaving a sandbox only
+        // while its row puts it in one.
+        if let Some(confined) = &confined
+            && let Some(held) =
+                declared::held(declare.as_ref().unwrap_or(&self.declared), &json!(confined))
+        {
+            declare = Some(held);
+        }
         let mut asked = json!({"bot": self.bot});
         if let Some(text) = &text {
             asked["instructions"] = json!(text);
@@ -7162,11 +7176,8 @@ impl App {
                 mode,
                 &approvals::gateable(&self.tools, declared),
             ));
-            // An agent's sandbox goes with its row, a lead's, a task's or
-            // a side chat's, which the daemon holds within its agent's.
-            let workspace = std::path::Path::new(&self.workspace);
-            settings.extend(approvals::sandbox(mode, workspace, self.state.as_deref()));
         }
+        settings.extend(confined.into_iter().flatten());
         if !settings.is_empty() {
             asked["settings"] = Value::Object(settings);
         }
@@ -26297,7 +26308,8 @@ mod tests {
         assert!(app.configure().await);
         let sent = asked.lock().unwrap()[0].clone();
         assert_eq!(sent["op"], "configure");
-        assert_eq!(sent["declare"], json!(declared::tools(served::Role::TASK)));
+        let unconfined = served::Role::TASK.within(&Value::Null);
+        assert_eq!(sent["declare"], json!(declared::tools(unconfined)));
         assert!(app.declare.is_none());
     }
 

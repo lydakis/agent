@@ -747,9 +747,18 @@ pub fn cli(args: &[String]) -> Result<(), String> {
             }
             Ok(())
         }
-        // The `exec` tool as agents opened now are given it, its
-        // description listing each server's tools from the last listing.
-        Some((verb, [])) if verb == "tool" => match crate::exec::tool() {
+        // The `exec` tool as agents opened now in the default row are
+        // given it, its description listing each server's tools from the
+        // last listing.
+        Some((verb, [])) if verb == "tool" => match crate::exec::tool(
+            crate::served::Role::LEAD
+                .within(&serde_json::json!(crate::approvals::sandbox(
+                    crate::approvals::default(),
+                    std::path::Path::new("."),
+                    None,
+                )))
+                .escalates,
+        ) {
             Some(tool) => {
                 println!("{tool}");
                 Ok(())

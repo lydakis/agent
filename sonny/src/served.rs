@@ -75,6 +75,9 @@ const SPLIT: [&str; 5] = crate::mux::SPLITS;
 pub struct Role {
     pub lead: bool,
     pub worker: bool,
+    /// Whether it works in a sandbox, so `exec` shows it `tools.shell`'s
+    /// fields for leaving one, as its daemon shows them on a direct call.
+    pub escalates: bool,
 }
 
 impl Role {
@@ -82,19 +85,36 @@ impl Role {
     pub const ALL: Role = Role {
         lead: true,
         worker: false,
+        escalates: true,
     };
     pub const LEAD: Role = Role {
         lead: true,
         worker: false,
+        escalates: true,
     };
     pub const TASK: Role = Role {
         lead: false,
         worker: false,
+        escalates: true,
     };
     pub const WORKER: Role = Role {
         lead: false,
         worker: true,
+        escalates: true,
     };
+
+    /// This role for an agent with `settings`, as `inspect` gives them or
+    /// `create` takes them: one that escalates when it works in a sandbox,
+    /// as its daemon shows a bot the shell's fields for leaving one.
+    pub fn within(self, settings: &Value) -> Role {
+        Role {
+            escalates: matches!(
+                settings["sandbox"].as_str(),
+                Some("read-only" | "workspace-write")
+            ),
+            ..self
+        }
+    }
 }
 
 /// Sonny's answered tools, as it declares them on a bot in `role`: a
@@ -103,7 +123,7 @@ impl Role {
 pub fn tools(role: Role) -> Vec<Value> {
     if role.worker {
         let mut tools = vec![memory()];
-        tools.extend(crate::exec::tool());
+        tools.extend(crate::exec::tool(role.escalates));
         tools.extend(crate::browser::tool());
         tools.extend(crate::desktop::tool());
         return tools;
@@ -117,7 +137,7 @@ pub fn tools(role: Role) -> Vec<Value> {
     if crate::commons::on() {
         tools.push(commons());
     }
-    tools.extend(crate::exec::tool());
+    tools.extend(crate::exec::tool(role.escalates));
     tools.extend(crate::browser::tool());
     tools.extend(crate::desktop::tool());
     tools
