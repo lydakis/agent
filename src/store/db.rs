@@ -1245,11 +1245,9 @@ impl Bot {
                 confinable(&call.name)
                     && !escapes(
                         mode,
-                        Some(
-                            self.workspace
-                                .as_deref()
-                                .map_or(workspace, std::path::Path::new),
-                        ),
+                        // The turn's own folder, which a steer that moved
+                        // the bot leaves it, as its sandbox does.
+                        Some(workspace),
                         &self.settings.writable,
                         &call.name,
                         &call.arguments,
@@ -1277,11 +1275,7 @@ impl Bot {
         if self.settings.sandbox != Some(Mode::WorkspaceWrite) || !calls.iter().any(wanted) {
             return None;
         }
-        let root = self
-            .workspace
-            .as_deref()
-            .map_or(workspace, std::path::Path::new)
-            .to_owned();
+        let root = workspace.to_owned();
         let writable = self.settings.writable.clone();
         let folder = workspace.to_owned();
         Some(move |calls: &mut [ToolCall]| {

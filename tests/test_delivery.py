@@ -78,10 +78,11 @@ class DeliveryTests(ModelFixture):
         # the steer's.
         self.assertEqual(ran_in(first), str(original))
         self.assertEqual(client.request('inspect', bot='Bob')['result']['workspace'], str(requested))
-        after = client.request('submit', bot='Bob', request_id='c', prompt='shell:pwd',
+        # Work sent now, which names no folder, is sent to the steer's.
+        after = client.request('submit', bot='Bob', request_id='c', prompt='later',
                                delivery='queue')['result']['message']
-        client.finished(after)
-        self.assertEqual(json.loads(self.tool_output(client, 'Bob', 'shell-1'))['stdout'].strip(), str(requested))
+        sent = client.request('messages', bot='Bob', after=after - 1, limit=1)['result']['messages'][0]
+        self.assertEqual((sent['message'], sent['workspace']), (after, str(requested)))
 
     def test_a_sandboxed_turn_keeps_writing_its_own_folder_after_a_steer_moves_the_bot(self):
         original, requested = self.path / 'original', self.path / 'requested'

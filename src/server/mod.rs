@@ -5020,12 +5020,21 @@ impl Service {
         let name = bot.to_owned();
         match (self.store)
             .op("configure_running", move |db| {
-                Ok(db.inspect(&name)?.running_turn.is_some())
+                let record = db.inspect(&name)?;
+                Ok((
+                    record.running_turn.is_some(),
+                    record.configure_pending.is_some(),
+                ))
             })
             .await
         {
-            Ok(true) => return Ok(()),
-            Ok(false) => {}
+            Ok((true, _)) => return Ok(()),
+            Ok((false, true)) => {}
+            // Noted for a steer that kept nothing after all.
+            Ok((false, false)) => {
+                self.kept.remove(bot);
+                return Ok(());
+            }
             Err(error) if error.code == "bot_not_found" => {
                 self.kept.remove(bot);
                 return Ok(());
@@ -6804,6 +6813,15 @@ impl Service {
                     );
                 }
                 let budget_counts = counts(budget_tokens, budget_counts)?;
+                // A steer that may keep its model or effort for the turn's
+                // end is noted before its commit, so an end reaped before
+                // its answer still looks for what it kept.
+                if delivery == Delivery::Steer
+                    && (model.is_some() || effort.is_some())
+                    && self.active.contains_key(&bot)
+                {
+                    self.kept.insert(bot.clone());
+                }
                 // A turn may run in another checkout or on another model of
                 // the same family; the conversation encoding never changes.
                 let options = TurnOptions {
