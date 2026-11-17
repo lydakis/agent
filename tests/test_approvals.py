@@ -1689,7 +1689,7 @@ class AutoApproverTests(ModelFixture):
         parsed[0] = False
         vague = daemon.request('submit', bot='Bob', request_id='c', prompt='shell:printf vague')['result']['message']
         self.assertEqual(daemon.finished(vague)['data']['status'], 'completed')
-        self.assertTrue(self.denial(daemon, vague).startswith(FAILED + "the reviewer's answer was not the JSON asked for."))
+        self.assertTrue(self.denial(daemon, vague).startswith(FAILED + "the reviewer's answer was not the JSON asked for\n"))
         events = [lines.get(timeout=5) for _ in range(3)]
         # The reply it could not read is kept, redacted, to be read later.
         self.assertIn({'event': 'review_failed', 'bot': 'Bob', 'turn': vague,
@@ -1836,7 +1836,7 @@ class AutoApproverTests(ModelFixture):
         self.assertEqual(request, [{'by': 'person', 'text': 'delete the build directory'},
                                    {'by': 'model', 'text': 'shell:printf DANGER'}])
 
-    def test_a_risky_call_is_denied_at_once_even_when_its_gate_does_not_lapse(self):
+    def test_a_risky_or_unreviewed_call_is_denied_at_once_even_when_its_gate_does_not_lapse(self):
         daemon = self.daemon()
         daemon.request('create', bot='Carol', workspace=str(self.path), approve=['shell'], approver='auto')
         _, lines = self.approver(daemon)
@@ -1848,24 +1848,18 @@ class AutoApproverTests(ModelFixture):
         self.assertEqual(daemon.finished(turn)['data']['status'], 'completed')
         self.assertFalse((self.path / 'danger').exists())
         self.assertEqual(daemon.request('inspect', bot='Carol')['result']['denials']['auto']['in_row'], 1)
-        # A review that never assessed the call hands it to the person as it
-        # is, labeled, and leaves the breaker's count where it was.
+        # A review that never assessed the call denies it back to the model
+        # at once, labeled, as Codex fails closed: nobody waits on it, and
+        # the breaker's count stays where it was.
         self.judge.failures = 3
         unchecked = daemon.request('submit', bot='Carol', request_id='c', prompt='shell:printf ok')['result']['message']
         judged = next(line for line in iter(lambda: lines.get(timeout=5), None) if line['event'] == 'reviewed')
-        self.assertEqual((judged['turn'], judged['calls'][0]['decision']), (unchecked, 'ask'))
+        self.assertEqual((judged['turn'], judged['calls'][0]['decision']), (unchecked, 'deny'))
         self.assertTrue(judged['calls'][0]['reason'].startswith(FAILED), judged)
-        self.assertTrue(judged['calls'][0]['reason'].endswith('so this waits for you.'), judged)
-        deadline = time.monotonic() + 5
-        while not (held := daemon.request('approvals', bot='Carol')['result']['approvals']):
-            self.assertLess(time.monotonic(), deadline)
-            time.sleep(0.05)
-        [held] = held
-        self.assertEqual((held['turn'], held['call_id']), (unchecked, 'shell-1'))
-        # The person's answer runs it.
-        self.assertNotIn('error', daemon.request('answer', bot='Carol', turn=unchecked, call_id='shell-1',
-                                                 request=held['request'], decision='allow', by='test'))
+        self.assertIn('This is a review failure, not a determination that the action is unsafe.',
+                      judged['calls'][0]['reason'])
         self.assertEqual(daemon.finished(unchecked)['data']['status'], 'completed')
+        self.assertEqual(daemon.request('approvals', bot='Carol')['result']['approvals'], [])
         denials = daemon.request('inspect', bot='Carol')['result'].get('denials', {})
         self.assertTrue(all(counts['turn'] != unchecked for counts in denials.values()), denials)
         # Only a deny is unreviewed.

@@ -7,7 +7,7 @@ tasks source, which tells what happens in the bots a follower watches
 to the person, an approval only they can give, a margin note), the
 sources the person sets up outside the daemon, such as a chat poller,
 and Sonny's own: the commons, memory and the linked machines. Each
-event is one envelope, `[source · topic · from]` and its text, and
+event is one envelope, `[source · topic · from · time]` and its text, and
 every follower and every follow is the same too: each
 filters, digests and steers alike. The lookout has no rule of its own
 for any source; what a source knows, it puts in its events' fields.
@@ -514,14 +514,20 @@ agents: about 2 ms for one topic.
 
 What sources said goes in the follower's next note, with what the tasks
 source said (The note, below). Each event is its header, `[source · topic
-· from]`, then its text as the source printed it, cut at 32,000
-characters and 80 KB with its two ends kept, then its link and its other
-fields as compact JSON, cut at 2,000 characters:
+· from · time]`, then its text as the source printed it, then its link
+and its other fields as compact JSON. The time is when the lookout heard
+it, as an Alertmanager notification carries each alert's `startsAt`: the
+time of day on the 24-hour clock, as the daemon's stamp on each message
+says it, after the day when it is not today and the year when not this
+one (`10:39`, `Sat 14 Nov 10:39`); the note's own stamp names the zone.
+An event says at most 32,000 characters of its text and as many of its
+other fields, one limit for both, each cut with its two ends kept, the
+text at 80 KB too:
 
 ```
-[ci · main]
+[ci · main · 10:31]
 deploy failed on prod
-[slack · eng · ana]
+[slack · eng · ana · 10:39]
 lunch?
 https://example.slack.com/archives/C1/p2
 ```
@@ -636,7 +642,9 @@ Use tabs.
 ```
 
 A note holds at most 192 KiB and 64 quotes, and always one event; the rest
-wait for the next, which it says under a `[lookout]` header. One note goes
+wait for the next, which it says under a `[lookout]` header with how many
+wait and when the lookout heard the first of them (`12 more events wait
+for the next note, the first heard 10:31`). One note goes
 at a time: what comes while one is under way waits for its answer, then
 goes. A note the daemon refuses goes again after 2 minutes; one lost with
 the connection goes again at once. The note reports what happened; what

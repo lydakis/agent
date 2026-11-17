@@ -329,7 +329,7 @@ at its model's own effort (`AGENT_EFFORT` when its model is
 | Each new task's effort | `[sonny] task_effort` | `task_effort` |
 | Each new task's speed (`standard`, `fast` or `ultrafast`) | `[sonny] task_speed` | `task_speed` |
 | The reviewer's model, for agents in Auto ([REVIEWER.md](REVIEWER.md)) | `[reviewer] model`, `effort` | |
-| How long a call in Auto waits for the reviewer's verdict before it goes to you | `[reviewer] timeout_ms` (90000 by default, as Codex's; 0 for as long as it takes) | |
+| How long a call in Auto waits for the reviewer's verdict before it is denied as not reviewed | `[reviewer] timeout_ms` (90000 by default, as Codex's; 0 for as long as it takes) | |
 | What `/side`'s copy may do | `[sonny] side_chat` (`work`, the default, or `answer`) | |
 | The chime, and what the conversation shows | `[sonny] chime` (true or false), `view` (`words`, the default, `steps` or `verbose`) | |
 | The widest the conversation is written | `[sonny] text_width` (100 by default, at least 40, 0 for the window's whole width) | |
@@ -338,7 +338,7 @@ at its model's own effort (`AGENT_EFFORT` when its model is
 | Whether agents have the commons | `[sonny] commons` (true, the default, or false) | |
 | When a note opens the margin | `[sonny] margin_opens` (`always`, the default, `unless-closed` or `never`) | |
 | The most notes a margin holds | `[sonny] margin_notes` (6 by default, at least 1; past it the agent's new note is refused, and it is told which notes are there) | |
-| The most rows a margin note draws | `[sonny] margin_note_lines` (6 by default, at least 1; the key keeps its name and counts rows drawn at the margin's own width, 38 columns, pictures as the rows they draw, so the count is the same in every window; a longer note or live fill is refused, and the agent told that a note is state and anything longer goes in its reply or a file the reply names; a file or a task's note folds at it) | |
+| The most rows a margin note draws | `[sonny] margin_note_lines` (40 by default, at least 1; the key keeps its name and counts rows drawn at the margin's own width, 38 columns, pictures as the rows they draw, so the count is the same in every window; a longer note or live fill is refused, and the agent told that a note is state and anything longer goes in its reply or a file the reply names; a file or a task's note folds at it) | |
 | Margin notes of your own, filled as their blanks change | `[sonny.notes.NAME] markdown`, `live`, `title` | |
 | Where a click on an agent's name goes | `[sonny] agent_opens` (`tab`, the default, or `beside`) | |
 | Which tasks open in a tab | `[sonny] task_tabs` (`asked`, the default, or `every`) | |
@@ -365,10 +365,9 @@ labelled with the project's name), in Herdr or cmux a workspace, chosen the
 same way. A task the lead (or one of its tasks) starts gets a window there
 (a Herdr tab; in cmux a tab in the lead's pane) running Sonny on that task,
 without taking focus, its block (pane, cmux tab) labelled with the task's
-name, when someone asks for one: its starter, which asks when it judges you
-will want to watch it or talk to it (`start_task`'s `tab`, within
-`most_task_tabs` as any task's tab), an agent that shows it, you, from `/status` or a click on its name, or the task itself
-coming to need you. The others, such as reviewers and a lead's own helpers,
+name, when someone asks for one: an agent that shows it (`show_agent`),
+only when you asked, you, from `/status` or a click on its name, or the task
+itself coming to need you. The others, such as reviewers and a lead's own helpers,
 work without one; `/status` and the footer count them. With `[sonny]
 task_tabs = "every"`, each task gets its window as a turn of its starts. In Rex, each window reports OSC 7501 status, so Rex
 shows which task is working, waiting on you (an approval, or a question it
@@ -415,7 +414,9 @@ first's calls open nothing anywhere and say nothing opened would be seen,
 while the Rex lead opens its tasks' tabs as before. With every window closed, the last one used still names the place. A
 project whose lead is in no multiplexer gets none, and its agents get no
 layout skill. A tab asked for stays until you or an agent close it, or the
-task is marked done. With `task_tabs = "every"`, a task's window
+task is marked done; one opened only because the task needed you closes once
+its work is taken, unless you went to it or typed in it since, or an agent
+showed it again. With `task_tabs = "every"`, a task's window
 closes once its work is taken: its turn completed and the lead (or the task
 that started it) waited on it. One that failed, was interrupted or waits on you stays
 open, and a task given more work opens again; ask the lead to show one, or
@@ -775,7 +776,8 @@ copy of the quote is its words alone.
 ![Two replies quoted and sent: both fold onto the one bar over the words](../docs/sonny/reply-quote-fold-several.png)
 
 The message under the mouse also says when it was written, muted, at
-its top right edge, the right end of the empty row over it:
+its top right edge, the right end of the empty row over it (over the
+`↳` row naming who started its turn, when it has one):
 `Sat 7 Nov 09:13`, the
 year too when it is not this one, on the 12-hour clock where your
 locale's time format (`LC_TIME`) reads that way, `Sat 7 Nov 9:13 AM`.
@@ -785,6 +787,8 @@ rest, no line is made wider for it, and where the row over the words
 has something on it, or is off the screen, no time shows.
 
 ![When a message was written, over it under the mouse](../docs/sonny/message-time.png)
+
+![A reply's time over the ↳ row naming who started its turn](../docs/sonny/message-time-over-came-row.png)
 
 ## Commands
 
@@ -943,13 +947,19 @@ has something on it, or is off the screen, no time shows.
   name stays in the sandbox, as the name's `allow` rules never let it out); Codex's
   `network_rule` is refused, since a sandbox's network is on or off. A
   file that doesn't read keeps the rules last read, or, with none read
-  yet, has every command refused with where it went wrong. When you
-  approve a plain command that asked to leave, `a` (always allow `cargo test`) adds the rule, and every agent
-  takes it from its next turn: Sonny reads the folder again when a file
-  in it changes. The rules hold for every folder, so a
-  program named from the folder it runs in (`./build.sh`) is never
-  offered, nor, as in Codex, a shell, an interpreter or a wrapper
-  (`bash`, `python3`, `timeout`), which runs whatever follows it. Agents
+  yet, has every command refused with where it went wrong. When a
+  command asks to leave, `a` always allows the prefix its agent proposed
+  with it (`prefix_rule`, as Codex's agents do), such as `a always allow
+  cargo test`, when that prefix allows every command of the call and no
+  rule names any of them yet; else, as in Codex, the call's first command
+  no rule names, whole. It adds the rule, and every agent takes it from
+  its next turn: Sonny reads the folder again when a file in it changes.
+  As in Codex, none is offered while a rule asks about the call, nor
+  Codex's banned suggestions (a shell or an interpreter alone, such as
+  `bash` or `python3`, or `git` or `rm` alone), nor for a script that
+  isn't plain, which no rule matches. The rules hold for every folder, so
+  a program named from the folder it runs in (`./build.sh`) is never
+  offered either. Agents
   can't write the rules folder from their sandbox, and
   an agent another made goes by its maker's rules.
 
@@ -1025,9 +1035,11 @@ has something on it, or is off the screen, no time shows.
 
   ![The same approval set aside with Esc: the composer types again and the row says it still waits](../docs/sonny/approval-aside.png)
 
-  ![An approval prompt offering to always allow cargo test](../docs/sonny/permissions-always.png)
+  ![An approval offering a always allow gh pr checks, the prefix the agent proposed for gh pr checks 12 --json 'name,state'](../docs/sonny/permissions-always.png)
 
-  ![The call allowed, and cargo test outside the sandbox from now on](../docs/sonny/permissions-allowed.png)
+  ![The call allowed, and gh pr checks outside the sandbox from now on](../docs/sonny/permissions-allowed.png)
+
+  ![With no prefix proposed for an install and a test run, the first command whole: a always allow python3 -m pip install -q 'pytest>=8'](../docs/sonny/permissions-always-first.png)
 - `/retry` lists the calls the reviewer denied while Sonny watched, with
   the reason for each. Enter writes the call out whole and asks once
   (`Allow one retry of shell? It can't be undone.`); Enter again sends
@@ -1727,7 +1739,7 @@ has each lead follow its tasks. As things happen, it tells the lead every
 message someone else wrote in its tasks, each turn's end with the task's
 reply, a question or approval waiting on you, and a margin note, in one
 note at a time beside what the sources it follows said, each event under
-a `[source · topic · from]` line, as a steer: the note joins the lead's
+a `[source · topic · from · time]` line, as a steer: the note joins the lead's
 running turn, or starts one, and the lead decides what matters. A turn a note started that ends with
 nothing to say stays folded under the note, with no sound. Any agent can
 follow more with its `follows` tool (other agents' tasks, bots
@@ -2187,7 +2199,7 @@ whatever link or path leads there), `modified('state.json')` (when it
 last changed, none while it is not there, refused as `file()` is), `tasks()` and `task('NAME')`
 (where its tasks stand, as `/status` reads them), `now()`, and `| ago`
 and `| time` for a time in seconds; Jinja's own filters, such as
-`selectattr`, `sort` and `tojson`, work as well, and so do Python's
+`selectattr`, `sort`, `truncate` and `tojson`, work as well, and so do Python's
 methods on strings, lists and maps, such as `file('x.py').splitlines()`
 to pick out the lines that matter. A blank never runs a command or reaches the network, so an agent
 that wants something no source covers writes it to a file from its own

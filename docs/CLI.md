@@ -22,7 +22,9 @@ The ID stays pinned after deletion, so a replacement with the same name rejects
 the call instead of receiving the work.
 
 A bot's shell gets the daemon's environment without the keys its providers
-use, which are also redacted from what tools return. `serve --shell-exclude
+use, whose values are also replaced with `[redacted by agent]` in what tools
+return. Nothing else in tool output is redacted, as in Codex: what a program
+prints of its own secrets reaches the model as it printed it. `serve --shell-exclude
 PATTERN`, repeatable, leaves out more: every variable whose name matches, with
 `*` for any run and `?` for any one character, in any case. A client that
 starts a daemon passes it Codex's `[shell_environment_policy]` from
@@ -54,12 +56,7 @@ ranked as `--context-window` patterns are and over the daemon's list: for
 a model the list does not name, or to take a tier from one it does. A
 client passes `[speeds]` from `~/.agent/config.toml`, and `ready.speeds`
 announces them.
-`serve --redact-field NAME` has the value printed after a field named like
-NAME (its end, any case, `_` and `-` ignored) redacted from tool output, and
-`serve --redact-block LABEL` the body of each PEM block whose header names
-LABEL. A client that starts a daemon passes `agent_client::SECRET_FIELDS`
-(`password`, `api_key`, `secret_access_key` and the like) and `PRIVATE KEY`.
-Likewise `serve --protect NAME` keeps NAME at the top of a sandboxed bot's
+`serve --protect NAME` keeps NAME at the top of a sandboxed bot's
 writable folders read-only and from being made, and `--protect-existing NAME`
 keeps it read-only where it exists; a client passes `.git`, `.agents` and
 `.codex`, and `.aws` where it exists. `serve --protect-path PATH`

@@ -386,7 +386,6 @@ fn configuration(args: &[String]) -> Result<server::Configuration> {
     let mut await_owner = None;
     let mut stall_timeout = None;
     let mut shell_excludes = Vec::new();
-    let (mut redact_fields, mut redact_blocks) = (Vec::new(), Vec::new());
     let (mut protected, mut protected_existing) = (Vec::new(), Vec::new());
     let mut protected_paths = Vec::new();
     let mut walled = Vec::new();
@@ -410,11 +409,6 @@ fn configuration(args: &[String]) -> Result<server::Configuration> {
                 return fail_with("usage", "--shell-exclude needs a name or pattern");
             }
             "--shell-exclude" => shell_excludes.push(value.clone()),
-            "--redact-field" | "--redact-block" if value.trim().is_empty() => {
-                return fail_with("usage", format!("{flag} needs a name"));
-            }
-            "--redact-field" => redact_fields.push(value.clone()),
-            "--redact-block" => redact_blocks.push(value.clone()),
             "--protect" | "--protect-existing"
                 if value.is_empty() || value.contains('/') || value == "." || value == ".." =>
             {
@@ -503,8 +497,6 @@ fn configuration(args: &[String]) -> Result<server::Configuration> {
         idle_exit,
         await_owner,
         shell_excludes,
-        redact_fields,
-        redact_blocks,
         protected,
         protected_existing,
         protected_paths,

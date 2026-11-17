@@ -1846,6 +1846,66 @@ fn held_verdicts_follow_the_group_that_holds_them() {
 }
 
 #[test]
+fn a_reader_lists_approvals_with_the_verdicts_the_writer_held_at_its_last_commit() {
+    let path =
+        std::env::temp_dir().join(format!("agent-held-reader-{}.sqlite", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+    let mut writer = Database::initialize(Connection::open(&path).unwrap()).unwrap();
+    let reader = Database::reader(Connection::open(&path).unwrap(), writer.shared()).unwrap();
+    let turn = gated_turn(&mut writer, None);
+    let (items, round): (Vec<Bytes>, Vec<ToolCall>) = ["s1", "s2"]
+        .iter()
+        .enumerate()
+        .map(|(i, id)| shell_call(&format!("fc_{i}"), id, "true"))
+        .unzip();
+    writer.append(turn, items, &round, None).unwrap();
+    let listed = |db: &Database, tag: Option<&str>| -> Vec<String> {
+        let bot = tag.is_none().then_some("Bob");
+        let page = db.approvals(bot, tag, 0, None, 64).unwrap();
+        (page["approvals"].as_array().unwrap().iter())
+            .map(|call| call["call_id"].as_str().unwrap().to_owned())
+            .collect()
+    };
+    for tag in [None, Some("manual")] {
+        assert_eq!(listed(&reader, tag), ["s1", "s2"]);
+    }
+    // A verdict the worker holds for the running turn: its own group
+    // lists it answered at once, a reader once the group commits.
+    writer.begin_group().unwrap();
+    assert!(allow(&mut writer, turn, "s1").unwrap().notify.is_some());
+    for tag in [None, Some("manual")] {
+        assert_eq!(listed(&writer, tag), ["s2"]);
+        assert_eq!(listed(&reader, tag), ["s1", "s2"]);
+    }
+    writer.commit_group().unwrap();
+    for tag in [None, Some("manual")] {
+        assert_eq!(listed(&reader, tag), ["s2"]);
+    }
+    // One a group held and abandoned is not shown answered.
+    writer.begin_group().unwrap();
+    allow(&mut writer, turn, "s2").unwrap();
+    writer.abandon_group().unwrap();
+    writer.begin_group().unwrap();
+    writer.commit_group().unwrap();
+    assert_eq!(listed(&reader, Some("manual")), ["s2"]);
+    // Written when the call starts, it is answered in the rows, and the
+    // worker holds it no longer.
+    writer.begin_group().unwrap();
+    assert!(matches!(
+        writer.approval_start(turn, &round[0], false, 0).unwrap(),
+        Gated::Started
+    ));
+    writer.commit_group().unwrap();
+    for tag in [None, Some("manual")] {
+        assert_eq!(listed(&reader, tag), ["s2"]);
+    }
+    drop((reader, writer));
+    for suffix in ["", "-wal", "-shm"] {
+        let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
+    }
+}
+
+#[test]
 fn the_announced_call_count_follows_the_rows() {
     let path = std::env::temp_dir().join(format!(
         "agent-approval-count-{}.sqlite",
