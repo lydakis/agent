@@ -8096,6 +8096,19 @@ impl App {
                 self.started_bot(arguments, output),
                 arguments["brief"].as_str().unwrap_or(""),
             ),
+            "spawn_agent" => {
+                // One the daemon refused started nothing.
+                if serde_json::from_str::<Value>(output)
+                    .is_ok_and(|reply| reply["error"].is_string())
+                {
+                    return;
+                }
+                (
+                    started::STARTED,
+                    self.started_bot(arguments, output),
+                    arguments["message"].as_str().unwrap_or(""),
+                )
+            }
             "send_message" => {
                 // One the daemon refused (no such agent) sent nothing.
                 if serde_json::from_str::<Value>(output)

@@ -1,5 +1,5 @@
-"""An agent's own tools for other agents: send_message, list_agents and
-pause_agents, made as the calling bot."""
+"""An agent's own tools for other agents: send_message, list_agents,
+pause_agents, spawn_agent and close_agent, made as the calling bot."""
 import hashlib
 import json
 import os
@@ -9,7 +9,7 @@ import unittest
 from tests.test_runtime import ModelFixture
 from bench.runtime_client import node_item
 
-TOOLS = 'echo,wait,send_message,list_agents,pause_agents'
+TOOLS = 'echo,wait,send_message,list_agents,pause_agents,spawn_agent,close_agent'
 
 
 def calls(*called):
@@ -127,3 +127,168 @@ class AgentToolsTests(ModelFixture):
                 break
             time.sleep(0.05)
         self.assertEqual(client.request('stats')['result']['sessions'], 1)
+
+    def test_an_agent_made_with_spawn_agent_works_in_the_callers_project_folder_and_tools(self):
+        client = self.client(TOOLS)
+        client.request('create', bot='shop.lead', workspace=str(self.path), settings={'speed': 'fast'})
+        turn = self.run_calls(client, 'shop.lead', 'go',
+                              ('spawn_agent', {'name': 'review', 'message': 'look it over'}))
+        made = json.loads(self.output(client, 'shop.lead', 'spawn_agent-1'))
+        self.assertEqual(made['name'], 'shop.review', made)
+        bot, message = made['handle'].rsplit('/', 1)
+        self.assertEqual(bot, 'shop.review')
+        self.assertEqual(client.finished(int(message))['data']['status'], 'completed')
+        lead = client.request('inspect', bot='shop.lead')['result']
+        review = client.request('inspect', bot='shop.review')['result']
+        self.assertEqual((review['created_by'], review['workspace'], review['tools'], review['model']),
+                         ('shop.lead', lead['workspace'], lead['tools'], lead['model']))
+        # Its speed too, as its other settings.
+        self.assertEqual(review['settings']['speed'], 'fast', review['settings'])
+        listed = client.request('messages', bot='shop.review', after=0)['result']['messages']
+        self.assertEqual(listed[0]['from'], {'bot': 'shop.lead', 'turn': turn}, listed[0])
+        # The same call made again makes and sends nothing new.
+        call = hashlib.sha256(b'spawn_agent-1').hexdigest()[:32]
+        again = client.request('submit', bot='shop.review', request_id=f'tool-{turn}-{call}',
+                               prompt='look it over', delivery='queue',
+                               **{'from': {'bot': 'shop.lead', 'turn': turn}})
+        self.assertTrue(again['result']['duplicate'], again)
+
+    def test_a_whole_name_stays_whole_and_an_effort_asked_for_is_kept(self):
+        client = self.client(TOOLS)
+        client.request('create', bot='shop.lead', workspace=str(self.path))
+        self.run_calls(client, 'shop.lead', 'go',
+                       ('spawn_agent', {'name': 'other.look', 'message': 'q', 'effort': 'low'}))
+        made = json.loads(self.output(client, 'shop.lead', 'spawn_agent-1'))
+        self.assertEqual(made['name'], 'other.look', made)
+        look = client.request('inspect', bot='other.look')['result']
+        self.assertEqual((look['created_by'], look.get('effort')), ('shop.lead', 'low'), look)
+
+    def test_a_new_agent_takes_what_run_new_takes(self):
+        (self.path / 'AGENTS.md').write_text('Folder rule: tabs.\n')
+        client = self.client(TOOLS)
+        client.request('create', bot='shop.lead', workspace=str(self.path), tools=TOOLS.split(','))
+        self.run_calls(client, 'shop.lead', 'go',
+                       ('spawn_agent', {'name': 'plain', 'message': 'q'}),
+                       ('spawn_agent', {'name': 'told', 'message': 'q', 'agents': True}),
+                       ('spawn_agent', {'name': 'set', 'message': 'q', 'instructions': 'Only this.',
+                                        'tools': ['echo', 'wait'], 'settings': {'max_rounds': 3},
+                                        'budget_tokens': 50000}),
+                       ('spawn_agent', {'name': 'both', 'message': 'q', 'instructions': 'x', 'agents': True}),
+                       ('spawn_agent', {'name': 'copy', 'message': 'q', 'fork': True, 'tools': ['echo']}),
+                       ('spawn_agent', {'name': 'copy', 'message': 'q', 'fork': True, 'allow': ['echo']}))
+        plain = client.request('inspect', bot='shop.plain')['result']
+        told = client.request('inspect', bot='shop.told')['result']
+        self.assertNotIn('Folder rule', plain['instructions'])
+        self.assertIn('Folder rule: tabs.', told['instructions'])
+        self.assertTrue(told['instructions'].startswith(plain['instructions'][:40]), told['instructions'][:200])
+        kept = client.request('inspect', bot='shop.set')['result']
+        self.assertEqual((kept['instructions'], kept['tools'], kept['settings']['max_rounds'], kept['budget_tokens']),
+                         ('Only this.', ['echo', 'wait'], 3, 50000))
+        self.assertIn('instructions sets them', self.output(client, 'shop.lead', 'spawn_agent-4'))
+        self.assertIn('give it allow', self.output(client, 'shop.lead', 'spawn_agent-5'))
+        copy = client.request('inspect', bot='shop.copy')['result']
+        self.assertEqual(copy['allowed'], ['echo'], copy)
+
+    def test_a_spawn_sent_again_after_its_folder_changed_keeps_the_agent_it_made(self):
+        (self.path / 'AGENTS.md').write_text('First rule.\n')
+        client = self.client(TOOLS)
+        client.request('create', bot='shop.lead', workspace=str(self.path))
+        spawn = ('spawn_agent', {'name': 'look', 'message': 'q', 'agents': True, 'request_id': 'once'})
+        self.run_calls(client, 'shop.lead', 'go', spawn)
+        (self.path / 'AGENTS.md').write_text('Second rule.\n')
+        # Sent again from another turn: the agent the first call made stands
+        # though its folder now composes otherwise; only the message, from
+        # another turn, is refused as a different request.
+        self.run_calls(client, 'shop.lead', 'again', spawn)
+        events = client.request('events', bot='shop.lead', after=0, limit=256)['result']['events']
+        node = [e for e in events if e['event'] == 'tool_completed'][-1]['data']['node']
+        again = node_item(client, 'shop.lead', node)['result']['output']
+        self.assertIn('from differs from the request that sent message', again)
+        look = client.request('inspect', bot='shop.look')['result']
+        self.assertIn('First rule.', look['instructions'])
+        # One that sets differently what it set itself is another request.
+        self.run_calls(client, 'shop.lead', 'other',
+                       ('spawn_agent', {'name': 'look', 'message': 'q', 'agents': True,
+                                        'request_id': 'once', 'budget_tokens': 9000}))
+        events = client.request('events', bot='shop.lead', after=0, limit=256)['result']['events']
+        node = [e for e in events if e['event'] == 'tool_completed'][-1]['data']['node']
+        other = node_item(client, 'shop.lead', node)['result']['output']
+        self.assertIn('budget_tokens differs from the request that made shop.look', other)
+
+    def test_a_new_agent_takes_the_running_turns_own_effort(self):
+        client = self.client(TOOLS)
+        client.request('create', bot='shop.lead', workspace=str(self.path), effort='low')
+        turn = client.request('submit', bot='shop.lead', request_id='go', effort='high',
+                              prompt=calls(('spawn_agent', {'name': 'look', 'message': 'q'})))['result']['message']
+        self.assertEqual(client.finished(turn)['data']['status'], 'completed')
+        look = client.request('inspect', bot='shop.look')['result']
+        self.assertEqual(look.get('effort'), 'high', look)
+
+    def test_a_caller_kept_to_some_tools_makes_agents_kept_to_them(self):
+        client = self.client(TOOLS)
+        client.request('create', bot='shop.lead', workspace=str(self.path))
+        client.request('fork', source='shop.lead', bot='shop.narrow', allow=['echo', 'spawn_agent'])
+        self.run_calls(client, 'shop.narrow', 'go',
+                       ('spawn_agent', {'name': 'helper', 'message': 'q'}),
+                       ('spawn_agent', {'name': 'asked', 'message': 'q', 'tools': ['echo', 'send_message']}))
+        helper = client.request('inspect', bot='shop.helper')['result']
+        asked = client.request('inspect', bot='shop.asked')['result']
+        self.assertEqual((helper['tools'], asked['tools']), (['echo', 'spawn_agent'], ['echo']))
+
+    def test_a_fork_takes_no_profile_and_a_missing_profile_is_refused(self):
+        client = self.client(TOOLS)
+        client.request('create', bot='shop.lead', workspace=str(self.path))
+        self.run_calls(client, 'shop.lead', 'go',
+                       ('spawn_agent', {'name': 'ask', 'message': 'q', 'fork': True, 'profile': 'task'}),
+                       ('spawn_agent', {'name': 'odd', 'message': 'q', 'profile': 'nobody'}),
+                       ('spawn_agent', {'name': 'ask', 'message': 'what did we decide?', 'fork': True}))
+        self.assertIn('a fork keeps', self.output(client, 'shop.lead', 'spawn_agent-1'))
+        self.assertIn('profile_not_found', self.output(client, 'shop.lead', 'spawn_agent-2'))
+        made = json.loads(self.output(client, 'shop.lead', 'spawn_agent-3'))
+        self.assertEqual(made['name'], 'shop.ask', made)
+        lead = client.request('inspect', bot='shop.lead')['result']
+        fork = client.request('inspect', bot='shop.ask')['result']
+        self.assertEqual((fork['created_by'], fork['instructions']), ('shop.lead', lead['instructions']))
+
+    def test_a_closed_agent_leaves_the_list_until_a_message_opens_it(self):
+        client = self.client(TOOLS)
+        client.request('create', bot='shop.lead', workspace=str(self.path))
+        self.run_calls(client, 'shop.lead', 'go',
+                       ('spawn_agent', {'name': 'fix', 'message': 'hi'}))
+        made = json.loads(self.output(client, 'shop.lead', 'spawn_agent-1'))
+        client.finished(int(made['handle'].rsplit('/', 1)[1]))
+        self.run_calls(client, 'shop.lead', 'close',
+                       ('close_agent', {'name': 'shop.fix'}),
+                       ('list_agents', {}),
+                       ('list_agents', {'closed': True}))
+        closed = json.loads(self.output(client, 'shop.lead', 'close_agent-1'))
+        self.assertEqual((closed['name'], closed['was_open']), ('shop.fix', True), closed)
+        self.assertNotIn('stopped_turn', closed)
+        own = json.loads(self.output(client, 'shop.lead', 'list_agents-2'))
+        self.assertEqual([a['name'] for a in own['bots']], ['shop.lead'])
+        every = json.loads(self.output(client, 'shop.lead', 'list_agents-3'))
+        self.assertEqual([a['name'] for a in every['bots']], ['shop.fix', 'shop.lead'])
+        self.assertTrue(every['bots'][0]['closed_ms'])
+        # Its history stays whole, and a message opens it again.
+        turn = client.request('submit', bot='shop.fix', request_id='again', prompt='more')['result']['message']
+        client.finished(turn)
+        self.assertNotIn('closed_ms', client.request('inspect', bot='shop.fix')['result'])
+
+    def test_closing_stops_a_running_turn_and_is_refused_for_an_agent_the_caller_did_not_make(self):
+        client = self.client(TOOLS)
+        lead = client.request('create', bot='shop.lead', workspace=str(self.path))['result']
+        client.request('create', bot='shop.fix', workspace=str(self.path),
+                       created_by='shop.lead', created_by_id=lead['bot_id'])
+        client.request('create', bot='shop.other', workspace=str(self.path))
+        busy = client.request('submit', bot='shop.fix', request_id='busy', prompt='wait')['result']['message']
+        self.model.requests.get(timeout=3)
+        self.run_calls(client, 'shop.lead', 'go',
+                       ('close_agent', {'name': 'shop.fix'}),
+                       ('close_agent', {'name': 'shop.other'}))
+        closed = json.loads(self.output(client, 'shop.lead', 'close_agent-1'))
+        self.assertEqual(closed['stopped_turn'], busy, closed)
+        self.assertEqual(client.finished(busy)['data']['status'], 'interrupted')
+        self.assertTrue(client.request('inspect', bot='shop.fix')['result']['closed_ms'])
+        refused = self.output(client, 'shop.lead', 'close_agent-2')
+        self.assertIn('not_permitted', refused)
+        self.assertNotIn('closed_ms', client.request('inspect', bot='shop.other')['result'])

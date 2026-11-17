@@ -26,6 +26,7 @@ OPTIONAL = {'{glob}': ('', " AND t.bot GLOB ?3 AND t.bot >= ?4 AND t.bot < ?4 ||
             '{from}': ('name > ?1', "name >= max(?1 || char(1), ?5) AND name < ?5 || CAST(x'ff' AS TEXT) AND name GLOB ?3"),
             '{maker}': ('', ' AND created_by_id = ?4'),
             '{running}': ('', ' AND running_turn IS NOT NULL'),
+            '{open}': ('', ' AND closed_ms IS NULL'),
             '{order}': ('ASC', 'DESC'),
             '{line}': ('', "AND m.id IN (SELECT id FROM messages WHERE bot=?1 AND status='queued' "
                            "UNION ALL SELECT id FROM messages WHERE bot=?1 AND status='ready')")}
