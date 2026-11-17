@@ -1385,8 +1385,17 @@ fn similar(dir: &Path, name: &str, title: &str) -> Vec<Value> {
 
 /// The most threads a brief's pointer names.
 const POINTED: usize = 3;
-/// The fewest title words a thread shares with a brief to be named under it.
+/// The fewest words a thread shares with a brief to be named under it.
 const POINTED_WORDS: usize = 2;
+/// The most of those shared words a pointer shows beside a thread.
+const SHOWN_WORDS: usize = 5;
+/// How much more a word of a thread's title weighs than one of its posts,
+/// as a title field is boosted over a body's.
+const TITLE_BOOST: f64 = 2.0;
+/// BM25's term frequency saturation and length normalization, Lucene's
+/// defaults.
+const BM25_K1: f64 = 1.2;
+const BM25_B: f64 = 0.75;
 
 /// Whether a new task's brief names the commons threads it shares words
 /// with, from `[sonny] commons_pointer`, read once: on by default, and
@@ -1401,74 +1410,194 @@ pub fn pointer_on() -> bool {
 /// A title's or brief's words that matching weighs: those of four letters
 /// or more, as invites take a title's, lowercased, each once.
 fn match_words(text: &str) -> Vec<String> {
-    let mut words: Vec<String> = (text.split(|c: char| !c.is_alphanumeric()))
-        .filter(|word| word.chars().count() >= 4)
-        .map(str::to_lowercase)
-        .collect();
+    let mut words: Vec<String> = counted_words(text).collect();
     words.sort();
     words.dedup();
     words
 }
 
-/// `brief` with a line under it naming the commons threads whose titles
-/// share at least `POINTED_WORDS` of its words, at most `POINTED`, as
-/// Stack Overflow names related questions: a word few titles hold weighs
-/// more than one many do (BM25's inverse document frequency, as Lucene's
-/// More Like This weighs terms), the best first, then the latest to move.
-/// The brief as it was when no thread shares enough. Only each thread's
-/// first line is read to match, and the named ones whole for their count
-/// of posts, so a start costs one short read a thread: a few milliseconds
-/// at thousands of threads. A fact about the commons, never a request to
-/// read it.
+/// [`match_words`] as often as `text` says each.
+fn counted_words(text: &str) -> impl Iterator<Item = String> + '_ {
+    (text.split(|c: char| !c.is_alphanumeric()))
+        .filter(|word| word.chars().count() >= 4)
+        .map(str::to_lowercase)
+}
+
+/// What the pointer keeps of one thread: its words counted, in its title
+/// and in its posts, as far as it read, and what the pointer says of it.
+#[derive(Default)]
+struct Indexed {
+    /// The bytes read: whole lines only, so a post being written is read
+    /// once it is all there.
+    read: u64,
+    title: String,
+    /// Each word, how often the title and the posts say it.
+    words: HashMap<String, (u32, u32)>,
+    /// How many words it says in all, BM25's document length.
+    length: u64,
+    posts: u64,
+    /// When its newest post was written.
+    at: i64,
+}
+
+impl Indexed {
+    /// The posts in `bytes`, the thread's from where it was read up to.
+    fn add(&mut self, bytes: &[u8]) {
+        for line in bytes.split(|b| *b == b'\n') {
+            let Ok(post) = serde_json::from_slice::<Value>(line) else {
+                continue;
+            };
+            if self.posts == 0 {
+                self.title = post["title"].as_str().unwrap_or_default().to_owned();
+                for word in counted_words(&self.title) {
+                    self.words.entry(word).or_default().0 += 1;
+                    self.length += 1;
+                }
+            }
+            for word in counted_words(post["text"].as_str().unwrap_or_default()) {
+                self.words.entry(word).or_default().1 += 1;
+                self.length += 1;
+            }
+            self.posts += 1;
+            self.at = post["at"].as_i64().unwrap_or(self.at);
+        }
+    }
+}
+
+/// Each thread's words, by its file, kept for the life of the process
+/// (the tool host makes every task): threads only grow, so a thread is
+/// read again only past what was read of it, one whose file shrank (made
+/// anew) whole, and one gone is forgotten.
+static INDEX: std::sync::Mutex<Option<HashMap<PathBuf, Indexed>>> = std::sync::Mutex::new(None);
+
+/// [`INDEX`] brought up to the threads in `dir` as they stand.
+fn index(dir: &Path, index: &mut HashMap<PathBuf, Indexed>) {
+    use std::io::{Read, Seek};
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        index.retain(|path, _| !path.starts_with(dir));
+        return;
+    };
+    let mut here = std::collections::HashSet::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let named = (path.file_name().and_then(|n| n.to_str()))
+            .and_then(|n| n.strip_suffix(".jsonl"))
+            .is_some_and(|n| valid_name(n).is_ok());
+        let Some(size) = (named.then(|| entry.metadata().ok()).flatten()).map(|m| m.len()) else {
+            continue;
+        };
+        here.insert(path.clone());
+        let kept = index.entry(path.clone()).or_default();
+        if size == kept.read {
+            continue;
+        }
+        if size < kept.read {
+            *kept = Indexed::default();
+        }
+        let mut grown = Vec::new();
+        let read = std::fs::File::open(&path).and_then(|mut file| {
+            file.seek(std::io::SeekFrom::Start(kept.read))?;
+            file.take(size - kept.read).read_to_end(&mut grown)
+        });
+        if read.is_err() {
+            continue;
+        }
+        let whole = grown
+            .iter()
+            .rposition(|b| *b == b'\n')
+            .map_or(0, |at| at + 1);
+        kept.add(&grown[..whole]);
+        kept.read += whole as u64;
+    }
+    index.retain(|path, _| !path.starts_with(dir) || here.contains(path));
+}
+
+/// `brief` with a line under it naming the commons threads that share at
+/// least `POINTED_WORDS` of its words, at most `POINTED`, as Stack
+/// Overflow names related questions, each with the words it shares. A
+/// thread is matched whole, its title and its posts, as Lucene's More
+/// Like This matches a document, and scored by BM25: a word few threads
+/// say weighs more than one many do, one a thread says often more than
+/// one it says once, short of saturating, a long thread's less, and a
+/// title's twice a post's. The best first, then the latest to move. The
+/// brief as it was when no thread shares enough. Each thread's words are
+/// kept between tasks and read again only as far as it grew, so a start
+/// costs one look at the folder once each thread was read. A fact about
+/// the commons, never a request to read it.
 pub fn pointed(home: &Path, brief: &str) -> String {
-    match pointer(&dir(home), brief) {
+    pointed_with(home, brief, std::env::var(POINTER_ENV).ok())
+}
+
+/// [`pointed`], with the line the host `handed` when it ran the start.
+fn pointed_with(home: &Path, brief: &str, handed: Option<String>) -> String {
+    let line = match handed {
+        Some(line) => (!line.is_empty()).then_some(line),
+        None => pointer(&dir(home), brief),
+    };
+    match line {
         Some(line) => format!("{brief}\n\n{line}"),
         None => brief.to_owned(),
     }
 }
 
+/// Where the tool host hands a `start_task` it runs the pointer it found,
+/// empty for none: the words it keeps live in the host, which lives
+/// across tasks, while each call runs in a process of its own.
+pub const POINTER_ENV: &str = "SONNY_COMMONS_POINTER";
+
+/// The pointer line for `brief` as [`pointed`] puts it under the brief,
+/// empty for none or when the pointer is off, as the config says now.
+pub fn pointer_line(home: &Path, brief: &str) -> String {
+    let wanted = on() && crate::kept::config().map_or(true, |config| config.sonny.commons_pointer);
+    match wanted {
+        true => pointer(&dir(home), brief).unwrap_or_default(),
+        false => String::new(),
+    }
+}
+
+/// A thread the pointer found: its score, when it last moved, its name,
+/// what it keeps of it, and the words it shares with their scores.
+type Found<'a> = (f64, i64, &'a str, &'a Indexed, Vec<(f64, &'a str)>);
+
 fn pointer(dir: &Path, brief: &str) -> Option<String> {
-    let briefed: std::collections::HashSet<String> = match_words(brief).into_iter().collect();
+    let briefed = match_words(brief);
     if briefed.len() < POINTED_WORDS {
         return None;
     }
-    let mut titles: Vec<(String, PathBuf, Vec<String>)> = Vec::new();
-    for entry in std::fs::read_dir(dir).ok()?.flatten() {
-        let path = entry.path();
-        let Some(name) = (path.file_name().and_then(|n| n.to_str()))
-            .and_then(|n| n.strip_suffix(".jsonl"))
-            .filter(|n| valid_name(n).is_ok())
-            .map(str::to_owned)
-        else {
-            continue;
-        };
-        let Some(first) = first_post(&path) else {
-            continue;
-        };
-        let words = match_words(first["title"].as_str().unwrap_or_default());
-        titles.push((name, path, words));
-    }
-    let threads = titles.len() as f64;
-    let mut held: HashMap<&str, usize> = HashMap::new();
-    for (_, _, words) in &titles {
-        for word in words {
-            *held.entry(word.as_str()).or_default() += 1;
-        }
-    }
-    let weight = |word: &str| {
-        let held = held.get(word).copied().unwrap_or(0) as f64;
-        (1.0 + (threads - held + 0.5) / (held + 0.5)).ln()
-    };
-    let mut found: Vec<(f64, std::time::SystemTime, &str, &Path)> = Vec::new();
-    for (name, path, words) in &titles {
-        let shared: Vec<&String> = words.iter().filter(|w| briefed.contains(*w)).collect();
+    let mut held = INDEX.lock().unwrap_or_else(|p| p.into_inner());
+    let held = held.get_or_insert_with(HashMap::new);
+    index(dir, held);
+    let threads: Vec<(&PathBuf, &Indexed)> = (held.iter())
+        .filter(|(path, thread)| path.starts_with(dir) && thread.posts > 0)
+        .collect();
+    let count = threads.len() as f64;
+    let average = threads.iter().map(|(_, t)| t.length).sum::<u64>() as f64 / count.max(1.0);
+    let weight: Vec<f64> = (briefed.iter())
+        .map(|word| {
+            let held = threads
+                .iter()
+                .filter(|(_, t)| t.words.contains_key(word))
+                .count() as f64;
+            (1.0 + (count - held + 0.5) / (held + 0.5)).ln()
+        })
+        .collect();
+    let mut found: Vec<Found> = Vec::new();
+    for (path, thread) in &threads {
+        let norm = BM25_K1 * (1.0 - BM25_B + BM25_B * thread.length as f64 / average.max(1.0));
+        let mut shared: Vec<(f64, &str)> = (briefed.iter().zip(&weight))
+            .filter_map(|(word, weight)| {
+                let (title, posts) = thread.words.get(word)?;
+                let tf = TITLE_BOOST * f64::from(*title) + f64::from(*posts);
+                Some((weight * tf * (BM25_K1 + 1.0) / (tf + norm), word.as_str()))
+            })
+            .collect();
         if shared.len() < POINTED_WORDS {
             continue;
         }
-        let score = shared.iter().map(|word| weight(word)).sum();
-        let moved =
-            (std::fs::metadata(path).and_then(|m| m.modified())).unwrap_or(std::time::UNIX_EPOCH);
-        found.push((score, moved, name, path));
+        let score = shared.iter().map(|(score, _)| score).sum();
+        shared.sort_by(|a, b| b.0.total_cmp(&a.0).then_with(|| a.1.cmp(b.1)));
+        let name = (path.file_stem().and_then(|n| n.to_str())).unwrap_or_default();
+        found.push((score, thread.at, name, thread, shared));
     }
     found.sort_by(|a, b| {
         (b.0.total_cmp(&a.0))
@@ -1476,23 +1605,22 @@ fn pointer(dir: &Path, brief: &str) -> Option<String> {
             .then_with(|| a.2.cmp(b.2))
     });
     let lines: Vec<String> = (found.into_iter())
-        .filter_map(|(_, _, name, path)| summary(name, path))
         .take(POINTED)
-        .map(|thread| {
-            let posts = thread["posts"].as_u64().unwrap_or(1);
-            let since = (now() - thread["at"].as_i64().unwrap_or(0)).max(0);
+        .map(|(_, at, name, thread, shared)| {
+            let posts = thread.posts;
+            let words: Vec<&str> = shared.iter().take(SHOWN_WORDS).map(|(_, w)| *w).collect();
             format!(
-                "- {} {} ({posts} post{}, last {})",
-                thread["thread"].as_str().unwrap_or_default(),
-                Value::from(thread["title"].as_str().unwrap_or_default()),
+                "- {name} {} ({posts} post{}, last {}; shares {})",
+                Value::from(thread.title.as_str()),
                 if posts == 1 { "" } else { "s" },
-                ago(since),
+                ago((now() - at).max(0)),
+                words.join(", "),
             )
         })
         .collect();
     (!lines.is_empty()).then(|| {
         format!(
-            "[The commons has threads whose titles share words with this brief:\n{}]",
+            "[The commons has threads that share words with this brief:\n{}]",
             lines.join("\n")
         )
     })
@@ -2288,7 +2416,7 @@ mod tests {
     }
 
     #[test]
-    fn a_brief_names_the_threads_whose_titles_share_two_of_its_words() {
+    fn a_brief_names_the_threads_that_share_two_of_its_words() {
         let home = home("pointer");
         let post =
             |by: &str, arguments: Value| caught_up(&home, by, None, None, &arguments).unwrap();
@@ -2311,13 +2439,181 @@ mod tests {
         assert_eq!(kept, brief);
         assert_eq!(
             line,
-            "[The commons has threads whose titles share words with this brief:\n\
-             - cache \"Sandbox cache misses after upgrade\" (2 posts, last just now)]"
+            "[The commons has threads that share words with this brief:\n\
+             - cache \"Sandbox cache misses after upgrade\" (2 posts, last just now; \
+             shares cache, sandbox, upgrade)]"
         );
         // One shared word, however rare, is no match.
         assert_eq!(pointed(&home, "Render the page."), "Render the page.");
         // Nor are words of three letters or fewer.
         assert_eq!(pointed(&home, "Fix the bad UI."), "Fix the bad UI.");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn a_thread_titled_by_its_trap_is_found_by_what_its_posts_say() {
+        let home = home("pointer-posts");
+        let send = |by: &str, arguments: Value| {
+            caught_up(&home, by, None, None, &arguments).unwrap();
+        };
+        send(
+            "a.x",
+            json!({"post": {"name": "trap", "title": "Do not trust the green check",
+                "text": "The lockfile drifts when two worktrees build at once."}}),
+        );
+        send(
+            "a.x",
+            json!({"post": {"name": "other", "title": "Lunch", "text": "Tacos on Friday."}}),
+        );
+        let brief = "Two worktrees fail to build: the lockfile changed.";
+        let line = pointed(&home, brief)
+            .split_once("\n\n")
+            .unwrap()
+            .1
+            .to_owned();
+        assert!(
+            line.contains("- trap \"Do not trust the green check\""),
+            "{line}"
+        );
+        assert!(line.contains("shares "), "{line}");
+        for word in ["lockfile", "worktrees", "build"] {
+            assert!(line.contains(word), "{word}: {line}");
+        }
+        assert!(!line.contains("other"), "{line}");
+        // A reply read past what was read before: what it says counts.
+        let before = pointed(&home, "Tacos and burritos for the team.");
+        assert_eq!(before, "Tacos and burritos for the team.");
+        send(
+            "b.y",
+            json!({"reply": {"thread": "other", "text": "Burritos too."}}),
+        );
+        let after = pointed(&home, "Tacos and burritos for the team.");
+        assert!(after.contains("- other \"Lunch\" (2 posts"), "{after}");
+        assert!(after.contains("shares "), "{after}");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn a_thread_is_read_again_only_past_what_was_read_and_forgotten_once_gone() {
+        let home = home("pointer-index");
+        let dir = dir(&home);
+        std::fs::create_dir_all(&dir).unwrap();
+        let line = |title: Option<&str>, text: &str| {
+            let mut post = json!({"by": "a.x", "at": 1, "text": text});
+            if let Some(title) = title {
+                post["title"] = json!(title);
+            }
+            format!("{post}\n")
+        };
+        let file = dir.join("t.jsonl");
+        std::fs::write(&file, line(Some("Cache misses"), "sandbox sandbox")).unwrap();
+        let mut held = HashMap::new();
+        index(&dir, &mut held);
+        let words =
+            |held: &HashMap<PathBuf, Indexed>, word: &str| held[&file].words.get(word).copied();
+        assert_eq!(words(&held, "cache"), Some((1, 0)));
+        assert_eq!(words(&held, "sandbox"), Some((0, 2)));
+        // A post half written is read once it is whole.
+        let mut grown = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&file)
+            .unwrap();
+        let reply = line(None, "sandbox again");
+        grown.write_all(&reply.as_bytes()[..10]).unwrap();
+        index(&dir, &mut held);
+        assert_eq!((held[&file].posts, words(&held, "again")), (1, None));
+        grown.write_all(&reply.as_bytes()[10..]).unwrap();
+        index(&dir, &mut held);
+        assert_eq!(held[&file].posts, 2);
+        assert_eq!(words(&held, "sandbox"), Some((0, 3)));
+        assert_eq!(words(&held, "again"), Some((0, 1)));
+        // Made anew, shorter: read whole again.
+        std::fs::write(&file, line(Some("Other"), "words")).unwrap();
+        index(&dir, &mut held);
+        assert_eq!((held[&file].posts, words(&held, "sandbox")), (1, None));
+        std::fs::remove_file(&file).unwrap();
+        index(&dir, &mut held);
+        assert!(held.is_empty());
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// How long a task's start takes to point at threads, cold (the first
+    /// start after the tool host started) and warm, at 0 to 5,000 threads
+    /// of 6 posts each: `cargo test -p sonny pointer_at_scale -- --ignored
+    /// --nocapture`.
+    #[test]
+    #[ignore]
+    fn pointer_at_scale() {
+        let words = [
+            "sandbox",
+            "cache",
+            "lookout",
+            "digest",
+            "margin",
+            "template",
+            "worktree",
+            "lockfile",
+            "runtime",
+            "upgrade",
+            "provider",
+            "approval",
+            "compaction",
+            "history",
+            "socket",
+            "daemon",
+            "commons",
+            "thread",
+            "review",
+            "merge",
+        ];
+        let brief =
+            "Fix the sandbox cache: builds miss it since the upgrade, and the lockfile drifts.";
+        for count in [0usize, 100, 1_000, 5_000] {
+            let home = home(&format!("pointer-scale-{count}"));
+            let dir = dir(&home);
+            std::fs::create_dir_all(&dir).unwrap();
+            for n in 0..count {
+                let pick = |k: usize| words[(n * 7 + k * 3) % words.len()];
+                let mut text = String::new();
+                for post in 0..6 {
+                    let mut line = json!({"by": "a.x", "at": n, "text":
+                        format!("{} {} and {} again, {} words of a post that says {} things",
+                            pick(post), pick(post + 1), pick(post + 2), pick(post + 3), pick(post + 4))});
+                    if post == 0 {
+                        line["title"] = json!(format!("{} {} {}", pick(0), pick(1), pick(2)));
+                    }
+                    text.push_str(&format!("{line}\n"));
+                }
+                std::fs::write(dir.join(format!("t{n}.jsonl")), text).unwrap();
+            }
+            let time = || {
+                let started = std::time::Instant::now();
+                std::hint::black_box(pointer(&dir, brief));
+                started.elapsed()
+            };
+            if let Some(held) = INDEX.lock().unwrap().as_mut() {
+                held.retain(|path, _| !path.starts_with(&dir));
+            }
+            let cold = time();
+            let warm: Vec<_> = (0..5).map(|_| time()).collect();
+            let warm = warm.iter().min().unwrap();
+            println!("{count:>5} threads: cold {cold:?}, warm {warm:?}");
+            let _ = std::fs::remove_dir_all(&home);
+        }
+    }
+
+    #[test]
+    fn a_start_the_tool_host_runs_takes_the_pointer_the_host_found() {
+        let home = home("pointer-handed");
+        let line = "[The commons has threads that share words with this brief:\n- t \"T\"]";
+        assert_eq!(
+            pointed_with(&home, "Fix the sandbox cache.", Some(line.into())),
+            format!("Fix the sandbox cache.\n\n{line}")
+        );
+        assert_eq!(
+            pointed_with(&home, "Fix the sandbox cache.", Some(String::new())),
+            "Fix the sandbox cache."
+        );
         let _ = std::fs::remove_dir_all(&home);
     }
 

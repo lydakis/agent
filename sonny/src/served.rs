@@ -1989,6 +1989,23 @@ async fn answer(client: &Client, call: &Value, me: &Path, store: &Path, socket: 
     } else {
         command.env_remove("AGENT_AUTOMATION");
     }
+    // A task's pointer comes from here, where the commons' words are kept
+    // between tasks, never read whole again by each start's own process.
+    command.env_remove(crate::commons::POINTER_ENV);
+    if name == START
+        && let (Some(home), Some(brief)) = (
+            std::env::var_os("HOME"),
+            call["arguments"]["brief"].as_str(),
+        )
+    {
+        let brief = brief.to_owned();
+        let line = tokio::task::spawn_blocking(move || {
+            crate::commons::pointer_line(Path::new(&home), &brief)
+        })
+        .await
+        .unwrap_or_default();
+        command.env(crate::commons::POINTER_ENV, line);
+    }
     let mut arguments = call["arguments"].clone();
     if call["name"] == MEMORY
         && arguments["save"].is_object()
