@@ -105,7 +105,7 @@ DELEGATES = re.compile(r'^(start_task|\S*(message|send|steer|tell)\S*) |agent"? 
 EDITS = {'write', 'edit', 'apply_patch'}
 
 # The event kinds kept from every agent's stream, small ones only.
-KINDS = {'created', 'forked', 'deleted', 'queued', 'accepted', 'usage', 'turn_finished'}
+KINDS = {'created', 'forked', 'deleted', 'queued', 'accepted', 'usage', 'turn_finished', 'compacted'}
 
 
 class Recorder:
