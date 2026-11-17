@@ -41,6 +41,7 @@ import collections
 import concurrent.futures
 import json
 import re
+import shlex
 import shutil
 import sqlite3
 import statistics
@@ -57,7 +58,40 @@ LEAD = 'shop.lead'
 # --- what main must hold, run at main's root in the sandbox ------------------
 
 SESSION = burst_ledger.LEDGER['B1 code ask: session timeout']['check']
-EXPORT = burst_ledger.LEDGER['B1 code ask: CSV export']['check']
+# Some public function of shop/export.py, given the sample orders (and a
+# file to write to, where it takes one), gives a CSV whose rows are those
+# orders: their id, total and created_at, each as the order holds it.
+EXPORT = """import csv, inspect, io
+from datetime import datetime
+from decimal import Decimal
+import shop.export as e
+from shop.orders import sample
+
+def rows(text):
+    table = list(csv.DictReader(io.StringIO(text)))
+    return [{k.strip(): (v or '').strip() for k, v in r.items() if k} for r in table]
+
+def right(text):
+    try:
+        got = rows(text)
+        return len(got) == len(sample()) and all(
+            int(r['id']) == o.id and Decimal(r['total']) == o.total
+            and datetime.fromisoformat(r['created_at']) == o.created_at
+            for r, o in zip(got, sample()))
+    except Exception:
+        return False
+
+ok = False
+for name, f in vars(e).items():
+    if name.startswith('_') or not inspect.isfunction(f) or f.__module__ != e.__name__:
+        continue
+    for args in ((sample(),), (sample(), io.StringIO())):
+        try:
+            r = f(*args)
+        except Exception:
+            continue
+        ok = ok or right(r if isinstance(r, str) else args[1].getvalue() if len(args) > 1 else '')
+assert ok"""
 NO_WARNING = "import warnings\nwarnings.simplefilter('error')\nfrom shop.audit import stamp\nstamp()"
 CONFIG = ("from datetime import timedelta\nfrom shop.config import SESSION_TIMEOUT\n"
           "assert SESSION_TIMEOUT == timedelta(hours=5)")
@@ -92,6 +126,17 @@ SIGN_OUT = "people get signed out after about five minutes"
 FIRST = ("Before we start, a note for later: the release codename is HERON-7731, and the rollback owner is "
          "whoever is on call that Thursday. Nothing to do with it now.")
 QUOTED = "the rollback owner is whoever is on call that Thursday"
+CODENAME = r'HERON-7731'
+
+
+def arguments(row):
+    """A trail row's arguments: its preview is their JSON, cut at 2048
+    characters; a cut or plain preview is its text as a command."""
+    try:
+        args = json.loads(row['preview'] or '{}')
+    except ValueError:
+        return {'command': row['preview']}
+    return args if isinstance(args, dict) else {}
 
 
 def weekdays_at_nine(cron):
@@ -216,8 +261,8 @@ CASES = [
          {'say': "What exactly was my first message today? Quote it word for word."},
      ],
      'checks': [
-         check('the context was cut before the question', lambda v: v.compactions() > 0),
-         check('gives the codename', lambda v: v.answer_says(r'HERON-7731')),
+         check('the context was cut before the answer', lambda v: v.compactions(before=v.answered(CODENAME)) > 0),
+         check('gives the codename', lambda v: v.answer_says(CODENAME)),
          check('quotes the first message word for word', lambda v: v.answer_quotes(QUOTED)),
      ]},
     {'id': 'remember', 'area': 'skills',
@@ -366,12 +411,30 @@ class View:
         flat = lambda t: ' '.join(re.sub(r'[\'"“”‘’*_`>]', ' ', t).lower().split())
         return flat(text) in flat(self.answer())
 
-    def compactions(self, bot=LEAD):
-        """How many times `bot`'s context was summarized."""
+    def answered(self, pattern):
+        """When the lead's answer to the person's last message first
+        matched `pattern`, by the clock of `acp.jsonl`, or None."""
+        log = self.out / 'acp.jsonl'
+        said, last = '', False
+        for line in open(log) if log.exists() else []:
+            row = json.loads(line)
+            if (row.get('sent') or {}).get('method') == 'session/prompt':
+                said, last = '', True
+                continue
+            u = ((row.get('m') or {}).get('params') or {}).get('update') or {}
+            if last and u.get('sessionUpdate') == 'agent_message_chunk':
+                said += (u.get('content') or {}).get('text', '')
+                if re.search(pattern, said, re.I):
+                    return row['t']
+        return None
+
+    def compactions(self, bot=LEAD, before=float('inf')):
+        """How many times `bot`'s context was summarized, before the time
+        `before` when given."""
         events = self.out / 'events.jsonl'
-        if not events.exists():
+        if not events.exists() or before is None:
             return 0
-        return sum(e.get('event') == 'compacted' and e.get('bot') == bot
+        return sum(e.get('event') == 'compacted' and e.get('bot') == bot and e.get('t', 0) < before
                    for e in map(json.loads, open(events)))
 
     # What the lead called.
@@ -426,24 +489,46 @@ class View:
                 ended[u.get('toolCallId')] = u['status']
         return [args for call, args in calls.items() if ended.get(call) == 'completed']
 
-    def automation(self, verb):
-        """The lead's automation calls that `add` or `remove` and
-        completed, as their arguments' text, by the tool or by the script
-        in a shell."""
-        found = [json.dumps(a) for a in self.completed('automations') if isinstance(a, dict) and verb in a]
-        script = {'add': 'add', 'remove': 'rm'}[verb]
-        found += [r['preview'] for r in self.lead_rows if r['outcome'] == 'completed'
-                  and re.search(rf'\.agent/automation\s+{script}\b', r['preview'] or '')]
+    def automation_calls(self):
+        """The arguments of the lead's completed `automations` calls: by
+        `sonny acp` for the tool, and by the trail for code-mode steps,
+        which `sonny acp` shows only as their `exec`."""
+        found = self.completed('automations')
+        for r in self.lead_rows:
+            if r['step'] and r['tool'] == 'automations' and r['outcome'] == 'completed':
+                found.append(arguments(r))
+        return [a for a in found if isinstance(a, dict)]
+
+    def scripts(self, verb):
+        """The words of the lead's completed shell commands that run the
+        automation script's `verb`."""
+        found = []
+        for r in self.lead_rows:
+            command = arguments(r).get('command') if r['tool'] == 'shell' and r['outcome'] == 'completed' else None
+            if not isinstance(command, str):
+                continue
+            try:
+                words = shlex.split(command)
+            except ValueError:
+                continue
+            for i, word in enumerate(words[:-1]):
+                if word.endswith('.agent/automation') and words[i + 1] == verb:
+                    found.append(words[i + 2:])
         return found
 
+    def automation(self, verb):
+        """The lead's automation calls that `add` or `remove` and
+        completed, by the tool, a step or the script in a shell."""
+        script = {'add': 'add', 'remove': 'rm'}[verb]
+        return [a for a in self.automation_calls() if verb in a] + self.scripts(script)
+
     def crons(self):
-        """The cron schedules of the lead's completed additions, by the tool
-        or by the script's `--cron`."""
-        found = [a['add'].get('cron') for a in self.completed('automations')
-                 if isinstance(a, dict) and isinstance(a.get('add'), dict)]
-        found += [m.group(2) for r in self.lead_rows if r['outcome'] == 'completed'
-                  for m in [re.search(r'\.agent/automation\s+add\b.*?--cron\s+([\'"])(.*?)\1', r['preview'] or '')]
-                  if m]
+        """The cron schedules of the lead's completed additions, by the
+        tool, a step or the script's `--cron`."""
+        found = [a['add'].get('cron') for a in self.automation_calls() if isinstance(a.get('add'), dict)]
+        for words in self.scripts('add'):
+            found += [words[i + 1] for i, w in enumerate(words[:-1]) if w == '--cron']
+            found += [w.split('=', 1)[1] for w in words if w.startswith('--cron=')]
         return [cron for cron in found if isinstance(cron, str)]
 
     def automations_left(self):

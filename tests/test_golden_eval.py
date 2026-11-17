@@ -1,4 +1,6 @@
 import json
+import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -160,16 +162,29 @@ class ScoreTests(unittest.TestCase):
                                   'automations.json': '{"automations": [{"name": "branches"}]}'})
             self.assertEqual(set(self.score('schedule', view).values()), {False})
 
+    @staticmethod
+    def answer(text):
+        """`acp.jsonl` with an early prompt, the last one at 10 and `text`
+        said at 20."""
+        prompt = lambda t: json.dumps({'t': t, 'sent': {'method': 'session/prompt', 'params': {}}})
+        chunk = {'sessionUpdate': 'agent_message_chunk', 'content': {'type': 'text', 'text': text}}
+        said = json.dumps({'t': 20, 'm': {'method': 'session/update', 'params': {'update': chunk}}})
+        return '\n'.join([prompt(1), prompt(10), said]) + '\n'
+
     def test_context_is_recovered_only_by_quoting_after_a_cut(self):
         quote = ("You wrote: \u201cBefore we start, a note for later: the release codename is HERON-7731, and "
                  "the rollback owner is\n whoever is on call that Thursday.\u201d")
-        cut = json.dumps({'event': 'compacted', 'bot': 'shop.lead', 'data': {}})
+        parts = [part('person', 'Noted.'), part('person', 'tz methods'),
+                 part('person', quote, [('history', {'turn': 1})])]
+        cut = lambda t: json.dumps({'t': t, 'event': 'compacted', 'bot': 'shop.lead', 'data': {}})
         with tempfile.TemporaryDirectory() as tmp:
-            view = run_dir(tmp, [part('person', 'Noted.'), part('person', 'tz methods'),
-                                 part('person', quote, [('history', {'turn': 1})])],
-                           files={'events.jsonl': cut})
+            view = run_dir(tmp, parts, files={'events.jsonl': cut(15), 'acp.jsonl': self.answer(quote)})
             self.assertEqual(set(self.score('recover-context', view).values()), {True})
             self.assertEqual(golden_eval.usage(view)['lead']['compactions'], 1)
+        with tempfile.TemporaryDirectory() as tmp:
+            # Cut only once the turn that quoted it ended.
+            view = run_dir(tmp, parts, files={'events.jsonl': cut(25), 'acp.jsonl': self.answer(quote)})
+            self.assertFalse(self.score('recover-context', view)['the context was cut before the answer'])
         with tempfile.TemporaryDirectory() as tmp:
             # The gist, from a summary, and the codename said only early on.
             view = run_dir(tmp, [part('person', 'Noted HERON-7731.'),
@@ -188,9 +203,34 @@ class ScoreTests(unittest.TestCase):
             view = run_dir(tmp, [part('person', 'Set.')], files={'acp.jsonl': acp})
             self.assertFalse(self.score('schedule', view)['on weekdays at 9'])
         with tempfile.TemporaryDirectory() as tmp:
-            view = run_dir(tmp, [part('person', 'Set.')], [row(
-                'shell', step='s', preview='~/.agent/automation add --name b --cron "0 9 * * 1-5" -- look')])
+            # The trail keeps a shell call's arguments as JSON.
+            command = '~/.agent/automation add --name b --cron "0 9 * * 1-5" -- look'
+            view = run_dir(tmp, [part('person', 'Set.')], [row('shell', preview=json.dumps({'command': command}))])
             self.assertTrue(self.score('schedule', view)['on weekdays at 9'])
+        with tempfile.TemporaryDirectory() as tmp:
+            # Code mode: steps in the trail, and `sonny acp` shows only `exec`.
+            steps = [row('automations', step='s1', preview=json.dumps({'add': {'name': 'b', 'cron': '0 9 * * 1-5'}})),
+                     row('automations', step='s2', preview=json.dumps({'remove': 'b'}))]
+            view = run_dir(tmp, [part('person', 'Set.', [('exec', {})]), part('person', 'Gone.')], steps,
+                           files={'automations.json': '{"automations": []}'})
+            self.assertEqual(set(self.score('schedule', view).values()), {True})
+            steps[0]['outcome'] = 'failed'
+            view = run_dir(tmp, [part('person', 'Set.')], steps, files={'automations.json': '{"automations": []}'})
+            self.assertFalse(self.score('schedule', view)['sets an automation'])
+
+    def test_the_export_check_reads_the_rows(self):
+        good = ("import csv\n\ndef export(orders, out):\n    w = csv.writer(out)\n"
+                "    w.writerow(['id', 'total', 'created_at'])\n"
+                "    for o in orders:\n        w.writerow([o.id, o.total, o.created_at.isoformat()])\n")
+        header = "def export(orders):\n    return 'id,total,created_at\\n'\n"
+        for code, ok in [(good, True), (header, False)]:
+            with tempfile.TemporaryDirectory() as tmp:
+                for name, text in {**role_eval.FILES, 'shop/export.py': code}.items():
+                    (Path(tmp) / name).parent.mkdir(parents=True, exist_ok=True)
+                    (Path(tmp) / name).write_text(text)
+                code = f'import sys; sys.path.insert(0, ".")\n{golden_eval.EXPORT}'
+                run = subprocess.run([sys.executable, '-I', '-c', code], cwd=tmp, capture_output=True)
+                self.assertEqual(run.returncode == 0, ok, run.stderr)
 
     def test_memory_and_main_come_from_the_run(self):
         with tempfile.TemporaryDirectory() as tmp:

@@ -205,7 +205,7 @@ it ships) is n/a.
 | | | with spawn_agent (needs `spawn_agent`) |
 | | | reports both |
 | | | changes no file |
-| recover-context | history | the context was cut before the question |
+| recover-context | history | the context was cut before the answer |
 | | | gives the codename |
 | | | quotes the first message word for word |
 | remember | skills | saves it to memory |
@@ -232,8 +232,9 @@ reply, as lead.md asks of news not worth interrupting the person for.
 sentence, then three asks with long command output, then asks for the first
 message word for word. A summary keeps the gist, so quoting the sentence
 back takes the conversation's own record, which `history` reads. Its first
-check says whether the context was cut at all: when it was not, the window
-is too large for the model and the case tested nothing.
+check says whether the context was cut before the answer gave the codename:
+when it was not, the window is too large for the model and the case tested
+nothing. A cut after the answer, as a turn's end may make, does not count.
 
 Each run also records what it used, for the lead and for the agents it
 started: tools by name (a code-mode script counted as `exec`, each of its
