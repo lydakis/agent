@@ -4175,7 +4175,7 @@ A refusal of the kind still repairs the nodes its request sent: each blank
 block goes, the item padded with JSON whitespace to its size so no total
 moves (content left with nothing is the text `<empty>`), and the call goes
 again at once, its `retry` event listing each node and what it held under
-`repaired`. `repair` (protocol 85; `agent repair --bot NAME`) does the same
+`repaired`. `repair` (protocol 86; `agent repair --bot NAME`) does the same
 to the bot's whole history and answers the same list. Responses providers
 take blank text, so a Responses bot's history is left as it is.
 
