@@ -603,7 +603,7 @@ async fn switch_daemon(store: &Path, socket: &Path, installed: bool) -> Result<b
     let (client, _events) = agent_client::Client::connect(socket)
         .await
         .map_err(|e| e.to_string())?;
-    crate::start_companions(&client).await?;
+    crate::start_companions(&client, crate::Companions::Replace).await?;
     client.close().await;
     println!("Companions: the lookout and tool host run Sonny {VERSION}");
     Ok(replace)

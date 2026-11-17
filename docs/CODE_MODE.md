@@ -205,7 +205,8 @@ What Sonny's lacks:
   The bot's `shell`, `read`, `edit` and `apply_patch` it cannot, which is
   the first of Agent's gaps.
 - **A restart loses the script.** A call taken before the host restarted is
-  answered `tool_outcome_unknown` (sonny/src/served.rs:1484).
+  answered `tool_outcome_unknown` (sonny/src/served.rs:1484). Only an
+  upgrade restarts the host now ([slice M](#m-a-message-never-ends-a-scripts-call)).
 - **It is about 3,400 lines** (engine, description, limits, step handling)
   that another client would write again.
 
@@ -858,6 +859,56 @@ run: whether a model that Codex shows only `exec` does better here with
 `steps_only` than with direct tools. The
 [long-task evaluation](LONG_TASK_EVAL.md) on luna gives rounds, tokens,
 cache reads and correct tasks for both arms.
+
+## Code mode, all in, as built
+
+The working design is the "Code mode, all in" document George set on
+2026-11-16; this section records each slice as it lands, and what it found
+that the document did not.
+
+### M. A message never ends a script's call
+
+Row 29 of the document's parity table: on 11-16, between 09:09 and 09:20
+ET, scripts whose turn took a message ended `tool_outcome_unknown` with
+their process gone, the error saying the tool host had restarted. The
+document's candidate cause (the host stops a lifted script whose
+`call_lifted` it did not register) does not hold: on main, a message during
+a script's step leaves the script running and its call answerable in every
+case tried (a short step, a sandboxed one, an escalated one at its gate and
+running, one that outlasts its turn, one that goes on to more steps, a
+message before the first step, two scripts in one round;
+tests/test_served.py).
+
+What reproduces row 29 exactly is a restart of the tool host while scripts
+run: each is cut, and the next host, meeting calls already taken, answers
+them `tool_outcome_unknown`, whether a message came or not. The message was
+a coincidence: on a busy morning one comes during most scripts.
+
+What restarted the host: every window, and every editor session, kept
+Sonny's companions (the lookout, the tool host, the reviewer) again with
+its own build and program as it started and each time the daemon came
+back. The daemon restarts a companion whose definition changed. The
+upgrade at 09:03 replaced the daemon, every open window reconnected, and a
+window of 0.9.5 put its own host back, which the next 0.10.0 window or tab
+replaced again. The reviewer went the same way, which is why escalated
+calls failed at once after a cut. Read in source and reproduced in a test;
+the box's own logs were not available.
+
+Now a window or session adds only the companions the daemon keeps none of
+(`Companions::Add`, sonny/src/main.rs). `sonny upgrade` puts its own build
+in their place (`Companions::Replace`), and so does a window that started
+the daemon itself (one that found none, or an older one it replaced),
+since its companions have only just started with it. After a hand-made
+upgrade (`brew upgrade`) on the same protocol, a window no longer moves
+the companions to the new build; `sonny upgrade` does.
+The names-folder spelling that made a companion report a link as its
+program is fixed apart, in #1094.
+
+Row 30 (a script a message moved to the background took 36 to 91 s for
+milliseconds of shell work) is not traced. In source, a step's command
+waits in one first-come line for the load gate (`[daemon] max_load`, 128
+on that box, whose load was near 170) and for a process slot
+(src/server/steps.rs `pump_steps`). That fits, and is unconfirmed.
 
 ## Open
 
