@@ -3052,8 +3052,9 @@ A bot created with `sandbox` runs its `shell` commands, `write`s and `edit`s
 confined, as Codex confines its agent: the mode names, the writable folders,
 the folders kept read-only inside them, the bubblewrap arguments on Linux and
 the Seatbelt profile on macOS are Codex's, ported (see NOTICE). Reading stays
-open. `read-only` writes nothing; `workspace-write` writes the bot's folder
-(its stored workspace, else the turn's), each `writable` folder, `$TMPDIR`
+open. `read-only` writes nothing; `workspace-write` writes the folder the
+turn runs in (the bot's, which a steer that moves the bot leaves the running
+turn's own), each `writable` folder, `$TMPDIR`
 and `/tmp`. Inside each writable folder, each name the daemon was started
 with as `serve --protect NAME` stays read-only and, when missing, may not be
 made, and each `--protect-existing NAME` stays read-only where it exists. A

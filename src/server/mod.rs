@@ -5009,11 +5009,14 @@ impl Service {
     /// writes leaves it kept and answers `storage_error`: no turn of the
     /// bot starts until it is taken.
     async fn take_configure(&mut self, bot: &str) -> Result<()> {
-        if !self.kept.contains(bot) {
+        // A turn still running keeps it, unchecked: what it would be
+        // checked against may yet change before the turn ends. One whose
+        // task has not begun its end needs no look, so a steer kept for
+        // the end costs the submissions after it nothing; once the end is
+        // committing, the store says.
+        if !self.kept.contains(bot) || self.active.get(bot).and_then(Active::running).is_some() {
             return Ok(());
         }
-        // A turn still running keeps it, unchecked: what it would be
-        // checked against may yet change before the turn ends.
         let name = bot.to_owned();
         match (self.store)
             .op("configure_running", move |db| {

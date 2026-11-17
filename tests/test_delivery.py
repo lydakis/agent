@@ -78,10 +78,35 @@ class DeliveryTests(ModelFixture):
         # the steer's.
         self.assertEqual(ran_in(first), str(original))
         self.assertEqual(client.request('inspect', bot='Bob')['result']['workspace'], str(requested))
-        after = client.request('submit', bot='Bob', request_id='c', prompt='bg:pwd',
+        after = client.request('submit', bot='Bob', request_id='c', prompt='shell:pwd',
                                delivery='queue')['result']['message']
         client.finished(after)
-        self.assertEqual(ran_in(after), str(requested))
+        self.assertEqual(json.loads(self.tool_output(client, 'Bob', 'shell-1'))['stdout'].strip(), str(requested))
+
+    def test_a_sandboxed_turn_keeps_writing_its_own_folder_after_a_steer_moves_the_bot(self):
+        original, requested = self.path / 'original', self.path / 'requested'
+        original.mkdir()
+        requested.mkdir()
+        client = self.client('echo,shell,wait')
+        client.request('create', bot='Bob', workspace=str(original), settings={'sandbox': 'workspace-write'})
+        started = client.request('submit', bot='Bob', request_id='bg', prompt='bg:sleep 5')['result']['message']
+        client.finished(started)
+        handle = json.loads(poll(client, 'Bob', started)['result']['text'].removeprefix('echo:'))['handle']
+        # Parked on a wait, the turn wakes for a steer that moves the bot.
+        turn = client.request('submit', bot='Bob', request_id='w', prompt='rewait:' + handle)['result']['message']
+        client.receive(lambda m: m.get('event') == 'turn_waiting' and m.get('turn') == turn)
+        steer = client.request('submit', bot='Bob', request_id='s', prompt='bg:touch made',
+                               workspace=str(requested), delivery='steer')['result']['message']
+        self.assertEqual(client.finished(steer)['data']['status'], 'taken')
+        ended = client.finished(turn)['data']
+        self.assertEqual(ended['status'], 'completed', ended)
+        # The command ran where the turn runs, and that folder stayed its
+        # to write.
+        made = json.loads(poll(client, 'Bob', turn)['result']['text'].removeprefix('echo:'))['handle']
+        done = client.request('wait', handles=[made])['result']['results'][made]
+        self.assertEqual(done['exit_code'], 0, done)
+        self.assertTrue((original / 'made').exists())
+        self.assertFalse((requested / 'made').exists())
 
     def test_a_steer_on_another_model_or_effort_joins_the_turn_and_is_the_bot_s_after_it(self):
         client = self.client(extra=('--provider', f'other=responses,{self.url}'))
