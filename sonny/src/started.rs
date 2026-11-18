@@ -1,6 +1,6 @@
 //! The tasks the lead started, drawn where it started them so the person
-//! sees them come and go: each with its name, its brief's first words,
-//! and what it is doing now. A click on a task opens it in the pane.
+//! sees them come and go: each with its title, its name, and what it is
+//! doing now. A click on a task opens it in the pane.
 use ratatui::{
     style::{Color, Stylize},
     text::{Line, Span},
@@ -17,7 +17,9 @@ pub struct Task {
     pub bot: String,
     /// Its name in the project, `fix`.
     pub name: String,
-    pub brief: String,
+    /// What it is for, as `start_task` set it: empty for one started
+    /// without.
+    pub title: String,
     /// What it is doing, as [`state`] reads it.
     pub state: String,
 }
@@ -59,7 +61,7 @@ pub fn settled(state: &str) -> bool {
     )
 }
 
-/// A brief's first line, cut short enough to keep.
+/// A message's first line, cut short enough to keep.
 pub fn first(brief: &str) -> String {
     let line = brief
         .lines()
@@ -70,8 +72,8 @@ pub fn first(brief: &str) -> String {
 
 /// The rows of `tasks` started together, `width` wide, each with the
 /// task a click on it opens, if any: `• Started 3 tasks`, then a row for
-/// each with its state's mark, its name, what it is doing, and its brief
-/// cut to fit.
+/// each that leads with its title, as `/status` does: its state's mark,
+/// its title, cut at a word to fit, its name and what it is doing.
 pub fn draw(tasks: &[Task], width: usize) -> Vec<(Line<'static>, Option<usize>)> {
     let count = match tasks.len() {
         1 => "1 task".to_owned(),
@@ -87,24 +89,32 @@ pub fn draw(tasks: &[Task], width: usize) -> Vec<(Line<'static>, Option<usize>)>
     )];
     let names = tasks.iter().map(|t| t.name.width()).max().unwrap_or(0);
     let states = tasks.iter().map(|t| t.state.width()).max().unwrap_or(0);
+    // "  ● title  name  state": the titles share a column as wide as the
+    // widest, as far as the row has room.
+    let room = width.saturating_sub(4 + 2 + names + 2 + states);
+    let titles = (tasks.iter())
+        .map(|t| crate::title::cut(&t.title, room).width())
+        .max()
+        .unwrap_or(0);
     for (at, task) in tasks.iter().enumerate() {
-        // "  ● name  state  brief"
-        let room = width.saturating_sub(4 + names + 2 + states + 2);
-        out.push((
-            Line::from(vec![
-                Span::raw("  "),
-                crate::status::sign(&task.state),
-                Span::raw(" "),
-                Span::raw(format!("{:<names$}", task.name))
-                    .bold()
-                    .fg(Color::Blue),
-                Span::raw("  "),
-                Span::raw(format!("{:<states$}", task.state)).dim(),
-                Span::raw("  "),
-                Span::raw(cut(&first(&task.brief), room)),
-            ]),
-            Some(at),
-        ));
+        let mut row = vec![
+            Span::raw("  "),
+            crate::status::sign(&task.state),
+            Span::raw(" "),
+        ];
+        if titles > 0 {
+            let title = crate::title::cut(&task.title, room);
+            let pad = " ".repeat(titles.saturating_sub(title.width()));
+            row.push(Span::raw(format!("{title}{pad}  ")));
+        }
+        row.extend([
+            Span::raw(format!("{:<names$}", task.name))
+                .bold()
+                .fg(Color::Blue),
+            Span::raw("  "),
+            Span::raw(task.state.clone()).dim(),
+        ]);
+        out.push((Line::from(row), Some(at)));
     }
     out
 }
@@ -118,8 +128,8 @@ pub struct SetGoing {
     pub bot: String,
     /// Its name as the conversation says it, `fix`.
     pub name: String,
-    /// Its title: a started task's brief's first line, or the first line
-    /// of the message sent.
+    /// Its title: a started task's, as `start_task` set it, or the first
+    /// line of the message sent.
     pub title: String,
 }
 
@@ -189,11 +199,11 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    fn task(name: &str, brief: &str, state: &str) -> Task {
+    fn task(name: &str, title: &str, state: &str) -> Task {
         Task {
             bot: format!("calc.{name}"),
             name: name.into(),
-            brief: brief.into(),
+            title: title.into(),
             state: state.into(),
         }
     }
@@ -258,23 +268,33 @@ mod tests {
     }
 
     #[test]
-    fn a_roster_counts_the_tasks_and_lines_their_states_up() {
+    fn a_roster_counts_the_tasks_and_leads_each_with_its_title() {
         let tasks = [
-            task("add", "Fix the add bug: 2+2 returns 5\nmore", "working"),
-            task("divide", "Fix division by zero", "done"),
+            task("add", "Fix two plus two", "working"),
+            task("divide", "Stop dividing by zero in the totals", "done"),
         ];
         assert_eq!(
-            texts(draw(&tasks, 60)),
+            texts(draw(&tasks, 64)),
             [
                 "• Started 2 tasks · click one to open it",
-                "  ● add     working  Fix the add bug: 2+2 returns 5",
-                "  ✓ divide  done     Fix division by zero",
+                "  ● Fix two plus two                     add     working",
+                "  ✓ Stop dividing by zero in the totals  divide  done",
             ]
         );
-        let rows = draw(&tasks, 60);
+        let rows = draw(&tasks, 64);
         assert_eq!(
             rows.iter().map(|(_, at)| *at).collect::<Vec<_>>(),
             [None, Some(0), Some(1)]
+        );
+        // Short of room, the title is cut at a word; the name stays.
+        assert_eq!(
+            texts(draw(&tasks, 44))[2],
+            "  ✓ Stop dividing by zero…  divide  done"
+        );
+        // A task started without one: its name alone.
+        assert_eq!(
+            texts(draw(&[task("add", "", "idle")], 44))[1],
+            "  ○ add  idle"
         );
     }
 }

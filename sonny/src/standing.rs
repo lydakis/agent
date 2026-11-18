@@ -339,10 +339,10 @@ mod tests {
         while follows.lock().unwrap().is_empty() {
             tokio::task::yield_now().await;
         }
+        let asked = follows.lock().unwrap()[0].clone();
         assert_eq!(
-            follows.lock().unwrap()[0],
-            json!({"id": follows.lock().unwrap()[0]["id"], "op": "follow", "bot": "shop.*",
-                "after": 40, "kinds": KINDS})
+            asked,
+            json!({"id": asked["id"], "op": "follow", "bot": "shop.*", "after": 40, "kinds": KINDS})
         );
         // What the follow brought is its own; the window's agent's events
         // are the window's, even of a kind the follow takes.

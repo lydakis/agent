@@ -366,10 +366,19 @@ request takes): each program's `count`, `held_ms`, `waited_ms`, and the
 live and durable events `delivered` to its sessions. A bot's own socket is
 `agent`, which its `hello` cannot change; a session that sent none is
 `unnamed`; the daemon keeps places for 13 names as first heard and counts
-any past those as `other`. `slow` lists the last 100 operations that took a
-second or more, newest first: a store job's or a commit's run (`kind`
-`store`) or the loop's hold on a request or a chore (`loop`, with the
-request's `program`), each with `at_ms` (when it ended), `op` and `ms`.
+any past those as `other`. A `hello` may add a `label` (1 to 128 bytes, no
+control characters) saying which one of its program the session is, as
+Sonny's window gives the agent it shows; a client library gives it on each
+connection once it has one, and a `hello` said again names the session
+anew. `connections` lists each open session, in the order they opened,
+with its `session` id, `program`, `label` when it gave one, and its own
+`count`, `held_ms`, `waited_ms` and `delivered`; a session's row goes as it
+closes, and `programs` keeps counting every session's requests, open or
+closed, so the list is as long as the sessions open. `slow` lists the last
+100 operations that took a second or more, newest first: a store job's or a
+commit's run (`kind` `store`) or the loop's hold on a request or a chore
+(`loop`, with the request's `program` and `label`), each with `at_ms` (when
+it ended), `op` and `ms`.
 `runtime` reports the async runtime's `workers`, `busy_ms` (time
 they ran rather than parked), `parks`, `alive_tasks` and `queued_tasks`,
 kept by tokio as it runs. `hub` counts the events published (`durable`,
@@ -1465,7 +1474,7 @@ own path from the turn. Example requests:
 {"id":32,"op":"follow","bot":"*","since_ms":1793000000000,"kinds":["accepted","message"]}
 {"id":17,"op":"wait","handles":["Bob/1","Alice/3"],"any":true,"timeout_ms":60000}
 {"id":18,"op":"stats"}
-{"id":33,"op":"hello","program":"window"}
+{"id":33,"op":"hello","program":"window","label":"shop.lead"}
 {"id":19,"op":"provider_models"}
 {"id":21,"op":"create","bot":"Carol","workspace":"/workspaces/project","model":"openai/gpt-6-luna","instructions":"...","tools":["shell","read","write","edit","wait","history"],"approve":["shell","write","edit","read"],"approver":"manual","settings":{"context_bytes":1048576,"keep_turns":16}}
 {"id":22,"op":"approvals","bot":"Carol","limit":64}
@@ -1547,7 +1556,7 @@ does not, and each is one op:
   the switch to live delivery, and a retention gap anywhere is announced as a
   `pruned` notice first. Live delivery has the socket follower's contract:
   a lagging session is disconnected rather than allowed to hold the daemon.
-  `agent follow --all [--after N]`. With `kinds`, a list of one or more
+  `agent follow --all [--after N]`, or `--bot GLOB` for a pattern's bots. With `kinds`, a list of one or more
   event kinds (`invalid_follow_kinds` otherwise), the follow receives only
   those, in replay and live; `follow_live` and `pruned` still come. A
   controller that never reads streamed text leaves the deltas, most of all
@@ -3954,7 +3963,10 @@ keeping the shorter expiry. A bot carries at most 8 gates: a `create` or
   its request `process` (an indexed column), and answers the call with
   `{"handle":"proc:N","background":true,"steered":true,"waits_for":"approval"}`,
   so the round goes on and the turn reads the message. `call_lifted`
-  `{call_id, handle, waits_for}` says so. Nothing is cancelled: the request
+  `{call_id, handle, waits_for}` says so. A call waiting on its verdict
+  also carries `holder`, beside `waits_for` in both, as its turn's waiting
+  status names it: `reviewer` while a reviewer serves its open gates,
+  else `person`. Nothing is cancelled: the request
   stays listed (with `handle`, as do the steps its client asks for), served
   and answerable past its turn's end, and a restart keeps it. Its verdict
   now goes to the command. A deny or a
