@@ -8,31 +8,42 @@ use std::{
     path::PathBuf,
 };
 
-/// The picture as drawn before, else as `draw` draws it now.
+/// What a look for a picture found.
+pub enum Drawing {
+    /// Drawn, or why it could not be.
+    Done(Result<Drawn, String>),
+    /// Being drawn beside the loop ([`crate::drawing`]), by this key: the
+    /// window is woken once it is.
+    Waits(u64),
+}
+
+/// The picture as drawn before, else drawn by `draw` beside the loop,
+/// which a look once it is ready finds. Only counted, it is drawn here
+/// and now, as nothing is shown.
 pub fn drawn(
     lang: &str,
     source: &str,
     width: usize,
-    draw: impl FnOnce() -> Result<Drawn, String>,
-) -> Result<Drawn, String> {
+    draw: impl FnOnce() -> Result<Drawn, String> + Send + 'static,
+) -> Drawing {
     // Counted only, as the tool host counts a note's rows: drawn afresh,
     // with nothing read from or written to a shared folder.
     if crate::term::measured() {
-        return draw();
+        return Drawing::Done(draw());
     }
-    let path = path(lang, source, width);
+    let key = key(lang, source, width);
+    if let Some(drawn) = crate::drawing::take(key) {
+        return Drawing::Done(drawn);
+    }
+    let path = directory().map(|dir| dir.join(format!("{key:016x}.bin")));
     if let Some(drawn) = path.as_ref().and_then(read) {
-        return Ok(drawn);
+        return Drawing::Done(Ok(drawn));
     }
-    let drawn = draw()?;
-    if let Some(path) = path {
-        let _ = write(&path, &drawn);
-    }
-    Ok(drawn)
+    crate::drawing::start(key, path, Box::new(draw));
+    Drawing::Waits(key)
 }
 
-fn path(lang: &str, source: &str, width: usize) -> Option<PathBuf> {
-    let dir = directory()?;
+fn key(lang: &str, source: &str, width: usize) -> u64 {
     let mut hasher = std::hash::DefaultHasher::new();
     (
         // A picture drawn by another build of Sonny may be drawn otherwise.
@@ -45,7 +56,7 @@ fn path(lang: &str, source: &str, width: usize) -> Option<PathBuf> {
         crate::term::light(),
     )
         .hash(&mut hasher);
-    Some(dir.join(format!("{:016x}.bin", hasher.finish())))
+    hasher.finish()
 }
 
 /// This user's own folder in the temporary one, which no other user can
@@ -75,7 +86,7 @@ fn read(path: &PathBuf) -> Option<Drawn> {
     })
 }
 
-fn write(path: &PathBuf, drawn: &Drawn) -> std::io::Result<()> {
+pub fn write(path: &PathBuf, drawn: &Drawn) -> std::io::Result<()> {
     let mut bytes = Vec::with_capacity(9 + drawn.png.len());
     bytes.extend_from_slice(&drawn.cols.to_le_bytes());
     bytes.extend_from_slice(&drawn.rows.to_le_bytes());

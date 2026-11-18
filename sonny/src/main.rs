@@ -30,6 +30,7 @@ mod context;
 mod declared;
 mod desktop;
 mod diff;
+mod drawing;
 mod embed;
 mod exec;
 mod footer;
@@ -5179,6 +5180,9 @@ struct App {
     opening_all: bool,
     /// A program in the pane drew something: the screen is drawn again.
     woken: Arc<tokio::sync::Notify>,
+    /// How many pictures drawn beside the loop were ready when it last
+    /// looked ([`App::drawings`]).
+    drawn_seen: u64,
     /// The daemon's events not applied yet, oldest first ([`App::hear`]).
     unheard: std::collections::VecDeque<Value>,
     /// The read under way for the first of them.
@@ -7136,6 +7140,7 @@ impl App {
             naming: None,
             opening_all: false,
             woken: Arc::new(tokio::sync::Notify::new()),
+            drawn_seen: drawing::landed(),
             unheard: Default::default(),
             hearing: None,
             cut: false,
@@ -7383,6 +7388,8 @@ impl App {
         let mut held: Option<Event> = None;
         // The daemon's events are ready to apply past those applied.
         let mut more_heard = false;
+        // Woken as each picture drawn beside the loop is ready.
+        drawing::wake(&self.woken);
         loop {
             let due = drawn.is_none_or(|at| at.elapsed() >= DRAW_EVERY);
             let wanted = keyed || changed || self.quit;
@@ -7538,6 +7545,7 @@ impl App {
             // What the person sent lands before the events after it.
             self.wrote();
             more_heard = self.hear();
+            changed |= self.drawings();
             // What came before the connection closed is applied first, so
             // catching up after it never meets an event from before.
             if self.cut && self.unheard.is_empty() && self.hearing.is_none() {
@@ -12215,6 +12223,28 @@ impl App {
             .read(self.client.clone(), self.bot.clone())
             .await;
         self.heard(event, read);
+    }
+
+    /// Pictures drawn beside the loop since it last looked, each in place
+    /// of the row that stood for it: in the conversation, the words still
+    /// held back, the pane and the margin. Whether any came.
+    fn drawings(&mut self) -> bool {
+        let landed = drawing::landed();
+        if landed == self.drawn_seen {
+            return false;
+        }
+        self.drawn_seen = landed;
+        self.flush();
+        self.screen.fill_drawn();
+        if let Some(live) = &mut self.live {
+            drawing::fill(&mut live.rows);
+        }
+        if let Some(pane) = &mut self.pane {
+            pane.drawn();
+        }
+        // The margin draws its notes again as pictures land.
+        drawing::settle(landed);
+        true
     }
 
     /// The daemon's events taken in the order they came, each applied

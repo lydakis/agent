@@ -785,6 +785,51 @@ impl Screen {
         true
     }
 
+    /// Whether a row stands for a picture still being drawn.
+    pub fn waits(&self) -> bool {
+        self.rows.iter().any(|row| crate::drawing::waits(&row.line))
+    }
+
+    /// Each row that stood for a picture now drawn swapped for its rows:
+    /// the first keeps what the row was besides its text, the last its
+    /// tag (a message's last row is still its last), and all its bar.
+    /// Whether any was.
+    pub fn fill_drawn(&mut self) -> bool {
+        let mut any = false;
+        let mut at = self.rows.len();
+        while at > 0 {
+            at -= 1;
+            if !crate::drawing::waits(&self.rows[at].line) {
+                continue;
+            }
+            let Some(lines) = crate::drawing::ready(&self.rows[at].line) else {
+                continue;
+            };
+            any = true;
+            let shown = self.shown_at(at);
+            let old = &self.rows[at];
+            let (tag, bar) = (old.tag, old.bar);
+            let mut fresh: Vec<Row> = lines.into_iter().map(Row::new).collect();
+            for row in &mut fresh {
+                row.bar = bar;
+            }
+            if let Some(first) = fresh.first_mut() {
+                first.rest = old.rest.clone();
+                first.link = old.link.clone();
+                first.buttons = old.buttons.clone();
+                (first.opens, first.over, first.written) = (old.opens, old.over, old.written);
+            }
+            if let Some(last) = fresh.last_mut() {
+                last.tag = tag;
+            }
+            let grown = fresh.len() as isize - 1;
+            self.rows.splice(at..at + 1, fresh);
+            self.grow_page(at, grown);
+            self.relay(at, shown);
+        }
+        any
+    }
+
     /// The page of older items the row `row` is in, if any, `by` rows
     /// longer: rows put into it or taken out, so it still ends where it
     /// does.

@@ -113,8 +113,8 @@ impl Backend for Probe {
 }
 
 /// The items bot `b` has, by node: a turn the person started and the
-/// agent's reply to it.
-fn kept() -> Value {
+/// agent's reply to it, `reply`.
+fn kept(reply: &str) -> Value {
     json!([
         {"node": 0, "message": 0, "item": {"type": "message", "role": "user",
             "content": [{"type": "input_text", "text": "An earlier question"}]}},
@@ -122,7 +122,7 @@ fn kept() -> Value {
             "content": [{"type": "input_text", "text": "Count the tallies"}]}},
         {"node": 2, "item": {"type": "message", "role": "assistant",
             "content": [{"type": "output_text",
-                "text": "First tally done\nSecond tally done\nAll tallies counted"}]}},
+                "text": reply}]}},
     ])
 }
 
@@ -130,6 +130,7 @@ fn kept() -> Value {
 /// sends the events `told` gives it. What it was asked is in the list.
 async fn held_daemon(
     held: Duration,
+    reply: &str,
 ) -> (
     Arc<Client>,
     Events,
@@ -148,6 +149,7 @@ async fn held_daemon(
     let (tell, mut told) = tokio::sync::mpsc::unbounded_channel::<Value>();
     let asked = Arc::new(Mutex::new(Vec::new()));
     let log = asked.clone();
+    let reply = reply.to_owned();
     tokio::spawn(async move {
         let (stream, _) = listener.accept().await.unwrap();
         let (read, write) = stream.into_split();
@@ -170,7 +172,7 @@ async fn held_daemon(
         while let Ok(Some(line)) = lines.next_line().await {
             let asked: Value = serde_json::from_str(&line).unwrap();
             log.lock().unwrap().push((Instant::now(), asked.clone()));
-            let entries = kept();
+            let entries = kept(&reply);
             let result = match asked["op"].as_str() {
                 Some("history_items") => json!({"items": entries.as_array().into_iter()
                     .flatten()
@@ -252,7 +254,11 @@ fn percentile(sorted: &[Duration], at: f64) -> Duration {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn typing_and_scrolling_never_wait_on_a_daemon_that_holds_every_answer() {
-    let (client, mut events, tell, asked) = held_daemon(HELD).await;
+    let (client, mut events, tell, asked) = held_daemon(
+        HELD,
+        "First tally done\nSecond tally done\nAll tallies counted",
+    )
+    .await;
     let mut app = window(client);
     // Older items to read as the view nears the first row drawn.
     app.older = Some(1);
@@ -389,4 +395,138 @@ async fn typing_and_scrolling_never_wait_on_a_daemon_that_holds_every_answer() {
         "{screen}\n---\n{whole}"
     );
     assert!(earlier < said && said < replied, "{screen}");
+}
+
+/// How long the stand-in browser takes to draw a page: as a cold Chrome
+/// can.
+const DRAWING: Duration = Duration::from_secs(3);
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn typing_never_waits_on_a_page_the_browser_is_slow_to_draw() {
+    use resvg::tiny_skia;
+    // A window that draws pictures, as Kitty's does, and a browser that
+    // takes 3 s to draw a page: a cold one, its first time.
+    term::draws_pictures(true);
+    let dir = std::env::temp_dir().join(format!("sonny-slow-page-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut page = tiny_skia::Pixmap::new(64, 32).unwrap();
+    page.fill(tiny_skia::Color::BLACK);
+    page.save_png(dir.join("drawn.png")).unwrap();
+    let browser = dir.join("chrome");
+    crate::testing::script(
+        &browser,
+        &format!(
+            "#!/bin/sh\nsleep {}\n\
+             for a; do case $a in --screenshot=*) cp '{drawn}' \"${{a#--screenshot=}}\";; esac; done\n",
+            DRAWING.as_secs(),
+            drawn = dir.join("drawn.png").display(),
+        ),
+    );
+    *crate::html::STAND_IN.lock().unwrap() = Some(browser);
+    // A page no earlier run kept drawn.
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let reply = format!("Here is the page\n```html\n<h1>{nonce}</h1>\n```\nThat was the page");
+    let (client, mut events, tell, _) = held_daemon(Duration::ZERO, &reply).await;
+    let mut app = window(client);
+    let frames = Arc::new(Mutex::new(Vec::new()));
+    let probe = Probe {
+        screen: ratatui::backend::TestBackend::new(100, 30),
+        frames: frames.clone(),
+    };
+    let mut terminal = Terminal::new(probe).unwrap();
+    let (keys, taken) = tokio::sync::mpsc::unbounded_channel();
+    // On a thread of its own: a window that stops to draw stops whatever
+    // runs on its own thread too, and the keys must come meanwhile.
+    let streamed = reply.clone();
+    let drive = tokio::spawn(async move {
+        tell.send(json!({"event": "accepted", "bot": "b", "turn": 1,
+            "data": {"node": 1}}))
+            .unwrap();
+        for line in streamed.split_inclusive('\n') {
+            tell.send(
+                json!({"event": "text_delta", "bot": "b", "turn": 1, "item": 0,
+                "text": line}),
+            )
+            .unwrap();
+        }
+        tell.send(json!({"event": "message", "bot": "b", "turn": 1,
+            "data": {"node": 2}}))
+            .unwrap();
+        tell.send(json!({"event": "turn_finished", "bot": "b", "turn": 1,
+            "data": {"status": "completed"}}))
+            .unwrap();
+        // The person types on while the page is drawn.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let mut sent: Vec<(Instant, String)> = Vec::new();
+        let mut typed = String::new();
+        for c in "the page looks right".chars() {
+            typed.push(c);
+            keys.send(key(KeyCode::Char(c))).unwrap();
+            sent.push((Instant::now(), typed.clone()));
+            tokio::time::sleep(Duration::from_millis(40)).await;
+        }
+        // Drawn by now: it takes the row that stood for it.
+        tokio::time::sleep(DRAWING * 2).await;
+        for _ in 0..typed.len() {
+            keys.send(key(KeyCode::Backspace)).unwrap();
+        }
+        for c in "/quit".chars() {
+            keys.send(key(KeyCode::Char(c))).unwrap();
+        }
+        keys.send(key(KeyCode::Enter)).unwrap();
+        sent
+    });
+    let ran = tokio::time::timeout(
+        Duration::from_secs(60),
+        app.run(&mut terminal, &mut events, taken),
+    )
+    .await
+    .expect("the window quit");
+    let sent = drive.await.unwrap();
+    term::draws_pictures(false);
+    *crate::html::STAND_IN.lock().unwrap() = None;
+    ran.unwrap();
+    let frames = frames.lock().unwrap().clone();
+    let mut waited = latencies(&sent, &frames);
+    waited.sort();
+    let p99 = percentile(&waited, 0.99);
+    let worst = *waited.last().unwrap();
+    eprintln!(
+        "keys {} p50 {:?} p99 {:?} worst {:?}",
+        waited.len(),
+        percentile(&waited, 0.5),
+        p99,
+        worst,
+    );
+    assert!(
+        p99 < Duration::from_millis(50),
+        "key to character p99 {p99:?}"
+    );
+    assert!(worst < Duration::from_millis(100), "a key waited {worst:?}");
+    // The reply showed at once, a row standing for its page; then the page
+    // in that row's place, the words around it as they were.
+    let waiting = frames
+        .iter()
+        .find(|(.., whole)| whole.contains("drawing the page…"));
+    assert!(
+        waiting.is_some_and(|(.., whole)| whole.contains("That was the page")),
+        "{:?}",
+        frames.last()
+    );
+    let screen = app.screen.texts().join("\n");
+    assert!(!screen.contains("drawing the page…"), "{screen}");
+    let (before, picture, after) = (
+        screen.find("Here is the page"),
+        screen.find(crate::image::PLACEHOLDER),
+        screen.find("That was the page"),
+    );
+    assert!(
+        before.is_some() && picture.is_some() && after.is_some(),
+        "{screen}"
+    );
+    assert!(before < picture && picture < after, "{screen}");
+    let _ = std::fs::remove_dir_all(&dir);
 }

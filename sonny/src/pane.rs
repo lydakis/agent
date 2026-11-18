@@ -798,18 +798,27 @@ impl Pane {
         if *laid == width || width == 0 {
             return;
         }
-        let path = path.clone();
-        let height = rows.height as usize;
-        // Not drawn yet, the view asked for (the file's top, at opening)
-        // is where the new rows open; drawn, they open as far through.
-        let going_to = self.screen.going_to();
-        let before = self.screen.height(*laid).saturating_sub(height).max(1);
-        let through = 1.0 - self.screen.back().min(before) as f64 / before as f64;
-        let mut screen = Screen::default();
-        if preview(&path, width, None, &mut screen).is_err() {
+        let (path, laid) = (path.clone(), *laid);
+        if !self.read_again(&path, laid, width, rows.height as usize) {
             // Gone or unreadable now: what was read stays as it was.
             self.laid = None;
             return;
+        }
+        self.laid = Some((path, width));
+    }
+
+    /// The file at `path`, laid at `laid` columns, read anew at `width`,
+    /// the view kept as far through it as it was in `height` rows; whether
+    /// it could be.
+    fn read_again(&mut self, path: &Path, laid: usize, width: usize, height: usize) -> bool {
+        // Not drawn yet, the view asked for (the file's top, at opening)
+        // is where the new rows open; drawn, they open as far through.
+        let going_to = self.screen.going_to();
+        let before = self.screen.height(laid).saturating_sub(height).max(1);
+        let through = 1.0 - self.screen.back().min(before) as f64 / before as f64;
+        let mut screen = Screen::default();
+        if preview(path, width, None, &mut screen).is_err() {
+            return false;
         }
         match going_to {
             Some((row, above)) => screen.show_row(row, above),
@@ -819,7 +828,29 @@ impl Pane {
             }
         }
         self.screen = screen;
-        self.laid = Some((path, width));
+        true
+    }
+
+    /// Pictures it waited on that are now drawn, drawn in their place: a
+    /// file it previews read again, as each look at it is (a picture the
+    /// file is, or those in it), else each row that stood for one swapped
+    /// for it. Whether any was.
+    pub fn drawn(&mut self) -> bool {
+        let card = self.card.as_mut().is_some_and(crate::drawing::fill);
+        if !self.screen.waits() {
+            return card;
+        }
+        let file = (self.tree.is_none() && self.program.is_none() && self.card.is_none())
+            .then(|| self.link.as_deref().and_then(file_url))
+            .flatten();
+        match file {
+            Some((path, None)) => {
+                let width = self.laid.as_ref().map_or(self.width, |(_, laid)| *laid);
+                let height = self.area.height as usize;
+                self.read_again(&path, width, width, height)
+            }
+            _ => self.screen.fill_drawn(),
+        }
     }
 }
 
@@ -896,6 +927,32 @@ pub fn file_url(url: &str) -> Option<(PathBuf, Option<usize>)> {
     Some((PathBuf::from(String::from_utf8(out).ok()?), line))
 }
 
+/// The file at `path` drawn as a picture `width` columns wide, as it
+/// was before when it has not changed since; else a row saying it is
+/// being drawn, beside the loop. The pane reads it again once it is
+/// ([`Pane::drawn`]).
+fn drawn(
+    path: &Path,
+    meta: &std::fs::Metadata,
+    width: usize,
+    draw: impl FnOnce() -> Result<crate::image::Drawn, String> + Send + 'static,
+) -> Result<Result<Vec<Line<'static>>, String>, Vec<Line<'static>>> {
+    let key = format!(
+        "{}\0{}\0{:?}\0{}",
+        path.display(),
+        meta.len(),
+        meta.modified().ok(),
+        crate::image::tall()
+    );
+    match crate::cache::drawn("pane file", &key, width, draw) {
+        crate::cache::Drawing::Done(drawn) => Ok(drawn.map(crate::image::show)),
+        // Read again whole once drawn: the row is what stands meanwhile.
+        crate::cache::Drawing::Waits(key) => {
+            Err(crate::drawing::placeholder(key, "the picture", Vec::new))
+        }
+    }
+}
+
 /// `path` written into `screen` at `width`: a picture drawn, Markdown
 /// as replies read, code in its colors with its line numbers. The row to show first: that of `line`, if any; and
 /// whether its rows are prose, to be read no wider than the conversation.
@@ -919,7 +976,19 @@ fn preview(
         .to_lowercase();
     if matches!(extension.as_str(), "png" | "jpg" | "jpeg" | "gif" | "webp") {
         let shown = match crate::term::graphics() {
-            true => crate::image::file(path, width, crate::image::tall()).map(crate::image::show),
+            true => {
+                let file = path.to_owned();
+                let tall = crate::image::tall();
+                match drawn(path, &meta, width, move || {
+                    crate::image::file(&file, width, tall)
+                }) {
+                    Ok(drawing) => drawing,
+                    Err(waiting) => {
+                        screen.push(waiting);
+                        return Ok((0, false));
+                    }
+                }
+            }
             false => Err("this terminal draws no pictures (Kitty and Ghostty do)".into()),
         };
         match shown {
@@ -956,24 +1025,31 @@ fn preview(
     // Drawn only where pictures can be, as tall as the pane; elsewhere,
     // or when it cannot be drawn, its source, and why.
     if line.is_none() && crate::term::graphics() {
-        let drawn =
-            match extension.as_str() {
-                "svg" => Some(crate::image::render_in(
-                    &text,
-                    width,
-                    crate::image::tall(),
-                    true,
-                )),
-                "mmd" | "mermaid" => Some(crate::mermaid::svg(&text).and_then(|svg| {
-                    crate::image::render_in(&svg, width, crate::image::tall(), true)
-                })),
-                "html" | "htm" => Some(
-                    crate::html::render(path, crate::image::page_width(width))
-                        .and_then(|png| crate::image::page_in(&png, width, crate::image::tall())),
-                ),
-                _ => None,
-            };
-        match drawn.map(|drawn| drawn.map(crate::image::show)) {
+        let tall = crate::image::tall();
+        let (file, source) = (path.to_owned(), text.clone());
+        let drawing = match extension.as_str() {
+            "svg" => Some(drawn(path, &meta, width, move || {
+                crate::image::render_in(&source, width, tall, true)
+            })),
+            "mmd" | "mermaid" => Some(drawn(path, &meta, width, move || {
+                crate::mermaid::svg(&source)
+                    .and_then(|svg| crate::image::render_in(&svg, width, tall, true))
+            })),
+            "html" | "htm" => Some(drawn(path, &meta, width, move || {
+                crate::html::render(&file, crate::image::page_width(width))
+                    .and_then(|png| crate::image::page_in(&png, width, tall))
+            })),
+            _ => None,
+        };
+        let drawn = match drawing {
+            Some(Err(waiting)) => {
+                screen.push(waiting);
+                return Ok((0, false));
+            }
+            Some(Ok(drawn)) => Some(drawn),
+            None => None,
+        };
+        match drawn {
             Some(Ok(rows)) => {
                 screen.push(rows);
                 return Ok((0, false));

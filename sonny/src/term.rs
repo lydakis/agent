@@ -191,11 +191,19 @@ pub fn heard(reply: &str) {
 /// Whether images can be drawn: Kitty graphics answered OK, or rows are
 /// being counted ([`measuring`]).
 pub fn graphics() -> bool {
-    measured() || PROBE.get().is_some_and(|p| p.graphics)
+    measured() || PROBE.get().is_some_and(|p| p.graphics) || cfg!(test) && DRAWS.get()
 }
 
 thread_local! {
     static MEASURING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// A test's window that draws pictures, as Kitty's does.
+    static DRAWS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// This thread drawn for as a terminal that draws pictures, until `false`.
+#[cfg(test)]
+pub fn draws_pictures(draws: bool) {
+    DRAWS.set(draws);
 }
 
 /// `count` run as a terminal that draws pictures lays rows out, its cells
