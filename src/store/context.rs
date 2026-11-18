@@ -310,6 +310,94 @@ pub fn without_thinking(item: &[u8]) -> Option<Vec<u8>> {
     Some(out)
 }
 
+/// Whether `c` is whitespace to JavaScript's `String.prototype.trim`, the
+/// test Pi leaves blank text out by: a zero-width space (U+200B) is not.
+fn trimmed(c: char) -> bool {
+    matches!(
+        c,
+        '\t' | '\n' | '\u{b}' | '\u{c}' | '\r' | ' ' | '\u{a0}' | '\u{1680}' | '\u{2000}'
+            ..='\u{200a}'
+                | '\u{2028}'
+                | '\u{2029}'
+                | '\u{202f}'
+                | '\u{205f}'
+                | '\u{3000}'
+                | '\u{feff}'
+    )
+}
+
+/// A Messages item without its blank text blocks, whose text is only
+/// whitespace: the API refuses them ("text content blocks must contain
+/// non-whitespace text"), so Pi leaves them out of each request it builds,
+/// and an emptied message with them (pi-mono
+/// packages/ai/src/api/anthropic-messages.ts `convertMessages`, read
+/// 2026-11-18). The stored item keeps them. `None` when it holds none;
+/// empty when they are all it holds; otherwise the item with spaces after
+/// its content in their place, as long as it is stored, so a request sends
+/// the length the store counted.
+pub(crate) fn without_blank_text(item: &[u8]) -> Option<Vec<u8>> {
+    #[derive(serde::Deserialize)]
+    struct Message<'a> {
+        #[serde(rename = "role")]
+        _role: &'a str,
+        #[serde(borrow)]
+        content: &'a serde_json::value::RawValue,
+    }
+    #[derive(serde::Deserialize)]
+    struct Block<'a> {
+        #[serde(rename = "type", borrow)]
+        kind: std::borrow::Cow<'a, str>,
+        #[serde(borrow)]
+        text: Option<std::borrow::Cow<'a, str>>,
+    }
+    let encoded = std::str::from_utf8(item).ok()?;
+    // Most items have no text that could be blank: one starts with a quote
+    // (empty), an escape, a space or a character past ASCII. The search
+    // skips parsing the rest.
+    const TEXT: &str = r#""text":""#;
+    if !encoded.match_indices(TEXT).any(|(at, _)| {
+        matches!(
+            item.get(at + TEXT.len()),
+            Some(b'"' | b'\\' | b' ' | 0x80..)
+        )
+    }) {
+        return None;
+    }
+    let message: Message<'_> = serde_json::from_str(encoded).ok()?;
+    let blocks: Vec<&serde_json::value::RawValue> =
+        serde_json::from_str(message.content.get()).ok()?;
+    let kept: Vec<_> = blocks
+        .iter()
+        .filter(|block| {
+            !serde_json::from_str::<Block<'_>>(block.get()).is_ok_and(|block| {
+                block.kind == "text" && block.text.is_some_and(|text| text.chars().all(trimmed))
+            })
+        })
+        .collect();
+    if kept.len() == blocks.len() {
+        return None;
+    }
+    if kept.is_empty() {
+        return Some(Vec::new());
+    }
+    // The content array, where the item holds it.
+    let start = message.content.get().as_ptr() as usize - encoded.as_ptr() as usize;
+    let end = start + message.content.get().len();
+    let mut out = Vec::with_capacity(item.len());
+    out.extend_from_slice(&item[..start]);
+    out.push(b'[');
+    for (index, block) in kept.iter().enumerate() {
+        if index != 0 {
+            out.push(b',');
+        }
+        out.extend_from_slice(block.get().as_bytes());
+    }
+    out.push(b']');
+    out.resize(end, b' ');
+    out.extend_from_slice(&item[end..]);
+    Some(out)
+}
+
 /// Whether `item` is a Responses reasoning item, which a request leaves
 /// out whole when it withholds thinking.
 pub(crate) fn reasoning(item: &[u8]) -> bool {
@@ -632,6 +720,7 @@ pub fn pinned_item(family: Family, text: &str, hour: bool) -> Result<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::codec::Image;
 
     #[test]
     fn a_declined_request_s_additions_become_notes_of_their_own_length() {
@@ -811,5 +900,75 @@ mod tests {
             thinking_bytes(br#"{"content":[{"type":"text","text":"hi"}],"role":"assistant"}"#),
             0
         );
+    }
+
+    #[test]
+    fn blank_text_is_left_out_as_spaces_and_a_zero_width_reply_stays() {
+        let blank = |text: &str| {
+            let item = json!({"content":[{"type":"text","text":text},{"type":"text","text":"kept"}],
+                "role":"assistant"});
+            let item = serde_json::to_vec(&item).unwrap();
+            let sent = without_blank_text(&item);
+            if let Some(sent) = &sent {
+                assert_eq!(sent.len(), item.len());
+                let sent: serde_json::Value = serde_json::from_slice(sent).unwrap();
+                assert_eq!(sent["content"], json!([{"type":"text","text":"kept"}]));
+            }
+            sent.is_some()
+        };
+        // What JavaScript's trim takes is blank, as Pi tests it.
+        for text in [
+            "",
+            " ",
+            "\n",
+            "\r\n\t",
+            "\u{b}\u{c}",
+            "\u{a0}",
+            "\u{3000}",
+            "\u{2028}",
+            "\u{feff}",
+        ] {
+            assert!(blank(text), "{text:?}");
+        }
+        // A zero-width space is not, nor is any other character.
+        for text in ["\u{200b}", " \u{200b}\n", "\u{85}", " a ", "\"", "\\"] {
+            assert!(!blank(text), "{text:?}");
+        }
+        // Wherever the blank blocks are, the rest keep their order.
+        let item = br#"{"content":[{"type":"text","text":"\n"},{"type":"thinking","thinking":" ","signature":"s"},{"type":"text","text":" "},{"type":"tool_use","id":"t","name":"echo","input":{"text":" "}},{"type":"text","text":""}],"role":"assistant"}"#;
+        let sent = without_blank_text(item).unwrap();
+        assert_eq!(sent.len(), item.len());
+        let sent: serde_json::Value = serde_json::from_slice(&sent).unwrap();
+        assert_eq!(
+            sent,
+            json!({"content":[{"type":"thinking","thinking":" ","signature":"s"},
+                {"type":"tool_use","id":"t","name":"echo","input":{"text":" "}}],"role":"assistant"})
+        );
+        // A user message's blank text goes too, beside its picture.
+        let user = Family::Anthropic
+            .user_item_with(
+                " ",
+                &[Image {
+                    media_type: "image/png".into(),
+                    data: "AAAA".into(),
+                }],
+            )
+            .unwrap();
+        let sent: serde_json::Value =
+            serde_json::from_slice(&without_blank_text(&user).unwrap()).unwrap();
+        assert_eq!(sent["content"].as_array().unwrap().len(), 1);
+        assert_eq!(sent["content"][0]["type"], "image");
+        // Only blank text: the message is left out.
+        let alone = br#"{"content":[{"type":"text","text":" \n"}],"role":"assistant"}"#;
+        assert_eq!(without_blank_text(alone), Some(Vec::new()));
+        // Items without blank text, and a Responses item, go as stored.
+        for item in [
+            &br#"{"content":[{"type":"text","text":"hi"}],"role":"assistant"}"#[..],
+            br#"{"content":[{"type":"tool_result","tool_use_id":"t","content":[{"type":"text","text":" "}]}],"role":"user"}"#,
+            br#"{"type":"message","role":"assistant","content":[{"type":"output_text","text":" "}]}"#,
+            br#"{"type":"function_call_output","call_id":"c","output":" "}"#,
+        ] {
+            assert_eq!(without_blank_text(item), None, "{}", String::from_utf8_lossy(item));
+        }
     }
 }

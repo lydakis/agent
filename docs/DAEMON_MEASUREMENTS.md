@@ -10805,6 +10805,36 @@ the CI runner, 2026-11-17:
 Store jobs a turn are unchanged on every screen: the gate fails on any
 increase, and it passed. Every row is within the runner's spread.
 
+## Blank text left out of Anthropic requests (#1147)
+
+Each Anthropic request now checks every stored item for a whitespace-only
+text block after the thinking strip, and leaves such blocks out at the
+length the store counted. Only items with `"text":"` followed by a quote,
+backslash, space or non-ASCII byte are parsed; every other item is copied
+as before. Item batches now carry the separator state from one batch to
+the next. Matched screen from the CI Perf job (`bench/perf_gate.py`), main
+(7860d0e) against the head (00670de), release build, synthetic model, the
+CI runner, 2026-11-18:
+
+| Screen | Row | Main | Head | Change |
+| --- | --- | ---: | ---: | ---: |
+| `bench.admission_burst` | Lone submit CPU | 22.434 ms | 22.338 ms | -0.4% |
+| `bench.admission_burst` | Burst submit p99 | 2.196 ms | 2.248 ms | +2.4% |
+| `bench.completion_burst` | Release to terminal p99 | 5.943 ms | 5.775 ms | -2.8% |
+| `bench.footprint` | Idle RSS | 17.012 MiB | 17.086 MiB | +0.4% |
+| `bench.footprint` | Per idle bot | 1.832 KiB | 1.912 KiB | +4.4% |
+| `bench.footprint` | RSS after a turn each | 59.490 MiB | 53.445 MiB | -10.2% |
+| `bench.footprint` | CPU per turn | 0.566 ms | 0.540 ms | -4.4% |
+| `bench.lifecycle` | Daemon CPU | 0.285 s | 0.315 s | +10.5% |
+| `bench.lifecycle` | Turn p95 | 569.936 ms | 570.648 ms | +0.1% |
+| `bench.lifecycle` | Peak RSS | 26.219 MiB | 25.854 MiB | -1.4% |
+
+Store jobs a turn are unchanged on every screen: the gate fails on any
+increase, and it passed. The lifecycle CPU row is 30 ms on a run of a few
+hundred turns, inside the spread of the runner's own repeats (the same
+row moved +9.4% on #1132's screen), with the turn p95 and memory
+unchanged.
+
 ## A bot's instructions out of its row (schema 107)
 
 Each bot's instructions and compaction instructions now live in
