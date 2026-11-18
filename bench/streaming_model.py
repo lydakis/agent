@@ -19,6 +19,8 @@ Prints {"port": N} then serves until SIGTERM, writing --stats JSON at exit.
 import argparse
 import asyncio
 import json
+import math
+from pathlib import Path
 import random
 import signal
 import time
@@ -53,7 +55,6 @@ async def main(args):
     tokens = Bucket(args.tpm) if args.tpm else None
     requests = Bucket(args.rpm) if args.rpm else None
     word = 'tok '
-    gap = args.per_delta / args.tps
 
     async def handle(reader, writer):
         nonlocal active
@@ -64,7 +65,7 @@ async def main(args):
                 for line in head.split(b'\r\n'):
                     if line[:15].lower() == b'content-length:':
                         length = int(line[15:])
-                body = await reader.readexactly(length)
+                await reader.readexactly(length)
                 stats['requests'] += 1
                 stats['request_bytes'] += length
                 input_tokens = length // 4
@@ -152,17 +153,22 @@ async def main(args):
     server = await asyncio.start_server(handle, '127.0.0.1', 0, limit=1 << 20, backlog=4096)
     print(json.dumps({'port': server.sockets[0].getsockname()[1]}), flush=True)
 
+    path = Path(args.stats)
+    staged = path.with_name(path.name + '.tmp')
+
+    def publish():
+        staged.write_text(json.dumps(stats))
+        staged.replace(path)
+
     async def dump():
         while True:
-            with open(args.stats, 'w') as f:
-                json.dump(stats, f)
+            publish()
             await asyncio.sleep(1)
     dumper = asyncio.create_task(dump())
     await stop.wait()
     dumper.cancel()
     server.close()
-    with open(args.stats, 'w') as f:
-        json.dump(stats, f)
+    publish()
 
 
 if __name__ == '__main__':
@@ -178,6 +184,8 @@ if __name__ == '__main__':
     p.add_argument('--no-headers', action='store_true')
     p.add_argument('--jitter', type=float, default=0)
     a = p.parse_args()
+    if not math.isfinite(a.tps) or a.tps <= 0 or a.per_delta <= 0:
+        p.error('--tps must be finite and positive and --per-delta must be positive')
     if uvloop:
         uvloop.install()
     asyncio.run(main(a))

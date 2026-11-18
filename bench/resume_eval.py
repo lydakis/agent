@@ -61,7 +61,8 @@ if [ "$n" = {cut} ] && ! grep -qx "start $n" steps.log 2>/dev/null; then wait={l
 echo "start $n" >> steps.log
 sleep "$wait"
 echo "done $n" >> steps.log
-printf 'step %s code: %s\\n' "$n" "$(printf '%s' "{seed}-$n" | shasum | cut -c1-6)"
+code=$(python3 -c 'import hashlib, sys; print(hashlib.sha1(sys.argv[1].encode()).hexdigest()[:6])' "{seed}-$n") || exit 1
+printf 'step %s code: %s\\n' "$n" "$code"
 """
 
 

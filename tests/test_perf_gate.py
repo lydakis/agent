@@ -22,7 +22,7 @@ class PerfGateTests(unittest.TestCase):
             folder.mkdir()
             rows = [{'warmup': True, **footprint(99)}] + [{'warmup': False, **run} for run in runs]
             (folder / 'result.json').write_text(json.dumps({'runs': rows}))
-        return compare(root)
+        return compare(root, ['footprint'])
 
     def test_more_store_work_fails_and_timing_only_warns_when_runs_do_not_overlap(self):
         # Timed counts and overlapping runs say nothing.
@@ -35,8 +35,20 @@ class PerfGateTests(unittest.TestCase):
         self.assertEqual(len(warned), 1)
         self.assertIn('CPU per turn', warned[0])
         # One store job more a turn fails, whatever the timings.
-        _, failed, _ = self.screen([footprint(1.0)], [footprint(1.0, jobs=4)])
+        _, failed, _ = self.screen([footprint(1.0), footprint(1.0)], [footprint(1.0), footprint(1.0, jobs=4)])
         self.assertEqual(failed, ['footprint: begin rose from 3 to 4'])
+
+    def test_gate_requires_both_sides_and_reports_failed_lifecycle_runs(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            for side, statuses in [('head', ['ok', 'failed']), ('base', ['failed'])]:
+                output = root / f'lifecycle-{side}-1'
+                output.mkdir()
+                (output / 'result.json').write_text(json.dumps({'runs': [{'status': s} for s in statuses]}))
+            _, failed, _ = compare(root)
+        self.assertTrue(any('footprint' in reason for reason in failed))
+        for side in ('base', 'head'):
+            self.assertTrue(any('lifecycle' in reason and side in reason for reason in failed))
 
     def test_a_turn_no_note_told_fails_where_the_base_told_every_one(self):
         def sonny(untold, p95):
@@ -49,7 +61,7 @@ class PerfGateTests(unittest.TestCase):
             folder = root / f'sonny-{side}-0'
             folder.mkdir()
             (folder / 'result.json').write_text(json.dumps({'runs': [run]}))
-        _, failed, _ = compare(root)
+        _, failed, _ = compare(root, ['sonny'])
         # However much faster the head's notes are.
         self.assertEqual(failed, ['sonny: lookout at 10x100 left 4 ended turns untold, '
                                   'where the base told every one'])

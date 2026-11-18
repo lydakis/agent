@@ -6,7 +6,7 @@ project whose `total()` truncates cents instead of rounding them.
 
 The model's words come from `scripted_model.py`, a local Responses endpoint, so
 the recording needs no API key and comes out the same every time. Everything
-else is real: the daemon, the store, both bots, the shell and edit tools, the
+else is real: the daemon, the store, both bots, the shell and patch tools, the
 `agent run --detach` that starts the helper, and the `wait` that collects it.
 
 From the repository root:

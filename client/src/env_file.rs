@@ -29,38 +29,57 @@ pub fn path() -> Option<PathBuf> {
 /// in matching quotes. A missing file is empty. One others can read, or a line
 /// that is not an assignment, is refused by path and line, never by value.
 pub fn read(path: &Path) -> Result<Vec<(String, String)>, String> {
-    use std::{io::Read, os::unix::fs::PermissionsExt};
+    parse(path, &read_text(path)?)
+}
+
+fn read_text(path: &Path) -> Result<String, String> {
+    use std::io::Read;
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
     let unreadable =
         |error: std::io::Error| format!("env_file_unreadable: {}: {error}", path.display());
-    // Checked before opening: opening a FIFO for reading would block.
-    let metadata = match std::fs::metadata(path) {
-        Ok(metadata) => metadata,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+    let file = match std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK)
+        .open(path)
+    {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(String::new()),
         Err(error) => return Err(unreadable(error)),
     };
+    let invalid = || {
+        format!(
+            "env_file_invalid: {} must be a regular file of at most {MAX} bytes",
+            path.display()
+        )
+    };
+    let metadata = file.metadata().map_err(unreadable)?;
     if !metadata.is_file() || metadata.len() > MAX {
-        return Err(format!(
-            "env_file_invalid: {} must be a regular file of at most {MAX} bytes",
-            path.display()
-        ));
+        return Err(invalid());
     }
-    let mut text = String::new();
-    std::fs::File::open(path)
-        .and_then(|file| file.take(MAX + 1).read_to_string(&mut text))
-        .map_err(unreadable)?;
-    if text.len() as u64 > MAX {
-        return Err(format!(
-            "env_file_invalid: {} must be a regular file of at most {MAX} bytes",
-            path.display()
-        ));
-    }
-    let mode = metadata.permissions().mode();
-    if mode & 0o077 != 0 {
+    if metadata.permissions().mode() & 0o077 != 0 {
         return Err(format!(
             "env_file_permissions: {} is readable by others; chmod 600 it",
             path.display()
         ));
     }
+    let mut text = String::new();
+    file.take(MAX + 1)
+        .read_to_string(&mut text)
+        .map_err(unreadable)?;
+    if text.len() as u64 > MAX {
+        return Err(invalid());
+    }
+    Ok(text)
+}
+
+fn valid(key: &str) -> bool {
+    key.chars()
+        .next()
+        .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+        && key.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+fn parse(path: &Path, text: &str) -> Result<Vec<(String, String)>, String> {
     let mut environment = Vec::new();
     for (index, line) in text.lines().enumerate() {
         let line = line.trim();
@@ -68,12 +87,6 @@ pub fn read(path: &Path) -> Result<Vec<(String, String)>, String> {
             continue;
         }
         let line = line.strip_prefix("export ").unwrap_or(line).trim_start();
-        let valid = |key: &str| {
-            key.chars()
-                .next()
-                .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
-                && key.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
-        };
         let Some((key, value)) = line
             .split_once('=')
             .map(|(key, value)| (key.trim_end(), value))
@@ -136,15 +149,24 @@ pub fn var(name: &str) -> Option<String> {
 /// owner when it is new: earlier lines naming one of them are dropped,
 /// every other line is kept as it was, and the file is replaced whole.
 pub fn set(path: &Path, pairs: &[(&str, &str)]) -> Result<(), String> {
-    use std::io::Write;
-    use std::os::unix::fs::OpenOptionsExt;
-    // A file this refuses to read is the person's to fix, not to replace.
-    read(path)?;
-    let text = match std::fs::read_to_string(path) {
-        Ok(text) => text,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
-        Err(error) => return Err(format!("env_file_unreadable: {}: {error}", path.display())),
-    };
+    // Lock the directory across the read and rename. Replacing the file
+    // changes its inode, so a lock on the file would not serialize edits.
+    let dir = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    let failed =
+        |error: std::io::Error| format!("env_file_unwritable: {}: {error}", path.display());
+    use std::os::unix::fs::DirBuilderExt;
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(dir)
+        .map_err(failed)?;
+    let lock = std::fs::File::open(dir).map_err(failed)?;
+    lock.lock().map_err(failed)?;
+    let text = read_text(path)?;
+    parse(path, &text)?;
     let named = |line: &str| {
         let line = line.trim();
         let line = line.strip_prefix("export ").unwrap_or(line).trim_start();
@@ -157,6 +179,9 @@ pub fn set(path: &Path, pairs: &[(&str, &str)]) -> Result<(), String> {
         .flat_map(|line| [line, "\n"])
         .collect();
     for (key, value) in pairs {
+        if !valid(key) {
+            return Err(String::from("env_file_invalid: invalid variable name"));
+        }
         if value.contains(['\n', '\r']) {
             return Err(format!("env_file_invalid: {key} holds a line break"));
         }
@@ -168,33 +193,8 @@ pub fn set(path: &Path, pairs: &[(&str, &str)]) -> Result<(), String> {
             path.display()
         ));
     }
-    let failed =
-        |error: std::io::Error| format!("env_file_unwritable: {}: {error}", path.display());
-    if let Some(parent) = path.parent() {
-        use std::os::unix::fs::DirBuilderExt;
-        // `~/.agent/keys` is its owner's alone when a client makes it, as
-        // when the daemon does; one that exists keeps its mode.
-        std::fs::DirBuilder::new()
-            .recursive(true)
-            .mode(0o700)
-            .create(parent)
-            .map_err(failed)?;
-    }
-    let staged = path.with_file_name(format!(".env.{}", std::process::id()));
-    let written = (|| {
-        let mut file = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(&staged)?;
-        file.write_all(kept.as_bytes())?;
-        file.sync_all()?;
-        std::fs::rename(&staged, path)
-    })();
-    if written.is_err() {
-        let _ = std::fs::remove_file(&staged);
-    }
-    written.map_err(failed)
+    crate::files::replace_mode(path, kept.as_bytes(), 0o600)
+        .map_err(|error| format!("env_file_unwritable: {error}"))
 }
 
 #[cfg(test)]
@@ -289,6 +289,23 @@ mod tests {
             "# mine\nOTHER=1\nAGENT_MODEL=c/d\nAWS_PROFILE=dev\n"
         );
         assert!(set(&file, &[("KEY", "a\nb")]).is_err());
+        let before = std::fs::read(&file).unwrap();
+        assert!(set(&file, &[("invalid key", "value")]).is_err());
+        assert_eq!(std::fs::read(&file).unwrap(), before);
+        std::thread::scope(|scope| {
+            for key in ["FIRST", "SECOND", "THIRD", "FOURTH"] {
+                let file = &file;
+                scope.spawn(move || set(file, &[(key, "kept")]).unwrap());
+            }
+        });
+        assert_eq!(
+            read(&file)
+                .unwrap()
+                .iter()
+                .filter(|(_, v)| v == "kept")
+                .count(),
+            4
+        );
         std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o644)).unwrap();
         assert!(
             set(&file, &[("KEY", "1")])

@@ -3237,6 +3237,21 @@ fn budget_exhausted(bot: &Bot, budget: u64) -> Error {
 /// What a keyed creation keeps of its instructions: a stable FNV-1a
 /// fingerprint, as hex, so a resend compares with what was sent even after
 /// `configure` replaced them.
+/// A new bot's instructions and compaction instructions, in a table of
+/// their own: a bot's row stays a few hundred bytes, so a listing never
+/// reads them and a write to the row never rewrites them.
+fn instruct(
+    conn: &Connection,
+    id: i64,
+    instructions: &str,
+    compaction_instructions: Option<&str>,
+) -> Result<()> {
+    conn.prepare_cached(
+        "INSERT INTO bot_instructions(id,instructions,compaction_instructions) VALUES (?,?,?)",
+    )?
+    .execute(params![id, instructions, compaction_instructions])?;
+    Ok(())
+}
 fn instructions_key(instructions: &str) -> String {
     let hash = instructions
         .bytes()
@@ -3390,7 +3405,7 @@ impl Database {
     /// before versioning, stores at versions 1 to 5 and stores from newer
     /// binaries are rejected; an older store from version 6 on is migrated
     /// forward, one version at a time, at open.
-    pub const SCHEMA: i32 = 106;
+    pub const SCHEMA: i32 = 107;
     /// The person's messages a compaction keeps verbatim, newest first:
     /// per-message text, and the total text plus `(ordinal, String)` entry
     /// metadata. Empty entries cost space too, so the retained list cannot
@@ -3549,7 +3564,7 @@ impl Database {
                 id INTEGER NOT NULL,
                 workspace TEXT, status TEXT NOT NULL, running_turn INTEGER,
                 provider TEXT NOT NULL, family TEXT NOT NULL, model TEXT NOT NULL,
-                instructions TEXT NOT NULL, reasoning TEXT,
+                reasoning TEXT,
                 budget_tokens INTEGER, tokens_used INTEGER NOT NULL DEFAULT 0,
                 context_start INTEGER REFERENCES nodes(id),
                 pruned_cursor INTEGER NOT NULL DEFAULT 0,
@@ -3559,7 +3574,7 @@ impl Database {
                 created_by TEXT,
                 created_by_id INTEGER,
                 compaction INTEGER REFERENCES compactions(node),
-                compaction_instructions TEXT, compaction_model TEXT,
+                compaction_model TEXT,
                 cache_bot INTEGER, thinking_prefix INTEGER,
                 thinking_floor INTEGER NOT NULL DEFAULT 0,
                 fallback TEXT,
@@ -3576,6 +3591,8 @@ impl Database {
                 last_started_ms INTEGER, last_finished_ms INTEGER, last_error TEXT,
                 configure_pending TEXT, refused_summary TEXT, closed_ms INTEGER);
             CREATE UNIQUE INDEX IF NOT EXISTS bots_id ON bots(id);
+            CREATE TABLE IF NOT EXISTS bot_instructions(id INTEGER PRIMARY KEY REFERENCES bots(id),
+                instructions TEXT NOT NULL, compaction_instructions TEXT);
             CREATE INDEX IF NOT EXISTS bots_compaction ON bots(compaction);
             CREATE INDEX IF NOT EXISTS bots_elision ON bots(elision);
             CREATE INDEX IF NOT EXISTS bots_configure_pending ON bots(name)
@@ -4392,7 +4409,10 @@ impl Database {
         self.with_snapshot(|| {
             // Cached: parsing this many columns costs more than the read.
             self.conn
-                .prepare_cached(&format!("SELECT {} FROM bots WHERE id=?", Self::COLUMNS))?
+                .prepare_cached(&format!(
+                    "SELECT {} FROM bots JOIN bot_instructions USING(id) WHERE id=?",
+                    Self::COLUMNS
+                ))?
                 .query_row([id], Self::row_held)
                 .optional()?
                 .ok_or(Error::new("bot_not_found"))
@@ -4413,7 +4433,10 @@ impl Database {
         self.with_snapshot(|| {
             // Cached: parsing this many columns costs more than the read.
             self.conn
-                .prepare_cached(&format!("SELECT {} FROM bots WHERE name=?", Self::COLUMNS))?
+                .prepare_cached(&format!(
+                    "SELECT {} FROM bots JOIN bot_instructions USING(id) WHERE name=?",
+                    Self::COLUMNS
+                ))?
                 .query_row([name], Self::row_held)
                 .optional()?
                 .ok_or(Error::new("bot_not_found"))
@@ -4457,11 +4480,19 @@ impl Database {
         instructions: &str,
     ) -> Result<bool> {
         let id = self.identity(name, bot_id)?;
-        let changed = self.conn.execute(
-            "UPDATE bots SET instructions=?, cache_bot=NULL, thinking_prefix=NULL WHERE id=? AND instructions<>?",
+        let tx = self.conn.savepoint()?;
+        let changed = tx.execute(
+            "UPDATE bot_instructions SET instructions=? WHERE id=? AND instructions<>?",
             params![instructions, id, instructions],
-        )?;
-        Ok(changed == 1)
+        )? == 1;
+        if changed {
+            tx.execute(
+                "UPDATE bots SET cache_bot=NULL, thinking_prefix=NULL WHERE id=?",
+                [id],
+            )?;
+        }
+        tx.commit()?;
+        Ok(changed)
     }
     /// Replace the tools a bot's client declared; whether they changed.
     /// The daemon has checked them. Its next request shows the new set,
@@ -4749,7 +4780,7 @@ impl Database {
         let mut changed = Vec::new();
         if let Some(instructions) = instructions
             && self.conn.execute(
-                "UPDATE bots SET compaction_instructions=? WHERE id=? AND compaction_instructions IS NOT ?",
+                "UPDATE bot_instructions SET compaction_instructions=? WHERE id=? AND compaction_instructions IS NOT ?",
                 params![instructions, id, instructions],
             )? == 1
         {
@@ -5064,7 +5095,7 @@ impl Database {
             None => binding.settings.clone(),
         };
         tx.execute(
-            "INSERT INTO bots(name,id,head,workspace,status,running_turn,provider,family,model,instructions,reasoning,budget_tokens,tokens_used,context_start,pruned_cursor,tools,created_by,created_by_id,compaction_instructions,compaction_model,fallback,gates,settings,creation,declared,budget_counts,depth) VALUES (?,?,NULL,?,'idle',NULL,?,?,?,?,?,?,0,NULL,0,?,?,?,?,?,?,?,?,?,?,?,?)",
+            "INSERT INTO bots(name,id,head,workspace,status,running_turn,provider,family,model,reasoning,budget_tokens,tokens_used,context_start,pruned_cursor,tools,created_by,created_by_id,compaction_model,fallback,gates,settings,creation,declared,budget_counts,depth) VALUES (?,?,NULL,?,'idle',NULL,?,?,?,?,?,0,NULL,0,?,?,?,?,?,?,?,?,?,?,?)",
             params![
                 name,
                 id,
@@ -5072,13 +5103,11 @@ impl Database {
                 binding.provider,
                 binding.family.name(),
                 binding.model,
-                binding.instructions,
                 binding.effort,
                 binding.budget_tokens.map(|b| b as i64),
                 binding.tools.join(","),
                 binding.created_by,
                 created_by_id,
-                binding.compaction_instructions,
                 binding.compaction_model,
                 binding.fallback,
                 gates,
@@ -5088,6 +5117,12 @@ impl Database {
                 binding.budget_counts.stored(),
                 depth as i64,
             ],
+        )?;
+        instruct(
+            &tx,
+            id,
+            binding.instructions,
+            binding.compaction_instructions,
         )?;
         // The event carries the list record's fields, so a follower can
         // seat a new bot without a request per creation.
@@ -14680,7 +14715,7 @@ impl Database {
             None => parent.settings.clone(),
         };
         tx.execute(
-            "INSERT INTO bots(name,id,head,workspace,status,running_turn,provider,family,model,instructions,reasoning,budget_tokens,tokens_used,context_start,pruned_cursor,tools,created_by,created_by_id,compaction_instructions,compaction_model,cache_bot,thinking_prefix,thinking_floor,fallback,thinking_from,thinking_to,thinking_elided,gates,allowed,settings,creation,expire_ms,expires_at,declared,budget_counts,depth) VALUES (?,?,?,?,'idle',NULL,?,?,?,?,?,?,0,NULL,0,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            "INSERT INTO bots(name,id,head,workspace,status,running_turn,provider,family,model,reasoning,budget_tokens,tokens_used,context_start,pruned_cursor,tools,created_by,created_by_id,compaction_model,cache_bot,thinking_prefix,thinking_floor,fallback,thinking_from,thinking_to,thinking_elided,gates,allowed,settings,creation,expire_ms,expires_at,declared,budget_counts,depth) VALUES (?,?,?,?,'idle',NULL,?,?,?,?,?,0,NULL,0,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             params![
                 name,
                 id,
@@ -14689,13 +14724,11 @@ impl Database {
                 parent.provider,
                 parent.family,
                 parent.model,
-                parent.instructions,
                 parent.effort,
                 budget_tokens.map(|b| b as i64),
                 parent.tools.join(","),
                 created_by,
                 created_by_id,
-                parent.compaction_instructions,
                 parent.compaction_model,
                 // The fork's first call can read the source's cache.
                 parent.cache_bot(),
@@ -14719,6 +14752,12 @@ impl Database {
                 budget_counts.stored(),
                 depth as i64,
             ],
+        )?;
+        instruct(
+            &tx,
+            id,
+            &parent.instructions,
+            parent.compaction_instructions.as_deref(),
         )?;
         if let Some(node) = checkpoint {
             // Its history is its source's: what the source's calls read of
@@ -15280,6 +15319,10 @@ impl Database {
             tx.query_row("SELECT declared FROM bots WHERE name=?", [name], |r| {
                 r.get(0)
             })?;
+        tx.execute(
+            "DELETE FROM bot_instructions WHERE id=(SELECT id FROM bots WHERE name=?)",
+            [name],
+        )?;
         tx.execute("DELETE FROM bots WHERE name=?", [name])?;
         drop_list(&tx, declared.as_deref())?;
         out["nodes"] = json!(freed);
@@ -19569,6 +19612,21 @@ fn migrate_since_73(conn: &Connection, from: i32) -> Result<()> {
         }
     }
 
+    // Schema 107: a bot's instructions and compaction instructions move to
+    // `bot_instructions`, so its row no longer spills into overflow pages
+    // that every listing and every write of the row walks. Moved, not
+    // copied: dropping the columns rewrites each row without them.
+    if from < 107 {
+        conn.execute_batch(
+            "CREATE TABLE bot_instructions(id INTEGER PRIMARY KEY REFERENCES bots(id),
+                 instructions TEXT NOT NULL, compaction_instructions TEXT);
+             INSERT INTO bot_instructions(id,instructions,compaction_instructions)
+                 SELECT id,instructions,compaction_instructions FROM bots;
+             ALTER TABLE bots DROP COLUMN instructions;
+             ALTER TABLE bots DROP COLUMN compaction_instructions;",
+        )?;
+    }
+
     Ok(())
 }
 /// 103 -> 104: a turn parked on a call's verdict says who holds the call
@@ -20881,8 +20939,9 @@ mod tests {
         let shared = db.shared();
         db.conn
             .execute_batch(
-                "INSERT INTO bots(name,id,status,provider,family,model,instructions)
-                 VALUES ('Bob',7,'idle','openai','responses','m','')",
+                "INSERT INTO bots(name,id,status,provider,family,model)
+                 VALUES ('Bob',7,'idle','openai','responses','m');
+                 INSERT INTO bot_instructions(id,instructions) VALUES (7,'')",
             )
             .unwrap();
         let read = |db: &Database| Arc::new(Identity::from(db.inspect_id(7).unwrap()));
@@ -20926,7 +20985,10 @@ mod tests {
         db.abandon_group().unwrap();
         let generation = shared.identity(7).unwrap_err();
         shared.know(generation, read(&db));
-        commit(&mut db, "DELETE FROM bots WHERE id=7");
+        commit(
+            &mut db,
+            "DELETE FROM bot_instructions WHERE id=7; DELETE FROM bots WHERE id=7",
+        );
         assert!(shared.identity(7).is_err());
         assert_eq!(db.inspect_id(7).unwrap_err().code, "bot_not_found");
     }

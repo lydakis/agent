@@ -2173,13 +2173,10 @@ note goes in the turn its condition ends. A call that names no kind is
 refused (`margin_kind`) with the three kinds and that anything else
 belongs in the reply; a note from a call made before kinds is not shown.
 The margin draws what waits on you first, then what you follow, then what
-you keep, and never scrolls: in a short window it folds notes until the
-whole margin fits, giving rows to what waits first, then what you follow,
-then what you keep, each folded note keeping its title, and a note cut
-short ends with a muted `… N more lines`. A long plan over the notes
-folds first, to `… N more lines of the plan`, so every note keeps its
-title. A live note whose last fill failed says why under what it
-follows, where no fold reaches it. A note that shows a file, or a
+you keep, every note whole up to the most rows a note draws, and the plan
+whole over them; the margin scrolls when they take more rows than it has.
+A live note whose last fill failed says why under what it follows, where
+no fold reaches it. A note that shows a file, or a
 task's note, shows its first rows up to the most a note draws, then a
 muted `… N more lines · enter opens it` row; Enter on it, or a click,
 opens the file whole in the pane (a task's note opens the text it shows
@@ -2299,9 +2296,11 @@ A note is drawn the way the conversation and the pane draw things:
 Markdown with its tables and math, Mermaid diagrams, HTML pages,
 pictures, and code in syntax colors.
 
-![A full margin in one look in a short window: two notes that wait on the person, two it follows filled live from sources, and a pinned checklist folded to a row and its fold row, then a pinned note folded to its title, beside a reply that reads whole on its own](../docs/sonny/margin-one-look.png)
+![A margin taller than its window, scrolled to its top: two notes that wait on the person, two it follows filled live from sources, then a pinned checklist, every note whole, beside a reply that reads whole on its own](../docs/sonny/margin-scroll-top.png)
 
-![The same margin in a taller window: the checklist file folds at the most rows a note draws, its last row saying how many more lines and that enter opens it](../docs/sonny/margin-fold.png)
+![The same margin scrolled to its end: the whole checklist and the pinned note under it](../docs/sonny/margin-scroll-bottom.png)
+
+![A checklist file longer than the most rows a note draws folds at them, its last row saying how many more lines and that enter opens it](../docs/sonny/margin-fold.png)
 
 ![The agent puts a diagram and a live table in the margin while it works; × takes the table away, /status opens over the margin and Esc goes back, Esc closes the margin and /margin brings it back](../docs/sonny/margin.gif)
 

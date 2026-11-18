@@ -1,7 +1,8 @@
 # Client policy
 
 The daemon composes no text. A bot's instructions are whatever the creating
-client sent, stored once, immutable for the bot's life. `agent-client`
+client sent. The bot keeps that text until a client replaces it with the socket
+protocol's `configure` operation. `agent-client`
 (`client/`) is where the human-facing clients agree on what that text is, so a
 bot created from Sonny or the CLI with `--agents` reads the same way. The
 crate also holds the socket protocol client Sonny uses.
@@ -116,9 +117,9 @@ user's.
 - **Sonny**: a lead and the tasks it starts get the policy, the lead with
   its role after it.
 - A **fork** takes no instructions: it copies its source's, so its first call
-  can read the source's prompt cache. An edited AGENTS.md reaches a new bot;
-  a caller that wants an existing conversation to follow it says so in a
-  message, and every existing bot stays immutable.
+  can read the source's prompt cache. New bots created with `--agents` read the
+  current AGENTS.md. To refresh an existing bot, a client recomposes the
+  instructions and sends the new text with `configure`.
 
 ## Verified
 
