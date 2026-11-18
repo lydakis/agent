@@ -11293,6 +11293,114 @@ turn are 6.001 on both sides in every footprint run, and the gate passed.
 The two p99 rises are under the gate's 15% warning line. None of these
 screens sends the client writes this change moves.
 
+## A live event encoded once for all its followers
+
+Before, the hub cloned a live event's JSON value for each session that
+followed its bot and encoded it again for each one, and the firehose sent
+another copy of each. Now the event is encoded when its first follower
+takes it, and every later follower queues the same bytes, each charged
+their cost against its own 2 MiB budget, so a follower that falls behind
+is still closed as before. An event nobody follows is never encoded. On
+the client, the reader reads only a line's `id` to route it and builds a
+notification once, when the window takes it, where it built it twice.
+
+`bench/fan_out.py`: one bot takes streaming turns back to back against
+`bench.streaming_model` (200 tokens, each its own `text_delta`, as fast as
+the model sends them), and N socket sessions follow that bot and read
+everything. `--slow` adds one more follower that never reads. Each count
+gets its own daemon; 2 s warm-up, 10 s measured, two runs a side, 4-CPU
+Linux, release builds of main `ae1bf65` and the change. "Run loop" is the
+daemon's CPU outside its store threads, per event published.
+
+| Followers | Side | Turns/s | Events/s | Run loop µs/event | Run loop % | Each follower, lines/s |
+| ---: | --- | ---: | ---: | ---: | ---: | ---: |
+| 0 | main | 86.1 / 87.1 | 17,561 / 17,788 | 14.75 / 15.07 | 25.9 / 26.8 | — |
+| 0 | head | 86.4 / 88.9 | 17,625 / 18,135 | 14.81 / 14.61 | 26.1 / 26.5 | — |
+| 1 | main | 94.0 / 94.0 | 19,175 / 19,174 | 14.29 / 14.24 | 27.4 / 27.3 | 19,175 / 19,174 |
+| 1 | head | 94.8 / 94.0 | 19,359 / 19,175 | 14.00 / 14.45 | 27.1 / 27.7 | 19,359 / 19,172 |
+| 32 | main | 53.4 / 52.5 | 10,875 / 10,710 | 67.39 / 68.44 | 73.3 / 73.3 | 10,873 / 10,710 |
+| 32 | head | 61.7 / 62.7 | 12,599 / 12,800 | 52.94 / 52.42 | 66.7 / 67.1 | 12,593 / 12,795 |
+| 200 | main | 12.4 / 12.1 | 2,514 / 2,470 | 381.0 / 389.4 | 95.8 / 96.2 | 2,513 / 2,469 |
+| 200 | head | 16.0 / 16.2 | 3,256 / 3,305 | 289.6 / 284.1 | 94.3 / 93.9 | 3,255 / 3,304 |
+| 32 + slow | main | 57.9 / 57.7 | 11,809 / 11,778 | 60.29 / 60.11 | 71.2 / 70.8 | 11,806 / 11,775 |
+| 32 + slow | head | 70.5 / 64.6 | 14,396 / 13,178 | 43.00 / 49.77 | 61.9 / 65.6 | 14,391 / 13,177 |
+
+With no follower and with one, nothing moves beyond run-to-run spread:
+the one encoding a single follower costs is the one it cost before. At
+32 followers the run loop spends 22% less per event and the bot streams
+18% faster; at 200, 25% less and 31% faster. The run loop is the
+bottleneck there on both sides (94 to 96%), so the saving goes into
+throughput. What is left per follower, about 1.4 µs, is its own queue,
+the wake of its writer and the write to its socket. In every run with a
+slow follower the daemon closed it and every fast follower received every
+event (minimum and maximum lines per follower agree).
+
+`bench/ends.py` (from #1163), with Sonny built from each side, since the
+client's reader changed too. Low end: one window on 10 agents, five runs a
+side. High end: 10,000 stored agents, 30 busy and 8 running scripts, one
+run a side at each size.
+
+| Low end | main | head |
+| --- | ---: | ---: |
+| Window start, ms | 42 / 52 | 46 / 74 |
+| Idle window CPU, % | 0.1 to 0.2 | 0.1 to 0.15 |
+| Idle window RSS, MiB | 25.4 to 25.8 | 25.3 to 25.9 |
+| Key to character p99, ms | 0.88 to 1.16 | 0.79 to 1.11 |
+| Turn p50, ms | 47.7 to 48.1 | 48.0 to 48.1 |
+
+| Windows | Layout | Side | Key p50, ms | Key p99, ms | Key max, ms | Window start p50, ms | Daemon CPU, % | Daemon RSS, MiB | Windows CPU, % | Windows RSS, MiB | Turns |
+| ---: | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 32 | one | main | 1.14 | 5.43 | 21.4 | 800 | 136.4 | 38.7 | 27.3 | 2,180 | 8,601 |
+| 32 | one | head | 1.14 | 11.25 | 22.7 | 699 | 132.6 | 40.2 | 28.6 | 2,173 | 8,343 |
+| 32 | spread | main | 1.04 | 5.39 | 5.7 | 754 | 134.5 | 39.4 | 26.1 | 2,189 | 8,682 |
+| 32 | spread | head | 1.09 | 6.38 | 7.9 | 815 | 134.6 | 39.5 | 27.4 | 2,184 | 8,437 |
+| 100 | one | main | 1.79 | 11.83 | 21.3 | 2,088 | 141.7 | 40.2 | 39.4 | 6,123 | 8,879 |
+| 100 | one | head | 1.61 | 10.46 | 19.0 | 2,091 | 141.6 | 41.9 | 38.6 | 6,153 | 9,142 |
+
+No pause over 100 ms on either side. Key to character stays far under the
+50 ms bar, and every other column moves within run-to-run spread. Head's
+11.25 ms p99 at 32 windows in one folder did not come back: two more runs
+a side there read 6.27 and 6.14 ms on head, 7.20 and 9.01 ms on main. These
+windows follow many agents, each with few followers, so the encoding saved
+here is small; the fan-out table above is where it shows. The idle daemon
+read about 2 MiB more on head in every low-end run (18.4 to 19.6 against
+20.6 to 21.9 MiB). That is the binary's file pages, not memory the daemon
+holds: an idle daemon's anonymous memory is 2,052 KiB on both, and a fresh
+copy of main's binary reads the same RSS as head's (17.5 to 17.7 MiB idle,
+no window), as the binary just copied has more of itself in the page
+cache. The Mac was not measured.
+
+The Perf workflow's screens (`bench/perf_gate.py`), run here the way it
+runs them, on the same builds: admission and completion six rounds a side
+(three with main first, three with head first), footprint two, lifecycle
+and Sonny's screen three. Store work per turn is the same on both sides:
+no count moved.
+
+| Bench | Measure | main | head |
+| --- | --- | ---: | ---: |
+| admission | lone submit CPU, ms | 31.4 | 33.5 |
+| admission | burst submit p99, ms | 4.49 | 4.48 |
+| completion | release to terminal p99, ms | 10.32 | 10.80 |
+| footprint | idle RSS, MiB | 17.11 | 17.07 |
+| footprint | per idle bot, KiB | 1.59 | 1.77 |
+| footprint | RSS after a turn each, MiB | 35.03 | 33.35 |
+| footprint | CPU per turn, ms | 0.817 | 0.813 |
+| lifecycle | CPU, s | 0.52 | 0.54 |
+| lifecycle | p95 turn, ms | 582.7 | 581.6 |
+| lifecycle | peak RSS, MiB | 26.02 | 25.98 |
+| sonny | lookout CPU per 1k deltas at 10x10 / 10x100 / 100x10, ms | 7.5 / 4.12 / 6.38 | 6.25 / 4.12 / 6.5 |
+| sonny | quiet window CPU, ms/s | 1.16 | 1.55 |
+| sonny | sky replay CPU per 1k lines, ms | 9.9 | 9.9 |
+
+The gate warns on none of them: every head range overlaps main's. Order
+moves the burst and completion numbers more than the change does. With
+main run first, head's burst p99 and completion p99 read 13% and 12%
+higher; with head first, 10% lower and 2% lower. Lone submit CPU varies
+from 30.2 to 36.9 ms between main's own rounds, and head's six round
+medians (31.1 to 35.9 ms) fall inside that. The quiet window's CPU is one
+10 ms clock tick over its 26 s: 30 ms in each of main's three runs, 30 ms
+in one of head's and 40 ms in two.
+
 ## A ramp's line indexed, and retained streams packed before the writer (#1168)
 
 2026-11-18, Linux x86_64 cloud VM, 4 CPUs. Main is `ae1bf65` (#1149) and
