@@ -4002,7 +4002,8 @@ impl Service {
                     || (self.held().is_none()
                         && self.limit_active != 0
                         && self.reserved > 0
-                        && self.active.holding() + self.reserved >= self.limit_active)
+                        && self.active.holding() + self.reserved + self.claims.len()
+                            >= self.limit_active)
             }
             // A read, or a wait, waits only for its own session's
             // admissions, to be answered after them. Another session's are
@@ -10119,6 +10120,46 @@ mod tests {
         assert_eq!(service.claims.behind.count, 1);
         let (bot, turn, task, exit) = service.jobs.join_next().await.unwrap().unwrap();
         service.complete(bot, turn, task, exit).await.unwrap();
+        drop(service);
+        drop(store);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn a_submission_settles_admissions_when_a_claim_fills_the_last_slot() {
+        let dir = scratch("claim-settles");
+        let path = dir.join("state.sqlite");
+        let (store, _publications) = Store::open(&path).await.unwrap();
+        let bob = running(&store, &["Bob".into()]).await[0].1;
+        store
+            .call(move |db| {
+                db.suspend_paced(
+                    bob, 0, 0, 0, 0, 0, 0, false, None, None, None, None, None, None, None,
+                )
+                .map(|_| ())
+            })
+            .await
+            .unwrap();
+        let mut service = admitting(&store, 2);
+        let (output, _writer) = Output::stdout();
+        let (held, gate) = hold(&store).await;
+        service.claim("Bob".into(), bob, true);
+        for (index, command) in [create("Ann", &dir), submit("Ann", "r1")]
+            .into_iter()
+            .enumerate()
+        {
+            let bytes = service.admission_sends(&command, &json!(index), 0);
+            let deferred = service
+                .dispatch(command, 0, &output, json!(index), bytes)
+                .await;
+            assert_eq!(deferred.unwrap_err().code, "deferred");
+        }
+        assert_eq!((service.reserved, service.claims.len()), (1, 1));
+        // The claim and the queued submission fill both slots, so another
+        // submission settles the admissions before it is refused for room.
+        assert!(service.must_settle(Some(&submit("Cat", "r1")), 0, &output, Bound::default()));
+        gate.send(()).unwrap();
+        held.await.unwrap();
         drop(service);
         drop(store);
         let _ = std::fs::remove_dir_all(dir);
