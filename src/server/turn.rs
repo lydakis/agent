@@ -21,8 +21,8 @@ use agent_runtime::{
     store::{
         AfterTurn, Answer, ArtifactLines, Bot, CallAnswer, Charge, ContextPrefix, ContextUsage,
         Database, DetachedRow, ElisionPlan, Gated, Halt, Halted, Joined, Lifted, LiftedRun, Limit,
-        ProcessKind, Settings, Slot, Spend, Store, Strip, TURN_VIEW_ACCOUNTING, Waiting, Window,
-        listed_command, unserved,
+        ProcessKind, Retained, Settings, Slot, Spend, Store, Strip, TURN_VIEW_ACCOUNTING, Waiting,
+        Window, listed_command, unserved,
     },
     tools::{
         Agents, Cord, Files, Outcome, POLL_YIELD_MS, Place, Prepared, ReadSource, Registry, Spill,
@@ -5382,7 +5382,7 @@ impl Turn {
                 None => outcome,
             },
         };
-        annotate(outcome, self.turn, call_id)
+        packed(annotate(outcome, self.turn, call_id)).await
     }
 
     /// The bot's sandbox, built from its settings. Reading its roots
@@ -7192,7 +7192,7 @@ impl Lifts {
                         }
                         _ => outcome,
                     };
-                    let mut outcome = annotate(outcome, turn, &call_id_for_refs);
+                    let mut outcome = packed(annotate(outcome, turn, &call_id_for_refs)).await;
                     let artifacts = std::mem::take(&mut outcome.artifacts);
                     let files = std::mem::take(&mut outcome.files);
                     // Pictures run to megabytes: copied into the result
@@ -7607,8 +7607,12 @@ impl Outputs {
             let mut stored = Vec::new();
             let mut written = Vec::new();
             for (stream, data) in artifacts {
+                let Some(whole) = data.whole() else {
+                    stored.push((stream, data));
+                    continue;
+                };
                 let file = self.folder.join(format!("{turn}-{name}-{stream}"));
-                match write_new(&file, &data).ok().and(file.to_str()) {
+                match write_new(&file, whole).ok().and(file.to_str()) {
                     Some(path) => written.push((stream, path.to_owned(), data)),
                     None => stored.push((stream, data)),
                 }
@@ -7716,7 +7720,7 @@ fn file_name(call_id: &str) -> String {
 /// A call's cut streams once kept: those the store keeps, and the files
 /// that hold the others.
 struct Kept {
-    stored: Vec<(&'static str, Vec<u8>)>,
+    stored: Vec<(&'static str, Retained)>,
     files: Files,
 }
 
@@ -7736,6 +7740,29 @@ fn write_new(path: &std::path::Path, data: &[u8]) -> std::io::Result<()> {
         return Err(error);
     }
     Ok(())
+}
+
+/// Pack the streams the store will keep, off the runtime thread, so the
+/// store's one writer, which every bot's turns share, only inserts them:
+/// compressing a mebibyte there held every other bot's writes behind it.
+/// An outcome with nothing to pack goes straight on.
+pub(super) async fn packed(mut outcome: Outcome) -> Outcome {
+    if !outcome.artifacts.iter().any(|(_, data)| data.packs()) {
+        return outcome;
+    }
+    let artifacts = std::mem::take(&mut outcome.artifacts);
+    let packed = tokio::task::spawn_blocking(move || {
+        (artifacts.into_iter())
+            .map(|(stream, data)| (stream, data.packed()))
+            .collect()
+    })
+    .await;
+    // A task that failed took the data with it: the cut text stands alone,
+    // as when keeping it in a file fails.
+    if let Ok(packed) = packed {
+        outcome.artifacts = packed;
+    }
+    outcome
 }
 
 /// Name retained streams in the model-facing result so the model can read
@@ -8578,6 +8605,27 @@ fn priced_at(
 
 #[cfg(test)]
 mod tests {
+    /// The streams the store keeps reach its writer packed, so the writer
+    /// only inserts them; what is not worth packing goes on whole.
+    #[tokio::test]
+    async fn retained_streams_reach_the_store_packed() {
+        use agent_runtime::{store::Retained, tools::Outcome};
+        let long = "a line of a long build log\n".repeat(20_000).into_bytes();
+        let mut outcome = Outcome::text("{}".into());
+        outcome.artifacts = vec![
+            ("stdout", Retained::Whole(long.clone())),
+            ("stderr", Retained::Whole(b"short".to_vec())),
+        ];
+        let outcome = super::packed(outcome).await;
+        let [(_, stdout), (_, stderr)] = &outcome.artifacts[..] else {
+            panic!("{:?}", outcome.artifacts);
+        };
+        assert!(
+            matches!(stdout, Retained::Packed(data, size) if data.len() < long.len() / 8 && *size == long.len())
+        );
+        assert_eq!(stderr, &Retained::Whole(b"short".to_vec()));
+    }
+
     #[test]
     fn approvals_match_names_as_the_bot_listing_does() {
         for (pattern, name) in [

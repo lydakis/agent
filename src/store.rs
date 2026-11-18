@@ -12,6 +12,7 @@ use std::{
 use tokio::sync::{mpsc, oneshot};
 
 mod artifact;
+pub use artifact::Retained;
 pub mod audit;
 mod context;
 mod db;

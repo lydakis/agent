@@ -155,7 +155,7 @@ async fn shell_timeout_and_output_overflow_are_bounded() {
     let (stream, kept) = &overflow.artifacts[0];
     assert_eq!(*stream, "stdout");
     assert!(kept.len() <= agent_runtime::tools::ARTIFACT_BYTES);
-    assert!(String::from_utf8_lossy(kept).contains("bytes dropped: past 1 MiB"));
+    assert!(String::from_utf8_lossy(kept.whole().unwrap()).contains("bytes dropped: past 1 MiB"));
 }
 
 #[tokio::test]
@@ -223,7 +223,12 @@ async fn large_output_is_redacted_off_the_runtime_whole() {
     let streams: HashMap<&str, String> = outcome
         .artifacts
         .iter()
-        .map(|(name, bytes)| (*name, String::from_utf8(bytes.clone()).unwrap()))
+        .map(|(name, bytes)| {
+            (
+                *name,
+                String::from_utf8(bytes.whole().unwrap().to_vec()).unwrap(),
+            )
+        })
         .collect();
     assert!(streams["stdout"].ends_with(" [redacted by agent]"));
     assert!(streams["stderr"].starts_with("[redacted by agent] "));
