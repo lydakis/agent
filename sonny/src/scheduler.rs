@@ -228,7 +228,7 @@ pub fn not_running() -> Option<String> {
                 Ok(manager) => manager,
                 Err(error) => return Some(error),
             };
-            let out = std::process::Command::new("systemctl")
+            let out = std::process::Command::new(systemctl())
                 .arg("--user")
                 .args([
                     "show",
@@ -335,6 +335,26 @@ fn last_line(stderr: &[u8], stdout: &[u8]) -> String {
         .unwrap_or_else(|| "no state".into())
 }
 
+/// Where a system's `systemctl` is installed. Never looked up on PATH:
+/// these calls run as the person outside any sandbox, some for an agent's
+/// own `automations` call, and a PATH entry in a folder an agent may write,
+/// such as an activated virtualenv, would let it plant the `systemctl` they
+/// run, as the daemon's `bwrap` is never looked up there either.
+const SYSTEMCTL: [&str; 4] = [
+    "/usr/bin/systemctl",
+    "/bin/systemctl",
+    "/usr/local/bin/systemctl",
+    "/run/current-system/sw/bin/systemctl",
+];
+
+/// This system's `systemctl`, the first of [`SYSTEMCTL`] there; the
+/// first one when none is, which fails to run with its own path.
+fn systemctl() -> &'static str {
+    (SYSTEMCTL.iter())
+        .find(|path| Path::new(path).is_file())
+        .unwrap_or(&SYSTEMCTL[0])
+}
+
 /// The logged-in user's systemd manager, found by its runtime folder as
 /// `systemctl --user` finds it.
 pub(crate) struct UserManager {
@@ -362,7 +382,7 @@ impl UserManager {
     }
     /// `systemctl --user ARGS`, also fine when it exits with one of `fine`.
     pub(crate) fn run_allowing(&self, args: &[&str], fine: &[i32]) -> Result<(), String> {
-        let out = std::process::Command::new("systemctl")
+        let out = std::process::Command::new(systemctl())
             .arg("--user")
             .args(args)
             .env("XDG_RUNTIME_DIR", &self.runtime)
@@ -1858,6 +1878,12 @@ mod tests {
         assert!(unit.contains("KillMode=process"));
         assert!(unit.contains("Environment=\"SHELL=/bin/zsh\""));
         assert!(unit.contains(&program(Scheduler::Systemd, sonny)));
+    }
+
+    #[test]
+    fn systemctl_is_a_system_one_never_one_on_path() {
+        assert!(SYSTEMCTL.iter().all(|path| path.starts_with('/')));
+        assert!(SYSTEMCTL.contains(&systemctl()));
     }
 
     #[test]
