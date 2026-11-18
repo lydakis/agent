@@ -30,6 +30,7 @@ mod context;
 mod declared;
 mod desktop;
 mod diff;
+mod drawing;
 mod embed;
 mod exec;
 mod footer;
@@ -5179,6 +5180,9 @@ struct App {
     opening_all: bool,
     /// A program in the pane drew something: the screen is drawn again.
     woken: Arc<tokio::sync::Notify>,
+    /// How many pictures drawn beside the loop were ready when it last
+    /// looked ([`App::drawings`]).
+    drawn_seen: u64,
     /// The daemon's event taken and not applied yet ([`App::hear`]): one
     /// at a time, as Codex's TUI takes its events, the rest waiting in the
     /// connection's own bounded queue.
@@ -7167,6 +7171,7 @@ impl App {
             naming: None,
             opening_all: false,
             woken: Arc::new(tokio::sync::Notify::new()),
+            drawn_seen: drawing::landed(),
             unheard: None,
             hearing: None,
             cut: false,
@@ -7414,6 +7419,8 @@ impl App {
         // An event taken while gathering a burst of the wheel's notches
         // that was not one, handled first next time round.
         let mut held: Option<Event> = None;
+        // Woken as each picture drawn beside the loop is ready.
+        drawing::wake(&self.woken);
         loop {
             let due = drawn.is_none_or(|at| at.elapsed() >= DRAW_EVERY);
             let wanted = keyed || changed || self.quit;
@@ -7568,6 +7575,7 @@ impl App {
             // What the person sent lands before the events after it.
             self.wrote();
             self.hear();
+            changed |= self.drawings();
             // The connection is gone: what it brought and was not applied
             // yet is let go, a read for it having failed with it, and the
             // window catches up from the last item it drew, so nothing is
@@ -12203,6 +12211,12 @@ impl App {
         }
         live.lines += rows.len();
         live.rows.extend(rows);
+        self.spill(live);
+    }
+
+    /// Held words grown longer than half the screen written above, as a
+    /// reply, rather than held out of the scrollback.
+    fn spill(&mut self, live: &mut Live) {
         // Words longer than half the screen are a reply, written as they
         // come rather than held out of the scrollback.
         if live.spilled || live.rows.len() > (self.height / 2).max(4) {
@@ -12262,6 +12276,47 @@ impl App {
             .read(self.client.clone(), self.bot.clone())
             .await;
         self.heard(event, read);
+    }
+
+    /// Pictures drawn beside the loop since it last looked, each in place
+    /// of the row that stood for it: in the conversation, the words still
+    /// held back, the pane and the margin. Whether any came.
+    fn drawings(&mut self) -> bool {
+        let landed = drawing::landed();
+        if landed == self.drawn_seen {
+            // Rows held a while (a call's, a note's) may have come out
+            // standing for a picture ready meanwhile.
+            if self.screen.pushed_waiting() {
+                return self.screen.fill_drawn();
+            }
+            return false;
+        }
+        self.drawn_seen = landed;
+        self.flush();
+        self.screen.fill_drawn();
+        // A picture taller than the row that stood for it may spill the
+        // words held back, as a line that long would.
+        if let Some(mut live) = self.live.take() {
+            if drawing::fill(&mut live.rows) {
+                self.spill(&mut live);
+            }
+            self.live = Some(live);
+        }
+        if let Some(pane) = &mut self.pane {
+            pane.drawn();
+        }
+        // The pane closed last, and one under another, shown again as
+        // they were.
+        if let Some((pane, _)) = &mut self.closed {
+            pane.drawn();
+        }
+        if let Some(pane) = &mut self.under {
+            pane.drawn();
+        }
+        // Messages sent and not landed, and the margin's notes, are drawn
+        // again from their words.
+        self.staged_drawn.get_mut().clear();
+        true
     }
 
     /// The daemon's event taken, applied once what it needs is read
@@ -27928,6 +27983,55 @@ mod tests {
         ))
         .await;
         assert!(lines(&app).iter().any(|row| row.starts_with("Worked for")));
+    }
+
+    #[tokio::test]
+    async fn a_picture_taller_than_its_row_spills_the_words_held_back() {
+        let client = daemon_answering(|_| json!({"items": []})).await;
+        let mut app = app(client);
+        app.height = 8;
+        app.daemon(turn_event("accepted", 1, json!({"request_id": "r1"})))
+            .await;
+        app.daemon(json!({"event": "text_delta", "bot": "b", "turn": 1, "text": "Here:\n"}))
+            .await;
+        // A row stands for a picture held back with the words; drawn, it
+        // is twelve rows, more than half the screen.
+        let key = u64::MAX - 7;
+        let (go, gate) = std::sync::mpsc::channel::<()>();
+        let gate = std::sync::Mutex::new(gate);
+        drawing::start(
+            key,
+            None,
+            Box::new(move || {
+                let _ = gate.lock().unwrap().recv();
+                Err("not drawn".into())
+            }),
+        );
+        let rows = (1..=12).map(|n| format!("  row {n}")).collect();
+        let standing = drawing::placeholder(key, "the diagram", drawing::Redraw::Rows(rows));
+        let live = app.live.as_mut().unwrap();
+        assert!(!live.spilled);
+        live.rows.extend(standing);
+        go.send(()).unwrap();
+        let asked = std::time::Instant::now();
+        while drawing::ready(&app.live.as_ref().unwrap().rows[1]).is_none() {
+            assert!(asked.elapsed() < std::time::Duration::from_secs(10));
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        app.drawn_seen = drawing::landed().wrapping_sub(1);
+        assert!(app.drawings());
+        let live = app.live.as_ref().unwrap();
+        assert!(live.spilled);
+        assert!(live.rows.is_empty());
+        let written: Vec<String> = app.pending.iter().map(|l| l.to_string()).collect();
+        assert!(
+            written.iter().any(|row| row.contains("row 1")),
+            "{written:?}"
+        );
+        assert!(
+            written.iter().any(|row| row.contains("row 12")),
+            "{written:?}"
+        );
     }
 
     #[tokio::test]
