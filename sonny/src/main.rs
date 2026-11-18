@@ -18546,6 +18546,12 @@ impl App {
             linked.extend(self.screen.link_cells(frame.buffer_mut()));
             let [live, status, gap, composer, pad, footer] = areas(view, live_rows);
             frame.render_widget(Paragraph::new(open_rows.clone()), live);
+            // The conversation's column and no wider, as the composer and
+            // the footer are.
+            let status = Rect {
+                width: status.width.min(measure() as u16),
+                ..status
+            };
             let status_line = self.status_row(status.width as usize);
             // The agents it names open them, as their names do anywhere.
             let parked: Vec<(String, String)> = (self.paused.as_ref())
@@ -19227,8 +19233,16 @@ impl App {
 
     /// The status row, `width` wide: what happens now, the first that
     /// applies of a pause, an approval, the agent's turn or its phase
-    /// without one, and a notice.
+    /// without one, and a notice. Never wider than `width`: each kind
+    /// gives way by its own parts first, and what still does not fit is
+    /// cut at a word with `…`.
     fn status_row(&self, width: usize) -> Line<'static> {
+        fit_row(self.status_parts(width), width)
+    }
+
+    /// The status row as [`App::status_row`] says, its parts given way
+    /// to `width` but not yet cut to it.
+    fn status_parts(&self, width: usize) -> Line<'static> {
         // Upgraded under it, the window reconnects no more: reopening it
         // is all there is to do, and the row says so alone.
         if self.upgraded {
@@ -19253,8 +19267,8 @@ impl App {
                 Span::raw("■ ").dim(),
                 Span::raw("Every agent is paused").bold(),
                 Span::raw(format!(" by {by}: ")).dim(),
-                Span::raw(first_line(pause["reason"].as_str().unwrap_or_default())),
             ];
+            let reason = first_line(pause["reason"].as_str().unwrap_or_default());
             // Whose turns it parked, so the one doing harm can be stopped
             // before the line goes on: Esc in its window ends its turn.
             let parked: Vec<&str> = (pause["parked"]["bots"].as_array())
@@ -19289,6 +19303,11 @@ impl App {
             if self.calls_waiting().0 > 0 {
                 line.push(Span::raw(" · an approval waits").dim());
             }
+            // The reason gives way first, at a word: who paused, whose
+            // turns it parked and the keys stay.
+            let rest: usize = line.iter().map(Span::width).sum();
+            let reason = cut_at_word(&reason, width.saturating_sub(rest));
+            line.insert(3, Span::raw(reason));
             return Line::from(line);
         }
         if let Some(call) = self.waiting() {
@@ -19299,12 +19318,17 @@ impl App {
                 Span::raw("y"),
                 Span::raw(" allow once · ").dim(),
             ];
-            if let Some(prefix) = approvals::always(call) {
-                // Cut to leave the row's other keys in view: a whole
-                // command offered can run long.
-                const KEYS: &str = "  ⏸ y allow once · a always allow  · n deny · esc set aside";
-                let room = self.width.saturating_sub(KEYS.width()).max(8);
-                let shown = transcript::cut(&approvals::shown(&prefix), room);
+            // Cut to leave the row's other keys in view: a whole command
+            // offered can run long. Where even a short one leaves no room
+            // for them, the offer goes and the keys stay.
+            const KEYS: &str = "⏸ y allow once · a always allow  · n deny · esc set aside";
+            let always = approvals::always(call)
+                .map(|prefix| {
+                    let room = width.saturating_sub(KEYS.width()).max(8);
+                    transcript::cut(&approvals::shown(&prefix), room)
+                })
+                .filter(|shown| KEYS.width() + shown.width() <= width);
+            if let Some(shown) = always {
                 line.push(Span::raw("a"));
                 line.push(Span::raw(format!(" always allow {shown} · ")).dim());
             }
@@ -19388,11 +19412,18 @@ impl App {
         if rest(queues, &notice) + said.width() > width {
             queues = false;
         }
-        if let Some(command) = said.strip_prefix("Running ")
-            && rest(queues, &notice) + said.width() > width
-        {
-            let room = width.saturating_sub(rest(queues, &notice) + "Running ".len());
-            said = format!("Running {}", cut_at_word(command, room));
+        if rest(queues, &notice) + said.width() > width {
+            // The command after `Running` is cut at a word; any other
+            // phase (a thought's heading, a tool's name, why it is held)
+            // the same way, whole.
+            let room = width.saturating_sub(rest(queues, &notice));
+            said = match said.strip_prefix("Running ") {
+                Some(command) => format!(
+                    "Running {}",
+                    cut_at_word(command, room.saturating_sub("Running ".len()))
+                ),
+                None => cut_at_word(&said, room),
+            };
         }
         let mut spans = vec![Span::raw("• ").dim()];
         spans.extend(shimmer(&said, self.started.elapsed()));
@@ -20039,6 +20070,60 @@ struct Phase {
 
 /// `text` cut to `room` columns at a word, with `…` after it; whole when
 /// it fits, and `…` alone when not one word does.
+/// `line` no wider than `width`: what is past it cut at the last word
+/// that fits, with `…`, so no row of Sonny's runs past its column.
+fn fit_row(line: Line<'static>, width: usize) -> Line<'static> {
+    if line.width() <= width {
+        return line;
+    }
+    let room = width.saturating_sub(1);
+    // Each character kept, with the span it came from.
+    let mut kept: Vec<(usize, char)> = Vec::new();
+    let mut used = 0;
+    'spans: for (at, span) in line.spans.iter().enumerate() {
+        for c in span.content.chars() {
+            let wide = unicode_width::UnicodeWidthChar::width(c).unwrap_or(0);
+            if used + wide > room {
+                break 'spans;
+            }
+            used += wide;
+            kept.push((at, c));
+        }
+    }
+    // Back to the last whole word, where one ended; then no space or
+    // separator left before the `…`.
+    let next = line
+        .spans
+        .iter()
+        .flat_map(|span| span.content.chars())
+        .nth(kept.len());
+    if next.is_some_and(|c| c != ' ')
+        && let Some(space) = kept.iter().rposition(|&(_, c)| c == ' ')
+    {
+        kept.truncate(space);
+    }
+    while kept
+        .last()
+        .is_some_and(|&(_, c)| matches!(c, ' ' | '·' | '•' | '('))
+    {
+        kept.pop();
+    }
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    for (at, c) in kept {
+        if spans.len() == at + 1 {
+            spans[at].content.to_mut().push(c);
+            continue;
+        }
+        while spans.len() < at {
+            spans.push(Span::styled("", line.spans[spans.len()].style));
+        }
+        spans.push(Span::styled(c.to_string(), line.spans[at].style));
+    }
+    let style = spans.last().map(|span| span.style).unwrap_or_default();
+    spans.push(Span::styled("…", style));
+    Line::from(spans).style(line.style)
+}
+
 fn cut_at_word(text: &str, room: usize) -> String {
     if text.width() <= room {
         return text.to_owned();
@@ -26253,7 +26338,85 @@ mod tests {
             "• Running cargo test --workspace… (0s • esc to interrupt)"
         );
         assert_eq!(row(&app, 44), "• Running cargo… (0s • esc to interrupt)");
-        assert_eq!(row(&app, 30), "• Running … (0s • esc to interrupt)");
+        // Narrower than the time and its key, the row is cut at a word.
+        assert_eq!(row(&app, 30), "• Running … (0s • esc to…");
+    }
+
+    #[tokio::test]
+    async fn nothing_on_the_status_row_runs_past_its_width() {
+        let mut app = app(daemon_with(json!([])).await);
+        let long = "word ".repeat(40);
+        let fits = |app: &App, width: usize| {
+            let row = app.status_row(width).to_string();
+            assert!(row.width() <= width, "{} > {width}: {row}", row.width());
+            row
+        };
+        // A thought's heading, a tool's name and why a turn is held are
+        // phases too: cut at a word, the time and esc kept.
+        for phase in [
+            format!("Checking {long}"),
+            format!("Calling mcp__{}", "x".repeat(150)),
+            format!("Held: {long}"),
+        ] {
+            app.running = Some(Running {
+                turn: 1,
+                started: Instant::now(),
+                phase,
+                note: false,
+                effort: None,
+                acted: false,
+            });
+            for width in [100, 60, 44] {
+                assert!(fits(&app, width).ends_with("… (0s • esc to interrupt)"));
+            }
+        }
+        app.running = None;
+        // A notice alone.
+        app.notice = Some(format!("could not read b: {long}"));
+        for width in [100, 60, 44] {
+            assert!(fits(&app, width).ends_with("word…"));
+        }
+        // An approval: the command offered gives way, then the offer, and
+        // its keys stay.
+        app.approvals
+            .push(json!({"turn": 1, "call_id": "c1", "name": "shell",
+            "arguments": {"command": "git push"},
+            "always_allow": ["git", "push", "origin", &"x".repeat(150)]}));
+        let row = fits(&app, 100);
+        assert!(row.contains("a always allow git push origin x"), "{row}");
+        assert!(row.ends_with("n deny · esc set aside"), "{row}");
+        for width in [60, 44] {
+            assert_eq!(fits(&app, width), "⏸ y allow once · n deny · esc set aside");
+        }
+        app.approvals.clear();
+        // A pause: its reason gives way at a word.
+        app.paused = Some(json!({"by": "tally.lead", "reason": long,
+            "parked": {"bots": ["fix", "halves", "readme"], "total": 9}}));
+        let row = fits(&app, 100);
+        assert!(
+            row.ends_with("· parked fix, halves, readme +6 · /resume"),
+            "{row}"
+        );
+        for width in [60, 44] {
+            fits(&app, width);
+        }
+    }
+
+    #[test]
+    fn a_row_too_wide_is_cut_at_a_word_and_keeps_its_styles() {
+        let line = Line::from(vec![
+            Span::raw("⏸ ").fg(Color::Yellow),
+            Span::raw("allow once"),
+            Span::raw(" · deny this call").dim(),
+        ]);
+        assert_eq!(fit_row(line.clone(), 40), line);
+        let cut = fit_row(line, 20);
+        assert_eq!(cut.to_string(), "⏸ allow once · deny…");
+        assert_eq!(cut.spans[0].style.fg, Some(Color::Yellow));
+        assert!(cut.spans[2].style.add_modifier.contains(Modifier::DIM));
+        // A word longer than the row is cut where the row ends.
+        let one = fit_row(Line::from("x".repeat(30)), 10);
+        assert_eq!(one.to_string(), format!("{}…", "x".repeat(9)));
     }
 
     #[tokio::test]
