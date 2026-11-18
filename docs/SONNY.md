@@ -1459,6 +1459,13 @@ too, as Codex's TUI sends its ops and hears back as events. Opening a card (its
 first read), `/switch` and a reconnect's catching up still read before they
 show.
 
+The window holds at most 64 of the daemon's events waiting to be shown. The
+rest wait in the connection's own queue (4,096 events or 8 MiB), so a fast
+stream behind a slow read costs no more memory than before. A stream past that
+queue lets go of the connection, as any reader that falls behind does: the
+window drops what it had not shown yet, connects again and draws the rest from
+history, from the last item it drew, each line once and in order.
+
 With every answer held 5 s (`docs/demo/held`), before this change Enter waited for the
 daemon and the window stopped: the clock stayed at 8 s, the steer stayed in the
 composer, and the words typed after it did not show. Now the steer shows at once

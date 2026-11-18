@@ -514,6 +514,13 @@ impl Client {
         let _ = self.writer.lock().await.shutdown().await;
     }
 
+    /// Whether the connection is gone: the daemon closed it, or this
+    /// client let go of it for falling behind. Every request fails from
+    /// then on, and what the events held is from before it.
+    pub fn is_closed(&self) -> bool {
+        self.closed.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
     /// Say which one of its program this process is, such as the agent a
     /// window shows, on this connection now and on each one it makes
     /// later, so the daemon's `stats` tells its connections from others
