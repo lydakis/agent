@@ -4465,8 +4465,12 @@ type Again = (u64, (Vec<(i64, Value)>, bool), PageRead);
 /// What a read for an open card found ([`App::reread`]).
 enum CardRead {
     Commands(Result<Value, String>),
-    Audit(Result<Value, String>),
+    /// What the audit read, with the request it asked: a filter changed
+    /// meanwhile leaves it unshown.
+    Audit(Value, Result<Value, String>),
+    /// What usage read, with the selection it asked for.
     Usage(
+        (bool, usage::Period),
         (i64, i64, usize),
         Result<Value, String>,
         Vec<(String, agent_client::config::Prices)>,
@@ -7567,6 +7571,9 @@ impl App {
             self.done_resting(false);
             if let Some(fleet) = &mut self.fleet {
                 fleet.rescan(&self.woken).await;
+                // Results taken whose read landed close their windows now,
+                // not when the next wait returns.
+                fleet.close_taken(&self.woken).await;
                 // What the rescan set off sounds now, not with the next
                 // event.
                 for (alert, what) in std::mem::take(&mut fleet.alerts) {
@@ -8501,7 +8508,7 @@ impl App {
             let ours = items.split_off(cut);
             if !self.to_first || paged.first {
                 blanks.reverse();
-                self.screen.prepend_blank(blanks);
+                self.screen.prepend_blank(std::mem::take(&mut blanks));
                 let page = PageRead {
                     items: ours,
                     short: read.short,
@@ -8514,7 +8521,13 @@ impl App {
                 self.pages.insert(id, paged);
                 self.screen.prepend(id, older);
                 self.join_page(id);
-                return true;
+                if nodes.is_empty() {
+                    return true;
+                }
+                // The way up to the first turn was left while this read
+                // was out: the rest it read waits above as blank pages,
+                // drawn as the view nears them, so none is skipped.
+                continue;
             }
             // Only read: what its calls returned is all drawing it gives.
             self.unpaired = unpaired(ours.into_iter().chain(after));
@@ -13550,9 +13563,9 @@ impl App {
             if view.due() {
                 let query = view.query();
                 self.card_read = Some(tokio::spawn(async move {
-                    let read = client.request("audit", query).await;
+                    let read = client.request("audit", query.clone()).await;
                     woken.notify_one();
-                    CardRead::Audit(read.map_err(|error| error.to_string()))
+                    CardRead::Audit(query, read.map_err(|error| error.to_string()))
                 }));
             }
             watch.read = Instant::now();
@@ -13567,6 +13580,7 @@ impl App {
                     .unwrap_or_default()
                     .as_millis() as i64;
                 let (query, window) = view.query(now);
+                let selection = view.selection();
                 self.card_read = Some(tokio::spawn(async move {
                     let read = client.request("usage", query).await;
                     // The price sheet as its file says now, so an edit shows
@@ -13576,7 +13590,8 @@ impl App {
                         .and_then(|config| agent_client::config::prices(&config))
                         .unwrap_or_default();
                     woken.notify_one();
-                    CardRead::Usage(window, read.map_err(|error| error.to_string()), prices)
+                    let read = read.map_err(|error| error.to_string());
+                    CardRead::Usage(selection, window, read, prices)
                 }));
             }
             watch.read = Instant::now();
@@ -13631,13 +13646,17 @@ impl App {
                     view.commands_loaded(read);
                 }
             }
-            CardRead::Audit(read) => {
-                if let Some(view) = &mut watch.audit {
+            // Asked for what the card no longer shows: left unshown, and
+            // the card, still due, reads what it shows next.
+            CardRead::Audit(query, read) => {
+                if let Some(view) = watch.audit.as_mut().filter(|view| view.query() == query) {
                     view.loaded(read);
                 }
             }
-            CardRead::Usage(window, read, prices) => {
-                if let Some(view) = &mut watch.usage {
+            CardRead::Usage(selection, window, read, prices) => {
+                if let Some(view) =
+                    (watch.usage.as_mut()).filter(|view| view.selection() == selection)
+                {
                     view.loaded(window, read, prices);
                 }
             }
@@ -17228,12 +17247,9 @@ impl App {
             Then::Composed {
                 typed, pictures, ..
             } => {
-                self.give_back(&typed);
-                if self.pictures.is_empty() {
-                    self.pictures = pictures;
-                }
+                self.give_back(&typed, pictures);
             }
-            Then::Zen(_, typed) => self.give_back(&typed),
+            Then::Zen(_, typed) => self.give_back(&typed, Vec::new()),
             Then::Ran(_) => {
                 if !error.is_empty() {
                     self.notice = Some(format!("{error}; it goes with your next message"));
@@ -17247,8 +17263,23 @@ impl App {
     }
 
     /// Words the person sent that did not go, back in the composer: in
-    /// front of anything typed since, as they were written first.
-    fn give_back(&mut self, typed: &str) {
+    /// front of anything typed since, as they were written first. Their
+    /// pictures follow any attached since, their placeholders numbered on
+    /// from those, so each still names its own picture.
+    fn give_back(&mut self, typed: &str, pictures: Vec<Option<attach::Picture>>) {
+        let after = self.pictures.len();
+        let mut typed = typed.to_owned();
+        if after > 0 {
+            // From the last, so no number is moved twice.
+            for number in (1..=pictures.len()).rev() {
+                typed = typed.replace(
+                    &attach::placeholder(number),
+                    &attach::placeholder(number + after),
+                );
+            }
+        }
+        self.pictures.extend(pictures);
+        let typed = typed.as_str();
         let now = (*self.input).to_owned();
         match now.trim().is_empty() {
             true => self.input.set(typed),
@@ -17293,10 +17324,7 @@ impl App {
             Err(error) => {
                 self.notice = Some(error);
                 if let Some((typed, pictures)) = back {
-                    self.give_back(&typed);
-                    if self.pictures.is_empty() {
-                        self.pictures = pictures;
-                    }
+                    self.give_back(&typed, pictures);
                 }
                 return;
             }
@@ -34074,6 +34102,34 @@ mod tests {
         app.key(ctrl(']')).await;
         assert_eq!(shown(&app), None);
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A refused message's pictures come back after those attached since,
+    /// each placeholder still naming its own picture.
+    #[tokio::test]
+    async fn a_refused_message_s_pictures_come_back_after_those_attached_since() {
+        let mut app = app(daemon_answering(|_| json!({})).await);
+        let picture = |n| attach::Picture {
+            media_type: "image/png",
+            data: vec![n],
+        };
+        app.attach(Ok(picture(3)));
+        app.input.set("next [Image #1]");
+        let then = Then::Composed {
+            typed: "look [Image #1] and [Image #2]".into(),
+            pictures: vec![Some(picture(1)), Some(picture(2))],
+            answering: None,
+        };
+        app.unsent(String::new(), then, "refused".into());
+        assert_eq!(
+            &*app.input,
+            "look [Image #2] and [Image #3]\nnext [Image #1]"
+        );
+        assert_eq!(
+            app.placed("look [Image #2] and [Image #3]"),
+            [picture(1), picture(2)]
+        );
+        assert_eq!(app.placed("next [Image #1]"), [picture(3)]);
     }
 
     #[tokio::test]
