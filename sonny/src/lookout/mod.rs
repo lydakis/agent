@@ -358,6 +358,55 @@ async fn find_call(
     Some((item["name"].as_str().map(str::to_owned), arguments))
 }
 
+/// A call waiting for approval, as the approvals listing has it: its tool
+/// and its arguments, every page read until it is found. A preview the
+/// listing cut is read whole from the call's planning item, where it has
+/// one; a script's step has none, and is shown as listed.
+async fn waiting_call(
+    client: &Client,
+    bot: &str,
+    turn: i64,
+    call: &str,
+) -> Option<(Option<String>, String)> {
+    let mut after = Value::Null;
+    let listed = loop {
+        let mut asked = json!({"bot": bot, "limit": 256});
+        if !after.is_null() {
+            asked["after"] = after;
+        }
+        let page = client.request("approvals", asked).await.ok()?;
+        let found = (page["approvals"].as_array().into_iter().flatten())
+            .find(|listed| listed["call_id"] == call && listed["turn"] == turn);
+        if let Some(found) = found {
+            break found.clone();
+        }
+        after = page["next_after"].clone();
+        if after.is_null() {
+            return None;
+        }
+    };
+    let name = listed["name"].as_str().map(str::to_owned);
+    let cut = listed["arguments_cut"]
+        .as_array()
+        .is_some_and(|cut| !cut.is_empty())
+        || listed["arguments_omitted"].as_u64().unwrap_or(0) > 0;
+    let whole = match listed["node"].as_i64().filter(|node| cut && *node > 0) {
+        Some(node) => client
+            .request("history_items", json!({"bot": bot, "nodes": [node]}))
+            .await
+            .ok()
+            .and_then(|read| {
+                agent_client::approver::call_arguments(&read["items"][0]["item"], call)
+            }),
+        None => None,
+    };
+    let arguments = match whole.as_ref().unwrap_or(&listed["arguments"]) {
+        Value::Null => String::new(),
+        arguments => arguments.to_string(),
+    };
+    Some((name, arguments))
+}
+
 /// `event`, a `margin` call's start whose arguments were cut before the
 /// note's id, or an `ask` call's start whose arguments were cut, with the
 /// call's arguments whole, as the bot's history keeps them; any other event
@@ -436,8 +485,18 @@ async fn read(client: &Client, pending: &activity::Pending) -> activity::Read {
             };
             Read::Reply { text, asker }
         }
-        Kind::Call { call, name, node } => {
-            let found = find_call(client, task, call, *node).await;
+        Kind::Call {
+            call, name, node, ..
+        } => {
+            // One the reviewer handed over names no node: it is read from
+            // the calls waiting, which hold a script's steps too.
+            let found = match node {
+                Some(_) => find_call(client, task, call, *node).await,
+                None => match waiting_call(client, task, turn, call).await {
+                    Some(found) => Some(found),
+                    None => find_call(client, task, call, None).await,
+                },
+            };
             let name = (found.as_ref().and_then(|(name, _)| name.clone())).or_else(|| name.clone());
             let arguments = found.as_ref().map(|(_, arguments)| arguments.as_str());
             let text = activity::call_text(name.as_deref(), arguments);
