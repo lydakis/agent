@@ -19,8 +19,8 @@ mod db;
 pub use context::{ContextPrefix, ContextUsage, pinned_item, thinking_bytes, without_thinking};
 pub use db::{
     Absorbed, AfterTurn, Answered, ApprovalPolicy, ArtifactLines, Binding, Blocked, Bot, CacheTtl,
-    CallAnswer, Capture, CatchUp, Charge, CompactionPlan, CompactionView, CopiedCall, Counts,
-    DENIAL_WINDOW, Database, Decision, Delivery, DetachedRow, ENV_JSON, EVENT_PAGE_KINDS,
+    CallAnswer, Capture, CatchUp, Charge, Closing, CompactionPlan, CompactionView, CopiedCall,
+    Counts, DENIAL_WINDOW, Database, Decision, Delivery, DetachedRow, ENV_JSON, EVENT_PAGE_KINDS,
     ElisionPlan, FOLDERS_JSON, Fork, Gate, Gated, Halt, Halted, Identity, Joined, Kept, Lapsed,
     Lifted, LiftedRun, Limit, MAX_GATES, Messages, NEVER_ASKS, PROCESSES_PAGE, ParkedFallback,
     Plan, Planning, ProcessKind, ProcessesPage, Publication, QuoteRef, RULES_JSON, Resumed, Room,

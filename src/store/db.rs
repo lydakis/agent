@@ -2653,6 +2653,19 @@ fn plan_stably(conn: &Connection) -> Result<()> {
 fn glob_prefix(pattern: &str) -> &str {
     &pattern[..pattern.find(['*', '?', '[']).unwrap_or(pattern.len())]
 }
+/// What `close` closes beside one bot named alone: several bots by name,
+/// or the open bots a GLOB pattern names, with `no_turn_since_ms` only
+/// those running no turn and with none since that time, a page at a time
+/// in name order after `after`.
+pub enum Closing<'a> {
+    Names(&'a [String]),
+    Pattern {
+        pattern: &'a str,
+        no_turn_since_ms: Option<i64>,
+        after: &'a str,
+        limit: usize,
+    },
+}
 /// What `messages` picks: a bot by name, or a GLOB pattern of names as
 /// `bots` takes one; a range of message numbers and of the times they were
 /// sent; who sent them; and the page. The same selector `follow` takes for
@@ -5148,6 +5161,119 @@ impl Database {
                 .execute(params![at, name])?;
         }
         Ok((before, running))
+    }
+    /// Close what `closing` names at `at`, as [`Database::close`] closes
+    /// one, in one job. With `by`, the bot asking, only the bots it made,
+    /// and itself when named alone: any other is refused. Answers
+    /// `{closed, refused, next_after}`: each closed bot with whether it was
+    /// open, when it was closed and the turn it was running as it was
+    /// marked; each refused one with why (`bot_not_found`, `not_permitted`).
+    pub fn close_all(&self, closing: &Closing, by: Option<i64>, at: i64) -> Result<Value> {
+        type Row = (String, i64, Option<i64>, Option<i64>, Option<i64>);
+        let read = |r: &rusqlite::Row| -> rusqlite::Result<Row> {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
+        };
+        let mut rows: Vec<std::result::Result<Row, String>> = Vec::new();
+        let mut next = None;
+        match closing {
+            Closing::Names(names) => {
+                if names.is_empty()
+                    || names.len() > 256
+                    || names.iter().any(|name| name.is_empty() || name.len() > 128)
+                {
+                    return fail_with(
+                        "invalid_bot_filter",
+                        "names lists 1 to 256 names of up to 128 bytes",
+                    );
+                }
+                let mut statement = self.conn.prepare_cached(
+                    "SELECT name,id,created_by_id,closed_ms,running_turn FROM bots
+                     WHERE name=? AND status!='deleting'",
+                )?;
+                for name in *names {
+                    let row = statement.query_row([name], read).optional()?;
+                    rows.push(row.ok_or_else(|| name.clone()));
+                }
+            }
+            Closing::Pattern {
+                pattern,
+                no_turn_since_ms,
+                after,
+                limit,
+            } => {
+                if !(1..=256).contains(limit) || after.len() > 128 {
+                    return fail_with(
+                        "invalid_bot_page",
+                        "limit must be 1 to 256 and after a name of up to 128 bytes",
+                    );
+                }
+                if pattern.is_empty() || pattern.len() > 256 {
+                    return fail_with(
+                        "invalid_bot_filter",
+                        "bot is a name or a GLOB pattern of 1 to 256 bytes",
+                    );
+                }
+                // The pattern's literal prefix's range of the name index, as
+                // `list` reads it; open bots only, as closing one again
+                // changes nothing. With a time, those running no turn whose
+                // last turn ended (or, ending, started) before it, or that
+                // never ran one.
+                let quiet = match no_turn_since_ms {
+                    Some(_) => {
+                        " AND running_turn IS NULL
+                          AND COALESCE(last_finished_ms,last_started_ms,-1) < ?5"
+                    }
+                    None => "",
+                };
+                let mut statement = self.conn.prepare_cached(&format!(
+                    "SELECT name,id,created_by_id,closed_ms,running_turn FROM bots
+                     WHERE name >= max(?1 || char(1), ?3) AND name < ?3 || CAST(x'ff' AS TEXT)
+                       AND name GLOB ?2 AND closed_ms IS NULL AND status!='deleting'{quiet}
+                     ORDER BY name LIMIT ?4"
+                ))?;
+                let prefix = glob_prefix(pattern);
+                let limit_rows = (*limit + 1) as i64;
+                let found: Vec<Row> = match no_turn_since_ms {
+                    Some(since) => statement
+                        .query_map(params![after, pattern, prefix, limit_rows, since], read)?
+                        .collect::<rusqlite::Result<_>>()?,
+                    None => statement
+                        .query_map(params![after, pattern, prefix, limit_rows], read)?
+                        .collect::<rusqlite::Result<_>>()?,
+                };
+                if found.len() > *limit {
+                    next = Some(found[*limit - 1].0.clone());
+                }
+                rows.extend(found.into_iter().take(*limit).map(Ok));
+            }
+        }
+        let mut mark = self
+            .conn
+            .prepare_cached("UPDATE bots SET closed_ms=? WHERE name=? AND closed_ms IS NULL")?;
+        let (mut closed, mut refused) = (Vec::new(), Vec::new());
+        for row in rows {
+            let (name, id, maker, before, running) = match row {
+                Ok(row) => row,
+                Err(name) => {
+                    refused.push(json!({"bot":name,"error":"bot_not_found"}));
+                    continue;
+                }
+            };
+            // Itself only named alone, as a bot's own socket closes itself
+            // today; a selector that happens to match it leaves it open.
+            let alone = matches!(closing, Closing::Names(names) if names.len() == 1);
+            if by.is_some_and(|by| maker != Some(by) && (by != id || !alone)) {
+                refused.push(json!({"bot":name,"error":"not_permitted",
+                    "message":format!("{name} was not made by this bot, so this bot may not close it")}));
+                continue;
+            }
+            if before.is_none() {
+                mark.execute(params![at, name])?;
+            }
+            closed.push(json!({"bot":name,"bot_id":id,"was_open":before.is_none(),
+                "closed_ms":before.unwrap_or(at),"running_turn":running}));
+        }
+        Ok(json!({"closed":closed,"refused":refused,"next_after":next}))
     }
     fn exists(&self, name: &str) -> Result<bool> {
         Ok(self
