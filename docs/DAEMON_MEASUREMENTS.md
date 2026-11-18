@@ -10989,3 +10989,21 @@ A follow of a pattern costs the publisher a GLOB check per pattern that
 some session follows, and nothing when none does: the set is empty and the
 exact-name and `*` lookups are the ones `main` makes. ASCII names match
 byte by byte with no allocation.
+
+The Perf workflow's matched screen (`bench.perf_gate`, GitHub runner, head
+15eec87 against main 7de072a): store work per turn is the same and the
+gate gave no warnings.
+
+| Measure | Base | Head | Change |
+| --- | ---: | ---: | ---: |
+| Lone submit CPU, ms | 23.332 | 22.987 | -1.5% |
+| Burst submit p99, ms | 2.542 | 2.687 | +5.7% |
+| Release to terminal p99, ms | 6.774 | 6.938 | +2.4% |
+| Idle RSS, MiB | 17.344 | 17.02 | -1.9% |
+| Per idle bot, KiB | 1.826 | 1.684 | -7.8% |
+| RSS after a turn each, MiB | 59.596 | 54.242 | -9.0% |
+| Daemon CPU per turn, ms | 0.69 | 0.674 | -2.3% |
+| Lifecycle CPU, s | 0.34 | 0.315 | -7.4% |
+| Lifecycle p95 turn, ms | 573.633 | 576.577 | +0.5% |
+| Lifecycle peak RSS, MiB | 26.148 | 26.244 | +0.4% |
+| Quiet window CPU, ms/s | 0.77 | 0.765 | -0.6% |
