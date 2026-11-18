@@ -515,12 +515,12 @@ fn keys_and_reply_whole(
     sent: &[(Instant, String)],
     lines: &[String],
 ) {
-    keys_at_once(app, frames, sent);
+    keys_at_once(frames, sent);
     reply_whole(app, lines);
 }
 
 /// Every key showed at once.
-fn keys_at_once(app: &App, frames: &[(Instant, String, String)], sent: &[(Instant, String)]) {
+fn keys_at_once(frames: &[(Instant, String, String)], sent: &[(Instant, String)]) {
     let mut waited = latencies(sent, frames);
     waited.sort();
     let p99 = percentile(&waited, 0.99);
