@@ -11159,3 +11159,45 @@ change adds nothing to a window after its start but the one `hello` line,
 and nothing to the daemon per key, so these are the full machine's, as
 main's are. Daemon CPU and RSS, window CPU and RSS, and window start move
 within run-to-run spread. The Mac was not measured.
+
+## A live event encoded once for all its followers
+
+Before, the hub cloned a live event's JSON value for each session that
+followed its bot and encoded it again for each one, and the firehose sent
+another copy of each. Now the event is encoded when its first follower
+takes it, and every later follower queues the same bytes, each charged
+their cost against its own 2 MiB budget, so a follower that falls behind
+is still closed as before. An event nobody follows is never encoded. On
+the client, the reader reads only a line's `id` to route it and builds a
+notification once, when the window takes it, where it built it twice.
+
+`bench/fan_out.py`: one bot takes streaming turns back to back against
+`bench.streaming_model` (200 tokens, each its own `text_delta`, as fast as
+the model sends them), and N socket sessions follow that bot and read
+everything. `--slow` adds one more follower that never reads. Each count
+gets its own daemon; 2 s warm-up, 10 s measured, two runs a side, 4-CPU
+Linux, release builds of main `ae1bf65` and the change. "Run loop" is the
+daemon's CPU outside its store threads, per event published.
+
+| Followers | Side | Turns/s | Events/s | Run loop µs/event | Run loop % | Each follower, lines/s |
+| ---: | --- | ---: | ---: | ---: | ---: | ---: |
+| 0 | main | 86.1 / 87.1 | 17,561 / 17,788 | 14.75 / 15.07 | 25.9 / 26.8 | — |
+| 0 | head | 86.4 / 88.9 | 17,625 / 18,135 | 14.81 / 14.61 | 26.1 / 26.5 | — |
+| 1 | main | 94.0 / 94.0 | 19,175 / 19,174 | 14.29 / 14.24 | 27.4 / 27.3 | 19,175 / 19,174 |
+| 1 | head | 94.8 / 94.0 | 19,359 / 19,175 | 14.00 / 14.45 | 27.1 / 27.7 | 19,359 / 19,172 |
+| 32 | main | 53.4 / 52.5 | 10,875 / 10,710 | 67.39 / 68.44 | 73.3 / 73.3 | 10,873 / 10,710 |
+| 32 | head | 61.7 / 62.7 | 12,599 / 12,800 | 52.94 / 52.42 | 66.7 / 67.1 | 12,593 / 12,795 |
+| 200 | main | 12.4 / 12.1 | 2,514 / 2,470 | 381.0 / 389.4 | 95.8 / 96.2 | 2,513 / 2,469 |
+| 200 | head | 16.0 / 16.2 | 3,256 / 3,305 | 289.6 / 284.1 | 94.3 / 93.9 | 3,255 / 3,304 |
+| 32 + slow | main | 57.9 / 57.7 | 11,809 / 11,778 | 60.29 / 60.11 | 71.2 / 70.8 | 11,806 / 11,775 |
+| 32 + slow | head | 70.5 / 64.6 | 14,396 / 13,178 | 43.00 / 49.77 | 61.9 / 65.6 | 14,391 / 13,177 |
+
+With no follower and with one, nothing moves beyond run-to-run spread:
+the one encoding a single follower costs is the one it cost before. At
+32 followers the run loop spends 22% less per event and the bot streams
+18% faster; at 200, 25% less and 31% faster. The run loop is the
+bottleneck there on both sides (94 to 96%), so the saving goes into
+throughput. What is left per follower, about 1.4 µs, is its own queue,
+the wake of its writer and the write to its socket. In every run with a
+slow follower the daemon closed it and every fast follower received every
+event (minimum and maximum lines per follower agree).
