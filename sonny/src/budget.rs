@@ -81,6 +81,31 @@ impl Budget {
             _claim: claim,
         }
     }
+
+    /// A place for `owner` if one is free now, within its share and the
+    /// whole: none, holding and waiting on nothing, if not. Those already
+    /// waiting keep their turn, as a semaphore with waiters has none free.
+    pub fn try_admit(&'static self, owner: &str) -> Option<Permit> {
+        let (share, claim) = {
+            let mut shares = self.shares.lock().unwrap_or_else(|e| e.into_inner());
+            let (share, users) = shares
+                .entry(owner.to_owned())
+                .or_insert_with(|| (Arc::new(Semaphore::new(self.share)), 0));
+            *users += 1;
+            let claim = Claim {
+                owner: owner.to_owned(),
+                budget: self,
+            };
+            (share.clone(), claim)
+        };
+        let share = share.try_acquire_owned().ok()?;
+        let all = self.all.clone().try_acquire_owned().ok()?;
+        Some(Permit {
+            _all: all,
+            _share: share,
+            _claim: claim,
+        })
+    }
 }
 
 /// The budget: `tool_processes` in the config, or four times the CPUs.
@@ -133,6 +158,20 @@ mod tests {
         let second = budget.admit("a");
         drop(held);
         drop(second.await);
+        assert!(budget.shares.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_place_taken_only_if_free_waits_on_nothing() {
+        let budget = leaked(2);
+        let a = budget.try_admit("a").unwrap();
+        // `a`'s share is full: none for it, and nothing left behind.
+        assert!(budget.try_admit("a").is_none());
+        let b = budget.try_admit("b").unwrap();
+        // The whole is full.
+        assert!(budget.try_admit("c").is_none());
+        assert!(!budget.shares.lock().unwrap().contains_key("c"));
+        drop((a, b));
         assert!(budget.shares.lock().unwrap().is_empty());
     }
 
