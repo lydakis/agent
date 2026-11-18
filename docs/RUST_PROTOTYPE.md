@@ -550,7 +550,9 @@ and delivers only the matching bots', in replay and live; `kinds` narrows
 it as before. Its replay pages are matched in the store (`bot GLOB` as the
 page reads the cursor's range), so a sparse pattern reads the backlog past
 its cursor once and decodes only its own events: 100 projects' follows of
-a 200,000-event backlog went live in 1.8 s, not 69 s. The
+a 200,000-event backlog went live in 1.6 s, not 69 s. Each page ends at
+the newest event when it began, so the switch to live reads only what was
+written since. The
 publisher matches a pattern by SQLite's GLOB rules, so live delivery agrees
 with what replay read.
 
