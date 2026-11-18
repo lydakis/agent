@@ -11771,3 +11771,91 @@ Daemon and window CPU are within 1 point at both sizes, and memory is
 within 2%. Window start runs 6 to 8% slower on the change and key p99
 moves both ways, all within the spread runs of main against itself show
 in the sections above.
+
+## A Sonny window waits for keys without waking
+
+A window read keys on a thread of its own that asked the terminal every 50 ms
+whether a key had come, so that it could end with the window: 20 wakeups a
+second in every window, idle or not, 4,000 a second for 200 windows. It now
+reads as Codex's TUI does, through crossterm's event stream: its reader
+blocks until the terminal says something, and the window letting go of it
+wakes the read to end it.
+
+Measured with `bench/ends.py` and its wakeups column (added here): the times any thread of the window's processes was put on a CPU
+(the third field of each thread's `schedstat`), per second. One daemon
+binary for every build, 4-CPU Linux. "Before" is the key-loop change (#1166)
+this builds on; "current thread" is this change with the window's runtime on
+one thread, tried and left out (below).
+
+Low end: one idle window on a folder of 10 agents.
+
+| Build | Window start | Idle window wakeups/s | Idle window CPU | Idle window RSS | Key p50 | Key p99 | Turn p50 |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| before | 46 ms | 26.6 | 0.20% | 25.8 MiB | 0.49 ms | 0.97 ms | 45.1 ms |
+| this change | 48 ms | 6.6 | 0.05% | 26.1 MiB | 0.35 ms | 1.14 ms | 47.8 ms |
+| this change, again | 41 ms | 6.7 | 0.05% | 26.1 MiB | 0.41 ms | 1.20 ms | 47.6 ms |
+| current thread | 45 ms | 4.0 | 0.05% | 25.5 MiB | 0.37 ms | 1.21 ms | 44.6 ms |
+
+Again against the key-loop change at 15e5b6d (main merged in, its 3 s
+reads applied at the look round rather than waking the window), with
+`bench/ends.py`'s own wakeups column, each build twice:
+
+| Build | Idle window wakeups/s | Idle window CPU | Idle window RSS | Key p99 | Turn p50 |
+|---|---:|---:|---:|---:|---:|
+| before | 26.6, 26.5 | 0.15%, 0.15% | 26.1 MiB | 1.08, 3.53 ms | 47.8, 46.0 ms |
+| this change | 6.6, 6.7 | 0.05%, 0.05% | 25.7, 26.0 MiB | 1.58, 1.08 ms | 47.7, 47.5 ms |
+
+And 200 windows in one project under the high end's load, against 15e5b6d:
+
+| Build | Windows wakeups/s | Windows CPU | Windows RSS | Daemon CPU | Key p50 | Key p99 | Key max | Pauses over 100 ms | Turns in 20 s |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| before | 16,867 | 65.9% | 11,910 MiB | 174% | 1.46 ms | 6.5 ms | 7.4 ms | 0 | 7,636 |
+| this change | 13,203 | 61.5% | 11,866 MiB | 177% | 1.52 ms | 6.6 ms | 8.0 ms | 0 | 7,792 |
+
+What an idle window still wakes for, from `strace` over 10 s: its look
+round once a second (its clocks, the reactions and config files it reads),
+which wakes the runtime's timer twice (the timer wheel's coarse slot, then
+the tick), a worker it hands a job to, and the reads it repeats every 3 s.
+
+High end: 10,000 stored agents, every window in one project, 30 agents
+running turns back to back and 8 running code-mode scripts, measured over
+the same 20 s as the keys.
+
+| Windows | Build | Windows wakeups/s | Windows CPU | Windows RSS | Daemon CPU | Key p50 | Key p99 | Key max | Pauses over 100 ms | Window start p50 | Turns in 20 s |
+|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 32 | before | 10,834 | 25.5% | 2,152 MiB | 139% | 1.01 ms | 6.3 ms | 8.5 ms | 0 | 0.70 s | 8,763 |
+| 32 | this change | 10,343 | 25.2% | 2,123 MiB | 138% | 1.08 ms | 5.3 ms | 5.4 ms | 0 | 0.77 s | 8,792 |
+| 32 | current thread | 8,200 | 21.9% | 2,198 MiB | 141% | 1.05 ms | 5.8 ms | 17.6 ms | 0 | 0.68 s | 8,799 |
+| 100 | before | 14,467 | 35.7% | 6,144 MiB | 146% | 1.37 ms | 7.4 ms | 12.3 ms | 0 | 1.81 s | 9,313 |
+| 100 | this change | 12,291 | 34.0% | 6,169 MiB | 145% | 1.52 ms | 7.5 ms | 18.6 ms | 0 | 1.92 s | 9,279 |
+| 100 | current thread | 8,930 | 30.1% | 6,559 MiB | 145% | 1.34 ms | 7.3 ms | 30.7 ms | 0 | 1.70 s | 9,221 |
+| 200 | before | 15,423 | 59.1% | 11,890 MiB | 180% | 1.81 ms | 8.5 ms | 19.6 ms | 0 | 3.56 s | 8,808 |
+| 200 | this change | 10,763 | 53.9% | 12,006 MiB | 183% | 1.84 ms | 9.0 ms | 10.2 ms | 0 | 3.76 s | 8,864 |
+| 200 | current thread | 6,693 | 54.3% | 13,090 MiB | 176% | 1.77 ms | 9.2 ms | 13.7 ms | 0 | 3.38 s | 8,605 |
+
+200 windows spread, each its own project, the same load (the first two
+runs of each were taken while the machine compiled, so run again; this
+change twice):
+
+| Build | Windows wakeups/s | Windows CPU | Windows RSS | Daemon CPU | Key p50 | Key p99 | Key max | Pauses over 100 ms | Window start p50 | Turns in 20 s |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| before | 15,423 | 59.4% | 11,971 MiB | 181% | 1.88 ms | 13.2 ms | 24.4 ms | 0 | 4.03 s | 8,847 |
+| this change | 10,745 | 54.4% | 11,907 MiB | 178% | 1.83 ms | 9.0 ms | 15.8 ms | 0 | 3.50 s | 8,769 |
+| this change, again | 10,916 | 54.0% | 11,872 MiB | 182% | 1.70 ms | 8.3 ms | 11.7 ms | 0 | 3.66 s | 8,857 |
+
+Every key stays under 10 ms at p99 with this change and none pauses over
+100 ms.
+
+The window's runtime on one thread cuts its wakeups further (4.0 a second
+idle, 38% fewer than two workers at 200 busy windows) and keeps keys as
+fast, but each window grows: about 5.5 MiB more at 200 busy windows (13,090
+against 12,006 MiB), 3.9 MiB at 100, while the window's own reads and the
+connection's reader share the one thread with drawing. The windows stay on
+two workers until what a window takes in has a bound of its own.
+
+After the busy agents stop, the windows of a busy project keep reading: 30 s
+later, 100 windows still sent the daemon about 11,500 `inspect` requests a
+second (230,000 in 20 s, against 34,000 while the turns ran), with their
+CPU at about 130%. Main at ae1bf65 does the same (220,000), so it is not the
+key loop's; it is the repeated reads of the project's tasks, measured here
+and left for that work.

@@ -190,6 +190,34 @@ const SOURCES_FRESH: Duration = Duration::from_secs(1);
 const LIVELY_TICK: Duration = Duration::from_millis(100);
 const LIVELY_FOR: Duration = Duration::from_secs(5);
 
+/// The terminal's keys, mouse and answers, sent on as they come until the
+/// window lets go of `keys`. The read blocks until the terminal says
+/// something, as Codex's TUI reads it, so an idle window never wakes to
+/// look; letting go wakes the read to end it, so the reader ends with
+/// the client.
+async fn read_keys(keys: tokio::sync::mpsc::UnboundedSender<Event>) {
+    use futures_core::Stream;
+    let mut stream = event::EventStream::new();
+    loop {
+        let next = std::future::poll_fn(|cx| std::pin::Pin::new(&mut stream).poll_next(cx));
+        let event = tokio::select! {
+            _ = keys.closed() => return,
+            event = next => event,
+        };
+        match event {
+            Some(Ok(event)) => {
+                if keys.send(event).is_err() {
+                    return;
+                }
+            }
+            // A read that fails, as one can while the Mac wakes, is tried
+            // again rather than leaving the client deaf to keys.
+            Some(Err(_)) => tokio::time::sleep(Duration::from_millis(100)).await,
+            None => return,
+        }
+    }
+}
+
 /// How long a window waits before it looks round again: [`LIVELY_TICK`]
 /// while something on it moves or it heard from the person or the daemon
 /// within [`LIVELY_FOR`], `quiet` ago; otherwise a frame.
@@ -7372,25 +7400,7 @@ impl App {
             }
         }
         let (keys_tx, keys) = tokio::sync::mpsc::unbounded_channel();
-        // Poll, not a bare read, so the reader ends with the client.
-        std::thread::spawn(move || {
-            while !keys_tx.is_closed() {
-                // A read that fails, as one can while the Mac wakes, is
-                // tried again rather than leaving the client deaf to keys.
-                match event::poll(Duration::from_millis(50)) {
-                    Ok(false) => {}
-                    Ok(true) => match event::read() {
-                        Ok(event) => {
-                            if keys_tx.send(event).is_err() {
-                                break;
-                            }
-                        }
-                        Err(_) => std::thread::sleep(Duration::from_millis(100)),
-                    },
-                    Err(_) => std::thread::sleep(Duration::from_millis(100)),
-                }
-            }
-        });
+        tokio::spawn(read_keys(keys_tx));
         self.run(terminal, events, keys).await
     }
 

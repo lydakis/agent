@@ -173,17 +173,23 @@ def tree(*roots):
 
 
 def usage(pids):
-    """CPU seconds and RSS MiB, summed over `pids`."""
+    """CPU seconds, RSS MiB and wakeups (the times any of their threads was
+    put on a CPU, from each thread's schedstat), summed over `pids`."""
     tick, page = os.sysconf('SC_CLK_TCK'), os.sysconf('SC_PAGE_SIZE')
-    cpu = rss = 0.0
+    cpu = rss = wakeups = 0.0
     for pid in pids:
         try:
             fields = Path(f'/proc/{pid}/stat').read_text().rsplit(')', 1)[1].split()
             rss += int(Path(f'/proc/{pid}/statm').read_text().split()[1]) * page / 2**20
             cpu += (int(fields[11]) + int(fields[12])) / tick
+            for task in Path(f'/proc/{pid}/task').iterdir():
+                try:
+                    wakeups += int((task / 'schedstat').read_text().split()[2])
+                except (OSError, IndexError):
+                    pass
         except (OSError, IndexError):
             pass
-    return cpu, rss
+    return cpu, rss, wakeups
 
 
 def pss(pids):
@@ -245,7 +251,9 @@ def measured(groups, seconds, daemon=None, control=None):
                          if count - was.get(op, 0)} for seen, was in zip(now, marked)]
     # CPU over the time measured, not the time asked for.
     found = {name: {'cpu_pct': round(100 * (after[name][0] - before[name][0]) / elapsed, 2),
-                    'rss_mib': round(after[name][1], 1)} for name in groups}
+                    'rss_mib': round(after[name][1], 1),
+                    'wakeups_s': round((after[name][2] - before[name][2]) / elapsed, 1)}
+             for name in groups}
     if daemon:
         # The daemon's CPU by thread: its run loop, the writer, the readers.
         found['daemon']['threads_pct'] = {
