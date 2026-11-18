@@ -4684,7 +4684,7 @@ fn prompts_name_who_wrote_each_and_what_the_turn_ran() {
     // The steer named no folder, so it records the one its turn ran in,
     // which a later move does not rewrite.
     let row = |db: &Database, id: i64| {
-        let messages = messages_page(&db, "Carol", 0, None, 10, false, false).unwrap();
+        let messages = messages_page(db, "Carol", 0, None, 10, false, false).unwrap();
         let ran = (messages["messages"].as_array().unwrap().iter())
             .find(|m| m["message"] == id)
             .unwrap()["turn"]
