@@ -2083,6 +2083,29 @@ impl Registry {
             before: Option<i64>,
             audit: Option<AuditArgs>,
         }
+        impl HistoryArgs {
+            /// The paging arguments given, which a search or an audit
+            /// read refuses.
+            fn paging(&self) -> Vec<&'static str> {
+                [
+                    ("turn", self.turn.is_some()),
+                    ("handle", self.handle.is_some()),
+                    ("offset", self.offset != 0),
+                    ("limit", self.limit.is_some()),
+                ]
+                .into_iter()
+                .filter_map(|(name, given)| given.then_some(name))
+                .collect()
+            }
+        }
+        /// `a`, `a or b`, `a, b or c`.
+        fn or_list(names: &[&str]) -> String {
+            match names.split_last() {
+                Some((last, [])) => (*last).to_owned(),
+                Some((last, rest)) => format!("{} or {last}", rest.join(", ")),
+                None => String::new(),
+            }
+        }
         #[derive(Deserialize)]
         #[serde(deny_unknown_fields)]
         struct AuditArgs {
@@ -2255,15 +2278,20 @@ impl Registry {
                 {
                     return fail("invalid_tool_arguments");
                 }
+                let given = args.paging();
                 if let Some(audit) = args.audit {
-                    if args.turn.is_some()
-                        || args.handle.is_some()
-                        || args.offset != 0
-                        || args.limit.is_some()
-                        || args.query.is_some()
-                        || args.before.is_some_and(|before| before < 1)
-                    {
-                        return fail("invalid_tool_arguments");
+                    let mut given = given;
+                    if args.query.is_some() {
+                        given.push("query");
+                    }
+                    if !given.is_empty() {
+                        return fail_with(
+                            "invalid_tool_arguments",
+                            format!("audit takes no {}", or_list(&given)),
+                        );
+                    }
+                    if args.before.is_some_and(|before| before < 1) {
+                        return fail_with("invalid_tool_arguments", "before is 1 or more");
                     }
                     let query = crate::store::audit::Query {
                         before: args.before,
@@ -2284,13 +2312,14 @@ impl Registry {
                 if let Some(query) = args.query {
                     // A search names no turn to page; the store checks the
                     // query's length.
-                    if args.turn.is_some()
-                        || args.handle.is_some()
-                        || args.offset != 0
-                        || args.limit.is_some()
-                        || args.before.is_some_and(|before| before < 1)
-                    {
-                        return fail("invalid_tool_arguments");
+                    if !given.is_empty() {
+                        return fail_with(
+                            "invalid_tool_arguments",
+                            format!("query takes no {}", or_list(&given)),
+                        );
+                    }
+                    if args.before.is_some_and(|before| before < 1) {
+                        return fail_with("invalid_tool_arguments", "before is 1 or more");
                     }
                     return Ok(Prepared::HistorySearch {
                         bot: args.bot,
@@ -5838,6 +5867,32 @@ mod tests {
                 ..
             })
         ));
+    }
+    #[test]
+    fn a_history_search_or_audit_says_which_argument_it_refuses() {
+        let history = Registry::new("history").unwrap();
+        let detail = |args: &str| match history.prepare("history", args) {
+            Err(error) if error.code == "invalid_tool_arguments" => error.detail.unwrap(),
+            _ => panic!("{args} was accepted"),
+        };
+        assert_eq!(
+            detail(r#"{"query":"x","limit":10}"#),
+            "query takes no limit"
+        );
+        assert_eq!(
+            detail(r#"{"query":"x","turn":2,"offset":5,"limit":10}"#),
+            "query takes no turn, offset or limit"
+        );
+        assert_eq!(detail(r#"{"query":"x","before":0}"#), "before is 1 or more");
+        assert_eq!(
+            detail(r#"{"audit":{},"query":"x","handle":"h"}"#),
+            "audit takes no handle or query"
+        );
+        assert!(
+            history
+                .prepare("history", r#"{"query":"x","before":3}"#)
+                .is_ok()
+        );
     }
     #[cfg(unix)]
     #[test]
