@@ -378,6 +378,19 @@ there, or when it runs another Sonny than this one (Sonny's start checks,
 for an install that keeps each version in a folder of its own); a ring
 that finds no scheduler running starts it.
 
+Whether the job runs is read, never repaired: while `/background` lists an
+automation, one status read goes out beside the window (`systemctl --user
+show` of the unit's `LoadState`, `ActiveState`, `SubState`, `Result` and
+`NRestarts`; `launchctl print` of the job's `state` and `last exit code`),
+and when the job does not run the automations' heading has one line under
+it in the service manager's own words, `✗ scheduler not running · failed
+(Result: resources) · restart counter is at 5`. A listing of automations
+(the `automations` tool, `sonny automation ls`) that lists any adds
+`scheduler_not_running` with the same words. Nothing is started, restarted
+or alerted, and the person's own drop-ins are not read.
+
+![/background when the scheduler's systemd unit failed: one line under Automations, in systemd's words](sonny/scheduler-not-running.png)
+
 The job runs `sonny scheduler`. It reads the definitions in
 `~/.agent/automations/jobs` when that folder changes, and runs an automation's
 run when one of its calendar times comes (once for any number missed while
