@@ -5487,16 +5487,29 @@ async fn follow(socket: PathBuf, store: PathBuf, send: Feeder) {
         return;
     }
     // What waits for the person now; the live replay from the past's end
-    // brings what changed since.
-    match crate::needs::listing(&client, None).await {
-        Ok(calls) => {
-            if send.send(Feed::Held(calls)).is_err() {
+    // brings what changed since. A connection let go as the past ended,
+    // its follow's live events past its room, is asked again on a new
+    // one, which follows nothing yet.
+    let mut asked_again = false;
+    loop {
+        match crate::needs::listing(&client, None).await {
+            Ok(calls) => {
+                if send.send(Feed::Held(calls)).is_err() {
+                    return;
+                }
+                break;
+            }
+            Err(error) if error.code == "daemon_disconnected" && !asked_again => {
+                asked_again = true;
+                (client, events) = match reconnect(&socket, &send).await {
+                    Some(connected) => connected,
+                    None => return,
+                };
+            }
+            Err(error) => {
+                let _ = send.send(Feed::Down(error.to_string()));
                 return;
             }
-        }
-        Err(error) => {
-            let _ = send.send(Feed::Down(error.to_string()));
-            return;
         }
     }
     // Live, a sky that falls behind reads on as the past does: from the
@@ -5564,6 +5577,19 @@ async fn follow(socket: PathBuf, store: PathBuf, send: Feeder) {
                 continue;
             }
             let at = event["cursor"].as_i64();
+            // One with no cursor, as a pause notice, passes on at once,
+            // within the room the handoff leaves: it waits on none it
+            // holds.
+            if handoff.is_some() && at.is_none() {
+                let Some(room) = send.hold(bytes) else {
+                    fell = true;
+                    break;
+                };
+                if !send.held(Feed::Live(event), room) {
+                    return;
+                }
+                continue;
+            }
             if let (Some(waiting), Some(at)) = (&mut handoff, at) {
                 if waiting.contains_key(&at) {
                     continue;
@@ -8413,6 +8439,7 @@ mod tests {
                     ready["paused"] = json!({"by": "shop.a1", "reason": "hold on"});
                     let mut out = vec![ready];
                     let pad = "x".repeat(2048);
+                    let notice = "x".repeat(64 * 1024);
                     loop {
                         for line in out.drain(..) {
                             // A connection let go for falling behind is
@@ -8456,8 +8483,24 @@ mod tests {
                                     at
                                 };
                                 match (at, past) {
-                                    (Burst::Past, true) | (Burst::Replay, false) => {
+                                    (Burst::Past, true) => {
                                         out.extend(events);
+                                        out.push(json!({"event": "follow_live", "cursor": count.max(after)}));
+                                    }
+                                    // A live replay, with the pause notices
+                                    // every session hears among it.
+                                    (Burst::Replay, false) => {
+                                        for event in events {
+                                            // Larger than an event: one may
+                                            // need more room than is left.
+                                            if event["cursor"].as_i64().unwrap_or(0) % 25 == 0 {
+                                                out.push(
+                                                    json!({"event": "paused", "durable": false,
+                                                    "pause": {"by": "shop.a1", "reason": notice}}),
+                                                );
+                                            }
+                                            out.push(event);
+                                        }
                                         out.push(json!({"event": "follow_live", "cursor": count.max(after)}));
                                     }
                                     (Burst::Live, false) => {
@@ -8503,6 +8546,8 @@ mod tests {
                     cord = event["event"].as_str().map(str::to_owned);
                     continue;
                 }
+                // A notice heard live, among the replay.
+                Feed::Live(event) if event["cursor"].is_null() => continue,
                 Feed::Past(event) | Feed::Live(event) => event,
                 Feed::Ready => {
                     ready = true;
