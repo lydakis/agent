@@ -1109,12 +1109,31 @@ impl Command {
                 | Command::StepResult { .. }
         )
     }
-    /// A read or a recorded write, which never looks at running turns: it
-    /// goes on while parked turns' claims are on their way. Anything else
-    /// waits for them to land, so it finds each claimed turn running, as
-    /// when each claim was awaited in turn.
-    fn passes_claims(&self) -> bool {
-        self.observes() || self.records()
+    /// The bots whose running turns this request may look at, while
+    /// parked turns' claims are on their way: a read, a recorded write or
+    /// a `wait` looks at none, a request for one bot at that bot's, and
+    /// one that ends or holds turns, or names no one bot, at any (`None`).
+    /// A claim on its way for a bot it looks at lands first, so it finds
+    /// the claimed turn running, as when each claim was awaited in turn.
+    fn turns_seen(&self) -> Option<Vec<&str>> {
+        if self.observes() || self.records() || matches!(self, Command::Wait { .. }) {
+            return Some(Vec::new());
+        }
+        if self.ends_turns() {
+            return None;
+        }
+        match self {
+            Command::Fork { source, bot, .. } => Some(vec![source, bot]),
+            Command::Create { bot, .. }
+            | Command::Lend { bot, .. }
+            | Command::Compact { bot, .. }
+            | Command::Submit { bot, .. }
+            | Command::Follow { bot, .. }
+            | Command::Artifact { bot, .. }
+            | Command::RunStep { bot, .. }
+            | Command::ProcessOutput { bot, .. } => Some(vec![bot]),
+            _ => None,
+        }
     }
     /// It ends or holds turns, or stops a call: the clients' writes on their way land first,
     /// as they did when each was awaited in turn, so none lets its client
@@ -2960,7 +2979,7 @@ pub async fn run(config: Configuration) -> Result<()> {
                 _ = service.tails.running.join_next(), if !service.tails.running.is_empty() => {}
                 joined = service.jobs.join_next(), if !service.jobs.is_empty() => {
                     let (bot, turn, task, exit) = joined.unwrap().map_err(|_| Error::new("turn_task_failed"))?;
-                    service.land_claims().await?;
+                    service.claims_landed().await?;
                     let chore = std::time::Instant::now();
                     service.complete(bot, turn, task, exit).await?;
                     service.chores.count("reap", chore);
@@ -2984,7 +3003,7 @@ pub async fn run(config: Configuration) -> Result<()> {
                 }
                 Some(woken) = pool_wakes.recv() => match woken {
                     agent_runtime::provider::pace::Woken::Turn(bot, turn) => {
-                        service.land_claims().await?;
+                        service.land_claims_of(&[&bot]).await?;
                         service.pool_wake(bot, turn);
                     }
                     agent_runtime::provider::pace::Woken::Lapse(at, pace) => ramp_lapses.entry(at).or_default().push(pace),
@@ -3008,7 +3027,6 @@ pub async fn run(config: Configuration) -> Result<()> {
                 // long backlog; resumes hold no slot and are not starved because
                 // the branch choice is fair.
                 _ = std::future::ready(()), if service.ready_hint && ready_retry.is_none() && service.has_capacity() => {
-                    service.land_claims().await?;
                     let chore = std::time::Instant::now();
                     service.dispatch_ready().await?;
                     service.chores.count("start_ready", chore);
@@ -3092,6 +3110,8 @@ pub async fn run(config: Configuration) -> Result<()> {
                 }
                 // Queued admissions are answered as their commits land, in order.
                 _ = arrived(&mut service.admissions), if !service.admissions.is_empty() => {
+                    // The claims queued before its commit have landed too.
+                    service.claims_landed().await?;
                     let chore = std::time::Instant::now();
                     let (session, output, id, result) = service.settled();
                     reply(&mut service, &mut sessions, stdio_owner, session, &output, id, result).await?;
@@ -3153,11 +3173,12 @@ pub async fn run(config: Configuration) -> Result<()> {
                         // up, or a write's once it lands.
                         Inbound::Request(id, request, credit, read) => {
                             let Some(output) = sessions.get(&id).cloned() else { continue };
-                            // A request that may look at running turns finds
-                            // each claimed turn running, as when each claim was
-                            // awaited in turn; reads and recorded writes go on.
-                            if !request.as_ref().is_ok_and(|r| r.command.passes_claims()) {
-                                service.land_claims().await?;
+                            // A request that may look at a running turn finds
+                            // it running if its claim is on its way.
+                            service.claims_landed().await?;
+                            match request.as_ref().map(|r| r.command.turns_seen()) {
+                                Ok(Some(bots)) => service.land_claims_of(&bots).await?,
+                                _ => service.land_claims().await?,
                             }
                             // A bad id is refused like a malformed line, after the
                             // admissions queued before it.
@@ -3182,7 +3203,10 @@ pub async fn run(config: Configuration) -> Result<()> {
                             let settling = std::time::Instant::now();
                             let mut settled = false;
                             while service.must_settle(request.as_ref().ok().map(|r| &r.command), id, &output, bound) {
-                                let (session, output, id, result) = service.settle().await;
+                                arrived(&mut service.admissions).await;
+                                // The claims queued before its commit have landed too.
+                                service.claims_landed().await?;
+                                let (session, output, id, result) = service.settled();
                                 reply(&mut service, &mut sessions, stdio_owner, session, &output, id, result).await?;
                                 settled = true;
                             }
@@ -4629,11 +4653,35 @@ impl Service {
         Ok(())
     }
 
-    /// Start every turn claimed so far, once its claim lands: what looks
-    /// at running turns (a request taken up on the loop, a turn reaped, a
-    /// pool's wake-up, the loop's timers) sees each claimed turn running,
-    /// as when each claim was awaited in turn. Its own store work would
-    /// queue behind the claims anyway.
+    /// Start the turns whose claims already landed, oldest first, without
+    /// waiting for one on its way. What the store answered after them (an
+    /// admission, a turn's end, the next ready turn) then finds them
+    /// running, as when each claim was awaited in turn.
+    async fn claims_landed(&mut self) -> Result<()> {
+        while let Some(((bot, turn, due), done)) = self.claims.landed().await {
+            self.claimed(bot, turn, due, done)?;
+        }
+        Ok(())
+    }
+
+    /// Wait for the claims on their way to land when one is for a bot in
+    /// `bots`, and start their turns.
+    async fn land_claims_of(&mut self, bots: &[&str]) -> Result<()> {
+        if self
+            .claims
+            .pending()
+            .any(|(bot, _, _)| bots.contains(&bot.as_str()))
+        {
+            self.land_claims().await?;
+        }
+        Ok(())
+    }
+
+    /// Start every turn claimed so far, once its claim lands: what may
+    /// look at any running turn (a request that ends or holds turns or
+    /// names no one bot, the loop's timers) sees each claimed turn
+    /// running, as when each claim was awaited in turn. Its own store work
+    /// would queue behind the claims anyway.
     async fn land_claims(&mut self) -> Result<()> {
         if self.claims.is_empty() {
             return Ok(());
@@ -4684,6 +4732,8 @@ impl Service {
             self.ready_hint = false;
             return Ok(());
         };
+        // Claims made before the look have landed: their turns start first.
+        self.claims_landed().await?;
         // One its last turn kept and no end took (a store that refused it
         // then, say) is taken before this one starts; a store refusing it
         // still leaves the turn ready, as a refused start does.
@@ -9897,7 +9947,7 @@ mod tests {
             bot: "Bob".into(),
             bot_id: None,
         };
-        assert!(inspect.passes_claims());
+        assert_eq!(inspect.turns_seen(), Some(Vec::new()));
         let deferred = (service.dispatch(inspect, 1, &output, json!("r"), Bound::default()))
             .await
             .unwrap_err();
@@ -9907,13 +9957,23 @@ mod tests {
             .expect("read beside the held writer")
             .unwrap();
         assert_eq!((asker.session, sent), (1, true));
+        // A request for another bot, or what the store answered before
+        // the claim, does not wait for it.
+        let other = service.land_claims_of(&["Zed"]);
+        tokio::time::timeout(Duration::from_secs(5), other)
+            .await
+            .expect("not held by Bob's claim")
+            .unwrap();
+        service.claims_landed().await.unwrap();
+        assert_eq!(service.claims.len(), 1);
         // The turn starts only once its claim lands.
         let early = tokio::time::timeout(Duration::from_millis(50), service.claims.next());
         assert!(early.await.is_err(), "landed before its commit");
         assert!(service.active.is_empty());
         gate.send(()).unwrap();
         held.await.unwrap();
-        service.land_claims().await.unwrap();
+        // A request for Bob waits for it, and finds the turn running.
+        service.land_claims_of(&["Bob"]).await.unwrap();
         assert!(service.claims.is_empty());
         assert!(service.active.contains_key("Bob"));
         assert_eq!(service.claims.behind.count, 1);
@@ -10574,16 +10634,20 @@ mod tests {
         assert!(ends(r#"{"op":"pause","reason":"r"}"#));
         assert!(!ends(r#"{"op":"resume"}"#));
         assert!(!ends(r#"{"op":"tool_calls","tag":"t"}"#));
-        // They and every other request but reads and recorded writes wait
-        // for parked turns' claims on their way.
-        let passes = |line: &str| {
-            serde_json::from_str::<Command>(line)
-                .unwrap()
-                .passes_claims()
+        // They wait for every parked turn's claim on its way, a request
+        // for one bot for that bot's, and a read or a wait for none.
+        let seen = |line: &str| {
+            let command = serde_json::from_str::<Command>(line).unwrap();
+            command.turns_seen().map(|bots| bots.join(","))
         };
-        assert!(!passes(r#"{"op":"interrupt","bot":"a","turn":1}"#));
-        assert!(!passes(r#"{"op":"pause","reason":"r"}"#));
-        assert!(passes(r#"{"op":"tool_calls","tag":"t"}"#));
+        assert_eq!(seen(r#"{"op":"interrupt","bot":"a","turn":1}"#), None);
+        assert_eq!(seen(r#"{"op":"pause","reason":"r"}"#), None);
+        assert_eq!(
+            seen(r#"{"op":"submit","bot":"a","request_id":"r","prompt":"p"}"#),
+            Some("a".into())
+        );
+        assert_eq!(seen(r#"{"op":"tool_calls","tag":"t"}"#), Some("".into()));
+        assert_eq!(seen(r#"{"op":"wait","handles":["a/1"]}"#), Some("".into()));
     }
 
     #[tokio::test]

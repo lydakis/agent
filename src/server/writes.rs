@@ -67,6 +67,20 @@ impl<T, D: Send + 'static> Ordered<T, D> {
         self.running.len()
     }
 
+    /// What was kept for each job on its way, oldest first.
+    pub fn pending(&self) -> impl Iterator<Item = &T> {
+        self.running.iter().map(|(then, _)| then)
+    }
+
+    /// The oldest job if its task already ended, as `next` gives it,
+    /// without waiting for one still on its way.
+    pub async fn landed(&mut self) -> Option<(T, Option<D>)> {
+        if !self.running.front()?.1.is_finished() {
+            return None;
+        }
+        self.next().await
+    }
+
     /// The oldest job, once its task ended: what was kept for it, and what
     /// it returned, or `None` when its task failed. Cancel-safe.
     pub async fn next(&mut self) -> Option<(T, Option<D>)> {
