@@ -425,11 +425,13 @@ pub fn resolved_itself(items: &[Value], bot: &str) -> bool {
 #[derive(Clone, Debug, Default)]
 pub struct Needs {
     calls: HashMap<String, BTreeSet<(i64, String)>>,
-    /// The calls a message lifted out of their turn: they, and the steps
-    /// their clients ask for, wait on past its end, until their verdict.
-    lifted: HashSet<(String, i64, String)>,
-    /// Of `calls`, the steps, each with the call it is a step of.
-    steps: HashMap<(String, i64, String), String>,
+    /// The calls a message lifted out of their turn, by agent: they, and
+    /// the steps their clients ask for, wait on past its end, until their
+    /// verdict.
+    lifted: HashMap<String, HashSet<(i64, String)>>,
+    /// Of `calls`, the steps, by agent, each with the call it is a step
+    /// of: an event for one agent touches no other's.
+    steps: HashMap<String, HashMap<(i64, String), String>>,
     /// Each agent with a question open.
     asks: HashMap<String, Open>,
     /// Agents whose questions an event left unsure, to read again once
@@ -468,15 +470,16 @@ impl Needs {
     /// place of every one kept for the agents `listed` covers.
     pub fn held(&mut self, held: Vec<Held>, listed: impl Fn(&str) -> bool) {
         self.calls.retain(|bot, _| !listed(bot));
-        self.steps.retain(|(bot, ..), _| !listed(bot));
+        self.steps.retain(|bot, _| !listed(bot));
         for held in held.into_iter().filter(|held| listed(&held.bot)) {
-            let key = (held.bot.clone(), held.turn, held.call.clone());
+            let key = (held.turn, held.call.clone());
             if held.lifted {
                 let call = held.step_of.clone().unwrap_or_else(|| held.call.clone());
-                self.lifted.insert((held.bot.clone(), held.turn, call));
+                (self.lifted.entry(held.bot.clone()).or_default()).insert((held.turn, call));
             }
             if let Some(of) = held.step_of {
-                self.steps.insert(key, of);
+                visit(1);
+                (self.steps.entry(held.bot.clone()).or_default()).insert(key, of);
             }
             (self.calls.entry(held.bot).or_default()).insert((held.turn, held.call));
         }
@@ -532,14 +535,17 @@ impl Needs {
                 Some(calls) => self.calls.insert(bot.clone(), calls.clone()),
                 None => self.calls.remove(bot),
             };
-            self.lifted.retain(|(of, ..)| of != bot);
-            (self.lifted).extend(other.lifted.iter().filter(|(of, ..)| of == bot).cloned());
-            self.steps.retain(|(of, ..), _| of != bot);
-            (self.steps).extend(
-                (other.steps.iter())
-                    .filter(|((of, ..), _)| of == bot)
-                    .map(|(step, call)| (step.clone(), call.clone())),
-            );
+            match other.lifted.get(bot) {
+                Some(lifted) => self.lifted.insert(bot.clone(), lifted.clone()),
+                None => self.lifted.remove(bot),
+            };
+            match other.steps.get(bot) {
+                Some(steps) => {
+                    visit(steps.len());
+                    self.steps.insert(bot.clone(), steps.clone())
+                }
+                None => self.steps.remove(bot),
+            };
         }
         for bot in asks {
             self.version += 1;
@@ -553,8 +559,8 @@ impl Needs {
     /// `bot` is gone, or resolved: nothing of its waits now.
     pub fn forget(&mut self, bot: &str) {
         self.calls.remove(bot);
-        self.lifted.retain(|(of, ..)| of != bot);
-        self.steps.retain(|(of, ..), _| of != bot);
+        self.lifted.remove(bot);
+        self.steps.remove(bot);
         if self.asks.remove(bot).is_some() {
             self.version += 1;
         }
@@ -600,12 +606,7 @@ impl Needs {
                     if person_call(call)
                         && let Some(id) = call["call_id"].as_str()
                     {
-                        let calls = self.calls.entry(bot.to_owned()).or_default();
-                        calls.insert((turn, id.to_owned()));
-                        if let Some(of) = call["step_of"].as_str() {
-                            let step = (bot.to_owned(), turn, id.to_owned());
-                            self.steps.insert(step, of.to_owned());
-                        }
+                        self.wait(bot, turn, id, call["step_of"].as_str());
                     }
                 }
             }
@@ -613,19 +614,13 @@ impl Needs {
             // call it is a step of.
             "approval_asked" => {
                 if let Some(id) = data["call_id"].as_str() {
-                    let calls = self.calls.entry(bot.to_owned()).or_default();
-                    calls.insert((turn, id.to_owned()));
-                    if let Some(of) = data["step_of"].as_str() {
-                        let step = (bot.to_owned(), turn, id.to_owned());
-                        self.steps.insert(step, of.to_owned());
-                    }
+                    self.wait(bot, turn, id, data["step_of"].as_str());
                 }
             }
             // A call allowed starts; a question is asked as it starts.
             "tool_started" if data["name"] != crate::asks::TOOL => {
-                if let (Some(calls), Some(id)) = (self.calls.get_mut(bot), data["call_id"].as_str())
-                {
-                    calls.retain(|(of, call)| (*of, call.as_str()) != (turn, id));
+                if let Some(id) = data["call_id"].as_str() {
+                    self.let_go(bot, turn, id);
                 }
                 // An agent closing a question of its own: which one, the
                 // history says once the turn ends.
@@ -645,30 +640,42 @@ impl Needs {
             // so do the steps its client asks for, then or later.
             "call_lifted" => {
                 if let Some(id) = data["call_id"].as_str() {
-                    self.lifted.insert((bot.to_owned(), turn, id.to_owned()));
+                    let lifted = self.lifted.entry(bot.to_owned()).or_default();
+                    lifted.insert((turn, id.to_owned()));
                 }
             }
             // Allowed, one its client answers waits on for that answer: no
             // longer for the person, but lifted still, as its steps are.
             "lifted_ended" if data["waits_for"] == "answer" => {
-                if let (Some(calls), Some(id)) = (self.calls.get_mut(bot), data["call_id"].as_str())
-                {
-                    calls.retain(|(of, call)| (*of, call.as_str()) != (turn, id));
+                if let Some(id) = data["call_id"].as_str() {
+                    self.let_go(bot, turn, id);
                 }
             }
             // Its verdict, or its agent, ended a lifted call, and its steps.
             "lifted_ended" => {
                 if let Some(id) = data["call_id"].as_str() {
-                    let steps = &self.steps;
-                    if let Some(calls) = self.calls.get_mut(bot) {
-                        calls.retain(|(of, call)| {
-                            *of != turn
-                                || (call != id
-                                    && steps.get(&(bot.to_owned(), *of, call.clone()))
-                                        != Some(&id.to_owned()))
-                        });
+                    let steps = self.steps.get(bot);
+                    let ended: Vec<String> = (self.turn_calls(bot, turn))
+                        .filter(|call| {
+                            *call == id
+                                || steps
+                                    .and_then(|steps| {
+                                        visit(1);
+                                        steps.get(&(turn, (*call).to_owned()))
+                                    })
+                                    .is_some_and(|of| of == id)
+                        })
+                        .map(str::to_owned)
+                        .collect();
+                    for call in ended {
+                        self.let_go(bot, turn, &call);
                     }
-                    self.lifted.remove(&(bot.to_owned(), turn, id.to_owned()));
+                    if let Some(lifted) = self.lifted.get_mut(bot) {
+                        lifted.remove(&(turn, id.to_owned()));
+                        if lifted.is_empty() {
+                            self.lifted.remove(bot);
+                        }
+                    }
                 }
             }
             // Each answer lets go of its call alone, but a lifted call's
@@ -678,10 +685,8 @@ impl Needs {
                 if let Some(id) = data["call_id"].as_str() {
                     let lifted =
                         kind != "step_decided" && lifted(&self.lifted, &self.steps, bot, turn, id);
-                    if let Some(calls) = self.calls.get_mut(bot)
-                        && !lifted
-                    {
-                        calls.retain(|(of, call)| (*of, call.as_str()) != (turn, id));
+                    if !lifted {
+                        self.let_go(bot, turn, id);
                     }
                     let refused = data["failed"] == true || data["denied"] == true;
                     let asking =
@@ -713,8 +718,12 @@ impl Needs {
             // in line ends as a message.
             "turn_finished" => {
                 let (kept, steps) = (&self.lifted, &self.steps);
-                if let Some(calls) = self.calls.get_mut(bot) {
-                    calls.retain(|(of, call)| *of != turn || lifted(kept, steps, bot, *of, call));
+                let ended: Vec<String> = (self.turn_calls(bot, turn))
+                    .filter(|call| !lifted(kept, steps, bot, turn, call))
+                    .map(str::to_owned)
+                    .collect();
+                for call in ended {
+                    self.let_go(bot, turn, &call);
                 }
                 if self.unsure.remove(bot) {
                     self.due.push((bot.to_owned(), event["turn"].as_i64()));
@@ -726,14 +735,43 @@ impl Needs {
         if self.calls.get(bot).is_some_and(BTreeSet::is_empty) {
             self.calls.remove(bot);
         }
-        let calls = &self.calls;
-        (self.steps).retain(|(of, turn, step), _| {
-            of != bot
-                || calls
-                    .get(of)
-                    .is_some_and(|c| c.contains(&(*turn, step.clone())))
-        });
         was != self.waits(bot)
+    }
+
+    /// `bot`'s call `id` of `turn` waits on the person, a step of `of`
+    /// where it is one.
+    fn wait(&mut self, bot: &str, turn: i64, id: &str, of: Option<&str>) {
+        let calls = self.calls.entry(bot.to_owned()).or_default();
+        calls.insert((turn, id.to_owned()));
+        if let Some(of) = of {
+            visit(1);
+            let steps = self.steps.entry(bot.to_owned()).or_default();
+            steps.insert((turn, id.to_owned()), of.to_owned());
+        }
+    }
+
+    /// `bot`'s call `id` of `turn` waits on the person no more, nor as a
+    /// step.
+    fn let_go(&mut self, bot: &str, turn: i64, id: &str) {
+        let key = (turn, id.to_owned());
+        if let Some(calls) = self.calls.get_mut(bot) {
+            calls.remove(&key);
+        }
+        if let Some(steps) = self.steps.get_mut(bot) {
+            visit(1);
+            steps.remove(&key);
+            if steps.is_empty() {
+                self.steps.remove(bot);
+            }
+        }
+    }
+
+    /// The calls of `bot`'s `turn` that wait on the person.
+    fn turn_calls(&self, bot: &str, turn: i64) -> impl Iterator<Item = &str> {
+        (self.calls.get(bot).into_iter())
+            .flat_map(move |calls| calls.range((turn, String::new())..))
+            .take_while(move |(of, _)| *of == turn)
+            .map(|(_, call)| call.as_str())
     }
 
     fn stir(&mut self, bot: &str) {
@@ -741,18 +779,39 @@ impl Needs {
     }
 }
 
+// Counts the steps an event looks at, in tests: an event for one agent
+// looks at none of another's.
+#[cfg(test)]
+thread_local!(static VISITED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) });
+
+/// `entries` of the steps looked at.
+fn visit(entries: usize) {
+    #[cfg(test)]
+    VISITED.with(|visited| visited.set(visited.get() + entries));
+    #[cfg(not(test))]
+    let _ = entries;
+}
+
 /// Whether `bot`'s call `id` of `turn` waits past its turn: a message
 /// lifted it, or the call it is a step of.
 fn lifted(
-    lifted: &HashSet<(String, i64, String)>,
-    steps: &HashMap<(String, i64, String), String>,
+    lifted: &HashMap<String, HashSet<(i64, String)>>,
+    steps: &HashMap<String, HashMap<(i64, String), String>>,
     bot: &str,
     turn: i64,
     id: &str,
 ) -> bool {
-    let key = (bot.to_owned(), turn, id.to_owned());
+    let Some(lifted) = lifted.get(bot) else {
+        return false;
+    };
+    let key = (turn, id.to_owned());
     lifted.contains(&key)
-        || (steps.get(&key)).is_some_and(|of| lifted.contains(&(bot.to_owned(), turn, of.clone())))
+        || (steps.get(bot))
+            .and_then(|steps| {
+                visit(1);
+                steps.get(&key)
+            })
+            .is_some_and(|of| lifted.contains(&(turn, of.clone())))
 }
 
 /// Whether a turn's prompt, as `accepted` or `steered` tells it, is the
@@ -1017,6 +1076,31 @@ mod tests {
             json!({"status": "completed"}),
         ));
         assert_eq!(needs.calls().collect::<Vec<_>>(), [("p.fix", 3, "c1/1")]);
+    }
+
+    #[test]
+    fn an_event_for_one_agent_looks_at_none_of_another_agents_steps() {
+        let step = || json!({"call_id": "c1/1", "step_of": "c1"});
+        // Every one of `agents` with a step waiting on the person: the
+        // steps looked at to hand them over, then for one more agent's
+        // step handed over, decided and its turn ended.
+        let looked = |agents: usize| {
+            let mut needs = Needs::default();
+            VISITED.with(|visited| visited.set(0));
+            for n in 0..agents {
+                needs.event(&event(&format!("b{n}"), 1, "approval_asked", step()));
+            }
+            let all = VISITED.with(|visited| visited.replace(0));
+            needs.event(&event("a", 1, "approval_asked", step()));
+            needs.event(&event("a", 1, "step_decided", json!({"call_id": "c1/1"})));
+            needs.event(&event("a", 1, "turn_finished", json!({})));
+            assert!(!needs.waits("a") && needs.waits("b0"));
+            (all, VISITED.with(|visited| visited.get()))
+        };
+        let (all, one) = looked(10_000);
+        assert_eq!(all, 10_000, "one look a step handed over");
+        assert_eq!(one, looked(1).1);
+        assert!(one <= 3, "{one}");
     }
 
     #[test]
