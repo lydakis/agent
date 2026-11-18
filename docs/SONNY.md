@@ -395,7 +395,8 @@ The job runs `sonny scheduler`. It reads the definitions in
 `~/.agent/automations/jobs` when that folder changes, and runs an automation's
 run when one of its calendar times comes (once for any number missed while
 the machine slept or the scheduler was not running: it keeps when it last
-looked at each automation in `~/.agent/automations/.scheduler/looked`), when the path it
+looked at each automation in `~/.agent/automations/.scheduler/looked`, and each
+change since in `looked.log` beside it, a line each), when the path it
 watches changes (a write after the automation was added and before the
 scheduler first read it included), and while its queue holds an ask. One run of an automation
 runs at a time, also across a restart of the scheduler: a run holds a lock
