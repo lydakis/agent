@@ -43,6 +43,8 @@ enum Undo {
 /// A `start_task` call.
 pub struct Start {
     pub name: String,
+    /// What the task is for, in the person's words, noted beside its name.
+    pub title: String,
     pub brief: String,
     pub profile: Option<String>,
     /// One of the person's `/permissions` rows to hold the task in, at
@@ -533,6 +535,7 @@ pub fn start(here: &Path, project: &str, starter: &str, start: &Start) -> Result
     };
     let profile = (start.profile.clone()).or_else(|| crate::project::task_profile(&info).ok());
     if let Some(store) = &store {
+        let _ = crate::title::note(store, name, &start.title);
         match profile {
             Some(profile) => {
                 let _ = note_profile(store, name, &profile);
@@ -3040,6 +3043,7 @@ mod tests {
         let store = dir.join("state.sqlite");
         let start = Start {
             name: "fix".into(),
+            title: "Fix the sums".into(),
             brief: String::new(),
             profile: None,
             permissions: None,

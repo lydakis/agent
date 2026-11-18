@@ -19,6 +19,9 @@ pub const INDENT: usize = 4;
 /// where in its name the letters typed are.
 pub struct Item {
     pub name: String,
+    /// What the row is, in the person's words, which it leads with before
+    /// its name; empty for none.
+    pub title: String,
     pub about: String,
     pub current: bool,
     pub found: Vec<usize>,
@@ -30,11 +33,18 @@ impl Item {
     pub fn new(name: impl Into<String>, about: impl Into<String>) -> Self {
         Self {
             name: name.into(),
+            title: String::new(),
             about: about.into(),
             current: false,
             found: Vec::new(),
             sign: None,
         }
+    }
+
+    /// Its title, drawn before its name.
+    pub fn title(mut self, title: impl Into<String>) -> Self {
+        self.title = title.into();
+        self
     }
 
     /// The state's mark, drawn before the name.
@@ -68,6 +78,19 @@ pub fn lines(items: &[Item], pick: usize, width: usize, room: usize) -> Vec<Line
         .map(|item| item.name.width())
         .max()
         .unwrap_or(0);
+    let signed = items.iter().any(|item| item.sign.is_some());
+    // Rows with titles lead with them, in a column as wide as the widest
+    // as far as there is room; what a row is doing gives way first.
+    let lead = 4 + 2 * usize::from(signed);
+    let title_room = width.saturating_sub(lead + wide + 2);
+    let titles = (items.iter())
+        .map(|item| crate::title::cut(&item.title, title_room).width())
+        .max()
+        .unwrap_or(0);
+    let titled = match titles {
+        0 => 0,
+        n => n + 2,
+    };
     let mut out = vec![Line::default()];
     for (at, item) in items.iter().enumerate().skip(first).take(shown) {
         let mark = match item.current {
@@ -78,9 +101,9 @@ pub fn lines(items: &[Item], pick: usize, width: usize, room: usize) -> Vec<Line
         // takes two.
         let pad = " ".repeat(wide.saturating_sub(item.name.width()));
         let name = format!("{}{pad}", item.name);
-        let signed = items.iter().any(|item| item.sign.is_some());
-        let room = width.saturating_sub(mark.width() + wide + 4 + 2 * usize::from(signed));
-        let about = match item.about.is_empty() {
+        let room = width.saturating_sub(mark.width() + titled + wide + 4 + 2 * usize::from(signed));
+        // No room for what it is doing: none of it, not a lone `…`.
+        let about = match item.about.is_empty() || room < 2 {
             true => String::new(),
             false => format!("  {}", crate::transcript::cut(&item.about, room)),
         };
@@ -89,6 +112,12 @@ pub fn lines(items: &[Item], pick: usize, width: usize, room: usize) -> Vec<Line
         if signed {
             row.push(item.sign.clone().unwrap_or_else(|| Span::raw(" ")));
             row.push(Span::raw(" "));
+        }
+        if titled > 0 {
+            let title = crate::title::cut(&item.title, title_room);
+            let pad = " ".repeat(titled - title.width());
+            let title = Span::raw(format!("{title}{pad}"));
+            row.push(if picked { title.reversed() } else { title });
         }
         row.extend(marked(&name, &item.found, picked));
         row.push(match picked {
@@ -371,6 +400,37 @@ impl Picker {
 mod tests {
     use super::*;
     use ratatui::style::{Color, Modifier, Stylize};
+
+    #[test]
+    fn a_row_with_a_title_leads_with_it_and_what_it_does_gives_way_first() {
+        let items = [
+            Item::new("tally.lead", "")
+                .title("Tally invoices")
+                .sign(Span::raw("○")),
+            Item::new("tally.halves", "working")
+                .title("Round half cents to even")
+                .sign(Span::raw("●")),
+            Item::new("notes", "interrupted · ~/notes").sign(Span::raw("■")),
+        ];
+        let text = |width: usize| -> Vec<String> {
+            (lines(&items, 0, width, 10).iter())
+                .map(|line| line.to_string().trim_end().to_owned())
+                .collect()
+        };
+        let wide = text(80);
+        assert_eq!(wide[1], "    ○ Tally invoices            tally.lead");
+        assert_eq!(
+            wide[2],
+            "    ● Round half cents to even  tally.halves  working"
+        );
+        assert_eq!(
+            wide[3],
+            "    ■                           notes         interrupted · ~/notes"
+        );
+        // Narrow: what it does gives way, then the title is cut at a word.
+        assert_eq!(text(44)[2], "    ● Round half cents to even  tally.halves");
+        assert_eq!(text(36)[2], "    ● Round half…     tally.halves");
+    }
 
     #[test]
     fn a_pane_rows_pick_is_one_reversed_band_past_its_lead() {

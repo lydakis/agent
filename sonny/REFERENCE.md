@@ -89,8 +89,9 @@ first), and `--new-lead NAME` makes one (numbered, as `lead.2`, with no
 name). In a window, `/switch` lists every agent the daemon keeps over the
 composer, found by typing as every list is: the folder's leads first, then
 the project's other agents, then other projects' leads, then the rest, the
-one beside the conversation picked to start. An agent that needs you, a
-question open in its last turn, reads `? NAME  needs you` as in `/status`.
+one beside the conversation picked to start. Each row leads with the
+agent's title, then its name, as `/status` does. An agent that needs you, a
+question open in its last turn, reads `? TITLE  NAME  needs you`.
 Enter opens the pick in the
 window. `/switch NAME` opens that agent at once (a name in this project may
 leave out the project), or lists what NAME narrows to. The `↗` beside the
@@ -126,6 +127,20 @@ names no place, as Codex asks where a new thread works when it starts and
 Claude Code's agents take `isolation` each time.
 
 ![/new listing the profiles, then where a reviewer works, then its first message](../docs/sonny/new-agent.png)
+
+### Titles
+
+A task and a project each have a title beside their name: a few words you
+know the work by, as `Round half cents to even` beside `halves`. The name
+stays the handle you address, link and click. A lead sets a task's with
+`start_task`'s `title`, 60 characters at most, and a project's with
+`new_project`'s, which goes in `.agents/project.toml` as `title`, where you
+can change it; a folder that is a project already keeps its own, and one
+with none shows its name. A lead's title is its project's. An agent you
+start with `/new` takes its first message's first line. Sonny keeps each
+agent's beside the store (`STORE.titles/NAME`); the daemon keeps none.
+Every row that lists an agent leads with its title: `/status`, `/switch`
+and the tasks a lead started.
 
 ### Focus with zen
 
@@ -1050,8 +1065,9 @@ has something on it, or is off the screen, no time shows.
   reviewer reads your words as consent. Codex calls this `/approve`.
 - `/status` shows the project's agents in the pane beside the
   conversation, grouped by where they stand, the lead first in its group,
-  under a head that counts each group that has any
-  (`calc · 1 needs you · 1 failed · 2 working · 1 idle · 3 done`, no total): **Needs you** (waiting on your
+  under a head that names the project by its title, else its name, and
+  counts each group that has any
+  (`Tally invoices · 1 needs you · 1 failed · 2 working · 1 idle · 3 done`, no total): **Needs you** (waiting on your
   approval, asking you a question, or held on something only you can fix,
   such as a ChatGPT sign-in), **Failed** (its last turn failed; it asks
   nothing, and says what went wrong under it),
@@ -1068,7 +1084,12 @@ has something on it, or is off the screen, no time shows.
   `?` needs you or held, `✗` failed, `●` working, `◌` waiting, queued,
   rate limited, parked, paused or starting, `○` idle or no reply, `■`
   interrupted, `✓` done; all but the first three muted.
-  Each agent is one line: its mark, name, state and time; one
+  Each agent is one line that says what the work is, then who does it:
+  its mark, its title, its name, its state where its group's heading
+  does not already say it (`waiting on halves`, `rate limited`, `no
+  reply`; never `working` under Working), and its time. Too long for its
+  row, the time goes first, then the title is cut at a word with `…`; the
+  mark and the name stay. An agent with no title shows its name alone. One
   that needs you says what for under it, one that failed why. That is all it shows as it opens; `m` shows more and hides it
   again: at each row's right edge, dim, the rest of what it tracks: what it follows (a source with an
   `icon` in `[sonny.sources.NAME]` shows as that icon, as it does wherever
@@ -1462,7 +1483,7 @@ has something on it, or is off the screen, no time shows.
 - Every task works in a git worktree of its own, at the last commit on
   the branch `agent/NAME`, so only the lead works in the folder; outside
   git, tasks work in the lead's folder. The lead starts each task with its
-  `start_task` tool (`name`, `brief`, `setup`, `profile`, `model`,
+  `start_task` tool (`name`, `title`, `brief`, `setup`, `profile`, `model`,
   `effort`, `reason`), which makes its worktree, runs `.agents/setup`
   there with `setup`, starts the task with `agent run`, and leaves no
   folder behind when that fails. While the lead has tasks still there, a
@@ -1874,8 +1895,9 @@ a failure, and its notification says `fix finished, no reply`.
 ### Opening tasks
 
 The tasks the lead starts show where it started them, as one roster for
-the tasks started together, each task with what it is doing now (starting,
-working, needs you, done, no reply, failed), read
+the tasks started together, each row leading with the task's title, then
+its name and what it is doing now (starting, working, needs you, done, no
+reply, failed), read
 again every few seconds. A task whose model ended its turn with nothing to
 say did not fail, but did not reply either, so it reads `no reply`, not
 `done`, in the roster and in `/status`. A click
