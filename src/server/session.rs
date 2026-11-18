@@ -199,7 +199,21 @@ impl Sender {
     /// own answer, not on the loop, so they take no room: sessions waiting
     /// on reads never hold the room the others need, each holds at most its
     /// share, and its reader still reaches the lease renewals behind them.
-    pub async fn send(&self, message: Inbound) -> std::result::Result<(), Gone> {
+    pub async fn send(&self, mut message: Inbound) -> std::result::Result<(), Gone> {
+        if let Inbound::Request(_, Ok(request), _, _) = &mut message
+            && let Some(path) = request.workspace_slot()
+        {
+            let given = path.clone();
+            match tokio::task::spawn_blocking(move || super::workspace(&given)).await {
+                Ok(Ok(real)) => *path = real,
+                Ok(Err(error)) => request.workspace_error = Some(error),
+                Err(_) => request.workspace_error = Some(Error::new("workspace_lookup_failed")),
+            }
+        }
+        self.enqueue(message).await
+    }
+
+    async fn enqueue(&self, message: Inbound) -> std::result::Result<(), Gone> {
         let session = message.session();
         let parked = loop {
             let taken = self.0.taken.notified();
@@ -306,9 +320,12 @@ impl Sender {
     pub fn blocking_send(
         &self,
         runtime: &tokio::runtime::Handle,
-        message: Inbound,
+        mut message: Inbound,
     ) -> std::result::Result<(), Gone> {
-        runtime.block_on(self.send(message))
+        if let Inbound::Request(_, Ok(request), _, _) = &mut message {
+            request.resolve_workspace();
+        }
+        runtime.block_on(self.enqueue(message))
     }
 }
 impl Clone for Sender {
@@ -680,6 +697,59 @@ mod tests {
 
     fn order(messages: &[Inbound]) -> Vec<u64> {
         messages.iter().map(Inbound::session).collect()
+    }
+
+    #[test]
+    fn workspace_resolution_holds_only_its_own_session() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .max_blocking_threads(1)
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let (release, hold) = std::sync::mpsc::channel::<()>();
+            let worker = tokio::task::spawn_blocking(move || {
+                let _ = hold.recv();
+            });
+            let (sender, mut inbound) = channel(16);
+            let line = |session, text: &[u8]| {
+                Inbound::Request(
+                    session,
+                    parse(text),
+                    Credit::default(),
+                    std::time::Instant::now(),
+                )
+            };
+            let pending = sender.send(line(
+                1,
+                br#"{"id":1,"op":"create","bot":"A","workspace":"/tmp"}"#,
+            ));
+            tokio::pin!(pending);
+            use std::{
+                future::Future,
+                task::{Context, Waker},
+            };
+            assert!(
+                pending
+                    .as_mut()
+                    .poll(&mut Context::from_waker(Waker::noop()))
+                    .is_pending()
+            );
+            sender
+                .send(line(2, br#"{"id":2,"op":"stats"}"#))
+                .await
+                .unwrap();
+            assert_eq!(inbound.recv().await.unwrap().session(), 2);
+            drop(release);
+            pending.await.unwrap();
+            let Some(Inbound::Request(1, Ok(mut request), ..)) = inbound.recv().await else {
+                panic!()
+            };
+            assert_eq!(
+                std::path::Path::new(request.workspace_slot().unwrap()),
+                std::fs::canonicalize("/tmp").unwrap()
+            );
+            worker.await.unwrap();
+        });
     }
 
     #[tokio::test]
