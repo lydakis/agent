@@ -11178,13 +11178,15 @@ step allowed starts after it. `configure`, `interrupt` and a `submit` at
 the active limit still write from the loop: each is several steps that
 later requests depend on.
 
-All on Linux x86_64 (4 CPUs), 2026-11-18, release builds made the same way
-(`cargo build --release --workspace --bins`), main (652af4b) against the
-change (2100e79; the commits after it only make the requests that end or
-hold turns wait for the writes on their way, answer writes in the order
-they were sent, and hold a write's input credit until it lands). The Mac was not measured.
+All on Linux x86_64 (4 CPUs), 2026-11-18, with release builds made the same
+way (`cargo build --release --workspace --bins`). The Mac was not measured.
 
 ### Slow disk, with scripts running
+
+Main (652af4b) against the change at 2100e79. The commits after it only
+make the requests that end or hold turns wait for the writes on their way,
+answer writes in the order they were sent, and hold a write's input credit
+until it lands.
 
 `bench.held_reads` with `slow_sync.c` (every sync 300 ms), 424 bots, 30
 running turns back to back and 8 running code-mode scripts (`--scripts`:
@@ -11199,57 +11201,76 @@ answer), 20 s. Milliseconds, p50 / most.
 What still holds the loop is `resume` (a paused turn going on, which
 awaits its claim inline) and `settle`; those are left for a later change.
 
-### Low end
+### Low end and high end
+
+Main (ae1bf65) against the change at 82b1c7f, which is main merged in
+plus every commit above. The harness was `bench/ends.py` at 0920334. It
+scans the process table once per sample for all windows together and
+divides CPU by the time actually measured. It also reads summed PSS
+beside summed RSS, after the CPU window, so a window's shared binary
+pages count once.
+
+Sonny's windows here run with `--no-layout`, so no lead follows the fleet
+(`Fleet::start`). These screens measure the daemon's write lane and what
+windows see of it. They do not measure how routing scales to many real
+lead windows, which is a separate screen.
+
+#### Low end
 
 `bench.ends --end low`: one Sonny window on a folder of 10 agents, three
-alternating runs each.
+alternating runs each. Each key's p99 is its worst of 40.
 
-| Side | Window start, ms | Daemon idle CPU % | Daemon RSS, MiB | Window idle CPU % | Window RSS, MiB | Key p50 / p99, ms | Turn p50 / p99, ms |
+| Side | Window start, ms | Daemon idle CPU % | Daemon RSS / PSS, MiB | Window idle CPU % | Window RSS / PSS, MiB | Key p50 / p99, ms | Turn p50 / p99, ms |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| main | 53 to 91 | 0 | 20.2 to 21.8 | 0.20 to 0.30 | 25.3 to 25.8 | 0.38 to 0.43 / 1.11 to 1.14 | 47.9 to 48.5 / 50.7 to 58.8 |
-| change | 55 to 62 | 0 | 21.6 to 21.8 | 0.20 | 25.3 to 26.0 | 0.43 to 0.46 / 1.20 to 1.58 | 48.0 to 48.1 / 50.4 to 51.5 |
+| main | 54 to 62 | 0 to 0.05 | 20.1 to 21.6 / 18.1 to 19.7 | 0.15 to 0.20 | 25.7 to 26.1 / 15.4 to 15.5 | 0.48 to 0.59 / 1.32 to 2.43 | 48.2 to 49.4 / 51.4 to 57.2 |
+| change | 53 to 74 | 0 to 0.05 | 20.9 to 21.7 / 18.9 to 19.7 | 0.20 to 0.25 | 25.4 to 26.0 / 15.1 to 15.6 | 0.44 to 0.58 / 1.47 to 4.83 | 48.1 to 48.2 / 51.7 to 56.5 |
 
-### High end
+Every key on both sides was under 5 ms, and nothing else moved past
+run-to-run spread.
+
+#### High end
 
 `bench.ends --end high --pace 0.5`: 10,000 stored agents, 30 agents
-running turns and 8 running scripts (each at most one every 0.5 s, so both
-sides do the same work), and N windows on one busy project (`one`) or each
-on its own folder (`spread`). 300 keys typed across the windows. CPU,
-requests and loop time are all counted over the same 20 s; CPU is percent
-of one core, and the windows' RSS is all of them together.
+running turns and 8 running scripts, each at most one every 0.5 s so both
+sides do the same work. Both sides finished 1,410 turns and 368 to 376
+scripts in every run. N windows were open on one busy project (`one`) or
+each on its own folder (`spread`), and 300 keys were typed across them.
+CPU, requests and loop time are all counted over the same 20 s. CPU is
+percent of one core. The windows' RSS and PSS are summed over all of them.
 
-| Windows | Layout | Side | Window start p50, ms | Key p50 / p99 / most, ms | Daemon CPU % | Daemon RSS, MiB | Windows CPU % | Windows RSS | Requests in the 20 s | Daemon CPU % per 1,000 requests |
-| ---: | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| 32 | one | main | 1,150 | 1.35 / 4.79 / 5.69 | 128.85 | 38.6 | 110.45 | 2.3 GiB | 160,047 | 0.805 |
-| 32 | one | change | 1,126 | 1.4 / 5.02 / 7.13 | 134.25 | 39.6 | 116.75 | 2.2 GiB | 173,171 | 0.775 |
-| 32 | spread | main | 1,006 | 1.31 / 6.8 / 20.36 | 129.8 | 39.1 | 110.35 | 2.2 GiB | 165,016 | 0.787 |
-| 32 | spread | change | 1,047 | 1.42 / 4.06 / 6.31 | 135.2 | 38.6 | 116.0 | 2.3 GiB | 178,570 | 0.757 |
-| 100 | one | main | 2,740 | 1.78 / 5.0 / 41.17 | 126.6 | 41.7 | 130.5 | 5.9 GiB | 153,071 | 0.827 |
-| 100 | one | change | 2,731 | 1.78 / 13.8 / 34.8 | 129.3 | 43.3 | 136.6 | 5.9 GiB | 158,267 | 0.817 |
-| 100 | spread | main | 2,656 | 1.67 / 12.07 / 22.22 | 125.7 | 41.3 | 132.7 | 5.8 GiB | 157,813 | 0.797 |
-| 100 | spread | change | 2,691 | 1.97 / 7.17 / 76.07 | 130.05 | 41.8 | 140.75 | 5.8 GiB | 162,642 | 0.800 |
-| 200 | one | main | 5,130 | 2.65 / 11.43 / 19.32 | 153.05 | 45.6 | 104.35 | 11.5 GiB | 43,490 | 3.519 |
-| 200 | one | change | 5,341 | 2.06 / 10.03 / 13.57 | 157.0 | 46.9 | 108.6 | 11.5 GiB | 43,434 | 3.615 |
-| 200 | spread | main | 5,872 | 1.77 / 13.37 / 23.79 | 149.1 | 45.1 | 113.75 | 11.7 GiB | 40,332 | 3.697 |
-| 200 | spread | change | 5,244 | 2.25 / 16.47 / 31.87 | 162.5 | 45.0 | 100.25 | 11.6 GiB | 45,479 | 3.573 |
+| Windows | Layout | Side | Window start p50, ms | Key p50 / p99 / most, ms | Daemon CPU % | Daemon RSS / PSS, MiB | Windows CPU % | Windows RSS / PSS, GiB | Requests in the 20 s | Daemon CPU % per 1,000 requests | Step writes held the loop, ms |
+| ---: | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 32 | one | main | 1,016 | 1.31 / 3.34 / 9.91 | 131.0 | 39.5 / 37.4 | 108.6 | 2.30 / 1.64 | 168,143 | 0.779 | 1,785 |
+| 32 | one | change | 1,110 | 1.33 / 3.55 / 4.69 | 134.4 | 39.7 / 37.6 | 116.6 | 2.19 / 1.53 | 179,892 | 0.747 | 11 |
+| 32 | spread | main | 1,047 | 1.24 / 3.29 / 7.47 | 129.2 | 39.5 / 37.4 | 109.4 | 2.18 / 1.53 | 164,392 | 0.786 | 1,823 |
+| 32 | spread | change | 1,049 | 1.40 / 3.33 / 4.12 | 134.7 | 40.3 / 38.2 | 116.9 | 2.13 / 1.47 | 181,057 | 0.744 | 11 |
+| 100 | one | main | 2,611 | 1.75 / 19.62 / 21.48 | 124.7 | 43.0 / 40.9 | 128.3 | 5.77 / 3.69 | 146,306 | 0.852 | 2,113 |
+| 100 | one | change | 2,778 | 1.87 / 8.24 / 24.85 | 129.6 | 42.2 / 40.0 | 132.7 | 6.02 / 3.93 | 148,418 | 0.873 | 12 |
+| 100 | spread | main | 2,905 | 1.63 / 8.20 / 50.92 | 124.5 | 41.9 / 40.4 | 125.8 | 6.00 / 3.90 | 136,197 | 0.914 | 2,247 |
+| 100 | spread | change | 3,017 | 1.93 / 5.37 / 59.67 | 128.8 | 42.0 / 39.8 | 133.6 | 5.98 / 3.89 | 146,185 | 0.881 | 12 |
+| 200 | one | main | 5,561 | 1.88 / 10.98 / 12.09 | 137.4 | 44.5 / 42.3 | 107.9 | 11.54 / 7.33 | 36,610 | 3.753 | 4,029 |
+| 200 | one | change | 5,276 | 1.96 / 7.06 / 35.37 | 143.0 | 45.2 / 43.0 | 106.7 | 11.58 / 7.37 | 37,509 | 3.813 | 28 |
+| 200 | spread | main | 5,595 | 1.77 / 9.89 / 11.19 | 138.9 | 45.0 / 42.8 | 105.2 | 11.62 / 7.42 | 36,970 | 3.757 | 4,274 |
+| 200 | spread | change | 5,342 | 1.94 / 7.75 / 8.91 | 143.7 | 45.4 / 43.2 | 103.0 | 11.68 / 7.47 | 38,639 | 3.719 | 23 |
 
-Every row is under 50 ms at p99 with no key over 100 ms. The step writes
-held the loop 2.9 to 7.0 s of the 20 on main and 14 to 41 ms with the
-change.
+Every row is under 50 ms at p99, and no key went over 100 ms. The step
+writes held the loop for 1.8 to 4.3 s of the 20 on main and 11 to 28 ms
+with the change.
 
-The daemon used 2.7 to 5.4 points more of a core at every size but 200
-spread (13.4, with 13% more requests), and it served up to 8% more
-requests: the windows' reads no longer wait behind a step write, so the
-windows ask again sooner, and their own CPU rose the same way. Per request
-served, the change was 3.8% under to 2.7% over main. With no windows, the
-same paced scripts and turns cost the change less: 20.5, 21.2 and 19.8% of
-a core against main's 21.6, 22.2 and 21.9 (three alternating 20 s runs on
-a0f574f). Window start moves by 10% from run to run and went either way.
-The windows' RSS is the same.
+The daemon used 3.4 to 5.6 points more of a core and served 1 to 10% more
+requests. The windows' reads no longer wait behind a step write, so the
+windows ask again sooner. Their own CPU rose 4.4 to 8.0 points up to 100
+windows and fell 1 to 2 at 200. Per request served, the change ranged from
+5.3% below main to 2.5% above. With no windows, the same paced scripts and
+turns cost the change less: 20.5, 21.2 and 19.8% of a core against main's
+21.6, 22.2 and 21.9 (three alternating 20 s runs on a0f574f). Window start
+moved by up to 9% in either direction. Memory is the same: summed window
+PSS is about two thirds of summed RSS on both sides, roughly 37 MiB a
+window at 200.
 
-The harness is `bench/ends.py`. Build both sides the same way: a daemon
-built with `--bin agent` alone links different features than one built
-with `--workspace --bins`, and its CPU is not comparable.
+Build both sides the same way: a daemon built with `--bin agent` alone
+links different features than one built with `--workspace --bins`, and its
+CPU is not comparable.
 
 ### Hot-path screens
 
