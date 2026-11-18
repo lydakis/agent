@@ -1566,17 +1566,16 @@ impl Kept {
             lines.push(b'\n');
         }
         let path = places.looked_log();
-        let appended = (|| {
-            use std::io::Write;
-            use std::os::unix::fs::OpenOptionsExt;
-            let mut log = std::fs::OpenOptions::new()
-                .append(true)
-                .create(true)
-                .mode(0o600)
-                .open(&path)?;
-            log.write_all(&lines)?;
+        // The log is made only with the whole, so that its name lasts.
+        let opened = std::fs::OpenOptions::new().append(true).open(&path);
+        if matches!(&opened, Err(e) if e.kind() == std::io::ErrorKind::NotFound) {
+            self.write_whole(places);
+            return;
+        }
+        let appended = opened.and_then(|mut log| {
+            std::io::Write::write_all(&mut log, &lines)?;
             log.sync_data()
-        })();
+        });
         match appended {
             Ok(()) => {
                 written(lines.len());
@@ -1614,6 +1613,21 @@ impl Kept {
             .collect();
         value.insert(LAST.to_owned(), last.into());
         let whole = serde_json::Value::Object(value).to_string();
+        // The log is made, when it is not yet, before the whole is written,
+        // whose write syncs the folder: its name lasts as the whole's does.
+        let path = places.looked_log();
+        let log = (|| {
+            use std::os::unix::fs::OpenOptionsExt;
+            if let Some(folder) = path.parent() {
+                std::fs::create_dir_all(folder)?;
+            }
+            std::fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .mode(0o600)
+                .open(&path)
+        })();
         if let Err(error) = trigger::replace_mode(&places.looked(), whole.as_bytes(), 0o600) {
             eprintln!("{}", trigger::error_json(&error));
             return;
@@ -1623,12 +1637,7 @@ impl Kept {
         // The lines left in the log, should it not start over, are passed
         // over when read: each is numbered at most the whole's last.
         self.last = last;
-        let path = places.looked_log();
-        let started_over = match std::fs::OpenOptions::new().write(true).open(&path) {
-            Ok(log) => log.set_len(0).and_then(|()| log.sync_data()),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(e) => Err(e),
-        };
+        let started_over = log.and_then(|log| log.set_len(0).and_then(|()| log.sync_data()));
         match started_over {
             Ok(()) => self.logged = 0,
             Err(e) => {
@@ -2647,6 +2656,9 @@ mod tests {
         kept.write(&places);
         let whole = std::fs::metadata(places.looked()).unwrap().len() as usize;
         assert!(whole > 10_000 * 30);
+        // The log is made with the whole, so the folder's sync that makes
+        // the whole's name last makes the log's last too.
+        assert_eq!(std::fs::metadata(places.looked_log()).unwrap().len(), 0);
         // Each start writes its own line: the bytes of 20,000 starts,
         // one a write, are those of the lines and of the whole written
         // again each time the log grew as long as what is kept.
@@ -2682,6 +2694,12 @@ mod tests {
         assert_eq!(read.get("t00008"), Some(&("h".to_owned(), 999)));
         assert_eq!(read.get("t09999"), Some(&("g".to_owned(), 120 + 19_999)));
         // The log was written into the whole: the next line starts clean.
+        assert_eq!(std::fs::metadata(places.looked_log()).unwrap().len(), 0);
+        assert_eq!(Kept::read(&places).times, kept.times);
+        // A log gone is made again only with the whole.
+        std::fs::remove_file(places.looked_log()).unwrap();
+        kept.insert("t00010".into(), ("h".into(), 5));
+        kept.write(&places);
         assert_eq!(std::fs::metadata(places.looked_log()).unwrap().len(), 0);
         assert_eq!(Kept::read(&places).times, kept.times);
         let _ = std::fs::remove_dir_all(&root);
@@ -2738,6 +2756,7 @@ mod tests {
         // The append fails: here the log cannot be opened, as when a
         // write or its sync fails after some of its lines went in.
         let next = kept.last + 1;
+        std::fs::remove_file(places.looked_log()).unwrap();
         std::fs::create_dir_all(places.looked_log()).unwrap();
         kept.insert("a".into(), ("g".into(), 100));
         kept.insert("b".into(), ("g".into(), 100));
