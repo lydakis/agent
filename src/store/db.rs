@@ -11106,6 +11106,36 @@ impl Database {
         }
         Ok(())
     }
+    /// Whether a client may still run a call it took, or a step of it: the
+    /// call's turn goes on and nothing has answered the call.
+    pub fn call_waiting(&self, bot: &str, turn: i64, call_id: &str) -> Result<()> {
+        self.step_turn(bot, turn, Some(call_id))?;
+        let call: Option<(bool, Option<String>, bool)> = self
+            .conn
+            .prepare_cached(
+                "SELECT a.output IS NOT NULL,t.status,a.process IS NOT NULL
+                 FROM answers a LEFT JOIN tools t ON t.turn=a.turn AND t.call_id=a.call_id
+                 WHERE a.turn=? AND a.call_id=?",
+            )?
+            .query_row(params![turn, call_id], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+            })
+            .optional()?;
+        let Some((stored, tool, lifted)) = call else {
+            return fail("no_pending_call");
+        };
+        let held = self
+            .live
+            .get(&turn)
+            .is_some_and(|live| live.answers.contains_key(call_id) || live.taken.contains(call_id));
+        if stored || held {
+            return fail("call_already_answered");
+        }
+        if tool.as_deref() != Some("executing") && !lifted {
+            return fail_with("no_pending_call", "the call ended unanswered");
+        }
+        Ok(())
+    }
     /// Take an answered call to run it: recorded, so that a second take,
     /// from a client that restarted or another one, is refused with
     /// `call_taken` and the call never runs twice. What a taken call did
