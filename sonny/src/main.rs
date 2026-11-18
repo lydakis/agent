@@ -868,11 +868,16 @@ async fn read_status_of(
         let seen = match turn {
             Some(last) if !running => match asks_seen.get(name) {
                 Some((at, seen)) if *at == last => seen.clone(),
-                _ => {
+                was => {
                     fresh = true;
-                    // A read that failed is kept for none: the next
+                    // Read on from where the last read ended, as the sky
+                    // does. A read that failed is kept for none: the next
                     // refresh, or window, reads it again.
-                    match needs::scan(client, name, turn).await {
+                    let read = match was.map(|(_, was)| was.clone()) {
+                        Some(was) => needs::scan_since(client, name, turn, &was).await,
+                        None => needs::scan(client, name, turn).await,
+                    };
+                    match read {
                         Some(seen) => {
                             asks_seen.insert(name.to_owned(), (last, seen.clone()));
                             seen
