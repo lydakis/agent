@@ -1297,10 +1297,11 @@ call but a read-only tool's; `prompt` asks for every call; `approve` never
 asks. Asking puts the call to the agent's own gate, through the daemon's
 `approve_step`: in `full` nothing waits, in `auto` the reviewer decides it, in
 `ask` the person does, the call drawn with `a call in a running script`.
-The script waits for the verdict with its 10 minutes stopped and its place
-among the four running given to another, though it stays among the sixteen
-alive; JavaScript it runs meanwhile, beside the waiting call, still spends
-its time. A denied call rejects with the reason, which the script can catch.
+The script waits for the verdict with its 10 minutes stopped, on its own
+thread, holding none of another's room: up to 2,048 scripts are alive at
+once, as Codex's host allows cells, and one past them is refused at once
+rather than kept waiting. JavaScript it runs meanwhile, beside the waiting
+call, still spends its time. A denied call rejects with the reason, which the script can catch.
 Once a call a gate allowed has run, Sonny tells the daemon how it ended
 (`step_result`), so the reviewer of the agent's next call counts it among those
 the turn already ran.
