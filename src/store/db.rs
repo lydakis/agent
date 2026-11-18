@@ -3459,20 +3459,31 @@ const KIND_CURSORS: &str = "SELECT id FROM events INDEXED BY events_kind_cursor 
 /// its own unless wrapped (SQLite flattens the wrapper).
 const KIND_ARM: &str = "SELECT * FROM (SELECT id FROM events INDEXED BY events_kind_cursor
     WHERE kind=?3 AND id>?1 ORDER BY id LIMIT ?2)";
+/// A kind's cursors of the bots a pattern matches, in place of `id>?1`.
+const KIND_MATCHING: &str = "id>?1 AND bot GLOB ?N";
 
 /// [`KINDS_PAGE`] for `kinds` distinct kinds bound from `?3` on, as one
 /// statement: the page's first `?2` are among each kind's first `?2`.
-fn kinds_page(kinds: usize) -> String {
+/// With a `pattern`, bound after the kinds, each kind's are only the bots
+/// it matches ([`KIND_MATCHING`]).
+fn kinds_page(kinds: usize, pattern: bool) -> String {
     let page = re_spaced(KINDS_PAGE);
     let cursors = re_spaced(KIND_CURSORS);
+    let matching = |arm: String| match pattern {
+        true => arm.replace(
+            "id>?1",
+            &re_spaced(KIND_MATCHING).replace("?N", &format!("?{}", kinds + 3)),
+        ),
+        false => arm,
+    };
     let wanted = match kinds {
-        1 => return page,
+        1 => cursors.clone(),
         _ => (0..kinds)
             .map(|at| re_spaced(KIND_ARM).replace("kind=?3", &format!("kind=?{}", at + 3)))
             .collect::<Vec<_>>()
             .join(" UNION ALL "),
     };
-    page.replace(&cursors, &wanted)
+    page.replace(&cursors, &matching(wanted))
 }
 
 /// A statement on one line, as written across several.
@@ -15023,23 +15034,38 @@ impl Database {
     }
     pub fn events(&self, name: &str, after: i64, limit: usize) -> Result<Value> {
         self.inspect(name)?;
-        self.event_page(Some(name), None, after, limit)
+        self.event_page(Some(name), None, None, after, limit)
     }
     /// Every bot's durable events after a store-wide cursor: what a fleet
     /// controller replays on one connection instead of one per bot.
     pub fn events_after(&self, after: i64, limit: usize) -> Result<Value> {
-        self.event_page(None, None, after, limit)
+        self.event_page(None, None, None, after, limit)
+    }
+    /// [`Self::events_after`] of the bots a GLOB `pattern` matches, and
+    /// only of `kinds` when some are named. SQLite matches each event's bot
+    /// as it reads the cursor's range, so a page of a sparse pattern passes
+    /// the others by in the store, without decoding them, and a replay
+    /// reads the store past its cursor once, however few events match.
+    pub fn events_matching(
+        &self,
+        pattern: &str,
+        kinds: Option<&[&str]>,
+        after: i64,
+        limit: usize,
+    ) -> Result<Value> {
+        self.event_page(None, Some(pattern), kinds, after, limit)
     }
     /// [`Self::events_after`], only of `kinds`. Each kind's next events
     /// come from its own place in the `events_kind_cursor` index, in one
     /// statement and so one snapshot, so a page costs the events it
     /// returns, not every event written between them.
     pub fn events_of_kinds(&self, kinds: &[&str], after: i64, limit: usize) -> Result<Value> {
-        self.event_page(None, Some(kinds), after, limit)
+        self.event_page(None, None, Some(kinds), after, limit)
     }
     fn event_page(
         &self,
         name: Option<&str>,
+        pattern: Option<&str>,
         kinds: Option<&[&str]>,
         after: i64,
         limit: usize,
@@ -15084,11 +15110,12 @@ impl Database {
         let mut stmt;
         let mut rows = match kinds {
             None => {
-                stmt = self.conn.prepare_cached(match name {
-                    Some(_) => "SELECT id,turn,kind,data,bot,written_ms,message FROM events WHERE bot=?1 AND id>?2 ORDER BY id LIMIT ?3",
-                    None => "SELECT id,turn,kind,data,bot,written_ms,message FROM events WHERE ?1 IS NULL AND id>?2 ORDER BY id LIMIT ?3",
+                stmt = self.conn.prepare_cached(match (name, pattern) {
+                    (Some(_), _) => "SELECT id,turn,kind,data,bot,written_ms,message FROM events WHERE bot=?1 AND id>?2 ORDER BY id LIMIT ?3",
+                    (None, Some(_)) => "SELECT id,turn,kind,data,bot,written_ms,message FROM events WHERE bot GLOB ?1 AND id>?2 ORDER BY id LIMIT ?3",
+                    (None, None) => "SELECT id,turn,kind,data,bot,written_ms,message FROM events WHERE ?1 IS NULL AND id>?2 ORDER BY id LIMIT ?3",
                 })?;
-                stmt.query(params![name, after, limit as i64])?
+                stmt.query(params![name.or(pattern), after, limit as i64])?
             }
             Some(kinds) => {
                 let mut kinds = kinds.to_vec();
@@ -15097,10 +15124,15 @@ impl Database {
                 if !(1..=EVENT_PAGE_KINDS).contains(&kinds.len()) {
                     return fail_with("invalid_event_page", "kinds must name 1 to 64 kinds");
                 }
-                stmt = self.conn.prepare_cached(&kinds_page(kinds.len()))?;
+                stmt = self
+                    .conn
+                    .prepare_cached(&kinds_page(kinds.len(), pattern.is_some()))?;
                 let most = limit as i64;
                 let mut values: Vec<&dyn rusqlite::ToSql> = vec![&after, &most];
                 values.extend(kinds.iter().map(|kind| kind as &dyn rusqlite::ToSql));
+                if let Some(pattern) = &pattern {
+                    values.push(pattern);
+                }
                 stmt.query(&values[..])?
             }
         };
@@ -21105,7 +21137,7 @@ mod tests {
             let step = |sql: &str| {
                 (db.conn.prepare_cached(sql).unwrap()).get_status(rusqlite::StatementStatus::VmStep)
             };
-            step(&kinds_page(2))
+            step(&kinds_page(2, false))
         };
         let (few, many) = (steps(30), steps(30_000));
         assert!(
@@ -21124,8 +21156,10 @@ mod tests {
             let db = store(events);
             let page = db.events_of_kinds(&common, 0, 1).unwrap();
             assert_eq!(page["events"].as_array().unwrap().len(), 1);
-            (db.conn.prepare_cached(&kinds_page(common.len())).unwrap())
-                .get_status(rusqlite::StatementStatus::VmStep)
+            (db.conn
+                .prepare_cached(&kinds_page(common.len(), false))
+                .unwrap())
+            .get_status(rusqlite::StatementStatus::VmStep)
         };
         let (few, many) = (steps(30), steps(30_000));
         assert!(
@@ -21137,6 +21171,44 @@ mod tests {
         let refused = db.events_of_kinds(&common, 0, 1).unwrap_err();
         assert_eq!(refused.code, "invalid_event_page");
         assert!(db.events_of_kinds(&[], 0, 1).is_err());
+    }
+
+    #[test]
+    fn a_pattern_page_holds_only_its_bots_events_in_order() {
+        let db = Database::initialize(Connection::open_in_memory().unwrap()).unwrap();
+        db.conn.execute_batch("PRAGMA foreign_keys=OFF").unwrap();
+        db.conn
+            .execute_batch(
+                "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM n WHERE i<300)
+                 INSERT INTO events(bot,turn,kind,data)
+                 SELECT CASE i%3 WHEN 0 THEN 'shop.a' WHEN 1 THEN 'shop.b' ELSE 'web.a' END,1,
+                  CASE WHEN i%10=0 THEN 'turn_finished' ELSE 'tool_started' END,'{}' FROM n",
+            )
+            .unwrap();
+        let read = |kinds: Option<&[&str]>| {
+            let mut cursors = Vec::new();
+            let mut after = 0;
+            loop {
+                let page = db.events_matching("shop.*", kinds, after, 7).unwrap();
+                let events = page["events"].as_array().unwrap().clone();
+                if events.is_empty() {
+                    return cursors;
+                }
+                for event in &events {
+                    assert!(event["bot"].as_str().unwrap().starts_with("shop."));
+                    if kinds.is_some() {
+                        assert_eq!(event["event"], "turn_finished");
+                    }
+                    cursors.push(event["cursor"].as_i64().unwrap());
+                }
+                after = page["next_cursor"].as_i64().unwrap();
+            }
+        };
+        let every: Vec<i64> = (1..=300).filter(|i| i % 3 != 2).collect();
+        assert_eq!(read(None), every);
+        let finished: Vec<i64> = every.iter().copied().filter(|i| i % 10 == 0).collect();
+        assert_eq!(read(Some(&["turn_finished"])), finished);
+        assert_eq!(read(Some(&["turn_finished", "accepted"])), finished);
     }
 
     #[test]

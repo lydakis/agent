@@ -545,9 +545,12 @@ messages have their own index (`messages_people`, by number), so
 any agent lately, reads only those; Sonny's `memory said` is that one
 read, paged, where it asked for every agent's turns, about 1,650 requests
 with 1,650 agents, and reads an agent's history only for a reaction or an
-answer to an ask among them. `follow` with a pattern replays every bot's
-events from a store-wide cursor, as `*` does, and delivers only the
-matching bots', in replay and live; `kinds` narrows it as before. The
+answer to an ask among them. `follow` with a pattern replays from a store-wide cursor, as `*` does,
+and delivers only the matching bots', in replay and live; `kinds` narrows
+it as before. Its replay pages are matched in the store (`bot GLOB` as the
+page reads the cursor's range), so a sparse pattern reads the backlog past
+its cursor once and decodes only its own events: 100 projects' follows of
+a 200,000-event backlog went live in 1.8 s, not 69 s. The
 publisher matches a pattern by SQLite's GLOB rules, so live delivery agrees
 with what replay read.
 

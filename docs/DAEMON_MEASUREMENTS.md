@@ -11247,3 +11247,46 @@ gate gave no warnings.
 | Lifecycle p95 turn, ms | 573.633 | 576.577 | +0.5% |
 | Lifecycle peak RSS, MiB | 26.148 | 26.244 | +0.4% |
 | Quiet window CPU, ms/s | 0.77 | 0.765 | -0.6% |
+
+### A sparse pattern's replay
+
+`python -m bench.pattern_replay` seeds 100 projects of 2 agents each
+(`p0.a0`, `p0.a1`, ...) with a 200,000-event backlog spread evenly across
+them, so each project is 1% of it, then follows from cursor 0 on a fresh
+daemon each time while turns run on one agent of each project: one agent
+by name, one project (`p0.*`), the 100 projects at once (one connection
+each, as 100 windows coming back together), and those 100 narrowed to
+`turn_finished`. Rows passed over per event delivered are the store's own
+counts: a name's follow reads its bot's rows by index; a pattern's every
+row past the cursor (or every row of its kinds). An unrelated agent's
+`history_nodes` is read back to back throughout. Release builds, one
+4-CPU Linux box.
+
+First the head as measured before this fix: a pattern's pages were every
+bot's events, decoded, with the other bots' passed by in the hub.
+
+| Follow | To `follow_live`, s | Rows passed over per event | Daemon CPU, s | Unrelated read p99 / max, ms |
+|---|---:|---:|---:|---:|
+| one agent by name | 0.02 | 1 | 0.4 | 2.0 / 3.3 |
+| one project | 1.34 | 100 | 2.4 | 2.6 / 3.4 |
+| 100 projects | 69.3 | 100 | 164.8 | 103.8 / 124.1 |
+| 100 projects, one kind | 6.24 | 100 | 15.9 | 84.3 / 119.4 |
+
+A pattern's page is now matched in the store (`bot GLOB` as the page reads
+the cursor's range; stable plans keep it a rowid range, never the
+`events_bot_cursor` prefix range, which sorts every matching entry for
+each page and grows with the square of a large pattern's backlog). The
+other bots' rows are still passed over, once, but in SQLite, without being
+decoded:
+
+| Follow | To `follow_live`, s | Rows passed over per event | Daemon CPU, s | Unrelated read p99 / max, ms |
+|---|---:|---:|---:|---:|
+| one agent by name | 0.02 | 1 | 0.4 | 2.0 / 3.1 |
+| one project | 0.06 | 100 | 0.4 | 1.6 / 4.4 |
+| 100 projects | 1.76 | 100 | 4.8 | 10.1 / 261.6 |
+| 100 projects, one kind | 1.06 | 100 | 3.7 | 2.1 / 210.4 |
+
+Every follower, in every row, received exactly the store's events for its
+selector after cursor 0, in order, none missing and none twice, across the
+hand-off from replay to live. The single slowest unrelated read waits for
+a reader behind the replays' pages; the p99 stays near an idle daemon's.
