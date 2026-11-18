@@ -177,9 +177,9 @@ a submission that names none with `workspace_required`. The conversation does no
 filesystem state; the caller is responsible for the workspace matching what the
 history assumes, exactly as with forks.
 
-Every named agent is a peer. Who submitted its work creates no CLI hierarchy,
-ownership, special permissions, or coupled lifetime. The same create, submit,
-resume, fork, inspect, and interrupt operations apply to all agents.
+The same CLI create, submit, resume, fork, inspect, and interrupt operations
+apply to all named bots. A bot can use `close_agent` on a peer it created.
+Closing a bot preserves its history, and a later message reopens it.
 
 `agent run --detach` commits a submission and prints its bot, turn, request ID,
 status, and durable cursor, then exits. Completion is independent of the
@@ -194,9 +194,9 @@ client that starts the daemon under a name of its own does), an absolute `AGENT_
 `AGENT_SOCKET` when a socket is configured, and `AGENT_MODEL`, the running
 turn's effective model, so newly created peers default to its model.
 Continuing an existing peer keeps that peer's stored model unless `--model`
-explicitly overrides it for the turn. The client's built-in instructions use
-`"$AGENT_BIN" run --detach --new --bot NAME -- TASK` to submit peer work and the
-`wait` tool to collect it. `AGENT_SHELL_CONTEXT=1` tells the CLI to reject
+explicitly overrides it for the turn. Bots can start a peer with `spawn_agent`, submit work to one with
+`send_message`, and collect the result with `wait`. Shell callers can submit
+peer work with `"$AGENT_BIN" run --detach --new --bot NAME -- TASK`. `AGENT_SHELL_CONTEXT=1` tells the CLI to reject
 blocking `run` and `follow` inside a shell tool: a blocked client would hold a
 process-budget unit while waiting, which is exactly what `wait` avoids. This is
 an execution-context guard, not a permission or agent-identity boundary. Arbitrary
@@ -204,13 +204,13 @@ shell synchronization can still block; this does not sandbox external commands.
 
 ## Deferred tool results
 
-A tool call may finish later than the model call that made it. Two tools
-produce handles, and one consumes them:
+A tool call may finish later than the model call that made it. The following operations produce or consume handles:
 
 - `shell` with `background: true` starts the command and immediately returns
   `proc:N`. The command holds one unit of the process budget while it runs;
   its bounded output and artifacts are recorded when it exits.
-- `agent run --detach` prints the message's handle, `BOT/N`, from the
+- `spawn_agent` and `send_message` return a message handle.
+  `agent run --detach` prints the message's handle, `BOT/N`, from the
   `submit` response.
 - `wait` takes up to 64 handles and an optional `timeout_ms`. It parks the turn:
   the turn's task ends, the store records `waiting` with the handles, deadline,
@@ -642,7 +642,7 @@ when it sets either.
 | `approval_hold_ms` (`--approval-hold`) | Milliseconds a gated call waits live for its verdict before its turn parks (see [tool approval](#tool-approval)), and a terminal read waits live for its output before its turn parks. 0 parks at once; at most 3,600,000. | 2,000 |
 | `max_output_tokens` (`--max-output-tokens`) | Generated tokens per model call, including reasoning, summaries included. Anthropic calls use the model's full output limit (read inside Bedrock ids) unless this is set; set, it is sent as `max_tokens`, at least 2,048 so a legacy thinking budget of 1,024 or more fits beside the answer. Bedrock holds input plus this bound against quota from a call's start, on both endpoints (the model's maximum when it is unset), so a bound near real output buys throughput there. | none |
 | `cache_ttl` (`--cache-ttl`) | Anthropic prompt-cache lifetime, `5m` or `1h`, on every cache marker of a request: the instructions', the request's own, and the pinned compaction summary's and note's, since the API refuses a longer lifetime after a shorter one. `1h` bills each write at twice the input rate instead of 1.25 times. Responses providers are unaffected. Bedrock takes `1h` for Claude 4.5 and later and may refuse it for older Claude (its prompt-caching guide, read 2026-10-28), so calls to older Claude there keep five minutes whatever this says, also after `configure` switches a bot to one. A bot whose summarizer or fallback is such a model keeps five minutes on every call, since those calls carry the same pinned blocks. `inspect` reports a lifetime never set as `null`, so a client's own default can tell it from `5m` someone chose. | unset (`5m`) |
-| `speed` (`--speed`) | The tier the bot's own model's calls are served at: `standard`, `fast` or `ultrafast`, each faster one at a higher price per token. A call sends it only to a model that serves it, and runs at standard on any other, as Codex sends a service tier only where its model catalog lists it; the setting is kept as asked, so a bot moved to a model that serves it gets it back. Which model serves which tier is the daemon's list of exact model ids (never read from a name), or the person's `serve --speeds`, announced in `ready` (see [providers](#providers)). The Claude API serves `fast`, its fast mode (sent as `speed` with the `fast-mode-2026-02-01` beta) on Fable 5.2, Mythos 5.2 and Opus 5.5, and on Opus 5 and Opus 4.8 in research preview: twice the price or more, its own rate limit, so its own pool, which learns `anthropic-fast-input-tokens-*` and `anthropic-fast-output-tokens-*`; Bedrock serves Claude at standard only (Claude's fast-mode guide, read 2026-11-10). Each list claims only what its endpoint, region and sign-in are documented to serve. OpenAI's API on a key serves `fast` (sent as `service_tier: priority`) on the models Codex's bundled catalog gives priority, and `ultrafast` on GPT-6.1 Sol and GPT-6 Astra; the ChatGPT sign-in serves what Codex's bundled catalog lists for it, `fast` on those models and no `ultrafast`. Bedrock serves those two `ultrafast` alone, through their `us.` and `global.` profiles in any region, and under their bare `openai.` ids on Mantle in us-east-1 only (Codex's Bedrock catalogs, and Bedrock's model cards). Each call's `usage` event says the tier that served it. A call the provider refuses for its tier (a 400 that names the field or the value sent) fails as `provider_speed_refused`, its detail and facts naming the provider, model, region (Bedrock's, else null) and speed; it is never retried at standard nor run there in its place. Switching it misses the prompt cache once. Calls on another model (a `compaction_model`, a fallback) go at standard. `inspect` reports the setting, `standard` when unset. | `standard` |
+| `speed` (`--speed`) | The tier the bot's own model's calls are served at: `standard`, `fast` or `ultrafast`, each faster one at a higher price per token. A call sends it only to a model that serves it, and runs at standard on any other, as Codex sends a service tier only where its model catalog lists it; the setting is kept as asked, so a bot moved to a model that serves it gets it back. Which model serves which tier is the daemon's list of exact model ids (never read from a name), or the person's `serve --speeds`, announced in `ready` (see [providers](#providers-and-models)). The Claude API serves `fast`, its fast mode (sent as `speed` with the `fast-mode-2026-02-01` beta) on Fable 5.2, Mythos 5.2 and Opus 5.5, and on Opus 5 and Opus 4.8 in research preview: twice the price or more, its own rate limit, so its own pool, which learns `anthropic-fast-input-tokens-*` and `anthropic-fast-output-tokens-*`; Bedrock serves Claude at standard only (Claude's fast-mode guide, read 2026-11-10). Each list claims only what its endpoint, region and sign-in are documented to serve. OpenAI's API on a key serves `fast` (sent as `service_tier: priority`) on the models Codex's bundled catalog gives priority, and `ultrafast` on GPT-6.1 Sol and GPT-6 Astra; the ChatGPT sign-in serves what Codex's bundled catalog lists for it, `fast` on those models and no `ultrafast`. Bedrock serves those two `ultrafast` alone, through their `us.` and `global.` profiles in any region, and under their bare `openai.` ids on Mantle in us-east-1 only (Codex's Bedrock catalogs, and Bedrock's model cards). Each call's `usage` event says the tier that served it. A call the provider refuses for its tier (a 400 that names the field or the value sent) fails as `provider_speed_refused`, its detail and facts naming the provider, model, region (Bedrock's, else null) and speed; it is never retried at standard nor run there in its place. Switching it misses the prompt cache once. Calls on another model (a `compaction_model`, a fallback) go at standard. `inspect` reports the setting, `standard` when unset. | `standard` |
 | `sandbox` (`--sandbox`) | How the bot's commands, writes and edits are confined, by Codex's names: `read-only`, `workspace-write` or `danger-full-access` (see [sandbox](#sandbox)). | none |
 | `writable` (`--writable`, repeatable) | Absolute folders a `workspace-write` bot may write besides its own; each must exist and is stored by its real path. At most 64, 32 KiB as JSON. | none |
 | `network` (`--network`) | A `workspace-write` bot's commands may use the network. Off, or in `read-only`, the bot is neither offered nor runs `web_fetch` or `web_search` (see [sandbox](#sandbox)). | off |
@@ -1607,7 +1607,10 @@ does not, and each is one op:
 Protocol version 3 changes `bots` to return `{bots, next_after}`. It pages by
 name, with a default limit of 64, maximum 256, and a 512 KiB encoded metadata
 budget. Pass `next_after` as the next request's `after` until it is null. Pages
-omit instructions; `inspect` returns the full individual bot record. With `bot_id`,
+omit instructions; `inspect` returns the full individual bot record. A bot's
+instructions and compaction instructions are stored apart from its row, in
+`bot_instructions` by bot id, so a page reads none of them and a write to the
+row never rewrites them; schema 107 moves them there. With `bot_id`,
 a bot that no longer holds that identity is `bot_not_found`, as on `submit`. Concurrent
 creations before an already-consumed cursor require restarting the listing.
 `agent ls` reads pages incrementally while preserving its JSON-array output.
@@ -3108,7 +3111,8 @@ see, and ends a command that makes system calls of another architecture.
 A sandboxed bot's commands reach the daemon through the bot's own socket,
 never the daemon's: so `agent` and the clients built on it work in its shell,
 as that bot and only as far as a sandboxed bot may go. The daemon opens the
-socket, `SOCKET.d/BOT_ID` beside its own, when one of the bot's turns
+socket, normally `SOCKET.d/BOT_ID` beside its own, or in a short private
+directory when the address would be too long, when one of the bot's turns
 needs it, and keeps it listening while any of the bot's live turns or
 running commands (foreground, background, detached or a terminal) holds
 it, as systemd's socket activation keeps a unit's socket. Thirty seconds

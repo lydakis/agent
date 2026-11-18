@@ -22,7 +22,6 @@ pub fn welcome(
 ) -> (Vec<Line<'static>>, Option<usize>) {
     let version = env!("CARGO_PKG_VERSION");
     let accent = Style::new().fg(Color::Cyan);
-    let art = pixels(&PORTRAIT, &PORTRAIT_COLORS);
     let words = vec![
         Line::from(vec![
             "Welcome to Sonny".bold(),
@@ -53,12 +52,13 @@ pub fn welcome(
         ],
     ]
     .concat();
-    let art_width = art.first().map_or(0, Line::width);
+    let art_width = PORTRAIT[0].len();
     let words_width = words.iter().map(Line::width).max().unwrap_or(0);
     // The portrait is its colors; with NO_COLOR it would be a smudge.
     if width < 2 + art_width + GAP + words_width || crate::look::no_color() {
         return (words, None);
     }
+    let art = pixels(&PORTRAIT, &PORTRAIT_COLORS);
     // The words beside the picture, centred on it.
     let top = art.len().saturating_sub(words.len()) / 2;
     let mut words = words.into_iter();
@@ -480,9 +480,12 @@ mod tests {
             }
         }
         let (lines, eyes) = welcome("~/x", "m", true, 200);
-        let eyes = eyes.unwrap();
-        let line = lines[eyes].to_string();
-        assert_eq!(line.chars().nth(2 + EYE_COLUMNS[0] as usize), Some('▀'));
+        if crate::look::no_color() {
+            assert_eq!(eyes, None);
+        } else {
+            let line = lines[eyes.unwrap()].to_string();
+            assert_eq!(line.chars().nth(2 + EYE_COLUMNS[0] as usize), Some('▀'));
+        }
         assert_eq!(welcome("~/x", "m", true, 20).1, None);
         // A task's window says what a task is, not what a lead is.
         let (task, _) = welcome("~/x", "m", false, 20);

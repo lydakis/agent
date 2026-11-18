@@ -4,10 +4,26 @@
 
 use rusqlite::Connection;
 
+macro_rules! instructions_in_row {
+    () => {
+        "ALTER TABLE bots ADD COLUMN instructions TEXT NOT NULL DEFAULT '';
+        ALTER TABLE bots ADD COLUMN compaction_instructions TEXT;
+        UPDATE bots SET (instructions,compaction_instructions)=
+            (SELECT instructions,compaction_instructions FROM bot_instructions i WHERE i.id=bots.id);
+        DROP TABLE bot_instructions;"
+    };
+}
+/// Puts each bot's instructions and compaction instructions back in its
+/// row, as every store before schema 107 kept them.
+pub const INSTRUCTIONS_IN_ROW: &str = instructions_in_row!();
+
 /// Puts a store back in schema 90's shape, where a message and the turn it
-/// opened were one `turns` row and each bot kept its own declared tools: the shape every store before 91 had, so an
+/// opened were one `turns` row and each bot kept its own declared tools and
+/// its instructions in its row: the shape every store before 91 had, so an
 /// older store built from today's is one the migrations really met.
-pub const UNSPLIT: &str = "
+pub const UNSPLIT: &str = concat!(
+    instructions_in_row!(),
+    "
     PRAGMA foreign_keys=OFF;
     DROP INDEX bots_declared;
     UPDATE bots SET creation=json_set(creation,'$.request.declare',json(COALESCE(
@@ -100,15 +116,24 @@ pub const UNSPLIT: &str = "
     DROP INDEX events_in_line;
     ALTER TABLE events DROP COLUMN message;
     ALTER TABLE nodes DROP COLUMN message;
-    PRAGMA user_version=90;";
+    PRAGMA user_version=90;"
+);
 /// An older store's changes, made to a store first put back in schema 90's
 /// shape.
 pub trait Older {
     fn older(&self, sql: &str) -> rusqlite::Result<()>;
+    /// An older store's changes, made to a store first put back in the
+    /// shape of the schemas from 90 to 106, where each bot's row held its
+    /// instructions.
+    fn before_107(&self, sql: &str) -> rusqlite::Result<()>;
 }
 impl Older for Connection {
     fn older(&self, sql: &str) -> rusqlite::Result<()> {
         self.execute_batch(UNSPLIT)?;
+        self.execute_batch(sql)
+    }
+    fn before_107(&self, sql: &str) -> rusqlite::Result<()> {
+        self.execute_batch(INSTRUCTIONS_IN_ROW)?;
         self.execute_batch(sql)
     }
 }

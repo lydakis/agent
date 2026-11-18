@@ -1167,9 +1167,15 @@ async fn a_sandboxed_command_reaches_only_the_sockets_it_names() {
     if !sandboxes() {
         return;
     }
-    let base = std::fs::canonicalize(env!("CARGO_TARGET_TMPDIR"))
+    // sockaddr_un has a fixed path length independent of the checkout.
+    use std::os::unix::fs::DirBuilderExt;
+    let base = std::fs::canonicalize("/tmp")
         .unwrap()
         .join(format!("agent-sockets-{}", std::process::id()));
+    std::fs::DirBuilder::new()
+        .mode(0o700)
+        .create(&base)
+        .unwrap();
     let (workspace, outside) = (base.join("ws"), base.join("out"));
     std::fs::create_dir_all(workspace.join(".local")).unwrap();
     std::fs::create_dir_all(outside.join("named")).unwrap();

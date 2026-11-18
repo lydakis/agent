@@ -852,8 +852,8 @@ pub const MARGIN_NOTES: u64 = 6;
 pub const TASK_WORKTREES: u64 = 15;
 
 /// The most rows a note draws unless `margin_note_lines` says otherwise:
-/// state to glance at beside the conversation, so a whole margin fits in
-/// one look; anything longer goes in the reply or a file it names.
+/// state to glance at beside the conversation; anything longer goes in
+/// the reply or a file it names.
 pub const MARGIN_NOTE_LINES: u64 = 40;
 
 /// What ends every lookout note unless `lookout_trailer` says otherwise:

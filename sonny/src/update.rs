@@ -259,12 +259,11 @@ fn brew(prefix: &Path) -> Result<Option<PathBuf>, String> {
     // A listing brew could not give is no proof of being current: the
     // upgrade itself then says what is behind.
     let listed: Option<serde_json::Value> = serde_json::from_slice(&outdated.stdout).ok();
-    if let Some(listed) = &listed {
-        let behind: Vec<&serde_json::Value> = (listed["formulae"].as_array().into_iter())
-            .flatten()
-            .filter(|formula| formula["current_version"].is_string())
-            .collect();
-        if behind.is_empty() {
+    if let Some(behind) = listed
+        .as_ref()
+        .and_then(|value| value["formulae"].as_array())
+    {
+        if outdated.status.success() && behind.is_empty() {
             return Ok(None);
         }
         let sonny = behind.iter().find(|formula| formula["name"] == "sonny");
@@ -698,6 +697,32 @@ pub fn installed_since() -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stable_upgrade_requires_a_successful_empty_listing_to_report_current() {
+        use std::os::unix::fs::PermissionsExt;
+        let prefix = std::env::temp_dir().join(format!("sonny-brew-list-{}", std::process::id()));
+        let bin = prefix.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let brew_path = bin.join("brew");
+        for (code, listing, current) in [
+            (0, r#"{"formulae":[]}"#, true),
+            (1, r#"{"formulae":[]}"#, false),
+            (0, "{}", false),
+            (1, r#"{"formulae":[{"name":"agent"}]}"#, false),
+        ] {
+            std::fs::write(&brew_path, format!(
+                "#!/bin/sh\ncase \"$1\" in\nupdate|upgrade) exit 0;;\noutdated) echo '{listing}'; exit {code};;\nesac\nexit 2\n"
+            )).unwrap();
+            std::fs::set_permissions(&brew_path, std::fs::Permissions::from_mode(0o755)).unwrap();
+            assert_eq!(
+                brew(&prefix).unwrap().is_none(),
+                current,
+                "{code} {listing}"
+            );
+        }
+        std::fs::remove_dir_all(prefix).unwrap();
+    }
 
     #[test]
     fn how_sonny_was_installed_is_told_by_where_it_is() {

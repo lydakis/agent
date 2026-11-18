@@ -14,8 +14,8 @@ FELT_LOG/<pid>.log; this script splits the lines by phase and process.
 
 Run from a checkout of the version to measure, after
 `cargo build --release --workspace --bins` and
-`clang -O2 -dynamiclib -o count.dylib count.c`:
-    python3 felt.py --agent target/release/agent --sonny target/release/sonny \
+`clang -O2 -dynamiclib -o count.dylib bench/felt/count.c`:
+    python3 bench/felt/felt.py --agent .local/target/release/agent --sonny .local/target/release/sonny \
         --dylib count.dylib --out /tmp/felt-090 --seconds 60
 """
 import argparse
@@ -24,7 +24,6 @@ import json
 import os
 import pty
 import select
-import shutil
 import signal
 import struct
 import subprocess
@@ -33,6 +32,7 @@ import termios
 import fcntl
 import threading
 import time
+from contextlib import ExitStack
 from pathlib import Path
 
 
@@ -163,8 +163,7 @@ def main():
         setattr(args, name, str(Path(getattr(args, name)).resolve()))
 
     out = Path(args.out).resolve()
-    if out.exists():
-        shutil.rmtree(out)
+    out.mkdir(parents=True)
     logs, home, ws = out / 'logs', out / 'home', out / 'ws'
     for d in (logs, home / '.agent', ws):
         d.mkdir(parents=True)
@@ -174,25 +173,28 @@ def main():
     sock = Path(f'/tmp/felt-{os.getpid()}.sock')
 
     port_file = out / 'port'
-    model = subprocess.Popen([sys.executable, '-m', 'bench.lookout_scale', '--model', str(port_file),
-                              '--judge-ms', '50'], cwd=args.repo, start_new_session=True)
-    while not port_file.exists() or not port_file.read_text():
-        time.sleep(.05)
-    url = f'http://127.0.0.1:{port_file.read_text()}/v1'
+    with ExitStack() as resources:
+        model = resources.enter_context(subprocess.Popen(
+            [sys.executable, '-m', 'bench.lookout_scale', '--model', str(port_file), '--judge-ms', '50'],
+            cwd=args.repo, start_new_session=True))
+        resources.callback(model.terminate)
+        deadline = time.monotonic() + 15
+        while not port_file.exists() or not port_file.read_text():
+            if model.poll() is not None or time.monotonic() >= deadline:
+                raise RuntimeError('synthetic model did not publish its port')
+            time.sleep(.05)
+        url = f'http://127.0.0.1:{port_file.read_text()}/v1'
 
-    env = {'PATH': os.environ['PATH'], 'HOME': str(home), 'TERM': 'xterm-256color',
-           'LANG': 'en_US.UTF-8', 'FELT_LOG': str(logs),
-           ('DYLD_INSERT_LIBRARIES' if sys.platform == 'darwin' else 'LD_PRELOAD'): str(Path(args.dylib).resolve())}
-    daemon = subprocess.Popen([args.agent, 'serve', '--store', str(store), '--provider',
-                               f'openai=responses,{url}', '--socket', str(sock)],
-                              stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-                              stderr=open(out / 'daemon.err', 'w'), env=env, start_new_session=True)
-    try:
+        env = {'PATH': os.environ['PATH'], 'HOME': str(home), 'TERM': 'xterm-256color',
+               'LANG': 'en_US.UTF-8', 'FELT_LOG': str(logs),
+               ('DYLD_INSERT_LIBRARIES' if sys.platform == 'darwin' else 'LD_PRELOAD'): args.dylib}
+        log = resources.enter_context((out / 'daemon.err').open('w'))
+        resources.callback(let_go_jobs, home)
+        daemon = resources.enter_context(subprocess.Popen(
+            [args.agent, 'serve', '--store', str(store), '--provider', f'openai=responses,{url}', '--socket', str(sock)],
+            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=log, env=env, start_new_session=True))
+        resources.callback(daemon.terminate)
         run(args, out, logs, home, ws, store, sock, env)
-    finally:
-        for proc in (daemon, model):
-            proc.terminate()
-        let_go_jobs(home)
     report(out)
 
 
