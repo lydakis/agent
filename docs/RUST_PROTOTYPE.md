@@ -3895,7 +3895,10 @@ keeping the shorter expiry. A bot carries at most 8 gates: a `create` or
   its request `process` (an indexed column), and answers the call with
   `{"handle":"proc:N","background":true,"steered":true,"waits_for":"approval"}`,
   so the round goes on and the turn reads the message. `call_lifted`
-  `{call_id, handle, waits_for}` says so. Nothing is cancelled: the request
+  `{call_id, handle, waits_for}` says so. A call waiting on its verdict
+  also carries `holder`, beside `waits_for` in both, as its turn's waiting
+  status names it: `reviewer` while a reviewer serves its open gates,
+  else `person`. Nothing is cancelled: the request
   stays listed (with `handle`, as do the steps its client asks for), served
   and answerable past its turn's end, and a restart keeps it. Its verdict
   now goes to the command. A deny or a

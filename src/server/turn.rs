@@ -3036,7 +3036,7 @@ impl Turn {
                         // or its time ran out meanwhile.
                         CallAnswer::Pending { .. }
                             if self.lift.is_armed()
-                                && self.lift_call(&waiting.call_id, None).await? =>
+                                && self.lift_call(&waiting.call_id, None, Vec::new()).await? =>
                         {
                             None
                         }
@@ -5488,7 +5488,12 @@ impl Turn {
             // it lifts a command: the turn takes the message, and the call
             // waits on for its verdict.
             if self.lift.is_armed() {
-                match self.lift_call(&call.call_id, Some(call)).await? {
+                let served = self.hub.serving(
+                    (record.gates.iter())
+                        .filter(|gate| gate.tools.contains(&call.name))
+                        .map(|gate| gate.tag.as_str()),
+                );
+                match self.lift_call(&call.call_id, Some(call), served).await? {
                     true => return Ok(Approval::Lifted),
                     false => continue,
                 }
@@ -5627,12 +5632,19 @@ impl Turn {
     /// Lift `call_id`, waiting on its verdict or its client's answer, to
     /// the background for a message that joins the turn. False when it is
     /// decided or answered by now: the next check takes it.
-    async fn lift_call(&self, call_id: &str, call: Option<&ToolCall>) -> Result<bool> {
+    /// `served`: the tags of its gates a reviewer serves, which say who
+    /// holds a call waiting on its verdict.
+    async fn lift_call(
+        &self,
+        call_id: &str,
+        call: Option<&ToolCall>,
+        served: Vec<String>,
+    ) -> Result<bool> {
         let (turn, id, call) = (self.turn, call_id.to_owned(), call.cloned());
         let lifted = self
             .store
             .op("lift", move |db| {
-                db.lift(turn, &id, call.as_ref(), None, now_ms())
+                db.lift(turn, &id, call.as_ref(), None, &served, now_ms())
             })
             .await?;
         // Its time goes on the schedule now: the turn's own no longer
@@ -5688,7 +5700,7 @@ impl Turn {
             // answer comes later, as the command's result.
             if liftable && self.lift.is_armed() && (gated || tokio::time::Instant::now() >= graced)
             {
-                match self.lift_call(call_id, None).await? {
+                match self.lift_call(call_id, None, Vec::new()).await? {
                     true => return Ok(ControlFlow::Continue(None)),
                     false => continue,
                 }

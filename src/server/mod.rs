@@ -6474,6 +6474,11 @@ impl Service {
                 }
                 let mut created = serde_json::to_value(created)?;
                 created["duplicate"] = json!(event.is_none());
+                // Without its instructions, as Codex's thread/fork answers
+                // with a thread that carries none: `inspect` shows them.
+                if let Value::Object(fields) = &mut created {
+                    fields.remove("instructions");
+                }
                 Ok(created)
             }
             Command::Events { bot, after, limit } => {
