@@ -90,6 +90,7 @@ mod skills;
 mod sky;
 mod sound;
 mod stamp;
+mod standing;
 mod started;
 mod state;
 mod status;
@@ -558,6 +559,37 @@ async fn read_status(
     asks_seen: &mut HashMap<String, (i64, Seen)>,
     view: StatusView<'_>,
 ) -> Result<StatusRead, String> {
+    let listed = standing::list(client, &scope.glob)
+        .await
+        .map_err(|_| "could not list the agents".to_owned())?
+        .0;
+    read_status_of(
+        client,
+        options_store,
+        scope,
+        &listed,
+        turns,
+        status_read,
+        asks_seen,
+        view,
+    )
+    .await
+}
+
+/// [`read_status`] of the agents `listed`, as a `bots` listing of the
+/// scope's pattern gives them: a window keeps its listing current from the
+/// daemon's events and reads only rows that changed.
+#[allow(clippy::too_many_arguments)]
+async fn read_status_of(
+    client: &Client,
+    options_store: &std::path::Path,
+    scope: background::Scope,
+    listed: &[Value],
+    turns: &HashMap<String, Value>,
+    status_read: &mut HashMap<String, (Value, Latest)>,
+    asks_seen: &mut HashMap<String, (i64, Seen)>,
+    view: StatusView<'_>,
+) -> Result<StatusRead, String> {
     let background::Scope {
         project,
         lead,
@@ -569,24 +601,6 @@ async fn read_status(
         }),
         false => Vec::new(),
     };
-    // Every page of the listing: past the first 256, agents are the
-    // project's too.
-    let mut listed = Vec::new();
-    let mut after: Option<String> = None;
-    loop {
-        let mut ask = json!({"name": pattern, "limit": 256});
-        if let Some(after) = &after {
-            ask["after"] = json!(after);
-        }
-        let Ok(page) = client.request("bots", ask).await else {
-            return Err("could not list the agents".into());
-        };
-        listed.extend(page["bots"].as_array().cloned().unwrap_or_default());
-        match page["next_after"].as_str() {
-            Some(next) if after.as_deref() != Some(next) => after = Some(next.to_owned()),
-            _ => break,
-        }
-    }
     // What waits on the person, read as every surface reads it: the
     // calls listed for them now, and each agent's open question below.
     let mut needs = needs::Needs::default();
@@ -612,11 +626,11 @@ async fn read_status(
     let mut profiles: HashMap<String, Option<String>> = HashMap::new();
     // With other leads in the folder, their tasks are theirs: each
     // lead shows as a row of its own.
-    let mine = owned(&listed, &project, &lead);
+    let mine = owned(listed, &project, &lead);
     // Side chats are not the project's agents.
     let mut kept = HashMap::new();
     let (mut fresh, mut whole) = (false, true);
-    for bot in &listed {
+    for bot in listed {
         let Some(name) = (bot["name"].as_str()).filter(|_| bot["expire_ms"].is_null()) else {
             continue;
         };
@@ -4042,55 +4056,75 @@ struct Counted {
     read: Option<((status::Counts, std::collections::HashSet<String>), Reads)>,
     /// The tasks as template notes' `tasks()` gives them, when read.
     tasks: Option<Vec<Value>>,
+    /// The project's agents as the count left them, the rows that moved
+    /// read again; none when a read failed, so the window takes a fresh
+    /// snapshot.
+    listed: Option<Arc<Vec<Value>>>,
 }
 
-/// A mark of where the agents `pattern` names stand, as the daemon lists
-/// them, and of what waits on the person: what decides each one's group,
-/// and a running one's history, whose newest items can hold a question.
-/// `here` is this window's own open question and calls. A task marked
-/// done beside `store` counts too: a lead elsewhere can mark it without
-/// it moving. None when the daemon could not be asked.
+/// A mark of where the agents `listed` stand, and of what waits on the
+/// person: what decides each one's group, and a running one's history,
+/// whose newest items can hold a question. `here` is this window's own
+/// open question and calls. A task marked done beside `store` counts too:
+/// a lead elsewhere can mark it without it moving. None when the daemon
+/// could not be asked.
 async fn standing(
     client: &Client,
     store: &std::path::Path,
-    pattern: &str,
+    listed: &[Value],
     here: (usize, usize),
 ) -> Option<u64> {
     use std::hash::{Hash, Hasher};
     let mut mark = std::collections::hash_map::DefaultHasher::new();
     here.hash(&mut mark);
-    let mut after: Option<String> = None;
-    loop {
-        let mut ask = json!({"name": pattern, "limit": 256});
-        if let Some(after) = &after {
-            ask["after"] = json!(after);
+    for bot in listed {
+        for key in [
+            "name",
+            "running_turn",
+            "status",
+            "waiting_on",
+            "last",
+            "expire_ms",
+        ] {
+            bot[key].to_string().hash(&mut mark);
         }
-        let page = client.request("bots", ask).await.ok()?;
-        for bot in page["bots"].as_array().into_iter().flatten() {
-            for key in [
-                "name",
-                "running_turn",
-                "status",
-                "waiting_on",
-                "last",
-                "expire_ms",
-            ] {
-                bot[key].to_string().hash(&mut mark);
-            }
-            if !bot["running_turn"].is_null() {
-                bot["head"].to_string().hash(&mut mark);
-            }
-            if let Some(name) = bot["name"].as_str() {
-                resolved::read(store, name).hash(&mut mark);
-            }
+        if !bot["running_turn"].is_null() {
+            bot["head"].to_string().hash(&mut mark);
         }
-        match page["next_after"].as_str() {
-            Some(next) if after.as_deref() != Some(next) => after = Some(next.to_owned()),
-            _ => break,
+        if let Some(name) = bot["name"].as_str() {
+            resolved::read(store, name).hash(&mut mark);
         }
     }
     needs::listing(client, None).await.ok().hash(&mut mark);
     Some(mark.finish())
+}
+
+/// `listed` with the rows of the agents `moved` read again: one gone is
+/// left out, one new is added, in name order as the listing keeps them.
+fn moved_rows(
+    listed: &[Value],
+    moved: &std::collections::BTreeSet<String>,
+    rows: Vec<Value>,
+) -> Vec<Value> {
+    let mut kept: std::collections::BTreeMap<String, Value> = (listed.iter())
+        .filter_map(|bot| Some((bot["name"].as_str()?.to_owned(), bot.clone())))
+        .filter(|(name, _)| !moved.contains(name))
+        .collect();
+    for row in rows {
+        if let Some(name) = row["name"].as_str() {
+            kept.insert(name.to_owned(), row);
+        }
+    }
+    kept.into_values().collect()
+}
+
+/// When the marks of tasks resolved beside `store` last changed: a mark is
+/// written to a file of its own and moved into place, which touches the
+/// folder, so one look says whether any changed.
+fn resolved_changed(store: &std::path::Path) -> Option<std::time::SystemTime> {
+    let mut dir = store.as_os_str().to_owned();
+    dir.push(".resolved");
+    std::fs::metadata(dir).and_then(|m| m.modified()).ok()
 }
 
 enum Warming {
@@ -4625,6 +4659,15 @@ struct App {
     /// What the listing said where each agent stands, when last counted:
     /// the agents are counted again only once it changes.
     counted_mark: Option<u64>,
+    /// What this window holds that the count reads, when last counted:
+    /// its own question and calls, and when the done marks last changed.
+    counted_local: Option<((usize, usize), Option<std::time::SystemTime>)>,
+    /// The follow of this window's project that keeps `listed` current,
+    /// and how it reaches the daemon: a connection of its own.
+    follower: Option<standing::Follower>,
+    follow_connect: standing::Connect,
+    /// The project's agents as last read, kept current by `follower`.
+    listed: Option<Arc<Vec<Value>>>,
     folded: Option<(bool, u64)>,
     refold: bool,
     /// The `plan` calls drawn, by the number each is tagged with, and the
@@ -6278,6 +6321,7 @@ impl App {
             record["provider"].as_str().unwrap_or("?"),
             record["model"].as_str().unwrap_or("?")
         );
+        let follow_connect = standing::connect_to(options.socket.clone());
         Self {
             client,
             bot: bot.to_owned(),
@@ -6457,6 +6501,10 @@ impl App {
             counting: None,
             counted_at: None,
             counted_mark: None,
+            counted_local: None,
+            follower: None,
+            follow_connect,
+            listed: None,
             folded: None,
             refold: false,
             plans: HashMap::new(),
@@ -10263,15 +10311,24 @@ impl App {
     }
 
     /// The project's agents counted as `/status` counts them, for the
-    /// footer: off the screen's thread, at most every few seconds, and
-    /// read whole only once where any agent stands changed (its turn,
-    /// what it waits on, a running one's history) or what waits on the
-    /// person did. While `/status` is open, its own reads count them.
+    /// footer: off the screen's thread, at most every few seconds, and only
+    /// once something moved. A snapshot of the project's agents is kept
+    /// current by the daemon's events (see [`standing`]): an event reads
+    /// again only the rows of the agents it moved, and an idle project is
+    /// read for nothing. A running agent's row is read again each time,
+    /// with the others running, as its history (a question asked partway)
+    /// moves without a change of state; and a task marked done beside the
+    /// store counts too. While `/status` is open, its own reads count them.
     async fn count_agents(&mut self) {
         if let Some(job) = self.counting.take_if(|job| job.is_finished())
             && let Ok(Some(counted)) = job.await
         {
             self.counted_mark = counted.mark;
+            match counted.listed {
+                Some(listed) => self.listed = Some(listed),
+                // A read failed: what moved is unknown, so start over.
+                None => self.follower = None,
+            }
             if let Some(tasks) = counted.tasks {
                 self.tasks_read(tasks);
             }
@@ -10287,26 +10344,85 @@ impl App {
         {
             return;
         }
-        self.counted_at = Some(Instant::now());
-        let (client, woken) = (self.client.clone(), self.woken.clone());
-        let (store, scope, bot) = (self.options.store.clone(), self.scope(), self.bot.clone());
+        let scope = self.scope();
+        if (self.follower.as_ref()).is_none_or(|follower| follower.pattern != scope.glob) {
+            self.listed = None;
+            self.follower = Some(standing::Follower::start(
+                self.follow_connect.clone(),
+                scope.glob.clone(),
+                self.woken.clone(),
+            ));
+        }
+        let changes = self.follower.as_ref().map(|f| f.take()).unwrap_or_default();
         let (asks, approvals) = (self.asks.clone(), self.approvals.clone());
-        let (mut latest, mut seen) = (self.status_read.clone(), self.asks_seen.clone());
-        let (was, turns) = (self.counted_mark, self.turns.clone());
         // This window's own question and calls count for its own row.
         let here = (
             asks.iter().filter(|ask| ask.task.is_none()).count(),
             approvals.len(),
         );
+        let marks = agent_client::socket::canonical_store(&self.options.store)
+            .unwrap_or_else(|_| self.options.store.clone());
+        let local = (here, resolved_changed(&marks));
+        let listed = match changes.snapshot {
+            Some(snapshot) => Arc::new(snapshot),
+            None => match &self.listed {
+                Some(listed) => listed.clone(),
+                // No snapshot yet: nothing to count from.
+                None => return,
+            },
+        };
+        let running = listed.iter().any(|bot| bot["running_turn"].is_i64());
+        let moved = changes.moved;
+        let whole = self
+            .listed
+            .as_ref()
+            .is_none_or(|was| !Arc::ptr_eq(was, &listed));
+        if !whole && moved.is_empty() && !running && self.counted_local == Some(local) {
+            return;
+        }
+        self.listed = Some(listed.clone());
+        self.counted_local = Some(local);
+        self.counted_at = Some(Instant::now());
+        let (client, woken) = (self.client.clone(), self.woken.clone());
+        let (store, bot) = (self.options.store.clone(), self.bot.clone());
+        let (mut latest, mut seen) = (self.status_read.clone(), self.asks_seen.clone());
+        let (was, turns) = (self.counted_mark, self.turns.clone());
         self.counting = Some(tokio::spawn(async move {
-            let marks =
-                agent_client::socket::canonical_store(&store).unwrap_or_else(|_| store.clone());
-            let mark = standing(&client, &marks, &scope.glob, here).await?;
+            let failed = || Counted {
+                mark: None,
+                read: None,
+                tasks: None,
+                listed: None,
+            };
+            let mut listed = (*listed).clone();
+            if !moved.is_empty() {
+                let names: Vec<String> = moved.iter().cloned().collect();
+                let Ok(rows) = standing::rows(&client, &names).await else {
+                    return Some(failed());
+                };
+                listed = moved_rows(&listed, &moved, rows);
+            }
+            if running {
+                let ask = json!({"name": scope.glob, "active": true, "limit": 256});
+                let Ok(page) = client.request("bots", ask).await else {
+                    return Some(failed());
+                };
+                let rows = page["bots"].as_array().cloned().unwrap_or_default();
+                let names = (rows.iter())
+                    .filter_map(|row| Some(row["name"].as_str()?.to_owned()))
+                    .collect();
+                listed = moved_rows(&listed, &names, rows);
+            }
+            let listed = Arc::new(listed);
+            let Some(mark) = standing(&client, &marks, &listed, here).await else {
+                return Some(failed());
+            };
             if was == Some(mark) {
                 return Some(Counted {
                     mark: Some(mark),
                     read: None,
                     tasks: None,
+                    listed: Some(listed),
                 });
             }
             let view = StatusView {
@@ -10318,9 +10434,18 @@ impl App {
                 aside: &|_| false,
                 details: false,
             };
-            let read = read_status(&client, &store, scope, &turns, &mut latest, &mut seen, view)
-                .await
-                .ok()?;
+            let read = read_status_of(
+                &client,
+                &store,
+                scope,
+                &listed,
+                &turns,
+                &mut latest,
+                &mut seen,
+                view,
+            )
+            .await
+            .ok()?;
             woken.notify_one();
             Some(Counted {
                 mark: read.whole.then_some(mark),
@@ -10329,6 +10454,7 @@ impl App {
                     (latest, seen),
                 )),
                 tasks: Some(status::tasks(&read.rows)),
+                listed: Some(listed),
             })
         }));
     }
@@ -22353,30 +22479,43 @@ mod tests {
 
     #[tokio::test]
     async fn the_footer_counts_as_status_does_and_reads_again_only_on_a_change() {
-        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-        let listings = Arc::new(AtomicUsize::new(0));
-        let ended = Arc::new(AtomicBool::new(false));
-        let failing = Arc::new(AtomicBool::new(false));
-        let (listed, over, fails) = (listings.clone(), ended.clone(), failing.clone());
-        let client = daemon_answering(move |asked| match asked["op"].as_str().unwrap_or("") {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let row = |ended: bool| match ended {
+            false => json!({"name": "shop.fix", "bot_id": 2, "head": 1,
+                "running_turn": 4, "status": "running", "created_by": "shop.lead"}),
+            true => json!({"name": "shop.fix", "bot_id": 2, "head": 2,
+                "last": {"turn": 4, "status": "completed"}, "created_by": "shop.lead"}),
+        };
+        let lead = json!({"name": "shop.lead", "bot_id": 1, "head": 1});
+        // A helper of the task folds under it, as on /status.
+        let help = json!({"name": "shop.fix.help", "bot_id": 3, "head": 1, "running_turn": 2,
+            "status": "running", "created_by": "shop.fix"});
+        let (reads, ended, failing) = (
+            Arc::new(std::sync::Mutex::new(Vec::<Value>::new())),
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicBool::new(false)),
+        );
+        let (asked, over, fails) = (reads.clone(), ended.clone(), failing.clone());
+        let (fix, running) = (row, help.clone());
+        let client = daemon_answering(move |ask| match ask["op"].as_str().unwrap_or("") {
             "history_nodes" | "history" if fails.load(Ordering::SeqCst) => {
                 json!({"error": "store_busy"})
             }
             "bots" => {
-                listed.fetch_add(1, Ordering::SeqCst);
-                let fix = match over.load(Ordering::SeqCst) {
-                    false => json!({"name": "shop.fix", "bot_id": 2, "head": 1,
-                        "running_turn": 4, "status": "running", "created_by": "shop.lead"}),
-                    true => json!({"name": "shop.fix", "bot_id": 2, "head": 2,
-                        "last": {"turn": 4, "status": "completed"}, "created_by": "shop.lead"}),
+                asked.lock().unwrap().push(ask.clone());
+                let fix = fix(over.load(Ordering::SeqCst));
+                // The rows asked for by name, or those running.
+                let rows: Vec<Value> = match ask["names"].as_array() {
+                    Some(names) => [fix.clone()]
+                        .into_iter()
+                        .filter(|row| names.contains(&row["name"]))
+                        .collect(),
+                    None => [fix.clone(), running.clone()]
+                        .into_iter()
+                        .filter(|row| row["running_turn"].is_i64())
+                        .collect(),
                 };
-                json!({"bots": [
-                    {"name": "shop.lead", "bot_id": 1, "head": 1},
-                    fix,
-                    // A helper of the task folds under it, as on /status.
-                    {"name": "shop.fix.help", "bot_id": 3, "head": 1, "running_turn": 2,
-                        "status": "running", "created_by": "shop.fix"},
-                ], "next_after": null})
+                json!({"bots": rows, "next_after": null})
             }
             "approvals" => json!({"approvals": []}),
             _ => json!({}),
@@ -22384,18 +22523,40 @@ mod tests {
         .await;
         let mut app = app(client);
         app.bot = "shop.lead".into();
+        // The window's own follow of the project: its snapshot, then events.
+        let snapshot = json!([lead, row(false), help]);
+        app.follow_connect = Arc::new(move || {
+            let snapshot = snapshot.clone();
+            Box::pin(async move {
+                Ok(
+                    daemon_with_events(json!({}), move |ask| match ask["op"].as_str() {
+                        Some("bots") => json!({"bots": snapshot, "cursor": 7, "next_after": null}),
+                        _ => json!({"following": "shop.*"}),
+                    })
+                    .await,
+                )
+            })
+        });
         let dir = std::env::temp_dir().join(unique("sonny-footer-counts"));
         std::fs::create_dir_all(&dir).unwrap();
         app.options.store = dir.join("state.sqlite");
+        // One count: its job run and taken in, and no other started.
         let counted = async |app: &mut App| {
             app.counted_at = None;
             app.count_agents().await;
-            while !app.counting.as_ref().unwrap().is_finished() {
-                tokio::task::yield_now().await;
+            if let Some(job) = &app.counting {
+                while !job.is_finished() {
+                    tokio::task::yield_now().await;
+                }
             }
-            app.counted_at = None;
+            app.counted_at = Some(Instant::now());
             app.count_agents().await;
         };
+        // The follow starts, and its snapshot is what the footer counts.
+        app.count_agents().await;
+        while !app.follower.as_ref().unwrap().snapshot_waits() {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
         counted(&mut app).await;
         let counts = |needs_you, working, idle| status::Counts {
             needs_you,
@@ -22405,21 +22566,28 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(app.counts, Some(counts(0, 1, 1)));
-        // Its mark, then the read itself.
-        assert_eq!(listings.load(Ordering::SeqCst), 2);
-        // Nothing changed: only the mark is read.
+        let taken =
+            |reads: &Arc<std::sync::Mutex<Vec<Value>>>| std::mem::take(&mut *reads.lock().unwrap());
+        // Only the running agents' rows were read again, never the project.
+        let read = taken(&reads);
+        assert!(read.iter().all(|ask| ask["active"] == true), "{read:?}");
+        // Nothing moved: the running rows again, and no more.
         counted(&mut app).await;
-        assert_eq!(listings.load(Ordering::SeqCst), 3);
-        // The task's turn ended: read again, and counted at rest.
+        assert!(taken(&reads).iter().all(|ask| ask["active"] == true));
+        // The task's turn ended: its row is read by name, and counted at rest.
         ended.store(true, Ordering::SeqCst);
+        app.follower.as_ref().unwrap().moved("shop.fix");
         counted(&mut app).await;
-        assert_eq!(listings.load(Ordering::SeqCst), 5);
+        let read = taken(&reads);
+        assert!(
+            read.iter().any(|ask| ask["names"] == json!(["shop.fix"])),
+            "{read:?}"
+        );
         assert_eq!(app.counts, Some(counts(0, 0, 2)));
         // Marked done by a lead elsewhere, the task itself unmoved: read
         // again, and counted done.
         resolved::keep(&dir.join("state.sqlite"), "shop.fix", 4, "call-1").unwrap();
         counted(&mut app).await;
-        assert_eq!(listings.load(Ordering::SeqCst), 7);
         assert_eq!(
             app.counts,
             Some(status::Counts {
@@ -22429,22 +22597,64 @@ mod tests {
             })
         );
         // A history read that failed keeps no mark: the next count reads
-        // again, and once it reads whole, only the mark again.
+        // again, and once it reads whole, keeps it.
         failing.store(true, Ordering::SeqCst);
-        let _ = app.counting.take().unwrap().await;
-        let listed = listings.load(Ordering::SeqCst);
         app.status_read.clear();
         app.asks_seen.clear();
         app.counted_mark = None;
+        app.follower.as_ref().unwrap().moved("shop.fix");
         counted(&mut app).await;
-        assert_eq!(listings.load(Ordering::SeqCst), listed + 2);
         assert_eq!(app.counted_mark, None);
         failing.store(false, Ordering::SeqCst);
+        app.follower.as_ref().unwrap().moved("shop.fix");
         counted(&mut app).await;
-        assert_eq!(listings.load(Ordering::SeqCst), listed + 4);
         assert!(app.counted_mark.is_some());
-        counted(&mut app).await;
-        assert_eq!(listings.load(Ordering::SeqCst), listed + 5);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn an_idle_project_is_read_for_nothing() {
+        let asked = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let seen = asked.clone();
+        let client = daemon_answering(move |_| {
+            seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            json!({"bots": [], "approvals": [], "next_after": null})
+        })
+        .await;
+        let mut app = app(client);
+        app.bot = "shop.lead".into();
+        let snapshot = json!([{"name": "shop.lead", "bot_id": 1, "head": 1},
+            {"name": "shop.fix", "bot_id": 2, "head": 3, "last": {"turn": 4, "status": "completed"}}]);
+        app.follow_connect = Arc::new(move || {
+            let snapshot = snapshot.clone();
+            Box::pin(async move {
+                Ok(
+                    daemon_with_events(json!({}), move |ask| match ask["op"].as_str() {
+                        Some("bots") => json!({"bots": snapshot, "cursor": 7, "next_after": null}),
+                        _ => json!({"following": "shop.*"}),
+                    })
+                    .await,
+                )
+            })
+        });
+        let dir = std::env::temp_dir().join(unique("sonny-footer-idle"));
+        std::fs::create_dir_all(&dir).unwrap();
+        app.options.store = dir.join("state.sqlite");
+        app.count_agents().await;
+        while !app.follower.as_ref().unwrap().snapshot_waits() {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        app.count_agents().await;
+        let _ = app.counting.take().unwrap().await;
+        let first = asked.load(std::sync::atomic::Ordering::SeqCst);
+        // Counted once from the snapshot; then, with nothing running and
+        // nothing moving, never again, however often the window looks.
+        for _ in 0..5 {
+            app.counted_at = None;
+            app.count_agents().await;
+            assert!(app.counting.is_none());
+        }
+        assert_eq!(asked.load(std::sync::atomic::Ordering::SeqCst), first);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

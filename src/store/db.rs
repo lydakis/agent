@@ -4931,7 +4931,16 @@ impl Database {
         active: bool,
         created_by: Option<i64>,
         open: bool,
+        names: Option<&[String]>,
     ) -> Result<Value> {
+        if names.is_some_and(|names| {
+            !(1..=256).contains(&names.len()) || names.iter().any(|n| n.is_empty() || n.len() > 128)
+        }) {
+            return fail_with(
+                "invalid_bot_filter",
+                "names lists 1 to 256 names of up to 128 bytes",
+            );
+        }
         if !(1..=256).contains(&limit) || after.is_some_and(|s| s.len() > 128) {
             return fail_with(
                 "invalid_bot_page",
@@ -4964,10 +4973,18 @@ impl Database {
         // where the prefix does: `after || char(1)` is the least name past
         // `after`, since no name holds a byte below '-'. One bound each
         // way, so the index range is the same whichever the planner reads.
-        let from = if name.is_some() {
-            "name >= max(?1 || char(1), ?5) AND name < ?5 || CAST(x'ff' AS TEXT) AND name GLOB ?3"
-        } else {
-            "name > ?1"
+        // Names listed are read by name, each one a point in the name
+        // index; a pattern given too keeps those it matches.
+        let listed = names.map(|names| json!(names).to_string());
+        let from = match (names.is_some(), name.is_some()) {
+            (true, true) => {
+                "name > ?1 AND name IN (SELECT value FROM json_each(?6)) AND name GLOB ?3"
+            }
+            (true, false) => "name > ?1 AND name IN (SELECT value FROM json_each(?6))",
+            (false, true) => {
+                "name >= max(?1 || char(1), ?5) AND name < ?5 || CAST(x'ff' AS TEXT) AND name GLOB ?3"
+            }
+            (false, false) => "name > ?1",
         };
         let maker = if created_by.is_some() {
             " AND created_by_id = ?4"
@@ -4975,12 +4992,15 @@ impl Database {
             ""
         };
         let mut values: Vec<&dyn rusqlite::ToSql> = vec![&after, &limit_rows];
-        if name.is_some() || created_by.is_some() {
+        if name.is_some() || created_by.is_some() || names.is_some() {
             values.push(&name);
             values.push(&created_by);
         }
-        if name.is_some() {
+        if name.is_some() || names.is_some() {
             values.push(&prefix);
+        }
+        if names.is_some() {
+            values.push(&listed);
         }
         let running = if active {
             " AND running_turn IS NOT NULL"

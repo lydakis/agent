@@ -1641,6 +1641,15 @@ row never rewrites them; schema 107 moves them there. With `bot_id`,
 a bot that no longer holds that identity is `bot_not_found`, as on `submit`. Concurrent
 creations before an already-consumed cursor require restarting the listing.
 `agent ls` reads pages incrementally while preserving its JSON-array output.
+Protocol 88 lets `bots` take `names`, 1 to 256 names of up to 128 bytes,
+listing only those (with `name`, those the pattern matches too), in name
+order and paged as before; a name not there is not listed. It is the read
+after a watch: Sonny's window lists its project once, with the page's
+`cursor`, then follows the project's pattern from that cursor for the
+events that move where an agent stands, and reads again by name only the
+agents those events named, as a Kubernetes informer lists once and then
+watches from the list's resourceVersion. A window that falls behind
+(`follow_lagged`, `pruned`) or loses the daemon lists again.
 Protocol version 14 adds `configure`, which changes what a bot's client
 chose for it when it was made: its `instructions` (up to 64 KiB, as on
 `create`), and its `model` with an optional `effort` (absent is the model's
