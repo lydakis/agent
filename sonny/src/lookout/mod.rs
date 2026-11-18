@@ -358,6 +358,28 @@ async fn find_call(
     Some((item["name"].as_str().map(str::to_owned), arguments))
 }
 
+/// A call waiting for approval, as the approvals listing has it: its tool
+/// and its arguments.
+async fn waiting_call(
+    client: &Client,
+    bot: &str,
+    turn: i64,
+    call: &str,
+) -> Option<(Option<String>, String)> {
+    let page = client
+        .request("approvals", json!({"bot": bot, "limit": 256}))
+        .await
+        .ok()?;
+    let listed = (page["approvals"].as_array().into_iter().flatten())
+        .find(|listed| listed["call_id"] == call && listed["turn"] == turn)?;
+    let name = listed["name"].as_str().map(str::to_owned);
+    let arguments = match &listed["arguments"] {
+        Value::Null => String::new(),
+        arguments => arguments.to_string(),
+    };
+    Some((name, arguments))
+}
+
 /// `event`, a `margin` call's start whose arguments were cut before the
 /// note's id, or an `ask` call's start whose arguments were cut, with the
 /// call's arguments whole, as the bot's history keeps them; any other event
@@ -436,8 +458,18 @@ async fn read(client: &Client, pending: &activity::Pending) -> activity::Read {
             };
             Read::Reply { text, asker }
         }
-        Kind::Call { call, name, node } => {
-            let found = find_call(client, task, call, *node).await;
+        Kind::Call {
+            call, name, node, ..
+        } => {
+            // One the reviewer handed over names no node: it is read from
+            // the calls waiting, which hold a script's steps too.
+            let found = match node {
+                Some(_) => find_call(client, task, call, *node).await,
+                None => match waiting_call(client, task, turn, call).await {
+                    Some(found) => Some(found),
+                    None => find_call(client, task, call, None).await,
+                },
+            };
             let name = (found.as_ref().and_then(|(name, _)| name.clone())).or_else(|| name.clone());
             let arguments = found.as_ref().map(|(_, arguments)| arguments.as_str());
             let text = activity::call_text(name.as_deref(), arguments);
