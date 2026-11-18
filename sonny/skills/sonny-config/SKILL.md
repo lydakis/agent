@@ -124,9 +124,10 @@ key `profile`:
   profile kept for the link, which its agents share in one Chrome, a tab
   each: a sign-in or an extension's sync there stays. Each time that
   Chrome starts, the person's native messaging hosts are linked in and
-  their Cookies copied over the kept ones when theirs are newer, so a
-  sign-in in their own Chrome reaches it once it starts again (it closes
-  30 minutes after its agents' last call). Sonny starts that
+  their Cookies copied over the kept ones, so a sign-in in their own
+  Chrome reaches it once it starts again: it closes when the last agent
+  with a tab in it runs `close`, or 30 minutes after its agents' last
+  call. Sonny starts that
   Chrome with the system's keychain (the person's Chrome, or
   `executablePath` in agent-browser's file), headless unless the file says
   `"headed": true`. To start it again
