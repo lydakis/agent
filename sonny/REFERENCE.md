@@ -142,6 +142,11 @@ agent's beside the store (`STORE.titles/NAME`); the daemon keeps none.
 Every row that lists an agent leads with its title: `/status`, `/switch`
 and the tasks a lead started.
 
+![/status at 150, 60 and 44 columns: each row its title, then its name; short of room the time goes, then the title is cut at a word](../docs/sonny/titles-status.png)
+![/switch at 150, 60 and 44 columns, each row led by its title](../docs/sonny/titles-switch.png)
+![The roster of three tasks started together, at 150, 60 and 44 columns](../docs/sonny/titles-roster.png)
+![The started row of one task, with its title where there is room](../docs/sonny/titles-started.png)
+
 ### Focus with zen
 
 `/zen FOCUS` asks the agent to talk with you about

@@ -212,7 +212,7 @@ class ServedToolTests(ModelFixture):
         # Its name is taken now, so a second start is refused, and nothing
         # is left behind.
         refused = json.loads(self.call('calc.lead', 'start_task',
-                                       {'name': 'fix', 'brief': 'Again.', 'reason': 'Another fix.'}))
+                                       {'title': 'Fix the sums again', 'name': 'fix', 'brief': 'Again.', 'reason': 'Another fix.'}))
         self.assertEqual(refused['error'], 'task_not_started')
         self.assertTrue(worktree.is_dir())
         # In `full`, with no gate to ask, a task runs unconfined, as its

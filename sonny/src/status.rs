@@ -451,13 +451,18 @@ pub fn card(
     };
     let trackers = details != Details::Quiet;
     // The titles share a column, so the names after them line up: as wide
-    // as the widest, a helper's counted from its indent.
-    let titles = (listed.iter().map(|row| (*row, 0)))
+    // as the widest, a helper's counted from its indent, and narrow enough
+    // that the widest name still fits after it.
+    let titled: Vec<(&Row, usize)> = (listed.iter().map(|row| (*row, 0)))
         .chain((under.values().flatten()).map(|row| (*row, 2)))
         .filter(|(row, _)| !row.title.is_empty() && row.run.is_none())
+        .collect();
+    let names = (titled.iter()).map(|(row, _)| row.name.width()).max();
+    let titles = (titled.iter())
         .map(|(row, indent)| indent + row.title.width())
         .max()
-        .unwrap_or(0);
+        .unwrap_or(0)
+        .min(width.saturating_sub(5 + names.unwrap_or(0)));
     for group in GROUPS {
         let in_group: Vec<&&Row> = listed.iter().filter(|r| r.group == group).collect();
         if in_group.is_empty() {
@@ -867,25 +872,18 @@ fn row_lines(
             let fixed = spans.iter().map(|s| s.content.width()).sum::<usize>()
                 + name
                 + state.as_ref().map_or(0, |s| s.content.width());
-            if !row.title.is_empty() {
+            let column = titles
+                .saturating_sub(indent.width())
+                .min(width.saturating_sub(fixed + 2));
+            if !row.title.is_empty() && column > 1 {
+                // The time goes first, then the title is cut at a word.
                 let timed = time.as_ref().map_or(0, |t| t.content.width());
-                let room = width.saturating_sub(fixed + 2);
-                let column = titles.saturating_sub(indent.width());
-                let title = match row.title.width() + timed <= room {
-                    true => {
-                        let wide = row.title.width();
-                        let pad = column.min(room - timed).max(wide) - wide;
-                        format!("{}{}", row.title, " ".repeat(pad))
-                    }
-                    // The time goes first, then the title is cut at a word.
-                    false => {
-                        time = None;
-                        crate::title::cut(&row.title, room)
-                    }
-                };
-                if !title.is_empty() {
-                    spans.push(Span::raw(format!("{title}  ")));
+                if fixed + 2 + column + timed > width {
+                    time = None;
                 }
+                let title = crate::title::cut(&row.title, column);
+                let pad = column.saturating_sub(title.width());
+                spans.push(Span::raw(format!("{title}{}  ", " ".repeat(pad))));
             }
             // In the agents' color: a click opens it.
             spans.push(Span::raw(row.name.clone()).bold().fg(Color::Blue));
@@ -1395,17 +1393,23 @@ mod tests {
             ]
         );
         // Too long for its row: the time goes first, then the title is
-        // cut at a word; the mark and the name stay.
-        let lines = text(&card("Tally invoices", &rows, 36, &[], Details::Quiet, &[]));
-        assert_eq!(lines[3].trim_end(), " ? Check the README against…  readme");
-        assert_eq!(lines[7].trim_end(), " ● Round half cents to even  halves");
-        let lines = text(&card("Tally invoices", &rows, 30, &[], Details::Quiet, &[]));
-        assert_eq!(lines[7].trim_end(), " ● Round half cents…  halves");
+        // cut at a word; the mark and the name stay, the names still in
+        // a column.
+        let lines = text(&card("Tally invoices", &rows, 60, &[], Details::Quiet, &[]));
+        assert_eq!(
+            lines[7].trim_end(),
+            " ● Round half cents to even           halves · 2m 10s   #412"
+        );
         let lines = text(&card("Tally invoices", &rows, 44, &[], Details::Quiet, &[]));
         assert_eq!(
             lines[7].trim_end(),
-            " ● Round half cents to even  halves · 2m 10s"
+            " ● Round half cents to even           halves"
         );
+        let lines = text(&card("Tally invoices", &rows, 36, &[], Details::Quiet, &[]));
+        assert_eq!(lines[3].trim_end(), " ? Check the README against…  readme");
+        assert_eq!(lines[7].trim_end(), " ● Round half cents to even   halves");
+        let lines = text(&card("Tally invoices", &rows, 30, &[], Details::Quiet, &[]));
+        assert_eq!(lines[7].trim_end(), " ● Round half cents…    halves");
         // Too narrow for any word: the name stays whole.
         let lines = text(&card("Tally invoices", &rows, 14, &[], Details::Quiet, &[]));
         assert!(lines[7].contains("halves"), "{}", lines[7]);
