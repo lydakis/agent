@@ -1045,9 +1045,8 @@ pub enum AgentOpens {
 }
 
 /// Which tasks open in a tab of their own in the lead's multiplexer:
-/// `"asked"`, the default, those their starter asked a tab for, those an
-/// agent shows, those the person opens and those that come to need them;
-/// or `"every"`, each task as a turn of its starts.
+/// `"asked"`, the default, those an agent shows and those the person
+/// opens; or `"every"`, each task as a turn of its starts.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum TaskTabs {
     #[default]

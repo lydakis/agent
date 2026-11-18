@@ -4,8 +4,9 @@ use agent_runtime::{
     provider::{ModelTokens, ToolCall, Usage},
     store::{
         Answered, ApprovalPolicy, Binding, Blocked, Bot, CacheTtl, CompactionPlan, ContextUsage,
-        Counts, Database, Decision, Delivery, Fork, Gate, Gated, Halt, Halted, Lifted, Limit,
-        Planning, ProcessKind, QuoteRef, Settings, Strip, Trailer, TurnBudget, TurnOptions, Wake,
+        Counts, Database, Decision, Delivery, Fork, Gate, Gated, Halt, Halted, Joined, Lifted,
+        Limit, Planning, ProcessKind, QuoteRef, Settings, Strip, Trailer, TurnBudget, TurnOptions,
+        Wake,
     },
     tools::{Declared, Inherit, Outcome, ToolList},
 };
@@ -13660,13 +13661,13 @@ fn fork_prompt_views_survive_source_deletion_and_reopen() {
                 .unwrap();
             assert_eq!(view.covered, (1, 3));
             assert_eq!(view.prompts, expected);
-            // Compaction leaves the original native items retrievable.
-            let raw = db.items_by_ids(&plan.ids, 0, 0).unwrap();
-            let items: Vec<Value> =
-                serde_json::from_slice(&[b"[", &raw[..], b"]"].concat()).unwrap();
+            // Compaction leaves the original native items retrievable, the
+            // empty prompt's text included, which a request leaves out.
+            let items = db.history_items("Alice", &plan.ids).unwrap()["items"].clone();
+            let items = items.as_array().unwrap();
             assert_eq!(items.len(), 6);
             for (item, prompt) in items.iter().step_by(2).zip(prompts) {
-                assert_eq!(item["content"][0]["text"], prompt);
+                assert_eq!(item["item"]["content"][0]["text"], prompt);
             }
         }
         std::fs::remove_file(path).unwrap();
@@ -14631,6 +14632,99 @@ fn oversized_history_items_do_not_hide_the_rest_of_the_batch() {
 }
 
 const THINKING: &[u8] = br#"{"content":[{"type":"thinking","thinking":"plan","signature":"s"},{"type":"text","text":"answer"}],"role":"assistant"}"#;
+
+#[test]
+fn requests_leave_out_blank_text_at_the_length_the_store_counted() {
+    let mut db = db();
+    let anthropic = Binding {
+        provider: "anthropic",
+        family: Family::Anthropic,
+        ..binding()
+    };
+    db.create("Bob", Some("/synthetic"), anthropic).unwrap();
+    let turn = db
+        .begin(
+            "Bob",
+            "r1",
+            "p1",
+            true,
+            &TurnOptions::default(),
+            allow_provider,
+        )
+        .unwrap()
+        .turn;
+    // A reply of only blank text, one with blank text beside its answer,
+    // a zero-width reply, and thinking beside a blank reply.
+    let mixed = json!({"content":[{"type":"text","text":"\u{3000}"},{"type":"text","text":"kept"},
+        {"type":"text","text":""}],"role":"assistant"});
+    let items = [
+        Bytes::from_static(br#"{"content":[{"text":" \n\t","type":"text"}],"role":"assistant"}"#),
+        Bytes::from(serde_json::to_vec(&mixed).unwrap()),
+        Bytes::from_static(br#"{"content":[{"text":"\u200b","type":"text"}],"role":"assistant"}"#),
+        Bytes::from_static(
+            br#"{"content":[{"type":"thinking","thinking":"plan","signature":"s"},{"type":"text","text":"\n"}],"role":"assistant"}"#,
+        ),
+    ];
+    db.append(turn, items.to_vec(), &[], None).unwrap();
+    db.finish(turn, None).unwrap();
+    let window = db.window("Bob", 1 << 20, 1024).unwrap().unwrap();
+    // The store keeps every item as it came.
+    assert_eq!(window.ids.len(), 5);
+    for (size, item) in window.sizes[1..].iter().zip(&items) {
+        assert_eq!(*size as usize, item.len());
+    }
+    let text = |item: &Value| -> Vec<String> {
+        item["content"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|block| match block["type"].as_str().unwrap() {
+                "text" => block["text"].as_str().unwrap().to_owned(),
+                kind => kind.to_owned(),
+            })
+            .collect()
+    };
+    for (strip, expected) in [
+        (0, vec![vec!["kept"], vec!["\u{200b}"], vec!["thinking"]]),
+        (i64::MAX, vec![vec!["kept"], vec!["\u{200b}"]]),
+    ] {
+        let stripped = match strip {
+            0 => 0,
+            _ => window.thinking.iter().map(|&t| t as usize).sum(),
+        };
+        let counted = window.sizes.iter().map(|&s| s as usize).sum::<usize>() + window.ids.len()
+            - 1
+            - stripped;
+        let sent = db.items_by_ids(&window.ids, strip, 0).unwrap();
+        assert_eq!(sent.len(), counted, "{}", String::from_utf8_lossy(&sent));
+        let sent: Vec<Value> = serde_json::from_slice(&[b"[", &sent[..], b"]"].concat()).unwrap();
+        assert_eq!(text(&sent[0])[0], "p1");
+        assert_eq!(sent[1..].iter().map(text).collect::<Vec<_>>(), expected);
+        // Read in batches, each after the ones before it, the request is
+        // the same; and a request that starts at a blank reply starts
+        // with its spaces.
+        for at in 1..window.ids.len() {
+            let mut joined = Joined::default();
+            let mut batches = db
+                .items_sent(&window.ids[..at], strip.into(), false, 0, &mut joined)
+                .unwrap();
+            batches.extend(
+                db.items_sent(&window.ids[at..], strip.into(), false, 0, &mut joined)
+                    .unwrap(),
+            );
+            assert_eq!(
+                batches,
+                db.items_by_ids(&window.ids, strip, 0).unwrap(),
+                "{at}"
+            );
+        }
+        let tail = db.items_by_ids(&window.ids[1..], strip, 0).unwrap();
+        assert_eq!(tail.len(), counted - window.sizes[0] as usize - 1);
+        assert!(tail.starts_with(b"   "));
+        let tail: Vec<Value> = serde_json::from_slice(&[b"[", &tail[..], b"]"].concat()).unwrap();
+        assert_eq!(tail.iter().map(text).collect::<Vec<_>>(), expected);
+    }
+}
 
 #[test]
 fn schema_27_migrates_cache_lineage_and_thinking_sizes() {
@@ -20573,6 +20667,131 @@ fn a_step_under_no_gate_is_recorded_even_when_it_would_ask() {
     assert_eq!(
         facts(&trail(&db)[0]),
         json!(["click", null, null, "nobody", "unknown", "completed"])
+    );
+}
+
+#[test]
+fn a_daemon_step_cut_short_still_names_the_files_it_changes() {
+    use agent_runtime::store::{StepAsk, StepOpened};
+    let mut db = db();
+    let run = Declared {
+        name: "run".into(),
+        description: "Run.".into(),
+        parameters: json!({"type":"object"}),
+        result: "ok".into(),
+        answered_by: Some("sonny".into()),
+        expire_ms: None,
+        grammar: None,
+        steps: true,
+        gate_daemon_steps: false,
+        lift: false,
+        inherit: Inherit::All,
+        kind: Some("mcp".into()),
+    };
+    // Writes are gated, edits and patches are not.
+    let gate = Gate {
+        tag: "manual".into(),
+        tools: vec!["write".into()],
+        expire_ms: None,
+    };
+    let tools: Vec<String> = ["read", "write", "edit", "apply_patch"]
+        .map(str::to_owned)
+        .to_vec();
+    db.create(
+        "Lead",
+        Some("/synthetic"),
+        Binding {
+            declared: Some(&ToolList::new(vec![run]).unwrap()),
+            gate: Some(&gate),
+            tools: &tools,
+            ..binding()
+        },
+    )
+    .unwrap();
+    let turn = db
+        .begin(
+            "Lead",
+            "request",
+            "work",
+            true,
+            &TurnOptions::default(),
+            allow_provider,
+        )
+        .unwrap()
+        .turn;
+    let call = ToolCall {
+        name: "run".into(),
+        call_id: "c1".into(),
+        arguments: "{}".into(),
+        custom: false,
+        links: Default::default(),
+    };
+    db.append(turn, vec![], std::slice::from_ref(&call), None)
+        .unwrap();
+    db.tool_start(turn, &call, false, false).unwrap();
+    let long = "x".repeat(3000);
+    // A script's arguments reach the daemon with their keys in order, so a
+    // long text comes before the path the preview would have named.
+    let ask = |step: &str, tool: &str, arguments: Value| StepAsk {
+        bot: "Lead".into(),
+        turn,
+        call_id: "c1".into(),
+        step: step.into(),
+        tool: tool.into(),
+        arguments: arguments.to_string(),
+        links: Default::default(),
+    };
+    let edit = ask("e", "edit", json!({"new":long,"old":"a","path":"notes.md"}));
+    assert!(matches!(
+        db.step_open(&edit, None, 0).unwrap(),
+        StepOpened::Run { .. }
+    ));
+    let patch = format!(
+        "*** Begin Patch\n*** Add File: a.md\n+{long}\n*** Add File: run.sh\n+ls\n*** End Patch"
+    );
+    let patch = ask("p", "apply_patch", json!({"input":patch}));
+    assert!(matches!(
+        db.step_open(&patch, None, 0).unwrap(),
+        StepOpened::Run { .. }
+    ));
+    // A gated step names them too once its gate allows it.
+    let write = ask("w", "write", json!({"content":long,"path":"run.sh"}));
+    assert!(matches!(
+        db.step_open(&write, None, 0).unwrap(),
+        StepOpened::Pending { .. }
+    ));
+    db.answer(Decision {
+        bot: "Lead",
+        turn,
+        call_id: "c1/w",
+        request: 1,
+        tag: Some("manual"),
+        allow: true,
+        unreviewed: false,
+        reason: None,
+        by: Some("test"),
+        leased: false,
+    })
+    .unwrap();
+    db.step_check("Lead", turn, "c1/w", 0, false).unwrap();
+    let read = db.prompts("Lead", turn, 64 * 1024).unwrap();
+    let named: Vec<(Value, Value, Value)> = (read["calls"].as_array().unwrap().iter())
+        .filter(|call| call["call_id"] != "c1")
+        .map(|call| {
+            (
+                call["call_id"].clone(),
+                call["arguments_truncated"].clone(),
+                call["paths"].clone(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        named,
+        [
+            (json!("c1/e"), json!(true), json!(["notes.md"])),
+            (json!("c1/p"), json!(true), json!(["a.md", "run.sh"])),
+            (json!("c1/w"), json!(true), json!(["run.sh"])),
+        ]
     );
 }
 

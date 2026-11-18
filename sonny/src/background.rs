@@ -787,6 +787,36 @@ pub struct View {
     source: SourcePage,
     /// The open command's newest output, read only while its page is.
     output: Output,
+    /// Whether the scheduler runs, read beside the window while it lists
+    /// an automation.
+    scheduler: SchedulerState,
+}
+
+/// Whether the scheduler that fires the automations runs, as the last
+/// read beside the window found: none while it runs, else the system's
+/// own words for its state.
+#[derive(Clone, Debug, Default)]
+pub struct SchedulerState(Arc<Mutex<SchedulerRead>>);
+
+#[derive(Debug, Default)]
+struct SchedulerRead {
+    /// A read is out: no other goes until it comes back.
+    asking: bool,
+    not_running: Option<String>,
+}
+
+impl SchedulerState {
+    /// What the read came back with.
+    pub fn came(&self, not_running: Option<String>) {
+        let mut read = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        read.asking = false;
+        read.not_running = not_running;
+    }
+
+    fn not_running(&self) -> Option<String> {
+        let read = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        read.not_running.clone()
+    }
 }
 
 /// A command's newest output as the daemon last said it, shared with
@@ -1161,6 +1191,7 @@ impl View {
             next_run: None,
             source: SourcePage::default(),
             output: Output::default(),
+            scheduler: SchedulerState::default(),
         };
         view.reload();
         view
@@ -1205,6 +1236,20 @@ impl View {
         read.asking = true;
         let query = json!({"bot": row["bot"], "handle": handle, "lines": OUTPUT_LINES});
         Some((query, self.output.clone()))
+    }
+
+    /// Where a read of the scheduler's state goes, when one should go
+    /// out: while an automation is listed and no read is out.
+    pub fn scheduler_query(&self) -> Option<SchedulerState> {
+        if !self.items.iter().any(|item| item.kind == Kind::Trigger) {
+            return None;
+        }
+        let mut read = (self.scheduler.0.lock()).unwrap_or_else(|e| e.into_inner());
+        if read.asking {
+            return None;
+        }
+        read.asking = true;
+        Some(self.scheduler.clone())
     }
 
     /// What the read of the commands came back with.
@@ -1761,6 +1806,17 @@ impl View {
             (None, Kind::Subscription) => "Follows",
             (None, _) => "Automations",
         };
+        // The scheduler not running heads the automations: under their
+        // own heading, or under Failed when every one failed.
+        let automations = (self.items.iter()).filter(|item| item.kind == Kind::Trigger);
+        let not_running = match automations.clone().next() {
+            Some(_) => self.scheduler.not_running(),
+            None => None,
+        };
+        let scheduler_under = match automations.clone().any(|item| item.failed.is_none()) {
+            true => "Automations",
+            false => "Failed",
+        };
         for heading in ["Failed", "Automations", "Follows"] {
             let takes = |item: &Item| section(item) == heading;
             let n = self.items.iter().filter(|i| takes(i)).count();
@@ -1772,6 +1828,12 @@ impl View {
                 Span::raw(heading).bold(),
                 Span::raw(format!(" · {n}")).dim(),
             ]));
+            if let Some(state) = not_running.as_ref().filter(|_| heading == scheduler_under) {
+                out.push(Line::from(vec![
+                    Span::raw("✗ ").fg(Color::Red),
+                    Span::raw(format!("scheduler not running · {state}")),
+                ]));
+            }
             for (index, item) in self.items.iter().enumerate() {
                 if !takes(item) {
                     continue;
@@ -3281,6 +3343,7 @@ mod tests {
             next_run: None,
             source: SourcePage::default(),
             output: Output::default(),
+            scheduler: SchedulerState::default(),
         }
     }
 
@@ -4191,6 +4254,7 @@ mod tests {
             next_run: None,
             source: SourcePage::default(),
             output: Output::default(),
+            scheduler: SchedulerState::default(),
         };
         let rows: Vec<String> = (view.card(100).0.iter())
             .map(|l| l.to_string())
@@ -4273,6 +4337,7 @@ mod tests {
             next_run: None,
             source: SourcePage::default(),
             output: Output::default(),
+            scheduler: SchedulerState::default(),
         };
         let clock = crate::asks::clock(at, now);
         // The pick reaches a column past the last word.
@@ -4629,6 +4694,7 @@ mod tests {
             next_run: None,
             source: SourcePage::default(),
             output: Output::default(),
+            scheduler: SchedulerState::default(),
         };
         let (card, at) = view.card(100);
         let lines: Vec<String> = card.iter().map(|l| l.to_string()).collect();
@@ -4842,6 +4908,7 @@ mod tests {
             next_run: None,
             source: SourcePage::default(),
             output: Output::default(),
+            scheduler: SchedulerState::default(),
         };
         let text = |view: &View| -> Vec<String> {
             view.card(100)
@@ -4858,6 +4925,25 @@ mod tests {
         assert_eq!(lines[6], "    └ Read preferences.md");
         assert_eq!(lines[8], "Follows · 1");
         assert_eq!(lines[9], "  ◎ tasks for lead");
+        // A read of the scheduler goes while an automation is listed, one
+        // at a time; when it does not run, the automations say so first,
+        // in the system's words, and nothing else moves.
+        let read = view.scheduler_query().unwrap();
+        assert!(view.scheduler_query().is_none());
+        read.came(Some(
+            "failed (Result: resources) · restart counter is at 5".into(),
+        ));
+        let down = text(&view);
+        assert_eq!(down[3], "Automations · 1");
+        assert_eq!(
+            down[4],
+            "✗ scheduler not running · failed (Result: resources) · restart counter is at 5"
+        );
+        assert_eq!(down[5..], lines[4..]);
+        read.came(None);
+        assert_eq!(text(&view), lines);
+        assert!(view.scheduler_query().is_some());
+        view.scheduler.came(None);
         // Enter opens the automation as a page, the agent it wakes its
         // first link, picked; it closes nothing.
         let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);

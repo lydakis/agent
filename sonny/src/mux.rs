@@ -116,7 +116,7 @@ pub enum Placement {
 /// own, as a VS Code editor never does, and closing it would take new
 /// work out of view before they saw it. It stays, and while only such
 /// windows could make room a new task's window does not open, until the
-/// person asks for it or its task comes to need them.
+/// person asks for it.
 pub struct Room {
     /// Task windows at most, 0 for no limit.
     pub most: usize,
@@ -910,14 +910,6 @@ impl Layout {
     /// keeps them across a restart, for [`Worker::aside`].
     fn asides(&self) -> (HashSet<String>, Option<Aside>) {
         (self.aside.clone(), self.kept.clone())
-    }
-
-    /// The block labelled `bot` in this home now, as the multiplexer lists
-    /// it: another once something placed `bot` again.
-    pub fn block_of(&mut self, bot: &str) -> Option<String> {
-        (self.listed().into_iter())
-            .find(|block| block.label == bot)
-            .map(|block| block.id)
     }
 
     /// Whether the task's window was closed for room.
