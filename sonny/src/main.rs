@@ -4963,13 +4963,6 @@ struct Fleet {
     ended: HashMap<String, i64>,
     /// Calls running in the project that may wait on tasks, by bot and call.
     waits: std::collections::HashSet<(String, String)>,
-    /// Tasks whose tab opened here only because they came to need the
-    /// person, with `task_tabs = "asked"`, with when and the block it
-    /// opened: it closes once their result is taken, as every task's does
-    /// with `"every"`, unless the person went to it or used it since, or
-    /// an agent showed the task again in another block. Read and written
-    /// on the layout's worker, in order with the windows it opens.
-    for_need: Arc<std::sync::Mutex<HashMap<String, (std::time::SystemTime, String)>>>,
     /// Finished calls that may have waited, to read for the turns they
     /// returned: the bot, the output's node, and the call.
     returned: Vec<(String, i64, String)>,
@@ -5453,7 +5446,6 @@ impl Fleet {
             zen: false,
             ended: HashMap::new(),
             waits: Default::default(),
-            for_need: Default::default(),
             returned: Vec::new(),
             resolving: Default::default(),
             began: HashMap::new(),
@@ -5505,7 +5497,6 @@ impl Fleet {
             zen: false,
             ended: HashMap::new(),
             waits: Default::default(),
-            for_need: Default::default(),
             returned: Vec::new(),
             resolving: Default::default(),
             began: HashMap::new(),
@@ -5799,11 +5790,10 @@ impl Fleet {
     /// Open the task's window, unless it has one, it was closed for room,
     /// or the person uses another of the project's windows now; with
     /// `[sonny] task_tabs = "asked"`, the default, none opens here: a task
-    /// has a tab when its starter asked for one, an agent shows it, the
-    /// person opens it or it comes to need them. With `tell`, the lead's view hears where it opened, when not
-    /// beside it, or why it did not; windows closed for room are said in
-    /// the status row. A task that needs the person has its window, as
-    /// [`Fleet::needs_window`] opens it.
+    /// has a tab when an agent shows it or the person opens it. With
+    /// `tell`, the lead's view hears where it opened, when not beside it,
+    /// or why it did not; windows closed for room are said in the status
+    /// row.
     fn show(&mut self, bot: &str, tell: bool) {
         if !self.windows.lock().is_ok_and(|mut windows| windows.every()) {
             self.doing(bot, "working");
@@ -5832,7 +5822,7 @@ impl Fleet {
                 return;
             }
             room.most = windows.lock().map_or(0, |mut windows| windows.most());
-            let said = match layout.show_task(&bot_name, &name, &command, &room, needs) {
+            let said = match layout.show_task(&bot_name, &name, &command, &room, false) {
                 Ok(mux::Shown::Opened(closed)) => {
                     if !closed.is_empty() {
                         let _ =
@@ -5854,46 +5844,6 @@ impl Fleet {
         self.doing(bot, "working");
     }
 
-    /// A task that came to need the person, its window set aside for
-    /// room or, as `task_tabs = "asked"` has it, never opened, has it open
-    /// now, until its result is taken, as what needs them keeps its window: it
-    /// closes the window they used least recently for room, never one
-    /// they have not looked at yet nor one that needs them, and with no
-    /// other passes the limit. The person's focus stays where it is.
-    fn needs_window(&self, bot: &str) {
-        let (command, name) = self.window(bot, "needs you");
-        let (windows, mut room) = self.room();
-        let (bot, told) = (bot.to_owned(), self.tell.clone());
-        let (socket, project) = (self.socket.clone(), self.project.clone());
-        let (place, lead) = (self.place.clone(), self.lead.clone());
-        let for_need = self.for_need.clone();
-        self.layout.send(move |layout| {
-            let every = windows.lock().is_ok_and(|mut windows| windows.every());
-            if (every && !layout.aside(&bot)) || !mux::mine(&socket, &project, &lead, &place) {
-                return;
-            }
-            room.most = windows.lock().map_or(0, |mut windows| windows.most());
-            match layout.show_task(&bot, &name, &command, &room, true) {
-                Ok(mux::Shown::Opened(closed)) => {
-                    if !every
-                        && let Some(block) = layout.block_of(&bot)
-                        && let Ok(mut for_need) = for_need.lock()
-                    {
-                        for_need.insert(bot.clone(), (std::time::SystemTime::now(), block));
-                    }
-                    if !closed.is_empty() {
-                        let _ =
-                            told.send(Told::Notice(made_room(&closed, &room.project, room.most)));
-                    }
-                }
-                Ok(_) => {}
-                Err(error) => {
-                    let _ = told.send(Told::Notice(error));
-                }
-            }
-        });
-    }
-
     /// Bring the task's own tab into view in the multiplexer, as the
     /// person asked; looked for on the worker, after every window opened
     /// so far, and opened again when it was closed for room, or opened
@@ -5904,13 +5854,8 @@ impl Fleet {
         let (command, name) = self.window(bot, doing);
         let (windows, mut room) = self.room();
         let task = bot != self.lead && self.lineage.contains(bot);
-        let for_need = self.for_need.clone();
         let (bot, told) = (bot.to_owned(), self.tell.clone());
         self.layout.send(move |layout| {
-            // Asked for now, it stays once taken.
-            if let Ok(mut for_need) = for_need.lock() {
-                for_need.remove(&bot);
-            }
             let every = windows.lock().is_ok_and(|mut windows| windows.every());
             if layout.aside(&bot) || (task && !every) {
                 room.most = windows.lock().map_or(0, |mut windows| windows.most());
@@ -5994,10 +5939,9 @@ impl Fleet {
     }
 
     /// Close the windows of the tasks whose completed turns the finished
-    /// waits returned: with `task_tabs = "every"`, as each task opened one,
-    /// and with `"asked"`, a tab opened only because the task needed the
-    /// person, which they have not used since; a tab asked for stays until
-    /// the person or an agent closes it, or the task is resolved.
+    /// waits returned, with `task_tabs = "every"`, as each task opened one;
+    /// with `"asked"`, a tab stays until the person or an agent closes it,
+    /// or the task is resolved.
     async fn close_taken(&mut self) {
         let every = self.windows.lock().is_ok_and(|mut windows| windows.every());
         for (bot, node, call) in std::mem::take(&mut self.returned) {
@@ -6022,9 +5966,8 @@ impl Fleet {
                     && !self.needs.waits(&task)
                 {
                     self.ended.remove(&task);
-                    match every {
-                        true => self.close(&task),
-                        false => self.close_for_need(&task),
+                    if every {
+                        self.close(&task);
                     }
                     self.doing.remove(&task);
                     self.activity.remove(&task);
@@ -6032,25 +5975,6 @@ impl Fleet {
                 }
             }
         }
-    }
-
-    /// Close the task's tab if it opened only because the task needed the
-    /// person, they have not used it since, and it is still the block
-    /// opened then, not one an agent showed since. Decided on the layout's
-    /// worker, after the windows asked for before it opened.
-    fn close_for_need(&self, task: &str) {
-        let (for_need, used_when) = (self.for_need.clone(), self.used_when);
-        let task = task.to_owned();
-        self.layout.send(move |layout| {
-            let Some((at, block)) =
-                (for_need.lock().ok()).and_then(|mut for_need| for_need.remove(&task))
-            else {
-                return;
-            };
-            if layout.block_of(&task) == Some(block) && !used::since(used_when(&task), at) {
-                layout.close(&task);
-            }
-        });
     }
 
     /// A task resolved, by the lead or itself: its window closes, unless
@@ -6113,9 +6037,6 @@ impl Fleet {
         };
         if self.doing.get(bot) != Some(&doing) {
             self.doing.insert(bot.to_owned(), doing);
-            if doing == "needs you" && bot != self.lead && self.lineage.contains(bot) {
-                self.needs_window(bot);
-            }
             self.name_windows();
             let short = self.short(bot).to_owned();
             let alert = match doing {
@@ -12356,6 +12277,7 @@ impl App {
             self.turns.clone(),
         );
         view.set_tasks(&self.blanks.tasks);
+        self.read_scheduler(&view);
         self.watch = Some(Watch {
             project,
             rows: Vec::new(),
@@ -12648,6 +12570,19 @@ impl App {
         view.loaded(window, read.map_err(|error| error.to_string()), prices);
     }
 
+    /// Whether the scheduler runs, read beside the window while
+    /// `/background` lists an automation: one status read of the system's
+    /// job, which the card says when it does not run.
+    fn read_scheduler(&self, view: &background::View) {
+        if let Some(state) = view.scheduler_query() {
+            let woken = self.woken.clone();
+            tokio::task::spawn_blocking(move || {
+                state.came(scheduler::not_running());
+                woken.notify_one();
+            });
+        }
+    }
+
     async fn reread(&mut self) {
         // `/sky` follows the daemon live and reads nothing again.
         if self.watch.as_ref().is_some_and(|w| w.sky.is_some()) {
@@ -12659,6 +12594,7 @@ impl App {
             if view.commands_due() {
                 self.read_commands(&mut view).await;
             }
+            self.read_scheduler(&view);
             // The open command's newest lines, beside the window.
             if let Some((query, output)) = view.output_query() {
                 let (client, woken) = (self.client.clone(), self.woken.clone());
@@ -18593,6 +18529,12 @@ impl App {
             linked.extend(self.screen.link_cells(frame.buffer_mut()));
             let [live, status, gap, composer, pad, footer] = areas(view, live_rows);
             frame.render_widget(Paragraph::new(open_rows.clone()), live);
+            // The conversation's column and no wider, as the composer and
+            // the footer are.
+            let status = Rect {
+                width: status.width.min(measure() as u16),
+                ..status
+            };
             let status_line = self.status_row(status.width as usize);
             // The agents it names open them, as their names do anywhere.
             let parked: Vec<(String, String)> = (self.paused.as_ref())
@@ -19275,8 +19217,16 @@ impl App {
 
     /// The status row, `width` wide: what happens now, the first that
     /// applies of a pause, an approval, the agent's turn or its phase
-    /// without one, and a notice.
+    /// without one, and a notice. Never wider than `width`: each kind
+    /// gives way by its own parts first, and what still does not fit is
+    /// cut at a word with `…`.
     fn status_row(&self, width: usize) -> Line<'static> {
+        fit_row(self.status_parts(width), width)
+    }
+
+    /// The status row as [`App::status_row`] says, its parts given way
+    /// to `width` but not yet cut to it.
+    fn status_parts(&self, width: usize) -> Line<'static> {
         // Upgraded under it, the window reconnects no more: reopening it
         // is all there is to do, and the row says so alone.
         if self.upgraded {
@@ -19301,8 +19251,8 @@ impl App {
                 Span::raw("■ ").dim(),
                 Span::raw("Every agent is paused").bold(),
                 Span::raw(format!(" by {by}: ")).dim(),
-                Span::raw(first_line(pause["reason"].as_str().unwrap_or_default())),
             ];
+            let reason = first_line(pause["reason"].as_str().unwrap_or_default());
             // Whose turns it parked, so the one doing harm can be stopped
             // before the line goes on: Esc in its window ends its turn.
             let parked: Vec<&str> = (pause["parked"]["bots"].as_array())
@@ -19337,6 +19287,11 @@ impl App {
             if self.calls_waiting().0 > 0 {
                 line.push(Span::raw(" · an approval waits").dim());
             }
+            // The reason gives way first, at a word: who paused, whose
+            // turns it parked and the keys stay.
+            let rest: usize = line.iter().map(Span::width).sum();
+            let reason = cut_at_word(&reason, width.saturating_sub(rest));
+            line.insert(3, Span::raw(reason));
             return Line::from(line);
         }
         if let Some(call) = self.waiting() {
@@ -19347,12 +19302,17 @@ impl App {
                 Span::raw("y"),
                 Span::raw(" allow once · ").dim(),
             ];
-            if let Some(prefix) = approvals::always(call) {
-                // Cut to leave the row's other keys in view: a whole
-                // command offered can run long.
-                const KEYS: &str = "  ⏸ y allow once · a always allow  · n deny · esc set aside";
-                let room = self.width.saturating_sub(KEYS.width()).max(8);
-                let shown = transcript::cut(&approvals::shown(&prefix), room);
+            // Cut to leave the row's other keys in view: a whole command
+            // offered can run long. Where even a short one leaves no room
+            // for them, the offer goes and the keys stay.
+            const KEYS: &str = "⏸ y allow once · a always allow  · n deny · esc set aside";
+            let always = approvals::always(call)
+                .map(|prefix| {
+                    let room = width.saturating_sub(KEYS.width()).max(8);
+                    transcript::cut(&approvals::shown(&prefix), room)
+                })
+                .filter(|shown| KEYS.width() + shown.width() <= width);
+            if let Some(shown) = always {
                 line.push(Span::raw("a"));
                 line.push(Span::raw(format!(" always allow {shown} · ")).dim());
             }
@@ -19436,11 +19396,18 @@ impl App {
         if rest(queues, &notice) + said.width() > width {
             queues = false;
         }
-        if let Some(command) = said.strip_prefix("Running ")
-            && rest(queues, &notice) + said.width() > width
-        {
-            let room = width.saturating_sub(rest(queues, &notice) + "Running ".len());
-            said = format!("Running {}", cut_at_word(command, room));
+        if rest(queues, &notice) + said.width() > width {
+            // The command after `Running` is cut at a word; any other
+            // phase (a thought's heading, a tool's name, why it is held)
+            // the same way, whole.
+            let room = width.saturating_sub(rest(queues, &notice));
+            said = match said.strip_prefix("Running ") {
+                Some(command) => format!(
+                    "Running {}",
+                    cut_at_word(command, room.saturating_sub("Running ".len()))
+                ),
+                None => cut_at_word(&said, room),
+            };
         }
         let mut spans = vec![Span::raw("• ").dim()];
         spans.extend(shimmer(&said, self.started.elapsed()));
@@ -20087,6 +20054,60 @@ struct Phase {
 
 /// `text` cut to `room` columns at a word, with `…` after it; whole when
 /// it fits, and `…` alone when not one word does.
+/// `line` no wider than `width`: what is past it cut at the last word
+/// that fits, with `…`, so no row of Sonny's runs past its column.
+fn fit_row(line: Line<'static>, width: usize) -> Line<'static> {
+    if line.width() <= width {
+        return line;
+    }
+    let room = width.saturating_sub(1);
+    // Each character kept, with the span it came from.
+    let mut kept: Vec<(usize, char)> = Vec::new();
+    let mut used = 0;
+    'spans: for (at, span) in line.spans.iter().enumerate() {
+        for c in span.content.chars() {
+            let wide = unicode_width::UnicodeWidthChar::width(c).unwrap_or(0);
+            if used + wide > room {
+                break 'spans;
+            }
+            used += wide;
+            kept.push((at, c));
+        }
+    }
+    // Back to the last whole word, where one ended; then no space or
+    // separator left before the `…`.
+    let next = line
+        .spans
+        .iter()
+        .flat_map(|span| span.content.chars())
+        .nth(kept.len());
+    if next.is_some_and(|c| c != ' ')
+        && let Some(space) = kept.iter().rposition(|&(_, c)| c == ' ')
+    {
+        kept.truncate(space);
+    }
+    while kept
+        .last()
+        .is_some_and(|&(_, c)| matches!(c, ' ' | '·' | '•' | '('))
+    {
+        kept.pop();
+    }
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    for (at, c) in kept {
+        if spans.len() == at + 1 {
+            spans[at].content.to_mut().push(c);
+            continue;
+        }
+        while spans.len() < at {
+            spans.push(Span::styled("", line.spans[spans.len()].style));
+        }
+        spans.push(Span::styled(c.to_string(), line.spans[at].style));
+    }
+    let style = spans.last().map(|span| span.style).unwrap_or_default();
+    spans.push(Span::styled("…", style));
+    Line::from(spans).style(line.style)
+}
+
 fn cut_at_word(text: &str, room: usize) -> String {
     if text.width() <= room {
         return text.to_owned();
@@ -26301,7 +26322,85 @@ mod tests {
             "• Running cargo test --workspace… (0s • esc to interrupt)"
         );
         assert_eq!(row(&app, 44), "• Running cargo… (0s • esc to interrupt)");
-        assert_eq!(row(&app, 30), "• Running … (0s • esc to interrupt)");
+        // Narrower than the time and its key, the row is cut at a word.
+        assert_eq!(row(&app, 30), "• Running … (0s • esc to…");
+    }
+
+    #[tokio::test]
+    async fn nothing_on_the_status_row_runs_past_its_width() {
+        let mut app = app(daemon_with(json!([])).await);
+        let long = "word ".repeat(40);
+        let fits = |app: &App, width: usize| {
+            let row = app.status_row(width).to_string();
+            assert!(row.width() <= width, "{} > {width}: {row}", row.width());
+            row
+        };
+        // A thought's heading, a tool's name and why a turn is held are
+        // phases too: cut at a word, the time and esc kept.
+        for phase in [
+            format!("Checking {long}"),
+            format!("Calling mcp__{}", "x".repeat(150)),
+            format!("Held: {long}"),
+        ] {
+            app.running = Some(Running {
+                turn: 1,
+                started: Instant::now(),
+                phase,
+                note: false,
+                effort: None,
+                acted: false,
+            });
+            for width in [100, 60, 44] {
+                assert!(fits(&app, width).ends_with("… (0s • esc to interrupt)"));
+            }
+        }
+        app.running = None;
+        // A notice alone.
+        app.notice = Some(format!("could not read b: {long}"));
+        for width in [100, 60, 44] {
+            assert!(fits(&app, width).ends_with("word…"));
+        }
+        // An approval: the command offered gives way, then the offer, and
+        // its keys stay.
+        app.approvals
+            .push(json!({"turn": 1, "call_id": "c1", "name": "shell",
+            "arguments": {"command": "git push"},
+            "always_allow": ["git", "push", "origin", &"x".repeat(150)]}));
+        let row = fits(&app, 100);
+        assert!(row.contains("a always allow git push origin x"), "{row}");
+        assert!(row.ends_with("n deny · esc set aside"), "{row}");
+        for width in [60, 44] {
+            assert_eq!(fits(&app, width), "⏸ y allow once · n deny · esc set aside");
+        }
+        app.approvals.clear();
+        // A pause: its reason gives way at a word.
+        app.paused = Some(json!({"by": "tally.lead", "reason": long,
+            "parked": {"bots": ["fix", "halves", "readme"], "total": 9}}));
+        let row = fits(&app, 100);
+        assert!(
+            row.ends_with("· parked fix, halves, readme +6 · /resume"),
+            "{row}"
+        );
+        for width in [60, 44] {
+            fits(&app, width);
+        }
+    }
+
+    #[test]
+    fn a_row_too_wide_is_cut_at_a_word_and_keeps_its_styles() {
+        let line = Line::from(vec![
+            Span::raw("⏸ ").fg(Color::Yellow),
+            Span::raw("allow once"),
+            Span::raw(" · deny this call").dim(),
+        ]);
+        assert_eq!(fit_row(line.clone(), 40), line);
+        let cut = fit_row(line, 20);
+        assert_eq!(cut.to_string(), "⏸ allow once · deny…");
+        assert_eq!(cut.spans[0].style.fg, Some(Color::Yellow));
+        assert!(cut.spans[2].style.add_modifier.contains(Modifier::DIM));
+        // A word longer than the row is cut where the row ends.
+        let one = fit_row(Line::from("x".repeat(30)), 10);
+        assert_eq!(one.to_string(), format!("{}…", "x".repeat(9)));
     }
 
     #[tokio::test]
@@ -30460,7 +30559,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_task_set_aside_for_room_says_so_and_opens_once_it_needs_you() {
+    async fn a_task_set_aside_for_room_says_so_and_stays_aside_when_it_needs_you() {
         let (client, events) = daemon_with_events(json!({}), |asked| {
             match asked["op"].as_str().unwrap_or("") {
                 "bots" => json!({"bots": [
@@ -30522,22 +30621,22 @@ mod tests {
         };
         assert_eq!(place(&rows, "calc.b"), "tab set aside for room");
         assert_ne!(place(&rows, "calc.a"), "tab set aside for room");
-        // A call of its held for the person: what needs them keeps its
-        // window, so it opens, past the limit, and the new one stays.
+        // A call of its held for the person waits in the lead's window:
+        // its tab stays set aside.
         let fleet = app.fleet.as_mut().unwrap();
         fleet.event(&event("calc.b", "approval_asked", json!({"call_id": "c1"})));
         assert_eq!(fleet.doing["calc.b"], "needs you");
         fleet.layout.settle();
         let shown = windowed(fleet);
-        assert!(shown.contains(&"calc.a".to_owned()) && shown.contains(&"calc.b".to_owned()));
-        assert!(!fleet.layout.aside("calc.b"));
+        assert!(shown.contains(&"calc.a".to_owned()) && !shown.contains(&"calc.b".to_owned()));
+        assert!(fleet.layout.aside("calc.b"));
     }
 
-    /// As `task_tabs = "asked"` has it, a task's turn opens no tab: one
-    /// opens once the task needs the person, and closes once its result
-    /// is taken, or they go to it, and it stays.
+    /// As `task_tabs = "asked"` has it, a task's turn opens no tab, nor
+    /// does its needing the person: one opens when they go to it, and it
+    /// stays once its result is taken.
     #[tokio::test]
-    async fn a_task_opens_a_tab_only_once_it_needs_you_or_you_go_to_it() {
+    async fn a_task_opens_a_tab_only_when_you_go_to_it() {
         // The lead's wait that took both tasks' results.
         let waited = json!({"results": {
             "calc.a/1": {"status": "completed"},
@@ -30594,11 +30693,11 @@ mod tests {
             "{shown:?}"
         );
         assert_eq!(fleet.doing["calc.a"], "working");
-        // A call of its held for the person opens its tab.
+        // A call of its held for the person opens no tab.
         fleet.event(&event("calc.a", "approval_asked", json!({"call_id": "c1"})));
         assert_eq!(fleet.doing["calc.a"], "needs you");
         fleet.layout.settle();
-        assert!(windowed(&fleet).contains(&"calc.a".to_owned()));
+        assert!(!windowed(&fleet).contains(&"calc.a".to_owned()));
         assert!(!windowed(&fleet).contains(&"calc.b".to_owned()));
         // The person goes to the other: its tab opens.
         fleet.go_to("calc.b", true);
@@ -30626,217 +30725,9 @@ mod tests {
         ));
         fleet.close_taken().await;
         fleet.layout.settle();
-        // The tab opened only for what needed the person closes; the one
-        // the person went to stays.
+        // The one the person went to stays.
         let shown = windowed(&fleet);
         assert!(!shown.contains(&"calc.a".to_owned()), "{shown:?}");
-        assert!(shown.contains(&"calc.b".to_owned()), "{shown:?}");
-    }
-
-    /// A tab opened only because its task needed the person, which an
-    /// agent showed again since (`show_agent` places a new block), stays
-    /// once the result is taken.
-    #[tokio::test]
-    async fn a_tab_opened_for_a_need_an_agent_showed_again_stays_once_taken() {
-        // The lead's wait that took both tasks' results.
-        let waited = json!({"results": {
-            "calc.a/1": {"status": "completed"},
-            "calc.b/1": {"status": "completed"},
-        }});
-        let (client, events) = daemon_with_events(json!({}), move |asked| {
-            match asked["op"].as_str().unwrap_or("") {
-                "bots" => json!({"bots": [
-                    {"name": "calc.lead", "bot_id": 1, "head": 1},
-                    {"name": "calc.a", "bot_id": 2, "created_by": "calc.lead",
-                        "running_turn": 1, "head": 2},
-                    {"name": "calc.b", "bot_id": 3, "created_by": "calc.lead",
-                        "running_turn": 1, "head": 3},
-                ], "next_after": null}),
-                "approvals" => json!({"approvals": []}),
-                "turns" => json!({"turns": []}),
-                "history_nodes" => json!({"nodes": []}),
-                "history_items" => json!({"items": [{"item": {
-                    "type": "function_call_output", "call_id": "w1",
-                    "output": waited.to_string(),
-                }}]}),
-                _ => json!({}),
-            }
-        })
-        .await;
-        let mut fleet = Fleet::in_memory(client.clone(), events, "calc", "calc.lead");
-        let read = (agent_client::config::path().as_ref())
-            .and_then(|path| std::fs::metadata(path).ok())
-            .and_then(|file| file.modified().ok());
-        fleet.windows = Arc::new(std::sync::Mutex::new(TaskWindows {
-            read: Some(read),
-            most: 32,
-            tabs: agent_client::config::TaskTabs::Asked,
-        }));
-        let event = |bot: &str, kind: &str, data: Value| json!({"event": kind, "bot": bot, "turn": 1, "data": data});
-        let windowed = |fleet: &Fleet| {
-            let (sent, got) = std::sync::mpsc::channel();
-            fleet.layout.send(move |layout| {
-                let labels: Vec<String> = (layout.windows().into_iter())
-                    .flat_map(|(_, labels)| labels)
-                    .collect();
-                let _ = sent.send(labels);
-            });
-            got.recv().unwrap()
-        };
-        for bot in ["calc.a", "calc.b"] {
-            fleet.lineage.insert(bot.into());
-            fleet.event(&event(bot, "accepted", json!({})));
-        }
-        fleet.layout.settle();
-        let shown = windowed(&fleet);
-        assert!(
-            !shown.iter().any(|label| label.starts_with("calc.")),
-            "{shown:?}"
-        );
-        assert_eq!(fleet.doing["calc.a"], "working");
-        // A call of its held for the person opens its tab.
-        fleet.event(&event("calc.a", "approval_asked", json!({"call_id": "c1"})));
-        assert_eq!(fleet.doing["calc.a"], "needs you");
-        fleet.layout.settle();
-        assert!(windowed(&fleet).contains(&"calc.a".to_owned()));
-        assert!(!windowed(&fleet).contains(&"calc.b".to_owned()));
-        // The person goes to the other: its tab opens.
-        fleet.go_to("calc.b", true);
-        fleet.layout.settle();
-        assert!(windowed(&fleet).contains(&"calc.b".to_owned()));
-        // An agent shows calc.a again, as show_agent does: a new block.
-        fleet.layout.send(|layout| {
-            let command = ["sonny".to_owned(), "--agent".into(), "calc.a".into()];
-            layout
-                .place("calc.a", "a", &command, &mux::Placement::Window)
-                .unwrap();
-        });
-        fleet.layout.settle();
-        // The person approves; both finish and the lead's wait takes them.
-        fleet.event(&event(
-            "calc.a",
-            "tool_started",
-            json!({"call_id": "c1", "name": "shell"}),
-        ));
-        assert_eq!(fleet.doing["calc.a"], "working");
-        for bot in ["calc.a", "calc.b"] {
-            fleet.event(&event(bot, "turn_finished", json!({"status": "completed"})));
-        }
-        fleet.event(&event(
-            "calc.lead",
-            "tool_started",
-            json!({"call_id": "w1", "name": "wait"}),
-        ));
-        fleet.event(&event(
-            "calc.lead",
-            "tool_completed",
-            json!({"call_id": "w1", "node": 9}),
-        ));
-        fleet.close_taken().await;
-        fleet.layout.settle();
-        // Both stay: calc.a's is the one the agent showed.
-        let shown = windowed(&fleet);
-        assert!(shown.contains(&"calc.a".to_owned()), "{shown:?}");
-        assert!(shown.contains(&"calc.b".to_owned()), "{shown:?}");
-    }
-
-    /// A tab opened only because its task needed the person, used by them
-    /// since, as when they answer in it, stays once the result is taken.
-    #[tokio::test]
-    async fn a_tab_opened_for_a_need_the_person_used_stays_once_taken() {
-        // The lead's wait that took both tasks' results.
-        let waited = json!({"results": {
-            "calc.a/1": {"status": "completed"},
-            "calc.b/1": {"status": "completed"},
-        }});
-        let (client, events) = daemon_with_events(json!({}), move |asked| {
-            match asked["op"].as_str().unwrap_or("") {
-                "bots" => json!({"bots": [
-                    {"name": "calc.lead", "bot_id": 1, "head": 1},
-                    {"name": "calc.a", "bot_id": 2, "created_by": "calc.lead",
-                        "running_turn": 1, "head": 2},
-                    {"name": "calc.b", "bot_id": 3, "created_by": "calc.lead",
-                        "running_turn": 1, "head": 3},
-                ], "next_after": null}),
-                "approvals" => json!({"approvals": []}),
-                "turns" => json!({"turns": []}),
-                "history_nodes" => json!({"nodes": []}),
-                "history_items" => json!({"items": [{"item": {
-                    "type": "function_call_output", "call_id": "w1",
-                    "output": waited.to_string(),
-                }}]}),
-                _ => json!({}),
-            }
-        })
-        .await;
-        let mut fleet = Fleet::in_memory(client.clone(), events, "calc", "calc.lead");
-        // The person types in calc.a's tab.
-        fleet.used_when = |bot| (bot == "calc.a").then(std::time::SystemTime::now);
-        let read = (agent_client::config::path().as_ref())
-            .and_then(|path| std::fs::metadata(path).ok())
-            .and_then(|file| file.modified().ok());
-        fleet.windows = Arc::new(std::sync::Mutex::new(TaskWindows {
-            read: Some(read),
-            most: 32,
-            tabs: agent_client::config::TaskTabs::Asked,
-        }));
-        let event = |bot: &str, kind: &str, data: Value| json!({"event": kind, "bot": bot, "turn": 1, "data": data});
-        let windowed = |fleet: &Fleet| {
-            let (sent, got) = std::sync::mpsc::channel();
-            fleet.layout.send(move |layout| {
-                let labels: Vec<String> = (layout.windows().into_iter())
-                    .flat_map(|(_, labels)| labels)
-                    .collect();
-                let _ = sent.send(labels);
-            });
-            got.recv().unwrap()
-        };
-        for bot in ["calc.a", "calc.b"] {
-            fleet.lineage.insert(bot.into());
-            fleet.event(&event(bot, "accepted", json!({})));
-        }
-        fleet.layout.settle();
-        let shown = windowed(&fleet);
-        assert!(
-            !shown.iter().any(|label| label.starts_with("calc.")),
-            "{shown:?}"
-        );
-        assert_eq!(fleet.doing["calc.a"], "working");
-        // A call of its held for the person opens its tab.
-        fleet.event(&event("calc.a", "approval_asked", json!({"call_id": "c1"})));
-        assert_eq!(fleet.doing["calc.a"], "needs you");
-        fleet.layout.settle();
-        assert!(windowed(&fleet).contains(&"calc.a".to_owned()));
-        assert!(!windowed(&fleet).contains(&"calc.b".to_owned()));
-        // The person goes to the other: its tab opens.
-        fleet.go_to("calc.b", true);
-        fleet.layout.settle();
-        assert!(windowed(&fleet).contains(&"calc.b".to_owned()));
-        // The person approves; both finish and the lead's wait takes them.
-        fleet.event(&event(
-            "calc.a",
-            "tool_started",
-            json!({"call_id": "c1", "name": "shell"}),
-        ));
-        assert_eq!(fleet.doing["calc.a"], "working");
-        for bot in ["calc.a", "calc.b"] {
-            fleet.event(&event(bot, "turn_finished", json!({"status": "completed"})));
-        }
-        fleet.event(&event(
-            "calc.lead",
-            "tool_started",
-            json!({"call_id": "w1", "name": "wait"}),
-        ));
-        fleet.event(&event(
-            "calc.lead",
-            "tool_completed",
-            json!({"call_id": "w1", "node": 9}),
-        ));
-        fleet.close_taken().await;
-        fleet.layout.settle();
-        // Both stay: the person used the one opened for a need.
-        let shown = windowed(&fleet);
-        assert!(shown.contains(&"calc.a".to_owned()), "{shown:?}");
         assert!(shown.contains(&"calc.b".to_owned()), "{shown:?}");
     }
 

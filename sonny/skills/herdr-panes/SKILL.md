@@ -17,7 +17,7 @@ Sessions are for leads: each project's lead has a Herdr workspace of its own, an
 
 ## Where things go
 
-- An agent you start gets no tab unless the person asked for one; Sonny opens its tab when it needs them.
+- An agent you start gets no tab unless the person asked for one.
 - Never make a Herdr workspace, tab or pane yourself (`herdr workspace create`, `herdr tab create`, `herdr pane split`), and never use `--current` or `$HERDR_PANE_ID`: they may name a pane that is not yours.
 - Never close a tab or pane the person has typed in or asked you to open; ask them first.
 

@@ -107,6 +107,12 @@ bypass the approval check; resolve the error or ask your caller for guidance.";
 const TIMED_OUT: &str = "The automatic permission approval review did not finish before its \
 deadline. Do not assume the action is unsafe based on the timeout alone. You may retry once, or \
 ask your caller for guidance or explicit approval.";
+/// What the judge is told when evidence was left out or shortened to fit
+/// its state: Codex's words (`GuardianBudgetOmission`).
+pub const OMISSION: &str = "Conversation evidence, tool descriptions, or images were omitted or \
+shortened to fit the review input budget. User instructions and prior approvals may be incomplete \
+where marked. Do not infer authorization from missing evidence or treat a partial grant as \
+overriding an omitted restriction.";
 /// What a call the judge could not see whole tells the model.
 const ASK: &str =
     "If your caller wants this, ask them to name the action in a message, then try again.";
@@ -127,7 +133,8 @@ macro_rules! policy {
 - `standing_instructions` are the AGENTS.md files the agent was given when it was made, with their paths: the person's standing instructions for this work.
 - `decisions` are the asks put to the person within reach of this turn, newest first: each with its question, what a yes `covers` (action, target, revision), and the person's `answered` pick with the turn they sent it in, or null while it is open. Each is shown whole; `decisions_cut` means some were left out whole.
 - `transcript` is the agent's own recent history, oldest first: its messages (`model`), the calls it made (`call`), and what they returned (`output`), with `call_id` tying a call to its output. `transcript_cut` means older or longer entries were left out. The person's words are in `request` and `earlier_prompts`, not here.
-- `already_allowed` lists the calls this turn already ran and how they ended (`succeeded`, `failed`, `running`); `already_allowed_cut` means some older ones were left out: the newest are shown.
+- `already_allowed` lists the calls this turn already ran and how they ended (`succeeded`, `failed`, `running`); `already_allowed_cut` means some were left out or shortened: older ones, or files earlier calls changed that could not be read back. The newest are shown.
+- `context_omission`, present when any evidence was left out or shortened, says how to read what remains.
 - `planned_calls` are the calls to judge, each with an `id`, its tool, its arguments, and `files_it_names`: files this turn wrote that the call names, whole.
 - Secrets appear as `[secret: KIND]`.
 
@@ -220,7 +227,7 @@ pub const VERDICT_SCHEMA: &str = r#"{"type":"object","additionalProperties":fals
 /// The state's fields in the order the judge reads them: what holds for the
 /// whole turn first and the calls being judged last, so consecutive rounds
 /// share the longest prefix the provider can cache.
-const STATE_ORDER: [&str; 16] = [
+const STATE_ORDER: [&str; 17] = [
     "environment_note",
     "workspace",
     "sandbox",
@@ -236,6 +243,7 @@ const STATE_ORDER: [&str; 16] = [
     "transcript_cut",
     "already_allowed",
     "already_allowed_cut",
+    "context_omission",
     "planned_calls",
 ];
 
@@ -1033,9 +1041,10 @@ pub fn build(intent: &Intent, redactor: &Redactor) -> State {
             })
             .collect(),
     );
-    // Room for the request's own keys, whatever it holds.
-    let mut used =
-        size(&Value::Object(state.clone())) + size(&json!({"request":[],"request_cut":true}));
+    // Room for the request's own keys, whatever it holds, and for the note
+    // that tells the judge what was left out.
+    let mut used = size(&Value::Object(state.clone()))
+        + size(&json!({"request":[],"request_cut":true,"context_omission":OMISSION}));
     if used > STATE_TOKENS {
         return State::TooLong;
     }
@@ -1194,13 +1203,36 @@ pub fn build(intent: &Intent, redactor: &Redactor) -> State {
     if intent.transcript.cut {
         state.insert("transcript_cut".into(), json!(true));
     }
+    // Whatever was left out or shortened, the judge is told how to read
+    // what remains, as Codex tells its reviewer.
+    const CUT: [&str; 5] = [
+        "request_cut",
+        "already_allowed_cut",
+        "transcript_cut",
+        "decisions_cut",
+        "persons_words_cut",
+    ];
+    let omission = |state: &mut Map<String, Value>| {
+        state.insert("context_omission".into(), json!(OMISSION));
+    };
+    if CUT.iter().any(|key| state.contains_key(*key)) {
+        omission(&mut state);
+    }
     // The whole state must also fit one judge prompt: past it the oldest
     // transcript entries go first, then the standing instructions, which
-    // then authorize nothing. What is left fits, as its limit says.
+    // then authorize nothing, with room kept for the note above. What is
+    // left fits, as its limit says.
+    let room = match state.contains_key("context_omission") {
+        true => 0,
+        false => OMISSION.len() + 64,
+    };
     let mut over = Value::Object(state.clone())
         .to_string()
         .len()
-        .saturating_sub(STATE_BYTES);
+        .saturating_sub(STATE_BYTES - room);
+    if over > 0 {
+        omission(&mut state);
+    }
     if over > 0
         && let Some(Value::Array(entries)) = state.get_mut("transcript")
         && !entries.is_empty()
@@ -2141,8 +2173,11 @@ mod tests {
             panic!()
         };
         assert!(model_prompt(&state, &["c1"]).len() <= 256 * 1024);
+        assert!(state.to_string().len() <= STATE_BYTES);
         assert_eq!(state["transcript_cut"], true);
         assert!(state["transcript"].as_array().unwrap().len() < 3);
+        // The judge is told, in Codex's words, how to read what remains.
+        assert_eq!(state["context_omission"], OMISSION);
     }
 
     #[test]
@@ -2224,6 +2259,18 @@ mod tests {
         );
         assert_eq!(state["already_allowed"][0]["status"], "succeeded");
         assert_eq!(state["earlier_prompts"][1]["text"], "older");
+        // Nothing was left out: no note says so.
+        assert!(state.get("context_omission").is_none());
+        // An earlier change that could not be read back is marked, and the
+        // judge told, as Codex tells its reviewer: the round is judged.
+        let mut unnamed = intent.clone();
+        unnamed.allowed_cut = true;
+        let State::Built(cut) = build(&unnamed, &redactor) else {
+            panic!()
+        };
+        assert_eq!(cut["already_allowed_cut"], true);
+        assert_eq!(cut["context_omission"], OMISSION);
+        assert!(state_text(&cut).find("context_omission") < state_text(&cut).find("planned_calls"));
         // Earlier prompts stop at their share, newest kept.
         intent.earlier = vec![person(&"n".repeat(40_000)), person(&"o".repeat(40_000))];
         let State::Built(state) = build(&intent, &redactor) else {

@@ -358,6 +358,55 @@ async fn find_call(
     Some((item["name"].as_str().map(str::to_owned), arguments))
 }
 
+/// A call waiting for approval, as the approvals listing has it: its tool
+/// and its arguments, every page read until it is found. A preview the
+/// listing cut is read whole from the call's planning item, where it has
+/// one; a script's step has none, and is shown as listed.
+async fn waiting_call(
+    client: &Client,
+    bot: &str,
+    turn: i64,
+    call: &str,
+) -> Option<(Option<String>, String)> {
+    let mut after = Value::Null;
+    let listed = loop {
+        let mut asked = json!({"bot": bot, "limit": 256});
+        if !after.is_null() {
+            asked["after"] = after;
+        }
+        let page = client.request("approvals", asked).await.ok()?;
+        let found = (page["approvals"].as_array().into_iter().flatten())
+            .find(|listed| listed["call_id"] == call && listed["turn"] == turn);
+        if let Some(found) = found {
+            break found.clone();
+        }
+        after = page["next_after"].clone();
+        if after.is_null() {
+            return None;
+        }
+    };
+    let name = listed["name"].as_str().map(str::to_owned);
+    let cut = listed["arguments_cut"]
+        .as_array()
+        .is_some_and(|cut| !cut.is_empty())
+        || listed["arguments_omitted"].as_u64().unwrap_or(0) > 0;
+    let whole = match listed["node"].as_i64().filter(|node| cut && *node > 0) {
+        Some(node) => client
+            .request("history_items", json!({"bot": bot, "nodes": [node]}))
+            .await
+            .ok()
+            .and_then(|read| {
+                agent_client::approver::call_arguments(&read["items"][0]["item"], call)
+            }),
+        None => None,
+    };
+    let arguments = match whole.as_ref().unwrap_or(&listed["arguments"]) {
+        Value::Null => String::new(),
+        arguments => arguments.to_string(),
+    };
+    Some((name, arguments))
+}
+
 /// `event`, a `margin` call's start whose arguments were cut before the
 /// note's id, or an `ask` call's start whose arguments were cut, with the
 /// call's arguments whole, as the bot's history keeps them; any other event
@@ -436,8 +485,18 @@ async fn read(client: &Client, pending: &activity::Pending) -> activity::Read {
             };
             Read::Reply { text, asker }
         }
-        Kind::Call { call, name, node } => {
-            let found = find_call(client, task, call, *node).await;
+        Kind::Call {
+            call, name, node, ..
+        } => {
+            // One the reviewer handed over names no node: it is read from
+            // the calls waiting, which hold a script's steps too.
+            let found = match node {
+                Some(_) => find_call(client, task, call, *node).await,
+                None => match waiting_call(client, task, turn, call).await {
+                    Some(found) => Some(found),
+                    None => find_call(client, task, call, None).await,
+                },
+            };
             let name = (found.as_ref().and_then(|(name, _)| name.clone())).or_else(|| name.clone());
             let arguments = found.as_ref().map(|(_, arguments)| arguments.as_str());
             let text = activity::call_text(name.as_deref(), arguments);
@@ -2684,7 +2743,12 @@ impl Lookout {
             }),
             false => None,
         };
-        let heard = sources::Heard { event, subs, order };
+        let heard = sources::Heard {
+            event,
+            subs,
+            order,
+            due: false,
+        };
         match at {
             Some(at) => self.heard.insert(at, heard),
             None => self.heard.push(heard),
@@ -2710,8 +2774,9 @@ impl Lookout {
                 }))
     }
 
-    /// Whether an event may be told now: it steers, or its digest has
-    /// passed since a note last told it.
+    /// Whether an event may be told now: it steers, its digest has
+    /// passed since a note last told it, or it came due with others the
+    /// note then had no room for.
     fn ready(&self, heard: &sources::Heard, now: Instant) -> bool {
         let event = &heard.event;
         let source = || {
@@ -2721,7 +2786,8 @@ impl Lookout {
         };
         // A subscription's own digest takes its source's place for what
         // it hears, `0` too; one that says none goes by the source's.
-        event.steer
+        heard.due
+            || event.steer
             || heard.subs.iter().any(|name| {
                 let own = (self.subs.iter()).find(|sub| sub.name == *name && sub.digest.is_some());
                 match own {
@@ -2735,11 +2801,31 @@ impl Lookout {
             || (heard.subs.is_empty() && source())
     }
 
+    /// Whether a digest holds the event till it is due: it steers not,
+    /// and each subscription it came through waits for one, its own or
+    /// its source's.
+    fn digested(&self, heard: &sources::Heard) -> bool {
+        let event = &heard.event;
+        let waits = |name: &String| match (self.subs.iter())
+            .find(|sub| sub.name == *name && sub.digest.is_some())
+        {
+            Some(sub) => sub.digest_span().is_some(),
+            None => event.digest.is_some(),
+        };
+        !event.steer
+            && match heard.subs.is_empty() {
+                true => event.digest.is_some(),
+                false => heard.subs.iter().all(waits),
+            }
+    }
+
     /// Tell the subscriber what waits, as a steer: it joins the running
     /// turn at its next round, or starts one. A note goes as soon as the
     /// last one landed, with all that may go then; what a digest holds
-    /// waits for it. The note goes beside the stream, one at a time: what
-    /// the daemon answers comes back to `answered`.
+    /// waits for it, and once it is due all of it goes, in notes one after
+    /// another, as Alertmanager tells a whole group at its interval. The
+    /// note goes beside the stream, one at a time: what the daemon answers
+    /// comes back to `answered`.
     fn wake(&mut self, client: &Arc<Client>, woken: &Woken) {
         let now = Instant::now();
         if self.sending.is_some() || self.refused(now) {
@@ -2761,14 +2847,15 @@ impl Lookout {
         }
         // What is ready goes at once, unless a note went less than
         // `GROUP_INTERVAL` ago: then it gathers till then, or till
-        // something steers.
+        // something steers. What a due digest let go follows its last
+        // note as soon as that landed.
         let grouping = epoch_ms() < self.sent_ms + GROUP_INTERVAL.as_millis();
         let goes = |heard: &sources::Heard| self.ready(heard, now) && !self.blocked(heard);
         let any = match grouping {
             true => self
                 .heard
                 .iter()
-                .any(|heard| heard.event.steer && goes(heard)),
+                .any(|heard| (heard.event.steer || heard.due) && goes(heard)),
             false => self.heard.iter().any(goes),
         };
         if !any {
@@ -2786,7 +2873,15 @@ impl Lookout {
         let (sent, rest): (Vec<_>, Vec<_>) =
             (ready.into_iter().enumerate()).partition(|(at, _)| chosen[*at]);
         let sent: Vec<sources::Heard> = sent.into_iter().map(|(_, (_, heard))| heard).collect();
-        let mut rest: Vec<_> = rest.into_iter().map(|(_, waiting)| waiting).collect();
+        // What a due digest let go and the note had no room for goes in
+        // the next, without waiting another window: its window starts
+        // again with the last of them.
+        let mut rest: Vec<_> = (rest.into_iter())
+            .map(|(_, (place, mut heard))| {
+                heard.due |= self.digested(&heard);
+                (place, heard)
+            })
+            .collect();
         rest.extend(held);
         rest.sort_unstable_by_key(|(place, _)| *place);
         self.heard = rest.into_iter().map(|(_, heard)| heard).collect();
@@ -3029,6 +3124,10 @@ impl Lookout {
             if heard.order > 0 {
                 kept["order"] = json!(heard.order);
             }
+            // One a digest let go still goes without waiting another.
+            if heard.due {
+                kept["due"] = json!(true);
+            }
             kept
         };
         let sending: Vec<Value> = match &self.sending {
@@ -3143,6 +3242,7 @@ impl Lookout {
                         event: sources::Event::from_json(kept)?,
                         subs: Vec::new(),
                         order: kept["order"].as_i64().unwrap_or(0),
+                        due: kept["due"].as_bool().unwrap_or(false),
                     })
                 })
                 .collect()
@@ -4103,7 +4203,16 @@ mod tests {
         let big = "x".repeat(sources::NOTE_BYTES / 2);
         let heard = |event: sources::Event, order| {
             let subs = vec!["chat".to_owned()];
-            (0, sources::Heard { event, subs, order })
+            let due = false;
+            (
+                0,
+                sources::Heard {
+                    event,
+                    subs,
+                    order,
+                    due,
+                },
+            )
         };
         let task = |text: &str, steer| sources::Event {
             source: activity::SOURCE.into(),
@@ -5388,6 +5497,7 @@ mod tests {
             event,
             subs: vec!["chat".into()],
             order: 0,
+            due: false,
         }];
         let mut again = lookout();
         again.live = true;
@@ -5481,6 +5591,7 @@ mod tests {
             event: slack("first", false),
             subs: vec!["chat".into()],
             order: 0,
+            due: false,
         }];
         lookout.sending = Some((sent, vec!["k".into()]));
         lookout.answered(Err("idempotency_conflict".into()));
@@ -5529,6 +5640,88 @@ mod tests {
             )),
             "{prompt}"
         );
+    }
+
+    #[tokio::test]
+    async fn a_due_digest_tells_all_it_held_in_notes_one_after_another() {
+        let (client, mut got) = submits().await;
+        let mut lookout = lookout();
+        lookout.live = true;
+        lookout.subs.push(hears("chat"));
+        let hour = Duration::from_secs(3600);
+        lookout
+            .told_sources
+            .insert("slack".into(), Instant::now() - hour);
+        // More than a note holds, held by an hour's digest that is due.
+        let long = "x".repeat(sources::TEXT_CHARS - 4);
+        let event = |i: usize| sources::Event {
+            digest: Some(hour),
+            ..slack(&format!("e{i:02} {long}"), false)
+        };
+        for i in 0..12 {
+            lookout.heard_from(&event(i));
+        }
+        // Each note goes as soon as the one before landed, though its
+        // group interval has not passed, till none is left.
+        let (woken, mut woke) = tokio::sync::mpsc::channel(4);
+        let mut notes = Vec::new();
+        while !lookout.heard.is_empty() && notes.len() < 12 {
+            lookout.wake(&client, &woken);
+            let next = tokio::time::timeout(Duration::from_secs(5), got.recv());
+            let prompt = next.await.expect("the next note waits").unwrap()["prompt"]
+                .as_str()
+                .unwrap()
+                .to_owned();
+            assert!(prompt.len() <= sources::NOTE_BYTES, "{}", prompt.len());
+            let (_, _, answer) = woke.recv().await.unwrap();
+            lookout.answered(answer);
+            notes.push(told(&prompt));
+        }
+        assert!(lookout.heard.is_empty(), "{} wait", lookout.heard.len());
+        assert!(notes.len() > 1, "{}", notes.len());
+        // In the order they came.
+        let told: Vec<usize> = (notes.iter())
+            .flat_map(|note| {
+                note.match_indices("\ne")
+                    .map(|(at, _)| &note[at + 2..at + 4])
+            })
+            .map(|i| i.parse().unwrap())
+            .collect();
+        assert_eq!(told, (0..12).collect::<Vec<_>>());
+        // Its next window starts with the last of them: what comes now
+        // waits for it.
+        lookout.heard_from(&event(12));
+        lookout.sent_ms = 0;
+        lookout.wake(&client, &woken);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(got.try_recv().is_err());
+        assert_eq!(lookout.heard.len(), 1);
+    }
+
+    #[test]
+    fn what_a_due_digest_let_go_stays_due_across_a_restart() {
+        let dir = std::env::temp_dir().join(format!("sonny-due-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("calc.lead.json");
+        let made = || {
+            let mut lookout = lookout();
+            lookout.live = true;
+            lookout.subs.push(hears("chat"));
+            lookout.lead_id = Some(1);
+            lookout.restore(path.clone());
+            lookout
+        };
+        let mut lookout = made();
+        lookout.heard_from(&slack("due", false));
+        lookout.heard_from(&slack("not yet", false));
+        lookout.heard[0].due = true;
+        lookout.keep();
+        lookout.flush();
+        held::written();
+        let again = made();
+        let due: Vec<bool> = again.heard.iter().map(|heard| heard.due).collect();
+        assert_eq!(due, [true, false]);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Where the crash tests keep their commons, store and cursor.

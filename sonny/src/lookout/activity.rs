@@ -27,7 +27,7 @@ pub const PERSON: &str = "the person";
 
 /// The fields its events have, as the `follows` tool lists them for an
 /// agent to filter on.
-pub const FIELDS: [(&str, &str); 14] = [
+pub const FIELDS: [(&str, &str); 15] = [
     (
         "type",
         "string: wrote, turn.ended, question, approval or margin",
@@ -61,6 +61,10 @@ pub const FIELDS: [(&str, &str); 14] = [
         "string, the line a question asked the person to run, for a step only they can take",
     ),
     ("call", "string, the tool a call waiting for approval calls"),
+    (
+        "reason",
+        "string, why the reviewer handed a call waiting for approval to the person",
+    ),
     ("id", "string, a margin note's id"),
     ("removed", "boolean, the margin note was taken away"),
 ];
@@ -89,11 +93,14 @@ pub enum Kind {
         done: bool,
         asked_by: Option<String>,
     },
-    /// A call waiting on the person, whose arguments are in the history.
+    /// A call waiting on the person, whose arguments are in the history
+    /// or the approvals listing; `reason` is the reviewer's, when it
+    /// handed the call over.
     Call {
         call: String,
         name: Option<String>,
         node: Option<i64>,
+        reason: Option<String>,
     },
 }
 
@@ -361,11 +368,12 @@ impl Activity {
                             call: id.to_owned(),
                             name: call["name"].as_str().map(str::to_owned),
                             node: call["node"].as_i64().filter(|node| *node > 0),
+                            reason: None,
                         })));
                     }
                 }
             }
-            // A reviewer handed the call to the person.
+            // A reviewer handed the call to the person, and said why.
             "approval_asked" => {
                 if let Some(id) = data["call_id"].as_str()
                     && self.approval(task, id)
@@ -374,6 +382,7 @@ impl Activity {
                         call: id.to_owned(),
                         name: None,
                         node: None,
+                        reason: data["reason"].as_str().map(str::to_owned),
                     })));
                 }
             }
@@ -617,7 +626,12 @@ pub fn built(lead: &str, pending: &Pending, read: Read) -> Option<Event> {
                 json!({"status": status, "done": done, "asked_by": asked_by, "error": error}),
             ))
         }
-        (Kind::Call { call, name, .. }, Read::Call { name: read, text }) => {
+        (
+            Kind::Call {
+                call, name, reason, ..
+            },
+            Read::Call { name: read, text },
+        ) => {
             let name = read.or_else(|| name.clone());
             let mut made = event(
                 task,
@@ -627,8 +641,10 @@ pub fn built(lead: &str, pending: &Pending, read: Read) -> Option<Event> {
                 format!("{task}/{turn}/approval/{call}"),
                 format!("{task} waits for the person's approval"),
                 text,
-                json!({"call": name}),
+                json!({"call": name, "reason": reason}),
             );
+            // The reviewer's reason on its own line, after what waits.
+            made.details = reason.as_deref().map(cut);
             made.steer = true;
             Some(made)
         }
@@ -903,11 +919,74 @@ mod tests {
         );
         assert_eq!(made.text, "rm -rf build/");
         assert_eq!(made.fields["call"], "exec");
+        assert!(made.details.is_none());
         // One the approver answers is not the person's.
         let auto = json!({"calls": [{"call_id": "y", "gates": ["auto"], "name": "exec"}]});
         assert!(
             reads(activity.event(&ev("calc.db", 4, "approval_requested", auto), None, 7))
                 .is_empty()
+        );
+    }
+
+    #[test]
+    fn a_call_the_reviewer_hands_over_names_what_waits_and_why() {
+        let mut activity = Activity::new("calc.lead");
+        let reason = "not reviewed: the call is too long to show. If your caller wants this, ask them to name the action in a message, then try again.";
+        let asked = json!({"call_id": "script-0/3", "request": 1, "tag": "auto", "reason": reason,
+            "step_of": "script-0"});
+        let pending =
+            reads(activity.event(&ev("calc.db", 4, "approval_asked", asked.clone()), None, 1));
+        let [pending] = &pending[..] else {
+            panic!("{pending:?}")
+        };
+        assert_eq!(
+            pending.kind,
+            Kind::Call {
+                call: "script-0/3".into(),
+                name: None,
+                node: None,
+                reason: Some(reason.into()),
+            }
+        );
+        // Told once a turn.
+        assert!(
+            reads(activity.event(&ev("calc.db", 4, "approval_asked", asked), None, 2)).is_empty()
+        );
+        // Read from the calls waiting: the command it runs, and the reason
+        // on its own line.
+        let text = call_text(
+            Some("shell"),
+            Some(r#"{"command":"git push --force origin main"}"#),
+        );
+        let read = Read::Call {
+            name: Some("shell".into()),
+            text,
+        };
+        let made = built("calc.lead", pending, read).unwrap();
+        assert_eq!(
+            made.from.as_deref(),
+            Some("calc.db waits for the person's approval")
+        );
+        assert_eq!(made.text, "git push --force origin main");
+        assert_eq!(made.details.as_deref(), Some(reason));
+        assert_eq!(
+            (&made.fields["call"], &made.fields["reason"]),
+            (&json!("shell"), &json!(reason))
+        );
+        let note = super::super::sources::line(&super::super::sources::Heard {
+            event: made,
+            subs: Vec::new(),
+            order: 1,
+            due: false,
+        });
+        assert!(
+            note.ends_with(&format!("\ngit push --force origin main\n{reason}")),
+            "{note}"
+        );
+        // A tool with no command shows its name and arguments.
+        assert_eq!(
+            call_text(Some("write"), Some(r#"{"path":"a.md"}"#)),
+            r#"write {"path":"a.md"}"#
         );
     }
 

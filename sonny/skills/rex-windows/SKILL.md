@@ -17,7 +17,7 @@ Sessions are for leads: each project's lead has a Rex session of its own, and it
 
 ## Where things go
 
-- An agent you start gets no tab unless the person asked for one; Sonny opens its tab when it needs them.
+- An agent you start gets no tab unless the person asked for one.
 - Never make a Rex session or window yourself (`rex new`, `rex window new`, `rex run`, `rex split`), and never use `$REX_SESSION` or `$REX_BLOCK`: they may name a terminal that is not yours.
 - Never close a window or block the person has typed in or asked you to open; ask them first.
 

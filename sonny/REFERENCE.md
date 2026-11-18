@@ -389,8 +389,9 @@ same way. A task the lead (or one of its tasks) starts gets a window there
 (a Herdr tab; in cmux a tab in the lead's pane) running Sonny on that task,
 without taking focus, its block (pane, cmux tab) labelled with the task's
 name, when someone asks for one: an agent that shows it (`show_agent`),
-only when you asked, you, from `/status` or a click on its name, or the task
-itself coming to need you. The others, such as reviewers and a lead's own helpers,
+only when you asked, or you, from `/status` or a click on its name. A task
+that needs you opens nothing: its approval or question waits in its lead's
+window, and its tab, where it has one, rings. The others, such as reviewers and a lead's own helpers,
 work without one; `/status` and the footer count them. With `[sonny]
 task_tabs = "every"`, each task gets its window as a turn of its starts. In Rex, each window reports OSC 7501 status, so Rex
 shows which task is working, waiting on you (an approval, or a question it
@@ -437,9 +438,7 @@ first's calls open nothing anywhere and say nothing opened would be seen,
 while the Rex lead opens its tasks' tabs as before. With every window closed, the last one used still names the place. A
 project whose lead is in no multiplexer gets none, and its agents get no
 layout skill. A tab asked for stays until you or an agent close it, or the
-task is marked done; one opened only because the task needed you closes once
-its work is taken, unless you went to it or typed in it since, or an agent
-showed it again. With `task_tabs = "every"`, a task's window
+task is marked done. With `task_tabs = "every"`, a task's window
 closes once its work is taken: its turn completed and the lead (or the task
 that started it) waited on it. One that failed, was interrupted or waits on you stays
 open, and a task given more work opens again; ask the lead to show one, or
@@ -460,8 +459,7 @@ only such tabs could make room, a new task's tab does not open (the
 status row says so) and waits for you, as one closed for room does. A tab closed for room stays closed while its
 task works on, and `/status` (or its name) opens it again, also after the
 lead starts again (kept in `~/.agent/sonny/aside/`); its `/status` row
-says `tab set aside for room`. A task set aside that comes to need you
-opens its tab again on its own, as what needs you keeps its tab. `--rex-host HOST` puts the session on another Rex
+says `tab set aside for room`. `--rex-host HOST` puts the session on another Rex
 server; `--no-layout` turns the layout off. Sonny writes a skill for each
 multiplexer the machine has to `~/.agents/skills` (`rex-windows`,
 `herdr-panes` and `cmux-tabs`, from `skills/`). Each sends the agent to
@@ -489,6 +487,8 @@ exit status to wait for, so their skills have agents end such a command with
 a line to wait for.
 The skill tells agents to close what they opened once read; whatever a task
 left open closes with its window.
+
+![A lead's window: the task it started asks whether to push to main, and the question waits there under From fix-avg, with no tab opened for the task](../docs/sonny/task-ask-in-lead.png)
 
 ## ACP clients
 
