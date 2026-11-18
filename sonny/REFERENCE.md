@@ -2314,7 +2314,20 @@ many rows as the margin draws it in, and it goes back beside the
 conversation once there is room again. The agent's plan sits over the
 notes, one plan however often it changes; each `plan` call in the
 conversation is a row of how far it had got, and where the margin cannot
-show, the newest is the whole checklist. The notes are kept by agent in
+show, the newest is the whole checklist. Under the plan and above the
+notes, `Tasks · 2` lists what the agent has going: its own tasks that
+need you, failed or work, in that order, each its mark, its title and its
+name, a task's helpers counted under it (`└ 2 helpers, 1 working`), and a
+workflow it runs as a row with its strip. Idle and done ones are not
+there: `/status` has them. Sonny draws it from what `/status` reads, as it
+draws the footer's counts; it is no tool call and no note, so no agent
+writes it and nothing folds it away. With none, it is not drawn; the
+margin opens for it as it does for a plan. A click on a task, or `enter`
+with it picked, goes to it.
+
+![The margin's tasks at 150, 60 and 44 columns: under the plan, above the notes, one that needs you first, a task's helpers counted under it](../docs/sonny/margin-tasks.png)
+
+The notes are kept by agent in
 `~/.agent/sonny/margin/`, with the newest node of the agent's history they
 were brought up to; the calls stay in its history. A window opened later
 reads the `margin` calls and closes made since that node, however far
