@@ -467,6 +467,8 @@ a line to wait for.
 The skill tells agents to close what they opened once read; whatever a task
 left open closes with its window.
 
+![A lead's window: the task it started asks whether to push to main, and the question waits there under From fix-avg, with no tab opened for the task](../docs/sonny/task-ask-in-lead.png)
+
 ## ACP clients
 
 ### T3 Code
