@@ -641,7 +641,7 @@ async fn read_status_of(
     client: &Client,
     options_store: &std::path::Path,
     scope: background::Scope,
-    listed: &[Value],
+    listed: &[standing::Agent],
     turns: &HashMap<String, Value>,
     status_read: &mut HashMap<String, (Value, Latest)>,
     asks_seen: &mut HashMap<String, (i64, Seen)>,
@@ -722,18 +722,20 @@ async fn read_status_of(
     let (mut fresh, mut whole) = (false, true);
     // Side chats are not the project's agents.
     for bot in listed {
-        let Some(name) = (bot["name"].as_str()).filter(|_| bot["expire_ms"].is_null()) else {
+        let name = bot.name.as_str();
+        if name.is_empty() || bot.expire_ms.is_some() {
             continue;
-        };
+        }
         // Nor are a workflow's workers: its run is one item. What one asks
         // the person is read with the agents', while it runs and a while
         // after, so a window raises it and lets it go once answered.
         if workflow::is_worker(name) {
-            let ended = bot["last"]["finished_ms"].as_u64().unwrap_or(0);
+            let ended = (bot.last.as_ref()).and_then(|last| last.finished_ms);
+            let ended = ended.unwrap_or(0);
             let held_here = held
                 .as_ref()
                 .is_ok_and(|held| held.iter().any(|held| held.bot == name));
-            if bot["running_turn"].is_i64() || held_here || now.saturating_sub(ended) < 600_000 {
+            if bot.running_turn.is_some() || held_here || now.saturating_sub(ended) < 600_000 {
                 read.push(name.to_owned());
             }
             continue;
@@ -748,7 +750,7 @@ async fn read_status_of(
         listed_here.insert(name);
         // An idle agent no event moved, built as the last count built it.
         if let Some((rows_kept, again)) = &mut reuse
-            && bot["running_turn"].is_null()
+            && bot.running_turn.is_none()
             && name != view.bot
             && !again.contains(name)
             && let Some(row) = rows_kept
@@ -763,11 +765,11 @@ async fn read_status_of(
         // Its latest items are read again only once its history moved:
         // the same head is the same history. A failed read is kept
         // for none, so the next refresh tries again.
-        let head = json!([bot["bot_id"], bot["head"]]);
+        let head = json!([bot.bot_id, bot.head]);
         let latest = match status_read.remove(name) {
             // No history yet: nothing to read, and nothing asked of the
             // daemon for it, however many such agents a project holds.
-            _ if bot["head"].is_null() => Some(Latest::default()),
+            _ if bot.head.is_none() => Some(Latest::default()),
             Some((seen, latest)) if seen == head => Some(latest),
             _ => {
                 fresh = true;
@@ -783,15 +785,28 @@ async fn read_status_of(
         // Its turn, as the listing says: the one the daemon runs, however
         // many messages were steered into it or queued after it since, or
         // how its newest that ran (or failed in line) ended.
-        let running_turn = bot["running_turn"].as_i64();
-        let running = running_turn.is_some();
-        let ran = match running {
-            true => json!({"turn": running_turn, "status": bot["status"],
-                "waiting_on": bot["waiting_on"], "started_ms": bot["started_ms"]}),
-            false => bot["last"].clone(),
+        let running = bot.running_turn.is_some();
+        let last = bot.last.as_ref().filter(|_| !running);
+        let (turn, ran_status, started, finished) = match running {
+            true => (
+                bot.running_turn,
+                bot.status.as_deref(),
+                bot.started_ms,
+                None,
+            ),
+            false => (
+                last.map(|last| last.turn),
+                last.map(|last| last.status.as_str()),
+                last.and_then(|last| last.started_ms),
+                last.and_then(|last| last.finished_ms),
+            ),
+        };
+        let waiting_on = match running {
+            true => &bot.waiting_on,
+            false => &Value::Null,
         };
         // A turn held on a cause, parked on its call or in line, says so.
-        let blocked = &bot["waiting_on"]["blocked"];
+        let blocked = &bot.waiting_on["blocked"];
         let blocked_on = blocked.is_object().then(|| {
             status::held_cause(
                 blocked["code"].as_str().unwrap_or(""),
@@ -799,10 +814,10 @@ async fn read_status_of(
             )
             .0
         });
-        let state = match (running, ran["status"].as_str()) {
+        let state = match (running, ran_status) {
             _ if let Some(what) = &blocked_on => format!("{}{what}", status::HELD),
             // A call a reviewer weighs waits on no one here.
-            (true, Some("waiting")) if ran["waiting_on"]["approval"] == true => {
+            (true, Some("waiting")) if waiting_on["approval"] == true => {
                 match held {
                     Ok(_) => "waiting on its reviewer".into(),
                     // Unlisted, the call may be the person's.
@@ -810,7 +825,7 @@ async fn read_status_of(
                 }
             }
             (true, Some("waiting")) => {
-                let on: Vec<String> = ran["waiting_on"]["handles"]
+                let on: Vec<String> = waiting_on["handles"]
                     .as_array()
                     .into_iter()
                     .flatten()
@@ -820,18 +835,20 @@ async fn read_status_of(
                     .collect();
                 format!("waiting on {}", on.join(", "))
             }
-            (true, Some("paced")) => status::paced(&ran["waiting_on"], now),
+            (true, Some("paced")) => status::paced(waiting_on, now),
             (true, _) => "working".into(),
             (false, Some("completed")) => started::IDLE.into(),
-            (false, Some("failed")) if ran["error"] == EMPTY => started::QUIET.into(),
+            (false, Some("failed"))
+                if last.and_then(|last| last.error.as_deref()) == Some(EMPTY) =>
+            {
+                started::QUIET.into()
+            }
             (false, Some("interrupted")) => started::INTERRUPTED.into(),
             (false, Some(other)) => other.to_owned(),
             (false, None) => "idle".into(),
         };
         // A running turn counts on from its start; one that ended
         // shows how long it took.
-        let started = ran["started_ms"].as_u64();
-        let finished = ran["finished_ms"].as_u64();
         let (at, seconds) = match running {
             true => (started, started.map(|at| now.saturating_sub(at) / 1000)),
             false => (
@@ -848,14 +865,14 @@ async fn read_status_of(
         // ended, as is whether that turn resolved the task. A running
         // turn shows its work, as its last items say; a question still
         // open shows again once it ends.
-        let seen = match ran["turn"].as_i64() {
+        let seen = match turn {
             Some(last) if !running => match asks_seen.get(name) {
                 Some((at, seen)) if *at == last => seen.clone(),
                 _ => {
                     fresh = true;
                     // A read that failed is kept for none: the next
                     // refresh, or window, reads it again.
-                    match needs::scan(client, name, ran["turn"].as_i64()).await {
+                    match needs::scan(client, name, turn).await {
                         Some(seen) => {
                             asks_seen.insert(name.to_owned(), (last, seen.clone()));
                             seen
@@ -872,9 +889,8 @@ async fn read_status_of(
                 ..Default::default()
             },
         };
-        let itself = seen.itself && ran["status"] == "completed";
-        let resolved =
-            itself || resolved::holds(resolved::read(&store, name), ran["turn"].as_i64(), running);
+        let itself = seen.itself && ran_status == Some("completed");
+        let resolved = itself || resolved::holds(resolved::read(&store, name), turn, running);
         let open = seen.ask.clone();
         // This window's own agent waits on what it shows open here too,
         // its transcript read only so far back.
@@ -921,8 +937,8 @@ async fn read_status_of(
             Some(model) if name == view.bot => model.to_owned(),
             _ => format!(
                 "{}/{}",
-                bot["provider"].as_str().unwrap_or("?"),
-                bot["model"].as_str().unwrap_or("?")
+                bot.provider.as_deref().unwrap_or("?"),
+                bot.model.as_deref().unwrap_or("?")
             ),
         };
         // The profile it runs as, said even when it is its seat's own,
@@ -932,7 +948,7 @@ async fn read_status_of(
         let profile = match project::is_lead(name) {
             _ if !view.details => None,
             true => project::chosen(&store, name).or_else(|| {
-                let folder = bot["workspace"].as_str().unwrap_or("").to_owned();
+                let folder = bot.workspace.clone().unwrap_or_default();
                 (profiles.entry(folder))
                     .or_insert_with_key(|folder| match folder.as_str() {
                         "" => None,
@@ -943,7 +959,7 @@ async fn read_status_of(
             false => seat_profile(&store, name, false, std::path::Path::new("")),
         }
         .unwrap_or_default();
-        let title = titles.of(bot);
+        let title = titles.named(name, bot.bot_id, bot.workspace.as_deref());
         rows.push(status::Row {
             name: short(name, &project, &lead),
             bot: name.to_owned(),
@@ -959,7 +975,7 @@ async fn read_status_of(
             pr: pr.unwrap_or_default(),
             background: background::fact(&behind, name, &icons),
             follows: background::icons(&behind, name, &icons),
-            maker: bot["created_by"].as_str().unwrap_or("").to_owned(),
+            maker: bot.maker().to_owned(),
             group,
             run: None,
             line: None,
@@ -988,8 +1004,8 @@ async fn read_status_of(
     status_read.retain(|name, _| listed_here.contains(name.as_str()));
     // The project's title, from its lead's folder's file.
     let lead_folder = (listed.iter())
-        .find(|bot| bot["name"] == lead.as_str())
-        .and_then(|bot| bot["workspace"].as_str())
+        .find(|bot| bot.name == lead)
+        .and_then(|bot| bot.workspace.as_deref())
         .unwrap_or("");
     let title = titles.project(lead_folder);
     // The lead first, then by group, the latest first in each.
@@ -4675,7 +4691,7 @@ struct Counted {
     /// The project's agents as the count left them, the rows that moved
     /// read again, with their [`rows_mark`]; none when a read failed, so
     /// the window takes a fresh snapshot.
-    listed: Option<(Vec<Value>, u64)>,
+    listed: Option<(Vec<standing::Agent>, u64)>,
     /// This window's agent's own tasks, as the margin lists them, when read.
     own: Option<Vec<status::Own>>,
     /// The rows the count built, for the next; none builds every row again.
@@ -4704,40 +4720,42 @@ type Local = ((usize, usize), Option<std::time::SystemTime>);
 /// A mark of where the agents `listed` stand as their rows say it: the
 /// sum of each row's [`row_mark`], so a row that changes changes it by its
 /// own marks alone.
-fn rows_mark(listed: &[Value]) -> u64 {
+fn rows_mark(listed: &[standing::Agent]) -> u64 {
     (listed.iter()).fold(0, |mark, bot| mark.wrapping_add(row_mark(bot)))
 }
 
 /// A mark of where one agent stands as its row says it.
-fn row_mark(bot: &Value) -> u64 {
+fn row_mark(bot: &standing::Agent) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut mark = std::collections::hash_map::DefaultHasher::new();
-    for key in [
-        "name",
-        "running_turn",
-        "status",
-        "waiting_on",
-        "last",
-        "expire_ms",
-    ] {
-        bot[key].to_string().hash(&mut mark);
+    (
+        &bot.name,
+        bot.running_turn,
+        &bot.status,
+        &bot.last,
+        bot.expire_ms,
+    )
+        .hash(&mut mark);
+    match &bot.waiting_on {
+        Value::Null => None,
+        on => Some(on.to_string()),
     }
-    if !bot["running_turn"].is_null() {
-        bot["head"].to_string().hash(&mut mark);
+    .hash(&mut mark);
+    if bot.running_turn.is_some() {
+        bot.head.hash(&mut mark);
     }
     mark.finish()
 }
 
 /// Whether `rows` differ from the rows of the same names in `listed`,
 /// which is in name order, or name agents it does not hold.
-fn rows_differ(listed: &[Value], rows: &[Value]) -> bool {
-    rows.iter().any(|row| {
-        let name = row["name"].as_str().unwrap_or_default();
-        match listed.binary_search_by(|bot| bot["name"].as_str().unwrap_or_default().cmp(name)) {
+fn rows_differ(listed: &[standing::Agent], rows: &[standing::Agent]) -> bool {
+    rows.iter().any(
+        |row| match listed.binary_search_by(|bot| bot.name.cmp(&row.name)) {
             Ok(at) => listed[at] != *row,
             Err(_) => true,
-        }
-    })
+        },
+    )
 }
 
 /// `listed`, in name order as the listing keeps it, with the rows of the
@@ -4746,17 +4764,16 @@ fn rows_differ(listed: &[Value], rows: &[Value]) -> bool {
 /// holds its project's listing once however often it counts; `mark`, the
 /// listing's [`rows_mark`], changes by the rows that changed.
 fn moved_rows(
-    listed: &mut Vec<Value>,
+    listed: &mut Vec<standing::Agent>,
     moved: &std::collections::BTreeSet<String>,
-    rows: Vec<Value>,
+    rows: Vec<standing::Agent>,
     mark: &mut Option<u64>,
 ) {
-    let at = |listed: &[Value], name: &str| {
-        listed.binary_search_by(|bot| bot["name"].as_str().unwrap_or_default().cmp(name))
+    let at = |listed: &[standing::Agent], name: &str| {
+        listed.binary_search_by(|bot| bot.name.as_str().cmp(name))
     };
-    let found: std::collections::HashSet<&str> = (rows.iter())
-        .filter_map(|row| row["name"].as_str())
-        .collect();
+    let found: std::collections::HashSet<&str> =
+        (rows.iter()).map(|row| row.name.as_str()).collect();
     for name in moved.iter().filter(|name| !found.contains(name.as_str())) {
         if let Ok(gone) = at(listed, name) {
             let gone = listed.remove(gone);
@@ -4765,11 +4782,8 @@ fn moved_rows(
     }
     drop(found);
     for row in rows {
-        let Some(name) = row["name"].as_str() else {
-            continue;
-        };
         let new = row_mark(&row);
-        match at(listed, name) {
+        match at(listed, &row.name) {
             Ok(at) => {
                 let old = row_mark(&listed[at]);
                 *mark = mark.map(|mark| mark.wrapping_sub(old).wrapping_add(new));
@@ -5344,7 +5358,7 @@ struct App {
     /// The project's agents as last read, kept current by `follower`,
     /// with their [`rows_mark`] once counted; the count holds it while it
     /// runs, so there is one copy.
-    listed: Option<Vec<Value>>,
+    listed: Option<Vec<standing::Agent>>,
     rows_mark: Option<u64>,
     folded: Option<(bool, u64)>,
     refold: bool,
@@ -5998,36 +6012,46 @@ fn kin(
 
 /// With other leads in `project`'s folder, the bots among `listed` that
 /// are `lead`'s ([`lineage_of`]); none to tell apart, with it the only one.
-fn owned(listed: &[Value], project: &str, lead: &str) -> Option<std::collections::HashSet<String>> {
+fn owned(
+    listed: &[standing::Agent],
+    project: &str,
+    lead: &str,
+) -> Option<std::collections::HashSet<String>> {
     let first = lead == format!("{project}.lead");
     let shared = !first
-        || (listed.iter()).any(|bot| {
-            let name = bot["name"].as_str().unwrap_or("");
-            name != lead && project::lead_project(name) == Some(project)
-        });
-    (shared && project::lead_project(lead) == Some(project))
-        .then(|| lineage_of(listed, lead, first))
+        || (listed.iter())
+            .any(|bot| bot.name != lead && project::lead_project(&bot.name) == Some(project));
+    let made = || (listed.iter()).map(|bot| (bot.name.as_str(), bot.maker()));
+    (shared && project::lead_project(lead) == Some(project)).then(|| lineage(made(), lead, first).0)
+}
+
+/// Each of `bots` (as `bots` lists them) by name, with the agent that made
+/// it, or empty.
+fn made_by(bots: &[Value]) -> impl Iterator<Item = (&str, &str)> {
+    (bots.iter()).filter_map(|bot| {
+        Some((
+            bot["name"].as_str()?,
+            bot["created_by"].as_str().unwrap_or(""),
+        ))
+    })
 }
 
 /// The bots among `bots` (as `bots` lists them) that are `lead`'s: made by
 /// it or by one of its, or, for the folder's first lead, made by no agent
 /// at all; never another lead.
 fn lineage_of(bots: &[Value], lead: &str, first: bool) -> std::collections::HashSet<String> {
-    lineage(bots, lead, first).0
+    lineage(made_by(bots), lead, first).0
 }
 
 /// [`lineage_of`], and how many makers it looked up: each bot's answer is
 /// worked out once, so a line of makers is walked by the first bot on it
 /// and every later one stops where it meets a bot already answered.
-fn lineage(bots: &[Value], lead: &str, first: bool) -> (std::collections::HashSet<String>, usize) {
-    let made_by: HashMap<&str, &str> = (bots.iter())
-        .filter_map(|bot| {
-            Some((
-                bot["name"].as_str()?,
-                bot["created_by"].as_str().unwrap_or(""),
-            ))
-        })
-        .collect();
+fn lineage<'a>(
+    bots: impl IntoIterator<Item = (&'a str, &'a str)>,
+    lead: &str,
+    first: bool,
+) -> (std::collections::HashSet<String>, usize) {
+    let made_by: HashMap<&str, &str> = bots.into_iter().collect();
     let mut answered: HashMap<&str, bool> = HashMap::with_capacity(made_by.len());
     let mut line: Vec<&str> = Vec::new();
     let mut on_line = std::collections::HashSet::new();
@@ -11579,7 +11603,7 @@ impl App {
                 None => return,
             },
         };
-        let running = listed.iter().any(|bot| bot["running_turn"].is_i64());
+        let running = listed.iter().any(|bot| bot.running_turn.is_some());
         let moved = changes.moved;
         if !whole && moved.is_empty() && !running && self.counted_local == Some(local) {
             self.listed = Some(listed);
@@ -11634,9 +11658,7 @@ impl App {
                 // Running agents that stand as they stood leave the
                 // listing, and its mark, as they were.
                 if rows_differ(&listed, &rows) {
-                    let names = (rows.iter())
-                        .filter_map(|row| Some(row["name"].as_str()?.to_owned()))
-                        .collect();
+                    let names = rows.iter().map(|row| row.name.clone()).collect();
                     moved_rows(&mut listed, &names, rows, &mut kept_mark);
                 }
             }
@@ -22976,7 +22998,11 @@ mod tests {
 
     #[test]
     fn rows_that_moved_are_changed_where_they_lie_in_name_order() {
-        let row = |name: &str, status: &str| json!({"name": name, "status": status});
+        let row = |name: &str, status: &str| standing::Agent {
+            name: name.into(),
+            status: Some(status.into()),
+            ..Default::default()
+        };
         let mut listed = vec![row("a", "idle"), row("b", "idle"), row("c", "idle")];
         let moved: std::collections::BTreeSet<String> =
             ["b", "c", "d"].into_iter().map(String::from).collect();
@@ -23197,7 +23223,7 @@ mod tests {
                 n => bot(&format!("shop.t{n}"), &format!("shop.t{}", n - 1)),
             })
             .collect();
-        let (mine, looked) = lineage(&bots, "shop.lead", true);
+        let (mine, looked) = lineage(made_by(&bots), "shop.lead", true);
         assert_eq!(mine.len(), 20_000);
         assert_eq!(looked, 20_000);
     }

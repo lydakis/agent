@@ -47,37 +47,58 @@ pub const KINDS: [&str; 17] = [
     "deleted",
 ];
 
-/// The fields of a `bots` row a window reads to count its agents;
-/// a kept listing holds only these, so a window that keeps every agent of
-/// a large fleet keeps a little of each.
-pub const KEPT: [&str; 14] = [
-    "name",
-    "bot_id",
-    "head",
-    "running_turn",
-    "status",
-    "waiting_on",
-    "last",
-    "started_ms",
-    "expire_ms",
-    "created_by",
-    "created_by_id",
-    "model",
-    "provider",
-    "workspace",
-];
+/// An agent as a window keeps it: the fields of a `bots` row a count
+/// reads, typed, so a window that keeps every agent of a large fleet keeps
+/// a little of each.
+#[derive(Clone, Debug, Default, PartialEq, serde::Deserialize)]
+#[serde(default)]
+pub struct Agent {
+    pub name: String,
+    pub bot_id: Option<i64>,
+    pub head: Option<i64>,
+    pub running_turn: Option<i64>,
+    pub status: Option<String>,
+    pub waiting_on: Value,
+    /// How its newest turn that ran ended.
+    pub last: Option<Ended>,
+    pub started_ms: Option<u64>,
+    /// When a side chat ends: a side chat is not a project's agent.
+    pub expire_ms: Option<i64>,
+    pub created_by: Option<String>,
+    pub created_by_id: Option<i64>,
+    pub model: Option<String>,
+    pub provider: Option<String>,
+    pub workspace: Option<String>,
+}
 
-/// `row` with only the [`KEPT`] fields.
-pub fn kept(mut row: Value) -> Value {
-    if let Some(fields) = row.as_object_mut() {
-        fields.retain(|field, _| KEPT.contains(&field.as_str()));
+/// How a turn ended, as a `bots` row's `last` says it.
+#[derive(Clone, Debug, Default, PartialEq, Hash, serde::Deserialize)]
+#[serde(default)]
+pub struct Ended {
+    pub turn: i64,
+    pub status: String,
+    pub started_ms: Option<u64>,
+    pub finished_ms: Option<u64>,
+    /// The code it failed or was interrupted with.
+    pub error: Option<String>,
+}
+
+impl Agent {
+    /// The agent that made it, or empty.
+    pub fn maker(&self) -> &str {
+        self.created_by.as_deref().unwrap_or("")
     }
-    row
+}
+
+/// `row`, a `bots` row, as a window keeps it; none for a row that is not
+/// one.
+pub fn kept(row: Value) -> Option<Agent> {
+    serde_json::from_value(row).ok()
 }
 
 /// Every agent `pattern` names, every page, with the events' cursor read
 /// before the first page: following from it misses no change.
-pub async fn list(client: &Client, pattern: &str) -> agent_client::Result<(Vec<Value>, i64)> {
+pub async fn list(client: &Client, pattern: &str) -> agent_client::Result<(Vec<Agent>, i64)> {
     let mut listed = Vec::new();
     let mut after: Option<String> = None;
     let mut cursor = None;
@@ -88,7 +109,11 @@ pub async fn list(client: &Client, pattern: &str) -> agent_client::Result<(Vec<V
         }
         let page = client.request("bots", ask).await?;
         cursor = cursor.or(page["cursor"].as_i64());
-        listed.extend(page["bots"].as_array().cloned().unwrap_or_default());
+        listed.extend(
+            (page["bots"].as_array().into_iter().flatten())
+                .cloned()
+                .filter_map(kept),
+        );
         match page["next_after"].as_str() {
             Some(next) if after.as_deref() != Some(next) => after = Some(next.to_owned()),
             _ => break,
@@ -99,7 +124,7 @@ pub async fn list(client: &Client, pattern: &str) -> agent_client::Result<(Vec<V
 
 /// The rows of `names`, read by name, 256 a request: the agents that
 /// moved. One that is gone is not among them.
-pub async fn rows(client: &Client, names: &[String]) -> agent_client::Result<Vec<Value>> {
+pub async fn rows(client: &Client, names: &[String]) -> agent_client::Result<Vec<Agent>> {
     let mut rows = Vec::new();
     for chunk in names.chunks(256) {
         rows.extend(every(client, json!({"names": chunk, "limit": 256})).await?);
@@ -109,7 +134,7 @@ pub async fn rows(client: &Client, names: &[String]) -> agent_client::Result<Vec
 
 /// Every page of the `bots` listing `ask` names, each row [`kept`]: a page
 /// ends at its row count or its size, whichever comes first.
-pub async fn every(client: &Client, ask: Value) -> agent_client::Result<Vec<Value>> {
+pub async fn every(client: &Client, ask: Value) -> agent_client::Result<Vec<Agent>> {
     let mut rows = Vec::new();
     let mut after: Option<String> = None;
     loop {
@@ -121,7 +146,7 @@ pub async fn every(client: &Client, ask: Value) -> agent_client::Result<Vec<Valu
         rows.extend(
             (page["bots"].as_array().into_iter().flatten())
                 .cloned()
-                .map(kept),
+                .filter_map(kept),
         );
         match page["next_after"].as_str() {
             Some(next) if after.as_deref() != Some(next) => after = Some(next.to_owned()),
@@ -135,7 +160,7 @@ pub async fn every(client: &Client, ask: Value) -> agent_client::Result<Vec<Valu
 pub struct Changes {
     /// A fresh snapshot, every agent the pattern names: taken at the start
     /// and after the follow said `pruned`.
-    pub snapshot: Option<Vec<Value>>,
+    pub snapshot: Option<Vec<Agent>>,
     /// The agents an event moved since.
     pub moved: BTreeSet<String>,
 }
@@ -260,7 +285,7 @@ async fn snapshot(
     let mut pause = Duration::from_millis(250);
     loop {
         if let Ok((listed, cursor)) = list(&client, &pattern).await {
-            changes.lock().unwrap().snapshot = Some(listed.into_iter().map(kept).collect());
+            changes.lock().unwrap().snapshot = Some(listed);
             woken.notify_one();
             if !is_glob(&pattern) {
                 return;
@@ -335,8 +360,17 @@ mod tests {
         (client, follows)
     }
 
+    /// An agent `name` at history `head`, as a window keeps it.
+    fn agent(name: &str, head: i64) -> Agent {
+        Agent {
+            name: name.into(),
+            head: Some(head),
+            ..Default::default()
+        }
+    }
+
     /// The next snapshot `follower` takes in.
-    async fn next_snapshot(follower: &Follower, woken: &Notify) -> Vec<Value> {
+    async fn next_snapshot(follower: &Follower, woken: &Notify) -> Vec<Agent> {
         loop {
             if let Some(snapshot) = follower.take().snapshot {
                 return snapshot;
@@ -353,7 +387,7 @@ mod tests {
         let mut follower = Follower::start(client, "shop.*".into(), woken.clone());
         // The snapshot, then the follow from the cursor it was listed at.
         let first = next_snapshot(&follower, &woken).await;
-        assert_eq!(first, vec![json!({"name": "shop.0", "head": 1})]);
+        assert_eq!(first, vec![agent("shop.0", 1)]);
         while follows.lock().unwrap().is_empty() {
             tokio::task::yield_now().await;
         }
@@ -379,7 +413,7 @@ mod tests {
         // follow again from its cursor.
         assert!(follower.heard(&json!({"event": "pruned", "bot": "shop.*", "before": 9})));
         let again = next_snapshot(&follower, &woken).await;
-        assert_eq!(again, vec![json!({"name": "shop.1", "head": 1})]);
+        assert_eq!(again, vec![agent("shop.1", 1)]);
         while follows.lock().unwrap().len() < 2 {
             tokio::task::yield_now().await;
         }
@@ -393,7 +427,7 @@ mod tests {
         let mut follower = Follower::start(client, "solo".into(), woken.clone());
         assert_eq!(
             next_snapshot(&follower, &woken).await,
-            vec![json!({"name": "solo0", "head": 1})]
+            vec![agent("solo0", 1)]
         );
         // Its events are the window's to show, and move it here too.
         assert!(!follower.heard(&json!({"event": "turn_finished", "bot": "solo"})));
