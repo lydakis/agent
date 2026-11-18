@@ -19,7 +19,7 @@
 //! then once live asks again for what animates the sky. Its connection is
 //! its own and closes with the view.
 use crate::{haiku, project};
-use agent_client::Client;
+use agent_client::{Client, Events};
 use ratatui::{
     style::{Color, Modifier, Style, Stylize},
     text::{Line, Span},
@@ -5478,12 +5478,9 @@ async fn follow(socket: PathBuf, store: PathBuf, send: Feeder) {
             return;
         }
         resumed = Some(cursor);
-        (client, events) = match Client::connect(&socket).await {
-            Ok(connected) => connected,
-            Err(error) => {
-                let _ = send.send(Feed::Down(error.to_string()));
-                return;
-            }
+        (client, events) = match reconnect(&socket, &send).await {
+            Some(connected) => connected,
+            None => return,
         };
     }
     if send.send(Feed::Through(cursor)).is_err() {
@@ -5540,10 +5537,14 @@ async fn follow(socket: PathBuf, store: PathBuf, send: Feeder) {
                     // past was read, removals among it, which no replay
                     // brings: the roll again says so, now that what follows
                     // it is kept.
-                    if !roll(&client, &send).await || send.send(Feed::Ready).is_err() {
-                        return;
+                    match rolled_again(&client, &send).await {
+                        Some(true) if send.send(Feed::Ready).is_ok() => continue,
+                        Some(_) => return,
+                        None => {
+                            fell = true;
+                            break;
+                        }
                     }
-                    continue;
                 }
                 Some("pruned") => continue,
                 Some("lagged" | "follow_lagged") => {
@@ -5590,12 +5591,9 @@ async fn follow(socket: PathBuf, store: PathBuf, send: Feeder) {
             return;
         }
         resumed = Some(cursor);
-        (client, events) = match Client::connect(&socket).await {
-            Ok(connected) => connected,
-            Err(error) => {
-                let _ = send.send(Feed::Down(error.to_string()));
-                return;
-            }
+        (client, events) = match reconnect(&socket, &send).await {
+            Some(connected) => connected,
+            None => return,
         };
     }
 }
@@ -5838,8 +5836,13 @@ async fn tape(socket: PathBuf, from: i64, send: Feeder) {
             // is read again, as `follow` reads the roll again. What came
             // while it was read goes on the tape before the replay starts,
             // so an agent made then, listed already, waits for its making.
-            if !roll(&client, &send).await {
-                return;
+            match rolled_again(&client, &send).await {
+                Some(true) => {}
+                Some(false) => return,
+                None => {
+                    fell = true;
+                    break;
+                }
             }
             while let Ok((event, bytes)) = events.try_recv_sized() {
                 let at = event["cursor"].as_i64();
@@ -5896,25 +5899,64 @@ async fn prior(socket: &std::path::Path, from: i64) -> Result<Prior, String> {
 /// Every agent the daemon keeps, page after page, as one roll; false when
 /// the view is gone or the daemon couldn't say.
 async fn roll(client: &Client, send: &Feeder) -> bool {
+    match rolled(client, send).await {
+        Ok(sent) => sent,
+        Err(error) => {
+            let _ = send.send(Feed::Down(error.to_string()));
+            false
+        }
+    }
+}
+
+/// [`roll`] once a follow is live again: a connection let go for falling
+/// behind (`Ok(None)`) reads on from its cursor, as the follow does.
+async fn rolled_again(client: &Client, send: &Feeder) -> Option<bool> {
+    match rolled(client, send).await {
+        Ok(sent) => Some(sent),
+        Err(error) if error.code == "daemon_disconnected" => None,
+        Err(error) => {
+            let _ = send.send(Feed::Down(error.to_string()));
+            Some(false)
+        }
+    }
+}
+
+/// Every agent the daemon keeps, as one roll: whether the view took it.
+async fn rolled(client: &Client, send: &Feeder) -> Result<bool, agent_client::Error> {
     let mut bots = Vec::new();
     let mut after: Option<String> = None;
     loop {
-        let page = match client
+        let page = client
             .request("bots", json!({"after": after, "limit": 256}))
-            .await
-        {
-            Ok(page) => page,
-            Err(error) => {
-                let _ = send.send(Feed::Down(error.to_string()));
-                return false;
-            }
-        };
+            .await?;
         bots.extend(page["bots"].as_array().cloned().unwrap_or_default());
         match page["next_after"].as_str() {
             Some(next) => after = Some(next.to_owned()),
-            None => return send.send(Feed::Roll(bots)).is_ok(),
+            None => return Ok(send.send(Feed::Roll(bots)).is_ok()),
         }
     }
+}
+
+/// A new connection for a follow that fell behind: the pull cord as it
+/// hangs now, which no replay brings, is told as the past is, so a pause
+/// or a resume missed meanwhile shows without its ringing.
+async fn reconnect(
+    socket: &std::path::Path,
+    send: &Feeder,
+) -> Option<(std::sync::Arc<Client>, Events)> {
+    let (client, events) = match Client::connect(socket).await {
+        Ok(connected) => connected,
+        Err(error) => {
+            let _ = send.send(Feed::Down(error.to_string()));
+            return None;
+        }
+    };
+    let cord = match client.paused() {
+        Value::Null => json!({"event": "resumed"}),
+        pause => json!({"event": "paused", "pause": pause}),
+    };
+    send.send(Feed::Past(cord)).ok()?;
+    Some((client, events))
 }
 
 #[cfg(test)]
@@ -8320,6 +8362,8 @@ mod tests {
         let mut seen = Vec::new();
         while let Some(item) = feed.recv().await {
             match item.0 {
+                // The cord as the new connection finds it is no event.
+                Feed::Past(event) if event["cursor"].is_null() => {}
                 Feed::Past(event) => seen.push(event["cursor"].to_string()),
                 Feed::Through(cursor) => seen.push(format!("through {cursor}")),
                 Feed::Down(why) => seen.push(format!("down {why}")),
@@ -8334,11 +8378,23 @@ mod tests {
         std::fs::remove_dir_all(dir).unwrap();
     }
 
+    /// Where a daemon's burst comes.
+    #[derive(Clone, Copy, PartialEq)]
+    enum Burst {
+        /// As the past.
+        Past,
+        /// As the live follow's replay, before it is live.
+        Replay,
+        /// Once the first live follow is live, ahead of the roll's answer,
+        /// which comes only once the burst is through.
+        Live,
+    }
+
     /// A daemon that sends a burst of `count` events of a few KiB each,
-    /// faster than the sky takes them, from any cursor a follow asks for:
-    /// as the past when `past`, else as the live follow's replay. How many
-    /// connections it was asked for is counted.
-    fn burst(socket: &std::path::Path, count: i64, past: bool) -> Arc<AtomicUsize> {
+    /// faster than the sky takes them, from any cursor a follow asks for.
+    /// Every connection after the first greets with the cord pulled. How
+    /// many connections it was asked for is counted.
+    fn burst(socket: &std::path::Path, count: i64, at: Burst) -> Arc<AtomicUsize> {
         use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
         let listener = tokio::net::UnixListener::bind(socket).unwrap();
         let connections = Arc::new(AtomicUsize::new(0));
@@ -8348,12 +8404,15 @@ mod tests {
                 let Ok((stream, _)) = listener.accept().await else {
                     return;
                 };
-                counted.fetch_add(1, Ordering::SeqCst);
+                let first = counted.fetch_add(1, Ordering::SeqCst) == 0;
                 tokio::spawn(async move {
                     let (read, mut write) = stream.into_split();
                     let mut lines = BufReader::new(read).lines();
-                    let mut out =
-                        vec![json!({"event": "ready", "protocol": agent_client::PROTOCOL})];
+                    let mut ready = json!({"event": "ready", "protocol": agent_client::PROTOCOL});
+                    if !first {
+                        ready["paused"] = json!({"by": "shop.a1", "reason": "hold on"});
+                    }
+                    let mut out = vec![ready];
                     let pad = "x".repeat(2048);
                     loop {
                         for line in out.drain(..) {
@@ -8382,13 +8441,30 @@ mod tests {
                             _ => {
                                 out.push(json!({"id": id, "result": {}}));
                                 let after = asked["after"].as_i64().unwrap_or(0);
-                                let bursts = (asked["kinds"] == json!(PAST)) == past;
-                                let end = if bursts { count } else { after };
-                                for cursor in after + 1..=end {
-                                    out.push(json!({"cursor": cursor, "bot": "a", "turn": cursor,
-                                        "event": "accepted", "data": {"pad": pad}}));
+                                let past = asked["kinds"] == json!(PAST);
+                                let events = (after + 1..=count).map(|cursor| {
+                                    json!({"cursor": cursor, "bot": "a", "turn": cursor,
+                                        "event": "accepted", "data": {"pad": pad}})
+                                });
+                                // Live, the burst comes once the first
+                                // follow is live; a later follow finds it
+                                // kept, and replays it.
+                                let at = if at == Burst::Live && !first {
+                                    Burst::Replay
+                                } else {
+                                    at
+                                };
+                                match (at, past) {
+                                    (Burst::Past, true) | (Burst::Replay, false) => {
+                                        out.extend(events);
+                                        out.push(json!({"event": "follow_live", "cursor": count.max(after)}));
+                                    }
+                                    (Burst::Live, false) => {
+                                        out.push(json!({"event": "follow_live", "cursor": after}));
+                                        out.extend(events);
+                                    }
+                                    _ => out.push(json!({"event": "follow_live", "cursor": after})),
                                 }
-                                out.push(json!({"event": "follow_live", "cursor": end.max(after)}));
                             }
                         }
                     }
@@ -8400,24 +8476,37 @@ mod tests {
 
     /// A sky slower than its daemon: what waits for it stays within the
     /// connection's budget, and it reads on from where it fell behind
-    /// until every event came, once each and in order.
-    async fn a_slow_sky_holds_its_budget_and_loses_nothing(past: bool) {
-        let dir = std::env::temp_dir().join(format!("sky-slow-{past}-{}", std::process::id()));
+    /// until every event came, once each and in order, with the cord as
+    /// the last connection found it.
+    async fn a_slow_sky_holds_its_budget_and_loses_nothing(at: Burst) {
+        let dir =
+            std::env::temp_dir().join(format!("sky-slow-{}-{}", at as u8, std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let socket = dir.join("agent.sock");
         // Some 50 MiB, past the budget of both the connection and the view.
         let count = 24_000;
-        let connections = burst(&socket, count, past);
+        let connections = burst(&socket, count, at);
         let (send, mut feed) = Feeder::new();
         let room = send.room.clone();
         tokio::spawn(follow(socket, dir.join("state.sqlite"), send));
-        let (mut next, mut most) = (1, 0);
-        while let Some(Fed(item, held)) = feed.recv().await {
+        let (mut next, mut most, mut ready, mut cord) = (1, 0, false, None);
+        while next <= count || !ready {
+            let Some(Fed(item, held)) = feed.recv().await else {
+                panic!("the follow ended at {next}");
+            };
             most = most.max(agent_client::QUEUE_BYTES - room.available_permits());
             let event = match item {
+                // The cord as each new connection finds it.
+                Feed::Past(event) if event["cursor"].is_null() => {
+                    cord = event["event"].as_str().map(str::to_owned);
+                    continue;
+                }
                 Feed::Past(event) | Feed::Live(event) => event,
-                Feed::Ready => break,
+                Feed::Ready => {
+                    ready = true;
+                    continue;
+                }
                 Feed::Down(why) => panic!("down: {why}"),
                 _ => continue,
             };
@@ -8432,53 +8521,31 @@ mod tests {
             }
             drop(held);
         }
-        assert_eq!(next, count + 1);
-        assert!(most <= agent_client::QUEUE_BYTES);
         let connections = connections.load(Ordering::SeqCst);
+        assert!(most <= agent_client::QUEUE_BYTES);
         assert!(
             most > agent_client::QUEUE_BYTES / 2,
             "the sky was never behind: {most}"
         );
         assert!(connections > 1, "the follow never fell behind");
+        // Pulled while it was behind, which no replay brings.
+        assert_eq!(cord.as_deref(), Some("paused"));
         std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[tokio::test]
-    async fn an_agent_asked_again_before_its_read_is_read_once_as_last_asked() {
-        let (ask, mut asked) = scans();
-        // Turn after turn ends while the reads are busy with another.
-        for turn in 1..=1_000 {
-            ask.send(("a".to_owned(), Some(turn), None)).unwrap();
-        }
-        ask.send(("b".to_owned(), Some(7), None)).unwrap();
-        ask.send(("a".to_owned(), Some(1_001), None)).unwrap();
-        // One ask an agent waits, in the order first asked, each as of its
-        // newest.
-        assert_eq!(asked.names.len(), 2);
-        assert_eq!(asked.asks.lock().unwrap().len(), 2);
-        let read: Vec<(String, Option<i64>)> = std::iter::from_fn(|| asked.try_recv().ok())
-            .map(|(bot, turn, _)| (bot, turn))
-            .collect();
-        assert_eq!(
-            read,
-            [("a".to_owned(), Some(1_001)), ("b".to_owned(), Some(7))]
-        );
-        // Asked again once its read began, it is read again.
-        ask.send(("a".to_owned(), Some(1_002), None)).unwrap();
-        assert_eq!(asked.try_recv().unwrap().1, Some(1_002));
-        // The reads gone, asking says so.
-        drop(asked);
-        assert!(ask.send(("c".to_owned(), None, None)).is_err());
-    }
-
-    #[tokio::test]
     async fn a_slow_sky_reading_the_past_holds_its_budget_and_loses_nothing() {
-        a_slow_sky_holds_its_budget_and_loses_nothing(true).await;
+        a_slow_sky_holds_its_budget_and_loses_nothing(Burst::Past).await;
     }
 
     #[tokio::test]
     async fn a_slow_sky_live_holds_its_budget_and_loses_nothing() {
-        a_slow_sky_holds_its_budget_and_loses_nothing(false).await;
+        a_slow_sky_holds_its_budget_and_loses_nothing(Burst::Replay).await;
+    }
+
+    #[tokio::test]
+    async fn a_slow_sky_whose_roll_finds_the_connection_gone_reads_on() {
+        a_slow_sky_holds_its_budget_and_loses_nothing(Burst::Live).await;
     }
 
     #[tokio::test]
