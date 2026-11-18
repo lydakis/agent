@@ -56,6 +56,15 @@ fn wanted(kinds: Option<&Arc<HashSet<String>>>, pattern: Option<&Arc<str>>, even
         && pattern
             .is_none_or(|pattern| (event["bot"].as_str()).is_some_and(|bot| glob(pattern, bot)))
 }
+/// `event` as a pattern's follow delivers it: naming the pattern as
+/// `following`, so a session that follows a pattern beside a bot of it
+/// tells which follow brought each event.
+fn followed(mut event: Value, pattern: Option<&Arc<str>>) -> Value {
+    if let Some(pattern) = pattern {
+        event["following"] = Value::from(&**pattern);
+    }
+    event
+}
 /// Whether `bot` names bots by a GLOB pattern other than every bot's: no
 /// name holds `*`, `?` or `[`.
 pub fn is_pattern(bot: &str) -> bool {
@@ -687,7 +696,7 @@ impl Hub {
                 .collect::<Vec<Sub>>()
         };
         for sub in subs {
-            let (session, output) = {
+            let (session, output, pattern) = {
                 let mut s = sub.lock().unwrap();
                 if s.cancelled || !s.live || cursor.is_some_and(|c| c <= s.last_cursor) {
                     continue;
@@ -698,9 +707,9 @@ impl Hub {
                 if !wanted(s.kinds.as_ref(), None, event) {
                     continue;
                 }
-                (s.session, s.output.clone())
+                (s.session, s.output.clone(), s.pattern.clone())
             };
-            if output.try_send(event.clone()).is_err() {
+            if output.try_send(followed(event.clone(), pattern.as_ref())).is_err() {
                 self.counts.dropped.fetch_add(1, Ordering::Relaxed);
                 self.close_session(session);
                 output.close();
@@ -930,7 +939,7 @@ pub async fn replay(store: Store, hub: Hub, bot: String, sub: Sub) -> Result<()>
         for event in
             (events.into_iter()).filter(|event| wanted(kinds.as_ref(), pattern.as_ref(), event))
         {
-            if output.send(event).await.is_err() {
+            if output.send(followed(event, pattern.as_ref())).await.is_err() {
                 hub.unsubscribe(&bot, session);
                 return Ok(());
             }
@@ -1008,7 +1017,12 @@ mod tests {
         let mut lines = tokio::io::BufReader::new(far).lines();
         let line = lines.next_line().await.unwrap().unwrap();
         let got: Value = serde_json::from_str(&line).unwrap();
-        assert_eq!(got, event(2, "shop.a"));
+        // It names the pattern that brought it, as a replayed one does.
+        let mut brought = event(2, "shop.a");
+        brought["following"] = json!("shop.*");
+        assert_eq!(got, brought);
+        assert_eq!(followed(event(2, "shop.a"), Some(&Arc::from("shop.*"))), brought);
+        assert_eq!(followed(event(2, "shop.a"), None), event(2, "shop.a"));
         // A replayed page passes the other bots' by too.
         let pattern: Arc<str> = Arc::from("shop.*");
         assert!(!wanted(None, Some(&pattern), &event(3, "web.a")));

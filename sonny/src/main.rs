@@ -4663,9 +4663,8 @@ struct App {
     /// its own question and calls, and when the done marks last changed.
     counted_local: Option<((usize, usize), Option<std::time::SystemTime>)>,
     /// The follow of this window's project that keeps `listed` current,
-    /// and how it reaches the daemon: a connection of its own.
+    /// on the window's own connection.
     follower: Option<standing::Follower>,
-    follow_connect: standing::Connect,
     /// The project's agents as last read, kept current by `follower`.
     listed: Option<Arc<Vec<Value>>>,
     folded: Option<(bool, u64)>,
@@ -6242,7 +6241,6 @@ impl App {
             record["provider"].as_str().unwrap_or("?"),
             record["model"].as_str().unwrap_or("?")
         );
-        let follow_connect = standing::connect_to(options.socket.clone());
         Self {
             client,
             bot: bot.to_owned(),
@@ -6424,7 +6422,6 @@ impl App {
             counted_mark: None,
             counted_local: None,
             follower: None,
-            follow_connect,
             listed: None,
             folded: None,
             refold: false,
@@ -6706,6 +6703,13 @@ impl App {
             }
             tokio::select! {
                 event = events.recv(), if self.down.is_none() => {
+                    // The project's follow shares the connection: what it
+                    // brings wakes the window once it has something new.
+                    if let Some(event) = &event
+                        && (self.follower.as_mut()).is_some_and(|follower| follower.heard(event))
+                    {
+                        continue;
+                    }
                     changed = true;
                     heard = Instant::now();
                     match event {
@@ -10266,10 +10270,14 @@ impl App {
             return;
         }
         let scope = self.scope();
-        if (self.follower.as_ref()).is_none_or(|follower| follower.pattern != scope.glob) {
+        // Started again on a new pattern, or on the connection a window that
+        // lost the daemon made again.
+        if (self.follower.as_ref())
+            .is_none_or(|follower| follower.pattern != scope.glob || !follower.on(&self.client))
+        {
             self.listed = None;
             self.follower = Some(standing::Follower::start(
-                self.follow_connect.clone(),
+                self.client.clone(),
                 scope.glob.clone(),
                 self.woken.clone(),
             ));
@@ -10315,26 +10323,28 @@ impl App {
                 tasks: None,
                 listed: None,
             };
-            let mut listed = (*listed).clone();
+            let mut listed = listed;
             if !moved.is_empty() {
                 let names: Vec<String> = moved.iter().cloned().collect();
                 let Ok(rows) = standing::rows(&client, &names).await else {
                     return Some(failed());
                 };
-                listed = moved_rows(&listed, &moved, rows);
+                listed = Arc::new(moved_rows(&listed, &moved, rows));
             }
             if running {
                 let ask = json!({"name": scope.glob, "active": true, "limit": 256});
                 let Ok(page) = client.request("bots", ask).await else {
                     return Some(failed());
                 };
-                let rows = page["bots"].as_array().cloned().unwrap_or_default();
+                let rows: Vec<Value> = (page["bots"].as_array().into_iter().flatten())
+                    .cloned()
+                    .map(standing::kept)
+                    .collect();
                 let names = (rows.iter())
                     .filter_map(|row| Some(row["name"].as_str()?.to_owned()))
                     .collect();
-                listed = moved_rows(&listed, &names, rows);
+                listed = Arc::new(moved_rows(&listed, &names, rows));
             }
-            let listed = Arc::new(listed);
             let Some(mark) = standing(&client, &marks, &listed, here).await else {
                 return Some(failed());
             };
@@ -22518,10 +22528,17 @@ mod tests {
         );
         let (asked, over, fails) = (reads.clone(), ended.clone(), failing.clone());
         let (fix, running) = (row, help.clone());
+        // The window's own follow of the project, on its own connection:
+        // the snapshot, read once with the pattern alone.
+        let snapshot = json!([lead, row(false), help]);
         let client = daemon_answering(move |ask| match ask["op"].as_str().unwrap_or("") {
             "history_nodes" | "history" if fails.load(Ordering::SeqCst) => {
                 json!({"error": "store_busy"})
             }
+            "bots" if ask["names"].is_null() && ask["active"].is_null() => {
+                json!({"bots": snapshot, "cursor": 7, "next_after": null})
+            }
+            "follow" => json!({"following": ask["bot"]}),
             "bots" => {
                 asked.lock().unwrap().push(ask.clone());
                 let fix = fix(over.load(Ordering::SeqCst));
@@ -22544,20 +22561,6 @@ mod tests {
         .await;
         let mut app = app(client);
         app.bot = "shop.lead".into();
-        // The window's own follow of the project: its snapshot, then events.
-        let snapshot = json!([lead, row(false), help]);
-        app.follow_connect = Arc::new(move || {
-            let snapshot = snapshot.clone();
-            Box::pin(async move {
-                Ok(
-                    daemon_with_events(json!({}), move |ask| match ask["op"].as_str() {
-                        Some("bots") => json!({"bots": snapshot, "cursor": 7, "next_after": null}),
-                        _ => json!({"following": "shop.*"}),
-                    })
-                    .await,
-                )
-            })
-        });
         let dir = std::env::temp_dir().join(unique("sonny-footer-counts"));
         std::fs::create_dir_all(&dir).unwrap();
         app.options.store = dir.join("state.sqlite");
@@ -22637,27 +22640,22 @@ mod tests {
     async fn an_idle_project_is_read_for_nothing() {
         let asked = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let seen = asked.clone();
-        let client = daemon_answering(move |_| {
+        let snapshot = json!([{"name": "shop.lead", "bot_id": 1, "head": 1},
+            {"name": "shop.fix", "bot_id": 2, "head": 3, "last": {"turn": 4, "status": "completed"}}]);
+        let client = daemon_answering(move |ask| {
             seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            json!({"bots": [], "approvals": [], "next_after": null})
+            match ask["op"].as_str() {
+                // The snapshot and the follow, on the window's connection.
+                Some("bots") if ask["names"].is_null() && ask["active"].is_null() => {
+                    json!({"bots": snapshot, "cursor": 7, "next_after": null})
+                }
+                Some("follow") => json!({"following": ask["bot"]}),
+                _ => json!({"bots": [], "approvals": [], "next_after": null}),
+            }
         })
         .await;
         let mut app = app(client);
         app.bot = "shop.lead".into();
-        let snapshot = json!([{"name": "shop.lead", "bot_id": 1, "head": 1},
-            {"name": "shop.fix", "bot_id": 2, "head": 3, "last": {"turn": 4, "status": "completed"}}]);
-        app.follow_connect = Arc::new(move || {
-            let snapshot = snapshot.clone();
-            Box::pin(async move {
-                Ok(
-                    daemon_with_events(json!({}), move |ask| match ask["op"].as_str() {
-                        Some("bots") => json!({"bots": snapshot, "cursor": 7, "next_after": null}),
-                        _ => json!({"following": "shop.*"}),
-                    })
-                    .await,
-                )
-            })
-        });
         let dir = std::env::temp_dir().join(unique("sonny-footer-idle"));
         std::fs::create_dir_all(&dir).unwrap();
         app.options.store = dir.join("state.sqlite");
