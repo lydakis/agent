@@ -585,13 +585,13 @@ async fn a_fast_stream_behind_a_held_read_stays_bounded_and_lands_in_order() {
 /// More than the connection's queue holds behind a held read: the
 /// connection lets go, as it does for any reader that falls behind, and
 /// the window connects again and draws what it missed from history,
-/// whole and in order. Catching up on connecting again still reads before
-/// it draws, so keys are not timed here.
+/// whole and in order; keys show at once throughout, the catching up read
+/// beside the loop as every other read is.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_stream_past_the_connection_s_queue_is_caught_up_from_history() {
-    let (app, _, _, lines, asked) = stream_behind_a_held_read(6_000).await;
+    let (app, frames, sent, lines, asked) = stream_behind_a_held_read(6_000).await;
     assert_eq!(reconnects(&asked), 1, "connected again once");
-    reply_whole(&app, &lines);
+    keys_and_reply_whole(&app, &frames, &sent, &lines);
 }
 
 /// How long the stand-in browser takes to draw a page: as a cold Chrome
