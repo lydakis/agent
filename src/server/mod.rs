@@ -3256,8 +3256,9 @@ pub async fn run(config: Configuration) -> Result<()> {
                             // too far behind to hear it is closed, as a lagging
                             // follower is, and hears it in its next greeting.
                             for notice in std::mem::take(&mut service.notices) {
+                                let mut notice = hub::Encoding::of(&notice);
                                 for (session, output) in &sessions {
-                                    if output.try_send(notice.clone()).is_err() {
+                                    if notice.frame().and_then(|frame| output.try_send_frame(frame)).is_err() {
                                         service.hub.close_session(*session);
                                         output.close();
                                     }
