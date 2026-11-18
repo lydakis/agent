@@ -706,13 +706,20 @@ async fn typing_never_waits_on_a_page_the_browser_is_slow_to_draw() {
     );
     assert!(worst < Duration::from_millis(100), "a key waited {worst:?}");
     // The reply showed at once, a row standing for its page; then the page
-    // in that row's place, the words around it as they were.
-    let waiting = frames
+    // in that row's place, the words around it as they were. The words come
+    // one delta at a time, so a frame may show the row before the words
+    // after it have come: some frame shows both.
+    let waiting: Vec<_> = frames
         .iter()
-        .find(|(.., whole)| whole.contains("drawing the page…"));
+        .filter(|(.., whole)| whole.contains("drawing the page…"))
+        .collect();
     assert!(
-        waiting.is_some_and(|(.., whole)| whole.contains("That was the page")),
-        "{:?}",
+        waiting
+            .iter()
+            .any(|(.., whole)| whole.contains("That was the page")),
+        "{} frames showed the row standing for the page, the first {:?}; the last frame {:?}",
+        waiting.len(),
+        waiting.first(),
         frames.last()
     );
     let screen = app.screen.texts().join("\n");
