@@ -1,6 +1,6 @@
 //! A project is a folder, its lead bot `NAME.lead`, and
 //! `.agents/project.toml` in that folder, which holds mechanics only: the
-//! name, the lead's model and effort level, and its tasks' model,
+//! name, its title (what the person calls it), the lead's model and effort level, and its tasks' model,
 //! effort and speed and whether they work in their own worktrees or the project
 //! folder, the profiles its lead and its tasks run as, and whether
 //! the folders below it are the project's too. Clients
@@ -14,8 +14,9 @@ pub const FILE: &str = ".agents/project.toml";
 /// The largest project file the reader takes.
 pub const LIMIT: u64 = 64 * 1024;
 /// Every key the file may hold; anything else is a mistake, not ignored.
-const KEYS: [&str; 11] = [
+const KEYS: [&str; 12] = [
     "name",
+    "title",
     "lead",
     "model",
     "effort",
@@ -184,7 +185,7 @@ pub fn read(dir: &Path) -> Result<Value, String> {
     let Some(text) = text else {
         let name = default_name(dir);
         return Ok(json!({
-            "dir": dir, "name": name, "lead": format!("{name}.lead"),
+            "dir": dir, "name": name, "title": null, "lead": format!("{name}.lead"),
             "model": null, "effort": null, "profile": null, "task_model": null,
             "task_effort": null, "task_speed": null, "task_profile": null,
             "task_in": "worktree",
@@ -211,6 +212,8 @@ pub fn read(dir: &Path) -> Result<Value, String> {
     if !valid_name(&name) {
         return Err(invalid("name must be 1-64 of A-Z a-z 0-9 - _ ."));
     }
+    // What the person calls the project, theirs to change.
+    let title = field("title")?.filter(|title| !title.trim().is_empty());
     let lead = format!("{name}.lead");
     if field("lead")?.is_some_and(|l| l != lead) {
         return Err(invalid(&format!("lead must be {lead}")));
@@ -261,7 +264,7 @@ pub fn read(dir: &Path) -> Result<Value, String> {
         return Err(invalid("subfolders must be \"own\" or \"project\""));
     }
     Ok(json!({
-        "dir": dir, "name": name, "lead": lead, "model": model,
+        "dir": dir, "name": name, "title": title, "lead": lead, "model": model,
         "effort": effort, "profile": profile, "task_model": task_model,
         "task_effort": task_effort, "task_speed": task_speed,
         "task_profile": task_profile, "task_in": task_in,
@@ -299,6 +302,7 @@ pub struct Tasks<'a> {
 pub fn write(
     dir: &Path,
     name: &str,
+    title: Option<&str>,
     model: &str,
     effort: Option<&str>,
     tasks: &Tasks,
@@ -308,15 +312,18 @@ pub fn write(
     }
     let path = dir.join(FILE);
     let quote = |s: &str| toml::Value::String(s.to_owned()).to_string();
-    let mut text = format!(
-        "name = {}\nlead = {}\nmodel = {}\n",
-        quote(name),
-        quote(&format!("{name}.lead")),
-        quote(model)
-    );
     fn some(value: Option<&str>) -> Option<&str> {
         value.filter(|v| !v.is_empty())
     }
+    let mut text = format!("name = {}\n", quote(name));
+    if let Some(title) = some(title.map(str::trim)) {
+        text.push_str(&format!("title = {}\n", quote(title)));
+    }
+    text.push_str(&format!(
+        "lead = {}\nmodel = {}\n",
+        quote(&format!("{name}.lead")),
+        quote(model)
+    ));
     if let Some(level) = some(effort) {
         text.push_str(&format!("effort = {}\n", quote(level)));
     }
@@ -381,13 +388,16 @@ fn place_new(
     }
 }
 
-/// What a project's creator asked for: the coordinator's model and effort,
-/// and its tasks' picks (none: they run as the client starting them
+/// What a project's creator asked for: its title, the coordinator's model
+/// and effort, and its tasks' picks (none: they run as the client starting them
 /// says, in worktrees). A folder whose file names a model keeps the file's
 /// settings instead, and the picks are not used, except an effort the file
 /// does not name.
 #[derive(Debug, Default)]
 pub struct Picks {
+    /// What the person calls the project, written to a new file; a folder
+    /// with a file keeps its own, or none.
+    pub title: Option<String>,
     pub model: Option<String>,
     pub effort: Option<String>,
     pub tasks: Option<TaskPicks>,
@@ -555,6 +565,7 @@ pub async fn create(
         write(
             dir,
             name,
+            picks.title.as_deref(),
             model,
             effort,
             &Tasks {
@@ -650,6 +661,7 @@ mod tests {
         let daemon = Fake::default();
         let policy = json!({"instructions": "rules", "compaction_instructions": "keep", "tools": null, "model": null});
         let picks = Picks {
+            title: Some("Synthetic \"shop\" repo".into()),
             model: Some("alpha/one".into()),
             effort: Some("high".into()),
             tasks: Some(TaskPicks {
@@ -733,12 +745,15 @@ mod tests {
                 &json!("project")
             )
         );
-        // Asked again, it is there: nothing is made or written.
+        assert_eq!(file["title"], "Synthetic \"shop\" repo");
+        // Asked again, it is there: nothing is made or written, the title
+        // the person may have changed kept.
         let again = make(
             &daemon,
             &dir,
             &policy,
             &Picks {
+                title: Some("Another title".into()),
                 model: Some("beta/two".into()),
                 ..Picks::default()
             },
@@ -757,6 +772,7 @@ mod tests {
             1
         );
         assert_eq!(read(&dir).unwrap()["model"], "alpha/one");
+        assert_eq!(read(&dir).unwrap()["title"], "Synthetic \"shop\" repo");
         // The same name from another folder is refused.
         let other = std::env::temp_dir()
             .join(format!(
@@ -892,6 +908,7 @@ mod tests {
         write(
             &dir,
             "demo",
+            None,
             "alpha/one",
             Some("low"),
             &Tasks {
@@ -903,6 +920,7 @@ mod tests {
         .unwrap();
         let daemon = Fake::default();
         let picks = Picks {
+            title: Some("Picked title".into()),
             model: Some("gamma/three".into()),
             effort: Some("max".into()),
             tasks: None,
@@ -914,6 +932,8 @@ mod tests {
             (&made["project"], &made["from_file"]),
             (&json!("demo"), &json!(true))
         );
+        // A folder that is a project already keeps its own title, here none.
+        assert_eq!(read(&dir).unwrap()["title"], json!(null));
         let calls = daemon.calls.lock().unwrap().clone();
         let create = &calls[1].1;
         assert_eq!(
@@ -922,7 +942,7 @@ mod tests {
         );
         // A kept file that names no effort takes the picked one.
         let dir = root("kept-effort");
-        write(&dir, "plain", "alpha/one", None, &Tasks::default()).unwrap();
+        write(&dir, "plain", None, "alpha/one", None, &Tasks::default()).unwrap();
         let daemon = Fake::default();
         make(&daemon, &dir, &json!({"instructions": "rules"}), &picks).unwrap();
         let calls = daemon.calls.lock().unwrap().clone();
@@ -951,9 +971,9 @@ mod tests {
             effort: Some("low"),
             in_project: true,
         };
-        write(&dir, "demo", "alpha/one", Some("high"), &tasks).unwrap();
+        write(&dir, "demo", None, "alpha/one", Some("high"), &tasks).unwrap();
         // One that appeared since the folder was read is kept and reported.
-        let refused = write(&dir, "other", "beta/two", None, &Tasks::default()).unwrap_err();
+        let refused = write(&dir, "other", None, "beta/two", None, &Tasks::default()).unwrap_err();
         assert!(refused.starts_with("project_changed: "), "{refused}");
         let project = read(&dir).unwrap();
         assert_eq!(project["name"], "demo");
@@ -969,7 +989,9 @@ mod tests {
             (&json!("beta/two"), &json!("low"), &json!("project"))
         );
         assert_eq!(project["file"], true);
-        assert!(write(&dir, "bad name", "alpha/one", None, &Tasks::default()).is_err());
+        // A file with no title gives none: the project shows its name.
+        assert_eq!(project["title"], json!(null));
+        assert!(write(&dir, "bad name", None, "alpha/one", None, &Tasks::default()).is_err());
         std::fs::remove_dir_all(dir.parent().unwrap()).unwrap();
     }
 
@@ -990,7 +1012,7 @@ mod tests {
             effort: Some("high"),
             ..Tasks::default()
         };
-        write(&dir, "demo", "alpha/one", None, &alone).unwrap();
+        write(&dir, "demo", None, "alpha/one", None, &alone).unwrap();
         let project = read(&dir).unwrap();
         assert_eq!(
             (

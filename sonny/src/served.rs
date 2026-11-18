@@ -163,9 +163,11 @@ fn start() -> Value {
                 "name": {"type": "string", "minLength": 1, "maxLength": 100,
                     "description": "A short name for the task, valid as a git branch name, that no agent of \
                         this project has yet; Sonny puts your project's name and a dot before it."},
+                "title": {"type": "string", "minLength": 1, "maxLength": 60,
+                    "description": "What the task is for, in a few words the person knows the work \
+                        by, as Round half cents to even."},
                 "brief": {"type": "string", "minLength": 1,
-                    "description": "Everything the task needs, since it never sees your conversation. Its \
-                        first line is the task's title."},
+                    "description": "Everything the task needs, since it never sees your conversation."},
                 "profile": {"type": "string", "minLength": 1,
                     "description": "A profile listed under Profiles that fits the task; without one, it \
                         starts with none."},
@@ -194,7 +196,7 @@ fn start() -> Value {
                         have any: a task given more work keeps what it learned. Without it, a start while \
                         you have tasks is refused with the list of them."}
             },
-            "required": ["name", "brief"],
+            "required": ["name", "title", "brief"],
             "additionalProperties": false
         },
         "answered_by": TAG,
@@ -268,6 +270,9 @@ fn project() -> Value {
             "type": "object",
             "properties": {
                 "folder": {"type": "string", "minLength": 1, "description": "The project's folder, absolute."},
+                "title": {"type": "string", "minLength": 1,
+                    "description": "What the person calls the project, as Tally invoices; they \
+                        can change it in its file."},
                 "model": {"type": "string", "minLength": 1,
                     "description": "The lead's PROVIDER/MODEL, as the person picked; else yours."},
                 "effort": {"type": "string", "minLength": 1, "description": "The lead's effort level."},
@@ -279,7 +284,7 @@ fn project() -> Value {
                     "description": "project when the person wants every task to work in the project's \
                         folder itself."}
             },
-            "required": ["folder"],
+            "required": ["folder", "title"],
             "additionalProperties": false
         },
         "answered_by": TAG,
@@ -630,6 +635,8 @@ async fn called(name: &str, arguments: &Value) -> Answer {
                     ),
                 ));
             }
+            let title = crate::title::checked(&text("title").unwrap_or_default())
+                .map_err(|e| ("invalid_arguments", e))?;
             // The daemon bounds how deep a line goes and refuses the
             // agent past it; asked first, by its own facts, so a start it
             // would refuse makes no folder and runs no setup.
@@ -695,6 +702,7 @@ async fn called(name: &str, arguments: &Value) -> Answer {
             };
             let start = crate::task::Start {
                 name: text("name").unwrap_or_default(),
+                title,
                 brief: text("brief").unwrap_or_default(),
                 profile: text("profile"),
                 permissions: text("permissions"),
