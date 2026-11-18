@@ -11160,6 +11160,139 @@ and nothing to the daemon per key, so these are the full machine's, as
 main's are. Daemon CPU and RSS, window CPU and RSS, and window start move
 within run-to-run spread. The Mac was not measured.
 
+## One selector for `messages` and `follow` (#1161)
+
+`messages` and `follow` take one selector: a bot's name or a GLOB pattern,
+`since_ms`/`until_ms`, `from` sender kinds (`person`, `bot`, `client`), and
+the cursor, limit and order they had. Sonny's `memory said` was a `bots`
+listing, then `turns`, `history_nodes` and `history_items` for every agent;
+it is now one paged `messages {bot: "*", from: ["person"], since_ms}` read,
+plus history reads only for agents with a reaction or an answer to an ask
+among the person's messages. The person's messages are found through a
+partial index, `messages_people` (`ON messages(id) WHERE from_bot IS NULL
+AND origin IS NULL`), created at open with no schema change, and `sent_ms`
+is kept monotone with `id` so a time bound is an id range.
+
+`bench/said_scale.py` seeds a store over stdio, then times `memory said`
+with each build and checks that both print the same words (release builds
+of the workspace on both sides, one 4-CPU Linux box):
+
+| Agents | Window | `main` | Head |
+| --- | --- | ---: | ---: |
+| 1,000 | since the last cleanup | 544 ms | 47 ms |
+| 1,000 | a day | 533 ms | 48 ms |
+| 10,000 | since the last cleanup | 6,752 ms | 326 ms |
+| 10,000 | a day | 6,405 ms | 334 ms |
+
+The output is identical on both sides in every row.
+
+### Low end and high end
+
+`bench/ends.py` (the freeze-5 harness), both sides built with `cargo build
+--release --workspace --bins`, `main` at d88d3ae against the head at
+bc7c4cc, one 4-CPU Linux box. High-end runs are paced (`--pace 0.5`) so both
+sides do the same agent work.
+
+Low end, one window and 10 agents (`main` → head):
+
+| Measure | `main` | Head |
+| --- | ---: | ---: |
+| Window start, s | 0.043 | 0.060 |
+| Idle daemon CPU, % / RSS, MiB | 0.05 / 21.2 | 0.0 / 21.2 |
+| Idle window CPU, % / RSS, MiB | 0.2 / 25.6 | 0.15 / 25.8 |
+| Key to character p50 / p99, ms | 0.46 / 1.18 | 0.41 / 1.09 |
+| Turn p50 / p99, ms | 48.2 / 54.1 | 48.0 / 48.5 |
+
+High end, 10,000 stored agents, 30 busy and 8 running code-mode scripts,
+windows all in one busy project (`one`) or one folder each (`spread`):
+
+| Windows, layout | Window start p50, ms | Key to character p99, ms | Pauses over 100 ms | Daemon CPU, % | Daemon RSS, MiB | Turns |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| 32, one | 1002 → 1105 | 5.88 → 5.17 | 0 → 0 | 134.3 → 134.5 | 39.4 → 39.1 | 1410 → 1410 |
+| 32, spread | 1133 → 1061 | 3.05 → 2.79 | 0 → 0 | 133.2 → 131.7 | 39.6 → 39.2 | 1410 → 1410 |
+| 100, one | 2960 → 3162 | 9.12 → 51.56 | 0 → 1 | 132.9 → 130.5 | 41.9 → 40.8 | 1500 → 1470 |
+| 100, spread | 3655 → 3191 | 69.64 → 60.26 | 1 → 2 | 132.9 → 131.0 | 40.2 → 40.4 | 1500 → 1500 |
+| 200, one | 6514 → 7268 | 27.12 → 26.15 | 0 → 0 | 153.2 → 154.8 | 46.0 → 46.5 | 1770 → 1770 |
+| 200, spread | 5880 → 5933 | 12.86 → 19.55 | 0 → 0 | 154.2 → 154.4 | 44.9 → 43.4 | 1650 → 1710 |
+
+Window start in the `one` layout read slower on the head in the first
+runs, so 32 windows in one project ran three more alternating pairs: p50
+998 to 1142 ms on `main` and 1051 to 1254 ms on the head, the head faster
+in the third pair. The two sides overlap, and nothing a window does at
+start changed: its requests are the same on both sides (32 `messages`, 34
+`follow`, about 1,800 `bots`), and the exact-bot `messages` query is the
+one `main` runs. At 100 windows the 4 CPUs are past full on both sides
+(key p99 over 50 ms and pauses over 100 ms on `main` too), so those rows say
+more about the box than the change.
+
+A follow of a pattern costs the publisher a GLOB check per pattern that
+some session follows, and nothing when none does: the set is empty and the
+exact-name and `*` lookups are the ones `main` makes. ASCII names match
+byte by byte with no allocation.
+
+The Perf workflow's matched screen (`bench.perf_gate`, GitHub runner, head
+15eec87 against main 7de072a): store work per turn is the same and the
+gate gave no warnings.
+
+| Measure | Base | Head | Change |
+| --- | ---: | ---: | ---: |
+| Lone submit CPU, ms | 23.332 | 22.987 | -1.5% |
+| Burst submit p99, ms | 2.542 | 2.687 | +5.7% |
+| Release to terminal p99, ms | 6.774 | 6.938 | +2.4% |
+| Idle RSS, MiB | 17.344 | 17.02 | -1.9% |
+| Per idle bot, KiB | 1.826 | 1.684 | -7.8% |
+| RSS after a turn each, MiB | 59.596 | 54.242 | -9.0% |
+| Daemon CPU per turn, ms | 0.69 | 0.674 | -2.3% |
+| Lifecycle CPU, s | 0.34 | 0.315 | -7.4% |
+| Lifecycle p95 turn, ms | 573.633 | 576.577 | +0.5% |
+| Lifecycle peak RSS, MiB | 26.148 | 26.244 | +0.4% |
+| Quiet window CPU, ms/s | 0.77 | 0.765 | -0.6% |
+
+### A sparse pattern's replay
+
+`python -m bench.pattern_replay` seeds 100 projects of 2 agents each
+(`p0.a0`, `p0.a1`, ...) with a 200,000-event backlog spread evenly across
+them, so each project is 1% of it, then follows from cursor 0 on a fresh
+daemon each time while turns run on one agent of each project: one agent
+by name, one project (`p0.*`), the 100 projects at once (one connection
+each, as 100 windows coming back together), and those 100 narrowed to
+`turn_finished`. Rows passed over per event delivered are the store's own
+counts: a name's follow reads its bot's rows by index; a pattern's every
+row past the cursor (or every row of its kinds). An unrelated agent's
+`history_nodes` is read back to back throughout. Release builds, one
+4-CPU Linux box.
+
+First the head as measured before this fix: a pattern's pages were every
+bot's events, decoded, with the other bots' passed by in the hub.
+
+| Follow | To `follow_live`, s | Rows passed over per event | Daemon CPU, s | Unrelated read p99 / max, ms |
+|---|---:|---:|---:|---:|
+| one agent by name | 0.02 | 1 | 0.4 | 2.0 / 3.3 |
+| one project | 1.34 | 100 | 2.4 | 2.6 / 3.4 |
+| 100 projects | 69.3 | 100 | 164.8 | 103.8 / 124.1 |
+| 100 projects, one kind | 6.24 | 100 | 15.9 | 84.3 / 119.4 |
+
+A pattern's page is now matched in the store (`bot GLOB` as the page reads
+the cursor's range; stable plans keep it a rowid range, never the
+`events_bot_cursor` prefix range, which sorts every matching entry for
+each page and grows with the square of a large pattern's backlog). The
+other bots' rows are still passed over, once, but in SQLite, without being
+decoded. Each page also ends at the newest event when it began, and a
+short page moves the cursor there, so the switch to live (on the writer)
+reads only the events written since, never a pattern's sparse tail:
+
+| Follow | To `follow_live`, s | Rows passed over per event | Daemon CPU, s | Unrelated read p99 / max, ms |
+|---|---:|---:|---:|---:|
+| one agent by name | 0.02 | 1 | 0.4 | 2.1 / 4.1 |
+| one project | 0.05 | 100 | 0.4 | 1.1 / 4.6 |
+| 100 projects | 1.58 | 100 | 4.4 | 2.9 / 220.9 |
+| 100 projects, one kind | 1.01 | 100 | 3.4 | 1.6 / 212.7 |
+
+Every follower, in every row, received exactly the store's events for its
+selector after cursor 0, in order, none missing and none twice, across the
+hand-off from replay to live. The single slowest unrelated read waits for
+a reader behind the replays' pages; the p99 stays near an idle daemon's.
+
 ## Code-mode step writes beside the run loop
 
 A code-mode script's steps froze every window on a slow disk: the service
@@ -11292,3 +11425,225 @@ turn are 6.001 on both sides in every footprint run, and the gate passed.
 
 The two p99 rises are under the gate's 15% warning line. None of these
 screens sends the client writes this change moves.
+
+## A live event encoded once for all its followers
+
+Before, the hub cloned a live event's JSON value for each session that
+followed its bot and encoded it again for each one, and the firehose sent
+another copy of each. Now the event is encoded when its first follower
+takes it, and every later follower queues the same bytes, each charged
+their cost against its own 2 MiB budget, so a follower that falls behind
+is still closed as before. An event nobody follows is never encoded. On
+the client, the reader reads only a line's `id` to route it and builds a
+notification once, when the window takes it, where it built it twice.
+
+`bench/fan_out.py`: one bot takes streaming turns back to back against
+`bench.streaming_model` (200 tokens, each its own `text_delta`, as fast as
+the model sends them), and N socket sessions follow that bot and read
+everything. `--slow` adds one more follower that never reads. Each count
+gets its own daemon; 2 s warm-up, 10 s measured, two runs a side, 4-CPU
+Linux, release builds of main `ae1bf65` and the change. "Run loop" is the
+daemon's CPU outside its store threads, per event published.
+
+| Followers | Side | Turns/s | Events/s | Run loop µs/event | Run loop % | Each follower, lines/s |
+| ---: | --- | ---: | ---: | ---: | ---: | ---: |
+| 0 | main | 86.1 / 87.1 | 17,561 / 17,788 | 14.75 / 15.07 | 25.9 / 26.8 | — |
+| 0 | head | 86.4 / 88.9 | 17,625 / 18,135 | 14.81 / 14.61 | 26.1 / 26.5 | — |
+| 1 | main | 94.0 / 94.0 | 19,175 / 19,174 | 14.29 / 14.24 | 27.4 / 27.3 | 19,175 / 19,174 |
+| 1 | head | 94.8 / 94.0 | 19,359 / 19,175 | 14.00 / 14.45 | 27.1 / 27.7 | 19,359 / 19,172 |
+| 32 | main | 53.4 / 52.5 | 10,875 / 10,710 | 67.39 / 68.44 | 73.3 / 73.3 | 10,873 / 10,710 |
+| 32 | head | 61.7 / 62.7 | 12,599 / 12,800 | 52.94 / 52.42 | 66.7 / 67.1 | 12,593 / 12,795 |
+| 200 | main | 12.4 / 12.1 | 2,514 / 2,470 | 381.0 / 389.4 | 95.8 / 96.2 | 2,513 / 2,469 |
+| 200 | head | 16.0 / 16.2 | 3,256 / 3,305 | 289.6 / 284.1 | 94.3 / 93.9 | 3,255 / 3,304 |
+| 32 + slow | main | 57.9 / 57.7 | 11,809 / 11,778 | 60.29 / 60.11 | 71.2 / 70.8 | 11,806 / 11,775 |
+| 32 + slow | head | 70.5 / 64.6 | 14,396 / 13,178 | 43.00 / 49.77 | 61.9 / 65.6 | 14,391 / 13,177 |
+
+With no follower and with one, nothing moves beyond run-to-run spread:
+the one encoding a single follower costs is the one it cost before. At
+32 followers the run loop spends 22% less per event and the bot streams
+18% faster; at 200, 25% less and 31% faster. The run loop is the
+bottleneck there on both sides (94 to 96%), so the saving goes into
+throughput. What is left per follower, about 1.4 µs, is its own queue,
+the wake of its writer and the write to its socket. In every run with a
+slow follower the daemon closed it and every fast follower received every
+event (minimum and maximum lines per follower agree).
+
+`bench/ends.py` (from #1163), with Sonny built from each side, since the
+client's reader changed too. Low end: one window on 10 agents, five runs a
+side. High end: 10,000 stored agents, 30 busy and 8 running scripts, one
+run a side at each size.
+
+| Low end | main | head |
+| --- | ---: | ---: |
+| Window start, ms | 42 / 52 | 46 / 74 |
+| Idle window CPU, % | 0.1 to 0.2 | 0.1 to 0.15 |
+| Idle window RSS, MiB | 25.4 to 25.8 | 25.3 to 25.9 |
+| Key to character p99, ms | 0.88 to 1.16 | 0.79 to 1.11 |
+| Turn p50, ms | 47.7 to 48.1 | 48.0 to 48.1 |
+
+| Windows | Layout | Side | Key p50, ms | Key p99, ms | Key max, ms | Window start p50, ms | Daemon CPU, % | Daemon RSS, MiB | Windows CPU, % | Windows RSS, MiB | Turns |
+| ---: | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 32 | one | main | 1.14 | 5.43 | 21.4 | 800 | 136.4 | 38.7 | 27.3 | 2,180 | 8,601 |
+| 32 | one | head | 1.14 | 11.25 | 22.7 | 699 | 132.6 | 40.2 | 28.6 | 2,173 | 8,343 |
+| 32 | spread | main | 1.04 | 5.39 | 5.7 | 754 | 134.5 | 39.4 | 26.1 | 2,189 | 8,682 |
+| 32 | spread | head | 1.09 | 6.38 | 7.9 | 815 | 134.6 | 39.5 | 27.4 | 2,184 | 8,437 |
+| 100 | one | main | 1.79 | 11.83 | 21.3 | 2,088 | 141.7 | 40.2 | 39.4 | 6,123 | 8,879 |
+| 100 | one | head | 1.61 | 10.46 | 19.0 | 2,091 | 141.6 | 41.9 | 38.6 | 6,153 | 9,142 |
+
+No pause over 100 ms on either side. Key to character stays far under the
+50 ms bar, and every other column moves within run-to-run spread. Head's
+11.25 ms p99 at 32 windows in one folder did not come back: two more runs
+a side there read 6.27 and 6.14 ms on head, 7.20 and 9.01 ms on main. These
+windows follow many agents, each with few followers, so the encoding saved
+here is small; the fan-out table above is where it shows. The idle daemon
+read about 2 MiB more on head in every low-end run (18.4 to 19.6 against
+20.6 to 21.9 MiB). That is the binary's file pages, not memory the daemon
+holds: an idle daemon's anonymous memory is 2,052 KiB on both, and a fresh
+copy of main's binary reads the same RSS as head's (17.5 to 17.7 MiB idle,
+no window), as the binary just copied has more of itself in the page
+cache. The Mac was not measured.
+
+The Perf workflow's screens (`bench/perf_gate.py`), run here the way it
+runs them, on the same builds: admission and completion six rounds a side
+(three with main first, three with head first), footprint two, lifecycle
+and Sonny's screen three. Store work per turn is the same on both sides:
+no count moved.
+
+| Bench | Measure | main | head |
+| --- | --- | ---: | ---: |
+| admission | lone submit CPU, ms | 31.4 | 33.5 |
+| admission | burst submit p99, ms | 4.49 | 4.48 |
+| completion | release to terminal p99, ms | 10.32 | 10.80 |
+| footprint | idle RSS, MiB | 17.11 | 17.07 |
+| footprint | per idle bot, KiB | 1.59 | 1.77 |
+| footprint | RSS after a turn each, MiB | 35.03 | 33.35 |
+| footprint | CPU per turn, ms | 0.817 | 0.813 |
+| lifecycle | CPU, s | 0.52 | 0.54 |
+| lifecycle | p95 turn, ms | 582.7 | 581.6 |
+| lifecycle | peak RSS, MiB | 26.02 | 25.98 |
+| sonny | lookout CPU per 1k deltas at 10x10 / 10x100 / 100x10, ms | 7.5 / 4.12 / 6.38 | 6.25 / 4.12 / 6.5 |
+| sonny | quiet window CPU, ms/s | 1.16 | 1.55 |
+| sonny | sky replay CPU per 1k lines, ms | 9.9 | 9.9 |
+
+The gate warns on none of them: every head range overlaps main's. Order
+moves the burst and completion numbers more than the change does. With
+main run first, head's burst p99 and completion p99 read 13% and 12%
+higher; with head first, 10% lower and 2% lower. Lone submit CPU varies
+from 30.2 to 36.9 ms between main's own rounds, and head's six round
+medians (31.1 to 35.9 ms) fall inside that. The quiet window's CPU is one
+10 ms clock tick over its 26 s: 30 ms in each of main's three runs, 30 ms
+in one of head's and 40 ms in two.
+
+## A ramp's line indexed, and retained streams packed before the writer (#1168)
+
+2026-11-18, Linux x86_64 cloud VM, 4 CPUs. Main is `ae1bf65` (#1149) and
+head is this change on it, both local release builds of the daemon (Sonny
+is the same build for both). Main and head alternate on the same machine
+with nothing else running.
+
+**The ramp's line.** A provider ramp's parked turns and kept places were a
+`VecDeque` and a `Vec` searched end to end on every join, return, admission
+and give-up, so a 429 storm parking N turns cost N² comparisons under the
+pool's lock. They are now a `Line`: the order turns came in and an index by
+turn id. The operations themselves, release, best of 7: N turns park, each
+comes back once before it is woken, then places free one at a time and each
+woken turn is admitted.
+
+| Turns parked | Main | Head |
+| ---: | ---: | ---: |
+| 10 | 0.93 µs | 1.41 µs |
+| 200 | 84 µs | 23 µs |
+| 2,000 | 7.2 ms | 0.24 ms |
+| 10,000 | 256 ms | 1.27 ms |
+
+At 10 turns the index costs about half a microsecond for the whole storm,
+once per refusal. A pool that never ramps runs none of this.
+
+**Packing before the writer.** `artifact::put` compressed each retained
+stream (up to 1 MiB of LZ4) on the store's one writer. Now each outcome is
+packed on a blocking thread before it is submitted, and `put` only inserts.
+A store-level screen (a scratch test, not committed: `Store::open`, then 196
+rounds of N 1 MiB build-log streams finishing as `process_finish`, each
+round with one small write, a `process_start`, submitted just after them,
+as another bot's turn would be; head packs as the daemon now does):
+
+| 1 MiB streams queued | Main small write p50 / p90 | Head small write p50 / p90 |
+| ---: | ---: | ---: |
+| 0 | 0.47 / 0.62 ms | 0.40 / 0.65 ms |
+| 1 | 2.49 / 3.01 ms | 0.40 / 0.66 ms |
+| 2 | 4.51 / 15.94 ms | 0.67 / 0.94 ms |
+| 4 | 8.40 / 20.01 ms | 4.50 / 15.20 ms |
+| 8 | 15.70 / 31.86 ms | 8.00 / 20.04 ms |
+
+With up to two streams finishing at once, the small write no longer waits
+on their compression. From four, the packing threads fill the 4-CPU machine
+and the writer and runtime wait for CPU instead; with the eight streams
+packed beforehand (no packing at all during the round) the small write's
+p50 is still 7.05 ms, which is inserting them, not compressing them.
+
+`bench/storage_artifacts.py` (8 shell bots writing 1 MiB beside 8 ordinary
+bots, four pairs per fixture) moved within its spread: varied-text ordinary
+turn p99 67.7 to 72.3 ms on main against 64.9 to 69.2 ms on head, the
+entropy fixture (which does not compress, so neither side packs it)
+unchanged, and daemon CPU 1.41 to 1.64 s a run on both. Its transcript check needs `wall_time_ms` left out of the
+hash now that shell results carry it; that was done locally for this run.
+
+**Low end and high end** (`bench.ends`, from the step-writes change). The
+synthetic model refuses nothing and these turns retain no stream, so the
+changed code does not run; these check that nothing else moved.
+
+Low end: one window on a folder of 10 agents, three runs each. Ranges are
+the runs; the median is in parentheses.
+
+| Measure | Main | Head |
+| --- | ---: | ---: |
+| Window start, s | 0.052 to 0.075 (0.053) | 0.047 to 0.072 (0.057) |
+| Idle daemon CPU, % | 0.0 to 0.05 (0.0) | 0.0 to 0.0 (0.0) |
+| Idle daemon RSS, MiB | 21.1 to 21.8 (21.5) | 20.5 to 21.8 (21.8) |
+| Idle window CPU, % | 0.2 to 0.25 (0.2) | 0.2 to 0.2 (0.2) |
+| Idle window RSS, MiB | 25.5 to 26.2 (25.7) | 25.5 to 25.9 (25.8) |
+| Key to character p50, ms | 0.46 to 0.61 (0.48) | 0.4 to 0.8 (0.41) |
+| Key to character p99, ms | 1.43 to 3.36 (2.56) | 1.12 to 1.46 (1.29) |
+| Key pauses over 100 ms | 0 to 0 (0) | 0 to 0 (0) |
+| Turn p50, ms | 48.0 to 48.43 (48.28) | 47.95 to 48.11 (48.01) |
+| Turn p99, ms | 51.14 to 56.05 (55.87) | 50.95 to 52.94 (51.64) |
+
+High end: 10,000 stored agents, 30 agents running turns back to back and 8
+running code-mode scripts. Each cell lists the runs. At 100 windows a third
+row runs main again in place of head, for the spread of main against itself.
+
+| Windows | Layout | Side | Key p50, ms | Key p99, ms | Key max, ms | Pauses over 100 ms | Window start p50, s | Daemon CPU, % | Daemon RSS, MiB | Windows CPU, % | Windows RSS, MiB |
+| ---: | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 32 | one | main | 1.31 / 1.26 | 9.4 / 6.46 | 13 / 8 | 0 / 0 | 0.89 / 0.93 | 132.6 / 132.9 | 40.1 / 40.9 | 27.6 / 27.2 | 2,282 / 2,274 |
+| 32 | one | head | 1.28 / 1.17 | 8.37 / 7.92 | 12 / 12 | 0 / 0 | 1.03 / 1.0 | 132.4 / 132.7 | 40.7 / 40.6 | 27.6 / 26.9 | 2,272 / 2,248 |
+| 100 | spread | main | 1.56 / 1.72 / 1.77 / 1.71 | 25.63 / 11.34 / 16.4 / 13.03 | 63 / 110 / 83 / 99 | 0 / 1 / 0 / 0 | 2.36 / 2.65 / 2.27 / 2.41 | 130.5 / 131.4 / 132.5 / 132.3 | 42.5 / 42.2 / 42.2 / 43.4 | 39.7 / 40.0 / 38.6 / 39.7 | 6,174 / 6,262 / 6,037 / 6,183 |
+| 100 | spread | head | 1.66 / 1.68 / 1.58 / 2.27 | 47.09 / 13.59 / 23.1 / 22.56 | 127 / 76 / 117 / 105 | 1 / 0 / 1 / 1 | 2.84 / 2.6 / 2.33 / 2.38 | 131.3 / 131.9 / 132.0 / 130.9 | 42.4 / 41.2 / 42.2 / 42.2 | 40.3 / 39.3 / 38.3 / 39.7 | 6,168 / 6,033 / 6,142 / 6,052 |
+| 100 | spread | main, again | 1.81 / 1.71 / 1.58 / 1.38 | 14.79 / 9.04 / 44.98 / 13.56 | 55 / 142 / 60 / 18 | 0 / 1 / 0 / 0 | 2.35 / 2.31 / 2.43 / 2.28 | 131.7 / 131.4 / 137.1 / 133.0 | 42.1 / 43.1 / 42.6 / 40.7 | 39.4 / 38.9 / 42.3 / 41.0 | 5,967 / 6,149 / 6,326 / 5,592 |
+| 200 | spread | main | 1.6 / 1.9 | 140.37 / 8.27 | 319 / 9 | 3 / 0 | 4.53 / 4.85 | 146.9 / 144.2 | 45.6 / 45.6 | 57.6 / 61.2 | 11,802 / 11,879 |
+| 200 | spread | head | 1.75 / 1.96 | 14.46 / 11.57 | 21 / 18 | 0 / 0 | 4.72 / 4.64 | 144.0 / 144.6 | 46.2 / 45.5 | 62.0 / 61.6 | 11,849 / 12,050 |
+
+Key p99 at 100 windows runs 13.6 to 47.1 ms on head and 9.0 to 45.0 ms on
+main against itself; the pauses (one probe in 300) come on both, on a
+machine the daemon (about 131%) and the windows fill. Daemon CPU and RSS,
+window CPU and RSS, and window start move within run-to-run spread. The
+Mac was not measured.
+
+Matched screen from the CI Perf job (`bench/perf_gate.py`), main against
+head `6e286b0`, release build, synthetic model, the CI runner:
+
+| Screen | Row | Main | Head | Change |
+| --- | --- | ---: | ---: | ---: |
+| `bench.admission_burst` | Lone submit CPU | 24.238 ms | 24.577 ms | +1.4% |
+| `bench.admission_burst` | Burst submit p99 | 2.583 ms | 2.717 ms | +5.2% |
+| `bench.completion_burst` | Release to terminal p99 | 6.811 ms | 6.883 ms | +1.1% |
+| `bench.footprint` | Idle RSS | 17.154 MiB | 17.207 MiB | +0.3% |
+| `bench.footprint` | Per idle bot | 1.732 KiB | 1.82 KiB | +5.1% |
+| `bench.footprint` | RSS after a turn each | 54.342 MiB | 55.338 MiB | +1.8% |
+| `bench.footprint` | CPU per turn | 0.711 ms | 0.71 ms | -0.2% |
+| `bench.lifecycle` | Daemon CPU | 0.34 s | 0.345 s | +1.5% |
+| `bench.lifecycle` | Turn p95 | 575.077 ms | 574.706 ms | -0.1% |
+| `bench.lifecycle` | Peak RSS | 26.461 MiB | 26.258 MiB | -0.8% |
+
+Store jobs a turn are unchanged on every screen (the gate fails on any
+increase, and it passed); the rest is within the runner's spread. The
+per-idle-bot row is 0.09 KiB; an idle bot holds nothing this change adds.

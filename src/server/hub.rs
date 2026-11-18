@@ -5,8 +5,8 @@
 //! A session serving a gate tag receives only the calls announced for it.
 use agent_runtime::{
     Error, Result, fail,
-    output::Output,
-    store::{Database, EVENT_PAGE_KINDS, Served, Store},
+    output::{Frame, Output},
+    store::{Database, EVENT_PAGE_KINDS, Served, Store, glob},
 };
 use serde_json::{Value, json};
 use std::{
@@ -25,6 +25,10 @@ pub struct Subscription {
     /// The event kinds it asked for, when it asked for some: others pass
     /// it by. Notices about the stream itself always reach it.
     kinds: Option<Arc<HashSet<String>>>,
+    /// The GLOB pattern it follows, when it names bots by one: a replay
+    /// reads every bot's events and passes the others by, as the publisher
+    /// does.
+    pattern: Option<Arc<str>>,
     live: bool,
     cancelled: bool,
     replay: Option<tokio::task::AbortHandle>,
@@ -45,9 +49,37 @@ impl Subscription {
     }
 }
 pub type Sub = Arc<Mutex<Subscription>>;
-/// Whether `event` is one of `kinds`, or any event when none were named.
-fn wanted(kinds: Option<&Arc<HashSet<String>>>, event: &Value) -> bool {
+/// An event on its way to the sessions that hear it, encoded when the
+/// first of them takes it and kept for the rest.
+pub struct Encoding<'a> {
+    pub event: &'a Value,
+    frame: Option<Result<Frame>>,
+}
+impl<'a> Encoding<'a> {
+    pub fn of(event: &'a Value) -> Self {
+        Self { event, frame: None }
+    }
+    /// Its JSON line, encoded on the first call.
+    pub fn frame(&mut self) -> Result<&Frame> {
+        let event = self.event;
+        (self
+            .frame
+            .get_or_insert_with(|| Frame::encode(event))
+            .as_ref())
+        .map_err(Clone::clone)
+    }
+}
+/// Whether `event` is one of `kinds`, or any event when none were named,
+/// of a bot `pattern` matches when one was.
+fn wanted(kinds: Option<&Arc<HashSet<String>>>, pattern: Option<&Arc<str>>, event: &Value) -> bool {
     kinds.is_none_or(|kinds| (event["event"].as_str()).is_some_and(|kind| kinds.contains(kind)))
+        && pattern
+            .is_none_or(|pattern| (event["bot"].as_str()).is_some_and(|bot| glob(pattern, bot)))
+}
+/// Whether `bot` names bots by a GLOB pattern other than every bot's: no
+/// name holds `*`, `?` or `[`.
+pub fn is_pattern(bot: &str) -> bool {
+    bot != ALL && bot.contains(['*', '?', '['])
 }
 /// Keep `subs` other than `session`'s, cancelling that session's. The
 /// session is read without locking, since a replay's switch to live holds
@@ -264,6 +296,9 @@ struct HubInner {
     /// The bots each session follows by name, so a session closing visits
     /// only their followers, however many bots others follow.
     follows: HashMap<u64, HashSet<String>>,
+    /// The GLOB patterns some session follows, each a key of `subs`: an
+    /// event goes to those it matches besides its bot's and `*`'s.
+    patterns: HashSet<String>,
     approvers: HashMap<String, Serving>,
     /// Every entry of `approvers` once, by lease and a deadline no later
     /// than its own, so leases that ran out are found without visiting the
@@ -545,12 +580,16 @@ impl Hub {
             .entry(session)
             .or_default()
             .insert(bot.to_owned());
+        if is_pattern(bot) {
+            inner.patterns.insert(bot.to_owned());
+        }
         let subs = inner.subs.entry(bot.to_owned()).or_default();
         retain_other_session(subs, session);
         let sub = Arc::new(Mutex::new(Subscription {
             session,
             output,
             kinds: kinds.map(Arc::new),
+            pattern: is_pattern(bot).then(|| Arc::from(bot)),
             live: false,
             cancelled: false,
             replay: None,
@@ -575,6 +614,7 @@ impl Hub {
             retain_other_session(subs, session);
             if subs.is_empty() {
                 inner.subs.remove(bot);
+                inner.patterns.remove(bot);
             }
         }
     }
@@ -613,7 +653,11 @@ impl Hub {
             .iter()
             .filter(|(id, _)| *id == session)
             .count();
-        firehose + follows(ALL) + if bot == ALL { 0 } else { follows(bot) }
+        let patterns: usize = (inner.patterns.iter())
+            .filter(|pattern| bot != ALL && glob(pattern, bot))
+            .map(|pattern| follows(pattern))
+            .sum();
+        firehose + follows(ALL) + if bot == ALL { 0 } else { follows(bot) } + patterns
     }
     /// Whether one of `session`'s follows that receives `bot`'s events is
     /// still paging history: the publisher passes those follows by, and
@@ -628,7 +672,11 @@ impl Hub {
                 })
             })
         };
-        replaying(ALL) || (bot != ALL && replaying(bot))
+        replaying(ALL)
+            || (bot != ALL
+                && (replaying(bot)
+                    || (inner.patterns.iter())
+                        .any(|pattern| glob(pattern, bot) && replaying(pattern))))
     }
     fn firehose(&self) -> Vec<Output> {
         self.inner
@@ -640,7 +688,10 @@ impl Hub {
             .collect()
     }
     /// Deliver to followers; `cursor` orders durable entries after replay.
-    fn fan_out(&self, bot: &str, event: &Value, cursor: Option<i64>) {
+    /// The event is encoded on its first delivery, and every follower
+    /// after queues the same bytes: an event nobody follows is never
+    /// encoded, and one many follow is encoded once.
+    fn fan_out(&self, bot: &str, event: &mut Encoding, cursor: Option<i64>) {
         let subs: Vec<Sub> = {
             let inner = self.inner.lock().unwrap();
             let followers = |name: &str| {
@@ -651,7 +702,13 @@ impl Hub {
                     .flatten()
                     .map(|(_, sub)| sub.clone())
             };
-            followers(bot).chain(followers(ALL)).collect::<Vec<Sub>>()
+            let matching = (inner.patterns.iter())
+                .filter(|pattern| glob(pattern, bot))
+                .flat_map(|pattern| followers(pattern));
+            followers(bot)
+                .chain(followers(ALL))
+                .chain(matching)
+                .collect::<Vec<Sub>>()
         };
         for sub in subs {
             let (session, output) = {
@@ -662,12 +719,16 @@ impl Hub {
                 if let Some(c) = cursor {
                     s.last_cursor = c;
                 }
-                if !wanted(s.kinds.as_ref(), event) {
+                if !wanted(s.kinds.as_ref(), None, event.event) {
                     continue;
                 }
                 (s.session, s.output.clone())
             };
-            if output.try_send(event.clone()).is_err() {
+            if event
+                .frame()
+                .and_then(|frame| output.try_send_frame(frame))
+                .is_err()
+            {
                 self.counts.dropped.fetch_add(1, Ordering::Relaxed);
                 self.close_session(session);
                 output.close();
@@ -693,10 +754,14 @@ impl Hub {
     pub async fn durable(&self, bot: &str, entry: Value) -> Result<()> {
         let cursor = entry["cursor"].as_i64();
         self.counts.durable.fetch_add(1, Ordering::Relaxed);
-        self.fan_out(bot, &entry, cursor);
+        let mut event = Encoding::of(&entry);
+        self.fan_out(bot, &mut event, cursor);
         let mut sent = Ok(());
         for output in self.firehose() {
-            sent = output.send(entry.clone()).await;
+            sent = match event.frame() {
+                Ok(frame) => output.send_frame(frame).await,
+                Err(error) => Err(error),
+            };
             if sent.is_err() {
                 break;
             }
@@ -730,17 +795,20 @@ impl Hub {
     }
     pub async fn live(&self, bot: &str, event: Value) -> Result<()> {
         self.counts.live.fetch_add(1, Ordering::Relaxed);
-        self.fan_out(bot, &event, None);
+        let mut event = Encoding::of(&event);
+        self.fan_out(bot, &mut event, None);
         for output in self.firehose() {
-            output.send(event.clone()).await?;
+            output.send_frame(event.frame()?).await?;
             self.counts.delivered(&output);
         }
         Ok(())
     }
 }
 
-/// `limit` of `bot`'s durable events after `after`, or every bot's for `*`.
-/// A follow of every bot that names `kinds`, up to as many as a page
+/// `limit` of `bot`'s durable events after `after`, or every bot's for `*`,
+/// or the bots a pattern matches, matched by the store as it reads the
+/// cursor's range so a sparse pattern decodes only its own events.
+/// A follow that names `kinds`, up to as many as a page
 /// takes, gets only those from the store, so a few rare kinds cost the
 /// events they are, not every event written since. One bot's events, or
 /// every bot's of more kinds, are paged whole and filtered as they are
@@ -753,13 +821,13 @@ fn event_page(
     after: i64,
     limit: usize,
 ) -> Result<Value> {
-    match (bot == ALL, kinds) {
-        (true, Some(kinds)) if (1..=EVENT_PAGE_KINDS).contains(&kinds.len()) => {
-            let kinds: Vec<&str> = kinds.iter().map(String::as_str).collect();
-            db.events_of_kinds(&kinds, after, limit)
-        }
-        (true, _) => db.events_after(after, limit),
-        (false, _) => db.events(bot, after, limit),
+    let few = kinds.filter(|kinds| (1..=EVENT_PAGE_KINDS).contains(&kinds.len()));
+    let few: Option<Vec<&str>> = few.map(|kinds| kinds.iter().map(String::as_str).collect());
+    match (bot == ALL, is_pattern(bot), few) {
+        (true, _, Some(kinds)) => db.events_of_kinds(&kinds, after, limit),
+        (true, _, None) => db.events_after(after, limit),
+        (false, true, kinds) => db.events_matching(bot, kinds.as_deref(), after, limit),
+        (false, false, _) => db.events(bot, after, limit),
     }
 }
 
@@ -784,12 +852,19 @@ enum Switch {
 pub async fn replay(store: Store, hub: Hub, bot: String, sub: Sub) -> Result<()> {
     let reader = store.reader();
     loop {
-        let (session, output, after, kinds) = {
+        let (session, output, after, kinds, pattern) = {
             let s = sub.lock().unwrap();
             if s.cancelled {
                 return Ok(());
             }
-            (s.session, s.output.clone(), s.last_cursor, s.kinds.clone())
+            let pattern = s.pattern.clone();
+            (
+                s.session,
+                s.output.clone(),
+                s.last_cursor,
+                s.kinds.clone(),
+                pattern,
+            )
         };
         let (page_bot, page_kinds) = (bot.clone(), kinds.clone());
         // The seat goes with the read itself: a replay cancelled while its
@@ -809,6 +884,16 @@ pub async fn replay(store: Store, hub: Hub, bot: String, sub: Sub) -> Result<()>
         let Value::Array(events) = page["events"].take() else {
             return fail("invalid_event_page");
         };
+        // The page's cursor is taken first, empty or not: an empty page of
+        // a pattern passed over what it read, so going live reads only
+        // what was committed since.
+        if let Some(next) = page["next_cursor"].as_i64() {
+            let mut s = sub.lock().unwrap();
+            if s.cancelled {
+                return Ok(());
+            }
+            s.last_cursor = s.last_cursor.max(next);
+        }
         if events.is_empty() {
             // The boundary marker, and a pruned notice ahead of it, go out
             // under the subscription's lock as it goes live, before any live
@@ -870,13 +955,6 @@ pub async fn replay(store: Store, hub: Hub, bot: String, sub: Sub) -> Result<()>
             }
             return Ok(());
         }
-        if let Some(next) = page["next_cursor"].as_i64() {
-            let mut s = sub.lock().unwrap();
-            if s.cancelled {
-                return Ok(());
-            }
-            s.last_cursor = next;
-        }
         if let Some(before) = page.get("pruned_before").and_then(Value::as_i64) {
             // Retention removed events the follower asked for: say so once,
             // ahead of what remains, rather than replaying a silent gap.
@@ -886,7 +964,9 @@ pub async fn replay(store: Store, hub: Hub, bot: String, sub: Sub) -> Result<()>
                 return Ok(());
             }
         }
-        for event in (events.into_iter()).filter(|event| wanted(kinds.as_ref(), event)) {
+        for event in
+            (events.into_iter()).filter(|event| wanted(kinds.as_ref(), pattern.as_ref(), event))
+        {
             if output.send(event).await.is_err() {
                 hub.unsubscribe(&bot, session);
                 return Ok(());
@@ -947,6 +1027,83 @@ mod tests {
         assert_eq!(got, event(2, "turn_finished"));
         // What it passed by still counts as seen: no replay sends it later.
         assert_eq!(sub.lock().unwrap().last_cursor, 2);
+    }
+
+    #[tokio::test]
+    async fn a_follow_of_a_pattern_gets_only_the_bots_it_names() {
+        use tokio::io::AsyncBufReadExt;
+        let hub = Hub::default();
+        let (near, far) = tokio::io::duplex(4096);
+        let sub = hub.subscribe("shop.*", 1, Output::writer(near), 0, None);
+        sub.lock().unwrap().live = true;
+        assert_eq!(hub.deliveries("shop.a", 1), 1);
+        assert_eq!(hub.deliveries("web.a", 1), 0);
+        let event =
+            |cursor: i64, bot: &str| json!({"cursor": cursor, "bot": bot, "event": "accepted"});
+        hub.durable("web.a", event(1, "web.a")).await.unwrap();
+        hub.durable("shop.a", event(2, "shop.a")).await.unwrap();
+        let mut lines = tokio::io::BufReader::new(far).lines();
+        let line = lines.next_line().await.unwrap().unwrap();
+        let got: Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(got, event(2, "shop.a"));
+        // A replayed page passes the other bots' by too.
+        let pattern: Arc<str> = Arc::from("shop.*");
+        assert!(!wanted(None, Some(&pattern), &event(3, "web.a")));
+        assert!(wanted(None, Some(&pattern), &event(3, "shop.b")));
+        // Its session closing leaves no pattern behind.
+        hub.close_session(1);
+        assert!(hub.inner.lock().unwrap().patterns.is_empty());
+    }
+
+    #[tokio::test]
+    async fn every_follower_queues_the_one_encoding_at_its_own_cost() {
+        use agent_runtime::output::PACKET_BYTES;
+        let hub = Hub::default();
+        let mut sessions = Vec::new();
+        for session in 1..=3 {
+            let (output, lines) = Output::in_process();
+            // The third names kinds the event is not: it gets nothing.
+            let kinds = (session == 3).then(|| ["turn_finished".to_owned()].into());
+            let sub = hub.subscribe("B", session, output.clone(), 0, kinds);
+            sub.lock().unwrap().live = true;
+            sessions.push((output, lines));
+        }
+        let room = sessions[0].0.room();
+        let event = json!({"bot": "B", "event": "text_delta", "data": {"text": "word"}});
+        hub.live("B", event.clone()).await.unwrap();
+        // Charged to each session's budget while it waits to be read.
+        let cost = serde_json::to_vec(&event).unwrap().len() + 1 + PACKET_BYTES;
+        assert_eq!(sessions[0].0.room(), room - cost);
+        assert_eq!(sessions[1].0.room(), room - cost);
+        assert_eq!(sessions[2].0.room(), room);
+        assert_eq!(hub.stats()["delivered"], 2);
+        // The same bytes, not a copy.
+        let first = sessions[0].1.next().await.unwrap();
+        let second = sessions[1].1.next().await.unwrap();
+        assert_eq!(serde_json::from_slice::<Value>(&first).unwrap(), event);
+        assert_eq!(first.as_ptr(), second.as_ptr());
+        assert_eq!(first.len(), cost - PACKET_BYTES);
+    }
+
+    #[tokio::test]
+    async fn an_event_too_large_to_send_closes_each_follower_it_reaches() {
+        let hub = Hub::default();
+        let mut outputs = Vec::new();
+        for session in 1..=2 {
+            let (output, _lines) = Output::in_process();
+            let sub = hub.subscribe("B", session, output.clone(), 0, None);
+            sub.lock().unwrap().live = true;
+            outputs.push(output);
+        }
+        let text = "x".repeat(agent_runtime::output::MAX_EVENT);
+        hub.live(
+            "B",
+            json!({"bot": "B", "event": "text_delta", "data": {"text": text}}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(hub.stats()["dropped"], 2);
+        assert_eq!(hub.deliveries("B", 1) + hub.deliveries("B", 2), 0);
     }
 
     #[test]

@@ -235,7 +235,7 @@ fn old_prompt_copies_migrate_without_touching_queued_work() {
 
 #[test]
 fn large_artifacts_remain_exact_after_reopen_and_background_completion() {
-    use agent_runtime::{provider::ToolCall, tools::Outcome};
+    use agent_runtime::{provider::ToolCall, store::Retained, tools::Outcome};
     let path = std::env::temp_dir().join(format!(
         "agent-artifact-codec-{}.sqlite",
         std::process::id()
@@ -273,7 +273,7 @@ fn large_artifacts_remain_exact_after_reopen_and_background_completion() {
             "call",
             &Outcome {
                 output: "preview".into(),
-                artifacts: vec![("stdout", data.as_bytes().to_vec())],
+                artifacts: vec![("stdout", Retained::Whole(data.as_bytes().to_vec()).packed())],
                 parts: Vec::new(),
                 failed: false,
                 files: Default::default(),
@@ -292,7 +292,7 @@ fn large_artifacts_remain_exact_after_reopen_and_background_completion() {
             process,
             &serde_json::json!({"success":true}),
             false,
-            &[("stderr", data.as_bytes().to_vec())],
+            &[("stderr", Retained::Whole(data.as_bytes().to_vec()).packed())],
             &[],
         )
         .unwrap();

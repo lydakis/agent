@@ -461,13 +461,21 @@ enum Command {
         #[serde(default)]
         newest: bool,
     },
-    /// A bot's messages, each with its number, where it stands and the
-    /// turn that took it in, paged as `turns` pages its runs.
+    /// Messages, each with its number, where it stands and the turn that
+    /// took it in, paged as `turns` pages its runs: one bot's, or those of
+    /// every bot a GLOB pattern names, as `bots` and `audit` take one,
+    /// narrowed by when they were sent and who sent them.
     Messages {
         bot: String,
         #[serde(default)]
         after: i64,
         before: Option<i64>,
+        /// Only those sent at or after this, in Unix ms.
+        since_ms: Option<i64>,
+        /// Only those sent before this, in Unix ms.
+        until_ms: Option<i64>,
+        /// Only those from these senders: `person`, `bot`, `client`.
+        from: Option<Vec<String>>,
         limit: Option<usize>,
         #[serde(default)]
         newest: bool,
@@ -475,6 +483,10 @@ enum Command {
         /// them in or for one of their own.
         #[serde(default)]
         waiting: bool,
+        /// Each one's words whole, as `text`; a page then holds as many
+        /// as fit in half a response, at least one.
+        #[serde(default)]
+        words: bool,
     },
     /// The tokens bots' turns spent: in all, by bot, by model, and over
     /// time. A read.
@@ -589,6 +601,9 @@ enum Command {
         offset: u64,
         limit: Option<usize>,
     },
+    /// One bot's events, every bot's (`*`), or those of the bots a GLOB
+    /// pattern names, as `messages` and `bots` take one: replayed from a
+    /// cursor, then live.
     Follow {
         bot: String,
         #[serde(default)]
@@ -3289,8 +3304,9 @@ pub async fn run(config: Configuration) -> Result<()> {
                             // too far behind to hear it is closed, as a lagging
                             // follower is, and hears it in its next greeting.
                             for notice in std::mem::take(&mut service.notices) {
+                                let mut notice = hub::Encoding::of(&notice);
                                 for (session, output) in &sessions {
-                                    if output.try_send(notice.clone()).is_err() {
+                                    if notice.frame().and_then(|frame| output.try_send_frame(frame)).is_err() {
                                         service.hub.close_session(*session);
                                         output.close();
                                     }
@@ -5773,14 +5789,29 @@ impl Service {
                 bot,
                 after,
                 before,
+                since_ms,
+                until_ms,
+                from,
                 limit,
                 newest,
                 waiting,
+                words,
             } => {
                 let reader = store.reader();
                 self.observe(session, output, id, async move {
                     (reader.read("messages", move |db| {
-                        db.messages(&bot, after, before, limit.unwrap_or(64), newest, waiting)
+                        db.messages(&agent_runtime::store::Messages {
+                            bot: &bot,
+                            after,
+                            before,
+                            since_ms,
+                            until_ms,
+                            from,
+                            limit: limit.unwrap_or(64),
+                            newest,
+                            waiting,
+                            words,
+                        })
                     }))
                     .await
                 })
@@ -7131,8 +7162,16 @@ impl Service {
                         "kinds must name one or more event kinds",
                     );
                 }
-                // `*` follows every bot from a store-wide cursor.
-                if bot != hub::ALL {
+                // `*` follows every bot from a store-wide cursor, and a GLOB
+                // pattern the bots it names, any made later too.
+                if hub::is_pattern(&bot) {
+                    if bot.len() > 256 {
+                        return fail_with(
+                            "invalid_bot_filter",
+                            "bot is a name or a GLOB pattern of 1 to 256 bytes",
+                        );
+                    }
+                } else if bot != hub::ALL {
                     let check = bot.clone();
                     store.read("inspect", move |db| db.inspect(&check)).await?;
                 }

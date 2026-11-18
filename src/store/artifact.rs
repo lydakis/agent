@@ -41,20 +41,70 @@ fn encode(raw: &[u8]) -> Option<Vec<u8>> {
 
 use crate::tools::FILE_RETAINED_BYTES;
 
-pub(super) fn put(db: &Connection, turn: i64, call: &str, stream: &str, raw: &[u8]) -> Result<()> {
-    let encoded = encode(raw);
-    db.prepare("INSERT INTO artifacts(turn,call_id,stream,data,raw_bytes) VALUES (?,?,?,?,?)")?
-        .execute(params![
-            turn,
-            call,
-            stream,
-            encoded.as_deref().unwrap_or(raw),
-            if encoded.is_some() {
-                raw.len() as i64
-            } else {
-                0
-            }
-        ])?;
+/// A retained stream's bytes: whole as a tool kept them, or packed as the
+/// store keeps them, in blocks compressed where that pays. Packing is work
+/// that grows with the stream, up to a mebibyte, so it is done off the
+/// runtime thread before the outcome is recorded (`packed`), and the
+/// store's one writer, which every bot's turns share, only inserts it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Retained {
+    Whole(Vec<u8>),
+    /// Its packed bytes and its size whole.
+    Packed(Vec<u8>, usize),
+}
+impl Retained {
+    /// Its size whole.
+    pub fn len(&self) -> usize {
+        match self {
+            Retained::Whole(raw) => raw.len(),
+            Retained::Packed(_, size) => *size,
+        }
+    }
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+    /// Its bytes whole, while not yet packed.
+    pub fn whole(&self) -> Option<&[u8]> {
+        match self {
+            Retained::Whole(raw) => Some(raw),
+            Retained::Packed(..) => None,
+        }
+    }
+    /// Whether it is worth packing: whole, past the preview and within the
+    /// bound. Packing one whose start does not compress leaves it whole.
+    pub fn packs(&self) -> bool {
+        matches!(self, Retained::Whole(raw) if raw.len() > PREVIEW_BYTES && raw.len() <= ARTIFACT_BYTES)
+    }
+    /// Packed as the store keeps it, where compressing pays; whole
+    /// otherwise.
+    pub fn packed(self) -> Retained {
+        match self {
+            Retained::Whole(raw) => match encode(&raw) {
+                Some(data) => Retained::Packed(data, raw.len()),
+                None => Retained::Whole(raw),
+            },
+            packed => packed,
+        }
+    }
+}
+
+/// Insert a retained stream as it was handed in: packed beforehand, or
+/// whole. The writer compresses nothing.
+pub(super) fn put(
+    db: &Connection,
+    turn: i64,
+    call: &str,
+    stream: &str,
+    retained: &Retained,
+) -> Result<()> {
+    let (data, raw_bytes) = match retained {
+        Retained::Whole(raw) => (raw.as_slice(), 0),
+        Retained::Packed(data, size) => (data.as_slice(), *size as i64),
+    };
+    db.prepare_cached(
+        "INSERT INTO artifacts(turn,call_id,stream,data,raw_bytes) VALUES (?,?,?,?,?)",
+    )?
+    .execute(params![turn, call, stream, data, raw_bytes])?;
     Ok(())
 }
 
@@ -277,7 +327,14 @@ mod tests {
         }
         for raw in [Vec::new(), vec![255; 100], mixed] {
             db.execute("DELETE FROM artifacts", []).unwrap();
-            put(&db, 1, "call", "stdout", &raw).unwrap();
+            let packed = Retained::Whole(raw.clone()).packed();
+            // Only the mebibyte, mostly zeros, is worth compressing.
+            assert_eq!(
+                matches!(packed, Retained::Packed(..)),
+                raw.len() == ARTIFACT_BYTES
+            );
+            assert_eq!(packed.len(), raw.len());
+            put(&db, 1, "call", "stdout", &packed).unwrap();
             for offset in [0, raw.len() / 2, raw.len().saturating_sub(1), raw.len()] {
                 for limit in [0, 4, BLOCK + 1, ARTIFACT_BYTES] {
                     let (_, page) = read(&db, 1, "call", "stdout", offset as u64, limit)

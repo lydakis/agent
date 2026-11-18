@@ -121,7 +121,7 @@ pub fn default_tools(
 
 /// The socket protocol's version in `ready`. The daemon and its clients ship
 /// together, so a client refuses a daemon of any other version.
-pub const PROTOCOL: u64 = 86;
+pub const PROTOCOL: u64 = 87;
 static PROGRAM: std::sync::OnceLock<&'static str> = std::sync::OnceLock::new();
 /// Name this process's connections as `program` (such as `window` or
 /// `reviewer`): each later [`Client::connect`] says it in its first line,
@@ -282,19 +282,126 @@ struct Notification {
 }
 
 /// Encoded notifications share an 8 MiB budget, released as callers drain them.
-/// Keeping the wire representation also bounds allocations for nested JSON.
+/// Keeping the wire representation also bounds allocations for nested JSON,
+/// and each notification is built once, when it is taken.
 pub struct Events(mpsc::Receiver<Notification>);
 impl Events {
     pub async fn recv(&mut self) -> Option<Value> {
-        self.0
-            .recv()
-            .await
-            .map(|event| serde_json::from_str(&event.encoded).expect("validated notification"))
+        loop {
+            if let Some(event) = self.0.recv().await?.decode() {
+                return Some(event);
+            }
+        }
     }
     pub fn try_recv(&mut self) -> std::result::Result<Value, mpsc::error::TryRecvError> {
-        self.0
-            .try_recv()
-            .map(|event| serde_json::from_str(&event.encoded).expect("validated notification"))
+        loop {
+            if let Some(event) = self.0.try_recv()?.decode() {
+                return Ok(event);
+            }
+        }
+    }
+}
+impl Notification {
+    /// The notification, or nothing for a line the reader routed by its
+    /// envelope that is not JSON a value can hold, as the reader passes by
+    /// a line it cannot read.
+    fn decode(&self) -> Option<Value> {
+        serde_json::from_str(&self.encoded).ok()
+    }
+}
+
+/// What the reader reads of a line to route it: the id of the request it
+/// answers, when it is one. The rest is checked as JSON and skipped, not
+/// built, so a notification is built once, by whoever takes it. A line is
+/// a response when it is an object whose `id` is a whole number a request
+/// is made under; any other line is a notification.
+struct Envelope(Option<u64>);
+impl<'de> serde::Deserialize<'de> for Envelope {
+    fn deserialize<D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> std::result::Result<Self, D::Error> {
+        Ok(Self(
+            deserializer.deserialize_any(Routing { object: true })?,
+        ))
+    }
+}
+/// Reads a line (`object`) or its `id`, building nothing.
+struct Routing {
+    object: bool,
+}
+struct Id(Option<u64>);
+impl<'de> serde::Deserialize<'de> for Id {
+    fn deserialize<D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> std::result::Result<Self, D::Error> {
+        Ok(Self(
+            deserializer.deserialize_any(Routing { object: false })?,
+        ))
+    }
+}
+/// Whether an object's key is `id`.
+struct IsId(bool);
+impl<'de> serde::Deserialize<'de> for IsId {
+    fn deserialize<D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> std::result::Result<Self, D::Error> {
+        struct Key;
+        impl serde::de::Visitor<'_> for Key {
+            type Value = IsId;
+            fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+                formatter.write_str("a key")
+            }
+            fn visit_str<E>(self, key: &str) -> std::result::Result<IsId, E> {
+                Ok(IsId(key == "id"))
+            }
+        }
+        deserializer.deserialize_str(Key)
+    }
+}
+impl<'de> serde::de::Visitor<'de> for Routing {
+    type Value = Option<u64>;
+    fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+        formatter.write_str("any JSON value")
+    }
+    fn visit_u64<E>(self, id: u64) -> std::result::Result<Option<u64>, E> {
+        Ok((!self.object).then_some(id))
+    }
+    fn visit_i64<E>(self, id: i64) -> std::result::Result<Option<u64>, E> {
+        Ok(u64::try_from(id).ok().filter(|_| !self.object))
+    }
+    fn visit_f64<E>(self, _: f64) -> std::result::Result<Option<u64>, E> {
+        Ok(None)
+    }
+    fn visit_bool<E>(self, _: bool) -> std::result::Result<Option<u64>, E> {
+        Ok(None)
+    }
+    fn visit_str<E>(self, _: &str) -> std::result::Result<Option<u64>, E> {
+        Ok(None)
+    }
+    fn visit_unit<E>(self) -> std::result::Result<Option<u64>, E> {
+        Ok(None)
+    }
+    fn visit_seq<A: serde::de::SeqAccess<'de>>(
+        self,
+        mut seq: A,
+    ) -> std::result::Result<Option<u64>, A::Error> {
+        while seq.next_element::<serde::de::IgnoredAny>()?.is_some() {}
+        Ok(None)
+    }
+    fn visit_map<A: serde::de::MapAccess<'de>>(
+        self,
+        mut map: A,
+    ) -> std::result::Result<Option<u64>, A::Error> {
+        // As a parsed object would, the last `id` counts.
+        let mut id = None;
+        while let Some(IsId(is_id)) = map.next_key()? {
+            if is_id && self.object {
+                id = map.next_value::<Id>()?.0;
+            } else {
+                map.next_value::<serde::de::IgnoredAny>()?;
+            }
+        }
+        Ok(id)
     }
 }
 
@@ -438,12 +545,15 @@ impl Client {
         tokio::spawn(async move {
             let mut lagged = false;
             while let Ok(Some(line)) = lines.next_line().await {
-                let Ok(message) = serde_json::from_str::<Value>(&line) else {
+                let Ok(Envelope(id)) = serde_json::from_str::<Envelope>(&line) else {
                     continue;
                 };
-                match message.get("id").and_then(Value::as_u64) {
+                match id {
                     Some(id) => {
-                        if let Some(sender) = routed.lock().unwrap().remove(&id) {
+                        let waiting = routed.lock().unwrap().remove(&id);
+                        if let Some(sender) = waiting
+                            && let Ok(message) = serde_json::from_str::<Value>(&line)
+                        {
                             let _ = sender.send(message);
                         }
                     }
@@ -456,7 +566,6 @@ impl Client {
                             lagged = true;
                             break;
                         };
-                        drop(message);
                         match events.try_send(Notification {
                             encoded: line,
                             _bytes: Some(bytes),
@@ -664,6 +773,53 @@ impl Client {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_line_is_routed_by_its_id_as_a_parsed_object_would_be() {
+        let routed = |line: &str| serde_json::from_str::<Envelope>(line).ok().map(|e| e.0);
+        let parsed = |line: &str| {
+            serde_json::from_str::<Value>(line)
+                .ok()
+                .map(|v| v.get("id").and_then(Value::as_u64))
+        };
+        for line in [
+            r#"{"id":7,"result":{"id":9}}"#,
+            r#"{"result":{"id":9},"id":7}"#,
+            r#"{"event":"text_delta","bot":"b","data":{"id":3,"text":"x"}}"#,
+            r#"{"id":"7","error":"x"}"#,
+            r#"{"id":-1}"#,
+            r#"{"id":1.5}"#,
+            r#"{"id":null}"#,
+            r#"{"id":[1],"x":{"y":[true,null]}}"#,
+            r#"{"id":1,"id":2}"#,
+            r#"{"\u0069d":4}"#,
+            r#"[{"id":1}]"#,
+            r#"7"#,
+            r#""id""#,
+            r#"{"id":1"#,
+            r#"{"id":1} x"#,
+        ] {
+            assert_eq!(routed(line), parsed(line), "{line}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_notification_is_taken_as_the_value_it_was_sent_as() {
+        let (sender, receiver) = mpsc::channel(4);
+        let mut events = Events(receiver);
+        let sent = json!({"event": "text_delta", "bot": "b", "data": {"text": "é\n"}});
+        for encoded in ["{\"bad\":\"\\ud800\"}".to_owned(), sent.to_string()] {
+            sender
+                .send(Notification {
+                    encoded,
+                    _bytes: None,
+                })
+                .await
+                .unwrap();
+        }
+        // A line no value holds is passed by, as the reader passes one by.
+        assert_eq!(events.recv().await.unwrap(), sent);
+    }
 
     #[test]
     fn a_service_leaves_the_session_it_was_started_from() {

@@ -529,6 +529,39 @@ line records `message_ended` (`status` `withdrawn` or `failed`, with the
 error), and one taken into a running turn the `steered` event on that
 turn; `queued`, `attached` and `held` name the message (`turn` null).
 
+Protocol 87 gives `messages` and `follow` one selector, the shape `bots`
+and `audit` already take, as Kubernetes lists and watches by one selector
+and Gmail lists one query across every thread. `bot` is a name, or a GLOB
+pattern (`shop.*`, `*.lead`, `*`); no name holds `*`, `?` or `[`, so a
+plain name is one bot's and an unknown one is `bot_not_found`, while a
+pattern names whichever bots match, any made later too. `messages` adds
+`since_ms` and `until_ms` (sent at or after, and before, in Unix ms) and
+`from`, the kinds of sender: `person` (no other bot's turn and no named
+client sent it, named person or not), `bot` (another bot's turn) and
+`client` (a client by its own name, such as an automation or the lookout);
+any other is `invalid_message_filter`. With `words`, each message carries
+its `text` whole beside the preview, and a page holds as many as fit in
+half a response, at least one; a message too large for a page alone keeps
+the words that fit, with `text_cut`. A message's `sent_ms` is never before the
+one sent before it, so times rise with numbers and a time range is found
+by halving the number range, a few point reads, as `audit` and `follow`'s
+`since_ms` find theirs; then the read is a range of numbers. People's
+messages have their own index (`messages_people`, by number), so
+`messages {bot:"*", from:["person"], since_ms}`, what the person wrote to
+any agent lately, reads only those; Sonny's `memory said` is that one
+read, paged, where it asked for every agent's turns, about 1,650 requests
+with 1,650 agents, and reads an agent's history only for a reaction or an
+answer to an ask among them. `follow` with a pattern replays from a store-wide cursor, as `*` does,
+and delivers only the matching bots', in replay and live; `kinds` narrows
+it as before. Its replay pages are matched in the store (`bot GLOB` as the
+page reads the cursor's range), so a sparse pattern reads the backlog past
+its cursor once and decodes only its own events: 100 projects' follows of
+a 200,000-event backlog went live in 1.6 s, not 69 s. Each page ends at
+the newest event when it began, so the switch to live reads only what was
+written since. The
+publisher matches a pattern by SQLite's GLOB rules, so live delivery agrees
+with what replay read.
+
 The model reads each message's number in a text part after its words:
 `[Message BOT/N.]`, `[Message BOT/N, written by PERSON.]`, `[Message BOT/N,
 sent by ORIGIN.]` or `[Message BOT/N, written by the agent NAME in
@@ -1534,7 +1567,7 @@ does not, and each is one op:
   the switch to live delivery, and a retention gap anywhere is announced as a
   `pruned` notice first. Live delivery has the socket follower's contract:
   a lagging session is disconnected rather than allowed to hold the daemon.
-  `agent follow --all [--after N]`. With `kinds`, a list of one or more
+  `agent follow --all [--after N]`, or `--bot GLOB` for a pattern's bots. With `kinds`, a list of one or more
   event kinds (`invalid_follow_kinds` otherwise), the follow receives only
   those, in replay and live; `follow_live` and `pruned` still come. A
   controller that never reads streamed text leaves the deltas, most of all
