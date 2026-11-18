@@ -1211,6 +1211,9 @@ pub fn tool() -> Option<Value> {
             " `machine` runs it on {names}, another machine of the person's; a path is still one in your folder, and what it saves there comes back over the link, up to {} MB a call.",
             CARRIED_BYTES >> 20
         ));
+        if lent.iter().any(|machine| machine.signed_in) {
+            description.push_str(" On a machine signed in as the person, your session is a tab of one Chrome its agents share, which takes the person's sign-ins there as it starts: after they sign in, `close` and open again, and it starts again with them once every agent with a tab in it has closed its own.");
+        }
         if !here {
             required.push("machine");
         } else {
@@ -1434,11 +1437,12 @@ pub async fn lent(
     // the profile kept for it.
     let browser = match profile.is_empty() {
         true => Browser::Fresh,
-        false => Browser::Shared(
-            link_browser(key, profile)
+        false => Browser::Shared {
+            link: key.to_owned(),
+            cdp: link_browser(key, profile, &session)
                 .await
                 .map_err(|e| ("browser_refused", e))?,
-        ),
+        },
     };
     // An agent of another machine: its share here is its session's, the
     // only place it takes here.
@@ -1453,8 +1457,9 @@ enum Browser {
     Own,
     /// One it starts from no profile.
     Fresh,
-    /// Its own tab of the Chrome at this CDP address, which it shares.
-    Shared(String),
+    /// Its own tab of the Chrome of the link `link`, at the CDP address
+    /// `cdp`, which it shares.
+    Shared { link: String, cdp: String },
 }
 
 // ---- A link's browser: one Chrome on a profile kept for it ----
@@ -1490,6 +1495,9 @@ struct LinkChrome {
     last: Option<std::time::Instant>,
     /// Whether a task closes it once it idles.
     watched: bool,
+    /// The sessions with a tab in it: each that called since it started,
+    /// until it closes its own.
+    tabs: std::collections::HashSet<String>,
 }
 
 /// Each link's Chrome, locked while it is found or started, so two calls
@@ -1499,8 +1507,8 @@ static LINKS: std::sync::LazyLock<
 > = std::sync::LazyLock::new(Default::default);
 
 /// Where the Chrome of the link `key`, started from `profile`, can be
-/// attached to: the one its agents share, started on the profile kept for
-/// the link if it is not running.
+/// attached to by `session`: the one its agents share, started on the
+/// profile kept for the link if it is not running.
 ///
 /// Sonny starts it, not agent-browser: agent-browser starts a profile
 /// folder with a stand-in keychain (`--use-mock-keychain`,
@@ -1513,15 +1521,15 @@ static LINKS: std::sync::LazyLock<
 /// It runs as a task of its own, so a call let go while the profile is
 /// copied or Chrome starts does not let another start the same, with the
 /// lock given up before the work is done.
-async fn link_browser(key: &str, profile: &str) -> Result<String, String> {
-    let (key, profile) = (key.to_owned(), profile.to_owned());
-    tokio::spawn(async move { find_link_browser(&key, &profile).await })
+async fn link_browser(key: &str, profile: &str, session: &str) -> Result<String, String> {
+    let (key, profile, session) = (key.to_owned(), profile.to_owned(), session.to_owned());
+    tokio::spawn(async move { find_link_browser(&key, &profile, &session).await })
         .await
         .map_err(|e| e.to_string())?
 }
 
 /// [`link_browser`], in its own task.
-async fn find_link_browser(key: &str, profile: &str) -> Result<String, String> {
+async fn find_link_browser(key: &str, profile: &str, session: &str) -> Result<String, String> {
     let held = {
         let mut links = LINKS.lock().unwrap_or_else(|e| e.into_inner());
         links.entry(key.to_owned()).or_default().clone()
@@ -1567,11 +1575,15 @@ async fn find_link_browser(key: &str, profile: &str) -> Result<String, String> {
                 })
                 .await;
             }
-            start_chrome(&dir).await?
+            let url = start_chrome(&dir).await?;
+            // A Chrome just started holds no session's tab.
+            chrome.tabs.clear();
+            url
         }
     };
     chrome.dir = Some(dir);
     chrome.last = Some(std::time::Instant::now());
+    chrome.tabs.insert(session.to_owned());
     if !chrome.watched {
         chrome.watched = true;
         tokio::spawn(close_when_idle(held.clone()));
@@ -1596,6 +1608,34 @@ async fn close_when_idle(held: Arc<tokio::sync::Mutex<LinkChrome>>) {
         drop(chrome);
         tokio::time::sleep(left).await;
     }
+}
+
+/// The session `session` of the link `key` closed its tab: the link's
+/// Chrome is closed too once no other session has one in it, so the next
+/// to open starts it again, with the person's sign-ins as they are then.
+/// In its own task, as [`link_browser`] is.
+async fn link_closed(key: &str, session: &str) {
+    let Some(held) = (LINKS.lock().unwrap_or_else(|e| e.into_inner()))
+        .get(key)
+        .cloned()
+    else {
+        return;
+    };
+    let session = session.to_owned();
+    let _ = tokio::spawn(async move {
+        let mut chrome = held.lock().await;
+        chrome.tabs.remove(&session);
+        if !chrome.tabs.is_empty() {
+            return;
+        }
+        // One that will not close is left to close once it idles.
+        if let Some(dir) = chrome.dir.take()
+            && stop_chrome(&dir).await.is_err()
+        {
+            chrome.dir = Some(dir);
+        }
+    })
+    .await;
 }
 
 /// The CDP address of the Chrome running on the profile folder `dir`, if
@@ -1943,8 +1983,9 @@ fn is_folder(profile: &str) -> bool {
 /// Chrome starts, which nothing has open: the person's native messaging
 /// hosts linked in, as Chrome reads them from beside its profiles, so an
 /// extension that talks to a program of theirs (a company's device check)
-/// reaches it, and their sign-ins copied over the copy's when theirs are
-/// newer. The rest of the copy stays as its browser left it.
+/// reaches it, and their sign-ins copied over the copy's, so one they made
+/// since its last start is in it. The rest of the copy stays as its
+/// browser left it.
 fn refresh_kept(dir: &Path, profile: &str, data: &Path) {
     let _ = link_hosts(
         &data.join("NativeMessagingHosts"),
@@ -1956,7 +1997,7 @@ fn refresh_kept(dir: &Path, profile: &str, data: &Path) {
     };
     // Where Chrome keeps them, by its version and system.
     for cookies in ["Cookies", "Network/Cookies"] {
-        let _ = newer_database(
+        let _ = copy_database(
             &data.join(&folder).join(cookies),
             &dir.join(&folder).join(cookies),
         );
@@ -1994,28 +2035,10 @@ fn link_hosts(from: &Path, to: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
-/// The SQLite database `from`, with its journal, copied over `to` when it
-/// was written after `to` was: whether it was. A journal of `to`'s that
-/// `from` has none of goes first, so it is never played back over the
-/// other's data.
-fn newer_database(from: &Path, to: &Path) -> std::io::Result<bool> {
-    // When each was last written: by its database or its journal, where a
-    // write-ahead log holds what was written since the last checkpoint.
-    let written = |path: &Path| -> std::io::Result<std::time::SystemTime> {
-        let mut latest = std::fs::metadata(path)?.modified()?;
-        for suffix in ["-journal", "-wal"] {
-            let mut side = path.as_os_str().to_owned();
-            side.push(suffix);
-            if let Ok(at) = std::fs::metadata(PathBuf::from(side)).and_then(|m| m.modified()) {
-                latest = latest.max(at);
-            }
-        }
-        Ok(latest)
-    };
-    let theirs = written(from)?;
-    if written(to).is_ok_and(|ours| ours >= theirs) {
-        return Ok(false);
-    }
+/// The SQLite database `from`, with its journal, copied over `to`:
+/// whether it was. A journal of `to`'s that `from` has none of goes first,
+/// so it is never played back over the other's data.
+fn copy_database(from: &Path, to: &Path) -> std::io::Result<bool> {
     let with = |suffix: &str| {
         let mut path = to.as_os_str().to_owned();
         path.push(suffix);
@@ -2220,7 +2243,7 @@ async fn drive(
     let (profile, cdp) = match &browser {
         Browser::Own => (None, None),
         Browser::Fresh => (Some(""), None),
-        Browser::Shared(cdp) => (None, Some(cdp.as_str())),
+        Browser::Shared { cdp, .. } => (None, Some(cdp.as_str())),
     };
     let session = session.to_owned();
     let checked: Vec<Checked> = lines
@@ -2262,6 +2285,8 @@ async fn drive(
         Err(why) => return Ok(Value::String(why)),
     };
     let mut failed = false;
+    // Whether the last command run was a `close` that closed the session.
+    let mut closed = false;
     let mut parts: Vec<Value> = Vec::new();
     let mut text = String::new();
     let mut shown = 0;
@@ -2276,6 +2301,7 @@ async fn drive(
         // Each command is told to the agent's daemon before it runs: put to
         // its gate when it asks, else recorded in its audit trail.
         let verb = command.args.first().map(String::as_str);
+        let mut ran_it = false;
         let mut ran = match steps
             .ask(NAME, NAME, json!({"command": line}), facts(verb), asks)
             .await
@@ -2283,6 +2309,7 @@ async fn drive(
             Ok(step) => {
                 let ran = run(&session, &command.args, &launch).await;
                 steps.ran(step, !ran.ok).await;
+                ran_it = true;
                 ran
             }
             Err(why) => Ran {
@@ -2307,6 +2334,9 @@ async fn drive(
                     };
                 }
             }
+        }
+        if ran_it {
+            closed = verb == Some("close") && ran.ok;
         }
         let (mut said, ok) = (ran.said, ran.ok);
         if reach.carry {
@@ -2401,6 +2431,9 @@ async fn drive(
     }
     if let Some(step) = allowed {
         steps.ran(step, failed).await;
+    }
+    if let (true, Browser::Shared { link, .. }) = (closed, &browser) {
+        link_closed(link, &session).await;
     }
     let text = text.trim_end().to_owned();
     if parts.is_empty() {
@@ -2675,7 +2708,7 @@ mod tests {
     }
 
     #[test]
-    fn a_kept_profile_gets_the_person_s_hosts_and_newer_sign_ins_as_its_chrome_starts() {
+    fn a_kept_profile_gets_the_person_s_hosts_and_sign_ins_as_its_chrome_starts() {
         let root = scratch("refresh");
         let data = root.join("chrome-data");
         let state = json!({"profile": {"info_cache": {"Profile 1": {"name": "Work"}}}});
@@ -2695,8 +2728,9 @@ mod tests {
                 .unwrap()
         };
         let hosts = dir.join("NativeMessagingHosts");
-        // The copy's own sign-ins, newer than the person's: kept, with
-        // their journal. A host Chrome made empty, and one gone since.
+        // The copy's browser wrote its own Cookies after the person's
+        // last did, as it does each time it browses. A host Chrome made
+        // empty, and one gone since.
         std::fs::write(dir.join("Profile 1/Cookies"), "ours").unwrap();
         std::fs::write(dir.join("Profile 1/Cookies-journal"), "ours too").unwrap();
         stamp(&data.join("Profile 1/Cookies"), 1_000);
@@ -2711,8 +2745,10 @@ mod tests {
         std::fs::write(hosts.join("own.json"), "kept").unwrap();
         refresh_kept(&dir, "Work", &data);
         let read = |path: PathBuf| std::fs::read_to_string(path).unwrap();
-        assert_eq!(read(dir.join("Profile 1/Cookies")), "ours");
-        assert_eq!(read(dir.join("Profile 1/Cookies-journal")), "ours too");
+        // The person's sign-ins replace the copy's all the same, whose
+        // journal goes with them.
+        assert_eq!(read(dir.join("Profile 1/Cookies")), "theirs");
+        assert!(!dir.join("Profile 1/Cookies-journal").exists());
         // The person's hosts are linked, read as they are now.
         assert_eq!(
             std::fs::read_link(hosts.join("check.json")).unwrap(),
@@ -2722,56 +2758,65 @@ mod tests {
         assert_eq!(read(hosts.join("check.json")), "{\"v\": 2}");
         assert!(std::fs::symlink_metadata(hosts.join("old.json")).is_err());
         assert_eq!(read(hosts.join("own.json")), "kept");
-        // The person signs in again: theirs, newer, replace the copy's,
-        // whose journal goes with it.
+        // The person signs in again: theirs reach the copy at its next
+        // start, with their journal.
         std::fs::write(data.join("Profile 1/Cookies"), "signed in").unwrap();
-        stamp(&data.join("Profile 1/Cookies"), 3_000);
+        std::fs::write(data.join("Profile 1/Cookies-journal"), "j").unwrap();
         refresh_kept(&dir, "Work", &data);
         assert_eq!(read(dir.join("Profile 1/Cookies")), "signed in");
-        assert!(!dir.join("Profile 1/Cookies-journal").exists());
-        // Their journal comes with theirs.
-        std::fs::write(data.join("Profile 1/Cookies-journal"), "j").unwrap();
-        stamp(&data.join("Profile 1/Cookies"), 4_000_000_000);
-        assert!(
-            newer_database(
-                &data.join("Profile 1/Cookies"),
-                &dir.join("Profile 1/Cookies")
-            )
-            .unwrap()
-        );
         assert_eq!(read(dir.join("Profile 1/Cookies-journal")), "j");
-        // What a write-ahead log holds since its last checkpoint counts,
-        // though the database itself is older than the copy.
+        // And what their write-ahead log holds since its last checkpoint.
+        std::fs::remove_file(data.join("Profile 1/Cookies-journal")).unwrap();
         std::fs::write(data.join("Profile 1/Cookies-wal"), "renewed").unwrap();
-        stamp(&data.join("Profile 1/Cookies"), 1_000);
-        stamp(&dir.join("Profile 1/Cookies"), 2_000_000);
-        stamp(&dir.join("Profile 1/Cookies-journal"), 2_000_000);
-        stamp(&data.join("Profile 1/Cookies-wal"), 3_000_000);
         assert!(
-            newer_database(
+            copy_database(
                 &data.join("Profile 1/Cookies"),
                 &dir.join("Profile 1/Cookies")
             )
             .unwrap()
         );
         assert_eq!(read(dir.join("Profile 1/Cookies-wal")), "renewed");
-        assert!(
-            !newer_database(
-                &data.join("Profile 1/Cookies"),
-                &dir.join("Profile 1/Cookies")
-            )
-            .unwrap()
-        );
+        assert!(!dir.join("Profile 1/Cookies-journal").exists());
         // Nothing half copied is left beside them.
         let left: Vec<String> = (std::fs::read_dir(dir.join("Profile 1")).unwrap().flatten())
             .map(|entry| entry.file_name().to_string_lossy().into_owned())
             .filter(|name| name.ends_with(".partial"))
             .collect();
         assert!(left.is_empty(), "{left:?}");
+        // A profile with no Cookies of its own leaves the copy's.
+        std::fs::remove_file(data.join("Profile 1/Cookies")).unwrap();
+        std::fs::remove_file(data.join("Profile 1/Cookies-wal")).unwrap();
+        refresh_kept(&dir, "Work", &data);
+        assert_eq!(read(dir.join("Profile 1/Cookies")), "signed in");
         // A host the person removed goes from the copy too.
         std::fs::remove_file(data.join("NativeMessagingHosts/check.json")).unwrap();
         refresh_kept(&dir, "Work", &data);
         assert!(std::fs::symlink_metadata(hosts.join("check.json")).is_err());
+    }
+
+    #[tokio::test]
+    async fn a_link_s_chrome_closes_once_its_last_tab_closes() {
+        // A link's Chrome on a profile no Chrome runs on, with two agents'
+        // tabs in it.
+        let dir = scratch("closed");
+        let held = Arc::new(tokio::sync::Mutex::new(LinkChrome {
+            dir: Some(dir.clone()),
+            tabs: ["a".to_owned(), "b".to_owned()].into(),
+            ..Default::default()
+        }));
+        let key = format!("closed-{}", std::process::id());
+        (LINKS.lock().unwrap()).insert(key.clone(), held.clone());
+        // One closes its tab: the other's keeps the Chrome.
+        link_closed(&key, "a").await;
+        assert_eq!(held.lock().await.dir.as_ref(), Some(&dir));
+        // The last closes: so does the Chrome, started again at the next
+        // open.
+        link_closed(&key, "b").await;
+        assert_eq!(held.lock().await.dir, None);
+        assert!(held.lock().await.tabs.is_empty());
+        // Another link's, or none, is left alone.
+        link_closed("no-such-link", "a").await;
+        LINKS.lock().unwrap().remove(&key);
     }
 
     #[test]

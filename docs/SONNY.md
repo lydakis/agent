@@ -1375,8 +1375,10 @@ The host's agents see each linked machine by name:
   person's native messaging hosts (`NativeMessagingHosts` beside their
   profiles, which an extension such as a company's device check talks to)
   are linked into the kept profile, and their `Cookies` are copied over
-  the kept profile's when theirs were written later, so signing in again
-  in their own Chrome reaches the shared browser at its next start. A `browser_profile` that is a
+  the kept profile's, so signing in again in their own Chrome reaches the
+  shared browser at its next start. An agent's `close` ends its tab, and
+  Sonny closes that Chrome once no agent of the link has a tab in it, so
+  the next open starts it again. A `browser_profile` that is a
   folder is used as it is; `""` gives each agent a fresh browser of its
   own instead. Sonny starts that Chrome itself, the person's own Chrome
   program (or agent-browser's `executablePath`), with the system's
