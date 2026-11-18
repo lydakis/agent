@@ -433,8 +433,6 @@ fn folder(path: &Path) -> &Path {
 /// name planted in the folder can only be skipped, never written through.
 fn stage(path: &Path, text: &str) -> Result<PathBuf, Error> {
     use std::io::Write;
-    use std::os::unix::fs::OpenOptionsExt;
-    static STAGED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let failed = |error: std::io::Error| {
         Error::with("models_unwritable", &format!("{}: {error}", path.display()))
     };
@@ -444,45 +442,19 @@ fn stage(path: &Path, text: &str) -> Result<PathBuf, Error> {
         .ok()
         .filter(std::fs::Metadata::is_file)
         .map(|meta| meta.permissions());
-    for _ in 0..8 {
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_or(0, |since| since.subsec_nanos());
-        let mut name = std::ffi::OsString::from(".");
-        name.push(path.file_name().unwrap_or_default());
-        name.push(format!(
-            ".{}.{}{nanos:08x}",
-            std::process::id(),
-            STAGED.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-        ));
-        let staged = path.with_file_name(name);
-        let mut file = match std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
-            .open(&staged)
-        {
-            Ok(file) => file,
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
-            Err(error) => return Err(failed(error)),
-        };
-        let written = (|| {
-            if let Some(permissions) = &permissions {
-                file.set_permissions(permissions.clone())?;
-            }
-            file.write_all(text.as_bytes())?;
-            file.sync_all()
-        })();
-        if let Err(error) = written {
-            let _ = std::fs::remove_file(&staged);
-            return Err(failed(error));
+    let (staged, mut file) = crate::files::temporary(path, 0o666).map_err(failed)?;
+    let written = (|| {
+        if let Some(permissions) = permissions {
+            file.set_permissions(permissions)?;
         }
-        return Ok(staged);
+        file.write_all(text.as_bytes())?;
+        file.sync_all()
+    })();
+    if let Err(error) = written {
+        let _ = std::fs::remove_file(&staged);
+        return Err(failed(error));
     }
-    Err(Error::with(
-        "models_unwritable",
-        &format!("{}: no free name to write beside it", path.display()),
-    ))
+    Ok(staged)
 }
 
 /// Renames a staged file over `path`, which replaces the name there (a

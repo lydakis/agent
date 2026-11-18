@@ -17,13 +17,15 @@ import argparse
 import asyncio
 import json
 import os
-import shutil
 import sqlite3
 import subprocess
 import sys
 import tempfile
 import time
+from contextlib import ExitStack
 from pathlib import Path
+
+from .targets import clean_env
 
 import psutil
 
@@ -35,7 +37,10 @@ TICK = os.sysconf('SC_CLK_TCK')
 def thread_cpu(pid):
     """CPU seconds by thread name (summed), from /proc."""
     out = {}
-    for task in Path(f'/proc/{pid}/task').iterdir():
+    tasks = Path(f'/proc/{pid}/task')
+    if not tasks.is_dir():
+        return None
+    for task in tasks.iterdir():
         try:
             stat = (task / 'stat').read_text()
         except OSError:
@@ -102,23 +107,37 @@ class Conn:
         return c
 
     async def read(self):
-        while True:
-            line = await self.reader.readline()
-            if not line:
-                return
-            self.bytes += len(line)
-            m = json.loads(line)
-            if 'id' in m and m['id'] in self.waiting:
-                self.waiting.pop(m['id']).set_result(m)
-                continue
-            kind = m.get('event')
-            if kind:
-                self.kinds[kind] = self.kinds.get(kind, 0) + 1
-                self.kind_bytes[kind] = self.kind_bytes.get(kind, 0) + len(line)
-            if self.on_event:
-                self.on_event(m)
+        error = ConnectionError('daemon connection closed')
+        try:
+            while True:
+                line = await self.reader.readline()
+                if not line:
+                    break
+                self.bytes += len(line)
+                m = json.loads(line)
+                if 'id' in m and m['id'] in self.waiting:
+                    future = self.waiting.pop(m['id'])
+                    if not future.done():
+                        future.set_result(m)
+                    continue
+                kind = m.get('event')
+                if kind:
+                    self.kinds[kind] = self.kinds.get(kind, 0) + 1
+                    self.kind_bytes[kind] = self.kind_bytes.get(kind, 0) + len(line)
+                if self.on_event:
+                    self.on_event(m)
+        except (OSError, ValueError) as exc:
+            error = exc
+        finally:
+            for future in self.waiting.values():
+                if not future.done():
+                    future.set_exception(error)
+            self.waiting.clear()
+            self.writer.close()
 
     def send(self, op, **params):
+        if self.writer.is_closing():
+            raise ConnectionError('daemon connection closed')
         self.next_id += 1
         fut = asyncio.get_running_loop().create_future()
         self.waiting[self.next_id] = fut
@@ -129,29 +148,40 @@ class Conn:
         return await self.send(op, **params)
 
 
+def stop(process):
+    if process.poll() is None:
+        process.terminate()
+        try:
+            process.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait()
+
+
 async def run(args):
     out = Path(args.out).resolve()
-    if out.exists():
-        shutil.rmtree(out)
     out.mkdir(parents=True)
     mock_cmd = [sys.executable, str(HERE / 'streaming_model.py'), '--stats', str(out / 'mock.json'),
                 '--ttft-ms', str(args.ttft_ms), '--tokens', str(args.tokens), '--tps', str(args.tps),
                 '--per-delta', str(args.per_delta), '--tpm', str(args.tpm), '--rpm', str(args.rpm),
                 '--charge-output', str(args.charge_output)] + (['--no-headers'] if args.no_headers else []) + ['--jitter', str(args.jitter)]
-    mock = subprocess.Popen(mock_cmd, stdout=subprocess.PIPE, text=True)
-    port = json.loads(mock.stdout.readline())['port']
-    sockdir = tempfile.mkdtemp(prefix='sc-', dir='/tmp')
-    sock = f'{sockdir}/d.sock'
-    workspace = out / 'ws'
-    workspace.mkdir()
-    env = {k: v for k, v in os.environ.items() if not k.startswith(('OPENAI', 'ANTHROPIC', 'AGENT'))}
-    env['HOME'] = str(out / 'home')
-    daemon_cmd = [args.binary, 'serve', '--store', str(out / 'state.sqlite'),
-                  '--provider', f'openai=responses,http://127.0.0.1:{port}/v1', '--socket', sock,
-                  *args.extra]
-    daemon = subprocess.Popen(daemon_cmd, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-                              stderr=open(out / 'daemon.err', 'w'), env=env, start_new_session=True)
-    try:
+    with ExitStack() as resources:
+        mock = subprocess.Popen(mock_cmd, stdout=subprocess.PIPE, text=True)
+        resources.callback(stop, mock)
+        resources.callback(mock.stdout.close)
+        port = json.loads(mock.stdout.readline())['port']
+        sockdir = resources.enter_context(tempfile.TemporaryDirectory(prefix='sc-', dir='/tmp'))
+        sock = f'{sockdir}/d.sock'
+        workspace = out / 'ws'
+        workspace.mkdir()
+        env = clean_env()
+        env['HOME'] = str(out / 'home')
+        daemon_cmd = [args.binary, 'serve', '--store', str(out / 'state.sqlite'),
+                      '--provider', f'openai=responses,http://127.0.0.1:{port}/v1', '--socket', sock,
+                      *args.extra]
+        daemon = subprocess.Popen(daemon_cmd, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                  stderr=resources.enter_context((out / 'daemon.err').open('w')), env=env, start_new_session=True)
+        resources.callback(stop, daemon)
         for _ in range(500):
             if os.path.exists(sock):
                 try:
@@ -200,7 +230,9 @@ async def run(args):
             def answered(f, sent=sent, measured=measuring[0]):
                 # A refused submission starts no turn, so its bot would
                 # silently drop out of the workload: the screen fails.
-                if 'error' in f.result():
+                if f.cancelled() or f.exception() is not None:
+                    refused.append((bot, 'daemon connection closed'))
+                elif 'error' in f.result():
                     refused.append((bot, f.result()['error']))
                 elif measured:
                     replies.append(time.time() * 1000 - sent)
@@ -236,11 +268,7 @@ async def run(args):
         me0 = time.process_time()
         fb0, fk0, fkb0 = fire.bytes, dict(fire.kinds), dict(fire.kind_bytes)
         measuring[0] = True
-        rss_peak_sample = 0
-        end = t0 + args.seconds
-        while time.monotonic() < end:
-            await asyncio.sleep(1)
-            rss_peak_sample = max(rss_peak_sample, psutil.Process(daemon.pid).memory_info().rss)
+        await asyncio.sleep(max(0, t0 + args.seconds - time.monotonic()))
         measuring[0] = False
         if refused:
             raise RuntimeError(f'{len(refused)} submissions refused, first {refused[0]}')
@@ -257,8 +285,10 @@ async def run(args):
             for k in path.split('.'):
                 a, b = a[k], b[k]
             return b - a
-        threads = {k: round(th1.get(k, 0) - th0.get(k, 0), 3) for k in th1}
-        threads = {k: v for k, v in sorted(threads.items(), key=lambda kv: -kv[1]) if v > 0}
+        threads = None
+        if th0 is not None and th1 is not None:
+            used = {k: round(v - th0.get(k, 0), 3) for k, v in th1.items()}
+            threads = {k: v for k, v in sorted(used.items(), key=lambda kv: -kv[1]) if v > 0}
         daemon_cpu = (d('process.cpu_user_ms') + d('process.cpu_system_ms')) / 1000
         timed = d('tokens.timed_rounds')
         jobs = d('store.jobs')
@@ -297,8 +327,8 @@ async def run(args):
             threads_cpu_s=threads,
             mock_cpu_pct=round((mock1 - mock0) / dt * 100, 1),
             driver_cpu_pct=round((me1 - me0) / dt * 100, 1),
-            runtime_thread_pct=round(sum(v for k, v in threads.items() if k.startswith('agent') and not k.startswith('agent-storage')) / dt * 100, 1),
-            writer_thread_pct=round(threads.get('agent-storage', 0) / dt * 100, 1),
+            runtime_thread_pct=None if threads is None else round(sum(v for k, v in threads.items() if k.startswith('agent') and not k.startswith('agent-storage')) / dt * 100, 1),
+            writer_thread_pct=None if threads is None else round(threads.get('agent-storage', 0) / dt * 100, 1),
             rss_empty_mib=round(rss_empty / 2**20, 1), rss_idle_mib=round(rss_idle / 2**20, 1),
             rss_mib=round(s1['process']['rss_bytes'] / 2**20, 1),
             rss_peak_mib=round(s1['process']['peak_rss_bytes'] / 2**20, 1),
@@ -329,14 +359,6 @@ async def run(args):
         daemon.wait(timeout=30)
         result.update(from_store(out / 'state.sqlite', trace))
         return result
-    finally:
-        try:
-            daemon.wait(timeout=10)
-        except subprocess.TimeoutExpired:
-            daemon.kill()
-        mock.terminate()
-        mock.wait()
-        shutil.rmtree(sockdir, ignore_errors=True)
 
 
 def main():

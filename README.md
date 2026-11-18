@@ -3,7 +3,7 @@
 Run many coding agents at once from one small daemon. Each agent is a named
 **bot** with a durable conversation: continue it later, fork it from any
 earlier point, steer it mid-turn, or follow it live as a stream of JSON
-events. Bots delegate by running the same `agent` command you do.
+events. Bots can start peers, send them work, and wait for their results.
 
 Agent is built for programs first. A script, a CI job, an app, or another bot
 drives it through a CLI whose default output is JSON Lines, or through the
@@ -139,11 +139,11 @@ set the default. Cancel a queued message with
 
 ## Let bots delegate
 
-Bots delegate the way the demo shows: from their shell tool they run
-`agent run --detach --new --bot NAME -- TASK`, keep working, and collect the
-result with their `wait` tool. The default instructions teach them this. Every
-bot is a peer with the same commands; a bot that starts another doesn't own it,
-and you can talk to either one directly.
+Bots use `spawn_agent` to start a peer and `send_message` to give an existing
+peer work. They can keep working and collect a result with `wait`. The demo
+shows the equivalent shell command, `agent run --detach --new --bot NAME -- TASK`.
+A bot can close a peer it started with `close_agent`. You can talk to either bot
+directly, and sending a new message reopens a closed bot.
 
 A waiting bot holds no execution capacity: while it waits, it costs a row in
 the store and an entry in the daemon's registry, not a process.

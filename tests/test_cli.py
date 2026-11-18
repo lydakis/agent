@@ -633,7 +633,7 @@ class SocketAndCliTests(ModelFixture):
                                   '--detach', 'hello'], env=env, capture_output=True, text=True, cwd=self.path)
             self.assertEqual(run.returncode, 0, run.stderr)
         with sqlite3.connect(self.store) as db:
-            rows = dict(db.execute('SELECT name, compaction_instructions FROM bots'))
+            rows = dict(db.execute('SELECT name, compaction_instructions FROM bots JOIN bot_instructions USING(id)'))
         self.assertTrue(rows['Default'].startswith('You are summarizing'))
         self.assertIsNone(rows['Declined'])
         self.assertEqual(rows['Own'], 'Keep it short.')
@@ -1578,9 +1578,10 @@ class CliTests(ModelFixture):
             bootstrap.close()
             with sqlite3.connect(path) as db:
                 for n in range(1, 1025):
-                    db.execute("INSERT INTO bots(name,id,head,workspace,status,running_turn,provider,family,model,instructions,reasoning)"
-                               " VALUES (?,?,NULL,?,'running',?,'openai','responses','synthetic-model','',NULL)",
+                    db.execute("INSERT INTO bots(name,id,head,workspace,status,running_turn,provider,family,model,reasoning)"
+                               " VALUES (?,?,NULL,?,'running',?,'openai','responses','synthetic-model',NULL)",
                                (f'old-{n}', n, directory, n))
+                    db.execute("INSERT INTO bot_instructions(id,instructions) VALUES (?,'')", (n,))
                     db.execute("INSERT INTO messages(id,bot,request_id,delivery,status,turn,text,workspace,model)"
                                " VALUES (?,?,'old','reject','taken',?,'check',?,'openai/synthetic-model')",
                                (n, f'old-{n}', n, directory))
@@ -2210,8 +2211,11 @@ class ModelListTests(ModelFixture):
 
     def setUp(self):
         super().setUp()
-        self.home = self.path / 'home'
-        self.home.mkdir()
+        # These tests connect to the store's sibling socket directly.
+        # Its address must fit even when the checkout has a long path.
+        home = tempfile.TemporaryDirectory(dir='/tmp')
+        self.addCleanup(home.cleanup)
+        self.home = Path(home.name).resolve()
         self.list = self.home / '.agent' / 'models'
         self.catalog = self.home / '.agent' / 'models.discovered'
         # The daemon of the store beside the list keeps it current.
