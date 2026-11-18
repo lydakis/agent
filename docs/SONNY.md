@@ -378,6 +378,19 @@ there, or when it runs another Sonny than this one (Sonny's start checks,
 for an install that keeps each version in a folder of its own); a ring
 that finds no scheduler running starts it.
 
+Whether the job runs is read, never repaired: while `/background` lists an
+automation, one status read goes out beside the window (`systemctl --user
+show` of the unit's `LoadState`, `ActiveState`, `SubState`, `Result` and
+`NRestarts`; `launchctl print` of the job's `state` and `last exit code`),
+and when the job does not run the automations' heading has one line under
+it in the service manager's own words, `✗ scheduler not running · failed
+(Result: resources) · restart counter is at 5`. A listing of automations
+(the `automations` tool, `sonny automation ls`) that lists any adds
+`scheduler_not_running` with the same words. Nothing is started, restarted
+or alerted, and the person's own drop-ins are not read.
+
+![/background when the scheduler's systemd unit failed: one line under Automations, in systemd's words](sonny/scheduler-not-running.png)
+
 The job runs `sonny scheduler`. It reads the definitions in
 `~/.agent/automations/jobs` when that folder changes, and runs an automation's
 run when one of its calendar times comes (once for any number missed while
@@ -1375,8 +1388,10 @@ The host's agents see each linked machine by name:
   person's native messaging hosts (`NativeMessagingHosts` beside their
   profiles, which an extension such as a company's device check talks to)
   are linked into the kept profile, and their `Cookies` are copied over
-  the kept profile's when theirs were written later, so signing in again
-  in their own Chrome reaches the shared browser at its next start. A `browser_profile` that is a
+  the kept profile's, so signing in again in their own Chrome reaches the
+  shared browser at its next start. An agent's `close` ends its tab, and
+  Sonny closes that Chrome once no agent of the link has a tab in it, so
+  the next open starts it again. A `browser_profile` that is a
   folder is used as it is; `""` gives each agent a fresh browser of its
   own instead. Sonny starts that Chrome itself, the person's own Chrome
   program (or agent-browser's `executablePath`), with the system's

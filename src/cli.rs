@@ -92,7 +92,7 @@ const COMMANDS: &[Command] = &[
     Command {
         name: "messages",
         about: "Messages, each by its number: where it stands and the turn that took it in",
-        usage: "messages --bot NAME|GLOB [--since DURATION] [--from person,agent,client] [--after N] [--newest] [--limit N]",
+        usage: "messages --bot NAME|GLOB [--since DURATION] [--from person,bot,client] [--after N] [--newest] [--limit N]",
         flags: "--bot --since --from --after --newest --limit --pretty --no-spawn",
         settings: "",
         startup: true,
@@ -629,7 +629,7 @@ fn print_flags(flags: &str) {
             ),
             "--from" => (
                 "KINDS",
-                "Only messages from these senders, comma-separated: person, agent, client",
+                "Only messages from these senders, comma-separated: person, bot, client",
             ),
             "--bucket" => (
                 "DURATION",

@@ -222,6 +222,31 @@ pub struct Request {
     id: Value,
     #[serde(flatten)]
     command: Command,
+    #[serde(skip)]
+    workspace_error: Option<Error>,
+}
+impl Request {
+    // Resolve explicit workspaces on the session's read side, before it
+    // enters the shared dispatcher. The resolved name is also the one
+    // checked for a bot caller. Keep errors for the normal validation
+    // point, after authorization and request ordering.
+    fn workspace_slot(&mut self) -> Option<&mut String> {
+        match &mut self.command {
+            Command::Create { workspace, .. }
+            | Command::Fork { workspace, .. }
+            | Command::Submit { workspace, .. } => workspace.as_mut(),
+            _ => None,
+        }
+    }
+
+    fn resolve_workspace(&mut self) {
+        if let Some(path) = self.workspace_slot() {
+            match workspace(path) {
+                Ok(real) => *path = real,
+                Err(error) => self.workspace_error = Some(error),
+            }
+        }
+    }
 }
 /// A declared call's answer: text, or parts in the order the model reads
 /// them, text and pictures, as a provider's own tool results take them.
@@ -448,7 +473,7 @@ enum Command {
         since_ms: Option<i64>,
         /// Only those sent before this, in Unix ms.
         until_ms: Option<i64>,
-        /// Only those from these senders: `person`, `agent`, `client`.
+        /// Only those from these senders: `person`, `bot`, `client`.
         from: Option<Vec<String>>,
         limit: Option<usize>,
         #[serde(default)]
@@ -2395,7 +2420,7 @@ pub async fn run(config: Configuration) -> Result<()> {
     daemon.capabilities = daemon
         .socket
         .as_deref()
-        .and_then(|socket| socket::capabilities(socket, sender.clone(), sessions_next.clone()));
+        .map(|socket| socket::capabilities(socket, sender.clone(), sessions_next.clone()));
     // Where the daemon is, not a bot's shell's marks: a companion is no
     // bot's command.
     let mut companions = companions::Companions::new(
@@ -3002,11 +3027,12 @@ pub async fn run(config: Configuration) -> Result<()> {
                                         Command::Answer { tag: Some(tag), lease: Some(lease), .. } if allowed => Some((tag.clone(), *lease)),
                                         _ => None,
                                     };
+                                    let request_id = request.id.clone();
                                     let result = match refused {
                                         Some(error) => Err(error),
                                         None => {
                                             let (op, held) = (request.command.op(), std::time::Instant::now());
-                                            let result = service.dispatch(request.command, id, &output, request.id.clone(), bound).await;
+                                            let result = service.dispatch_request(request, id, &output, bound).await;
                                             service.commands.request(op, output.program(), read, held);
                                             result
                                         }
@@ -3016,13 +3042,13 @@ pub async fn run(config: Configuration) -> Result<()> {
                                     if result.as_ref().is_err_and(|e| e.code == "deferred") { continue; }
                                     // A refused admission still answers after those queued before it.
                                     if admission && !service.admissions.is_empty() {
-                                        service.admissions.push_back(Admission { session: id, output, id: request.id, bound, pending: Pending::Settled(result) });
+                                        service.admissions.push_back(Admission { session: id, output, id: request_id, bound, pending: Pending::Settled(result) });
                                         continue;
                                     }
                                     let serving = result.as_ref().ok().filter(|_| serves).and_then(|page| {
                                         Some((page["tag"].as_str()?.to_owned(), page["lease"].as_u64()?))
                                     }).or(answered);
-                                    (request.id, result, shutdown, serving)
+                                    (request_id, result, shutdown, serving)
                                 }
                                 // A request that did not parse is answered under its id when it had one.
                                 Err(mut error) => {
@@ -5115,6 +5141,7 @@ impl Service {
         Err(Error::new("deferred"))
     }
 
+    #[cfg(test)]
     async fn dispatch(
         &mut self,
         command: Command,
@@ -5123,6 +5150,27 @@ impl Service {
         id: Value,
         bound: Bound,
     ) -> Result<Value> {
+        let mut request = Request {
+            id,
+            command,
+            workspace_error: None,
+        };
+        request.resolve_workspace();
+        self.dispatch_request(request, session, output, bound).await
+    }
+
+    async fn dispatch_request(
+        &mut self,
+        request: Request,
+        session: u64,
+        output: &Output,
+        bound: Bound,
+    ) -> Result<Value> {
+        let Request {
+            id,
+            command,
+            workspace_error,
+        } = request;
         let store = &self.store;
         match command {
             Command::Create {
@@ -5173,7 +5221,7 @@ impl Service {
                 if let Some(creator) = &created_by {
                     name("created_by", creator)?;
                 }
-                let path = path.as_deref().map(workspace).transpose()?;
+                let path = workspace_error.map_or(Ok(path), Err)?;
                 // The daemon supplies no agent behavior: who creates a bot
                 // says what it runs and what it is told, and the bot keeps both.
                 let reference = model.ok_or(Error::new("model_required"))?;
@@ -6483,7 +6531,7 @@ impl Service {
                 if let Some(creator) = &created_by {
                     name("created_by", creator)?;
                 }
-                let path = path.as_deref().map(workspace).transpose()?;
+                let path = workspace_error.map_or(Ok(path), Err)?;
                 let (created, event) = store
                     .op("fork", move |db| {
                         db.fork(
@@ -6870,7 +6918,7 @@ impl Service {
                 // A turn may run in another checkout or on another model of
                 // the same family; the conversation encoding never changes.
                 let options = TurnOptions {
-                    workspace: path.as_deref().map(workspace).transpose()?,
+                    workspace: workspace_error.map_or(Ok(path), Err)?,
                     model,
                     effort,
                     delivery,

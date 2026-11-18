@@ -2378,6 +2378,30 @@ pub struct Window {
     /// How many pictures the window's items send.
     pub pictures: i64,
 }
+/// Where a request's items stand as the next is read: whether one came
+/// before it, and whether one was sent. A message of only blank text is
+/// left out as spaces as long as it is, so the request keeps the length
+/// the store counted; every item after the first is preceded by a comma
+/// between two sent items and by a space otherwise.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Joined {
+    items: bool,
+    sent: bool,
+}
+impl Joined {
+    fn send(&mut self, out: &mut Vec<u8>, item: &[u8]) {
+        if self.items {
+            out.push(if self.sent { b',' } else { b' ' });
+        }
+        out.extend_from_slice(item);
+        (self.items, self.sent) = (true, true);
+    }
+    fn skip(&mut self, out: &mut Vec<u8>, len: usize) {
+        let len = len + usize::from(self.items);
+        out.resize(out.len() + len, b' ');
+        self.items = true;
+    }
+}
 /// The nodes an Anthropic request sends without their thinking blocks:
 /// those below `below`, written before the context in front of the window
 /// changed, and those in `from..to`, written after a tool result that now
@@ -2639,8 +2663,8 @@ pub struct Messages<'a> {
     pub before: Option<i64>,
     pub since_ms: Option<i64>,
     pub until_ms: Option<i64>,
-    /// Who sent them: `person` (no other agent's turn and no named
-    /// client), `agent` (another agent's turn) or `client` (a client by
+    /// Who sent them: `person` (no other bot's turn and no named
+    /// client), `bot` (another bot's turn) or `client` (a client by
     /// its own name, such as an automation); any when absent.
     pub from: Option<Vec<String>>,
     pub limit: usize,
@@ -2656,10 +2680,10 @@ pub struct Messages<'a> {
 struct Senders(u8);
 impl Senders {
     const PERSON: u8 = 1;
-    const AGENT: u8 = 2;
+    const BOT: u8 = 2;
     const CLIENT: u8 = 4;
     const ALL: Self = Self(7);
-    const NAMES: [&'static str; 3] = ["person", "agent", "client"];
+    const NAMES: [&'static str; 3] = ["person", "bot", "client"];
     fn named(names: &[String]) -> Result<Self> {
         let refused = || {
             Error::with(
@@ -2672,7 +2696,7 @@ impl Senders {
         for name in names {
             kinds |= match name.as_str() {
                 "person" => Self::PERSON,
-                "agent" => Self::AGENT,
+                "bot" => Self::BOT,
                 "client" => Self::CLIENT,
                 _ => return Err(refused()),
             };
@@ -2702,61 +2726,77 @@ impl Senders {
 /// one not in it), case kept. What a live follow of a pattern delivers
 /// against, so it delivers what its replay read from the store.
 pub fn glob(pattern: &str, name: &str) -> bool {
-    fn class(set: &[char], c: char) -> Option<(bool, usize)> {
-        // `set` starts after `[`; answers whether `c` is in it and how
-        // long the class is, through its `]`.
-        let (negated, mut i) = match set.first() {
-            Some('^') => (true, 1),
-            _ => (false, 0),
-        };
-        let mut found = false;
-        let mut first = true;
-        while i < set.len() {
-            let start = set[i];
-            if start == ']' && !first {
-                return Some((found != negated, i + 1));
+    // Bytes when both are ASCII, as names mostly are, so a match on the
+    // publisher's path allocates nothing; characters otherwise.
+    match pattern.is_ascii() && name.is_ascii() {
+        true => glob_in(pattern.as_bytes(), name.as_bytes()),
+        false => glob_in(
+            &pattern.chars().collect::<Vec<_>>(),
+            &name.chars().collect::<Vec<_>>(),
+        ),
+    }
+}
+fn glob_in<T: Copy + Ord + From<u8>>(pattern: &[T], name: &[T]) -> bool {
+    let [any, one, open, close, not, dash] = (*b"*?[]^-").map(T::from);
+    // `set` starts after `[`; answers whether `c` is in it and how long the
+    // class is, through its `]`, step for step as SQLite's patternCompare
+    // reads one: a `]` first is a member, a range's first character counts
+    // on its own before the range is tested, and a `-` first or last is
+    // itself. `None` for a class with no `]`, which matches nothing.
+    let class = |set: &[T], c: T| -> Option<(bool, usize)> {
+        let mut i = 0;
+        let mut seen = false;
+        let negated = set.first() == Some(&not);
+        if negated {
+            i += 1;
+        }
+        if set.get(i) == Some(&close) {
+            seen = c == close;
+            i += 1;
+        }
+        let mut prior: Option<T> = None;
+        while let Some(&member) = set.get(i) {
+            if member == close {
+                return Some((seen != negated, i + 1));
             }
-            first = false;
-            if set.get(i + 1) == Some(&'-') && set.get(i + 2).is_some_and(|end| *end != ']') {
-                found |= (start..=set[i + 2]).contains(&c);
-                i += 3;
-            } else {
-                found |= start == c;
-                i += 1;
+            match (prior, set.get(i + 1)) {
+                (Some(low), Some(&high)) if member == dash && high != close => {
+                    seen |= low <= c && c <= high;
+                    prior = None;
+                    i += 2;
+                }
+                _ => {
+                    seen |= member == c;
+                    prior = Some(member);
+                    i += 1;
+                }
             }
         }
         None
-    }
-    let (pattern, name): (Vec<char>, Vec<char>) =
-        (pattern.chars().collect(), name.chars().collect());
+    };
     let (mut p, mut n) = (0, 0);
     let mut star: Option<(usize, usize)> = None;
     loop {
-        if p < pattern.len() {
-            match pattern[p] {
-                '*' => {
-                    star = Some((p, n));
-                    p += 1;
-                    continue;
-                }
-                '?' if n < name.len() => {
-                    p += 1;
+        if let Some(&at) = pattern.get(p) {
+            if at == any {
+                star = Some((p, n));
+                p += 1;
+                continue;
+            }
+            if let Some(&c) = name.get(n) {
+                let step = match at {
+                    _ if at == one => Some(1),
+                    _ if at == open => match class(&pattern[p + 1..], c) {
+                        Some((true, len)) => Some(1 + len),
+                        _ => None,
+                    },
+                    _ => (at == c).then_some(1),
+                };
+                if let Some(step) = step {
+                    p += step;
                     n += 1;
                     continue;
                 }
-                '[' if n < name.len() => {
-                    if let Some((true, len)) = class(&pattern[p + 1..], name[n]) {
-                        p += 1 + len;
-                        n += 1;
-                        continue;
-                    }
-                }
-                c if c != '?' && c != '[' && n < name.len() && c == name[n] => {
-                    p += 1;
-                    n += 1;
-                    continue;
-                }
-                _ => {}
             }
         } else if n == name.len() {
             return true;
@@ -6959,17 +6999,19 @@ impl Database {
         strip: impl Into<Strip>,
         elided: i64,
     ) -> Result<Vec<u8>> {
-        self.items_sent(ids, strip.into(), false, elided)
+        self.items_sent(ids, strip.into(), false, elided, &mut Joined::default())
     }
-    /// [`Self::items_by_ids`], and with `reasoning` a Responses reasoning
-    /// item `strip` names left out whole too, as [`Self::reasoning_of`]
-    /// counts it.
+    /// [`Self::items_by_ids`] after the items `joined` has seen, and with
+    /// `reasoning` a Responses reasoning item `strip` names left out whole
+    /// too, as [`Self::reasoning_of`] counts it. A message of only blank
+    /// text goes as spaces (see [`Joined`]).
     pub fn items_sent(
         &self,
         ids: &[i64],
         strip: Strip,
         reasoning: bool,
         elided: i64,
+        joined: &mut Joined,
     ) -> Result<Vec<u8>> {
         let mut statement = self
             .conn
@@ -6985,10 +7027,7 @@ impl Database {
                     .query_row([id], |r| Ok(r.get_ref(0)?.as_blob()?.to_vec()))
                     .optional()?
             {
-                if !out.is_empty() {
-                    out.push(b',');
-                }
-                out.extend_from_slice(&stub);
+                joined.send(&mut out, &stub);
                 continue;
             }
             statement.query_row([id], |r| {
@@ -7005,10 +7044,11 @@ impl Database {
                     Some(kept) => std::borrow::Cow::Owned(kept),
                     None => std::borrow::Cow::Borrowed(item),
                 };
-                if !out.is_empty() {
-                    out.push(b',');
+                match super::context::without_blank_text(&item) {
+                    Some(kept) if kept.is_empty() => joined.skip(&mut out, item.len()),
+                    Some(kept) => joined.send(&mut out, &kept),
+                    None => joined.send(&mut out, &item),
                 }
-                out.extend_from_slice(&item);
                 Ok(())
             })?;
         }
@@ -10856,11 +10896,7 @@ impl Database {
         });
         let facts = audit::of_call(&ask.tool, None, plan.in_sandbox());
         let mut decided = json!({"call_id":id,"step_of":call_id,"name":ask.tool,"daemon":true});
-        let preview: String = ask.arguments.chars().take(2048).collect();
-        if preview.len() < ask.arguments.len() {
-            decided["arguments_truncated"] = json!(true);
-        }
-        decided["arguments"] = json!(preview);
+        previewed(&mut decided, &ask.tool, &ask.arguments);
         if let Some((error, denied)) = refusal {
             let tx = self.conn.savepoint()?;
             audit::insert(
@@ -16215,9 +16251,25 @@ impl Database {
             // The folder it runs in once taken in, else the one it named.
             message["workspace"] = json!(r.get::<_, Option<String>>(at + 11)?);
             if words {
-                message["text"] = json!(r.get::<_, Option<String>>(at + 12)?.unwrap_or_default());
-                let size = crate::output::encoded_len(&message)? + 1;
-                if !messages.is_empty() && bytes + size > crate::output::MAX_EVENT / 2 {
+                let budget = crate::output::MAX_EVENT / 2;
+                let mut text = r.get::<_, Option<String>>(at + 12)?.unwrap_or_default();
+                message["text"] = json!(text);
+                let mut size = crate::output::encoded_len(&message)? + 1;
+                // A message too large for any page on its own (its words
+                // escaped in JSON can be six times their bytes) keeps the
+                // words that fit, and says they were cut, so paging goes on.
+                while size > budget && !text.is_empty() {
+                    let mut keep = ((text.len() as u128 * budget as u128) / size as u128) as usize;
+                    keep = keep.min(text.len() - 1);
+                    while !text.is_char_boundary(keep) {
+                        keep -= 1;
+                    }
+                    text.truncate(keep);
+                    message["text"] = json!(text);
+                    message["text_cut"] = json!(true);
+                    size = crate::output::encoded_len(&message)? + 1;
+                }
+                if !messages.is_empty() && bytes + size > budget {
                     more = true;
                     break;
                 }
@@ -16922,19 +16974,25 @@ fn clock_tool(tx: &Connection, turn: i64, row: i64, now: i64) -> Result<()> {
 }
 /// A `tool_started` event's data: the call with its arguments previewed.
 fn started(call: &ToolCall) -> Value {
-    let preview: String = call.arguments.chars().take(2048).collect();
-    let truncated = preview.len() < call.arguments.len();
-    let mut data = json!({"call_id":call.call_id,"name":call.name,"arguments":preview,
-        "arguments_truncated":truncated});
-    // A cut write, edit or patch still names every file it changes, for a
-    // judge of a later call that runs one.
-    if truncated && let Some((paths, whole)) = changed_paths(&call.name, &call.arguments) {
+    let mut data = json!({"call_id":call.call_id,"name":call.name});
+    previewed(&mut data, &call.name, &call.arguments);
+    data
+}
+/// A started call's or a decided step's `arguments`, previewed, and
+/// `arguments_truncated`. A cut write, edit or patch still names every file
+/// it changes, for a judge of a later call that runs one: a step has no
+/// planning item to read its whole arguments back from.
+fn previewed(data: &mut Value, name: &str, arguments: &str) {
+    let preview: String = arguments.chars().take(2048).collect();
+    let truncated = preview.len() < arguments.len();
+    data["arguments"] = json!(preview);
+    data["arguments_truncated"] = json!(truncated);
+    if truncated && let Some((paths, whole)) = changed_paths(name, arguments) {
         if !whole {
             data["paths_cut"] = json!(true);
         }
         data["paths"] = json!(paths);
     }
-    data
 }
 
 /// The files a write, edit or patch with `arguments` changes, and whether
@@ -17155,13 +17213,9 @@ fn end_step(
     let bot = bot.name.as_str();
     data["step_of"] = json!(parent);
     // Previewed as a started call is, for a judge of a later call that
-    // weighs what this turn was refused.
-    let preview: String = arguments.chars().take(2048).collect();
-    if preview.len() < arguments.len() {
-        data["arguments_truncated"] = json!(true);
-    }
+    // weighs what this turn was refused or runs a file it wrote.
     data["name"] = json!(name);
-    data["arguments"] = json!(preview);
+    previewed(&mut data, &name, &arguments);
     event(tx, bot, Some(turn), "step_decided", data)?;
     resume_call(tx, turn, parent, now_ms)
 }

@@ -1328,12 +1328,14 @@ fn preview(store: &Path, subscriber: &str, sub: &Sub) -> Value {
             event: (*event).clone(),
             subs: vec![sub.name.clone()],
             order: 0,
+            due: false,
         };
         let bytes = super::sources::bytes(&heard);
         let window = digest.map_or(0, |d| d.as_millis());
         times.push(Timed {
             at: event.at_ms,
             steer,
+            due: false,
             window,
             clock,
             bytes,
@@ -1387,6 +1389,9 @@ struct Timed<'a> {
     /// When it came, in epoch ms.
     at: u128,
     steer: bool,
+    /// Its digest came due with more than a note holds: it goes in the
+    /// next, as soon as that one landed.
+    due: bool,
     /// The digest it waits for, in ms; `0` for none.
     window: u128,
     /// Whose clock that digest counts on.
@@ -1402,14 +1407,15 @@ const FLIGHT_MS: u128 = 100;
 /// About how many notes these events would be, as the lookout sends
 /// them: a note goes as soon as an event is ready and the note before
 /// landed, and no sooner than its group interval after it but for a
-/// steer, carrying
-/// what is ready by then, as many as a note holds; each event no sooner
-/// than a digest after the note before on its clock. What a note had no
-/// room for, or a digest still holds, waits for a later one.
+/// steer, carrying what is ready by then, as many as a note holds; each
+/// event no sooner than a digest after the note before on its clock.
+/// What a digest still holds waits for a later note; what came due with
+/// it and the note had no room for goes in the next, as soon as it
+/// landed.
 fn notes(times: &[Timed]) -> usize {
     use std::collections::HashMap;
     fn ready(last: &HashMap<&str, u128>, e: &Timed) -> u128 {
-        match e.steer {
+        match e.steer || e.due {
             true => e.at,
             false => (last.get(e.clock)).map_or(e.at, |told| e.at.max(told + e.window)),
         }
@@ -1425,7 +1431,7 @@ fn notes(times: &[Timed]) -> usize {
         // ends.
         let goes = |last: &HashMap<&str, u128>, (landed, ends): (u128, u128), e: &Timed| {
             let at = ready(last, e).max(landed);
-            if e.steer { at } else { at.max(ends) }
+            if e.steer || e.due { at } else { at.max(ends) }
         };
         let mut notes = 0;
         while !waiting.is_empty() {
@@ -1448,6 +1454,9 @@ fn notes(times: &[Timed]) -> usize {
                 .max(1);
             for e in carried.drain(..take) {
                 last.insert(e.clock, went);
+            }
+            for e in &mut carried {
+                e.due |= !e.steer && e.window > 0;
             }
             carried.extend(held);
             *waiting = carried;
@@ -2069,6 +2078,7 @@ mod tests {
         let t = |at: u128, steer: bool, window: u128, clock: &'static str| Timed {
             at,
             steer,
+            due: false,
             window,
             clock,
             bytes: 100,
