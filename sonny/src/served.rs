@@ -1483,23 +1483,29 @@ pub enum Admitted {
     Wait(std::pin::Pin<Box<dyn std::future::Future<Output = Place> + Send>>),
 }
 
-/// The place `call` of `owner` runs in, if there is one now; if not, the
-/// wait for one.
-fn admit(call: &Value, owner: &str) -> Admitted {
+/// Whether `call` runs a process, and so needs a place in the budget
+/// before it is taken. The rest run in no place: a script the script host
+/// takes or refuses at once, and a browser command, which waits for its
+/// own place in the budget's queue, one command at a time.
+fn needs_place(call: &Value) -> bool {
     match call["name"].as_str() {
-        Some(EXEC | BROWSER | DESKTOP | WORKFLOW | crate::reactions::TOOL) => {
-            Admitted::Now(Place::Free)
+        Some(EXEC | BROWSER | DESKTOP | WORKFLOW | crate::reactions::TOOL) => false,
+        Some(AUTOMATIONS) => looks(&call["arguments"]),
+        _ => true,
+    }
+}
+
+/// The place a call of `owner` that runs a process runs in, if there is
+/// one now; if not, the wait for one.
+fn admit(_call: &Value, owner: &str) -> Admitted {
+    match crate::budget::processes().try_admit(owner) {
+        Ok(place) => Admitted::Now(Place::Process(place)),
+        Err(_) => {
+            let owner = owner.to_owned();
+            Admitted::Wait(Box::pin(async move {
+                Place::Process(crate::budget::processes().admit(&owner).await)
+            }))
         }
-        Some(AUTOMATIONS) if !looks(&call["arguments"]) => Admitted::Now(Place::Free),
-        _ => match crate::budget::processes().try_admit(owner) {
-            Ok(place) => Admitted::Now(Place::Process(place)),
-            Err(_) => {
-                let owner = owner.to_owned();
-                Admitted::Wait(Box::pin(async move {
-                    Place::Process(crate::budget::processes().admit(&owner).await)
-                }))
-            }
-        },
     }
 }
 
@@ -1603,41 +1609,46 @@ where
                 continue;
             }
             // The place the agent waited for in the budget's queue, once
-            // it came; while it waits, its calls wait with it.
-            let place = match calls.reserved.remove(&owner) {
-                Some(Reserved::Held(place)) => place,
-                Some(waiting) => {
-                    calls.reserved.insert(owner.clone(), waiting);
-                    left = true;
-                    waited.insert(owner);
-                    continue;
-                }
-                None => match admit(call, &owner) {
-                    Admitted::Now(place) => place,
-                    // One wait an agent, not a call: what it waits for in
-                    // the budget's queue, kept here for its next call.
-                    Admitted::Wait(place) => {
+            // it came; while it waits, its calls that run a process wait
+            // with it. A call that runs none leaves that place alone.
+            let place = if !needs_place(call) {
+                Place::Free
+            } else {
+                match calls.reserved.remove(&owner) {
+                    Some(Reserved::Held(place)) => place,
+                    Some(waiting) => {
+                        calls.reserved.insert(owner.clone(), waiting);
                         left = true;
-                        calls.left = true;
-                        waited.insert(owner.clone());
-                        let (serving, nudge, held) =
-                            (serving.clone(), nudge.clone(), owner.clone());
-                        let wait = tokio::spawn(async move {
-                            let place = place.await;
-                            let mut calls = serving.lock().unwrap();
-                            if let Some(reserved @ Reserved::Waiting(_)) =
-                                calls.reserved.get_mut(&held)
-                            {
-                                *reserved = Reserved::Held(place);
-                                nudge.notify_one();
-                            }
-                        });
-                        calls
-                            .reserved
-                            .insert(owner, Reserved::Waiting(wait.abort_handle()));
+                        waited.insert(owner);
                         continue;
                     }
-                },
+                    None => match admit(call, &owner) {
+                        Admitted::Now(place) => place,
+                        // One wait an agent, not a call: what it waits for in
+                        // the budget's queue, kept here for its next call.
+                        Admitted::Wait(place) => {
+                            left = true;
+                            calls.left = true;
+                            waited.insert(owner.clone());
+                            let (serving, nudge, held) =
+                                (serving.clone(), nudge.clone(), owner.clone());
+                            let wait = tokio::spawn(async move {
+                                let place = place.await;
+                                let mut calls = serving.lock().unwrap();
+                                if let Some(reserved @ Reserved::Waiting(_)) =
+                                    calls.reserved.get_mut(&held)
+                                {
+                                    *reserved = Reserved::Held(place);
+                                    nudge.notify_one();
+                                }
+                            });
+                            calls
+                                .reserved
+                                .insert(owner, Reserved::Waiting(wait.abort_handle()));
+                            continue;
+                        }
+                    },
+                }
             };
             if lifted {
                 calls.lifted.insert(key.clone());
@@ -2707,6 +2718,63 @@ mod tests {
         );
         assert_eq!(browsed.load(Ordering::SeqCst), 0);
         browser.abort();
+    }
+
+    #[tokio::test]
+    async fn a_call_that_runs_no_process_is_taken_while_its_agent_waits_for_a_place() {
+        // Two places, held by a and b. c waits for one; its browser call,
+        // which waits for its own place one command at a time, is taken now.
+        let listed = json!([
+            {"bot": "a", "turn": 1, "call_id": "a1", "name": "memory", "id": 1},
+            {"bot": "b", "turn": 1, "call_id": "b1", "name": "memory", "id": 2},
+            {"bot": "c", "turn": 1, "call_id": "c1", "name": "memory", "id": 3},
+            {"bot": "c", "turn": 1, "call_id": "c2", "name": BROWSER, "id": 4},
+        ]);
+        let taken = Arc::new(Mutex::new(Vec::<String>::new()));
+        let client = {
+            let taken = taken.clone();
+            crate::tests::daemon_answering(move |asked| match asked["op"].as_str() {
+                Some("tool_calls") => json!({"calls": listed, "next_after": null}),
+                Some("take_call") => {
+                    taken.lock().unwrap().push(str_of(&asked["call_id"]));
+                    json!({})
+                }
+                _ => json!({}),
+            })
+            .await
+        };
+        let budget: &'static crate::budget::Budget =
+            Box::leak(Box::new(crate::budget::Budget::new(2)));
+        let admit = move |_: &Value, owner: &str| match budget.try_admit(owner) {
+            Ok(place) => Admitted::Now(Place::Process(place)),
+            Err(_) => {
+                let owner = owner.to_owned();
+                Admitted::Wait(Box::pin(async move {
+                    Place::Process(budget.admit(&owner).await)
+                }))
+            }
+        };
+        let run = |_call: Value, place: Place| async move {
+            let _place = place;
+            std::future::pending::<()>().await;
+            Ok(json!("done"))
+        };
+        let serving: Serving = Default::default();
+        let nudge = Arc::new(Notify::new());
+        sweep(&client, &serving, &nudge, admit, run).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while taken.lock().unwrap().len() < 3 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the browser call is taken");
+        assert_eq!(*taken.lock().unwrap(), ["a1", "b1", "c2"]);
+        // c still waits for the place its process call needs.
+        assert!(matches!(
+            serving.lock().unwrap().reserved.get("c"),
+            Some(Reserved::Waiting(_))
+        ));
     }
 
     #[tokio::test]
