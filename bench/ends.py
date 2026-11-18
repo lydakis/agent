@@ -152,8 +152,9 @@ class Windows:
         self.stop.set()
 
 
-def tree(pid):
-    """`pid` and every process below it."""
+def tree(*roots):
+    """The `roots` and every process below them, each once, from one scan
+    of the process table."""
     children = {}
     for entry in Path('/proc').iterdir():
         if entry.name.isdigit():
@@ -162,12 +163,13 @@ def tree(pid):
             except (OSError, IndexError):
                 continue
             children.setdefault(parent, []).append(int(entry.name))
-    found, todo = [], [pid]
+    found, todo = set(), list(roots)
     while todo:
         p = todo.pop()
-        found.append(p)
-        todo += children.get(p, [])
-    return found
+        if p not in found:
+            found.add(p)
+            todo += children.get(p, [])
+    return sorted(found)
 
 
 def usage(pids):
@@ -182,6 +184,21 @@ def usage(pids):
         except (OSError, IndexError):
             pass
     return cpu, rss
+
+
+def pss(pids):
+    """Proportional set size MiB, summed over `pids`: each shared page
+    counted once across them all."""
+    total = 0
+    for pid in pids:
+        try:
+            for line in Path(f'/proc/{pid}/smaps_rollup').read_text().splitlines():
+                if line.startswith('Pss:'):
+                    total += int(line.split()[1])
+                    break
+        except (OSError, IndexError, ValueError):
+            pass
+    return total / 1024
 
 
 def threads(pid):
@@ -214,23 +231,34 @@ def measured(groups, seconds, daemon=None, control=None):
     and, with `control`, the daemon's requests and loop-held time over the
     same seconds."""
     marked = counters(control) if control else None
-    before = {name: usage(pids()) for name, pids in groups.items()}
+    found_pids = {name: pids() for name, pids in groups.items()}
+    began = time.monotonic()
+    before = {name: usage(found_pids[name]) for name in groups}
     held = threads(daemon) if daemon else {}
     time.sleep(seconds)
-    after = {name: usage(pids()) for name, pids in groups.items()}
+    found_pids = {name: pids() for name, pids in groups.items()}
+    elapsed = time.monotonic() - began
+    after = {name: usage(found_pids[name]) for name in groups}
     if control:
         now = counters(control)
         found_counts = [{op: count - was.get(op, 0) for op, count in seen.items()
                          if count - was.get(op, 0)} for seen, was in zip(now, marked)]
-    found = {name: {'cpu_pct': round(100 * (after[name][0] - before[name][0]) / seconds, 2),
+    # CPU over the time measured, not the time asked for.
+    found = {name: {'cpu_pct': round(100 * (after[name][0] - before[name][0]) / elapsed, 2),
                     'rss_mib': round(after[name][1], 1)} for name in groups}
     if daemon:
         # The daemon's CPU by thread: its run loop, the writer, the readers.
         found['daemon']['threads_pct'] = {
-            name: round(100 * (cpu - held.get(name, 0)) / seconds, 2)
+            name: round(100 * (cpu - held.get(name, 0)) / elapsed, 2)
             for name, cpu in sorted(threads(daemon).items(), key=lambda kv: -kv[1])}
     if control:
         found['requests'], found['loop_held_ms'] = found_counts
+    # Footprint, after the CPU window so reading it costs that window
+    # nothing: summed PSS beside summed RSS, so what each window adds is
+    # plain once their binary pages are shared.
+    for name in groups:
+        found[name]['pss_mib'] = round(pss(found_pids[name]), 1)
+    found['seconds'] = round(elapsed, 3)
     return found
 
 
@@ -455,7 +483,7 @@ def main():
             time.sleep(3)
             names_open = [name for name, _, _ in names[:args.windows]]
             groups = {'daemon': lambda: [daemon.pid],
-                      'windows': lambda: [p for name in names_open for p in tree(windows.pids[name][0])]}
+                      'windows': lambda: tree(*(windows.pids[name][0] for name in names_open))}
             keys, began = [], time.monotonic()
             usage_box = {}
             meter = threading.Thread(target=lambda: usage_box.update(measured(groups, args.seconds, daemon.pid, control)))
