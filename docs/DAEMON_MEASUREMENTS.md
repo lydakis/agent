@@ -11716,6 +11716,62 @@ Still read before showing: a card's first read when it opens (`/status`,
 agents, a fold opened on items not yet read, a react click on a reply too old
 to be kept, and a reconnect's catching up.
 
+## Close by a selector (#1181)
+
+`close` takes a pattern or up to 256 names and closes them in one store
+job; every close stops the turn its bot runs. Main is 3cb71ec, and the
+change is the same base with bulk close on it, both built with
+`--workspace --bins` on the 4-CPU Linux container.
+
+### Closing 1,000 agents
+
+A copy of the 10,000-agent store, a fresh daemon each run, 1,000 idle
+agents closed. One at a time (`close {bot}`), the per-close time is the
+store write either way. By `names`, four requests close all of them:
+
+| Side | How | 1,000 closes, ms (two runs) |
+| --- | --- | ---: |
+| main | one `close` a name | 886, 569 |
+| change | one `close` a name | 741, 809 |
+| change | `close {names}`, 256 a request | 12, 15 |
+
+### Low end and high end
+
+`bench.ends`, as in the step writes section above. Neither end calls
+`close`; these rows check that nothing else moved.
+
+#### Low end
+
+One window on a folder of 10 agents, three alternating runs each:
+
+| Side | Window start, ms | Daemon idle CPU % | Daemon RSS / PSS, MiB | Window idle CPU % | Window RSS / PSS, MiB | Key p50 / p99, ms | Turn p50 / p99, ms |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| main | 61 to 96 | 0 to 0.05 | 20.1 / 18.0 to 18.1 | 0.15 to 0.20 | 22.4 to 22.7 / 14.5 to 14.6 | 0.45 to 0.65 / 0.93 to 2.42 | 48.1 to 48.2 / 51.4 to 54.9 |
+| change | 71 to 421 | 0 to 0.05 | 19.1 to 20.6 / 17.0 to 18.6 | 0.15 to 0.25 | 21.7 to 22.8 / 14.1 to 14.4 | 0.32 to 0.53 / 1.19 to 6.97 | 48.3 to 48.7 / 51.8 to 68.0 |
+
+The change's two slow figures, a 421 ms start and a 68 ms turn, came in its
+first run, which was the first after a build, and they did not come again.
+Every key on both sides was under 10 ms.
+
+#### High end
+
+10,000 stored agents, 30 running turns and 8 running scripts at most one
+every 0.5 s, N windows on one busy project. Both sides finished 1,410
+turns and 369 to 376 scripts. The figures are over 20 s, with CPU as a
+percent of one core and the windows summed:
+
+| Windows | Side | Window start p50, ms | Key p50 / p99 / most, ms | Daemon CPU % | Daemon RSS / PSS, MiB | Windows CPU % | Windows RSS / PSS, GiB | Requests |
+| ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 100 | main | 3,168 | 1.46 / 18.0 / 76.0 | 133.9 | 40.7 / 38.7 | 121.4 | 5.58 / 3.79 | 145,160 |
+| 100 | change | 3,344 | 1.48 / 9.0 / 50.9 | 133.0 | 39.6 / 37.6 | 122.1 | 5.69 / 3.92 | 148,292 |
+| 200 | main | 5,549 | 1.78 / 9.5 / 27.4 | 138.5 | 44.8 / 42.6 | 111.7 | 10.95 / 7.36 | 33,577 |
+| 200 | change | 5,968 | 1.93 / 12.5 / 15.7 | 138.5 | 44.8 / 42.5 | 112.4 | 11.15 / 7.59 | 33,563 |
+
+Daemon and window CPU are within 1 point at both sizes, and memory is
+within 2%. Window start runs 6 to 8% slower on the change and key p99
+moves both ways, all within the spread runs of main against itself show
+in the sections above.
+
 ## A parked turn's claim beside the run loop
 
 A parked turn going on (store op `resume`: check the turn, claim it, drop

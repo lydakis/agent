@@ -405,14 +405,27 @@ enum Command {
         /// An idempotency key, as on `create`.
         request_id: Option<String>,
     },
-    /// Close a bot, done with: it is listed only when closed bots are
-    /// asked for, its history kept whole, until a turn of its starts. Only
-    /// the mark: a turn it is running runs on unless interrupted, and the
-    /// answer names that turn, read as the mark is made.
+    /// Close bots, done with: each is listed only when closed bots are
+    /// asked for, its history kept whole, until a turn of its starts, and a
+    /// turn it was running as it was marked is stopped. One bot by name,
+    /// several by `names`, or the open bots a GLOB pattern in `bot` names,
+    /// with `no_turn_since_ms` only those running no turn and with none
+    /// since, paged by `after` and `limit` as `bots` pages. A bot's own
+    /// socket closes only itself and the bots it made; the rest are refused.
     Close {
-        bot: String,
-        /// The identity `bot` must hold; another is `bot_not_found`.
+        bot: Option<String>,
+        /// The identity `bot`, a name, must hold; another is `bot_not_found`.
         bot_id: Option<i64>,
+        names: Option<Vec<String>>,
+        /// Unix ms: of the pattern's bots, only those whose last turn ended
+        /// before it, or that never ran one.
+        no_turn_since_ms: Option<i64>,
+        after: Option<String>,
+        limit: Option<usize>,
+        /// The bot whose socket asks, set by the daemon; a person's
+        /// connection closes any bot.
+        #[serde(skip)]
+        by: Option<i64>,
     },
     /// Remove an idle bot and everything only it owns.
     Delete {
@@ -3863,8 +3876,9 @@ impl Service {
                     }
                 }
             }
+            // Each bot a selector names is checked as it is closed.
+            Command::Close { by, .. } => *by = Some(me.bot_id),
             Command::Delete { bot, .. }
-            | Command::Close { bot, .. }
             | Command::Prune { bot, .. }
             | Command::Compact { bot, .. }
             | Command::Interrupt { bot, .. }
@@ -5459,6 +5473,96 @@ impl Service {
         Err(Error::new("deferred"))
     }
 
+    /// Stop `bot`'s turn `turn`: a running one is cancelled, a message in
+    /// line withdrawn, a parked turn ended here. Answers the turn's view,
+    /// with whether the stop was asked for, or how it had already ended.
+    async fn interrupt(&mut self, bot: String, turn: i64) -> Result<Value> {
+        let store = &self.store;
+        // The reply is the turn view: as it stood when the interrupt
+        // was requested, or its final state when it had already ended.
+        let reader = store.clone();
+        let view = |store: &Store, bot: String, requested: bool| {
+            let store = store.clone();
+            async move {
+                // On the writer, which has seen the end it just recorded.
+                let mut view = store
+                    .op("turn_view", move |db| db.turn_view(&bot, turn))
+                    .await?;
+                view["interrupt_requested"] = json!(requested);
+                Ok(view)
+            }
+        };
+        if let Some(active) = self.active.get(&bot).filter(|a| a.turn == turn) {
+            if active.cancel(turn::INTERRUPTED) {
+                return view(&reader, bot, true).await;
+            }
+            // The task exited but its JoinSet result has not been reaped.
+            // Release its slot; the result still gets checked by the loop.
+            self.active.remove(&bot);
+        }
+        let check = bot.clone();
+        let status = store
+            .op("turn_status", move |db| db.turn_status(&check, turn))
+            .await?;
+        match status.as_str() {
+            // A message in line has no task either; withdraw it.
+            "queued" | "ready" | "attached" => {
+                self.end_queued(bot.clone(), turn, Error::new(turn::INTERRUPTED))
+                    .await?;
+                return view(&reader, bot, true).await;
+            }
+            // Repeating an interrupt, or one that crossed the turn's
+            // own end, finds it ended and says how; a message
+            // another turn took in is that turn's now.
+            "completed" | "failed" | "interrupted" | "withdrawn" | "taken" => {
+                return view(&reader, bot, false).await;
+            }
+            _ => {}
+        }
+        // Refusals say what the bot is running and where the named
+        // turn stands.
+        let stale = |running: Option<i64>| {
+            Error::with(
+                "stale_turn",
+                match running {
+                    Some(running) if running == turn => format!("turn {turn} is starting"),
+                    Some(running) => format!("{bot} is running turn {running}, not {turn}"),
+                    None => format!("{bot} is running no turn"),
+                },
+            )
+            .facts(json!({"running_turn":running,"status":status}))
+        };
+        if let Some(active) = self.active.get(&bot) {
+            return Err(stale(Some(active.turn)));
+        }
+        // A parked turn has no task; confirm durable state and end it.
+        let check = bot.clone();
+        let state = store.op("inspect", move |db| db.inspect(&check)).await?;
+        if state.running_turn != Some(turn)
+            || (state.status != "waiting" && state.status != "paced")
+        {
+            return Err(stale(state.running_turn));
+        }
+        let name = bot.clone();
+        let next_ready = store
+            .op_pruning("finish", name.clone(), move |db| {
+                turn::Finished::record(db, &name, turn, Some(&Error::new(turn::INTERRUPTED)))
+            })
+            .await?;
+        // Only once the end commits: a refused one leaves the turn
+        // parked, and its wait or lapse must still wake it.
+        self.handles.forget(Waiter::Turn(turn));
+        self.wakes.cancel(turn);
+        self.steer_wakes.remove(&turn);
+        if next_ready {
+            self.ready_hint = true;
+        }
+        // It ended here, with no task to finish: what a `configure`
+        // kept for its end is taken now.
+        kept_for_start(self.take_configure(&bot).await)?;
+        view(&reader, bot, true).await
+    }
+
     /// Hand a client's write to the store from its own task, answered from
     /// the run loop once it lands; the session's next request waits for it.
     fn write(
@@ -5831,23 +5935,109 @@ impl Service {
                     .await
                 })
             }
-            Command::Close { bot, bot_id } => {
+            Command::Close {
+                bot,
+                bot_id,
+                names,
+                no_turn_since_ms,
+                after,
+                limit,
+                by,
+            } => {
                 let at = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .map_or(0, |d| d.as_millis() as i64);
-                let name = bot.clone();
-                let (before, running) = store
-                    .op("close", move |db| {
-                        if bot_id.is_some() {
-                            db.identity(&name, bot_id)?;
+                // `*`, every bot, is a pattern too.
+                let pattern =
+                    (bot.as_deref()).is_some_and(|bot| bot == hub::ALL || hub::is_pattern(bot));
+                let one = bot.is_some() && !pattern;
+                let selector = || {
+                    fail_with(
+                        "invalid_close_selector",
+                        "close takes a bot (a name, with bot_id, or a GLOB pattern, with \
+                         no_turn_since_ms, after and limit) or names",
+                    )
+                };
+                if bot.is_some() == names.is_some()
+                    || (bot_id.is_some() && pattern)
+                    || (!pattern
+                        && (no_turn_since_ms.is_some() || after.is_some() || limit.is_some()))
+                {
+                    return selector();
+                }
+                let mut answer = match (bot, names) {
+                    (Some(name), None) if !pattern => {
+                        // One bot by name: one not there, or not the
+                        // caller's, is refused outright.
+                        let names = vec![name];
+                        let answer = store
+                            .op("close", move |db| {
+                                if bot_id.is_some() {
+                                    db.identity(&names[0], bot_id)?;
+                                }
+                                db.close_all(&agent_runtime::store::Closing::Names(&names), by, at)
+                            })
+                            .await?;
+                        if let Some(refused) = answer["refused"].get(0) {
+                            let code = refused["error"].as_str().unwrap_or("not_permitted");
+                            return Err(match refused["message"].as_str() {
+                                Some(message) => Error::with(code, message),
+                                None => Error::new(code),
+                            });
                         }
-                        db.close(&name, at)
-                    })
-                    .await?;
-                Ok(
-                    json!({"bot":bot,"was_open":before.is_none(),"closed_ms":before.unwrap_or(at),
-                    "running_turn":running}),
-                )
+                        answer
+                    }
+                    (Some(pattern), None) => {
+                        let (after, limit) = (after.unwrap_or_default(), limit.unwrap_or(64));
+                        store
+                            .op("close", move |db| {
+                                let closing = agent_runtime::store::Closing::Pattern {
+                                    pattern: &pattern,
+                                    no_turn_since_ms,
+                                    after: &after,
+                                    limit,
+                                };
+                                db.close_all(&closing, by, at)
+                            })
+                            .await?
+                    }
+                    (None, Some(names)) => {
+                        store
+                            .op("close", move |db| {
+                                db.close_all(&agent_runtime::store::Closing::Names(&names), by, at)
+                            })
+                            .await?
+                    }
+                    _ => return selector(),
+                };
+                // The turn each ran as it was marked stops, as `interrupt`
+                // stops it; one that ended meanwhile stopped nothing. A bot
+                // closing itself is marked, and the turn asking runs on.
+                for closed in answer["closed"].as_array_mut().into_iter().flatten() {
+                    let (Some(name), Some(turn)) =
+                        (closed["bot"].as_str(), closed["running_turn"].as_i64())
+                    else {
+                        continue;
+                    };
+                    if by.is_some() && closed["bot_id"].as_i64() == by {
+                        continue;
+                    }
+                    // A stop that failed leaves the turn parked, to wake
+                    // again: one bot asked for by name is refused with the
+                    // failure, and each of many says it.
+                    match self.interrupt(name.to_owned(), turn).await {
+                        Ok(view) if view["interrupt_requested"] == true => {
+                            closed["stopped_turn"] = json!(turn);
+                        }
+                        Ok(_) => {}
+                        Err(error) if one => return Err(error),
+                        Err(error) => {
+                            closed["stop_failed"] =
+                                json!({"turn": turn, "error": error.code, "message": error.detail});
+                        }
+                    }
+                }
+                Ok(answer)
             }
             Command::Delete { bot, bot_id } => {
                 if let Some(id) = bot_id {
@@ -7443,96 +7633,7 @@ impl Service {
                 });
                 Err(Error::new("deferred"))
             }
-            Command::Interrupt { bot, turn } => {
-                // The reply is the turn view: as it stood when the interrupt
-                // was requested, or its final state when it had already ended.
-                let reader = store.clone();
-                let view = |store: &Store, bot: String, requested: bool| {
-                    let store = store.clone();
-                    async move {
-                        // On the writer, which has seen the end it just recorded.
-                        let mut view = store
-                            .op("turn_view", move |db| db.turn_view(&bot, turn))
-                            .await?;
-                        view["interrupt_requested"] = json!(requested);
-                        Ok(view)
-                    }
-                };
-                if let Some(active) = self.active.get(&bot).filter(|a| a.turn == turn) {
-                    if active.cancel(turn::INTERRUPTED) {
-                        return view(&reader, bot, true).await;
-                    }
-                    // The task exited but its JoinSet result has not been reaped.
-                    // Release its slot; the result still gets checked by the loop.
-                    self.active.remove(&bot);
-                }
-                let check = bot.clone();
-                let status = store
-                    .op("turn_status", move |db| db.turn_status(&check, turn))
-                    .await?;
-                match status.as_str() {
-                    // A message in line has no task either; withdraw it.
-                    "queued" | "ready" | "attached" => {
-                        self.end_queued(bot.clone(), turn, Error::new(turn::INTERRUPTED))
-                            .await?;
-                        return view(&reader, bot, true).await;
-                    }
-                    // Repeating an interrupt, or one that crossed the turn's
-                    // own end, finds it ended and says how; a message
-                    // another turn took in is that turn's now.
-                    "completed" | "failed" | "interrupted" | "withdrawn" | "taken" => {
-                        return view(&reader, bot, false).await;
-                    }
-                    _ => {}
-                }
-                // Refusals say what the bot is running and where the named
-                // turn stands.
-                let stale = |running: Option<i64>| {
-                    Error::with(
-                        "stale_turn",
-                        match running {
-                            Some(running) if running == turn => format!("turn {turn} is starting"),
-                            Some(running) => format!("{bot} is running turn {running}, not {turn}"),
-                            None => format!("{bot} is running no turn"),
-                        },
-                    )
-                    .facts(json!({"running_turn":running,"status":status}))
-                };
-                if let Some(active) = self.active.get(&bot) {
-                    return Err(stale(Some(active.turn)));
-                }
-                // A parked turn has no task; confirm durable state and end it.
-                let check = bot.clone();
-                let state = store.op("inspect", move |db| db.inspect(&check)).await?;
-                if state.running_turn != Some(turn)
-                    || (state.status != "waiting" && state.status != "paced")
-                {
-                    return Err(stale(state.running_turn));
-                }
-                let name = bot.clone();
-                let next_ready = store
-                    .op_pruning("finish", name.clone(), move |db| {
-                        turn::Finished::record(
-                            db,
-                            &name,
-                            turn,
-                            Some(&Error::new(turn::INTERRUPTED)),
-                        )
-                    })
-                    .await?;
-                // Only once the end commits: a refused one leaves the turn
-                // parked, and its wait or lapse must still wake it.
-                self.handles.forget(Waiter::Turn(turn));
-                self.wakes.cancel(turn);
-                self.steer_wakes.remove(&turn);
-                if next_ready {
-                    self.ready_hint = true;
-                }
-                // It ended here, with no task to finish: what a `configure`
-                // kept for its end is taken now.
-                kept_for_start(self.take_configure(&bot).await)?;
-                view(&reader, bot, true).await
-            }
+            Command::Interrupt { bot, turn } => self.interrupt(bot, turn).await,
             Command::Shutdown { grace_ms } => {
                 if grace_ms > 86_400_000 {
                     return fail_with("invalid_timeout", "grace_ms may be up to 86400000");
