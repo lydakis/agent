@@ -1547,7 +1547,7 @@ does not, and each is one op:
   the switch to live delivery, and a retention gap anywhere is announced as a
   `pruned` notice first. Live delivery has the socket follower's contract:
   a lagging session is disconnected rather than allowed to hold the daemon.
-  `agent follow --all [--after N]`. With `kinds`, a list of one or more
+  `agent follow --all [--after N]`, or `--bot GLOB` for a pattern's bots. With `kinds`, a list of one or more
   event kinds (`invalid_follow_kinds` otherwise), the follow receives only
   those, in replay and live; `follow_live` and `pruned` still come. A
   controller that never reads streamed text leaves the deltas, most of all
