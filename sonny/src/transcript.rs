@@ -1006,14 +1006,18 @@ fn page(source: &str, width: usize) -> Vec<Line<'static>> {
     if crate::term::measured() {
         return vec![Line::default(); crate::image::ROWS as usize];
     }
+    // Numbered in the window as well as timed: fences laid out in the
+    // same millisecond keep files of their own.
+    static KEPT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let dir = std::env::temp_dir().join("sonny-pages");
     let name = format!(
-        "{}-{}.html",
+        "{}-{}-{}.html",
         std::process::id(),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
-            .as_millis()
+            .as_millis(),
+        KEPT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
     );
     let path = dir.join(name);
     if let Err(error) =
@@ -1021,6 +1025,11 @@ fn page(source: &str, width: usize) -> Vec<Line<'static>> {
     {
         return vec![Line::from(format!("    could not keep the page: {error}")).dim()];
     }
+    kept_page(path, source, width)
+}
+
+/// The page `source`, kept at `path`, drawn under it.
+fn kept_page(path: std::path::PathBuf, source: &str, width: usize) -> Vec<Line<'static>> {
     let drawn = match crate::term::graphics() {
         true => {
             let file = path.clone();
@@ -1031,9 +1040,10 @@ fn page(source: &str, width: usize) -> Vec<Line<'static>> {
             match drawing {
                 crate::cache::Drawing::Done(drawn) => drawn,
                 crate::cache::Drawing::Waits(key) => {
-                    let source = source.to_owned();
+                    // Drawn again in the file it was kept in.
+                    let (path, source) = (path.clone(), source.to_owned());
                     return crate::drawing::placeholder(key, "the page", move || {
-                        page(&source, width)
+                        kept_page(path.clone(), &source, width)
                     });
                 }
             }
@@ -4835,6 +4845,26 @@ mod tests {
         assert!(!browser_page("file:///w/site/index.html"));
         let beside = crate::links::file_url(&std::env::temp_dir().join("sonny-pages2/a.html"));
         assert!(!browser_page(&beside.unwrap()));
+    }
+
+    #[test]
+    fn pages_laid_out_in_the_same_moment_keep_files_of_their_own() {
+        let kept: Vec<String> = (0..20)
+            .map(|n| {
+                let lines = page(&format!("<p>{n}</p>"), 80);
+                let last = lines.last().unwrap().to_string();
+                assert!(!last.contains("could not keep"), "{last}");
+                last.trim_start_matches("    ↗ ").to_owned()
+            })
+            .collect();
+        let mut unique = kept.clone();
+        unique.sort();
+        unique.dedup();
+        assert_eq!(unique.len(), kept.len(), "{kept:?}");
+        for path in kept {
+            assert!(std::path::Path::new(&path).exists(), "{path}");
+            let _ = std::fs::remove_file(path);
+        }
     }
 
     #[test]
