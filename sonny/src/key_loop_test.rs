@@ -412,6 +412,7 @@ async fn stream_behind_a_held_read(
     Vec<(Instant, String, String)>,
     Vec<(Instant, String)>,
     Vec<String>,
+    Arc<Mutex<Vec<(Instant, Value)>>>,
 ) {
     let lines: Vec<String> = (0..pieces).map(|n| format!("tally {n:05}\n")).collect();
     let reply = lines.concat();
@@ -423,7 +424,7 @@ async fn stream_behind_a_held_read(
     ]);
     let nodes = json!([{"node": 2}, {"node": 1}]);
     let held = Duration::from_secs(2);
-    let (client, mut events, tell, _, socket) = held_daemon(held, items, nodes).await;
+    let (client, mut events, tell, asked, socket) = held_daemon(held, items, nodes).await;
     let mut app = window(client, socket);
     let frames = Arc::new(Mutex::new(Vec::new()));
     let probe = Probe {
@@ -486,7 +487,7 @@ async fn stream_behind_a_held_read(
     .expect("the window quit");
     ran.unwrap();
     let frames = frames.lock().unwrap().clone();
-    (app, frames, sent, lines)
+    (app, frames, sent, lines, asked)
 }
 
 /// Keys showed at once, and the reply is there whole, every line once and
@@ -508,12 +509,11 @@ fn keys_at_once(app: &App, frames: &[(Instant, String, String)], sent: &[(Instan
     let p99 = percentile(&waited, 0.99);
     let worst = *waited.last().unwrap();
     eprintln!(
-        "keys {} p50 {:?} p99 {:?} worst {:?}; most unheard {}",
+        "keys {} p50 {:?} p99 {:?} worst {:?}",
         waited.len(),
         percentile(&waited, 0.5),
         p99,
         worst,
-        app.unheard_most
     );
     assert!(
         p99 < Duration::from_millis(50),
@@ -539,18 +539,28 @@ fn reply_whole(app: &App, lines: &[String]) {
     }
 }
 
-/// A reply streamed fast, in more pieces than the window takes at once,
-/// behind an event whose read the daemon holds: the window holds no more
-/// than one pass of them, the rest waiting in the connection's bounded
-/// queue; keys show at once throughout; and the reply ends whole and in
-/// order.
+/// How many times the window connected again, following its agent anew
+/// each time (the test's own connection is followed from the start).
+fn reconnects(asked: &Mutex<Vec<(Instant, Value)>>) -> usize {
+    let asked = asked.lock().unwrap();
+    asked
+        .iter()
+        .filter(|(_, asked)| asked["op"] == "follow")
+        .count()
+}
+
+/// A reply streamed fast behind an event whose read the daemon holds: the
+/// window takes one event at a time (its type holds no more), the rest
+/// waiting in the connection's bounded queue, which holds them all here
+/// with no reconnect; keys show at once throughout; and the reply ends
+/// whole and in order.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_fast_stream_behind_a_held_read_stays_bounded_and_lands_in_order() {
-    let (app, frames, sent, lines) = stream_behind_a_held_read(3_000).await;
-    assert!(
-        app.unheard_most <= HEARD_AT_ONCE,
-        "held {} unheard",
-        app.unheard_most
+    let (app, frames, sent, lines, asked) = stream_behind_a_held_read(3_000).await;
+    assert_eq!(
+        reconnects(&asked),
+        0,
+        "the connection's queue held the stream"
     );
     keys_and_reply_whole(&app, &frames, &sent, &lines);
 }
@@ -558,16 +568,11 @@ async fn a_fast_stream_behind_a_held_read_stays_bounded_and_lands_in_order() {
 /// More than the connection's queue holds behind a held read: the
 /// connection lets go, as it does for any reader that falls behind, and
 /// the window connects again and draws what it missed from history,
-/// whole and in order, holding no more than one pass meanwhile. Catching
-/// up on connecting again still reads before it draws, so keys are not
-/// timed here.
+/// whole and in order. Catching up on connecting again still reads before
+/// it draws, so keys are not timed here.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_stream_past_the_connection_s_queue_is_caught_up_from_history() {
-    let (app, _, _, lines) = stream_behind_a_held_read(6_000).await;
-    assert!(
-        app.unheard_most <= HEARD_AT_ONCE,
-        "held {} unheard",
-        app.unheard_most
-    );
+    let (app, _, _, lines, asked) = stream_behind_a_held_read(6_000).await;
+    assert_eq!(reconnects(&asked), 1, "connected again once");
     reply_whole(&app, &lines);
 }

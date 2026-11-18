@@ -175,8 +175,6 @@ const DRAW_ATTEMPTS: u32 = 30;
 /// second, Ink's default cap.
 const DRAW_EVERY: Duration = Duration::from_millis(33);
 
-/// The most of the daemon's events applied between two looks at the keys.
-const HEARD_AT_ONCE: usize = 64;
 /// The most time between two frames of a window where nothing moves: its
 /// clocks count seconds, and what it reads now and then (counts, tasks,
 /// the margin's files) shows within one.
@@ -5181,13 +5179,12 @@ struct App {
     opening_all: bool,
     /// A program in the pane drew something: the screen is drawn again.
     woken: Arc<tokio::sync::Notify>,
-    /// The daemon's events not applied yet, oldest first ([`App::hear`]).
-    unheard: std::collections::VecDeque<Value>,
-    /// The read under way for the first of them.
+    /// The daemon's event taken and not applied yet ([`App::hear`]): one
+    /// at a time, as Codex's TUI takes its events, the rest waiting in the
+    /// connection's own bounded queue.
+    unheard: Option<Value>,
+    /// The read under way for it.
     hearing: Option<tokio::sync::oneshot::Receiver<Read>>,
-    /// The most `unheard` held at once, for a test to see it stays small.
-    #[cfg(test)]
-    unheard_most: usize,
     /// The words last given back to the composer, in front of what was
     /// typed since ([`App::give_back`]): a message refused after them goes
     /// after them.
@@ -7150,10 +7147,8 @@ impl App {
             naming: None,
             opening_all: false,
             woken: Arc::new(tokio::sync::Notify::new()),
-            unheard: Default::default(),
+            unheard: None,
             hearing: None,
-            #[cfg(test)]
-            unheard_most: 0,
             cut: false,
             given_back: None,
             verdicting: Vec::new(),
@@ -7398,8 +7393,6 @@ impl App {
         // An event taken while gathering a burst of the wheel's notches
         // that was not one, handled first next time round.
         let mut held: Option<Event> = None;
-        // The daemon's events are ready to apply past those applied.
-        let mut more_heard = false;
         loop {
             let due = drawn.is_none_or(|at| at.elapsed() >= DRAW_EVERY);
             let wanted = keyed || changed || self.quit;
@@ -7465,17 +7458,11 @@ impl App {
                 }
                 // Taken only as fast as they are heard: the rest wait in
                 // the connection's own bounded queue.
-                event = events.recv(), if self.down.is_none() && !self.cut && self.unheard.len() < HEARD_AT_ONCE => {
+                event = events.recv(), if self.down.is_none() && !self.cut && self.unheard.is_none() => {
                     changed = true;
                     heard = Instant::now();
                     match event {
-                        Some(event) => {
-                            self.unheard.push_back(event);
-                            #[cfg(test)]
-                            {
-                                self.unheard_most = self.unheard.len().max(self.unheard_most);
-                            }
-                        }
+                        Some(event) => self.unheard = Some(event),
                         None => self.cut = true,
                     }
                 }
@@ -7556,21 +7543,20 @@ impl App {
                     changed = true;
                     heard = Instant::now();
                 }
-                _ = std::future::ready(()), if more_heard => {}
             }
             // What the person sent lands before the events after it.
             self.wrote();
-            more_heard = self.hear();
+            self.hear();
             // The connection is gone: what it brought and was not applied
             // yet is let go, a read for it having failed with it, and the
             // window catches up from the last item it drew, so nothing is
             // drawn from a read that never came or drawn twice.
             if self.down.is_none() && self.client.is_closed() {
                 self.cut = true;
-                self.unheard.clear();
+                self.unheard = None;
                 self.hearing = None;
             }
-            if self.cut && self.unheard.is_empty() && self.hearing.is_none() {
+            if self.cut && self.unheard.is_none() && self.hearing.is_none() {
                 self.cut = false;
                 self.dropped();
             }
@@ -7941,14 +7927,14 @@ impl App {
         loop {
             self.wrote();
             self.verdicts_came();
-            while self.hear() {}
+            self.hear();
             if let Some(job) = self.raising.take_if(|job| job.is_finished()) {
                 self.approvals_raised(job.await.expect("the calls below were read"));
             }
             if self.writes.is_empty()
                 && self.hearing.is_none()
                 && self.verdicting.is_empty()
-                && self.unheard.is_empty()
+                && self.unheard.is_none()
                 && self.raising.is_none()
             {
                 return;
@@ -12247,53 +12233,50 @@ impl App {
         self.heard(event, read);
     }
 
-    /// The daemon's events taken in the order they came, each applied
-    /// once what it needs is read ([`App::wants`]): the read runs beside
-    /// the loop, which goes on taking keys, and the events after it wait
-    /// for it. A few are applied at a time, so a burst of them never keeps
-    /// a key waiting. Whether more are ready to apply.
-    fn hear(&mut self) -> bool {
+    /// The daemon's event taken, applied once what it needs is read
+    /// ([`App::wants`]): the read runs beside the loop, which goes on
+    /// taking keys, and the events after it wait in the connection's queue
+    /// for it. One is applied a pass, so a burst of them never keeps a key
+    /// waiting.
+    fn hear(&mut self) {
         // What the person sent lands before what the daemon says after it.
         if self.sending > 0 {
-            return false;
+            return;
         }
         // The connection went: what it brought and what was read for it
         // may be short, and catching up from history draws it whole.
         if self.client.is_closed() {
-            return false;
+            return;
         }
         if let Some(reading) = &mut self.hearing {
             let read = match reading.try_recv() {
                 Ok(read) => read,
-                Err(tokio::sync::oneshot::error::TryRecvError::Empty) => return false,
+                Err(tokio::sync::oneshot::error::TryRecvError::Empty) => return,
                 // Its read went with the daemon: applied with nothing read.
                 Err(_) => Read::default(),
             };
             self.hearing = None;
-            if let Some(event) = self.unheard.pop_front() {
+            if let Some(event) = self.unheard.take() {
                 self.heard(event, read);
             }
+            return;
         }
-        for _ in 0..HEARD_AT_ONCE {
-            let Some(event) = self.unheard.front() else {
-                return false;
-            };
-            let wants = self.wants(event);
-            if wants.any() {
-                let (client, bot, woken) =
-                    (self.client.clone(), self.bot.clone(), self.woken.clone());
-                let (send, receive) = tokio::sync::oneshot::channel();
-                tokio::spawn(async move {
-                    let _ = send.send(wants.read(client, bot).await);
-                    woken.notify_one();
-                });
-                self.hearing = Some(receive);
-                return false;
-            }
-            let event = self.unheard.pop_front().unwrap_or_default();
-            self.heard(event, Read::default());
+        let Some(event) = self.unheard.take() else {
+            return;
+        };
+        let wants = self.wants(&event);
+        if wants.any() {
+            let (client, bot, woken) = (self.client.clone(), self.bot.clone(), self.woken.clone());
+            let (send, receive) = tokio::sync::oneshot::channel();
+            tokio::spawn(async move {
+                let _ = send.send(wants.read(client, bot).await);
+                woken.notify_one();
+            });
+            self.unheard = Some(event);
+            self.hearing = Some(receive);
+            return;
         }
-        !self.unheard.is_empty()
+        self.heard(event, Read::default());
     }
 
     /// What the daemon's event `event` needs read before [`App::heard`]
