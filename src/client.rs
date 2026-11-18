@@ -2430,12 +2430,14 @@ fn follow_from(options: &Options) -> Result<Value> {
 }
 
 fn follow(options: &Options) -> Result<i32> {
-    if options.all {
-        // Every bot's events from a store-wide cursor, then live, until the
-        // connection ends: the fleet controller's view.
+    // A GLOB pattern names whichever bots match, later ones too.
+    let pattern = (options.bot.as_deref()).filter(|bot| bot.contains(['*', '?', '[']));
+    if options.all || pattern.is_some() {
+        // Every bot's events, or a pattern's, from a store-wide cursor,
+        // then live, until the connection ends: the fleet controller's view.
         let mut connection = connect_running(options)?;
         let mut request = follow_from(options)?;
-        request["bot"] = json!("*");
+        request["bot"] = json!(pattern.unwrap_or("*"));
         connection.request("follow", request)?;
         let mut renderer = Renderer::new(options.pretty, None, &options.target);
         loop {

@@ -1193,6 +1193,18 @@ class SocketAndCliTests(ModelFixture):
                                                      'bot_id': by_name['Bob']['bot_id']})
         self.assertEqual(events[-1]['event'], 'follow_live')
         self.assertTrue(all(e['cursor'] < f['cursor'] for e, f in zip(events[:-2], events[1:-1])))
+        # A pattern follows whichever bots match, from the store-wide
+        # cursor, and stays live.
+        pattern = subprocess.Popen([*self.base, 'follow', '--store', str(self.store), '--bot', 'A*'],
+                                   env=clean_env(), stdout=subprocess.PIPE, text=True)
+        matched = []
+        while not matched or matched[-1]['event'] != 'follow_live':
+            matched.append(json.loads(pattern.stdout.readline()))
+        pattern.kill()
+        pattern.wait(timeout=5)
+        pattern.stdout.close()
+        self.assertEqual({e['bot'] for e in matched[:-1]}, {'Alice'})
+        self.assertIn('created', [e['event'] for e in matched])
         # A follower attached while a turn runs replays, then sees live deltas and the end.
         live = subprocess.Popen([*self.base, 'run', '--store', str(self.store), '--bot', 'Alice', 'wait'],
                                 env=clean_env(), stdout=subprocess.PIPE, text=True)

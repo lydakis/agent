@@ -105,6 +105,28 @@ class BlindTests(unittest.TestCase):
                 self.assertNotIn('trim', text)
 
 
+    def test_each_task_s_title_is_kept_for_scoring_beside_its_name(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp) / 'out'
+            runs = out / 'runs'
+            run = runs / 'A1'
+            run.mkdir(parents=True)
+            (run / 'bin.txt').write_text('/work/a/target/release')
+            update = lambda u: {'t': 0, 'm': {'method': 'session/update', 'params': {'update': u}}}
+            rows = [{'t': 0, 'sent': {'method': 'session/prompt', 'params': {'prompt': [{'text': 'Fix it'}]}}},
+                    update({'sessionUpdate': 'tool_call', 'name': 'start_task', 'rawInput': {
+                        'name': 'halves', 'title': 'Round half cents to even', 'brief': 'Round...'}}),
+                    update({'sessionUpdate': 'tool_call', 'name': 'start_task', 'rawInput': {
+                        'name': 'readme', 'brief': 'Check it'}})]
+            (run / 'acp.jsonl').write_text(''.join(json.dumps(r) + '\n' for r in rows))
+            role_eval.transcript(run)
+            self.assertEqual((run / 'titles.md').read_text(),
+                             '- halves: Round half cents to even\n- readme: (no title)\n')
+            with mock.patch.object(role_eval, 'OUT', out), mock.patch.object(role_eval, 'RUNS', runs):
+                role_eval.blind()
+            [blind] = list((out / 'blind').iterdir())
+            self.assertIn('## Titles the lead set\n\n- halves: Round half cents to even', blind.read_text())
+
 
 class ConfinedTests(unittest.TestCase):
     """What the eval allows has effects only in the run (#521)."""

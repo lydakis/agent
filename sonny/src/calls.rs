@@ -1100,9 +1100,8 @@ pub fn declared(name: &str, arguments: &Value, failed: bool) -> Option<Said> {
     match name {
         crate::served::START => {
             let mut said = said("Started", field("name")?);
-            if let Some(brief) = field("brief") {
-                said.under
-                    .push(Line::from(first_line(brief)).italic().dim());
+            if let Some(title) = field("title").filter(|title| !title.is_empty()) {
+                said.under.push(Line::from(title.to_owned()).italic().dim());
             }
             Some(said)
         }
@@ -1618,10 +1617,19 @@ Keep the rest.'"#,
         assert_eq!(
             call(
                 "start_task",
-                serde_json::json!({"name": "fix", "brief": "Fix it.\nThen test."})
+                serde_json::json!({"name": "fix", "title": "Fix the sums", "brief": "Fix it.\nThen test."})
             ),
             "Started fix"
         );
+        // Under it, the task's title, never its brief.
+        let said = declared(
+            "start_task",
+            &serde_json::json!({"name": "fix", "title": "Fix the sums", "brief": "Fix it."}),
+            false,
+        )
+        .unwrap();
+        assert_eq!(said.under.len(), 1);
+        assert_eq!(said.under[0].to_string(), "Fix the sums");
         assert_eq!(
             call("remove_task", serde_json::json!({"task": "fix"})),
             "Cleaned up fix"
