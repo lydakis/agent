@@ -89,6 +89,7 @@ def main():
     store, sock = work / 'state.sqlite', work / 'd.sock'
     folder = work / 'folder'
     folder.mkdir()
+    process = None
     try:
         # Seeded on a fast disk.
         process, control = daemon(args.binary, store, url, sock, clean_env())
@@ -250,6 +251,10 @@ def main():
         Path(args.out).write_text(json.dumps(result, indent=1) + '\n')
         print(json.dumps(result))
     finally:
+        # A screen that failed leaves no daemon running into the next.
+        if process and process.poll() is None:
+            process.kill()
+            process.wait(timeout=60)
         server.shutdown()
         shutil.rmtree(work, ignore_errors=True)
 
