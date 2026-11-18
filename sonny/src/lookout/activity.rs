@@ -977,6 +977,7 @@ mod tests {
             event: made,
             subs: Vec::new(),
             order: 1,
+            due: false,
         });
         assert!(
             note.ends_with(&format!("\ngit push --force origin main\n{reason}")),
