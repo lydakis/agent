@@ -2378,6 +2378,30 @@ pub struct Window {
     /// How many pictures the window's items send.
     pub pictures: i64,
 }
+/// Where a request's items stand as the next is read: whether one came
+/// before it, and whether one was sent. A message of only blank text is
+/// left out as spaces as long as it is, so the request keeps the length
+/// the store counted; every item after the first is preceded by a comma
+/// between two sent items and by a space otherwise.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Joined {
+    items: bool,
+    sent: bool,
+}
+impl Joined {
+    fn send(&mut self, out: &mut Vec<u8>, item: &[u8]) {
+        if self.items {
+            out.push(if self.sent { b',' } else { b' ' });
+        }
+        out.extend_from_slice(item);
+        (self.items, self.sent) = (true, true);
+    }
+    fn skip(&mut self, out: &mut Vec<u8>, len: usize) {
+        let len = len + usize::from(self.items);
+        out.resize(out.len() + len, b' ');
+        self.items = true;
+    }
+}
 /// The nodes an Anthropic request sends without their thinking blocks:
 /// those below `below`, written before the context in front of the window
 /// changed, and those in `from..to`, written after a tool result that now
@@ -6955,17 +6979,19 @@ impl Database {
         strip: impl Into<Strip>,
         elided: i64,
     ) -> Result<Vec<u8>> {
-        self.items_sent(ids, strip.into(), false, elided)
+        self.items_sent(ids, strip.into(), false, elided, &mut Joined::default())
     }
-    /// [`Self::items_by_ids`], and with `reasoning` a Responses reasoning
-    /// item `strip` names left out whole too, as [`Self::reasoning_of`]
-    /// counts it.
+    /// [`Self::items_by_ids`] after the items `joined` has seen, and with
+    /// `reasoning` a Responses reasoning item `strip` names left out whole
+    /// too, as [`Self::reasoning_of`] counts it. A message of only blank
+    /// text goes as spaces (see [`Joined`]).
     pub fn items_sent(
         &self,
         ids: &[i64],
         strip: Strip,
         reasoning: bool,
         elided: i64,
+        joined: &mut Joined,
     ) -> Result<Vec<u8>> {
         let mut statement = self
             .conn
@@ -6981,10 +7007,7 @@ impl Database {
                     .query_row([id], |r| Ok(r.get_ref(0)?.as_blob()?.to_vec()))
                     .optional()?
             {
-                if !out.is_empty() {
-                    out.push(b',');
-                }
-                out.extend_from_slice(&stub);
+                joined.send(&mut out, &stub);
                 continue;
             }
             statement.query_row([id], |r| {
@@ -7001,10 +7024,11 @@ impl Database {
                     Some(kept) => std::borrow::Cow::Owned(kept),
                     None => std::borrow::Cow::Borrowed(item),
                 };
-                if !out.is_empty() {
-                    out.push(b',');
+                match super::context::without_blank_text(&item) {
+                    Some(kept) if kept.is_empty() => joined.skip(&mut out, item.len()),
+                    Some(kept) => joined.send(&mut out, &kept),
+                    None => joined.send(&mut out, &item),
                 }
-                out.extend_from_slice(&item);
                 Ok(())
             })?;
         }
@@ -10852,11 +10876,7 @@ impl Database {
         });
         let facts = audit::of_call(&ask.tool, None, plan.in_sandbox());
         let mut decided = json!({"call_id":id,"step_of":call_id,"name":ask.tool,"daemon":true});
-        let preview: String = ask.arguments.chars().take(2048).collect();
-        if preview.len() < ask.arguments.len() {
-            decided["arguments_truncated"] = json!(true);
-        }
-        decided["arguments"] = json!(preview);
+        previewed(&mut decided, &ask.tool, &ask.arguments);
         if let Some((error, denied)) = refusal {
             let tx = self.conn.savepoint()?;
             audit::insert(
@@ -16934,19 +16954,25 @@ fn clock_tool(tx: &Connection, turn: i64, row: i64, now: i64) -> Result<()> {
 }
 /// A `tool_started` event's data: the call with its arguments previewed.
 fn started(call: &ToolCall) -> Value {
-    let preview: String = call.arguments.chars().take(2048).collect();
-    let truncated = preview.len() < call.arguments.len();
-    let mut data = json!({"call_id":call.call_id,"name":call.name,"arguments":preview,
-        "arguments_truncated":truncated});
-    // A cut write, edit or patch still names every file it changes, for a
-    // judge of a later call that runs one.
-    if truncated && let Some((paths, whole)) = changed_paths(&call.name, &call.arguments) {
+    let mut data = json!({"call_id":call.call_id,"name":call.name});
+    previewed(&mut data, &call.name, &call.arguments);
+    data
+}
+/// A started call's or a decided step's `arguments`, previewed, and
+/// `arguments_truncated`. A cut write, edit or patch still names every file
+/// it changes, for a judge of a later call that runs one: a step has no
+/// planning item to read its whole arguments back from.
+fn previewed(data: &mut Value, name: &str, arguments: &str) {
+    let preview: String = arguments.chars().take(2048).collect();
+    let truncated = preview.len() < arguments.len();
+    data["arguments"] = json!(preview);
+    data["arguments_truncated"] = json!(truncated);
+    if truncated && let Some((paths, whole)) = changed_paths(name, arguments) {
         if !whole {
             data["paths_cut"] = json!(true);
         }
         data["paths"] = json!(paths);
     }
-    data
 }
 
 /// The files a write, edit or patch with `arguments` changes, and whether
@@ -17167,13 +17193,9 @@ fn end_step(
     let bot = bot.name.as_str();
     data["step_of"] = json!(parent);
     // Previewed as a started call is, for a judge of a later call that
-    // weighs what this turn was refused.
-    let preview: String = arguments.chars().take(2048).collect();
-    if preview.len() < arguments.len() {
-        data["arguments_truncated"] = json!(true);
-    }
+    // weighs what this turn was refused or runs a file it wrote.
     data["name"] = json!(name);
-    data["arguments"] = json!(preview);
+    previewed(&mut data, &name, &arguments);
     event(tx, bot, Some(turn), "step_decided", data)?;
     resume_call(tx, turn, parent, now_ms)
 }

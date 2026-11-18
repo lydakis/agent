@@ -1273,6 +1273,10 @@ pub struct Heard {
     /// Where in the daemon's stream an agent source's event happened, 0
     /// for any other: a task's events are told in this order.
     pub order: i64,
+    /// Its digest came due while it waited: it goes in the notes that
+    /// follow one another then, with no other window to wait, as
+    /// Alertmanager tells a whole group at its interval.
+    pub due: bool,
 }
 
 /// An event's header, `[source · topic · from · time]`, leaving out
@@ -2215,6 +2219,7 @@ mod tests {
             event,
             subs: vec!["crs".into()],
             order: 0,
+            due: false,
         };
         assert_eq!(
             untimed(&line(&heard)),
@@ -2581,6 +2586,7 @@ mod tests {
             event,
             subs: subs.iter().map(|s| s.to_string()).collect(),
             order: 0,
+            due: false,
         };
         let mut older = event("lunch?", None);
         older.at_ms = now - 3 * 24 * 3600 * 1000;
@@ -3172,6 +3178,7 @@ mod tests {
             event: down,
             subs: vec!["chat".into()],
             order: 0,
+            due: false,
         }));
         assert!(
             line.starts_with("[slack · the lookout]\nThe source"),

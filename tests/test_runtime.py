@@ -663,6 +663,17 @@ class AnthropicModel(http.server.BaseHTTPRequestHandler):
             if 'thinking' in request:
                 assert request['thinking']['block_binding'] == {'prefix_mismatch_behavior': 'drop_block'}
             assert request['model'] in ('synthetic-claude', 'synthetic-claude-2', 'synthetic-claude-3') and request['stream']
+            # The API refuses blank text wherever a message holds it.
+            if any(b['type'] == 'text' and not b['text'].strip()
+                   for m in request['messages'] for b in m['content']):
+                body = (b'{"type":"error","error":{"type":"invalid_request_error","message":'
+                        b'"messages: text content blocks must contain non-whitespace text"}}')
+                self.send_response(400)
+                self.send_header('Content-Length', str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+                self.wfile.flush()
+                return
             cache = getattr(self.server, 'cache_control', {'type': 'ephemeral'})
             for block in request.get('system', []):
                 assert block['text'] and block['cache_control'] == cache
@@ -848,6 +859,10 @@ class AnthropicModel(http.server.BaseHTTPRequestHandler):
                 elif user == 'silent':
                     blocks = []
                     stop = 'end_turn'
+                elif user.startswith('blank'):
+                    # A reply of only blank text, after thinking when asked.
+                    blocks = blocks[:user == 'blank:thinking'] + [{'type': 'text', 'text': ' \n'}]
+                    stop = 'end_turn'
                 elif user.startswith('tool:'):
                     blocks.append({'type': 'tool_use', 'id': 'toolu_1', 'name': 'echo', 'input': {'text': user[5:]}})
                     stop = 'tool_use'
@@ -978,6 +993,34 @@ class AnthropicRuntimeTests(unittest.TestCase):
                         extra=extra, settings=settings)
         self.addCleanup(client.close)
         return client, model, path
+
+    def test_blank_text_stays_stored_and_each_request_leaves_it_out(self):
+        # The API refuses blank text, so a reply of only that, kept as the
+        # model wrote it, would refuse every request after it; as Pi does,
+        # each request leaves it out instead.
+        client, model, path = self.start()
+        client.request('create', bot='Bob', workspace=str(path), effort='low')
+        turns = []
+        for n, prompt in enumerate(('blank', 'blank:thinking', 'hello')):
+            turn = client.request('submit', bot='Bob', request_id=f'b{n}', prompt=prompt)['result']['message']
+            end = client.finished(turn)['data']
+            self.assertEqual(end['status'], 'completed', end)
+            turns.append(turn)
+        requests = [model.requests.get(timeout=1) for _ in turns]
+        for request in requests:
+            self.assertFalse([b for m in request['messages'] for b in m['content']
+                              if b['type'] == 'text' and not b['text'].strip()])
+        # The reply of only blank text is left out whole; the one beside
+        # thinking goes as its thinking.
+        last = requests[-1]['messages']
+        self.assertEqual([m['role'] for m in last], ['user', 'user', 'assistant', 'user'])
+        self.assertEqual([b['type'] for b in last[2]['content']], ['thinking'])
+        # The store keeps both replies as the model wrote them.
+        events = client.request('events', bot='Bob', after=0, limit=256)['result']['events']
+        replies = [node_item(client, 'Bob', e['data']['node'])['result']['content']
+                   for e in events if e['event'] == 'message' and e['turn'] in turns[:2]]
+        self.assertEqual([[b['type'] for b in c] for c in replies], [['text'], ['thinking', 'text']])
+        self.assertEqual([c[-1]['text'] for c in replies], [' \n', ' \n'])
 
     def test_a_turns_reply_follows_the_schema_it_was_sent_with(self):
         client, model, path = self.start()

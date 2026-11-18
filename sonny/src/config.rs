@@ -325,7 +325,7 @@ pub const SETTINGS: &[Setting] = &[
         group: "Tabs",
         name: "task tabs",
         label: "which tasks open a tab of their own: those asked for, or every one",
-        about: "which tasks open in a tab of their own in Rex, Herdr or cmux: those an agent asks a tab for, shows you, or you open, and any that comes to need you; or every task as its turn starts",
+        about: "which tasks open in a tab of their own in Rex, Herdr or cmux: those an agent shows you or you open; or every task as its turn starts",
         values: &["asked", "every"],
         default: "asked",
     },

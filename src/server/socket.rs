@@ -8,26 +8,21 @@ use std::{
 };
 use tokio::net::{UnixListener, UnixStream};
 
-/// The longest socket path every system takes: macOS holds 104 bytes with
-/// the terminating NUL, Linux 108.
-const SOCKET_PATH: usize = 103;
-
 /// How long a bot's socket keeps listening after the last command or turn
 /// that could use it is gone, so back-to-back commands don't bind again.
 const LISTEN_GRACE: Duration = Duration::from_secs(30);
 
-/// Each sandboxed bot's own socket, in a folder beside the daemon's: opened
+/// Each sandboxed bot's own socket, in a private folder: opened
 /// when one of its commands needs it, listening while any of its live turns
 /// or running commands holds a share, and closed a grace after the last one
 /// goes, as systemd's socket activation keeps a unit's socket, or when the
 /// bot is deleted. Connections already accepted keep their sessions.
-/// A connection on it is a session answered as that bot. `None` when the
-/// folder's sockets wouldn't fit a socket path.
+/// A connection on it is a session answered as that bot.
 pub fn capabilities(
     socket: &Path,
     sender: super::session::Sender,
     next: std::sync::Arc<std::sync::atomic::AtomicU64>,
-) -> Option<agent_runtime::sandbox::Capabilities> {
+) -> agent_runtime::sandbox::Capabilities {
     capabilities_with(socket, sender, next, LISTEN_GRACE)
 }
 
@@ -128,13 +123,8 @@ fn capabilities_with(
     sender: super::session::Sender,
     next: std::sync::Arc<std::sync::atomic::AtomicU64>,
     grace: Duration,
-) -> Option<agent_runtime::sandbox::Capabilities> {
-    let mut folder = socket.as_os_str().to_owned();
-    folder.push(".d");
-    let folder = PathBuf::from(folder);
-    if folder.as_os_str().len() + 1 + i64::MAX.to_string().len() > SOCKET_PATH {
-        return None;
-    }
+) -> agent_runtime::sandbox::Capabilities {
+    let folder = agent_runtime::sandbox::bots_folder(socket);
     let runtime = tokio::runtime::Handle::current();
     // The folder is made ready by the first bot to need it, once the
     // daemon owns its socket.
@@ -148,7 +138,7 @@ fn capabilities_with(
     let generations = std::sync::atomic::AtomicU64::new(0);
     let (place, own) = (folder.clone(), socket.to_owned());
     let closing = opened.clone();
-    Some(agent_runtime::sandbox::Capabilities {
+    agent_runtime::sandbox::Capabilities {
         folder,
         close: std::sync::Arc::new(move |bot| {
             let mut opened = closing.lock().unwrap_or_else(|e| e.into_inner());
@@ -210,7 +200,7 @@ fn capabilities_with(
             );
             Ok((path, agent_runtime::sandbox::Listening(held)))
         }),
-    })
+    }
 }
 
 /// The bots' socket folder, the daemon user's alone (whoever owns the
@@ -413,14 +403,16 @@ mod tests {
     #[tokio::test]
     async fn a_bot_s_socket_listens_while_a_share_lives_and_a_grace_after() {
         let directory =
-            std::env::temp_dir().join(format!("agent-socket-shares-{}", std::process::id()));
+            Path::new("/tmp").join(format!("agent-socket-shares-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&directory);
         std::fs::create_dir_all(&directory).unwrap();
-        let socket = directory.join("d.sock");
+        let name = "s".repeat(98 - directory.as_os_str().len() - 1);
+        let socket = directory.join(name);
         let _daemon = std::os::unix::net::UnixListener::bind(&socket).unwrap();
         let (sender, _receiver) = super::super::session::channel(64);
         let grace = Duration::from_millis(200);
-        let capabilities = capabilities_with(&socket, sender, Default::default(), grace).unwrap();
+        let capabilities = capabilities_with(&socket, sender, Default::default(), grace);
+        assert_ne!(capabilities.folder.parent(), socket.parent());
         let (path, first) = (capabilities.open)(7).unwrap();
         let (again, second) = (capabilities.open)(7).unwrap();
         assert_eq!(path, again);
@@ -450,6 +442,7 @@ mod tests {
         (capabilities.close)(7);
         assert!(UnixStream::connect(&path).await.is_err());
         drop(fourth);
+        std::fs::remove_dir(&capabilities.folder).unwrap();
         std::fs::remove_dir_all(directory).unwrap();
     }
 

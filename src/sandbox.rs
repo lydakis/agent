@@ -101,7 +101,7 @@ pub struct Policy {
     pub walled: Vec<PathBuf>,
     /// The other daemons' sockets, which its commands never reach, the
     /// network on or off, nor the folder of each one's bots' own sockets
-    /// beside it (`SOCKET.d`): each answers as the person, or as another
+    /// for its bots: each answers as the person, or as another
     /// daemon's bot ([`known`]).
     #[serde(default)]
     pub daemons: Vec<PathBuf>,
@@ -1058,11 +1058,29 @@ fn linked(kept: &Path) -> Result<Root> {
     )
 }
 
-/// The folder of the bots' own sockets of the daemon at `socket`, beside it.
-fn bots_folder(socket: &Path) -> PathBuf {
-    let mut folder = socket.as_os_str().to_owned();
-    folder.push(".d");
-    PathBuf::from(folder)
+/// Where the daemon binds its per-bot sockets. Every sandbox derives this
+/// same path for the daemons it protects, even before the folder exists.
+pub fn bots_folder(socket: &Path) -> PathBuf {
+    use std::os::unix::net::SocketAddr;
+    let mut name = socket.as_os_str().to_owned();
+    name.push(".d");
+    let beside = PathBuf::from(name);
+    if SocketAddr::from_pathname(beside.join("9223372036854775807")).is_ok() {
+        return beside;
+    }
+    // The canonical socket path identifies this daemon, including one
+    // started with an explicit socket. prepare checks ownership and mode.
+    let digest = aws_lc_rs::digest::digest(
+        &aws_lc_rs::digest::SHA256,
+        socket.as_os_str().as_encoded_bytes(),
+    );
+    let id = u128::from_be_bytes(digest.as_ref()[..16].try_into().unwrap());
+    let tmp = if cfg!(target_os = "macos") {
+        "/private/tmp"
+    } else {
+        "/tmp"
+    };
+    Path::new(tmp).join(format!("agent-bots-{id:032x}"))
 }
 
 /// The store and the files SQLite and the daemon keep beside it.
@@ -2521,11 +2539,15 @@ mod tests {
         let base =
             std::env::temp_dir().join(format!("agent-sandbox-others-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&base);
-        std::fs::create_dir_all(base.join("work/side.sock.d")).unwrap();
+        std::fs::create_dir_all(base.join("work")).unwrap();
         let base = std::fs::canonicalize(&base).unwrap();
         let work = base.join("work");
         // A side daemon an agent started in the folder it works in.
         let (store, socket) = (work.join("side.sqlite"), work.join("side.sock"));
+        // Beside its socket, or in a short folder where a long temporary
+        // folder leaves no room for a bot's socket address there.
+        let bots = bots_folder(&socket);
+        std::fs::create_dir_all(&bots).unwrap();
         std::fs::write(&store, "").unwrap();
         std::fs::write(&socket, "").unwrap();
         let folder = base.join("daemons");
@@ -2560,7 +2582,7 @@ mod tests {
             let (key, _) = params.iter().find(|(_, named)| named == path).unwrap();
             key.clone()
         };
-        for hidden in [socket.clone(), work.join("side.sock.d")] {
+        for hidden in [socket.clone(), bots.clone()] {
             let denied = format!(
                 "(deny network-outbound (remote unix-socket (subpath (param \"{}\"))))",
                 key(&hidden)
@@ -2588,15 +2610,14 @@ mod tests {
                 assert!(has("--ro-bind-try", &kept, &kept));
             }
             assert!(
-                args.windows(2).any(
-                    |w| w[0] == "--tmpfs" && w[1] == work.join("side.sock.d").to_string_lossy()
-                )
+                args.windows(2)
+                    .any(|w| w[0] == "--tmpfs" && w[1] == bots.to_string_lossy())
             );
             // A daemon that stopped took its socket: nothing to hide, and
             // nothing made where it was, which a read-only root couldn't
             // hold; what is kept only while there is skipped by bubblewrap.
             std::fs::remove_file(&socket).unwrap();
-            std::fs::remove_dir(work.join("side.sock.d")).unwrap();
+            std::fs::remove_dir(&bots).unwrap();
             let args = linux::args(&policy, false);
             assert!(
                 !args
@@ -2604,11 +2625,13 @@ mod tests {
                     .any(|w| w[0] == "--ro-bind" && w[2] == socket.to_string_lossy())
             );
             assert!(
-                !args.windows(2).any(
-                    |w| w[0] == "--tmpfs" && w[1] == work.join("side.sock.d").to_string_lossy()
-                )
+                !args
+                    .windows(2)
+                    .any(|w| w[0] == "--tmpfs" && w[1] == bots.to_string_lossy())
             );
         }
+        // Where it is outside the test's folder.
+        let _ = std::fs::remove_dir(&bots);
         std::fs::remove_dir_all(base).unwrap();
     }
 
