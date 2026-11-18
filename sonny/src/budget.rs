@@ -15,6 +15,8 @@ pub struct Budget {
     /// many hold or wait; gone once none does.
     shares: Mutex<HashMap<String, (Arc<Semaphore>, usize)>>,
     share: usize,
+    /// Woken each time a place is given back.
+    freed: tokio::sync::Notify,
 }
 
 /// A place in the budget, given back when dropped.
@@ -22,6 +24,26 @@ pub struct Permit {
     _all: OwnedSemaphorePermit,
     _share: OwnedSemaphorePermit,
     _claim: Claim,
+    // Last, so it wakes whoever waits once the place is back.
+    _given: Given,
+}
+
+/// Says a place was given back, as its permit drops.
+struct Given(&'static Budget);
+
+impl Drop for Given {
+    fn drop(&mut self) {
+        self.0.freed.notify_one();
+    }
+}
+
+/// Why no place was free now.
+#[derive(Debug, PartialEq)]
+pub enum Full {
+    /// The agent holds its whole share.
+    Share,
+    /// Every place is held.
+    Whole,
 }
 
 /// One holder of, or waiter on, an agent's share. Dropped, whether its
@@ -50,6 +72,7 @@ impl Budget {
             all: Arc::new(Semaphore::new(size)),
             shares: Mutex::new(HashMap::new()),
             share: size.div_ceil(2),
+            freed: tokio::sync::Notify::new(),
         }
     }
 
@@ -79,13 +102,13 @@ impl Budget {
             _all: all,
             _share: share,
             _claim: claim,
+            _given: Given(self),
         }
     }
 
     /// A place for `owner` if one is free now, within its share and the
-    /// whole: none, holding and waiting on nothing, if not. Those already
-    /// waiting keep their turn, as a semaphore with waiters has none free.
-    pub fn try_admit(&'static self, owner: &str) -> Option<Permit> {
+    /// whole: if not, which was full, holding and waiting on nothing.
+    pub fn try_admit(&'static self, owner: &str) -> Result<Permit, Full> {
         let (share, claim) = {
             let mut shares = self.shares.lock().unwrap_or_else(|e| e.into_inner());
             let (share, users) = shares
@@ -98,13 +121,24 @@ impl Budget {
             };
             (share.clone(), claim)
         };
-        let share = share.try_acquire_owned().ok()?;
-        let all = self.all.clone().try_acquire_owned().ok()?;
-        Some(Permit {
+        let share = share.try_acquire_owned().map_err(|_| Full::Share)?;
+        let all = self
+            .all
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| Full::Whole)?;
+        Ok(Permit {
             _all: all,
             _share: share,
             _claim: claim,
+            _given: Given(self),
         })
+    }
+
+    /// Wakes once a place is given back after it is called, or at once if
+    /// one was given back since the last wake.
+    pub async fn freed(&self) {
+        self.freed.notified().await
     }
 }
 
@@ -166,13 +200,17 @@ mod tests {
         let budget = leaked(2);
         let a = budget.try_admit("a").unwrap();
         // `a`'s share is full: none for it, and nothing left behind.
-        assert!(budget.try_admit("a").is_none());
+        assert_eq!(budget.try_admit("a").err(), Some(Full::Share));
         let b = budget.try_admit("b").unwrap();
         // The whole is full.
-        assert!(budget.try_admit("c").is_none());
+        assert_eq!(budget.try_admit("c").err(), Some(Full::Whole));
         assert!(!budget.shares.lock().unwrap().contains_key("c"));
         drop((a, b));
         assert!(budget.shares.lock().unwrap().is_empty());
+        // Each place given back woke whoever waits for one.
+        tokio::time::timeout(Duration::from_secs(1), budget.freed())
+            .await
+            .expect("a place given back wakes");
     }
 
     #[tokio::test]
