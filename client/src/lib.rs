@@ -338,12 +338,16 @@ impl Client {
                 &format!("{}: {error}", socket.display()),
             )
         };
-        let path = socket.to_owned();
-        // In a Linux sandbox, the connection the daemon hands this command.
-        let handed = tokio::task::spawn_blocking(move || socket::handed(&path))
-            .await
-            .map_err(|_| Error::new("daemon_unavailable"))?
-            .map_err(unavailable)?;
+        // Only the Linux sandbox broker can require a blocking read.
+        let handed = if cfg!(target_os = "linux") && std::env::var_os(socket::HANDED).is_some() {
+            let path = socket.to_owned();
+            tokio::task::spawn_blocking(move || socket::handed(&path))
+                .await
+                .map_err(|_| Error::new("daemon_unavailable"))?
+                .map_err(unavailable)?
+        } else {
+            None
+        };
         let stream = match handed {
             Some(stream) => {
                 stream.set_nonblocking(true).map_err(unavailable)?;
@@ -559,6 +563,12 @@ impl Client {
     }
 
     pub async fn request(&self, op: &str, mut params: Value) -> Result<Value> {
+        if !(params.is_object() || params.is_null()) {
+            return Err(Error::with(
+                "invalid_request",
+                "expected an object of request parameters",
+            ));
+        }
         let _room = match self.in_flight.get() {
             Some(room) if !matches!(op, "wait" | "renew_approvals") => Some(
                 room.acquire()
@@ -742,7 +752,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn canceled_waits_release_pending_requests_without_closing_the_session() {
+    async fn invalid_parameters_and_canceled_waits_leave_the_session_usable() {
         let (stream, peer) = UnixStream::pair().unwrap();
         let (_, write) = stream.into_split();
         let client = Arc::new(Client {
@@ -760,6 +770,10 @@ mod tests {
             in_flight: std::sync::OnceLock::new(),
         });
         let mut lines = BufReader::new(peer).lines();
+        assert_eq!(
+            client.request("wait", json!([])).await.unwrap_err().code,
+            "invalid_request"
+        );
         for _ in 0..20 {
             let request = tokio::spawn({
                 let client = client.clone();

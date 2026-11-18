@@ -4,44 +4,63 @@ use std::{
     path::{Path, PathBuf},
 };
 
-/// Write a file whole beside its place, then rename it there, with its mode
-/// set from creation, so the new name never has any other.
-pub fn replace_mode(path: &Path, text: &[u8], mode: u32) -> Result<(), String> {
+/// Open a new sibling for this write alone. Concurrent callers and files
+/// left by interrupted processes never share a staging file.
+pub(crate) fn temporary(path: &Path, mode: u32) -> std::io::Result<(PathBuf, std::fs::File)> {
     use std::os::unix::fs::OpenOptionsExt;
-    let dir = path.parent().ok_or("no folder")?;
-    std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
-    let temporary = dir.join(format!(
-        ".{}.{}",
-        path.file_name().unwrap_or_default().to_string_lossy(),
-        std::process::id()
-    ));
-    let written = (|| {
-        // Made anew, never through what is there: the folder may be one a
-        // sandboxed agent writes, which could leave a link by that name to
-        // any file. An old temporary of this pid goes first; one made
-        // since fails the write.
-        match std::fs::remove_file(&temporary) {
-            Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e),
-            _ => {}
-        }
-        let mut file = std::fs::OpenOptions::new()
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+
+    let mut name = std::ffi::OsString::from(".");
+    name.push(path.file_name().ok_or(std::io::ErrorKind::InvalidInput)?);
+    name.push(format!(".{}", std::process::id()));
+    let mut staged = path.with_file_name(&name);
+    loop {
+        match std::fs::OpenOptions::new()
             .write(true)
             .create_new(true)
             .custom_flags(libc::O_NOFOLLOW)
             .mode(mode)
-            .open(&temporary)?;
+            .open(&staged)
+        {
+            Ok(file) => return Ok((staged, file)),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                let mut next = name.clone();
+                next.push(format!(".{}", NEXT.fetch_add(1, Ordering::Relaxed)));
+                staged.set_file_name(next);
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+/// Write a file whole beside its place, then rename it there, with its mode
+/// set from creation, so the new name never has any other.
+pub fn replace_mode(path: &Path, text: &[u8], mode: u32) -> Result<(), String> {
+    let dir = path.parent().ok_or("no folder")?;
+    let dir = if dir.as_os_str().is_empty() {
+        Path::new(".")
+    } else {
+        dir
+    };
+    std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+    let (temporary, mut file) =
+        temporary(path, mode).map_err(|e| format!("{}: {e}", path.display()))?;
+    let written = (|| {
         // Past the umask, on the file opened, not on its name.
         file.set_permissions(std::os::unix::fs::PermissionsExt::from_mode(mode))?;
         file.write_all(text)?;
         file.sync_all()?;
-        std::fs::rename(&temporary, path)?;
-        // The new name is durable only once its folder is.
-        std::fs::File::open(dir)?.sync_all()
+        std::fs::rename(&temporary, path)
     })();
     if written.is_err() {
         let _ = std::fs::remove_file(&temporary);
     }
-    written.map_err(|e| format!("{}: {e}", path.display()))
+    // Once renamed, another writer can own the staging name, even if
+    // syncing the directory fails.
+    written
+        .and_then(|()| std::fs::File::open(dir)?.sync_all())
+        .map_err(|e| format!("{}: {e}", path.display()))
 }
 
 /// `path` with what exists of it resolved to its real path and the rest
@@ -91,6 +110,28 @@ fn real_within(path: &Path, links: u32) -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn concurrent_replacements_each_publish_a_whole_file() {
+        let dir =
+            std::env::temp_dir().join(format!("agent-replace-threads-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("focus");
+        let start = std::sync::Barrier::new(8);
+        std::thread::scope(|scope| {
+            for byte in 0..8 {
+                let (path, start) = (&path, &start);
+                scope.spawn(move || {
+                    start.wait();
+                    replace_mode(path, &[byte; 8192], 0o600).unwrap();
+                });
+            }
+        });
+        let content = std::fs::read(path).unwrap();
+        assert_eq!(content.len(), 8192);
+        assert!(content.iter().all(|&byte| byte == content[0]));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 
     #[test]
     fn a_link_left_by_the_temporary_s_name_is_never_written_through() {
