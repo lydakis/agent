@@ -27,7 +27,7 @@ use tokio::sync::Notify;
 /// The events that move where an agent stands, as a `bots` row says it:
 /// its status, running turn, what it waits on and how its last turn
 /// ended; an approval held for the person; an agent made or gone.
-pub const KINDS: [&str; 16] = [
+pub const KINDS: [&str; 17] = [
     "created",
     "forked",
     "queued",
@@ -43,6 +43,7 @@ pub const KINDS: [&str; 16] = [
     "approval_asked",
     "call_lifted",
     "lifted_ended",
+    "step_decided",
     "deleted",
 ];
 
