@@ -11236,3 +11236,34 @@ holds: an idle daemon's anonymous memory is 2,052 KiB on both, and a fresh
 copy of main's binary reads the same RSS as head's (17.5 to 17.7 MiB idle,
 no window), as the binary just copied has more of itself in the page
 cache. The Mac was not measured.
+
+The Perf workflow's screens (`bench/perf_gate.py`), run here the way it
+runs them, on the same builds: admission and completion six rounds a side
+(three with main first, three with head first), footprint two, lifecycle
+and Sonny's screen three. Store work per turn is the same on both sides:
+no count moved.
+
+| Bench | Measure | main | head |
+| --- | --- | ---: | ---: |
+| admission | lone submit CPU, ms | 31.4 | 33.5 |
+| admission | burst submit p99, ms | 4.49 | 4.48 |
+| completion | release to terminal p99, ms | 10.32 | 10.80 |
+| footprint | idle RSS, MiB | 17.11 | 17.07 |
+| footprint | per idle bot, KiB | 1.59 | 1.77 |
+| footprint | RSS after a turn each, MiB | 35.03 | 33.35 |
+| footprint | CPU per turn, ms | 0.817 | 0.813 |
+| lifecycle | CPU, s | 0.52 | 0.54 |
+| lifecycle | p95 turn, ms | 582.7 | 581.6 |
+| lifecycle | peak RSS, MiB | 26.02 | 25.98 |
+| sonny | lookout CPU per 1k deltas at 10x10 / 10x100 / 100x10, ms | 7.5 / 4.12 / 6.38 | 6.25 / 4.12 / 6.5 |
+| sonny | quiet window CPU, ms/s | 1.16 | 1.55 |
+| sonny | sky replay CPU per 1k lines, ms | 9.9 | 9.9 |
+
+The gate warns on none of them: every head range overlaps main's. Order
+moves the burst and completion numbers more than the change does. With
+main run first, head's burst p99 and completion p99 read 13% and 12%
+higher; with head first, 10% lower and 2% lower. Lone submit CPU varies
+from 30.2 to 36.9 ms between main's own rounds, and head's six round
+medians (31.1 to 35.9 ms) fall inside that. The quiet window's CPU is one
+10 ms clock tick over its 26 s: 30 ms in each of main's three runs, 30 ms
+in one of head's and 40 ms in two.
