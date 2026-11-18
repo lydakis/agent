@@ -8631,6 +8631,7 @@ impl App {
                     items: ours,
                     short: read.short,
                     prompts: std::mem::take(&mut read.prompts),
+                    rest: None,
                 };
                 let (older, unpaired) = self.draw_page(&paged, after, page).await;
                 self.unpaired = unpaired;
@@ -11625,11 +11626,30 @@ impl App {
             began.insert(turn);
         }
         // A chunk read at a time, what it held let go before the next.
-        let mut chunks = nodes.chunks(100);
+        let mut chunks = nodes.chunks(DRAW_CHUNK);
         let mut after = Some(after);
+        let mut first = true;
         loop {
             let items = match (chunks.next(), &mut page) {
-                (Some(_), Some(page)) => std::mem::take(&mut page.items),
+                (Some(_), Some(page)) if std::mem::take(&mut first) => {
+                    std::mem::take(&mut page.items)
+                }
+                // Read ahead beside the loop while the chunk before drew.
+                (
+                    Some(chunk),
+                    Some(PageRead {
+                        rest: Some(rest), ..
+                    }),
+                ) => match rest.recv().await {
+                    Some((items, short)) => {
+                        if short {
+                            self.short_read.set(true);
+                        }
+                        items
+                    }
+                    None => self.items_at(chunk).await,
+                },
+                (Some(_), Some(_)) => Vec::new(),
                 (Some(chunk), None) => self.items_at(chunk).await,
                 (None, _) => match after.take() {
                     Some(after) => after,
@@ -21698,7 +21718,18 @@ struct PageRead {
     short: bool,
     /// What `prompts` gave for the turns pages start in, by turn.
     prompts: HashMap<i64, Value>,
+    /// The items of the chunks after the first ([`DRAW_CHUNK`] nodes
+    /// each), read ahead one at a time while the one before draws, so a
+    /// long gap holds no more than a chunk or two in memory.
+    rest: Option<tokio::sync::mpsc::Receiver<Chunk>>,
 }
+
+/// A chunk's items, and whether they were read short ([`needs::items`]).
+type Chunk = (Vec<(i64, Value)>, bool);
+
+/// The nodes whose items [`App::draw_nodes`] holds at once: what each
+/// chunk held is let go before the next.
+const DRAW_CHUNK: usize = 100;
 
 /// The items at `nodes` of `bot`, and with `prompts` the words that
 /// started each turn of `turns`.
@@ -21714,7 +21745,34 @@ async fn read_page(client: &Client, bot: &str, nodes: &[i64], turns: &[i64]) -> 
         items,
         short,
         prompts,
+        rest: None,
     }
+}
+
+/// The items at `nodes`, a gap however long: the first chunk read now,
+/// with `prompts` for `turns`, and the chunks after it read as the window
+/// draws them, one ahead, rather than the whole gap held at once.
+async fn read_gap(client: &Arc<Client>, bot: &str, nodes: &[i64], turns: &[i64]) -> PageRead {
+    let head = &nodes[..nodes.len().min(DRAW_CHUNK)];
+    let mut page = read_page(client, bot, head, turns).await;
+    let later: Vec<i64> = nodes[head.len()..].to_vec();
+    if !later.is_empty() {
+        let (send, rest) = tokio::sync::mpsc::channel(1);
+        let (client, bot) = (client.clone(), bot.to_owned());
+        tokio::spawn(async move {
+            for chunk in later.chunks(DRAW_CHUNK) {
+                if send
+                    .send(needs::items(&client, &bot, chunk).await)
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        });
+        page.rest = Some(rest);
+    }
+    page
 }
 
 /// The bot's items after a node, as [`read_since`] read them for
@@ -21866,7 +21924,7 @@ async fn read_reattached(asked: Reattaching) -> Result<Reattached, String> {
     if let Some(history) = &mut history {
         let first = (history.nodes.first()).and_then(|node| history.turns.get(node));
         let turns: Vec<i64> = first.copied().into_iter().collect();
-        history.page = Some(read_page(&client, &asked.bot, &history.nodes, &turns).await);
+        history.page = Some(read_gap(&client, &asked.bot, &history.nodes, &turns).await);
     }
     let waiting = read_waiting(&client, &asked.bot, &asked.staged).await;
     let now = record["running_turn"].as_i64();
@@ -26959,6 +27017,48 @@ mod tests {
         assert!(app.staged.is_empty());
         // Nor waiting in line, so the row never says `Queued` for it.
         assert!(!app.in_line.contains(&6));
+    }
+
+    /// A reconnect's long gap, read a chunk ahead beside the loop, draws
+    /// every item once and in order.
+    #[tokio::test]
+    async fn a_long_gap_read_a_chunk_ahead_draws_whole_and_in_order() {
+        let count = DRAW_CHUNK as i64 * 2 + 50;
+        let items: serde_json::Map<String, Value> = (1..=count)
+            .map(|node| {
+                let item = json!({"type": "message", "role": "assistant",
+                    "content": [{"type": "output_text", "text": format!("gap line {node}.")}]});
+                (node.to_string(), item)
+            })
+            .collect();
+        let client = daemon_with(Value::Object(items)).await;
+        let mut app = app(client.clone());
+        let nodes: Vec<i64> = (1..=count).collect();
+        let page = read_gap(&client, &app.bot.clone(), &nodes, &[]).await;
+        assert_eq!(
+            page.items.len(),
+            DRAW_CHUNK,
+            "only the first chunk is held at once"
+        );
+        (app.draw_nodes(&nodes, &HashMap::new(), false, Vec::new(), None, Some(page))).await;
+        let drawn: Vec<String> = app
+            .pending
+            .iter()
+            .chain(&app.open_rows(80))
+            .map(|line| line.to_string())
+            .collect();
+        let at: Vec<usize> = (1..=count)
+            .map(|node| {
+                let text = format!("gap line {node}.");
+                let found: Vec<usize> = (drawn.iter().enumerate())
+                    .filter(|(_, line)| line.contains(&text))
+                    .map(|(at, _)| at)
+                    .collect();
+                assert_eq!(found.len(), 1, "{text} drawn once: {drawn:?}");
+                found[0]
+            })
+            .collect();
+        assert!(at.windows(2).all(|pair| pair[0] < pair[1]), "in order");
     }
 
     #[tokio::test]
