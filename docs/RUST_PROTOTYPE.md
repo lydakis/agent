@@ -357,9 +357,15 @@ reports beside them, with `waited_ms` and a `waited` histogram, how long
 each request waited for the loop from its line's read to its dispatch.
 One map entry per op the daemon has seen, touched only by the loop, so no
 lock. `loop` reports the same holds for the loop's own work between
-requests: `reap` (a turn's task ended), `start_ready`, `resume`, `wake`,
-`admission` (a queued admission answered), `lapse`, `holds`, `expire` and
-`reload`. `programs` splits the requests by the program each session
+requests: `reap` (a turn's task ended), `start_ready`, `claimed` (a
+parked turn's claim landed and its turn started), `resume` (the loop
+waiting for claims on their way to land before work that looks at running
+turns), `admission` (a queued admission answered), `lapse`, `holds`,
+`expire` and `reload`. `writes` and `claims` count the clients' writes and
+the parked turns' claims that landed (`landed`), and how long they waited
+after landing for the loop to take them up, behind an older one still on
+its way or the loop's other work: `behind_ms` in all and `behind_most_ms`
+at most. `programs` splits the requests by the program each session
 named in its first line, `{"op":"hello","program":NAME}` (1 to 32 of
 `a-z`, `0-9` and `_`; a client library sends it unanswered, under an id no
 request takes): each program's `count`, `held_ms`, `waited_ms`, and the
