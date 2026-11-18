@@ -11097,6 +11097,69 @@ is unchanged.
     against 0.7 to 1.0 s.
   - Codex's settings are kept.
 
+## Each open connection in `stats`, by its label
+
+2026-11-18, Linux x86_64 cloud VM, 4 CPUs. Main is `8ae56e87` (#1145),
+and head is the change merged onto it. The change adds the `label` to `hello`, the `connections`
+list and the label on `slow` rows, and Sonny's window labels its
+connections with the agent it shows. Both sides are local release builds
+of the daemon and Sonny. `bench.ends` (from the step-writes change),
+alternating main and head on the same machine with nothing else running.
+
+The change costs the daemon one relaxed atomic add per delivered event
+(the session's own count, beside its program's) and one hash map entry per
+open session, which the loop touches once per request; nothing is
+allocated per request. A window sends one more `hello` line, once, when it
+knows its agent.
+
+Low end: one window on a folder of 10 agents, three runs each. Ranges are
+the runs; the median is in parentheses.
+
+| Measure | Main | Head |
+| --- | ---: | ---: |
+| Window start, s | 0.039 to 0.047 (0.04) | 0.041 to 0.049 (0.04) |
+| Idle daemon CPU, % | 0 to 0.05 (0) | 0 to 0.05 (0) |
+| Idle daemon RSS, MiB | 20.7 to 21.1 (20.7) | 20.7 to 21.2 (20.9) |
+| Idle window CPU, % | 0.1 to 0.15 (0.1) | 0.1 to 0.15 (0.15) |
+| Idle window RSS, MiB | 25.6 to 26.0 (26.0) | 25.6 to 26.1 (25.8) |
+| Key to character p50, ms | 0.35 to 0.39 (0.35) | 0.34 to 0.38 (0.35) |
+| Key to character p99, ms | 0.87 to 0.99 (0.92) | 0.88 to 1.21 (0.90) |
+| Key pauses over 100 ms | 0 | 0 |
+| Turn p50, ms | 44.08 to 44.25 (44.11) | 43.98 to 44.18 (44.06) |
+| Turn p99, ms | 47.69 to 49.98 (49.58) | 47.88 to 50.01 (48.10) |
+
+High end: 10,000 stored agents, 30 agents running turns back to back and
+8 running code-mode scripts, with every window in one busy project (`one`)
+or each in its own folder (`spread`). Each cell lists the runs, two at 32
+and 100 windows and four at 200.
+
+| Windows | Layout | Side | Key p50, ms | Key p99, ms | Key max, ms | Pauses over 100 ms | Window start p50, s | Daemon CPU, % | Daemon RSS, MiB | Windows CPU, % | Windows RSS, MiB |
+| ---: | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 32 | one | main | 0.88 / 0.93 | 4.86 / 4.90 | 5.93 / 11.16 | 0 / 0 | 0.70 / 0.75 | 138.5 / 135.6 | 40.1 / 39.4 | 25.4 / 26.3 | 2,154 / 2,212 |
+| 32 | one | head | 0.87 / 0.92 | 4.88 / 5.60 | 19.73 / 11.22 | 0 / 0 | 0.68 / 0.78 | 138.0 / 136.6 | 39.5 / 41.5 | 25.1 / 26.2 | 2,161 / 2,192 |
+| 32 | spread | main | 0.87 / 0.90 | 4.35 / 4.10 | 9.85 / 7.76 | 0 / 0 | 0.66 / 0.77 | 137.4 / 137.1 | 39.8 / 39.9 | 25.6 / 26.3 | 2,120 / 2,154 |
+| 32 | spread | head | 0.90 / 0.93 | 4.23 / 4.98 | 6.43 / 6.77 | 0 / 0 | 0.71 / 0.80 | 138.6 / 135.4 | 39.3 / 40.8 | 25.6 / 26.4 | 2,123 / 2,174 |
+| 100 | one | main | 1.28 / 1.42 | 6.84 / 6.25 | 11.11 / 8.73 | 0 / 0 | 1.83 / 1.88 | 142.6 / 143.0 | 42.0 / 42.6 | 35.9 / 36.1 | 6,063 / 6,034 |
+| 100 | one | head | 1.35 / 1.37 | 6.78 / 6.00 | 10.58 / 9.01 | 0 / 0 | 1.84 / 1.79 | 142.5 / 144.8 | 41.9 / 42.4 | 35.2 / 35.5 | 6,179 / 6,079 |
+| 100 | spread | main | 1.20 / 1.22 | 7.03 / 7.62 | 10.56 / 10.33 | 0 / 0 | 1.83 / 1.75 | 142.6 / 143.8 | 43.8 / 42.9 | 34.0 / 37.1 | 5,962 / 6,097 |
+| 100 | spread | head | 1.34 / 1.29 | 7.17 / 6.71 | 11.18 / 15.32 | 0 / 0 | 1.83 / 1.69 | 144.1 / 143.7 | 41.5 / 41.8 | 35.3 / 37.0 | 5,995 / 6,128 |
+| 200 | one | main | 1.54 / 1.52 / 1.60 / 1.62 | 8.86 / 6.38 / 8.63 / 7.35 | 107 / 11 / 15 / 84 | 1 / 0 / 0 / 0 | 3.73 / 3.46 / 3.34 / 3.67 | 177.1 / 176.7 / 176.9 / 178.0 | 43.9 / 43.7 / 43.2 / 43.2 | 60.1 / 59.0 / 59.8 / 59.7 | 11,894 / 12,130 / 11,880 / 11,878 |
+| 200 | one | head | 1.48 / 1.98 / 1.53 / 1.62 | 7.11 / 8.21 / 10.18 / 9.04 | 10 / 185 / 230 / 218 | 0 / 1 / 1 / 1 | 3.58 / 3.50 / 3.26 / 3.41 | 176.2 / 180.4 / 177.1 / 176.6 | 45.0 / 43.6 / 44.4 / 44.4 | 58.9 / 60.1 / 59.8 / 59.7 | 11,929 / 11,797 / 12,014 / 11,921 |
+| 200 | spread | main | 1.37 / 1.33 / 1.44 / 1.47 | 5.49 / 7.27 / 11.40 / 6.98 | 6 / 156 / 131 / 102 | 0 / 1 / 2 / 1 | 3.50 / 3.75 / 3.73 / 3.56 | 177.7 / 178.2 / 178.8 / 178.8 | 45.0 / 43.8 / 43.0 / 44.4 | 58.9 / 62.6 / 58.2 / 59.2 | 11,934 / 11,952 / 12,129 / 12,035 |
+| 200 | spread | head | 1.54 / 1.70 / 1.66 / 1.37 | 7.82 / 9.78 / 7.60 / 7.83 | 100 / 317 / 11 / 8 | 1 / 1 / 0 / 0 | 3.60 / 3.53 / 3.47 / 3.31 | 177.7 / 177.9 / 178.0 / 177.9 | 44.7 / 44.3 / 44.1 / 43.9 | 60.4 / 60.5 / 60.0 / 58.7 | 12,062 / 11,931 / 11,946 / 12,069 |
+
+Key to character p99 stays under 12 ms everywhere on both sides, against
+the 50 ms bar. At 32 and 100 windows neither side pauses over 100 ms. At
+200 windows both sides do, now and then, five times in eight runs each
+(each pause one probe out of 300). The daemon there runs at about 178% and
+the windows at about 60% of a 4-CPU machine that also runs the model and
+the harness, so the machine is full on both sides. Head's two longest
+pauses (230 and 317 ms) are longer than main's longest (156 ms). The
+change adds nothing to a window after its start but the one `hello` line,
+and nothing to the daemon per key, so these are the full machine's, as
+main's are. Daemon CPU and RSS, window CPU and RSS, and window start move
+within run-to-run spread. The Mac was not measured.
+
 ## Code-mode step writes beside the run loop
 
 A code-mode script's steps froze every window on a slow disk: the service

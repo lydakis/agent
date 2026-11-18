@@ -740,10 +740,13 @@ enum Command {
     /// connections, pools, storage worker, and handle registry.
     Stats,
     /// The program this session is, such as a client's window or its
-    /// reviewer, so `stats` counts its requests under it. A bot's own
-    /// socket is named `agent` by the daemon and keeps that name.
+    /// reviewer, so `stats` counts its requests under it, and, with
+    /// `label`, which one, such as the agent a window shows. A bot's own
+    /// socket is named `agent` by the daemon and keeps that name. Said
+    /// again, it names the session anew.
     Hello {
         program: String,
+        label: Option<String>,
     },
     /// Each provider's own model listing, for a client writing its model
     /// list. Asked when requested and kept five minutes; nothing runs on it.
@@ -867,13 +870,18 @@ const OTHER: usize = agent_runtime::output::PROGRAMS - 1;
 /// how long each waited for the loop, from its line's read to its
 /// dispatch. Each is a count, sums, the slowest and histograms over the
 /// store's latency buckets. Touched only by the loop; no lock, no
-/// allocation once an op has been seen.
+/// allocation once an op has been seen, but one entry per open session.
 #[derive(Default)]
 struct Commands {
     ops: HashMap<&'static str, Held>,
     /// Requests by the program of the session that sent them, by its
-    /// place: unnamed, agent, then `names`, then other.
+    /// place: unnamed, agent, then `names`, then other. Every session's,
+    /// open or closed.
     programs: [Program; agent_runtime::output::PROGRAMS],
+    /// Requests by each open session, by its id, with the label it gave:
+    /// one entry a session, gone as it closes, while its requests stay
+    /// counted under its program.
+    connections: HashMap<u64, Connection>,
     /// The programs sessions named in `hello`, as first heard.
     names: Vec<String>,
     /// Where a hold of a second or more is kept, by name.
@@ -884,6 +892,28 @@ struct Program {
     count: u64,
     held_ns: u64,
     waited_ns: u64,
+}
+impl Program {
+    fn add(&mut self, held_ns: u64, waited_ns: u64) {
+        self.count += 1;
+        self.held_ns += held_ns;
+        self.waited_ns += waited_ns;
+    }
+}
+/// An open session: its requests, and its program, deliveries and label.
+struct Connection {
+    tally: std::sync::Arc<agent_runtime::output::Tally>,
+    label: Option<Box<str>>,
+    requests: Program,
+}
+impl Connection {
+    fn of(output: &Output) -> Self {
+        Self {
+            tally: output.tally(),
+            label: None,
+            requests: Program::default(),
+        }
+    }
 }
 #[derive(Default)]
 struct Held {
@@ -906,7 +936,22 @@ impl Commands {
     /// The loop's own work, dispatched at `since`: no line, no wait, no
     /// program.
     fn count(&mut self, op: &'static str, since: std::time::Instant) {
-        self.hold(op, None, since);
+        let ns = self.hold(op, since);
+        self.slow(op, None, None, ns);
+    }
+    /// A session opened: listed from now on, with no requests yet.
+    fn open(&mut self, session: u64, output: &Output) {
+        (self.connections.entry(session)).or_insert_with(|| Connection::of(output));
+    }
+    /// A session's label from its `hello`.
+    fn label(&mut self, session: u64, output: &Output, label: Option<String>) {
+        let connection =
+            (self.connections.entry(session)).or_insert_with(|| Connection::of(output));
+        connection.label = label.map(String::into_boxed_str);
+    }
+    /// A session closed: its requests stay counted under its program.
+    fn close(&mut self, session: u64) {
+        self.connections.remove(&session);
     }
     /// A program's place, given it the first time it is heard while
     /// places are left.
@@ -929,38 +974,49 @@ impl Commands {
         }
     }
     /// A request dispatched at `since`, whose line was read at `read`, from
-    /// a session of the program at place `program`.
+    /// the session `session`, writing to `output`.
     fn request(
         &mut self,
         op: &'static str,
-        program: usize,
+        session: u64,
+        output: &Output,
         read: std::time::Instant,
         since: std::time::Instant,
     ) {
-        let ns = self.hold(op, Some(program), since);
+        let ns = self.hold(op, since);
         let waited = since.saturating_duration_since(read).as_nanos() as u64;
+        let program = output.program();
         if let Some(row) = self.programs.get_mut(program) {
-            row.count += 1;
-            row.held_ns += ns;
-            row.waited_ns += waited;
+            row.add(ns, waited);
         }
+        let connection =
+            (self.connections.entry(session)).or_insert_with(|| Connection::of(output));
+        connection.requests.add(ns, waited);
         let held = self.ops.entry(op).or_default();
         held.waited_ns += waited;
         held.waited[agent_runtime::store::bucket(waited)] += 1;
+        if ns >= agent_runtime::store::SLOW_NS {
+            let label = (self.connections.get(&session)).and_then(|c| c.label.clone());
+            self.slow(op, Some(program), label.as_deref(), ns);
+        }
     }
-    fn hold(&mut self, op: &'static str, program: Option<usize>, since: std::time::Instant) -> u64 {
+    fn hold(&mut self, op: &'static str, since: std::time::Instant) -> u64 {
         let ns = since.elapsed().as_nanos() as u64;
         let held = self.ops.entry(op).or_default();
         held.count += 1;
         held.held_ns += ns;
         held.slowest_ns = held.slowest_ns.max(ns);
         held.held[agent_runtime::store::bucket(ns)] += 1;
+        ns
+    }
+    /// A hold of a second or more, kept by name with its session's
+    /// program and label.
+    fn slow(&self, op: &'static str, program: Option<usize>, label: Option<&str>, ns: u64) {
         if ns >= agent_runtime::store::SLOW_NS
             && let Some(slow) = &self.slow
         {
-            slow.held(op, program.map(|at| self.name(at)), ns);
+            slow.held(op, program.map(|at| self.name(at)), label, ns);
         }
-        ns
     }
     /// Requests by program, for each that sent one, with the events
     /// delivered to sessions of each.
@@ -980,6 +1036,27 @@ impl Commands {
             })
             .collect();
         Value::Object(rows)
+    }
+    /// Requests by each open session, in the order they opened, with its
+    /// program, its label and the events delivered to it.
+    fn connections(&self) -> Value {
+        let mut open: Vec<_> = self.connections.iter().collect();
+        open.sort_unstable_by_key(|(session, _)| **session);
+        (open.into_iter())
+            .map(|(session, connection)| {
+                let requests = &connection.requests;
+                let mut row = json!({"session": session,
+                    "program": self.name(connection.tally.program()),
+                    "count": requests.count,
+                    "held_ms": requests.held_ns / 1_000_000,
+                    "waited_ms": requests.waited_ns / 1_000_000,
+                    "delivered": connection.tally.delivered()});
+                if let Some(label) = &connection.label {
+                    row["label"] = json!(label);
+                }
+                row
+            })
+            .collect()
     }
     fn snapshot(&self, waits: bool) -> Value {
         let ops: serde_json::Map<String, Value> = (self.ops.iter())
@@ -2735,6 +2812,11 @@ pub async fn run(config: Configuration) -> Result<()> {
         lapses: None,
         holds: None,
     };
+    // The stdio owner's session is open from the start, as a socket's is
+    // once it connects.
+    if let Some(stdout) = sessions.get(&0) {
+        service.commands.open(0, stdout);
+    }
     // A `configure` kept for a turn that ended while no daemon ran is
     // taken now; one whose turn still waits stays kept for its end.
     service.kept = service
@@ -3017,6 +3099,7 @@ pub async fn run(config: Configuration) -> Result<()> {
                             ready["paused"] = json!(service.paused);
                             let _ = output.try_send(ready);
                             if caller.is_some() { output.name_program(AGENT); }
+                            service.commands.open(id, &output);
                             sessions.insert(id, output);
                             if let Some(caller) = caller { callers.insert(id, caller); }
                             if companion { companion_sessions.insert(id); }
@@ -3024,6 +3107,7 @@ pub async fn run(config: Configuration) -> Result<()> {
                         }
                         Inbound::Closed(id) => {
                             sessions.remove(&id);
+                            service.commands.close(id);
                             callers.remove(&id);
                             service.lent.remove(&id);
                             companion_sessions.remove(&id);
@@ -3110,7 +3194,7 @@ pub async fn run(config: Configuration) -> Result<()> {
                                         None => {
                                             let (op, held) = (request.command.op(), std::time::Instant::now());
                                             let result = service.dispatch_request(request, id, &output, bound).await;
-                                            service.commands.request(op, output.program(), read, held);
+                                            service.commands.request(op, id, &output, read, held);
                                             result
                                         }
                                     };
@@ -6031,7 +6115,7 @@ impl Service {
                 }
                 (None, None) => Ok(json!({"companions": self.companions.listed()})),
             },
-            Command::Hello { program } => {
+            Command::Hello { program, label } => {
                 // A short name of its own; the daemon's are its own.
                 let fits = (1..=32).contains(&program.len())
                     && (program.bytes())
@@ -6043,9 +6127,18 @@ impl Service {
                         "a program is 1 to 32 of a-z, 0-9 and _, and not unnamed, agent or other",
                     );
                 }
+                if let Some(label) = &label
+                    && (!(1..=128).contains(&label.len()) || label.chars().any(char::is_control))
+                {
+                    return fail_with(
+                        "invalid_label",
+                        "a label is 1 to 128 bytes of text, with no control characters",
+                    );
+                }
                 // A bot's own socket keeps the daemon's name for it.
                 if output.program() != AGENT {
                     output.name_program(self.commands.place(&program));
+                    self.commands.label(session, output, label);
                 }
                 Ok(json!({}))
             }
@@ -6135,6 +6228,9 @@ impl Service {
                     // `hello` (`agent` for a bot's own socket), and the
                     // events delivered to sessions of each.
                     "programs": self.commands.programs(|program| self.hub.delivered_to(program)),
+                    // The same for each open session, with the label its
+                    // `hello` gave, such as the agent a window shows.
+                    "connections": self.commands.connections(),
                     // The last hundred holds of a second or more, of the
                     // store or of this loop, newest first.
                     "slow": store.counters().slow(),
@@ -6737,6 +6833,11 @@ impl Service {
                 }
                 let mut created = serde_json::to_value(created)?;
                 created["duplicate"] = json!(event.is_none());
+                // Without its instructions, as Codex's thread/fork answers
+                // with a thread that carries none: `inspect` shows them.
+                if let Value::Object(fields) = &mut created {
+                    fields.remove("instructions");
+                }
                 Ok(created)
             }
             Command::Events { bot, after, limit } => {
@@ -10017,6 +10118,7 @@ mod tests {
         let (output, _writer) = Output::stdout();
         let hello = |program: &str| Command::Hello {
             program: program.into(),
+            label: None,
         };
         let named = service.dispatch(hello("window"), 1, &output, json!(1), Bound::default());
         named.await.unwrap();
@@ -10029,6 +10131,23 @@ mod tests {
         let kept = service.dispatch(hello("sky"), 2, &agent, json!(3), Bound::default());
         kept.await.unwrap();
         assert_eq!(service.commands.name(agent.program()), "agent");
+        // A label says which window: the agent it shows.
+        let labeled = |label: &str| Command::Hello {
+            program: "window".into(),
+            label: Some(label.into()),
+        };
+        let named = service.dispatch(labeled("shop.lead"), 1, &output, json!(5), Bound::default());
+        named.await.unwrap();
+        let open = service.commands.connections();
+        assert_eq!(
+            (&open[0]["session"], &open[0]["label"]),
+            (&json!(1), &json!("shop.lead")),
+            "{open}"
+        );
+        for bad in ["", "a\nb", &"x".repeat(129)] {
+            let refused = service.dispatch(labeled(bad), 1, &output, json!(6), Bound::default());
+            assert_eq!(refused.await.unwrap_err().code, "invalid_label");
+        }
         // Names past the places left count together.
         for n in 0..20 {
             let (other, _writer) = Output::stdout();
@@ -10052,39 +10171,81 @@ mod tests {
         commands.place("window");
         let window = commands.place("window");
         assert_eq!(window, 2, "a name heard again keeps its place");
+        let ((one, _a), (two, _b), (bot, _c)) =
+            (Output::stdout(), Output::stdout(), Output::stdout());
+        one.name_program(window);
+        two.name_program(window);
+        bot.name_program(AGENT);
         let now = std::time::Instant::now();
-        commands.request("bots", window, now, now);
-        commands.request("bots", window, now, now);
-        commands.request("inspect", AGENT, now, now);
+        commands.request("bots", 10, &one, now, now);
+        commands.request("bots", 10, &one, now, now);
+        commands.request("bots", 11, &two, now, now);
+        commands.request("inspect", 12, &bot, now, now);
         let programs = commands.programs(|program| (program == AGENT) as u64 * 7);
-        assert_eq!(programs["window"]["count"], 2);
+        assert_eq!(programs["window"]["count"], 3);
         assert_eq!(programs["agent"]["count"], 1);
         assert_eq!(programs["agent"]["delivered"], 7);
         assert!(programs.get("sky").is_none(), "only programs heard from");
-        // A hold of a second or more is kept, newest first, with its program.
+        // Each open session apart, with the label its hello gave.
+        commands.label(11, &two, Some("shop.lead".into()));
+        two.delivered();
+        two.delivered();
+        // A session is listed from its open, before it asks anything.
+        let (idle, _d) = Output::stdout();
+        commands.open(13, &idle);
+        let open = commands.connections();
+        assert_eq!(open.as_array().unwrap().len(), 4, "{open}");
+        assert_eq!(
+            (&open[3]["session"], &open[3]["program"], &open[3]["count"]),
+            (&json!(13), &json!("unnamed"), &json!(0))
+        );
+        assert_eq!(
+            (&open[0]["session"], &open[0]["program"], &open[0]["count"]),
+            (&json!(10), &json!("window"), &json!(2))
+        );
+        assert!(open[0].get("label").is_none());
+        assert_eq!(
+            (&open[1]["label"], &open[1]["count"], &open[1]["delivered"]),
+            (&json!("shop.lead"), &json!(1), &json!(2))
+        );
+        assert_eq!(open[2]["program"], "agent");
+        // A closed session's requests stay under its program alone.
+        commands.close(10);
+        assert_eq!(commands.connections().as_array().unwrap().len(), 3);
+        assert_eq!(commands.programs(|_| 0)["window"]["count"], 3);
+        // A hold of a second or more is kept, newest first, with its
+        // program and label.
         let counters = store.counters();
-        counters.held("approvals", Some("window"), 2_000_000_000);
-        counters.held("reap", None, 1_500_000_000);
-        counters.held("bots", Some("window"), 999_999_999);
+        counters.held(
+            "approvals",
+            Some("window"),
+            Some("shop.lead"),
+            2_000_000_000,
+        );
+        counters.held("reap", None, None, 1_500_000_000);
+        counters.held("bots", Some("window"), None, 999_999_999);
         let slow = counters.slow();
         assert_eq!(slow.as_array().unwrap().len(), 2, "{slow}");
         assert_eq!(slow[0]["op"], "reap");
+        assert!(slow[0].get("label").is_none());
         assert_eq!(
             (
                 &slow[1]["op"],
                 &slow[1]["kind"],
                 &slow[1]["program"],
+                &slow[1]["label"],
                 &slow[1]["ms"]
             ),
             (
                 &json!("approvals"),
                 &json!("loop"),
                 &json!("window"),
+                &json!("shop.lead"),
                 &json!(2000)
             )
         );
         for _ in 0..150 {
-            counters.held("wait", None, 1_000_000_000);
+            counters.held("wait", None, None, 1_000_000_000);
         }
         assert_eq!(
             counters.slow().as_array().unwrap().len(),
