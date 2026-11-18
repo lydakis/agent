@@ -5566,6 +5566,10 @@ struct Fleet {
     /// person in theirs waits in this window too, and is answered here.
     /// Never a window here, nor a tab.
     raised: std::collections::HashSet<String>,
+    /// Bots the daemon's events added to `raised` (true) or took from it
+    /// (false) since the followed leads were last asked for: a read of
+    /// them that lands later started before these, and keeps them.
+    raised_since: HashMap<String, bool>,
     /// How a task's window runs Sonny on it, without the bot's name.
     command: Vec<String>,
     /// Said once in the status row when tasks open where this pane is not.
@@ -6068,6 +6072,7 @@ impl Fleet {
             refollow: false,
             unheld: Default::default(),
             raised: Default::default(),
+            raised_since: HashMap::new(),
             command,
             note,
             place,
@@ -6123,6 +6128,7 @@ impl Fleet {
             refollow: false,
             unheld: Default::default(),
             raised: Default::default(),
+            raised_since: HashMap::new(),
             command: Vec::new(),
             note: None,
             doing: HashMap::new(),
@@ -6302,6 +6308,7 @@ impl Fleet {
             return None;
         }
         self.followed_at = Some(Instant::now());
+        self.raised_since.clear();
         let store = self.store.clone();
         let followed = followed_leads(&self.lead, |bot| lookout::subs::read(&store, bot));
         if !now && !self.refollow && followed == self.followed {
@@ -6332,11 +6339,19 @@ impl Fleet {
         for name in &read.sure {
             self.needs.sure(name);
         }
-        for gone in self.raised.difference(&read.raised) {
+        // What events changed since the read was asked for stands over it.
+        let mut raised = read.raised;
+        for (bot, joined) in self.raised_since.drain() {
+            match joined {
+                true => raised.insert(bot),
+                false => raised.remove(&bot),
+            };
+        }
+        for gone in self.raised.difference(&raised) {
             self.needs.forget(gone);
             self.scanned.remove(gone);
         }
-        self.raised = read.raised;
+        self.raised = raised;
         self.followed = read.followed;
         self.refollow = false;
         // A reconcile reads every call after; else the new ones' now, and
@@ -6904,6 +6919,7 @@ impl Fleet {
                     // A followed lead's new task is followed with it.
                     Kin::None if self.raised.contains(by) && !project::is_lead(bot) => {
                         self.raised.insert(bot.to_owned());
+                        self.raised_since.insert(bot.to_owned(), true);
                     }
                     // One no agent made may be a followed first lead's:
                     // the listing says, as it does at the start.
@@ -6933,6 +6949,7 @@ impl Fleet {
                 self.layout.send(move |_| used::forget(&gone));
                 self.lineage.remove(bot);
                 self.raised.remove(bot);
+                self.raised_since.insert(bot.to_owned(), false);
                 self.doing.remove(bot);
                 self.activity.remove(bot);
                 self.needs.forget(bot);
@@ -31321,6 +31338,16 @@ mod tests {
         let unread = fleet.follow_leads(false).await;
         assert!(fleet.raised.contains("shop.loose"));
         assert!(unread.iter().any(|(bot, _)| bot == "shop.loose"));
+        // A read that lands after the events since it was asked for keeps
+        // what they changed: a task made and one deleted meanwhile.
+        let asked = fleet.follow_due(true).expect("asked now");
+        let read = asked.read(&fleet.client).await;
+        fleet.event(&json!({"event": "created", "bot": "shop.new",
+            "data": {"created_by": "shop.lead"}}));
+        fleet.event(&json!({"event": "deleted", "bot": "shop.fix", "data": {}}));
+        fleet.followed_read(read);
+        assert!(fleet.raised.contains("shop.new"));
+        assert!(!fleet.raised.contains("shop.fix"));
         let _ = std::fs::remove_dir_all(dir);
     }
 
