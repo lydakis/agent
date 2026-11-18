@@ -996,7 +996,7 @@ async fn read_status_of(
             latest: run.more(),
             maker: run.caller.clone(),
             group: status::Group::Working,
-            run: Some(run),
+            run: Some(Box::new(run)),
             ..Default::default()
         });
     }
@@ -1008,8 +1008,9 @@ async fn read_status_of(
         .and_then(|bot| bot.workspace.as_deref())
         .unwrap_or("");
     let title = titles.project(lead_folder);
-    // The lead first, then by group, the latest first in each.
-    rows.sort_by_key(|row| {
+    // The lead first, then by group, the latest first in each: each row's
+    // key taken once, and each row moved once into its place.
+    rows.sort_by_cached_key(|row| {
         (
             row.name != "lead",
             row.group,
@@ -11730,13 +11731,14 @@ impl App {
             drop(told);
             // An idle agent's row is kept for the next count, once every
             // read the count made was read.
-            kept_rows.rows = match whole {
-                true => (built.into_iter())
-                    .filter(|row| !row.running && row.run.is_none())
-                    .map(|row| (name_key(&row.bot), row))
-                    .collect(),
-                false => HashMap::new(),
-            };
+            kept_rows.rows = HashMap::with_capacity(if whole { built.len() } else { 0 });
+            if whole {
+                (kept_rows.rows).extend(
+                    (built.into_iter())
+                        .filter(|row| !row.running && row.run.is_none())
+                        .map(|row| (name_key(&row.bot), row)),
+                );
+            }
             Some(Counted {
                 mark: whole.then_some(mark),
                 read: Some((counts, bots)),
@@ -21731,7 +21733,7 @@ const PICK_KEYS: &str = "↑↓ pick · enter open · esc close";
 /// The agents `/status` lists, in its order: what its keys pick from.
 /// The workflow run `id` as `/status` last read it, while it runs.
 fn run_of<'a>(watch: &'a Watch, id: &str) -> Option<&'a workflow::view::Live> {
-    (watch.rows.iter()).find_map(|row| row.run.as_ref().filter(|run| run.id == id))
+    (watch.rows.iter()).find_map(|row| row.run.as_deref().filter(|run| run.id == id))
 }
 
 /// What the confirm and its notices call the run `id`: its script's
@@ -28522,7 +28524,7 @@ mod tests {
                 bot: "calc.lead#wf-run1".into(),
                 group: status::Group::Working,
                 running: true,
-                run: workflow::view::ran(&store, "run1").map(|ran| ran.live),
+                run: workflow::view::ran(&store, "run1").map(|ran| Box::new(ran.live)),
                 ..Default::default()
             }],
             read: Instant::now(),
@@ -34840,7 +34842,7 @@ mod tests {
                 bot: live.bot(),
                 group: status::Group::Working,
                 running: true,
-                run: Some(live),
+                run: Some(Box::new(live)),
                 ..Default::default()
             }],
             read: Instant::now(),

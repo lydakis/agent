@@ -50,7 +50,7 @@ pub struct Row {
     pub group: Group,
     /// The workflow run this row is, whose strip stands where an
     /// agent's state does.
-    pub run: Option<crate::workflow::view::Live>,
+    pub run: Option<Box<crate::workflow::view::Live>>,
     /// Its line in [`tasks`], once made: a row kept from one count to the
     /// next keeps it.
     pub line: Option<Task>,
@@ -561,7 +561,7 @@ pub struct Own {
     pub group: Group,
     /// Its helpers' groups: each agent whose line of makers leads to it.
     pub helpers: Vec<Group>,
-    pub run: Option<crate::workflow::view::Live>,
+    pub run: Option<Box<crate::workflow::view::Live>>,
 }
 
 /// The tasks among `rows` that `bot` made and that need the person,
@@ -634,7 +634,7 @@ pub fn own_lines(own: &[Own], width: usize) -> Vec<(Line<'static>, Option<String
             // that has not ended works.
             let run = crate::workflow::view::Live {
                 phase: String::new(),
-                ..run.clone()
+                ..(**run).clone()
             };
             spans = vec![Span::raw(" "), mark("working")];
             spans.extend(run_spans(&run, width, &spans.clone(), None));
@@ -1109,7 +1109,7 @@ mod tests {
             running: true,
             seconds: Some(19),
             group: Group::Working,
-            run: Some(Live {
+            run: Some(Box::new(Live {
                 name: "blind-role-eval-score".into(),
                 phase: "Score".into(),
                 phases: vec![
@@ -1130,7 +1130,7 @@ mod tests {
                     ),
                 ],
                 ..Default::default()
-            }),
+            })),
             ..Default::default()
         };
         assert_eq!(
@@ -1504,7 +1504,7 @@ mod tests {
                 state: "Score · 2 working, 3 finished".into(),
                 maker: "calc.lead".into(),
                 group: Group::Working,
-                run: Some(Live {
+                run: Some(Box::new(Live {
                     name: "blind-role-eval-score".into(),
                     phase: "Score".into(),
                     phases: vec![
@@ -1524,7 +1524,7 @@ mod tests {
                         ),
                     ],
                     ..Default::default()
-                }),
+                })),
                 ..Row::default()
             },
         ];
