@@ -2,7 +2,8 @@
 //! or a picture file the cache does not have yet is drawn by one worker
 //! thread, in the order asked, while the loop goes on taking keys. Where
 //! it goes, a row says it is being drawn; once it is, the window is woken
-//! and every such row whose picture is ready is drawn again in its place.
+//! and every such row whose picture is ready is drawn again in its place,
+//! as is one pushed later from rows held meanwhile.
 //! The same picture asked for again while it is drawn is drawn once.
 use std::{
     collections::{HashMap, HashSet, VecDeque},
@@ -24,14 +25,13 @@ type Draw = Box<dyn FnOnce() -> Result<Drawn, String> + Send>;
 type Redraw = Arc<dyn Fn() -> Vec<Line<'static>> + Send + Sync>;
 
 /// A row standing where a picture goes, by the mark it wears: the picture
-/// it waits for, how to draw its rows again, and when that picture was
-/// ready, once it is.
+/// it waits for, and how to draw its rows again. Kept while the window
+/// is, as rows held anywhere (a call's, a staged message's, a pane gone
+/// back from) may wear its mark long after the picture is ready: one for
+/// each picture ever drawn beside the loop, its source and no more.
 struct Placed {
     key: u64,
     redraw: Redraw,
-    landed: Option<u64>,
-    /// The thread that drew the row: its window's, which lets it go.
-    owner: std::thread::ThreadId,
 }
 
 #[derive(Default)]
@@ -40,13 +40,14 @@ struct State {
     running: HashSet<u64>,
     jobs: VecDeque<(u64, Option<PathBuf>, Draw)>,
     worker: bool,
-    /// What was drawn and no file kept, taken by the next look for it; and
-    /// what could not be drawn, and why.
+    /// What was drawn and no file kept (no folder for pictures, or it
+    /// could not be written), as the folder would have kept it; and what
+    /// could not be drawn, and why, so it is not tried again at each look.
     done: HashMap<u64, Result<Drawn, String>>,
     /// Rows standing for pictures, by the number their mark carries.
     placed: HashMap<u32, Placed>,
     /// That number for each picture with rows standing for it: one of its
-    /// own among those standing, however its key is cut to fit.
+    /// own, however its key is cut to fit.
     ids: HashMap<u64, u32>,
     last_id: u32,
     /// The windows woken as a picture is ready.
@@ -75,16 +76,10 @@ pub fn landed() -> u64 {
     LANDED.load(Ordering::Acquire)
 }
 
-/// What was drawn of `key` and not kept in a file, once; or why it could
-/// not be drawn, which stands, so a picture that cannot be drawn is not
-/// tried again at every look.
+/// What was drawn of `key` and not kept in a file, or why it could not
+/// be drawn.
 pub fn take(key: u64) -> Option<Result<Drawn, String>> {
-    let mut state = state();
-    let state = state.as_mut()?;
-    match state.done.get(&key)? {
-        Err(error) => Some(Err(error.clone())),
-        Ok(_) => state.done.remove(&key),
-    }
+    state().as_ref()?.done.get(&key).cloned()
 }
 
 /// `draw` run beside the loop, kept in `path` once drawn, unless the
@@ -132,10 +127,7 @@ fn work() {
             if !kept {
                 state.done.insert(key, drawn);
             }
-            let landed = LANDED.fetch_add(1, Ordering::AcqRel) + 1;
-            for placed in state.placed.values_mut().filter(|p| p.key == key) {
-                placed.landed = Some(landed);
-            }
+            LANDED.fetch_add(1, Ordering::AcqRel);
             state.wake.retain(|w| w.strong_count() > 0);
             state
                 .wake
@@ -177,19 +169,10 @@ pub fn placeholder(
 ) -> Vec<Line<'static>> {
     let mut state = state();
     let state = state.get_or_insert_with(State::default);
-    // Ready already: the next look draws it.
-    let landed = (!state.running.contains(&key)).then(landed);
     let id = match state.ids.get(&key) {
         Some(id) => *id,
         None => {
-            // The next number no standing row has.
-            let mut id = state.last_id;
-            loop {
-                id = id % 0xFF_FFFF + 1;
-                if !state.placed.contains_key(&id) {
-                    break;
-                }
-            }
+            let id = state.last_id % 0xFF_FFFF + 1;
             state.last_id = id;
             state.ids.insert(key, id);
             id
@@ -200,8 +183,6 @@ pub fn placeholder(
         Placed {
             key,
             redraw: Arc::new(redraw),
-            landed,
-            owner: std::thread::current().id(),
         },
     );
     // The mark first: a row's lead swapped ([`crate::transcript::relead`])
@@ -268,22 +249,6 @@ pub fn fill(rows: &mut Vec<Line<'static>>) -> bool {
     any
 }
 
-/// The rows this thread drew that stood for pictures ready by the count
-/// `seen` let go: its window looked at them since.
-pub fn settle(seen: u64) {
-    let owner = std::thread::current().id();
-    if let Some(state) = state().as_mut() {
-        let ids = &mut state.ids;
-        state.placed.retain(|_, placed| {
-            let kept = placed.owner != owner || placed.landed.is_none_or(|at| at > seen);
-            if !kept {
-                ids.remove(&placed.key);
-            }
-            kept
-        });
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -334,8 +299,10 @@ mod tests {
         go.send(()).unwrap();
         until(|| state().as_ref().is_some_and(|s| !s.running.contains(&key)));
         assert_eq!(runs.load(Ordering::SeqCst), 1);
-        assert!(take(key).is_some_and(|d| d.is_ok_and(|d| d.rows == 2)));
-        assert!(take(key).is_none());
+        // Kept for every look, as a file would keep it.
+        for _ in 0..2 {
+            assert!(take(key).is_some_and(|d| d.is_ok_and(|d| d.rows == 2)));
+        }
     }
 
     #[test]
@@ -368,12 +335,8 @@ mod tests {
         assert!(!fill(&mut rows));
         go.send(()).unwrap();
         until(|| ready(&rows[1]).is_some());
-        let seen = landed();
         assert!(fill(&mut rows));
         assert_eq!(text(&rows), ["above", "│ first", "│ second", "below"]);
-        settle(seen);
-        let state = state();
-        assert!(!state.as_ref().unwrap().ids.contains_key(&key));
     }
 
     #[test]
@@ -435,5 +398,21 @@ mod tests {
             .join()
             .unwrap();
         assert_eq!(drawn, light);
+    }
+
+    #[test]
+    fn rows_held_until_after_their_picture_is_ready_still_take_it() {
+        use crate::screen::Screen;
+        let key = 0xD1A6_0005;
+        start(key, None, Box::new(|| Err("no".into())));
+        // Held elsewhere (a call's rows) while the picture is drawn.
+        let held = placeholder(key, "the picture", || vec![Line::from("  drawn")]);
+        until(|| state().as_ref().is_some_and(|s| !s.running.contains(&key)));
+        let mut screen = Screen::default();
+        screen.push(held);
+        assert!(screen.pushed_waiting());
+        assert!(screen.fill_drawn());
+        assert_eq!(screen.texts(), ["  drawn"]);
+        assert!(!screen.pushed_waiting());
     }
 }

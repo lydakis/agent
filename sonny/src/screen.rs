@@ -293,6 +293,10 @@ pub struct Screen {
     /// Each message's handle and when it was written, by its node: shown
     /// over the message under the mouse.
     dates: HashMap<i64, Stamp>,
+    /// A row standing for a picture was pushed since the last look for
+    /// pictures ready ([`Screen::fill_drawn`]): one held elsewhere a while
+    /// may stand for a picture ready already.
+    pushed_waiting: bool,
 }
 
 /// What the mark over a message says: its handle, `BOT/N`, the number the
@@ -486,6 +490,7 @@ impl Screen {
     }
 
     fn push_line(&mut self, line: Line<'static>) {
+        self.pushed_waiting |= crate::drawing::waits(&line);
         let Some(lead) = crate::transcript::lead(&line).filter(|_| !self.rows.is_empty()) else {
             self.rows.push(Row::new(line));
             return;
@@ -785,6 +790,12 @@ impl Screen {
         true
     }
 
+    /// Whether a row standing for a picture was pushed since the last
+    /// look for pictures ready.
+    pub fn pushed_waiting(&self) -> bool {
+        self.pushed_waiting
+    }
+
     /// Whether a row stands for a picture still being drawn.
     pub fn waits(&self) -> bool {
         self.rows.iter().any(|row| crate::drawing::waits(&row.line))
@@ -796,6 +807,7 @@ impl Screen {
     /// last row is still its last), on all when it marks a run of them.
     /// Whether any was.
     pub fn fill_drawn(&mut self) -> bool {
+        self.pushed_waiting = false;
         let mut any = false;
         let mut at = self.rows.len();
         while at > 0 {

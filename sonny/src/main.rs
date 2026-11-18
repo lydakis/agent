@@ -12231,6 +12231,11 @@ impl App {
     fn drawings(&mut self) -> bool {
         let landed = drawing::landed();
         if landed == self.drawn_seen {
+            // Rows held a while (a call's, a note's) may have come out
+            // standing for a picture ready meanwhile.
+            if self.screen.pushed_waiting() {
+                return self.screen.fill_drawn();
+            }
             return false;
         }
         self.drawn_seen = landed;
@@ -12250,8 +12255,9 @@ impl App {
         if let Some(pane) = &mut self.under {
             pane.drawn();
         }
-        // The margin draws its notes again as pictures land.
-        drawing::settle(landed);
+        // Messages sent and not landed, and the margin's notes, are drawn
+        // again from their words.
+        self.staged_drawn.get_mut().clear();
         true
     }
 
