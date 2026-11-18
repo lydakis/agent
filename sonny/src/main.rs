@@ -18217,11 +18217,8 @@ impl App {
         {
             let live = self.running.as_ref().map(|running| running.turn);
             let width = (pane::margin_room(at.width).saturating_sub(1) as usize).min(measure());
-            // Under the pane's title and the row after it: the margin is
-            // folded to fit, and never scrolls.
-            let height = at.height.saturating_sub(2) as usize;
             self.margin_blanks();
-            let (lines, marks) = self.margin.lines(width, height, &workspace, live);
+            let (lines, marks) = self.margin.lines(width, &workspace, live);
             if let Some(pane) = &mut self.pane {
                 pane.set_margin(lines, marks);
                 if let Some(pin) = self.margin_focus.take() {
@@ -21034,7 +21031,7 @@ mod tests {
         app.margin.apply("c1", &post, None, None, None);
         let shown = |app: &mut App| {
             app.margin.set_blanks(app.blanks.clone());
-            let (lines, _) = app.margin.lines(60, usize::MAX, Path::new("/"), None);
+            let (lines, _) = app.margin.lines(60, Path::new("/"), None);
             (lines.iter().map(|line| line.to_string()))
                 .collect::<Vec<_>>()
                 .join("\n")
@@ -25266,10 +25263,7 @@ mod tests {
         assert_eq!(rows(&app), ["› check on the tasks", "• Done."]);
         // The plan is the margin's still.
         app.fold_notes(true);
-        let margin = app
-            .margin
-            .lines(60, usize::MAX, std::path::Path::new("/"), None)
-            .0;
+        let margin = app.margin.lines(60, std::path::Path::new("/"), None).0;
         let margin: Vec<String> = margin.iter().map(|l| l.to_string()).collect();
         assert!(margin.iter().any(|r| r.contains("Plan  1/3")), "{margin:?}");
         // And never in the conversation, the margin beside it or not.
@@ -33063,10 +33057,7 @@ mod tests {
                 "reply 1"
             ]
         );
-        let margin = app
-            .margin
-            .lines(60, usize::MAX, std::path::Path::new("/"), None)
-            .0;
+        let margin = app.margin.lines(60, std::path::Path::new("/"), None).0;
         let margin: Vec<String> = margin.iter().map(|l| l.to_string()).collect();
         assert!(margin.iter().any(|r| r.contains("Plan  1/3")), "{margin:?}");
         assert!(margin.iter().any(|r| r.contains("→ Fix")));
@@ -33288,10 +33279,7 @@ mod tests {
         let shut = "↳ 1 lookout note · calc.neg · sent 2 to calc.neg, saved a memory, plan 1/3 ▸";
         assert_eq!(texts(&app)[1..], [shut, "• calc.neg is on it."]);
         // The plan it holds is still the margin's.
-        let margin = app
-            .margin
-            .lines(60, usize::MAX, std::path::Path::new("/"), None)
-            .0;
+        let margin = app.margin.lines(60, std::path::Path::new("/"), None).0;
         let margin: Vec<String> = margin.iter().map(|l| l.to_string()).collect();
         assert!(margin.iter().any(|r| r.contains("Plan  1/3")), "{margin:?}");
         // With no margin beside, the newest plan shows in full under it.
