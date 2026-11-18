@@ -49,6 +49,14 @@ def counts(name, run):
     return {}
 
 
+def peak_counts(name, measured_runs):
+    peak = {}
+    for run in measured_runs:
+        for kind, count in counts(name, run).items():
+            peak[kind] = max(peak.get(kind, 0), count)
+    return peak
+
+
 def untold(base, head):
     """Turns no note told by the end of the settle: a lost note is not
     timing noise, so the head telling fewer than every one fails where the
@@ -95,26 +103,31 @@ TIMINGS = {
 }
 
 
-def compare(root):
+def compare(root, benches=TIMINGS):
     """The table's rows, the count rises that fail, and the timing warnings."""
     rows, failed, warned = [], [], []
-    for name, timings in TIMINGS.items():
+    for name in benches:
         base, head = runs(root, name, 'base'), runs(root, name, 'head')
-        if not base or not head:
+        problem_count = len(failed)
+        for side, measured_runs in [('base', base), ('head', head)]:
+            if not measured_runs:
+                failed.append(f'{name}: no measured {side} runs')
+            elif name == 'lifecycle':
+                failures = sum(r.get('status') != 'ok' for r in measured_runs)
+                if failures:
+                    failed.append(f'{name}: {failures} of {len(measured_runs)} {side} runs unsuccessful')
+        if len(failed) > problem_count:
             continue
-        if name == 'lifecycle':
-            base = [r for r in base if r['status'] == 'ok']
-            head = [r for r in head if r['status'] == 'ok']
         if name == 'sonny':
             failed += untold(base, head)
-        before, after = counts(name, base[0]), counts(name, head[0])
+        before, after = peak_counts(name, base), peak_counts(name, head)
         for kind in sorted(set(before) | set(after)):
             was, now = before.get(kind, 0), after.get(kind, 0)
             if now > was:
                 failed.append(f'{name}: {kind} rose from {was} to {now}')
             if now != was:
                 rows.append((name, f'{kind} (count)', was, now, ''))
-        for label, value in timings:
+        for label, value in TIMINGS[name]:
             try:
                 was_all, now_all = [value(r) for r in base], [value(r) for r in head]
             except (KeyError, TypeError):
@@ -141,7 +154,7 @@ def main():
     table += [f'| {b} | {m} | {was} | {now} | {change} |' for b, m, was, now, change in rows]
     text = '\n'.join(['## Daemon and Sonny screen, base against head', '', *table, ''])
     if failed:
-        text += '\nStore work per turn rose; record why in docs/DAEMON_MEASUREMENTS.md:\n'
+        text += '\nPerformance screen failures:\n'
         text += ''.join(f'- {line}\n' for line in failed)
     print(text)
     if os.environ.get('GITHUB_STEP_SUMMARY'):
