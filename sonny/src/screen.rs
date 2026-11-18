@@ -3636,7 +3636,11 @@ mod tests {
         let y = (0..5)
             .find(|y| row(&buf, *y).trim_end() == "row 13 Needle")
             .unwrap();
-        assert_eq!(buf[(7, y)].bg, Color::Yellow);
+        if crate::look::no_color() {
+            assert!(buf[(7, y)].modifier.contains(Modifier::REVERSED));
+        } else {
+            assert_eq!(buf[(7, y)].bg, Color::Yellow);
+        }
         // Typing on looks from where the view is.
         screen.find("needle");
         assert_eq!(screen.found(), Some((2, 3)));
