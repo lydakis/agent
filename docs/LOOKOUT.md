@@ -199,10 +199,12 @@ tells, and the count outlasts a lookout restart. A follow also ends
 with its bot: deleting a bot ends every follow it held, and one
 that watched only bots by exact name, every one of them deleted now, and
 no source, ends too. Closing a bot (`close_agent`, or the `close`
-request) ends every follow it held but those that follow only the
-commons, so it can still take part in a thread it posted in; the daemon's
-`closed` event says when. A closed bot still is, and is sent work again
-by a message, so another's follow that watches it stays. Each end is a
+request) ends every follow it held but those that outlive a close
+(`outlives_close`, which Sonny writes on what posting in a commons thread
+subscribes, so a closed bot can still take part there); the daemon's
+`closed` event says when, and a lookout that was away reads it from the
+listing's `closed_ms`. A closed bot still is, and is sent work again by
+a message, so another's follow that watches it stays. Each end is a
 line in the lookout's log with why.
 
 ```

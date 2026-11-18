@@ -1019,6 +1019,10 @@ impl Service {
         if complete && self.unheld(listed_at) {
             self.subscribers = subs::all(&self.store).into_iter().collect();
         }
+        // And bots closed while it was away, or before it first watched.
+        if self.closed_unheard() {
+            self.subscribers = subs::all(&self.store).into_iter().collect();
+        }
         self.read_at.clear();
         subs::take(&mut self.read_at, &revisions, epoch_ms());
         subs::took(&self.store, &self.read_at);
@@ -1179,7 +1183,7 @@ impl Service {
                     if news
                         && event["event"] == "closed"
                         && let Some(name) = event["bot"].as_str()
-                        && self.closed(name)
+                        && self.closed(name, None)
                     {
                         self.reread();
                     }
@@ -1710,21 +1714,37 @@ impl Service {
     }
 
     /// A bot was closed: the subscriptions it held end, but those that
-    /// follow only the commons, so it can still take part in a thread it
-    /// posted in. Another's that watch it stay: it can be sent work again.
-    /// Whether any ended.
-    fn closed(&self, name: &str) -> bool {
+    /// outlive a close. Another's that watch it stay: it can be sent work
+    /// again. With `at`, when it was closed, as a listing says: a file
+    /// written since is left. Whether any ended.
+    fn closed(&self, name: &str, at: Option<std::time::SystemTime>) -> bool {
         if !self.subscribers.contains_key(name) {
             return false;
         }
         let id = (self.records.get(name)).and_then(|record| record["bot_id"].as_i64());
-        let ended = subs::closed(&self.store, name, id);
+        let ended = subs::closed(&self.store, name, id, at);
         let any = ended.as_ref().is_ok_and(|n| *n > 0) || ended.is_err();
         if any {
             self.write(
-                &json!({"at_ms": epoch_ms(), "lead": name, "ended": "all but the commons",
+                &json!({"at_ms": epoch_ms(), "lead": name, "ended": "all but what outlives a close",
                 "why": "its subscriber was closed", "error": ended.err()}),
             );
+        }
+        any
+    }
+
+    /// Subscribers the listing shows closed, as after closes the lookout
+    /// was away for: what they held ends, as for one it hears closed.
+    /// Whether any did.
+    fn closed_unheard(&self) -> bool {
+        let mut any = false;
+        for name in self.subscribers.keys() {
+            let Some(at) = (self.records.get(name)).and_then(|bot| bot["closed_ms"].as_u64())
+            else {
+                continue;
+            };
+            let at = std::time::UNIX_EPOCH + Duration::from_millis(at);
+            any |= self.closed(name, Some(at));
         }
         any
     }
@@ -3751,6 +3771,7 @@ mod tests {
             until: None,
             runs: None,
             made: None,
+            outlives_close: false,
         }
     }
 
@@ -5366,7 +5387,8 @@ mod tests {
             2,
             json!({"name": "both", "sources": ["ci", "commons:t2"]}),
         );
-        add("shop.fix", 2, subs::Sub::commons("t1", Some(2)).to_json());
+        // As posting in a commons thread subscribes it.
+        subs::ensure(&store, "shop.fix", subs::Sub::commons("t1", Some(2))).unwrap();
         add(
             "shop.fix",
             2,
@@ -5382,20 +5404,35 @@ mod tests {
         let mut service = service(store.clone(), &[lead, fix]);
         service.log = dir.join("state.sqlite.lookout.jsonl");
         service.subscribers = subs::all(&store).into_iter().collect();
-        assert!(service.closed("shop.fix"));
+        assert!(service.closed("shop.fix", None));
         let names = |subscriber: &str| -> Vec<String> {
             (subs::read(&store, subscriber).into_iter())
                 .map(|s| s.name)
                 .collect()
         };
-        assert_eq!(names("shop.fix"), ["commons.t1", "threads"]);
+        // What posting in a thread subscribed outlives it; a follow of the
+        // commons it added itself does not.
+        assert_eq!(names("shop.fix"), ["commons.t1"]);
         // It still is, and may be sent work again: who watches it still does.
         assert_eq!(names("shop.lead"), ["fix"]);
         // Closed again, nothing more ends.
         service.subscribers = subs::all(&store).into_iter().collect();
-        assert!(!service.closed("shop.fix"));
+        assert!(!service.closed("shop.fix", None));
         // One with no follows of its own ends nothing.
-        assert!(!service.closed("shop.docs"));
+        assert!(!service.closed("shop.docs", None));
+        // Closed while the lookout was away: the listing says when. One
+        // whose file was written since, opened again, keeps it.
+        add("shop.lead", 1, json!({"name": "ci", "sources": ["ci"]}));
+        service.subscribers = subs::all(&store).into_iter().collect();
+        let closed_ms = |ms: u64| json!({"name": "shop.lead", "bot_id": 1, "closed_ms": ms});
+        service.records.insert("shop.lead".into(), closed_ms(1_000));
+        assert!(!service.closed_unheard());
+        assert_eq!(names("shop.lead"), ["fix", "ci"]);
+        service
+            .records
+            .insert("shop.lead".into(), closed_ms(epoch_ms() as u64 + 5_000));
+        assert!(service.closed_unheard());
+        assert!(names("shop.lead").is_empty());
         let log = std::fs::read_to_string(&service.log).unwrap();
         assert!(log.contains("its subscriber was closed"), "{log}");
         let _ = std::fs::remove_dir_all(&dir);

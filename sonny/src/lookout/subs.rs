@@ -42,6 +42,10 @@ pub struct Sub {
     /// the epoch: its notes are counted under it, so one removed and
     /// added again under the name starts afresh.
     pub made: Option<u64>,
+    /// Whether it lasts while its bot is closed, as what posting in a
+    /// commons thread subscribes does: a closed bot still is, and can
+    /// still take part there. Sonny sets it; a `follows` add cannot.
+    pub outlives_close: bool,
 }
 
 impl Sub {
@@ -66,12 +70,13 @@ impl Sub {
             until: None,
             runs: None,
             made: None,
+            outlives_close: false,
         }
     }
 
     /// What posting in a commons thread subscribes an agent to: the
     /// thread's new posts, as the commons source tells them, for the bot
-    /// of that ID.
+    /// of that ID, which hears them while it is closed too.
     pub fn commons(thread: &str, owner: Option<i64>) -> Sub {
         Sub {
             name: format!("{COMMONS_SOURCE}.{thread}"),
@@ -85,16 +90,8 @@ impl Sub {
             until: None,
             runs: None,
             made: None,
+            outlives_close: true,
         }
-    }
-
-    /// Whether it follows the commons and nothing else: a thread's posts,
-    /// as posting in one subscribes, or the commons heard otherwise.
-    pub fn commons_only(&self) -> bool {
-        self.tasks_of.is_empty()
-            && self.agents.is_empty()
-            && !self.sources.is_empty()
-            && (self.sources.iter()).all(|name| super::sources::named(name).0 == COMMONS_SOURCE)
     }
 
     /// Which subscription it is, for its counts: all it says, and the
@@ -160,6 +157,9 @@ impl Sub {
         if let Some(made) = self.made {
             out["made"] = json!(made);
         }
+        if self.outlives_close {
+            out["outlives_close"] = json!(true);
+        }
         out
     }
 
@@ -223,6 +223,7 @@ impl Sub {
                 .map(str::to_owned),
             runs: value["runs"].as_u64().map(|n| n.max(1)),
             made: value["made"].as_u64(),
+            outlives_close: value["outlives_close"] == true,
         })
     }
 
@@ -291,6 +292,37 @@ pub fn agents_files(store: &Path) {
     });
 }
 
+/// What posting in a commons thread subscribed outlives a close (0.10.2):
+/// one written before is marked so.
+pub const COMMONS_OUTLIVE_CLOSE: &str = "lookout-commons-outlive-close";
+
+/// Each subscription posting in a commons thread wrote, as
+/// [`Sub::commons`] writes it, marked `outlives_close`, once for the store.
+pub fn commons_outlive_close(store: &Path) {
+    let mut record = store.as_os_str().to_owned();
+    record.push(".migrated");
+    crate::upgrade::once(Path::new(&record), COMMONS_OUTLIVE_CLOSE, || {
+        files_changed(store, |sub| {
+            let (Some(name), Some(sources)) = (sub["name"].as_str(), sub["sources"].as_array())
+            else {
+                return false;
+            };
+            let Some(thread) = name.strip_prefix(&format!("{COMMONS_SOURCE}.")) else {
+                return false;
+            };
+            let posted = sources.len() == 1
+                && sources[0] == json!(format!("{COMMONS_SOURCE}:{thread}"))
+                && sub.get("agents").is_none()
+                && sub.get("tasks_of").is_none();
+            if posted && sub["outlives_close"] != true {
+                sub["outlives_close"] = json!(true);
+                return true;
+            }
+            false
+        })
+    });
+}
+
 /// Goals are gone (0.9.0): what the lookout kept of them goes with them.
 pub const GOALS_GONE: &str = "lookout-goals-gone";
 
@@ -312,6 +344,21 @@ pub fn goals_gone(store: &Path) {
 /// Every subscription file beside `store` with each subscription's `from`
 /// named `to`: whether each that had one was written.
 fn files_renamed(store: &Path, from: &str, to: &str) -> bool {
+    files_changed(store, |sub| match sub.as_object_mut() {
+        Some(object) => match object.remove(from) {
+            Some(value) => {
+                object.insert(to.into(), value);
+                true
+            }
+            None => false,
+        },
+        None => false,
+    })
+}
+
+/// Every subscription file beside `store` with `change` made to each of
+/// its subscriptions, written when it changed one: whether each was.
+fn files_changed(store: &Path, change: impl Fn(&mut Value) -> bool) -> bool {
     let Ok(entries) = std::fs::read_dir(dir(store)) else {
         return true;
     };
@@ -333,12 +380,7 @@ fn files_renamed(store: &Path, from: &str, to: &str) -> bool {
         };
         let mut moved = false;
         for sub in (value["subscriptions"].as_array_mut().into_iter()).flatten() {
-            if let Some(object) = sub.as_object_mut()
-                && let Some(value) = object.remove(from)
-            {
-                object.insert(to.into(), value);
-                moved = true;
-            }
+            moved |= change(sub);
         }
         if moved {
             let partial = path.with_extension(format!("json.{}.partial", std::process::id()));
@@ -962,11 +1004,22 @@ pub fn forget(store: &Path, subscriber: &str, id: Option<i64>) -> Result<usize, 
 }
 
 /// End the subscriptions the closed bot of `id` held as `subscriber`, as
-/// `forget` does when it is deleted, but for those that follow only the
-/// commons: a closed bot still is, and still takes part in the commons
-/// threads it posted in. How many ended.
-pub fn closed(store: &Path, subscriber: &str, id: Option<i64>) -> Result<usize, String> {
-    end_held(store, subscriber, id, Sub::commons_only)
+/// `forget` does when it is deleted, but for those that outlive a close.
+/// With `at`, when it was closed, a file written since is left as it is:
+/// the bot opened again and may have written it. How many ended.
+pub fn closed(
+    store: &Path,
+    subscriber: &str,
+    id: Option<i64>,
+    at: Option<std::time::SystemTime>,
+) -> Result<usize, String> {
+    if let Some(at) = at {
+        let written = std::fs::metadata(file(store, subscriber)).and_then(|m| m.modified());
+        if written.is_ok_and(|written| written >= at) {
+            return Ok(0);
+        }
+    }
+    end_held(store, subscriber, id, |sub| sub.outlives_close)
 }
 
 /// End what the bot of `id` held as `subscriber`, but what `keep` keeps
@@ -1600,6 +1653,7 @@ fn parse(value: &Value) -> Result<Sub, String> {
         until,
         runs,
         made: None,
+        outlives_close: false,
     };
     if sub.tasks_of.is_empty() && sub.agents.is_empty() && sub.sources.is_empty() {
         return Err("a follow watches tasks_of an agent, agents by name or sources".into());
@@ -1648,6 +1702,38 @@ mod tests {
         assert_eq!(now[1].sources, ["ci"]);
         let text = std::fs::read_to_string(&path).unwrap();
         assert!(!text.contains("bots"), "{text}");
+        let _ = std::fs::remove_dir_all(dir(&store));
+        let mut record = store.as_os_str().to_owned();
+        record.push(".migrated");
+        let _ = std::fs::remove_file(record);
+    }
+
+    #[test]
+    fn what_posting_in_the_commons_subscribed_outlives_a_close_once_marked() {
+        let store = std::env::temp_dir().join(format!("sonny-outlive-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(dir(&store));
+        std::fs::create_dir_all(dir(&store)).unwrap();
+        let path = file(&store, "shop.fix");
+        let old = json!({"subscriptions": [
+            {"name": "commons.t1", "sources": ["commons:t1"], "bot_id": 2},
+            {"name": "commons.t2", "sources": ["commons:t2", "ci"], "bot_id": 2},
+            {"name": "threads", "sources": ["commons"], "bot_id": 2},
+            {"name": "ci", "sources": ["ci"], "bot_id": 2}]});
+        std::fs::write(&path, old.to_string()).unwrap();
+        commons_outlive_close(&store);
+        let kept: Vec<String> = (read(&store, "shop.fix").into_iter())
+            .filter(|sub| sub.outlives_close)
+            .map(|sub| sub.name)
+            .collect();
+        assert_eq!(kept, ["commons.t1"]);
+        // As posting writes it now.
+        assert!(
+            Sub::from_json(&Sub::commons("t3", Some(2)).to_json())
+                .unwrap()
+                .outlives_close
+        );
+        assert_eq!(closed(&store, "shop.fix", Some(2), None), Ok(3));
+        assert_eq!(read(&store, "shop.fix").len(), 1);
         let _ = std::fs::remove_dir_all(dir(&store));
         let mut record = store.as_os_str().to_owned();
         record.push(".migrated");

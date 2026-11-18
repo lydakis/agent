@@ -370,11 +370,12 @@ class LookoutTests(ModelFixture):
         folder = self.path / 'state.sqlite.lookout'
         folder.mkdir(exist_ok=True)
         subs = [{'name': 'deploys', 'agents': ['ops.*']},
-                {'name': 'commons.t1', 'sources': ['commons:t1']}]
+                {'name': 'commons.t1', 'sources': ['commons:t1'], 'outlives_close': True}]
         (folder / 'reviewer.json').write_text(json.dumps({'subscriptions': subs}))
         self.start()
         time.sleep(1)
         # The person closes it, as a bot closes one it made: it still is.
+        # What posting in a commons thread subscribed outlives it.
         self.assertTrue(self.daemon.request('close', bot='reviewer')['result']['was_open'])
         deadline = time.monotonic() + 20
         while True:
