@@ -10826,7 +10826,7 @@ does less.
 The hot-path screen, two alternating rounds (`bench/perf_gate.py`), where
 bots have short instructions and nothing should move:
 
-| Screen | Row | Main | Change | Change |
+| Screen | Row | Main | Head | Change |
 | --- | --- | ---: | ---: | ---: |
 | `bench.admission_burst` | Lone submit CPU | 32.275 ms | 33.797 ms | +4.7% |
 | `bench.admission_burst` | Burst submit p99 | 4.220 ms | 4.087 ms | -3.1% |
