@@ -171,7 +171,42 @@ pub fn theme() -> Theme {
 }
 
 pub fn light() -> bool {
+    if let Some(drawn) = AS_ASKED.get() {
+        return drawn.light;
+    }
     SEEN.light()
+}
+
+/// What a picture is drawn for: the terminal as it was when the picture
+/// was asked for, so one drawn later, beside the loop, is drawn as its
+/// cache key says, whatever changed meanwhile.
+#[derive(Clone, Copy, Debug)]
+pub struct Drawn {
+    light: bool,
+    cell: (u32, u32),
+    size: Option<Size>,
+}
+
+thread_local! {
+    static AS_ASKED: std::cell::Cell<Option<Drawn>> = const { std::cell::Cell::new(None) };
+}
+
+/// The terminal as pictures are drawn for now.
+pub fn drawn() -> Drawn {
+    Drawn {
+        light: light(),
+        cell: cell(),
+        size: size().ok(),
+    }
+}
+
+/// `draw` run with [`light`], [`cell`] and [`size`] answering as they did
+/// when `drawn` was taken.
+pub fn drawn_as<T>(drawn: Drawn, draw: impl FnOnce() -> T) -> T {
+    let was = AS_ASKED.replace(Some(drawn));
+    let out = draw();
+    AS_ASKED.set(was);
+    out
 }
 
 /// Whether the theme changed since asked: its background between light
@@ -191,11 +226,19 @@ pub fn heard(reply: &str) {
 /// Whether images can be drawn: Kitty graphics answered OK, or rows are
 /// being counted ([`measuring`]).
 pub fn graphics() -> bool {
-    measured() || PROBE.get().is_some_and(|p| p.graphics)
+    measured() || PROBE.get().is_some_and(|p| p.graphics) || cfg!(test) && DRAWS.get()
 }
 
 thread_local! {
     static MEASURING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// A test's window that draws pictures, as Kitty's does.
+    static DRAWS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// This thread drawn for as a terminal that draws pictures, until `false`.
+#[cfg(test)]
+pub fn draws_pictures(draws: bool) {
+    DRAWS.set(draws);
 }
 
 /// `count` run as a terminal that draws pictures lays rows out, its cells
@@ -218,6 +261,9 @@ pub fn measured() -> bool {
 /// not laid out yet, and the real size once it has); 8×16 while rows are
 /// counted.
 pub fn cell() -> (u32, u32) {
+    if let Some(drawn) = AS_ASKED.get() {
+        return drawn.cell;
+    }
     if measured() {
         return (8, 16);
     }
@@ -381,6 +427,11 @@ static STALE: LazyLock<Option<Arc<AtomicBool>>> = LazyLock::new(|| {
 /// changed: crossterm opens /dev/tty for each read, and a frame took the
 /// size five times, ten frames a second, in every window.
 pub fn size() -> std::io::Result<Size> {
+    if let Some(drawn) = AS_ASKED.get() {
+        return drawn
+            .size
+            .ok_or_else(|| std::io::Error::other("no size when asked"));
+    }
     let mut kept = KEPT.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     // Taken before the read, so a resize during it is read next time.
     let stale = STALE

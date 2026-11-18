@@ -4086,6 +4086,8 @@ dependencies = [
  "agent-client",
  "anyhow",
  "base64 0.23.1",
+ "crossterm",
+ "futures-core",
  "image",
  "jsonschema",
  "libc",

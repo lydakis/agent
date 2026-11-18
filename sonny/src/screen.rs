@@ -293,6 +293,10 @@ pub struct Screen {
     /// Each message's handle and when it was written, by its node: shown
     /// over the message under the mouse.
     dates: HashMap<i64, Stamp>,
+    /// A row standing for a picture was pushed since the last look for
+    /// pictures ready ([`Screen::fill_drawn`]): one held elsewhere a while
+    /// may stand for a picture ready already.
+    pushed_waiting: bool,
 }
 
 /// What the mark over a message says: its handle, `BOT/N`, the number the
@@ -498,6 +502,7 @@ impl Screen {
     }
 
     fn push_line(&mut self, line: Line<'static>) {
+        self.pushed_waiting |= crate::drawing::waits(&line);
         let Some(lead) = crate::transcript::lead(&line).filter(|_| !self.rows.is_empty()) else {
             self.rows.push(Row::new(line));
             return;
@@ -795,6 +800,66 @@ impl Screen {
         self.grow_page(first, grown);
         self.relay(first, shown);
         true
+    }
+
+    /// Whether a row standing for a picture was pushed since the last
+    /// look for pictures ready.
+    pub fn pushed_waiting(&self) -> bool {
+        self.pushed_waiting
+    }
+
+    /// Whether a row stands for a picture still being drawn.
+    pub fn waits(&self) -> bool {
+        self.rows.iter().any(|row| crate::drawing::waits(&row.line))
+    }
+
+    /// Each row that stood for a picture now drawn swapped for its rows:
+    /// the first keeps what the row was besides its text, all its bar,
+    /// and its tag goes on the last when it marks one row (a message's
+    /// last row is still its last), on all when it marks a run of them.
+    /// Whether any was.
+    pub fn fill_drawn(&mut self) -> bool {
+        self.pushed_waiting = false;
+        let mut any = false;
+        let mut at = self.rows.len();
+        while at > 0 {
+            at -= 1;
+            if !crate::drawing::waits(&self.rows[at].line) {
+                continue;
+            }
+            let Some(lines) = crate::drawing::ready(&self.rows[at].line) else {
+                continue;
+            };
+            any = true;
+            let shown = self.shown_at(at);
+            let old = &self.rows[at];
+            let (tag, bar) = (old.tag, old.bar);
+            let mut fresh: Vec<Row> = lines.into_iter().map(Row::new).collect();
+            for row in &mut fresh {
+                row.bar = bar;
+            }
+            if let Some(first) = fresh.first_mut() {
+                first.rest = old.rest.clone();
+                first.link = old.link.clone();
+                first.buttons = old.buttons.clone();
+                (first.opens, first.over, first.written) = (old.opens, old.over, old.written);
+            }
+            // A tag that marks one row (a message's last) goes on the
+            // last; one over rows (a group, an open fold) on every row.
+            match tag {
+                Some(Tag::End(_) | Tag::Streamed(_) | Tag::Eyes) => {
+                    if let Some(last) = fresh.last_mut() {
+                        last.tag = tag;
+                    }
+                }
+                _ => fresh.iter_mut().for_each(|row| row.tag = tag),
+            }
+            let grown = fresh.len() as isize - 1;
+            self.rows.splice(at..at + 1, fresh);
+            self.grow_page(at, grown);
+            self.relay(at, shown);
+        }
+        any
     }
 
     /// The page of older items the row `row` is in, if any, `by` rows

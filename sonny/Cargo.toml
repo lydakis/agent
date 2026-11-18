@@ -29,6 +29,11 @@ reqwest = { version = "0.13.4", default-features = false, features = ["rustls", 
 # Scroll regions write history rows without padding them to the width, so
 # a pane that narrows later does not re-wrap them.
 ratatui = { version = "0.30", features = ["scrolling-regions"] }
+# The window reads keys as Codex's TUI does: crossterm's event stream, whose
+# reader blocks until the terminal says something and is woken to end, so
+# an idle window never wakes to look for keys.
+crossterm = { version = "0.29", default-features = false, features = ["event-stream"] }
+futures-core = "0.3"
 # Syntax colors for code, as bat draws them: syntect with bat's own
 # syntaxes and themes, read with Oniguruma as bat reads them: about three
 # times faster than the pure-Rust regex engine on code-heavy history.
