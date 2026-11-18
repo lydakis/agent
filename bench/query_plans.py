@@ -93,8 +93,11 @@ def main():
         if statement in seen:
             continue
         seen.add(statement)
-        numbered = [int(n) for n in re.findall(r'\?(\d+)', statement)]
-        count = max(numbered) if numbered else statement.count('?')
+        # As SQLite numbers them: `?N` is N, a bare `?` one past the
+        # largest so far.
+        count = 0
+        for number in re.findall(r'\?(\d*)', statement):
+            count = max(count, int(number)) if number else count + 1
         try:
             rows = conn.execute('EXPLAIN QUERY PLAN ' + statement, tuple([1] * count)).fetchall()
         except sqlite3.Error as error:
