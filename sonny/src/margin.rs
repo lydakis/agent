@@ -932,10 +932,10 @@ pub struct Blanks {
     pub notes: Arc<Vec<(String, String, Body)>>,
 }
 
-/// What a margin's rows were drawn from: its width and height, the
-/// running turn, the terminal's light, how many times its notes and files
-/// changed, and the folder its files are read from.
-type Drawn = (usize, usize, Option<i64>, bool, u64, PathBuf);
+/// What a margin's rows were drawn from: its width, the running turn,
+/// the terminal's light, how many times its notes and files changed, and
+/// the folder its files are read from.
+type Drawn = (usize, Option<i64>, bool, u64, PathBuf);
 
 /// The rows a margin's notes draw, with their marks.
 type Rows = (Vec<Line<'static>>, Vec<(usize, Mark)>);
@@ -1296,23 +1296,16 @@ impl Margin {
         })();
     }
 
-    /// The margin's notes as rows `width` wide, folded to fit in
-    /// `height` ([`fit`]), files read from `workspace`, those the running
+    /// The margin's notes as rows `width` wide, every note whole up to the
+    /// most a note draws, files read from `workspace`, those the running
     /// turn `live` changes marked so: each note's first row tagged with
     /// its pin and carrying its buttons, ↑ back to where it was put and ×
     /// to take it away. The rows last drawn while nothing they show
     /// changed.
-    pub fn lines(
-        &mut self,
-        width: usize,
-        height: usize,
-        workspace: &Path,
-        live: Option<i64>,
-    ) -> Rows {
+    pub fn lines(&mut self, width: usize, workspace: &Path, live: Option<i64>) -> Rows {
         self.freshen(workspace);
         let from = (
             width,
-            height,
             live,
             crate::term::light(),
             self.changes,
@@ -1323,7 +1316,7 @@ impl Margin {
         {
             return rows.clone();
         }
-        let rows = self.draw(width, height, workspace, live);
+        let rows = self.draw(width, workspace, live);
         self.drawn = Some((from, rows.clone()));
         rows
     }
@@ -1530,7 +1523,7 @@ impl Margin {
         Some(whole)
     }
 
-    fn draw(&mut self, width: usize, height: usize, workspace: &Path, live: Option<i64>) -> Rows {
+    fn draw(&mut self, width: usize, workspace: &Path, live: Option<i64>) -> Rows {
         let mut lines = Vec::new();
         let mut marks = Vec::new();
         if !self.plan.is_empty() {
@@ -1562,19 +1555,6 @@ impl Margin {
                 );
             }
             return (lines, marks);
-        }
-        // The plan folded to leave a row for every note's title, so what
-        // waits on the person is never behind it.
-        let titles = person.len() + self.kept.notes.len();
-        let room = height.saturating_sub(titles);
-        if lines.len() > room {
-            let keep = room.saturating_sub(1);
-            let more = lines.len() - keep;
-            lines.truncate(keep);
-            marks.retain(|(at, _)| *at < keep);
-            if room > 0 {
-                lines.push(Line::from(format!("{BODY}… {more} more lines of the plan")).dim());
-            }
         }
         // The person's own, over the agent's: theirs to change in their
         // config, so no buttons, and given rows as a note they keep beside
@@ -1618,44 +1598,18 @@ impl Margin {
             let whole = self.whole(&note.id, width, workspace).unwrap_or_default();
             blocks.push((note.kind, head, marked, whole));
         }
-        let wanted: Vec<(Kind, usize)> = (blocks.iter())
-            .map(|(kind, .., whole)| (*kind, whole.wanted()))
-            .collect();
-        let (gaps, given) = fit(height.saturating_sub(lines.len()), &wanted);
-        let mut heads = Vec::new();
-        for ((_, head, marked, whole), given) in blocks.into_iter().zip(given) {
-            if gaps {
-                lines.push(Line::default());
-            }
+        // Every note whole up to the most a note draws, however many rows
+        // they take together: the pane scrolls.
+        for (_, head, marked, whole) in blocks {
+            lines.push(Line::default());
             let at = lines.len();
-            heads.push(at);
             lines.push(head);
             marks.extend(marked.into_iter().map(|mark| (at, mark)));
-            let most = match given < whole.wanted() {
-                // Short of room: its fold row is one of the rows given.
-                true => given.saturating_sub(1),
-                false => whole.most,
-            };
-            if given == 0 {
-                continue;
-            }
-            let (rows, opens) = fold(whole.rows, whole.unread, most, whole.opens);
+            let (rows, opens) = fold(whole.rows, whole.unread, whole.most, whole.opens);
             if let Some(url) = opens {
                 marks.push((lines.len() + rows.len() - 1, Mark::Link(url)));
             }
             lines.extend(rows);
-        }
-        // Too short even for every title: the margin never scrolls, so
-        // its last row says how many more there are.
-        if lines.len() > height {
-            let keep = height.saturating_sub(1);
-            let more = heads.iter().filter(|at| **at >= keep).count();
-            lines.truncate(keep);
-            marks.retain(|(at, _)| *at < keep);
-            if height > 0 {
-                let notes = if more == 1 { "note" } else { "notes" };
-                lines.push(Line::from(format!("{BODY}… {more} more {notes}")).dim());
-            }
         }
         (lines, marks)
     }
@@ -1853,17 +1807,6 @@ struct Whole {
     opens: Option<String>,
 }
 
-impl Whole {
-    /// The rows it is drawn in with room to spare: all of them, or its
-    /// most and its fold row.
-    fn wanted(&self) -> usize {
-        match self.rows.len() > self.most || self.unread > 0 {
-            true => self.most + 1,
-            false => self.rows.len(),
-        }
-    }
-}
-
 /// `rows` cut at `most`, then a muted row saying how many more there are,
 /// `unread` lines of a file among them, and, when `opens` names what shows
 /// it whole, that enter opens it; with what it opens, when cut.
@@ -1884,26 +1827,6 @@ fn fold(
     };
     rows.push(Line::from(format!("{BODY}… {more} more lines{tail}")).dim());
     (rows, opens)
-}
-
-/// The body rows each note is given in `room` rows, `wanted` saying each
-/// one's kind and the rows it would take, in the order they are drawn;
-/// and whether a blank row goes over each. Every note keeps its title,
-/// then the blank rows go in, then rows go to what waits on the person,
-/// then to what they follow, then to what they keep, so a margin always
-/// fits in one look.
-fn fit(room: usize, wanted: &[(Kind, usize)]) -> (bool, Vec<usize>) {
-    let titles = wanted.len();
-    let gaps = room >= 2 * titles;
-    let mut left = room.saturating_sub(if gaps { 2 * titles } else { titles });
-    let mut given = vec![0; titles];
-    for kind in [Kind::Waits, Kind::Follows, Kind::Pinned] {
-        for (at, (_, rows)) in (wanted.iter().enumerate()).filter(|(_, (k, _))| *k == kind) {
-            given[at] = (*rows).min(left);
-            left -= given[at];
-        }
-    }
-    (gaps, given)
 }
 
 /// What the agent is told when the person takes its note `id` away,
@@ -1974,7 +1897,7 @@ mod tests {
 
     /// The rows drawn, as text.
     fn drawn(margin: &mut Margin, folder: &Path) -> String {
-        let (lines, _) = margin.lines(60, usize::MAX, folder, None);
+        let (lines, _) = margin.lines(60, folder, None);
         (lines.iter())
             .map(|line| {
                 line.spans
@@ -2212,7 +2135,7 @@ mod tests {
     fn the_plan_is_drawn_in_glyphs_one_column_wide_everywhere() {
         let mut margin = margin();
         margin.set_plan(&["[x] Run the tests".to_owned(), "[ ] Push".to_owned()]);
-        let (lines, _) = margin.lines(60, usize::MAX, Path::new("/"), None);
+        let (lines, _) = margin.lines(60, Path::new("/"), None);
         // Each cell is one character: a glyph Unicode counts as two while
         // terminals draw it as one leaves a stale letter beside it.
         for line in &lines {
@@ -2731,7 +2654,7 @@ mod tests {
             let post = json!({"kind": "pinned", "id": format!("n{n}"), "markdown": long});
             margin.apply(&format!("c{n}"), &post, None, None, None);
         }
-        let (lines, marks) = margin.lines(60, usize::MAX, Path::new("."), None);
+        let (lines, marks) = margin.lines(60, Path::new("."), None);
         // Under what a screen keeps, each note cut short and saying so.
         assert!(lines.len() < 12_500, "{}", lines.len());
         let heads = marks.iter().filter(|(_, m)| matches!(m, Mark::Tag(_)));
@@ -2803,7 +2726,7 @@ mod tests {
         let post = json!({"kind": "waits", "id": "pr", "markdown": "Merge #12."});
         margin.apply("c1", &post, None, None, Some(1_000));
         let written = |margin: &mut Margin| {
-            let (_, marks) = margin.lines(40, usize::MAX, Path::new("/"), None);
+            let (_, marks) = margin.lines(40, Path::new("/"), None);
             (marks.into_iter()).find_map(|(_, mark)| match mark {
                 Mark::Written(ms) => Some(ms),
                 _ => None,
@@ -2833,7 +2756,7 @@ mod tests {
             Some(2),
             None,
         );
-        let (lines, _) = margin.lines(40, usize::MAX, Path::new("/"), Some(2));
+        let (lines, _) = margin.lines(40, Path::new("/"), Some(2));
         // Put there in this turn is not live; changed in it is.
         assert!(!lines[1].to_string().contains("live"));
         margin.apply(
@@ -2843,7 +2766,7 @@ mod tests {
             Some(2),
             None,
         );
-        let (lines, marks) = margin.lines(40, usize::MAX, Path::new("/"), Some(2));
+        let (lines, marks) = margin.lines(40, Path::new("/"), Some(2));
         let head = lines[1].to_string();
         assert!(head.starts_with(" ✎ Repro live"), "{head}");
         assert!(head.ends_with("↑  ×"), "{head}");
@@ -2881,7 +2804,7 @@ mod tests {
             "opens": "shop.wire"});
         margin.apply("c1", &post, None, None, None);
         let buttons = |margin: &mut Margin| {
-            let (lines, marks) = margin.lines(40, usize::MAX, Path::new("/"), None);
+            let (lines, marks) = margin.lines(40, Path::new("/"), None);
             let buttons = marks.into_iter().find_map(|(_, m)| match m {
                 Mark::Buttons(buttons) => Some(buttons),
                 _ => None,
@@ -2964,7 +2887,7 @@ mod tests {
             None,
         );
         let text = |margin: &mut Margin| {
-            let (lines, _) = margin.lines(60, usize::MAX, &dir, None);
+            let (lines, _) = margin.lines(60, &dir, None);
             lines
                 .iter()
                 .map(|l| l.to_string())
@@ -3004,7 +2927,7 @@ mod tests {
         let mut margin = margin();
         let post = json!({"kind": "pinned", "id": "f", "title": "F", "file": "a.py"});
         margin.apply("c1", &post, None, None, None);
-        let (lines, _) = margin.lines(60, usize::MAX, &dir, None);
+        let (lines, _) = margin.lines(60, &dir, None);
         let text: Vec<String> = lines.iter().map(|l| l.to_string()).collect();
         assert!(text.iter().any(|l| l.contains("```html")), "{text:?}");
         assert!(text.iter().any(|l| l.contains("<b>x</b>")), "{text:?}");
@@ -3023,10 +2946,10 @@ mod tests {
             None,
         );
         let workspace = Path::new("/");
-        margin.lines(40, usize::MAX, workspace, None);
+        margin.lines(40, workspace, None);
         let drawn = margin.changes;
         let kept = margin.drawn.clone().map(|(from, _)| from);
-        margin.lines(40, usize::MAX, workspace, None);
+        margin.lines(40, workspace, None);
         assert_eq!(margin.drawn.clone().map(|(from, _)| from), kept);
         assert_eq!(margin.changes, drawn);
         margin.apply(
@@ -3036,15 +2959,15 @@ mod tests {
             Some(1),
             None,
         );
-        let (lines, _) = margin.lines(40, usize::MAX, workspace, None);
+        let (lines, _) = margin.lines(40, workspace, None);
         assert!(lines.iter().any(|line| line.to_string().contains('y')));
-        let (wider, _) = margin.lines(60, usize::MAX, workspace, None);
+        let (wider, _) = margin.lines(60, workspace, None);
         assert_eq!(wider[1].width(), 60);
     }
 
-    /// The rows drawn, as text, `height` tall.
-    fn shown(margin: &mut Margin, height: usize, folder: &Path) -> Vec<String> {
-        let (lines, _) = margin.lines(60, height, folder, None);
+    /// The rows drawn, as text.
+    fn shown(margin: &mut Margin, folder: &Path) -> Vec<String> {
+        let (lines, _) = margin.lines(60, folder, None);
         lines.iter().map(|line| line.to_string()).collect()
     }
 
@@ -3099,7 +3022,7 @@ mod tests {
             text: text(30).join("\n"),
         };
         margin.resolved("flow", "Flow", read, Some(dir.join("there")));
-        let (lines, marks) = margin.lines(60, usize::MAX, &dir, None);
+        let (lines, marks) = margin.lines(60, &dir, None);
         let rows: Vec<String> = lines.iter().map(|line| line.to_string()).collect();
         let at = |text: &str| rows.iter().position(|row| row.trim() == text);
         // The first rows up to the most, then one muted row saying how
@@ -3197,7 +3120,7 @@ mod tests {
     }
 
     #[test]
-    fn a_margin_taller_than_its_pane_folds_in_kind_order_and_never_scrolls() {
+    fn a_margin_draws_every_note_whole_in_kind_order_and_scrolls() {
         set_limits(6, 6);
         let mut margin = margin();
         let list = |name: &str| {
@@ -3216,45 +3139,23 @@ mod tests {
             assert!(margin.refusal(&post).is_none(), "{post}");
             margin.apply(call, &post, None, None, None);
         }
-        let folder = Path::new("/");
-        let rows = shown(&mut margin, 16, folder);
-        assert!(rows.len() <= 16, "{rows:#?}");
+        let rows = shown(&mut margin, Path::new("/"));
         let title = |id: &str| {
             rows.iter()
                 .position(|row| row.starts_with(&format!(" ✎ {id} ")))
                 .unwrap()
         };
         assert!(title("review") < title("ci") && title("ci") < title("keep"));
-        // Rows go to what waits first, then what is followed; what is kept
-        // keeps its title.
-        assert!((1..=6).all(|i| rows.contains(&format!("     - review {i}"))));
-        assert!(
-            rows.contains(&"     - ci 3".to_owned()) && !rows.contains(&"     - ci 4".to_owned())
-        );
-        assert!(
-            rows.contains(&"     … 3 more lines".to_owned()),
-            "{rows:#?}"
-        );
-        assert!(!rows.iter().any(|row| row.contains("- keep")));
-        // Tall enough, every note is whole.
-        let rows = shown(&mut margin, 40, folder);
-        assert!(
-            rows.iter().all(|row| !row.contains("more lines")),
-            "{rows:#?}"
-        );
-        assert!(rows.contains(&"     - keep 6".to_owned()));
-        // Too short even for the titles: still one look, saying how many
-        // more there are.
-        let rows = shown(&mut margin, 3, folder);
-        assert_eq!(rows.len(), 3, "{rows:#?}");
-        assert!(rows[2].starts_with(" ✎ keep "), "{rows:#?}");
-        let rows = shown(&mut margin, 2, folder);
-        assert_eq!(rows.len(), 2, "{rows:#?}");
-        assert_eq!(rows[1], "     … 2 more notes");
-        // As the pane takes them: never more than it holds, so nothing in
-        // it scrolls.
-        let (lines, marks) = margin.lines(60, 9, folder, None);
-        assert!(lines.len() <= 9 && marks.iter().all(|(at, _)| *at < 9));
+        // Every note whole, however many rows they take together: the
+        // pane scrolls, nothing folds to fit it.
+        for id in ["review", "ci", "keep"] {
+            assert!(
+                (1..=6).all(|i| rows.contains(&format!("     - {id} {i}"))),
+                "{rows:#?}"
+            );
+        }
+        assert!(!rows.iter().any(|row| row.contains(" more ")), "{rows:#?}");
+        assert_eq!(rows.len(), 3 * (1 + 1 + 6), "{rows:#?}");
     }
 
     #[test]
@@ -3275,7 +3176,7 @@ mod tests {
         let post = json!({"id": "n", "kind": "follows", "live": true,
             "markdown": "{% for i in range(20) %}- row {{ i }}\n{% endfor %}"});
         margin.apply("c1", &post, None, None, None);
-        let rows = shown(&mut margin, usize::MAX, Path::new("/"));
+        let rows = shown(&mut margin, Path::new("/"));
         assert!(
             rows.contains(&"     - row 5".to_owned()) && !rows.contains(&"     - row 6".to_owned()),
             "{rows:#?}"
@@ -3287,35 +3188,27 @@ mod tests {
     }
 
     #[test]
-    fn a_long_plan_folds_to_leave_every_note_its_title() {
+    fn a_long_plan_is_drawn_whole_over_the_notes() {
         set_limits(6, 6);
         let mut margin = margin();
-        let steps: Vec<String> = (1..=12).map(|i| format!("[ ] step {i}")).collect();
+        let steps: Vec<String> = (1..=40).map(|i| format!("[ ] step {i}")).collect();
         margin.set_plan(&steps);
         for (call, id, kind) in [("c1", "review", "waits"), ("c2", "keep", "pinned")] {
             let post = json!({"id": id, "kind": kind, "title": id, "markdown": "- one"});
             margin.apply(call, &post, None, None, None);
         }
-        let rows = shown(&mut margin, 8, Path::new("/"));
-        assert_eq!(rows.len(), 8, "{rows:#?}");
+        let rows = shown(&mut margin, Path::new("/"));
+        assert!(rows.iter().any(|row| row.contains("step 40")), "{rows:#?}");
+        assert!(
+            !rows.iter().any(|row| row.contains("of the plan")),
+            "{rows:#?}"
+        );
         assert!(
             rows.iter().any(|row| row.starts_with(" ✎ review ")),
             "{rows:#?}"
         );
         assert!(
             rows.iter().any(|row| row.starts_with(" ✎ keep ")),
-            "{rows:#?}"
-        );
-        assert!(
-            rows.iter()
-                .any(|row| row.contains("more lines of the plan")),
-            "{rows:#?}"
-        );
-        // With room, the plan is whole.
-        let rows = shown(&mut margin, 40, Path::new("/"));
-        assert!(rows.iter().any(|row| row.contains("step 12")), "{rows:#?}");
-        assert!(
-            !rows.iter().any(|row| row.contains("of the plan")),
             "{rows:#?}"
         );
     }
@@ -3338,13 +3231,13 @@ mod tests {
         let post = json!({"id": "n", "kind": "follows", "live": true, "markdown": template});
         margin.apply("c1", &post, None, None, None);
         let folder = Path::new("/");
-        let rows = shown(&mut margin, usize::MAX, folder);
+        let rows = shown(&mut margin, folder);
         assert!(rows.contains(&"     - t0".to_owned()), "{rows:#?}");
         assert!(!rows.iter().any(|row| row.contains('⟨')), "{rows:#?}");
         margin.blanks.tasks = tasks(8);
         margin.blanks.tasks_read += 1;
         later(&mut margin);
-        let rows = shown(&mut margin, usize::MAX, folder);
+        let rows = shown(&mut margin, folder);
         // What it filled to before, folded, and why it stopped, kept.
         let failed = rows
             .iter()
