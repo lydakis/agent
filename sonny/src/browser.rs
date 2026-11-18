@@ -2279,7 +2279,7 @@ async fn drive(
             }
         },
     };
-    let launch = Launch {
+    let mut launch = Launch {
         confirm: confirm.clone(),
         profile: profile.map(str::to_owned),
         cdp,
@@ -2303,6 +2303,27 @@ async fn drive(
     for (n, (line, command)) in lines.iter().zip(&checked).enumerate() {
         if lines.len() > 1 {
             text.push_str(&format!("$ {line}\n"));
+        }
+        // After its `close`, a session opens again in the link's Chrome as
+        // it is now: started again if that close was its last tab's.
+        if let (true, Browser::Shared { link, profile }) = (closed, &browser) {
+            match link_browser(link, profile, &session).await {
+                Ok(cdp) => {
+                    launch.cdp = Some(cdp);
+                    *policy = Some(format!("{confirm}\0{browser:?}\0{:?}", launch.cdp));
+                    closed = false;
+                }
+                Err(e) => {
+                    text.push_str(&e);
+                    text.push('\n');
+                    failed = true;
+                    let left = lines.len() - n - 1;
+                    if left > 0 {
+                        text.push_str(&format!("(stopped: {left} more not run)\n"));
+                    }
+                    break;
+                }
+            }
         }
         let asks = command.ask
             || (command.subaction.as_deref())
@@ -2346,6 +2367,11 @@ async fn drive(
         }
         if ran_it {
             closed = verb == Some("close") && ran.ok;
+            // Its tab in a link's Chrome is given back: the Chrome closes
+            // once no session has one.
+            if let (true, Browser::Shared { link, .. }) = (closed, &browser) {
+                link_closed(link, &session).await;
+            }
         }
         let (mut said, ok) = (ran.said, ran.ok);
         if reach.carry {
@@ -2440,9 +2466,6 @@ async fn drive(
     }
     if let Some(step) = allowed {
         steps.ran(step, failed).await;
-    }
-    if let (true, Browser::Shared { link, .. }) = (closed, &browser) {
-        link_closed(link, &session).await;
     }
     let text = text.trim_end().to_owned();
     if parts.is_empty() {
