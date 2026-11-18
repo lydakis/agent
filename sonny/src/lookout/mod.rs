@@ -1178,12 +1178,16 @@ impl Service {
                             }
                         }
                     }
-                    // Closed, it still is: what it held ends but its
-                    // commons follows, and only as news, as for a delete.
+                    // Closed, it still is: what it held ends but what
+                    // outlives a close, only as news, as for a delete. A
+                    // close the replay tells ends it only if the listing
+                    // shows it closed still: one a turn opened again since
+                    // keeps what it holds now.
                     if news
                         && event["event"] == "closed"
                         && let Some(name) = event["bot"].as_str()
-                        && self.closed(name, event["data"]["closed_ms"].as_u64())
+                        && (live || self.listed_closed(name))
+                        && self.closed(name)
                     {
                         self.reread();
                     }
@@ -1715,15 +1719,13 @@ impl Service {
 
     /// A bot was closed: the subscriptions it held end, but those that
     /// outlive a close. Another's that watch it stay: it can be sent work
-    /// again. With `at`, when it was closed in milliseconds, as its event or a listing
-    /// says: a file written since, the bot opened again, is left. Whether
-    /// any ended.
-    fn closed(&self, name: &str, at: Option<u64>) -> bool {
+    /// again. Whether any ended.
+    fn closed(&self, name: &str) -> bool {
         if !self.subscribers.contains_key(name) {
             return false;
         }
         let id = (self.records.get(name)).and_then(|record| record["bot_id"].as_i64());
-        let ended = subs::closed(&self.store, name, id, at);
+        let ended = subs::closed(&self.store, name, id);
         let any = ended.as_ref().is_ok_and(|n| *n > 0) || ended.is_err();
         if any {
             self.write(
@@ -1740,13 +1742,17 @@ impl Service {
     fn closed_unheard(&self) -> bool {
         let mut any = false;
         for name in self.subscribers.keys() {
-            let Some(at) = (self.records.get(name)).and_then(|bot| bot["closed_ms"].as_u64())
-            else {
-                continue;
-            };
-            any |= self.closed(name, Some(at));
+            if self.listed_closed(name) {
+                any |= self.closed(name);
+            }
         }
         any
+    }
+
+    /// Whether the listing shows `name` closed: none of its turns has
+    /// started since it was.
+    fn listed_closed(&self, name: &str) -> bool {
+        (self.records.get(name)).is_some_and(|bot| !bot["closed_ms"].is_null())
     }
 
     /// Whether `event` ends a call of Sonny's that wrote files the lookout
@@ -5520,10 +5526,10 @@ mod tests {
         let mut service = service(store.clone(), &[lead, fix]);
         service.log = dir.join("state.sqlite.lookout.jsonl");
         service.subscribers = subs::all(&store).into_iter().collect();
-        // A close from before its file was last written, heard late after
-        // the bot opened again and followed more, ends nothing.
-        assert!(!service.closed("shop.fix", Some(1_000)));
-        assert!(service.closed("shop.fix", None));
+        // A close the replay tells, of a bot the listing shows open, a
+        // turn having opened it again since, is not its to end.
+        assert!(!service.listed_closed("shop.fix"));
+        assert!(service.closed("shop.fix"));
         let names = |subscriber: &str| -> Vec<String> {
             (subs::read(&store, subscriber).into_iter())
                 .map(|s| s.name)
@@ -5536,20 +5542,19 @@ mod tests {
         assert_eq!(names("shop.lead"), ["fix"]);
         // Closed again, nothing more ends.
         service.subscribers = subs::all(&store).into_iter().collect();
-        assert!(!service.closed("shop.fix", None));
+        assert!(!service.closed("shop.fix"));
         // One with no follows of its own ends nothing.
-        assert!(!service.closed("shop.docs", None));
-        // Closed while the lookout was away: the listing says when. One
-        // whose file was written since, opened again, keeps it.
-        add("shop.lead", 1, json!({"name": "ci", "sources": ["ci"]}));
+        assert!(!service.closed("shop.docs"));
+        // Closed while the lookout was away, or before it first watched:
+        // the listing shows it closed still.
         service.subscribers = subs::all(&store).into_iter().collect();
-        let closed_ms = |ms: u64| json!({"name": "shop.lead", "bot_id": 1, "closed_ms": ms});
-        service.records.insert("shop.lead".into(), closed_ms(1_000));
         assert!(!service.closed_unheard());
-        assert_eq!(names("shop.lead"), ["fix", "ci"]);
-        service
-            .records
-            .insert("shop.lead".into(), closed_ms(epoch_ms() as u64 + 5_000));
+        assert_eq!(names("shop.lead"), ["fix"]);
+        (service.records).insert(
+            "shop.lead".into(),
+            json!({"name": "shop.lead", "bot_id": 1, "closed_ms": 1_000}),
+        );
+        assert!(service.listed_closed("shop.lead"));
         assert!(service.closed_unheard());
         assert!(names("shop.lead").is_empty());
         let log = std::fs::read_to_string(&service.log).unwrap();
