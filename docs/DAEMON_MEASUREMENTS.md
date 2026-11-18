@@ -11370,8 +11370,7 @@ reads as Codex's TUI does, through crossterm's event stream: its reader
 blocks until the terminal says something, and the window letting go of it
 wakes the read to end it.
 
-Measured with `bench/ends.py` from the step-writes change, plus a wakeups
-column: the times any thread of the window's processes was put on a CPU
+Measured with `bench/ends.py` and its wakeups column (added here): the times any thread of the window's processes was put on a CPU
 (the third field of each thread's `schedstat`), per second. One daemon
 binary for every build, 4-CPU Linux. "Before" is the key-loop change (#1166)
 this builds on; "current thread" is this change with the window's runtime on
@@ -11385,6 +11384,22 @@ Low end: one idle window on a folder of 10 agents.
 | this change | 48 ms | 6.6 | 0.05% | 26.1 MiB | 0.35 ms | 1.14 ms | 47.8 ms |
 | this change, again | 41 ms | 6.7 | 0.05% | 26.1 MiB | 0.41 ms | 1.20 ms | 47.6 ms |
 | current thread | 45 ms | 4.0 | 0.05% | 25.5 MiB | 0.37 ms | 1.21 ms | 44.6 ms |
+
+Again against the key-loop change at 15e5b6d (main merged in, its 3 s
+reads applied at the look round rather than waking the window), with
+`bench/ends.py`'s own wakeups column, each build twice:
+
+| Build | Idle window wakeups/s | Idle window CPU | Idle window RSS | Key p99 | Turn p50 |
+|---|---:|---:|---:|---:|---:|
+| before | 26.6, 26.5 | 0.15%, 0.15% | 26.1 MiB | 1.08, 3.53 ms | 47.8, 46.0 ms |
+| this change | 6.6, 6.7 | 0.05%, 0.05% | 25.7, 26.0 MiB | 1.58, 1.08 ms | 47.7, 47.5 ms |
+
+And 200 windows in one project under the high end's load, against 15e5b6d:
+
+| Build | Windows wakeups/s | Windows CPU | Windows RSS | Daemon CPU | Key p50 | Key p99 | Key max | Pauses over 100 ms | Turns in 20 s |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| before | 16,867 | 65.9% | 11,910 MiB | 174% | 1.46 ms | 6.5 ms | 7.4 ms | 0 | 7,636 |
+| this change | 13,203 | 61.5% | 11,866 MiB | 177% | 1.52 ms | 6.6 ms | 8.0 ms | 0 | 7,792 |
 
 What an idle window still wakes for, from `strace` over 10 s: its look
 round once a second (its clocks, the reactions and config files it reads),
