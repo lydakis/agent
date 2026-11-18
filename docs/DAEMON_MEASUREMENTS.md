@@ -11270,5 +11270,5 @@ turn are 6.001 on both sides in every footprint run, and the gate passed.
 | footprint | RSS after a turn each, MiB | 57.826 | 57.41 | -0.7% |
 | footprint | CPU per turn, ms | 0.729 | 0.725 | -0.5% |
 
-The two p99 rises are under the gate's 15% and within run-to-run noise
-for these screens: none of them sends the client writes this change moves.
+The two p99 rises are under the gate's 15% warning line. None of these
+screens sends the client writes this change moves.
