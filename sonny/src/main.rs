@@ -2139,6 +2139,16 @@ fn reopen(bot: &str) -> Vec<String> {
     command
 }
 
+// As Codex's binaries: jemalloc in the static Linux builds, where musl's
+// allocator takes one lock for every thread.
+#[cfg(all(
+    target_os = "linux",
+    target_env = "musl",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+#[global_allocator]
+static ALLOCATOR: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
 // Two threads, so the daemon's events are read while a picture is drawn:
 // a reader that stops is dropped by the daemon as lagging.
 fn main() -> std::process::ExitCode {

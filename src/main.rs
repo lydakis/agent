@@ -18,6 +18,18 @@ const SANDBOX_FAILED: i32 = 125;
 #[global_allocator]
 static ALLOC: dhat::Alloc = dhat::Alloc;
 
+// As Codex's binaries: jemalloc in the static Linux builds, where musl's
+// allocator takes one lock for every thread. A heap profile counts with
+// dhat's allocator instead.
+#[cfg(all(
+    not(feature = "heap-profile"),
+    target_os = "linux",
+    target_env = "musl",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+#[global_allocator]
+static ALLOCATOR: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
 fn main() {
     // The profile is written when the profiler drops, so it must outlive
     // `run` and be dropped before the process exits.
