@@ -2237,7 +2237,7 @@ class RuntimeTests(ModelFixture):
             text = poll(client, bot, turn)['result']['text']
             lifted = json.loads(text.removeprefix('seen:'))
             self.assertEqual(lifted, {'handle': lifted['handle'], 'background': True,
-                                      'steered': True, 'waits_for': 'approval'}, bot)
+                                      'steered': True, 'waits_for': 'approval', 'holder': 'person'}, bot)
             # The request outlives the turn; its verdict runs the call and
             # tells the bot how it ended.
             client.request('answer', bot=bot, turn=turn, call_id='echo-1', request=1,
