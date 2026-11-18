@@ -65,12 +65,6 @@ pub enum Ask<'a> {
     Defers,
 }
 
-impl Waiter {
-    fn is(&self, other: &Waiter) -> bool {
-        self.bot == other.bot && self.turn == other.turn
-    }
-}
-
 /// An in-process caller's place in a ramp's queue. A caller dropped while
 /// it waits gives its place up, and any place kept for it goes on.
 struct Queued<'a> {
@@ -224,10 +218,12 @@ struct Ramp {
     /// Answers counted toward the next call of growth past the threshold.
     credit: u32,
     /// Turns parked on the full window, in the order they came.
-    queued: std::collections::VecDeque<Waiter>,
+    queued: Line<Waiter>,
     /// Turns woken for a place, which the window keeps for each until it
-    /// comes back or `PROMISE` passes.
-    promised: Vec<(String, i64, Instant)>,
+    /// comes back or `PROMISE` passes. Each is kept for `PROMISE` from when
+    /// it was woken, read under the state's lock, so the oldest lapses
+    /// first.
+    promised: Line<Kept>,
 }
 impl Ramp {
     fn new(generation: u64) -> Self {
@@ -237,37 +233,38 @@ impl Ramp {
             threshold: None,
             flying: 0,
             credit: 0,
-            queued: Default::default(),
-            promised: Vec::new(),
+            queued: Line::default(),
+            promised: Line::default(),
         }
     }
     fn full(&self) -> bool {
         self.flying + self.promised.len() as u32 >= self.window
     }
     fn promised_to(&self, waiter: Option<&Waiter>) -> bool {
-        waiter.is_some_and(|w| {
-            self.promised
-                .iter()
-                .any(|(bot, turn, _)| *bot == w.bot && *turn == w.turn)
-        })
+        waiter.is_some_and(|w| self.promised.has(&w.bot, w.turn))
     }
     /// Drop a caller's place in the queue and any place kept for it.
     fn forget(&mut self, bot: &str, turn: i64) {
-        self.queued.retain(|w| !(w.bot == bot && w.turn == turn));
-        self.promised.retain(|(b, t, _)| !(b == bot && *t == turn));
+        self.queued.remove(bot, turn);
+        self.promised.remove(bot, turn);
     }
     /// Wake parked turns, oldest first, for the places the window has free,
     /// and have the run loop look again when the places kept for them
     /// lapse, so one that never comes back does not hold its place.
     fn wake(&mut self, now: Instant, pace: &Weak<Pace>) {
-        self.promised.retain(|(_, _, until)| *until > now);
+        while self.promised.first().is_some_and(|kept| kept.until <= now) {
+            self.promised.pop();
+        }
         let mut last = None;
         while !self.full() {
-            let Some(waiter) = self.queued.pop_front() else {
+            let Some(waiter) = self.queued.pop() else {
                 break;
             };
-            self.promised
-                .push((waiter.bot.clone(), waiter.turn, now + PROMISE));
+            let kept = Kept {
+                bot: waiter.bot.clone(),
+                until: now + PROMISE,
+            };
+            self.promised.push(waiter.turn, kept);
             (waiter.wake)(Woken::Turn(waiter.bot.clone(), waiter.turn));
             last = Some(waiter.wake);
         }
@@ -276,6 +273,143 @@ impl Ramp {
         }
     }
 }
+
+/// A place a ramp keeps for a woken turn, until it comes back or `until`.
+struct Kept {
+    bot: String,
+    until: Instant,
+}
+
+/// What a line holds for a turn: the turn's bot, so a place is found by
+/// bot and turn as a waiter is.
+trait OfBot {
+    fn bot(&self) -> &str;
+}
+impl OfBot for Waiter {
+    fn bot(&self) -> &str {
+        &self.bot
+    }
+}
+impl OfBot for Kept {
+    fn bot(&self) -> &str {
+        &self.bot
+    }
+}
+
+/// Turns in the order they came, each found by its turn without a scan,
+/// however many a 429 storm parks at once. A turn's id is its message's,
+/// unique across bots; an in-process caller's is a negative one of its
+/// pool's own. A turn that leaves leaves its entry in the order where it
+/// stands, passed over when the line reaches it, so leaving costs nothing
+/// however long the line; once the passed-over entries outnumber the live
+/// ones, the order is tidied in one sweep, as the step line is. An empty
+/// line allocates nothing, so a pool that never ramps pays nothing.
+struct Line<T> {
+    order: std::collections::VecDeque<(i64, u64)>,
+    live: TurnIndex<(u64, T)>,
+    serial: u64,
+    /// Entries of `order` visited, for the test that holds the work per
+    /// turn constant however long the line.
+    #[cfg(test)]
+    visited: u64,
+}
+impl<T> Default for Line<T> {
+    fn default() -> Self {
+        Self {
+            order: Default::default(),
+            live: HashMap::default(),
+            serial: 0,
+            #[cfg(test)]
+            visited: 0,
+        }
+    }
+}
+impl<T: OfBot> Line<T> {
+    fn len(&self) -> usize {
+        self.live.len()
+    }
+    fn has(&self, bot: &str, turn: i64) -> bool {
+        self.live.get(&turn).is_some_and(|(_, t)| t.bot() == bot)
+    }
+    /// Add a turn at the back; one already in the line moves there.
+    fn push(&mut self, turn: i64, value: T) {
+        self.serial += 1;
+        self.order.push_back((turn, self.serial));
+        if self.live.insert(turn, (self.serial, value)).is_some() {
+            self.tidy();
+        }
+    }
+    fn remove(&mut self, bot: &str, turn: i64) -> Option<T> {
+        if !self.has(bot, turn) {
+            return None;
+        }
+        let (_, value) = self.live.remove(&turn)?;
+        self.tidy();
+        Some(value)
+    }
+    /// Sweep out passed-over entries once they outnumber the live ones.
+    fn tidy(&mut self) {
+        if self.order.len() > 2 * self.live.len() + 64 {
+            #[cfg(test)]
+            {
+                self.visited += self.order.len() as u64;
+            }
+            let live = &self.live;
+            self.order
+                .retain(|(turn, serial)| live.get(turn).is_some_and(|(s, _)| s == serial));
+        }
+    }
+    /// Pass over the entries of turns that left, up to the first live one.
+    fn skip_left(&mut self) {
+        while let Some(&(turn, serial)) = self.order.front() {
+            #[cfg(test)]
+            {
+                self.visited += 1;
+            }
+            if self.live.get(&turn).is_some_and(|(s, _)| *s == serial) {
+                return;
+            }
+            self.order.pop_front();
+        }
+    }
+    fn first(&mut self) -> Option<&T> {
+        self.skip_left();
+        let &(turn, _) = self.order.front()?;
+        self.live.get(&turn).map(|(_, value)| value)
+    }
+    fn pop(&mut self) -> Option<T> {
+        self.skip_left();
+        let (turn, _) = self.order.pop_front()?;
+        self.live.remove(&turn).map(|(_, value)| value)
+    }
+    /// Every turn still in the line, oldest first.
+    fn drain(mut self) -> impl Iterator<Item = T> {
+        std::iter::from_fn(move || self.pop())
+    }
+}
+
+/// A line's index hashes turn ids, which the daemon hands out itself, so
+/// one multiply spreads them: half the work of the standard hasher at
+/// every length of line, measured on a storm of 10 to 10,000 turns.
+#[derive(Default)]
+struct TurnHasher(u64);
+impl std::hash::Hasher for TurnHasher {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+    fn write(&mut self, bytes: &[u8]) {
+        for &byte in bytes {
+            self.write_u64(u64::from(byte));
+        }
+    }
+    fn write_u64(&mut self, n: u64) {
+        self.0 = (self.0.rotate_left(5) ^ n).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    }
+    fn write_i64(&mut self, n: i64) {
+        self.write_u64(n as u64);
+    }
+}
+type TurnIndex<T> = HashMap<i64, T, std::hash::BuildHasherDefault<TurnHasher>>;
 
 /// How long a woken turn's place is kept for it to come back.
 const PROMISE: Duration = Duration::from_secs(5);
@@ -848,8 +982,8 @@ impl Pace {
                                     }
                                 };
                                 let ramp = state.ramp.as_mut().unwrap();
-                                if !ramp.queued.iter().any(|w| w.is(&waiter)) {
-                                    ramp.queued.push_back(waiter);
+                                if !ramp.queued.has(&waiter.bot, waiter.turn) {
+                                    ramp.queued.push(waiter.turn, waiter);
                                 }
                                 match &queued.ticket {
                                     Some((_, notify)) => {
@@ -1040,7 +1174,7 @@ impl Pace {
                 false => ramp.wake(Instant::now(), &self.this),
                 // Every turn still parked on it goes now.
                 true => {
-                    for waiter in state.ramp.take().into_iter().flat_map(|r| r.queued) {
+                    for waiter in state.ramp.take().into_iter().flat_map(|r| r.queued.drain()) {
                         (waiter.wake)(Woken::Turn(waiter.bot, waiter.turn));
                     }
                 }
@@ -2549,6 +2683,124 @@ mod tests {
         let n = 8_000;
         let grew = crate::doubling::outgrows(|twice| drain(if twice { 2 * n } else { n }));
         assert_eq!(grew, None, "{n} parked calls, then twice as many");
+    }
+
+    /// A 429 storm parks thousands of turns on a full ramp at once, and
+    /// many come back or give up before a place frees. Each costs the line
+    /// the same however many are in it: twice the turns take twice the
+    /// work, and the entries visited stay a few per turn, while the line
+    /// keeps them in the order they came.
+    #[test]
+    fn a_storm_parked_on_a_full_ramp_costs_each_turn_the_same_however_many() {
+        let storm = |turns: i64| {
+            let woken = Arc::new(Mutex::new(Vec::new()));
+            let wake: Wake = {
+                let woken = woken.clone();
+                Arc::new(move |w| {
+                    if let Woken::Turn(_, turn) = w {
+                        woken.lock().unwrap().push(turn)
+                    }
+                })
+            };
+            let now = Instant::now();
+            let pace = Weak::new();
+            let mut ramp = Ramp::new(1);
+            ramp.flying = 1;
+            let started = std::time::Instant::now();
+            // Every turn parks, then comes back before it is woken.
+            for _ in 0..2 {
+                for turn in 1..=turns {
+                    let waiter = Waiter {
+                        bot: format!("bot{turn}"),
+                        turn,
+                        wake: wake.clone(),
+                    };
+                    if !ramp.queued.has(&waiter.bot, waiter.turn) {
+                        ramp.queued.push(waiter.turn, waiter);
+                    }
+                }
+            }
+            // A third give up (callers that cannot park, dropped).
+            for turn in (3..=turns).step_by(3) {
+                ramp.forget(&format!("bot{turn}"), turn);
+            }
+            // Places free one at a time; each woken turn comes back and
+            // flies.
+            ramp.flying = 0;
+            loop {
+                ramp.wake(now, &pace);
+                let Some(&turn) = woken.lock().unwrap().last() else {
+                    break;
+                };
+                if !ramp.promised_to(Some(&Waiter {
+                    bot: format!("bot{turn}"),
+                    turn,
+                    wake: wake.clone(),
+                })) {
+                    break;
+                }
+                ramp.forget(&format!("bot{turn}"), turn);
+            }
+            let elapsed = started.elapsed();
+            let order = woken.lock().unwrap().clone();
+            let visited = ramp.queued.visited + ramp.promised.visited;
+            (elapsed, order, visited)
+        };
+        let turns = 20_000;
+        let (_, order, visited) = storm(turns);
+        let expected: Vec<i64> = (1..=turns).filter(|turn| turn % 3 != 0).collect();
+        assert_eq!(order, expected, "woken out of the order they came");
+        assert!(
+            visited <= 4 * turns as u64,
+            "{visited} entries visited for {turns} turns"
+        );
+        let grew =
+            crate::doubling::outgrows(|twice| storm(if twice { 2 * turns } else { turns }).0);
+        assert_eq!(grew, None, "{turns} turns, then twice as many");
+    }
+
+    /// The same storm through the pool itself: every turn parks once on
+    /// the full ramp however often it asks, and goes in the order it came.
+    #[tokio::test(start_paused = true)]
+    async fn a_storm_of_turns_on_a_full_ramp_goes_in_the_order_it_came() {
+        let pace = Pace::default();
+        let woken = Arc::new(Mutex::new(Vec::new()));
+        let wake: Wake = {
+            let woken = woken.clone();
+            Arc::new(move |w| {
+                if let Woken::Turn(_, turn) = w {
+                    woken.lock().unwrap().push(turn)
+                }
+            })
+        };
+        let waiter = |turn: i64| Waiter {
+            bot: format!("bot{turn}"),
+            turn,
+            wake: wake.clone(),
+        };
+        pace.limited(None);
+        tokio::time::advance(Duration::from_secs(2)).await;
+        let mut flying = ask(&pace, None).await.0.unwrap();
+        let turns = 5_000;
+        for _ in 0..2 {
+            for turn in 1..=turns {
+                let (call, park_for) = ask(&pace, Some(&waiter(turn))).await;
+                assert_eq!(call.err().unwrap().code, "provider_paced");
+                assert_eq!(park_for, Some(RAMP_PARK));
+            }
+        }
+        // Each settle frees one place, kept for the oldest parked turn,
+        // which comes back for it.
+        for turn in 1..=turns {
+            drop(flying);
+            assert_eq!(woken.lock().unwrap().last(), Some(&turn));
+            flying = ask(&pace, Some(&waiter(turn))).await.0.unwrap();
+        }
+        assert_eq!(*woken.lock().unwrap(), (1..=turns).collect::<Vec<_>>());
+        drop(flying);
+        let state = pace.state.lock().unwrap();
+        let ramp = state.ramp.as_ref().unwrap();
+        assert_eq!((ramp.queued.len(), ramp.promised.len()), (0, 0));
     }
 
     #[test]

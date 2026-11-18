@@ -3164,40 +3164,25 @@ impl Lookout {
     }
 
     /// What waits to be told, and when each source was last told, as its
-    /// file should hold it: none waiting, no file.
-    fn kept(&self) -> Option<(PathBuf, Option<Vec<u8>>)> {
+    /// file should hold it: none waiting, no file. Taken on the loop as
+    /// clones (an event's fields are shared, not copied) and encoded by
+    /// the writer, which never encodes one a newer body replaced.
+    fn kept(&self) -> Option<(PathBuf, held::Body)> {
         let path = self.held.clone()?;
-        // A task's event keeps its place in the daemon's stream, so one
-        // read again after a restart is still told before it.
-        let json = |heard: &sources::Heard| {
-            let mut kept = heard.event.to_json();
-            if heard.order > 0 {
-                kept["order"] = json!(heard.order);
-            }
-            // One a digest let go still goes without waiting another.
-            if heard.due {
-                kept["due"] = json!(true);
-            }
-            kept
+        let sending: Vec<sources::Heard> = match &self.sending {
+            Some((sent, ..)) => sent.clone(),
+            None => self.resend.clone(),
         };
-        let sending: Vec<Value> = match &self.sending {
-            Some((sent, ..)) => sent.iter().map(json).collect(),
-            None => self.resend.iter().map(json).collect(),
-        };
-        let events: Vec<Value> = self.heard.iter().map(json).collect();
-        let told_subs = &self.told_subs;
-        // What the note under way says was not kept stays with it, so the
-        // note sent again says the same.
         let (unkept, unkept_sending) = (&self.unkept, &self.unkept_sent);
-        if events.is_empty()
+        if self.heard.is_empty()
             && unkept.count == 0
             && unkept_sending.count == 0
             && sending.is_empty()
             && self.told_sources.is_empty()
-            && told_subs.is_empty()
+            && self.told_subs.is_empty()
             && self.runs_told.is_empty()
         {
-            return Some((path, None));
+            return Some((path, held::Body::Gone));
         }
         let (now, epoch) = (Instant::now(), epoch_ms());
         let at_ms = |times: &HashMap<String, Instant>| -> serde_json::Map<String, Value> {
@@ -3208,23 +3193,50 @@ impl Lookout {
                 })
                 .collect()
         };
-        let mut body = json!({"bot_id": self.lead_id, "sending": sending,
-            "events": events, "told": at_ms(&self.told_sources)});
-        // Only when a subscription's own digest told something, so a file
-        // reads as it did before there were any.
-        if !told_subs.is_empty() {
-            body["told_subs"] = json!(at_ms(told_subs));
-        }
-        if !self.runs_told.is_empty() {
-            body["runs_told"] = json!(self.runs_told);
-        }
-        if unkept.count > 0 {
-            body["unkept"] = unkept.to_json();
-        }
-        if unkept_sending.count > 0 {
-            body["unkept_sending"] = unkept_sending.to_json();
-        }
-        Some((path, Some(body.to_string().into_bytes())))
+        let (told, told_subs) = (at_ms(&self.told_sources), at_ms(&self.told_subs));
+        let (lead_id, events) = (self.lead_id, self.heard.clone());
+        let runs_told = (!self.runs_told.is_empty()).then(|| json!(self.runs_told));
+        let unkept = (unkept.count > 0).then(|| unkept.to_json());
+        let unkept_sending = (unkept_sending.count > 0).then(|| unkept_sending.to_json());
+        Some((
+            path,
+            held::Body::later(move || {
+                // A task's event keeps its place in the daemon's stream, so
+                // one read again after a restart is still told before it.
+                let json = |heard: &sources::Heard| {
+                    let mut kept = heard.event.to_json();
+                    if heard.order > 0 {
+                        kept["order"] = json!(heard.order);
+                    }
+                    // One a digest let go still goes without waiting another.
+                    if heard.due {
+                        kept["due"] = json!(true);
+                    }
+                    kept
+                };
+                let sending: Vec<Value> = sending.iter().map(json).collect();
+                let events: Vec<Value> = events.iter().map(json).collect();
+                let mut body = json!({"bot_id": lead_id, "sending": sending,
+                    "events": events, "told": told});
+                // Only when a subscription's own digest told something, so
+                // a file reads as it did before there were any.
+                if !told_subs.is_empty() {
+                    body["told_subs"] = json!(told_subs);
+                }
+                if let Some(runs_told) = runs_told {
+                    body["runs_told"] = runs_told;
+                }
+                // What the note under way says was not kept stays with it,
+                // so the note sent again says the same.
+                if let Some(unkept) = unkept {
+                    body["unkept"] = unkept;
+                }
+                if let Some(unkept_sending) = unkept_sending {
+                    body["unkept_sending"] = unkept_sending;
+                }
+                body.to_string().into_bytes()
+            }),
+        ))
     }
 
     /// Hands what changed to the writer, once a tick.
@@ -3237,8 +3249,11 @@ impl Lookout {
         if std::mem::take(&mut self.counts_dirty)
             && let Some(path) = &self.counts_file
         {
-            let body = (!self.counts.is_empty()).then(|| self.counts.to_json().to_string());
-            held::write(path.clone(), body.map(String::into_bytes));
+            let body = match self.counts.is_empty() {
+                true => held::Body::Gone,
+                false => held::Body::Bytes(self.counts.to_json().to_string().into_bytes()),
+            };
+            held::write(path.clone(), body);
         }
     }
 
@@ -3246,10 +3261,10 @@ impl Lookout {
     /// is no one's.
     fn unheld(&self) {
         if let Some(path) = &self.held {
-            held::write(path.clone(), None);
+            held::write(path.clone(), held::Body::Gone);
         }
         if let Some(path) = &self.counts_file {
-            held::write(path.clone(), None);
+            held::write(path.clone(), held::Body::Gone);
         }
     }
 
@@ -3415,49 +3430,74 @@ fn unquote(event: &mut sources::Event) {
 }
 
 /// The one thread that writes what lookouts hold, so a write and its
-/// syncs never hold up the event loop: the newest body for each file
-/// wins, in the order handed over.
+/// syncs never hold up the event loop. What waits for it is a mailbox
+/// keyed by file, as a keyed mailbox keeps a state topic's latest: a newer
+/// body for a file takes the place of one not yet written, so what waits
+/// is at most one body a file, however slow the disk, and one replaced is
+/// never encoded.
 mod held {
     use std::collections::HashMap;
     use std::path::PathBuf;
-    use std::sync::{Mutex, OnceLock, mpsc};
+    use std::sync::{Condvar, Mutex, OnceLock};
 
     /// What is called once the writes handed over before it are done:
     /// whether every file of its store holds what it was last handed.
     type Then = Box<dyn FnOnce(bool) + Send>;
 
-    enum Job {
-        Write(PathBuf, Option<Vec<u8>>),
-        /// The store whose files it asks about, by the path each is
-        /// named beside, and what to call.
-        Done(PathBuf, Then),
+    /// What a file is to hold.
+    pub enum Body {
+        /// No file.
+        Gone,
+        Bytes(Vec<u8>),
+        /// Encoded by the writer, only if no newer body replaced it first.
+        Later(Box<dyn FnOnce() -> Vec<u8> + Send>),
     }
 
-    fn sender() -> &'static Mutex<mpsc::Sender<Job>> {
-        static SENDER: OnceLock<Mutex<mpsc::Sender<Job>>> = OnceLock::new();
-        SENDER.get_or_init(|| {
-            let (send, jobs) = mpsc::channel::<Job>();
-            std::thread::spawn(move || {
+    impl Body {
+        pub fn later(encode: impl FnOnce() -> Vec<u8> + Send + 'static) -> Self {
+            Body::Later(Box::new(encode))
+        }
+
+        fn bytes(self) -> Option<Vec<u8>> {
+            match self {
+                Body::Gone => None,
+                Body::Bytes(bytes) => Some(bytes),
+                Body::Later(encode) => Some(encode()),
+            }
+        }
+    }
+
+    /// What waits for the writer: each file's newest body, and what to call
+    /// once they are written, with the store each asks about.
+    #[derive(Default)]
+    struct Mailbox {
+        writes: HashMap<PathBuf, Body>,
+        done: Vec<(PathBuf, Then)>,
+    }
+
+    fn mailbox() -> &'static (Mutex<Mailbox>, Condvar) {
+        static MAILBOX: OnceLock<(Mutex<Mailbox>, Condvar)> = OnceLock::new();
+        MAILBOX.get_or_init(|| {
+            std::thread::spawn(|| {
+                let (mailbox, wake) = mailbox();
                 // Writes that failed, tried again with the next, unless a
                 // newer body for the file came since.
                 let mut failed: HashMap<PathBuf, Option<Vec<u8>>> = HashMap::new();
-                while let Ok(job) = jobs.recv() {
-                    let mut writes: Vec<(PathBuf, Option<Vec<u8>>)> = Vec::new();
-                    let mut done = Vec::new();
-                    for job in std::iter::once(job).chain(jobs.try_iter()) {
-                        match job {
-                            Job::Write(path, body) => {
-                                writes.retain(|(had, _)| *had != path);
-                                writes.push((path, body));
-                            }
-                            Job::Done(store, then) => done.push((store, then)),
+                loop {
+                    let Mailbox { writes, done } = {
+                        let mut waiting = mailbox.lock().unwrap_or_else(|e| e.into_inner());
+                        while waiting.writes.is_empty() && waiting.done.is_empty() {
+                            waiting = wake.wait(waiting).unwrap_or_else(|e| e.into_inner());
                         }
+                        std::mem::take(&mut *waiting)
+                    };
+                    for path in writes.keys() {
+                        failed.remove(path);
                     }
-                    for (path, body) in failed.drain() {
-                        if !writes.iter().any(|(had, _)| *had == path) {
-                            writes.push((path, body));
-                        }
-                    }
+                    let writes = (writes.into_iter())
+                        .map(|(path, body)| (path, body.bytes()))
+                        .chain(failed.drain())
+                        .collect::<Vec<_>>();
                     for (path, body) in writes {
                         if !lands(&path, body.as_deref()) {
                             failed.insert(path, body);
@@ -3475,7 +3515,7 @@ mod held {
                     }
                 }
             });
-            Mutex::new(send)
+            (Mutex::new(Mailbox::default()), Condvar::new())
         })
     }
 
@@ -3495,26 +3535,44 @@ mod held {
         }
     }
 
-    pub fn write(path: PathBuf, body: Option<Vec<u8>>) {
-        if let Ok(send) = sender().lock() {
-            let _ = send.send(Job::Write(path, body));
-        }
+    /// Hand the writer `body` for the file at `path`, in place of one it
+    /// has not written yet.
+    pub fn write(path: PathBuf, body: Body) {
+        let (mailbox, wake) = mailbox();
+        let replaced = {
+            let mut waiting = mailbox.lock().unwrap_or_else(|e| e.into_inner());
+            waiting.writes.insert(path, body)
+        };
+        wake.notify_one();
+        // Let go of outside the lock.
+        drop(replaced);
     }
 
     /// Calls `then` once every write handed over before it is done, with
     /// whether each file of `store`, named beside it, holds what it was
-    /// last handed. Never called only if the writer is gone, which drops
-    /// `then`.
+    /// last handed.
     pub fn then(store: PathBuf, then: impl FnOnce(bool) + Send + 'static) {
-        if let Ok(send) = sender().lock() {
-            let _ = send.send(Job::Done(store, Box::new(then)));
-        }
+        let (mailbox, wake) = mailbox();
+        let mut waiting = mailbox.lock().unwrap_or_else(|e| e.into_inner());
+        waiting.done.push((store, Box::new(then)));
+        drop(waiting);
+        wake.notify_one();
+    }
+
+    /// The bodies waiting for the writer, for a test to see they stay one
+    /// a file.
+    #[cfg(test)]
+    pub fn waiting(store: &std::path::Path) -> usize {
+        let waiting = mailbox().0.lock().unwrap_or_else(|e| e.into_inner());
+        (waiting.writes.keys())
+            .filter(|path| path.starts_with(store))
+            .count()
     }
 
     /// Waits for every write handed over before it.
     #[cfg(test)]
     pub fn written() {
-        let (tell, told) = mpsc::channel();
+        let (tell, told) = std::sync::mpsc::channel();
         then(PathBuf::new(), move |_| {
             let _ = tell.send(());
         });
@@ -4126,6 +4184,64 @@ mod tests {
         assert!(service.lookouts.is_empty());
         self::held::written();
         assert!(!held.exists());
+    }
+
+    #[test]
+    fn a_slow_disk_holds_one_body_a_file_and_the_newest_lands() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        /// A body not yet written or dropped: what a slow disk keeps.
+        struct Live(Arc<AtomicUsize>, Vec<u8>);
+        impl Drop for Live {
+            fn drop(&mut self) {
+                self.0.fetch_sub(1, Ordering::SeqCst);
+            }
+        }
+        let dir = std::env::temp_dir().join(format!("sonny-slow-disk-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("held.json");
+        // The writer is held up, as by a disk that stalls: what the
+        // lookouts hand it meanwhile waits.
+        let (release, stalled) = std::sync::mpsc::channel::<()>();
+        let (stalling, writer) = std::sync::mpsc::channel();
+        held::then(PathBuf::new(), move |_| {
+            let _ = stalling.send(());
+            let _ = stalled.recv();
+        });
+        writer.recv().unwrap();
+        let (live, most, encoded) = (
+            Arc::new(AtomicUsize::new(0)),
+            Arc::new(AtomicUsize::new(0)),
+            Arc::new(AtomicUsize::new(0)),
+        );
+        // A lookout busier than the disk: a body of 64 KiB a tick, many
+        // ticks while the disk is stalled.
+        for tick in 0..2_000u32 {
+            live.fetch_add(1, Ordering::SeqCst);
+            let body = Live(live.clone(), tick.to_be_bytes().repeat(16 * 1024));
+            let encoded = encoded.clone();
+            held::write(
+                path.clone(),
+                held::Body::later(move || {
+                    encoded.fetch_add(1, Ordering::SeqCst);
+                    body.1.clone()
+                }),
+            );
+            most.fetch_max(live.load(Ordering::SeqCst), Ordering::SeqCst);
+        }
+        // What waits levelled off at one body, never encoded until written.
+        assert_eq!(most.load(Ordering::SeqCst), 1);
+        assert_eq!(held::waiting(&dir), 1);
+        assert_eq!(encoded.load(Ordering::SeqCst), 0);
+        release.send(()).unwrap();
+        held::written();
+        // The newest is on disk, and only it was encoded.
+        assert_eq!(encoded.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            1_999u32.to_be_bytes().repeat(16 * 1024)
+        );
+        assert_eq!(live.load(Ordering::SeqCst), 0);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

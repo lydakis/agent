@@ -121,7 +121,7 @@ pub fn default_tools(
 
 /// The socket protocol's version in `ready`. The daemon and its clients ship
 /// together, so a client refuses a daemon of any other version.
-pub const PROTOCOL: u64 = 86;
+pub const PROTOCOL: u64 = 87;
 static PROGRAM: std::sync::OnceLock<&'static str> = std::sync::OnceLock::new();
 /// Name this process's connections as `program` (such as `window` or
 /// `reviewer`): each later [`Client::connect`] says it in its first line,
@@ -274,7 +274,10 @@ impl Drop for FrameWrite<'_> {
 /// Notifications queued ahead of the UI before the session is let go.
 /// Larger than any replay page, so a normal attach never trips it.
 const QUEUE: usize = 4096;
-const QUEUE_BYTES: usize = 8 * 1024 * 1024;
+/// The bytes of notifications, as sent, queued ahead of the UI. A caller
+/// that keeps notifications past this queue carries the same budget on
+/// with [`Events::recv_sized`].
+pub const QUEUE_BYTES: usize = 8 * 1024 * 1024;
 
 struct Notification {
     encoded: String,
@@ -297,6 +300,29 @@ impl Events {
         loop {
             if let Some(event) = self.0.try_recv()?.decode() {
                 return Ok(event);
+            }
+        }
+    }
+    /// The next notification with its size as sent, which it held of
+    /// [`QUEUE_BYTES`]: a caller that queues it again charges that much
+    /// to a budget of its own, so the bound holds past this queue.
+    pub async fn recv_sized(&mut self) -> Option<(Value, usize)> {
+        loop {
+            let notification = self.0.recv().await?;
+            let size = notification.encoded.len();
+            if let Some(event) = notification.decode() {
+                return Some((event, size));
+            }
+        }
+    }
+    pub fn try_recv_sized(
+        &mut self,
+    ) -> std::result::Result<(Value, usize), mpsc::error::TryRecvError> {
+        loop {
+            let notification = self.0.try_recv()?;
+            let size = notification.encoded.len();
+            if let Some(event) = notification.decode() {
+                return Ok((event, size));
             }
         }
     }

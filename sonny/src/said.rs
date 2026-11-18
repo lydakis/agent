@@ -25,10 +25,15 @@ pub const DAY_MS: i64 = 24 * 60 * 60 * 1000;
 
 /// Every message the person wrote to an agent at or after `since_ms`,
 /// newest first, each with its agent, turn, and the project whose memory
-/// the turn's folder reads (null for none). The one that started a turn
-/// before `since_ms` is older, though the turn still ran after. With the
-/// `home` and canonical store path the windows keep reactions under, a
-/// reaction the person took back since is left out.
+/// the turn's folder reads (null for none). With the `home` and canonical
+/// store path the windows keep reactions under, a reaction the person took
+/// back since is left out.
+///
+/// One read finds them: the daemon's messages from people, across every
+/// agent, since the time, as Gmail lists one query across every thread.
+/// Only an agent with a reaction or an answer to an ask among them has its
+/// history read, for the reply each reaction answers and what each ask
+/// recommended.
 pub async fn said(
     client: &Client,
     kept: Option<(&Path, &Path)>,
@@ -36,151 +41,144 @@ pub async fn said(
 ) -> Result<Value, String> {
     let failed = |e: agent_client::Error| format!("said_unread: {e}");
     let mut said = Newest::default();
-    let mut after = Value::Null;
+    // Answers to the bots' asks, each waiting for the ask it answers, for
+    // what it recommended.
+    let mut answers: Vec<(String, i64)> = Vec::new();
+    // The bots whose history is read, by name, with their ids.
+    let mut histories: BTreeMap<String, Option<i64>> = BTreeMap::new();
+    let mut folders: HashMap<String, Option<String>> = HashMap::new();
+    let mut before = Value::Null;
     loop {
         let page = client
-            .request("bots", json!({"after": after, "limit": 64}))
+            .request(
+                "messages",
+                json!({"bot": "*", "from": ["person"], "since_ms": since_ms, "newest": true,
+                    "words": true, "limit": 256, "before": before}),
+            )
             .await
             .map_err(failed)?;
-        for bot in page["bots"].as_array().into_iter().flatten() {
-            let name = bot["name"].as_str().unwrap_or_default();
-            let turns = turns_since(client, name, since_ms).await.map_err(failed)?;
-            let Some(first) = turns.keys().min().copied() else {
+        for message in page["messages"].as_array().into_iter().flatten() {
+            let (Some(bot), Some(turn), Some(node)) = (
+                message["bot"].as_str(),
+                message["turn"].as_i64(),
+                message["node"].as_i64(),
+            ) else {
+                // Not taken in by a turn: no agent has read it yet.
                 continue;
             };
-            // A message is dated by when it was written. One from before
-            // the daemon kept that is dated by its turn: a turn's first
-            // entry is what started it, written when the turn started, and
-            // what the person sent into it later came while it ran. Newest
-            // first, and a turn's entries together, its oldest message is
-            // held until an older entry shows it came later or the turn
-            // ends, when it counts only if the turn started since.
-            let opened = |turn: i64| {
-                (turns.get(&turn).and_then(|t| t.started_ms)).is_none_or(|ms| ms >= since_ms)
-            };
-            let mut held: Option<(i64, i64, Value)> = None;
-            // What the bot's replies are reacted with now, by node; none
-            // when no window kept a file for it.
-            let on = kept
-                .zip(bot["bot_id"].as_i64())
-                .and_then(|((home, store), id)| {
-                    Reactions::kept(home, &crate::reactions::key(store, id))
-                });
-            // Reactions, kept as they are read and each waiting for the
-            // reply it answers, which comes later walking back: the next
-            // reply for one to the bot's last reply, else a reply it
-            // quotes.
-            let mut waiting: Vec<Waiting> = Vec::new();
-            // The oldest node walked.
-            let mut oldest = i64::MAX;
-            // Answers to the bot's asks, each waiting for the ask it
-            // answers, which comes later walking back, for what it
-            // recommended.
-            let mut answers: Vec<(String, i64)> = Vec::new();
-            walk(client, name, first, |turn, entry| {
-                if held.as_ref().is_some_and(|(at, ..)| *at != turn)
-                    && let Some((at, node, message)) = held.take()
-                    && opened(at)
-                {
-                    admit(&mut said, &mut answers, node, message);
-                }
-                let project = turns.get(&turn).and_then(|t| t.project.clone());
-                let written = entry["written_ms"].as_i64();
-                let later = match crate::reactions::said_by_person(entry) {
-                    Some(node) => {
-                        let text = cut(crate::text(&entry["item"]));
-                        let message =
-                            json!({"bot": name, "turn": turn, "text": text, "project": project});
-                        match written {
-                            Some(ms) => {
-                                if ms >= since_ms {
-                                    admit(&mut said, &mut answers, node, message);
-                                }
-                                held.take()
-                            }
-                            None => held.replace((turn, node, message)),
-                        }
-                    }
-                    None => held.take(),
-                };
-                if let Some((_, node, message)) = later {
-                    admit(&mut said, &mut answers, node, message);
-                }
-                if let Some((node, quote, emoji)) = reaction(entry)
-                    && written.is_none_or(|ms| ms >= since_ms)
-                    // One no reply holds now was taken off: it takes no room.
-                    && (on.as_ref()).is_none_or(|on| on.before(i64::MAX, &emoji))
-                {
-                    said.add(
-                        node,
-                        json!({"bot": name, "turn": turn, "text": emoji,
-                        "reacted_to": quote, "project": project}),
-                    );
-                    waiting.retain(|waiting| said.kept.contains_key(&waiting.node));
-                    waiting.push(Waiting { node, quote, emoji });
-                }
-                for (call, recommended) in asked(turn, entry) {
-                    if let Some(at) = answers.iter().position(|(answered, _)| *answered == call) {
-                        let (_, node) = answers.remove(at);
-                        said.amend(node, "recommended", json!(recommended));
-                    }
-                }
-                if let Some(reply) = reply(entry)
-                    && let Some(at) = entry["node"].as_i64()
-                {
-                    let quoted = crate::transcript::cut(&reply, crate::QUOTED);
-                    let has = |emoji: &str| {
-                        on.as_ref()
-                            .is_none_or(|on| on.on(at).iter().any(|e| e == emoji))
-                    };
-                    // Each emoji once per reply, the newest kept.
-                    let mut counted: Vec<String> = Vec::new();
-                    waiting.retain_mut(|waiting| {
-                        // The newest reply it can answer that holds it: a
-                        // reply of the bot's may come between the reply and
-                        // a reaction that waited for its call, and two
-                        // replies may begin alike.
-                        let can = (waiting.quote.as_ref()).is_none_or(|quote| *quote == quoted);
-                        if !(can && has(&waiting.emoji)) {
-                            return true;
-                        }
-                        if counted.contains(&waiting.emoji) {
-                            // Put on again.
-                            said.remove(waiting.node);
-                        } else {
-                            counted.push(waiting.emoji.clone());
-                            said.amend(waiting.node, "reacted_to", json!(cut_reply(&reply)));
-                        }
-                        false
-                    });
-                }
-                oldest = oldest.min(entry["node"].as_i64().unwrap_or(i64::MAX));
-                false
-            })
-            .await
-            .map_err(failed)?;
-            if let Some((at, node, message)) = held
-                && opened(at)
-            {
-                admit(&mut said, &mut answers, node, message);
+            // A named person is not the person whose memory this is.
+            let text = message["text"].as_str().unwrap_or_default();
+            if !message["person"].is_null() || text.trim().is_empty() {
+                continue;
             }
-            // A reaction no reply in reach holds answers one out of reach,
-            // when what is on those says so, else it was taken off. Each
-            // counts once.
-            let mut counted: Vec<(Option<String>, String)> = Vec::new();
-            for waiting in waiting {
-                let out_of_reach = (on.as_ref()).is_none_or(|on| on.before(oldest, &waiting.emoji));
-                let key = (waiting.quote, waiting.emoji);
-                if !out_of_reach || counted.contains(&key) {
-                    said.remove(waiting.node);
-                } else {
-                    counted.push(key);
-                }
+            let read_history = || (bot.to_owned(), message["bot_id"].as_i64());
+            if crate::reactions::is_reaction(text) {
+                let (name, id) = read_history();
+                histories.insert(name, id);
+                continue;
             }
+            if crate::asks::answer_of(text, None).is_some() {
+                let (name, id) = read_history();
+                histories.insert(name, id);
+            }
+            let project = message["workspace"]
+                .as_str()
+                .and_then(|dir| project_of(&mut folders, dir));
+            let entry = json!({"bot": bot, "turn": turn, "text": cut(text.to_owned()),
+                "project": project});
+            admit(&mut said, &mut answers, node, entry);
         }
-        after = page["next_after"].clone();
-        if after.is_null() {
+        before = page["next_before"].clone();
+        if before.is_null() {
             break;
+        }
+    }
+    for (name, bot_id) in histories {
+        let name = name.as_str();
+        let turns = turns_since(client, name, since_ms).await.map_err(failed)?;
+        let Some(first) = turns.keys().min().copied() else {
+            continue;
+        };
+        // What the bot's replies are reacted with now, by node; none
+        // when no window kept a file for it.
+        let on = kept.zip(bot_id).and_then(|((home, store), id)| {
+            Reactions::kept(home, &crate::reactions::key(store, id))
+        });
+        // Reactions, kept as they are read and each waiting for the
+        // reply it answers, which comes later walking back: the next
+        // reply for one to the bot's last reply, else a reply it
+        // quotes.
+        let mut waiting: Vec<Waiting> = Vec::new();
+        // The oldest node walked.
+        let mut oldest = i64::MAX;
+        walk(client, name, first, |turn, entry| {
+            let project = turns.get(&turn).and_then(|t| t.project.clone());
+            let written = entry["written_ms"].as_i64();
+            if let Some((node, quote, emoji)) = reaction(entry)
+                && written.is_none_or(|ms| ms >= since_ms)
+                // One no reply holds now was taken off: it takes no room.
+                && (on.as_ref()).is_none_or(|on| on.before(i64::MAX, &emoji))
+            {
+                said.add(
+                    node,
+                    json!({"bot": name, "turn": turn, "text": emoji,
+                    "reacted_to": quote, "project": project}),
+                );
+                waiting.retain(|waiting| said.kept.contains_key(&waiting.node));
+                waiting.push(Waiting { node, quote, emoji });
+            }
+            for (call, recommended) in asked(turn, entry) {
+                if let Some(at) = answers.iter().position(|(answered, _)| *answered == call) {
+                    let (_, node) = answers.remove(at);
+                    said.amend(node, "recommended", json!(recommended));
+                }
+            }
+            if let Some(reply) = reply(entry)
+                && let Some(at) = entry["node"].as_i64()
+            {
+                let quoted = crate::transcript::cut(&reply, crate::QUOTED);
+                let has = |emoji: &str| {
+                    on.as_ref()
+                        .is_none_or(|on| on.on(at).iter().any(|e| e == emoji))
+                };
+                // Each emoji once per reply, the newest kept.
+                let mut counted: Vec<String> = Vec::new();
+                waiting.retain_mut(|waiting| {
+                    // The newest reply it can answer that holds it: a
+                    // reply of the bot's may come between the reply and
+                    // a reaction that waited for its call, and two
+                    // replies may begin alike.
+                    let can = (waiting.quote.as_ref()).is_none_or(|quote| *quote == quoted);
+                    if !(can && has(&waiting.emoji)) {
+                        return true;
+                    }
+                    if counted.contains(&waiting.emoji) {
+                        // Put on again.
+                        said.remove(waiting.node);
+                    } else {
+                        counted.push(waiting.emoji.clone());
+                        said.amend(waiting.node, "reacted_to", json!(cut_reply(&reply)));
+                    }
+                    false
+                });
+            }
+            oldest = oldest.min(entry["node"].as_i64().unwrap_or(i64::MAX));
+            false
+        })
+        .await
+        .map_err(failed)?;
+        // A reaction no reply in reach holds answers one out of reach,
+        // when what is on those says so, else it was taken off. Each
+        // counts once.
+        let mut counted: Vec<(Option<String>, String)> = Vec::new();
+        for waiting in waiting {
+            let out_of_reach = (on.as_ref()).is_none_or(|on| on.before(oldest, &waiting.emoji));
+            let key = (waiting.quote, waiting.emoji);
+            if !out_of_reach || counted.contains(&key) {
+                said.remove(waiting.node);
+            } else {
+                counted.push(key);
+            }
         }
     }
     let kept: Vec<Value> = said
@@ -190,6 +188,19 @@ pub async fn said(
         .map(|(_, entry)| entry)
         .collect();
     Ok(json!({"since_ms": since_ms, "said": kept, "cut": said.left_out}))
+}
+
+/// The project whose memory `dir` reads, as memory finds it, once per
+/// folder: a task in a folder of its own works for its lead's project.
+fn project_of(folders: &mut HashMap<String, Option<String>>, dir: &str) -> Option<String> {
+    folders
+        .entry(dir.to_owned())
+        .or_insert_with(|| {
+            let dir =
+                crate::task::source_folder(Path::new(dir)).unwrap_or_else(|| PathBuf::from(dir));
+            agent_client::policy::project(&dir).ok().flatten()
+        })
+        .clone()
 }
 
 /// A message of the person's into the answer; an answer to an ask also
@@ -273,10 +284,9 @@ impl Newest {
 
 /// A turn that ran at or after `since_ms`: the project whose memory its
 /// folder reads, as memory finds it, so a bot that moved between projects
-/// keeps each turn's own, and when it started (none while queued).
+/// keeps each turn's own.
 struct Ran {
     project: Option<String>,
-    started_ms: Option<i64>,
 }
 
 /// The turns of `bot` that were running at or after `since_ms`.
@@ -311,27 +321,10 @@ async fn turns_since(
             let Some(id) = turn["turn"].as_i64() else {
                 continue;
             };
-            let project = match turn["workspace"].as_str() {
-                Some(dir) => folders
-                    .entry(dir.to_owned())
-                    .or_insert_with(|| {
-                        // A task in a folder of its own works for its
-                        // lead's project.
-                        let dir = crate::task::source_folder(Path::new(dir))
-                            .unwrap_or_else(|| PathBuf::from(dir));
-                        agent_client::policy::project(&dir).ok().flatten()
-                    })
-                    .clone(),
-                None => None,
-            };
-            let started_ms = turn["started_ms"].as_i64();
-            found.insert(
-                id,
-                Ran {
-                    project,
-                    started_ms,
-                },
-            );
+            let project = turn["workspace"]
+                .as_str()
+                .and_then(|dir| project_of(&mut folders, dir));
+            found.insert(id, Ran { project });
         }
         before = page["next_before"].clone();
         if ended || before.is_null() {
