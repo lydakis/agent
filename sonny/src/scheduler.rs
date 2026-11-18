@@ -18,13 +18,16 @@
 //!
 //! A write to its doorbell (`~/.agent/automations/.ring`, a FIFO) has it look
 //! again at once: Sonny rings it when a definition or a queue changes, and
-//! a fire when it ends. Else it looks at least every minute, and at a
-//! watched path every two seconds. It sleeps until the next calendar time,
-//! and takes no process between fires. When Sonny is upgraded it runs the
+//! a fire's end wakes it for that trigger alone. Else it looks at least
+//! every minute, and at a watched path every two seconds. It sleeps until
+//! the next calendar time, and takes no process between fires. A wake
+//! looks only at the triggers it may start: calendar times are kept
+//! soonest first, a trigger waiting for room has its place in line, and
+//! one waiting a moment is kept by when its wait is over. When Sonny is upgraded it runs the
 //! new Sonny in place of itself; when its HOME is gone, as a test's is, it
 //! lets its own job go.
 use crate::trigger::{self, Entry, Job, Places, Scheduler};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -705,39 +708,334 @@ fn launch(
     }
 }
 
-/// Start the fires due this pass, `(name, for an ask alone)`: those that
-/// waited for room longest first, so a place a fire leaves goes to one in
-/// line before one just served. One due only for an ask its queue holds,
-/// whose lock a fire the scheduler did not start holds, is not due again:
-/// the ask waits in its queue, looked at each minute and ring, and that
-/// fire may be the one taking it. Whether `kept` changed.
-fn admit(
-    ready: Vec<(String, bool)>,
-    followed: &mut HashMap<String, Followed>,
-    fleet: &mut Fleet,
-    now: std::time::Instant,
-    kept: &mut HashMap<String, (String, i64)>,
-    spawn: &mut Spawn,
-) -> bool {
-    let mut ready: Vec<_> = ready
+/// The triggers the scheduler follows, and where each one due waits, so
+/// a wake looks at those it may start and no others: as a kernel keeps
+/// its timers by deadline and a queue of what is ready. An entry in
+/// `timed`, `waits` or `line` that no longer says what its trigger holds
+/// is passed over and dropped when reached.
+#[derive(Default)]
+struct Schedule {
+    followed: HashMap<String, Followed>,
+    /// Each trigger's next calendar time, soonest first.
+    timed: BTreeSet<(i64, String)>,
+    /// Those due again until a moment after their last start, or a failed
+    /// start's wait, is over: by when.
+    waits: BTreeSet<(std::time::Instant, String)>,
+    /// Those waiting for room in the fleet, by their place in line.
+    line: BTreeMap<u64, String>,
+    /// Those due again with no place in line, as their fire runs or they
+    /// wait: by name, the order a full fleet gives them places in.
+    held: BTreeSet<String>,
+    /// Those that watch a path.
+    watched: BTreeSet<String>,
+}
+
+/// When a trigger due again may start, its last start a moment old and a
+/// failed start's wait over.
+fn until(f: &Followed) -> Option<std::time::Instant> {
+    [f.started.map(|at| at + AGAIN_AFTER), f.retry]
         .into_iter()
-        .filter_map(|(name, ask)| {
-            let queued = followed.get(&name)?.queued;
-            Some((queued.is_none(), queued.unwrap_or(0), name, ask))
-        })
-        .collect();
-    ready.sort_unstable();
-    let mut changed = false;
-    for (_, _, name, ask) in ready {
-        let Some(f) = followed.get_mut(&name) else {
-            continue;
+        .flatten()
+        .max()
+}
+
+/// The triggers a wake looks at: due (a calendar time came, a watched
+/// path changed), with an ask in their queue, or due again where it may
+/// start now.
+#[derive(Default)]
+struct Ready(HashMap<String, (bool, bool)>);
+
+impl Ready {
+    fn due(&mut self, name: &str) {
+        self.0.entry(name.to_owned()).or_default().0 = true;
+    }
+    fn asked(&mut self, name: &str) {
+        self.0.entry(name.to_owned()).or_default().1 = true;
+    }
+    /// Due again only: whether it is, its `again` says.
+    fn again(&mut self, name: &str) {
+        self.0.entry(name.to_owned()).or_default();
+    }
+}
+
+impl Schedule {
+    /// `name` filed where it waits now, after its trigger changed.
+    fn file(&mut self, name: &str, now: std::time::Instant) {
+        let Some(f) = self.followed.get(name) else {
+            self.held.remove(name);
+            self.watched.remove(name);
+            return;
         };
-        if launch(&name, f, fleet, now, spawn) == Launched::Held && ask {
+        if let Some(next) = f.next {
+            self.timed.insert((next, name.to_owned()));
+        }
+        if let Some(queued) = f.queued {
+            self.line.insert(queued, name.to_owned());
+        }
+        match f.again && f.queued.is_none() {
+            true => self.held.insert(name.to_owned()),
+            false => self.held.remove(name),
+        };
+        if f.again
+            && let Some(at) = until(f).filter(|at| *at > now)
+        {
+            self.waits.insert((at, name.to_owned()));
+        }
+        match f.job.watch.is_some() {
+            true => self.watched.insert(name.to_owned()),
+            false => self.watched.remove(name),
+        };
+    }
+
+    /// One wake: the calendar times that came by `now`, the watched paths
+    /// when `watch`, the queues of every trigger when `asks` and of those
+    /// whose fire `ended`, and those due again whose wait is over or that
+    /// now have room, then those [`Schedule::admit`] may start, started.
+    /// `fresh` are those read again. Whether `kept` changed.
+    #[allow(clippy::too_many_arguments)]
+    fn pass(
+        &mut self,
+        fleet: &mut Fleet,
+        now: i64,
+        instant: std::time::Instant,
+        watch: bool,
+        asks: bool,
+        ended: &std::collections::HashSet<String>,
+        fresh: &[String],
+        asked: &mut dyn FnMut(&str) -> bool,
+        kept: &mut HashMap<String, (String, i64)>,
+        spawn: &mut Spawn,
+    ) -> bool {
+        let mut fired = false;
+        let mut ready = Ready::default();
+        while let Some((at, name)) = self.timed.first().cloned()
+            && at <= now
+        {
+            self.timed.pop_first();
+            visit();
+            let Some(f) = self.followed.get_mut(&name).filter(|f| f.next == Some(at)) else {
+                continue;
+            };
+            let busy = fleet.busy.contains(&name);
+            if came(&name, f, busy, now, kept) {
+                fired |= busy;
+                if !busy {
+                    ready.due(&name);
+                }
+            }
+            if let Some(next) = f.next {
+                self.timed.insert((next, name));
+            }
+        }
+        while let Some((at, name)) = self.waits.first().cloned()
+            && at <= instant
+        {
+            self.waits.pop_first();
+            visit();
+            if (self.followed.get(&name)).is_some_and(|f| f.again && until(f) == Some(at)) {
+                ready.again(&name);
+            }
+        }
+        for name in fresh.iter().chain(ended) {
+            visit();
+            if self.followed.get(name).is_some_and(|f| f.again) {
+                ready.again(name);
+            }
+        }
+        if watch {
+            for name in &self.watched {
+                visit();
+                let Some(f) = self.followed.get_mut(name) else {
+                    continue;
+                };
+                let Some(path) = f.job.watch.as_ref() else {
+                    continue;
+                };
+                let seen = look(path);
+                if seen != f.seen {
+                    f.seen = seen;
+                    ready.due(name);
+                }
+            }
+        }
+        // An ask while its fire runs is looked at when that fire ends:
+        // the one it is taking is no ask for another.
+        let looked: Box<dyn Iterator<Item = &String>> = match asks {
+            true => Box::new(self.followed.keys()),
+            false => Box::new(ended.iter()),
+        };
+        for name in looked {
+            visit();
+            if self.followed.contains_key(name) && !fleet.busy.contains(name) && asked(name) {
+                ready.asked(name);
+            }
+        }
+        fired | self.admit(ready, fleet, instant, kept, spawn)
+    }
+
+    /// Start the fires `ready`: those that waited for room longest first,
+    /// so a place a fire leaves goes to one in line before one just
+    /// served, then the rest by name. One due only for an ask its queue
+    /// holds, whose lock a fire the scheduler did not start holds, is not
+    /// due again: the ask waits in its queue, looked at each minute and
+    /// ring, and that fire may be the one taking it. Those due again but
+    /// held take places in line, by name, once the fleet is full, as they
+    /// would were each looked at. Whether `kept` changed.
+    fn admit(
+        &mut self,
+        mut ready: Ready,
+        fleet: &mut Fleet,
+        now: std::time::Instant,
+        kept: &mut HashMap<String, (String, i64)>,
+        spawn: &mut Spawn,
+    ) -> bool {
+        let mut changed = false;
+        // The line, from its head, while the fleet has room.
+        let mut from = 0;
+        while !fleet.full()
+            && let Some((&place, name)) = self.line.range(from..).next()
+        {
+            let name = name.clone();
+            from = place + 1;
+            visit();
+            if self.followed.get(&name).and_then(|f| f.queued) != Some(place) {
+                self.line.remove(&place);
+                continue;
+            }
+            let (due, ask) = ready.0.remove(&name).unwrap_or_default();
+            changed |= self.start(&name, due, ask, fleet, now, kept, spawn);
+        }
+        // The rest: what is left in line, then the others by name.
+        let mut rest: Vec<_> = (ready.0.into_iter())
+            .filter_map(|(name, (due, ask))| {
+                let queued = self.followed.get(&name)?.queued;
+                Some((queued.is_none(), queued.unwrap_or(0), name, due, ask))
+            })
+            .collect();
+        rest.sort_unstable();
+        let mut after = std::ops::Bound::Unbounded;
+        for (unqueued, _, name, due, ask) in rest {
+            if unqueued {
+                self.line_up(fleet, (after, std::ops::Bound::Excluded(name.clone())));
+                after = std::ops::Bound::Excluded(name.clone());
+            }
+            changed |= self.start(&name, due, ask, fleet, now, kept, spawn);
+        }
+        self.line_up(fleet, (after, std::ops::Bound::Unbounded));
+        changed
+    }
+
+    /// Start `name` if it is due, or `asked` alone, and may start; filed
+    /// again where it waits. Whether `kept` changed.
+    #[allow(clippy::too_many_arguments)]
+    fn start(
+        &mut self,
+        name: &str,
+        due: bool,
+        asked: bool,
+        fleet: &mut Fleet,
+        now: std::time::Instant,
+        kept: &mut HashMap<String, (String, i64)>,
+        spawn: &mut Spawn,
+    ) -> bool {
+        let Some(f) = self.followed.get_mut(name) else {
+            return false;
+        };
+        let due = std::mem::take(&mut f.again) || due;
+        if !due && !asked {
+            return false;
+        }
+        let queued = f.queued;
+        if launch(name, f, fleet, now, spawn) == Launched::Held && !due {
             (f.again, f.failures, f.retry) = (false, 0, None);
         }
-        changed |= started(&name, f, now, kept);
+        let changed = started(name, f, now, kept);
+        if let Some(place) = queued.filter(|_| f.queued != queued) {
+            self.line.remove(&place);
+        }
+        self.file(name, now);
+        changed
     }
-    changed
+
+    /// With the fleet full, those held in `names` take places in line, in
+    /// order, as each would were it looked at.
+    fn line_up(
+        &mut self,
+        fleet: &mut Fleet,
+        names: (std::ops::Bound<String>, std::ops::Bound<String>),
+    ) {
+        if !fleet.full() {
+            return;
+        }
+        let held: Vec<String> = self.held.range(names).cloned().collect();
+        for name in held {
+            visit();
+            self.held.remove(&name);
+            let Some(f) = self.followed.get_mut(&name) else {
+                continue;
+            };
+            f.queued = Some(fleet.line);
+            self.line.insert(fleet.line, name);
+            fleet.line += 1;
+        }
+    }
+
+    /// How long until the next calendar time, a watched path's next look,
+    /// or a wait over for one that may start then: one whose fire runs,
+    /// or that waits for room, is woken by a fire's end.
+    fn wake(&mut self, fleet: &Fleet, mut wake: Duration, watch_in: Duration) -> Duration {
+        let now_exact = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default();
+        while let Some((next, name)) = self.timed.first() {
+            visit();
+            if self
+                .followed
+                .get(name)
+                .is_some_and(|f| f.next == Some(*next))
+            {
+                let at = Duration::from_secs((*next).max(0) as u64);
+                wake = wake.min(at.saturating_sub(now_exact));
+                break;
+            }
+            self.timed.pop_first();
+        }
+        if !self.watched.is_empty() {
+            wake = wake.min(watch_in);
+        }
+        if fleet.full() {
+            return wake;
+        }
+        let mut stale = Vec::new();
+        for (at, name) in &self.waits {
+            visit();
+            match self.followed.get(name) {
+                Some(f) if f.again && until(f) == Some(*at) => {
+                    if !fleet.busy.contains(name) {
+                        let now = std::time::Instant::now();
+                        wake = wake.min(at.saturating_duration_since(now));
+                        break;
+                    }
+                }
+                _ => stale.push((*at, name.clone())),
+            }
+        }
+        for entry in stale {
+            self.waits.remove(&entry);
+        }
+        wake
+    }
+}
+
+// Counts the triggers a wake looks at, in tests: a fire's end looks at
+// those it may start, not at every trigger.
+#[cfg(test)]
+thread_local!(static VISITED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) });
+
+/// One trigger looked at.
+fn visit() {
+    #[cfg(test)]
+    VISITED.with(|visited| visited.set(visited.get() + 1));
 }
 
 /// A trigger whose fire did not start, due again after a wait that
@@ -786,7 +1084,7 @@ pub fn run() -> i32 {
     };
     let born = me.as_deref().and_then(identity);
     let zoned = zone();
-    let mut followed: HashMap<String, Followed> = HashMap::new();
+    let mut schedule = Schedule::default();
     let mut kept = read_looked(&places);
     let mut fleet = Fleet::new();
     let mut folder = None;
@@ -839,50 +1137,35 @@ pub fn run() -> i32 {
         }
         let now_folder = modified(&places.jobs);
         let mut fired = false;
+        let mut read = Vec::new();
         if rang || every_minute || now_folder != folder {
             folder = now_folder;
-            fired = read_jobs(&places, &mut followed, &mut kept);
+            fired = read_jobs(&places, &mut schedule.followed, &mut kept, &mut read);
         }
         let now = trigger::now();
         let instant = std::time::Instant::now();
+        for name in &read {
+            schedule.file(name, instant);
+        }
         // Watched paths every two seconds, however often it wakes.
         let watch = instant.duration_since(last_watch) >= WATCH_EVERY;
         if watch {
             last_watch = instant;
         }
-        let mut ready = Vec::new();
-        for (name, f) in followed.iter_mut() {
-            let busy = fleet.busy.contains(name);
-            let mut due = std::mem::take(&mut f.again);
-            if came(name, f, busy, now, &mut kept) {
-                fired |= busy;
-                due |= !busy;
-            }
-            if let Some(path) = f.job.watch.as_ref().filter(|_| watch) {
-                let seen = look(path);
-                if seen != f.seen {
-                    f.seen = seen;
-                    due = true;
-                }
-            }
-            // An ask while its fire runs is looked at when that fire ends:
-            // the one it is taking is no ask for another.
-            let ask =
-                !busy && (rang || every_minute || ended.contains(name)) && asked(&places, name);
-            if due || ask {
-                ready.push((name.clone(), !due));
-            }
-        }
-        fired |= admit(
-            ready,
-            &mut followed,
+        fired |= schedule.pass(
             &mut fleet,
+            now,
             instant,
+            watch,
+            rang || every_minute,
+            &ended,
+            &read,
+            &mut |name| asked(&places, name),
             &mut kept,
             &mut |name, job| spawn(&places, name, job),
         );
         if fired {
-            kept.retain(|name, _| followed.contains_key(name));
+            kept.retain(|name, _| schedule.followed.contains_key(name));
             write_looked(&places, &kept);
         }
         if every_minute {
@@ -890,30 +1173,9 @@ pub fn run() -> i32 {
         }
         // Asleep until the next time, a watched path's next look, a fire
         // run again, or a ring.
-        let mut wake = Duration::from_secs((60 - now.rem_euclid(60)) as u64).min(LOOK_EVERY);
-        let now_exact = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default();
-        for (name, f) in &followed {
-            if let Some(next) = f.next {
-                let at = Duration::from_secs(next.max(0) as u64);
-                wake = wake.min(at.saturating_sub(now_exact));
-            }
-            if f.job.watch.is_some() {
-                wake = wake.min(WATCH_EVERY.saturating_sub(last_watch.elapsed()));
-            }
-            // One whose fire runs, or that waits for room, is woken by a
-            // fire's end.
-            if f.again && !fleet.full() && !fleet.busy.contains(name) {
-                let at = [f.started.map(|at| at + AGAIN_AFTER), f.retry]
-                    .into_iter()
-                    .flatten()
-                    .max();
-                wake = wake.min(at.map_or(Duration::ZERO, |at| {
-                    at.saturating_duration_since(std::time::Instant::now())
-                }));
-            }
-        }
+        let minute = Duration::from_secs((60 - now.rem_euclid(60)) as u64).min(LOOK_EVERY);
+        let watch_in = WATCH_EVERY.saturating_sub(last_watch.elapsed());
+        let wake = schedule.wake(&fleet, minute, watch_in);
         rang = bell.wait(wake.max(Duration::from_millis(50)));
     }
 }
@@ -929,6 +1191,7 @@ fn read_jobs(
     places: &Places,
     followed: &mut HashMap<String, Followed>,
     kept: &mut HashMap<String, (String, i64)>,
+    read: &mut Vec<String>,
 ) -> bool {
     let mut new = false;
     use std::os::unix::fs::MetadataExt;
@@ -950,12 +1213,14 @@ fn read_jobs(
         if followed.get(name).is_some_and(|f| f.file == stamp) {
             continue;
         }
-        let read = std::fs::read_to_string(entry.path())
+        let read_job = std::fs::read_to_string(entry.path())
             .ok()
             .and_then(|text| Job::read(&text))
             .and_then(|job| Some((trigger::trigger_of(&job.program)?.0.generation, job)));
-        let Some((generation, job)) = read else {
-            followed.remove(name);
+        let Some((generation, job)) = read_job else {
+            if followed.remove(name).is_some() {
+                read.push(name.to_owned());
+            }
             continue;
         };
         let known = followed
@@ -1007,8 +1272,15 @@ fn read_jobs(
                 queued,
             },
         );
+        read.push(name.to_owned());
     }
-    followed.retain(|name, _| there.contains(name));
+    followed.retain(|name, _| {
+        let stays = there.contains(name);
+        if !stays {
+            read.push(name.clone());
+        }
+        stays
+    });
     new
 }
 
@@ -1203,11 +1475,16 @@ fn write_looked(places: &Places, kept: &HashMap<String, (String, i64)>) {
 /// The doorbell's own writer, for the SIGCHLD handler.
 static BELL: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
 
+/// The byte a fire's end writes on the doorbell: it wakes the scheduler
+/// for the fires that ended, and is no ring, which every other writer's
+/// byte is, to read the definitions and every queue again.
+const ENDED: u8 = 2;
+
 extern "C" fn rung(_: libc::c_int) {
     let fd = BELL.load(std::sync::atomic::Ordering::Relaxed);
     if fd >= 0 {
         // SAFETY: write is async-signal-safe; a full pipe drops the byte.
-        unsafe { libc::write(fd, [1u8].as_ptr().cast(), 1) };
+        unsafe { libc::write(fd, [ENDED].as_ptr().cast(), 1) };
     }
 }
 
@@ -1276,7 +1553,7 @@ impl Doorbell {
         }))
     }
 
-    /// Wait up to `wait` for a ring; whether one came.
+    /// Wait up to `wait` for a ring or a fire's end; whether a ring came.
     fn wait(&self, wait: Duration) -> bool {
         use std::io::Read;
         use std::os::fd::AsRawFd;
@@ -1292,14 +1569,14 @@ impl Doorbell {
             return false;
         }
         let mut buffer = [0u8; 256];
-        let mut any = false;
+        let mut rang = false;
         while let Ok(n @ 1..) = (&self.read).read(&mut buffer) {
-            any = true;
+            rang |= buffer[..n].iter().any(|byte| *byte != ENDED);
             if n < buffer.len() {
                 break;
             }
         }
-        any
+        rang
     }
 }
 
@@ -1575,8 +1852,10 @@ mod tests {
             unkept: None,
             queued: None,
         };
-        let mut followed: HashMap<String, Followed> =
-            ["a", "b", "z"].map(|n| (n.to_owned(), follow())).into();
+        let mut schedule = Schedule {
+            followed: ["a", "b", "z"].map(|n| (n.to_owned(), follow())).into(),
+            ..Schedule::default()
+        };
         let mut fleet = Fleet {
             running: HashMap::new(),
             busy: std::collections::HashSet::new(),
@@ -1589,34 +1868,30 @@ mod tests {
             pid += 1;
             Ok::<_, String>(Some(pid))
         };
-        let ready = |names: &[&str]| names.iter().map(|n| (n.to_string(), false)).collect();
+        let ready = |names: &[&str]| {
+            let mut ready = Ready::default();
+            names.iter().for_each(|name| ready.due(name));
+            ready
+        };
         let now = std::time::Instant::now();
-        admit(
+        schedule.admit(
             ready(&["a", "b", "z"]),
-            &mut followed,
             &mut fleet,
             now,
             &mut kept,
             &mut spawn,
         );
         assert!(fleet.busy.contains("a") && fleet.busy.contains("b"));
-        assert_eq!(followed["z"].queued, Some(0));
+        assert_eq!(schedule.followed["z"].queued, Some(0));
         // a's fire ends and a is due again at once: z, in line, goes first.
         let a = *fleet.running.iter().find(|(_, n)| *n == "a").unwrap().0;
         fleet.ended(a);
         let later = now + AGAIN_AFTER * 2;
-        admit(
-            ready(&["a", "z"]),
-            &mut followed,
-            &mut fleet,
-            later,
-            &mut kept,
-            &mut spawn,
-        );
+        schedule.admit(ready(&["a", "z"]), &mut fleet, later, &mut kept, &mut spawn);
         assert!(fleet.busy.contains("z") && !fleet.busy.contains("a"));
-        assert_eq!(followed["z"].queued, None);
-        assert_eq!(followed["a"].queued, Some(1));
-        assert!(followed["a"].again);
+        assert_eq!(schedule.followed["z"].queued, None);
+        assert_eq!(schedule.followed["a"].queued, Some(1));
+        assert!(schedule.followed["a"].again);
     }
 
     #[test]
@@ -1640,34 +1915,331 @@ mod tests {
             unkept: None,
             queued: None,
         };
-        let mut followed: HashMap<String, Followed> = [("t".to_owned(), f)].into();
+        let mut schedule = Schedule {
+            followed: [("t".to_owned(), f)].into(),
+            ..Schedule::default()
+        };
         let mut fleet = Fleet::new();
         let mut kept = HashMap::new();
         let mut held = |_: &str, _: &Job| Ok::<Option<libc::pid_t>, String>(None);
         let now = std::time::Instant::now();
         // An ask alone: not due again, so no fire follows the one that
         // holds the lock once it ends; the queue is looked at again.
-        admit(
-            vec![("t".into(), true)],
-            &mut followed,
-            &mut fleet,
-            now,
-            &mut kept,
-            &mut held,
-        );
-        let f = &followed["t"];
+        let mut asked = Ready::default();
+        asked.asked("t");
+        schedule.admit(asked, &mut fleet, now, &mut kept, &mut held);
+        let f = &schedule.followed["t"];
         assert_eq!((f.again, f.retry), (false, None));
         // A time or a change: due again, after a wait.
-        admit(
-            vec![("t".into(), false)],
-            &mut followed,
-            &mut fleet,
-            now,
-            &mut kept,
-            &mut held,
-        );
-        let f = &followed["t"];
+        let mut due = Ready::default();
+        due.due("t");
+        schedule.admit(due, &mut fleet, now, &mut kept, &mut held);
+        let f = &schedule.followed["t"];
         assert!(f.again && f.retry.is_some_and(|at| at > now));
+    }
+
+    /// A trigger as the fleet tests follow it: due again when `again`, a
+    /// calendar time each hour at the minute `timed` names.
+    fn followed(again: bool, timed: Option<usize>, now: i64) -> Followed {
+        let calendar = match timed {
+            Some(minute) => trigger::cron(&format!("{minute} * * * *")).unwrap().entries,
+            None => Vec::new(),
+        };
+        Followed {
+            file: (0, 0, 0),
+            next: next_after(&calendar, now),
+            job: Job {
+                program: vec!["/A/sonny".into()],
+                environment: Vec::new(),
+                calendar,
+                watch: None,
+            },
+            generation: "g".into(),
+            looked: now,
+            seen: None,
+            again,
+            started: None,
+            failures: 0,
+            retry: None,
+            unkept: None,
+            queued: None,
+        }
+    }
+
+    /// A wake as the scheduler took it when it looked at every trigger:
+    /// each one's calendar and queue, then those ready, sorted, launched.
+    #[allow(clippy::too_many_arguments)]
+    fn every_trigger(
+        followed: &mut HashMap<String, Followed>,
+        fleet: &mut Fleet,
+        now: i64,
+        instant: std::time::Instant,
+        asks: bool,
+        ended: &std::collections::HashSet<String>,
+        asked: &mut dyn FnMut(&str) -> bool,
+        kept: &mut HashMap<String, (String, i64)>,
+        spawn: &mut Spawn,
+    ) -> bool {
+        let mut fired = false;
+        let mut ready = Vec::new();
+        for (name, f) in followed.iter_mut() {
+            let busy = fleet.busy.contains(name);
+            let mut due = std::mem::take(&mut f.again);
+            if came(name, f, busy, now, kept) {
+                fired |= busy;
+                due |= !busy;
+            }
+            let ask = !busy && (asks || ended.contains(name)) && asked(name);
+            if due || ask {
+                ready.push((name.clone(), !due));
+            }
+        }
+        let mut ready: Vec<_> = (ready.into_iter())
+            .map(|(name, ask)| {
+                let queued = followed[&name].queued;
+                (queued.is_none(), queued.unwrap_or(0), name, ask)
+            })
+            .collect();
+        ready.sort_unstable();
+        for (_, _, name, ask) in ready {
+            let f = followed.get_mut(&name).unwrap();
+            if launch(&name, f, fleet, instant, spawn) == Launched::Held && ask {
+                (f.again, f.failures, f.retry) = (false, 0, None);
+            }
+            fired |= started(&name, f, instant, kept);
+        }
+        fired
+    }
+
+    /// What a test compares of a trigger.
+    type Kept = (
+        bool,
+        Option<u64>,
+        Option<i64>,
+        i64,
+        u32,
+        Option<std::time::Instant>,
+    );
+
+    #[test]
+    fn a_wake_starts_the_fires_looking_at_every_trigger_started() {
+        // Two schedulers, one looking at every trigger and this one, over
+        // the same 3,000 wakes: fires end, time passes, asks come, starts
+        // fail or find a fire from before holding the lock, triggers are
+        // read again due. Every wake starts the same fires in the same
+        // order and leaves every trigger the same.
+        let start = 1_799_999_940;
+        let base = std::time::Instant::now();
+        let names: Vec<String> = (0..300).map(|i| format!("t{i:03}")).collect();
+        let make = |i: usize| {
+            followed(
+                i.is_multiple_of(5),
+                i.is_multiple_of(4).then_some(i % 3 * 20),
+                start,
+            )
+        };
+        let mut old: HashMap<String, Followed> = (names.iter().enumerate())
+            .map(|(i, n)| (n.clone(), make(i)))
+            .collect();
+        let mut new = Schedule::default();
+        for (i, name) in names.iter().enumerate() {
+            new.followed.insert(name.clone(), make(i));
+            new.file(name, base);
+        }
+        let fleet = || Fleet {
+            running: HashMap::new(),
+            busy: std::collections::HashSet::new(),
+            cap: 4,
+            line: 0,
+        };
+        let (mut old_fleet, mut new_fleet) = (fleet(), fleet());
+        let (mut old_kept, mut new_kept) = (HashMap::new(), HashMap::new());
+        let mut seed: u64 = 7;
+        let mut roll = move |n: u64| {
+            seed = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+            (seed >> 33) % n
+        };
+        // How each try to start a trigger goes, by how many it had: the
+        // same in both, as each tries the same.
+        let outcome = |name: &str, tries: u32| {
+            let hash = name
+                .bytes()
+                .fold(tries as u64, |h, b| h.wrapping_mul(31) + b as u64);
+            match hash % 10 {
+                0 => Err(format!("{name}: gone")),
+                1 => Ok(None),
+                _ => Ok(Some(())),
+            }
+        };
+        let (mut old_tries, mut new_tries) = (HashMap::new(), HashMap::new());
+        let (mut now, mut instant) = (start, base);
+        for wake in 0..3_000 {
+            now += roll(40) as i64;
+            instant += Duration::from_millis(roll(4_000));
+            // Some fires end, the same in both.
+            let mut running: Vec<String> = old_fleet.busy.iter().cloned().collect();
+            running.sort();
+            let ended: std::collections::HashSet<String> =
+                (running.into_iter()).filter(|_| roll(4) == 0).collect();
+            for (fleet, running) in [(&mut old_fleet, true), (&mut new_fleet, false)] {
+                let _ = running;
+                let pids: Vec<_> = (fleet.running.iter())
+                    .filter(|(_, name)| ended.contains(*name))
+                    .map(|(pid, _)| *pid)
+                    .collect();
+                for pid in pids {
+                    fleet.ended(pid);
+                }
+            }
+            // A ring, asks in some queues, a trigger read again due.
+            let asks = roll(4) == 0;
+            let asking: std::collections::HashSet<String> = (0..roll(3))
+                .map(|_| names[roll(300) as usize].clone())
+                .collect();
+            // At the start every trigger was read.
+            let mut fresh = match wake {
+                0 => names.clone(),
+                _ => Vec::new(),
+            };
+            for _ in 0..roll(4) {
+                let name = names[roll(300) as usize].clone();
+                old.get_mut(&name).unwrap().again = true;
+                new.followed.get_mut(&name).unwrap().again = true;
+                new.file(&name, instant);
+                fresh.push(name);
+            }
+            let (mut old_started, mut new_started) = (Vec::new(), Vec::new());
+            let mut pid = 0;
+            let old_fired = every_trigger(
+                &mut old,
+                &mut old_fleet,
+                now,
+                instant,
+                asks,
+                &ended,
+                &mut |name| asking.contains(name),
+                &mut old_kept,
+                &mut |name, _| {
+                    let tries = old_tries.entry(name.to_owned()).or_insert(0);
+                    *tries += 1;
+                    outcome(name, *tries).map(|ok| {
+                        ok.map(|()| {
+                            old_started.push(name.to_owned());
+                            pid += 1;
+                            pid
+                        })
+                    })
+                },
+            );
+            let mut pid = 0;
+            let new_fired = new.pass(
+                &mut new_fleet,
+                now,
+                instant,
+                false,
+                asks,
+                &ended,
+                &fresh,
+                &mut |name| asking.contains(name),
+                &mut new_kept,
+                &mut |name, _| {
+                    let tries = new_tries.entry(name.to_owned()).or_insert(0);
+                    *tries += 1;
+                    outcome(name, *tries).map(|ok| {
+                        ok.map(|()| {
+                            new_started.push(name.to_owned());
+                            pid += 1;
+                            pid
+                        })
+                    })
+                },
+            );
+            assert_eq!(
+                old_started, new_started,
+                "the same fires, in the same order"
+            );
+            assert_eq!(old_fired, new_fired);
+            assert_eq!(old_kept, new_kept);
+            assert_eq!(old_fleet.busy, new_fleet.busy);
+            assert_eq!(old_fleet.line, new_fleet.line);
+            let state = |f: &Followed| -> Kept {
+                (f.again, f.queued, f.next, f.looked, f.failures, f.retry)
+            };
+            for name in &names {
+                let (a, b) = (&old[name], &new.followed[name]);
+                assert_eq!(state(a), state(b), "{name}");
+                assert_eq!((a.started, a.unkept), (b.started, b.unkept), "{name}");
+            }
+        }
+        assert!(old_fleet.line > 300, "{} places in line", old_fleet.line);
+    }
+
+    #[test]
+    fn a_fire_ending_looks_at_the_triggers_it_may_start_not_at_every_one() {
+        // `triggers` due at once, a fleet of 64 at a time: the triggers
+        // looked at by each wake a fire's end brings, and by them all.
+        let looked = |triggers: usize| {
+            let mut schedule = Schedule::default();
+            let names: Vec<String> = (0..triggers).map(|i| format!("t{i:05}")).collect();
+            let now = std::time::Instant::now();
+            for name in &names {
+                schedule
+                    .followed
+                    .insert(name.clone(), followed(true, None, 0));
+                schedule.file(name, now);
+            }
+            let mut fleet = Fleet {
+                running: HashMap::new(),
+                busy: std::collections::HashSet::new(),
+                cap: 64,
+                line: 0,
+            };
+            let mut kept = HashMap::new();
+            let mut pid = 0;
+            let mut spawn = |_: &str, _: &Job| {
+                pid += 1;
+                Ok::<_, String>(Some(pid))
+            };
+            let none = std::collections::HashSet::new();
+            let mut asked = |_: &str| false;
+            schedule.pass(
+                &mut fleet, 0, now, false, false, &none, &names, &mut asked, &mut kept, &mut spawn,
+            );
+            let (mut most, mut all) = (0, 0);
+            let mut at = now;
+            while let Some(&pid) = fleet.running.keys().min() {
+                let ended = std::collections::HashSet::from([fleet.ended(pid).unwrap()]);
+                at += AGAIN_AFTER;
+                VISITED.with(|visited| visited.set(0));
+                schedule.pass(
+                    &mut fleet,
+                    0,
+                    at,
+                    false,
+                    false,
+                    &ended,
+                    &[],
+                    &mut asked,
+                    &mut kept,
+                    &mut spawn,
+                );
+                schedule.wake(&fleet, LOOK_EVERY, LOOK_EVERY);
+                let wake = VISITED.with(|visited| visited.get());
+                (most, all) = (most.max(wake), all + wake);
+            }
+            assert!(
+                schedule
+                    .followed
+                    .values()
+                    .all(|f| !f.again && f.queued.is_none())
+            );
+            assert_eq!(pid as usize, triggers, "every trigger fired once");
+            (most, all)
+        };
+        let (most, all) = looked(10_000);
+        assert!(most <= 4, "a wake looked at {most}");
+        assert!(all <= 3 * 10_000, "{all} in all");
+        assert_eq!(most, looked(200).0);
     }
 
     /// In a zone with daylight saving, as a child of this test binary, so
@@ -1803,7 +2375,12 @@ mod tests {
         // Written before the trigger was added: nothing to fire for.
         std::thread::sleep(Duration::from_millis(20));
         define();
-        assert!(read_jobs(&places, &mut followed, &mut kept));
+        assert!(read_jobs(
+            &places,
+            &mut followed,
+            &mut kept,
+            &mut Vec::new()
+        ));
         assert!(!followed["w"].again);
         assert_eq!(kept["w"].0, "g1");
         // Written after it was added, before the scheduler first read it.
@@ -1811,11 +2388,21 @@ mod tests {
         kept.clear();
         std::thread::sleep(Duration::from_millis(20));
         std::fs::write(&watched, "after\n").unwrap();
-        assert!(read_jobs(&places, &mut followed, &mut kept));
+        assert!(read_jobs(
+            &places,
+            &mut followed,
+            &mut kept,
+            &mut Vec::new()
+        ));
         assert!(followed["w"].again);
         // One it kept already, as after the scheduler restarts: no fire.
         followed.clear();
-        assert!(!read_jobs(&places, &mut followed, &mut kept));
+        assert!(!read_jobs(
+            &places,
+            &mut followed,
+            &mut kept,
+            &mut Vec::new()
+        ));
         assert!(!followed["w"].again);
         let _ = std::fs::remove_dir_all(&root);
     }
