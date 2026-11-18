@@ -11991,3 +11991,93 @@ both sides in every footprint run, and the gate passed.
 
 This change does not touch Sonny. Of the same job's Sonny rows, only the
 quiet window's CPU moved more than 15% (0.77 to 0.96 ms a second).
+
+## jemalloc in the aarch64 Linux build, compiled as Codex's
+
+The static Linux builds compile their C dependencies with Zig 0.14.0's
+clang (`zig cc -target <arch>-linux-musl`), as Codex's musl releases do,
+instead of Ubuntu's `musl-gcc`. With `musl-gcc` on the arm runner,
+jemalloc's configure found no usable atomics and v0.10.2's aarch64 build
+failed (#1192), so #1193 had kept musl's allocator there. With Zig's clang
+jemalloc builds, and aarch64 allocates with it again, with Codex's
+`narenas_ratio:0.25`.
+
+Screened as the Perf job screens (`bench/perf_gate.py`, two alternating
+rounds) but on the static musl builds, each on its own GitHub runner: main
+(d3f8309) built as its release does with `musl-gcc`, against 7e67cb3
+built with Zig. The gate passed on both: store work per turn
+did not rise.
+
+### aarch64 (ubuntu-24.04-arm): musl's allocator against jemalloc
+
+| Bench | Measure | Base | Head | Change |
+| --- | --- | ---: | ---: | ---: |
+| admission | lone submit CPU, ms | 47.145 | 44.753 | -5.1% |
+| admission | burst submit p99, ms | 7.246 | 7.833 | +8.1% |
+| completion | release to terminal p99, ms | 14.134 | 13.954 | -1.3% |
+| footprint | idle RSS, MiB | 11.576 | 12.883 | +11.3% |
+| footprint | per idle bot, KiB | 1.772 | 2.982 | +68.3% |
+| footprint | RSS after a turn each, MiB | 20.076 | 30.385 | +51.3% |
+| footprint | CPU per turn, ms | 1.062 | 0.939 | -11.6% |
+| sonny | lookout CPU per 1k deltas at 10x1, ms | 43.75 | 37.5 | -14.3% |
+| sonny | lookout CPU per 1k deltas at 10x10, ms | 10.0 | 7.5 | -25.0% |
+| sonny | lookout CPU per 1k deltas at 10x100, ms | 6.685 | 3.75 | -43.9% |
+| sonny | lookout CPU per 1k deltas at 100x10, ms | 10.44 | 7.06 | -32.4% |
+| sonny | lookout seated at 100x10, s | 0.1 | 0.1 | +0.0% |
+| sonny | lookout note p95 at 10x100, ms | 2212.0 | 2163.5 | -2.2% |
+| sonny | lookout note p95 at 100x10, ms | 2400.5 | 2328.0 | -3.0% |
+| sonny | quiet window CPU, ms/s | 0.575 | 0.78 | +35.7% |
+| sonny | quiet window reads, KiB/s | 0.0 | 0.0 | +0.0% |
+| sonny | quiet window requests, /s | 0.0 | 0.0 | +0.0% |
+| sonny | quiet window RSS, MiB | 17.7 | 24.4 | +37.9% |
+| sonny | sky replay CPU per 1k lines, ms | 13.61 | 6.805 | -50.0% |
+| sonny | sky replay RSS, MiB | 51.55 | 62.85 | +21.9% |
+| lifecycle | CPU, s | 0.695 | 0.6 | -13.7% |
+| lifecycle | p95 turn, ms | 586.583 | 589.822 | +0.6% |
+| lifecycle | peak RSS, MiB | 20.406 | 24.193 | +18.6% |
+
+As on x86_64 (#1158), jemalloc spends less CPU and holds more memory:
+
+- **Faster:** CPU per turn −12%, lifecycle CPU −14%, lookout CPU −14% to
+  −44%, sky replay CPU −50%. Latency moves within the runner's noise
+  (burst submit p99 +8%, completion p99 −1%).
+- **More memory:** memory after a turn each is 20.1 → 30.4 MiB (+51%), a
+  quiet window 17.7 → 24.4 MiB (+38%), lifecycle peak +19%, idle +11%.
+  jemalloc keeps freed pages for 10 s, as #1158 measured, and George kept
+  Codex's settings knowing this (11-18).
+- **Quiet window CPU** is 0.58 → 0.78 ms a second.
+
+### x86_64 (ubuntu-24.04): the compiler alone
+
+Both sides already allocate with jemalloc here, so this row isolates the
+switch from `musl-gcc` to Zig's clang for SQLite, jemalloc, aws-lc and
+ring.
+
+| Bench | Measure | Base | Head | Change |
+| --- | --- | ---: | ---: | ---: |
+| admission | lone submit CPU, ms | 34.32 | 35.171 | +2.5% |
+| admission | burst submit p99, ms | 6.329 | 6.413 | +1.3% |
+| completion | release to terminal p99, ms | 11.767 | 12.411 | +5.5% |
+| footprint | idle RSS, MiB | 14.398 | 13.895 | -3.5% |
+| footprint | per idle bot, KiB | 2.448 | 2.846 | +16.3% |
+| footprint | RSS after a turn each, MiB | 31.744 | 31.863 | +0.4% |
+| footprint | CPU per turn, ms | 0.839 | 0.849 | +1.2% |
+| sonny | lookout CPU per 1k deltas at 10x1, ms | 25.0 | 25.0 | +0.0% |
+| sonny | lookout CPU per 1k deltas at 10x10, ms | 5.625 | 5.625 | +0.0% |
+| sonny | lookout CPU per 1k deltas at 10x100, ms | 4.125 | 4.065 | -1.5% |
+| sonny | lookout CPU per 1k deltas at 100x10, ms | 5.75 | 5.88 | +2.3% |
+| sonny | lookout seated at 100x10, s | 0.1 | 0.1 | +0.0% |
+| sonny | lookout note p95 at 10x100, ms | 2090.5 | 2140.0 | +2.4% |
+| sonny | lookout note p95 at 100x10, ms | 2255.0 | 2207.0 | -2.1% |
+| sonny | quiet window CPU, ms/s | 0.585 | 0.385 | -34.2% |
+| sonny | quiet window reads, KiB/s | 0.0 | 0.0 | +0.0% |
+| sonny | quiet window requests, /s | 0.0 | 0.0 | +0.0% |
+| sonny | quiet window RSS, MiB | 27.05 | 26.9 | -0.6% |
+| sonny | sky replay CPU per 1k lines, ms | 10.94 | 11.02 | +0.7% |
+| sonny | sky replay RSS, MiB | 61.7 | 63.95 | +3.6% |
+| lifecycle | CPU, s | 0.465 | 0.465 | +0.0% |
+| lifecycle | p95 turn, ms | 591.682 | 578.401 | -2.2% |
+| lifecycle | peak RSS, MiB | 25.432 | 25.078 | -1.4% |
+
+Every row moves within the runner's run-to-run noise. The largest, the
+quiet window's CPU, is lower (0.59 → 0.39 ms a second).
