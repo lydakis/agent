@@ -5,6 +5,11 @@
 //! and every such row whose picture is ready is drawn again in its place,
 //! as is one pushed later from rows held meanwhile.
 //! The same picture asked for again while it is drawn is drawn once.
+//!
+//! A row standing for a picture carries the picture's key, and how to
+//! draw its rows again is kept beside the picture in the cache's folder:
+//! the window keeps nothing for a picture once it is drawn, however long
+//! the conversation.
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     path::PathBuf,
@@ -18,20 +23,61 @@ use ratatui::{
     style::{Color, Modifier, Style, Stylize},
     text::{Line, Span},
 };
+use serde::{Deserialize, Serialize};
 
 use crate::image::Drawn;
 
 type Draw = Box<dyn FnOnce() -> Result<Drawn, String> + Send>;
-type Redraw = Arc<dyn Fn() -> Vec<Line<'static>> + Send + Sync>;
 
-/// A row standing where a picture goes, by the mark it wears: the picture
-/// it waits for, and how to draw its rows again. Kept while the window
-/// is, as rows held anywhere (a call's, a staged message's, a pane gone
-/// back from) may wear its mark long after the picture is ready: one for
-/// each picture ever drawn beside the loop, its source and no more.
-struct Placed {
-    key: u64,
-    redraw: Redraw,
+/// How the rows of a picture are drawn again once it is ready: from the
+/// cache, by what it was drawn from.
+#[derive(Clone, Serialize, Deserialize)]
+pub enum Redraw {
+    /// A fence of `lang`.
+    Fence {
+        lang: String,
+        source: String,
+        width: usize,
+    },
+    /// An HTML page kept at `path`.
+    Page { path: PathBuf, width: usize },
+    /// A picture file, named by its description and where it was linked.
+    File {
+        path: PathBuf,
+        width: usize,
+        alt: String,
+        src: String,
+    },
+    /// Nothing: whoever shows it draws it again from its file.
+    Nothing,
+    /// Rows as they are, for tests.
+    #[cfg(test)]
+    Rows(Vec<String>),
+}
+
+impl Redraw {
+    fn rows(&self) -> Vec<Line<'static>> {
+        match self {
+            Redraw::Fence {
+                lang,
+                source,
+                width,
+            } => crate::transcript::fence_picture(lang.clone(), source.clone(), *width),
+            Redraw::Page { path, width } => {
+                let source = std::fs::read_to_string(path).unwrap_or_default();
+                crate::transcript::kept_page(path.clone(), &source, *width)
+            }
+            Redraw::File {
+                path,
+                width,
+                alt,
+                src,
+            } => crate::transcript::picture_again(path, *width, alt, src),
+            Redraw::Nothing => Vec::new(),
+            #[cfg(test)]
+            Redraw::Rows(rows) => rows.iter().map(|row| Line::from(row.clone())).collect(),
+        }
+    }
 }
 
 #[derive(Default)]
@@ -40,16 +86,14 @@ struct State {
     running: HashSet<u64>,
     jobs: VecDeque<(u64, Option<PathBuf>, Draw)>,
     worker: bool,
-    /// What was drawn and no file kept (no folder for pictures, or it
-    /// could not be written), as the folder would have kept it; and what
-    /// could not be drawn, and why, so it is not tried again at each look.
+    /// How to draw again the rows standing for a picture still drawing;
+    /// kept beside it in the folder once it is drawn.
+    asked: HashMap<u64, Redraw>,
+    /// Where there is no folder for pictures, or it could not be written:
+    /// what was drawn, or why it could not be, so it is not tried again at
+    /// each look; and how to draw its rows again.
     done: HashMap<u64, Result<Drawn, String>>,
-    /// Rows standing for pictures, by the number their mark carries.
-    placed: HashMap<u32, Placed>,
-    /// That number for each picture with rows standing for it: one of its
-    /// own, however its key is cut to fit.
-    ids: HashMap<u64, u32>,
-    last_id: u32,
+    unkept: HashMap<u64, Redraw>,
     /// The windows woken as a picture is ready.
     wake: Vec<Weak<tokio::sync::Notify>>,
 }
@@ -100,6 +144,11 @@ pub fn start(key: u64, path: Option<PathBuf>, draw: Draw) {
     JOBS.notify_one();
 }
 
+/// Where how to draw again the rows of picture `key` is kept.
+fn redraw_path(drawn: &std::path::Path) -> PathBuf {
+    drawn.with_extension("redraw")
+}
+
 /// The worker: each picture in turn, kept, and the windows woken.
 fn work() {
     loop {
@@ -123,6 +172,19 @@ fn work() {
         let wake = {
             let mut state = state();
             let state = state.get_or_insert_with(State::default);
+            // How to draw its rows again kept beside it, under the lock,
+            // so no row asked for meanwhile is missed: small, and once
+            // for each picture.
+            if let Some(redraw) = state.asked.remove(&key) {
+                let written = path.as_ref().is_some_and(|path| {
+                    serde_json::to_vec(&redraw).is_ok_and(|bytes| {
+                        crate::cache::write_whole(&redraw_path(path), &bytes).is_ok()
+                    })
+                });
+                if !written {
+                    state.unkept.insert(key, redraw);
+                }
+            }
             state.running.remove(&key);
             if !kept {
                 state.done.insert(key, drawn);
@@ -141,15 +203,29 @@ fn work() {
     }
 }
 
-/// The mark a row standing for picture `id` wears: an empty span, never
-/// drawn, its underline colour the 24-bit number, as a wrapped row's lead
-/// is marked ([`crate::transcript::lead`]) in an indexed one.
-fn mark(id: u32) -> Span<'static> {
-    let style = Style::new()
-        .underline_color(Color::Rgb((id >> 16) as u8, (id >> 8) as u8, id as u8))
-        .add_modifier(Modifier::HIDDEN);
-    Span::styled("", style)
+/// The marks a row standing for picture `key` wears: three empty spans,
+/// never drawn, their underline colours the key, 24 bits at a time with
+/// a check in the last, as a wrapped row's lead is marked
+/// ([`crate::transcript::lead`]) in an indexed one.
+fn marks(key: u64) -> [Span<'static>; 3] {
+    let parts = [
+        (key >> 40) as u32,
+        (key >> 16) as u32 & 0xFF_FFFF,
+        ((key as u32 & 0xFFFF) << 8) | CHECK,
+    ];
+    parts.map(|part| {
+        let style = Style::new()
+            .underline_color(Color::Rgb(
+                (part >> 16) as u8,
+                (part >> 8) as u8,
+                part as u8,
+            ))
+            .add_modifier(Modifier::HIDDEN);
+        Span::styled("", style)
+    })
 }
+
+const CHECK: u32 = 0xD7;
 
 fn marked(span: &Span) -> Option<u32> {
     match (span.content.is_empty(), span.style.underline_color) {
@@ -160,38 +236,49 @@ fn marked(span: &Span) -> Option<u32> {
     }
 }
 
+/// Where `line`'s marks start, and the key they carry.
+fn key_of(line: &Line) -> Option<(usize, u64)> {
+    let at = line.spans.iter().position(|span| marked(span).is_some())?;
+    let parts = line.spans.get(at..at + 3)?;
+    let [a, b, c] = [&parts[0], &parts[1], &parts[2]].map(marked);
+    let (a, b, c) = (a?, b?, c?);
+    (c & 0xFF == CHECK).then_some((
+        at,
+        (u64::from(a) << 40) | (u64::from(b) << 16) | u64::from(c >> 8),
+    ))
+}
+
 /// The row that stands where picture `key` goes while it is drawn, saying
-/// so; `redraw` draws its rows once it is.
-pub fn placeholder(
-    key: u64,
-    what: &str,
-    redraw: impl Fn() -> Vec<Line<'static>> + Send + Sync + 'static,
-) -> Vec<Line<'static>> {
-    let mut state = state();
-    let state = state.get_or_insert_with(State::default);
-    let id = match state.ids.get(&key) {
-        Some(id) => *id,
-        None => {
-            let id = state.last_id % 0xFF_FFFF + 1;
-            state.last_id = id;
-            state.ids.insert(key, id);
-            id
+/// so; `redraw` draws its rows once it is. Drawn already, its rows.
+pub fn placeholder(key: u64, what: &str, redraw: Redraw) -> Vec<Line<'static>> {
+    {
+        let mut state = state();
+        let state = state.get_or_insert_with(State::default);
+        // Drawn already, as it was asked for: its rows, unless whoever
+        // shows it draws it again from its file, which a row standing
+        // for it tells them to.
+        let drawn = !state.running.contains(&key);
+        if !drawn || matches!(redraw, Redraw::Nothing) {
+            match drawn {
+                // Its window looks again at its next pass.
+                true => {
+                    state.unkept.insert(key, redraw);
+                    LANDED.fetch_add(1, Ordering::AcqRel);
+                }
+                false => {
+                    state.asked.insert(key, redraw);
+                }
+            }
+            // The marks first: a row's lead swapped
+            // ([`crate::transcript::relead`]) keeps the empty spans it
+            // starts with.
+            let mut spans = marks(key).to_vec();
+            spans.push(Span::raw("  "));
+            spans.push(Span::raw(format!("drawing {what}…")).dim());
+            return vec![Line::from(spans)];
         }
-    };
-    state.placed.insert(
-        id,
-        Placed {
-            key,
-            redraw: Arc::new(redraw),
-        },
-    );
-    // The mark first: a row's lead swapped ([`crate::transcript::relead`])
-    // keeps the empty spans it starts with.
-    vec![Line::from(vec![
-        mark(id),
-        Span::raw("  "),
-        Span::raw(format!("drawing {what}…")).dim(),
-    ])]
+    }
+    redraw.rows()
 }
 
 /// Whether `line` stands for a picture still to come.
@@ -202,22 +289,26 @@ pub fn waits(line: &Line) -> bool {
 /// The rows in place of `line`, when it stands for a picture now ready:
 /// what was before its words leads each of them.
 pub fn ready(line: &Line<'static>) -> Option<Vec<Line<'static>>> {
-    let (at, mark) = (line.spans.iter().enumerate()).find_map(|(at, s)| Some((at, marked(s)?)))?;
-    let redraw = {
+    let (at, key) = key_of(line)?;
+    let kept = {
         let state = state();
         let state = state.as_ref()?;
-        let placed = state.placed.get(&mark)?;
-        if state.running.contains(&placed.key) {
+        if state.running.contains(&key) {
             return None;
         }
-        placed.redraw.clone()
+        state.unkept.get(&key).cloned()
     };
-    // The lead: every span but the mark and the words, which end it.
+    let redraw = kept.or_else(|| {
+        let path = redraw_path(&crate::cache::path(key)?);
+        serde_json::from_slice(&std::fs::read(path).ok()?).ok()
+    })?;
+    // The lead: every span but the marks and the words, which end it.
     let lead = (line.spans.iter().enumerate())
-        .filter(|(i, _)| *i != at && *i + 1 != line.spans.len())
+        .filter(|(i, _)| !(at..at + 3).contains(i) && *i + 1 != line.spans.len())
         .map(|(_, span)| span.clone());
     let lead = Line::from(lead.collect::<Vec<_>>());
-    let rows = redraw()
+    let rows = redraw
+        .rows()
         .into_iter()
         .map(|row| {
             let mut row = crate::transcript::relead(row, &lead);
@@ -271,6 +362,57 @@ mod tests {
         }
     }
 
+    /// Picture `key` asked for, drawn once the sender sends.
+    fn gated(key: u64, path: Option<PathBuf>) -> std::sync::mpsc::Sender<()> {
+        let (go, gate) = std::sync::mpsc::channel::<()>();
+        let gate = Mutex::new(gate);
+        start(
+            key,
+            path,
+            Box::new(move || {
+                let _ = gate.lock().unwrap().recv();
+                Ok(drawn(2))
+            }),
+        );
+        go
+    }
+
+    #[test]
+    fn a_drawn_picture_leaves_nothing_in_memory_and_its_rows_still_take_it() {
+        let key = 0xD1A6_0000_0000_0006 ^ u64::from(std::process::id());
+        let Some(path) = crate::cache::path(key) else {
+            return;
+        };
+        let go = gated(key, Some(path.clone()));
+        let held = placeholder(key, "the diagram", Redraw::Rows(vec!["  drawn".into()]));
+        go.send(()).unwrap();
+        until(|| state().as_ref().is_some_and(|s| !s.running.contains(&key)));
+        {
+            let state = state();
+            let state = state.as_ref().unwrap();
+            assert!(!state.asked.contains_key(&key));
+            assert!(!state.unkept.contains_key(&key));
+            assert!(!state.done.contains_key(&key));
+        }
+        // Long after, its row takes it from what the folder kept.
+        let rows = ready(&held[0]).expect("ready");
+        let text: Vec<String> = rows.iter().map(|r| r.to_string()).collect();
+        assert_eq!(text, ["  drawn"]);
+        let _ = std::fs::remove_file(redraw_path(&path));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn a_row_carries_its_picture_s_whole_key() {
+        for key in [0, 1, u64::MAX, 0xD1A6_0000_00AB_C003, 0x0123_4567_89AB_CDEF] {
+            let mut spans = marks(key).to_vec();
+            spans.push(Span::raw("  drawing…"));
+            let line = Line::from(spans);
+            assert!(waits(&line));
+            assert_eq!(key_of(&line), Some((0, key)));
+        }
+    }
+
     #[test]
     fn the_same_picture_asked_twice_while_drawn_is_drawn_once() {
         let key = 0xD1A6_0001;
@@ -319,9 +461,11 @@ mod tests {
             }),
         );
         let mut rows = vec![Line::from("above")];
-        let waiting = placeholder(key, "the diagram", || {
-            vec![Line::from("  first"), Line::from("  second")]
-        });
+        let waiting = placeholder(
+            key,
+            "the diagram",
+            Redraw::Rows(vec!["  first".into(), "  second".into()]),
+        );
         // A lead in place of the row's own two columns, as a note's.
         rows.extend(
             waiting
@@ -354,10 +498,12 @@ mod tests {
             }),
         );
         start(two, None, Box::new(|| Err("no".into())));
-        let mut rows = placeholder(one, "the diagram", || vec![Line::from("  one")]);
-        rows.extend(placeholder(two, "the formula", || {
-            vec![Line::from("  two")]
-        }));
+        let mut rows = placeholder(one, "the diagram", Redraw::Rows(vec!["  one".into()]));
+        rows.extend(placeholder(
+            two,
+            "the formula",
+            Redraw::Rows(vec!["  two".into()]),
+        ));
         go.send(()).unwrap();
         until(|| ready(&rows[0]).is_some() && ready(&rows[1]).is_some());
         assert!(fill(&mut rows));
@@ -369,16 +515,19 @@ mod tests {
     fn a_picture_in_a_run_of_tagged_rows_keeps_the_run_whole() {
         use crate::screen::{Mark, Screen, Tag};
         let key = 0xD1A6_0004;
-        start(key, None, Box::new(|| Err("no".into())));
+        let go = gated(key, None);
         let mut lines = vec![Line::from("words")];
-        lines.extend(placeholder(key, "the diagram", || {
-            vec![Line::from("  first"), Line::from("  second")]
-        }));
+        lines.extend(placeholder(
+            key,
+            "the diagram",
+            Redraw::Rows(vec!["  first".into(), "  second".into()]),
+        ));
         lines.push(Line::from("more words"));
         let mut screen = Screen::default();
         let marks = (0..3).map(|at| (at, Mark::Tag(Tag::More(7)))).collect();
         screen.push_marked(lines, marks);
         screen.push_marked(vec![Line::from("end")], vec![(0, Mark::Tag(Tag::End(7)))]);
+        go.send(()).unwrap();
         until(|| state().as_ref().is_some_and(|s| !s.running.contains(&key)));
         assert!(screen.fill_drawn());
         assert_eq!(
@@ -404,9 +553,10 @@ mod tests {
     fn rows_held_until_after_their_picture_is_ready_still_take_it() {
         use crate::screen::Screen;
         let key = 0xD1A6_0005;
-        start(key, None, Box::new(|| Err("no".into())));
+        let go = gated(key, None);
         // Held elsewhere (a call's rows) while the picture is drawn.
-        let held = placeholder(key, "the picture", || vec![Line::from("  drawn")]);
+        let held = placeholder(key, "the picture", Redraw::Rows(vec!["  drawn".into()]));
+        go.send(()).unwrap();
         until(|| state().as_ref().is_some_and(|s| !s.running.contains(&key)));
         let mut screen = Screen::default();
         screen.push(held);

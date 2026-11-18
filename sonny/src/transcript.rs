@@ -323,8 +323,7 @@ impl Markdown {
         };
         for picture in pictures {
             let path = self.path(&picture.src);
-            let named = || Line::from(picture_words(picture, path.is_some()));
-            match (path.as_deref()).and_then(|path| picture_file(path, width, named())) {
+            match (path.as_deref()).and_then(|path| picture_file(path, width, picture)) {
                 Some(rows) => {
                     flush(&mut words, &mut out);
                     out.extend(rows);
@@ -368,7 +367,7 @@ impl Markdown {
 /// The picture a fence drew, as rows of the terminal's image cells; or,
 /// when it could not be drawn, its source and why; or a row saying it is
 /// being drawn, beside the loop.
-fn fence_picture(lang: String, source: String, width: usize) -> Vec<Line<'static>> {
+pub(crate) fn fence_picture(lang: String, source: String, width: usize) -> Vec<Line<'static>> {
     if matches!(lang.as_str(), "diff" | "patch") {
         return crate::diff::fence(&source, width);
     }
@@ -428,9 +427,12 @@ fn fence_picture(lang: String, source: String, width: usize) -> Vec<Line<'static
                 "math" => "the formula",
                 _ => "the picture",
             };
-            return crate::drawing::placeholder(key, what, move || {
-                fence_picture(lang.clone(), source.clone(), width)
-            });
+            let redraw = crate::drawing::Redraw::Fence {
+                lang,
+                source,
+                width,
+            };
+            return crate::drawing::placeholder(key, what, redraw);
         }
     };
     let kept = kept.or(math.flatten().filter(|path| path.is_file()));
@@ -516,13 +518,10 @@ fn markdown_picture(text: &str) -> Option<(usize, Picture)> {
 
 /// A picture file drawn, `path`'s rows of the terminal's cells that a
 /// click opens in the pane; none where it cannot be.
-///
-/// `named` is the picture as its words: what shows once a picture drawn
-/// beside the loop turns out not to draw.
 fn picture_file(
     path: &std::path::Path,
     width: usize,
-    named: Line<'static>,
+    picture: &Picture,
 ) -> Option<Vec<Line<'static>>> {
     if !crate::term::graphics() {
         return None;
@@ -557,17 +556,37 @@ fn picture_file(
     let drawn = match drawing {
         crate::cache::Drawing::Done(drawn) => drawn,
         crate::cache::Drawing::Waits(key) => {
-            let path = path.to_owned();
-            return Some(crate::drawing::placeholder(key, "the picture", move || {
-                picture_file(&path, width, named.clone())
-                    .unwrap_or_else(|| wrap(named.clone(), width, Span::raw("  "), Span::raw("  ")))
-            }));
+            let redraw = crate::drawing::Redraw::File {
+                path: path.to_owned(),
+                width,
+                alt: picture.alt.clone(),
+                src: picture.src.clone(),
+            };
+            return Some(crate::drawing::placeholder(key, "the picture", redraw));
         }
     };
     let url = crate::links::file_url(path);
     drawn
         .map(|drawn| crate::image::show_linked(drawn, url))
         .ok()
+}
+
+/// A picture file drawn beside the loop, drawn again once it is ready:
+/// as its words, should it turn out not to draw.
+pub(crate) fn picture_again(
+    path: &std::path::Path,
+    width: usize,
+    alt: &str,
+    src: &str,
+) -> Vec<Line<'static>> {
+    let picture = Picture {
+        alt: alt.to_owned(),
+        src: src.to_owned(),
+    };
+    picture_file(path, width, &picture).unwrap_or_else(|| {
+        let named = Line::from(picture_words(&picture, true));
+        wrap(named, width, Span::raw("  "), Span::raw("  "))
+    })
 }
 
 /// A picture as words where it is not drawn: a mark, its description
@@ -1029,7 +1048,11 @@ fn page(source: &str, width: usize) -> Vec<Line<'static>> {
 }
 
 /// The page `source`, kept at `path`, drawn under it.
-fn kept_page(path: std::path::PathBuf, source: &str, width: usize) -> Vec<Line<'static>> {
+pub(crate) fn kept_page(
+    path: std::path::PathBuf,
+    source: &str,
+    width: usize,
+) -> Vec<Line<'static>> {
     let drawn = match crate::term::graphics() {
         true => {
             let file = path.clone();
@@ -1040,11 +1063,12 @@ fn kept_page(path: std::path::PathBuf, source: &str, width: usize) -> Vec<Line<'
             match drawing {
                 crate::cache::Drawing::Done(drawn) => drawn,
                 crate::cache::Drawing::Waits(key) => {
-                    // Drawn again in the file it was kept in.
-                    let (path, source) = (path.clone(), source.to_owned());
-                    return crate::drawing::placeholder(key, "the page", move || {
-                        kept_page(path.clone(), &source, width)
-                    });
+                    // Drawn again from the file it was kept in.
+                    let redraw = crate::drawing::Redraw::Page {
+                        path: path.clone(),
+                        width,
+                    };
+                    return crate::drawing::placeholder(key, "the page", redraw);
                 }
             }
         }

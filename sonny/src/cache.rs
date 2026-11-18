@@ -38,13 +38,18 @@ pub fn drawn(
     if let Some(drawn) = crate::drawing::take(key) {
         return Drawing::Done(drawn);
     }
-    let path = directory().map(|dir| dir.join(format!("{key:016x}.bin")));
+    let path = path(key);
     if let Some(drawn) = path.as_ref().and_then(read) {
         return Drawing::Done(Ok(drawn));
     }
     let draw = move || crate::term::drawn_as(asked, draw);
     crate::drawing::start(key, path, Box::new(draw));
     Drawing::Waits(key)
+}
+
+/// Where picture `key` is kept once drawn.
+pub fn path(key: u64) -> Option<PathBuf> {
+    directory().map(|dir| dir.join(format!("{key:016x}.bin")))
 }
 
 fn key(lang: &str, source: &str, width: usize) -> u64 {
@@ -90,15 +95,24 @@ fn read(path: &PathBuf) -> Option<Drawn> {
     })
 }
 
-pub fn write(path: &PathBuf, drawn: &Drawn) -> std::io::Result<()> {
+pub fn write(path: &std::path::Path, drawn: &Drawn) -> std::io::Result<()> {
     let mut bytes = Vec::with_capacity(9 + drawn.png.len());
     bytes.extend_from_slice(&drawn.cols.to_le_bytes());
     bytes.extend_from_slice(&drawn.rows.to_le_bytes());
     bytes.push(u8::from(drawn.cut));
     bytes.extend_from_slice(&drawn.png);
-    // Whole or not at all, should another Sonny read it meanwhile.
-    let part = path.with_extension(format!("{}.part", std::process::id()));
-    write_new(&part, &bytes)?;
+    write_whole(path, &bytes)
+}
+
+/// `bytes` written to `path` whole or not at all, should another Sonny
+/// read it meanwhile.
+pub fn write_whole(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+    let extension = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or_default();
+    let part = path.with_extension(format!("{extension}.{}.part", std::process::id()));
+    write_new(&part, bytes)?;
     std::fs::rename(part, path)
 }
 

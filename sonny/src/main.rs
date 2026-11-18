@@ -27979,12 +27979,27 @@ mod tests {
         // A row stands for a picture held back with the words; drawn, it
         // is twelve rows, more than half the screen.
         let key = u64::MAX - 7;
-        let standing = drawing::placeholder(key, "the diagram", || {
-            (1..=12).map(|n| Line::from(format!("  row {n}"))).collect()
-        });
+        let (go, gate) = std::sync::mpsc::channel::<()>();
+        let gate = std::sync::Mutex::new(gate);
+        drawing::start(
+            key,
+            None,
+            Box::new(move || {
+                let _ = gate.lock().unwrap().recv();
+                Err("not drawn".into())
+            }),
+        );
+        let rows = (1..=12).map(|n| format!("  row {n}")).collect();
+        let standing = drawing::placeholder(key, "the diagram", drawing::Redraw::Rows(rows));
         let live = app.live.as_mut().unwrap();
         assert!(!live.spilled);
         live.rows.extend(standing);
+        go.send(()).unwrap();
+        let asked = std::time::Instant::now();
+        while drawing::ready(&app.live.as_ref().unwrap().rows[1]).is_none() {
+            assert!(asked.elapsed() < std::time::Duration::from_secs(10));
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
         app.drawn_seen = drawing::landed().wrapping_sub(1);
         assert!(app.drawings());
         let live = app.live.as_ref().unwrap();

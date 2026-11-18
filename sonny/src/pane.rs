@@ -954,9 +954,11 @@ fn drawn(
     match crate::cache::drawn("pane file", &key, width, draw) {
         crate::cache::Drawing::Done(drawn) => Ok(drawn.map(crate::image::show)),
         // Read again whole once drawn: the row is what stands meanwhile.
-        crate::cache::Drawing::Waits(key) => {
-            Err(crate::drawing::placeholder(key, "the picture", Vec::new))
-        }
+        crate::cache::Drawing::Waits(key) => Err(crate::drawing::placeholder(
+            key,
+            "the picture",
+            crate::drawing::Redraw::Nothing,
+        )),
     }
 }
 
