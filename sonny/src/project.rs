@@ -1124,7 +1124,14 @@ fn picks(arguments: &Value) -> Result<(PathBuf, agent_client::project::Picks), S
             .map(str::to_owned)
     };
     let folder = text("folder").ok_or("project_invalid: a folder")?;
+    let title = (text("title").map(|title| title.trim().to_owned()))
+        .filter(|title| !title.is_empty())
+        .ok_or("project_invalid: a title, what the person calls the project")?;
+    if title.contains(['\n', '\r']) {
+        return Err("project_invalid: a title is one line".into());
+    }
     let mut picks = agent_client::project::Picks {
+        title: Some(title),
         model: text("model").or_else(|| std::env::var("AGENT_MODEL").ok()),
         effort: text("effort"),
         ..Default::default()
@@ -1264,12 +1271,27 @@ mod tests {
             );
         }
         assert!(
-            picked(json!({"folder": "/no/such/folder/here"}))
+            picked(json!({"folder": "/no/such/folder/here", "title": "Gone"}))
                 .unwrap_err()
                 .starts_with("project_invalid: ")
         );
-        let (_, picks) =
-            picked(json!({"folder": "/", "model": "a/b", "task_in": "project"})).unwrap();
+        // A project is made with what the person calls it, on one line.
+        for bad in [
+            json!({"folder": "/"}),
+            json!({"folder": "/", "title": "Two\nlines"}),
+        ] {
+            assert!(
+                picked(bad.clone())
+                    .unwrap_err()
+                    .starts_with("project_invalid: "),
+                "{bad}"
+            );
+        }
+        let (_, picks) = picked(
+            json!({"folder": "/", "title": " Tally invoices ", "model": "a/b", "task_in": "project"}),
+        )
+        .unwrap();
+        assert_eq!(picks.title.as_deref(), Some("Tally invoices"));
         assert_eq!(picks.model.as_deref(), Some("a/b"));
         assert!(
             picks
@@ -1277,7 +1299,8 @@ mod tests {
                 .is_some_and(|t| t.in_project && t.model.is_none())
         );
         // Tasks may take an effort of their own on the lead's model.
-        let (_, picks) = picked(json!({"folder": "/", "task_effort": "xhigh"})).unwrap();
+        let (_, picks) =
+            picked(json!({"folder": "/", "title": "Root", "task_effort": "xhigh"})).unwrap();
         assert!(picks.tasks.is_some_and(|t| t.model.is_none()
             && t.effort.as_deref() == Some("xhigh")
             && !t.in_project));
