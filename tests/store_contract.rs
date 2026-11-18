@@ -5,8 +5,8 @@ use agent_runtime::{
     store::{
         Answered, ApprovalPolicy, Binding, Blocked, Bot, CacheTtl, CompactionPlan, ContextUsage,
         Counts, Database, Decision, Delivery, Fork, Gate, Gated, Halt, Halted, Joined, Lifted,
-        Limit, Planning, ProcessKind, QuoteRef, Settings, Strip, Trailer, TurnBudget, TurnOptions,
-        Wake,
+        Limit, Planning, ProcessKind, QuoteRef, Retained, Settings, Strip, Trailer, TurnBudget,
+        TurnOptions, Wake,
     },
     tools::{Declared, Inherit, Outcome, ToolList},
 };
@@ -6183,6 +6183,95 @@ fn waiting_calls_page_past_held_answers_and_an_answer_out_of_time_is_refused() {
 }
 
 #[test]
+fn a_reader_lists_waiting_calls_past_the_answers_the_writer_held_at_its_last_commit() {
+    let path = std::env::temp_dir().join(format!("agent-held-calls-{}.sqlite", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+    let mut writer = Database::initialize(Connection::open(&path).unwrap()).unwrap();
+    let reader = Database::reader(Connection::open(&path).unwrap(), writer.shared()).unwrap();
+    let start = Declared {
+        name: "start".into(),
+        description: "Start.".into(),
+        parameters: json!({"type":"object"}),
+        result: "ok".into(),
+        answered_by: Some("sonny".into()),
+        expire_ms: None,
+        grammar: None,
+        steps: false,
+        gate_daemon_steps: false,
+        lift: false,
+        inherit: Inherit::All,
+        kind: None,
+    };
+    writer
+        .create(
+            "Lead",
+            Some("/synthetic"),
+            Binding {
+                declared: Some(&ToolList::new(vec![start]).unwrap()),
+                ..binding()
+            },
+        )
+        .unwrap();
+    let turn = writer
+        .begin(
+            "Lead",
+            "request",
+            "work",
+            true,
+            &TurnOptions::default(),
+            allow_provider,
+        )
+        .unwrap()
+        .turn;
+    let calls: Vec<ToolCall> = (1..=3)
+        .map(|n| ToolCall {
+            name: "start".into(),
+            call_id: format!("c{n}"),
+            arguments: "{}".into(),
+            custom: false,
+            links: Default::default(),
+        })
+        .collect();
+    writer.append(turn, vec![], &calls, None).unwrap();
+    for call in &calls {
+        writer.tool_start(turn, call, false, false).unwrap();
+    }
+    let listed = |db: &Database| -> Vec<String> {
+        let page = db.tool_calls("sonny", 0, 10).unwrap();
+        (page["calls"].as_array().unwrap().iter())
+            .map(|call| call["call_id"].as_str().unwrap().to_owned())
+            .collect()
+    };
+    assert_eq!(listed(&reader), ["c1", "c2", "c3"]);
+    // An answer the worker holds for the running turn: its own group
+    // lists the call answered at once, a reader once the group commits.
+    writer.begin_group().unwrap();
+    (writer.answer_call("Lead", turn, "c1", result("started"), 0)).unwrap();
+    assert_eq!(listed(&writer), ["c2", "c3"]);
+    assert_eq!(listed(&reader), ["c1", "c2", "c3"]);
+    writer.commit_group().unwrap();
+    assert_eq!(listed(&reader), ["c2", "c3"]);
+    // One a group held and abandoned is still waiting.
+    writer.begin_group().unwrap();
+    (writer.answer_call("Lead", turn, "c2", result("started"), 0)).unwrap();
+    writer.abandon_group().unwrap();
+    assert_eq!(listed(&reader), ["c2", "c3"]);
+    // Taken by its turn and not yet written, it is still answered.
+    writer.begin_group().unwrap();
+    assert!(matches!(
+        writer.answer_take(turn, "c1", 0).unwrap(),
+        agent_runtime::store::CallAnswer::Given(_)
+    ));
+    writer.commit_group().unwrap();
+    assert_eq!(listed(&writer), ["c2", "c3"]);
+    assert_eq!(listed(&reader), ["c2", "c3"]);
+    drop((reader, writer));
+    for suffix in ["", "-wal", "-shm"] {
+        let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
+    }
+}
+
+#[test]
 fn a_parked_answer_s_pictures_are_stored_once_its_result_is() {
     let path =
         std::env::temp_dir().join(format!("agent-parked-parts-{}.sqlite", std::process::id()));
@@ -6412,8 +6501,11 @@ fn artifacts_are_scoped_to_the_owning_bot_and_lineage_checks_use_depth() {
     let outcome = Outcome {
         output: "preview".into(),
         artifacts: vec![
-            ("stdout", b"full output".to_vec()),
-            ("stderr", "\"\né🙂".repeat(100_000).into_bytes()),
+            ("stdout", Retained::Whole(b"full output".to_vec())),
+            (
+                "stderr",
+                Retained::Whole("\"\né🙂".repeat(100_000).into_bytes()).packed(),
+            ),
         ],
         parts: Vec::new(),
         failed: false,
@@ -8997,7 +9089,7 @@ fn a_fork_waits_on_its_own_commands_and_reads_only_delivered_output() {
         process,
         &json!({"stdout":"large"}),
         false,
-        &[("stdout", b"synthetic output".to_vec())],
+        &[("stdout", Retained::Whole(b"synthetic output".to_vec()))],
         &[],
     )
     .unwrap();
@@ -10337,7 +10429,7 @@ fn retention_keeps_running_processes_until_their_results_commit() {
         process,
         &json!({"stdout":"done"}),
         false,
-        &[("stdout", b"full output".to_vec())],
+        &[("stdout", Retained::Whole(b"full output".to_vec()))],
         &[],
     )
     .unwrap();

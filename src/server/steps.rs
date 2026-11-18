@@ -30,7 +30,9 @@ use agent_runtime::{
     codec::Part,
     fail_with,
     output::{self, Output},
-    store::{ArtifactLines, Capture, ProcessKind, Resumed, StepAsk, StepOpened, Stepped, Store},
+    store::{
+        ArtifactLines, Capture, ProcessKind, Resumed, Retained, StepAsk, StepOpened, Stepped, Store,
+    },
     tools::{Outcome, POLL_YIELD_MS, Prepared, ReadSource, Slot},
 };
 use serde_json::{Value, json};
@@ -934,7 +936,7 @@ impl Service {
                 }
                 _ => outcome,
             };
-            let outcome = turn::annotate(outcome, turn, &id);
+            let outcome = turn::packed(turn::annotate(outcome, turn, &id)).await;
             let built = |outcome: Outcome, id: String| {
                 let mut reply =
                     json!({"call_id":id,"output":outcome.output,"failed":outcome.failed});
@@ -1659,7 +1661,7 @@ fn parted(mut outcome: Outcome, turn: i64, id: &str, envelope: usize) -> Outcome
                 "a {} picture too large for the reply kept as {turn}/{id}/{stream}; read it with artifact",
                 image.media_type
             ));
-            outcome.artifacts.push((stream, image.data.into_bytes()));
+            outcome.artifacts.push((stream, Retained::Whole(image.data.into_bytes())));
             None
         })
         .collect();
