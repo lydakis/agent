@@ -1439,9 +1439,7 @@ pub async fn lent(
         true => Browser::Fresh,
         false => Browser::Shared {
             link: key.to_owned(),
-            cdp: link_browser(key, profile, &session)
-                .await
-                .map_err(|e| ("browser_refused", e))?,
+            profile: profile.to_owned(),
         },
     };
     // An agent of another machine: its share here is its session's, the
@@ -1457,9 +1455,9 @@ enum Browser {
     Own,
     /// One it starts from no profile.
     Fresh,
-    /// Its own tab of the Chrome of the link `link`, at the CDP address
-    /// `cdp`, which it shares.
-    Shared { link: String, cdp: String },
+    /// Its own tab of the Chrome of the link `link`, started from
+    /// `profile`, which it shares.
+    Shared { link: String, profile: String },
 }
 
 // ---- A link's browser: one Chrome on a profile kept for it ----
@@ -2240,11 +2238,6 @@ async fn drive(
     browser: Browser,
     steps: &crate::exec::Steps,
 ) -> Result<Value, (&'static str, String)> {
-    let (profile, cdp) = match &browser {
-        Browser::Own => (None, None),
-        Browser::Fresh => (Some(""), None),
-        Browser::Shared { cdp, .. } => (None, Some(cdp.as_str())),
-    };
     let session = session.to_owned();
     let checked: Vec<Checked> = lines
         .iter()
@@ -2255,12 +2248,6 @@ async fn drive(
         Ok(config) => confirmed(&config.sonny.browser_confirm),
         Err(_) => confirmed(&agent_client::config::BROWSER_CONFIRM.map(str::to_owned)),
     };
-    let launch = Launch {
-        confirm: confirm.clone(),
-        profile: profile.map(str::to_owned),
-        cdp: cdp.map(str::to_owned),
-        owner: owner.to_owned(),
-    };
     // One call at a time in a session, through its confirmations:
     // agent-browser holds one pending action a session and confirms it
     // whatever ID it is given, so another call's would be confirmed too.
@@ -2269,14 +2256,6 @@ async fn drive(
         sessions.entry(session.clone()).or_default().clone()
     };
     let mut policy = held.lock().await;
-    // Its browser keeps the confirmations and profile it started with, so
-    // a session started under others, or before this tool host, starts
-    // again.
-    let started = format!("{confirm}\0{browser:?}");
-    if policy.as_deref() != Some(started.as_str()) {
-        let _ = run(&session, &["close".into()], &launch).await;
-        *policy = Some(started);
-    }
     // The browser reaches the network wherever the agent's commands may
     // not, so for an agent kept off it the whole call is the person's to
     // allow first, as a command of its that would reach it is.
@@ -2284,6 +2263,36 @@ async fn drive(
         Ok(step) => step,
         Err(why) => return Ok(Value::String(why)),
     };
+    // A link's Chrome, found or started under the session's lock, as the
+    // session takes a tab in it, so its own close in another call never
+    // ends the Chrome this call's commands run in.
+    let (profile, cdp) = match &browser {
+        Browser::Own => (None, None),
+        Browser::Fresh => (Some(""), None),
+        Browser::Shared { link, profile } => match link_browser(link, profile, &session).await {
+            Ok(cdp) => (None, Some(cdp)),
+            Err(e) => {
+                if let Some(step) = allowed {
+                    steps.ran(step, true).await;
+                }
+                return Err(("browser_refused", e));
+            }
+        },
+    };
+    let launch = Launch {
+        confirm: confirm.clone(),
+        profile: profile.map(str::to_owned),
+        cdp,
+        owner: owner.to_owned(),
+    };
+    // Its browser keeps the confirmations and profile it started with, so
+    // a session started under others, or before this tool host, starts
+    // again: in a link's Chrome, one started since too.
+    let started = format!("{confirm}\0{browser:?}\0{:?}", launch.cdp);
+    if policy.as_deref() != Some(started.as_str()) {
+        let _ = run(&session, &["close".into()], &launch).await;
+        *policy = Some(started);
+    }
     let mut failed = false;
     // Whether the last command run was a `close` that closed the session.
     let mut closed = false;
