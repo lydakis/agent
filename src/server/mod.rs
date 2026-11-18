@@ -938,6 +938,10 @@ impl Commands {
         let ns = self.hold(op, since);
         self.slow(op, None, None, ns);
     }
+    /// A session opened: listed from now on, with no requests yet.
+    fn open(&mut self, session: u64, output: &Output) {
+        (self.connections.entry(session)).or_insert_with(|| Connection::of(output));
+    }
     /// A session's label from its `hello`.
     fn label(&mut self, session: u64, output: &Output, label: Option<String>) {
         let connection =
@@ -2730,6 +2734,11 @@ pub async fn run(config: Configuration) -> Result<()> {
         lapses: None,
         holds: None,
     };
+    // The stdio owner's session is open from the start, as a socket's is
+    // once it connects.
+    if let Some(stdout) = sessions.get(&0) {
+        service.commands.open(0, stdout);
+    }
     // A `configure` kept for a turn that ended while no daemon ran is
     // taken now; one whose turn still waits stays kept for its end.
     service.kept = service
@@ -3004,6 +3013,7 @@ pub async fn run(config: Configuration) -> Result<()> {
                             ready["paused"] = json!(service.paused);
                             let _ = output.try_send(ready);
                             if caller.is_some() { output.name_program(AGENT); }
+                            service.commands.open(id, &output);
                             sessions.insert(id, output);
                             if let Some(caller) = caller { callers.insert(id, caller); }
                             if companion { companion_sessions.insert(id); }
@@ -9914,8 +9924,15 @@ mod tests {
         commands.label(11, &two, Some("shop.lead".into()));
         two.delivered();
         two.delivered();
+        // A session is listed from its open, before it asks anything.
+        let (idle, _d) = Output::stdout();
+        commands.open(13, &idle);
         let open = commands.connections();
-        assert_eq!(open.as_array().unwrap().len(), 3, "{open}");
+        assert_eq!(open.as_array().unwrap().len(), 4, "{open}");
+        assert_eq!(
+            (&open[3]["session"], &open[3]["program"], &open[3]["count"]),
+            (&json!(13), &json!("unnamed"), &json!(0))
+        );
         assert_eq!(
             (&open[0]["session"], &open[0]["program"], &open[0]["count"]),
             (&json!(10), &json!("window"), &json!(2))
@@ -9928,7 +9945,7 @@ mod tests {
         assert_eq!(open[2]["program"], "agent");
         // A closed session's requests stay under its program alone.
         commands.close(10);
-        assert_eq!(commands.connections().as_array().unwrap().len(), 2);
+        assert_eq!(commands.connections().as_array().unwrap().len(), 3);
         assert_eq!(commands.programs(|_| 0)["window"]["count"], 3);
         // A hold of a second or more is kept, newest first, with its
         // program and label.
