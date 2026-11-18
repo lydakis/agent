@@ -3165,6 +3165,8 @@ pub async fn run(config: Configuration) -> Result<()> {
     service.retention.abort_all();
     while service.retention.join_next().await.is_some() {}
     answer_queued(&mut service, &mut sessions, stdio_owner).await;
+    // Stopping, however it was asked: a write landing now starts nothing.
+    (service.draining).store(true, std::sync::atomic::Ordering::Relaxed);
     answer_written(&mut service, &mut sessions, stdio_owner).await;
     answer_observed(&mut service, &mut sessions, stdio_owner).await;
     // Release every slot as it is cancelled: a turn interrupted earlier keeps
