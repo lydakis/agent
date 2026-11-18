@@ -10867,6 +10867,29 @@ spread. `bench.query_plans` plans 488 statements with no table scan. The
 migration of a store of 2,000 such bots (70 MB of instructions) from schema
 106, its backup copy included, took 0.73 s at open.
 
+## Workspace resolution before shared request dispatch
+
+November 17, 2026. Matched offline release builds on macOS arm64 against `7860d0e5`. SHA-256 prefixes were `fa68990710aa` (base) and `746f97c33bc6` (candidate).
+
+A second client issued `stats` while the first client's `create` checked a directory. A local test interposed a 150 ms delay on `stat` for that one directory and signaled the observer on entry. Both binaries ran with identical instrumentation for seven trials each. Median observer latency was 155.62 ms on the base (153.28 to 156.60) and 0.56 ms on the change (0.46 to 0.74). This isolates the explicit workspace lookup on an ordinary client socket. Bot authorization has separate checks.
+
+In the uninstrumented footprint trials below the base used 6.001 store jobs per turn throughout. The candidate used 6.001 in three trials and 6.005 in one, with two extra pacing notes and two retry writes. A paired two-trial repeat gave 6.001 on both binaries in both trials. Resolution adds no store job. The unchanged admission and completion operations were also checked in each measured trial.
+
+The table gives medians after warmup. The base ran first and last across two blocks. Each side contributed six 32-bot admission and completion trials, four 1,000-bot footprint trials, and two 32-bot socket echo lifecycle trials.
+
+| Benchmark | Measure | Base | Candidate |
+| --- | --- | ---: | ---: |
+| admission | lone submit CPU, ms | 22.584 | 24.801 |
+| admission | burst submit p99, ms | 2.341 | 2.416 |
+| completion | release to terminal p99, ms | 5.434 | 5.841 |
+| footprint | idle RSS, MiB | 13.523 | 13.594 |
+| footprint | per idle bot, KiB | 2.528 | 2.640 |
+| footprint | RSS after a turn each, MiB | 37.289 | 39.703 |
+| footprint | CPU per turn, ms | 0.429 | 0.431 |
+| lifecycle | CPU, s | 0.373 | 0.348 |
+| lifecycle | p95 turn, ms | 600.258 | 601.289 |
+| lifecycle | peak RSS, MiB | 27.750 | 28.383 |
+
 ## jemalloc in the Linux builds, as Codex's
 
 The Linux release is static musl, and musl's allocator takes one lock for
