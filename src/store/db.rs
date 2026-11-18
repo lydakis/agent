@@ -13793,7 +13793,7 @@ impl Database {
         id: i64,
         result: &Value,
         failed: bool,
-        artifacts: &[(&str, Vec<u8>)],
+        artifacts: &[(&str, artifact::Retained)],
         files: &[(&str, String)],
     ) -> Result<()> {
         let tx = self.conn.savepoint()?;

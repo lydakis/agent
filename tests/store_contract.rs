@@ -5,8 +5,8 @@ use agent_runtime::{
     store::{
         Answered, ApprovalPolicy, Binding, Blocked, Bot, CacheTtl, CompactionPlan, ContextUsage,
         Counts, Database, Decision, Delivery, Fork, Gate, Gated, Halt, Halted, Joined, Lifted,
-        Limit, Planning, ProcessKind, QuoteRef, Settings, Strip, Trailer, TurnBudget, TurnOptions,
-        Wake,
+        Limit, Planning, ProcessKind, QuoteRef, Retained, Settings, Strip, Trailer, TurnBudget,
+        TurnOptions, Wake,
     },
     tools::{Declared, Inherit, Outcome, ToolList},
 };
@@ -6412,8 +6412,11 @@ fn artifacts_are_scoped_to_the_owning_bot_and_lineage_checks_use_depth() {
     let outcome = Outcome {
         output: "preview".into(),
         artifacts: vec![
-            ("stdout", b"full output".to_vec()),
-            ("stderr", "\"\né🙂".repeat(100_000).into_bytes()),
+            ("stdout", Retained::Whole(b"full output".to_vec())),
+            (
+                "stderr",
+                Retained::Whole("\"\né🙂".repeat(100_000).into_bytes()).packed(),
+            ),
         ],
         parts: Vec::new(),
         failed: false,
@@ -8938,7 +8941,7 @@ fn a_fork_waits_on_its_own_commands_and_reads_only_delivered_output() {
         process,
         &json!({"stdout":"large"}),
         false,
-        &[("stdout", b"synthetic output".to_vec())],
+        &[("stdout", Retained::Whole(b"synthetic output".to_vec()))],
         &[],
     )
     .unwrap();
@@ -10279,7 +10282,7 @@ fn retention_keeps_running_processes_until_their_results_commit() {
         process,
         &json!({"stdout":"done"}),
         false,
-        &[("stdout", b"full output".to_vec())],
+        &[("stdout", Retained::Whole(b"full output".to_vec()))],
         &[],
     )
     .unwrap();
