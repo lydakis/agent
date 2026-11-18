@@ -1183,7 +1183,7 @@ impl Service {
                     if news
                         && event["event"] == "closed"
                         && let Some(name) = event["bot"].as_str()
-                        && self.closed(name, event["data"]["closed_ms"].as_u64().map(at_ms))
+                        && self.closed(name, event["data"]["closed_ms"].as_u64())
                     {
                         self.reread();
                     }
@@ -1715,10 +1715,10 @@ impl Service {
 
     /// A bot was closed: the subscriptions it held end, but those that
     /// outlive a close. Another's that watch it stay: it can be sent work
-    /// again. With `at`, when it was closed, as its event or a listing
+    /// again. With `at`, when it was closed in milliseconds, as its event or a listing
     /// says: a file written since, the bot opened again, is left. Whether
     /// any ended.
-    fn closed(&self, name: &str, at: Option<std::time::SystemTime>) -> bool {
+    fn closed(&self, name: &str, at: Option<u64>) -> bool {
         if !self.subscribers.contains_key(name) {
             return false;
         }
@@ -1744,7 +1744,7 @@ impl Service {
             else {
                 continue;
             };
-            any |= self.closed(name, Some(at_ms(at)));
+            any |= self.closed(name, Some(at));
         }
         any
     }
@@ -2055,11 +2055,6 @@ fn cursor_path(store: &Path) -> PathBuf {
 
 /// The most fires' turns noted at once.
 const FIRES: usize = 4096;
-
-/// A time in milliseconds since the epoch, as the daemon says one.
-fn at_ms(ms: u64) -> std::time::SystemTime {
-    std::time::UNIX_EPOCH + Duration::from_millis(ms)
-}
 
 /// The number an event names: its turn's, or for a message in line that
 /// no turn has taken, the message's, which the turn it opens shares.
@@ -5527,7 +5522,7 @@ mod tests {
         service.subscribers = subs::all(&store).into_iter().collect();
         // A close from before its file was last written, heard late after
         // the bot opened again and followed more, ends nothing.
-        assert!(!service.closed("shop.fix", Some(at_ms(1_000))));
+        assert!(!service.closed("shop.fix", Some(1_000)));
         assert!(service.closed("shop.fix", None));
         let names = |subscriber: &str| -> Vec<String> {
             (subs::read(&store, subscriber).into_iter())

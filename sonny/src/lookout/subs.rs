@@ -1013,17 +1013,25 @@ pub fn forget(store: &Path, subscriber: &str, id: Option<i64>) -> Result<usize, 
 
 /// End the subscriptions the closed bot of `id` held as `subscriber`, as
 /// `forget` does when it is deleted, but for those that outlive a close.
-/// With `at`, when it was closed, a file written since is left as it is:
-/// the bot opened again and may have written it. How many ended.
+/// With `at_ms`, when it was closed in whole milliseconds as the daemon
+/// says it, a file written in a later millisecond is left as it is: the
+/// bot opened again and may have written it. One written in the same
+/// millisecond came before: a close and a turn that opens it again are
+/// never that close. How many ended.
 pub fn closed(
     store: &Path,
     subscriber: &str,
     id: Option<i64>,
-    at: Option<std::time::SystemTime>,
+    at_ms: Option<u64>,
 ) -> Result<usize, String> {
-    if let Some(at) = at {
-        let written = std::fs::metadata(file(store, subscriber)).and_then(|m| m.modified());
-        if written.is_ok_and(|written| written >= at) {
+    if let Some(at_ms) = at_ms {
+        let written = (std::fs::metadata(file(store, subscriber)))
+            .and_then(|m| m.modified())
+            .map(|at| {
+                at.duration_since(std::time::UNIX_EPOCH)
+                    .map_or(0, |d| d.as_millis())
+            });
+        if written.is_ok_and(|written| written > u128::from(at_ms)) {
             return Ok(0);
         }
     }
@@ -1748,8 +1756,8 @@ mod tests {
                 .unwrap()
                 .outlives_close
         );
-        let since = long_ago + std::time::Duration::from_secs(1);
-        assert_eq!(closed(&store, "shop.fix", Some(2), Some(since)), Ok(3));
+        // Closed in the millisecond it was written: it came after.
+        assert_eq!(closed(&store, "shop.fix", Some(2), Some(1_000_000)), Ok(3));
         assert_eq!(read(&store, "shop.fix").len(), 1);
         let _ = std::fs::remove_dir_all(dir(&store));
         let mut record = store.as_os_str().to_owned();
