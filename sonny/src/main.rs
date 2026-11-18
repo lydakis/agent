@@ -5570,6 +5570,10 @@ struct Fleet {
     /// person in theirs waits in this window too, and is answered here.
     /// Never a window here, nor a tab.
     raised: std::collections::HashSet<String>,
+    /// Bots the daemon's events added to `raised` (true) or took from it
+    /// (false) since the followed leads were last asked for: a read of
+    /// them that lands later started before these, and keeps them.
+    raised_since: HashMap<String, bool>,
     /// How a task's window runs Sonny on it, without the bot's name.
     command: Vec<String>,
     /// Said once in the status row when tasks open where this pane is not.
@@ -6072,6 +6076,7 @@ impl Fleet {
             refollow: false,
             unheld: Default::default(),
             raised: Default::default(),
+            raised_since: HashMap::new(),
             command,
             note,
             place,
@@ -6127,6 +6132,7 @@ impl Fleet {
             refollow: false,
             unheld: Default::default(),
             raised: Default::default(),
+            raised_since: HashMap::new(),
             command: Vec::new(),
             note: None,
             doing: HashMap::new(),
@@ -6306,6 +6312,7 @@ impl Fleet {
             return None;
         }
         self.followed_at = Some(Instant::now());
+        self.raised_since.clear();
         let store = self.store.clone();
         let followed = followed_leads(&self.lead, |bot| lookout::subs::read(&store, bot));
         if !now && !self.refollow && followed == self.followed {
@@ -6336,11 +6343,19 @@ impl Fleet {
         for name in &read.sure {
             self.needs.sure(name);
         }
-        for gone in self.raised.difference(&read.raised) {
+        // What events changed since the read was asked for stands over it.
+        let mut raised = read.raised;
+        for (bot, joined) in self.raised_since.drain() {
+            match joined {
+                true => raised.insert(bot),
+                false => raised.remove(&bot),
+            };
+        }
+        for gone in self.raised.difference(&raised) {
             self.needs.forget(gone);
             self.scanned.remove(gone);
         }
-        self.raised = read.raised;
+        self.raised = raised;
         self.followed = read.followed;
         self.refollow = false;
         // A reconcile reads every call after; else the new ones' now, and
@@ -6908,6 +6923,7 @@ impl Fleet {
                     // A followed lead's new task is followed with it.
                     Kin::None if self.raised.contains(by) && !project::is_lead(bot) => {
                         self.raised.insert(bot.to_owned());
+                        self.raised_since.insert(bot.to_owned(), true);
                     }
                     // One no agent made may be a followed first lead's:
                     // the listing says, as it does at the start.
@@ -6937,6 +6953,7 @@ impl Fleet {
                 self.layout.send(move |_| used::forget(&gone));
                 self.lineage.remove(bot);
                 self.raised.remove(bot);
+                self.raised_since.insert(bot.to_owned(), false);
                 self.doing.remove(bot);
                 self.activity.remove(bot);
                 self.needs.forget(bot);
@@ -23555,10 +23572,6 @@ mod tests {
 
     #[tokio::test]
     async fn the_cleanup_reads_only_what_the_person_wrote_since_the_last_one() {
-        let said_ = |text: &str| {
-            json!({"type": "message", "role": "user",
-            "content": [{"type": "input_text", "text": text}]})
-        };
         // The agent moved into the shop project after turn 6: each message
         // keeps the project of the folder its turn ran in.
         let shop = std::env::temp_dir().join(format!("said-shop-{}", std::process::id()));
@@ -23566,56 +23579,28 @@ mod tests {
         std::fs::write(shop.join(".agents/project.toml"), "name = \"shop\"\n").unwrap();
         let elsewhere = std::env::temp_dir();
         let (shop_, elsewhere_) = (shop.clone(), elsewhere.clone());
-        let client = daemon_answering(move |asked| {
-            let args = asked;
-            match (
-                asked["op"].as_str().unwrap_or_default(),
-                args["bot"].as_str(),
-            ) {
-                ("bots", _) => json!({"bots": [{"name": "shop.lead"}, {"name": "shop.old"}],
-                    "next_after": null}),
-                // Turns come a page at a time.
-                // Turns come a page at a time. Turn 7 was queued behind 6
-                // and cancelled before the cleanup; turn 4 ran before it.
-                ("turns", Some("shop.lead")) if args["before"].is_null() => json!({"turns": [
-                    {"turn": 8, "started_ms": 3000, "finished_ms": null, "workspace": shop_},
-                    {"turn": 7, "started_ms": null, "finished_ms": 600, "workspace": shop_}],
-                    "next_before": 7}),
-                ("turns", Some("shop.lead")) => json!({"turns": [
-                    {"turn": 6, "started_ms": 400, "finished_ms": 2000, "workspace": elsewhere_},
-                    {"turn": 4, "started_ms": 100, "finished_ms": 300, "workspace": elsewhere_}],
-                    "next_before": 4}),
-                ("turns", _) => json!({"turns": [{"turn": 3, "finished_ms": 100}]}),
-                ("history_nodes", Some("shop.lead")) => json!({"nodes": [
-                    {"node": 30, "turn": 8}, {"node": 29, "turn": 8}, {"node": 28, "turn": 6},
-                    {"node": 27, "turn": 6}, {"node": 26, "turn": 6}, {"node": 20, "turn": 4}],
-                    "next_from": 19}),
-                ("history_items", Some("shop.lead")) => {
-                    let items: Vec<Value> = (args["nodes"].as_array().into_iter().flatten())
-                        .filter_map(|node| {
-                            let item = match node.as_i64()? {
-                                30 => {
-                                    json!({"node": 30, "item": said_("Keep Bedrock out of evals.")})
-                                }
-                                29 => json!({"node": 29, "item": {"type": "message",
-                                    "role": "assistant", "content": [{"type": "output_text",
-                                    "text": "Noted."}]}}),
-                                28 => json!({"node": 28, "item": said_("Use the old API."),
-                                    "from": {"bot": "shop.fix", "turn": 2}}),
-                                27 => {
-                                    json!({"node": 27, "item": said_("Squash-merge from now on.")})
-                                }
-                                // What started turn 6, before the last
-                                // cleanup; the line above came while it ran.
-                                26 => json!({"node": 26, "item": said_("Start the migration.")}),
-                                _ => return None,
-                            };
-                            Some(item)
-                        })
-                        .collect();
-                    json!({"items": items})
-                }
-                _ => json!({"error": {"code": "unexpected", "message": asked.to_string()}}),
+        let asked = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = asked.clone();
+        let client = daemon_answering(move |ask| {
+            seen.lock().unwrap().push(ask.clone());
+            match ask["op"].as_str().unwrap_or_default() {
+                // The daemon picks the people's messages since the time,
+                // across every agent, newest first. One a named person
+                // sent, one still in line, and one with no words are not
+                // the person's words to an agent.
+                "messages" => json!({"messages": [
+                    {"bot": "shop.lead", "bot_id": 1, "turn": null, "node": null,
+                        "text": "Queued behind.", "workspace": shop_},
+                    {"bot": "shop.lead", "bot_id": 1, "turn": 8, "node": 30,
+                        "text": "Keep Bedrock out of evals.", "workspace": shop_},
+                    {"bot": "shop.lead", "bot_id": 1, "turn": 8, "node": 29,
+                        "text": "Ship it.", "person": "Dana", "workspace": shop_},
+                    {"bot": "shop.lead", "bot_id": 1, "turn": 6, "node": 27,
+                        "text": "Squash-merge from now on.", "workspace": elsewhere_},
+                    {"bot": "shop.lead", "bot_id": 1, "turn": 6, "node": 26,
+                        "text": " ", "workspace": elsewhere_}],
+                    "next_before": null}),
+                _ => json!({"error": {"code": "unexpected", "message": ask.to_string()}}),
             }
         })
         .await;
@@ -23627,6 +23612,14 @@ mod tests {
                     "project": "shop"},
                 {"bot": "shop.lead", "turn": 6, "text": "Squash-merge from now on.",
                     "project": null}]})
+        );
+        // One read, whatever number of agents there are.
+        assert_eq!(
+            *asked.lock().unwrap(),
+            [
+                json!({"id": 1, "op": "messages", "bot": "*", "from": ["person"], "since_ms": 1000,
+                "newest": true, "words": true, "limit": 256, "before": null})
+            ]
         );
         std::fs::remove_dir_all(shop).unwrap();
     }
@@ -23662,7 +23655,14 @@ mod tests {
         let client =
             daemon_answering(
                 move |asked| match asked["op"].as_str().unwrap_or_default() {
-                    "bots" => json!({"bots": [{"name": "shop.lead"}], "next_after": null}),
+                    "messages" => json!({"messages": [
+                        {"bot": "shop.lead", "bot_id": 3, "turn": 4, "node": 17,
+                            "text": "You asked (ask:4/c1): Ship it now?\n\nLater"},
+                        {"bot": "shop.lead", "bot_id": 3, "turn": 4, "node": 15,
+                            "text": "> Tagged 0.6.0.\n\n🎉"},
+                        {"bot": "shop.lead", "bot_id": 3, "turn": 4, "node": 14, "text": "👍"},
+                        {"bot": "shop.lead", "bot_id": 3, "turn": 3, "node": 11,
+                            "text": "Review the cart change."}], "next_before": null}),
                     "turns" => json!({"turns": [
                 {"turn": 4, "started_ms": 2500, "finished_ms": 2600},
                 {"turn": 3, "started_ms": 1500, "finished_ms": 1800}], "next_before": null}),
@@ -23790,8 +23790,17 @@ mod tests {
         let client =
             daemon_answering(
                 move |asked| match asked["op"].as_str().unwrap_or_default() {
-                    "bots" => {
-                        json!({"bots": [{"name": "shop.lead", "bot_id": 3}], "next_after": null})
+                    "messages" => {
+                        let message = |node: i64, text: &str| {
+                            json!({"bot": "shop.lead",
+                            "bot_id": 3, "turn": 2, "node": node, "text": text})
+                        };
+                        json!({"messages": [
+                            message(13, "You asked (ask:2/t2): Tag it too?\n\nNo"),
+                            message(12, "🙌"), message(10, "> Done.\n\n🚀"),
+                            message(9, "You asked (ask:2/t1): Ship it now?\n\nNow"),
+                            message(8, "👍"), message(7, "👍"),
+                            message(5, "> Split the review.\n\n🎉")], "next_before": null})
                     }
                     "turns" => {
                         json!({"turns": [{"turn": 2, "started_ms": 1500, "finished_ms": 1800}],
@@ -24474,7 +24483,12 @@ mod tests {
         let client =
             daemon_answering(
                 move |asked| match asked["op"].as_str().unwrap_or_default() {
-                    "bots" => json!({"bots": [{"name": "shop.lead"}], "next_after": null}),
+                    // The daemon dates each message by when it was
+                    // written: the two written since the cleanup.
+                    "messages" => json!({"messages": [
+                        {"bot": "shop.lead", "bot_id": 1, "turn": 6, "node": 15, "text": "👍"},
+                        {"bot": "shop.lead", "bot_id": 1, "turn": 6, "node": 14,
+                            "text": "And the docs."}], "next_before": null}),
                     "turns" => {
                         json!({"turns": [{"turn": 6, "started_ms": 400, "finished_ms": null}],
                 "next_before": null})
@@ -24503,7 +24517,11 @@ mod tests {
         let answering = |text: &'static str| {
             daemon_answering(
                 move |asked| match asked["op"].as_str().unwrap_or_default() {
-                    "bots" => json!({"bots": [{"name": "shop.lead"}], "next_after": null}),
+                    // A trigger's words are not the person's: the daemon
+                    // leaves them out.
+                    "messages" => json!({"messages": if text.is_empty() { json!([]) } else {
+                        json!([{"bot": "shop.lead", "bot_id": 1, "turn": 2, "node": 5,
+                            "text": text}]) }, "next_before": null}),
                     "turns" => json!({"turns": [
                     {"turn": 2, "started_ms": 1500, "finished_ms": 1800}], "next_before": null}),
                     "history_nodes" => {
@@ -31425,6 +31443,16 @@ mod tests {
         let unread = fleet.follow_leads(false).await;
         assert!(fleet.raised.contains("shop.loose"));
         assert!(unread.iter().any(|(bot, _)| bot == "shop.loose"));
+        // A read that lands after the events since it was asked for keeps
+        // what they changed: a task made and one deleted meanwhile.
+        let asked = fleet.follow_due(true).expect("asked now");
+        let read = asked.read(&fleet.client).await;
+        fleet.event(&json!({"event": "created", "bot": "shop.new",
+            "data": {"created_by": "shop.lead"}}));
+        fleet.event(&json!({"event": "deleted", "bot": "shop.fix", "data": {}}));
+        fleet.followed_read(read);
+        assert!(fleet.raised.contains("shop.new"));
+        assert!(!fleet.raised.contains("shop.fix"));
         let _ = std::fs::remove_dir_all(dir);
     }
 
