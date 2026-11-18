@@ -22,11 +22,11 @@ pub use db::{
     CallAnswer, Capture, CatchUp, Charge, CompactionPlan, CompactionView, CopiedCall, Counts,
     DENIAL_WINDOW, Database, Decision, Delivery, DetachedRow, ENV_JSON, EVENT_PAGE_KINDS,
     ElisionPlan, FOLDERS_JSON, Fork, Gate, Gated, Halt, Halted, Identity, Joined, Kept, Lapsed,
-    Lifted, LiftedRun, Limit, MAX_GATES, NEVER_ASKS, PROCESSES_PAGE, ParkedFallback, Plan,
-    Planning, ProcessKind, ProcessesPage, Publication, QuoteRef, RULES_JSON, Resumed, Room,
+    Lifted, LiftedRun, Limit, MAX_GATES, Messages, NEVER_ASKS, PROCESSES_PAGE, ParkedFallback,
+    Plan, Planning, ProcessKind, ProcessesPage, Publication, QuoteRef, RULES_JSON, Resumed, Room,
     SANDBOX, SETTINGS, Served, Settings, Shared, Spend, Started, Step, StepAsk, StepOpened,
     Stepped, Strip, TRAILER, TURN_VIEW_ACCOUNTING, Trailer, TurnBudget, TurnOptions, Waiting, Wake,
-    Window, Work, cache_hit, listed_command, share, unserved,
+    Window, Work, cache_hit, glob, listed_command, share, unserved,
 };
 
 type ReadJob = Box<dyn FnOnce(&Database) + Send>;
