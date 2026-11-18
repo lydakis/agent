@@ -337,7 +337,11 @@ A source's `digest` says how often at most a follower hears it, as
 Slack's "send me email notifications at most once every 15 minutes or
 hour": the first event after a quiet spell is told as it comes, and what
 comes after waits until the digest has passed since the note that last
-told that source, then goes in one note. An event that steers never waits.
+told that source, then all of it goes: in one note, or in notes one after
+another, each as soon as the one before landed, when it is more than a
+note holds (192 KiB, 64 quotes), as Alertmanager notifies a whole group at
+its interval. The digest counts again from the last of them. An event
+that steers never waits.
 
 ```toml
 [sonny.sources.slack]
@@ -591,7 +595,8 @@ task is still being read.
 A follow's `digest`, as `15m` or `1h`, says how often at most it tells
 what it hears, in place of its sources' own: the first after a quiet
 spell goes as it comes, and what comes after waits until the digest has
-passed since the note that last told what it held, then goes in one note.
+passed since the note that last told what it held, then all of it goes,
+in notes one after another when one does not hold it, as a source's does.
 `0` says it waits for none, though its source digests. Heard by several
 follows, an event goes when the first of them allows. What steers never
 waits for one. However soon a note tells what a follow heard, its digest
