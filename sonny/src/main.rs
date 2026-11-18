@@ -5181,6 +5181,10 @@ struct App {
     unheard: std::collections::VecDeque<Value>,
     /// The read under way for the first of them.
     hearing: Option<tokio::sync::oneshot::Receiver<Read>>,
+    /// The words last given back to the composer, in front of what was
+    /// typed since ([`App::give_back`]): a message refused after them goes
+    /// after them.
+    given_back: Option<String>,
     /// The connection closed after the events in `unheard`: it is let go
     /// ([`App::dropped`]) once they are applied, as they came before it.
     cut: bool,
@@ -7124,6 +7128,7 @@ impl App {
             unheard: Default::default(),
             hearing: None,
             cut: false,
+            given_back: None,
             verdicting: Vec::new(),
             writes: Default::default(),
             lane: None,
@@ -7937,8 +7942,10 @@ impl App {
                     }
                 }
                 Wrote::TaskAnswered(answering, reply) => self.task_answered(*answering, reply),
+                // Taken off, not toggled: the person may have taken it off
+                // already while it was being sent.
                 Wrote::Reacted(node, emoji, Some(error)) => {
-                    let _ = self.reactions.toggle(node, &emoji);
+                    let _ = self.reactions.set(node, &emoji, false);
                     self.notice = Some(error);
                     let row = self.reacted_row(node);
                     self.flush();
@@ -8056,6 +8063,10 @@ impl App {
                     .map_or(&self.model, |(model, _)| model)
                     .clone()
             });
+        let let_go = match switch {
+            Some(_) => (self.turn_model.take(), self.boost.take()),
+            None => (None, None),
+        };
         let picked = Configuring {
             text,
             switch,
@@ -8064,6 +8075,7 @@ impl App {
             cache,
             pace,
             env,
+            let_go,
         };
         let client = self.client.clone();
         self.write(async move {
@@ -8093,7 +8105,15 @@ impl App {
             cache,
             pace,
             env,
+            let_go,
         } = picked;
+        // Not taken: what the switch let go is the window's again, unless
+        // picked anew meanwhile.
+        if taken.is_err() {
+            let (turn_model, boost) = let_go;
+            self.turn_model = self.turn_model.take().or(turn_model);
+            self.boost = self.boost.take().or(boost);
+        }
         match taken {
             Ok(_) => {
                 if let Some(declare) = &declare {
@@ -14331,7 +14351,20 @@ impl App {
                     _ => transcript::Decided::Denied { you: true },
                 };
                 if let Some(written) = self.written.get_mut(&self.aside_key(&call)) {
-                    written.decided = Some(decided);
+                    match (&mut written.decided, decided) {
+                        // Its own verdict came first and is final: what the
+                        // person kept is only added to an allow.
+                        (
+                            Some(transcript::Decided::Allowed { kept: heard, .. }),
+                            transcript::Decided::Allowed { kept, .. },
+                        ) if written.heard => {
+                            if heard.is_none() {
+                                *heard = kept;
+                            }
+                        }
+                        _ if written.heard => {}
+                        (_, decided) => written.decided = Some(decided),
+                    }
                 }
             }
             Ok(_) if decision == "allow" => {
@@ -17301,12 +17334,22 @@ impl App {
             }
         }
         self.pictures.extend(pictures);
-        let typed = typed.as_str();
         let now = (*self.input).to_owned();
+        // After words given back before it and still in front, as each
+        // message was sent after them.
+        let (before, now) = match self.given_back.take() {
+            Some(given) if !given.is_empty() && now.starts_with(&given) => (
+                format!("{given}\n"),
+                now[given.len()..].trim_start_matches('\n').to_owned(),
+            ),
+            _ => (String::new(), now),
+        };
+        let given = format!("{before}{typed}");
         match now.trim().is_empty() {
-            true => self.input.set(typed),
-            false => self.input.set(&format!("{typed}\n{now}")),
+            true => self.input.set(&given),
+            false => self.input.set(&format!("{given}\n{now}")),
         }
+        self.given_back = Some(given);
     }
 
     /// The person's answer to `task`'s question `ask`, sent to the task as
@@ -21680,6 +21723,10 @@ struct Configuring {
     cache: Option<&'static str>,
     pace: Option<&'static str>,
     env: Option<Value>,
+    /// The window's own turn model and boost, let go as the switch went
+    /// so a message sent behind it runs on the new model: given back when
+    /// the switch was not taken.
+    let_go: (Option<String>, Option<String>),
 }
 
 /// What a daemon event needs read before it is applied ([`App::wants`]),
@@ -34152,6 +34199,17 @@ mod tests {
             [picture(1), picture(2)]
         );
         assert_eq!(app.placed("next [Image #1]"), [picture(3)]);
+        // One sent after it and refused after it comes back after it.
+        let then = Then::Composed {
+            typed: "then this".into(),
+            pictures: Vec::new(),
+            answering: None,
+        };
+        app.unsent(String::new(), then, "refused".into());
+        assert_eq!(
+            &*app.input,
+            "look [Image #2] and [Image #3]\nthen this\nnext [Image #1]"
+        );
     }
 
     #[tokio::test]
