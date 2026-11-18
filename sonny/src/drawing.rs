@@ -345,7 +345,8 @@ mod tests {
         assert!(fill(&mut rows));
         assert_eq!(text(&rows), ["above", "│ first", "│ second", "below"]);
         settle(seen);
-        let placed = &state().as_ref().unwrap().placed;
+        let state = state();
+        let placed = &state.as_ref().unwrap().placed;
         assert!(!placed.contains_key(&(key as u32 & 0xFF_FFFF)));
     }
 }
