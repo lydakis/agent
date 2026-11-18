@@ -284,10 +284,9 @@ impl Newest {
 
 /// A turn that ran at or after `since_ms`: the project whose memory its
 /// folder reads, as memory finds it, so a bot that moved between projects
-/// keeps each turn's own, and when it started (none while queued).
+/// keeps each turn's own.
 struct Ran {
     project: Option<String>,
-    started_ms: Option<i64>,
 }
 
 /// The turns of `bot` that were running at or after `since_ms`.
@@ -325,14 +324,7 @@ async fn turns_since(
             let project = turn["workspace"]
                 .as_str()
                 .and_then(|dir| project_of(&mut folders, dir));
-            let started_ms = turn["started_ms"].as_i64();
-            found.insert(
-                id,
-                Ran {
-                    project,
-                    started_ms,
-                },
-            );
+            found.insert(id, Ran { project });
         }
         before = page["next_before"].clone();
         if ended || before.is_null() {
