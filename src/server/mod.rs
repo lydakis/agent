@@ -12,6 +12,7 @@ mod socket;
 mod steps;
 
 mod turn;
+mod writes;
 
 use actives::{Actives, Slot};
 use agent_runtime::{
@@ -1092,6 +1093,34 @@ impl Command {
                 | Command::HistorySearch { .. }
                 | Command::Audit { .. }
                 | Command::Prompts { .. }
+                | Command::ToolCalls { .. }
+        )
+    }
+    /// A write that only records what its client says, which the write
+    /// lane hands to the store and answers once it commits.
+    fn records(&self) -> bool {
+        matches!(
+            self,
+            Command::Answer { .. }
+                | Command::ToolResult { .. }
+                | Command::YieldCall { .. }
+                | Command::TakeCall { .. }
+                | Command::ApproveStep { .. }
+                | Command::StepResult { .. }
+        )
+    }
+    /// It ends or holds turns, or stops a call: the clients' writes on their way land first,
+    /// as they did when each was awaited in turn, so none lets its client
+    /// start work after it.
+    fn ends_turns(&self) -> bool {
+        matches!(
+            self,
+            Command::Interrupt { .. }
+                | Command::Close { .. }
+                | Command::Delete { .. }
+                | Command::Pause { .. }
+                | Command::Shutdown { .. }
+                | Command::StopProcess { .. }
         )
     }
     /// The request's `op`, as `stats` counts it.
@@ -1510,6 +1539,52 @@ struct Stepping {
     /// coordinator, which runs it or answers.
     daemon: Option<(i64, Box<str>)>,
 }
+/// Clients' writes on their way to the store, and what keeps a step put
+/// to its gates from missing a decision made before its write lands.
+#[derive(Default)]
+struct Writing {
+    lane: writes::Writes<Write, Written>,
+    /// `approve_step` writes on their way.
+    announcing: usize,
+    /// Approvals decided while a step was on its way that no waiting step
+    /// claimed: the step landing as one of them is checked at once.
+    unclaimed: std::collections::HashSet<i64>,
+    /// Pauses lifted: a step whose write was on its way across one is
+    /// checked at once, as `resume` checks those already waiting.
+    lifts: u64,
+    /// The input credit of each session's write on its way: its payload
+    /// counts against the sessions' input bound until it lands.
+    credits: HashMap<u64, session::Credit>,
+}
+
+/// Whom a client's write answers, and what the run loop does once it lands.
+struct Write {
+    output: Output,
+    id: Value,
+    then: Then,
+}
+enum Then {
+    /// Answer with what the write returned.
+    Reply,
+    /// A call taken: refused if the daemon began stopping meanwhile.
+    Taken,
+    /// An answer to a call or a gate: wake what waits on it, then reply.
+    /// One given under a lease starts its tag's serving again after.
+    Answered {
+        bot: String,
+        turn: i64,
+        serving: Option<(String, u64)>,
+    },
+    /// A step put to its call's gates, and the pauses lifted when it left:
+    /// one left waiting is answered once it is decided.
+    Stepped(Box<Stepping>, u64),
+}
+/// What a client's write returned.
+enum Written {
+    Value(Result<Value>),
+    Answered(Result<agent_runtime::store::Answered>),
+    Stepped(Result<Stepped>),
+}
 /// Tell the turn waiting on a step's call that the call's time runs again,
 /// and give the step's reply once it is decided.
 fn settle_step(handles: &Handles, bot: &str, turn: i64, stepped: Stepped) -> Option<Value> {
@@ -1812,6 +1887,8 @@ struct Service {
     /// run loop once the step is decided: a step goes with the client
     /// that put it.
     stepping: HashMap<i64, Stepping>,
+    /// Clients' writes on their way to the store, answered as they land.
+    writing: Writing,
     /// Checks of waiting steps with the store.
     step_checks: JoinSet<Vec<(i64, Result<Stepped>)>>,
     /// Daemon steps, from their asking to their reply.
@@ -2689,6 +2766,7 @@ pub async fn run(config: Configuration) -> Result<()> {
     let mut service = Service {
         store,
         stepping: HashMap::new(),
+        writing: Writing::default(),
         lent: HashMap::new(),
         step_checks: JoinSet::new(),
         steps: Default::default(),
@@ -2988,6 +3066,14 @@ pub async fn run(config: Configuration) -> Result<()> {
                     reply(&mut service, &mut sessions, stdio_owner, session, &output, id, result).await?;
                     service.chores.count("admission", chore);
                 }
+                // A client's write landed: answer it, and take its session's
+                // next request.
+                Some((session, write, done)) = service.writing.lane.next(), if !service.writing.lane.is_empty() => {
+                    let chore = std::time::Instant::now();
+                    answer_write(&mut service, &mut sessions, stdio_owner, session, write, done).await?;
+                    inbound.unpark(session);
+                    service.chores.count("write", chore);
+                }
                 // A read answered: its session's next request may be taken.
                 Some((asker, sent)) = service.lane.next(), if !service.lane.is_empty() => {
                     if !sent {
@@ -3032,8 +3118,9 @@ pub async fn run(config: Configuration) -> Result<()> {
                             service.steps_session_closed(id);
                             if id == 0 && stdio_owner { break; }
                         }
-                        // The line's credit goes back as this request is taken up.
-                        Inbound::Request(id, request, _credit, read) => {
+                        // The line's credit goes back as this request is taken
+                        // up, or a write's once it lands.
+                        Inbound::Request(id, request, credit, read) => {
                             let Some(output) = sessions.get(&id).cloned() else { continue };
                             // A bad id is refused like a malformed line, after the
                             // admissions queued before it.
@@ -3080,6 +3167,14 @@ pub async fn run(config: Configuration) -> Result<()> {
                                 service.chores.count("publication", publishing);
                                 if *output.subscribe_closed().borrow() { continue; }
                             }
+                            if request.as_ref().is_ok_and(|r| r.command.ends_turns()) && !service.writing.lane.is_empty() {
+                                let landing = std::time::Instant::now();
+                                while let Some((session, write, done)) = service.writing.lane.next().await {
+                                    answer_write(&mut service, &mut sessions, stdio_owner, session, write, done).await?;
+                                    inbound.unpark(session);
+                                }
+                                service.chores.count("write", landing);
+                            }
                             let (request_id, result, shutdown, serving) = match request {
                                 Ok(request) => {
                                     let allowed = refused.is_none();
@@ -3103,8 +3198,13 @@ pub async fn run(config: Configuration) -> Result<()> {
                                             result
                                         }
                                     };
-                                    // A session given a read waits for it before its next request.
+                                    // A session given a read or a write waits for it before its next request.
                                     for session in service.lane.parked() { inbound.park(session); }
+                                    let mut credit = Some(credit);
+                                    for session in service.writing.lane.parked() {
+                                        inbound.park(session);
+                                        if let Some(credit) = credit.take() { service.writing.credits.insert(session, credit); }
+                                    }
                                     if result.as_ref().is_err_and(|e| e.code == "deferred") { continue; }
                                     // A refused admission still answers after those queued before it.
                                     if admission && !service.admissions.is_empty() {
@@ -3177,6 +3277,9 @@ pub async fn run(config: Configuration) -> Result<()> {
     service.retention.abort_all();
     while service.retention.join_next().await.is_some() {}
     answer_queued(&mut service, &mut sessions, stdio_owner).await;
+    // Stopping, however it was asked: a write landing now starts nothing.
+    (service.draining).store(true, std::sync::atomic::Ordering::Relaxed);
+    answer_written(&mut service, &mut sessions, stdio_owner).await;
     answer_observed(&mut service, &mut sessions, stdio_owner).await;
     // Release every slot as it is cancelled: a turn interrupted earlier keeps
     // its first cause, and its dropped sender still stops a finish retry.
@@ -3811,8 +3914,12 @@ impl Service {
             // not answered yet, so one that misses them misses nothing
             // anyone was told, and one session's admissions never hold
             // another's reads.
+            // So does a write that only records what its client says: it
+            // is answered once it commits, and another session's admission
+            // is no more answered than it.
             Some(command)
                 if command.observes()
+                    || command.records()
                     || matches!(command, Command::Wait { .. } | Command::Hello { .. }) =>
             {
                 (self.admissions.iter()).any(|admission| admission.session == session)
@@ -4212,6 +4319,10 @@ impl Service {
         let mut asked = Vec::new();
         for approval in approvals {
             let Some(stepping) = self.stepping.get_mut(&approval) else {
+                // A step on its way to the store may land as this one.
+                if self.writing.announcing > 0 {
+                    self.writing.unclaimed.insert(approval);
+                }
                 continue;
             };
             stepping.gone |= gone;
@@ -5208,6 +5319,115 @@ impl Service {
         Err(Error::new("deferred"))
     }
 
+    /// Hand a client's write to the store from its own task, answered from
+    /// the run loop once it lands; the session's next request waits for it.
+    fn write(
+        &mut self,
+        session: u64,
+        output: &Output,
+        id: Value,
+        then: Then,
+        write: impl Future<Output = Written> + Send + 'static,
+    ) -> Result<Value> {
+        if matches!(then, Then::Stepped(..)) {
+            self.writing.announcing += 1;
+        }
+        let output = output.clone();
+        (self.writing.lane).write(session, Write { output, id, then }, write);
+        Err(Error::new("deferred"))
+    }
+
+    /// A client's write landed: do what its commit allows, as the serial
+    /// path did after its store call, and give its reply, or none for a
+    /// step left waiting on its gates.
+    fn written(&mut self, then: Then, done: Option<Written>) -> Option<Result<Value>> {
+        match (then, done) {
+            (Then::Reply, Some(Written::Value(result))) => Some(result),
+            (Then::Taken, Some(Written::Value(Ok(reply)))) => Some(self.release(reply)),
+            (Then::Taken, Some(Written::Value(Err(error)))) => Some(Err(error)),
+            // Held by the worker or durable by now; only then does the turn
+            // look for it.
+            (Then::Answered { bot, turn, .. }, Some(Written::Answered(result))) => {
+                Some(result.map(|answered| {
+                    if let Some(notify) = answered.notify {
+                        notify.notify_one();
+                    }
+                    if answered.resume {
+                        self.handles.wake(bot, turn);
+                    }
+                    self.check_lifted(answered.lifted.into_iter().collect());
+                    answered.reply
+                }))
+            }
+            (Then::Stepped(stepping, lifts), Some(Written::Stepped(result))) => {
+                self.writing.announcing -= 1;
+                let reply = match result {
+                    Ok(Stepped {
+                        step:
+                            Step::Pending {
+                                approval,
+                                expires_ms,
+                            },
+                        notify,
+                        wake,
+                        ..
+                    }) => {
+                        self.handles.step_lapses(approval, expires_ms);
+                        // The call now waits on a verdict: a steer waiting
+                        // for its turn lifts it.
+                        if let Some(notify) = notify {
+                            notify.notify_one();
+                        }
+                        if wake {
+                            self.handles.wake(stepping.bot.clone(), stepping.turn);
+                        }
+                        // Decided, or let go by a lifted pause, before it
+                        // landed: checked now, as it would have been.
+                        let missed =
+                            self.writing.unclaimed.remove(&approval) || lifts != self.writing.lifts;
+                        self.stepping.insert(approval, *stepping);
+                        if missed {
+                            self.check_steps(vec![approval], false);
+                        }
+                        // Answered from the run loop once the step is decided.
+                        None
+                    }
+                    Ok(stepped) => {
+                        let reply =
+                            settle_step(&self.handles, &stepping.bot, stepping.turn, stepped)
+                                .expect("a decided step");
+                        if reply["decision"] == "allow" {
+                            Some(self.release(reply))
+                        } else {
+                            Some(Ok(reply))
+                        }
+                    }
+                    Err(error) => Some(Err(error)),
+                };
+                if self.writing.announcing == 0 {
+                    self.writing.unclaimed.clear();
+                }
+                reply
+            }
+            (then, _) => {
+                if matches!(then, Then::Stepped(..)) {
+                    self.writing.announcing -= 1;
+                }
+                Some(Err(Error::new("write_failed")))
+            }
+        }
+    }
+
+    /// A write that lets its client start work, landed. Whatever holds
+    /// the daemon waits for the writes on their way before it is taken up,
+    /// so only a stop by signal can come between: then nothing starts.
+    fn release(&self, reply: Value) -> Result<Value> {
+        match self.held() {
+            None => Ok(reply),
+            Some(held) => fail_with(held, "nothing starts while the daemon is held"),
+        }
+    }
+
     #[cfg(test)]
     async fn dispatch(
         &mut self,
@@ -5852,8 +6072,10 @@ impl Service {
                 let changed = lifted.is_some();
                 if changed {
                     // What waited starts as capacity allows, and the steps
-                    // allowed meanwhile go on.
+                    // allowed meanwhile go on, those still on their way to
+                    // the store once they land.
                     self.ready_hint = true;
+                    self.writing.lifts += 1;
                     let waiting: Vec<i64> = self.stepping.keys().copied().collect();
                     self.check_steps(waiting, false);
                     self.pump_steps();
@@ -6070,46 +6292,46 @@ impl Service {
                     self.hub.hold(tag, session, lease)?;
                 }
                 let name = bot.clone();
-                let answered = store
-                    .op("answer", move |db| {
-                        let decision = Decision {
-                            bot: &name,
-                            turn,
-                            call_id: &call_id,
-                            request,
-                            tag: tag.as_deref(),
-                            allow,
-                            unreviewed,
-                            reason: reason.as_deref(),
-                            by: by.as_deref(),
-                            leased: lease.is_some(),
-                        };
-                        match ask {
-                            true => db.ask(decision),
-                            false => db.answer(decision),
-                        }
-                    })
-                    .await?;
-                // The answer is durable or held by the worker by now; only
-                // then does the turn look for it.
-                if let Some(notify) = answered.notify {
-                    notify.notify_one();
-                }
-                if answered.resume {
-                    self.handles.wake(bot, turn);
-                }
-                self.check_lifted(answered.lifted.into_iter().collect());
-                Ok(answered.reply)
+                let store = store.clone();
+                let then = Then::Answered {
+                    bot,
+                    turn,
+                    serving: tag.clone().zip(lease),
+                };
+                self.write(session, output, id, then, async move {
+                    Written::Answered(
+                        store
+                            .op("answer", move |db| {
+                                let decision = Decision {
+                                    bot: &name,
+                                    turn,
+                                    call_id: &call_id,
+                                    request,
+                                    tag: tag.as_deref(),
+                                    allow,
+                                    unreviewed,
+                                    reason: reason.as_deref(),
+                                    by: by.as_deref(),
+                                    leased: lease.is_some(),
+                                };
+                                match ask {
+                                    true => db.ask(decision),
+                                    false => db.answer(decision),
+                                }
+                            })
+                            .await,
+                    )
+                })
             }
             Command::ToolResult {
                 bot,
                 turn,
                 call_id,
-                output,
+                output: given,
                 error,
             } => {
-                let outcome = match (output, error) {
-                    (Some(output), None) => self.answer_output(output).await?,
+                let outcome = match (given, error) {
+                    (Some(given), None) => self.answer_output(given).await?,
                     (None, Some(ToolError { code, detail })) => {
                         let coded = !code.is_empty()
                             && code.len() <= 64
@@ -6144,47 +6366,44 @@ impl Service {
                 // A daemon step of the call still running is stopped
                 // first: the answer is recorded once its stop is sent.
                 self.call_answered(&bot, turn, &call_id);
-                let name = bot.clone();
-                let answered = self
-                    .store
-                    .op("tool_result", move |db| {
-                        db.answer_call(&name, turn, &call_id, outcome, now_ms())
-                    })
-                    .await?;
-                // Held by the worker or durable by now; only then does the
-                // turn look for it.
-                if let Some(notify) = answered.notify {
-                    notify.notify_one();
-                }
-                if answered.resume {
-                    self.handles.wake(bot, turn);
-                }
-                self.check_lifted(answered.lifted.into_iter().collect());
-                Ok(answered.reply)
+                let (name, store) = (bot.clone(), self.store.clone());
+                let then = Then::Answered {
+                    bot,
+                    turn,
+                    serving: None,
+                };
+                self.write(session, output, id, then, async move {
+                    Written::Answered(
+                        store
+                            .op("tool_result", move |db| {
+                                db.answer_call(&name, turn, &call_id, outcome, now_ms())
+                            })
+                            .await,
+                    )
+                })
             }
             Command::YieldCall {
                 bot,
                 turn,
                 call_id,
-                output,
+                output: given,
             } => {
-                let so_far = self.answer_output(output).await?;
-                let name = bot.clone();
-                let yielded = self
-                    .store
-                    .op("yield_call", move |db| {
-                        db.yield_call(&name, turn, &call_id, &so_far, now_ms())
-                    })
-                    .await?;
-                // Its handle answers the call by now; only then does the
-                // turn look.
-                if let Some(notify) = yielded.notify {
-                    notify.notify_one();
-                }
-                if yielded.resume {
-                    self.handles.wake(bot, turn);
-                }
-                Ok(yielded.reply)
+                let so_far = self.answer_output(given).await?;
+                let (name, store) = (bot.clone(), self.store.clone());
+                let then = Then::Answered {
+                    bot,
+                    turn,
+                    serving: None,
+                };
+                self.write(session, output, id, then, async move {
+                    Written::Answered(
+                        store
+                            .op("yield_call", move |db| {
+                                db.yield_call(&name, turn, &call_id, &so_far, now_ms())
+                            })
+                            .await,
+                    )
+                })
             }
             Command::ApproveStep {
                 bot,
@@ -6242,7 +6461,7 @@ impl Service {
                 let stepping = Stepping {
                     session,
                     output: output.clone(),
-                    request: id,
+                    request: id.clone(),
                     bot: bot.clone(),
                     turn,
                     id: format!("{call_id}/{step}"),
@@ -6251,43 +6470,27 @@ impl Service {
                     again: false,
                     daemon: None,
                 };
-                let name = bot;
-                let stepped = store
-                    .op("approve_step", move |db| {
-                        db.step_announce(
-                            &name,
-                            turn,
-                            &call_id,
-                            &step,
-                            &tool,
-                            arguments,
-                            record,
-                            facts,
-                            now_ms(),
-                        )
-                    })
-                    .await?;
-                if let Step::Pending {
-                    approval,
-                    expires_ms,
-                } = stepped.step
-                {
-                    self.handles.step_lapses(approval, expires_ms);
-                    // The call now waits on a verdict: a steer waiting for
-                    // its turn lifts it.
-                    if let Some(notify) = stepped.notify {
-                        notify.notify_one();
-                    }
-                    if stepped.wake {
-                        self.handles.wake(stepping.bot.clone(), turn);
-                    }
-                    self.stepping.insert(approval, stepping);
-                    // The response is sent from the run loop once the step
-                    // is decided, not by this dispatch.
-                    return Err(Error::new("deferred"));
-                }
-                Ok(settle_step(&self.handles, &stepping.bot, turn, stepped)
-                    .expect("a decided step"))
+                let (name, store) = (bot, store.clone());
+                let then = Then::Stepped(Box::new(stepping), self.writing.lifts);
+                self.write(session, output, id, then, async move {
+                    Written::Stepped(
+                        store
+                            .op("approve_step", move |db| {
+                                db.step_announce(
+                                    &name,
+                                    turn,
+                                    &call_id,
+                                    &step,
+                                    &tool,
+                                    arguments,
+                                    record,
+                                    facts,
+                                    now_ms(),
+                                )
+                            })
+                            .await,
+                    )
+                })
             }
             Command::RunStep {
                 bot,
@@ -6377,11 +6580,16 @@ impl Service {
                 step,
                 failed,
             } => {
-                store
-                    .op("step_result", move |db| {
-                        db.step_result(&bot, turn, &call_id, &step, failed)
-                    })
-                    .await
+                let store = store.clone();
+                self.write(session, output, id, Then::Reply, async move {
+                    Written::Value(
+                        store
+                            .op("step_result", move |db| {
+                                db.step_result(&bot, turn, &call_id, &step, failed)
+                            })
+                            .await,
+                    )
+                })
             }
             Command::TakeCall { bot, turn, call_id } => {
                 if call_id.is_empty() {
@@ -6395,18 +6603,25 @@ impl Service {
                         "no call is taken while the daemon is held; take it after resume",
                     );
                 }
-                store
-                    .op("take_call", move |db| {
-                        db.take_call(&bot, turn, &call_id, now_ms())
-                    })
-                    .await
+                let store = store.clone();
+                self.write(session, output, id, Then::Taken, async move {
+                    Written::Value(
+                        store
+                            .op("take_call", move |db| {
+                                db.take_call(&bot, turn, &call_id, now_ms())
+                            })
+                            .await,
+                    )
+                })
             }
             Command::ToolCalls { tag, after, limit } => {
-                store
-                    .op("tool_calls", move |db| {
+                let reader = store.reader();
+                self.observe(session, output, id, async move {
+                    (reader.read("tool_calls", move |db| {
                         db.tool_calls(&tag, after, limit.unwrap_or(64))
-                    })
+                    }))
                     .await
+                })
             }
             Command::Approvals {
                 bot,
@@ -7255,6 +7470,48 @@ async fn answer_queued(
     }
 }
 
+/// Answer a client's write that landed, then start the serving its lease
+/// held, as the serial path did after its reply.
+async fn answer_write(
+    service: &mut Service,
+    sessions: &mut HashMap<u64, Output>,
+    stdio_owner: bool,
+    session: u64,
+    write: Write,
+    done: Option<Written>,
+) -> Result<()> {
+    let Write { output, id, then } = write;
+    let serving = match &then {
+        Then::Answered { serving, .. } => serving.clone(),
+        _ => None,
+    };
+    if let Some(result) = service.written(then, done) {
+        reply(service, sessions, stdio_owner, session, &output, id, result).await?;
+    }
+    if let Some((tag, lease)) = serving {
+        service.hub.start(&tag, session, lease);
+    }
+    service.writing.credits.remove(&session);
+    Ok(())
+}
+
+/// Answer the writes on their way as they land: they are in the store's
+/// queue, which commits them before it closes.
+async fn answer_written(
+    service: &mut Service,
+    sessions: &mut HashMap<u64, Output>,
+    stdio_owner: bool,
+) {
+    while let Some((session, write, done)) = service.writing.lane.next().await {
+        if answer_write(service, sessions, stdio_owner, session, write, done)
+            .await
+            .is_err()
+        {
+            break;
+        }
+    }
+}
+
 /// Answer the reads still running or waiting, within a few seconds; any
 /// left after that go unanswered, as the daemon stops.
 async fn answer_observed(
@@ -7925,6 +8182,7 @@ mod tests {
         let mut service = Service {
             store: store.clone(),
             stepping: HashMap::new(),
+            writing: Writing::default(),
             lent: HashMap::new(),
             step_checks: JoinSet::new(),
             steps: Default::default(),
@@ -8147,6 +8405,7 @@ mod tests {
         let mut service = Service {
             store: store.clone(),
             stepping: HashMap::new(),
+            writing: Writing::default(),
             lent: HashMap::new(),
             step_checks: JoinSet::new(),
             steps: Default::default(),
@@ -8341,7 +8600,7 @@ mod tests {
         );
         drop(service);
         drop(store);
-        std::fs::remove_dir_all(dir).unwrap();
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[tokio::test]
@@ -8405,7 +8664,7 @@ mod tests {
             .unwrap();
         assert_eq!(in_use(&["other"]).await, ["Bob"]);
         drop(store);
-        std::fs::remove_dir_all(dir).unwrap();
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[tokio::test]
@@ -8463,6 +8722,7 @@ mod tests {
             identity: 0,
             store: store.clone(),
             stepping: HashMap::new(),
+            writing: Writing::default(),
             lent: HashMap::new(),
             step_checks: JoinSet::new(),
             steps: Default::default(),
@@ -8552,7 +8812,7 @@ mod tests {
         drop(service);
         writer.join().unwrap().unwrap();
         drop(store);
-        std::fs::remove_dir_all(dir).unwrap();
+        let _ = std::fs::remove_dir_all(dir);
     }
     #[tokio::test]
     async fn finished_turns_commit_without_service_reaping() {
@@ -8595,7 +8855,7 @@ mod tests {
         assert_eq!(terminal, turns.len(), "one terminal event per turn");
         drop(service);
         drop(store);
-        std::fs::remove_dir_all(dir).unwrap();
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     fn submit(bot: &str, request_id: &str) -> Command {
@@ -8723,6 +8983,7 @@ mod tests {
             identity: 0,
             store: store.clone(),
             stepping: HashMap::new(),
+            writing: Writing::default(),
             lent: HashMap::new(),
             step_checks: JoinSet::new(),
             steps: Default::default(),
@@ -9143,7 +9404,7 @@ mod tests {
         );
         drop(service);
         drop(store);
-        std::fs::remove_dir_all(dir).unwrap();
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[tokio::test]
@@ -9219,7 +9480,7 @@ mod tests {
         assert_eq!(kept, 0, "retention ran with the completion");
         drop(service);
         drop(store);
-        std::fs::remove_dir_all(dir).unwrap();
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[tokio::test]
@@ -9251,7 +9512,7 @@ mod tests {
         assert_eq!(status, "interrupted", "not the failure it was retrying");
         drop(service);
         drop(store);
-        std::fs::remove_dir_all(dir).unwrap();
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     /// Lose every group that changes one of Bob's turns' status, the way a
@@ -9344,7 +9605,7 @@ mod tests {
         assert_eq!(service.storage_backoff, Duration::ZERO);
         drop(service);
         drop(store);
-        std::fs::remove_dir_all(dir).unwrap();
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[tokio::test]
@@ -9409,7 +9670,7 @@ mod tests {
         assert!(service.storage_backoff > Duration::ZERO);
         drop(service);
         drop(store);
-        std::fs::remove_dir_all(dir).unwrap();
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[tokio::test]
@@ -9489,7 +9750,7 @@ mod tests {
         assert_eq!(resumed.try_recv().ok(), Some(("Bob".into(), bob)));
         drop(service);
         drop(store);
-        std::fs::remove_dir_all(dir).unwrap();
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[tokio::test(start_paused = true)]
@@ -9523,7 +9784,7 @@ mod tests {
         );
         drop(service);
         drop(store);
-        std::fs::remove_dir_all(dir).unwrap();
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[tokio::test]
@@ -9572,7 +9833,7 @@ mod tests {
         assert!(service.active.is_empty(), "the backoff holds no slot");
         drop(service);
         drop(store);
-        std::fs::remove_dir_all(dir).unwrap();
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[tokio::test]
@@ -9603,7 +9864,7 @@ mod tests {
         assert_eq!(status, "running", "the next start ends it as interrupted");
         drop(service);
         drop(store);
-        std::fs::remove_dir_all(dir).unwrap();
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     /// A service whose bots may start turns, bound to `openai`, whose
@@ -9753,7 +10014,7 @@ mod tests {
         assert_eq!(service.reserved, 0);
         drop(service);
         drop(store);
-        std::fs::remove_dir_all(dir).unwrap();
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[tokio::test]
@@ -9847,7 +10108,7 @@ mod tests {
         }
         drop(service);
         drop(store);
-        std::fs::remove_dir_all(dir).unwrap();
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[tokio::test]
@@ -9994,7 +10255,7 @@ mod tests {
         );
         drop(service);
         drop(store);
-        std::fs::remove_dir_all(dir).unwrap();
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[tokio::test]
@@ -10027,6 +10288,203 @@ mod tests {
             let (_, _, _, started) = service.settle().await;
             started.unwrap();
         }
+        drop(service);
+        drop(store);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn a_client_s_write_waits_for_its_commit_beside_the_run_loop() {
+        let dir = scratch("held-writes");
+        let (store, _publications) = Store::open(&dir.join("state.sqlite")).await.unwrap();
+        let mut service = admitting(&store, 1024);
+        let (output, _writer) = Output::stdout();
+        requests(&mut service, vec![create("A", &dir)], &output).await;
+        // A commit that takes seconds, as on a saturated disk.
+        let (held, gate) = hold(&store).await;
+        let take = Command::TakeCall {
+            bot: "A".into(),
+            turn: 1,
+            call_id: "c".into(),
+        };
+        let step = Command::StepResult {
+            bot: "A".into(),
+            turn: 1,
+            call_id: "c".into(),
+            step: "1".into(),
+            failed: false,
+        };
+        // Each goes to the store from its own task, and its session waits
+        // for it while the loop goes on.
+        for (session, command) in [(1, take), (2, step)] {
+            assert!(command.records());
+            assert!(!service.must_settle(Some(&command), session, &output, Bound::default()));
+            let deferred = tokio::time::timeout(
+                Duration::from_secs(5),
+                service.dispatch(command, session, &output, json!(session), Bound::default()),
+            )
+            .await
+            .expect("handed to the held writer without waiting for it");
+            assert_eq!(deferred.unwrap_err().code, "deferred");
+        }
+        assert_eq!(service.writing.lane.parked().collect::<Vec<_>>(), [1, 2]);
+        // The waiting calls are listed from the readers meanwhile.
+        let calls = Command::ToolCalls {
+            tag: "host".into(),
+            after: 0,
+            limit: None,
+        };
+        let deferred = (service.dispatch(calls, 3, &output, json!("r"), Bound::default()))
+            .await
+            .unwrap_err();
+        assert_eq!(deferred.code, "deferred");
+        let (asker, sent) = tokio::time::timeout(Duration::from_secs(5), service.lane.next())
+            .await
+            .expect("listed beside the held writer")
+            .unwrap();
+        assert_eq!((asker.session, sent), (3, true));
+        // No write is answered before its commit.
+        let early = tokio::time::timeout(Duration::from_millis(50), service.writing.lane.next());
+        assert!(early.await.is_err(), "answered before its commit");
+        gate.send(()).unwrap();
+        held.await.unwrap();
+        let mut answered = Vec::new();
+        for _ in 0..2 {
+            let (session, write, done) = service.writing.lane.next().await.unwrap();
+            let reply = service.written(write.then, done).expect("a reply");
+            answered.push((session, reply.unwrap_err().code));
+        }
+        // In the order they were sent.
+        assert_eq!(
+            answered,
+            [
+                (1, "turn_not_found".to_owned()),
+                (2, "turn_not_found".to_owned())
+            ]
+        );
+        assert!(service.writing.lane.is_empty());
+        drop(service);
+        drop(store);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_step_decided_before_its_write_lands_is_checked_as_it_lands() {
+        let dir = scratch("early-step");
+        let (store, _publications) = Store::open(&dir.join("state.sqlite")).await.unwrap();
+        let mut service = admitting(&store, 1024);
+        let (output, _writer) = Output::stdout();
+        let stepping = |id: &str| Stepping {
+            session: 1,
+            output: output.clone(),
+            request: json!(1),
+            bot: "A".into(),
+            turn: 1,
+            id: id.into(),
+            gone: false,
+            checking: false,
+            again: false,
+            daemon: None,
+        };
+        let pending = |approval| {
+            Some(Written::Stepped(Ok(Stepped {
+                step: Step::Pending {
+                    approval,
+                    expires_ms: None,
+                },
+                notify: None,
+                wake: false,
+                lifted: None,
+            })))
+        };
+        // Two steps on their way; a verdict for the first's approval comes
+        // before it lands, while no waiting step claims it.
+        service.writing.announcing = 2;
+        service.check_steps(vec![41], false);
+        assert!(service.step_checks.is_empty());
+        let lifts = service.writing.lifts;
+        let reply = service.written(Then::Stepped(Box::new(stepping("c/1")), lifts), pending(41));
+        assert!(reply.is_none(), "a waiting step is answered once decided");
+        assert!(service.stepping[&41].checking, "checked as it lands");
+        // One that left before a pause was lifted is checked too.
+        service.writing.lifts += 1;
+        let reply = service.written(Then::Stepped(Box::new(stepping("c/2")), lifts), pending(42));
+        assert!(reply.is_none());
+        assert!(service.stepping[&42].checking);
+        assert_eq!(service.writing.announcing, 0);
+        assert!(service.writing.unclaimed.is_empty());
+        // With nothing on its way, nothing is kept for later.
+        service.check_steps(vec![43], false);
+        assert!(service.writing.unclaimed.is_empty());
+        service.writing.announcing = 1;
+        let reply = service.written(
+            Then::Stepped(Box::new(stepping("c/3")), service.writing.lifts),
+            pending(43),
+        );
+        assert!(reply.is_none());
+        assert!(!service.stepping[&43].checking, "nothing to check");
+        while service.step_checks.join_next().await.is_some() {}
+        drop(service);
+        drop(store);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_request_that_ends_a_turn_or_stops_a_call_waits_for_the_writes_on_their_way() {
+        let ends = |line: &str| serde_json::from_str::<Command>(line).unwrap().ends_turns();
+        assert!(ends(r#"{"op":"interrupt","bot":"a","turn":1}"#));
+        assert!(ends(r#"{"op":"stop_process","bot":"a","handle":"proc:1"}"#));
+        assert!(ends(r#"{"op":"pause","reason":"r"}"#));
+        assert!(!ends(r#"{"op":"resume"}"#));
+        assert!(!ends(r#"{"op":"tool_calls","tag":"t"}"#));
+    }
+
+    #[tokio::test]
+    async fn a_step_allowed_or_a_call_taken_as_the_daemon_stops_starts_nothing() {
+        let dir = scratch("stopping-step");
+        let (store, _publications) = Store::open(&dir.join("state.sqlite")).await.unwrap();
+        let mut service = admitting(&store, 1024);
+        let (output, _writer) = Output::stdout();
+        let stepping = || Stepping {
+            session: 1,
+            output: output.clone(),
+            request: json!(1),
+            bot: "A".into(),
+            turn: 1,
+            id: "c/1".into(),
+            gone: false,
+            checking: false,
+            again: false,
+            daemon: None,
+        };
+        let decided = |decision: &str| {
+            Some(Written::Stepped(Ok(Stepped {
+                step: Step::Decided(json!({"call_id":"c/1","decision":decision,"approvals":[]})),
+                notify: None,
+                wake: false,
+                lifted: None,
+            })))
+        };
+        let taken = || Some(Written::Value(Ok(json!({"call_id": "c"}))));
+        // Landing with nothing holding the daemon, they are answered.
+        service.writing.announcing = 1;
+        let lifts = service.writing.lifts;
+        let allowed = service.written(Then::Stepped(Box::new(stepping()), lifts), decided("allow"));
+        assert_eq!(allowed.unwrap().unwrap()["decision"], "allow");
+        assert_eq!(
+            service.written(Then::Taken, taken()).unwrap().unwrap()["call_id"],
+            "c"
+        );
+        // Stopped by a signal while they were on their way, nothing starts;
+        // a denial is still told.
+        (service.draining).store(true, std::sync::atomic::Ordering::Relaxed);
+        service.writing.announcing = 2;
+        let allowed = service.written(Then::Stepped(Box::new(stepping()), lifts), decided("allow"));
+        assert_eq!(allowed.unwrap().unwrap_err().code, "daemon_draining");
+        let denied = service.written(Then::Stepped(Box::new(stepping()), lifts), decided("deny"));
+        assert_eq!(denied.unwrap().unwrap()["decision"], "deny");
+        let refused = service.written(Then::Taken, taken()).unwrap().unwrap_err();
+        assert_eq!(refused.code, "daemon_draining");
         drop(service);
         drop(store);
         std::fs::remove_dir_all(dir).unwrap();
@@ -10069,7 +10527,7 @@ mod tests {
         assert_eq!(refused.code, "invalid_name");
         drop(service);
         drop(store);
-        std::fs::remove_dir_all(dir).unwrap();
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[tokio::test]
@@ -10112,7 +10570,7 @@ mod tests {
         );
         drop(service);
         drop(store);
-        std::fs::remove_dir_all(dir).unwrap();
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[tokio::test]
@@ -10165,7 +10623,7 @@ mod tests {
         }
         drop(service);
         drop(store);
-        std::fs::remove_dir_all(dir).unwrap();
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[tokio::test]
@@ -10245,7 +10703,7 @@ mod tests {
         publisher.abort();
         drop(service);
         drop(store);
-        std::fs::remove_dir_all(dir).unwrap();
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[tokio::test]
@@ -10325,7 +10783,7 @@ mod tests {
         publisher.abort();
         drop(service);
         drop(store);
-        std::fs::remove_dir_all(dir).unwrap();
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[tokio::test]
@@ -10410,7 +10868,7 @@ mod tests {
         paging.await.unwrap().unwrap();
         assert!(!*closed.borrow());
         drop(store);
-        std::fs::remove_dir_all(dir).unwrap();
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[tokio::test]
@@ -10500,7 +10958,7 @@ mod tests {
         publisher.abort();
         drop(service);
         drop(store);
-        std::fs::remove_dir_all(dir).unwrap();
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[tokio::test]
@@ -10539,7 +10997,7 @@ mod tests {
         publisher.abort();
         drop(service);
         drop(store);
-        std::fs::remove_dir_all(dir).unwrap();
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[tokio::test]
@@ -10618,7 +11076,7 @@ mod tests {
         publisher.abort();
         drop(service);
         drop(store);
-        std::fs::remove_dir_all(dir).unwrap();
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[tokio::test]
@@ -10764,7 +11222,7 @@ mod tests {
         }
         drop(service);
         drop(store);
-        std::fs::remove_dir_all(dir).unwrap();
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[tokio::test]
@@ -10818,7 +11276,7 @@ mod tests {
         assert_eq!(service.reserved, 0);
         drop(service);
         drop(store);
-        std::fs::remove_dir_all(dir).unwrap();
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[tokio::test]
@@ -10882,7 +11340,7 @@ mod tests {
         assert_eq!(retry["status"], "running");
         drop(service);
         drop(store);
-        std::fs::remove_dir_all(dir).unwrap();
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[tokio::test]
@@ -10918,7 +11376,7 @@ mod tests {
         assert_eq!(status, "interrupted");
         drop(service);
         drop(store);
-        std::fs::remove_dir_all(dir).unwrap();
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     /// Bob with one turn parked on a `wait` for a process that never ends.
@@ -11080,7 +11538,7 @@ mod tests {
             .unwrap();
         drop(service);
         drop(store);
-        std::fs::remove_dir_all(dir).unwrap();
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[tokio::test]
@@ -11117,7 +11575,7 @@ mod tests {
         assert_eq!(*results[&names[0]], json!({"exit_code":0}));
         assert_eq!(*results[&names[1]], json!({"pending":true}));
         drop(store);
-        std::fs::remove_dir_all(dir).unwrap();
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[tokio::test]
@@ -11165,7 +11623,7 @@ mod tests {
             .unwrap();
         drop(service);
         drop(store);
-        std::fs::remove_dir_all(dir).unwrap();
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[tokio::test]
@@ -11257,7 +11715,7 @@ mod tests {
         drop(gate);
         waker.await.unwrap();
         drop(store);
-        std::fs::remove_dir_all(dir).unwrap();
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[tokio::test]
@@ -11283,6 +11741,6 @@ mod tests {
         service.complete(bot, id, task, exit).await.unwrap();
         drop(service);
         drop(store);
-        std::fs::remove_dir_all(dir).unwrap();
+        let _ = std::fs::remove_dir_all(dir);
     }
 }
