@@ -8832,9 +8832,16 @@ impl App {
                 return;
             };
             let back = match job.await {
-                // Another agent opened meanwhile: caught up on the old one,
-                // it connects again for this one.
-                Ok(Ok(back)) if back.bot != self.bot => return,
+                // Another agent opened meanwhile, or the conversation was
+                // drawn again from the start (`/verbose`): what was read
+                // follows a view no longer shown, so it connects again for
+                // the one shown now.
+                Ok(Ok(back))
+                    if back.bot != self.bot
+                        || back.after != self.seen_node.max(self.options.side.unwrap_or(0)) =>
+                {
+                    return;
+                }
                 Ok(Ok(back)) => back,
                 Ok(Err(error)) if error == UPGRADED => {
                     self.notice = Some(UPGRADED.to_owned());
@@ -8872,6 +8879,7 @@ impl App {
     async fn reattached(&mut self, back: Reattached, events: &mut Events) {
         let Reattached {
             bot: _,
+            after: _,
             client,
             events: fresh,
             record,
@@ -21888,6 +21896,8 @@ struct Reattaching {
 struct Reattached {
     /// The bot it caught up on.
     bot: String,
+    /// The last node the window had drawn when it asked.
+    after: i64,
     client: Arc<Client>,
     events: Events,
     record: Value,
@@ -21953,6 +21963,7 @@ async fn read_reattached(asked: Reattaching) -> Result<Reattached, String> {
         notices.push(error);
     }
     Ok(Reattached {
+        after: asked.after,
         bot: asked.bot,
         client,
         events,
@@ -26910,6 +26921,43 @@ mod tests {
         // no turn runs, so its turn has not started.
         assert_eq!(app.in_line, [7, 9]);
         assert!(app.status_line().to_string().starts_with("• Queued ("));
+    }
+
+    /// A reconnect read for a view since drawn again from the start
+    /// (`/verbose` while away) is not applied: it connects again for the
+    /// view shown now, so the conversation comes back whole.
+    #[tokio::test]
+    async fn a_reconnect_read_for_a_view_drawn_again_is_read_again() {
+        for (after, applied) in [(7, false), (0, true)] {
+            let (client, mut events) = daemon_with_events(json!({}), |_| json!({})).await;
+            let (fresh, fresh_events) = daemon_with_events(json!({}), |_| json!({})).await;
+            let mut app = app(client);
+            app.dropped();
+            app.seen_node = 0;
+            app.retry = Some(Instant::now());
+            let back = Reattached {
+                bot: app.bot.clone(),
+                after,
+                client: fresh,
+                events: fresh_events,
+                record: json!({}),
+                caught: Caught::default(),
+                history: None,
+                waiting: None,
+                ended: None,
+                began: None,
+                approvals: None,
+                notices: Vec::new(),
+            };
+            let job = tokio::spawn(async move { Ok(back) });
+            while !job.is_finished() {
+                tokio::task::yield_now().await;
+            }
+            app.reattaching = Some(job);
+            app.reattach(&mut events).await;
+            assert_eq!(app.down.is_none(), applied, "read after node {after}");
+            assert!(app.reattaching.is_none());
+        }
     }
 
     #[tokio::test]
