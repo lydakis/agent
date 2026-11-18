@@ -782,9 +782,10 @@ impl Hub {
     }
 }
 
-/// `limit` of `bot`'s durable events after `after`, or every bot's for `*`
-/// or a pattern, whose replay passes the other bots' by as it sends.
-/// A follow of every bot that names `kinds`, up to as many as a page
+/// `limit` of `bot`'s durable events after `after`, or every bot's for `*`,
+/// or the bots a pattern matches, matched by the store as it reads the
+/// cursor's range so a sparse pattern decodes only its own events.
+/// A follow that names `kinds`, up to as many as a page
 /// takes, gets only those from the store, so a few rare kinds cost the
 /// events they are, not every event written since. One bot's events, or
 /// every bot's of more kinds, are paged whole and filtered as they are
@@ -797,13 +798,13 @@ fn event_page(
     after: i64,
     limit: usize,
 ) -> Result<Value> {
-    match (bot == ALL || is_pattern(bot), kinds) {
-        (true, Some(kinds)) if (1..=EVENT_PAGE_KINDS).contains(&kinds.len()) => {
-            let kinds: Vec<&str> = kinds.iter().map(String::as_str).collect();
-            db.events_of_kinds(&kinds, after, limit)
-        }
-        (true, _) => db.events_after(after, limit),
-        (false, _) => db.events(bot, after, limit),
+    let few = kinds.filter(|kinds| (1..=EVENT_PAGE_KINDS).contains(&kinds.len()));
+    let few: Option<Vec<&str>> = few.map(|kinds| kinds.iter().map(String::as_str).collect());
+    match (bot == ALL, is_pattern(bot), few) {
+        (true, _, Some(kinds)) => db.events_of_kinds(&kinds, after, limit),
+        (true, _, None) => db.events_after(after, limit),
+        (false, true, kinds) => db.events_matching(bot, kinds.as_deref(), after, limit),
+        (false, false, _) => db.events(bot, after, limit),
     }
 }
 
