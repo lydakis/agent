@@ -88,6 +88,15 @@ impl Sub {
         }
     }
 
+    /// Whether it follows the commons and nothing else: a thread's posts,
+    /// as posting in one subscribes, or the commons heard otherwise.
+    pub fn commons_only(&self) -> bool {
+        self.tasks_of.is_empty()
+            && self.agents.is_empty()
+            && !self.sources.is_empty()
+            && (self.sources.iter()).all(|name| super::sources::named(name).0 == COMMONS_SOURCE)
+    }
+
     /// Which subscription it is, for its counts: all it says, and the
     /// subscriber bot it is for.
     pub fn identity(&self, subscriber: Option<i64>) -> String {
@@ -949,10 +958,29 @@ fn drop_named(
 /// End the subscriptions the deleted bot of `id` held as `subscriber`:
 /// all of them, but one held by another bot of the name. How many ended.
 pub fn forget(store: &Path, subscriber: &str, id: Option<i64>) -> Result<usize, String> {
+    end_held(store, subscriber, id, |_| false)
+}
+
+/// End the subscriptions the closed bot of `id` held as `subscriber`, as
+/// `forget` does when it is deleted, but for those that follow only the
+/// commons: a closed bot still is, and still takes part in the commons
+/// threads it posted in. How many ended.
+pub fn closed(store: &Path, subscriber: &str, id: Option<i64>) -> Result<usize, String> {
+    end_held(store, subscriber, id, Sub::commons_only)
+}
+
+/// End what the bot of `id` held as `subscriber`, but what `keep` keeps
+/// and what another bot of the name holds. How many ended.
+fn end_held(
+    store: &Path,
+    subscriber: &str,
+    id: Option<i64>,
+    keep: impl Fn(&Sub) -> bool,
+) -> Result<usize, String> {
     let _held = held(store)?;
     let mut subs = read_whole(store, subscriber)?;
     let before = subs.len();
-    subs.retain(|sub| sub.owner.is_some_and(|owner| Some(owner) != id));
+    subs.retain(|sub| sub.owner.is_some_and(|owner| Some(owner) != id) || keep(sub));
     if subs.len() < before {
         write(store, subscriber, &subs)?;
     }

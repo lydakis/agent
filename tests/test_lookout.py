@@ -365,6 +365,33 @@ class LookoutTests(ModelFixture):
         self.assertIsNotNone(woke, 'the subscriber was not woken')
         self.assertIn('[tasks · ops.deploy · ops.deploy replied to the person, completed]\nreply:ship it', woke)
 
+    def test_a_closed_bot_s_follows_end_but_its_commons_ones(self):
+        self.make('reviewer', 'ops.deploy')
+        folder = self.path / 'state.sqlite.lookout'
+        folder.mkdir(exist_ok=True)
+        subs = [{'name': 'deploys', 'agents': ['ops.*']},
+                {'name': 'commons.t1', 'sources': ['commons:t1']}]
+        (folder / 'reviewer.json').write_text(json.dumps({'subscriptions': subs}))
+        self.start()
+        time.sleep(1)
+        # The person closes it, as a bot closes one it made: it still is.
+        self.assertTrue(self.daemon.request('close', bot='reviewer')['result']['was_open'])
+        deadline = time.monotonic() + 20
+        while True:
+            held = json.loads((folder / 'reviewer.json').read_text())['subscriptions']
+            if [sub['name'] for sub in held] == ['commons.t1']:
+                break
+            self.assertLess(time.monotonic(), deadline, held)
+            time.sleep(.1)
+        log = [json.loads(line) for line in (self.path / 'state.sqlite.lookout.jsonl').read_text().splitlines()]
+        self.assertTrue(any(line.get('why') == 'its subscriber was closed' and line['lead'] == 'reviewer'
+                            for line in log), log)
+        # What it followed no longer wakes it, and so never opens it again.
+        self.daemon.request('submit', bot='ops.deploy', request_id='d', prompt='ship it')
+        self.assertIsNone(self.note_for('reviewer', timeout=5))
+        listed = self.daemon.request('bots', name='reviewer')['result']['bots']
+        self.assertIsNotNone(listed[0].get('closed_ms'), listed)
+
     def test_a_changed_subscription_is_said_once_read_and_its_listing_says_when(self):
         tool = {'name': 'follows', 'description': 'Follow.', 'answered_by': 'sonny',
                 'parameters': {'type': 'object', 'properties': {'add': {'type': 'object'}}}}

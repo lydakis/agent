@@ -22760,6 +22760,13 @@ fn a_closed_bot_is_listed_only_when_asked_until_a_turn_of_its_starts() {
     assert_eq!(db.close("shop.fix", 2_000).unwrap(), (Some(1_000), None));
     assert_eq!(db.inspect("shop.fix").unwrap().closed_ms, Some(1_000));
     assert_eq!(db.inspect("shop.look").unwrap().closed_ms, None);
+    // Followers are told once, when it closes: closing it again tells
+    // nothing.
+    let closed = db.events_of_kinds(&["closed"], 0, 256).unwrap();
+    let closed = closed["events"].as_array().unwrap();
+    assert_eq!(closed.len(), 1);
+    assert_eq!(closed[0]["bot"], "shop.fix");
+    assert_eq!(closed[0]["data"]["closed_ms"], 1_000);
     assert_eq!(
         names(
             db.list(None, 64, Some("shop.*"), false, None, true)

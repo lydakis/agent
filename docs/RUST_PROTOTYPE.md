@@ -1801,7 +1801,8 @@ its `message` event keeps it, and a larger `item` starts the next, as Codex
 streams a response's items apart. A call retried or resumed after a park
 streams its items again under the same numbers. The `pruned`
 and `deleted` retention notices carry `durable:false` too. Durable event kinds
-are `created`, `forked`, `queued` (a submission waiting its turn), `accepted`
+are `created`, `forked`, `closed` (a bot closed, with its `closed_ms`,
+written once as it closes), `queued` (a submission waiting its turn), `accepted`
 (a turn starting, with its prompt's node), `message`, `usage`, `tool_started`
 (with a 2 KiB argument preview, and `approvals` and the planning `node`
 for a gated call), `tool_completed` (with retained artifact names; `failed`
@@ -2919,8 +2920,8 @@ names one, keys both the making and the message, so a call made again
 makes and sends nothing new. The models the person lists in
 `~/.agent/models`, with their notes, are named in its `model` parameter,
 read as the daemon starts. `close_agent` closes an agent the caller made:
-the `close` request marks it (`closed_ms` on its record, kept first) and
-names the turn it runs, read in the same store job, which the tool
+the `close` request marks it (`closed_ms` on its record, kept first,
+and a `closed` event in its log the first time) and names the turn it runs, read in the same store job, which the tool
 interrupts; `list_agents` leaves it out unless asked with `closed` (the
 `bots` request's `open` filter). Nothing of its history goes; the next turn
 it starts, from a message sent later or one already in line, opens it
