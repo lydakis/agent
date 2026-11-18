@@ -10919,3 +10919,73 @@ The table gives medians after warmup. The base ran first and last across two blo
 | lifecycle | CPU, s | 0.373 | 0.348 |
 | lifecycle | p95 turn, ms | 600.258 | 601.289 |
 | lifecycle | peak RSS, MiB | 27.750 | 28.383 |
+
+## One selector for `messages` and `follow` (#1161)
+
+`messages` and `follow` take one selector: a bot's name or a GLOB pattern,
+`since_ms`/`until_ms`, `from` sender kinds (`person`, `bot`, `client`), and
+the cursor, limit and order they had. Sonny's `memory said` was a `bots`
+listing, then `turns`, `history_nodes` and `history_items` for every agent;
+it is now one paged `messages {bot: "*", from: ["person"], since_ms}` read,
+plus history reads only for agents with a reaction or an answer to an ask
+among the person's messages. The person's messages are found through a
+partial index, `messages_people` (`ON messages(id) WHERE from_bot IS NULL
+AND origin IS NULL`), created at open with no schema change, and `sent_ms`
+is kept monotone with `id` so a time bound is an id range.
+
+`bench/said_scale.py` seeds a store over stdio, then times `memory said`
+with each build and checks that both print the same words (release builds
+of the workspace on both sides, one 4-CPU Linux box):
+
+| Agents | Window | `main` | Head |
+| --- | --- | ---: | ---: |
+| 1,000 | since the last cleanup | 544 ms | 47 ms |
+| 1,000 | a day | 533 ms | 48 ms |
+| 10,000 | since the last cleanup | 6,752 ms | 326 ms |
+| 10,000 | a day | 6,405 ms | 334 ms |
+
+The output is identical on both sides in every row.
+
+### Low end and high end
+
+`bench/ends.py` (the freeze-5 harness), both sides built with `cargo build
+--release --workspace --bins`, `main` at d88d3ae against the head at
+bc7c4cc, one 4-CPU Linux box. High-end runs are paced (`--pace 0.5`) so both
+sides do the same agent work.
+
+Low end, one window and 10 agents (`main` → head):
+
+| Measure | `main` | Head |
+| --- | ---: | ---: |
+| Window start, s | 0.043 | 0.060 |
+| Idle daemon CPU, % / RSS, MiB | 0.05 / 21.2 | 0.0 / 21.2 |
+| Idle window CPU, % / RSS, MiB | 0.2 / 25.6 | 0.15 / 25.8 |
+| Key to character p50 / p99, ms | 0.46 / 1.18 | 0.41 / 1.09 |
+| Turn p50 / p99, ms | 48.2 / 54.1 | 48.0 / 48.5 |
+
+High end, 10,000 stored agents, 30 busy and 8 running code-mode scripts,
+windows all in one busy project (`one`) or one folder each (`spread`):
+
+| Windows, layout | Window start p50, ms | Key to character p99, ms | Pauses over 100 ms | Daemon CPU, % | Daemon RSS, MiB | Turns |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| 32, one | 1002 → 1105 | 5.88 → 5.17 | 0 → 0 | 134.3 → 134.5 | 39.4 → 39.1 | 1410 → 1410 |
+| 32, spread | 1133 → 1061 | 3.05 → 2.79 | 0 → 0 | 133.2 → 131.7 | 39.6 → 39.2 | 1410 → 1410 |
+| 100, one | 2960 → 3162 | 9.12 → 51.56 | 0 → 1 | 132.9 → 130.5 | 41.9 → 40.8 | 1500 → 1470 |
+| 100, spread | 3655 → 3191 | 69.64 → 60.26 | 1 → 2 | 132.9 → 131.0 | 40.2 → 40.4 | 1500 → 1500 |
+| 200, one | 6514 → 7268 | 27.12 → 26.15 | 0 → 0 | 153.2 → 154.8 | 46.0 → 46.5 | 1770 → 1770 |
+| 200, spread | 5880 → 5933 | 12.86 → 19.55 | 0 → 0 | 154.2 → 154.4 | 44.9 → 43.4 | 1650 → 1710 |
+
+Window start in the `one` layout read slower on the head in the first
+runs, so 32 windows in one project ran three more alternating pairs: p50
+998 to 1142 ms on `main` and 1051 to 1254 ms on the head, the head faster
+in the third pair. The two sides overlap, and nothing a window does at
+start changed: its requests are the same on both sides (32 `messages`, 34
+`follow`, about 1,800 `bots`), and the exact-bot `messages` query is the
+one `main` runs. At 100 windows the 4 CPUs are past full on both sides
+(key p99 over 50 ms and pauses over 100 ms on `main` too), so those rows say
+more about the box than the change.
+
+A follow of a pattern costs the publisher a GLOB check per pattern that
+some session follows, and nothing when none does: the set is empty and the
+exact-name and `*` lookups are the ones `main` makes. ASCII names match
+byte by byte with no allocation.
