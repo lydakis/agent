@@ -11648,6 +11648,74 @@ Store jobs a turn are unchanged on every screen (the gate fails on any
 increase, and it passed); the rest is within the runner's spread. The
 per-idle-bot row is 0.09 KiB; an idle bot holds nothing this change adds.
 
+## Sonny's keys never wait on the daemon (freeze cause 3)
+
+Sonny's window loop awaited the daemon: the reads an event needed before it
+was drawn, a submit, an answer, an older page, and the reads it repeats every
+few seconds. While the daemon was slow, a key waited for all of it. Now those
+run beside the loop and come back to it in order, as Codex's TUI sends ops and
+hears back as events.
+
+The acceptance test, `sonny/src/key_loop_test.rs`, holds every daemon answer
+5 s while an agent streams, then types a known string with a backspace and a
+wheel notch every few keys, sends it, and types on. It times each key to the
+first frame whose composer shows it.
+
+| Build | p50 | p99 |
+| --- | ---: | ---: |
+| main | 9.25 s | 9.8 s |
+| this change (debug build) | 1.3 ms | 6.7 ms |
+
+The message shows within 100 ms of Enter, the older page and the reply land
+in order once the daemon answers, and the submit carries what was typed.
+
+Both ends against main at ef34245, `bench/ends.py` from the step-writes
+change, one daemon binary for both sides (Sonny's change bumps no protocol):
+
+Low end: one window on a folder of 10 agents, 4-CPU Linux.
+
+| Build | Window start | Idle window CPU | Idle window RSS | Idle daemon CPU | Idle daemon RSS | Key p50 | Key p99 | Turn p50 | Turn p99 |
+|---|---|---|---|---|---|---|---|---|---|
+| main | 47 ms | 0.15% | 22.2 MiB | 0.00% | 19.8 MiB | 0.41 ms | 1.14 ms | 46.6 ms | 50.1 ms |
+| this PR | 50 ms | 0.15% | 26.2 MiB | 0.00% | 19.1 MiB | 0.66 ms | 1.20 ms | 47.5 ms | 50.1 ms |
+
+High end: 10,000 stored agents, 30 agents running turns back to back and 8 running code-mode scripts, 4-CPU Linux.
+
+| Windows | Layout | Build | Key p50 | Key p99 | Key max | Pauses over 100 ms | Window start p50 | Daemon CPU | Windows CPU | Windows RSS | Turns done in 20 s |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| 32 | one project | main | 1.1 ms | 5.8 ms | 11.2 ms | 0 | 1.06 s | 139% | 27% | 2,292 MiB | 8,453 |
+| 32 | one project | this PR | 0.9 ms | 9.6 ms | 10.0 ms | 0 | 0.82 s | 138% | 26% | 2,184 MiB | 8,809 |
+| 32 | spread | main | 1.1 ms | 6.9 ms | 9.1 ms | 0 | 0.94 s | 137% | 26% | 2,247 MiB | 8,402 |
+| 32 | spread | this PR | 0.9 ms | 4.4 ms | 5.5 ms | 0 | 0.84 s | 139% | 25% | 2,198 MiB | 8,874 |
+| 100 | one project | main | 1.6 ms | 21.2 ms | 62.7 ms | 0 | 2.49 s | 144% | 37% | 6,090 MiB | 9,060 |
+| 100 | one project | this PR | 1.2 ms | 5.7 ms | 8.3 ms | 0 | 1.98 s | 146% | 36% | 6,082 MiB | 9,363 |
+| 100 | spread | main | 1.3 ms | 7.4 ms | 30.4 ms | 0 | 2.42 s | 144% | 36% | 5,885 MiB | 9,060 |
+| 100 | spread | this PR | 1.2 ms | 6.0 ms | 6.4 ms | 0 | 2.23 s | 144% | 37% | 6,058 MiB | 9,174 |
+| 200 | one project | main | 1.5 ms | 10.4 ms | 22.6 ms | 0 | 4.69 s | 173% | 60% | 12,522 MiB | 8,839 |
+| 200 | one project | this PR | 1.4 ms | 14.9 ms | 18.4 ms | 0 | 4.18 s | 170% | 61% | 11,909 MiB | 8,606 |
+| 200 | spread | main | 1.7 ms | 13.6 ms | 108.5 ms | 1 | 4.64 s | 183% | 59% | 11,243 MiB | 9,119 |
+| 200 | spread | this PR | 1.4 ms | 6.7 ms | 13.3 ms | 0 | 4.16 s | 181% | 59% | 11,681 MiB | 9,060 |
+
+At idle the window's own memory is the same: anonymous 4.4 to 4.6 MiB on main
+and 4.5 to 4.7 MiB here (`smaps_rollup`, two runs each). The rest of the RSS
+above is the binary's clean pages, 18.2 to 18.6 MiB mapped on main against
+22.2 MiB here, which every window of the same build shares. Over nine idle
+runs the window's RSS was 22.2 to 25.9 MiB on main and 23.9 to 26.3 MiB here,
+and its CPU 0.15 to 0.18% on main and 0.15 to 0.20% here. Before the change
+that let a read changing nothing wait for the next look round, a count of the
+background reads woke an idle window every 10 s: 0.24% against 0.16%.
+
+At the high end the windows' total RSS moved within main's own spread between
+runs (11,243 to 12,522 MiB at 200 windows); window CPU and turns done are the
+same. Main had one key over 100 ms at 200 windows spread here and three
+(p99 150 ms) at 200 in one project in an earlier round; this change had none
+in any round.
+
+Still read before showing: a card's first read when it opens (`/status`,
+`/usage`, `/audit`, `/context`), `/switch`, `/new` and a side chat, listing
+agents, a fold opened on items not yet read, a react click on a reply too old
+to be kept, and a reconnect's catching up.
+
 ## Close by a selector (#1181)
 
 `close` takes a pattern or up to 256 names and closes them in one store

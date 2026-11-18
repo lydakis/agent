@@ -7,7 +7,9 @@ configure them. For installation and everyday controls, start with the
 
 [Automations](#automations) · [Scheduler](#the-scheduler) · [Memory](#memory) ·
 [Commons](#commons) · [Pause](#pause) · [Skills](#skills) ·
-[Tool host](#tool-host) · [MCP servers](#mcp-servers) · [Links](#links)
+[Tool host](#tool-host) · [MCP servers](#mcp-servers) · [Links](#links) ·
+[Keys](#keys-never-wait-on-the-daemon)
+
 
 ## Automations
 
@@ -1445,6 +1447,35 @@ sandboxed command can write. That leaves only the person's own programs
 through its agent's gate like the agent's other calls. Both ends speak link
 protocol 1. A machine speaking another protocol is refused, with a reason
 that names both, so run Sonny from the same commit on both ends.
+
+## Keys never wait on the daemon
+
+A Sonny window takes every key at once, however slow its daemon is to answer.
+What the daemon says is read beside the window's loop and shown in the order it
+came, one event at a time between looks at the keys. What the person sends (a
+message, a steer, an answer, a pick, `/compact`, Esc's interrupt) goes out in
+order beside the loop, and a message shows under the conversation at once. Older
+pages, an open card's refresh and the reads Sonny repeats every few seconds
+(tasks, the calls of agents below, their questions, margin notes) run beside it
+too, as Codex's TUI sends its ops and hears back as events. Opening a card (its
+first read), `/switch` and a reconnect's catching up still read before they
+show.
+
+The window holds only the event it is showing, as Codex's TUI takes one at a
+time. The rest wait in the connection's own queue (4,096 events or 8 MiB), so a fast
+stream behind a slow read costs no more memory than before. A stream past that
+queue lets go of the connection, as any reader that falls behind does: the
+window drops what it had not shown yet, connects again and draws the rest from
+history, from the last item it drew, each line once and in order.
+
+With every answer held 5 s (`docs/demo/held`), before this change Enter waited for the
+daemon and the window stopped: the clock stayed at 8 s, the steer stayed in the
+composer, and the words typed after it did not show. Now the steer shows at once
+and the person types on while the reply streams:
+
+![Before: with the daemon's answers held, Enter freezes the window, the steer still in the composer](sonny/keys-held-daemon-main.png)
+
+![After: the steer shows under the reply at once, and the next words show as they are typed](sonny/keys-held-daemon.png)
 
 ## Checks
 
