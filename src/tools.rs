@@ -6,6 +6,7 @@ use crate::{
     codec::{Family, ToolSchema},
     fail, fail_with,
     sandbox::{Daemon, Policy},
+    store::Retained,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -1532,7 +1533,7 @@ impl Drop for Owned {
 #[derive(Debug, Clone)]
 pub struct Outcome {
     pub output: String,
-    pub artifacts: Vec<(&'static str, Vec<u8>)>,
+    pub artifacts: Vec<(&'static str, crate::store::Retained)>,
     /// Retained streams written whole to a file in the bot's outputs
     /// folder, in place of a copy in the store: each one's path.
     pub files: Files,
@@ -2927,7 +2928,7 @@ impl Registry {
             text
         } else {
             let shown = truncate(&text, dropped);
-            artifacts.push(("text", text.into_bytes()));
+            artifacts.push(("text", Retained::Whole(text.into_bytes())));
             shown
         };
         let success = (200..300).contains(&page.status);
@@ -2987,7 +2988,7 @@ impl Registry {
             // read_to_end may have reserved beyond the output length.
             // Do not retain that spare capacity while storage catches up.
             text.shrink_to_fit();
-            artifacts.push((name, text.into_bytes()));
+            artifacts.push((name, Retained::Whole(text.into_bytes())));
             shown
         };
         let (stdout, stderr) = (preview("stdout", stdout), preview("stderr", stderr));

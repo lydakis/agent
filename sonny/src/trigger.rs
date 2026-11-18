@@ -171,6 +171,11 @@ impl Places {
     pub(crate) fn looked(&self) -> PathBuf {
         self.locks().join("looked")
     }
+    /// What changed in [`Places::looked`] since it was last written whole,
+    /// a line each.
+    pub(crate) fn looked_log(&self) -> PathBuf {
+        self.locks().join("looked.log")
+    }
     /// The scheduler's own folder, which [`finish`] leaves, so neither a
     /// lock nor a write of its own under way is taken from it.
     fn locks(&self) -> PathBuf {
