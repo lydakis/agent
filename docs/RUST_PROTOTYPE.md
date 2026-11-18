@@ -506,7 +506,13 @@ each with `message`, `turn` (null until taken), `delivery`, `node`,
 prompt preview, paged as `turns` is, and with `waiting` only those still in
 line, `queued` or `ready` (protocol 74), which a window that opens on a busy
 bot reads to show what waits there; `turns` lists runs only, so steers and
-attached messages never hide what a bot did.
+attached messages never hide what a bot did. `wait` on a message's handle
+resolves when it is taken, withdrawn or failed, or for a turn's opener when
+the turn ends; `interrupt` names a message (`turn` keeps its field name)
+and withdraws one in line or stops the turn it opened. A message ended in
+line records `message_ended` (`status` `withdrawn` or `failed`, with the
+error), and one taken into a running turn the `steered` event on that
+turn; `queued`, `attached` and `held` name the message (`turn` null).
 
 Protocol 87 gives `messages` and `follow` one selector, the shape `bots`
 and `audit` already take, as Kubernetes lists and watches by one selector
@@ -533,13 +539,7 @@ answer to an ask among them. `follow` with a pattern replays every bot's
 events from a store-wide cursor, as `*` does, and delivers only the
 matching bots', in replay and live; `kinds` narrows it as before. The
 publisher matches a pattern by SQLite's GLOB rules, so live delivery agrees
-with what replay read. `wait` on a message's handle
-resolves when it is taken, withdrawn or failed, or for a turn's opener when
-the turn ends; `interrupt` names a message (`turn` keeps its field name)
-and withdraws one in line or stops the turn it opened. A message ended in
-line records `message_ended` (`status` `withdrawn` or `failed`, with the
-error), and one taken into a running turn the `steered` event on that
-turn; `queued`, `attached` and `held` name the message (`turn` null).
+with what replay read.
 
 The model reads each message's number in a text part after its words:
 `[Message BOT/N.]`, `[Message BOT/N, written by PERSON.]`, `[Message BOT/N,
