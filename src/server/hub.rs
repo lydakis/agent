@@ -852,6 +852,16 @@ pub async fn replay(store: Store, hub: Hub, bot: String, sub: Sub) -> Result<()>
         let Value::Array(events) = page["events"].take() else {
             return fail("invalid_event_page");
         };
+        // The page's cursor is taken first, empty or not: an empty page of
+        // a pattern passed over what it read, so going live reads only
+        // what was committed since.
+        if let Some(next) = page["next_cursor"].as_i64() {
+            let mut s = sub.lock().unwrap();
+            if s.cancelled {
+                return Ok(());
+            }
+            s.last_cursor = s.last_cursor.max(next);
+        }
         if events.is_empty() {
             // The boundary marker, and a pruned notice ahead of it, go out
             // under the subscription's lock as it goes live, before any live
@@ -912,13 +922,6 @@ pub async fn replay(store: Store, hub: Hub, bot: String, sub: Sub) -> Result<()>
                 Switch::Live => {}
             }
             return Ok(());
-        }
-        if let Some(next) = page["next_cursor"].as_i64() {
-            let mut s = sub.lock().unwrap();
-            if s.cancelled {
-                return Ok(());
-            }
-            s.last_cursor = next;
         }
         if let Some(before) = page.get("pruned_before").and_then(Value::as_i64) {
             // Retention removed events the follower asked for: say so once,
