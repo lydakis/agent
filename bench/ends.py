@@ -374,8 +374,30 @@ def main():
             result['window_start_ms'] = spread(starts)
             time.sleep(10)
             finished = [0, 0]
+            failures = []
+
+            def need(response, what):
+                if 'result' not in response:
+                    raise RuntimeError(f'{what}: {response.get("error")}')
+                return response['result']
+
+            def ended(connection, handle):
+                found = need(connection.request('wait', handles=[handle], timeout_ms=60_000),
+                             'wait')['results'][handle]
+                if found.get('pending') or found.get('status') != 'completed':
+                    raise RuntimeError(f'turn: {found}')
+
+            def worker(run, name):
+                try:
+                    run()
+                except Exception as error:  # the measurement fails below
+                    failures.append(f'{name}: {error}')
+                    stopping.set()
 
             def busy(n):
+                worker(lambda: run_busy(n), f'b{n}')
+
+            def run_busy(n):
                 connection = Connection(sock, retain_durable=False)
                 turn = 0
                 while not stopping.is_set():
@@ -385,25 +407,13 @@ def main():
                     if 'result' not in submitted:
                         time.sleep(.05)
                         continue
-                    connection.request('wait', handles=[f'b{n}/{submitted["result"]["message"]}'],
-                                       timeout_ms=60_000)
+                    ended(connection, f'b{n}/{submitted["result"]["message"]}')
                     finished[0] += 1
                     stopping.wait(max(0, due - time.monotonic()))
                 connection.close()
 
-            failures = []
-
-            def need(response, what):
-                if 'result' not in response:
-                    raise RuntimeError(f'{what}: {response.get("error")}')
-                return response['result']
-
             def script(n):
-                try:
-                    run_script(n)
-                except Exception as error:  # the measurement fails below
-                    failures.append(f's{n}: {error}')
-                    stopping.set()
+                worker(lambda: run_script(n), f's{n}')
 
             def run_script(n):
                 connection = Connection(sock, retain_durable=False)
@@ -433,11 +443,7 @@ def main():
                             raise RuntimeError(f'approve_step: {decided}')
                         need(connection.request('step_result', **at, step=step), 'step_result')
                     need(connection.request('tool_result', **at, output='done'), 'tool_result')
-                    handle = f'{bot}/{submitted["result"]["message"]}'
-                    ended = need(connection.request('wait', handles=[handle], timeout_ms=60_000),
-                                 'wait')['results'][handle]
-                    if ended.get('pending') or ended.get('status') != 'completed':
-                        raise RuntimeError(f'turn: {ended}')
+                    ended(connection, f'{bot}/{submitted["result"]["message"]}')
                     finished[1] += 1
                     stopping.wait(max(0, due - time.monotonic()))
                 connection.close()
@@ -467,7 +473,7 @@ def main():
             for thread in threads:
                 thread.join(timeout=120)
             if failures:
-                raise RuntimeError('scripts failed: ' + '; '.join(failures))
+                raise RuntimeError('workers failed: ' + '; '.join(failures))
             result['turns_finished'] = finished[0]
             result['scripts_finished'] = finished[1]
             result.update(windows=args.windows, layout=args.layout, busy_agents=args.busy,
