@@ -521,12 +521,13 @@ pattern (`shop.*`, `*.lead`, `*`); no name holds `*`, `?` or `[`, so a
 plain name is one bot's and an unknown one is `bot_not_found`, while a
 pattern names whichever bots match, any made later too. `messages` adds
 `since_ms` and `until_ms` (sent at or after, and before, in Unix ms) and
-`from`, the kinds of sender: `person` (no other agent's turn and no named
-client sent it, named person or not), `agent` (another agent's turn) and
+`from`, the kinds of sender: `person` (no other bot's turn and no named
+client sent it, named person or not), `bot` (another bot's turn) and
 `client` (a client by its own name, such as an automation or the lookout);
 any other is `invalid_message_filter`. With `words`, each message carries
 its `text` whole beside the preview, and a page holds as many as fit in
-half a response, at least one. A message's `sent_ms` is never before the
+half a response, at least one; a message too large for a page alone keeps
+the words that fit, with `text_cut`. A message's `sent_ms` is never before the
 one sent before it, so times rise with numbers and a time range is found
 by halving the number range, a few point reads, as `audit` and `follow`'s
 `since_ms` find theirs; then the read is a range of numbers. People's

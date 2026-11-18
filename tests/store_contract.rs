@@ -22808,11 +22808,11 @@ fn messages_pick_bots_by_pattern_time_and_sender() {
         [(person, "ship the cart".into())]
     );
     assert_eq!(
-        pick(&db, "*", Some(&["agent"]), None),
+        pick(&db, "*", Some(&["bot"]), None),
         [(agent, "check the page".into())]
     );
     assert_eq!(
-        pick(&db, "*", Some(&["client", "agent"]), None),
+        pick(&db, "*", Some(&["client", "bot"]), None),
         [
             (agent, "check the page".into()),
             (client, "a digest".into())
@@ -22826,6 +22826,31 @@ fn messages_pick_bots_by_pattern_time_and_sender() {
         .as_millis() as i64
         + 60_000;
     assert!(pick(&db, "*", None, Some(later)).is_empty());
+    // Words too large for any page on their own (JSON writes each U+0001
+    // in six bytes) keep what fits, said so, and the next page follows.
+    let huge = "\u{1}".repeat(200 * 1024);
+    let big = send(&mut db, "web.c", "r4", &huge, queue.clone());
+    let page = db
+        .messages(&agent_runtime::store::Messages {
+            bot: "web.c",
+            after: 0,
+            before: None,
+            since_ms: None,
+            until_ms: None,
+            from: None,
+            limit: 10,
+            newest: true,
+            waiting: false,
+            words: true,
+        })
+        .unwrap();
+    let first = &page["messages"][0];
+    assert_eq!(first["message"], big);
+    assert_eq!(first["text_cut"], true);
+    let kept = first["text"].as_str().unwrap();
+    assert!(!kept.is_empty() && huge.starts_with(kept));
+    assert!(serde_json::to_vec(&page).unwrap().len() <= 1024 * 1024);
+    assert_eq!(page["next_before"], big);
     // A name is one bot's, which must exist; a sender kind must be known.
     let refused = |bot: &str, from: Option<Vec<String>>| {
         db.messages(&agent_runtime::store::Messages {
@@ -22867,6 +22892,21 @@ fn glob_matches_as_the_store_does() {
         ("shop.[a-c]*", "shop.cart"),
         ("shop.[^a]", "shop.a"),
         ("shop.[^a]", "shop.b"),
+        ("shop.[b-a]", "shop.b"),
+        ("shop.[b-a]", "shop.a"),
+        ("shop.[b-a]", "shop.c"),
+        ("shop.[]a]", "shop.]"),
+        ("shop.[]-a]", "shop.-"),
+        ("shop.[]-a]", "shop.b"),
+        ("shop.[-a]", "shop.-"),
+        ("shop.[a-]", "shop.-"),
+        ("shop.[^]a]", "shop.]"),
+        ("shop.[^]a]", "shop.b"),
+        ("shop.[a-cx-z]", "shop.y"),
+        ("shop.[a-c-e]", "shop.d"),
+        ("shop.[a-c-e]", "shop.-"),
+        ("shop.[ab", "shop.a"),
+        ("*[", "x["),
         ("*a*b*", "xaxxbx"),
         ("*a*b", "xaxxbx"),
         ("a.b", "a.b"),

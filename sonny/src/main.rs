@@ -22528,7 +22528,12 @@ mod tests {
         let client =
             daemon_answering(
                 move |asked| match asked["op"].as_str().unwrap_or_default() {
-                    "bots" => json!({"bots": [{"name": "shop.lead"}], "next_after": null}),
+                    // The daemon dates each message by when it was
+                    // written: the two written since the cleanup.
+                    "messages" => json!({"messages": [
+                        {"bot": "shop.lead", "bot_id": 1, "turn": 6, "node": 15, "text": "👍"},
+                        {"bot": "shop.lead", "bot_id": 1, "turn": 6, "node": 14,
+                            "text": "And the docs."}], "next_before": null}),
                     "turns" => {
                         json!({"turns": [{"turn": 6, "started_ms": 400, "finished_ms": null}],
                 "next_before": null})
@@ -22557,7 +22562,11 @@ mod tests {
         let answering = |text: &'static str| {
             daemon_answering(
                 move |asked| match asked["op"].as_str().unwrap_or_default() {
-                    "bots" => json!({"bots": [{"name": "shop.lead"}], "next_after": null}),
+                    // A trigger's words are not the person's: the daemon
+                    // leaves them out.
+                    "messages" => json!({"messages": if text.is_empty() { json!([]) } else {
+                        json!([{"bot": "shop.lead", "bot_id": 1, "turn": 2, "node": 5,
+                            "text": text}]) }, "next_before": null}),
                     "turns" => json!({"turns": [
                     {"turn": 2, "started_ms": 1500, "finished_ms": 1800}], "next_before": null}),
                     "history_nodes" => {

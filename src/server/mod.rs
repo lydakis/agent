@@ -448,7 +448,7 @@ enum Command {
         since_ms: Option<i64>,
         /// Only those sent before this, in Unix ms.
         until_ms: Option<i64>,
-        /// Only those from these senders: `person`, `agent`, `client`.
+        /// Only those from these senders: `person`, `bot`, `client`.
         from: Option<Vec<String>>,
         limit: Option<usize>,
         #[serde(default)]
