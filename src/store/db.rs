@@ -2891,11 +2891,15 @@ pub struct Shared {
     held: std::sync::Mutex<Arc<HashMap<i64, Held>>>,
     identities: std::sync::Mutex<Identities>,
 }
-/// One running turn's verdicts the worker holds, as `Live` keeps them.
+/// One running turn's verdicts and answers the worker holds, as `Live`
+/// keeps them.
 #[derive(Clone, Default)]
 struct Held {
     answered: HashMap<i64, Vec<String>>,
     verdicts: HashMap<String, Vec<Verdict>>,
+    /// Its answered calls whose answer the worker holds or the turn took,
+    /// not yet written: answered, though no row says so.
+    answers: std::collections::HashSet<String>,
 }
 #[derive(Default)]
 struct Identities {
@@ -2921,12 +2925,18 @@ impl Shared {
         let held = Arc::make_mut(&mut shared);
         for turn in turns {
             match live.get(turn) {
-                Some(live) if !live.answered.is_empty() || !live.verdicts.is_empty() => {
+                Some(live)
+                    if !live.answered.is_empty()
+                        || !live.verdicts.is_empty()
+                        || !live.answers.is_empty()
+                        || !live.taken.is_empty() =>
+                {
                     held.insert(
                         *turn,
                         Held {
                             answered: live.answered.clone(),
                             verdicts: live.verdicts.clone(),
+                            answers: (live.answers.keys()).chain(&live.taken).cloned().collect(),
                         },
                     );
                 }
@@ -3025,6 +3035,18 @@ enum HeldView<'a> {
     Shared(Arc<HashMap<i64, Held>>),
 }
 impl HeldView<'_> {
+    /// Whether call `call_id` of `turn` is answered with an answer not yet
+    /// written: held by the worker, or taken by its turn.
+    fn answer_held(&self, turn: i64, call_id: &str) -> bool {
+        match self {
+            HeldView::Live(live) => live.get(&turn).is_some_and(|live| {
+                live.answers.contains_key(call_id) || live.taken.contains(call_id)
+            }),
+            HeldView::Shared(held) => held
+                .get(&turn)
+                .is_some_and(|held| held.answers.contains(call_id)),
+        }
+    }
     fn answered(&self, turn: i64, approval: i64) -> Option<&[String]> {
         match self {
             HeldView::Live(live) => live.get(&turn)?.answered.get(&approval),
@@ -3472,20 +3494,33 @@ const KIND_CURSORS: &str = "SELECT id FROM events INDEXED BY events_kind_cursor 
 /// its own unless wrapped (SQLite flattens the wrapper).
 const KIND_ARM: &str = "SELECT * FROM (SELECT id FROM events INDEXED BY events_kind_cursor
     WHERE kind=?3 AND id>?1 ORDER BY id LIMIT ?2)";
+/// A kind's cursors of the bots a pattern matches, up to the newest
+/// event when the page started, in place of `id>?1`.
+const KIND_MATCHING: &str = "id>?1 AND id<=?M AND bot GLOB ?N";
 
 /// [`KINDS_PAGE`] for `kinds` distinct kinds bound from `?3` on, as one
 /// statement: the page's first `?2` are among each kind's first `?2`.
-fn kinds_page(kinds: usize) -> String {
+/// With a `pattern`, bound after the kinds and followed by the newest
+/// cursor, each kind's are only the bots it matches ([`KIND_MATCHING`]).
+fn kinds_page(kinds: usize, pattern: bool) -> String {
     let page = re_spaced(KINDS_PAGE);
     let cursors = re_spaced(KIND_CURSORS);
+    let matching = |arm: String| match pattern {
+        true => arm.replace(
+            "id>?1",
+            &(re_spaced(KIND_MATCHING).replace("?N", &format!("?{}", kinds + 3)))
+                .replace("?M", &format!("?{}", kinds + 4)),
+        ),
+        false => arm,
+    };
     let wanted = match kinds {
-        1 => return page,
+        1 => cursors.clone(),
         _ => (0..kinds)
             .map(|at| re_spaced(KIND_ARM).replace("kind=?3", &format!("kind=?{}", at + 3)))
             .collect::<Vec<_>>()
             .join(" UNION ALL "),
     };
-    page.replace(&cursors, &wanted)
+    page.replace(&cursors, &matching(wanted))
 }
 
 /// A statement on one line, as written across several.
@@ -10343,7 +10378,7 @@ impl Database {
                 format!("{name} is not declared lift: only its answer ends the call"),
             );
         }
-        let Some((process, _)) = self.lift(turn, call_id, None, Some(so_far), now_ms)? else {
+        let Some((process, _)) = self.lift(turn, call_id, None, Some(so_far), &[], now_ms)? else {
             return fail_with(
                 "no_pending_call",
                 "the call was answered, moved to the background or ran out of time",
@@ -11450,6 +11485,9 @@ impl Database {
         if !(1..=256).contains(&limit) || after < 0 {
             return fail_with("invalid_page", "limit must be 1 to 256 and after 0 or more");
         }
+        // Taken before the rows are read: an answer held now is in it, and
+        // one written since is in the rows.
+        let held = self.held_view();
         let mut statement = self.conn.prepare_cached(
             "SELECT a.id,t.bot,a.turn,a.call_id,a.name,a.arguments,a.expires_ms,a.taken_ms,a.process FROM answers a
              JOIN turns t ON t.id=a.turn JOIN tools l ON l.turn=a.turn AND l.call_id=a.call_id
@@ -11464,11 +11502,7 @@ impl Database {
             scanned += 1;
             let (id, turn, call_id): (i64, i64, String) = (r.get(0)?, r.get(2)?, r.get(3)?);
             // An answer the worker holds is given already.
-            if self
-                .live
-                .get(&turn)
-                .is_some_and(|live| live.answers.contains_key(&call_id))
-            {
+            if held.answer_held(turn, &call_id) {
                 last = id;
                 continue;
             }
@@ -14321,6 +14355,7 @@ impl Database {
         call_id: &str,
         call: Option<&ToolCall>,
         yielded: Option<&Outcome>,
+        served: &[String],
         now_ms: u64,
     ) -> Result<Option<(i64, Option<u64>)>> {
         let bot = self.active(turn)?;
@@ -14409,6 +14444,12 @@ impl Database {
             }
             let mut lifted =
                 json!({"call_id":call_id,"handle":handle_of(process),"waits_for":waits_for});
+            // Who holds a call waiting on its verdict, as its turn's
+            // waiting status names them.
+            let holder = (request.as_ref()).map(|request| request.holder(served).0);
+            if let Some(holder) = holder {
+                lifted["holder"] = holder.into();
+            }
             if yielded.is_some() {
                 lifted["yielded"] = true.into();
             }
@@ -14423,11 +14464,14 @@ impl Database {
                 .prepare_cached("UPDATE tools SET audit=NULL WHERE turn=? AND call_id=?")?
                 .execute(params![turn, call_id])?;
             let outcome = match yielded {
-                None => Outcome::text(
-                    json!({"handle":handle_of(process),"background":true,"steered":true,
-                        "waits_for":waits_for})
-                    .to_string(),
-                ),
+                None => {
+                    let mut result = json!({"handle":handle_of(process),"background":true,
+                        "steered":true,"waits_for":waits_for});
+                    if let Some(holder) = holder {
+                        result["holder"] = holder.into();
+                    }
+                    Outcome::text(result.to_string())
+                }
                 // What the client wrote so far, pictures too, as an answer
                 // carries them.
                 Some(so_far) => Outcome {
@@ -15139,23 +15183,38 @@ impl Database {
     }
     pub fn events(&self, name: &str, after: i64, limit: usize) -> Result<Value> {
         self.inspect(name)?;
-        self.event_page(Some(name), None, after, limit)
+        self.event_page(Some(name), None, None, after, limit)
     }
     /// Every bot's durable events after a store-wide cursor: what a fleet
     /// controller replays on one connection instead of one per bot.
     pub fn events_after(&self, after: i64, limit: usize) -> Result<Value> {
-        self.event_page(None, None, after, limit)
+        self.event_page(None, None, None, after, limit)
+    }
+    /// [`Self::events_after`] of the bots a GLOB `pattern` matches, and
+    /// only of `kinds` when some are named. SQLite matches each event's bot
+    /// as it reads the cursor's range, so a page of a sparse pattern passes
+    /// the others by in the store, without decoding them, and a replay
+    /// reads the store past its cursor once, however few events match.
+    pub fn events_matching(
+        &self,
+        pattern: &str,
+        kinds: Option<&[&str]>,
+        after: i64,
+        limit: usize,
+    ) -> Result<Value> {
+        self.event_page(None, Some(pattern), kinds, after, limit)
     }
     /// [`Self::events_after`], only of `kinds`. Each kind's next events
     /// come from its own place in the `events_kind_cursor` index, in one
     /// statement and so one snapshot, so a page costs the events it
     /// returns, not every event written between them.
     pub fn events_of_kinds(&self, kinds: &[&str], after: i64, limit: usize) -> Result<Value> {
-        self.event_page(None, Some(kinds), after, limit)
+        self.event_page(None, None, Some(kinds), after, limit)
     }
     fn event_page(
         &self,
         name: Option<&str>,
+        pattern: Option<&str>,
         kinds: Option<&[&str]>,
         after: i64,
         limit: usize,
@@ -15197,15 +15256,33 @@ impl Database {
             events.push(item);
             Ok(true)
         };
+        // A pattern's page reads up to the newest event committed as it
+        // starts: one that comes back short passed over every other bot's
+        // event up to it, so its cursor moves there, and the next page, or
+        // the check as a follow goes live, starts past what this one read.
+        let top: Option<i64> = match pattern {
+            Some(_) => Some(self.conn.query_row(
+                "SELECT COALESCE(MAX(id),0) FROM events",
+                [],
+                |r| r.get(0),
+            )?),
+            None => None,
+        };
         let mut stmt;
         let mut rows = match kinds {
-            None => {
-                stmt = self.conn.prepare_cached(match name {
-                    Some(_) => "SELECT id,turn,kind,data,bot,written_ms,message FROM events WHERE bot=?1 AND id>?2 ORDER BY id LIMIT ?3",
-                    None => "SELECT id,turn,kind,data,bot,written_ms,message FROM events WHERE ?1 IS NULL AND id>?2 ORDER BY id LIMIT ?3",
-                })?;
-                stmt.query(params![name, after, limit as i64])?
-            }
+            None => match (pattern, top) {
+                (Some(pattern), Some(top)) => {
+                    stmt = self.conn.prepare_cached("SELECT id,turn,kind,data,bot,written_ms,message FROM events WHERE bot GLOB ?1 AND id>?2 AND id<=?4 ORDER BY id LIMIT ?3")?;
+                    stmt.query(params![pattern, after, limit as i64, top])?
+                }
+                _ => {
+                    stmt = self.conn.prepare_cached(match name {
+                        Some(_) => "SELECT id,turn,kind,data,bot,written_ms,message FROM events WHERE bot=?1 AND id>?2 ORDER BY id LIMIT ?3",
+                        None => "SELECT id,turn,kind,data,bot,written_ms,message FROM events WHERE ?1 IS NULL AND id>?2 ORDER BY id LIMIT ?3",
+                    })?;
+                    stmt.query(params![name, after, limit as i64])?
+                }
+            },
             Some(kinds) => {
                 let mut kinds = kinds.to_vec();
                 kinds.sort_unstable();
@@ -15213,17 +15290,28 @@ impl Database {
                 if !(1..=EVENT_PAGE_KINDS).contains(&kinds.len()) {
                     return fail_with("invalid_event_page", "kinds must name 1 to 64 kinds");
                 }
-                stmt = self.conn.prepare_cached(&kinds_page(kinds.len()))?;
+                stmt = self
+                    .conn
+                    .prepare_cached(&kinds_page(kinds.len(), pattern.is_some()))?;
                 let most = limit as i64;
                 let mut values: Vec<&dyn rusqlite::ToSql> = vec![&after, &most];
                 values.extend(kinds.iter().map(|kind| kind as &dyn rusqlite::ToSql));
+                if let (Some(pattern), Some(top)) = (&pattern, &top) {
+                    values.push(pattern);
+                    values.push(top);
+                }
                 stmt.query(&values[..])?
             }
         };
+        let mut whole = true;
         while let Some(row) = rows.next()? {
             if !take(row)? {
+                whole = false;
                 break;
             }
+        }
+        if let Some(top) = top.filter(|_| whole && events.len() < limit) {
+            cursor = cursor.max(top);
         }
         let pruned: i64 = match name {
             Some(name) => {
@@ -16397,7 +16485,10 @@ impl Database {
 
     /// The smallest message number sent at or after `ms`, by bisection
     /// over numbers: times rise with them. One past the newest when none
-    /// is; a message with no time counts as older.
+    /// is. A message with no time (kept from before messages had times,
+    /// whose events retention removed) counts as sent with the next one
+    /// that has one, so a range never passes over a dated message for an
+    /// undated one beside it; one after the newest dated is never older.
     fn first_sent(&self, ms: i64) -> Result<i64> {
         let bounds: Option<(i64, i64)> = self.conn.query_row(
             "SELECT (SELECT MIN(id) FROM messages),(SELECT MAX(id) FROM messages)",
@@ -16409,7 +16500,7 @@ impl Database {
         };
         let mut high = high + 1;
         let mut at = self.conn.prepare_cached(
-            "SELECT id,COALESCE(sent_ms,-1) FROM messages WHERE id>=? ORDER BY id LIMIT 1",
+            "SELECT id,sent_ms FROM messages WHERE id>=? AND sent_ms IS NOT NULL ORDER BY id LIMIT 1",
         )?;
         while low < high {
             let middle = low + (high - low) / 2;
@@ -21221,7 +21312,7 @@ mod tests {
             let step = |sql: &str| {
                 (db.conn.prepare_cached(sql).unwrap()).get_status(rusqlite::StatementStatus::VmStep)
             };
-            step(&kinds_page(2))
+            step(&kinds_page(2, false))
         };
         let (few, many) = (steps(30), steps(30_000));
         assert!(
@@ -21240,8 +21331,10 @@ mod tests {
             let db = store(events);
             let page = db.events_of_kinds(&common, 0, 1).unwrap();
             assert_eq!(page["events"].as_array().unwrap().len(), 1);
-            (db.conn.prepare_cached(&kinds_page(common.len())).unwrap())
-                .get_status(rusqlite::StatementStatus::VmStep)
+            (db.conn
+                .prepare_cached(&kinds_page(common.len(), false))
+                .unwrap())
+            .get_status(rusqlite::StatementStatus::VmStep)
         };
         let (few, many) = (steps(30), steps(30_000));
         assert!(
@@ -21253,6 +21346,53 @@ mod tests {
         let refused = db.events_of_kinds(&common, 0, 1).unwrap_err();
         assert_eq!(refused.code, "invalid_event_page");
         assert!(db.events_of_kinds(&[], 0, 1).is_err());
+    }
+
+    #[test]
+    fn a_pattern_page_holds_only_its_bots_events_in_order() {
+        let db = Database::initialize(Connection::open_in_memory().unwrap()).unwrap();
+        db.conn.execute_batch("PRAGMA foreign_keys=OFF").unwrap();
+        db.conn
+            .execute_batch(
+                "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM n WHERE i<300)
+                 INSERT INTO events(bot,turn,kind,data)
+                 SELECT CASE i%3 WHEN 0 THEN 'shop.a' WHEN 1 THEN 'shop.b' ELSE 'web.a' END,1,
+                  CASE WHEN i%10=0 THEN 'turn_finished' ELSE 'tool_started' END,'{}' FROM n",
+            )
+            .unwrap();
+        let read = |kinds: Option<&[&str]>| {
+            let mut cursors = Vec::new();
+            let mut after = 0;
+            loop {
+                let page = db.events_matching("shop.*", kinds, after, 7).unwrap();
+                let events = page["events"].as_array().unwrap().clone();
+                if events.is_empty() {
+                    return cursors;
+                }
+                for event in &events {
+                    assert!(event["bot"].as_str().unwrap().starts_with("shop."));
+                    if kinds.is_some() {
+                        assert_eq!(event["event"], "turn_finished");
+                    }
+                    cursors.push(event["cursor"].as_i64().unwrap());
+                }
+                after = page["next_cursor"].as_i64().unwrap();
+            }
+        };
+        let every: Vec<i64> = (1..=300).filter(|i| i % 3 != 2).collect();
+        assert_eq!(read(None), every);
+        // A short page passed every other bot's event up to the newest:
+        // its cursor is there, so going live reads past nothing again.
+        let short = db.events_matching("shop.*", None, 290, 256).unwrap();
+        assert_eq!(short["events"].as_array().unwrap().len(), 7);
+        assert_eq!(short["next_cursor"], 300);
+        let none = db
+            .events_matching("shop.*", Some(&["accepted"]), 0, 256)
+            .unwrap();
+        assert_eq!(none["next_cursor"], 300);
+        let finished: Vec<i64> = every.iter().copied().filter(|i| i % 10 == 0).collect();
+        assert_eq!(read(Some(&["turn_finished"])), finished);
+        assert_eq!(read(Some(&["turn_finished", "accepted"])), finished);
     }
 
     #[test]
@@ -21316,6 +21456,7 @@ mod tests {
             Held {
                 answered: HashMap::from([(1, vec!["manual".to_owned()])]),
                 verdicts: HashMap::from([("call".to_owned(), vec![verdict])]),
+                answers: Default::default(),
             },
         )])));
         assert_eq!(held.verdicts(7, 1, "call").map(<[_]>::len), Some(1));

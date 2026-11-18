@@ -11097,6 +11097,69 @@ is unchanged.
     against 0.7 to 1.0 s.
   - Codex's settings are kept.
 
+## Each open connection in `stats`, by its label
+
+2026-11-18, Linux x86_64 cloud VM, 4 CPUs. Main is `8ae56e87` (#1145),
+and head is the change merged onto it. The change adds the `label` to `hello`, the `connections`
+list and the label on `slow` rows, and Sonny's window labels its
+connections with the agent it shows. Both sides are local release builds
+of the daemon and Sonny. `bench.ends` (from the step-writes change),
+alternating main and head on the same machine with nothing else running.
+
+The change costs the daemon one relaxed atomic add per delivered event
+(the session's own count, beside its program's) and one hash map entry per
+open session, which the loop touches once per request; nothing is
+allocated per request. A window sends one more `hello` line, once, when it
+knows its agent.
+
+Low end: one window on a folder of 10 agents, three runs each. Ranges are
+the runs; the median is in parentheses.
+
+| Measure | Main | Head |
+| --- | ---: | ---: |
+| Window start, s | 0.039 to 0.047 (0.04) | 0.041 to 0.049 (0.04) |
+| Idle daemon CPU, % | 0 to 0.05 (0) | 0 to 0.05 (0) |
+| Idle daemon RSS, MiB | 20.7 to 21.1 (20.7) | 20.7 to 21.2 (20.9) |
+| Idle window CPU, % | 0.1 to 0.15 (0.1) | 0.1 to 0.15 (0.15) |
+| Idle window RSS, MiB | 25.6 to 26.0 (26.0) | 25.6 to 26.1 (25.8) |
+| Key to character p50, ms | 0.35 to 0.39 (0.35) | 0.34 to 0.38 (0.35) |
+| Key to character p99, ms | 0.87 to 0.99 (0.92) | 0.88 to 1.21 (0.90) |
+| Key pauses over 100 ms | 0 | 0 |
+| Turn p50, ms | 44.08 to 44.25 (44.11) | 43.98 to 44.18 (44.06) |
+| Turn p99, ms | 47.69 to 49.98 (49.58) | 47.88 to 50.01 (48.10) |
+
+High end: 10,000 stored agents, 30 agents running turns back to back and
+8 running code-mode scripts, with every window in one busy project (`one`)
+or each in its own folder (`spread`). Each cell lists the runs, two at 32
+and 100 windows and four at 200.
+
+| Windows | Layout | Side | Key p50, ms | Key p99, ms | Key max, ms | Pauses over 100 ms | Window start p50, s | Daemon CPU, % | Daemon RSS, MiB | Windows CPU, % | Windows RSS, MiB |
+| ---: | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 32 | one | main | 0.88 / 0.93 | 4.86 / 4.90 | 5.93 / 11.16 | 0 / 0 | 0.70 / 0.75 | 138.5 / 135.6 | 40.1 / 39.4 | 25.4 / 26.3 | 2,154 / 2,212 |
+| 32 | one | head | 0.87 / 0.92 | 4.88 / 5.60 | 19.73 / 11.22 | 0 / 0 | 0.68 / 0.78 | 138.0 / 136.6 | 39.5 / 41.5 | 25.1 / 26.2 | 2,161 / 2,192 |
+| 32 | spread | main | 0.87 / 0.90 | 4.35 / 4.10 | 9.85 / 7.76 | 0 / 0 | 0.66 / 0.77 | 137.4 / 137.1 | 39.8 / 39.9 | 25.6 / 26.3 | 2,120 / 2,154 |
+| 32 | spread | head | 0.90 / 0.93 | 4.23 / 4.98 | 6.43 / 6.77 | 0 / 0 | 0.71 / 0.80 | 138.6 / 135.4 | 39.3 / 40.8 | 25.6 / 26.4 | 2,123 / 2,174 |
+| 100 | one | main | 1.28 / 1.42 | 6.84 / 6.25 | 11.11 / 8.73 | 0 / 0 | 1.83 / 1.88 | 142.6 / 143.0 | 42.0 / 42.6 | 35.9 / 36.1 | 6,063 / 6,034 |
+| 100 | one | head | 1.35 / 1.37 | 6.78 / 6.00 | 10.58 / 9.01 | 0 / 0 | 1.84 / 1.79 | 142.5 / 144.8 | 41.9 / 42.4 | 35.2 / 35.5 | 6,179 / 6,079 |
+| 100 | spread | main | 1.20 / 1.22 | 7.03 / 7.62 | 10.56 / 10.33 | 0 / 0 | 1.83 / 1.75 | 142.6 / 143.8 | 43.8 / 42.9 | 34.0 / 37.1 | 5,962 / 6,097 |
+| 100 | spread | head | 1.34 / 1.29 | 7.17 / 6.71 | 11.18 / 15.32 | 0 / 0 | 1.83 / 1.69 | 144.1 / 143.7 | 41.5 / 41.8 | 35.3 / 37.0 | 5,995 / 6,128 |
+| 200 | one | main | 1.54 / 1.52 / 1.60 / 1.62 | 8.86 / 6.38 / 8.63 / 7.35 | 107 / 11 / 15 / 84 | 1 / 0 / 0 / 0 | 3.73 / 3.46 / 3.34 / 3.67 | 177.1 / 176.7 / 176.9 / 178.0 | 43.9 / 43.7 / 43.2 / 43.2 | 60.1 / 59.0 / 59.8 / 59.7 | 11,894 / 12,130 / 11,880 / 11,878 |
+| 200 | one | head | 1.48 / 1.98 / 1.53 / 1.62 | 7.11 / 8.21 / 10.18 / 9.04 | 10 / 185 / 230 / 218 | 0 / 1 / 1 / 1 | 3.58 / 3.50 / 3.26 / 3.41 | 176.2 / 180.4 / 177.1 / 176.6 | 45.0 / 43.6 / 44.4 / 44.4 | 58.9 / 60.1 / 59.8 / 59.7 | 11,929 / 11,797 / 12,014 / 11,921 |
+| 200 | spread | main | 1.37 / 1.33 / 1.44 / 1.47 | 5.49 / 7.27 / 11.40 / 6.98 | 6 / 156 / 131 / 102 | 0 / 1 / 2 / 1 | 3.50 / 3.75 / 3.73 / 3.56 | 177.7 / 178.2 / 178.8 / 178.8 | 45.0 / 43.8 / 43.0 / 44.4 | 58.9 / 62.6 / 58.2 / 59.2 | 11,934 / 11,952 / 12,129 / 12,035 |
+| 200 | spread | head | 1.54 / 1.70 / 1.66 / 1.37 | 7.82 / 9.78 / 7.60 / 7.83 | 100 / 317 / 11 / 8 | 1 / 1 / 0 / 0 | 3.60 / 3.53 / 3.47 / 3.31 | 177.7 / 177.9 / 178.0 / 177.9 | 44.7 / 44.3 / 44.1 / 43.9 | 60.4 / 60.5 / 60.0 / 58.7 | 12,062 / 11,931 / 11,946 / 12,069 |
+
+Key to character p99 stays under 12 ms everywhere on both sides, against
+the 50 ms bar. At 32 and 100 windows neither side pauses over 100 ms. At
+200 windows both sides do, now and then, five times in eight runs each
+(each pause one probe out of 300). The daemon there runs at about 178% and
+the windows at about 60% of a 4-CPU machine that also runs the model and
+the harness, so the machine is full on both sides. Head's two longest
+pauses (230 and 317 ms) are longer than main's longest (156 ms). The
+change adds nothing to a window after its start but the one `hello` line,
+and nothing to the daemon per key, so these are the full machine's, as
+main's are. Daemon CPU and RSS, window CPU and RSS, and window start move
+within run-to-run spread. The Mac was not measured.
+
 ## One selector for `messages` and `follow` (#1161)
 
 `messages` and `follow` take one selector: a bot's name or a GLOB pattern,
@@ -11184,3 +11247,181 @@ gate gave no warnings.
 | Lifecycle p95 turn, ms | 573.633 | 576.577 | +0.5% |
 | Lifecycle peak RSS, MiB | 26.148 | 26.244 | +0.4% |
 | Quiet window CPU, ms/s | 0.77 | 0.765 | -0.6% |
+
+### A sparse pattern's replay
+
+`python -m bench.pattern_replay` seeds 100 projects of 2 agents each
+(`p0.a0`, `p0.a1`, ...) with a 200,000-event backlog spread evenly across
+them, so each project is 1% of it, then follows from cursor 0 on a fresh
+daemon each time while turns run on one agent of each project: one agent
+by name, one project (`p0.*`), the 100 projects at once (one connection
+each, as 100 windows coming back together), and those 100 narrowed to
+`turn_finished`. Rows passed over per event delivered are the store's own
+counts: a name's follow reads its bot's rows by index; a pattern's every
+row past the cursor (or every row of its kinds). An unrelated agent's
+`history_nodes` is read back to back throughout. Release builds, one
+4-CPU Linux box.
+
+First the head as measured before this fix: a pattern's pages were every
+bot's events, decoded, with the other bots' passed by in the hub.
+
+| Follow | To `follow_live`, s | Rows passed over per event | Daemon CPU, s | Unrelated read p99 / max, ms |
+|---|---:|---:|---:|---:|
+| one agent by name | 0.02 | 1 | 0.4 | 2.0 / 3.3 |
+| one project | 1.34 | 100 | 2.4 | 2.6 / 3.4 |
+| 100 projects | 69.3 | 100 | 164.8 | 103.8 / 124.1 |
+| 100 projects, one kind | 6.24 | 100 | 15.9 | 84.3 / 119.4 |
+
+A pattern's page is now matched in the store (`bot GLOB` as the page reads
+the cursor's range; stable plans keep it a rowid range, never the
+`events_bot_cursor` prefix range, which sorts every matching entry for
+each page and grows with the square of a large pattern's backlog). The
+other bots' rows are still passed over, once, but in SQLite, without being
+decoded. Each page also ends at the newest event when it began, and a
+short page moves the cursor there, so the switch to live (on the writer)
+reads only the events written since, never a pattern's sparse tail:
+
+| Follow | To `follow_live`, s | Rows passed over per event | Daemon CPU, s | Unrelated read p99 / max, ms |
+|---|---:|---:|---:|---:|
+| one agent by name | 0.02 | 1 | 0.4 | 2.1 / 4.1 |
+| one project | 0.05 | 100 | 0.4 | 1.1 / 4.6 |
+| 100 projects | 1.58 | 100 | 4.4 | 2.9 / 220.9 |
+| 100 projects, one kind | 1.01 | 100 | 3.4 | 1.6 / 212.7 |
+
+Every follower, in every row, received exactly the store's events for its
+selector after cursor 0, in order, none missing and none twice, across the
+hand-off from replay to live. The single slowest unrelated read waits for
+a reader behind the replays' pages; the p99 stays near an idle daemon's.
+
+## Code-mode step writes beside the run loop
+
+A code-mode script's steps froze every window on a slow disk: the service
+loop awaited the storage writer for `take_call`, `approve_step`,
+`step_result`, `tool_result`, `yield_call` and a client's `answer`, and
+listed the calls waiting on a client (`tool_calls`) on the writer's
+connection too. Now the loop hands each write to the writer and answers it
+when its commit lands, and the connection that sent it reads nothing else
+until then, so each connection's order is kept; the write's line keeps its
+input credit until then too. Writes are answered in the order they were
+sent, whichever connection sent them. `tool_calls` reads on the readers, past the
+answers the writer held at its last commit. An `interrupt`, `close`,
+`delete`, `pause`, `shutdown` or `stop_process` waits for the writes on their way before it
+is taken up, as it did when each was awaited in turn, so no call taken or
+step allowed starts after it. `configure`, `interrupt` and a `submit` at
+the active limit still write from the loop: each is several steps that
+later requests depend on.
+
+All on Linux x86_64 (4 CPUs), 2026-11-18, with release builds made the same
+way (`cargo build --release --workspace --bins`): main (ae1bf65) against
+the change at 82b1c7f, which is main merged in plus every commit above.
+The slow-disk screen ran on `bench/held_reads.py` as committed here, and
+the low and high end on `bench/ends.py` at 0920334. The later commits to
+either only make a run fail when a worker's request is refused or its
+turn does not end completed. `bench/ends.py` scans the process table once
+per sample for all windows together and divides CPU by the time actually
+measured. It also reads summed PSS beside summed RSS, after
+the CPU window, so a window's shared binary pages count once. The Mac was
+not measured.
+
+### Slow disk, with scripts running
+
+`bench.held_reads` with `slow_sync.c` (every sync 300 ms), 424 bots, 30
+running turns back to back and 8 running code-mode scripts (`--scripts`:
+submit, list the call, take it, three steps put to the gates and recorded,
+answer), 20 s. Milliseconds, p50 / most.
+
+| Side | `approvals` | `inspect` | `bots` | New connection's `ready` | Turns | Scripts | Loop held |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| main | 2,643 / 3,268 | 2,714 / 3,342 | 2,737 / 3,946 | 2,778 / 3,549 | 146 | 8 | 31.4 s |
+| change | 1.3 / 2,411 | 0.8 / 605 | 2.3 / 301 | 0.7 / 2,022 | 262 | 16 | 7.6 s |
+
+On main, `step_result`, `approve_step`, `take_call` and `tool_calls`
+alone held the loop for 21.1 s of it. With the change, what still
+holds the loop is `resume` (6.4 s: a paused turn going on awaits its claim
+inline), `submit` and `settle`; those are left for a later change.
+
+### Low end and high end
+
+Sonny's windows here run with `--no-layout`, so no lead follows the fleet
+(`Fleet::start`). These screens measure the daemon's write lane and what
+windows see of it. They do not measure how routing scales to many real
+lead windows, which is a separate screen.
+
+#### Low end
+
+`bench.ends --end low`: one Sonny window on a folder of 10 agents, three
+alternating runs each. Each key's p99 is its worst of 40.
+
+| Side | Window start, ms | Daemon idle CPU % | Daemon RSS / PSS, MiB | Window idle CPU % | Window RSS / PSS, MiB | Key p50 / p99, ms | Turn p50 / p99, ms |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| main | 54 to 62 | 0 to 0.05 | 20.1 to 21.6 / 18.1 to 19.7 | 0.15 to 0.20 | 25.7 to 26.1 / 15.4 to 15.5 | 0.48 to 0.59 / 1.32 to 2.43 | 48.2 to 49.4 / 51.4 to 57.2 |
+| change | 53 to 74 | 0 to 0.05 | 20.9 to 21.7 / 18.9 to 19.7 | 0.20 to 0.25 | 25.4 to 26.0 / 15.1 to 15.6 | 0.44 to 0.58 / 1.47 to 4.83 | 48.1 to 48.2 / 51.7 to 56.5 |
+
+Every key on both sides was under 5 ms, and nothing else moved past
+run-to-run spread.
+
+#### High end
+
+`bench.ends --end high --pace 0.5`: 10,000 stored agents, 30 agents
+running turns and 8 running scripts, each at most one every 0.5 s so both
+sides do the same work. Both sides finished 1,410 turns and 368 to 376
+scripts in every run. N windows were open on one busy project (`one`) or
+each on its own folder (`spread`), and 300 keys were typed across them.
+CPU, requests and loop time are all counted over the same 20 s. CPU is
+percent of one core. The windows' RSS and PSS are summed over all of them.
+
+| Windows | Layout | Side | Window start p50, ms | Key p50 / p99 / most, ms | Daemon CPU % | Daemon RSS / PSS, MiB | Windows CPU % | Windows RSS / PSS, GiB | Requests in the 20 s | Daemon CPU % per 1,000 requests | Step writes held the loop, ms |
+| ---: | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 32 | one | main | 1,016 | 1.31 / 3.34 / 9.91 | 131.0 | 39.5 / 37.4 | 108.6 | 2.30 / 1.64 | 168,143 | 0.779 | 1,785 |
+| 32 | one | change | 1,110 | 1.33 / 3.55 / 4.69 | 134.4 | 39.7 / 37.6 | 116.6 | 2.19 / 1.53 | 179,892 | 0.747 | 11 |
+| 32 | spread | main | 1,047 | 1.24 / 3.29 / 7.47 | 129.2 | 39.5 / 37.4 | 109.4 | 2.18 / 1.53 | 164,392 | 0.786 | 1,823 |
+| 32 | spread | change | 1,049 | 1.40 / 3.33 / 4.12 | 134.7 | 40.3 / 38.2 | 116.9 | 2.13 / 1.47 | 181,057 | 0.744 | 11 |
+| 100 | one | main | 2,611 | 1.75 / 19.62 / 21.48 | 124.7 | 43.0 / 40.9 | 128.3 | 5.77 / 3.69 | 146,306 | 0.852 | 2,113 |
+| 100 | one | change | 2,778 | 1.87 / 8.24 / 24.85 | 129.6 | 42.2 / 40.0 | 132.7 | 6.02 / 3.93 | 148,418 | 0.873 | 12 |
+| 100 | spread | main | 2,905 | 1.63 / 8.20 / 50.92 | 124.5 | 41.9 / 40.4 | 125.8 | 6.00 / 3.90 | 136,197 | 0.914 | 2,247 |
+| 100 | spread | change | 3,017 | 1.93 / 5.37 / 59.67 | 128.8 | 42.0 / 39.8 | 133.6 | 5.98 / 3.89 | 146,185 | 0.881 | 12 |
+| 200 | one | main | 5,561 | 1.88 / 10.98 / 12.09 | 137.4 | 44.5 / 42.3 | 107.9 | 11.54 / 7.33 | 36,610 | 3.753 | 4,029 |
+| 200 | one | change | 5,276 | 1.96 / 7.06 / 35.37 | 143.0 | 45.2 / 43.0 | 106.7 | 11.58 / 7.37 | 37,509 | 3.813 | 28 |
+| 200 | spread | main | 5,595 | 1.77 / 9.89 / 11.19 | 138.9 | 45.0 / 42.8 | 105.2 | 11.62 / 7.42 | 36,970 | 3.757 | 4,274 |
+| 200 | spread | change | 5,342 | 1.94 / 7.75 / 8.91 | 143.7 | 45.4 / 43.2 | 103.0 | 11.68 / 7.47 | 38,639 | 3.719 | 23 |
+
+Every row is under 50 ms at p99, and no key went over 100 ms. The step
+writes held the loop for 1.8 to 4.3 s of the 20 on main and 11 to 28 ms
+with the change.
+
+The daemon used 3.4 to 5.6 points more of a core and served 1 to 10% more
+requests. The windows' reads no longer wait behind a step write, so the
+windows ask again sooner. Their own CPU rose 4.4 to 8.0 points up to 100
+windows and fell 1 to 2 at 200. Per request served, the change ranged from
+5.3% below main to 2.5% above. With no windows, the same paced scripts and
+turns cost the change less: 20.5, 21.2 and 19.8% of a core against main's
+21.6, 22.2 and 21.9 (three alternating 20 s runs on a0f574f). Window start
+moved by up to 9% in either direction. Memory is the same: summed window
+PSS is about two thirds of summed RSS on both sides, roughly 37 MiB a
+window at 200.
+
+Build both sides the same way: a daemon built with `--bin agent` alone
+links different features than one built with `--workspace --bins`, and its
+CPU is not comparable.
+
+### Hot-path screens
+
+The CI Perf job (`bench/perf_gate.py`, Ubuntu 24.04 runner, 2026-11-18)
+on 15b6c0e against its base, both screened alternately. Store jobs per
+turn are 6.001 on both sides in every footprint run, and the gate passed.
+
+| Bench | Measure | Base | Head | Change |
+| --- | --- | ---: | ---: | ---: |
+| lifecycle | CPU, s | 0.35 | 0.345 | -1.4% |
+| lifecycle | p95 turn, ms | 575.481 | 575.395 | -0.0% |
+| lifecycle | peak RSS, MiB | 26.281 | 26.346 | +0.2% |
+| completion | release to terminal p99, ms | 6.602 | 7.004 | +6.1% |
+| admission | lone submit CPU, ms | 24.769 | 24.608 | -0.6% |
+| admission | burst submit p99, ms | 2.61 | 2.739 | +5.0% |
+| footprint | idle RSS, MiB | 17.205 | 17.293 | +0.5% |
+| footprint | per idle bot, KiB | 1.89 | 1.628 | -13.9% |
+| footprint | RSS after a turn each, MiB | 57.826 | 57.41 | -0.7% |
+| footprint | CPU per turn, ms | 0.729 | 0.725 | -0.5% |
+
+The two p99 rises are under the gate's 15% warning line. None of these
+screens sends the client writes this change moves.

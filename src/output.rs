@@ -44,9 +44,26 @@ pub struct Output {
     sender: mpsc::UnboundedSender<Packet>,
     budget: Arc<Semaphore>,
     closed: watch::Sender<bool>,
-    /// The program the session names itself as, by its place among the
-    /// names the daemon has heard ([`PROGRAMS`]): 0, unnamed, until it says.
-    program: Arc<std::sync::atomic::AtomicU8>,
+    /// The session's program and the events delivered to it.
+    tally: Arc<Tally>,
+}
+
+/// What `stats` counts of a session as others write to it: the program it
+/// names itself as, by its place among the names the daemon has heard
+/// ([`PROGRAMS`]), 0, unnamed, until it says; and the events delivered to
+/// it.
+#[derive(Default)]
+pub struct Tally {
+    program: std::sync::atomic::AtomicU8,
+    delivered: std::sync::atomic::AtomicU64,
+}
+impl Tally {
+    pub fn program(&self) -> usize {
+        self.program.load(std::sync::atomic::Ordering::Relaxed) as usize
+    }
+    pub fn delivered(&self) -> u64 {
+        self.delivered.load(std::sync::atomic::Ordering::Relaxed)
+    }
 }
 
 /// How many program names the daemon counts sessions under: unnamed, a
@@ -81,7 +98,7 @@ impl Output {
                 sender,
                 budget,
                 closed,
-                program: Arc::default(),
+                tally: Arc::default(),
             },
             receiver,
         )
@@ -90,12 +107,20 @@ impl Output {
     /// The program the session named itself as, by its place among the
     /// names the daemon has heard.
     pub fn program(&self) -> usize {
-        self.program.load(std::sync::atomic::Ordering::Relaxed) as usize
+        self.tally.program()
     }
     /// Name the session's program, by its place among the names the
     /// daemon has heard.
     pub fn name_program(&self, program: usize) {
-        (self.program).store(program as u8, std::sync::atomic::Ordering::Relaxed);
+        (self.tally.program).store(program as u8, std::sync::atomic::Ordering::Relaxed);
+    }
+    /// One event delivered to the session.
+    pub fn delivered(&self) {
+        (self.tally.delivered).fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+    /// The session's program and deliveries, as they go on counting.
+    pub fn tally(&self) -> Arc<Tally> {
+        self.tally.clone()
     }
 
     pub fn stdout() -> (Self, std::thread::JoinHandle<Result<()>>) {

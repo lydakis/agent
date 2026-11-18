@@ -6183,6 +6183,95 @@ fn waiting_calls_page_past_held_answers_and_an_answer_out_of_time_is_refused() {
 }
 
 #[test]
+fn a_reader_lists_waiting_calls_past_the_answers_the_writer_held_at_its_last_commit() {
+    let path = std::env::temp_dir().join(format!("agent-held-calls-{}.sqlite", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+    let mut writer = Database::initialize(Connection::open(&path).unwrap()).unwrap();
+    let reader = Database::reader(Connection::open(&path).unwrap(), writer.shared()).unwrap();
+    let start = Declared {
+        name: "start".into(),
+        description: "Start.".into(),
+        parameters: json!({"type":"object"}),
+        result: "ok".into(),
+        answered_by: Some("sonny".into()),
+        expire_ms: None,
+        grammar: None,
+        steps: false,
+        gate_daemon_steps: false,
+        lift: false,
+        inherit: Inherit::All,
+        kind: None,
+    };
+    writer
+        .create(
+            "Lead",
+            Some("/synthetic"),
+            Binding {
+                declared: Some(&ToolList::new(vec![start]).unwrap()),
+                ..binding()
+            },
+        )
+        .unwrap();
+    let turn = writer
+        .begin(
+            "Lead",
+            "request",
+            "work",
+            true,
+            &TurnOptions::default(),
+            allow_provider,
+        )
+        .unwrap()
+        .turn;
+    let calls: Vec<ToolCall> = (1..=3)
+        .map(|n| ToolCall {
+            name: "start".into(),
+            call_id: format!("c{n}"),
+            arguments: "{}".into(),
+            custom: false,
+            links: Default::default(),
+        })
+        .collect();
+    writer.append(turn, vec![], &calls, None).unwrap();
+    for call in &calls {
+        writer.tool_start(turn, call, false, false).unwrap();
+    }
+    let listed = |db: &Database| -> Vec<String> {
+        let page = db.tool_calls("sonny", 0, 10).unwrap();
+        (page["calls"].as_array().unwrap().iter())
+            .map(|call| call["call_id"].as_str().unwrap().to_owned())
+            .collect()
+    };
+    assert_eq!(listed(&reader), ["c1", "c2", "c3"]);
+    // An answer the worker holds for the running turn: its own group
+    // lists the call answered at once, a reader once the group commits.
+    writer.begin_group().unwrap();
+    (writer.answer_call("Lead", turn, "c1", result("started"), 0)).unwrap();
+    assert_eq!(listed(&writer), ["c2", "c3"]);
+    assert_eq!(listed(&reader), ["c1", "c2", "c3"]);
+    writer.commit_group().unwrap();
+    assert_eq!(listed(&reader), ["c2", "c3"]);
+    // One a group held and abandoned is still waiting.
+    writer.begin_group().unwrap();
+    (writer.answer_call("Lead", turn, "c2", result("started"), 0)).unwrap();
+    writer.abandon_group().unwrap();
+    assert_eq!(listed(&reader), ["c2", "c3"]);
+    // Taken by its turn and not yet written, it is still answered.
+    writer.begin_group().unwrap();
+    assert!(matches!(
+        writer.answer_take(turn, "c1", 0).unwrap(),
+        agent_runtime::store::CallAnswer::Given(_)
+    ));
+    writer.commit_group().unwrap();
+    assert_eq!(listed(&writer), ["c2", "c3"]);
+    assert_eq!(listed(&reader), ["c2", "c3"]);
+    drop((reader, writer));
+    for suffix in ["", "-wal", "-shm"] {
+        let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
+    }
+}
+
+#[test]
 fn a_parked_answer_s_pictures_are_stored_once_its_result_is() {
     let path =
         std::env::temp_dir().join(format!("agent-parked-parts-{}.sqlite", std::process::id()));
@@ -21665,11 +21754,23 @@ fn a_lifted_call_waits_on_past_its_turn_and_its_verdict_runs_or_ends_it() {
     )
     .unwrap();
     let now = epoch_now();
-    let (p1, lapse) = db.lift(turn, "s1", Some(&s1), None, now).unwrap().unwrap();
+    // A reviewer serves the first call's gate; no one serves the others',
+    // which wait on a person.
+    let reviewer = ["manual".to_owned()];
+    let (p1, lapse) = db
+        .lift(turn, "s1", Some(&s1), None, &reviewer, now)
+        .unwrap()
+        .unwrap();
     // No gate runs it out, so nothing goes on the schedule.
     assert_eq!(lapse, None);
-    let (p2, _) = db.lift(turn, "s2", Some(&s2), None, now).unwrap().unwrap();
-    let (p3, _) = db.lift(turn, "s3", Some(&s3), None, now).unwrap().unwrap();
+    let (p2, _) = db
+        .lift(turn, "s2", Some(&s2), None, &[], now)
+        .unwrap()
+        .unwrap();
+    let (p3, _) = db
+        .lift(turn, "s3", Some(&s3), None, &[], now)
+        .unwrap()
+        .unwrap();
     // Each call is answered with its handle, so the round is closed and
     // the turn can end.
     let events = db.events("Bob", 0, 256).unwrap()["events"].clone();
@@ -21679,6 +21780,26 @@ fn a_lifted_call_waits_on_past_its_turn_and_its_verdict_runs_or_ends_it() {
     assert_eq!(lifted.len(), 3);
     assert_eq!(lifted[0]["data"]["waits_for"], "approval");
     assert_eq!(lifted[0]["data"]["handle"], format!("proc:{p1}"));
+    // Each says who holds it, as a waiting turn's status does, and so does
+    // the result that answers its call.
+    let holders: Vec<&Value> = lifted.iter().map(|e| &e["data"]["holder"]).collect();
+    assert_eq!(
+        holders,
+        [&json!("reviewer"), &json!("person"), &json!("person")]
+    );
+    let items = stored(&mut db, "Bob");
+    let answered = |call: &str| -> Value {
+        let output = (items.iter())
+            .find(|item| item["type"] == "function_call_output" && item["call_id"] == call)
+            .unwrap();
+        serde_json::from_str(output["output"].as_str().unwrap()).unwrap()
+    };
+    assert_eq!(
+        answered("s1"),
+        json!({"handle":format!("proc:{p1}"),"background":true,"steered":true,
+            "waits_for":"approval","holder":"reviewer"})
+    );
+    assert_eq!(answered("s2")["holder"], "person");
     db.append(turn, vec![assistant("done")], &[], None).unwrap();
     db.finish(turn, None).unwrap();
     // Both still wait, listed for the bot with their handles.
@@ -21847,8 +21968,14 @@ fn a_lifted_calls_verdict_leaves_a_later_turns_denials_be() {
     db.append(turn, vec![first, second], &[s1.clone(), s2.clone()], None)
         .unwrap();
     let now = epoch_now();
-    let (p1, _) = db.lift(turn, "s1", Some(&s1), None, now).unwrap().unwrap();
-    let (p2, _) = db.lift(turn, "s2", Some(&s2), None, now).unwrap().unwrap();
+    let (p1, _) = db
+        .lift(turn, "s1", Some(&s1), None, &[], now)
+        .unwrap()
+        .unwrap();
+    let (p2, _) = db
+        .lift(turn, "s2", Some(&s2), None, &[], now)
+        .unwrap()
+        .unwrap();
     db.append(turn, vec![assistant("done")], &[], None).unwrap();
     db.finish(turn, None).unwrap();
     // A later turn has a denial of its own under the same gate.
@@ -21965,9 +22092,9 @@ fn a_lifted_answered_call_takes_its_answer_or_is_stopped_and_outlives_a_restart(
             db.tool_start(turn, call, false, false).unwrap();
         }
         let now = epoch_now();
-        let (p1, _) = db.lift(turn, "c1", None, None, now).unwrap().unwrap();
-        let (p2, _) = db.lift(turn, "c2", None, None, now).unwrap().unwrap();
-        let (p3, _) = db.lift(turn, "c3", None, None, now).unwrap().unwrap();
+        let (p1, _) = db.lift(turn, "c1", None, None, &[], now).unwrap().unwrap();
+        let (p2, _) = db.lift(turn, "c2", None, None, &[], now).unwrap().unwrap();
+        let (p3, _) = db.lift(turn, "c3", None, None, &[], now).unwrap().unwrap();
         db.append(turn, vec![assistant("done")], &[], None).unwrap();
         db.finish(turn, None).unwrap();
         (turn, p1, p2, p3)
@@ -22077,7 +22204,7 @@ fn a_lifted_answered_call_keeps_its_time_steps_listing_and_audit_row() {
         .unwrap();
     db.tool_start(turn, &call, false, false).unwrap();
     let now = epoch_now();
-    let (process, lapse) = db.lift(turn, "c1", None, None, now).unwrap().unwrap();
+    let (process, lapse) = db.lift(turn, "c1", None, None, &[], now).unwrap().unwrap();
     let Some(lapse) = lapse else {
         panic!("a lifted call with a time of its own was not scheduled");
     };
@@ -23197,6 +23324,60 @@ fn messages_pick_bots_by_pattern_time_and_sender() {
         "invalid_message_filter"
     );
     assert_eq!(refused("*", Some(vec![])), "invalid_message_filter");
+}
+
+#[test]
+fn a_message_kept_without_a_time_counts_as_sent_with_the_next_dated_one() {
+    let path = std::env::temp_dir().join(format!("agent-undated-{}.sqlite", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+    let mut db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
+    db.create("Bob", Some("/synthetic"), binding()).unwrap();
+    let queue = TurnOptions {
+        delivery: Delivery::Queue,
+        ..TurnOptions::default()
+    };
+    let sent: Vec<i64> = (0..4)
+        .map(|n| {
+            (db.begin("Bob", &format!("r{n}"), "hi", false, &queue, allow_provider))
+                .unwrap()
+                .turn
+        })
+        .collect();
+    // As a store from before messages had times keeps them: some dated
+    // from their events, some whose events retention removed.
+    let conn = Connection::open(&path).unwrap();
+    for (message, ms) in sent.iter().zip([Some(1000), None, Some(3000), None]) {
+        conn.execute(
+            "UPDATE messages SET sent_ms=?2 WHERE id=?1",
+            rusqlite::params![message, ms],
+        )
+        .unwrap();
+    }
+    let range = |since_ms: Option<i64>, until_ms: Option<i64>| {
+        let page = db
+            .messages(&agent_runtime::store::Messages {
+                bot: "Bob",
+                after: 0,
+                before: None,
+                since_ms,
+                until_ms,
+                from: None,
+                limit: 10,
+                newest: false,
+                waiting: false,
+                words: false,
+            })
+            .unwrap();
+        (page["messages"].as_array().unwrap().iter())
+            .map(|m| m["message"].as_i64().unwrap())
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(range(Some(1000), None), sent);
+    assert_eq!(range(Some(2000), None), sent[1..]);
+    assert_eq!(range(None, Some(2000)), sent[..1]);
+    assert_eq!(range(Some(3001), None), sent[3..]);
+    drop(db);
+    let _ = std::fs::remove_file(path);
 }
 
 #[test]
