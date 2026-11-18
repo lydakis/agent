@@ -11250,3 +11250,25 @@ The windows' RSS is the same.
 The harness is `bench/ends.py`. Build both sides the same way: a daemon
 built with `--bin agent` alone links different features than one built
 with `--workspace --bins`, and its CPU is not comparable.
+
+### Hot-path screens
+
+The CI Perf job (`bench/perf_gate.py`, Ubuntu 24.04 runner, 2026-11-18)
+on 15b6c0e against its base, both screened alternately. Store jobs per
+turn are 6.001 on both sides in every footprint run, and the gate passed.
+
+| Bench | Measure | Base | Head | Change |
+| --- | --- | ---: | ---: | ---: |
+| lifecycle | CPU, s | 0.35 | 0.345 | -1.4% |
+| lifecycle | p95 turn, ms | 575.481 | 575.395 | -0.0% |
+| lifecycle | peak RSS, MiB | 26.281 | 26.346 | +0.2% |
+| completion | release to terminal p99, ms | 6.602 | 7.004 | +6.1% |
+| admission | lone submit CPU, ms | 24.769 | 24.608 | -0.6% |
+| admission | burst submit p99, ms | 2.61 | 2.739 | +5.0% |
+| footprint | idle RSS, MiB | 17.205 | 17.293 | +0.5% |
+| footprint | per idle bot, KiB | 1.89 | 1.628 | -13.9% |
+| footprint | RSS after a turn each, MiB | 57.826 | 57.41 | -0.7% |
+| footprint | CPU per turn, ms | 0.729 | 0.725 | -0.5% |
+
+The two p99 rises are under the gate's 15% and within run-to-run noise
+for these screens: none of them sends the client writes this change moves.
