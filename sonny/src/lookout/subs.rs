@@ -357,7 +357,9 @@ fn files_renamed(store: &Path, from: &str, to: &str) -> bool {
 }
 
 /// Every subscription file beside `store` with `change` made to each of
-/// its subscriptions, written when it changed one: whether each was.
+/// its subscriptions, written when it changed one: whether each was. A
+/// file keeps when it was written, so a migration reads as no write of
+/// the bot's, which a close is weighed against (`closed`).
 fn files_changed(store: &Path, change: impl Fn(&mut Value) -> bool) -> bool {
     let Ok(entries) = std::fs::read_dir(dir(store)) else {
         return true;
@@ -383,8 +385,14 @@ fn files_changed(store: &Path, change: impl Fn(&mut Value) -> bool) -> bool {
             moved |= change(sub);
         }
         if moved {
+            let written = entry.metadata().and_then(|m| m.modified());
             let partial = path.with_extension(format!("json.{}.partial", std::process::id()));
-            all &= super::write_moved(&partial, &path, &format!("{value:#}\n")).is_ok();
+            all &= super::write_moved(&partial, &path, &format!("{value:#}\n")).is_ok()
+                && written.is_ok_and(|at| {
+                    (std::fs::File::options().write(true).open(&path))
+                        .and_then(|file| file.set_modified(at))
+                        .is_ok()
+                });
         }
     }
     all
@@ -1720,7 +1728,15 @@ mod tests {
             {"name": "threads", "sources": ["commons"], "bot_id": 2},
             {"name": "ci", "sources": ["ci"], "bot_id": 2}]});
         std::fs::write(&path, old.to_string()).unwrap();
+        let long_ago = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_000);
+        (std::fs::File::options().write(true).open(&path).unwrap())
+            .set_modified(long_ago)
+            .unwrap();
         commons_outlive_close(&store);
+        // Marked, it reads as no write of the bot's: a close since still
+        // ends what it held.
+        let written = std::fs::metadata(&path).unwrap().modified().unwrap();
+        assert_eq!(written, long_ago);
         let kept: Vec<String> = (read(&store, "shop.fix").into_iter())
             .filter(|sub| sub.outlives_close)
             .map(|sub| sub.name)
@@ -1732,7 +1748,8 @@ mod tests {
                 .unwrap()
                 .outlives_close
         );
-        assert_eq!(closed(&store, "shop.fix", Some(2), None), Ok(3));
+        let since = long_ago + std::time::Duration::from_secs(1);
+        assert_eq!(closed(&store, "shop.fix", Some(2), Some(since)), Ok(3));
         assert_eq!(read(&store, "shop.fix").len(), 1);
         let _ = std::fs::remove_dir_all(dir(&store));
         let mut record = store.as_os_str().to_owned();
