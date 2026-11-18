@@ -10192,7 +10192,7 @@ mod tests {
             let reply = service.written(write.then, done).expect("a reply");
             answered.push((session, reply.unwrap_err().code));
         }
-        answered.sort();
+        // In the order they were sent.
         assert_eq!(
             answered,
             [

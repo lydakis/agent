@@ -4,28 +4,35 @@
 //! loop answers it once its commit lands. As the observation lane does for
 //! a read, its session is parked meanwhile, so the session's next request
 //! never overtakes its write, while every other session goes on: a slow
-//! commit holds the writer, not the loop. Writes from different sessions
-//! meet in the worker's queue, which commits them in the order they reach
-//! it; none was answered before its commit, so no one was told an order.
-use std::collections::HashMap;
-use tokio::task::{Id, JoinSet};
+//! commit holds the writer, not the loop. Writes are answered in the order
+//! they were sent, whichever session sent them, as when each was awaited
+//! in turn: a call taken or a step allowed is answered before an answer to
+//! that call sent after it.
+use std::collections::VecDeque;
+use tokio::task::JoinHandle;
 
-/// Writes on their way to the storage worker: each one's task, and what
-/// the run loop keeps to answer it (`T`) once the task gives what the
-/// write returned (`D`).
+/// Writes on their way to the storage worker, oldest first: each one's
+/// session, what the run loop keeps to answer it (`T`), and its task,
+/// which gives what the write returned (`D`).
 pub struct Writes<T, D> {
-    running: JoinSet<D>,
-    waiting: HashMap<Id, (u64, T)>,
+    running: VecDeque<(u64, T, JoinHandle<D>)>,
     /// Sessions given a write since the run loop last looked: it parks them.
     parked: Vec<u64>,
 }
 
-impl<T, D: Send + 'static> Default for Writes<T, D> {
+impl<T, D> Default for Writes<T, D> {
     fn default() -> Self {
         Writes {
-            running: JoinSet::new(),
-            waiting: HashMap::new(),
+            running: VecDeque::new(),
             parked: Vec::new(),
+        }
+    }
+}
+
+impl<T, D> Drop for Writes<T, D> {
+    fn drop(&mut self) {
+        for (_, _, task) in &self.running {
+            task.abort();
         }
     }
 }
@@ -40,8 +47,7 @@ impl<T, D: Send + 'static> Writes<T, D> {
         write: impl Future<Output = D> + Send + 'static,
     ) {
         self.parked.push(session);
-        let task = self.running.spawn(write).id();
-        self.waiting.insert(task, (session, then));
+        self.running.push_back((session, then, tokio::spawn(write)));
     }
 
     /// The sessions given a write since the last call.
@@ -54,16 +60,13 @@ impl<T, D: Send + 'static> Writes<T, D> {
         self.running.is_empty()
     }
 
-    /// The next write whose task ended: its session, what was kept for
-    /// it, and what it returned, or `None` when its task failed.
+    /// The oldest write, once its task ended: its session, what was kept
+    /// for it, and what it returned, or `None` when its task failed.
     /// Cancel-safe.
     pub async fn next(&mut self) -> Option<(u64, T, Option<D>)> {
-        let joined = self.running.join_next_with_id().await?;
-        let (task, done) = match joined {
-            Ok((task, done)) => (task, Some(done)),
-            Err(error) => (error.id(), None),
-        };
-        let (session, then) = self.waiting.remove(&task).expect("every write is kept");
+        let (_, _, task) = self.running.front_mut()?;
+        let done = task.await.ok();
+        let (session, then, _) = self.running.pop_front().expect("the write just awaited");
         Some((session, then, done))
     }
 }
@@ -75,7 +78,7 @@ mod tests {
     use tokio::sync::oneshot;
 
     #[tokio::test]
-    async fn each_write_is_given_back_with_its_session_as_it_lands() {
+    async fn writes_are_given_back_with_their_sessions_in_the_order_they_were_sent() {
         let mut writes = Writes::<&str, u32>::default();
         let (held, gate) = oneshot::channel::<()>();
         writes.write(1, "first", async move {
@@ -84,14 +87,13 @@ mod tests {
         });
         writes.write(2, "second", async { 2 });
         assert_eq!(writes.parked().collect::<Vec<_>>(), [1, 2]);
-        // The second lands while the first is held: it is not kept behind it.
-        let (session, then, done) = writes.next().await.unwrap();
-        assert_eq!((session, then, done), (2, "second", Some(2)));
+        // The second lands while the first is held: it waits behind it.
+        tokio::task::yield_now().await;
         let early = tokio::time::timeout(Duration::from_millis(20), writes.next()).await;
-        assert!(early.is_err(), "a held write was given back");
+        assert!(early.is_err(), "a later write overtook a held one");
         held.send(()).unwrap();
-        let (session, then, done) = writes.next().await.unwrap();
-        assert_eq!((session, then, done), (1, "first", Some(1)));
+        assert_eq!(writes.next().await.unwrap(), (1, "first", Some(1)));
+        assert_eq!(writes.next().await.unwrap(), (2, "second", Some(2)));
         assert!(writes.is_empty());
         assert!(writes.next().await.is_none());
     }
