@@ -304,7 +304,8 @@ class AgentToolsTests(ModelFixture):
         self.model.requests.get(timeout=3)
         self.run_calls(client, 'shop.lead', 'go',
                        ('close_agent', {'name': 'shop.*', 'no_turn_since_ms': int(time.time() * 1000) + 60_000}),
-                       ('close_agent', {'names': ['shop.busy', 'shop.gone']}))
+                       ('close_agent', {'names': ['shop.busy', 'shop.gone']}),
+                       ('close_agent', {'names': ['shop.lead']}))
         answer = json.loads(self.output(client, 'shop.lead', 'close_agent-1'))
         # The running one and the lead, whose turn asks, have a turn now.
         self.assertEqual([c['bot'] for c in answer['closed']], ['shop.fix', 'shop.look'], answer)
@@ -315,3 +316,9 @@ class AgentToolsTests(ModelFixture):
         self.assertEqual(named['refused'], [{'bot': 'shop.gone', 'error': 'bot_not_found'}])
         self.assertEqual(client.finished(busy)['data']['status'], 'interrupted')
         self.assertNotIn('closed_ms', client.request('inspect', bot='shop.other')['result'])
+        # The tool never closes its own agent, named alone or in a list.
+        self.assertIn('not_permitted', self.output(client, 'shop.lead', 'close_agent-3'))
+        self.assertNotIn('closed_ms', client.request('inspect', bot='shop.lead')['result'])
+        # `*` is a pattern: a person's connection closes every open bot.
+        every = client.request('close', bot='*')['result']
+        self.assertEqual([c['bot'] for c in every['closed']], ['shop.lead', 'shop.other'], every)

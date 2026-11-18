@@ -6182,7 +6182,9 @@ impl Turn {
                 // The daemon closes, as this bot: only the bots it made, and
                 // stops the turns they run. This one closes itself by ending
                 // its turn, not with the tool.
-                if name.as_deref() == Some(self.bot.as_str()) {
+                if name.as_deref() == Some(self.bot.as_str())
+                    || (names.as_deref()).is_some_and(|names| names.contains(&self.bot))
+                {
                     return Err(Error::with(
                         "not_permitted",
                         format!(

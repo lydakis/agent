@@ -2617,7 +2617,12 @@ fn close(options: &Options) -> Result<i32> {
         &json!({"closed": closed, "refused": refused}),
         options.pretty,
     )?;
-    Ok(if refused.is_empty() { 0 } else { 1 })
+    let stop_failed = closed.iter().any(|bot| !bot["stop_failed"].is_null());
+    Ok(if refused.is_empty() && !stop_failed {
+        0
+    } else {
+        1
+    })
 }
 
 /// Ask for a summary of a bot's context before its next model call.

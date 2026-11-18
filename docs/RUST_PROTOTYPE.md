@@ -2971,7 +2971,9 @@ whose last turn ended before then, or that never ran one; or `names`, 1 to
 `bot_id`, `was_open`, `closed_ms` (kept first, as before), the
 `running_turn` it was marked in, and `stopped_turn` when the daemon
 stopped that turn, as `interrupt` stops one, so every client that closes
-stops what it runs, where only the tool did; each refused one with
+stops what it runs, where only the tool did (a stop that failed, leaving
+the turn parked, is `stop_failed` with the `turn`, `error` and why, and
+one name alone is refused with that error); each refused one with
 `error` (`bot_not_found`, `not_permitted`) and why. Each bot is checked by
 the rule a single name always met: a bot's own socket closes the bots it
 made, and itself only when named alone, whose own turn runs on; a person's
@@ -2979,7 +2981,7 @@ connections close any. One name alone is refused outright, as before; a
 selector lists its refusals and closes the rest, in one store job. History
 is never touched. `agent close --bot NAME|GLOB [--no-turn-since DURATION]`
 or `agent close NAME...` pages through and prints `{closed, refused}`,
-exiting 1 when any was refused, and `close_agent` takes `name`, `names`,
+exiting 1 when any was refused or its stop failed, and `close_agent` takes `name`, `names`,
 `no_turn_since_ms`, `after` and `limit` and answers the same; it closes
 what its agent made, as Codex's does, never the agent itself.
 

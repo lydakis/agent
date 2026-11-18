@@ -5822,7 +5822,10 @@ impl Service {
                 let at = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .map_or(0, |d| d.as_millis() as i64);
-                let pattern = bot.as_deref().is_some_and(hub::is_pattern);
+                // `*`, every bot, is a pattern too.
+                let pattern =
+                    (bot.as_deref()).is_some_and(|bot| bot == hub::ALL || hub::is_pattern(bot));
+                let one = bot.is_some() && !pattern;
                 let selector = || {
                     fail_with(
                         "invalid_close_selector",
@@ -5894,9 +5897,19 @@ impl Service {
                     if by.is_some() && closed["bot_id"].as_i64() == by {
                         continue;
                     }
-                    let stopped = self.interrupt(name.to_owned(), turn).await;
-                    if stopped.is_ok_and(|view| view["interrupt_requested"] == true) {
-                        closed["stopped_turn"] = json!(turn);
+                    // A stop that failed leaves the turn parked, to wake
+                    // again: one bot asked for by name is refused with the
+                    // failure, and each of many says it.
+                    match self.interrupt(name.to_owned(), turn).await {
+                        Ok(view) if view["interrupt_requested"] == true => {
+                            closed["stopped_turn"] = json!(turn);
+                        }
+                        Ok(_) => {}
+                        Err(error) if one => return Err(error),
+                        Err(error) => {
+                            closed["stop_failed"] =
+                                json!({"turn": turn, "error": error.code, "message": error.detail});
+                        }
                     }
                 }
                 Ok(answer)
