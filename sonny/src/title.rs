@@ -150,11 +150,14 @@ impl Titles {
 }
 
 /// `title` cut to `room` columns at a word, with `…`; where no word fits,
-/// cut where the room ends.
+/// cut where the room ends; with room for no more than the `…`, none.
 pub fn cut(title: &str, room: usize) -> String {
     use unicode_width::UnicodeWidthStr;
     if title.width() <= room {
         return title.to_owned();
+    }
+    if room < 2 {
+        return String::new();
     }
     let mut kept = String::new();
     for word in title.split(' ') {
@@ -200,6 +203,9 @@ mod tests {
         assert_eq!(cut(title, 6), "Check…");
         // No word fits: cut where the room ends.
         assert_eq!(cut("Internationalization", 8).chars().count(), 8);
+        // No room past the `…`: no title, so the row keeps its name whole.
+        assert_eq!(cut(title, 1), "");
+        assert_eq!(cut(title, 0), "");
     }
 
     #[test]
