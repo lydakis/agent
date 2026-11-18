@@ -11510,7 +11510,7 @@ impl App {
             };
             woken.notify_one();
             Some(Counted {
-                mark: read.whole.then_some(mark),
+                mark: (read.whole && read.listed).then_some(mark),
                 read: Some((
                     (status::counts(&read.rows), status::bots(&read.rows)),
                     (latest, seen),
