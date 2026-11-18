@@ -2600,6 +2600,8 @@ async fn run() -> Result<(), String> {
         herdr::announce(&name, reopen(&name));
         cmux::announce(&name, reopen(&name));
     }
+    // The daemon's `stats` names this window's connections by its agent.
+    let _ = client.label(&name).await;
     // Everything after now arrives live; history is read from the bot's
     // items instead of replayed events, so the replay is skipped. The bot
     // is read after that, so a turn that ended during the replay is seen
