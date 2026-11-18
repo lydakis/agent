@@ -150,6 +150,8 @@ async fn held_daemon(
     ));
     std::fs::create_dir_all(&dir).unwrap();
     let socket = dir.join("agent.sock");
+    // One left by an earlier run under the same process id.
+    let _ = std::fs::remove_file(&socket);
     let listener = tokio::net::UnixListener::bind(&socket).unwrap();
     let (tell, told) = tokio::sync::mpsc::unbounded_channel::<Value>();
     let asked = Arc::new(Mutex::new(Vec::new()));
@@ -450,12 +452,22 @@ async fn stream_behind_a_held_read(
         tell.send(json!({"event": "turn_finished", "bot": "b", "turn": 1,
             "data": {"status": "completed"}}))
             .unwrap();
-        // The person types while the read is held and while the pieces
-        // are taken after it.
+        // The person types while the read is held, while the pieces are
+        // taken after it, and while the window catches up, until the
+        // reply's last line shows.
+        let last = lines.last().unwrap().trim_end().to_owned();
+        let shown = || {
+            let frames = frames.lock().unwrap();
+            frames
+                .last()
+                .is_some_and(|(_, _, whole)| whole.contains(&last))
+        };
         let mut sent: Vec<(Instant, String)> = Vec::new();
         let mut typed = String::new();
         let typing = Instant::now();
-        while typing.elapsed() < held * 3 {
+        while (typing.elapsed() < held * 3 || !shown())
+            && typing.elapsed() < Duration::from_secs(45)
+        {
             for c in "tallies".chars() {
                 typed.push(c);
                 keys.send(key(KeyCode::Char(c))).unwrap();
@@ -473,7 +485,7 @@ async fn stream_behind_a_held_read(
             tokio::time::sleep(Duration::from_millis(40)).await;
         }
         // Everything heard, or caught up from history, the window quits.
-        tokio::time::sleep(held * 3).await;
+        tokio::time::sleep(held).await;
         for c in "/quit".chars() {
             keys.send(key(KeyCode::Char(c))).unwrap();
         }
