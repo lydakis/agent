@@ -27,6 +27,11 @@ Patched (`src/event.rs`, `src/event/sys/unix/parse.rs`, with tests):
 
 Upstream's lints are left as they are: its `Cargo.toml` allows them.
 
+Sonny reads keys through the `event-stream` feature, whose waker carried a
+misspelt lint name (`clippy::clippy::unnecessary_wraps`, in
+`src/event/sys/unix/waker/mio.rs`), which the workspace's clippy refuses;
+it is spelt `clippy::unnecessary_wraps`.
+
 The colour tests are steadied, since the workspace's test run runs
 crossterm's too (`src/style/types/colored.rs`). Whether colour is off is one
 setting for the whole process, and the tests set it (and `NO_COLOR`) while
