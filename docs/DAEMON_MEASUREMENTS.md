@@ -11201,3 +11201,36 @@ throughput. What is left per follower, about 1.4 µs, is its own queue,
 the wake of its writer and the write to its socket. In every run with a
 slow follower the daemon closed it and every fast follower received every
 event (minimum and maximum lines per follower agree).
+
+`bench/ends.py` (from #1163), with Sonny built from each side, since the
+client's reader changed too. Low end: one window on 10 agents, five runs a
+side. High end: 10,000 stored agents, 30 busy and 8 running scripts, one
+run a side at each size.
+
+| Low end | main | head |
+| --- | ---: | ---: |
+| Window start, ms | 42 / 52 | 46 / 74 |
+| Idle window CPU, % | 0.1 to 0.2 | 0.1 to 0.15 |
+| Idle window RSS, MiB | 25.4 to 25.8 | 25.3 to 25.9 |
+| Key to character p99, ms | 0.88 to 1.16 | 0.79 to 1.11 |
+| Turn p50, ms | 47.7 to 48.1 | 48.0 to 48.1 |
+
+| Windows | Layout | Side | Key p50, ms | Key p99, ms | Key max, ms | Window start p50, ms | Daemon CPU, % | Daemon RSS, MiB | Windows CPU, % | Windows RSS, MiB | Turns |
+| ---: | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 32 | one | main | 1.14 | 5.43 | 21.4 | 800 | 136.4 | 38.7 | 27.3 | 2,180 | 8,601 |
+| 32 | one | head | 1.14 | 11.25 | 22.7 | 699 | 132.6 | 40.2 | 28.6 | 2,173 | 8,343 |
+| 32 | spread | main | 1.04 | 5.39 | 5.7 | 754 | 134.5 | 39.4 | 26.1 | 2,189 | 8,682 |
+| 32 | spread | head | 1.09 | 6.38 | 7.9 | 815 | 134.6 | 39.5 | 27.4 | 2,184 | 8,437 |
+| 100 | one | main | 1.79 | 11.83 | 21.3 | 2,088 | 141.7 | 40.2 | 39.4 | 6,123 | 8,879 |
+| 100 | one | head | 1.61 | 10.46 | 19.0 | 2,091 | 141.6 | 41.9 | 38.6 | 6,153 | 9,142 |
+
+No pause over 100 ms on either side. Key to character stays far under the
+50 ms bar, and every other column moves within run-to-run spread. These
+windows follow many agents, each with few followers, so the encoding saved
+here is small; the fan-out table above is where it shows. The idle daemon
+read about 2 MiB more on head in every low-end run (18.4 to 19.6 against
+20.6 to 21.9 MiB). That is the binary's file pages, not memory the daemon
+holds: an idle daemon's anonymous memory is 2,052 KiB on both, and a fresh
+copy of main's binary reads the same RSS as head's (17.5 to 17.7 MiB idle,
+no window), as the binary just copied has more of itself in the page
+cache. The Mac was not measured.
