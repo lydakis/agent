@@ -16313,7 +16313,10 @@ impl Database {
 
     /// The smallest message number sent at or after `ms`, by bisection
     /// over numbers: times rise with them. One past the newest when none
-    /// is; a message with no time counts as older.
+    /// is. A message with no time (kept from before messages had times,
+    /// whose events retention removed) counts as sent with the next one
+    /// that has one, so a range never passes over a dated message for an
+    /// undated one beside it; one after the newest dated is never older.
     fn first_sent(&self, ms: i64) -> Result<i64> {
         let bounds: Option<(i64, i64)> = self.conn.query_row(
             "SELECT (SELECT MIN(id) FROM messages),(SELECT MAX(id) FROM messages)",
@@ -16325,7 +16328,7 @@ impl Database {
         };
         let mut high = high + 1;
         let mut at = self.conn.prepare_cached(
-            "SELECT id,COALESCE(sent_ms,-1) FROM messages WHERE id>=? ORDER BY id LIMIT 1",
+            "SELECT id,sent_ms FROM messages WHERE id>=? AND sent_ms IS NOT NULL ORDER BY id LIMIT 1",
         )?;
         while low < high {
             let middle = low + (high - low) / 2;

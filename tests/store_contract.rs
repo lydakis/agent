@@ -23134,6 +23134,60 @@ fn messages_pick_bots_by_pattern_time_and_sender() {
 }
 
 #[test]
+fn a_message_kept_without_a_time_counts_as_sent_with_the_next_dated_one() {
+    let path = std::env::temp_dir().join(format!("agent-undated-{}.sqlite", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+    let mut db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
+    db.create("Bob", Some("/synthetic"), binding()).unwrap();
+    let queue = TurnOptions {
+        delivery: Delivery::Queue,
+        ..TurnOptions::default()
+    };
+    let sent: Vec<i64> = (0..4)
+        .map(|n| {
+            (db.begin("Bob", &format!("r{n}"), "hi", false, &queue, allow_provider))
+                .unwrap()
+                .turn
+        })
+        .collect();
+    // As a store from before messages had times keeps them: some dated
+    // from their events, some whose events retention removed.
+    let conn = Connection::open(&path).unwrap();
+    for (message, ms) in sent.iter().zip([Some(1000), None, Some(3000), None]) {
+        conn.execute(
+            "UPDATE messages SET sent_ms=?2 WHERE id=?1",
+            rusqlite::params![message, ms],
+        )
+        .unwrap();
+    }
+    let range = |since_ms: Option<i64>, until_ms: Option<i64>| {
+        let page = db
+            .messages(&agent_runtime::store::Messages {
+                bot: "Bob",
+                after: 0,
+                before: None,
+                since_ms,
+                until_ms,
+                from: None,
+                limit: 10,
+                newest: false,
+                waiting: false,
+                words: false,
+            })
+            .unwrap();
+        (page["messages"].as_array().unwrap().iter())
+            .map(|m| m["message"].as_i64().unwrap())
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(range(Some(1000), None), sent);
+    assert_eq!(range(Some(2000), None), sent[1..]);
+    assert_eq!(range(None, Some(2000)), sent[..1]);
+    assert_eq!(range(Some(3001), None), sent[3..]);
+    drop(db);
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
 fn glob_matches_as_the_store_does() {
     use agent_runtime::store::glob;
     let sqlite = Connection::open_in_memory().unwrap();
