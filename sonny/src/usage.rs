@@ -219,6 +219,12 @@ impl View {
         (query, (since, bucket, buckets))
     }
 
+    /// What it shows: every project's or this one's, and over which
+    /// period. A read asked for another is not shown.
+    pub fn selection(&self) -> (bool, Period) {
+        (self.all, self.period)
+    }
+
     /// What the read asked with `window` came back with, priced at
     /// `prices`.
     pub fn loaded(
