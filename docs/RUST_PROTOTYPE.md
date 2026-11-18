@@ -3111,7 +3111,8 @@ see, and ends a command that makes system calls of another architecture.
 A sandboxed bot's commands reach the daemon through the bot's own socket,
 never the daemon's: so `agent` and the clients built on it work in its shell,
 as that bot and only as far as a sandboxed bot may go. The daemon opens the
-socket, `SOCKET.d/BOT_ID` beside its own, when one of the bot's turns
+socket, normally `SOCKET.d/BOT_ID` beside its own, or in a short private
+directory when the address would be too long, when one of the bot's turns
 needs it, and keeps it listening while any of the bot's live turns or
 running commands (foreground, background, detached or a terminal) holds
 it, as systemd's socket activation keeps a unit's socket. Thirty seconds
