@@ -1134,7 +1134,14 @@ async fn run_keeping(
     std::thread::Builder::new()
         .name("exec".into())
         .spawn(move || {
-            let _ = done.send(script_thread(run, script.code, (clock, alive), started, calls, output));
+            let _ = done.send(script_thread(
+                run,
+                script.code,
+                (clock, alive),
+                started,
+                calls,
+                output,
+            ));
         })
         .map_err(|e| e.to_string())?;
     let (text, sent) = ran.await.map_err(|e| e.to_string())??;
@@ -1155,24 +1162,22 @@ fn script_thread(
     calls: Arc<Mutex<BTreeMap<String, usize>>>,
     output: Arc<Mutex<Output>>,
 ) -> Result<(String, Option<String>), String> {
-    {
-        // Its place is held until the script's runtime is gone, so an
-        // interrupted turn frees it only once its script has stopped.
-        let _alive = held;
-        let ended = tokio::runtime::Builder::new_current_thread()
-            .enable_time()
-            .build()
-            .map_err(|e| e.to_string())?
-            .block_on(run.script(code))?;
-        // Here, off the runtime: the end of a saved output is written and
-        // its file closed.
-        let calls = calls.lock().unwrap().clone();
-        let output = std::mem::replace(
-            &mut *output.lock().unwrap(),
-            Output::new(0, &Whole::Saved(None)),
-        );
-        Ok(said(&ended, started, &calls, output))
-    }
+    // Its place is held until the script's runtime is gone, so an
+    // interrupted turn frees it only once its script has stopped.
+    let _alive = held;
+    let ended = tokio::runtime::Builder::new_current_thread()
+        .enable_time()
+        .build()
+        .map_err(|e| e.to_string())?
+        .block_on(run.script(code))?;
+    // Here, off the runtime: the end of a saved output is written and
+    // its file closed.
+    let calls = calls.lock().unwrap().clone();
+    let output = std::mem::replace(
+        &mut *output.lock().unwrap(),
+        Output::new(0, &Whole::Saved(None)),
+    );
+    Ok(said(&ended, started, &calls, output))
 }
 
 /// Mark where an `image()` call's picture goes in the output, opening and
