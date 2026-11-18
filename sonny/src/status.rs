@@ -532,6 +532,125 @@ pub fn card(
     }
 }
 
+/// One of an agent's own tasks as the margin lists it: one that needs
+/// the person, failed or works, or a workflow it runs.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Own {
+    pub bot: String,
+    pub name: String,
+    pub title: String,
+    pub state: String,
+    pub group: Group,
+    /// Its helpers' groups: each agent whose line of makers leads to it.
+    pub helpers: Vec<Group>,
+    pub run: Option<crate::workflow::view::Live>,
+}
+
+/// The tasks among `rows` that `bot` made and that need the person,
+/// failed or work, workflows it runs among them, in the order of the
+/// groups; each with its helpers counted.
+pub fn own(rows: &[Row], bot: &str) -> Vec<Own> {
+    let by_bot: HashMap<&str, &Row> = rows.iter().map(|r| (r.bot.as_str(), r)).collect();
+    // The task of `bot`'s own that `row`'s line of makers leads to.
+    fn under<'a>(
+        row: &'a Row,
+        bot: &str,
+        by_bot: &HashMap<&str, &'a Row>,
+        most: usize,
+    ) -> Option<&'a str> {
+        let mut at = row;
+        for _ in 0..=most {
+            if at.maker == bot {
+                return Some(at.bot.as_str());
+            }
+            at = by_bot.get(at.maker.as_str())?;
+        }
+        None
+    }
+    let mut helpers: HashMap<&str, Vec<Group>> = HashMap::new();
+    for row in rows.iter().filter(|r| r.maker != bot && r.run.is_none()) {
+        if let Some(task) = under(row, bot, &by_bot, rows.len()) {
+            helpers.entry(task).or_default().push(row.group);
+        }
+    }
+    let mut own: Vec<Own> = (rows.iter())
+        .filter(|r| r.maker == bot && r.bot != bot)
+        .filter(|r| matches!(r.group, Group::NeedsYou | Group::Failed | Group::Working))
+        .map(|r| Own {
+            bot: r.bot.clone(),
+            name: r.name.clone(),
+            title: r.title.clone(),
+            state: r.state.clone(),
+            group: r.group,
+            helpers: helpers.remove(r.bot.as_str()).unwrap_or_default(),
+            run: r.run.clone(),
+        })
+        .collect();
+    own.sort_by_key(|task| task.group);
+    own
+}
+
+/// The margin's tasks, `width` wide: `Tasks · 2`, then a row for each,
+/// its mark, its title in a column and its name, its helpers counted
+/// under it, a workflow with its strip; each row with the agent a click
+/// on it goes to. None, nothing.
+pub fn own_lines(own: &[Own], width: usize) -> Vec<(Line<'static>, Option<String>)> {
+    if own.is_empty() {
+        return Vec::new();
+    }
+    let mut out = vec![(
+        Line::from(vec![
+            Span::raw(" Tasks").bold(),
+            Span::raw(format!(" · {}", own.len())).dim(),
+        ]),
+        None,
+    )];
+    let agents = || own.iter().filter(|task| task.run.is_none());
+    let names = agents().map(|task| task.name.width()).max().unwrap_or(0);
+    let titles = (agents().map(|task| task.title.width()).max().unwrap_or(0))
+        .min(width.saturating_sub(5 + names));
+    for task in own {
+        let mut spans = vec![Span::raw(" "), mark(&task.state)];
+        if let Some(run) = &task.run {
+            // Its name and its strip, as the Pane draws it: a workflow
+            // that has not ended works.
+            let run = crate::workflow::view::Live {
+                phase: String::new(),
+                ..run.clone()
+            };
+            spans = vec![Span::raw(" "), mark("working")];
+            spans.extend(run_spans(&run, width, &spans.clone(), None));
+            out.push((Line::from(spans), None));
+            continue;
+        }
+        let room = width.saturating_sub(5 + task.name.width());
+        let column = titles.min(room);
+        if !task.title.is_empty() && column > 1 {
+            let title = crate::title::cut(&task.title, column);
+            let pad = column.saturating_sub(title.width());
+            spans.push(Span::raw(format!("{title}{}  ", " ".repeat(pad))));
+        }
+        // In the agents' color: a click goes to it.
+        spans.push(Span::raw(task.name.clone()).bold().fg(Color::Blue));
+        out.push((Line::from(spans), Some(task.bot.clone())));
+        if !task.helpers.is_empty() {
+            let n = task.helpers.len();
+            let mut said = format!("└ {n} helper{}", if n == 1 { "" } else { "s" });
+            for state in [Group::NeedsYou, Group::Failed, Group::Working] {
+                let k = task.helpers.iter().filter(|h| **h == state).count();
+                if k > 0 {
+                    said.push_str(&format!(", {k} {}", state.counted(k)));
+                }
+            }
+            out.push((
+                Line::from(vec![Span::raw("   "), Span::raw(said).dim()]),
+                None,
+            ));
+        }
+    }
+    out
+}
+
 /// Something broken around the agents, which `/status` says under its
 /// heading after a red `✗`: a companion that keeps restarting, turns held
 /// on a cause the person can fix, a temporary folder low on room, failures
@@ -1329,6 +1448,116 @@ mod tests {
             maker: "calc.lead".into(),
             ..Row::default()
         }
+    }
+
+    #[test]
+    fn the_margin_lists_this_agent_s_own_tasks_that_need_you_failed_or_work() {
+        use crate::workflow::view::{Counts, Live};
+        let titled = |title: &str, row: Row| Row {
+            title: title.into(),
+            ..row
+        };
+        let helper = |name: &str, state: &str, group: Group, maker: &str| Row {
+            maker: maker.into(),
+            ..row(name, state, group)
+        };
+        let rows = [
+            row("lead", "working", Group::Working),
+            titled(
+                "Round half cents to even",
+                row("halves", "working", Group::Working),
+            ),
+            helper("halves-a", "working", Group::Working, "calc.halves"),
+            helper("halves-b", "idle", Group::Idle, "calc.halves"),
+            // A helper's own helper counts for the task too.
+            helper("halves-c", "needs you", Group::NeedsYou, "calc.halves-a"),
+            titled(
+                "Check the README against the code",
+                row("readme", "needs you", Group::NeedsYou),
+            ),
+            // Idle and done are /status's, and another agent's tasks are
+            // its own.
+            titled("Stop dividing by zero", row("divide", "idle", Group::Idle)),
+            titled("Tidy", row("tidy", "done", Group::Done)),
+            helper("other", "working", Group::Working, "calc.elsewhere"),
+            Row {
+                name: "workflow blind-role-eval-score".into(),
+                bot: "calc.lead~r6".into(),
+                state: "Score · 2 working, 3 finished".into(),
+                maker: "calc.lead".into(),
+                group: Group::Working,
+                run: Some(Live {
+                    name: "blind-role-eval-score".into(),
+                    phase: "Score".into(),
+                    phases: vec![
+                        (
+                            "Find".into(),
+                            Counts {
+                                done: 3,
+                                ..Default::default()
+                            },
+                        ),
+                        (
+                            "Score".into(),
+                            Counts {
+                                running: 2,
+                                ..Default::default()
+                            },
+                        ),
+                    ],
+                    ..Default::default()
+                }),
+                ..Row::default()
+            },
+        ];
+        let own = own(&rows, "calc.lead");
+        let names: Vec<&str> = own.iter().map(|task| task.name.as_str()).collect();
+        assert_eq!(
+            names,
+            ["readme", "halves", "workflow blind-role-eval-score"]
+        );
+        assert_eq!(
+            own[1].helpers,
+            [Group::Working, Group::Idle, Group::NeedsYou]
+        );
+        let text = |width| -> Vec<String> {
+            (own_lines(&own, width).into_iter())
+                .map(|(line, _)| line.spans.iter().map(|s| s.content.as_ref()).collect())
+                .collect::<Vec<String>>()
+                .into_iter()
+                .map(|line| line.trim_end().to_owned())
+                .collect()
+        };
+        assert_eq!(
+            text(48),
+            [
+                " Tasks · 3",
+                " ? Check the README against the code  readme",
+                " ● Round half cents to even           halves",
+                "   └ 3 helpers, 1 needs you, 1 working",
+                " ● blind-role-eval-score ✓✓✓ ●●",
+            ]
+        );
+        // Narrow, the title is cut at a word; the name stays.
+        assert_eq!(text(30)[1], " ? Check the README…    readme");
+        // A click on a task goes to it; the heading, its helpers and a
+        // workflow go nowhere.
+        let goes: Vec<Option<String>> = own_lines(&own, 48)
+            .into_iter()
+            .map(|(_, bot)| bot)
+            .collect();
+        assert_eq!(
+            goes,
+            [
+                None,
+                Some("calc.readme".into()),
+                Some("calc.halves".into()),
+                None,
+                None
+            ]
+        );
+        // None of its own going: no block.
+        assert!(own_lines(&super::own(&rows, "calc.halves-c"), 48).is_empty());
     }
 
     #[test]

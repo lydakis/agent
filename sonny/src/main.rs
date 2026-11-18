@@ -4060,6 +4060,8 @@ struct Counted {
     read: Option<((status::Counts, std::collections::HashSet<String>), Reads)>,
     /// The tasks as template notes' `tasks()` gives them, when read.
     tasks: Option<Vec<Value>>,
+    /// This window's agent's own tasks, as the margin lists them, when read.
+    own: Option<Vec<status::Own>>,
 }
 
 /// A mark of where the agents `pattern` names stand, as the daemon lists
@@ -10292,6 +10294,9 @@ impl App {
             if let Some(tasks) = counted.tasks {
                 self.tasks_read(tasks);
             }
+            if let Some(own) = counted.own {
+                self.margin.set_tasks(own);
+            }
             if let Some(((counts, bots), (latest, seen))) = counted.read {
                 self.counts = Some(counts);
                 self.status_counted(bots);
@@ -10324,6 +10329,7 @@ impl App {
                     mark: Some(mark),
                     read: None,
                     tasks: None,
+                    own: None,
                 });
             }
             let view = StatusView {
@@ -10346,6 +10352,7 @@ impl App {
                     (latest, seen),
                 )),
                 tasks: Some(status::tasks(&read.rows)),
+                own: Some(status::own(&read.rows, &bot)),
             })
         }));
     }
@@ -12850,6 +12857,7 @@ impl App {
         self.counts = Some(status::counts(&read.rows));
         self.status_counted(status::bots(&read.rows));
         self.tasks_read(status::tasks(&read.rows));
+        self.margin.set_tasks(status::own(&read.rows, &self.bot));
         // The windows' names and the footer say what this read, as it is
         // newer than what they had. A running agent's question is read
         // from its last few items here, so its events keep theirs.
