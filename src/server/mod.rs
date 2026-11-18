@@ -1032,6 +1032,19 @@ impl Command {
                 | Command::StepResult { .. }
         )
     }
+    /// It ends or holds turns: the clients' writes on their way land first,
+    /// as they did when each was awaited in turn, so none lets its client
+    /// start work after it.
+    fn ends_turns(&self) -> bool {
+        matches!(
+            self,
+            Command::Interrupt { .. }
+                | Command::Close { .. }
+                | Command::Delete { .. }
+                | Command::Pause { .. }
+                | Command::Shutdown { .. }
+        )
+    }
     /// The request's `op`, as `stats` counts it.
     fn op(&self) -> &'static str {
         match self {
@@ -1461,22 +1474,11 @@ struct Writing {
     /// Pauses lifted: a step whose write was on its way across one is
     /// checked at once, as `resume` checks those already waiting.
     lifts: u64,
-    /// Calls taken and steps allowed by writes that landed while the
-    /// daemon was paused: nothing runs until the line goes on, so they are
-    /// answered on resume, those whose calls still wait.
-    allowed: Vec<(Call, Value)>,
     /// The input credit of each session's write on its way: its payload
     /// counts against the sessions' input bound until it lands.
     credits: HashMap<u64, session::Credit>,
 }
-/// Whom a call taken, or a step of it allowed, answers, and the call.
-struct Call {
-    output: Output,
-    request: Value,
-    bot: String,
-    turn: i64,
-    call_id: String,
-}
+
 /// Whom a client's write answers, and what the run loop does once it lands.
 struct Write {
     output: Output,
@@ -1486,8 +1488,8 @@ struct Write {
 enum Then {
     /// Answer with what the write returned.
     Reply,
-    /// A call taken: answered once nothing holds the daemon.
-    Taken(Box<Call>),
+    /// A call taken: refused if the daemon began stopping meanwhile.
+    Taken,
     /// An answer to a call or a gate: wake what waits on it, then reply.
     /// One given under a lease starts its tag's serving again after.
     Answered {
@@ -1495,9 +1497,9 @@ enum Then {
         turn: i64,
         serving: Option<(String, u64)>,
     },
-    /// A step put to its call's gates, the pauses lifted when it left, and
-    /// its call: one left waiting is answered once it is decided.
-    Stepped(Box<Stepping>, u64, String),
+    /// A step put to its call's gates, and the pauses lifted when it left:
+    /// one left waiting is answered once it is decided.
+    Stepped(Box<Stepping>, u64),
 }
 /// What a client's write returned.
 enum Written {
@@ -3079,6 +3081,14 @@ pub async fn run(config: Configuration) -> Result<()> {
                                 service.hub.published_through(cursor).await;
                                 service.chores.count("publication", publishing);
                                 if *output.subscribe_closed().borrow() { continue; }
+                            }
+                            if request.as_ref().is_ok_and(|r| r.command.ends_turns()) && !service.writing.lane.is_empty() {
+                                let landing = std::time::Instant::now();
+                                while let Some((session, write, done)) = service.writing.lane.next().await {
+                                    answer_write(&mut service, &mut sessions, stdio_owner, session, write, done).await?;
+                                    inbound.unpark(session);
+                                }
+                                service.chores.count("write", landing);
                             }
                             let (request_id, result, shutdown, serving) = match request {
                                 Ok(request) => {
@@ -5247,8 +5257,8 @@ impl Service {
     fn written(&mut self, then: Then, done: Option<Written>) -> Option<Result<Value>> {
         match (then, done) {
             (Then::Reply, Some(Written::Value(result))) => Some(result),
-            (Then::Taken(call), Some(Written::Value(Ok(reply)))) => self.release(*call, reply),
-            (Then::Taken(..), Some(Written::Value(Err(error)))) => Some(Err(error)),
+            (Then::Taken, Some(Written::Value(Ok(reply)))) => Some(self.release(reply)),
+            (Then::Taken, Some(Written::Value(Err(error)))) => Some(Err(error)),
             // Held by the worker or durable by now; only then does the turn
             // look for it.
             (Then::Answered { bot, turn, .. }, Some(Written::Answered(result))) => {
@@ -5263,7 +5273,7 @@ impl Service {
                     answered.reply
                 }))
             }
-            (Then::Stepped(stepping, lifts, call_id), Some(Written::Stepped(result))) => {
+            (Then::Stepped(stepping, lifts), Some(Written::Stepped(result))) => {
                 self.writing.announcing -= 1;
                 let reply = match result {
                     Ok(Stepped {
@@ -5301,21 +5311,7 @@ impl Service {
                             settle_step(&self.handles, &stepping.bot, stepping.turn, stepped)
                                 .expect("a decided step");
                         if reply["decision"] == "allow" {
-                            let Stepping {
-                                output,
-                                request,
-                                bot,
-                                turn,
-                                ..
-                            } = *stepping;
-                            let call = Call {
-                                output,
-                                request,
-                                bot,
-                                turn,
-                                call_id,
-                            };
-                            self.release(call, reply)
+                            Some(self.release(reply))
                         } else {
                             Some(Ok(reply))
                         }
@@ -5336,17 +5332,13 @@ impl Service {
         }
     }
 
-    /// A write that lets its client start work, landed: answered now, or
-    /// on resume if a pause began while it was on its way, as nothing runs
-    /// until the line goes on; refused if the daemon began shutting down.
-    fn release(&mut self, call: Call, reply: Value) -> Option<Result<Value>> {
+    /// A write that lets its client start work, landed. Whatever holds
+    /// the daemon waits for the writes on their way before it is taken up,
+    /// so only a stop by signal can come between: then nothing starts.
+    fn release(&self, reply: Value) -> Result<Value> {
         match self.held() {
-            None => Some(Ok(reply)),
-            Some(_) if self.paused.is_some() => {
-                self.writing.allowed.push((call, reply));
-                None
-            }
-            Some(held) => Some(fail_with(held, "nothing starts while the daemon is held")),
+            None => Ok(reply),
+            Some(held) => fail_with(held, "nothing starts while the daemon is held"),
         }
     }
 
@@ -5998,32 +5990,6 @@ impl Service {
                     // the store once they land.
                     self.ready_hint = true;
                     self.writing.lifts += 1;
-                    // Each held for the pause goes on if its call still
-                    // waits: an interrupt meanwhile ended it.
-                    let allowed = std::mem::take(&mut self.writing.allowed);
-                    if !allowed.is_empty() {
-                        let calls: Vec<(String, i64, String)> = (allowed.iter())
-                            .map(|(call, _)| (call.bot.clone(), call.turn, call.call_id.clone()))
-                            .collect();
-                        let waiting = store
-                            .op("released", move |db| {
-                                Ok((calls.iter())
-                                    .map(|(bot, turn, call_id)| {
-                                        db.call_waiting(bot, *turn, call_id)
-                                    })
-                                    .collect::<Vec<_>>())
-                            })
-                            .await;
-                        for (n, (call, reply)) in allowed.into_iter().enumerate() {
-                            let answer = match &waiting {
-                                Ok(waiting) => waiting[n].clone().map(|()| reply),
-                                Err(error) => Err(error.clone()),
-                            };
-                            if call.output.try_respond(call.request, answer).is_err() {
-                                call.output.close();
-                            }
-                        }
-                    }
                     let waiting: Vec<i64> = self.stepping.keys().copied().collect();
                     self.check_steps(waiting, false);
                     self.pump_steps();
@@ -6407,7 +6373,7 @@ impl Service {
                     daemon: None,
                 };
                 let (name, store) = (bot, store.clone());
-                let then = Then::Stepped(Box::new(stepping), self.writing.lifts, call_id.clone());
+                let then = Then::Stepped(Box::new(stepping), self.writing.lifts);
                 self.write(session, output, id, then, async move {
                     Written::Stepped(
                         store
@@ -6540,14 +6506,7 @@ impl Service {
                     );
                 }
                 let store = store.clone();
-                let then = Then::Taken(Box::new(Call {
-                    output: output.clone(),
-                    request: id.clone(),
-                    bot: bot.clone(),
-                    turn,
-                    call_id: call_id.clone(),
-                }));
-                self.write(session, output, id, then, async move {
+                self.write(session, output, id, Then::Taken, async move {
                     Written::Value(
                         store
                             .op("take_call", move |db| {
@@ -10281,18 +10240,12 @@ mod tests {
         service.check_steps(vec![41], false);
         assert!(service.step_checks.is_empty());
         let lifts = service.writing.lifts;
-        let reply = service.written(
-            Then::Stepped(Box::new(stepping("c/1")), lifts, "c".into()),
-            pending(41),
-        );
+        let reply = service.written(Then::Stepped(Box::new(stepping("c/1")), lifts), pending(41));
         assert!(reply.is_none(), "a waiting step is answered once decided");
         assert!(service.stepping[&41].checking, "checked as it lands");
         // One that left before a pause was lifted is checked too.
         service.writing.lifts += 1;
-        let reply = service.written(
-            Then::Stepped(Box::new(stepping("c/2")), lifts, "c".into()),
-            pending(42),
-        );
+        let reply = service.written(Then::Stepped(Box::new(stepping("c/2")), lifts), pending(42));
         assert!(reply.is_none());
         assert!(service.stepping[&42].checking);
         assert_eq!(service.writing.announcing, 0);
@@ -10302,7 +10255,7 @@ mod tests {
         assert!(service.writing.unclaimed.is_empty());
         service.writing.announcing = 1;
         let reply = service.written(
-            Then::Stepped(Box::new(stepping("c/3")), service.writing.lifts, "c".into()),
+            Then::Stepped(Box::new(stepping("c/3")), service.writing.lifts),
             pending(43),
         );
         assert!(reply.is_none());
@@ -10314,16 +10267,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_step_allowed_or_a_call_taken_as_a_pause_begins_is_answered_on_resume_if_still_due() {
-        let dir = scratch("paused-step");
+    async fn a_step_allowed_or_a_call_taken_as_the_daemon_stops_starts_nothing() {
+        let dir = scratch("stopping-step");
         let (store, _publications) = Store::open(&dir.join("state.sqlite")).await.unwrap();
         let mut service = admitting(&store, 1024);
         let (output, _writer) = Output::stdout();
-        let (client, mut lines) = Output::in_process();
-        let stepping = |request: &str| Stepping {
+        let stepping = || Stepping {
             session: 1,
-            output: client.clone(),
-            request: json!(request),
+            output: output.clone(),
+            request: json!(1),
             bot: "A".into(),
             turn: 1,
             id: "c/1".into(),
@@ -10340,47 +10292,26 @@ mod tests {
                 lifted: None,
             })))
         };
-        let pause = Command::Pause {
-            reason: "look".into(),
-            by: None,
-        };
-        let answers = requests(&mut service, vec![pause], &output).await;
-        assert!(answers.iter().all(|(_, answer)| answer.is_ok()));
-        // Two steps asked before the pause land after it.
-        service.writing.announcing = 2;
+        let taken = || Some(Written::Value(Ok(json!({"call_id": "c"}))));
+        // Landing with nothing holding the daemon, they are answered.
+        service.writing.announcing = 1;
         let lifts = service.writing.lifts;
-        let allowed = service.written(
-            Then::Stepped(Box::new(stepping("s1")), lifts, "c".into()),
-            decided("allow"),
+        let allowed = service.written(Then::Stepped(Box::new(stepping()), lifts), decided("allow"));
+        assert_eq!(allowed.unwrap().unwrap()["decision"], "allow");
+        assert_eq!(
+            service.written(Then::Taken, taken()).unwrap().unwrap()["call_id"],
+            "c"
         );
-        assert!(allowed.is_none(), "nothing runs while paused");
-        let denied = service.written(
-            Then::Stepped(Box::new(stepping("s2")), lifts, "c".into()),
-            decided("deny"),
-        );
+        // Stopped by a signal while they were on their way, nothing starts;
+        // a denial is still told.
+        (service.draining).store(true, std::sync::atomic::Ordering::Relaxed);
+        service.writing.announcing = 2;
+        let allowed = service.written(Then::Stepped(Box::new(stepping()), lifts), decided("allow"));
+        assert_eq!(allowed.unwrap().unwrap_err().code, "daemon_draining");
+        let denied = service.written(Then::Stepped(Box::new(stepping()), lifts), decided("deny"));
         assert_eq!(denied.unwrap().unwrap()["decision"], "deny");
-        let taken = Some(Written::Value(Ok(json!({"call_id": "c"}))));
-        let call = Call {
-            output: client.clone(),
-            request: json!("t1"),
-            bot: "A".into(),
-            turn: 1,
-            call_id: "c".into(),
-        };
-        let taken = service.written(Then::Taken(Box::new(call)), taken);
-        assert!(taken.is_none(), "nothing is taken while paused");
-        let answers = requests(&mut service, vec![Command::Resume { by: None }], &output).await;
-        assert!(answers.iter().all(|(_, answer)| answer.is_ok()));
-        assert!(service.writing.allowed.is_empty());
-        // Answered as their call stands by then: this one's turn is gone,
-        // as an interrupt during the pause would have ended it.
-        for request in ["s1", "t1"] {
-            let line: Value = serde_json::from_slice(&lines.next().await.unwrap()).unwrap();
-            assert_eq!(
-                (&line["id"], &line["error"]),
-                (&json!(request), &json!("turn_not_found"))
-            );
-        }
+        let refused = service.written(Then::Taken, taken()).unwrap().unwrap_err();
+        assert_eq!(refused.code, "daemon_draining");
         drop(service);
         drop(store);
         std::fs::remove_dir_all(dir).unwrap();
