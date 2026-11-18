@@ -796,6 +796,9 @@ enum Command {
         /// Only bots not closed.
         #[serde(default)]
         open: bool,
+        /// Only these bots, by name: up to 256, each read by its name, so
+        /// a client that heard some changed reads only their rows.
+        names: Option<Vec<String>>,
     },
     /// Stop the daemon. With `grace_ms`, it first drains for up to that
     /// long: nothing starts, and each running turn parks at its next
@@ -7081,6 +7084,7 @@ impl Service {
                 active,
                 created_by_id,
                 open,
+                names,
             } => {
                 let reader = store.reader();
                 self.observe(session, output, id, async move {
@@ -7092,6 +7096,7 @@ impl Service {
                             active,
                             created_by_id,
                             open,
+                            names.as_deref(),
                         )
                     }))
                     .await

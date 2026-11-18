@@ -7359,13 +7359,21 @@ fn bot_pages_obey_byte_budget_without_loading_instructions() {
         db.create(&format!("bot-{n:03}"), Some(&workspace), config)
             .unwrap();
     }
-    let page = db.list(None, 256, None, false, None, false).unwrap();
+    let page = db.list(None, 256, None, false, None, false, None).unwrap();
     let bots = page["bots"].as_array().unwrap();
     assert!(!bots.is_empty() && bots.len() < 140);
     assert!(serde_json::to_vec(&page).unwrap().len() < 524288);
     assert!(bots.iter().all(|b| b.get("instructions").is_none()));
     let rest = db
-        .list(page["next_after"].as_str(), 256, None, false, None, false)
+        .list(
+            page["next_after"].as_str(),
+            256,
+            None,
+            false,
+            None,
+            false,
+            None,
+        )
         .unwrap();
     assert_eq!(bots.len() + rest["bots"].as_array().unwrap().len(), 140);
     assert!(rest["next_after"].is_null());
@@ -7405,32 +7413,59 @@ fn bot_pages_filter_by_name_pattern_and_activity() {
     };
     assert_eq!(
         names(
-            db.list(None, 64, Some("alpha.*"), false, None, false)
+            db.list(None, 64, Some("alpha.*"), false, None, false, None)
                 .unwrap()
         ),
         ["alpha.lead", "alpha.worker"]
     );
     assert_eq!(
         names(
-            db.list(None, 64, Some("*.lead"), false, None, false)
+            db.list(None, 64, Some("*.lead"), false, None, false, None)
                 .unwrap()
         ),
         ["alpha.lead", "beta.lead"]
     );
     assert_eq!(
-        names(db.list(None, 64, None, true, None, false).unwrap()),
+        names(db.list(None, 64, None, true, None, false, None).unwrap()),
         ["alpha.worker", "beta.lead"]
     );
     assert_eq!(
         names(
-            db.list(None, 64, Some("beta.*"), true, None, false)
+            db.list(None, 64, Some("beta.*"), true, None, false, None)
                 .unwrap()
         ),
         ["beta.lead"]
     );
+    // Names listed read only those rows, in name order; one unknown is
+    // left out, and a pattern given too narrows them.
+    let listed = [
+        "beta.lead".to_owned(),
+        "alpha.lead".to_owned(),
+        "gone".to_owned(),
+    ];
+    assert_eq!(
+        names(
+            db.list(None, 64, None, false, None, false, Some(&listed))
+                .unwrap()
+        ),
+        ["alpha.lead", "beta.lead"]
+    );
+    assert_eq!(
+        names(
+            db.list(None, 64, Some("beta.*"), false, None, false, Some(&listed))
+                .unwrap()
+        ),
+        ["beta.lead"]
+    );
+    assert_eq!(
+        db.list(None, 64, None, false, None, false, Some(&[]))
+            .unwrap_err()
+            .code,
+        "invalid_bot_filter"
+    );
     // Filtered pages continue from their cursor like any other.
     let page = db
-        .list(None, 1, Some("*.lead"), false, None, false)
+        .list(None, 1, Some("*.lead"), false, None, false, None)
         .unwrap();
     assert_eq!(page["next_after"], "alpha.lead");
     let rest = db
@@ -7441,6 +7476,7 @@ fn bot_pages_filter_by_name_pattern_and_activity() {
             false,
             None,
             false,
+            None,
         )
         .unwrap();
     assert_eq!(names(rest.clone()), ["beta.lead"]);
@@ -7448,7 +7484,7 @@ fn bot_pages_filter_by_name_pattern_and_activity() {
     // GLOB is case-sensitive, like names.
     assert!(
         names(
-            db.list(None, 64, Some("ALPHA.*"), false, None, false)
+            db.list(None, 64, Some("ALPHA.*"), false, None, false, None)
                 .unwrap()
         )
         .is_empty()
@@ -7458,49 +7494,57 @@ fn bot_pages_filter_by_name_pattern_and_activity() {
     // inside or past the prefix's range starts where it should.
     assert_eq!(
         names(
-            db.list(None, 64, Some("alpha.lead"), false, None, false)
+            db.list(None, 64, Some("alpha.lead"), false, None, false, None)
                 .unwrap()
         ),
         ["alpha.lead"]
     );
     assert_eq!(
         names(
-            db.list(None, 64, Some("alpha.lead*"), false, None, false)
+            db.list(None, 64, Some("alpha.lead*"), false, None, false, None)
                 .unwrap()
         ),
         ["alpha.lead"]
     );
     assert_eq!(
         names(
-            db.list(Some("a"), 64, Some("beta.*"), false, None, false)
+            db.list(Some("a"), 64, Some("beta.*"), false, None, false, None)
                 .unwrap()
         ),
         ["beta.lead", "beta.worker"]
     );
     assert_eq!(
         names(
-            db.list(Some("beta.lead"), 64, Some("beta.*"), false, None, false)
-                .unwrap()
+            db.list(
+                Some("beta.lead"),
+                64,
+                Some("beta.*"),
+                false,
+                None,
+                false,
+                None
+            )
+            .unwrap()
         ),
         ["beta.worker"]
     );
     assert!(
         names(
-            db.list(Some("c"), 64, Some("beta.*"), false, None, false)
+            db.list(Some("c"), 64, Some("beta.*"), false, None, false, None)
                 .unwrap()
         )
         .is_empty()
     );
     assert_eq!(
         names(
-            db.list(None, 64, Some("[ab]*.worker"), false, None, false)
+            db.list(None, 64, Some("[ab]*.worker"), false, None, false, None)
                 .unwrap()
         ),
         ["alpha.worker", "beta.worker"]
     );
     for bad in ["", &"*".repeat(257)] {
         assert_eq!(
-            db.list(None, 64, Some(bad), false, None, false)
+            db.list(None, 64, Some(bad), false, None, false, None)
                 .unwrap_err()
                 .code,
             "invalid_bot_filter"
@@ -7563,29 +7607,37 @@ fn bot_pages_filter_by_maker_from_its_own_index() {
             .collect()
     };
     assert_eq!(
-        names(db.list(None, 64, None, false, Some(lead), false).unwrap()),
+        names(
+            db.list(None, 64, None, false, Some(lead), false, None)
+                .unwrap()
+        ),
         ["a.task", "c.task"]
     );
     assert_eq!(
-        names(db.list(None, 64, None, true, Some(lead), false).unwrap()),
+        names(
+            db.list(None, 64, None, true, Some(lead), false, None)
+                .unwrap()
+        ),
         ["c.task"]
     );
     assert_eq!(
         names(
-            db.list(None, 64, Some("b.*"), false, Some(lead), false)
+            db.list(None, 64, Some("b.*"), false, Some(lead), false, None)
                 .unwrap()
         ),
         Vec::<String>::new()
     );
     assert_eq!(
         names(
-            db.list(None, 64, Some("*.task"), false, Some(other), false)
+            db.list(None, 64, Some("*.task"), false, Some(other), false, None)
                 .unwrap()
         ),
         ["b.task"]
     );
     // Pages by maker continue from their cursor like any other.
-    let page = db.list(None, 1, None, false, Some(lead), false).unwrap();
+    let page = db
+        .list(None, 1, None, false, Some(lead), false, None)
+        .unwrap();
     assert_eq!(page["next_after"], "a.task");
     let rest = db
         .list(
@@ -7595,6 +7647,7 @@ fn bot_pages_filter_by_maker_from_its_own_index() {
             false,
             Some(lead),
             false,
+            None,
         )
         .unwrap();
     assert_eq!(names(rest.clone()), ["c.task"]);
@@ -7602,7 +7655,7 @@ fn bot_pages_filter_by_maker_from_its_own_index() {
     // A maker reused by name is another id, and sees none of the first's.
     assert!(
         names(
-            db.list(None, 64, None, false, Some(lead + 1000), false)
+            db.list(None, 64, None, false, Some(lead + 1000), false, None)
                 .unwrap()
         )
         .is_empty()
@@ -8226,7 +8279,7 @@ fn creation_and_fork_reject_incomplete_deleted_and_reused_creator_identities() {
             (Some("Creator"), None, "creator_identity_required"),
             (None, Some(creator.bot_id), "creator_identity_required"),
         ] {
-            let before = db.list(None, 64, None, false, None, false).unwrap();
+            let before = db.list(None, 64, None, false, None, false, None).unwrap();
             let mut b = binding();
             b.created_by = name;
             b.created_by_id = id;
@@ -8248,7 +8301,10 @@ fn creation_and_fork_reject_incomplete_deleted_and_reused_creator_identities() {
                 .code,
                 code
             );
-            assert_eq!(db.list(None, 64, None, false, None, false).unwrap(), before);
+            assert_eq!(
+                db.list(None, 64, None, false, None, false, None).unwrap(),
+                before
+            );
         }
         if !reused {
             db.create("Creator", Some("/synthetic"), binding()).unwrap();
@@ -8285,7 +8341,7 @@ fn a_bot_is_made_no_deeper_below_the_start_of_its_line_than_the_bound() {
         .unwrap();
     assert_eq!((task.depth, helper.depth), (1, 2));
     // Past the bound, a typed refusal with the facts, and nothing made.
-    let before = db.list(None, 64, None, false, None, false).unwrap();
+    let before = db.list(None, 64, None, false, None, false, None).unwrap();
     let refused = db
         .create("Deeper", Some("/synthetic"), by("Helper", &helper))
         .unwrap_err();
@@ -8299,7 +8355,10 @@ fn a_bot_is_made_no_deeper_below_the_start_of_its_line_than_the_bound() {
         (&facts["depth"], &facts["max_depth"]),
         (&json!(3), &json!(2))
     );
-    assert_eq!(db.list(None, 64, None, false, None, false).unwrap(), before);
+    assert_eq!(
+        db.list(None, 64, None, false, None, false, None).unwrap(),
+        before
+    );
     // A fork another makes is one below its maker, wherever its source is:
     // a bot at the bound can't fork its way back up.
     let refused = db
@@ -8327,7 +8386,7 @@ fn a_bot_is_made_no_deeper_below_the_start_of_its_line_than_the_bound() {
     db.create("Below", Some("/synthetic"), by("Fresh", &fresh))
         .unwrap();
     // Listed and inspected with it.
-    let listed = db.list(None, 64, None, false, None, false).unwrap();
+    let listed = db.list(None, 64, None, false, None, false, None).unwrap();
     let depth_of = |name: &str| {
         (listed["bots"].as_array().unwrap().iter())
             .find(|bot| bot["name"] == name)
@@ -8383,7 +8442,7 @@ fn lineage_pins_the_creator_identity_so_a_reused_name_is_a_stranger() {
         Some(first_a.bot_id),
         "B still names the A that made it"
     );
-    let page = db.list(None, 64, None, false, None, false).unwrap();
+    let page = db.list(None, 64, None, false, None, false, None).unwrap();
     let listed = page["bots"].as_array().unwrap();
     let b_row = listed.iter().find(|r| r["name"] == "B").unwrap();
     assert_eq!(b_row["created_by_id"], first_a.bot_id);
@@ -8542,7 +8601,7 @@ fn forks_keep_the_binding_and_instructions_and_record_a_creator() {
     );
     assert_eq!(db.inspect("Bob").unwrap().instructions, "first text");
     // Listing carries the creator; a fork keeps the model and tools.
-    let page = db.list(None, 64, None, false, None, false).unwrap();
+    let page = db.list(None, 64, None, false, None, false, None).unwrap();
     let listed: Vec<(&str, Option<&str>)> = page["bots"]
         .as_array()
         .unwrap()
@@ -11512,7 +11571,7 @@ fn cached_input_tokens_are_kept_per_turn_and_per_bot_with_their_ratio() {
         (400, 240, 0.6)
     );
     assert_eq!(bot.tokens_used, 420);
-    let page = db.list(None, 10, None, false, None, false).unwrap();
+    let page = db.list(None, 10, None, false, None, false, None).unwrap();
     assert_eq!(page["bots"][0]["cache_hit"], 0.6);
     assert_eq!(agent_runtime::store::cache_hit(0, 0), 0.0);
     assert_eq!(agent_runtime::store::cache_hit(1, 3), 0.333);
@@ -11871,7 +11930,7 @@ fn a_declared_list_is_stored_once_and_let_go_when_no_bot_holds_it() {
     let record = serde_json::to_value(&a).unwrap();
     assert_eq!(record["declared_digest"], json!(digest));
     assert_eq!(record["declared"].as_array().unwrap().len(), 8);
-    let listed = db.list(None, 64, None, false, None, false).unwrap();
+    let listed = db.list(None, 64, None, false, None, false, None).unwrap();
     assert!(
         (listed["bots"].as_array().unwrap())
             .iter()
@@ -12171,7 +12230,7 @@ fn bot_identities_are_assigned_in_creation_order_and_never_reused() {
         let db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
         assert_eq!(db.inspect("New").unwrap().bot_id, 3);
         assert_eq!(
-            db.list(None, 8, None, false, None, false).unwrap()["bots"][0]["bot_id"],
+            db.list(None, 8, None, false, None, false, None).unwrap()["bots"][0]["bot_id"],
             1
         );
     }
@@ -16957,7 +17016,7 @@ fn a_fork_narrows_what_it_may_call_and_never_widens() {
         .collect();
     assert_eq!(announced.len(), 1);
     assert_eq!(announced[0]["name"], "read");
-    let listed = db.list(None, 16, None, false, None, false).unwrap();
+    let listed = db.list(None, 16, None, false, None, false, None).unwrap();
     let reader = listed["bots"]
         .as_array()
         .unwrap()
@@ -17619,7 +17678,7 @@ fn an_expiring_fork_is_due_once_idle_that_long_and_never_while_a_turn_runs() {
     let at = side.expires_at.unwrap();
     assert!(at >= before + 900_000, "{at} from {before}");
     // Records show it; a source that never asked for one shows none.
-    let listed = db.list(None, 10, None, false, None, false).unwrap();
+    let listed = db.list(None, 10, None, false, None, false, None).unwrap();
     assert_eq!(listed["bots"][0]["name"], "Bob");
     assert!(listed["bots"][0].get("expires_at").is_none());
     assert_eq!(listed["bots"][1]["expires_at"], at);
@@ -21012,7 +21071,7 @@ fn a_gated_step_is_told_done_once_even_when_its_row_was_trimmed() {
 
 /// Bob as a `bots` page lists him, with the page's cursor.
 fn listed(db: &Database) -> (Value, i64) {
-    let page = db.list(None, 64, None, false, None, false).unwrap();
+    let page = db.list(None, 64, None, false, None, false, None).unwrap();
     let bob = (page["bots"].as_array().unwrap().iter())
         .find(|bot| bot["name"] == "Bob")
         .unwrap()
@@ -21305,7 +21364,7 @@ fn a_store_before_bot_status_reads_each_bots_status_from_its_turns() {
         )
         .unwrap();
     let db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
-    let page = db.list(None, 64, None, false, None, false).unwrap();
+    let page = db.list(None, 64, None, false, None, false, None).unwrap();
     let (ann, bob) = (&page["bots"][0], &page["bots"][1]);
     assert_eq!(ann["status"], "failed");
     assert_eq!(ann["last"]["turn"], failed);
@@ -22870,13 +22929,13 @@ fn a_closed_bot_is_listed_only_when_asked_until_a_turn_of_its_starts() {
     assert_eq!(db.inspect("shop.look").unwrap().closed_ms, None);
     assert_eq!(
         names(
-            db.list(None, 64, Some("shop.*"), false, None, true)
+            db.list(None, 64, Some("shop.*"), false, None, true, None)
                 .unwrap()
         ),
         ["shop.lead", "shop.look"]
     );
     let all = db
-        .list(None, 64, Some("shop.*"), false, None, false)
+        .list(None, 64, Some("shop.*"), false, None, false, None)
         .unwrap();
     assert_eq!(names(all.clone()), ["shop.fix", "shop.lead", "shop.look"]);
     assert_eq!(all["bots"][0]["closed_ms"], 1_000);
@@ -22901,7 +22960,7 @@ fn a_closed_bot_is_listed_only_when_asked_until_a_turn_of_its_starts() {
     db.finish(turn, None).unwrap();
     assert_eq!(
         names(
-            db.list(None, 64, Some("shop.*"), false, None, true)
+            db.list(None, 64, Some("shop.*"), false, None, true, None)
                 .unwrap()
         ),
         ["shop.fix", "shop.lead", "shop.look"]
