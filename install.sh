@@ -121,8 +121,11 @@ main() {
     name="sonny-$version-linux-$arch"
     url="$repo/releases/download/v$version/$name.tar.gz"
 
-    work=$(mktemp -d)
-    trap 'rm -rf "$work"' EXIT
+    mkdir -p "$prefix/opt" "$prefix/bin"
+    # Unpacked beside where it goes, so putting it in place is a rename.
+    work=$(mktemp -d "$prefix/opt/.sonny-install.XXXXXX")
+    link="$prefix/bin/.sonny.$$"
+    trap 'rm -rf "$work" "$link"' EXIT
     echo "Downloading $name"
     curl -fsSL -o "$work/$name.tar.gz" "$url" || fail "could not download $url"
     curl -fsSL -o "$work/$name.tar.gz.sha256" "$url.sha256" || fail "could not download $url.sha256"
@@ -135,14 +138,23 @@ main() {
             fail "$name.tar.gz has no build attestation from the release workflow"
     fi
 
-    mkdir -p "$prefix/opt" "$prefix/bin"
     tar -xzf "$work/$name.tar.gz" -C "$work"
     [ -x "$work/$name/bin/sonny" ] && [ -x "$work/$name/libexec/agent" ] ||
         fail "$name.tar.gz is not laid out as bin/sonny and libexec/agent"
-    rm -rf "${prefix:?}/opt/$name"
+    "$work/$name/bin/sonny" --version >/dev/null && "$work/$name/libexec/agent" --version >/dev/null ||
+        fail "$name does not run on this machine; the installed Sonny is kept"
+    # A reinstall of the same version moves the old copy aside only for the
+    # moment the new one takes its place.
+    if [ -e "$prefix/opt/$name" ] || [ -L "$prefix/opt/$name" ]; then
+        mv "$prefix/opt/$name" "$work/replaced"
+    fi
     mv "$work/$name" "$prefix/opt/$name"
-    ln -sfn "$name" "$prefix/opt/sonny"
-    ln -sfn "../opt/sonny/bin/sonny" "$prefix/bin/sonny"
+    # Each link is made aside and renamed over the old one, so neither name
+    # is ever missing.
+    ln -s "$name" "$work/sonny"
+    mv -Tf "$work/sonny" "$prefix/opt/sonny"
+    ln -s "../opt/sonny/bin/sonny" "$link"
+    mv -Tf "$link" "$prefix/bin/sonny"
 
     echo "Installed $("$prefix/bin/sonny" --version) at $prefix/bin/sonny"
     packages
