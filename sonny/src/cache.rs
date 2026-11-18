@@ -32,10 +32,12 @@ pub fn drawn(
 }
 
 fn path(lang: &str, source: &str, width: usize) -> Option<PathBuf> {
-    let dir = std::env::temp_dir().join("sonny-pictures");
-    std::fs::create_dir_all(&dir).ok()?;
+    let dir = directory()?;
     let mut hasher = std::hash::DefaultHasher::new();
     (
+        // A picture drawn by another build of Sonny may be drawn otherwise.
+        env!("CARGO_PKG_VERSION"),
+        option_env!("SONNY_COMMIT"),
         lang,
         source,
         crate::image::now(width),
@@ -44,6 +46,21 @@ fn path(lang: &str, source: &str, width: usize) -> Option<PathBuf> {
     )
         .hash(&mut hasher);
     Some(dir.join(format!("{:016x}.bin", hasher.finish())))
+}
+
+/// This user's own folder in the temporary one, which no other user can
+/// fill with pictures for this one to show.
+fn directory() -> Option<PathBuf> {
+    use std::os::unix::fs::{DirBuilderExt, MetadataExt};
+    // SAFETY: geteuid takes nothing and cannot fail.
+    let uid = unsafe { libc::geteuid() };
+    let dir = std::env::temp_dir().join(format!("sonny-pictures-{uid}"));
+    match std::fs::DirBuilder::new().mode(0o700).create(&dir) {
+        Err(e) if e.kind() != std::io::ErrorKind::AlreadyExists => return None,
+        _ => {}
+    }
+    let meta = dir.symlink_metadata().ok()?;
+    (meta.is_dir() && meta.uid() == uid && meta.mode() & 0o077 == 0).then_some(dir)
 }
 
 /// Columns, rows and whether it was cut, then the PNG.
@@ -84,6 +101,16 @@ pub fn write_new(path: &std::path::Path, bytes: impl AsRef<[u8]>) -> std::io::Re
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn pictures_are_kept_in_a_folder_of_this_user_s_alone() {
+        use std::os::unix::fs::MetadataExt;
+        let dir = super::directory().unwrap();
+        let meta = dir.symlink_metadata().unwrap();
+        // SAFETY: geteuid takes nothing and cannot fail.
+        assert_eq!(meta.uid(), unsafe { libc::geteuid() });
+        assert_eq!(meta.mode() & 0o777, 0o700);
+    }
+
     #[cfg(unix)]
     #[test]
     fn a_new_file_is_never_written_through_a_link_left_in_its_place() {
