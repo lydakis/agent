@@ -6,7 +6,8 @@ name: Test
 # driven by scripted models through replay, restart and recovery, steering,
 # compaction, forks, approvals, triggers and the lookout. The macos job runs
 # the Rust tests where the release is built, so a failure only macOS has
-# shows on the pull request instead of at release. No provider key is used
+# shows on the pull request instead of at release, and the musl job builds
+# the static Linux binaries the release ships. No provider key is used
 # and nothing is spent. The jobs run side by side.
 
 on:
@@ -108,3 +109,42 @@ jobs:
           # third of the time of one after another. More than that starved
           # timing-sensitive tests in local runs.
           .local/venv/bin/python -m tests.run --jobs 4
+
+  musl:
+    # The static Linux builds the release makes, on the same runners and
+    # with the same compiler, so a target only the release builds (the
+    # aarch64 jemalloc build that failed v0.10.2's first run) fails here on
+    # the pull request instead of at the tag.
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            arch: x86_64
+          - runner: ubuntu-24.04-arm
+            arch: aarch64
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    defaults:
+      run:
+        shell: bash
+    env:
+      CARGO_TERM_COLOR: never
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Build Sonny and the daemon for Linux, as the release does
+        env:
+          ARCH: ${{ matrix.arch }}
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y musl-tools
+          target="${ARCH}-unknown-linux-musl"
+          rustup target add "$target"
+          export "CC_${ARCH}_unknown_linux_musl=musl-gcc"
+          cargo build --release --locked --bin agent --target "$target"
+          cargo build --release --locked -p sonny --bin sonny --target "$target"
+          for binary in sonny agent; do
+            file ".local/target/$target/release/$binary" | grep -q 'static'
+          done
