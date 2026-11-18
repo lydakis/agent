@@ -262,6 +262,21 @@ def measured(groups, seconds, daemon=None, control=None):
     return found
 
 
+def need(response, what):
+    """A request's result, or the run fails."""
+    if 'result' not in response:
+        raise RuntimeError(f'{what}: {response.get("error")}')
+    return response['result']
+
+
+def ended(connection, handle):
+    """Wait for a turn, which must end completed, or the run fails."""
+    found = need(connection.request('wait', handles=[handle], timeout_ms=60_000),
+                 'wait')['results'][handle]
+    if found.get('pending') or found.get('status') != 'completed':
+        raise RuntimeError(f'turn: {found}')
+
+
 def spread(values):
     if not values:
         return {'n': 0}
@@ -387,9 +402,9 @@ def main():
             turns = []
             for n in range(args.turns):
                 began = time.monotonic()
-                submitted = control.request('submit', bot='t1', request_id=f'turn{n}', prompt='hi')
-                handle = f't1/{submitted["result"]["message"]}'
-                control.request('wait', handles=[handle], timeout_ms=60_000)
+                submitted = need(control.request('submit', bot='t1', request_id=f'turn{n}',
+                                                 prompt='hi'), 'submit')
+                ended(control, f't1/{submitted["message"]}')
                 turns.append((time.monotonic() - began) * 1000)
             result['turn_ms'] = spread(turns)
         else:
@@ -403,17 +418,6 @@ def main():
             time.sleep(10)
             finished = [0, 0]
             failures = []
-
-            def need(response, what):
-                if 'result' not in response:
-                    raise RuntimeError(f'{what}: {response.get("error")}')
-                return response['result']
-
-            def ended(connection, handle):
-                found = need(connection.request('wait', handles=[handle], timeout_ms=60_000),
-                             'wait')['results'][handle]
-                if found.get('pending') or found.get('status') != 'completed':
-                    raise RuntimeError(f'turn: {found}')
 
             def busy_still(submitted):
                 # Only a bot still ending its last turn is tried again;
