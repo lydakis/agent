@@ -31,7 +31,10 @@ pub fn drawn(
     if crate::term::measured() {
         return Drawing::Done(draw());
     }
-    let key = key(lang, source, width);
+    // The terminal as it is now: the key says it, and the picture is
+    // drawn for it, whenever the worker gets to it.
+    let asked = crate::term::drawn();
+    let key = crate::term::drawn_as(asked, || key(lang, source, width));
     if let Some(drawn) = crate::drawing::take(key) {
         return Drawing::Done(drawn);
     }
@@ -39,6 +42,7 @@ pub fn drawn(
     if let Some(drawn) = path.as_ref().and_then(read) {
         return Drawing::Done(Ok(drawn));
     }
+    let draw = move || crate::term::drawn_as(asked, draw);
     crate::drawing::start(key, path, Box::new(draw));
     Drawing::Waits(key)
 }

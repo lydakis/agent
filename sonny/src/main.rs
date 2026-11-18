@@ -12242,6 +12242,14 @@ impl App {
         if let Some(pane) = &mut self.pane {
             pane.drawn();
         }
+        // The pane closed last, and one under another, shown again as
+        // they were.
+        if let Some((pane, _)) = &mut self.closed {
+            pane.drawn();
+        }
+        if let Some(pane) = &mut self.under {
+            pane.drawn();
+        }
         // The margin draws its notes again as pictures land.
         drawing::settle(landed);
         true

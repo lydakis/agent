@@ -831,14 +831,21 @@ impl Pane {
         true
     }
 
-    /// Pictures it waited on that are now drawn, drawn in their place: a
-    /// file it previews read again, as each look at it is (a picture the
-    /// file is, or those in it), else each row that stood for one swapped
-    /// for it. Whether any was.
+    /// Pictures it waited on that are now drawn, drawn in their place,
+    /// here and in the panes it goes back and forward to: a file it
+    /// previews read again, as each look at it is (a picture the file is,
+    /// or those in it), else each row that stood for one swapped for it.
+    /// Whether any was.
     pub fn drawn(&mut self) -> bool {
-        let card = self.card.as_mut().is_some_and(crate::drawing::fill);
+        // Those it goes back and forward to as well: shown again as they
+        // were left.
+        let mut any = false;
+        for kept in self.back.iter_mut().chain(self.forward.iter_mut()) {
+            any |= kept.drawn();
+        }
+        any |= self.card.as_mut().is_some_and(crate::drawing::fill);
         if !self.screen.waits() {
-            return card;
+            return any;
         }
         let file = (self.tree.is_none() && self.program.is_none() && self.card.is_none())
             .then(|| self.link.as_deref().and_then(file_url))

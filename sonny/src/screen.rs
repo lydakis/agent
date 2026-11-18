@@ -791,8 +791,9 @@ impl Screen {
     }
 
     /// Each row that stood for a picture now drawn swapped for its rows:
-    /// the first keeps what the row was besides its text, the last its
-    /// tag (a message's last row is still its last), and all its bar.
+    /// the first keeps what the row was besides its text, all its bar,
+    /// and its tag goes on the last when it marks one row (a message's
+    /// last row is still its last), on all when it marks a run of them.
     /// Whether any was.
     pub fn fill_drawn(&mut self) -> bool {
         let mut any = false;
@@ -819,8 +820,15 @@ impl Screen {
                 first.buttons = old.buttons.clone();
                 (first.opens, first.over, first.written) = (old.opens, old.over, old.written);
             }
-            if let Some(last) = fresh.last_mut() {
-                last.tag = tag;
+            // A tag that marks one row (a message's last) goes on the
+            // last; one over rows (a group, an open fold) on every row.
+            match tag {
+                Some(Tag::End(_) | Tag::Streamed(_) | Tag::Eyes) => {
+                    if let Some(last) = fresh.last_mut() {
+                        last.tag = tag;
+                    }
+                }
+                _ => fresh.iter_mut().for_each(|row| row.tag = tag),
             }
             let grown = fresh.len() as isize - 1;
             self.rows.splice(at..at + 1, fresh);

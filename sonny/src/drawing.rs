@@ -43,7 +43,12 @@ struct State {
     /// What was drawn and no file kept, taken by the next look for it; and
     /// what could not be drawn, and why.
     done: HashMap<u64, Result<Drawn, String>>,
+    /// Rows standing for pictures, by the number their mark carries.
     placed: HashMap<u32, Placed>,
+    /// That number for each picture with rows standing for it: one of its
+    /// own among those standing, however its key is cut to fit.
+    ids: HashMap<u64, u32>,
+    last_id: u32,
     /// The windows woken as a picture is ready.
     wake: Vec<Weak<tokio::sync::Notify>>,
 }
@@ -144,12 +149,12 @@ fn work() {
     }
 }
 
-/// The mark a row standing for picture `key` wears: an empty span, never
-/// drawn, its underline colour the key's low 24 bits, as a wrapped row's
-/// lead is marked ([`crate::transcript::lead`]) in an indexed one.
-fn mark(key: u64) -> Span<'static> {
+/// The mark a row standing for picture `id` wears: an empty span, never
+/// drawn, its underline colour the 24-bit number, as a wrapped row's lead
+/// is marked ([`crate::transcript::lead`]) in an indexed one.
+fn mark(id: u32) -> Span<'static> {
     let style = Style::new()
-        .underline_color(Color::Rgb((key >> 16) as u8, (key >> 8) as u8, key as u8))
+        .underline_color(Color::Rgb((id >> 16) as u8, (id >> 8) as u8, id as u8))
         .add_modifier(Modifier::HIDDEN);
     Span::styled("", style)
 }
@@ -174,8 +179,24 @@ pub fn placeholder(
     let state = state.get_or_insert_with(State::default);
     // Ready already: the next look draws it.
     let landed = (!state.running.contains(&key)).then(landed);
+    let id = match state.ids.get(&key) {
+        Some(id) => *id,
+        None => {
+            // The next number no standing row has.
+            let mut id = state.last_id;
+            loop {
+                id = id % 0xFF_FFFF + 1;
+                if !state.placed.contains_key(&id) {
+                    break;
+                }
+            }
+            state.last_id = id;
+            state.ids.insert(key, id);
+            id
+        }
+    };
     state.placed.insert(
-        key as u32 & 0xFF_FFFF,
+        id,
         Placed {
             key,
             redraw: Arc::new(redraw),
@@ -186,7 +207,7 @@ pub fn placeholder(
     // The mark first: a row's lead swapped ([`crate::transcript::relead`])
     // keeps the empty spans it starts with.
     vec![Line::from(vec![
-        mark(key),
+        mark(id),
         Span::raw("  "),
         Span::raw(format!("drawing {what}…")).dim(),
     ])]
@@ -252,8 +273,14 @@ pub fn fill(rows: &mut Vec<Line<'static>>) -> bool {
 pub fn settle(seen: u64) {
     let owner = std::thread::current().id();
     if let Some(state) = state().as_mut() {
-        (state.placed)
-            .retain(|_, placed| placed.owner != owner || placed.landed.is_none_or(|at| at > seen));
+        let ids = &mut state.ids;
+        state.placed.retain(|_, placed| {
+            let kept = placed.owner != owner || placed.landed.is_none_or(|at| at > seen);
+            if !kept {
+                ids.remove(&placed.key);
+            }
+            kept
+        });
     }
 }
 
@@ -346,7 +373,67 @@ mod tests {
         assert_eq!(text(&rows), ["above", "│ first", "│ second", "below"]);
         settle(seen);
         let state = state();
-        let placed = &state.as_ref().unwrap().placed;
-        assert!(!placed.contains_key(&(key as u32 & 0xFF_FFFF)));
+        assert!(!state.as_ref().unwrap().ids.contains_key(&key));
+    }
+
+    #[test]
+    fn pictures_whose_keys_end_alike_wait_in_rows_of_their_own() {
+        // Two keys alike in their low 24 bits, still drawing.
+        let (one, two) = (0xD1A6_0000_00AB_C003, 0x0000_0001_00AB_C003);
+        let (go, gate) = std::sync::mpsc::channel::<()>();
+        let gate = Mutex::new(gate);
+        start(
+            one,
+            None,
+            Box::new(move || {
+                let _ = gate.lock().unwrap().recv();
+                Err("no".into())
+            }),
+        );
+        start(two, None, Box::new(|| Err("no".into())));
+        let mut rows = placeholder(one, "the diagram", || vec![Line::from("  one")]);
+        rows.extend(placeholder(two, "the formula", || {
+            vec![Line::from("  two")]
+        }));
+        go.send(()).unwrap();
+        until(|| ready(&rows[0]).is_some() && ready(&rows[1]).is_some());
+        assert!(fill(&mut rows));
+        let text: Vec<String> = rows.iter().map(|r| r.to_string()).collect();
+        assert_eq!(text, ["  one", "  two"]);
+    }
+
+    #[test]
+    fn a_picture_in_a_run_of_tagged_rows_keeps_the_run_whole() {
+        use crate::screen::{Mark, Screen, Tag};
+        let key = 0xD1A6_0004;
+        start(key, None, Box::new(|| Err("no".into())));
+        let mut lines = vec![Line::from("words")];
+        lines.extend(placeholder(key, "the diagram", || {
+            vec![Line::from("  first"), Line::from("  second")]
+        }));
+        lines.push(Line::from("more words"));
+        let mut screen = Screen::default();
+        let marks = (0..3).map(|at| (at, Mark::Tag(Tag::More(7)))).collect();
+        screen.push_marked(lines, marks);
+        screen.push_marked(vec![Line::from("end")], vec![(0, Mark::Tag(Tag::End(7)))]);
+        until(|| state().as_ref().is_some_and(|s| !s.running.contains(&key)));
+        assert!(screen.fill_drawn());
+        assert_eq!(
+            screen.texts(),
+            ["words", "  first", "  second", "more words", "end"]
+        );
+        assert_eq!(screen.count_tagged(Tag::More(7)), 4);
+        assert_eq!(screen.count_tagged(Tag::End(7)), 1);
+        assert!(!screen.waits());
+    }
+
+    #[test]
+    fn a_picture_is_drawn_for_the_terminal_as_it_was_when_asked() {
+        let asked = crate::term::drawn();
+        let light = crate::term::light();
+        let drawn = std::thread::spawn(move || crate::term::drawn_as(asked, crate::term::light))
+            .join()
+            .unwrap();
+        assert_eq!(drawn, light);
     }
 }
