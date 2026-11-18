@@ -11,7 +11,6 @@
 //! environment its shell would have, so a slow setup script or a failure
 //! touches only that call. What it prints is the call's result. `exec`
 //! runs in the host itself, where the MCP servers stay up.
-use crate::budget::Full;
 use agent_client::Client;
 use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet};
@@ -1281,11 +1280,16 @@ struct Calls {
     /// The last look left a call waiting in the daemon for a place: one
     /// let go wakes the next.
     left: bool,
-    /// The agents a look found waiting for a place when every place was
-    /// held, in the order they were first found waiting: the first takes
-    /// the next place, as each waited on the budget's fair semaphore in
-    /// turn when the host waited for places itself.
-    queued: std::collections::VecDeque<String>,
+    /// For each agent a look found waiting for a place, the one place it
+    /// waits for in the budget's fair queue, beside browser commands and
+    /// other agents, or holds once it came: its next call takes it.
+    reserved: HashMap<String, Reserved>,
+}
+
+/// An agent's place in the budget's queue.
+enum Reserved {
+    Waiting(tokio::task::AbortHandle),
+    Held(Place),
 }
 
 impl Calls {
@@ -1472,17 +1476,30 @@ pub enum Place {
     Held(#[allow(dead_code)] tokio::sync::OwnedSemaphorePermit),
 }
 
-/// The place `call` of `owner` runs in, if there is one now: none leaves
-/// it waiting in the daemon, which keeps it, for a later look once a place
-/// frees. One whose turn has not come, `may` false, takes none.
-fn admit(call: &Value, owner: &str, may: bool) -> Result<Place, Full> {
+/// Where `call` of `owner` runs: in a place free now, or one to wait for
+/// in the budget's queue, while the call itself waits in the daemon.
+pub enum Admitted {
+    Now(Place),
+    Wait(std::pin::Pin<Box<dyn std::future::Future<Output = Place> + Send>>),
+}
+
+/// The place `call` of `owner` runs in, if there is one now; if not, the
+/// wait for one.
+fn admit(call: &Value, owner: &str) -> Admitted {
     match call["name"].as_str() {
-        Some(EXEC | BROWSER | DESKTOP | WORKFLOW | crate::reactions::TOOL) => Ok(Place::Free),
-        Some(AUTOMATIONS) if !looks(&call["arguments"]) => Ok(Place::Free),
-        _ if !may => Err(Full::Whole),
-        _ => crate::budget::processes()
-            .try_admit(owner)
-            .map(Place::Process),
+        Some(EXEC | BROWSER | DESKTOP | WORKFLOW | crate::reactions::TOOL) => {
+            Admitted::Now(Place::Free)
+        }
+        Some(AUTOMATIONS) if !looks(&call["arguments"]) => Admitted::Now(Place::Free),
+        _ => match crate::budget::processes().try_admit(owner) {
+            Ok(place) => Admitted::Now(Place::Process(place)),
+            Err(_) => {
+                let owner = owner.to_owned();
+                Admitted::Wait(Box::pin(async move {
+                    Place::Process(crate::budget::processes().admit(&owner).await)
+                }))
+            }
+        },
     }
 }
 
@@ -1538,7 +1555,7 @@ async fn sweep<Admit, Run, Ran>(
     run: Run,
 ) -> Result<bool, agent_client::Error>
 where
-    Admit: Fn(&Value, &str, bool) -> Result<Place, Full>,
+    Admit: Fn(&Value, &str) -> Admitted,
     Run: Fn(Value, Place) -> Ran,
     Ran: std::future::Future<Output = Result<Value, (&'static str, String)>> + Send + 'static,
 {
@@ -1554,7 +1571,7 @@ where
         calls.looks += 1;
         (calls.stops, calls.looks)
     };
-    let (mut after, mut left) = (0, false);
+    let (mut after, mut left, mut whole) = (0, false, false);
     // The agents this look found waiting for a place.
     let mut waited = HashSet::new();
     'pages: loop {
@@ -1585,29 +1602,43 @@ where
             if calls.paused || calls.jobs.contains_key(&key) || calls.over(&key, lifted) {
                 continue;
             }
-            let may = calls.queued.front().is_none_or(|first| *first == owner);
-            let place = match admit(call, &owner, may) {
-                Ok(place) => place,
-                // Published now: a place let go while the rest is read
-                // wakes the next look.
-                Err(full) => {
+            // The place the agent waited for in the budget's queue, once
+            // it came; while it waits, its calls wait with it.
+            let place = match calls.reserved.remove(&owner) {
+                Some(Reserved::Held(place)) => place,
+                Some(waiting) => {
+                    calls.reserved.insert(owner.clone(), waiting);
                     left = true;
-                    calls.left = true;
-                    waited.insert(owner.clone());
-                    match full {
-                        Full::Whole if !calls.queued.contains(&owner) => {
-                            calls.queued.push_back(owner)
-                        }
-                        Full::Whole => {}
-                        // One waiting on its own share waits on no other.
-                        Full::Share => calls.queued.retain(|queued| *queued != owner),
-                    }
+                    waited.insert(owner);
                     continue;
                 }
+                None => match admit(call, &owner) {
+                    Admitted::Now(place) => place,
+                    // One wait an agent, not a call: what it waits for in
+                    // the budget's queue, kept here for its next call.
+                    Admitted::Wait(place) => {
+                        left = true;
+                        calls.left = true;
+                        waited.insert(owner.clone());
+                        let (serving, nudge, held) =
+                            (serving.clone(), nudge.clone(), owner.clone());
+                        let wait = tokio::spawn(async move {
+                            let place = place.await;
+                            let mut calls = serving.lock().unwrap();
+                            if let Some(reserved @ Reserved::Waiting(_)) =
+                                calls.reserved.get_mut(&held)
+                            {
+                                *reserved = Reserved::Held(place);
+                                nudge.notify_one();
+                            }
+                        });
+                        calls
+                            .reserved
+                            .insert(owner, Reserved::Waiting(wait.abort_handle()));
+                        continue;
+                    }
+                },
             };
-            if calls.queued.front() == Some(&owner) {
-                calls.queued.pop_front();
-            }
             if lifted {
                 calls.lifted.insert(key.clone());
             }
@@ -1615,7 +1646,10 @@ where
         }
         match next {
             Some(next) => after = next,
-            None => break,
+            None => {
+                whole = true;
+                break;
+            }
         }
     }
     // A call let go before this listing began is on no listing from now
@@ -1629,12 +1663,16 @@ where
     calls.retired.retain(|_, at| *at >= look);
     calls.ended.retain(|_, at| *at >= look);
     calls.left = left;
-    // An agent no longer waiting gives up its turn; the next look offers
-    // the place it held to the one after it.
-    let queued = calls.queued.len();
-    calls.queued.retain(|owner| waited.contains(owner));
-    if calls.queued.len() < queued && left {
-        nudge.notify_one();
+    // An agent with no call waiting any more gives up the place it waits
+    // for or holds, once a whole listing says so.
+    if whole {
+        calls.reserved.retain(|owner, reserved| {
+            let keep = waited.contains(owner);
+            if let (false, Reserved::Waiting(waiting)) = (keep, &reserved) {
+                waiting.abort();
+            }
+            keep
+        });
     }
     Ok((calls.jobs.values()).any(|job| matches!(job, Job::Answered(_))))
 }
@@ -2355,8 +2393,8 @@ mod tests {
     use super::*;
 
     /// Every call has a place at once.
-    fn free(_: &Value, _: &str, _: bool) -> Result<Place, Full> {
-        Ok(Place::Free)
+    fn free(_: &Value, _: &str) -> Admitted {
+        Admitted::Now(Place::Free)
     }
 
     #[test]
@@ -2475,11 +2513,14 @@ mod tests {
                     taken.fetch_add(1, Ordering::SeqCst);
                     json!({})
                 }
+                // A result handed in again while the first is on its way,
+                // as a look that starts meanwhile does, is refused as the
+                // daemon refuses it; each call still runs once (`ran`).
                 Some("tool_result") => {
-                    let fresh = (answered.lock().unwrap())
-                        .insert(str_of(&asked["call_id"]));
-                    assert!(fresh, "answered twice");
-                    json!({})
+                    match (answered.lock().unwrap()).insert(str_of(&asked["call_id"])) {
+                        true => json!({}),
+                        false => json!({"error": "call_already_answered"}),
+                    }
                 }
                 _ => json!({}),
             })
@@ -2488,11 +2529,14 @@ mod tests {
         let places = Arc::new(tokio::sync::Semaphore::new(2));
         let admit = {
             let places = places.clone();
-            move |_: &Value, _: &str, may: bool| match may {
-                true => (places.clone().try_acquire_owned())
-                    .map(Place::Held)
-                    .map_err(|_| Full::Whole),
-                false => Err(Full::Whole),
+            move |_: &Value, _: &str| match places.clone().try_acquire_owned() {
+                Ok(place) => Admitted::Now(Place::Held(place)),
+                Err(_) => {
+                    let places = places.clone();
+                    Admitted::Wait(Box::pin(async move {
+                        Place::Held(places.acquire_owned().await.unwrap())
+                    }))
+                }
             }
         };
         let go = Arc::new(tokio::sync::Semaphore::new(0));
@@ -2587,9 +2631,14 @@ mod tests {
         };
         let budget: &'static crate::budget::Budget =
             Box::leak(Box::new(crate::budget::Budget::new(2)));
-        let admit = move |_: &Value, owner: &str, may: bool| match may {
-            true => budget.try_admit(owner).map(Place::Process),
-            false => Err(Full::Whole),
+        let admit = move |_: &Value, owner: &str| match budget.try_admit(owner) {
+            Ok(place) => Admitted::Now(Place::Process(place)),
+            Err(_) => {
+                let owner = owner.to_owned();
+                Admitted::Wait(Box::pin(async move {
+                    Place::Process(budget.admit(&owner).await)
+                }))
+            }
         };
         let go = Arc::new(tokio::sync::Semaphore::new(0));
         let run = {
@@ -2605,7 +2654,6 @@ mod tests {
         };
         let serving: Serving = Default::default();
         let nudge = Arc::new(Notify::new());
-        let ran = Arc::new(AtomicUsize::new(0));
         let took = |count: usize| {
             let taken = taken.clone();
             async move {
@@ -2621,25 +2669,44 @@ mod tests {
         took(2).await;
         tokio::time::sleep(Duration::from_millis(50)).await;
         assert_eq!(*taken.lock().unwrap(), ["a1", "b1"]);
-        for _ in 0..2 {
-            go.add_permits(1);
-            ran.fetch_add(1, Ordering::SeqCst);
-            tokio::time::timeout(Duration::from_secs(5), budget.freed())
-                .await
-                .expect("a place given back wakes the next look");
-            while answered.lock().unwrap().len() < ran.load(Ordering::SeqCst) {
-                tokio::time::sleep(Duration::from_millis(5)).await;
+        // A browser command waits for a place after c did.
+        let browsed = Arc::new(AtomicUsize::new(0));
+        let browser = {
+            let browsed = browsed.clone();
+            tokio::spawn(async move {
+                let place = budget.admit("x").await;
+                browsed.fetch_add(1, Ordering::SeqCst);
+                place
+            })
+        };
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        go.add_permits(1);
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                nudge.notified().await;
+                sweep(&client, &serving, &nudge, admit, run.clone())
+                    .await
+                    .unwrap();
+                if tokio::time::timeout(Duration::from_millis(200), took(3))
+                    .await
+                    .is_ok()
+                {
+                    break;
+                }
             }
-            sweep(&client, &serving, &nudge, admit, run.clone())
-                .await
-                .unwrap();
-        }
-        // The first place let go went to c, ahead of a's and b's backlogs.
-        tokio::time::timeout(Duration::from_secs(5), took(4))
-            .await
-            .unwrap();
-        let taken = taken.lock().unwrap();
-        assert_eq!(taken[2], "c1", "{taken:?}");
+        })
+        .await
+        .expect("a place given back goes to the next call");
+        // The first place let go went to c, ahead of a's and b's backlogs
+        // and of the browser command that came after it.
+        assert_eq!(
+            taken.lock().unwrap()[2],
+            "c1",
+            "{:?}",
+            taken.lock().unwrap()
+        );
+        assert_eq!(browsed.load(Ordering::SeqCst), 0);
+        browser.abort();
     }
 
     #[tokio::test]
