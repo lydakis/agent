@@ -11991,3 +11991,70 @@ both sides in every footprint run, and the gate passed.
 
 This change does not touch Sonny. Of the same job's Sonny rows, only the
 quiet window's CPU moved more than 15% (0.77 to 0.96 ms a second).
+
+## Release 0.10.2 against 0.10.1
+
+This measures every change since 0.10.1 together: v0.10.1 (c9902ec) against
+the release tree before #1179 and #1180 (main at 882b285; #1187 and #1188
+after it change only a test and the version). Each side runs its own daemon
+with its own Sonny, since the protocol moved from 85.
+
+The benchmark is `bench/ends.py` (#1163) at the low end (10 agents, one
+window) and the high end (10,000 stored agents, 30 busy, 8 scripts, 20 s). It
+ran locally on Linux 6.18 with 4 cores, glibc release builds, so jemalloc
+(#1158, musl builds only) is not in these numbers. Base and head alternated,
+two rounds each, except the 100-window high end, which ran once.
+
+### Low end
+
+| Measure | 0.10.1 | 0.10.2 |
+| --- | ---: | ---: |
+| key p99, ms | 2.38 / 1.20 | 1.12 / 1.26 |
+| turn p50, ms | 48.1 / 48.0 | 47.9 / 48.1 |
+| turn p99, ms | 53.3 / 50.5 | 51.4 / 52.4 |
+| idle daemon RSS, MiB | 18.5 / 19.5 | 22.6 / 21.2 |
+| idle window RSS, MiB | 21.3 / 22.1 | 26.2 / 26.3 |
+| idle window CPU, % | 0.20 / 0.15 | 0.10 / 0.10 |
+| idle window wakeups, /s | 25.9 / 26.5 | 6.5 / 6.7 |
+
+- **Keys and turns hold.** Every latency row overlaps.
+- **A quiet window wakes four times less.** #1176 reads keys from an event
+  stream instead of polling.
+- **Idle memory is higher.** The window is 4 to 5 MiB higher, which #1166
+  measured as clean shared code pages. The daemon is 2 to 3 MiB higher.
+
+### High end
+
+The store's one-time migration of nested repositories
+(`approvals::nested_gone`, run from a window's start until `<store>.migrated`
+records it) is marked done before the windows open, as it is on any store a
+window has opened once. Without the mark, every window of the run inspects all
+10,000 agents one by one at once, and that dominates the run: 32 windows sent
+about 100,000 inspects in 20 s on 0.10.2 against 26,000 on 0.10.1, because
+#1163 freed the loop that had throttled them. Both versions run the same
+migration.
+
+| Measure | 0.10.1 | 0.10.2 |
+| --- | ---: | ---: |
+| 32 windows, one project: windows CPU, % | 6.49 / 6.54 | 5.00 / 5.04 |
+| windows wakeups, /s | 1,712 / 1,717 | 1,230 / 1,218 |
+| daemon CPU, % | 123.8 / 124.3 | 134.0 / 133.1 |
+| key p99, ms | 9.8 / 10.3 | 13.3 / 10.8 |
+| worst key, ms | 58.0 / 16.5 | 14.2 / 12.3 |
+| turns finished | 8,018 / 8,127 | 8,198 / 8,220 |
+| scripts finished | 705 / 740 | 985 / 1,007 |
+| 100 windows, spread: windows CPU, % | 15.8 | 12.3 |
+| daemon CPU, % | 124.6 | 132.2 |
+| key p99, ms | 9.8 | 18.5 |
+| worst key, ms | 22.8 | 26.6 |
+| turns finished | 8,129 | 8,470 |
+| scripts finished | 743 | 1,028 |
+
+- **The daemon does more in the same time.** Scripts finished rise 38 to 40%
+  and turns 1 to 4%, as step writes no longer hold the loop (#1163) and a
+  parked turn's claim no longer does either (#1177). The daemon's 8 to 10
+  more CPU points go to that extra work.
+- **Windows cost less.** Windows CPU falls 23% at 32 windows and 22% at 100.
+- **Keys.** The worst key at 32 windows is 12 to
+  14 ms against 16 to 58 ms. Key p99 at 100 windows is 18.5 ms against 9.8 ms
+  in a single round.
