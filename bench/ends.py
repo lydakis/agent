@@ -352,8 +352,10 @@ def main():
                       'window': lambda: tree(windows.pids['lead'][0])}
             result['window_start_s'] = round(started, 3) if started else None
             result['idle'] = measured(groups, args.seconds, daemon.pid, control)
-            result['key_ms'] = spread([t for t in (windows.probe('lead') for _ in range(40))
-                                       if t is not None])
+            # A key with no echo in two seconds counts as two seconds, so a
+            # freeze shows.
+            result['key_ms'] = spread([t if t is not None else 2000.0
+                                       for t in (windows.probe('lead') for _ in range(40))])
             turns = []
             for n in range(args.turns):
                 began = time.monotonic()
@@ -389,7 +391,21 @@ def main():
                     stopping.wait(max(0, due - time.monotonic()))
                 connection.close()
 
+            failures = []
+
+            def need(response, what):
+                if 'result' not in response:
+                    raise RuntimeError(f'{what}: {response.get("error")}')
+                return response['result']
+
             def script(n):
+                try:
+                    run_script(n)
+                except Exception as error:  # the measurement fails below
+                    failures.append(f's{n}: {error}')
+                    stopping.set()
+
+            def run_script(n):
                 connection = Connection(sock, retain_durable=False)
                 bot, tag, turn = f's{n}', f'h{n}', 0
                 while not stopping.is_set():
@@ -408,14 +424,20 @@ def main():
                     if call is None:
                         break
                     at = dict(bot=bot, turn=call['turn'], call_id=call['call_id'])
-                    connection.request('take_call', **at)
+                    need(connection.request('take_call', **at), 'take_call')
                     for step in ('1', '2', '3'):
-                        connection.request('approve_step', **at, step=step, name='mcp__docs__read',
-                                           arguments={'path': step})
-                        connection.request('step_result', **at, step=step)
-                    connection.request('tool_result', **at, output='done')
-                    connection.request('wait', handles=[f'{bot}/{submitted["result"]["message"]}'],
-                                       timeout_ms=60_000)
+                        decided = need(connection.request('approve_step', **at, step=step,
+                                                          name='mcp__docs__read',
+                                                          arguments={'path': step}), 'approve_step')
+                        if decided.get('decision') != 'allow':
+                            raise RuntimeError(f'approve_step: {decided}')
+                        need(connection.request('step_result', **at, step=step), 'step_result')
+                    need(connection.request('tool_result', **at, output='done'), 'tool_result')
+                    handle = f'{bot}/{submitted["result"]["message"]}'
+                    ended = need(connection.request('wait', handles=[handle], timeout_ms=60_000),
+                                 'wait')['results'][handle]
+                    if ended.get('pending') or ended.get('status') != 'completed':
+                        raise RuntimeError(f'turn: {ended}')
                     finished[1] += 1
                     stopping.wait(max(0, due - time.monotonic()))
                 connection.close()
@@ -444,6 +466,8 @@ def main():
             stopping.set()
             for thread in threads:
                 thread.join(timeout=120)
+            if failures:
+                raise RuntimeError('scripts failed: ' + '; '.join(failures))
             result['turns_finished'] = finished[0]
             result['scripts_finished'] = finished[1]
             result.update(windows=args.windows, layout=args.layout, busy_agents=args.busy,

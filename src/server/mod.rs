@@ -1032,7 +1032,7 @@ impl Command {
                 | Command::StepResult { .. }
         )
     }
-    /// It ends or holds turns: the clients' writes on their way land first,
+    /// It ends or holds turns, or stops a call: the clients' writes on their way land first,
     /// as they did when each was awaited in turn, so none lets its client
     /// start work after it.
     fn ends_turns(&self) -> bool {
@@ -1043,6 +1043,7 @@ impl Command {
                 | Command::Delete { .. }
                 | Command::Pause { .. }
                 | Command::Shutdown { .. }
+                | Command::StopProcess { .. }
         )
     }
     /// The request's `op`, as `stats` counts it.
@@ -10264,6 +10265,16 @@ mod tests {
         drop(service);
         drop(store);
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_request_that_ends_a_turn_or_stops_a_call_waits_for_the_writes_on_their_way() {
+        let ends = |line: &str| serde_json::from_str::<Command>(line).unwrap().ends_turns();
+        assert!(ends(r#"{"op":"interrupt","bot":"a","turn":1}"#));
+        assert!(ends(r#"{"op":"stop_process","bot":"a","handle":"proc:1"}"#));
+        assert!(ends(r#"{"op":"pause","reason":"r"}"#));
+        assert!(!ends(r#"{"op":"resume"}"#));
+        assert!(!ends(r#"{"op":"tool_calls","tag":"t"}"#));
     }
 
     #[tokio::test]
