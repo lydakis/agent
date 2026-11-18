@@ -1436,7 +1436,9 @@ fn orphaned() -> bool {
 /// each change since, a line, in `looked.log`: a fire's start writes its
 /// own trigger's line, not every trigger's. Once the log would hold as
 /// many lines as there are triggers kept, the whole is written again and
-/// the log starts over, so the log stays shorter than the whole.
+/// the log starts over, so the log stays shorter than the whole. Each line
+/// is numbered, and the whole says the last number it holds, so lines a
+/// crash left in the log after the whole was written are passed over.
 #[derive(Debug, Default, PartialEq)]
 struct Kept {
     times: HashMap<String, (String, i64)>,
@@ -1444,7 +1446,13 @@ struct Kept {
     changed: BTreeSet<String>,
     /// Lines in the log.
     logged: usize,
+    /// The number of the last change written.
+    last: u64,
 }
+
+/// The key of the whole that holds the number of the last change in it:
+/// no trigger's name starts with a dot.
+const LAST: &str = ".last";
 
 impl Kept {
     fn get(&self, name: &str) -> Option<&(String, i64)> {
@@ -1486,30 +1494,33 @@ impl Kept {
     /// log after it. A line cut short by a crash is left out, and the log
     /// is written into the whole at once, so the next line starts clean.
     fn read(places: &Places) -> Self {
-        let mut times: HashMap<String, (String, i64)> = std::fs::read(places.looked())
+        let whole = std::fs::read(places.looked())
             .ok()
             .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
-            .and_then(|value| {
-                value.as_object().map(|map| {
-                    map.iter()
-                        .filter_map(|(name, v)| {
-                            Some((
-                                name.clone(),
-                                (v["generation"].as_str()?.to_owned(), v["looked"].as_i64()?),
-                            ))
-                        })
-                        .collect()
-                })
-            })
             .unwrap_or_default();
+        let mut times: HashMap<String, (String, i64)> = (whole.as_object().into_iter())
+            .flatten()
+            .filter_map(|(name, v)| {
+                Some((
+                    name.clone(),
+                    (v["generation"].as_str()?.to_owned(), v["looked"].as_i64()?),
+                ))
+            })
+            .collect();
+        let mut last = whole[LAST].as_u64().unwrap_or(0);
         let log = std::fs::read(places.looked_log()).unwrap_or_default();
         for line in log.split(|byte| *byte == b'\n') {
             let Ok(change) = serde_json::from_slice::<serde_json::Value>(line) else {
                 continue;
             };
-            let Some(name) = change["name"].as_str() else {
+            let (Some(name), Some(number)) = (change["name"].as_str(), change["n"].as_u64()) else {
                 continue;
             };
+            // Already in the whole, written after it.
+            if number <= last {
+                continue;
+            }
+            last = number;
             match (change["generation"].as_str(), change["looked"].as_i64()) {
                 (Some(generation), Some(looked)) => {
                     times.insert(name.to_owned(), (generation.to_owned(), looked))
@@ -1519,6 +1530,7 @@ impl Kept {
         }
         let mut kept = Self {
             times,
+            last,
             ..Self::default()
         };
         if !log.is_empty() {
@@ -1538,12 +1550,14 @@ impl Kept {
             return;
         }
         let mut lines = Vec::new();
+        let mut last = self.last;
         for name in &self.changed {
+            last += 1;
             let change = match self.times.get(name) {
-                Some((generation, looked)) => {
-                    serde_json::json!({"name": name, "generation": generation, "looked": looked})
-                }
-                None => serde_json::json!({ "name": name }),
+                Some((generation, looked)) => serde_json::json!({
+                    "n": last, "name": name, "generation": generation, "looked": looked
+                }),
+                None => serde_json::json!({ "n": last, "name": name }),
             };
             lines.extend(change.to_string().into_bytes());
             lines.push(b'\n');
@@ -1565,6 +1579,7 @@ impl Kept {
                 written(lines.len());
                 self.logged += self.changed.len();
                 self.changed.clear();
+                self.last = last;
             }
             Err(error) => {
                 let error = format!("{}: {error}", path.display());
@@ -1575,7 +1590,9 @@ impl Kept {
 
     /// Everything kept, written whole, and the log started over.
     fn write_whole(&mut self, places: &Places) {
-        let value: serde_json::Map<String, serde_json::Value> = (self.times.iter())
+        // Every change so far is in it, those not yet logged too.
+        let last = self.last + self.changed.len() as u64;
+        let mut value: serde_json::Map<String, serde_json::Value> = (self.times.iter())
             .map(|(name, (generation, looked))| {
                 (
                     name.clone(),
@@ -1583,24 +1600,29 @@ impl Kept {
                 )
             })
             .collect();
+        value.insert(LAST.to_owned(), last.into());
         let whole = serde_json::Value::Object(value).to_string();
+        if let Err(error) = trigger::replace_mode(&places.looked(), whole.as_bytes(), 0o600) {
+            eprintln!("{}", trigger::error_json(&error));
+            return;
+        }
+        written(whole.len());
+        self.changed.clear();
+        // The lines left in the log, should it not start over, are passed
+        // over when read: each is numbered at most the whole's last.
+        self.last = last;
         let path = places.looked_log();
-        let done =
-            trigger::replace_mode(&places.looked(), whole.as_bytes(), 0o600).and_then(|()| {
-                match std::fs::OpenOptions::new().write(true).open(&path) {
-                    Ok(log) => (log.set_len(0).and_then(|()| log.sync_data()))
-                        .map_err(|e| format!("{}: {e}", path.display())),
-                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-                    Err(e) => Err(format!("{}: {e}", path.display())),
-                }
-            });
-        match done {
-            Ok(()) => {
-                written(whole.len());
-                self.logged = 0;
-                self.changed.clear();
+        let started_over = match std::fs::OpenOptions::new().write(true).open(&path) {
+            Ok(log) => log.set_len(0).and_then(|()| log.sync_data()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(e),
+        };
+        match started_over {
+            Ok(()) => self.logged = 0,
+            Err(e) => {
+                let error = format!("{}: {e}", path.display());
+                eprintln!("{}", trigger::error_json(&error));
             }
-            Err(error) => eprintln!("{}", trigger::error_json(&error)),
         }
     }
 }
@@ -2646,6 +2668,43 @@ mod tests {
         // The log was written into the whole: the next line starts clean.
         assert_eq!(std::fs::metadata(places.looked_log()).unwrap().len(), 0);
         assert_eq!(Kept::read(&places).times, kept.times);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_crash_after_the_whole_is_written_and_before_the_log_starts_over_loses_nothing() {
+        let root =
+            std::env::temp_dir().join(format!("agent-scheduler-torn-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let places = Places::under(&root);
+        let mut kept = Kept::default();
+        for name in ["a", "b", "c", "d", "e", "f", "g", "h", "i", "j"] {
+            kept.insert(name.into(), ("g".into(), 60));
+        }
+        kept.write(&places);
+        // Logged: a at 100, then a at 200 and b gone.
+        kept.insert("a".into(), ("g".into(), 100));
+        kept.write(&places);
+        kept.insert("a".into(), ("g".into(), 200));
+        kept.remove("b");
+        kept.write(&places);
+        assert!(std::fs::metadata(places.looked_log()).unwrap().len() > 0);
+        // a at 300 and b back, not yet logged when the whole is written;
+        // the crash leaves the log as it was.
+        kept.insert("a".into(), ("g".into(), 300));
+        kept.insert("b".into(), ("g".into(), 50));
+        let log = std::fs::read(places.looked_log()).unwrap();
+        kept.write_whole(&places);
+        std::fs::write(places.looked_log(), &log).unwrap();
+        let read = Kept::read(&places);
+        assert_eq!(read.get("a"), Some(&("g".to_owned(), 300)));
+        assert_eq!(read.get("b"), Some(&("g".to_owned(), 50)));
+        assert_eq!(read.times, kept.times);
+        // And what is logged after it is read over it.
+        let mut again = read;
+        again.insert("d".into(), ("g".into(), 400));
+        again.write(&places);
+        assert_eq!(Kept::read(&places).get("d"), Some(&("g".to_owned(), 400)));
         let _ = std::fs::remove_dir_all(&root);
     }
 
