@@ -5,7 +5,7 @@
 //! A session serving a gate tag receives only the calls announced for it.
 use agent_runtime::{
     Error, Result, fail,
-    output::Output,
+    output::{Frame, Output},
     store::{Database, EVENT_PAGE_KINDS, Served, Store},
 };
 use serde_json::{Value, json};
@@ -45,6 +45,26 @@ impl Subscription {
     }
 }
 pub type Sub = Arc<Mutex<Subscription>>;
+/// An event on its way to the sessions that hear it, encoded when the
+/// first of them takes it and kept for the rest.
+pub struct Encoding<'a> {
+    pub event: &'a Value,
+    frame: Option<Result<Frame>>,
+}
+impl<'a> Encoding<'a> {
+    pub fn of(event: &'a Value) -> Self {
+        Self { event, frame: None }
+    }
+    /// Its JSON line, encoded on the first call.
+    pub fn frame(&mut self) -> Result<&Frame> {
+        let event = self.event;
+        (self
+            .frame
+            .get_or_insert_with(|| Frame::encode(event))
+            .as_ref())
+        .map_err(Clone::clone)
+    }
+}
 /// Whether `event` is one of `kinds`, or any event when none were named.
 fn wanted(kinds: Option<&Arc<HashSet<String>>>, event: &Value) -> bool {
     kinds.is_none_or(|kinds| (event["event"].as_str()).is_some_and(|kind| kinds.contains(kind)))
@@ -640,7 +660,10 @@ impl Hub {
             .collect()
     }
     /// Deliver to followers; `cursor` orders durable entries after replay.
-    fn fan_out(&self, bot: &str, event: &Value, cursor: Option<i64>) {
+    /// The event is encoded on its first delivery, and every follower
+    /// after queues the same bytes: an event nobody follows is never
+    /// encoded, and one many follow is encoded once.
+    fn fan_out(&self, bot: &str, event: &mut Encoding, cursor: Option<i64>) {
         let subs: Vec<Sub> = {
             let inner = self.inner.lock().unwrap();
             let followers = |name: &str| {
@@ -662,12 +685,16 @@ impl Hub {
                 if let Some(c) = cursor {
                     s.last_cursor = c;
                 }
-                if !wanted(s.kinds.as_ref(), event) {
+                if !wanted(s.kinds.as_ref(), event.event) {
                     continue;
                 }
                 (s.session, s.output.clone())
             };
-            if output.try_send(event.clone()).is_err() {
+            if event
+                .frame()
+                .and_then(|frame| output.try_send_frame(frame))
+                .is_err()
+            {
                 self.counts.dropped.fetch_add(1, Ordering::Relaxed);
                 self.close_session(session);
                 output.close();
@@ -693,10 +720,14 @@ impl Hub {
     pub async fn durable(&self, bot: &str, entry: Value) -> Result<()> {
         let cursor = entry["cursor"].as_i64();
         self.counts.durable.fetch_add(1, Ordering::Relaxed);
-        self.fan_out(bot, &entry, cursor);
+        let mut event = Encoding::of(&entry);
+        self.fan_out(bot, &mut event, cursor);
         let mut sent = Ok(());
         for output in self.firehose() {
-            sent = output.send(entry.clone()).await;
+            sent = match event.frame() {
+                Ok(frame) => output.send_frame(frame).await,
+                Err(error) => Err(error),
+            };
             if sent.is_err() {
                 break;
             }
@@ -730,9 +761,10 @@ impl Hub {
     }
     pub async fn live(&self, bot: &str, event: Value) -> Result<()> {
         self.counts.live.fetch_add(1, Ordering::Relaxed);
-        self.fan_out(bot, &event, None);
+        let mut event = Encoding::of(&event);
+        self.fan_out(bot, &mut event, None);
         for output in self.firehose() {
-            output.send(event.clone()).await?;
+            output.send_frame(event.frame()?).await?;
             self.counts.delivered(&output);
         }
         Ok(())
@@ -947,6 +979,57 @@ mod tests {
         assert_eq!(got, event(2, "turn_finished"));
         // What it passed by still counts as seen: no replay sends it later.
         assert_eq!(sub.lock().unwrap().last_cursor, 2);
+    }
+
+    #[tokio::test]
+    async fn every_follower_queues_the_one_encoding_at_its_own_cost() {
+        use agent_runtime::output::PACKET_BYTES;
+        let hub = Hub::default();
+        let mut sessions = Vec::new();
+        for session in 1..=3 {
+            let (output, lines) = Output::in_process();
+            // The third names kinds the event is not: it gets nothing.
+            let kinds = (session == 3).then(|| ["turn_finished".to_owned()].into());
+            let sub = hub.subscribe("B", session, output.clone(), 0, kinds);
+            sub.lock().unwrap().live = true;
+            sessions.push((output, lines));
+        }
+        let room = sessions[0].0.room();
+        let event = json!({"bot": "B", "event": "text_delta", "data": {"text": "word"}});
+        hub.live("B", event.clone()).await.unwrap();
+        // Charged to each session's budget while it waits to be read.
+        let cost = serde_json::to_vec(&event).unwrap().len() + 1 + PACKET_BYTES;
+        assert_eq!(sessions[0].0.room(), room - cost);
+        assert_eq!(sessions[1].0.room(), room - cost);
+        assert_eq!(sessions[2].0.room(), room);
+        assert_eq!(hub.stats()["delivered"], 2);
+        // The same bytes, not a copy.
+        let first = sessions[0].1.next().await.unwrap();
+        let second = sessions[1].1.next().await.unwrap();
+        assert_eq!(serde_json::from_slice::<Value>(&first).unwrap(), event);
+        assert_eq!(first.as_ptr(), second.as_ptr());
+        assert_eq!(first.len(), cost - PACKET_BYTES);
+    }
+
+    #[tokio::test]
+    async fn an_event_too_large_to_send_closes_each_follower_it_reaches() {
+        let hub = Hub::default();
+        let mut outputs = Vec::new();
+        for session in 1..=2 {
+            let (output, _lines) = Output::in_process();
+            let sub = hub.subscribe("B", session, output.clone(), 0, None);
+            sub.lock().unwrap().live = true;
+            outputs.push(output);
+        }
+        let text = "x".repeat(agent_runtime::output::MAX_EVENT);
+        hub.live(
+            "B",
+            json!({"bot": "B", "event": "text_delta", "data": {"text": text}}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(hub.stats()["dropped"], 2);
+        assert_eq!(hub.deliveries("B", 1) + hub.deliveries("B", 2), 0);
     }
 
     #[test]
