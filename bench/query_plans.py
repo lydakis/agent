@@ -29,7 +29,11 @@ OPTIONAL = {'{glob}': ('', " AND t.bot GLOB ?3 AND t.bot >= ?4 AND t.bot < ?4 ||
             '{open}': ('', ' AND closed_ms IS NULL'),
             '{order}': ('ASC', 'DESC'),
             '{line}': ('', "AND m.id IN (SELECT id FROM messages WHERE bot=?1 AND status='queued' "
-                           "UNION ALL SELECT id FROM messages WHERE bot=?1 AND status='ready')")}
+                           "UNION ALL SELECT id FROM messages WHERE bot=?1 AND status='ready')"),
+            '{bots}': ('m.bot=?1', 'm.bot GLOB ?1'),
+            '{kinds}': ('', ' AND m.from_bot IS NULL AND m.origin IS NULL', ' AND m.from_bot IS NOT NULL'),
+            '{text}': ('',),
+            '{text_node}': ('',)}
 
 STRUCTURAL_SCANS = {'SCAN CONSTANT ROW', 'SCAN c', 'SCAN chain', 'SCAN held', 'SCAN kin', 'SCAN sqlite_master',
                     'SCAN sqlite_sequence'}
@@ -89,8 +93,11 @@ def main():
         if statement in seen:
             continue
         seen.add(statement)
-        numbered = [int(n) for n in re.findall(r'\?(\d+)', statement)]
-        count = max(numbered) if numbered else statement.count('?')
+        # As SQLite numbers them: `?N` is N, a bare `?` one past the
+        # largest so far.
+        count = 0
+        for number in re.findall(r'\?(\d*)', statement):
+            count = max(count, int(number)) if number else count + 1
         try:
             rows = conn.execute('EXPLAIN QUERY PLAN ' + statement, tuple([1] * count)).fetchall()
         except sqlite3.Error as error:

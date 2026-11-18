@@ -104,6 +104,8 @@ struct Options {
     limit: Option<usize>,
     /// `usage --since`: how far back, and `--bucket`: the series' step.
     since_ms: Option<u64>,
+    /// `messages --from`: the kinds of sender listed.
+    from_kinds: Option<Vec<String>>,
     /// `audit`'s filters, each one of the trail's words, and its bounds.
     audit: AuditFilters,
     bucket_ms: Option<u64>,
@@ -208,6 +210,7 @@ fn parse(args: &[String]) -> Result<Options> {
         timeout_ms: None,
         grace_ms: 0,
         since_ms: None,
+        from_kinds: None,
         audit: AuditFilters::default(),
         bucket_ms: None,
         budget_tokens: None,
@@ -392,6 +395,9 @@ fn parse(args: &[String]) -> Result<Options> {
                     "--grace" => options.grace_ms = crate::cli::duration_ms(flag, &value)?,
                     "--since" => options.since_ms = Some(crate::cli::duration_ms(flag, &value)?),
                     "--bucket" => options.bucket_ms = Some(crate::cli::duration_ms(flag, &value)?),
+                    "--from" => {
+                        options.from_kinds = Some(value.split(',').map(str::to_owned).collect())
+                    }
                     "--timeout" => {
                         options.timeout_ms = Some(crate::cli::duration_ms(flag, &value)?)
                     }
@@ -2417,12 +2423,14 @@ fn follow_from(options: &Options) -> Result<Value> {
 }
 
 fn follow(options: &Options) -> Result<i32> {
-    if options.all {
-        // Every bot's events from a store-wide cursor, then live, until the
-        // connection ends: the fleet controller's view.
+    // A GLOB pattern names whichever bots match, later ones too.
+    let pattern = (options.bot.as_deref()).filter(|bot| bot.contains(['*', '?', '[']));
+    if options.all || pattern.is_some() {
+        // Every bot's events, or a pattern's, from a store-wide cursor,
+        // then live, until the connection ends: the fleet controller's view.
         let mut connection = connect_running(options)?;
         let mut request = follow_from(options)?;
-        request["bot"] = json!("*");
+        request["bot"] = json!(pattern.unwrap_or("*"));
         connection.request("follow", request)?;
         let mut renderer = Renderer::new(options.pretty, None, &options.target);
         loop {
@@ -3032,12 +3040,14 @@ fn turns(options: &Options) -> Result<i32> {
     })
 }
 
-/// A bot's messages, each with its number, where it stands and the turn
-/// that took it in, paged as `turns` pages its runs.
+/// Messages, each with its number, where it stands and the turn that took
+/// it in, paged as `turns` pages its runs: one bot's, or every bot's a
+/// pattern names, sent `--since` ago or later, `--from` some senders.
 fn messages(options: &Options) -> Result<i32> {
     pages(options, "messages", |message| {
         format!(
-            "{:>6} {:<10} turn {:>6} {:<6}  {}",
+            "{:<20} {:>6} {:<10} turn {:>6} {:<6}  {}",
+            message["bot"].as_str().unwrap_or(""),
             message["message"],
             message["status"].as_str().unwrap_or(""),
             message["turn"]
@@ -3071,14 +3081,19 @@ fn pages(options: &Options, op: &str, row: impl Fn(&Value) -> String) -> Result<
     let mut before = Value::Null;
     let mut left = options.limit.unwrap_or(usize::MAX);
     let mut first = true;
+    // One time for every page, so a slow reader loses none to the clock.
+    let since = since_ms(options)?;
     if !options.pretty {
         say_raw!("[");
     }
     loop {
-        let page = connection.request(
-            op,
-            json!({"bot":bot,"after":after,"before":before,"limit":left.min(256),"newest":options.newest}),
-        )?;
+        let mut ask = json!({"bot":bot,"after":after,"before":before,"limit":left.min(256),
+            "newest":options.newest});
+        if op == "messages" {
+            ask["since_ms"] = json!(since);
+            ask["from"] = json!(options.from_kinds);
+        }
+        let page = connection.request(op, ask)?;
         let turns = page[op]
             .as_array()
             .ok_or(Error::new("daemon_protocol_mismatch"))?;
