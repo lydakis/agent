@@ -11225,7 +11225,9 @@ run a side at each size.
 | 100 | one | head | 1.61 | 10.46 | 19.0 | 2,091 | 141.6 | 41.9 | 38.6 | 6,153 | 9,142 |
 
 No pause over 100 ms on either side. Key to character stays far under the
-50 ms bar, and every other column moves within run-to-run spread. These
+50 ms bar, and every other column moves within run-to-run spread. Head's
+11.25 ms p99 at 32 windows in one folder did not come back: two more runs
+a side there read 6.27 and 6.14 ms on head, 7.20 and 9.01 ms on main. These
 windows follow many agents, each with few followers, so the encoding saved
 here is small; the fan-out table above is where it shows. The idle daemon
 read about 2 MiB more on head in every low-end run (18.4 to 19.6 against
