@@ -211,6 +211,130 @@ fn start(scheduler: Scheduler, file: &Path, label: &str) -> Result<(), String> {
     }
 }
 
+/// What a listing of the automations adds when the scheduler does not
+/// run: its key, and the system's own words for the job's state.
+pub const NOT_RUNNING: &str = "scheduler_not_running";
+
+/// Whether this HOME's scheduler runs, as one read of the system says:
+/// none while it runs, else the service manager's own words for its
+/// state, as `failed (Result: resources)`. A fact only: nothing is
+/// started or changed.
+pub fn not_running() -> Option<String> {
+    let home = PathBuf::from(std::env::var_os("HOME")?);
+    let label = label(&home);
+    match Scheduler::here() {
+        Scheduler::Systemd => {
+            let manager = match UserManager::find() {
+                Ok(manager) => manager,
+                Err(error) => return Some(error),
+            };
+            let out = std::process::Command::new("systemctl")
+                .arg("--user")
+                .args([
+                    "show",
+                    &format!("{label}.service"),
+                    "--property=LoadState,ActiveState,SubState,Result,NRestarts",
+                ])
+                .env("XDG_RUNTIME_DIR", &manager.runtime)
+                .stdin(std::process::Stdio::null())
+                .output();
+            match out {
+                Ok(out) if out.status.success() => {
+                    systemd_state(&String::from_utf8_lossy(&out.stdout))
+                }
+                Ok(out) => Some(last_line(&out.stderr, &out.stdout)),
+                Err(error) => Some(format!("systemctl: {error}")),
+            }
+        }
+        Scheduler::Launchd => {
+            let out = std::process::Command::new("/bin/launchctl")
+                .args(["print", &format!("{}/{label}", launchd_domain())])
+                .stdin(std::process::Stdio::null())
+                .output();
+            match out {
+                Ok(out) if out.status.success() => {
+                    launchd_state(&String::from_utf8_lossy(&out.stdout))
+                }
+                Ok(out) => Some(last_line(&out.stderr, &out.stdout)),
+                Err(error) => Some(format!("launchctl: {error}")),
+            }
+        }
+    }
+}
+
+/// What `systemctl show` says of the job, in `systemctl status`'s words
+/// for its state (`failed (Result: resources)`), with its restart
+/// counter as systemd logs it: none while it is active.
+fn systemd_state(show: &str) -> Option<String> {
+    let get = |key: &str| {
+        (show.lines())
+            .find_map(|line| line.strip_prefix(key)?.strip_prefix('='))
+            .unwrap_or_default()
+            .trim()
+    };
+    let (load, active, sub, result) = (
+        get("LoadState"),
+        get("ActiveState"),
+        get("SubState"),
+        get("Result"),
+    );
+    if matches!(active, "active" | "reloading") {
+        return None;
+    }
+    let mut said = Vec::new();
+    if !load.is_empty() && load != "loaded" {
+        said.push(load.to_owned());
+    }
+    let mut state = active.to_owned();
+    if !sub.is_empty() && sub != active {
+        state += &format!(" ({sub})");
+    }
+    if !result.is_empty() && result != "success" {
+        state += &format!(" (Result: {result})");
+    }
+    said.push(state);
+    if let Some(n) = get("NRestarts").parse::<u64>().ok().filter(|n| *n > 0) {
+        said.push(format!("restart counter is at {n}"));
+    }
+    Some(said.join(" · "))
+}
+
+/// What `launchctl print` says of the job, in its own words (`state =
+/// not running · last exit code = 78: EX_CONFIG`): none while it runs.
+fn launchd_state(print: &str) -> Option<String> {
+    let get = |key: &str| {
+        (print.lines()).find_map(|line| {
+            let value = line
+                .trim()
+                .strip_prefix(key)?
+                .trim_start()
+                .strip_prefix('=')?;
+            Some(value.trim().to_owned())
+        })
+    };
+    let state = get("state").unwrap_or_default();
+    if state == "running" {
+        return None;
+    }
+    let mut said = vec![format!("state = {state}")];
+    if let Some(exit) = get("last exit code") {
+        said.push(format!("last exit code = {exit}"));
+    }
+    Some(said.join(" · "))
+}
+
+/// The last line a command that failed printed, its error first.
+fn last_line(stderr: &[u8], stdout: &[u8]) -> String {
+    [stderr, stdout]
+        .iter()
+        .find_map(|out| {
+            let out = String::from_utf8_lossy(out);
+            let line = out.lines().rev().find(|l| !l.trim().is_empty())?;
+            Some(line.trim().to_owned())
+        })
+        .unwrap_or_else(|| "no state".into())
+}
+
 /// The logged-in user's systemd manager, found by its runtime folder as
 /// `systemctl --user` finds it.
 pub(crate) struct UserManager {
@@ -1734,5 +1858,43 @@ mod tests {
         assert!(unit.contains("KillMode=process"));
         assert!(unit.contains("Environment=\"SHELL=/bin/zsh\""));
         assert!(unit.contains(&program(Scheduler::Systemd, sonny)));
+    }
+
+    #[test]
+    fn a_scheduler_that_does_not_run_is_said_in_the_system_s_own_words() {
+        // Running: nothing to say.
+        let running =
+            "LoadState=loaded\nActiveState=active\nSubState=running\nResult=success\nNRestarts=0\n";
+        assert_eq!(systemd_state(running), None);
+        // 11-17: a drop-in named an environment file that had moved.
+        let failed = "LoadState=loaded\nActiveState=failed\nSubState=failed\nResult=resources\nNRestarts=5\n";
+        assert_eq!(
+            systemd_state(failed).as_deref(),
+            Some("failed (Result: resources) · restart counter is at 5")
+        );
+        let waiting = "LoadState=loaded\nActiveState=activating\nSubState=auto-restart\nResult=exit-code\nNRestarts=2\n";
+        assert_eq!(
+            systemd_state(waiting).as_deref(),
+            Some("activating (auto-restart) (Result: exit-code) · restart counter is at 2")
+        );
+        let gone = "LoadState=not-found\nActiveState=inactive\nSubState=dead\nResult=success\nNRestarts=0\n";
+        assert_eq!(
+            systemd_state(gone).as_deref(),
+            Some("not-found · inactive (dead)")
+        );
+        let print = "gui/501/sonny.scheduler.0a = {\n\tactive count = 0\n\tstate = running\n\tlast exit code = (never exited)\n}\n";
+        assert_eq!(launchd_state(print), None);
+        let print = "gui/501/sonny.scheduler.0a = {\n\tactive count = 0\n\tstate = not running\n\truns = 9\n\tlast exit code = 78: EX_CONFIG\n\tevent triggers = {\n\t\tstate = 1\n\t}\n}\n";
+        assert_eq!(
+            launchd_state(print).as_deref(),
+            Some("state = not running · last exit code = 78: EX_CONFIG")
+        );
+        assert_eq!(
+            last_line(
+                b"Bad request.\nCould not find service \"sonny.scheduler.0a\" in domain for user gui: 501\n",
+                b""
+            ),
+            "Could not find service \"sonny.scheduler.0a\" in domain for user gui: 501"
+        );
     }
 }

@@ -12332,6 +12332,7 @@ impl App {
             self.turns.clone(),
         );
         view.set_tasks(&self.blanks.tasks);
+        self.read_scheduler(&view);
         self.watch = Some(Watch {
             project,
             rows: Vec::new(),
@@ -12624,6 +12625,19 @@ impl App {
         view.loaded(window, read.map_err(|error| error.to_string()), prices);
     }
 
+    /// Whether the scheduler runs, read beside the window while
+    /// `/background` lists an automation: one status read of the system's
+    /// job, which the card says when it does not run.
+    fn read_scheduler(&self, view: &background::View) {
+        if let Some(state) = view.scheduler_query() {
+            let woken = self.woken.clone();
+            tokio::task::spawn_blocking(move || {
+                state.came(scheduler::not_running());
+                woken.notify_one();
+            });
+        }
+    }
+
     async fn reread(&mut self) {
         // `/sky` follows the daemon live and reads nothing again.
         if self.watch.as_ref().is_some_and(|w| w.sky.is_some()) {
@@ -12635,6 +12649,7 @@ impl App {
             if view.commands_due() {
                 self.read_commands(&mut view).await;
             }
+            self.read_scheduler(&view);
             // The open command's newest lines, beside the window.
             if let Some((query, output)) = view.output_query() {
                 let (client, woken) = (self.client.clone(), self.woken.clone());
