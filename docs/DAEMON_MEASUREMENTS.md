@@ -11277,14 +11277,16 @@ the cursor's range; stable plans keep it a rowid range, never the
 `events_bot_cursor` prefix range, which sorts every matching entry for
 each page and grows with the square of a large pattern's backlog). The
 other bots' rows are still passed over, once, but in SQLite, without being
-decoded:
+decoded. Each page also ends at the newest event when it began, and a
+short page moves the cursor there, so the switch to live (on the writer)
+reads only the events written since, never a pattern's sparse tail:
 
 | Follow | To `follow_live`, s | Rows passed over per event | Daemon CPU, s | Unrelated read p99 / max, ms |
 |---|---:|---:|---:|---:|
-| one agent by name | 0.02 | 1 | 0.4 | 2.0 / 3.1 |
-| one project | 0.06 | 100 | 0.4 | 1.6 / 4.4 |
-| 100 projects | 1.76 | 100 | 4.8 | 10.1 / 261.6 |
-| 100 projects, one kind | 1.06 | 100 | 3.7 | 2.1 / 210.4 |
+| one agent by name | 0.02 | 1 | 0.4 | 2.1 / 4.1 |
+| one project | 0.05 | 100 | 0.4 | 1.1 / 4.6 |
+| 100 projects | 1.58 | 100 | 4.4 | 2.9 / 220.9 |
+| 100 projects, one kind | 1.01 | 100 | 3.4 | 1.6 / 212.7 |
 
 Every follower, in every row, received exactly the store's events for its
 selector after cursor 0, in order, none missing and none twice, across the

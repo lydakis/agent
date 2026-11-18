@@ -3459,20 +3459,22 @@ const KIND_CURSORS: &str = "SELECT id FROM events INDEXED BY events_kind_cursor 
 /// its own unless wrapped (SQLite flattens the wrapper).
 const KIND_ARM: &str = "SELECT * FROM (SELECT id FROM events INDEXED BY events_kind_cursor
     WHERE kind=?3 AND id>?1 ORDER BY id LIMIT ?2)";
-/// A kind's cursors of the bots a pattern matches, in place of `id>?1`.
-const KIND_MATCHING: &str = "id>?1 AND bot GLOB ?N";
+/// A kind's cursors of the bots a pattern matches, up to the newest
+/// event when the page started, in place of `id>?1`.
+const KIND_MATCHING: &str = "id>?1 AND id<=?M AND bot GLOB ?N";
 
 /// [`KINDS_PAGE`] for `kinds` distinct kinds bound from `?3` on, as one
 /// statement: the page's first `?2` are among each kind's first `?2`.
-/// With a `pattern`, bound after the kinds, each kind's are only the bots
-/// it matches ([`KIND_MATCHING`]).
+/// With a `pattern`, bound after the kinds and followed by the newest
+/// cursor, each kind's are only the bots it matches ([`KIND_MATCHING`]).
 fn kinds_page(kinds: usize, pattern: bool) -> String {
     let page = re_spaced(KINDS_PAGE);
     let cursors = re_spaced(KIND_CURSORS);
     let matching = |arm: String| match pattern {
         true => arm.replace(
             "id>?1",
-            &re_spaced(KIND_MATCHING).replace("?N", &format!("?{}", kinds + 3)),
+            &(re_spaced(KIND_MATCHING).replace("?N", &format!("?{}", kinds + 3)))
+                .replace("?M", &format!("?{}", kinds + 4)),
         ),
         false => arm,
     };
@@ -15128,16 +15130,33 @@ impl Database {
             events.push(item);
             Ok(true)
         };
+        // A pattern's page reads up to the newest event committed as it
+        // starts: one that comes back short passed over every other bot's
+        // event up to it, so its cursor moves there, and the next page, or
+        // the check as a follow goes live, starts past what this one read.
+        let top: Option<i64> = match pattern {
+            Some(_) => Some(self.conn.query_row(
+                "SELECT COALESCE(MAX(id),0) FROM events",
+                [],
+                |r| r.get(0),
+            )?),
+            None => None,
+        };
         let mut stmt;
         let mut rows = match kinds {
-            None => {
-                stmt = self.conn.prepare_cached(match (name, pattern) {
-                    (Some(_), _) => "SELECT id,turn,kind,data,bot,written_ms,message FROM events WHERE bot=?1 AND id>?2 ORDER BY id LIMIT ?3",
-                    (None, Some(_)) => "SELECT id,turn,kind,data,bot,written_ms,message FROM events WHERE bot GLOB ?1 AND id>?2 ORDER BY id LIMIT ?3",
-                    (None, None) => "SELECT id,turn,kind,data,bot,written_ms,message FROM events WHERE ?1 IS NULL AND id>?2 ORDER BY id LIMIT ?3",
-                })?;
-                stmt.query(params![name.or(pattern), after, limit as i64])?
-            }
+            None => match (pattern, top) {
+                (Some(pattern), Some(top)) => {
+                    stmt = self.conn.prepare_cached("SELECT id,turn,kind,data,bot,written_ms,message FROM events WHERE bot GLOB ?1 AND id>?2 AND id<=?4 ORDER BY id LIMIT ?3")?;
+                    stmt.query(params![pattern, after, limit as i64, top])?
+                }
+                _ => {
+                    stmt = self.conn.prepare_cached(match name {
+                        Some(_) => "SELECT id,turn,kind,data,bot,written_ms,message FROM events WHERE bot=?1 AND id>?2 ORDER BY id LIMIT ?3",
+                        None => "SELECT id,turn,kind,data,bot,written_ms,message FROM events WHERE ?1 IS NULL AND id>?2 ORDER BY id LIMIT ?3",
+                    })?;
+                    stmt.query(params![name, after, limit as i64])?
+                }
+            },
             Some(kinds) => {
                 let mut kinds = kinds.to_vec();
                 kinds.sort_unstable();
@@ -15151,16 +15170,22 @@ impl Database {
                 let most = limit as i64;
                 let mut values: Vec<&dyn rusqlite::ToSql> = vec![&after, &most];
                 values.extend(kinds.iter().map(|kind| kind as &dyn rusqlite::ToSql));
-                if let Some(pattern) = &pattern {
+                if let (Some(pattern), Some(top)) = (&pattern, &top) {
                     values.push(pattern);
+                    values.push(top);
                 }
                 stmt.query(&values[..])?
             }
         };
+        let mut whole = true;
         while let Some(row) = rows.next()? {
             if !take(row)? {
+                whole = false;
                 break;
             }
+        }
+        if let Some(top) = top.filter(|_| whole && events.len() < limit) {
+            cursor = cursor.max(top);
         }
         let pruned: i64 = match name {
             Some(name) => {
@@ -16334,7 +16359,10 @@ impl Database {
 
     /// The smallest message number sent at or after `ms`, by bisection
     /// over numbers: times rise with them. One past the newest when none
-    /// is; a message with no time counts as older.
+    /// is. A message with no time (kept from before messages had times,
+    /// whose events retention removed) counts as sent with the next one
+    /// that has one, so a range never passes over a dated message for an
+    /// undated one beside it; one after the newest dated is never older.
     fn first_sent(&self, ms: i64) -> Result<i64> {
         let bounds: Option<(i64, i64)> = self.conn.query_row(
             "SELECT (SELECT MIN(id) FROM messages),(SELECT MAX(id) FROM messages)",
@@ -16346,7 +16374,7 @@ impl Database {
         };
         let mut high = high + 1;
         let mut at = self.conn.prepare_cached(
-            "SELECT id,COALESCE(sent_ms,-1) FROM messages WHERE id>=? ORDER BY id LIMIT 1",
+            "SELECT id,sent_ms FROM messages WHERE id>=? AND sent_ms IS NOT NULL ORDER BY id LIMIT 1",
         )?;
         while low < high {
             let middle = low + (high - low) / 2;
@@ -21227,6 +21255,15 @@ mod tests {
         };
         let every: Vec<i64> = (1..=300).filter(|i| i % 3 != 2).collect();
         assert_eq!(read(None), every);
+        // A short page passed every other bot's event up to the newest:
+        // its cursor is there, so going live reads past nothing again.
+        let short = db.events_matching("shop.*", None, 290, 256).unwrap();
+        assert_eq!(short["events"].as_array().unwrap().len(), 7);
+        assert_eq!(short["next_cursor"], 300);
+        let none = db
+            .events_matching("shop.*", Some(&["accepted"]), 0, 256)
+            .unwrap();
+        assert_eq!(none["next_cursor"], 300);
         let finished: Vec<i64> = every.iter().copied().filter(|i| i % 10 == 0).collect();
         assert_eq!(read(Some(&["turn_finished"])), finished);
         assert_eq!(read(Some(&["turn_finished", "accepted"])), finished);
