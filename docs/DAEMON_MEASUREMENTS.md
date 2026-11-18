@@ -11179,14 +11179,18 @@ the active limit still write from the loop: each is several steps that
 later requests depend on.
 
 All on Linux x86_64 (4 CPUs), 2026-11-18, with release builds made the same
-way (`cargo build --release --workspace --bins`). The Mac was not measured.
+way (`cargo build --release --workspace --bins`): main (ae1bf65) against
+the change at 82b1c7f, which is main merged in plus every commit above.
+The slow-disk screen ran on `bench/held_reads.py` as committed here, and
+the low and high end on `bench/ends.py` at 0920334. The later commits to
+either only make a run fail when a worker's request is refused or its
+turn does not end completed. `bench/ends.py` scans the process table once
+per sample for all windows together and divides CPU by the time actually
+measured. It also reads summed PSS beside summed RSS, after
+the CPU window, so a window's shared binary pages count once. The Mac was
+not measured.
 
 ### Slow disk, with scripts running
-
-Main (652af4b) against the change at 2100e79. The commits after it only
-make the requests that end or hold turns wait for the writes on their way,
-answer writes in the order they were sent, and hold a write's input credit
-until it lands.
 
 `bench.held_reads` with `slow_sync.c` (every sync 300 ms), 424 bots, 30
 running turns back to back and 8 running code-mode scripts (`--scripts`:
@@ -11195,20 +11199,15 @@ answer), 20 s. Milliseconds, p50 / most.
 
 | Side | `approvals` | `inspect` | `bots` | New connection's `ready` | Turns | Scripts | Loop held |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| main | 2,651 / 3,872 | 2,721 / 3,947 | 2,721 / 4,245 | 3,090 / 4,153 | 120 | 8 | 31.5 s |
-| change | 1.4 / 1,173 | 0.8 / 914 | 2.2 / 613 | 0.8 / 830 | 240 | 16 | 6.1 s |
+| main | 2,643 / 3,268 | 2,714 / 3,342 | 2,737 / 3,946 | 2,778 / 3,549 | 146 | 8 | 31.4 s |
+| change | 1.3 / 2,411 | 0.8 / 605 | 2.3 / 301 | 0.7 / 2,022 | 262 | 16 | 7.6 s |
 
-What still holds the loop is `resume` (a paused turn going on, which
-awaits its claim inline) and `settle`; those are left for a later change.
+On main, `step_result`, `approve_step`, `take_call` and `tool_calls`
+alone held the loop for 21.1 s of it. With the change, what still
+holds the loop is `resume` (6.4 s: a paused turn going on awaits its claim
+inline), `submit` and `settle`; those are left for a later change.
 
 ### Low end and high end
-
-Main (ae1bf65) against the change at 82b1c7f, which is main merged in
-plus every commit above. The harness was `bench/ends.py` at 0920334. It
-scans the process table once per sample for all windows together and
-divides CPU by the time actually measured. It also reads summed PSS
-beside summed RSS, after the CPU window, so a window's shared binary
-pages count once.
 
 Sonny's windows here run with `--no-layout`, so no lead follows the fleet
 (`Fleet::start`). These screens measure the daemon's write lane and what

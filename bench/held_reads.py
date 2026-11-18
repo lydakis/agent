@@ -113,6 +113,25 @@ def main():
             control.request('submit', bot=f'b{n}', request_id=f'g{n}', prompt='shell:true')
         stopping = threading.Event()
         finished = [0]
+        failures = []
+
+        def refused_busy(submitted):
+            # Only a bot still ending its last turn is tried again.
+            if 'result' in submitted:
+                return False
+            error = submitted.get('error')
+            assert (error.get('code') if isinstance(error, dict) else error) == 'bot_busy', submitted
+            return True
+
+        def guarded(work, *args):
+            # A worker that fails ends the screen with no measurement.
+            def run():
+                try:
+                    work(*args)
+                except Exception as error:
+                    failures.append(f'{work.__name__}{args}: {error!r}')
+                    stopping.set()
+            return threading.Thread(target=run)
 
         def busy(n):
             connection = Connection(sock, retain_durable=False)
@@ -120,11 +139,13 @@ def main():
             while not stopping.is_set():
                 turn += 1
                 submitted = connection.request('submit', bot=bot, request_id=f'r{turn}', prompt='delay:50')
-                if 'result' not in submitted:
+                if refused_busy(submitted):
                     time.sleep(.05)
                     continue
                 handle = f'{bot}/{submitted["result"]["message"]}'
-                connection.request('wait', handles=[handle], timeout_ms=60_000)
+                ended = connection.request('wait', handles=[handle], timeout_ms=60_000)
+                found = ended['result']['results'][handle]
+                assert not found.get('pending') and found.get('status') == 'completed', found
                 finished[0] += 1
             connection.close()
 
@@ -145,7 +166,7 @@ def main():
             while not stopping.is_set():
                 turn += 1
                 submitted = connection.request('submit', bot=bot, request_id=f'r{turn}', prompt='call:exec')
-                if 'result' not in submitted:
+                if refused_busy(submitted):
                     time.sleep(.05)
                     continue
                 call = None
@@ -164,8 +185,10 @@ def main():
                     assert stepped.get('result', {}).get('decision') == 'allow', stepped
                     assert 'result' in timed(connection, 'step_result', **at, step=step)
                 assert 'result' in timed(connection, 'tool_result', **at, output='done')
-                connection.request('wait', handles=[f'{bot}/{submitted["result"]["message"]}'],
-                                   timeout_ms=60_000)
+                handle = f'{bot}/{submitted["result"]["message"]}'
+                ended = connection.request('wait', handles=[handle], timeout_ms=60_000)
+                found = ended['result']['results'][handle]
+                assert not found.get('pending') and found.get('status') == 'completed', found
                 scripts[0] += 1
             connection.close()
 
@@ -190,17 +213,21 @@ def main():
                 connection.close()
                 stopping.wait(1)
 
-        threads = [threading.Thread(target=busy, args=(n,)) for n in range(args.busy)]
-        threads += [threading.Thread(target=script, args=(n,)) for n in range(args.scripts)]
+        threads = [guarded(busy, n) for n in range(args.busy)]
+        threads += [guarded(script, n) for n in range(args.scripts)]
         time.sleep(1)
-        threads += [threading.Thread(target=window)] if args.window else []
-        threads += [threading.Thread(target=connects)]
+        threads += [guarded(window)] if args.window else []
+        threads += [guarded(connects)]
         for thread in threads:
             thread.start()
         time.sleep(args.seconds)
         stopping.set()
         for thread in threads:
             thread.join(timeout=120)
+        if failures:
+            raise RuntimeError('workers failed: ' + '; '.join(failures))
+        if args.scripts and not scripts[0]:
+            raise RuntimeError('no script finished')
         stats = control.request('stats')['result']
         storage = stats.get('store', stats.get('storage', {}))
         result = {'agents': args.agents, 'busy': args.busy, 'sync_ms': args.sync_ms,
