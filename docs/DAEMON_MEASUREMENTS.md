@@ -11274,7 +11274,18 @@ the same 20 s as the keys.
 | 200 | this change | 10,763 | 53.9% | 12,006 MiB | 183% | 1.84 ms | 9.0 ms | 10.2 ms | 0 | 3.76 s | 8,864 |
 | 200 | current thread | 6,693 | 54.3% | 13,090 MiB | 176% | 1.77 ms | 9.2 ms | 13.7 ms | 0 | 3.38 s | 8,605 |
 
-Every key stays under 10 ms at p99 and none pauses over 100 ms.
+200 windows spread, each its own project, the same load (the first two
+runs of each were taken while the machine compiled, so run again; this
+change twice):
+
+| Build | Windows wakeups/s | Windows CPU | Windows RSS | Daemon CPU | Key p50 | Key p99 | Key max | Pauses over 100 ms | Window start p50 | Turns in 20 s |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| before | 15,423 | 59.4% | 11,971 MiB | 181% | 1.88 ms | 13.2 ms | 24.4 ms | 0 | 4.03 s | 8,847 |
+| this change | 10,745 | 54.4% | 11,907 MiB | 178% | 1.83 ms | 9.0 ms | 15.8 ms | 0 | 3.50 s | 8,769 |
+| this change, again | 10,916 | 54.0% | 11,872 MiB | 182% | 1.70 ms | 8.3 ms | 11.7 ms | 0 | 3.66 s | 8,857 |
+
+Every key stays under 10 ms at p99 with this change and none pauses over
+100 ms.
 
 The window's runtime on one thread cuts its wakeups further (4.0 a second
 idle, 38% fewer than two workers at 200 busy windows) and keeps keys as
