@@ -10991,3 +10991,78 @@ RSS is the mean per window.
 - **What is left.** The 50 ms bar is not met on either side while 30
   agents saturate four CPUs. The window's own loop is the rest of the
   freeze work.
+
+### Paced high end, from the shared harness
+
+`bench/ends.py --end high --pace 0.5` runs the same agent work on both
+sides: 30 busy agents and 8 running code-mode scripts. Two alternating
+rounds, 2026-11-18.
+
+| Windows | Layout | Side | Turns done | Key p99, ms | Worst key, ms | Window start p50, ms | Daemon CPU, % | Daemon RSS, MiB | Windows RSS (all), MiB |
+| ---: | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 32 | one | main | 1410 | 3.7 to 6.7 | 5.0 to 10.5 | 3391 to 5594 | 151 to 155 | 25.6 to 26.2 | 742 to 744 |
+| 32 | one | change | 1410 | 2.8 to 4.5 | 8.3 to 10.2 | 713 to 811 | 90 to 97 | 27.9 to 28.4 | 741 to 744 |
+| 32 | spread | main | 1410 | 3.3 to 5.4 | 6.8 to 14.2 | 3780 to 4132 | 151 to 155 | 26.2 | 744 to 745 |
+| 32 | spread | change | 1410 | 3.0 to 4.7 | 3.8 to 5.7 | 806 to 829 | 93 to 98 | 27.7 to 28.7 | 744 |
+| 100 | one | main | 1440 | 5.1 to 5.4 | 7.4 to 10.2 | 10769 to 13476 | 204 to 215 | 28.9 to 30.5 | 4385 to 4986 |
+| 100 | one | change | 1440 | 4.2 to 6.0 | 6.8 to 8.2 | 1772 to 2127 | 124 to 127 | 29.4 to 30.5 | 2336 to 2339 |
+| 100 | spread | main | 1440 | 4.7 to 5.7 | 5.4 to 9.5 | 11524 to 11643 | 209 | 30.0 to 30.6 | 4723 to 4761 |
+| 100 | spread | change | 1440 | 3.8 to 6.0 | 21.2 to 29.5 | 2024 to 2209 | 128 | 28.5 to 30.7 | 2335 to 2338 |
+
+With the same 1,410 to 1,440 turns done:
+
+- **Daemon CPU.** It is 37 to 40% lower.
+- **Window start.** A window starts 4 to 6 times sooner.
+- **Window memory.** The 100 windows together hold 2.3 GiB, against 4.4
+  to 5.0 GiB on main.
+- **Keys.** p99 is under 7 ms on both sides.
+
+### The Perf workflow's screens
+
+The screens ran on the same musl builds, base (main) and head
+alternating, two rounds each (`bench/perf_gate.py`). Store work per turn
+is unchanged.
+
+| Bench | Measure | Base | Head | Change |
+| --- | --- | ---: | ---: | ---: |
+| admission | lone submit CPU, ms | 39.71 | 34.075 | -14.2% |
+| admission | burst submit p99, ms | 6.352 | 5.185 | -18.4% |
+| completion | release to terminal p99, ms | 13.673 | 11.004 | -19.5% |
+| footprint | idle RSS, MiB | 12.789 | 14.053 | +9.9% |
+| footprint | per idle bot, KiB | 1.694 | 2.27 | +34.0% |
+| footprint | RSS after a turn each, MiB | 22.094 | 32.92 | +49.0% |
+| footprint | CPU per turn, ms | 0.974 | 0.879 | -9.8% |
+| sonny | lookout CPU per 1k deltas at 10x1, ms | 50.0 | 43.75 | -12.5% |
+| sonny | lookout CPU per 1k deltas at 10x10, ms | 10.625 | 6.875 | -35.3% |
+| sonny | lookout CPU per 1k deltas at 10x100, ms | 5.875 | 3.875 | -34.0% |
+| sonny | lookout CPU per 1k deltas at 100x10, ms | 8.19 | 6.31 | -23.0% |
+| sonny | lookout seated at 100x10, s | 0.1 | 0.1 | +0.0% |
+| sonny | lookout note p95 at 10x100, ms | 2105.5 | 2093.5 | -0.6% |
+| sonny | lookout note p95 at 100x10, ms | 2341.0 | 2199.5 | -6.0% |
+| sonny | quiet window CPU, ms/s | 1.155 | 1.375 | +19.0% |
+| sonny | quiet window reads, KiB/s | 0.225 | 0.24 | +6.7% |
+| sonny | quiet window requests, /s | 0.655 | 0.71 | +8.4% |
+| sonny | quiet window RSS, MiB | 20.75 | 26.45 | +27.5% |
+| sonny | sky replay CPU per 1k lines, ms | 61.595 | 12.375 | -79.9% |
+| sonny | sky replay RSS, MiB | 51.55 | 55.45 | +7.6% |
+| lifecycle | CPU, s | 0.605 | 0.57 | -5.8% |
+| lifecycle | p95 turn, ms | 586.243 | 585.467 | -0.1% |
+| lifecycle | peak RSS, MiB | 22.27 | 25.494 | +14.5% |
+
+- **CPU and latency.** Every row improves or holds except a quiet
+  window's CPU, at 1.16 against 1.38 ms/s. The rig above measured that
+  the other way (1.8 to 2.3 against 1.5 to 1.8 ms/s).
+- **Memory.** The rows that measure memory after work rose: the daemon
+  after a turn on each of 1,000 bots, the lifecycle peak, and a quiet
+  window that has listed 1,000 agents. This is freed memory that jemalloc
+  keeps for reuse.
+  - jemalloc returns these pages after 10 s, but only while the process
+    is still allocating. Codex starts no background thread, so a process
+    that goes idle keeps them.
+  - With the pages returned at once (`dirty_decay_ms:0,muzzy_decay_ms:0`
+    at run time), the footprint after turns read 23.1 MiB, about base,
+    and the quiet window 21.9 MiB.
+  - That setting cost the high end. At 100 and 200 windows the daemon
+    used 8 to 10% more CPU, and 200-window key p99 was 1.7 to 1.8 s
+    against 0.7 to 1.0 s.
+  - Codex's settings are kept.
