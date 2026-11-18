@@ -430,6 +430,8 @@ mod tests {
         // Narrow: what it does gives way, then the title is cut at a word.
         assert_eq!(text(44)[2], "    ● Round half cents to even  tally.halves");
         assert_eq!(text(36)[2], "    ● Round half…     tally.halves");
+        // No room for a word of it: no title, and the name whole.
+        assert_eq!(text(21)[2], "    ● tally.halves");
     }
 
     #[test]
