@@ -122,6 +122,14 @@ const COMMANDS: &[Command] = &[
         startup: true,
     },
     Command {
+        name: "close",
+        about: "Close bots done with, keeping their history: by name, several names, or a pattern's open bots, those with no turn for a while alone; a turn one runs stops",
+        usage: "close (--bot NAME|GLOB [--bot-id N] [--no-turn-since DURATION] | NAME...)",
+        flags: "--bot --bot-id --no-turn-since --pretty --no-spawn",
+        settings: "",
+        startup: true,
+    },
+    Command {
         name: "compact",
         about: "Summarize a bot's context before its next model call",
         usage: "compact --bot NAME [--bot-id N]",
@@ -627,6 +635,10 @@ fn print_flags(flags: &str) {
                 "DURATION",
                 "From this long ago: for usage, only turns started since (default: all); for follow, events written since; for messages, those sent since",
             ),
+            "--no-turn-since" => (
+                "DURATION",
+                "For close, only the bots a pattern names that run no turn and ran none in this long",
+            ),
             "--from" => (
                 "KINDS",
                 "Only messages from these senders, comma-separated: person, agent, client",
@@ -954,7 +966,8 @@ pub fn prepare(args: Vec<String>) -> Result<Option<Vec<String>>> {
         }) {
             return fail_with("usage", format!("audit trim does not take {flag}"));
         }
-    } else if !matches!(c.name, "run" | "wait" | "companion" | "audit") && positional != 0 {
+    } else if !matches!(c.name, "run" | "wait" | "companion" | "audit" | "close") && positional != 0
+    {
         return fail_with("usage", format!("{} takes no positional arguments", c.name));
     }
     if has("--budget-counts") && !has("--budget-tokens") && !has("--turn-budget-tokens") {

@@ -104,6 +104,8 @@ struct Options {
     limit: Option<usize>,
     /// `usage --since`: how far back, and `--bucket`: the series' step.
     since_ms: Option<u64>,
+    /// `--no-turn-since`, as an age in ms.
+    no_turn_ms: Option<u64>,
     /// `messages --from`: the kinds of sender listed.
     from_kinds: Option<Vec<String>>,
     /// `audit`'s filters, each one of the trail's words, and its bounds.
@@ -210,6 +212,7 @@ fn parse(args: &[String]) -> Result<Options> {
         timeout_ms: None,
         grace_ms: 0,
         since_ms: None,
+        no_turn_ms: None,
         from_kinds: None,
         audit: AuditFilters::default(),
         bucket_ms: None,
@@ -394,6 +397,9 @@ fn parse(args: &[String]) -> Result<Options> {
                     }
                     "--grace" => options.grace_ms = crate::cli::duration_ms(flag, &value)?,
                     "--since" => options.since_ms = Some(crate::cli::duration_ms(flag, &value)?),
+                    "--no-turn-since" => {
+                        options.no_turn_ms = Some(crate::cli::duration_ms(flag, &value)?)
+                    }
                     "--bucket" => options.bucket_ms = Some(crate::cli::duration_ms(flag, &value)?),
                     "--from" => {
                         options.from_kinds = Some(value.split(',').map(str::to_owned).collect())
@@ -1724,6 +1730,7 @@ pub fn main(args: Vec<String>) -> Result<i32> {
 
         "usage" => usage(&options),
         "rm" => remove(&options),
+        "close" => close(&options),
         "prune" => prune(&options),
         "compact" => compact(&options),
         "approvals" => approvals(&options),
@@ -2573,6 +2580,42 @@ fn remove(options: &Options) -> Result<i32> {
         options.pretty,
     )?;
     Ok(0)
+}
+
+/// Close bots: one by `--bot`, names given as arguments, or every open bot
+/// a `--bot` pattern names, page by page, with `--no-turn-since` those with
+/// no turn for that long alone. Prints what was closed and what refused.
+fn close(options: &Options) -> Result<i32> {
+    if options.bot.is_some() == !options.positional.is_empty() {
+        return fail_with("usage", "close needs --bot or names, not both");
+    }
+    let mut asked = match &options.bot {
+        Some(bot) => json!({"bot": bot, "bot_id": options.bot_id}),
+        None => json!({"names": options.positional}),
+    };
+    if let Some(ago) = options.no_turn_ms {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(|_| Error::new("clock_before_epoch"))?
+            .as_millis() as u64;
+        asked["no_turn_since_ms"] = json!(now.saturating_sub(ago));
+    }
+    let mut connection = ensure_existing_daemon(options)?;
+    let (mut closed, mut refused) = (Vec::new(), Vec::new());
+    loop {
+        let mut page = connection.request("close", asked.clone())?;
+        closed.append(page["closed"].as_array_mut().unwrap_or(&mut Vec::new()));
+        refused.append(page["refused"].as_array_mut().unwrap_or(&mut Vec::new()));
+        match page.get("next_after") {
+            Some(after) if !after.is_null() => asked["after"] = after.clone(),
+            _ => break,
+        }
+    }
+    print_json(
+        &json!({"closed": closed, "refused": refused}),
+        options.pretty,
+    )?;
+    Ok(if refused.is_empty() { 0 } else { 1 })
 }
 
 /// Ask for a summary of a bot's context before its next model call.

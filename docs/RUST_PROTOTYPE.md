@@ -2934,6 +2934,28 @@ again. Both arrive in protocol version 84 (the `close` request, the
 `bots` request's `open` filter); a store from before schema 105 gives the
 two to every bot that has `send_message`.
 
+Protocol 89 lets `close` take the selector `messages` and `follow` take,
+as Kubernetes deletes a collection by the selector it lists by: `bot` is a
+name, or a GLOB pattern naming every open bot it matches (a page in name
+order, `after` and `limit` as `bots` pages, 64 by default, at most 256,
+with `next_after`), with `no_turn_since_ms` only those running no turn
+whose last turn ended before then, or that never ran one; or `names`, 1 to
+256 names. It answers `{closed, refused, next_after}`: each closed bot with
+`bot_id`, `was_open`, `closed_ms` (kept first, as before), the
+`running_turn` it was marked in, and `stopped_turn` when the daemon
+stopped that turn, as `interrupt` stops one, so every client that closes
+stops what it runs, where only the tool did; each refused one with
+`error` (`bot_not_found`, `not_permitted`) and why. Each bot is checked by
+the rule a single name always met: a bot's own socket closes the bots it
+made, and itself only when named alone, whose own turn runs on; a person's
+connections close any. One name alone is refused outright, as before; a
+selector lists its refusals and closes the rest, in one store job. History
+is never touched. `agent close --bot NAME|GLOB [--no-turn-since DURATION]`
+or `agent close NAME...` pages through and prints `{closed, refused}`,
+exiting 1 when any was refused, and `close_agent` takes `name`, `names`,
+`no_turn_since_ms`, `after` and `limit` and answers the same; it closes
+what its agent made, as Codex's does, never the agent itself.
+
 `shell` runs a noninteractive command with `/bin/bash -c` (`/bin/sh` where
 bash is not installed) in the bot workspace, or in `workdir` when the call
 names one, read against the workspace unless absolute, as Codex's

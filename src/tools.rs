@@ -312,10 +312,14 @@ impl Tool {
                 "required":["name","message"],"additionalProperties":false}),
             ),
             Tool::CloseAgent => (
-                "Close an agent this one made, by its whole name, once its work is done: a turn it is running stops, list_agents leaves it out unless asked for closed agents, and its history stays whole. A message sent to it later, or one already waiting in line for it, opens it again. Returns its name, whether it was open, and the turn stopped, if any.",
+                "Close an agent this one made, once its work is done: by its whole name; several by names; or, with name a pattern where * is any run of characters and ? any one, such as shop.*, every open agent it names that this one made, with no_turn_since_ms (Unix ms) only those running no turn and with none since. A turn one is running stops, list_agents leaves it out unless asked for closed agents, and its history stays whole. A message sent to it later, or one already waiting in line for it, opens it again. Returns closed, each with its name (bot), whether it was open and the turn stopped, if any, and refused, each with why. A pattern closes a page of up to limit (default 64, at most 256) in name order; pass next_after as after for the next.",
                 json!({"type":"object","properties":{
-                "name":{"type":"string","minLength":1,"maxLength":128}},
-                "required":["name"],"additionalProperties":false}),
+                "name":{"type":"string","minLength":1,"maxLength":256},
+                "names":{"type":"array","items":{"type":"string","minLength":1,"maxLength":128},"minItems":1,"maxItems":256},
+                "no_turn_since_ms":{"type":"integer","minimum":0},
+                "after":{"type":"string","minLength":1,"maxLength":128},
+                "limit":{"type":"integer","minimum":1,"maximum":256}},
+                "additionalProperties":false}),
             ),
             Tool::Wait => (
                 "Suspend until every handle resolves, without holding any execution capacity. Handles are 'BOT/N' (a message sent to a peer agent, numbered as run gives it) or 'proc:N' (a background or detached shell, or a call a message moved to the background). Each result reports the outcome: for a message that opened a turn, that turn's status and final text, with before_steer, the last text it wrote before it was steered, when it ended on a reply to a steer; for one another turn took in, status taken and that turn's number, to wait on in turn; or a process's output and exit code.
@@ -1279,8 +1283,14 @@ pub enum Agents {
         turn_budget_tokens: Option<u64>,
         request_id: Option<String>,
     },
-    /// Close an agent this one made.
-    Close { name: String },
+    /// Close agents this one made: by name, by names, or a pattern's.
+    Close {
+        name: Option<String>,
+        names: Option<Vec<String>>,
+        no_turn_since_ms: Option<i64>,
+        after: Option<String>,
+        limit: Option<usize>,
+    },
 }
 
 /// A quote's handle, `BOT/N` or `BOT/N:reply`, as `submit` takes it.
@@ -2596,13 +2606,23 @@ impl Registry {
                 #[derive(Deserialize)]
                 #[serde(deny_unknown_fields)]
                 struct Close {
-                    name: String,
+                    name: Option<String>,
+                    names: Option<Vec<String>>,
+                    no_turn_since_ms: Option<i64>,
+                    after: Option<String>,
+                    limit: Option<usize>,
                 }
                 let args: Close = serde_json::from_str(args).map_err(invalid)?;
-                if args.name.is_empty() || args.name.len() > 128 {
-                    return fail_with("invalid_tool_arguments", "name is 1 to 128 bytes");
+                if args.name.is_some() == args.names.is_some() {
+                    return fail_with("invalid_tool_arguments", "close takes name or names");
                 }
-                Prepared::Agents(Agents::Close { name: args.name })
+                Prepared::Agents(Agents::Close {
+                    name: args.name,
+                    names: args.names,
+                    no_turn_since_ms: args.no_turn_since_ms,
+                    after: args.after,
+                    limit: args.limit,
+                })
             }
             Tool::Wait => {
                 let args: Wait = serde_json::from_str(args).map_err(invalid)?;
