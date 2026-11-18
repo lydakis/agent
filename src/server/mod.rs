@@ -8340,7 +8340,7 @@ mod tests {
         );
         drop(service);
         drop(store);
-        std::fs::remove_dir_all(dir).unwrap();
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[tokio::test]
@@ -8404,7 +8404,7 @@ mod tests {
             .unwrap();
         assert_eq!(in_use(&["other"]).await, ["Bob"]);
         drop(store);
-        std::fs::remove_dir_all(dir).unwrap();
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[tokio::test]
@@ -8551,7 +8551,7 @@ mod tests {
         drop(service);
         writer.join().unwrap().unwrap();
         drop(store);
-        std::fs::remove_dir_all(dir).unwrap();
+        let _ = std::fs::remove_dir_all(dir);
     }
     #[tokio::test]
     async fn finished_turns_commit_without_service_reaping() {
@@ -8594,7 +8594,7 @@ mod tests {
         assert_eq!(terminal, turns.len(), "one terminal event per turn");
         drop(service);
         drop(store);
-        std::fs::remove_dir_all(dir).unwrap();
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     fn submit(bot: &str, request_id: &str) -> Command {
@@ -9142,7 +9142,7 @@ mod tests {
         );
         drop(service);
         drop(store);
-        std::fs::remove_dir_all(dir).unwrap();
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[tokio::test]
@@ -9218,7 +9218,7 @@ mod tests {
         assert_eq!(kept, 0, "retention ran with the completion");
         drop(service);
         drop(store);
-        std::fs::remove_dir_all(dir).unwrap();
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[tokio::test]
@@ -9250,7 +9250,7 @@ mod tests {
         assert_eq!(status, "interrupted", "not the failure it was retrying");
         drop(service);
         drop(store);
-        std::fs::remove_dir_all(dir).unwrap();
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     /// Lose every group that changes one of Bob's turns' status, the way a
@@ -9343,7 +9343,7 @@ mod tests {
         assert_eq!(service.storage_backoff, Duration::ZERO);
         drop(service);
         drop(store);
-        std::fs::remove_dir_all(dir).unwrap();
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[tokio::test]
@@ -9408,7 +9408,7 @@ mod tests {
         assert!(service.storage_backoff > Duration::ZERO);
         drop(service);
         drop(store);
-        std::fs::remove_dir_all(dir).unwrap();
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[tokio::test]
@@ -9488,7 +9488,7 @@ mod tests {
         assert_eq!(resumed.try_recv().ok(), Some(("Bob".into(), bob)));
         drop(service);
         drop(store);
-        std::fs::remove_dir_all(dir).unwrap();
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[tokio::test(start_paused = true)]
@@ -9522,7 +9522,7 @@ mod tests {
         );
         drop(service);
         drop(store);
-        std::fs::remove_dir_all(dir).unwrap();
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[tokio::test]
@@ -9571,7 +9571,7 @@ mod tests {
         assert!(service.active.is_empty(), "the backoff holds no slot");
         drop(service);
         drop(store);
-        std::fs::remove_dir_all(dir).unwrap();
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[tokio::test]
@@ -9602,7 +9602,7 @@ mod tests {
         assert_eq!(status, "running", "the next start ends it as interrupted");
         drop(service);
         drop(store);
-        std::fs::remove_dir_all(dir).unwrap();
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     /// A service whose bots may start turns, bound to `openai`, whose
@@ -9752,7 +9752,7 @@ mod tests {
         assert_eq!(service.reserved, 0);
         drop(service);
         drop(store);
-        std::fs::remove_dir_all(dir).unwrap();
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[tokio::test]
@@ -9846,7 +9846,7 @@ mod tests {
         }
         drop(service);
         drop(store);
-        std::fs::remove_dir_all(dir).unwrap();
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[tokio::test]
@@ -9993,7 +9993,7 @@ mod tests {
         );
         drop(service);
         drop(store);
-        std::fs::remove_dir_all(dir).unwrap();
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[tokio::test]
@@ -10028,7 +10028,7 @@ mod tests {
         }
         drop(service);
         drop(store);
-        std::fs::remove_dir_all(dir).unwrap();
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[tokio::test]
@@ -10068,7 +10068,7 @@ mod tests {
         assert_eq!(refused.code, "invalid_name");
         drop(service);
         drop(store);
-        std::fs::remove_dir_all(dir).unwrap();
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[tokio::test]
@@ -10111,7 +10111,7 @@ mod tests {
         );
         drop(service);
         drop(store);
-        std::fs::remove_dir_all(dir).unwrap();
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[tokio::test]
@@ -10164,7 +10164,7 @@ mod tests {
         }
         drop(service);
         drop(store);
-        std::fs::remove_dir_all(dir).unwrap();
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[tokio::test]
@@ -10244,7 +10244,7 @@ mod tests {
         publisher.abort();
         drop(service);
         drop(store);
-        std::fs::remove_dir_all(dir).unwrap();
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[tokio::test]
@@ -10324,7 +10324,7 @@ mod tests {
         publisher.abort();
         drop(service);
         drop(store);
-        std::fs::remove_dir_all(dir).unwrap();
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[tokio::test]
@@ -10409,7 +10409,7 @@ mod tests {
         paging.await.unwrap().unwrap();
         assert!(!*closed.borrow());
         drop(store);
-        std::fs::remove_dir_all(dir).unwrap();
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[tokio::test]
@@ -10499,7 +10499,7 @@ mod tests {
         publisher.abort();
         drop(service);
         drop(store);
-        std::fs::remove_dir_all(dir).unwrap();
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[tokio::test]
@@ -10538,7 +10538,7 @@ mod tests {
         publisher.abort();
         drop(service);
         drop(store);
-        std::fs::remove_dir_all(dir).unwrap();
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[tokio::test]
@@ -10617,7 +10617,7 @@ mod tests {
         publisher.abort();
         drop(service);
         drop(store);
-        std::fs::remove_dir_all(dir).unwrap();
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[tokio::test]
@@ -10763,7 +10763,7 @@ mod tests {
         }
         drop(service);
         drop(store);
-        std::fs::remove_dir_all(dir).unwrap();
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[tokio::test]
@@ -10817,7 +10817,7 @@ mod tests {
         assert_eq!(service.reserved, 0);
         drop(service);
         drop(store);
-        std::fs::remove_dir_all(dir).unwrap();
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[tokio::test]
@@ -10881,7 +10881,7 @@ mod tests {
         assert_eq!(retry["status"], "running");
         drop(service);
         drop(store);
-        std::fs::remove_dir_all(dir).unwrap();
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[tokio::test]
@@ -10917,7 +10917,7 @@ mod tests {
         assert_eq!(status, "interrupted");
         drop(service);
         drop(store);
-        std::fs::remove_dir_all(dir).unwrap();
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     /// Bob with one turn parked on a `wait` for a process that never ends.
@@ -11079,7 +11079,7 @@ mod tests {
             .unwrap();
         drop(service);
         drop(store);
-        std::fs::remove_dir_all(dir).unwrap();
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[tokio::test]
@@ -11116,7 +11116,7 @@ mod tests {
         assert_eq!(*results[&names[0]], json!({"exit_code":0}));
         assert_eq!(*results[&names[1]], json!({"pending":true}));
         drop(store);
-        std::fs::remove_dir_all(dir).unwrap();
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[tokio::test]
@@ -11164,7 +11164,7 @@ mod tests {
             .unwrap();
         drop(service);
         drop(store);
-        std::fs::remove_dir_all(dir).unwrap();
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[tokio::test]
@@ -11256,7 +11256,7 @@ mod tests {
         drop(gate);
         waker.await.unwrap();
         drop(store);
-        std::fs::remove_dir_all(dir).unwrap();
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[tokio::test]
@@ -11282,6 +11282,6 @@ mod tests {
         service.complete(bot, id, task, exit).await.unwrap();
         drop(service);
         drop(store);
-        std::fs::remove_dir_all(dir).unwrap();
+        let _ = std::fs::remove_dir_all(dir);
     }
 }
