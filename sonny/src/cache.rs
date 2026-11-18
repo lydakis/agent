@@ -5,7 +5,8 @@
 use crate::image::Drawn;
 use std::{
     hash::{Hash, Hasher},
-    path::PathBuf,
+    io::{Read, Write},
+    path::{Path, PathBuf},
 };
 
 /// The picture as drawn before, else as `draw` draws it now.
@@ -20,22 +21,35 @@ pub fn drawn(
     if crate::term::measured() {
         return draw();
     }
-    let path = path(lang, source, width);
-    if let Some(drawn) = path.as_ref().and_then(read) {
-        return Ok(drawn);
+    let key = key(lang, source, width);
+    // Sixteen buckets bound the sweep on a miss and allow unrelated
+    // writers to publish concurrently.
+    let directory = directory().and_then(|root| {
+        let bucket = root.join(&key[..1]);
+        std::fs::create_dir_all(&bucket).ok()?;
+        Some(bucket)
+    });
+    if let Some(hit) = directory.as_ref().and_then(|dir| read(&dir.join(&key))) {
+        return Ok(hit);
     }
     let drawn = draw()?;
-    if let Some(path) = path {
-        let _ = write(&path, &drawn);
+    if let Some(dir) = directory {
+        let _ = store(&dir, &key, &drawn, BUCKET_BYTES);
     }
     Ok(drawn)
 }
 
-fn path(lang: &str, source: &str, width: usize) -> Option<PathBuf> {
-    let dir = std::env::temp_dir().join("sonny-pictures");
-    std::fs::create_dir_all(&dir).ok()?;
+// Bump when the rendering or cached header changes between releases.
+const RENDER_REVISION: u32 = 1;
+const BUCKET_BYTES: u64 = (64 << 20) / 16;
+const HEADER: usize = 9;
+
+fn key(lang: &str, source: &str, width: usize) -> String {
     let mut hasher = std::hash::DefaultHasher::new();
     (
+        env!("CARGO_PKG_VERSION"),
+        option_env!("SONNY_COMMIT"),
+        RENDER_REVISION,
         lang,
         source,
         crate::image::now(width),
@@ -43,31 +57,96 @@ fn path(lang: &str, source: &str, width: usize) -> Option<PathBuf> {
         crate::term::light(),
     )
         .hash(&mut hasher);
-    Some(dir.join(format!("{:016x}.bin", hasher.finish())))
+    format!("{:016x}.bin", hasher.finish())
+}
+
+fn directory() -> Option<PathBuf> {
+    use std::os::unix::fs::{DirBuilderExt, MetadataExt};
+    // SAFETY: geteuid takes no arguments and cannot fail.
+    let uid = unsafe { libc::geteuid() };
+    let dir = std::env::temp_dir().join(format!("sonny-pictures-{uid}"));
+    match std::fs::DirBuilder::new().mode(0o700).create(&dir) {
+        Err(e) if e.kind() != std::io::ErrorKind::AlreadyExists => return None,
+        _ => {}
+    }
+    let meta = dir.symlink_metadata().ok()?;
+    (meta.is_dir() && meta.uid() == uid && meta.mode() & 0o077 == 0).then_some(dir)
 }
 
 /// Columns, rows and whether it was cut, then the PNG.
-fn read(path: &PathBuf) -> Option<Drawn> {
-    let bytes = std::fs::read(path).ok()?;
-    let (head, png) = bytes.split_at_checked(9)?;
-    Some(Drawn {
-        cols: u32::from_le_bytes(head[0..4].try_into().ok()?),
-        rows: u32::from_le_bytes(head[4..8].try_into().ok()?),
+fn read(path: &Path) -> Option<Drawn> {
+    let mut file = std::fs::File::open(path).ok()?;
+    let size = file.metadata().ok()?.len();
+    if !(HEADER as u64..=BUCKET_BYTES).contains(&size) {
+        return None;
+    }
+    let mut head = [0; HEADER];
+    file.read_exact(&mut head).ok()?;
+    let mut png = Vec::with_capacity(size as usize - HEADER);
+    file.take(size - HEADER as u64).read_to_end(&mut png).ok()?;
+    (png.len() + HEADER == size as usize).then(|| Drawn {
+        cols: u32::from_le_bytes(head[0..4].try_into().unwrap()),
+        rows: u32::from_le_bytes(head[4..8].try_into().unwrap()),
         cut: head[8] == 1,
-        png: png.to_vec(),
+        png,
     })
 }
 
-fn write(path: &PathBuf, drawn: &Drawn) -> std::io::Result<()> {
-    let mut bytes = Vec::with_capacity(9 + drawn.png.len());
-    bytes.extend_from_slice(&drawn.cols.to_le_bytes());
-    bytes.extend_from_slice(&drawn.rows.to_le_bytes());
-    bytes.push(u8::from(drawn.cut));
-    bytes.extend_from_slice(&drawn.png);
-    // Whole or not at all, should another Sonny read it meanwhile.
-    let part = path.with_extension(format!("{}.part", std::process::id()));
-    write_new(&part, &bytes)?;
-    std::fs::rename(part, path)
+fn store(dir: &Path, key: &str, drawn: &Drawn, limit: u64) -> std::io::Result<()> {
+    // Charge at least a filesystem block, bounding the number of entries
+    // inspected even for tiny images. Hits never scan or touch the directory.
+    let cost = |bytes: u64| bytes.div_ceil(4096) * 4096;
+    let incoming = cost(drawn.png.len() as u64 + HEADER as u64);
+    if incoming > limit {
+        return Ok(());
+    }
+    let lock = std::fs::File::open(dir)?;
+    if lock.try_lock().is_err() {
+        return Ok(());
+    }
+    let path = dir.join(key);
+    if path.exists() {
+        return Ok(());
+    }
+    let part = dir.join(".next");
+    match std::fs::remove_file(&part) {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e),
+        _ => {}
+    }
+    let mut total = incoming;
+    let mut files = Vec::new();
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        if path.extension().is_some_and(|ext| ext == "bin") && entry.file_type()?.is_file() {
+            let meta = entry.metadata()?;
+            let bytes = cost(meta.len());
+            total += bytes;
+            files.push((meta.modified()?, path, bytes));
+        }
+    }
+    if total > limit {
+        files.sort_unstable();
+        for (_, old, bytes) in files {
+            std::fs::remove_file(old)?;
+            total -= bytes;
+            if total <= limit {
+                break;
+            }
+        }
+    }
+    let result = (|| {
+        let mut file = std::fs::File::create_new(&part)?;
+        file.write_all(&drawn.cols.to_le_bytes())?;
+        file.write_all(&drawn.rows.to_le_bytes())?;
+        file.write_all(&[u8::from(drawn.cut)])?;
+        file.write_all(&drawn.png)?;
+        std::fs::rename(&part, path)
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(part);
+    }
+    result
 }
 
 /// `bytes` written to a file made new at `path`: refused when anything is
@@ -84,6 +163,32 @@ pub fn write_new(path: &std::path::Path, bytes: impl AsRef<[u8]>) -> std::io::Re
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn cache_evicts_oldest_across_versions_and_skips_oversized_pictures() {
+        use super::*;
+        let dir = std::env::temp_dir().join(format!("sonny-retention-{}", std::process::id()));
+        std::fs::create_dir(&dir).unwrap();
+        let mut pic = Drawn {
+            cols: 7,
+            rows: 2,
+            cut: true,
+            png: vec![42; 75],
+        };
+        for name in ["previous-version.bin", "second.bin"] {
+            store(&dir, name, &pic, 8192).unwrap();
+        }
+        let first = std::fs::File::open(dir.join("previous-version.bin")).unwrap();
+        first.set_modified(std::time::UNIX_EPOCH).unwrap();
+        store(&dir, "third.bin", &pic, 8192).unwrap();
+        assert!(read(&dir.join("previous-version.bin")).is_none());
+        assert!(read(&dir.join("second.bin")).is_some());
+        assert_eq!(read(&dir.join("third.bin")).unwrap().png, pic.png);
+        pic.png.resize(8192, 42);
+        store(&dir, "oversized.bin", &pic, 8192).unwrap();
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 2);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
     #[cfg(unix)]
     #[test]
     fn a_new_file_is_never_written_through_a_link_left_in_its_place() {
