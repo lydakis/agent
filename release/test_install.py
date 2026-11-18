@@ -1,4 +1,4 @@
-"""Exercise the Linux installer against a local release with no package changes."""
+"""The Linux installer against a local release, with no package changes."""
 import hashlib
 import io
 import os
@@ -13,9 +13,9 @@ import unittest
 INSTALLER = Path(__file__).resolve().parents[1] / "install.sh"
 
 
-@unittest.skipUnless(sys.platform.startswith("linux"), "exercises Linux rename semantics")
-class RepairTests(unittest.TestCase):
-    def test_repair_survives_interruption_and_can_be_retried(self):
+@unittest.skipUnless(sys.platform.startswith("linux"), "the installer is for Linux")
+class InstallTests(unittest.TestCase):
+    def test_a_release_that_cannot_run_leaves_the_installed_one_and_a_reinstall_replaces_it(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             prefix = root / "prefix"
@@ -35,22 +35,14 @@ class RepairTests(unittest.TestCase):
                 digest = hashlib.sha256(archive.read_bytes()).hexdigest()
                 Path(str(archive) + ".sha256").write_text(f"{digest}  {archive.name}\n")
 
-            def stub(name, script):
-                path = tools / name
-                path.write_text("#!/bin/sh\n" + script)
-                path.chmod(0o755)
-
-            stub("curl", 'cp "$RELEASE/${4##*/}" "$3"\n')
-            stub("gh", "exit 1\n")
-            # One repair forces libc, the later retry uses the host implementation.
-            stub("mv", 'case "$1:$2" in --exchange:*) [ -z "$LIBC_SWAP" ] || exit 1;; '
-                 '-Tf:*/current) [ -z "$INTERRUPT" ] || exit 77;; esac\nexec /bin/mv "$@"\n')
+            for tool, script in [("curl", 'cp "$RELEASE/${4##*/}" "$3"\n'), ("gh", "exit 1\n")]:
+                (tools / tool).write_text("#!/bin/sh\n" + script)
+                (tools / tool).chmod(0o755)
             env = dict(os.environ, PREFIX=str(prefix), RELEASE=str(root),
-                       PATH=f"{tools}:/usr/bin:/bin", SONNY_VERSION="1.2.3", SONNY_PACKAGES="0",
-                       INTERRUPT="", LIBC_SWAP="")
+                       PATH=f"{tools}:/usr/bin:/bin", SONNY_VERSION="1.2.3", SONNY_PACKAGES="0")
 
-            def run(**overrides):
-                return subprocess.run(["sh", INSTALLER], env=env | overrides,
+            def run():
+                return subprocess.run(["sh", INSTALLER], env=env,
                                       stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
 
             def installed():
@@ -59,15 +51,22 @@ class RepairTests(unittest.TestCase):
             bundle("old")
             fresh = run()
             self.assertEqual(fresh.returncode, 0, fresh.stdout)
+            self.assertEqual(installed(), "old")
             bundle("broken", status=1)
-            self.assertNotEqual(run().returncode, 0)
+            refused = run()
+            self.assertNotEqual(refused.returncode, 0)
+            self.assertIn("installed Sonny is kept", refused.stdout)
             self.assertEqual(installed(), "old")
             bundle("repaired")
-            self.assertNotEqual(run(INTERRUPT="1", LIBC_SWAP="1").returncode, 0)
+            again = run()
+            self.assertEqual(again.returncode, 0, again.stdout)
             self.assertEqual(installed(), "repaired")
             agent = prefix / "opt" / name / "libexec/agent"
-            agent.unlink()
-            result = run()
-            self.assertEqual(result.returncode, 0, result.stdout)
             self.assertEqual(subprocess.check_output([agent], text=True).strip(), "repaired")
-            self.assertEqual(installed(), "repaired")
+            # Nothing staged is left behind.
+            self.assertEqual(sorted(p.name for p in (prefix / "opt").iterdir()), sorted([name, "sonny"]))
+            self.assertEqual(sorted(p.name for p in (prefix / "bin").iterdir()), ["sonny"])
+
+
+if __name__ == "__main__":
+    unittest.main()

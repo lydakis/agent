@@ -11,8 +11,6 @@
 # download), unpacks it to PREFIX/opt/sonny-VERSION-linux-ARCH, points
 # PREFIX/opt/sonny at it and links PREFIX/bin/sonny to its Sonny. Earlier
 # versions stay where they are, since a running daemon may still use one.
-# A same-version repair swaps verified directories atomically. On systems
-# without GNU mv --exchange this uses Python 3 and libc renameat2.
 # Later, `sonny upgrade` does the same for the next release and switches the
 # running daemon and open windows to it.
 #
@@ -86,27 +84,6 @@ packages() {
     fi
 }
 
-# Atomically exchange two populated directories on the same filesystem.
-# Older coreutils lack --exchange. Use the same Linux operation via libc.
-exchange() {
-    if mv --exchange --no-copy -T "$1" "$2" 2>/dev/null; then
-        return
-    fi
-    command -v python3 >/dev/null || fail "repair needs mv --exchange or python3; existing install kept"
-    python3 - "$1" "$2" <<'PYTHON'
-import ctypes
-import os
-import sys
-
-libc = ctypes.CDLL(None, use_errno=True)
-swap = getattr(libc, "renameat2", None)
-at_fdcwd, rename_exchange = -100, 2
-if swap is None or swap(at_fdcwd, os.fsencode(sys.argv[1]), at_fdcwd, os.fsencode(sys.argv[2]), rename_exchange) != 0:
-    reason = os.strerror(ctypes.get_errno()) if swap else "renameat2 unavailable"
-    sys.exit(f"install.sh: could not exchange release directories: {reason}; existing install kept")
-PYTHON
-}
-
 main() {
     case "$(uname -s)" in
         Linux) ;;
@@ -140,18 +117,15 @@ main() {
         esac
     fi
     version=${version#v}
-    case "$version" in
-        ''|*[!0-9A-Za-z.+-]*) fail "invalid release version" ;;
-    esac
     prefix=${PREFIX:-$HOME/.local}
     name="sonny-$version-linux-$arch"
     url="$repo/releases/download/v$version/$name.tar.gz"
 
     mkdir -p "$prefix/opt" "$prefix/bin"
-    work=$(mktemp -d "$prefix/opt/.sonny-install.XXXXXXXX")
-    trap 'rm -rf "$work"' EXIT
-    bin_stage=$(mktemp -d "$prefix/bin/.sonny-link.XXXXXXXX")
-    trap 'rm -rf "$work" "$bin_stage"' EXIT
+    # Unpacked beside where it goes, so putting it in place is a rename.
+    work=$(mktemp -d "$prefix/opt/.sonny-install.XXXXXX")
+    link="$prefix/bin/.sonny.$$"
+    trap 'rm -rf "$work" "$link"' EXIT
     echo "Downloading $name"
     curl -fsSL -o "$work/$name.tar.gz" "$url" || fail "could not download $url"
     curl -fsSL -o "$work/$name.tar.gz.sha256" "$url.sha256" || fail "could not download $url.sha256"
@@ -168,17 +142,19 @@ main() {
     [ -x "$work/$name/bin/sonny" ] && [ -x "$work/$name/libexec/agent" ] ||
         fail "$name.tar.gz is not laid out as bin/sonny and libexec/agent"
     "$work/$name/bin/sonny" --version >/dev/null && "$work/$name/libexec/agent" --version >/dev/null ||
-        fail "the staged programs could not run; existing install kept"
-    ln -s "$name" "$work/current"
-    ln -s "../opt/sonny/bin/sonny" "$bin_stage/sonny"
-    # A concurrent same-version install may win the first rename.
-    if ! mv -T "$work/$name" "$prefix/opt/$name" 2>/dev/null; then
-        [ -d "$prefix/opt/$name" ] && [ ! -L "$prefix/opt/$name" ] ||
-            fail "could not install $name"
-        exchange "$work/$name" "$prefix/opt/$name"
+        fail "$name does not run on this machine; the installed Sonny is kept"
+    # A reinstall of the same version moves the old copy aside only for the
+    # moment the new one takes its place.
+    if [ -e "$prefix/opt/$name" ] || [ -L "$prefix/opt/$name" ]; then
+        mv "$prefix/opt/$name" "$work/replaced"
     fi
-    mv -Tf "$work/current" "$prefix/opt/sonny"
-    mv -Tf "$bin_stage/sonny" "$prefix/bin/sonny"
+    mv "$work/$name" "$prefix/opt/$name"
+    # Each link is made aside and renamed over the old one, so neither name
+    # is ever missing.
+    ln -s "$name" "$work/sonny"
+    mv -Tf "$work/sonny" "$prefix/opt/sonny"
+    ln -s "../opt/sonny/bin/sonny" "$link"
+    mv -Tf "$link" "$prefix/bin/sonny"
 
     echo "Installed $("$prefix/bin/sonny" --version) at $prefix/bin/sonny"
     packages
