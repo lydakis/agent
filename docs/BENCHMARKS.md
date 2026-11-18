@@ -525,7 +525,8 @@ start and end of a measured window and reports the deltas (turns and tokens
 a second, CPU and store jobs per turn, per-op store timings), per-thread
 daemon CPU from `/proc` (Linux), the model's own CPU, how long each
 `submit` took to answer, and, from the store's own timestamps, how long each
-turn waited to start and how much it was paced or retried.
+turn waited to start and how much it was paced or retried. Outside Linux,
+per-thread CPU fields are null. Give `--out` a new directory for each run.
 
 `--jitter` spreads call lengths so turns end at different times, as real
 ones do. `--tpm` makes the model a provider with a tokens-per-minute limit
