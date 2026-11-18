@@ -201,6 +201,139 @@ const MODEL_HUES: [Color; 8] = [
 /// of them, and what was read of it before, to go on from.
 type Scan = (String, Option<i64>, Option<crate::needs::Seen>);
 
+/// What each agent waiting for its questions to be read was last asked
+/// with: an agent asked again before its read begins is read once, as of
+/// its newest ask, so what waits is one ask an agent however often its
+/// turns end.
+type Asks =
+    std::sync::Arc<std::sync::Mutex<HashMap<String, (Option<i64>, Option<crate::needs::Seen>)>>>;
+
+/// Where the view asks for agents' questions to be read: the agents, each
+/// named once while its ask waits, in the order first asked.
+#[derive(Clone)]
+struct Scans {
+    names: mpsc::UnboundedSender<String>,
+    asks: Asks,
+}
+
+/// Where the reads take the asks from, in order.
+struct Asked {
+    names: mpsc::UnboundedReceiver<String>,
+    asks: Asks,
+}
+
+fn scans() -> (Scans, Asked) {
+    let (names, named) = mpsc::unbounded_channel();
+    let asks = Asks::default();
+    let scans = Scans {
+        names,
+        asks: asks.clone(),
+    };
+    (scans, Asked { names: named, asks })
+}
+
+impl Scans {
+    /// Ask for `scan`'s agent to be read, in place of its ask still
+    /// waiting; an error once the reads are gone.
+    fn send(&self, (bot, turn, was): Scan) -> Result<(), mpsc::error::SendError<String>> {
+        let mut asks = self.asks.lock().unwrap_or_else(|e| e.into_inner());
+        if asks.insert(bot.clone(), (turn, was)).is_none()
+            && let Err(gone) = self.names.send(bot)
+        {
+            asks.remove(&gone.0);
+            return Err(gone);
+        }
+        Ok(())
+    }
+}
+
+impl Asked {
+    async fn recv(&mut self) -> Option<Scan> {
+        loop {
+            let bot = self.names.recv().await?;
+            if let Some(scan) = self.take(bot) {
+                return Some(scan);
+            }
+        }
+    }
+
+    #[cfg(test)]
+    fn try_recv(&mut self) -> Result<Scan, mpsc::error::TryRecvError> {
+        loop {
+            let bot = self.names.try_recv()?;
+            if let Some(scan) = self.take(bot) {
+                return Ok(scan);
+            }
+        }
+    }
+
+    fn take(&self, bot: String) -> Option<Scan> {
+        let mut asks = self.asks.lock().unwrap_or_else(|e| e.into_inner());
+        let (turn, was) = asks.remove(&bot)?;
+        Some((bot, turn, was))
+    }
+}
+
+/// What the follow brings the view, holding the bytes of the view's room
+/// its event came in as, given back once the view takes it.
+struct Fed(Feed, Option<tokio::sync::OwnedSemaphorePermit>);
+
+/// Where the follow sends what it brings the view. An event waits for room
+/// within the budget the connection's own queue has
+/// ([`agent_client::QUEUE_BYTES`], counted as sent): a view that falls
+/// behind holds the follow back, so the follow reads no further ahead of
+/// it than that. Past it, the connection falls behind too, and the follow
+/// reads on from the last event it passed on. What answers the follow's
+/// own reads goes at once: one an ask.
+#[derive(Clone)]
+struct Feeder {
+    send: mpsc::UnboundedSender<Fed>,
+    room: std::sync::Arc<tokio::sync::Semaphore>,
+}
+
+impl Feeder {
+    fn new() -> (Self, mpsc::UnboundedReceiver<Fed>) {
+        let (send, feed) = mpsc::unbounded_channel();
+        let room = tokio::sync::Semaphore::new(agent_client::QUEUE_BYTES);
+        let room = std::sync::Arc::new(room);
+        (Feeder { send, room }, feed)
+    }
+
+    /// Send what answers a read of the follow's own.
+    fn send(&self, feed: Feed) -> Result<(), mpsc::error::SendError<Fed>> {
+        self.send.send(Fed(feed, None))
+    }
+
+    /// Send what an event of `bytes`, as it came, brings, once the view
+    /// has room for it: false once the view is gone.
+    async fn event(&self, feed: Feed, bytes: usize) -> bool {
+        // The view gone, its queue goes, and with it the room it held.
+        let room = tokio::select! {
+            room = self.room.clone().acquire_many_owned(Self::size(bytes)) => room.ok(),
+            _ = self.send.closed() => return false,
+        };
+        self.send.send(Fed(feed, room)).is_ok()
+    }
+
+    /// Room for an event of `bytes` the follow holds back a while before
+    /// sending, if there is room now.
+    fn hold(&self, bytes: usize) -> Option<tokio::sync::OwnedSemaphorePermit> {
+        self.room
+            .clone()
+            .try_acquire_many_owned(Self::size(bytes))
+            .ok()
+    }
+
+    /// Send what an event brings with the room held for it.
+    fn held(&self, feed: Feed, room: tokio::sync::OwnedSemaphorePermit) -> bool {
+        self.send.send(Fed(feed, Some(room))).is_ok()
+    }
+
+    fn size(bytes: usize) -> u32 {
+        bytes.clamp(1, agent_client::QUEUE_BYTES) as u32
+    }
+}
+
 /// An agent as [`Talked`] names it: by name, and by id, as a name used
 /// again is someone else.
 type Named = (String, Option<i64>);
@@ -252,7 +385,7 @@ enum Feed {
     Held(Vec<crate::needs::Held>),
     /// Where to ask for an agent's questions to be read, with the turn
     /// that ended unsure of them.
-    Scans(mpsc::UnboundedSender<Scan>),
+    Scans(Scans),
     /// An agent's history read for its questions: none when it could not be.
     Asked(String, Option<Box<crate::needs::Seen>>),
     /// What windows and skies before read of each agent's questions, as
@@ -480,7 +613,7 @@ pub struct View {
     /// The daemon's store, beside which leads keep the tasks they
     /// resolved, whose questions are set aside.
     resolved: PathBuf,
-    feed: mpsc::UnboundedReceiver<Feed>,
+    feed: mpsc::UnboundedReceiver<Fed>,
     task: tokio::task::JoinHandle<()>,
     agents: Vec<Agent>,
     index: HashMap<String, usize>,
@@ -539,7 +672,7 @@ pub struct View {
     kept_changed: bool,
     paused: bool,
     /// Where the follow reads agents' questions, once it says.
-    scans: Option<mpsc::UnboundedSender<Scan>>,
+    scans: Option<Scans>,
     /// What each mark, colour and shape means, and the counts, in the
     /// chat log's place.
     pub legend: bool,
@@ -939,7 +1072,7 @@ impl Drop for View {
 
 impl View {
     pub fn open(socket: PathBuf, store: PathBuf) -> Self {
-        let (send, feed) = mpsc::unbounded_channel();
+        let (send, feed) = Feeder::new();
         let task = tokio::spawn(follow(socket.clone(), store.clone(), send));
         let mut view = Self::with(socket, feed, task);
         view.resolved = store;
@@ -948,7 +1081,7 @@ impl View {
 
     fn with(
         socket: PathBuf,
-        feed: mpsc::UnboundedReceiver<Feed>,
+        feed: mpsc::UnboundedReceiver<Fed>,
         task: tokio::task::JoinHandle<()>,
     ) -> Self {
         let now = Instant::now();
@@ -1057,7 +1190,7 @@ impl View {
     fn restart(&mut self) {
         self.task.abort();
         self.scans = None;
-        let (send, feed) = mpsc::unbounded_channel();
+        let (send, feed) = Feeder::new();
         self.feed = feed;
         self.task = match &mut self.replay {
             Some(replay) => {
@@ -1127,8 +1260,9 @@ impl View {
         let now = Instant::now();
         // At most half a frame's work: what is left waits for the next
         // frame, so a burst slows the sky's catching up, not its keys.
+        // What each event held of the room goes back as it is taken.
         while now.elapsed() < FRAME / 2
-            && let Ok(feed) = self.feed.try_recv()
+            && let Ok(Fed(feed, _room)) = self.feed.try_recv()
         {
             match feed {
                 // A replay seats who was here once its tape is in.
@@ -5243,7 +5377,7 @@ impl ratatui::widgets::Widget for &mut View {
 
 /// The view's own connection: every agent, then who talked to whom in the
 /// turns kept, then live. A daemon gone ends it, saying so.
-async fn follow(socket: PathBuf, store: PathBuf, send: mpsc::UnboundedSender<Feed>) {
+async fn follow(socket: PathBuf, store: PathBuf, send: Feeder) {
     let (mut client, mut events) = match Client::connect(&socket).await {
         Ok(connected) => connected,
         Err(error) => {
@@ -5267,7 +5401,7 @@ async fn follow(socket: PathBuf, store: PathBuf, send: mpsc::UnboundedSender<Fee
     }
     // Agents' questions are read beside the follow, as the view asks: it
     // ends with the view's asking.
-    let (scans, asked) = mpsc::unbounded_channel::<Scan>();
+    let (scans, asked) = scans();
     if send.send(Feed::Scans(scans)).is_err() {
         return;
     }
@@ -5312,7 +5446,7 @@ async fn follow(socket: PathBuf, store: PathBuf, send: mpsc::UnboundedSender<Fee
         }
         let mut fell = false;
         let mut live = false;
-        while let Some(event) = events.recv().await {
+        while let Some((event, bytes)) = events.recv_sized().await {
             match event["event"].as_str() {
                 Some("follow_live") => {
                     cursor = event["cursor"].as_i64().unwrap_or(cursor);
@@ -5328,7 +5462,7 @@ async fn follow(socket: PathBuf, store: PathBuf, send: mpsc::UnboundedSender<Fee
             if let Some(at) = event["cursor"].as_i64() {
                 cursor = cursor.max(at);
             }
-            if send.send(Feed::Past(event)).is_err() {
+            if !send.event(Feed::Past(event), bytes).await {
                 return;
             }
         }
@@ -5368,64 +5502,102 @@ async fn follow(socket: PathBuf, store: PathBuf, send: mpsc::UnboundedSender<Fee
             return;
         }
     }
-    // Asking again replaces the follow: from where the past ended, what
-    // animates the sky. Its own replay repeats nothing already sent.
-    if let Err(error) = client
-        .request(
-            "follow",
-            json!({"bot": "*", "after": cursor, "kinds": LIVE}),
-        )
-        .await
-    {
-        let _ = send.send(Feed::Down(error.to_string()));
-        return;
-    }
-    // Until the new follow is live, the old one's last events may still be
-    // arriving, ahead of the replay that brings them again in order: wait
-    // for it, and pass each cursor once, in the store's order.
-    let mut handoff = Some(BTreeMap::new());
-    while let Some(event) = events.recv().await {
-        match event["event"].as_str() {
-            Some("follow_live") => {
-                for (_, event) in handoff.take().into_iter().flatten() {
-                    if send.send(Feed::Live(event)).is_err() {
+    // Live, a sky that falls behind reads on as the past does: from the
+    // last event it passed on, on a new connection, whose own replay
+    // brings what the old one let go.
+    let mut resumed = None;
+    loop {
+        // Asking again replaces the follow: from where the past ended, what
+        // animates the sky. Its own replay repeats nothing already sent.
+        if let Err(error) = client
+            .request(
+                "follow",
+                json!({"bot": "*", "after": cursor, "kinds": LIVE}),
+            )
+            .await
+        {
+            let _ = send.send(Feed::Down(error.to_string()));
+            return;
+        }
+        // Until the new follow is live, the old one's last events may still
+        // be arriving, ahead of the replay that brings them again in order:
+        // wait for it, and pass each cursor once, in the store's order. What
+        // waits holds its room in the view's budget: past it, the follow
+        // reads on as if it fell behind, on a new connection, where no old
+        // follow's events arrive.
+        let mut handoff = resumed.is_none().then(BTreeMap::new);
+        let mut fell = false;
+        while let Some((event, bytes)) = events.recv_sized().await {
+            match event["event"].as_str() {
+                Some("follow_live") => {
+                    for (at, (event, room)) in handoff.take().into_iter().flatten() {
+                        cursor = cursor.max(at);
+                        if !send.held(Feed::Live(event), room) {
+                            return;
+                        }
+                    }
+                    // Who is here and who works may have changed while the
+                    // past was read, removals among it, which no replay
+                    // brings: the roll again says so, now that what follows
+                    // it is kept.
+                    if !roll(&client, &send).await || send.send(Feed::Ready).is_err() {
                         return;
                     }
+                    continue;
                 }
-                // Who is here and who works may have changed while the past
-                // was read, removals among it, which no replay brings: the
-                // roll again says so, now that what follows it is kept.
-                if !roll(&client, &send).await || send.send(Feed::Ready).is_err() {
+                Some("pruned") => continue,
+                Some("lagged" | "follow_lagged") => {
+                    fell = true;
+                    break;
+                }
+                _ => {}
+            }
+            // A configured agent is read again: the event says only what
+            // changed, and `m` colours by its model.
+            if event["event"] == "configured" {
+                if let Some(model) = configured(&client, &event).await
+                    && send.send(model).is_err()
+                {
                     return;
                 }
                 continue;
             }
-            Some("pruned") => continue,
-            Some("lagged" | "follow_lagged") => {
-                let _ = send.send(Feed::Down("fell behind the daemon".into()));
+            let at = event["cursor"].as_i64();
+            if let (Some(waiting), Some(at)) = (&mut handoff, at) {
+                if waiting.contains_key(&at) {
+                    continue;
+                }
+                let Some(room) = send.hold(bytes) else {
+                    fell = true;
+                    break;
+                };
+                waiting.insert(at, (event, room));
+                continue;
+            }
+            if let Some(at) = at {
+                cursor = cursor.max(at);
+            }
+            if !send.event(Feed::Live(event), bytes).await {
                 return;
             }
-            _ => {}
         }
-        // A configured agent is read again: the event says only what
-        // changed, and `m` colours by its model.
-        if event["event"] == "configured" {
-            if let Some(model) = configured(&client, &event).await
-                && send.send(model).is_err()
-            {
-                return;
-            }
-            continue;
-        }
-        if let (Some(waiting), Some(at)) = (&mut handoff, event["cursor"].as_i64()) {
-            waiting.insert(at, event);
-            continue;
-        }
-        if send.send(Feed::Live(event)).is_err() {
+        if !fell {
+            let _ = send.send(Feed::Down("the daemon closed the connection".into()));
             return;
         }
+        if resumed == Some(cursor) {
+            let _ = send.send(Feed::Down("fell behind the daemon".into()));
+            return;
+        }
+        resumed = Some(cursor);
+        (client, events) = match Client::connect(&socket).await {
+            Ok(connected) => connected,
+            Err(error) => {
+                let _ = send.send(Feed::Down(error.to_string()));
+                return;
+            }
+        };
     }
-    let _ = send.send(Feed::Down("the daemon closed the connection".into()));
 }
 
 /// Read each agent's history the view asks for, one at a time and in
@@ -5435,11 +5607,7 @@ async fn follow(socket: PathBuf, store: PathBuf, send: mpsc::UnboundedSender<Fee
 /// with no room closes a connection). One read before goes on from where
 /// it ended. A connection that cannot be made reads nothing: each agent
 /// is told unread.
-async fn scan_all(
-    socket: PathBuf,
-    mut asked: mpsc::UnboundedReceiver<Scan>,
-    told: mpsc::UnboundedSender<Feed>,
-) {
+async fn scan_all(socket: PathBuf, mut asked: Asked, told: Feeder) {
     // Its events, unread, kept for as long as the connection is.
     let connected = Client::connect(&socket).await.ok();
     while let Some((bot, turn, was)) = asked.recv().await {
@@ -5582,33 +5750,43 @@ fn pair(a: usize, b: usize) -> (usize, usize) {
     (a.min(b), a.max(b))
 }
 
-/// An event of a replay's connection onto its tape; false once the sky
-/// or the daemon has gone.
-async fn taped(client: &Client, event: Value, send: &mpsc::UnboundedSender<Feed>) -> bool {
+/// What an event of a replay's connection did onto its tape.
+enum Onto {
+    On,
+    /// The connection fell behind: the replay reads on from its cursor.
+    Fell,
+    /// The sky or the daemon has gone.
+    Gone,
+}
+
+/// An event of a replay's connection onto its tape, `bytes` as it came.
+async fn taped(client: &Client, event: Value, bytes: usize, send: &Feeder) -> Onto {
     let sent = match event["event"].as_str() {
         // A pause's notices tell of now, not of the past a replay plays,
         // and are no events to seek through: a replay leaves the cord out.
-        Some("pruned" | "paused" | "resumed") => return true,
+        Some("pruned" | "paused" | "resumed") => return Onto::On,
         // As live: a new model is read again, for `m`.
         Some("configured") => match configured(client, &event).await {
-            Some(model) => send.send(model),
-            None => return true,
+            Some(model) => send.send(model).is_ok(),
+            None => return Onto::On,
         },
-        Some("lagged" | "follow_lagged") => {
-            let _ = send.send(Feed::Down("fell behind the daemon".into()));
-            return false;
-        }
+        Some("lagged" | "follow_lagged") => return Onto::Fell,
         // What the sky reads of a tool's arguments is a commons post; the
         // rest stays with the daemon, not in the tape. An unwritten event
         // is dated as it comes.
-        _ => send.send(Feed::Tape(slim(event))),
+        _ => send.event(Feed::Tape(slim(event)), bytes).await,
     };
-    sent.is_ok()
+    match sent {
+        true => Onto::On,
+        false => Onto::Gone,
+    }
 }
 
 /// A replay's connection: every agent here now, then every event written
 /// since `from` (Unix ms), the past as one tape, then what follows live.
-async fn tape(socket: PathBuf, from: i64, send: mpsc::UnboundedSender<Feed>) {
+/// One that falls behind reads on from the last event it put on the tape,
+/// on a new connection.
+async fn tape(socket: PathBuf, from: i64, send: Feeder) {
     match prior(&socket, from).await {
         Ok(prior) => {
             if send.send(Feed::Prior(prior)).is_err() {
@@ -5620,51 +5798,75 @@ async fn tape(socket: PathBuf, from: i64, send: mpsc::UnboundedSender<Feed>) {
             return;
         }
     }
-    let (client, mut events) = match Client::connect(&socket).await {
-        Ok(connected) => connected,
-        Err(error) => {
+    let mut cursor: Option<i64> = None;
+    let mut resumed = None;
+    loop {
+        let (client, mut events) = match Client::connect(&socket).await {
+            Ok(connected) => connected,
+            Err(error) => {
+                let _ = send.send(Feed::Down(error.to_string()));
+                return;
+            }
+        };
+        if cursor.is_none() && !roll(&client, &send).await {
+            return;
+        }
+        let asked = match cursor {
+            Some(after) => json!({"bot": "*", "after": after, "kinds": LIVE}),
+            None => json!({"bot": "*", "since_ms": from, "kinds": LIVE}),
+        };
+        if let Err(error) = client.request("follow", asked).await {
             let _ = send.send(Feed::Down(error.to_string()));
             return;
         }
-    };
-    if !roll(&client, &send).await {
-        return;
-    }
-    if let Err(error) = client
-        .request(
-            "follow",
-            json!({"bot": "*", "since_ms": from, "kinds": LIVE}),
-        )
-        .await
-    {
-        let _ = send.send(Feed::Down(error.to_string()));
-        return;
-    }
-    while let Some(event) = events.recv().await {
-        if event["event"] != "follow_live" {
-            if !taped(&client, event, &send).await {
+        let mut fell = false;
+        'events: while let Some((event, bytes)) = events.recv_sized().await {
+            if event["event"] != "follow_live" {
+                let at = event["cursor"].as_i64();
+                match taped(&client, event, bytes, &send).await {
+                    Onto::On => cursor = cursor.max(at),
+                    Onto::Fell => {
+                        fell = true;
+                        break;
+                    }
+                    Onto::Gone => return,
+                }
+                continue;
+            }
+            // Who is here may have changed while the past was read, and a
+            // removal then is in neither the tape nor what follows: the cast
+            // is read again, as `follow` reads the roll again. What came
+            // while it was read goes on the tape before the replay starts,
+            // so an agent made then, listed already, waits for its making.
+            if !roll(&client, &send).await {
                 return;
             }
-            continue;
-        }
-        // Who is here may have changed while the past was read, and a
-        // removal then is in neither the tape nor what follows: the cast is
-        // read again, as `follow` reads the roll again. What came while it
-        // was read goes on the tape before the replay starts, so an agent
-        // made then, listed already, waits for its making.
-        if !roll(&client, &send).await {
-            return;
-        }
-        while let Ok(event) = events.try_recv() {
-            if !taped(&client, event, &send).await {
+            while let Ok((event, bytes)) = events.try_recv_sized() {
+                let at = event["cursor"].as_i64();
+                match taped(&client, event, bytes, &send).await {
+                    Onto::On => cursor = cursor.max(at),
+                    Onto::Fell => {
+                        fell = true;
+                        break 'events;
+                    }
+                    Onto::Gone => return,
+                }
+            }
+            if send.send(Feed::Ready).is_err() {
                 return;
             }
         }
-        if send.send(Feed::Ready).is_err() {
+        if !fell {
+            let _ = send.send(Feed::Down("the daemon closed the connection".into()));
             return;
         }
+        // Nothing new since the last time it fell behind: it cannot keep up.
+        if cursor.is_none() || resumed == cursor {
+            let _ = send.send(Feed::Down("fell behind the daemon".into()));
+            return;
+        }
+        resumed = cursor;
     }
-    let _ = send.send(Feed::Down("the daemon closed the connection".into()));
 }
 
 /// Who told whom before `from` (Unix ms), from the turns kept, as live
@@ -5693,7 +5895,7 @@ async fn prior(socket: &std::path::Path, from: i64) -> Result<Prior, String> {
 
 /// Every agent the daemon keeps, page after page, as one roll; false when
 /// the view is gone or the daemon couldn't say.
-async fn roll(client: &Client, send: &mpsc::UnboundedSender<Feed>) -> bool {
+async fn roll(client: &Client, send: &Feeder) -> bool {
     let mut bots = Vec::new();
     let mut after: Option<String> = None;
     loop {
@@ -5718,6 +5920,8 @@ async fn roll(client: &Client, send: &mpsc::UnboundedSender<Feed>) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     /// The layout as it was drawn before it took one pass: each child's
     /// weight walked again for every node above it.
@@ -5874,8 +6078,8 @@ mod tests {
         assert_eq!(order.last(), Some(&(199_999, 199_999)));
     }
 
-    fn view() -> (View, mpsc::UnboundedSender<Feed>) {
-        let (send, feed) = mpsc::unbounded_channel();
+    fn view() -> (View, Feeder) {
+        let (send, feed) = Feeder::new();
         let task = tokio::spawn(async {});
         (View::with(PathBuf::new(), feed, task), send)
     }
@@ -5892,7 +6096,7 @@ mod tests {
             .join("\n")
     }
 
-    fn cord_sky() -> (View, mpsc::UnboundedSender<Feed>) {
+    fn cord_sky() -> (View, Feeder) {
         let (mut view, send) = view();
         send.send(Feed::Roll(vec![
             json!({"name": "shop.lead", "running_turn": 3}),
@@ -7995,11 +8199,11 @@ mod tests {
             ..Talked::default()
         };
         crate::keep_beside(&Talked::file(&store), &serde_json::to_vec(&kept).unwrap());
-        let (send, mut feed) = mpsc::unbounded_channel();
+        let (send, mut feed) = Feeder::new();
         tokio::spawn(follow(socket, store, send));
         let mut seen = Vec::new();
         while let Some(item) = feed.recv().await {
-            seen.push(match item {
+            seen.push(match item.0 {
                 Feed::Live(event) => event["cursor"].to_string(),
                 Feed::Roll(_) => "roll".into(),
                 Feed::Ready => "ready".into(),
@@ -8111,11 +8315,11 @@ mod tests {
                 }
             }
         });
-        let (send, mut feed) = mpsc::unbounded_channel();
+        let (send, mut feed) = Feeder::new();
         tokio::spawn(follow(socket, dir.join("state.sqlite"), send));
         let mut seen = Vec::new();
         while let Some(item) = feed.recv().await {
-            match item {
+            match item.0 {
                 Feed::Past(event) => seen.push(event["cursor"].to_string()),
                 Feed::Through(cursor) => seen.push(format!("through {cursor}")),
                 Feed::Down(why) => seen.push(format!("down {why}")),
@@ -8128,6 +8332,153 @@ mod tests {
         }
         assert_eq!(seen, ["6", "7", "9", "through 9", "ready"]);
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// A daemon that sends a burst of `count` events of a few KiB each,
+    /// faster than the sky takes them, from any cursor a follow asks for:
+    /// as the past when `past`, else as the live follow's replay. How many
+    /// connections it was asked for is counted.
+    fn burst(socket: &std::path::Path, count: i64, past: bool) -> Arc<AtomicUsize> {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        let listener = tokio::net::UnixListener::bind(socket).unwrap();
+        let connections = Arc::new(AtomicUsize::new(0));
+        let counted = connections.clone();
+        tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = listener.accept().await else {
+                    return;
+                };
+                counted.fetch_add(1, Ordering::SeqCst);
+                tokio::spawn(async move {
+                    let (read, mut write) = stream.into_split();
+                    let mut lines = BufReader::new(read).lines();
+                    let mut out =
+                        vec![json!({"event": "ready", "protocol": agent_client::PROTOCOL})];
+                    let pad = "x".repeat(2048);
+                    loop {
+                        for line in out.drain(..) {
+                            // A connection let go for falling behind is
+                            // closed under the writes.
+                            if write
+                                .write_all(format!("{line}\n").as_bytes())
+                                .await
+                                .is_err()
+                            {
+                                return;
+                            }
+                        }
+                        let Ok(Some(line)) = lines.next_line().await else {
+                            return;
+                        };
+                        let asked: Value = serde_json::from_str(&line).unwrap();
+                        let id = asked["id"].clone();
+                        match asked["op"].as_str() {
+                            Some("bots") => {
+                                out.push(json!({"id": id, "result": {"bots": [{"name": "a"}]}}))
+                            }
+                            Some("approvals") => {
+                                out.push(json!({"id": id, "result": {"approvals": []}}))
+                            }
+                            _ => {
+                                out.push(json!({"id": id, "result": {}}));
+                                let after = asked["after"].as_i64().unwrap_or(0);
+                                let bursts = (asked["kinds"] == json!(PAST)) == past;
+                                let end = if bursts { count } else { after };
+                                for cursor in after + 1..=end {
+                                    out.push(json!({"cursor": cursor, "bot": "a", "turn": cursor,
+                                        "event": "accepted", "data": {"pad": pad}}));
+                                }
+                                out.push(json!({"event": "follow_live", "cursor": end.max(after)}));
+                            }
+                        }
+                    }
+                });
+            }
+        });
+        connections
+    }
+
+    /// A sky slower than its daemon: what waits for it stays within the
+    /// connection's budget, and it reads on from where it fell behind
+    /// until every event came, once each and in order.
+    async fn a_slow_sky_holds_its_budget_and_loses_nothing(past: bool) {
+        let dir = std::env::temp_dir().join(format!("sky-slow-{past}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let socket = dir.join("agent.sock");
+        // Some 50 MiB, past the budget of both the connection and the view.
+        let count = 24_000;
+        let connections = burst(&socket, count, past);
+        let (send, mut feed) = Feeder::new();
+        let room = send.room.clone();
+        tokio::spawn(follow(socket, dir.join("state.sqlite"), send));
+        let (mut next, mut most) = (1, 0);
+        while let Some(Fed(item, held)) = feed.recv().await {
+            most = most.max(agent_client::QUEUE_BYTES - room.available_permits());
+            let event = match item {
+                Feed::Past(event) | Feed::Live(event) => event,
+                Feed::Ready => break,
+                Feed::Down(why) => panic!("down: {why}"),
+                _ => continue,
+            };
+            assert_eq!(event["cursor"], next);
+            next += 1;
+            // The sky stalls a while, as on a long frame, then takes its
+            // time.
+            if next == 2 {
+                tokio::time::sleep(Duration::from_secs(2)).await;
+            } else if next % 32 == 0 {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+            drop(held);
+        }
+        assert_eq!(next, count + 1);
+        assert!(most <= agent_client::QUEUE_BYTES);
+        let connections = connections.load(Ordering::SeqCst);
+        assert!(
+            most > agent_client::QUEUE_BYTES / 2,
+            "the sky was never behind: {most}"
+        );
+        assert!(connections > 1, "the follow never fell behind");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn an_agent_asked_again_before_its_read_is_read_once_as_last_asked() {
+        let (ask, mut asked) = scans();
+        // Turn after turn ends while the reads are busy with another.
+        for turn in 1..=1_000 {
+            ask.send(("a".to_owned(), Some(turn), None)).unwrap();
+        }
+        ask.send(("b".to_owned(), Some(7), None)).unwrap();
+        ask.send(("a".to_owned(), Some(1_001), None)).unwrap();
+        // One ask an agent waits, in the order first asked, each as of its
+        // newest.
+        assert_eq!(asked.names.len(), 2);
+        assert_eq!(asked.asks.lock().unwrap().len(), 2);
+        let read: Vec<(String, Option<i64>)> = std::iter::from_fn(|| asked.try_recv().ok())
+            .map(|(bot, turn, _)| (bot, turn))
+            .collect();
+        assert_eq!(
+            read,
+            [("a".to_owned(), Some(1_001)), ("b".to_owned(), Some(7))]
+        );
+        // Asked again once its read began, it is read again.
+        ask.send(("a".to_owned(), Some(1_002), None)).unwrap();
+        assert_eq!(asked.try_recv().unwrap().1, Some(1_002));
+        // The reads gone, asking says so.
+        drop(asked);
+        assert!(ask.send(("c".to_owned(), None, None)).is_err());
+    }
+
+    #[tokio::test]
+    async fn a_slow_sky_reading_the_past_holds_its_budget_and_loses_nothing() {
+        a_slow_sky_holds_its_budget_and_loses_nothing(true).await;
+    }
+
+    #[tokio::test]
+    async fn a_slow_sky_live_holds_its_budget_and_loses_nothing() {
+        a_slow_sky_holds_its_budget_and_loses_nothing(false).await;
     }
 
     #[tokio::test]
@@ -8202,7 +8553,7 @@ mod tests {
         crate::resolved::keep(&store, "busy", 5, "c3").unwrap();
         let (mut view, send) = view();
         view.resolved = store.clone();
-        let (scans, mut asked) = mpsc::unbounded_channel();
+        let (scans, mut asked) = scans();
         send.send(Feed::Scans(scans)).unwrap();
         send.send(Feed::Roll(vec![
             json!({"name": "done", "last": {"turn": 5}}),
@@ -8317,7 +8668,7 @@ mod tests {
     #[tokio::test]
     async fn the_sky_opens_whole_once_who_is_here_and_what_was_read_before_is_read_again() {
         let (mut view, send) = view();
-        let (scans, mut asked) = mpsc::unbounded_channel();
+        let (scans, mut asked) = scans();
         send.send(Feed::Scans(scans)).unwrap();
         // `a` was read before, as of a turn it has ended one since; `b`
         // never was, as on a store's first sky; nor `c`, which works.
@@ -8406,7 +8757,7 @@ mod tests {
         let store = dir.join("state.sqlite");
         let (mut view, send) = view();
         view.resolved = store.clone();
-        let (scans, mut asked) = mpsc::unbounded_channel();
+        let (scans, mut asked) = scans();
         send.send(Feed::Scans(scans)).unwrap();
         let read = |turn| {
             let seen = crate::needs::Seen {
@@ -8530,8 +8881,8 @@ mod tests {
                 }
             }
         });
-        let (ask, scans) = mpsc::unbounded_channel();
-        let (told, mut heard) = mpsc::unbounded_channel();
+        let (ask, scans) = scans();
+        let (told, mut heard) = Feeder::new();
         let was = crate::needs::Seen {
             itself: true,
             turn: Some(2),
@@ -8545,7 +8896,7 @@ mod tests {
         tokio::spawn(scan_all(socket.clone(), scans, told));
         let mut seen = HashMap::new();
         while let Some(feed) = heard.recv().await {
-            if let Feed::Asked(bot, Some(read)) = feed {
+            if let Feed::Asked(bot, Some(read)) = feed.0 {
                 seen.insert(bot, *read);
             }
         }
@@ -8987,7 +9338,7 @@ mod scale {
     #[ignore]
     async fn frame_times_at_scale() {
         for count in [30usize, 300, 3_000, 10_000] {
-            let (send, feed) = mpsc::unbounded_channel();
+            let (send, feed) = Feeder::new();
             let mut view = View::with(PathBuf::new(), feed, tokio::spawn(async {}));
             let projects = (count / 30).max(1);
             let mut bots = Vec::new();
@@ -9141,7 +9492,7 @@ mod scale {
             .and_then(|n| n.parse().ok())
             .unwrap_or(200_000);
         let base = rss_kib();
-        let (send, feed) = mpsc::unbounded_channel();
+        let (send, feed) = Feeder::new();
         let mut view = View::with(PathBuf::new(), feed, tokio::spawn(async {}));
         let (bots, projects) = fleet(count);
         // Who told whom before: a past of accepted turns.

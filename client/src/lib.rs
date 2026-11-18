@@ -274,7 +274,10 @@ impl Drop for FrameWrite<'_> {
 /// Notifications queued ahead of the UI before the session is let go.
 /// Larger than any replay page, so a normal attach never trips it.
 const QUEUE: usize = 4096;
-const QUEUE_BYTES: usize = 8 * 1024 * 1024;
+/// The bytes of notifications, as sent, queued ahead of the UI. A caller
+/// that keeps notifications past this queue carries the same budget on
+/// with [`Events::recv_sized`].
+pub const QUEUE_BYTES: usize = 8 * 1024 * 1024;
 
 struct Notification {
     encoded: String,
@@ -295,6 +298,29 @@ impl Events {
         self.0
             .try_recv()
             .map(|event| serde_json::from_str(&event.encoded).expect("validated notification"))
+    }
+    /// The next notification with its size as sent, which it held of
+    /// [`QUEUE_BYTES`]: a caller that queues it again charges that much
+    /// to a budget of its own, so the bound holds past this queue.
+    pub async fn recv_sized(&mut self) -> Option<(Value, usize)> {
+        self.0.recv().await.map(|event| {
+            let size = event.encoded.len();
+            (
+                serde_json::from_str(&event.encoded).expect("validated notification"),
+                size,
+            )
+        })
+    }
+    pub fn try_recv_sized(
+        &mut self,
+    ) -> std::result::Result<(Value, usize), mpsc::error::TryRecvError> {
+        self.0.try_recv().map(|event| {
+            let size = event.encoded.len();
+            (
+                serde_json::from_str(&event.encoded).expect("validated notification"),
+                size,
+            )
+        })
     }
 }
 
