@@ -10217,7 +10217,7 @@ impl Database {
                 format!("{name} is not declared lift: only its answer ends the call"),
             );
         }
-        let Some((process, _)) = self.lift(turn, call_id, None, Some(so_far), now_ms)? else {
+        let Some((process, _)) = self.lift(turn, call_id, None, Some(so_far), &[], now_ms)? else {
             return fail_with(
                 "no_pending_call",
                 "the call was answered, moved to the background or ran out of time",
@@ -14195,6 +14195,7 @@ impl Database {
         call_id: &str,
         call: Option<&ToolCall>,
         yielded: Option<&Outcome>,
+        served: &[String],
         now_ms: u64,
     ) -> Result<Option<(i64, Option<u64>)>> {
         let bot = self.active(turn)?;
@@ -14283,6 +14284,12 @@ impl Database {
             }
             let mut lifted =
                 json!({"call_id":call_id,"handle":handle_of(process),"waits_for":waits_for});
+            // Who holds a call waiting on its verdict, as its turn's
+            // waiting status names them.
+            let holder = (request.as_ref()).map(|request| request.holder(served).0);
+            if let Some(holder) = holder {
+                lifted["holder"] = holder.into();
+            }
             if yielded.is_some() {
                 lifted["yielded"] = true.into();
             }
@@ -14297,11 +14304,14 @@ impl Database {
                 .prepare_cached("UPDATE tools SET audit=NULL WHERE turn=? AND call_id=?")?
                 .execute(params![turn, call_id])?;
             let outcome = match yielded {
-                None => Outcome::text(
-                    json!({"handle":handle_of(process),"background":true,"steered":true,
-                        "waits_for":waits_for})
-                    .to_string(),
-                ),
+                None => {
+                    let mut result = json!({"handle":handle_of(process),"background":true,
+                        "steered":true,"waits_for":waits_for});
+                    if let Some(holder) = holder {
+                        result["holder"] = holder.into();
+                    }
+                    Outcome::text(result.to_string())
+                }
                 // What the client wrote so far, pictures too, as an answer
                 // carries them.
                 Some(so_far) => Outcome {

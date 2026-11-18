@@ -149,3 +149,50 @@ async fn readiness_rejects_missing_or_mismatched_protocol_versions() {
     assert!(error.facts.is_none());
     std::fs::remove_file(path).unwrap();
 }
+
+#[tokio::test]
+async fn a_label_names_this_connection_and_every_later_one() {
+    use tokio::io::AsyncBufReadExt;
+    let path = std::env::temp_dir().join(format!("ac-label-{}.sock", std::process::id()));
+    let listener = UnixListener::bind(&path).unwrap();
+    agent_client::name_program("window");
+    let connect =
+        |path: std::path::PathBuf| tokio::spawn(async move { Client::connect(&path).await });
+    let first = connect(path.clone());
+    let (peer, _) = listener.accept().await.unwrap();
+    let (read, mut write) = peer.into_split();
+    write.write_all(ready_line().as_bytes()).await.unwrap();
+    let mut said = tokio::io::BufReader::new(read).lines();
+    let (client, _events) = first.await.unwrap().unwrap();
+    let line = |text: String| serde_json::from_str::<serde_json::Value>(&text).unwrap();
+    let hello = line(said.next_line().await.unwrap().unwrap());
+    assert_eq!(
+        (&hello["op"], &hello["program"]),
+        (&"hello".into(), &"window".into())
+    );
+    assert!(hello.get("label").is_none(), "{hello}");
+    client.label("shop.lead").await.unwrap();
+    let again = line(said.next_line().await.unwrap().unwrap());
+    assert_eq!(
+        (&again["id"], &again["program"], &again["label"]),
+        (&u64::MAX.into(), &"window".into(), &"shop.lead".into())
+    );
+    // A later connection names itself with the label from the start.
+    let second = connect(path.clone());
+    let (peer, _) = listener.accept().await.unwrap();
+    let (read, mut write) = peer.into_split();
+    write.write_all(ready_line().as_bytes()).await.unwrap();
+    let (later, _events) = second.await.unwrap().unwrap();
+    let hello = line(
+        tokio::io::BufReader::new(read)
+            .lines()
+            .next_line()
+            .await
+            .unwrap()
+            .unwrap(),
+    );
+    assert_eq!(hello["label"], "shop.lead");
+    client.close().await;
+    later.close().await;
+    std::fs::remove_file(path).unwrap();
+}

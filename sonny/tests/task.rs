@@ -615,6 +615,16 @@ fn a_task_outside_git_works_in_an_empty_folder_of_its_own() {
         lab.ran()[6],
         std::fs::canonicalize(&ws).unwrap().to_string_lossy()
     );
+    // It writes its lead's state folder, as a task in a repository does.
+    let state = std::fs::canonicalize(lab.home.join(".local/state/sonny/agents/demo.lead"))
+        .unwrap()
+        .to_string_lossy()
+        .into_owned();
+    let shared_ran = lab.ran();
+    assert!(
+        (shared_ran.windows(2)).any(|pair| pair[0] == "--writable" && pair[1] == state),
+        "{shared_ran:?}"
+    );
     let start = serde_json::json!({"title": "Synthetic work", "name": "fix", "brief": "fix it", "own_folder": true});
     let (ok, said) = lab.tool(&ws, "start_task", start.clone(), false);
     assert!(ok, "{said}");
@@ -635,10 +645,6 @@ fn a_task_outside_git_works_in_an_empty_folder_of_its_own() {
         .filter(|(flag, _)| *flag == "--writable")
         .map(|(_, folder)| folder)
         .collect();
-    let state = std::fs::canonicalize(lab.home.join(".local/state/sonny/agents/demo.lead"))
-        .unwrap()
-        .to_string_lossy()
-        .into_owned();
     assert!(writable.contains(&&state), "{ran:?}");
     assert!(
         (writable.iter()).all(|folder| folder.ends_with(".agent/sonny/zen") || **folder == state),

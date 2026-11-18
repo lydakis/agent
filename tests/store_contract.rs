@@ -21665,11 +21665,23 @@ fn a_lifted_call_waits_on_past_its_turn_and_its_verdict_runs_or_ends_it() {
     )
     .unwrap();
     let now = epoch_now();
-    let (p1, lapse) = db.lift(turn, "s1", Some(&s1), None, now).unwrap().unwrap();
+    // A reviewer serves the first call's gate; no one serves the others',
+    // which wait on a person.
+    let reviewer = ["manual".to_owned()];
+    let (p1, lapse) = db
+        .lift(turn, "s1", Some(&s1), None, &reviewer, now)
+        .unwrap()
+        .unwrap();
     // No gate runs it out, so nothing goes on the schedule.
     assert_eq!(lapse, None);
-    let (p2, _) = db.lift(turn, "s2", Some(&s2), None, now).unwrap().unwrap();
-    let (p3, _) = db.lift(turn, "s3", Some(&s3), None, now).unwrap().unwrap();
+    let (p2, _) = db
+        .lift(turn, "s2", Some(&s2), None, &[], now)
+        .unwrap()
+        .unwrap();
+    let (p3, _) = db
+        .lift(turn, "s3", Some(&s3), None, &[], now)
+        .unwrap()
+        .unwrap();
     // Each call is answered with its handle, so the round is closed and
     // the turn can end.
     let events = db.events("Bob", 0, 256).unwrap()["events"].clone();
@@ -21679,6 +21691,26 @@ fn a_lifted_call_waits_on_past_its_turn_and_its_verdict_runs_or_ends_it() {
     assert_eq!(lifted.len(), 3);
     assert_eq!(lifted[0]["data"]["waits_for"], "approval");
     assert_eq!(lifted[0]["data"]["handle"], format!("proc:{p1}"));
+    // Each says who holds it, as a waiting turn's status does, and so does
+    // the result that answers its call.
+    let holders: Vec<&Value> = lifted.iter().map(|e| &e["data"]["holder"]).collect();
+    assert_eq!(
+        holders,
+        [&json!("reviewer"), &json!("person"), &json!("person")]
+    );
+    let items = stored(&mut db, "Bob");
+    let answered = |call: &str| -> Value {
+        let output = (items.iter())
+            .find(|item| item["type"] == "function_call_output" && item["call_id"] == call)
+            .unwrap();
+        serde_json::from_str(output["output"].as_str().unwrap()).unwrap()
+    };
+    assert_eq!(
+        answered("s1"),
+        json!({"handle":format!("proc:{p1}"),"background":true,"steered":true,
+            "waits_for":"approval","holder":"reviewer"})
+    );
+    assert_eq!(answered("s2")["holder"], "person");
     db.append(turn, vec![assistant("done")], &[], None).unwrap();
     db.finish(turn, None).unwrap();
     // Both still wait, listed for the bot with their handles.
@@ -21847,8 +21879,14 @@ fn a_lifted_calls_verdict_leaves_a_later_turns_denials_be() {
     db.append(turn, vec![first, second], &[s1.clone(), s2.clone()], None)
         .unwrap();
     let now = epoch_now();
-    let (p1, _) = db.lift(turn, "s1", Some(&s1), None, now).unwrap().unwrap();
-    let (p2, _) = db.lift(turn, "s2", Some(&s2), None, now).unwrap().unwrap();
+    let (p1, _) = db
+        .lift(turn, "s1", Some(&s1), None, &[], now)
+        .unwrap()
+        .unwrap();
+    let (p2, _) = db
+        .lift(turn, "s2", Some(&s2), None, &[], now)
+        .unwrap()
+        .unwrap();
     db.append(turn, vec![assistant("done")], &[], None).unwrap();
     db.finish(turn, None).unwrap();
     // A later turn has a denial of its own under the same gate.
@@ -21965,9 +22003,9 @@ fn a_lifted_answered_call_takes_its_answer_or_is_stopped_and_outlives_a_restart(
             db.tool_start(turn, call, false, false).unwrap();
         }
         let now = epoch_now();
-        let (p1, _) = db.lift(turn, "c1", None, None, now).unwrap().unwrap();
-        let (p2, _) = db.lift(turn, "c2", None, None, now).unwrap().unwrap();
-        let (p3, _) = db.lift(turn, "c3", None, None, now).unwrap().unwrap();
+        let (p1, _) = db.lift(turn, "c1", None, None, &[], now).unwrap().unwrap();
+        let (p2, _) = db.lift(turn, "c2", None, None, &[], now).unwrap().unwrap();
+        let (p3, _) = db.lift(turn, "c3", None, None, &[], now).unwrap().unwrap();
         db.append(turn, vec![assistant("done")], &[], None).unwrap();
         db.finish(turn, None).unwrap();
         (turn, p1, p2, p3)
@@ -22077,7 +22115,7 @@ fn a_lifted_answered_call_keeps_its_time_steps_listing_and_audit_row() {
         .unwrap();
     db.tool_start(turn, &call, false, false).unwrap();
     let now = epoch_now();
-    let (process, lapse) = db.lift(turn, "c1", None, None, now).unwrap().unwrap();
+    let (process, lapse) = db.lift(turn, "c1", None, None, &[], now).unwrap().unwrap();
     let Some(lapse) = lapse else {
         panic!("a lifted call with a time of its own was not scheduled");
     };

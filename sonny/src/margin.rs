@@ -957,6 +957,9 @@ pub struct Margin {
     /// What template notes are filled from, as the window sets it before
     /// each draw ([`Margin::set_blanks`]).
     blanks: Blanks,
+    /// The bot's own tasks that need the person, failed or work, as
+    /// `/status` last read them, shown under the plan.
+    tasks: Vec<crate::status::Own>,
     /// Template notes as last filled, by note id; the person's own by
     /// `~NAME`.
     watch: crate::live::Watch,
@@ -1060,9 +1063,21 @@ impl Margin {
         )
     }
 
-    /// Whether it holds no note and no plan.
+    /// Whether it holds no note, no plan and no task.
     pub fn is_empty(&self) -> bool {
-        self.kept.notes.is_empty() && self.plan.is_empty() && self.blanks.notes.is_empty()
+        self.kept.notes.is_empty()
+            && self.plan.is_empty()
+            && self.tasks.is_empty()
+            && self.blanks.notes.is_empty()
+    }
+
+    /// The bot's own tasks that need the person, failed or work, as
+    /// `/status` read them now ([`crate::status::own`]).
+    pub fn set_tasks(&mut self, tasks: Vec<crate::status::Own>) {
+        if self.tasks != tasks {
+            self.tasks = tasks;
+            self.changes += 1;
+        }
     }
 
     /// The newest node of the bot's history the notes were brought up to.
@@ -1546,9 +1561,21 @@ impl Margin {
                 lines.extend(crate::transcript::wrap(step, width, lead(), lead()));
             }
         }
+        // What the bot has going, under the plan and above the notes: a
+        // click on a task goes to it.
+        let tasks = crate::status::own_lines(&self.tasks, width);
+        if !tasks.is_empty() {
+            lines.push(Line::default());
+        }
+        for (line, bot) in tasks {
+            if let Some(bot) = bot {
+                marks.push((lines.len(), Mark::Link(format!("{BUTTON}task/{bot}"))));
+            }
+            lines.push(line);
+        }
         let person = self.blanks.notes.clone();
         if self.kept.notes.is_empty() && person.is_empty() {
-            if self.plan.is_empty() {
+            if self.plan.is_empty() && self.tasks.is_empty() {
                 lines.push(Line::default());
                 lines.push(
                     Line::from(" Notes the agent keeps beside the conversation show here.").dim(),
@@ -2147,6 +2174,51 @@ mod tests {
                 .iter()
                 .any(|line| line.spans.iter().any(|s| s.content.contains('≡')))
         );
+    }
+
+    #[test]
+    fn the_agent_s_tasks_show_under_the_plan_and_above_the_notes() {
+        use crate::status::{Group, Own};
+        let mut margin = margin();
+        let task = |name: &str, title: &str, state: &str, group| Own {
+            bot: format!("calc.{name}"),
+            name: name.into(),
+            title: title.into(),
+            state: state.into(),
+            group,
+            helpers: Vec::new(),
+            run: None,
+        };
+        // Its tasks alone open it, as a plan does.
+        margin.set_tasks(vec![task(
+            "halves",
+            "Round half cents to even",
+            "working",
+            Group::Working,
+        )]);
+        assert!(!margin.is_empty());
+        margin.set_plan(&["[ ] Ship".to_owned()]);
+        let post = json!({"kind": "pinned", "id": "repro", "title": "Repro", "markdown": "1 of 5"});
+        margin.apply("c1", &post, Some(7), Some(3), None);
+        let text = drawn(&mut margin, Path::new("/"));
+        let at = |what: &str| {
+            text.find(what)
+                .unwrap_or_else(|| panic!("{what} in {text}"))
+        };
+        assert!(at("Plan") < at(" Tasks · 1") && at(" Tasks · 1") < at("Repro"));
+        assert!(
+            text.contains(" ● Round half cents to even  halves"),
+            "{text}"
+        );
+        // A click on the task goes to it.
+        let (lines, marks) = margin.lines(60, Path::new("/"), None);
+        let row = (lines.iter())
+            .position(|line| line.spans.iter().any(|s| s.content == "halves"))
+            .unwrap();
+        assert!(marks.contains(&(row, Mark::Link(format!("{BUTTON}task/calc.halves")))));
+        // None going: no block, drawn again once that changes.
+        margin.set_tasks(Vec::new());
+        assert!(!drawn(&mut margin, Path::new("/")).contains("Tasks"));
     }
 
     #[test]

@@ -448,8 +448,12 @@ class SocketAndCliTests(ModelFixture):
         last = json.loads(self.agent('turns', *store, '--bot', 'Bob', '--newest', '--limit', '1').stdout)[0]['handle']
         done = json.loads(self.agent('wait', *store, '--bot', 'Bob').stdout)
         self.assertEqual(done['results'][last]['text'], 'reply:p0')
-        # A fork has no turns of its own yet.
-        self.agent('fork', *store, '--source', 'Bob', '--bot', 'Fresh')
+        # A fork has no turns of its own yet. Its answer leaves out the
+        # instructions it copied, which inspect shows.
+        fresh = json.loads(self.agent('fork', *store, '--source', 'Bob', '--bot', 'Fresh').stdout)
+        self.assertEqual((fresh['name'], 'instructions' in fresh), ('Fresh', False))
+        self.assertEqual(json.loads(self.agent('inspect', *store, '--bot', 'Fresh').stdout)['instructions'],
+                         bob['instructions'])
         none = self.agent('wait', *store, '--bot', 'Fresh', check=False)
         self.assertEqual((none.returncode, json.loads(none.stderr)['error']), (1, 'no_turn'))
         # A running turn is the one waited on, whoever submitted it.

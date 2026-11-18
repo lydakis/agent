@@ -241,6 +241,7 @@ struct Counts {
 impl Counts {
     fn delivered(&self, output: &Output) {
         self.delivered.fetch_add(1, Ordering::Relaxed);
+        output.delivered();
         if let Some(count) = self.delivered_to.get(output.program()) {
             count.fetch_add(1, Ordering::Relaxed);
         }
