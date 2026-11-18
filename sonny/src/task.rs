@@ -535,7 +535,12 @@ pub fn start(here: &Path, project: &str, starter: &str, start: &Start) -> Result
     };
     let profile = (start.profile.clone()).or_else(|| crate::project::task_profile(&info).ok());
     if let Some(store) = &store {
-        let _ = crate::title::note(store, name, &start.title);
+        // Noted by the id it started with, which no agent given its name
+        // later has.
+        let started: Value = serde_json::from_slice(&output.stdout).unwrap_or_default();
+        if let Some(id) = started["bot_id"].as_i64() {
+            let _ = crate::title::note(store, name, id, &start.title);
+        }
         match profile {
             Some(profile) => {
                 let _ = note_profile(store, name, &profile);

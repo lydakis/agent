@@ -138,7 +138,8 @@ stays the handle you address, link and click. A lead sets a task's with
 can change it; a folder that is a project already keeps its own, and one
 with none shows its name. A lead's title is its project's. An agent you
 start with `/new` takes its first message's first line. Sonny keeps each
-agent's beside the store (`STORE.titles/NAME`); the daemon keeps none.
+agent's beside the store (`STORE.titles/NAME`) with the agent's id, so one
+given the name later takes none of it; the daemon keeps none.
 Every row that lists an agent leads with its title: `/status`, `/switch`
 and the tasks a lead started.
 

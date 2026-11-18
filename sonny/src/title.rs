@@ -18,11 +18,12 @@ fn file(store: &Path, bot: &str) -> PathBuf {
     PathBuf::from(dir).join(bot)
 }
 
-/// Note `title` as `bot`'s.
-pub fn note(store: &Path, bot: &str, title: &str) -> std::io::Result<()> {
+/// Note `title` as the title of `bot`, the agent of id `id`: its id
+/// first, so an agent given the name later takes none of it.
+pub fn note(store: &Path, bot: &str, id: i64, title: &str) -> std::io::Result<()> {
     let file = file(store, bot);
     std::fs::create_dir_all(file.parent().unwrap_or(Path::new("/")))?;
-    std::fs::write(file, format!("{}\n", title.trim()))
+    std::fs::write(file, format!("{id}\n{}\n", title.trim()))
 }
 
 /// The titles noted beside a store, for a listing of many agents: the
@@ -50,21 +51,25 @@ impl Noted {
         Self { dir, names }
     }
 
-    /// The title noted for `bot`, the agent of id `id`.
+    /// The title noted for `bot`, the agent of id `id`: none where it
+    /// was noted for another agent of that name.
     pub fn of(&self, bot: &str, id: Option<i64>) -> Option<String> {
+        let id = id?;
         if !self.names.contains(std::ffi::OsStr::new(bot)) {
             return None;
         }
-        let key = id.map(|id| (bot.to_owned(), id));
+        let key = (bot.to_owned(), id);
         let mut read = READ.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(title) = key.as_ref().and_then(|key| read.get(key)) {
+        if let Some(title) = read.get(&key) {
             return Some(title.clone());
         }
         let text = std::fs::read_to_string(self.dir.join(bot)).ok()?;
-        let title = Some(text.trim().to_owned()).filter(|title| !title.is_empty())?;
-        if let Some(key) = key {
-            read.insert(key, title.clone());
+        let (noted, title) = text.split_once('\n')?;
+        if noted.trim().parse::<i64>().ok()? != id {
+            return None;
         }
+        let title = Some(title.trim().to_owned()).filter(|title| !title.is_empty())?;
+        read.insert(key, title.clone());
         Some(title)
     }
 }
@@ -225,13 +230,15 @@ mod tests {
         );
         // A task never takes its project's.
         assert_eq!(titles(&bot("tally.halves", 2)), None);
-        note(&store, "tally.halves", "Round half cents to even").unwrap();
+        note(&store, "tally.halves", 2, "Round half cents to even").unwrap();
         assert_eq!(
             titles(&bot("tally.halves", 2)).as_deref(),
             Some("Round half cents to even")
         );
+        // Another agent given the name later takes none of it.
+        assert_eq!(titles(&bot("tally.halves", 9)), None);
         // A lead the person started with /new keeps its own.
-        note(&store, "tally.lead.notes", "Draft the release notes").unwrap();
+        note(&store, "tally.lead.notes", 3, "Draft the release notes").unwrap();
         assert_eq!(
             titles(&bot("tally.lead.notes", 3)).as_deref(),
             Some("Draft the release notes")
