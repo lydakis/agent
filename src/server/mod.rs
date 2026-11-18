@@ -1436,6 +1436,10 @@ struct Writing {
     /// Pauses lifted: a step whose write was on its way across one is
     /// checked at once, as `resume` checks those already waiting.
     lifts: u64,
+    /// Steps allowed by their writes that landed while the daemon was
+    /// paused: nothing runs until the line goes on, so they are answered on
+    /// resume.
+    allowed: Vec<(Output, Value, Value)>,
 }
 /// Whom a client's write answers, and what the run loop does once it lands.
 struct Write {
@@ -5244,13 +5248,27 @@ impl Service {
                         // Answered from the run loop once the step is decided.
                         None
                     }
-                    Ok(stepped) => Some(Ok(settle_step(
-                        &self.handles,
-                        &stepping.bot,
-                        stepping.turn,
-                        stepped,
-                    )
-                    .expect("a decided step"))),
+                    Ok(stepped) => {
+                        let reply =
+                            settle_step(&self.handles, &stepping.bot, stepping.turn, stepped)
+                                .expect("a decided step");
+                        // Held since it was asked: no step runs until the
+                        // line goes on.
+                        match self.held() {
+                            Some(held) if reply["decision"] == "allow" => {
+                                if self.paused.is_some() {
+                                    let Stepping {
+                                        output, request, ..
+                                    } = *stepping;
+                                    self.writing.allowed.push((output, request, reply));
+                                    None
+                                } else {
+                                    Some(fail_with(held, "no step runs while the daemon is held"))
+                                }
+                            }
+                            _ => Some(Ok(reply)),
+                        }
+                    }
                     Err(error) => Some(Err(error)),
                 };
                 if self.writing.announcing == 0 {
@@ -5893,6 +5911,11 @@ impl Service {
                     // the store once they land.
                     self.ready_hint = true;
                     self.writing.lifts += 1;
+                    for (output, request, reply) in std::mem::take(&mut self.writing.allowed) {
+                        if output.try_respond(request, Ok(reply)).is_err() {
+                            output.close();
+                        }
+                    }
                     let waiting: Vec<i64> = self.stepping.keys().copied().collect();
                     self.check_steps(waiting, false);
                     self.pump_steps();
@@ -10163,6 +10186,63 @@ mod tests {
         assert!(reply.is_none());
         assert!(!service.stepping[&43].checking, "nothing to check");
         while service.step_checks.join_next().await.is_some() {}
+        drop(service);
+        drop(store);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_step_allowed_as_a_pause_begins_is_answered_on_resume() {
+        let dir = scratch("paused-step");
+        let (store, _publications) = Store::open(&dir.join("state.sqlite")).await.unwrap();
+        let mut service = admitting(&store, 1024);
+        let (output, _writer) = Output::stdout();
+        let (client, mut lines) = Output::in_process();
+        let stepping = |request: &str| Stepping {
+            session: 1,
+            output: client.clone(),
+            request: json!(request),
+            bot: "A".into(),
+            turn: 1,
+            id: "c/1".into(),
+            gone: false,
+            checking: false,
+            again: false,
+            daemon: None,
+        };
+        let decided = |decision: &str| {
+            Some(Written::Stepped(Ok(Stepped {
+                step: Step::Decided(json!({"call_id":"c/1","decision":decision,"approvals":[]})),
+                notify: None,
+                wake: false,
+                lifted: None,
+            })))
+        };
+        let pause = Command::Pause {
+            reason: "look".into(),
+            by: None,
+        };
+        let answers = requests(&mut service, vec![pause], &output).await;
+        assert!(answers.iter().all(|(_, answer)| answer.is_ok()));
+        // Two steps asked before the pause land after it.
+        service.writing.announcing = 2;
+        let lifts = service.writing.lifts;
+        let allowed = service.written(
+            Then::Stepped(Box::new(stepping("s1")), lifts),
+            decided("allow"),
+        );
+        assert!(allowed.is_none(), "nothing runs while paused");
+        let denied = service.written(
+            Then::Stepped(Box::new(stepping("s2")), lifts),
+            decided("deny"),
+        );
+        assert_eq!(denied.unwrap().unwrap()["decision"], "deny");
+        let answers = requests(&mut service, vec![Command::Resume { by: None }], &output).await;
+        assert!(answers.iter().all(|(_, answer)| answer.is_ok()));
+        assert!(service.writing.allowed.is_empty());
+        let line: Value = serde_json::from_slice(&lines.next().await.unwrap()).unwrap();
+        assert_eq!(line["id"], "s1");
+        assert_eq!(line["result"]["decision"], "allow");
         drop(service);
         drop(store);
         std::fs::remove_dir_all(dir).unwrap();

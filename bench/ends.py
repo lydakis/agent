@@ -198,12 +198,30 @@ def threads(pid):
     return found
 
 
-def measured(groups, seconds, daemon=None):
-    """CPU percent and RSS MiB of each group of processes over `seconds`."""
+def counters(control):
+    """The daemon's requests and loop-held milliseconds by op, so far."""
+    stats = control.request('stats')['result']
+    requests = {op: row['count'] for op, row in stats.get('commands', {}).get('ops', {}).items()}
+    held = {}
+    for part in ('commands', 'loop'):
+        for op, row in stats.get(part, {}).get('ops', {}).items():
+            held[op] = held.get(op, 0) + (row.get('held_ms') or 0)
+    return requests, held
+
+
+def measured(groups, seconds, daemon=None, control=None):
+    """CPU percent and RSS MiB of each group of processes over `seconds`,
+    and, with `control`, the daemon's requests and loop-held time over the
+    same seconds."""
+    marked = counters(control) if control else None
     before = {name: usage(pids()) for name, pids in groups.items()}
     held = threads(daemon) if daemon else {}
     time.sleep(seconds)
     after = {name: usage(pids()) for name, pids in groups.items()}
+    if control:
+        now = counters(control)
+        found_counts = [{op: count - was.get(op, 0) for op, count in seen.items()
+                         if count - was.get(op, 0)} for seen, was in zip(now, marked)]
     found = {name: {'cpu_pct': round(100 * (after[name][0] - before[name][0]) / seconds, 2),
                     'rss_mib': round(after[name][1], 1)} for name in groups}
     if daemon:
@@ -211,6 +229,8 @@ def measured(groups, seconds, daemon=None):
         found['daemon']['threads_pct'] = {
             name: round(100 * (cpu - held.get(name, 0)) / seconds, 2)
             for name, cpu in sorted(threads(daemon).items(), key=lambda kv: -kv[1])}
+    if control:
+        found['requests'], found['loop_held_ms'] = found_counts
     return found
 
 
@@ -331,7 +351,7 @@ def main():
             groups = {'daemon': lambda: [daemon.pid],
                       'window': lambda: tree(windows.pids['lead'][0])}
             result['window_start_s'] = round(started, 3) if started else None
-            result['idle'] = measured(groups, args.seconds, daemon.pid)
+            result['idle'] = measured(groups, args.seconds, daemon.pid, control)
             result['key_ms'] = spread([t for t in (windows.probe('lead') for _ in range(40))
                                        if t is not None])
             turns = []
@@ -410,7 +430,7 @@ def main():
                       'windows': lambda: [p for name in names_open for p in tree(windows.pids[name][0])]}
             keys, began = [], time.monotonic()
             usage_box = {}
-            meter = threading.Thread(target=lambda: usage_box.update(measured(groups, args.seconds, daemon.pid)))
+            meter = threading.Thread(target=lambda: usage_box.update(measured(groups, args.seconds, daemon.pid, control)))
             meter.start()
             n = 0
             while len(keys) < args.probes and time.monotonic() - began < args.seconds * 4:
@@ -428,11 +448,6 @@ def main():
             result['scripts_finished'] = finished[1]
             result.update(windows=args.windows, layout=args.layout, busy_agents=args.busy,
                           script_agents=args.scripts, pace_s=args.pace)
-        stats = control.request('stats')['result']
-        result['requests'] = {op: row['count'] for op, row in stats.get('commands', {}).get('ops', {}).items()}
-        result['loop_held_ms'] = {op: row['held_ms'] for part in ('commands', 'loop')
-                                  for op, row in stats.get(part, {}).get('ops', {}).items()
-                                  if row.get('held_ms')}
         Path(args.out).write_text(json.dumps(result, indent=1) + '\n')
         print(json.dumps(result))
     finally:
