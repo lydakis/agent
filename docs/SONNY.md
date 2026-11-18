@@ -1457,8 +1457,10 @@ message, a steer, an answer, a pick, `/compact`, Esc's interrupt) goes out in
 order beside the loop, and a message shows under the conversation at once. Older
 pages, an open card's refresh and the reads Sonny repeats every few seconds
 (tasks, the calls of agents below, their questions, margin notes) run beside it
-too, as Codex's TUI sends its ops and hears back as events. Opening a card (its
-first read), `/switch` and a reconnect's catching up still read before they
+too, as Codex's TUI sends its ops and hears back as events. A reconnect's
+catching up (what came since the last item drawn, the turn still running, its
+approvals and companions) is read beside the loop too, and drawn when it has
+all come. Opening a card (its first read) and `/switch` still read before they
 show.
 
 The window holds only the event it is showing, as Codex's TUI takes one at a
