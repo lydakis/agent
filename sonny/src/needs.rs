@@ -437,6 +437,9 @@ pub struct Needs {
     unsure: HashSet<String>,
     /// Those whose turn ended since, with the turn.
     due: Vec<(String, Option<i64>)>,
+    /// For each agent, how many events changed its question: a read begun
+    /// before one of them is older than what the events said.
+    stirred: HashMap<String, u64>,
     /// Counts every change to the questions open, so a window showing
     /// them reads them again only when they changed.
     version: u64,
@@ -570,6 +573,12 @@ impl Needs {
         self.unsure.remove(bot);
     }
 
+    /// How many events changed `bot`'s question: the same before and after
+    /// a read of it, none came between.
+    pub fn stirred(&self, bot: &str) -> u64 {
+        self.stirred.get(bot).copied().unwrap_or(0)
+    }
+
     /// The agents to read again, their turn over, with that turn.
     pub fn due(&mut self) -> Vec<(String, Option<i64>)> {
         std::mem::take(&mut self.due)
@@ -622,6 +631,7 @@ impl Needs {
                 // history says once the turn ends.
                 if data["name"] == crate::asks::CLOSE && self.asks.contains_key(bot) {
                     self.unsure.insert(bot.to_owned());
+                    self.stir(bot);
                 }
             }
             "tool_started" => {
@@ -629,6 +639,7 @@ impl Needs {
                 self.asks.insert(bot.to_owned(), Open { call, ask: None });
                 self.version += 1;
                 self.unsure.insert(bot.to_owned());
+                self.stir(bot);
             }
             // A message lifted the call out of its turn: it waits on, and
             // so do the steps its client asks for, then or later.
@@ -678,6 +689,7 @@ impl Needs {
                     if refused && asking {
                         self.asks.remove(bot);
                         self.version += 1;
+                        self.stir(bot);
                     }
                     // Taken, the question is in its history whole, with what
                     // Sonny took it as: read now, not when the turn ends,
@@ -694,6 +706,7 @@ impl Needs {
                 if self.asks.remove(bot).is_some() {
                     self.unsure.insert(bot.to_owned());
                     self.version += 1;
+                    self.stir(bot);
                 }
             }
             // Only a turn's end lets go of its calls; a message that ended
@@ -721,6 +734,10 @@ impl Needs {
                     .is_some_and(|c| c.contains(&(*turn, step.clone())))
         });
         was != self.waits(bot)
+    }
+
+    fn stir(&mut self, bot: &str) {
+        *self.stirred.entry(bot.to_owned()).or_default() += 1;
     }
 }
 

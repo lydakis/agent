@@ -197,8 +197,11 @@ configured ones; none is measured against the other harnesses:
 - **`exec` is a declared tool** with `answered_by`, `steps` and `lift`
   (sonny/src/exec.rs:144), so a waiting script costs the daemon a parked
   row, and each nested call is judged, not the script.
-- **Bounded memory.** Four scripts run and sixteen are alive, each under
-  256 MB (sonny/src/exec.rs:37-45).
+- **Codex's one bound.** Up to 2,048 scripts are alive at once, running or
+  waiting, each on its own thread and under 256 MB; one more is refused at
+  once with `code-mode host has too many active scripts`, as Codex's host
+  refuses a cell past its `MAX_ACTIVE_CELLS` (sonny/src/exec.rs:45-59). There
+  is no cap on those running: the OS schedules their threads.
 - **`browser`, `desktop` and links** are declared tools the same host
   answers.
 
@@ -307,8 +310,8 @@ carries `shell`:
 - **The runtime thread.** A script is CPU-bound JavaScript. In the daemon
   it would need threads of its own and a bridge back, which is a host
   process in all but the address space.
-- **Memory.** Sonny's sixteen scripts at their cap are 4 GB. The daemon's
-  peak in the 32-agent screen is 27 MiB.
+- **Memory.** Each of Sonny's scripts may grow to 256 MB, and up to 2,048
+  are alive. The daemon's peak in the 32-agent screen is 27 MiB.
 - **Failure.** An engine that aborts on a bad allocation or a deep stack
   takes its process with it. In a companion that is one restart with
   backoff; in the daemon it is every bot's turn.

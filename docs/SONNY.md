@@ -1298,10 +1298,11 @@ call but a read-only tool's; `prompt` asks for every call; `approve` never
 asks. Asking puts the call to the agent's own gate, through the daemon's
 `approve_step`: in `full` nothing waits, in `auto` the reviewer decides it, in
 `ask` the person does, the call drawn with `a call in a running script`.
-The script waits for the verdict with its 10 minutes stopped and its place
-among the four running given to another, though it stays among the sixteen
-alive; JavaScript it runs meanwhile, beside the waiting call, still spends
-its time. A denied call rejects with the reason, which the script can catch.
+The script waits for the verdict with its 10 minutes stopped, on its own
+thread, holding none of another's room: up to 2,048 scripts are alive at
+once, as Codex's host allows cells, and one past them is refused at once
+rather than kept waiting. JavaScript it runs meanwhile, beside the waiting
+call, still spends its time. A denied call rejects with the reason, which the script can catch.
 Once a call a gate allowed has run, Sonny tells the daemon how it ended
 (`step_result`), so the reviewer of the agent's next call counts it among those
 the turn already ran.
@@ -1450,7 +1451,7 @@ that names both, so run Sonny from the same commit on both ends.
 
 A Sonny window takes every key at once, however slow its daemon is to answer.
 What the daemon says is read beside the window's loop and shown in the order it
-came, a few events at a time between looks at the keys. What the person sends (a
+came, one event at a time between looks at the keys. What the person sends (a
 message, a steer, an answer, a pick, `/compact`, Esc's interrupt) goes out in
 order beside the loop, and a message shows under the conversation at once. Older
 pages, an open card's refresh and the reads Sonny repeats every few seconds
@@ -1458,6 +1459,13 @@ pages, an open card's refresh and the reads Sonny repeats every few seconds
 too, as Codex's TUI sends its ops and hears back as events. Opening a card (its
 first read), `/switch` and a reconnect's catching up still read before they
 show.
+
+The window holds only the event it is showing, as Codex's TUI takes one at a
+time. The rest wait in the connection's own queue (4,096 events or 8 MiB), so a fast
+stream behind a slow read costs no more memory than before. A stream past that
+queue lets go of the connection, as any reader that falls behind does: the
+window drops what it had not shown yet, connects again and draws the rest from
+history, from the last item it drew, each line once and in order.
 
 With every answer held 5 s (`docs/demo/held`), before this change Enter waited for the
 daemon and the window stopped: the clock stayed at 8 s, the steer stayed in the

@@ -127,15 +127,20 @@ fn kept(reply: &str) -> Value {
 }
 
 /// A daemon that holds back every answer by `held`, each on its own, and
-/// sends the events `told` gives it. What it was asked is in the list.
+/// sends the events `told` gives it on the first connection; the bot's
+/// items are `items`, its nodes as `history_nodes` lists them `nodes`.
+/// A window that connects again is answered the same way, its follow
+/// live at once. What it was asked is in the list.
 async fn held_daemon(
     held: Duration,
-    reply: &str,
+    items: Value,
+    nodes: Value,
 ) -> (
     Arc<Client>,
     Events,
     tokio::sync::mpsc::UnboundedSender<Value>,
     Arc<Mutex<Vec<(Instant, Value)>>>,
+    PathBuf,
 ) {
     static STARTED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
     let dir = std::env::temp_dir().join(format!(
@@ -145,72 +150,77 @@ async fn held_daemon(
     ));
     std::fs::create_dir_all(&dir).unwrap();
     let socket = dir.join("agent.sock");
+    // One left by an earlier run under the same process id.
+    let _ = std::fs::remove_file(&socket);
     let listener = tokio::net::UnixListener::bind(&socket).unwrap();
-    let (tell, mut told) = tokio::sync::mpsc::unbounded_channel::<Value>();
+    let (tell, told) = tokio::sync::mpsc::unbounded_channel::<Value>();
     let asked = Arc::new(Mutex::new(Vec::new()));
     let log = asked.clone();
-    let reply = reply.to_owned();
     tokio::spawn(async move {
-        let (stream, _) = listener.accept().await.unwrap();
-        let (read, write) = stream.into_split();
-        let write = Arc::new(tokio::sync::Mutex::new(write));
-        let ready = json!({"event": "ready", "protocol": agent_client::PROTOCOL,
-            "providers": {}});
-        (write.lock().await)
-            .write_all(format!("{ready}\n").as_bytes())
-            .await
-            .unwrap();
-        let events = write.clone();
-        tokio::spawn(async move {
-            while let Some(event) = told.recv().await {
-                let line = format!("{event}\n");
-                let _ = events.lock().await.write_all(line.as_bytes()).await;
+        let mut told = Some(told);
+        let message = Arc::new(std::sync::atomic::AtomicI64::new(1));
+        while let Ok((stream, _)) = listener.accept().await {
+            let (read, write) = stream.into_split();
+            let write = Arc::new(tokio::sync::Mutex::new(write));
+            let ready = json!({"event": "ready", "protocol": agent_client::PROTOCOL,
+                "providers": {}});
+            (write.lock().await)
+                .write_all(format!("{ready}\n").as_bytes())
+                .await
+                .unwrap();
+            if let Some(mut told) = told.take() {
+                let events = write.clone();
+                tokio::spawn(async move {
+                    while let Some(event) = told.recv().await {
+                        let line = format!("{event}\n");
+                        let _ = events.lock().await.write_all(line.as_bytes()).await;
+                    }
+                });
             }
-        });
-        let mut lines = BufReader::new(read).lines();
-        let mut message = 1;
-        while let Ok(Some(line)) = lines.next_line().await {
-            let asked: Value = serde_json::from_str(&line).unwrap();
-            log.lock().unwrap().push((Instant::now(), asked.clone()));
-            let entries = kept(&reply);
-            let result = match asked["op"].as_str() {
-                Some("history_items") => json!({"items": entries.as_array().into_iter()
-                    .flatten()
-                    .filter(|entry| asked["nodes"].as_array().into_iter().flatten()
-                        .any(|node| *node == entry["node"]))
-                    .cloned()
-                    .collect::<Vec<_>>()}),
-                // What is older than the window drew: one node.
-                Some("history_nodes") => {
-                    json!({"nodes": [{"node": 0, "turn": 0}], "next_from": null})
-                }
-                Some("submit") => {
-                    message += 1;
-                    json!({"message": message})
-                }
-                Some("inspect") => json!({"name": "b"}),
-                _ => json!({}),
-            };
-            let answer = json!({"id": asked["id"], "result": result});
-            let write = write.clone();
+            let (log, items, nodes, message) =
+                (log.clone(), items.clone(), nodes.clone(), message.clone());
             tokio::spawn(async move {
-                tokio::time::sleep(held).await;
-                let _ = write
-                    .lock()
-                    .await
-                    .write_all(format!("{answer}\n").as_bytes())
-                    .await;
+                let mut lines = BufReader::new(read).lines();
+                while let Ok(Some(line)) = lines.next_line().await {
+                    let asked: Value = serde_json::from_str(&line).unwrap();
+                    log.lock().unwrap().push((Instant::now(), asked.clone()));
+                    let result = match asked["op"].as_str() {
+                        Some("history_items") => json!({"items": items.as_array().into_iter()
+                            .flatten()
+                            .filter(|entry| asked["nodes"].as_array().into_iter().flatten()
+                                .any(|node| *node == entry["node"]))
+                            .cloned()
+                            .collect::<Vec<_>>()}),
+                        Some("history_nodes") => json!({"nodes": nodes, "next_from": null}),
+                        Some("submit") => json!({"message":
+                            message.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1}),
+                        Some("inspect") => json!({"name": "b"}),
+                        _ => json!({}),
+                    };
+                    let answer = json!({"id": asked["id"], "result": result});
+                    let follow = asked["op"] == "follow";
+                    let write = write.clone();
+                    tokio::spawn(async move {
+                        tokio::time::sleep(held).await;
+                        let mut write = write.lock().await;
+                        let _ = write.write_all(format!("{answer}\n").as_bytes()).await;
+                        if follow {
+                            let live = json!({"event": "follow_live"});
+                            let _ = write.write_all(format!("{live}\n").as_bytes()).await;
+                        }
+                    });
+                }
             });
         }
     });
     let (client, events) = Client::connect(&socket).await.unwrap();
-    (client, events, tell, asked)
+    (client, events, tell, asked, socket)
 }
 
-fn window(client: Arc<Client>) -> App {
+fn window(client: Arc<Client>, socket: PathBuf) -> App {
     let options = Options {
         store: PathBuf::new(),
-        socket: PathBuf::new(),
+        socket,
         bot: None,
         new: false,
         model: None,
@@ -254,12 +264,14 @@ fn percentile(sorted: &[Duration], at: f64) -> Duration {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn typing_and_scrolling_never_wait_on_a_daemon_that_holds_every_answer() {
-    let (client, mut events, tell, asked) = held_daemon(
+    let nodes = json!([{"node": 0, "turn": 0}]);
+    let (client, mut events, tell, asked, socket) = held_daemon(
         HELD,
-        "First tally done\nSecond tally done\nAll tallies counted",
+        kept("First tally done\nSecond tally done\nAll tallies counted"),
+        nodes,
     )
     .await;
-    let mut app = window(client);
+    let mut app = window(client, socket);
     // Older items to read as the view nears the first row drawn.
     app.older = Some(1);
     let frames = Arc::new(Mutex::new(Vec::new()));
@@ -397,6 +409,191 @@ async fn typing_and_scrolling_never_wait_on_a_daemon_that_holds_every_answer() {
     assert!(earlier < said && said < replied, "{screen}");
 }
 
+/// A reply of `pieces` lines streamed fast behind an event whose read the
+/// daemon holds 2 s, while the person types: the window after it quit,
+/// what it drew, the keys, and the lines.
+async fn stream_behind_a_held_read(
+    pieces: usize,
+) -> (
+    App,
+    Vec<(Instant, String, String)>,
+    Vec<(Instant, String)>,
+    Vec<String>,
+    Arc<Mutex<Vec<(Instant, Value)>>>,
+) {
+    let lines: Vec<String> = (0..pieces).map(|n| format!("tally {n:05}\n")).collect();
+    let reply = lines.concat();
+    let items = json!([
+        {"node": 1, "message": 1, "item": {"type": "message", "role": "user",
+            "content": [{"type": "input_text", "text": "Count the tallies"}]}},
+        {"node": 2, "item": {"type": "message", "role": "assistant",
+            "content": [{"type": "output_text", "text": reply.trim_end()}]}},
+    ]);
+    let nodes = json!([{"node": 2}, {"node": 1}]);
+    let held = Duration::from_secs(2);
+    let (client, mut events, tell, asked, socket) = held_daemon(held, items, nodes).await;
+    let mut app = window(client, socket);
+    let frames = Arc::new(Mutex::new(Vec::new()));
+    let probe = Probe {
+        screen: ratatui::backend::TestBackend::new(100, 30),
+        frames: frames.clone(),
+    };
+    let mut terminal = Terminal::new(probe).unwrap();
+    let (keys, taken) = tokio::sync::mpsc::unbounded_channel();
+    let drive = async {
+        // The turn's start needs a read the daemon holds; every piece of
+        // the reply comes behind it at once.
+        tell.send(json!({"event": "accepted", "bot": "b", "turn": 1,
+            "data": {"node": 1}}))
+            .unwrap();
+        for piece in &lines {
+            tell.send(json!({"event": "text_delta", "bot": "b", "turn": 1,
+                "item": 0, "text": piece}))
+                .unwrap();
+        }
+        tell.send(json!({"event": "message", "bot": "b", "turn": 1,
+            "data": {"node": 2}}))
+            .unwrap();
+        tell.send(json!({"event": "turn_finished", "bot": "b", "turn": 1,
+            "data": {"status": "completed"}}))
+            .unwrap();
+        // The person types while the read is held, while the pieces are
+        // taken after it, and while the window catches up, until the
+        // reply's last line shows.
+        let last = lines.last().unwrap().trim_end().to_owned();
+        let shown = || {
+            let frames = frames.lock().unwrap();
+            frames
+                .last()
+                .is_some_and(|(_, _, whole)| whole.contains(&last))
+        };
+        let mut sent: Vec<(Instant, String)> = Vec::new();
+        let mut typed = String::new();
+        let typing = Instant::now();
+        while (typing.elapsed() < held * 3 || !shown())
+            && typing.elapsed() < Duration::from_secs(45)
+        {
+            for c in "tallies".chars() {
+                typed.push(c);
+                keys.send(key(KeyCode::Char(c))).unwrap();
+                sent.push((Instant::now(), typed.clone()));
+                tokio::time::sleep(Duration::from_millis(40)).await;
+            }
+            // Cleared, so the words stay on one row.
+            typed.clear();
+            keys.send(Event::Key(event::KeyEvent::new(
+                KeyCode::Char('u'),
+                KeyModifiers::CONTROL,
+            )))
+            .unwrap();
+            sent.push((Instant::now(), typed.clone()));
+            tokio::time::sleep(Duration::from_millis(40)).await;
+        }
+        // Everything heard, or caught up from history, the window quits.
+        tokio::time::sleep(held).await;
+        for c in "/quit".chars() {
+            keys.send(key(KeyCode::Char(c))).unwrap();
+        }
+        keys.send(key(KeyCode::Enter)).unwrap();
+        sent
+    };
+    let (ran, sent) = tokio::time::timeout(Duration::from_secs(60), async {
+        tokio::join!(app.run(&mut terminal, &mut events, taken), drive)
+    })
+    .await
+    .expect("the window quit");
+    ran.unwrap();
+    let frames = frames.lock().unwrap().clone();
+    (app, frames, sent, lines, asked)
+}
+
+/// Keys showed at once, and the reply is there whole, every line once and
+/// in order, after the person's words.
+fn keys_and_reply_whole(
+    app: &App,
+    frames: &[(Instant, String, String)],
+    sent: &[(Instant, String)],
+    lines: &[String],
+) {
+    keys_at_once(app, frames, sent);
+    reply_whole(app, lines);
+}
+
+/// Every key showed at once.
+fn keys_at_once(app: &App, frames: &[(Instant, String, String)], sent: &[(Instant, String)]) {
+    let mut waited = latencies(sent, frames);
+    waited.sort();
+    let p99 = percentile(&waited, 0.99);
+    let worst = *waited.last().unwrap();
+    eprintln!(
+        "keys {} p50 {:?} p99 {:?} worst {:?}",
+        waited.len(),
+        percentile(&waited, 0.5),
+        p99,
+        worst,
+    );
+    assert!(
+        p99 < Duration::from_millis(50),
+        "key to character p99 {p99:?}"
+    );
+    assert!(worst < Duration::from_millis(100), "a key waited {worst:?}");
+}
+
+/// The reply is there whole, every line once and in order, after the
+/// person's words.
+fn reply_whole(app: &App, lines: &[String]) {
+    let screen = app.screen.texts().join("\n");
+    let mut from = screen
+        .find("Count the tallies")
+        .expect("the person's words");
+    for line in lines {
+        let line = line.trim_end();
+        let at = screen[from..]
+            .find(line)
+            .unwrap_or_else(|| panic!("{line} missing or out of order"));
+        from += at + line.len();
+        assert!(!screen[from..].contains(line), "{line} drawn twice");
+    }
+}
+
+/// How many times the window connected again, following its agent anew
+/// each time (the test's own connection is followed from the start).
+fn reconnects(asked: &Mutex<Vec<(Instant, Value)>>) -> usize {
+    let asked = asked.lock().unwrap();
+    asked
+        .iter()
+        .filter(|(_, asked)| asked["op"] == "follow")
+        .count()
+}
+
+/// A reply streamed fast behind an event whose read the daemon holds: the
+/// window takes one event at a time (its type holds no more), the rest
+/// waiting in the connection's bounded queue, which holds them all here
+/// with no reconnect; keys show at once throughout; and the reply ends
+/// whole and in order.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_fast_stream_behind_a_held_read_stays_bounded_and_lands_in_order() {
+    let (app, frames, sent, lines, asked) = stream_behind_a_held_read(3_000).await;
+    assert_eq!(
+        reconnects(&asked),
+        0,
+        "the connection's queue held the stream"
+    );
+    keys_and_reply_whole(&app, &frames, &sent, &lines);
+}
+
+/// More than the connection's queue holds behind a held read: the
+/// connection lets go, as it does for any reader that falls behind, and
+/// the window connects again and draws what it missed from history,
+/// whole and in order. Catching up on connecting again still reads before
+/// it draws, so keys are not timed here.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_stream_past_the_connection_s_queue_is_caught_up_from_history() {
+    let (app, _, _, lines, asked) = stream_behind_a_held_read(6_000).await;
+    assert_eq!(reconnects(&asked), 1, "connected again once");
+    reply_whole(&app, &lines);
+}
+
 /// How long the stand-in browser takes to draw a page: as a cold Chrome
 /// can.
 const DRAWING: Duration = Duration::from_secs(3);
@@ -429,8 +626,10 @@ async fn typing_never_waits_on_a_page_the_browser_is_slow_to_draw() {
         .unwrap()
         .as_nanos();
     let reply = format!("Here is the page\n```html\n<h1>{nonce}</h1>\n```\nThat was the page");
-    let (client, mut events, tell, _) = held_daemon(Duration::ZERO, &reply).await;
-    let mut app = window(client);
+    let nodes = json!([{"node": 0, "turn": 0}]);
+    let (client, mut events, tell, _, socket) =
+        held_daemon(Duration::ZERO, kept(&reply), nodes).await;
+    let mut app = window(client, socket);
     let frames = Arc::new(Mutex::new(Vec::new()));
     let probe = Probe {
         screen: ratatui::backend::TestBackend::new(100, 30),

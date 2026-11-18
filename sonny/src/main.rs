@@ -176,8 +176,6 @@ const DRAW_ATTEMPTS: u32 = 30;
 /// second, Ink's default cap.
 const DRAW_EVERY: Duration = Duration::from_millis(33);
 
-/// The most of the daemon's events applied between two looks at the keys.
-const HEARD_AT_ONCE: usize = 64;
 /// The most time between two frames of a window where nothing moves: its
 /// clocks count seconds, and what it reads now and then (counts, tasks,
 /// the margin's files) shows within one.
@@ -4280,6 +4278,8 @@ struct Raised {
     calls: Vec<(String, Value)>,
     /// The calls looked up, held or not: one no longer listed was answered.
     looked: Vec<CallKey>,
+    /// The calls whose verdicts were read, found or not.
+    verdicts_asked: Vec<CallKey>,
 }
 
 /// The calls of `unread` that wait on the person, each bot's read by
@@ -5183,19 +5183,24 @@ struct App {
     /// How many pictures drawn beside the loop were ready when it last
     /// looked ([`App::drawings`]).
     drawn_seen: u64,
-    /// The daemon's events not applied yet, oldest first ([`App::hear`]).
-    unheard: std::collections::VecDeque<Value>,
-    /// The read under way for the first of them.
+    /// The daemon's event taken and not applied yet ([`App::hear`]): one
+    /// at a time, as Codex's TUI takes its events, the rest waiting in the
+    /// connection's own bounded queue.
+    unheard: Option<Value>,
+    /// The read under way for it.
     hearing: Option<tokio::sync::oneshot::Receiver<Read>>,
     /// The words last given back to the composer, in front of what was
     /// typed since ([`App::give_back`]): a message refused after them goes
     /// after them.
     given_back: Option<String>,
-    /// The connection closed after the events in `unheard`: it is let go
-    /// ([`App::dropped`]) once they are applied, as they came before it.
+    /// The connection closed: it is let go ([`App::dropped`]) once
+    /// nothing it brought waits to be applied.
     cut: bool,
     /// Verdicts of calls written out here, read from the audit trail.
-    verdicting: Vec<tokio::sync::oneshot::Receiver<Vec<(CallKey, Value)>>>,
+    verdicting: Vec<(Vec<CallKey>, VerdictsReading)>,
+    /// The calls whose verdicts a read beside the loop reads now: none is
+    /// read again until it ends.
+    verdicts_out: std::collections::HashSet<CallKey>,
     /// The writes to the daemon not yet done, or done and not yet
     /// applied, oldest first ([`App::write`]).
     writes: std::collections::VecDeque<tokio::sync::oneshot::Receiver<Wrote>>,
@@ -5518,8 +5523,9 @@ impl Following {
 /// What a rescan of the fleet read ([`Fleet::rescan`]).
 struct Rescanned {
     followed: Option<Result<Followed, Box<Following>>>,
-    /// The questions of the agents whose turn ended unsure of them.
-    scanned: Vec<(String, needs::Seen)>,
+    /// The questions of the agents whose turn ended unsure of them, each
+    /// with [`needs::Needs::stirred`] as the read began.
+    scanned: Vec<(String, needs::Seen, u64)>,
     /// Those of one agent not read since the last reconcile, at its head.
     one: Option<(String, Value, needs::Seen)>,
 }
@@ -6384,7 +6390,12 @@ impl Fleet {
             return;
         }
         let following = self.follow_due(false);
-        let due = self.needs.due();
+        let due: Vec<_> = (self.needs.due().into_iter())
+            .map(|(bot, turn)| {
+                let stirred = self.needs.stirred(&bot);
+                (bot, turn, stirred)
+            })
+            .collect();
         let one = (self.unread.pop()).filter(|(bot, _)| self.below(bot));
         if following.is_none() && due.is_empty() && one.is_none() {
             return;
@@ -6396,9 +6407,9 @@ impl Fleet {
                 None => None,
             };
             let mut scanned = Vec::new();
-            for (bot, turn) in due {
+            for (bot, turn, stirred) in due {
                 if let Some(seen) = needs::scan(&client, &bot, turn).await {
-                    scanned.push((bot, seen));
+                    scanned.push((bot, seen, stirred));
                 }
             }
             // One that failed is read at the next reconcile.
@@ -6423,10 +6434,10 @@ impl Fleet {
             let raised = self.followed_read(followed);
             self.unread.extend(raised);
         }
-        for (bot, seen) in read.scanned {
-            // An event since left its questions unsure: what was read is
-            // older than that, and the turn's end reads them again.
-            if self.needs.unsure(&bot) {
+        for (bot, seen, stirred) in read.scanned {
+            // An event since changed its question: what was read is older
+            // than what it said, and any read it asks for comes after.
+            if self.needs.stirred(&bot) != stirred {
                 continue;
             }
             let ask = self.open_ask(&bot, seen);
@@ -7141,11 +7152,12 @@ impl App {
             opening_all: false,
             woken: Arc::new(tokio::sync::Notify::new()),
             drawn_seen: drawing::landed(),
-            unheard: Default::default(),
+            unheard: None,
             hearing: None,
             cut: false,
             given_back: None,
             verdicting: Vec::new(),
+            verdicts_out: Default::default(),
             writes: Default::default(),
             lane: None,
             sending: 0,
@@ -7386,8 +7398,6 @@ impl App {
         // An event taken while gathering a burst of the wheel's notches
         // that was not one, handled first next time round.
         let mut held: Option<Event> = None;
-        // The daemon's events are ready to apply past those applied.
-        let mut more_heard = false;
         // Woken as each picture drawn beside the loop is ready.
         drawing::wake(&self.woken);
         loop {
@@ -7455,11 +7465,11 @@ impl App {
                 }
                 // Taken only as fast as they are heard: the rest wait in
                 // the connection's own bounded queue.
-                event = events.recv(), if self.down.is_none() && !self.cut && self.unheard.len() < HEARD_AT_ONCE => {
+                event = events.recv(), if self.down.is_none() && !self.cut && self.unheard.is_none() => {
                     changed = true;
                     heard = Instant::now();
                     match event {
-                        Some(event) => self.unheard.push_back(event),
+                        Some(event) => self.unheard = Some(event),
                         None => self.cut = true,
                     }
                 }
@@ -7540,15 +7550,21 @@ impl App {
                     changed = true;
                     heard = Instant::now();
                 }
-                _ = std::future::ready(()), if more_heard => {}
             }
             // What the person sent lands before the events after it.
             self.wrote();
-            more_heard = self.hear();
+            self.hear();
             changed |= self.drawings();
-            // What came before the connection closed is applied first, so
-            // catching up after it never meets an event from before.
-            if self.cut && self.unheard.is_empty() && self.hearing.is_none() {
+            // The connection is gone: what it brought and was not applied
+            // yet is let go, a read for it having failed with it, and the
+            // window catches up from the last item it drew, so nothing is
+            // drawn from a read that never came or drawn twice.
+            if self.down.is_none() && self.client.is_closed() {
+                self.cut = true;
+                self.unheard = None;
+                self.hearing = None;
+            }
+            if self.cut && self.unheard.is_none() && self.hearing.is_none() {
                 self.cut = false;
                 self.dropped();
             }
@@ -7919,14 +7935,14 @@ impl App {
         loop {
             self.wrote();
             self.verdicts_came();
-            while self.hear() {}
+            self.hear();
             if let Some(job) = self.raising.take_if(|job| job.is_finished()) {
                 self.approvals_raised(job.await.expect("the calls below were read"));
             }
             if self.writes.is_empty()
                 && self.hearing.is_none()
                 && self.verdicting.is_empty()
-                && self.unheard.is_empty()
+                && self.unheard.is_none()
                 && self.raising.is_none()
             {
                 return;
@@ -12261,48 +12277,50 @@ impl App {
         true
     }
 
-    /// The daemon's events taken in the order they came, each applied
-    /// once what it needs is read ([`App::wants`]): the read runs beside
-    /// the loop, which goes on taking keys, and the events after it wait
-    /// for it. A few are applied at a time, so a burst of them never keeps
-    /// a key waiting. Whether more are ready to apply.
-    fn hear(&mut self) -> bool {
+    /// The daemon's event taken, applied once what it needs is read
+    /// ([`App::wants`]): the read runs beside the loop, which goes on
+    /// taking keys, and the events after it wait in the connection's queue
+    /// for it. One is applied a pass, so a burst of them never keeps a key
+    /// waiting.
+    fn hear(&mut self) {
         // What the person sent lands before what the daemon says after it.
         if self.sending > 0 {
-            return false;
+            return;
+        }
+        // The connection went: what it brought and what was read for it
+        // may be short, and catching up from history draws it whole.
+        if self.client.is_closed() {
+            return;
         }
         if let Some(reading) = &mut self.hearing {
             let read = match reading.try_recv() {
                 Ok(read) => read,
-                Err(tokio::sync::oneshot::error::TryRecvError::Empty) => return false,
+                Err(tokio::sync::oneshot::error::TryRecvError::Empty) => return,
                 // Its read went with the daemon: applied with nothing read.
                 Err(_) => Read::default(),
             };
             self.hearing = None;
-            if let Some(event) = self.unheard.pop_front() {
+            if let Some(event) = self.unheard.take() {
                 self.heard(event, read);
             }
+            return;
         }
-        for _ in 0..HEARD_AT_ONCE {
-            let Some(event) = self.unheard.front() else {
-                return false;
-            };
-            let wants = self.wants(event);
-            if wants.any() {
-                let (client, bot, woken) =
-                    (self.client.clone(), self.bot.clone(), self.woken.clone());
-                let (send, receive) = tokio::sync::oneshot::channel();
-                tokio::spawn(async move {
-                    let _ = send.send(wants.read(client, bot).await);
-                    woken.notify_one();
-                });
-                self.hearing = Some(receive);
-                return false;
-            }
-            let event = self.unheard.pop_front().unwrap_or_default();
-            self.heard(event, Read::default());
+        let Some(event) = self.unheard.take() else {
+            return;
+        };
+        let wants = self.wants(&event);
+        if wants.any() {
+            let (client, bot, woken) = (self.client.clone(), self.bot.clone(), self.woken.clone());
+            let (send, receive) = tokio::sync::oneshot::channel();
+            tokio::spawn(async move {
+                let _ = send.send(wants.read(client, bot).await);
+                woken.notify_one();
+            });
+            self.unheard = Some(event);
+            self.hearing = Some(receive);
+            return;
         }
-        !self.unheard.is_empty()
+        self.heard(event, Read::default());
     }
 
     /// What the daemon's event `event` needs read before [`App::heard`]
@@ -14262,9 +14280,13 @@ impl App {
         // the next pass begins.
         if !(verdicts.is_empty() && unread.is_empty()) {
             let (client, woken) = (self.client.clone(), self.woken.clone());
+            let verdicts_asked: Vec<CallKey> =
+                verdicts.iter().map(|(key, _)| key.clone()).collect();
+            self.verdicts_out.extend(verdicts_asked.iter().cloned());
             self.raising = Some(tokio::spawn(async move {
                 let raised = Raised {
                     verdicts: read_verdicts(client.clone(), verdicts).await,
+                    verdicts_asked,
                     ..raise_calls(&client, unread).await
                 };
                 woken.notify_one();
@@ -14277,6 +14299,9 @@ impl App {
     /// What a read of the calls below found: the verdicts drawn, the calls
     /// that wait raised, each once.
     fn approvals_raised(&mut self, came: Raised) {
+        for key in &came.verdicts_asked {
+            self.verdicts_out.remove(key);
+        }
         self.verdicts_read(came.verdicts);
         for (bot, mut call) in came.calls {
             let read = raised_key(&call);
@@ -19425,33 +19450,41 @@ impl App {
             return;
         }
         let (client, woken) = (self.client.clone(), self.woken.clone());
+        let keys: Vec<CallKey> = reads.iter().map(|(key, _)| key.clone()).collect();
+        self.verdicts_out.extend(keys.iter().cloned());
         let (send, receive) = tokio::sync::oneshot::channel();
         tokio::spawn(async move {
             let _ = send.send(read_verdicts(client, reads).await);
             woken.notify_one();
         });
-        self.verdicting.push(receive);
+        self.verdicting.push((keys, receive));
     }
 
     /// The verdicts read beside the loop that came.
     fn verdicts_came(&mut self) {
         let mut came = Vec::new();
-        self.verdicting
-            .retain_mut(|reading| match reading.try_recv() {
-                Ok(rows) => {
-                    came.extend(rows);
-                    false
-                }
-                Err(tokio::sync::oneshot::error::TryRecvError::Empty) => true,
-                Err(_) => false,
-            });
+        let mut ended = Vec::new();
+        self.verdicting.retain_mut(|(keys, reading)| {
+            match reading.try_recv() {
+                Ok(rows) => came.extend(rows),
+                Err(tokio::sync::oneshot::error::TryRecvError::Empty) => return true,
+                Err(_) => {}
+            }
+            ended.append(keys);
+            false
+        });
+        for key in &ended {
+            self.verdicts_out.remove(key);
+        }
         self.verdicts_read(came);
     }
 
     /// Those of `gone` written out here whose verdict was not heard yet,
-    /// with when each was written: what [`read_verdicts`] reads.
+    /// nor being read, with when each was written: what [`read_verdicts`]
+    /// reads.
     fn verdicts_to_read(&self, gone: Vec<CallKey>) -> Vec<(CallKey, i64)> {
         (gone.into_iter())
+            .filter(|key| !self.verdicts_out.contains(key))
             .filter_map(|key| {
                 let at_ms = (self.written.get(&key))
                     .filter(|written| !written.heard)?
@@ -21872,6 +21905,9 @@ struct Read {
 /// A call of a bot written out in a window: the bot, its turn (-1 for
 /// none) and the call's id, a step's as `CALL/STEP`.
 type CallKey = (String, i64, String);
+
+/// The verdicts a read beside the loop found, as they come.
+type VerdictsReading = tokio::sync::oneshot::Receiver<Vec<(CallKey, Value)>>;
 
 /// The audit trail's row for each call of `calls` written at the time
 /// given, when it has one: who allowed or denied it.
@@ -31761,6 +31797,41 @@ mod tests {
         );
     }
 
+    /// A verdict still being read is not read again beside it: one read
+    /// per call at a time, however often the loop passes meanwhile.
+    #[tokio::test]
+    async fn a_verdict_being_read_is_not_read_again_until_its_read_ends() {
+        let client = daemon_answering(|request| match request["op"].as_str() {
+            Some("audit") => json!({"rows": [], "next_before": null}),
+            _ => json!({}),
+        })
+        .await;
+        let mut app = app(client);
+        app.bot = "home.lead".into();
+        app.width = 80;
+        app.raised
+            .push(json!({"bot": "shop.fix", "turn": 4, "call_id": "c1",
+            "name": "shell", "gates": ["manual", "auto"], "arguments": {"command": "cargo publish"}}));
+        app.show_asked();
+        app.flush();
+        let key = |code| Event::Key(event::KeyEvent::new(code, KeyModifiers::NONE));
+        app.key(key(KeyCode::Char('y'))).await;
+        app.beside_done().await;
+        app.raised.clear();
+        let call: CallKey = ("shop.fix".into(), 4, "c1".into());
+        app.raise();
+        assert!(app.raising.is_some(), "its verdict is read");
+        assert!(app.verdicts_to_read(vec![call.clone()]).is_empty());
+        // Passes while that read is out start no other read of it.
+        app.raise();
+        app.raise();
+        assert!(app.verdicting.is_empty(), "read once");
+        let came = app.raising.take().unwrap().await.unwrap();
+        app.approvals_raised(came);
+        // Found nothing yet: it is read again on a later pass.
+        assert_eq!(app.verdicts_to_read(vec![call.clone()]).len(), 1);
+    }
+
     #[tokio::test]
     async fn a_lifted_call_allowed_here_that_expired_timed_out() {
         let client = daemon_answering(|_| json!({})).await;
@@ -32979,6 +33050,41 @@ mod tests {
         assert!(FLEET_KINDS.contains(&"steered"));
         fleet.event(&event("steered", 4, json!({"message": 5})));
         assert_eq!(fleet.doing["calc.new"], "idle");
+    }
+
+    /// A question a task asked and goes on working past is read as its
+    /// call completes, not held back for the turn's end; a read the
+    /// person's words overtook is not shown.
+    #[tokio::test]
+    async fn a_task_s_question_is_read_as_asked_unless_answered_meanwhile() {
+        let (client, events) = project_waiting().await;
+        let mut fleet = Fleet::in_memory(client.clone(), events, "calc", "calc.lead");
+        fleet.reconcile().await;
+        while !fleet.unread.is_empty() {
+            fleet.rescan_through().await;
+        }
+        let event = |kind: &str, turn: i64, data: Value| json!({"event": kind, "bot": "calc.new", "turn": turn, "data": data});
+        let asking = |fleet: &Fleet| fleet.needs.asks().any(|(bot, _)| bot == "calc.new");
+        fleet.event(&event("accepted", 3, json!({})));
+        let ask = json!({"name": "ask", "call_id": "q2", "arguments": "{}"});
+        fleet.event(&event("tool_started", 3, ask.clone()));
+        fleet.event(&event("tool_completed", 3, json!({"call_id": "q2"})));
+        assert!(!asking(&fleet), "not read yet");
+        fleet.rescan_through().await;
+        assert!(asking(&fleet), "read while the turn goes on");
+        // Asked again, and answered while the read is out.
+        fleet.event(&event(
+            "tool_started",
+            3,
+            json!({"name": "ask", "call_id": "q3", "arguments": "{}"}),
+        ));
+        fleet.event(&event("tool_completed", 3, json!({"call_id": "q3"})));
+        fleet.rescan(&Arc::new(tokio::sync::Notify::new())).await;
+        fleet.event(&event("steered", 3, json!({"message": 5})));
+        let read = fleet.rescanning.take().unwrap().await.unwrap();
+        fleet.rescanned(read);
+        assert!(!asking(&fleet), "the answer stands");
+        assert!(fleet.needs.unsure("calc.new"), "the turn's end reads it");
     }
 
     /// An outer lead's footer counts the questions its window shows from
