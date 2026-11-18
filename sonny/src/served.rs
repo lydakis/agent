@@ -2552,14 +2552,22 @@ mod tests {
         };
         let go = Arc::new(tokio::sync::Semaphore::new(0));
         let ran = Arc::new(AtomicUsize::new(0));
+        // The calls running at once, and the most there ever were.
+        let (running, most_running) =
+            (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
         let run = {
             let (go, ran) = (go.clone(), ran.clone());
+            let (running, most_running) = (running.clone(), most_running.clone());
             move |_call: Value, place: Place| {
                 let (go, ran) = (go.clone(), ran.clone());
+                let (running, most_running) = (running.clone(), most_running.clone());
                 async move {
                     let _place = place;
+                    most_running
+                        .fetch_max(running.fetch_add(1, Ordering::SeqCst) + 1, Ordering::SeqCst);
                     go.acquire().await.unwrap().forget();
                     ran.fetch_add(1, Ordering::SeqCst);
+                    running.fetch_sub(1, Ordering::SeqCst);
                     Ok(json!("noted"))
                 }
             }
@@ -2572,8 +2580,10 @@ mod tests {
         loop {
             // Only what has a place was taken; the rest wait in the daemon.
             let done = answered.lock().unwrap().len();
-            assert!(taken.load(Ordering::SeqCst) <= done + 2);
-            assert!(serving.lock().unwrap().jobs.len() <= 2);
+            // A call that ran and gave back its place may still be
+            // handing in its result: the places, not the jobs, are two.
+            assert!(taken.load(Ordering::SeqCst) <= ran.load(Ordering::SeqCst) + 2);
+            assert!(most_running.load(Ordering::SeqCst) <= 2);
             if done == CALLS as usize {
                 break;
             }
