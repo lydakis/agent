@@ -1591,7 +1591,20 @@ pub fn next_after(entries: &[Entry], after: i64) -> Option<i64> {
     let first = after - after.rem_euclid(60) + 60;
     let start = trigger::local(first);
     let day0 = days_from_civil(start.year, start.month, start.day);
+    // How far the clock reads ahead of UTC at `at`.
+    let ahead = |at: i64| {
+        let clock = trigger::local(at);
+        let day = days_from_civil(clock.year, clock.month, clock.day);
+        day * 86_400 + clock.hour as i64 * 3600 + clock.minute as i64 * 60 - at
+    };
+    // The times of the first day before `start` all came before it, so
+    // none is tried, unless the clock goes back later that day and comes
+    // through some of them again.
+    let came = ahead(first + 86_400) >= ahead(first);
     for offset in 0..=(8 * 366 + 1) {
+        let before = |hour: u8, minute: u8| {
+            offset == 0 && came && (hour, minute) < (start.hour, start.minute)
+        };
         let (year, month, day) = civil_from_days(day0 + offset);
         // 1970-01-01 was a Thursday.
         let weekday = (day0 + offset + 4).rem_euclid(7) as u8;
@@ -1606,7 +1619,14 @@ pub fn next_after(entries: &[Entry], after: i64) -> Option<i64> {
             let hours: Vec<u8> = entry.hour.map_or_else(|| (0..24).collect(), |h| vec![h]);
             let minutes: Vec<u8> = entry.minute.map_or_else(|| (0..60).collect(), |m| vec![m]);
             'hours: for &hour in &hours {
+                if before(hour, 59) {
+                    continue;
+                }
                 for &minute in &minutes {
+                    if before(hour, minute) {
+                        continue;
+                    }
+                    visit();
                     let local = trigger::Local {
                         year,
                         month,
@@ -1691,6 +1711,140 @@ mod tests {
         }
         assert_eq!(civil_from_days(0), (1970, 1, 1));
         assert_eq!(days_from_civil(2026, 10, 31), 20_757);
+    }
+
+    /// [`next_after`] as it was, trying every time of the first day.
+    fn next_after_trying_every_time(entries: &[Entry], after: i64) -> Option<i64> {
+        if entries.is_empty() {
+            return None;
+        }
+        let first = after - after.rem_euclid(60) + 60;
+        let start = trigger::local(first);
+        let day0 = days_from_civil(start.year, start.month, start.day);
+        for offset in 0..=(8 * 366 + 1) {
+            let (year, month, day) = civil_from_days(day0 + offset);
+            // 1970-01-01 was a Thursday.
+            let weekday = (day0 + offset + 4).rem_euclid(7) as u8;
+            let mut best: Option<i64> = None;
+            for entry in entries {
+                let matches = entry.month.is_none_or(|m| m == month)
+                    && entry.day.is_none_or(|d| d == day)
+                    && entry.weekday.is_none_or(|w| w % 7 == weekday);
+                if !matches {
+                    continue;
+                }
+                let hours: Vec<u8> = entry.hour.map_or_else(|| (0..24).collect(), |h| vec![h]);
+                let minutes: Vec<u8> = entry.minute.map_or_else(|| (0..60).collect(), |m| vec![m]);
+                'hours: for &hour in &hours {
+                    for &minute in &minutes {
+                        let local = trigger::Local {
+                            year,
+                            month,
+                            day,
+                            hour,
+                            minute,
+                        };
+                        // A time the clock goes through twice as daylight
+                        // saving ends: an entry with a set hour comes at the
+                        // first, as cron runs a job at a set time once; one
+                        // that comes every hour comes at both, as time goes.
+                        let mut ats = trigger::epochs_of(local);
+                        if entry.hour.is_some() {
+                            ats.truncate(1);
+                        }
+                        if let Some((i, at)) =
+                            ats.into_iter().enumerate().find(|(_, at)| *at >= first)
+                        {
+                            best = Some(best.map_or(at, |b| b.min(at)));
+                            // Later minutes this hour, and later hours, come
+                            // later than a first time. A second time does not:
+                            // after 01:30 the first time round, 01:31 comes
+                            // before the second 01:00, so the search goes on.
+                            if i == 0 {
+                                break 'hours;
+                            }
+                        }
+                    }
+                }
+            }
+            if best.is_some() {
+                return best;
+            }
+        }
+        None
+    }
+
+    /// Every 17 minutes for three days from `from`: [`next_after`] finds
+    /// what trying every time found, for each of a few calendars; how
+    /// many times it tried, at most, for every minute and for one minute
+    /// an hour, on days the clock does not go back.
+    fn next_times_agree(from: i64) -> (usize, usize) {
+        let calendars = [
+            "* * * * *",
+            "7 * * * *",
+            "30 1 * * *",
+            "0 9 * * 1",
+            "45 23 * * *",
+        ];
+        let (mut every, mut hourly) = (0, 0);
+        for (i, calendar) in calendars.iter().enumerate() {
+            let entries = trigger::cron(calendar).unwrap().entries;
+            let mut after = from;
+            while after < from + 3 * 86_400 {
+                VISITED.with(|visited| visited.set(0));
+                let next = next_after(&entries, after);
+                let tried = VISITED.with(|visited| visited.get());
+                assert_eq!(
+                    next,
+                    next_after_trying_every_time(&entries, after),
+                    "{calendar} after {after}"
+                );
+                match i {
+                    0 => every = every.max(tried),
+                    1 => hourly = hourly.max(tried),
+                    _ => {}
+                }
+                after += 17 * 60 + 13;
+            }
+        }
+        (every, hourly)
+    }
+
+    #[test]
+    fn the_next_time_tries_no_time_of_the_day_before_the_first_it_may_be() {
+        // Late in the day, every minute tried each time of the day before
+        // it: 1,410 at 23:30. Now one, and one or two for a time an hour.
+        let (every, hourly) = next_times_agree(clock(2026, 10, 30, 0, 0) + 11);
+        assert_eq!(every, 1);
+        assert!(hourly <= 2, "{hourly}");
+    }
+
+    #[test]
+    fn the_next_time_agrees_across_the_nights_the_clock_changes() {
+        if std::env::var_os("AGENT_TEST_DST").is_none() {
+            let me = std::env::current_exe().unwrap();
+            let out = std::process::Command::new(me)
+                .args([
+                    "--exact",
+                    "scheduler::tests::the_next_time_agrees_across_the_nights_the_clock_changes",
+                    "--nocapture",
+                ])
+                .env("AGENT_TEST_DST", "1")
+                .env("TZ", "America/New_York")
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success() && String::from_utf8_lossy(&out.stdout).contains("1 passed"),
+                "{}{}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            );
+            return;
+        }
+        // The days around 2026-11-01, when 01:00 to 02:00 comes twice, and
+        // 2027-03-14, when 02:00 to 03:00 never comes.
+        next_times_agree(1_793_512_800 - 2 * 86_400);
+        next_times_agree(1_805_007_600 - 2 * 86_400);
     }
 
     #[test]
