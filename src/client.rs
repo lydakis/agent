@@ -3122,6 +3122,8 @@ fn pages(options: &Options, op: &str, row: impl Fn(&Value) -> String) -> Result<
     let mut before = Value::Null;
     let mut left = options.limit.unwrap_or(usize::MAX);
     let mut first = true;
+    // One time for every page, so a slow reader loses none to the clock.
+    let since = since_ms(options)?;
     if !options.pretty {
         say_raw!("[");
     }
@@ -3129,7 +3131,7 @@ fn pages(options: &Options, op: &str, row: impl Fn(&Value) -> String) -> Result<
         let mut ask = json!({"bot":bot,"after":after,"before":before,"limit":left.min(256),
             "newest":options.newest});
         if op == "messages" {
-            ask["since_ms"] = json!(since_ms(options)?);
+            ask["since_ms"] = json!(since);
             ask["from"] = json!(options.from_kinds);
         }
         let page = connection.request(op, ask)?;

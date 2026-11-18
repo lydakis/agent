@@ -89,8 +89,9 @@ what it leaves open is summed up in
 Every daemon lists its store and socket in `~/.agent/run/daemons` as it
 opens its store, and keeps every other listed daemon's as it keeps its own:
 the store and the files SQLite keeps beside it read-only in every sandbox,
-and the socket and its bots' own sockets (`SOCKET.d`) out of every
-sandboxed command's reach, the network on or not. So a second daemon on
+and the socket and its bots' own sockets out of every sandboxed command's
+reach, the network on or not. Per-bot sockets live in `SOCKET.d` or, for a
+long socket address, a short private directory. So a second daemon on
 the machine is no way out of the first one's sandbox, nor the first out of
 the second's. An entry stays while its store does, so an idle store is kept
 too. A daemon that cannot write the list, as one started inside a sandbox

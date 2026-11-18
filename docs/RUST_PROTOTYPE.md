@@ -521,12 +521,13 @@ pattern (`shop.*`, `*.lead`, `*`); no name holds `*`, `?` or `[`, so a
 plain name is one bot's and an unknown one is `bot_not_found`, while a
 pattern names whichever bots match, any made later too. `messages` adds
 `since_ms` and `until_ms` (sent at or after, and before, in Unix ms) and
-`from`, the kinds of sender: `person` (no other agent's turn and no named
-client sent it, named person or not), `agent` (another agent's turn) and
+`from`, the kinds of sender: `person` (no other bot's turn and no named
+client sent it, named person or not), `bot` (another bot's turn) and
 `client` (a client by its own name, such as an automation or the lookout);
 any other is `invalid_message_filter`. With `words`, each message carries
 its `text` whole beside the preview, and a page holds as many as fit in
-half a response, at least one. A message's `sent_ms` is never before the
+half a response, at least one; a message too large for a page alone keeps
+the words that fit, with `text_cut`. A message's `sent_ms` is never before the
 one sent before it, so times rise with numbers and a time range is found
 by halving the number range, a few point reads, as `audit` and `follow`'s
 `since_ms` find theirs; then the read is a range of numbers. People's
@@ -941,6 +942,18 @@ dropped blocks rather than the turn. The response reports each drop in
 `input_transformations`; the runtime publishes the count as a non-durable
 `thinking_dropped` event, which should never appear. The synthetic endpoint
 in the tests refuses mismatches outright, as `error` would.
+
+The Messages API also refuses a text block that holds only whitespace ("text
+content blocks must contain non-whitespace text"), and a model can reply with
+one. The node keeps the reply as the model wrote it, and every Anthropic
+request, Bedrock's included, leaves such blocks out as it reads its items,
+with a message they were all it held, as Pi does (pi-mono
+`packages/ai/src/api/anthropic-messages.ts` `convertMessages`, read
+2026-11-18). Blank is JavaScript's `trim`, as there, so a zero-width space is
+text. The request keeps the length the store counted: a block left out goes
+as spaces after the message's content, and a message left out as spaces in
+its place, its comma one of them. A summary request reads its items the same
+way.
 
 A provider can also fail to read a replayed block back with nothing in front
 of it changed. On 2026-10-11, Opus 5.5 and Fable 5.1 on Bedrock
@@ -3160,7 +3173,8 @@ see, and ends a command that makes system calls of another architecture.
 A sandboxed bot's commands reach the daemon through the bot's own socket,
 never the daemon's: so `agent` and the clients built on it work in its shell,
 as that bot and only as far as a sandboxed bot may go. The daemon opens the
-socket, `SOCKET.d/BOT_ID` beside its own, when one of the bot's turns
+socket, normally `SOCKET.d/BOT_ID` beside its own, or in a short private
+directory when the address would be too long, when one of the bot's turns
 needs it, and keeps it listening while any of the bot's live turns or
 running commands (foreground, background, detached or a terminal) holds
 it, as systemd's socket activation keeps a unit's socket. Thirty seconds

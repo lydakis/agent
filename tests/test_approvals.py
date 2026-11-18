@@ -2028,6 +2028,53 @@ class AutoApproverTests(ModelFixture):
         [shell] = state['planned_calls']
         self.assertEqual(shell['files_it_names'], [{'path': 'run.sh', 'content': script}])
 
+    def test_a_script_s_file_steps_cut_short_leave_a_later_call_to_the_judge_not_the_person(self):
+        # A script's step reaches the daemon with its keys in order, so a
+        # long text comes before the path its preview would name.
+        def shell_danger(round, id):
+            [planned] = [c for c in round['state']['planned_calls'] if c['id'] == id]
+            return .9 if 'DANGER' in json.dumps(planned) else .05
+        self.judge.answer = shell_danger
+        script_tool = {'name': 'exec', 'description': 'Run a script.',
+                       'parameters': {'type': 'object', 'properties': {'code': {'type': 'string'}},
+                                      'required': ['code'], 'additionalProperties': False},
+                       'answered_by': 'sonny', 'steps': True}
+        daemon = SocketClient(self.binary, self.path / 'state.sqlite', self.url, 'shell,write,edit')
+        self.addCleanup(daemon.close)
+        _, lines = self.approver(daemon)
+        for bot, name, script in (('Bob', 'safe', 'printf ok\n'), ('Carol', 'risky', 'printf DANGER\n')):
+            daemon.request('create', bot=bot, workspace=str(self.path), declare=[script_tool], approve=['shell'],
+                           approver='auto', approve_expire_ms=15000)
+            self.model.call_script = [('exec', {'code': 'run()'}), ('shell', {'command': f'sh {name}.sh'})]
+            turn = daemon.request('submit', bot=bot, request_id=name, prompt='script')['result']['message']
+            padding = '# padding line\n' * 250
+            for step, tool, arguments in (
+                    ('w', 'write', {'path': f'{name}.sh', 'content': padding + 'printf old\n'}),
+                    ('e', 'edit', {'path': f'{name}.sh', 'old': 'printf old\n', 'new': padding + script})):
+                # The first waits for the script's call to start.
+                deadline = time.monotonic() + 5
+                while 'error' in (ran := daemon.request('run_step', bot=bot, turn=turn, call_id='script-0',
+                                                        step=step, name=tool, arguments=arguments)):
+                    self.assertEqual(ran['error'], 'no_pending_call', ran)
+                    self.assertLess(time.monotonic(), deadline, 'the script never started')
+                    time.sleep(.02)
+                self.assertFalse(ran['result']['failed'], ran)
+            daemon.request('tool_result', bot=bot, turn=turn, call_id='script-0', output='done')
+            self.assertEqual(daemon.finished(turn)['data']['status'], 'completed')
+            # The judge decided it: nobody was asked, and nothing waits.
+            judged = next(line for line in iter(lambda: lines.get(timeout=5), None) if line['event'] == 'reviewed')
+            decision = judged['calls'][0]['decision']
+            self.assertEqual(decision, 'allow' if name == 'safe' else 'deny', judged)
+            events = daemon.request('events', bot=bot, after=0, limit=256)['result']['events']
+            self.assertFalse([e for e in events if e['turn'] == turn and e['event'] == 'approval_asked'])
+            state = self.judge.requests.get(timeout=5)['state']
+            [shell] = state['planned_calls']
+            self.assertEqual(shell['files_it_names'], [{'path': f'{name}.sh', 'content': padding + padding + script}])
+            self.assertEqual([(c['tool'], c['arguments']) for c in state['already_allowed'] if c['tool'] != 'exec'],
+                             [('write', {'path': f'{name}.sh', 'bytes': None}),
+                              ('edit', {'path': f'{name}.sh', 'bytes': None})])
+            self.assertNotIn('context_omission', state)
+
     def test_the_judge_sees_the_bots_history_and_the_agents_md_it_was_given(self):
         self.judge.answer = lambda round, id: .05
         # The first call returns words meant for the judge, and edits AGENTS.md.
