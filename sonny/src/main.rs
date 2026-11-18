@@ -2187,11 +2187,7 @@ fn reopen(bot: &str) -> Vec<String> {
 
 // As Codex's binaries: jemalloc in the static Linux builds, where musl's
 // allocator takes one lock for every thread.
-#[cfg(all(
-    target_os = "linux",
-    target_env = "musl",
-    any(target_arch = "x86_64", target_arch = "aarch64")
-))]
+#[cfg(all(target_os = "linux", target_env = "musl", target_arch = "x86_64"))]
 #[global_allocator]
 static ALLOCATOR: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
