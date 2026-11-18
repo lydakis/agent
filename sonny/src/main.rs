@@ -102,6 +102,7 @@ mod template;
 mod term;
 #[cfg(test)]
 mod testing;
+mod title;
 mod tool_host;
 mod transcript;
 mod tree;
@@ -531,6 +532,8 @@ struct StatusView<'a> {
 /// agents it read and found idle.
 struct StatusRead {
     project: String,
+    /// What the person calls the project, where its file says.
+    title: Option<String>,
     rows: Vec<status::Row>,
     needs: needs::Needs,
     /// Whether the calls waiting on someone were listed.
@@ -610,6 +613,9 @@ async fn read_status(
     // Each lead's project file read once a refresh; a task's profile
     // is the one noted when it started.
     let mut profiles: HashMap<String, Option<String>> = HashMap::new();
+    // Each agent's title, as noted when it started; a lead with none
+    // takes its project's.
+    let mut titles = crate::title::Titles::read(&store);
     // With other leads in the folder, their tasks are theirs: each
     // lead shows as a row of its own.
     let mine = owned(&listed, &project, &lead);
@@ -823,9 +829,11 @@ async fn read_status(
             false => seat_profile(&store, name, false, std::path::Path::new("")),
         }
         .unwrap_or_default();
+        let title = titles.of(bot);
         rows.push(status::Row {
             name: short(name, &project, &lead),
             bot: name.to_owned(),
+            title: title.unwrap_or_default(),
             state,
             running,
             seconds,
@@ -863,6 +871,12 @@ async fn read_status(
     }
     // Agents gone from the listing are forgotten with it.
     *status_read = kept;
+    // The project's title, from its lead's folder's file.
+    let lead_folder = (listed.iter())
+        .find(|bot| bot["name"] == lead.as_str())
+        .and_then(|bot| bot["workspace"].as_str())
+        .unwrap_or("");
+    let title = titles.project(lead_folder);
     // The lead first, then by group, the latest first in each.
     rows.sort_by_key(|row| {
         (
@@ -873,6 +887,7 @@ async fn read_status(
     });
     Ok(StatusRead {
         project,
+        title,
         rows,
         listed: held.is_ok(),
         needs,
@@ -2124,6 +2139,16 @@ fn reopen(bot: &str) -> Vec<String> {
     command
 }
 
+// As Codex's binaries: jemalloc in the static Linux builds, where musl's
+// allocator takes one lock for every thread.
+#[cfg(all(
+    target_os = "linux",
+    target_env = "musl",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+#[global_allocator]
+static ALLOCATOR: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
 // Two threads, so the daemon's events are read while a picture is drawn:
 // a reader that stops is dropped by the daemon as lagging.
 fn main() -> std::process::ExitCode {
@@ -2451,18 +2476,21 @@ fn status_cli(args: &[String]) -> Result<(), String> {
         }
         Ok::<_, String>(read)
     })?;
-    println!("{}", status_said(&read.project, &read.rows, as_json));
+    println!(
+        "{}",
+        status_said(&read.project, read.title.as_deref(), &read.rows, as_json)
+    );
     Ok(())
 }
 
 /// `sonny status`'s output: the card `/status` draws, as plain text, every
 /// group open; or its rows as JSON.
-fn status_said(project: &str, rows: &[status::Row], as_json: bool) -> String {
+fn status_said(project: &str, title: Option<&str>, rows: &[status::Row], as_json: bool) -> String {
     if as_json {
         let agents: Vec<Value> = (rows.iter())
             .map(|row| {
                 json!({
-                    "name": row.name, "bot": row.bot, "state": row.state,
+                    "name": row.name, "bot": row.bot, "title": row.title, "state": row.state,
                     "group": row.group.key(), "running": row.running,
                     "seconds": row.seconds, "at_ms": row.at, "model": row.model,
                     "profile": row.profile, "latest": row.latest, "pr": row.pr,
@@ -2470,11 +2498,11 @@ fn status_said(project: &str, rows: &[status::Row], as_json: bool) -> String {
                 })
             })
             .collect();
-        return json!({"project": project, "agents": agents}).to_string();
+        return json!({"project": project, "title": title, "agents": agents}).to_string();
     }
     let every: Vec<String> = rows.iter().map(|row| row.bot.clone()).collect();
     let card = status::card(
-        project,
+        title.unwrap_or(project),
         rows,
         100,
         &status::FOLDS,
@@ -8039,8 +8067,7 @@ impl App {
         let task = started::Task {
             bot,
             name,
-            // Only its first words are drawn.
-            brief: started::first(arguments["brief"].as_str().unwrap_or("")),
+            title: arguments["title"].as_str().unwrap_or("").trim().to_owned(),
             state: "starting".into(),
         };
         // Its name opens it at once, where it was drawn before it was made.
@@ -8081,7 +8108,7 @@ impl App {
             served::START => (
                 started::STARTED,
                 self.started_bot(arguments, output),
-                arguments["brief"].as_str().unwrap_or(""),
+                arguments["title"].as_str().unwrap_or(""),
             ),
             "spawn_agent" => {
                 // One the daemon refused started nothing.
@@ -12779,7 +12806,8 @@ impl App {
             fleet.adopt(&read.needs, calls, &read.idle);
         }
         self.reads_unkept |= read.fresh;
-        Ok((read.project, read.rows))
+        // The head names the project by its title, else its name.
+        Ok((read.title.unwrap_or(read.project), read.rows))
     }
 
     /// Start a lead window's one background pass over its agents'
@@ -17286,6 +17314,23 @@ impl App {
                             }
                             None => task::forget_profile(&self.store(), &lead.bot),
                         }
+                        // Its title is its first message's first line,
+                        // noted by its id.
+                        let first = crate::title::first_line(&brief);
+                        let asked = json!({"bot": lead.bot});
+                        let noted = match self.client.request("inspect", asked).await {
+                            Ok(record) => match record["bot_id"].as_i64() {
+                                Some(id) => {
+                                    crate::title::note(&self.store(), &lead.bot, id, &first)
+                                        .map_err(|error| error.to_string())
+                                }
+                                None => Err("no id".to_owned()),
+                            },
+                            Err(error) => Err(error.to_string()),
+                        };
+                        if let Err(error) = noted {
+                            self.notice = Some(format!("{}'s title: {error}", lead.bot));
+                        }
                         self.send_after = Some(file);
                         Ok(lead.bot)
                     }
@@ -17361,6 +17406,8 @@ impl App {
         }
         let start = task::Start {
             name: short.clone(),
+            // Its title is its first message's first line.
+            title: crate::title::first_line(&brief),
             brief,
             // Named even when every task runs as it, so its model and
             // tools apply; its words are told once.
@@ -17476,9 +17523,11 @@ impl App {
         let waits =
             |bot: &str| held.contains(bot) || fleet.is_some_and(|fleet| fleet.needs.waits(bot));
         let beside = self.beside();
+        let mut titles = crate::title::Titles::read(&self.store());
         let mut picker = switch::Picker::new(
             &bots,
             waits,
+            |bot| titles.of(bot),
             &self.bot,
             self.project.as_deref(),
             &self.workspace,
@@ -18747,6 +18796,7 @@ impl App {
                 let items: Vec<list::Item> = (agents.rows().into_iter())
                     .map(|(agent, found)| {
                         list::Item::new(agent.name.clone(), agent.about.clone())
+                            .title(agent.title.clone())
                             .sign(status::sign(&agent.state))
                             .current(agent.name == agents.current)
                             .found(&found)
@@ -25317,7 +25367,7 @@ mod tests {
         // started and sent under it.
         app.daemon(turn_event("accepted", 1, json!({"node": 7})))
             .await;
-        let start = json!({"name": "readme", "brief": "Say how cents round\nmore"});
+        let start = json!({"name": "readme", "title": "Say how cents round", "brief": "Say how cents round\nmore"});
         app.commit_call("s1", Some(1), served::START, &start, "calc.readme/1", false);
         let send = json!({"to": "calc.fix", "message": "Check div too.\nThanks"});
         app.commit_call("m1", Some(1), "send_message", &send, "{}", false);
@@ -25756,7 +25806,7 @@ mod tests {
         app.pending.clear();
         app.daemon(turn_event("accepted", 2, json!({"node": 9})))
             .await;
-        let start = json!({"name": "readme", "brief": "Say how cents round"});
+        let start = json!({"name": "readme", "title": "Say how cents round", "brief": "Say how cents round"});
         let started = json!({"name": served::START, "call_id": "s1"});
         app.daemon(turn_event("tool_started", 2, started)).await;
         app.commit_call("s1", Some(2), served::START, &start, "calc.readme/1", false);
@@ -25814,7 +25864,7 @@ mod tests {
             .await;
         app.daemon(turn_event("accepted", 5, json!({"node": 19})))
             .await;
-        let start = json!({"name": "docs", "brief": "Write the docs"});
+        let start = json!({"name": "docs", "title": "Write the docs", "brief": "Write the docs"});
         app.commit_call("s5", Some(5), served::START, &start, "calc.docs/1", false);
         // As reconnecting leaves it: still following the turn that ended.
         app.running.as_mut().unwrap().turn = 4;
@@ -27973,7 +28023,7 @@ mod tests {
         );
         app.read_tasks().await;
         let rows = drawn(&mut app);
-        assert_eq!(rows[1], "  ● many  working  Fix many");
+        assert_eq!(rows[1], "  ● many  working");
     }
 
     #[tokio::test]
@@ -28048,13 +28098,13 @@ mod tests {
         let arguments = json!({"name": "add", "brief": "Fix add"});
         app.commit_call("c", Some(1), served::START, &arguments, "calc.add/1", false);
         app.read_tasks().await;
-        assert_eq!(drawn(&mut app)[1], "  ● add  working  Fix add");
+        assert_eq!(drawn(&mut app)[1], "  ● add  working");
         // Idle, the stopped message never ran: the turn before it says
         // what the task did.
         running.store(false, std::sync::atomic::Ordering::SeqCst);
         app.tasks_read = None;
         app.read_tasks().await;
-        assert_eq!(drawn(&mut app)[1], "  ○ add  idle  Fix add");
+        assert_eq!(drawn(&mut app)[1], "  ○ add  idle");
     }
 
     #[tokio::test]
@@ -28094,7 +28144,8 @@ mod tests {
         let mut app = app(client);
         app.width = 80;
         let start = |app: &mut App, name: &str| {
-            let arguments = json!({"name": name, "brief": format!("Fix {name}")});
+            let arguments = json!({"name": name, "title": format!("Fix {name}"),
+                "brief": format!("Fix {name} now")});
             let output = format!("calc.{name}/1");
             app.commit_call("c", Some(1), served::START, &arguments, &output, false);
         };
@@ -28102,19 +28153,19 @@ mod tests {
         start(&mut app, "neg");
         let rows = drawn(&mut app);
         assert_eq!(rows[0], "• Started 2 tasks · click one to open it");
-        assert_eq!(rows[1], "  ◌ add  starting  Fix add");
+        assert_eq!(rows[1], "  ◌ Fix add  add  starting");
         // What each does is read, and drawn where they are.
         app.read_tasks().await;
         let rows = drawn(&mut app);
-        assert_eq!(rows[1], "  ○ add  idle     Fix add");
-        assert_eq!(rows[2], "  ● neg  working  Fix neg");
+        assert_eq!(rows[1], "  ○ Fix add  add  idle");
+        assert_eq!(rows[2], "  ● Fix neg  neg  working");
         // A task the daemon could not read stays as it was; one it does not
         // have is removed.
         start(&mut app, "gone");
         app.read_tasks().await;
         let rows = drawn(&mut app);
-        assert_eq!(rows[2], "  ● neg   working  Fix neg");
-        assert_eq!(rows[3], "  ■ gone  removed  Fix gone");
+        assert_eq!(rows[2], "  ● Fix neg   neg   working");
+        assert_eq!(rows[3], "  ■ Fix gone  gone  removed");
         // A click on a task's row opens that task.
         let links = app.screen.links();
         assert_eq!(links[0], None);
@@ -28411,8 +28462,8 @@ mod tests {
         }
         app.read_tasks().await;
         let rows = drawn(&mut app);
-        assert_eq!(rows[1], "  ○ quiet  no reply  Fix quiet");
-        assert_eq!(rows[2], "  ✗ bad    failed    Fix bad");
+        assert_eq!(rows[1], "  ○ quiet  no reply");
+        assert_eq!(rows[2], "  ✗ bad    failed");
     }
 
     #[test]
@@ -28554,7 +28605,7 @@ mod tests {
         let arguments = json!({"name": "ask", "brief": "Fix ask"});
         app.commit_call("c", Some(1), served::START, &arguments, "calc.ask/1", false);
         app.read_tasks().await;
-        assert_eq!(drawn(&mut app)[1], "  ? ask  needs you  Fix ask");
+        assert_eq!(drawn(&mut app)[1], "  ? ask  needs you");
         // Its history is read once for the turn it ended.
         app.tasks_read = None;
         app.read_tasks().await;
@@ -30506,7 +30557,7 @@ mod tests {
         gone.store(true, std::sync::atomic::Ordering::SeqCst);
         app.read_tasks().await;
         let rows = drawn(&mut app);
-        assert!(rows[1].ends_with("ask  removed  Ask"), "{rows:?}");
+        assert!(rows[1].ends_with("ask  removed"), "{rows:?}");
         app.pin_task_asks();
         assert!(app.asks.is_empty());
     }
@@ -31241,7 +31292,7 @@ mod tests {
                 .map(|(_, mark)| mark.clone())
         };
         let neg = (lines.iter())
-            .position(|line| line.to_string().contains("neg working"))
+            .position(|line| line.to_string().ends_with(" neg"))
             .unwrap();
         assert_eq!(
             link(neg),
@@ -31251,7 +31302,7 @@ mod tests {
             )))
         );
         let first = (lines.iter())
-            .position(|line| line.to_string().contains("first lead working"))
+            .position(|line| line.to_string().ends_with(" first lead"))
             .unwrap();
         assert_eq!(
             link(first),
@@ -31262,7 +31313,7 @@ mod tests {
         );
         // This window's own agent is listed and picked as any other.
         let own = (lines.iter())
-            .position(|line| line.to_string().contains(" lead working"))
+            .position(|line| line.to_string().ends_with(" lead"))
             .unwrap();
         assert_eq!(
             link(own),
@@ -31277,7 +31328,7 @@ mod tests {
         watch.rows[2].state = "waiting on lead, first lead".into();
         let (lines, _, marks) = watch_card(&watch, 80);
         let neg = (lines.iter())
-            .position(|line| line.to_string().contains("neg waiting on"))
+            .position(|line| line.to_string().contains("neg · waiting on"))
             .unwrap();
         let buttons = (marks.iter())
             .find_map(|(at, mark)| match mark {

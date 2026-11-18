@@ -5368,10 +5368,11 @@ mod tests {
         // How a lead in Sonny starts a task.
         let task = clean(
             "start_task",
-            serde_json::json!({"name": "fix", "brief": "Fix the tests.", "setup": true}),
+            serde_json::json!({"name": "fix", "title": "Fix the failing tests",
+                "brief": "Fix the tests.", "setup": true}),
             "Started calc.fix: {\"handle\":\"calc.fix/3\"}",
         );
-        assert_eq!(task, ["• Started fix", "  └ Fix the tests."]);
+        assert_eq!(task, ["• Started fix", "  └ Fix the failing tests"]);
         // An agent a lead makes, and closes when its work is done.
         let made = clean(
             "spawn_agent",

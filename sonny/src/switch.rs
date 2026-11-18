@@ -11,6 +11,9 @@ use serde_json::Value;
 /// One agent, as listed.
 pub struct Agent {
     pub name: String,
+    /// What its work is, in the person's words, which its row leads with;
+    /// empty for one with none.
+    pub title: String,
     /// What it is doing and where, muted beside its name.
     pub about: String,
     /// Its state, as the state table names it.
@@ -73,10 +76,12 @@ impl Picker {
     /// The agents in `bots` (the daemon's `bots` rows), ordered for a
     /// window of `current` in folder `workspace`, of project `project` or
     /// of none; `beside` picked when listed. Those `waits` names wait on
-    /// the person, as [`crate::needs`] reads it.
+    /// the person, as [`crate::needs`] reads it; `title` gives each one's.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         bots: &[Value],
         waits: impl Fn(&str) -> bool,
+        mut title: impl FnMut(&Value) -> Option<String>,
         current: &str,
         project: Option<&str>,
         workspace: &str,
@@ -127,6 +132,7 @@ impl Picker {
                     .map(|folder| crate::footer::fish(&crate::tilde(folder)));
                 Agent {
                     name: bot["name"].as_str().unwrap_or("").to_owned(),
+                    title: title(bot).unwrap_or_default(),
                     about: Agent::about(&state, folder.as_deref()),
                     state,
                     folder,
@@ -260,6 +266,7 @@ mod tests {
         let picker = Picker::new(
             &bots(),
             |bot| bot == "shop.lead.ok",
+            |_| None,
             "shop.lead",
             Some("shop"),
             "/w/shop",
@@ -314,6 +321,7 @@ mod tests {
         let mut picker = Picker::new(
             &bots(),
             |bot| bot == "shop.lead.ok",
+            |_| None,
             "shop.lead",
             Some("shop"),
             "/w/shop",
@@ -340,6 +348,7 @@ mod tests {
         let picker = Picker::new(
             &bots(),
             |_| false,
+            |_| None,
             "notes",
             None,
             "/w/notes",

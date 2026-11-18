@@ -10920,6 +10920,183 @@ The table gives medians after warmup. The base ran first and last across two blo
 | lifecycle | p95 turn, ms | 600.258 | 601.289 |
 | lifecycle | peak RSS, MiB | 27.750 | 28.383 |
 
+## jemalloc in the Linux builds, as Codex's
+
+The Linux release is static musl, and musl's allocator takes one lock for
+every thread. Under load the daemon's threads queued on it: the Nov 17
+report had 41 to 43 of 50 threads waiting in a futex and 150,000 voluntary
+context switches a second. Codex links tikv-jemallocator into exactly these
+builds (Linux, musl, x86_64 and aarch64) with `narenas_ratio:0.25` baked in.
+This change does the same for the daemon and Sonny. The Mac and glibc builds
+keep the system allocator: `cargo tree --target aarch64-apple-darwin -i
+tikv-jemallocator` prints nothing. A `heap-profile` build keeps dhat's
+allocator.
+
+Both sides were built the same way, as release.yml builds them
+(`--target x86_64-unknown-linux-musl`, `CC=musl-gcc`, thin LTO, one
+codegen unit), from main (7860d0e) with and without this change. They ran
+on a 4-CPU Linux host, two alternating rounds each, 2026-11-18. Sonny
+windows ran in 160x48 pseudo-terminals on one socket daemon and a synthetic
+Responses model. A key alternated `x` and backspace in each window, and its
+latency is the time to the end of the next frame the window drew. The rig
+is a scratch copy kept outside the repo.
+
+### Low end: one window, 10 agents
+
+The window opens on one of the 10 agents. It sits idle for 60 s, then
+takes a key every 50 ms for 30 s. Then 10 turns are sent from the window,
+each timed from Enter to the reply on screen. A range gives both rounds.
+
+| Measure | main | change |
+| --- | ---: | ---: |
+| Window open, ms | 64 to 78 | 62 to 63 |
+| Idle daemon CPU, ms/s | 0.17 | 0.33 to 0.50 |
+| Idle window CPU, ms/s | 1.83 to 2.33 | 1.50 to 1.83 |
+| Idle daemon RSS, MiB | 16.3 | 17.9 to 18.0 |
+| Idle window RSS, MiB | 22.8 | 24.4 |
+| Key p50, ms | 0.77 to 0.95 | 0.83 to 0.84 |
+| Key p99, ms | 1.80 to 1.95 | 1.64 to 2.09 |
+| Worst key, ms | 2.8 to 4.2 | 2.3 to 25.9 |
+| Turn p50, ms | 38.4 to 38.8 | 38.2 to 38.6 |
+| Turn worst, ms | 40.6 | 39.0 to 39.9 |
+
+Every timing is the same within the noise. Idle daemon CPU is one or two
+10 ms clock ticks a minute on either side.
+
+Memory is about 1.6 MiB higher in each process. 0.5 MiB of that is the
+larger binary's code, file-backed and shared between windows. The other
+1.0 MiB is anonymous memory, jemalloc's fixed cost: its arena, thread
+caches and metadata. George took that cost for the high end's gains
+(11-18). The shared low-end harness (`bench/ends.py`) agreed: daemon 16.3
+to 16.5 MiB against 17.6 to 18.5, window 20.7 against 22.4 to 22.5, with
+key and turn latency equal.
+
+### High end: 10,000 agents, 32, 100 and 200 windows
+
+The store holds 10,000 agents in 50 projects, 1,000 of them in project
+`p0`, each with one finished turn. 30 agents run rich turns back to back
+without pacing, and the first 30 windows watch them. "One busy project"
+puts every window and the busy agents in `p0`. "Spread" puts each window
+in its own project, round-robin over all 50.
+
+Each window takes one key a second for 60 s. Beside them, one client lists
+`p0` (1,000 agents, four pages of 256) every 250 ms. Window open is the
+median time from launch to the agent's history on screen. CPU, voluntary
+context switches and RSS are the daemon's, sampled each second. Window
+RSS is the mean per window.
+
+| Windows | Layout | Side | Key p99, ms | Worst key, ms | Window open, s | Project listing p99, ms | Daemon CPU, % | Daemon switches/s | Daemon RSS, MiB | Window RSS, MiB |
+| ---: | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 32 | one busy project | main | 440 to 973 | 614 to 1541 | 5.5 to 7.3 | 858 to 1633 | 160 to 167 | 21250 to 23477 | 30 to 32 | 38.6 to 41.0 |
+| 32 | one busy project | change | 289 to 291 | 403 to 462 | 1.4 to 1.5 | 482 to 496 | 141 to 143 | 15159 to 17595 | 36 | 42.6 to 42.8 |
+| 32 | spread | main | 497 to 721 | 681 to 1070 | 5.9 to 6.9 | 845 to 1364 | 155 to 157 | 18670 to 18969 | 30 to 31 | 37.0 |
+| 32 | spread | change | 284 to 386 | 477 to 538 | 1.4 | 486 to 762 | 136 to 140 | 12657 to 14434 | 36 to 38 | 39.2 to 39.3 |
+| 100 | one busy project | main | 4791 to 5643 | 12211 to 15802 | 17.8 to 21.6 | 7201 to 8635 | 196 to 200 | 31841 to 33161 | 35 | 43.7 to 46.2 |
+| 100 | one busy project | change | 535 to 537 | 831 to 973 | 3.7 to 4.7 | 1068 to 1311 | 141 to 147 | 14793 to 17346 | 37 to 38 | 33.3 to 33.4 |
+| 100 | spread | main | 3484 to 3543 | 8316 to 8812 | 18.6 to 21.2 | 5128 to 5367 | 184 to 188 | 27084 to 28912 | 34 to 35 | 27.9 to 28.0 |
+| 100 | spread | change | 586 to 647 | 814 to 1170 | 3.6 to 3.9 | 1134 to 1197 | 136 to 138 | 12494 to 12928 | 37 to 42 | 30.2 to 30.3 |
+| 200 | one busy project | main | 9401 to 9809 | 35967 to 38510 | 34.1 to 39.8 | 13481 to 14729 | 180 to 182 | 25634 to 26334 | 37 | 57.3 to 58.8 |
+| 200 | one busy project | change | 879 to 1164 | 1423 to 1931 | 8.1 to 8.4 | 1615 to 2276 | 132 to 135 | 9734 to 10976 | 44 to 52 | 31.2 |
+| 200 | spread | main | 7322 to 7817 | 25299 to 27103 | 30.0 to 35.9 | 10170 to 10286 | 186 to 188 | 26484 to 27097 | 37 | 59.5 to 61.0 |
+| 200 | spread | change | 673 to 741 | 1043 to 1215 | 6.2 to 7.7 | 1445 to 1881 | 130 to 132 | 11463 to 11682 | 38 to 47 | 27.7 |
+
+- **Keys.** At 100 and 200 windows, main's p99 was 3.5 to 9.8 s, and its
+  worst key waited 8 to 38 s. With jemalloc, p99 is 0.5 to 1.2 s and no
+  key waited 2 s. At 32 windows, p99 fell from 0.44 to 0.97 s to 0.28 to
+  0.39 s.
+- **Opening and listing.** A window opens 4 to 5 times sooner. A
+  1,000-agent listing's p99 is 2 to 9 times shorter.
+- **Daemon CPU.** It is 10 to 30% lower, and voluntary context switches
+  are about halved. The busy agents are not paced, so with jemalloc the
+  daemon also served more of everything in the same minute: more listings
+  (54 to 132 against 4 to 106) and keys answered in every window.
+- **Memory.**
+  - The daemon's peak is 2 to 15 MiB higher, since jemalloc keeps freed
+    pages for 10 s before it returns them.
+  - At 32 windows, each window is 2 to 4 MiB higher.
+  - At 100 and 200 windows on main, the windows fell behind and buffered
+    what they had not drawn: 44 to 61 MiB each against 27 to 33 MiB with
+    jemalloc. The one spread case at 100 windows is the exception (28
+    against 30).
+- **What is left.** The 50 ms bar is not met on either side while 30
+  agents saturate four CPUs. The window's own loop is the rest of the
+  freeze work.
+
+### Paced high end, from the shared harness
+
+`bench/ends.py --end high --pace 0.5` runs the same agent work on both
+sides: 30 busy agents and 8 running code-mode scripts. Two alternating
+rounds, 2026-11-18.
+
+| Windows | Layout | Side | Turns done | Key p99, ms | Worst key, ms | Window start p50, ms | Daemon CPU, % | Daemon RSS, MiB | Windows RSS (all), MiB |
+| ---: | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 32 | one | main | 1410 | 3.7 to 6.7 | 5.0 to 10.5 | 3391 to 5594 | 151 to 155 | 25.6 to 26.2 | 742 to 744 |
+| 32 | one | change | 1410 | 2.8 to 4.5 | 8.3 to 10.2 | 713 to 811 | 90 to 97 | 27.9 to 28.4 | 741 to 744 |
+| 32 | spread | main | 1410 | 3.3 to 5.4 | 6.8 to 14.2 | 3780 to 4132 | 151 to 155 | 26.2 | 744 to 745 |
+| 32 | spread | change | 1410 | 3.0 to 4.7 | 3.8 to 5.7 | 806 to 829 | 93 to 98 | 27.7 to 28.7 | 744 |
+| 100 | one | main | 1440 | 5.1 to 5.4 | 7.4 to 10.2 | 10769 to 13476 | 204 to 215 | 28.9 to 30.5 | 4385 to 4986 |
+| 100 | one | change | 1440 | 4.2 to 6.0 | 6.8 to 8.2 | 1772 to 2127 | 124 to 127 | 29.4 to 30.5 | 2336 to 2339 |
+| 100 | spread | main | 1440 | 4.7 to 5.7 | 5.4 to 9.5 | 11524 to 11643 | 209 | 30.0 to 30.6 | 4723 to 4761 |
+| 100 | spread | change | 1440 | 3.8 to 6.0 | 21.2 to 29.5 | 2024 to 2209 | 128 | 28.5 to 30.7 | 2335 to 2338 |
+
+With the same 1,410 to 1,440 turns done:
+
+- **Daemon CPU.** It is 37 to 40% lower.
+- **Window start.** A window starts 4 to 6 times sooner.
+- **Window memory.** The 100 windows together hold 2.3 GiB, against 4.4
+  to 5.0 GiB on main.
+- **Keys.** p99 is under 7 ms on both sides.
+
+### The Perf workflow's screens
+
+The screens ran on the same musl builds, base (main) and head
+alternating, two rounds each (`bench/perf_gate.py`). Store work per turn
+is unchanged.
+
+| Bench | Measure | Base | Head | Change |
+| --- | --- | ---: | ---: | ---: |
+| admission | lone submit CPU, ms | 39.71 | 34.075 | -14.2% |
+| admission | burst submit p99, ms | 6.352 | 5.185 | -18.4% |
+| completion | release to terminal p99, ms | 13.673 | 11.004 | -19.5% |
+| footprint | idle RSS, MiB | 12.789 | 14.053 | +9.9% |
+| footprint | per idle bot, KiB | 1.694 | 2.27 | +34.0% |
+| footprint | RSS after a turn each, MiB | 22.094 | 32.92 | +49.0% |
+| footprint | CPU per turn, ms | 0.974 | 0.879 | -9.8% |
+| sonny | lookout CPU per 1k deltas at 10x1, ms | 50.0 | 43.75 | -12.5% |
+| sonny | lookout CPU per 1k deltas at 10x10, ms | 10.625 | 6.875 | -35.3% |
+| sonny | lookout CPU per 1k deltas at 10x100, ms | 5.875 | 3.875 | -34.0% |
+| sonny | lookout CPU per 1k deltas at 100x10, ms | 8.19 | 6.31 | -23.0% |
+| sonny | lookout seated at 100x10, s | 0.1 | 0.1 | +0.0% |
+| sonny | lookout note p95 at 10x100, ms | 2105.5 | 2093.5 | -0.6% |
+| sonny | lookout note p95 at 100x10, ms | 2341.0 | 2199.5 | -6.0% |
+| sonny | quiet window CPU, ms/s | 1.155 | 1.375 | +19.0% |
+| sonny | quiet window reads, KiB/s | 0.225 | 0.24 | +6.7% |
+| sonny | quiet window requests, /s | 0.655 | 0.71 | +8.4% |
+| sonny | quiet window RSS, MiB | 20.75 | 26.45 | +27.5% |
+| sonny | sky replay CPU per 1k lines, ms | 61.595 | 12.375 | -79.9% |
+| sonny | sky replay RSS, MiB | 51.55 | 55.45 | +7.6% |
+| lifecycle | CPU, s | 0.605 | 0.57 | -5.8% |
+| lifecycle | p95 turn, ms | 586.243 | 585.467 | -0.1% |
+| lifecycle | peak RSS, MiB | 22.27 | 25.494 | +14.5% |
+
+- **CPU and latency.** Every row improves or holds except a quiet
+  window's CPU, at 1.16 against 1.38 ms/s. The rig above measured that
+  the other way (1.8 to 2.3 against 1.5 to 1.8 ms/s).
+- **Memory.** The rows that measure memory after work rose: the daemon
+  after a turn on each of 1,000 bots, the lifecycle peak, and a quiet
+  window that has listed 1,000 agents. This is freed memory that jemalloc
+  keeps for reuse.
+  - jemalloc returns these pages after 10 s, but only while the process
+    is still allocating. Codex starts no background thread, so a process
+    that goes idle keeps them.
+  - With the pages returned at once (`dirty_decay_ms:0,muzzy_decay_ms:0`
+    at run time), the footprint after turns read 23.1 MiB, about base,
+    and the quiet window 21.9 MiB.
+  - That setting cost the high end. At 100 and 200 windows the daemon
+    used 8 to 10% more CPU, and 200-window key p99 was 1.7 to 1.8 s
+    against 0.7 to 1.0 s.
+  - Codex's settings are kept.
+
 ## Each open connection in `stats`, by its label
 
 2026-11-18, Linux x86_64 cloud VM, 4 CPUs. Main is `8ae56e87` (#1145),
