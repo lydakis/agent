@@ -3,6 +3,7 @@
 //! for capacity (`send`) or fail immediately (`try_send`) so a slow subscriber
 //! never blocks another bot's turn.
 use crate::{Error, Result};
+use bytes::Bytes;
 use serde_json::Value;
 use std::io::Write;
 use std::sync::Arc;
@@ -24,13 +25,34 @@ pub const MAX_EVENT: usize = 1024 * 1024;
 /// elided so the refusal always fits, and its start and end, where the
 /// value and the rule are named, survive.
 pub const DETAIL_LIMIT: usize = 4096;
-type Packet = (Vec<u8>, OwnedSemaphorePermit, Option<oneshot::Sender<()>>);
+type Packet = (Bytes, OwnedSemaphorePermit, Option<oneshot::Sender<()>>);
+
+/// An event encoded once as its JSON line, no longer than `MAX_EVENT`.
+/// Every session it goes to queues the same bytes, each charged their
+/// cost against its own budget, so one event reaching many followers is
+/// encoded once and copied never.
+#[derive(Clone, Debug)]
+pub struct Frame(Bytes);
+impl Frame {
+    pub fn encode(event: &Value) -> Result<Self> {
+        let mut bytes = serde_json::to_vec(event)?;
+        bytes.push(b'\n');
+        if bytes.len() > MAX_EVENT {
+            return crate::fail("event_size_limit");
+        }
+        Ok(Self(bytes.into()))
+    }
+    /// What it takes from a session's budget.
+    fn cost(&self) -> u32 {
+        cost(&self.0)
+    }
+}
 
 /// What an in-process session was sent, each a JSON line.
 pub struct Lines(mpsc::UnboundedReceiver<Packet>);
 impl Lines {
     /// The next line, or `None` once the session's output is gone.
-    pub async fn next(&mut self) -> Option<Vec<u8>> {
+    pub async fn next(&mut self) -> Option<Bytes> {
         let (bytes, _permit, flushed) = self.0.recv().await?;
         if let Some(flushed) = flushed {
             let _ = flushed.send(());
@@ -203,18 +225,9 @@ impl Output {
             .await
             .map_err(|_| Error::new("output_closed"))?;
         self.sender
-            .send((Vec::new(), permit, Some(done)))
+            .send((Bytes::new(), permit, Some(done)))
             .map_err(|_| Error::new("output_closed"))?;
         drained.await.map_err(|_| Error::new("output_closed"))
-    }
-
-    fn encode(event: &Value) -> Result<Vec<u8>> {
-        let mut bytes = serde_json::to_vec(event)?;
-        bytes.push(b'\n');
-        if bytes.len() > MAX_EVENT {
-            return crate::fail("event_size_limit");
-        }
-        Ok(bytes)
     }
 
     fn response(id: Value, result: Result<Value>) -> Value {
@@ -256,15 +269,19 @@ impl Output {
     /// `send` for an event the caller keeps: cancelled while it waits for
     /// room, it has queued nothing, and the event can be sent again.
     pub async fn send_ref(&self, event: &Value) -> Result<()> {
-        let bytes = Self::encode(event)?;
+        self.send_frame(&Frame::encode(event)?).await
+    }
+
+    /// `send` for an event already encoded, as one going to many sessions.
+    pub async fn send_frame(&self, frame: &Frame) -> Result<()> {
         let permit = self
             .budget
             .clone()
-            .acquire_many_owned(cost(&bytes))
+            .acquire_many_owned(frame.cost())
             .await
             .map_err(|_| Error::new("output_closed"))?;
         self.sender
-            .send((bytes, permit, None))
+            .send((frame.0.clone(), permit, None))
             .map_err(|_| Error::new("output_closed"))
     }
 
@@ -277,7 +294,7 @@ impl Output {
     pub async fn reserve(&self, upto: &[Value]) -> Result<Room> {
         let mut total = 0u32;
         for event in upto {
-            total += cost(&Self::encode(event)?);
+            total += Frame::encode(event)?.cost();
         }
         let permit = self
             .budget
@@ -290,13 +307,13 @@ impl Output {
 
     /// Send `event` into `room`, never waiting, taking only what it costs.
     pub fn send_in(&self, room: &mut Room, event: &Value) -> Result<()> {
-        let bytes = Self::encode(event)?;
+        let frame = Frame::encode(event)?;
         let permit = room
             .0
-            .split(cost(&bytes) as usize)
+            .split(frame.cost() as usize)
             .ok_or_else(|| Error::new("output_room"))?;
         self.sender
-            .send((bytes, permit, None))
+            .send((frame.0, permit, None))
             .map_err(|_| Error::new("output_closed"))
     }
 
@@ -308,14 +325,19 @@ impl Output {
 
     /// Never waits. `output_lagged` means the consumer has not kept up.
     pub fn try_send(&self, event: Value) -> Result<()> {
-        let bytes = Self::encode(&event)?;
+        self.try_send_frame(&Frame::encode(&event)?)
+    }
+
+    /// `try_send` for an event already encoded, as one going to many
+    /// sessions: each queues the same bytes and is charged their cost.
+    pub fn try_send_frame(&self, frame: &Frame) -> Result<()> {
         let permit = self
             .budget
             .clone()
-            .try_acquire_many_owned(cost(&bytes))
+            .try_acquire_many_owned(frame.cost())
             .map_err(|_| Error::new("output_lagged"))?;
         self.sender
-            .send((bytes, permit, None))
+            .send((frame.0.clone(), permit, None))
             .map_err(|_| Error::new("output_closed"))
     }
 }
@@ -348,6 +370,21 @@ pub fn encoded_len<T: serde::Serialize + ?Sized>(value: &T) -> Result<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn a_frame_sent_to_many_sessions_is_one_copy_charged_to_each() {
+        let event = serde_json::json!({"event":"text_delta","data":{"text":"word"}});
+        let frame = Frame::encode(&event).unwrap();
+        let (first, mut first_lines) = Output::channel();
+        let (second, mut second_lines) = Output::channel();
+        first.try_send_frame(&frame).unwrap();
+        second.send_frame(&frame).await.unwrap();
+        let (a, _held, _) = first_lines.recv().await.unwrap();
+        let (b, _held_too, _) = second_lines.recv().await.unwrap();
+        assert_eq!(a.as_ptr(), b.as_ptr());
+        assert_eq!(&a[..], &Frame::encode(&event).unwrap().0[..]);
+        assert_eq!(first.room(), QUEUE_BYTES - a.len() - PACKET_BYTES);
+        assert_eq!(second.room(), QUEUE_BYTES - a.len() - PACKET_BYTES);
+    }
     #[tokio::test]
     async fn closing_a_stalled_socket_writer_releases_the_connection() {
         let (writer, mut reader) = tokio::io::duplex(16);
@@ -423,7 +460,7 @@ mod tests {
             output.try_send(event.clone()).unwrap();
         }
         // The budget still ends it, counting each packet's cost.
-        let fits = QUEUE_BYTES / (Output::encode(&event).unwrap().len() + PACKET_BYTES);
+        let fits = QUEUE_BYTES / (Frame::encode(&event).unwrap().0.len() + PACKET_BYTES);
         let error = (4096..=fits).find_map(|_| output.try_send(event.clone()).err());
         assert_eq!(error.unwrap().code, "output_lagged");
     }
