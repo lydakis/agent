@@ -10805,6 +10805,36 @@ the CI runner, 2026-11-17:
 Store jobs a turn are unchanged on every screen: the gate fails on any
 increase, and it passed. Every row is within the runner's spread.
 
+## Blank text left out of Anthropic requests (#1147)
+
+Each Anthropic request now checks every stored item for a whitespace-only
+text block after the thinking strip, and leaves such blocks out at the
+length the store counted. Only items with `"text":"` followed by a quote,
+backslash, space or non-ASCII byte are parsed; every other item is copied
+as before. Item batches now carry the separator state from one batch to
+the next. Matched screen from the CI Perf job (`bench/perf_gate.py`), main
+(7860d0e) against the head (00670de), release build, synthetic model, the
+CI runner, 2026-11-18:
+
+| Screen | Row | Main | Head | Change |
+| --- | --- | ---: | ---: | ---: |
+| `bench.admission_burst` | Lone submit CPU | 22.434 ms | 22.338 ms | -0.4% |
+| `bench.admission_burst` | Burst submit p99 | 2.196 ms | 2.248 ms | +2.4% |
+| `bench.completion_burst` | Release to terminal p99 | 5.943 ms | 5.775 ms | -2.8% |
+| `bench.footprint` | Idle RSS | 17.012 MiB | 17.086 MiB | +0.4% |
+| `bench.footprint` | Per idle bot | 1.832 KiB | 1.912 KiB | +4.4% |
+| `bench.footprint` | RSS after a turn each | 59.490 MiB | 53.445 MiB | -10.2% |
+| `bench.footprint` | CPU per turn | 0.566 ms | 0.540 ms | -4.4% |
+| `bench.lifecycle` | Daemon CPU | 0.285 s | 0.315 s | +10.5% |
+| `bench.lifecycle` | Turn p95 | 569.936 ms | 570.648 ms | +0.1% |
+| `bench.lifecycle` | Peak RSS | 26.219 MiB | 25.854 MiB | -1.4% |
+
+Store jobs a turn are unchanged on every screen: the gate fails on any
+increase, and it passed. The lifecycle CPU row is 30 ms on a run of a few
+hundred turns, inside the spread of the runner's own repeats (the same
+row moved +9.4% on #1132's screen), with the turn p95 and memory
+unchanged.
+
 ## A bot's instructions out of its row (schema 107)
 
 Each bot's instructions and compaction instructions now live in
@@ -10866,3 +10896,26 @@ Store work a turn is unchanged on every screen and every row is within the
 spread. `bench.query_plans` plans 488 statements with no table scan. The
 migration of a store of 2,000 such bots (70 MB of instructions) from schema
 106, its backup copy included, took 0.73 s at open.
+
+## Workspace resolution before shared request dispatch
+
+November 17, 2026. Matched offline release builds on macOS arm64 against `7860d0e5`. SHA-256 prefixes were `fa68990710aa` (base) and `746f97c33bc6` (candidate).
+
+A second client issued `stats` while the first client's `create` checked a directory. A local test interposed a 150 ms delay on `stat` for that one directory and signaled the observer on entry. Both binaries ran with identical instrumentation for seven trials each. Median observer latency was 155.62 ms on the base (153.28 to 156.60) and 0.56 ms on the change (0.46 to 0.74). This isolates the explicit workspace lookup on an ordinary client socket. Bot authorization has separate checks.
+
+In the uninstrumented footprint trials below the base used 6.001 store jobs per turn throughout. The candidate used 6.001 in three trials and 6.005 in one, with two extra pacing notes and two retry writes. A paired two-trial repeat gave 6.001 on both binaries in both trials. Resolution adds no store job. The unchanged admission and completion operations were also checked in each measured trial.
+
+The table gives medians after warmup. The base ran first and last across two blocks. Each side contributed six 32-bot admission and completion trials, four 1,000-bot footprint trials, and two 32-bot socket echo lifecycle trials.
+
+| Benchmark | Measure | Base | Candidate |
+| --- | --- | ---: | ---: |
+| admission | lone submit CPU, ms | 22.584 | 24.801 |
+| admission | burst submit p99, ms | 2.341 | 2.416 |
+| completion | release to terminal p99, ms | 5.434 | 5.841 |
+| footprint | idle RSS, MiB | 13.523 | 13.594 |
+| footprint | per idle bot, KiB | 2.528 | 2.640 |
+| footprint | RSS after a turn each, MiB | 37.289 | 39.703 |
+| footprint | CPU per turn, ms | 0.429 | 0.431 |
+| lifecycle | CPU, s | 0.373 | 0.348 |
+| lifecycle | p95 turn, ms | 600.258 | 601.289 |
+| lifecycle | peak RSS, MiB | 27.750 | 28.383 |

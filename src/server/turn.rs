@@ -20,7 +20,7 @@ use agent_runtime::{
     sandbox::Policy,
     store::{
         AfterTurn, Answer, ArtifactLines, Bot, CallAnswer, Charge, ContextPrefix, ContextUsage,
-        Database, DetachedRow, ElisionPlan, Gated, Halt, Halted, Lifted, LiftedRun, Limit,
+        Database, DetachedRow, ElisionPlan, Gated, Halt, Halted, Joined, Lifted, LiftedRun, Limit,
         ProcessKind, Settings, Slot, Spend, Store, Strip, TURN_VIEW_ACCOUNTING, Waiting, Window,
         listed_command, unserved,
     },
@@ -152,9 +152,9 @@ fn batches(ids: &[i64], sizes: &[u32], pictured: &[i32]) -> Vec<Vec<i64>> {
     out
 }
 
-/// Stored items read batch by batch and joined by commas. A batch can come
-/// back empty when every item in it held only replayed thinking, so the
-/// separator goes only between batches that carry something.
+/// Stored items read batch by batch and joined by commas, each batch after
+/// the items the ones before it held. A batch can come back empty when
+/// every item in it held only replayed thinking.
 fn item_chunks(
     store: Store,
     chunks: Arc<[Vec<i64>]>,
@@ -162,27 +162,27 @@ fn item_chunks(
     reasoning: bool,
     elided: i64,
 ) -> impl futures_util::Stream<Item = std::io::Result<Bytes>> + Send + 'static {
-    let mut started = false;
-    stream::iter(0..chunks.len())
-        .then(move |index| {
-            let (store, chunks) = (store.clone(), chunks.clone());
-            async move {
-                store
-                    .read("items_by_ids", move |db| {
-                        db.items_sent(&chunks[index], strip, reasoning, elided)
-                    })
-                    .await
-                    .map_err(|error| std::io::Error::other(error.code))
+    stream::unfold((0, Joined::default()), move |(index, joined)| {
+        let (store, chunks) = (store.clone(), chunks.clone());
+        async move {
+            let count = chunks.len();
+            if index == count {
+                return None;
             }
-        })
-        .map(move |bytes| {
-            let mut bytes = bytes?;
-            if started && !bytes.is_empty() {
-                bytes.insert(0, b',');
-            }
-            started |= !bytes.is_empty();
-            Ok(Bytes::from(bytes))
-        })
+            let read = store
+                .read("items_by_ids", move |db| {
+                    let mut joined = joined;
+                    let bytes =
+                        db.items_sent(&chunks[index], strip, reasoning, elided, &mut joined)?;
+                    Ok((bytes, joined))
+                })
+                .await;
+            Some(match read {
+                Ok((bytes, joined)) => (Ok(Bytes::from(bytes)), (index + 1, joined)),
+                Err(error) => (Err(std::io::Error::other(error.code)), (count, joined)),
+            })
+        }
+    })
 }
 
 /// The Responses prompt-cache key for a bot's calls: the store id of the bot

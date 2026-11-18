@@ -3303,8 +3303,8 @@ fn orphaned() -> bool {
 pub fn cli(args: &[String]) -> i32 {
     let done = match Places::home().and_then(|places| match args.split_first() {
         Some((verb, rest)) if verb == "ls" => match rest {
-            [] => Ok(list(&places, None)),
-            [flag, name] if flag == "--after" => Ok(list(&places, Some(name))),
+            [] => Ok(with_scheduler(list(&places, None))),
+            [flag, name] if flag == "--after" => Ok(with_scheduler(list(&places, Some(name)))),
             _ => Err(format!("usage: {USAGE}")),
         },
         Some((verb, [name])) if verb == "rm" => {
@@ -3345,7 +3345,20 @@ pub fn tool(arguments: &Value, caller: &Caller) -> Result<Value, String> {
     if let Some(name) = named("show") {
         return own(&places, name, caller).ok_or_else(|| format!("automation_not_found: {name}"));
     }
-    Ok(list_of(&places, caller))
+    Ok(with_scheduler(list_of(&places, caller)))
+}
+
+/// A listing of automations, and the scheduler's state when it lists
+/// any and the scheduler does not run, in the system's own words: none
+/// of them fires until it runs again.
+fn with_scheduler(mut listed: Value) -> Value {
+    let any = listed["automations"]
+        .as_array()
+        .is_some_and(|rows| !rows.is_empty());
+    if any && let Some(state) = crate::scheduler::not_running() {
+        listed[crate::scheduler::NOT_RUNNING] = json!(state);
+    }
+    listed
 }
 
 /// The agent asking for its own automations, as durably as the daemon
