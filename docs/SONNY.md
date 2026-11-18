@@ -1451,7 +1451,7 @@ that names both, so run Sonny from the same commit on both ends.
 
 A Sonny window takes every key at once, however slow its daemon is to answer.
 What the daemon says is read beside the window's loop and shown in the order it
-came, a few events at a time between looks at the keys. What the person sends (a
+came, one event at a time between looks at the keys. What the person sends (a
 message, a steer, an answer, a pick, `/compact`, Esc's interrupt) goes out in
 order beside the loop, and a message shows under the conversation at once. Older
 pages, an open card's refresh and the reads Sonny repeats every few seconds
@@ -1460,8 +1460,8 @@ too, as Codex's TUI sends its ops and hears back as events. Opening a card (its
 first read), `/switch` and a reconnect's catching up still read before they
 show.
 
-The window holds at most 64 of the daemon's events waiting to be shown. The
-rest wait in the connection's own queue (4,096 events or 8 MiB), so a fast
+The window holds only the event it is showing, as Codex's TUI takes one at a
+time. The rest wait in the connection's own queue (4,096 events or 8 MiB), so a fast
 stream behind a slow read costs no more memory than before. A stream past that
 queue lets go of the connection, as any reader that falls behind does: the
 window drops what it had not shown yet, connects again and draws the rest from
