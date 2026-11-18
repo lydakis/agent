@@ -33,9 +33,8 @@ GATE_MS = 20 * 60 * 1000
 DAY_MS = 24 * 60 * 60 * 1000
 
 
-def seed(binary, store, socket, url, agents):
-    client = Client(binary, store, url, tools='echo',
-                    extra=('--socket', str(socket), '--max-active', '64'))
+def seed(binary, store, url, agents):
+    client = Client(binary, store, url, tools='echo', extra=('--max-active', '64'))
     try:
         workspace = str(store.parent)
         for n in range(agents):
@@ -82,7 +81,7 @@ def timed(build, store, socket, url, since_ms):
             assert done.returncode == 0, done.stderr
             said = json.loads(done.stdout)
         return {'median_ms': round(statistics.median(times), 1), 'max_ms': round(max(times), 1),
-                'said': len(said['said'])}
+                'said': len(said['said']), 'output': said}
     finally:
         daemon.stdin.close()
         daemon.terminate()
@@ -103,12 +102,15 @@ def main():
         try:
             store, socket = folder / 'state.sqlite', folder / 'agent.sock'
             started = time.monotonic()
-            seed(args.base / 'agent', store, socket, url, agents)
+            seed(args.base / 'agent', store, url, agents)
             row = {'agents': agents, 'seed_s': round(time.monotonic() - started, 1)}
             now = int(time.time() * 1000)
             for name, build in (('main', args.base), ('branch', args.new)):
                 row[name] = {'gate': timed(build, store, socket, url, now - GATE_MS),
                              'day': timed(build, store, socket, url, now - DAY_MS)}
+            # Both builds print the same `said`, word for word.
+            for window in ('gate', 'day'):
+                row[f'same_{window}'] = row['main'][window].pop('output') == row['branch'][window].pop('output')
             results.append(row)
             print(json.dumps(row), flush=True)
         finally:
