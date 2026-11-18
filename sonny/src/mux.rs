@@ -1219,6 +1219,16 @@ impl Worker {
         })
     }
 
+    /// [`Worker::aside`], asked from beside the window.
+    pub fn asides(&self) -> impl Fn(&str) -> bool + Send + Sync + 'static {
+        let aside = self.aside.clone();
+        move |bot| {
+            aside.lock().is_ok_and(|aside| {
+                aside.0.contains(bot) || aside.1.as_ref().is_some_and(|kept| (kept.was)(bot))
+            })
+        }
+    }
+
     /// Run `job` on the layout, after those sent before it.
     pub fn send(&self, job: impl FnOnce(&mut Layout) + Send + 'static) {
         let _ = self.work.send(Work::Job(Box::new(job)));
