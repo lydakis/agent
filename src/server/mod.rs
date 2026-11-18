@@ -2377,7 +2377,7 @@ pub async fn run(config: Configuration) -> Result<()> {
     daemon.capabilities = daemon
         .socket
         .as_deref()
-        .and_then(|socket| socket::capabilities(socket, sender.clone(), sessions_next.clone()));
+        .map(|socket| socket::capabilities(socket, sender.clone(), sessions_next.clone()));
     // Where the daemon is, not a bot's shell's marks: a companion is no
     // bot's command.
     let mut companions = companions::Companions::new(

@@ -101,7 +101,7 @@ pub struct Policy {
     pub walled: Vec<PathBuf>,
     /// The other daemons' sockets, which its commands never reach, the
     /// network on or off, nor the folder of each one's bots' own sockets
-    /// beside it (`SOCKET.d`): each answers as the person, or as another
+    /// for its bots: each answers as the person, or as another
     /// daemon's bot ([`known`]).
     #[serde(default)]
     pub daemons: Vec<PathBuf>,
@@ -1058,11 +1058,29 @@ fn linked(kept: &Path) -> Result<Root> {
     )
 }
 
-/// The folder of the bots' own sockets of the daemon at `socket`, beside it.
-fn bots_folder(socket: &Path) -> PathBuf {
-    let mut folder = socket.as_os_str().to_owned();
-    folder.push(".d");
-    PathBuf::from(folder)
+/// Where the daemon binds its per-bot sockets. Every sandbox derives this
+/// same path for the daemons it protects, even before the folder exists.
+pub fn bots_folder(socket: &Path) -> PathBuf {
+    use std::os::unix::net::SocketAddr;
+    let mut name = socket.as_os_str().to_owned();
+    name.push(".d");
+    let beside = PathBuf::from(name);
+    if SocketAddr::from_pathname(beside.join("9223372036854775807")).is_ok() {
+        return beside;
+    }
+    // The canonical socket path identifies this daemon, including one
+    // started with an explicit socket. prepare checks ownership and mode.
+    let digest = aws_lc_rs::digest::digest(
+        &aws_lc_rs::digest::SHA256,
+        socket.as_os_str().as_encoded_bytes(),
+    );
+    let id = u128::from_be_bytes(digest.as_ref()[..16].try_into().unwrap());
+    let tmp = if cfg!(target_os = "macos") {
+        "/private/tmp"
+    } else {
+        "/tmp"
+    };
+    Path::new(tmp).join(format!("agent-bots-{id:032x}"))
 }
 
 /// The store and the files SQLite and the daemon keep beside it.

@@ -6687,6 +6687,29 @@ opening covers only a field's name and separator, so the cost of a read
 stays with the redaction it already did. The session sweep runs once per
 terminal or detached command, at its end, off the runtime thread.
 
+## Private per-bot sockets for long daemon addresses
+
+November 17, 2026. Matched offline release builds on macOS arm64 against `7860d0e5`. SHA-256 prefixes were `fa68990710aa` (base) and `70d3854dd265` (candidate).
+
+The Linux sandbox CLI integration passed with the previously failing store path, and the listener lifetime test passed using an explicit 98-byte daemon address. The main socket keeps its configured address. Other daemons derive the same per-bot folder for their sandbox rules.
+
+Both sides used 6.001 store jobs per turn in all four footprint trials. Admission and completion operation counts also matched. The initial footprint CPU medians crossed the 15% warning threshold (0.429 to 0.509 ms per turn). The footprint bench uses stdio and does not open per-bot sockets. In two additional socket-branch trials CPU was 0.442 and 0.419 ms per turn. The paired base trials were 0.416 and 0.443 ms per turn. This screen gives no sustained CPU gain or loss estimate.
+
+The table gives medians after warmup. The base ran first and last across two blocks. Each side contributed six 32-bot admission and completion trials, four 1,000-bot footprint trials, and two 32-bot socket echo lifecycle trials.
+
+| Benchmark | Measure | Base | Candidate |
+| --- | --- | ---: | ---: |
+| admission | lone submit CPU, ms | 22.584 | 25.327 |
+| admission | burst submit p99, ms | 2.341 | 2.395 |
+| completion | release to terminal p99, ms | 5.434 | 5.220 |
+| footprint | idle RSS, MiB | 13.523 | 13.500 |
+| footprint | per idle bot, KiB | 2.528 | 2.536 |
+| footprint | RSS after a turn each, MiB | 37.289 | 38.695 |
+| footprint | CPU per turn, ms | 0.429 | 0.509 |
+| lifecycle | CPU, s | 0.373 | 0.328 |
+| lifecycle | p95 turn, ms | 600.258 | 600.890 |
+| lifecycle | peak RSS, MiB | 27.750 | 26.672 |
+
 ## A bot's socket listens while it is used (#563)
 
 A sandboxed bot's own socket now listens only while a share in it is
