@@ -12194,6 +12194,12 @@ impl App {
         }
         live.lines += rows.len();
         live.rows.extend(rows);
+        self.spill(live);
+    }
+
+    /// Held words grown longer than half the screen written above, as a
+    /// reply, rather than held out of the scrollback.
+    fn spill(&mut self, live: &mut Live) {
         // Words longer than half the screen are a reply, written as they
         // come rather than held out of the scrollback.
         if live.spilled || live.rows.len() > (self.height / 2).max(4) {
@@ -12271,8 +12277,13 @@ impl App {
         self.drawn_seen = landed;
         self.flush();
         self.screen.fill_drawn();
-        if let Some(live) = &mut self.live {
-            drawing::fill(&mut live.rows);
+        // A picture taller than the row that stood for it may spill the
+        // words held back, as a line that long would.
+        if let Some(mut live) = self.live.take() {
+            if drawing::fill(&mut live.rows) {
+                self.spill(&mut live);
+            }
+            self.live = Some(live);
         }
         if let Some(pane) = &mut self.pane {
             pane.drawn();
@@ -27954,6 +27965,34 @@ mod tests {
         ))
         .await;
         assert!(lines(&app).iter().any(|row| row.starts_with("Worked for")));
+    }
+
+    #[tokio::test]
+    async fn a_picture_taller_than_its_row_spills_the_words_held_back() {
+        let client = daemon_answering(|_| json!({"items": []})).await;
+        let mut app = app(client);
+        app.height = 8;
+        app.daemon(turn_event("accepted", 1, json!({"request_id": "r1"})))
+            .await;
+        app.daemon(json!({"event": "text_delta", "bot": "b", "turn": 1, "text": "Here:\n"}))
+            .await;
+        // A row stands for a picture held back with the words; drawn, it
+        // is twelve rows, more than half the screen.
+        let key = u64::MAX - 7;
+        let standing = drawing::placeholder(key, "the diagram", || {
+            (1..=12).map(|n| Line::from(format!("  row {n}"))).collect()
+        });
+        let live = app.live.as_mut().unwrap();
+        assert!(!live.spilled);
+        live.rows.extend(standing);
+        app.drawn_seen = drawing::landed().wrapping_sub(1);
+        assert!(app.drawings());
+        let live = app.live.as_ref().unwrap();
+        assert!(live.spilled);
+        assert!(live.rows.is_empty());
+        let written: Vec<String> = app.pending.iter().map(|l| l.to_string()).collect();
+        assert!(written.iter().any(|row| row.contains("row 1")), "{written:?}");
+        assert!(written.iter().any(|row| row.contains("row 12")), "{written:?}");
     }
 
     #[tokio::test]
