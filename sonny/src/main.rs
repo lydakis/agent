@@ -5181,6 +5181,9 @@ struct App {
     unheard: std::collections::VecDeque<Value>,
     /// The read under way for the first of them.
     hearing: Option<tokio::sync::oneshot::Receiver<Read>>,
+    /// The connection closed after the events in `unheard`: it is let go
+    /// ([`App::dropped`]) once they are applied, as they came before it.
+    cut: bool,
     /// Verdicts of calls written out here, read from the audit trail.
     verdicting: Vec<tokio::sync::oneshot::Receiver<Vec<(CallKey, Value)>>>,
     /// The writes to the daemon not yet done, or done and not yet
@@ -7120,6 +7123,7 @@ impl App {
             woken: Arc::new(tokio::sync::Notify::new()),
             unheard: Default::default(),
             hearing: None,
+            cut: false,
             verdicting: Vec::new(),
             writes: Default::default(),
             lane: None,
@@ -7394,6 +7398,11 @@ impl App {
             // once the cap allows.
             let undrawn = drawn.filter(|_| wanted && skipped);
             if self.quit {
+                // What the person sent goes before the window does, as it
+                // did when each write was awaited where it was made.
+                if let Some(lane) = self.lane.take() {
+                    let _ = lane.await;
+                }
                 return Ok(());
             }
             let every = tick_every(self.moving(), heard.elapsed());
@@ -7419,12 +7428,12 @@ impl App {
                         held = self.wheel_burst(&mut keys, chat).await;
                     }
                 }
-                event = events.recv(), if self.down.is_none() => {
+                event = events.recv(), if self.down.is_none() && !self.cut => {
                     changed = true;
                     heard = Instant::now();
                     match event {
                         Some(event) => self.unheard.push_back(event),
-                        None => self.dropped(),
+                        None => self.cut = true,
                     }
                 }
                 _ = tokio::time::sleep(undrawn.map_or(Duration::ZERO, |at| DRAW_EVERY.saturating_sub(at.elapsed()))), if undrawn.is_some() => {}
@@ -7509,6 +7518,12 @@ impl App {
             // What the person sent lands before the events after it.
             self.wrote();
             more_heard = self.hear();
+            // What came before the connection closed is applied first, so
+            // catching up after it never meets an event from before.
+            if self.cut && self.unheard.is_empty() && self.hearing.is_none() {
+                self.cut = false;
+                self.dropped();
+            }
             if self.picked_read.elapsed() > Duration::from_secs(1) {
                 self.picked_read = Instant::now();
                 // The person's reactions another program kept, as a client
@@ -14143,9 +14158,16 @@ impl App {
             .filter(|read| !self.raised_read.contains(read))
             .collect();
         let verdicts = self.verdicts_to_read(gone);
+        // The calls gone are no longer raised, so their verdicts are read
+        // now, beside a read already under way, or never.
+        if self.raising.is_some() {
+            self.read_verdicts_beside(verdicts);
+            self.aside_waiting();
+            return;
+        }
         // One read at a time, beside the loop: what it found is kept as
         // the next pass begins.
-        if self.raising.is_none() && !(verdicts.is_empty() && unread.is_empty()) {
+        if !(verdicts.is_empty() && unread.is_empty()) {
             let (client, woken) = (self.client.clone(), self.woken.clone());
             self.raising = Some(tokio::spawn(async move {
                 let raised = Raised {
