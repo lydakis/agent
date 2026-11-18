@@ -11160,6 +11160,139 @@ and nothing to the daemon per key, so these are the full machine's, as
 main's are. Daemon CPU and RSS, window CPU and RSS, and window start move
 within run-to-run spread. The Mac was not measured.
 
+## One selector for `messages` and `follow` (#1161)
+
+`messages` and `follow` take one selector: a bot's name or a GLOB pattern,
+`since_ms`/`until_ms`, `from` sender kinds (`person`, `bot`, `client`), and
+the cursor, limit and order they had. Sonny's `memory said` was a `bots`
+listing, then `turns`, `history_nodes` and `history_items` for every agent;
+it is now one paged `messages {bot: "*", from: ["person"], since_ms}` read,
+plus history reads only for agents with a reaction or an answer to an ask
+among the person's messages. The person's messages are found through a
+partial index, `messages_people` (`ON messages(id) WHERE from_bot IS NULL
+AND origin IS NULL`), created at open with no schema change, and `sent_ms`
+is kept monotone with `id` so a time bound is an id range.
+
+`bench/said_scale.py` seeds a store over stdio, then times `memory said`
+with each build and checks that both print the same words (release builds
+of the workspace on both sides, one 4-CPU Linux box):
+
+| Agents | Window | `main` | Head |
+| --- | --- | ---: | ---: |
+| 1,000 | since the last cleanup | 544 ms | 47 ms |
+| 1,000 | a day | 533 ms | 48 ms |
+| 10,000 | since the last cleanup | 6,752 ms | 326 ms |
+| 10,000 | a day | 6,405 ms | 334 ms |
+
+The output is identical on both sides in every row.
+
+### Low end and high end
+
+`bench/ends.py` (the freeze-5 harness), both sides built with `cargo build
+--release --workspace --bins`, `main` at d88d3ae against the head at
+bc7c4cc, one 4-CPU Linux box. High-end runs are paced (`--pace 0.5`) so both
+sides do the same agent work.
+
+Low end, one window and 10 agents (`main` → head):
+
+| Measure | `main` | Head |
+| --- | ---: | ---: |
+| Window start, s | 0.043 | 0.060 |
+| Idle daemon CPU, % / RSS, MiB | 0.05 / 21.2 | 0.0 / 21.2 |
+| Idle window CPU, % / RSS, MiB | 0.2 / 25.6 | 0.15 / 25.8 |
+| Key to character p50 / p99, ms | 0.46 / 1.18 | 0.41 / 1.09 |
+| Turn p50 / p99, ms | 48.2 / 54.1 | 48.0 / 48.5 |
+
+High end, 10,000 stored agents, 30 busy and 8 running code-mode scripts,
+windows all in one busy project (`one`) or one folder each (`spread`):
+
+| Windows, layout | Window start p50, ms | Key to character p99, ms | Pauses over 100 ms | Daemon CPU, % | Daemon RSS, MiB | Turns |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| 32, one | 1002 → 1105 | 5.88 → 5.17 | 0 → 0 | 134.3 → 134.5 | 39.4 → 39.1 | 1410 → 1410 |
+| 32, spread | 1133 → 1061 | 3.05 → 2.79 | 0 → 0 | 133.2 → 131.7 | 39.6 → 39.2 | 1410 → 1410 |
+| 100, one | 2960 → 3162 | 9.12 → 51.56 | 0 → 1 | 132.9 → 130.5 | 41.9 → 40.8 | 1500 → 1470 |
+| 100, spread | 3655 → 3191 | 69.64 → 60.26 | 1 → 2 | 132.9 → 131.0 | 40.2 → 40.4 | 1500 → 1500 |
+| 200, one | 6514 → 7268 | 27.12 → 26.15 | 0 → 0 | 153.2 → 154.8 | 46.0 → 46.5 | 1770 → 1770 |
+| 200, spread | 5880 → 5933 | 12.86 → 19.55 | 0 → 0 | 154.2 → 154.4 | 44.9 → 43.4 | 1650 → 1710 |
+
+Window start in the `one` layout read slower on the head in the first
+runs, so 32 windows in one project ran three more alternating pairs: p50
+998 to 1142 ms on `main` and 1051 to 1254 ms on the head, the head faster
+in the third pair. The two sides overlap, and nothing a window does at
+start changed: its requests are the same on both sides (32 `messages`, 34
+`follow`, about 1,800 `bots`), and the exact-bot `messages` query is the
+one `main` runs. At 100 windows the 4 CPUs are past full on both sides
+(key p99 over 50 ms and pauses over 100 ms on `main` too), so those rows say
+more about the box than the change.
+
+A follow of a pattern costs the publisher a GLOB check per pattern that
+some session follows, and nothing when none does: the set is empty and the
+exact-name and `*` lookups are the ones `main` makes. ASCII names match
+byte by byte with no allocation.
+
+The Perf workflow's matched screen (`bench.perf_gate`, GitHub runner, head
+15eec87 against main 7de072a): store work per turn is the same and the
+gate gave no warnings.
+
+| Measure | Base | Head | Change |
+| --- | ---: | ---: | ---: |
+| Lone submit CPU, ms | 23.332 | 22.987 | -1.5% |
+| Burst submit p99, ms | 2.542 | 2.687 | +5.7% |
+| Release to terminal p99, ms | 6.774 | 6.938 | +2.4% |
+| Idle RSS, MiB | 17.344 | 17.02 | -1.9% |
+| Per idle bot, KiB | 1.826 | 1.684 | -7.8% |
+| RSS after a turn each, MiB | 59.596 | 54.242 | -9.0% |
+| Daemon CPU per turn, ms | 0.69 | 0.674 | -2.3% |
+| Lifecycle CPU, s | 0.34 | 0.315 | -7.4% |
+| Lifecycle p95 turn, ms | 573.633 | 576.577 | +0.5% |
+| Lifecycle peak RSS, MiB | 26.148 | 26.244 | +0.4% |
+| Quiet window CPU, ms/s | 0.77 | 0.765 | -0.6% |
+
+### A sparse pattern's replay
+
+`python -m bench.pattern_replay` seeds 100 projects of 2 agents each
+(`p0.a0`, `p0.a1`, ...) with a 200,000-event backlog spread evenly across
+them, so each project is 1% of it, then follows from cursor 0 on a fresh
+daemon each time while turns run on one agent of each project: one agent
+by name, one project (`p0.*`), the 100 projects at once (one connection
+each, as 100 windows coming back together), and those 100 narrowed to
+`turn_finished`. Rows passed over per event delivered are the store's own
+counts: a name's follow reads its bot's rows by index; a pattern's every
+row past the cursor (or every row of its kinds). An unrelated agent's
+`history_nodes` is read back to back throughout. Release builds, one
+4-CPU Linux box.
+
+First the head as measured before this fix: a pattern's pages were every
+bot's events, decoded, with the other bots' passed by in the hub.
+
+| Follow | To `follow_live`, s | Rows passed over per event | Daemon CPU, s | Unrelated read p99 / max, ms |
+|---|---:|---:|---:|---:|
+| one agent by name | 0.02 | 1 | 0.4 | 2.0 / 3.3 |
+| one project | 1.34 | 100 | 2.4 | 2.6 / 3.4 |
+| 100 projects | 69.3 | 100 | 164.8 | 103.8 / 124.1 |
+| 100 projects, one kind | 6.24 | 100 | 15.9 | 84.3 / 119.4 |
+
+A pattern's page is now matched in the store (`bot GLOB` as the page reads
+the cursor's range; stable plans keep it a rowid range, never the
+`events_bot_cursor` prefix range, which sorts every matching entry for
+each page and grows with the square of a large pattern's backlog). The
+other bots' rows are still passed over, once, but in SQLite, without being
+decoded. Each page also ends at the newest event when it began, and a
+short page moves the cursor there, so the switch to live (on the writer)
+reads only the events written since, never a pattern's sparse tail:
+
+| Follow | To `follow_live`, s | Rows passed over per event | Daemon CPU, s | Unrelated read p99 / max, ms |
+|---|---:|---:|---:|---:|
+| one agent by name | 0.02 | 1 | 0.4 | 2.1 / 4.1 |
+| one project | 0.05 | 100 | 0.4 | 1.1 / 4.6 |
+| 100 projects | 1.58 | 100 | 4.4 | 2.9 / 220.9 |
+| 100 projects, one kind | 1.01 | 100 | 3.4 | 1.6 / 212.7 |
+
+Every follower, in every row, received exactly the store's events for its
+selector after cursor 0, in order, none missing and none twice, across the
+hand-off from replay to live. The single slowest unrelated read waits for
+a reader behind the replays' pages; the p99 stays near an idle daemon's.
+
 ## Code-mode step writes beside the run loop
 
 A code-mode script's steps froze every window on a slow disk: the service
