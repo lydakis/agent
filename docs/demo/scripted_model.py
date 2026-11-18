@@ -1,7 +1,7 @@
 """A scripted Responses endpoint for recording the README demo without an API key.
 
 Only the model's words are scripted. The daemon, the store, the bots, and every
-tool call (shell, edit, wait, and the `agent run --detach` a bot uses to
+tool call (shell, apply_patch, wait, and the `agent run --detach` a bot uses to
 delegate) run for real against the files in `tally/`. Each bot's script is
 chosen by its latest prompt and advanced by the tool results it has received.
 
@@ -15,7 +15,13 @@ import re
 import sys
 import time
 
-TESTS = "python3 -m unittest 2>&1 | grep -E 'Error|FAILED|OK'"
+TESTS = "python3 -m unittest"
+PATCH = """*** Begin Patch
+*** Update File: tally.py
+@@
+-    cents = sum(int(p * 100) for p in prices)
++    cents = sum(round(p * 100) for p in prices)
+*** End Patch"""
 DELEGATE = 'agent run --detach --new --bot docs -- "Check that README.md matches what tally.py does"'
 
 
@@ -32,7 +38,7 @@ SCRIPTS = {
         ('', call('shell', command=TESTS)),
         ("Before I change the code, I'll hear from the helper:", call('wait', handles='HANDLE')),
         ('Both point at `int()`, which truncates 28.999… to 28 cents. Rounding instead:',
-         call('edit', path='tally.py', old='int(p * 100)', new='round(p * 100)')),
+         call('apply_patch', input=PATCH)),
         ('', call('shell', command=TESTS)),
         ('Fixed: `total()` truncated each price to whole cents instead of rounding '
          '(tally.py:3). All 3 tests pass. The helper confirmed the README already describes '
@@ -62,6 +68,9 @@ class Model(http.server.BaseHTTPRequestHandler):
             text, tool = f'No script for: {prompt}', None
         else:
             text, tool = script[min(len(results), len(script) - 1)]
+            if script is SCRIPTS['Fix the failing test'] and len(results) == len(script) - 1:
+                if not json.loads(results[-1]['output']).get('success'):
+                    text = 'The tests still fail after the edit.'
         output = []
         if text:
             output.append({'type': 'message', 'role': 'assistant',

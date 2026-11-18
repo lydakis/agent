@@ -86,7 +86,7 @@ mod own {
     use super::Output;
     use std::ffi::{CString, OsString};
     use std::io::Read;
-    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    use std::os::fd::{AsRawFd, OwnedFd};
     use std::os::unix::ffi::OsStrExt;
     use std::path::Path;
     use std::sync::{Arc, Mutex};
@@ -110,22 +110,6 @@ mod own {
         CString::new(bytes).map_err(|_| std::io::Error::other("a NUL byte in an argument"))
     }
 
-    /// A pipe whose ends close in any program started after it, but where
-    /// the start puts one in place.
-    fn pipe() -> std::io::Result<(OwnedFd, OwnedFd)> {
-        let mut fds = [0; 2];
-        if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
-            return Err(std::io::Error::last_os_error());
-        }
-        let ends = unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) };
-        for end in [&ends.0, &ends.1] {
-            if unsafe { libc::fcntl(end.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC) } != 0 {
-                return Err(std::io::Error::last_os_error());
-            }
-        }
-        Ok(ends)
-    }
-
     /// The program, started; `None` once it has been waited for.
     struct Started(Arc<Mutex<Option<libc::pid_t>>>);
 
@@ -134,6 +118,7 @@ mod own {
         /// own, so no other process gets the signal.
         fn drop(&mut self) {
             if let Some(pid) = *self.0.lock().unwrap_or_else(|e| e.into_inner()) {
+                // SAFETY: the lock keeps the child from being reaped while it is signaled.
                 unsafe { libc::kill(pid, libc::SIGKILL) };
             }
         }
@@ -163,8 +148,10 @@ mod own {
         let (argv_p, envp_p) = (pointers(&argv), pointers(&envp));
         let null = c(b"/dev/null")?;
         let dir = c(dir.as_os_str().as_bytes())?;
-        let (out_r, out_w) = pipe()?;
-        let (err_r, err_w) = pipe()?;
+        let (out_r, out_w) = std::io::pipe()?;
+        let (err_r, err_w) = std::io::pipe()?;
+        // SAFETY: the initialized spawn objects are destroyed after use. The file
+        // descriptors, C strings and null-terminated pointer arrays outlive spawn.
         unsafe {
             let mut actions: libc::posix_spawn_file_actions_t = std::ptr::null_mut();
             check(libc::posix_spawn_file_actions_init(&mut actions))?;
@@ -221,15 +208,15 @@ mod own {
             })();
             libc::posix_spawn_file_actions_destroy(&mut actions);
             libc::posix_spawnattr_destroy(&mut attrs);
-            Ok((started?, out_r, err_r))
+            Ok((started?, out_r.into(), err_r.into()))
         }
     }
 
-    fn drain(end: OwnedFd) -> tokio::task::JoinHandle<Vec<u8>> {
+    fn drain(end: OwnedFd) -> tokio::task::JoinHandle<std::io::Result<Vec<u8>>> {
         tokio::task::spawn_blocking(move || {
             let mut read = Vec::new();
-            let _ = std::fs::File::from(end).read_to_end(&mut read);
-            read
+            std::fs::File::from(end).read_to_end(&mut read)?;
+            Ok(read)
         })
     }
 
@@ -245,13 +232,14 @@ mod own {
         let waited = tokio::task::spawn_blocking(move || -> std::io::Result<i32> {
             // Ended but not yet waited for, so its ID stays its own while
             // a drop may still signal it.
-            let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+            let mut info = std::mem::MaybeUninit::uninit();
             loop {
+                // SAFETY: waitid writes one siginfo_t into the provided storage.
                 let code = unsafe {
                     libc::waitid(
                         libc::P_PID,
                         pid as libc::id_t,
-                        &mut info,
+                        info.as_mut_ptr(),
                         libc::WEXITED | libc::WNOWAIT,
                     )
                 };
@@ -260,21 +248,33 @@ mod own {
                 }
                 let e = std::io::Error::last_os_error();
                 if e.kind() != std::io::ErrorKind::Interrupted {
+                    if e.raw_os_error() == Some(libc::ECHILD) {
+                        *held.lock().unwrap_or_else(|e| e.into_inner()) = None;
+                    }
                     return Err(e);
                 }
             }
             let mut held = held.lock().unwrap_or_else(|e| e.into_inner());
             let mut status = 0;
-            unsafe { libc::waitpid(pid, &mut status, 0) };
-            *held = None;
-            Ok(status)
+            loop {
+                // SAFETY: status is writable and pid is the child reported by waitid.
+                if unsafe { libc::waitpid(pid, &mut status, 0) } == pid {
+                    *held = None;
+                    return Ok(status);
+                }
+                let error = std::io::Error::last_os_error();
+                if error.kind() != std::io::ErrorKind::Interrupted {
+                    *held = None;
+                    return Err(error);
+                }
+            }
         });
         let (stdout, stderr) = (drain(out), drain(err));
         let status = waited.await.map_err(std::io::Error::other)??;
         drop(started);
         Ok(Output {
-            stdout: stdout.await.map_err(std::io::Error::other)?,
-            stderr: stderr.await.map_err(std::io::Error::other)?,
+            stdout: stdout.await.map_err(std::io::Error::other)??,
+            stderr: stderr.await.map_err(std::io::Error::other)??,
             success: libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0,
         })
     }
@@ -320,6 +320,7 @@ mod own {
             }
             let pid = seen.expect("the program runs under this one");
             assert_eq!(
+                // SAFETY: this lookup takes only a process ID.
                 unsafe { responsibility_get_pid_responsible_for_pid(pid) },
                 pid
             );

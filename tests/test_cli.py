@@ -2206,8 +2206,11 @@ class ModelListTests(ModelFixture):
 
     def setUp(self):
         super().setUp()
-        self.home = self.path / 'home'
-        self.home.mkdir()
+        # These tests connect to the store's sibling socket directly.
+        # Its address must fit even when the checkout has a long path.
+        home = tempfile.TemporaryDirectory(dir='/tmp')
+        self.addCleanup(home.cleanup)
+        self.home = Path(home.name).resolve()
         self.list = self.home / '.agent' / 'models'
         self.catalog = self.home / '.agent' / 'models.discovered'
         # The daemon of the store beside the list keeps it current.
