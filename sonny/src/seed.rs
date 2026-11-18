@@ -5,6 +5,7 @@
 //! writes, and where the disk cannot clone, the task builds from scratch.
 use std::io;
 use std::path::{Path, PathBuf};
+#[cfg(not(target_os = "macos"))]
 use std::process::{Command, Stdio};
 
 /// Clone the build folders of the checkout at `top` into the new worktree
@@ -162,7 +163,7 @@ mod tests {
     use std::time::{Duration, SystemTime};
 
     fn git(dir: &Path, args: &[&str]) {
-        let done = Command::new("git")
+        let done = std::process::Command::new("git")
             .arg("-C")
             .arg(dir)
             .args(["-c", "user.name=t", "-c", "user.email=t@t"])
