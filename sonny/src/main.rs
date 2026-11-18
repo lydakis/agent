@@ -27991,8 +27991,14 @@ mod tests {
         assert!(live.spilled);
         assert!(live.rows.is_empty());
         let written: Vec<String> = app.pending.iter().map(|l| l.to_string()).collect();
-        assert!(written.iter().any(|row| row.contains("row 1")), "{written:?}");
-        assert!(written.iter().any(|row| row.contains("row 12")), "{written:?}");
+        assert!(
+            written.iter().any(|row| row.contains("row 1")),
+            "{written:?}"
+        );
+        assert!(
+            written.iter().any(|row| row.contains("row 12")),
+            "{written:?}"
+        );
     }
 
     #[tokio::test]
