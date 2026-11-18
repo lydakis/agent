@@ -2338,7 +2338,7 @@ fn schema_104_says_who_holds_a_call_parked_before_it() {
     // An earlier daemon parked it before the holder was recorded.
     Connection::open(&path)
         .unwrap()
-        .execute_batch(
+        .before_107(
             "UPDATE turns SET waiting=json_remove(waiting,'$.holder','$.since_ms');
              UPDATE bots SET waiting_on=json_remove(waiting_on,'$.holder','$.since_ms');
              PRAGMA user_version=102;",
@@ -11706,7 +11706,7 @@ fn schema_98_hidden_senders_become_an_empty_trailer() {
     // its creation and a change kept for its turn's end.
     Connection::open(&path)
         .unwrap()
-        .execute_batch(
+        .before_107(
             "UPDATE bots SET settings='{\"hide_senders\":true}',
              creation=json_set(json_remove(creation,'$.request.settings.trailer'),'$.request.settings.hide_senders',json('true'))
              WHERE name='Bob';
@@ -11867,7 +11867,7 @@ fn schema_100_declared_tools_move_to_lists_by_digest() {
     // Before 101 each bot's row held its own copy, and so did the record of
     // a creation that declared some.
     let old = Connection::open(&path).unwrap();
-    old.execute_batch("DROP TABLE tool_lists; DROP INDEX bots_declared; PRAGMA user_version=100;")
+    old.before_107("DROP TABLE tool_lists; DROP INDEX bots_declared; PRAGMA user_version=100;")
         .unwrap();
     old.execute(
         "UPDATE bots SET declared=?1, creation=json_set(creation,'$.request.declare',json(?1))",
@@ -13424,7 +13424,7 @@ fn schema_96_drops_the_carry_forward_note() {
     }
     // The note as schema 95 kept it: a version on the bot's head node.
     let conn = Connection::open(&path).unwrap();
-    conn.execute_batch(
+    conn.before_107(
         "CREATE TABLE notes(node INTEGER PRIMARY KEY REFERENCES nodes(id),
             previous INTEGER REFERENCES notes(node), text TEXT NOT NULL);
          CREATE INDEX notes_previous ON notes(previous);
@@ -18503,7 +18503,7 @@ fn schema_98_clocks_the_timed_turns_from_the_audit_trail() {
         assert!(timed < lifted && lifted < pruned);
     }
     let conn = Connection::open(&path).unwrap();
-    conn.execute_batch(
+    conn.before_107(
         "ALTER TABLE turns DROP COLUMN tool_calls;
          ALTER TABLE turns DROP COLUMN tool_ms;
          ALTER TABLE turns DROP COLUMN tools_until_ms;
@@ -18570,7 +18570,7 @@ fn schema_95_starts_earlier_spend_untimed() {
         db.finish(turn, None).unwrap();
     }
     let conn = Connection::open(&path).unwrap();
-    conn.execute_batch(
+    conn.before_107(
         "ALTER TABLE turn_models DROP COLUMN timed_rounds;
          ALTER TABLE turn_models DROP COLUMN timed_output_tokens;
          ALTER TABLE turn_models DROP COLUMN model_ms;
@@ -22481,7 +22481,7 @@ fn schema_105_bots_that_message_with_tools_make_and_close_agents_too() {
     // Before 105 no bot was closed, and none made or closed agents, though
     // the store was already at 104.
     let old = Connection::open(&path).unwrap();
-    old.execute_batch(
+    old.before_107(
         "ALTER TABLE bots DROP COLUMN closed_ms;
          UPDATE bots SET tools='shell,wait,history,send_message,list_agents,pause_agents' WHERE name='Bob';
          UPDATE bots SET tools='shell,read' WHERE name='Carol';
@@ -22623,7 +22623,7 @@ fn schema_106_adds_the_yield_mark() {
     drop(Database::initialize(Connection::open(&path).unwrap()).unwrap());
     Connection::open(&path)
         .unwrap()
-        .execute_batch("ALTER TABLE answers DROP COLUMN yielded; PRAGMA user_version=105;")
+        .before_107("ALTER TABLE answers DROP COLUMN yielded; PRAGMA user_version=105;")
         .unwrap();
     drop(Database::initialize(Connection::open(&path).unwrap()).unwrap());
     let has: bool = Connection::open(&path)
@@ -22635,5 +22635,67 @@ fn schema_106_adds_the_yield_mark() {
         )
         .unwrap();
     assert!(has);
+    std::fs::remove_file(path).unwrap();
+}
+
+/// Schema 107 moves each bot's instructions and compaction instructions
+/// out of its row into `bot_instructions`, keeping every bot's own.
+#[test]
+fn schema_107_moves_instructions_out_of_the_row() {
+    let path = std::env::temp_dir().join(format!(
+        "agent-schema107-instructions-{}.sqlite",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&path);
+    let long = "rule ".repeat(8_000);
+    {
+        let mut db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
+        let mut bob = binding();
+        bob.instructions = &long;
+        bob.compaction_instructions = Some("keep decisions");
+        db.create("Bob", Some("/synthetic"), bob).unwrap();
+        db.create("Carol", Some("/synthetic"), binding()).unwrap();
+    }
+    Connection::open(&path)
+        .unwrap()
+        .before_107("PRAGMA user_version=106;")
+        .unwrap();
+    let mut db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
+    let bob = db.inspect("Bob").unwrap();
+    assert_eq!(bob.instructions, long);
+    assert_eq!(
+        bob.compaction_instructions.as_deref(),
+        Some("keep decisions")
+    );
+    let carol = db.inspect("Carol").unwrap();
+    assert_eq!(carol.instructions, "test");
+    assert_eq!(carol.compaction_instructions, None);
+    let conn = Connection::open(&path).unwrap();
+    let left: i64 = conn
+        .query_row(
+            "SELECT count(*) FROM pragma_table_info('bots')
+             WHERE name IN ('instructions','compaction_instructions')",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(left, 0);
+    // The rows a bot keeps follow it: a fork has its own, changed apart
+    // from its source's, and a deleted bot takes its own with it.
+    db.fork("Bob", "Ben", Fork::default()).unwrap();
+    assert!(db.set_instructions("Ben", None, "new rules").unwrap());
+    assert_eq!(db.inspect("Ben").unwrap().instructions, "new rules");
+    assert_eq!(db.inspect("Bob").unwrap().instructions, long);
+    assert_eq!(
+        db.set_compaction("Ben", None, Some(None), None).unwrap(),
+        vec!["compaction_instructions"]
+    );
+    assert_eq!(db.inspect("Ben").unwrap().compaction_instructions, None);
+    db.delete_bot("Ben").unwrap();
+    let rows: i64 = conn
+        .query_row("SELECT count(*) FROM bot_instructions", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(rows, 2);
+    drop(db);
     std::fs::remove_file(path).unwrap();
 }

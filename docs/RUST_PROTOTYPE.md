@@ -1607,7 +1607,10 @@ does not, and each is one op:
 Protocol version 3 changes `bots` to return `{bots, next_after}`. It pages by
 name, with a default limit of 64, maximum 256, and a 512 KiB encoded metadata
 budget. Pass `next_after` as the next request's `after` until it is null. Pages
-omit instructions; `inspect` returns the full individual bot record. With `bot_id`,
+omit instructions; `inspect` returns the full individual bot record. A bot's
+instructions and compaction instructions are stored apart from its row, in
+`bot_instructions` by bot id, so a page reads none of them and a write to the
+row never rewrites them; schema 107 moves them there. With `bot_id`,
 a bot that no longer holds that identity is `bot_not_found`, as on `submit`. Concurrent
 creations before an already-consumed cursor require restarting the listing.
 `agent ls` reads pages incrementally while preserving its JSON-array output.
