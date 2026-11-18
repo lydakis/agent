@@ -17366,9 +17366,21 @@ impl App {
                             }
                             None => task::forget_profile(&self.store(), &lead.bot),
                         }
-                        // Its title is its first message's first line.
+                        // Its title is its first message's first line,
+                        // noted by its id.
                         let first = crate::title::first_line(&brief);
-                        if let Err(error) = crate::title::note(&self.store(), &lead.bot, &first) {
+                        let asked = json!({"bot": lead.bot});
+                        let noted = match self.client.request("inspect", asked).await {
+                            Ok(record) => match record["bot_id"].as_i64() {
+                                Some(id) => {
+                                    crate::title::note(&self.store(), &lead.bot, id, &first)
+                                        .map_err(|error| error.to_string())
+                                }
+                                None => Err("no id".to_owned()),
+                            },
+                            Err(error) => Err(error.to_string()),
+                        };
+                        if let Err(error) = noted {
                             self.notice = Some(format!("{}'s title: {error}", lead.bot));
                         }
                         self.send_after = Some(file);
