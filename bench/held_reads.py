@@ -241,6 +241,9 @@ def main():
                   'reads': {op: {k: row[k] for k in ('count', 'queued_ms', 'ran_ms', 'slowest_ms')}
                             for op, row in storage.get('operations', {}).items()
                             if op in ('approvals', 'inspect', 'list', 'identity', 'turn_answer')},
+                  # Writes and claims landed, and how long they waited
+                  # after landing for the loop, where the daemon says.
+                  **{lane: stats[lane] for lane in ('writes', 'claims') if lane in stats},
                   'groups': storage.get('groups', {}).get('count'),
                   'wal_bytes': storage.get('wal_bytes')}
         stop(process, control)

@@ -1109,6 +1109,13 @@ impl Command {
                 | Command::StepResult { .. }
         )
     }
+    /// A read or a recorded write, which never looks at running turns: it
+    /// goes on while parked turns' claims are on their way. Anything else
+    /// waits for them to land, so it finds each claimed turn running, as
+    /// when each claim was awaited in turn.
+    fn passes_claims(&self) -> bool {
+        self.observes() || self.records()
+    }
     /// It ends or holds turns, or stops a call: the clients' writes on their way land first,
     /// as they did when each was awaited in turn, so none lets its client
     /// start work after it.
@@ -1539,6 +1546,15 @@ struct Stepping {
     /// coordinator, which runs it or answers.
     daemon: Option<(i64, Box<str>)>,
 }
+/// What a parked turn's claim found: it runs (with what it waited for,
+/// and whether a steer waits and lifts its call), waits again (until its
+/// next lapse, if any), or is no longer parked.
+enum Claim {
+    Run(Box<Waiting>, bool, bool),
+    Later(Option<u64>),
+    Stale,
+}
+
 /// Clients' writes on their way to the store, and what keeps a step put
 /// to its gates from missing a decision made before its write lands.
 #[derive(Default)]
@@ -1889,6 +1905,9 @@ struct Service {
     stepping: HashMap<i64, Stepping>,
     /// Clients' writes on their way to the store, answered as they land.
     writing: Writing,
+    /// Parked turns' claims on their way to the store, each turn started
+    /// as its claim lands, in the order claimed.
+    claims: writes::Ordered<(String, i64, bool), Result<Claim>>,
     /// Checks of waiting steps with the store.
     step_checks: JoinSet<Vec<(i64, Result<Stepped>)>>,
     /// Daemon steps, from their asking to their reply.
@@ -2767,6 +2786,7 @@ pub async fn run(config: Configuration) -> Result<()> {
         store,
         stepping: HashMap::new(),
         writing: Writing::default(),
+        claims: writes::Ordered::default(),
         lent: HashMap::new(),
         step_checks: JoinSet::new(),
         steps: Default::default(),
@@ -2902,7 +2922,7 @@ pub async fn run(config: Configuration) -> Result<()> {
             Vec<std::sync::Weak<agent_runtime::provider::pace::Pace>>,
         >::new();
         loop {
-            if service.draining() && service.active.is_empty() {
+            if service.draining() && service.active.is_empty() && service.claims.is_empty() {
                 break;
             }
             // Computed before the select so its arms borrow the service freely.
@@ -2940,6 +2960,7 @@ pub async fn run(config: Configuration) -> Result<()> {
                 _ = service.tails.running.join_next(), if !service.tails.running.is_empty() => {}
                 joined = service.jobs.join_next(), if !service.jobs.is_empty() => {
                     let (bot, turn, task, exit) = joined.unwrap().map_err(|_| Error::new("turn_task_failed"))?;
+                    service.land_claims().await?;
                     let chore = std::time::Instant::now();
                     service.complete(bot, turn, task, exit).await?;
                     service.chores.count("reap", chore);
@@ -2955,14 +2976,17 @@ pub async fn run(config: Configuration) -> Result<()> {
                     // the next start.
                     let running = service.store.op("running_processes", |db| db.running_processes()).await?;
                     let clients = sessions.keys().any(|id| !companion_sessions.contains(id));
-                    if !clients && service.active.is_empty() && service.admissions.is_empty() && running == 0 && service.tails.running.is_empty() {
+                    if !clients && service.active.is_empty() && service.claims.is_empty() && service.admissions.is_empty() && running == 0 && service.tails.running.is_empty() {
                         if last_activity.elapsed() >= idle_exit.unwrap() { break; }
                     } else {
                         last_activity = std::time::Instant::now();
                     }
                 }
                 Some(woken) = pool_wakes.recv() => match woken {
-                    agent_runtime::provider::pace::Woken::Turn(bot, turn) => service.pool_wake(bot, turn),
+                    agent_runtime::provider::pace::Woken::Turn(bot, turn) => {
+                        service.land_claims().await?;
+                        service.pool_wake(bot, turn);
+                    }
                     agent_runtime::provider::pace::Woken::Lapse(at, pace) => ramp_lapses.entry(at).or_default().push(pace),
                 },
                 _ = tokio::time::sleep_until(ramp_lapse.unwrap_or_else(tokio::time::Instant::now)), if ramp_lapse.is_some() => {
@@ -2970,15 +2994,21 @@ pub async fn run(config: Configuration) -> Result<()> {
                         pools.iter().filter_map(std::sync::Weak::upgrade).for_each(|pace| pace.lapse());
                     }
                 }
+                // A parked turn goes on: its claim goes to the store, and the
+                // turn starts once it lands.
                 Some((bot, turn)) = resumes.recv(), if service.has_capacity() => {
+                    service.claim(bot, turn, false);
+                }
+                Some(((bot, turn, due), done)) = service.claims.next(), if !service.claims.is_empty() => {
                     let chore = std::time::Instant::now();
-                    service.resume(bot, turn, false).await?;
-                    service.chores.count("resume", chore);
+                    service.claimed(bot, turn, due, done)?;
+                    service.chores.count("claimed", chore);
                 }
                 // One queued turn per iteration, so requests interleave with a
                 // long backlog; resumes hold no slot and are not starved because
                 // the branch choice is fair.
                 _ = std::future::ready(()), if service.ready_hint && ready_retry.is_none() && service.has_capacity() => {
+                    service.land_claims().await?;
                     let chore = std::time::Instant::now();
                     service.dispatch_ready().await?;
                     service.chores.count("start_ready", chore);
@@ -2993,6 +3023,7 @@ pub async fn run(config: Configuration) -> Result<()> {
                 // Idle bots whose time ran out are deleted, here and not on a
                 // client's request, so a client that stopped leaves none.
                 _ = tokio::time::sleep_until(expiry.unwrap_or_else(tokio::time::Instant::now)), if expiry.is_some() && !service.draining() => {
+                    service.land_claims().await?;
                     let chore = std::time::Instant::now();
                     service.expire().await?;
                     service.chores.count("expire", chore);
@@ -3002,6 +3033,7 @@ pub async fn run(config: Configuration) -> Result<()> {
                 _ = tokio::time::sleep_until(lapses.unwrap_or_else(tokio::time::Instant::now)), if lapses.is_some() && !service.draining() => {
                     // A store refusing writes leaves them attached and due,
                     // looked at again after a backoff, as ready turns are.
+                    service.land_claims().await?;
                     let chore = std::time::Instant::now();
                     match service.lapse().await {
                         Err(error) if error.code == "storage_error" => {
@@ -3014,6 +3046,7 @@ pub async fn run(config: Configuration) -> Result<()> {
                 }
                 // Turns held in line on a cause are tried again.
                 _ = tokio::time::sleep_until(holds.unwrap_or_else(tokio::time::Instant::now)), if holds.is_some() && !service.draining() => {
+                    service.land_claims().await?;
                     let chore = std::time::Instant::now();
                     match service.holds_due().await {
                         Err(error) if error.code == "storage_error" => {
@@ -3030,9 +3063,7 @@ pub async fn run(config: Configuration) -> Result<()> {
                 // reused) is dropped.
                 _ = tokio::time::sleep(wake_delay), if wake_due && service.has_capacity() => {
                     if let Some((bot, turn, due)) = service.wakes.pop() {
-                        let chore = std::time::Instant::now();
-                        service.resume(bot, turn, due).await?;
-                        service.chores.count("wake", chore);
+                        service.claim(bot, turn, due);
                     }
                 }
                 // A wait's deadline, or a step answered, ended or lapsing:
@@ -3122,6 +3153,12 @@ pub async fn run(config: Configuration) -> Result<()> {
                         // up, or a write's once it lands.
                         Inbound::Request(id, request, credit, read) => {
                             let Some(output) = sessions.get(&id).cloned() else { continue };
+                            // A request that may look at running turns finds
+                            // each claimed turn running, as when each claim was
+                            // awaited in turn; reads and recorded writes go on.
+                            if !request.as_ref().is_ok_and(|r| r.command.passes_claims()) {
+                                service.land_claims().await?;
+                            }
                             // A bad id is refused like a malformed line, after the
                             // admissions queued before it.
                             let request = request.and_then(|request| match &request.id {
@@ -3275,6 +3312,10 @@ pub async fn run(config: Configuration) -> Result<()> {
     // explicit pruning can be reissued. Await drops before joining stdout.
     service.retention.abort_all();
     while service.retention.join_next().await.is_some() {}
+    // Claims on their way land first, as when each was awaited in turn:
+    // their turns are stopped below like any other.
+    let landed = service.land_claims().await;
+    let served = served.and(landed);
     answer_queued(&mut service, &mut sessions, stdio_owner).await;
     // Stopping, however it was asked: a write landing now starts nothing.
     (service.draining).store(true, std::sync::atomic::Ordering::Relaxed);
@@ -3839,7 +3880,8 @@ impl Service {
     }
     fn has_capacity(&self) -> bool {
         self.held().is_none()
-            && (self.limit_active == 0 || self.active.holding() + self.reserved < self.limit_active)
+            && (self.limit_active == 0
+                || self.active.holding() + self.reserved + self.claims.len() < self.limit_active)
     }
 
     /// Why no turn may start, if none may: the daemon is shutting down or
@@ -4523,38 +4565,47 @@ impl Service {
         }
     }
 
-    /// `due` marks a wake-up from the turn's own time rather than an
-    /// answer or a resolved handle.
-    async fn resume(&mut self, bot: String, turn: i64, due: bool) -> Result<()> {
+    /// Claim a parked turn to go on. `due` marks a wake-up from the turn's
+    /// own time rather than an answer or a resolved handle. The claim goes
+    /// to the store from its own task, holding a slot meanwhile
+    /// (`has_capacity`), and the turn starts once it lands (`claimed`), so
+    /// a slow commit holds the writer, not the loop.
+    fn claim(&mut self, bot: String, turn: i64, due: bool) {
         // A wake-up can outlive an interrupt, deletion, or reuse of the name,
         // and one turn can get several (a restart's check and an answer). The
         // job that checks its identity and state also claims it, so a later
         // wake-up finds it running and is dropped; the claim also drops the
         // turn's lapse, which would otherwise wait out the gate's expiry.
-        enum Claim {
-            Run(String, Box<Waiting>, bool, bool),
-            Later(String, Option<u64>),
-            Stale,
-        }
-        let name = bot.clone();
-        let claimed = match self
-            .store
-            .op("resume", move |db| match db.wake(&name, turn, due)? {
-                Wake::Resume => match db.resume(turn) {
-                    Ok((waiting, _, steers)) => {
-                        // A steer for the turn lifts what the rest of the
-                        // parked call's batch would block on.
-                        let joins = steers && db.joining_steer(&name)?;
-                        Ok(Claim::Run(name, Box::new(waiting), steers, joins))
-                    }
-                    Err(error) if error.code == "turn_not_waiting" => Ok(Claim::Stale),
-                    Err(error) => Err(error),
-                },
-                Wake::Later(at) => Ok(Claim::Later(name, at)),
-                Wake::Stale => Ok(Claim::Stale),
-            })
-            .await
-        {
+        let (store, name) = (self.store.clone(), bot.clone());
+        self.claims.push((bot, turn, due), async move {
+            store
+                .op("resume", move |db| match db.wake(&name, turn, due)? {
+                    Wake::Resume => match db.resume(turn) {
+                        Ok((waiting, _, steers)) => {
+                            // A steer for the turn lifts what the rest of the
+                            // parked call's batch would block on.
+                            let joins = steers && db.joining_steer(&name)?;
+                            Ok(Claim::Run(Box::new(waiting), steers, joins))
+                        }
+                        Err(error) if error.code == "turn_not_waiting" => Ok(Claim::Stale),
+                        Err(error) => Err(error),
+                    },
+                    Wake::Later(at) => Ok(Claim::Later(at)),
+                    Wake::Stale => Ok(Claim::Stale),
+                })
+                .await
+        });
+    }
+
+    /// A claim landed: its turn starts, or waits again.
+    fn claimed(
+        &mut self,
+        bot: String,
+        turn: i64,
+        due: bool,
+        done: Option<Result<Claim>>,
+    ) -> Result<()> {
+        let claimed = match done.ok_or_else(|| Error::new("resume_failed"))? {
             // A lost group (a full disk, say) leaves the turn parked: the
             // same wake-up comes due again after a backoff.
             Err(error) if error.code == "storage_error" => {
@@ -4566,16 +4617,40 @@ impl Service {
         };
         self.storage_backoff = Duration::ZERO;
         match claimed {
-            Claim::Run(bot, waiting, steers, joins) => {
+            Claim::Run(waiting, steers, joins) => {
                 self.wakes.cancel(turn);
                 self.spawn(bot, turn, Some(*waiting), steers, joins);
             }
             // Still parked: its next lapse may have moved, or gone.
-            Claim::Later(bot, Some(at)) => self.wakes.set(at, bot, turn),
-            Claim::Later(_, None) => self.wakes.cancel(turn),
+            Claim::Later(Some(at)) => self.wakes.set(at, bot, turn),
+            Claim::Later(None) => self.wakes.cancel(turn),
             Claim::Stale => {}
         }
         Ok(())
+    }
+
+    /// Start every turn claimed so far, once its claim lands: what looks
+    /// at running turns (a request taken up on the loop, a turn reaped, a
+    /// pool's wake-up, the loop's timers) sees each claimed turn running,
+    /// as when each claim was awaited in turn. Its own store work would
+    /// queue behind the claims anyway.
+    async fn land_claims(&mut self) -> Result<()> {
+        if self.claims.is_empty() {
+            return Ok(());
+        }
+        let landing = std::time::Instant::now();
+        while let Some(((bot, turn, due), done)) = self.claims.next().await {
+            self.claimed(bot, turn, due, done)?;
+        }
+        self.chores.count("resume", landing);
+        Ok(())
+    }
+
+    /// Claim a parked turn and start it once the claim lands.
+    #[cfg(test)]
+    async fn resume(&mut self, bot: String, turn: i64, due: bool) -> Result<()> {
+        self.claim(bot, turn, due);
+        self.land_claims().await
     }
 
     /// The wait after the store refused to start a turn: doubling from
@@ -6238,6 +6313,11 @@ impl Service {
                     // turns, starting ready ones, resuming parked ones,
                     // answering queued admissions, and its timers.
                     "loop": self.chores.snapshot(false),
+                    // Clients' writes and parked turns' claims landed, and
+                    // how long each waited after landing for the loop to
+                    // take it up, behind an older one still on its way.
+                    "writes": self.writing.lane.ordered.behind.snapshot(),
+                    "claims": self.claims.behind.snapshot(),
                     "draining": self.draining(),
                     "paused": self.paused,
                 }))
@@ -8182,6 +8262,7 @@ mod tests {
             store: store.clone(),
             stepping: HashMap::new(),
             writing: Writing::default(),
+            claims: writes::Ordered::default(),
             lent: HashMap::new(),
             step_checks: JoinSet::new(),
             steps: Default::default(),
@@ -8405,6 +8486,7 @@ mod tests {
             store: store.clone(),
             stepping: HashMap::new(),
             writing: Writing::default(),
+            claims: writes::Ordered::default(),
             lent: HashMap::new(),
             step_checks: JoinSet::new(),
             steps: Default::default(),
@@ -8722,6 +8804,7 @@ mod tests {
             store: store.clone(),
             stepping: HashMap::new(),
             writing: Writing::default(),
+            claims: writes::Ordered::default(),
             lent: HashMap::new(),
             step_checks: JoinSet::new(),
             steps: Default::default(),
@@ -8983,6 +9066,7 @@ mod tests {
             store: store.clone(),
             stepping: HashMap::new(),
             writing: Writing::default(),
+            claims: writes::Ordered::default(),
             lent: HashMap::new(),
             step_checks: JoinSet::new(),
             steps: Default::default(),
@@ -9787,6 +9871,60 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_parked_turn_s_claim_goes_to_the_store_beside_the_run_loop() {
+        let dir = scratch("claim-beside");
+        let path = dir.join("state.sqlite");
+        let (store, _publications) = Store::open(&path).await.unwrap();
+        let bob = running(&store, &["Bob".into()]).await[0].1;
+        store
+            .call(move |db| {
+                db.suspend_paced(
+                    bob, 0, 0, 0, 0, 0, 0, false, None, None, None, None, None, None, None,
+                )
+                .map(|_| ())
+            })
+            .await
+            .unwrap();
+        let mut service = admitting(&store, 1);
+        let (output, _writer) = Output::stdout();
+        // A commit that takes seconds, as on a saturated disk.
+        let (held, gate) = hold(&store).await;
+        service.claim("Bob".into(), bob, true);
+        // The claim holds the only slot while it is on its way.
+        assert!(!service.has_capacity());
+        // A read is answered from the readers meanwhile.
+        let inspect = Command::Inspect {
+            bot: "Bob".into(),
+            bot_id: None,
+        };
+        assert!(inspect.passes_claims());
+        let deferred = (service.dispatch(inspect, 1, &output, json!("r"), Bound::default()))
+            .await
+            .unwrap_err();
+        assert_eq!(deferred.code, "deferred");
+        let (asker, sent) = tokio::time::timeout(Duration::from_secs(5), service.lane.next())
+            .await
+            .expect("read beside the held writer")
+            .unwrap();
+        assert_eq!((asker.session, sent), (1, true));
+        // The turn starts only once its claim lands.
+        let early = tokio::time::timeout(Duration::from_millis(50), service.claims.next());
+        assert!(early.await.is_err(), "landed before its commit");
+        assert!(service.active.is_empty());
+        gate.send(()).unwrap();
+        held.await.unwrap();
+        service.land_claims().await.unwrap();
+        assert!(service.claims.is_empty());
+        assert!(service.active.contains_key("Bob"));
+        assert_eq!(service.claims.behind.count, 1);
+        let (bot, turn, task, exit) = service.jobs.join_next().await.unwrap().unwrap();
+        service.complete(bot, turn, task, exit).await.unwrap();
+        drop(service);
+        drop(store);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
     async fn a_resume_the_store_refuses_leaves_the_turn_parked() {
         let dir = scratch("resume-write-refused");
         let path = dir.join("state.sqlite");
@@ -10436,6 +10574,16 @@ mod tests {
         assert!(ends(r#"{"op":"pause","reason":"r"}"#));
         assert!(!ends(r#"{"op":"resume"}"#));
         assert!(!ends(r#"{"op":"tool_calls","tag":"t"}"#));
+        // They and every other request but reads and recorded writes wait
+        // for parked turns' claims on their way.
+        let passes = |line: &str| {
+            serde_json::from_str::<Command>(line)
+                .unwrap()
+                .passes_claims()
+        };
+        assert!(!passes(r#"{"op":"interrupt","bot":"a","turn":1}"#));
+        assert!(!passes(r#"{"op":"pause","reason":"r"}"#));
+        assert!(passes(r#"{"op":"tool_calls","tag":"t"}"#));
     }
 
     #[tokio::test]

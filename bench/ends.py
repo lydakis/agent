@@ -11,7 +11,9 @@ their own daemon, a synthetic model, and a scratch HOME.
         code-mode scripts as Sonny serves them (list, take, three steps
         put to the gates and recorded, answer): key to character across
         every window, its p99 and the pauses over 100 ms, and the CPU and
-        RSS of the daemon and of the windows together.
+        RSS of the daemon and of the windows together. The windows open
+        before the fleet starts, or with `--open busy` while it runs, so
+        their start is measured under load.
 
 Key to character types `q` into a window and times the first write back
 holding it, then takes it out again unmeasured. One poller reads every
@@ -216,14 +218,18 @@ def threads(pid):
 
 
 def counters(control):
-    """The daemon's requests and loop-held milliseconds by op, so far."""
+    """The daemon's requests and loop-held milliseconds by op, so far, and
+    the writes and claims landed with how long they waited after landing
+    (`behind_ms`) for the loop to take them up, where the daemon says."""
     stats = control.request('stats')['result']
     requests = {op: row['count'] for op, row in stats.get('commands', {}).get('ops', {}).items()}
     held = {}
     for part in ('commands', 'loop'):
         for op, row in stats.get(part, {}).get('ops', {}).items():
             held[op] = held.get(op, 0) + (row.get('held_ms') or 0)
-    return requests, held
+    behind = {f'{lane}_{key}': stats[lane][key] for lane in ('writes', 'claims')
+              if lane in stats for key in ('landed', 'behind_ms', 'behind_most_ms')}
+    return requests, held, behind
 
 
 def measured(groups, seconds, daemon=None, control=None):
@@ -242,7 +248,10 @@ def measured(groups, seconds, daemon=None, control=None):
     if control:
         now = counters(control)
         found_counts = [{op: count - was.get(op, 0) for op, count in seen.items()
-                         if count - was.get(op, 0)} for seen, was in zip(now, marked)]
+                         if count - was.get(op, 0)} for seen, was in zip(now[:2], marked[:2])]
+        # Most is since the daemon started; the rest over these seconds.
+        found_behind = {key: value if key.endswith('most_ms') else value - marked[2].get(key, 0)
+                        for key, value in now[2].items()}
     # CPU over the time measured, not the time asked for.
     found = {name: {'cpu_pct': round(100 * (after[name][0] - before[name][0]) / elapsed, 2),
                     'rss_mib': round(after[name][1], 1)} for name in groups}
@@ -253,6 +262,7 @@ def measured(groups, seconds, daemon=None, control=None):
             for name, cpu in sorted(threads(daemon).items(), key=lambda kv: -kv[1])}
     if control:
         found['requests'], found['loop_held_ms'] = found_counts
+        found['behind'] = found_behind
     # Footprint, after the CPU window so reading it costs that window
     # nothing: summed PSS beside summed RSS, so what each window adds is
     # plain once their binary pages are shared.
@@ -307,6 +317,8 @@ def main():
     parser.add_argument('--stored', type=int, default=10_000)
     parser.add_argument('--windows', type=int, default=32)
     parser.add_argument('--layout', choices=('one', 'spread'), default='one')
+    parser.add_argument('--open', choices=('idle', 'busy'), default='idle',
+                        help='open the windows before the fleet starts, or while it runs')
     parser.add_argument('--busy', type=int, default=30)
     parser.add_argument('--scripts', type=int, default=8)
     parser.add_argument('--seconds', type=float, default=20)
@@ -408,14 +420,6 @@ def main():
                 turns.append((time.monotonic() - began) * 1000)
             result['turn_ms'] = spread(turns)
         else:
-            for n in range(args.windows):
-                name, folder, _ = names[n]
-                window(name, name, folder)
-                time.sleep(.05)
-            starts = [windows.drawn(name) for name, _, _ in names[:args.windows]]
-            starts = [s * 1000 for s in starts if s is not None]
-            result['window_start_ms'] = spread(starts)
-            time.sleep(10)
             finished = [0, 0]
             failures = []
 
@@ -490,11 +494,29 @@ def main():
                     stopping.wait(max(0, due - time.monotonic()))
                 connection.close()
 
-            threads = [threading.Thread(target=busy, args=(n,)) for n in range(args.busy)]
-            threads += [threading.Thread(target=script, args=(n,)) for n in range(args.scripts)]
-            for thread in threads:
-                thread.start()
-            time.sleep(3)
+            def run_fleet():
+                threads.extend(threading.Thread(target=busy, args=(n,)) for n in range(args.busy))
+                threads.extend(threading.Thread(target=script, args=(n,)) for n in range(args.scripts))
+                for thread in threads:
+                    thread.start()
+                time.sleep(3)
+
+            # The windows open on an idle fleet, or (`--open busy`) on one
+            # already running its turns and scripts, so their start is
+            # measured under load.
+            if args.open == 'busy':
+                run_fleet()
+            for n in range(args.windows):
+                name, folder, _ = names[n]
+                window(name, name, folder)
+                time.sleep(.05)
+            starts = [windows.drawn(name) for name, _, _ in names[:args.windows]]
+            result['windows_undrawn'] = sum(s is None for s in starts)
+            starts = [s * 1000 for s in starts if s is not None]
+            result['window_start_ms'] = spread(starts)
+            time.sleep(10)
+            if args.open == 'idle':
+                run_fleet()
             names_open = [name for name, _, _ in names[:args.windows]]
             groups = {'daemon': lambda: [daemon.pid],
                       'windows': lambda: tree(*(windows.pids[name][0] for name in names_open))}
@@ -520,7 +542,7 @@ def main():
                 raise RuntimeError(f'no work done: {finished}')
             result['turns_finished'] = finished[0]
             result['scripts_finished'] = finished[1]
-            result.update(windows=args.windows, layout=args.layout, busy_agents=args.busy,
+            result.update(windows=args.windows, layout=args.layout, open=args.open, busy_agents=args.busy,
                           script_agents=args.scripts, pace_s=args.pace)
         Path(args.out).write_text(json.dumps(result, indent=1) + '\n')
         print(json.dumps(result))
