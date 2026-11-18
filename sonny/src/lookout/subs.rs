@@ -1008,6 +1008,7 @@ fn drop_named(
 /// End the subscriptions the deleted bot of `id` held as `subscriber`:
 /// all of them, but one held by another bot of the name. How many ended.
 pub fn forget(store: &Path, subscriber: &str, id: Option<i64>) -> Result<usize, String> {
+    let _held = held(store)?;
     end_held(store, subscriber, id, |_| false)
 }
 
@@ -1017,13 +1018,15 @@ pub fn forget(store: &Path, subscriber: &str, id: Option<i64>) -> Result<usize, 
 /// says it, a file written in a later millisecond is left as it is: the
 /// bot opened again and may have written it. One written in the same
 /// millisecond came before: a close and a turn that opens it again are
-/// never that close. How many ended.
+/// never that close. The file's time is read under the edit lock, so a
+/// write under way is weighed once it is done. How many ended.
 pub fn closed(
     store: &Path,
     subscriber: &str,
     id: Option<i64>,
     at_ms: Option<u64>,
 ) -> Result<usize, String> {
+    let _held = held(store)?;
     if let Some(at_ms) = at_ms {
         let written = (std::fs::metadata(file(store, subscriber)))
             .and_then(|m| m.modified())
@@ -1039,14 +1042,14 @@ pub fn closed(
 }
 
 /// End what the bot of `id` held as `subscriber`, but what `keep` keeps
-/// and what another bot of the name holds. How many ended.
+/// and what another bot of the name holds, with the edit lock held. How
+/// many ended.
 fn end_held(
     store: &Path,
     subscriber: &str,
     id: Option<i64>,
     keep: impl Fn(&Sub) -> bool,
 ) -> Result<usize, String> {
-    let _held = held(store)?;
     let mut subs = read_whole(store, subscriber)?;
     let before = subs.len();
     subs.retain(|sub| sub.owner.is_some_and(|owner| Some(owner) != id) || keep(sub));
