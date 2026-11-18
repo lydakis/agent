@@ -42,13 +42,21 @@ pub const TIMEOUT: Duration = Duration::from_secs(600);
 const YIELD_TIME: Duration = Duration::from_secs(30);
 /// Past any call's own time: a bound on one that has none.
 const CALL_BOUND: Duration = Duration::from_secs(24 * 3600);
-/// Scripts that run at once in the tool host; the rest wait their turn.
-const SCRIPTS: usize = 4;
-static RUNNING: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(SCRIPTS);
-/// Scripts alive at once, running or waiting for verdicts, so that their
-/// heaps at the memory cap hold at most 4 GB however many calls wait.
-const LIVE: usize = 16;
+/// Scripts alive at once in the tool host, running or waiting, each on
+/// its own thread: Codex's `MAX_ACTIVE_CELLS`, its host's one bound,
+/// shared by every agent. One past it is refused at once, as Codex's is,
+/// never kept waiting.
+const LIVE: usize = 2_048;
 static ALIVE: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(LIVE);
+/// What a script past [`LIVE`] answers: Codex's words, of its cells.
+const TOO_MANY: &str = "code-mode host has too many active scripts";
+
+/// A script's place among those alive, or [`TOO_MANY`] at once.
+fn admit(
+    alive: &'static tokio::sync::Semaphore,
+) -> Result<tokio::sync::SemaphorePermit<'static>, String> {
+    alive.try_acquire().map_err(|_| TOO_MANY.to_owned())
+}
 /// The longest pause between two of a script's interrupt checks that is
 /// still one stretch of running JavaScript.
 const RUNNING_GAP: Duration = Duration::from_millis(50);
@@ -1032,23 +1040,21 @@ async fn run_keeping(
 ) -> Result<Value, String> {
     let script = parse(input)?;
     let started = Instant::now();
-    // Its own time and its call's from here: waiting for a place and
-    // listing the servers' tools spend them as its JavaScript does.
+    let alive = admit(&ALIVE)?;
+    // Its own time and its call's from here: listing the servers' tools
+    // spends them as its JavaScript does.
     let timeout = script
         .timeout_ms
         .map_or(TIMEOUT, Duration::from_millis)
         .min(TIMEOUT);
     let deadline = started + timeout.min(left);
     let readied = tokio::time::timeout_at(deadline.into(), async {
-        let alive = ALIVE.acquire().await.map_err(|e| e.to_string())?;
-        let running = RUNNING.acquire().await.map_err(|e| e.to_string())?;
-        let (discovered, own) = tokio::join!(discover(hub), daemon_tools(steps.as_ref()));
-        Ok::<_, String>((alive, running, discovered, own))
+        tokio::join!(discover(hub), daemon_tools(steps.as_ref()))
     })
     .await;
     let budget = script.max_output_tokens.unwrap_or(OUTPUT_TOKENS);
-    let (alive, running, (mut nested, mut listed, failed), own) = match readied {
-        Ok(readied) => readied?,
+    let ((mut nested, mut listed, failed), own) = match readied {
+        Ok(readied) => readied,
         Err(_) => {
             let ended = Ended::Terminated("it ran out of time before it started".into());
             let output = Output::new(budget, whole);
@@ -1084,7 +1090,7 @@ async fn run_keeping(
         calls: Arc::default(),
         halt: Arc::default(),
         steps: steps.map(Arc::new),
-        clock: Clock::new(started + timeout, started + left.min(CALL_BOUND), running),
+        clock: Clock::new(started + timeout, started + left.min(CALL_BOUND)),
         yielding: Arc::default(),
     };
     // Still running at its yield time, or once it calls `yield_control()`,
@@ -1122,32 +1128,56 @@ async fn run_keeping(
         Arc::clone(&run.pictures),
     );
     let clock = Arc::clone(&run.clock);
-    let (text, sent) = tokio::task::spawn_blocking(move || {
-        // Its places are held until the script's runtime is gone, so an
-        // interrupted turn frees them only once its script has stopped.
-        let _running = (clock, alive);
-        let ended = tokio::runtime::Builder::new_current_thread()
-            .enable_time()
-            .build()
-            .map_err(|e| e.to_string())?
-            .block_on(run.script(script.code))?;
-        // Here, off the runtime: the end of a saved output is written and
-        // its file closed.
-        let calls = calls.lock().unwrap().clone();
-        let output = std::mem::replace(
-            &mut *output.lock().unwrap(),
-            Output::new(0, &Whole::Saved(None)),
-        );
-        Ok::<_, String>(said(&ended, started, &calls, output))
-    })
-    .await
-    .map_err(|e| e.to_string())??;
+    // Each script on a thread of its own, as each of Codex's cells is, so
+    // none waits behind another for a thread.
+    let (done, ran) = tokio::sync::oneshot::channel();
+    std::thread::Builder::new()
+        .name("exec".into())
+        .spawn(move || {
+            let _ = done.send(script_thread(
+                run,
+                script.code,
+                (clock, alive),
+                started,
+                calls,
+                output,
+            ));
+        })
+        .map_err(|e| e.to_string())?;
+    let (text, sent) = ran.await.map_err(|e| e.to_string())??;
     drop(yielder);
     if let (Whole::Sent(_, cut), Some(sent)) = (whole, sent) {
         *cut.lock().unwrap() = Some(sent);
     }
     let pictures = std::mem::take(&mut *pictures.lock().unwrap());
     Ok(parts(text, pictures))
+}
+
+/// A script's whole run on its thread: what it said once it ended.
+fn script_thread(
+    run: Run,
+    code: String,
+    held: (Arc<Clock>, tokio::sync::SemaphorePermit<'static>),
+    started: Instant,
+    calls: Arc<Mutex<BTreeMap<String, usize>>>,
+    output: Arc<Mutex<Output>>,
+) -> Result<(String, Option<String>), String> {
+    // Its place is held until the script's runtime is gone, so an
+    // interrupted turn frees it only once its script has stopped.
+    let _alive = held;
+    let ended = tokio::runtime::Builder::new_current_thread()
+        .enable_time()
+        .build()
+        .map_err(|e| e.to_string())?
+        .block_on(run.script(code))?;
+    // Here, off the runtime: the end of a saved output is written and
+    // its file closed.
+    let calls = calls.lock().unwrap().clone();
+    let output = std::mem::replace(
+        &mut *output.lock().unwrap(),
+        Output::new(0, &Whole::Saved(None)),
+    );
+    Ok(said(&ended, started, &calls, output))
 }
 
 /// Mark where an `image()` call's picture goes in the output, opening and
@@ -1762,16 +1792,10 @@ struct Run {
 /// stops while any of its calls waits, for a server, a step or a gate.
 /// Its call's, as the daemon counts the call's time: it stops only while a
 /// step runs or a call waits for the agent's gate, and it ends once the
-/// call yields, since a yielded call has no deadline. While a step or a
-/// gate holds it, the script gives up its place among the scripts
-/// running: a verdict can take a person hours, and four scripts waiting
-/// on theirs would hold back every other agent's.
+/// call yields, since a yielded call has no deadline.
 struct Clock {
     times: Mutex<Times>,
     resumed: tokio::sync::Notify,
-    place: Mutex<Option<tokio::sync::SemaphorePermit<'static>>>,
-    /// Taken while a call takes the place back, so only one waits for it.
-    returning: tokio::sync::Mutex<()>,
 }
 
 struct Times {
@@ -1858,31 +1882,14 @@ impl Times {
 }
 
 impl Clock {
-    fn new(
-        script: Instant,
-        call: Instant,
-        place: tokio::sync::SemaphorePermit<'static>,
-    ) -> Arc<Self> {
+    fn new(script: Instant, call: Instant) -> Arc<Self> {
         Arc::new(Self {
             times: Mutex::new(Times {
                 script: Meter::new(script),
                 call: Some(Meter::new(call)),
             }),
             resumed: tokio::sync::Notify::new(),
-            place: Mutex::new(Some(place)),
-            returning: tokio::sync::Mutex::new(()),
         })
-    }
-
-    /// Take the script's place back once a call's verdict came, waiting
-    /// for one as a new script does, with the time still stopped.
-    async fn take_place(&self) -> Result<(), String> {
-        let _one = self.returning.lock().await;
-        if self.place.lock().unwrap().is_none() {
-            let place = RUNNING.acquire().await.map_err(|e| e.to_string())?;
-            *self.place.lock().unwrap() = Some(place);
-        }
-        Ok(())
     }
 
     fn out(&self) -> bool {
@@ -1913,15 +1920,13 @@ impl Clock {
     }
 
     /// Stop both times until the guard is dropped, while a step runs or a
-    /// call waits on the agent's gate, and give up the place, even one a
-    /// call that waited beside this one took back meanwhile.
+    /// call waits on the agent's gate.
     fn stop(self: &Arc<Self>) -> Stopped {
         let mut times = self.times.lock().unwrap();
         times.script.stop();
         if let Some(call) = &mut times.call {
             call.stop();
         }
-        self.place.lock().unwrap().take();
         Stopped(Arc::clone(self), true)
     }
 
@@ -2235,17 +2240,15 @@ impl Caller {
             };
             // The daemon decides it, a person perhaps, and runs it under
             // its own bounds (a command's timeout, the call's stop): the
-            // script's time stops and its place goes to another script
-            // meanwhile, as while a server's tool waits on its gate.
+            // script's time stops meanwhile, as while a server's tool waits
+            // on its gate.
             let stopped = self.clock.stop();
             let ran = Abort(
                 self.host
                     .spawn(async move { steps.run(&id, arguments).await }),
             )
             .await;
-            let placed = self.clock.take_place().await;
             drop(stopped);
-            placed?;
             return ran.map_err(|e| e.to_string())?;
         }
         // Told to the agent's daemon first, with the script's time stopped,
@@ -2265,10 +2268,8 @@ impl Caller {
             }));
             let approved = approval.await;
             // Whatever the verdict, the script runs on from here, its time
-            // starting again once it has a place, as a new script's does.
-            let placed = self.clock.take_place().await;
+            // starting again.
             drop(stopped);
-            placed?;
             allowed = Some((steps, approved.map_err(|e| e.to_string())??));
         }
         // A place among the script's calls in flight, held until its
@@ -3123,7 +3124,7 @@ text("done");"#;
     }
 
     #[tokio::test]
-    async fn scripts_waiting_for_verdicts_leave_their_places_to_others() {
+    async fn a_script_runs_at_once_beside_many_waiting_for_verdicts() {
         let dir = scratch("steps-places");
         let hub = hub(&dir).await;
         let mut servers = hub.servers();
@@ -3131,7 +3132,7 @@ text("done");"#;
             agent_client::config::ApprovalMode::Prompt;
         hub.configure(&servers).await;
         let (client, _steps) = gate(&dir, Duration::from_secs(3), None).await;
-        let waiting: Vec<_> = (0..SCRIPTS)
+        let waiting: Vec<_> = (0..32)
             .map(|n| {
                 let (hub, dir) = (hub.clone(), dir.clone());
                 let asker = Steps::new(client.clone(), "shop.lead".into(), 7, format!("c{n}"));
@@ -3149,7 +3150,7 @@ text("done");"#;
                 })
             })
             .collect();
-        // Every place is free while their verdicts are out: another runs.
+        // Twice the old host's whole room waits on verdicts: another runs.
         let said = ran(&hub, &dir, "text('meanwhile');").await;
         assert!(said.ends_with("Output:\nmeanwhile"), "{said}");
         assert!(waiting.iter().all(|script| !script.is_finished()));
@@ -3159,61 +3160,15 @@ text("done");"#;
         }
     }
 
-    #[tokio::test]
-    async fn scripts_waiting_for_verdicts_still_count_toward_those_alive() {
-        let dir = scratch("steps-alive");
-        let hub = hub(&dir).await;
-        let mut servers = hub.servers();
-        servers.get_mut("test").unwrap().default_tools_approval_mode =
-            agent_client::config::ApprovalMode::Prompt;
-        hub.configure(&servers).await;
-        let go = Arc::new(tokio::sync::Semaphore::new(0));
-        let (client, mut steps) = gate(&dir, Duration::ZERO, Some(Arc::clone(&go))).await;
-        assert_eq!(LIVE, 16);
-        let waiting: Vec<_> = (0..LIVE)
-            .map(|n| {
-                let (hub, dir) = (hub.clone(), dir.clone());
-                let asker = Steps::new(client.clone(), "shop.lead".into(), 7, format!("c{n}"));
-                tokio::spawn(async move {
-                    let script = "await tools.mcp__test__slow({ms: 1}); text('approved');";
-                    run(
-                        &hub,
-                        Some(&dir),
-                        "shop.lead",
-                        script,
-                        Duration::from_secs(30),
-                        Some(asker),
-                    )
-                    .await
-                })
-            })
-            .collect();
-        for _ in 0..LIVE {
-            steps.recv().await.unwrap();
-        }
-        // Every one waits with its heap kept: none is left for another.
-        assert_eq!(ALIVE.available_permits(), 0);
-        go.add_permits(LIVE);
-        for script in waiting {
-            let said = script.await.unwrap().unwrap().as_str().unwrap().to_owned();
-            assert!(said.ends_with("Output:\napproved"), "{said}");
-        }
-    }
-
-    #[tokio::test]
-    async fn every_wait_gives_up_the_place_however_the_waits_overlap() {
-        let place = RUNNING.acquire().await.unwrap();
-        let clock = Clock::new(Instant::now() + TIMEOUT, Instant::now() + TIMEOUT, place);
-        let (first, second) = (clock.stop(), clock.stop());
-        assert!(clock.place.lock().unwrap().is_none());
-        // The first's verdict comes: it takes a place back and runs on,
-        // while the second still waits, then waits again.
-        clock.take_place().await.unwrap();
-        drop(first);
-        assert!(clock.place.lock().unwrap().is_some());
-        let again = clock.stop();
-        assert!(clock.place.lock().unwrap().is_none());
-        drop((second, again));
+    #[test]
+    fn a_script_past_those_alive_is_refused_at_once() {
+        assert_eq!(LIVE, 2_048);
+        let alive: &'static tokio::sync::Semaphore =
+            Box::leak(Box::new(tokio::sync::Semaphore::new(2)));
+        let held = (admit(alive).unwrap(), admit(alive).unwrap());
+        assert_eq!(admit(alive).unwrap_err(), TOO_MANY);
+        drop(held);
+        let _again = admit(alive).unwrap();
     }
 
     #[tokio::test]
@@ -3647,27 +3602,24 @@ text(ALL_TOOLS.map(t => t.name).join(","));"#,
     }
 
     #[tokio::test]
-    async fn scripts_past_the_running_limit_wait_their_turn() {
+    async fn scripts_run_at_once_however_many() {
         let dir = scratch("running");
         let hub = hub(&dir).await;
         let slept = "await tools.mcp__test__slow({ms: 400}); text('done');";
         let started = Instant::now();
-        assert_eq!(SCRIPTS, 4);
-        let (a, b, c, d, e) = tokio::join!(
-            ran(&hub, &dir, slept),
-            ran(&hub, &dir, slept),
-            ran(&hub, &dir, slept),
-            ran(&hub, &dir, slept),
-            ran(&hub, &dir, slept)
-        );
-        let all = [a, b, c, d, e];
+        let mut running = tokio::task::JoinSet::new();
+        for _ in 0..16 {
+            let (hub, dir) = (hub.clone(), dir.clone());
+            running.spawn(async move { ran(&hub, &dir, slept).await });
+        }
+        let all = running.join_all().await;
         assert!(
             all.iter().all(|said| said.ends_with("Output:\ndone")),
             "{all:?}"
         );
-        // One more than may run at once ran after the first finished.
+        // None waited for another to finish.
         assert!(
-            started.elapsed() >= Duration::from_millis(800),
+            started.elapsed() < Duration::from_millis(800),
             "{:?}",
             started.elapsed()
         );
