@@ -11991,3 +11991,73 @@ both sides in every footprint run, and the gate passed.
 
 This change does not touch Sonny. Of the same job's Sonny rows, only the
 quiet window's CPU moved more than 15% (0.77 to 0.96 ms a second).
+
+## A window lists its project once and follows it (#1180)
+
+A window lists its project once, follows the project's pattern from the
+listing's cursor, and reads again by name only the agents an event moved,
+plus the running ones. Main is 6e5392f (#1161), and the change is the same
+base with #1180 on it, both built with `--workspace --bins` on the 4-CPU
+Linux container. `bench/ends.py`, with agents in projects; the high end is
+10,000 agents, 30 busy, 8 scripts, a 0.5 s pace, and N windows, then 20 s
+after the turns stop.
+
+### Low end
+
+One window, 10 agents:
+
+| Side | Window start, s | Key p50 / p99, ms | Turn p50 / p99, ms | Idle CPU, window | `bots` requests |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| main | 0.120 | 0.92 / 3.45 | 51.9 / 200.2 | 0.2% | 15 |
+| change | 0.129 | 1.15 / 2.99 | 52.0 / 63.3 | 0.2% | 6 |
+
+### High end, every window in its own project (`spread`)
+
+| Windows | Side | Key p50 / p99, ms | Daemon CPU busy / after, % | Windows CPU busy / after, % | `bots` requests |
+| ---: | --- | ---: | ---: | ---: | ---: |
+| 100 | main | 1.94 / 29.3 | 57.7 / 14.8 | 36.9 / 20.0 | 3,440 |
+| 100 | change | 2.17 / 11.6 | 43.5 / 1.3 | 31.5 / 16.2 | 374 |
+| 200 | main | 2.30 / 13.2 | 76.1 / 19.4 | 60.6 / 39.6 | 6,721 |
+| 200 | change | 3.04 / 16.7 | 58.4 / 1.4 | 55.9 / 32.7 | 584 |
+
+### High end, every window in one 10,000-agent project (`one`)
+
+| Windows | Side | Key p50 / p99, ms | Daemon CPU busy / after, % | Windows CPU busy / after, % | Windows anon, GiB | `bots` requests |
+| ---: | --- | ---: | ---: | ---: | ---: | ---: |
+| 32 | main | 2.02 / 11.0 | 155.6 / 151.6 | 98.7 / 106.9 | 3.29 | 10,279 |
+| 32 | change | 3.08 / 136.9 | 88.1 / 49.2 | 225.0 / 86.9 | 3.18 | 2,113 |
+| 100 | main | 3.35 / 10.3 | 164.7 / 152.7 | 109.6 / 123.9 | 4.98 | 12,474 |
+| 100 | change | 4.36 / 76.7 | 104.1 / 111.8 | 217.2 / 236.6 | 8.19 | 4,828 |
+| 200 | main | 4.95 / 16.7 | 150.9 / 154.9 | 96.1 / 117.6 | 2.52 | 14,082 |
+| 200 | change | 5.31 / 50.6 | 119.1 / 93.6 | 139.0 / 267.2 | 8.59 | 7,718 |
+
+The daemon's share moved into the windows. With one project shared by
+every window, each count still builds every one of the 10,000 rows' status
+and the tasks listing again every 3 s, in each window. A `perf
+--call-graph dwarf` profile of one of the 32 puts 60% of its CPU in the
+count: `read_status_of` 35%, `status::tasks` 9%, dropping the old tasks
+on the window's thread 7%, `needs::scan` 6%, `resolved::read` 4%, and
+`moved_rows` 3.5%. George shipped it in 0.10.2 with this cost; a count
+that builds again only the rows that moved follows it.
+
+### Daemon screens
+
+The Perf workflow's matched screens on 5ddd887 against main (91805174):
+
+| Bench | Measure | Main | Change | Change % |
+| --- | --- | ---: | ---: | ---: |
+| lifecycle | CPU, s | 0.340 | 0.315 | -7.4 |
+| lifecycle | p95 turn, ms | 581.3 | 590.3 | +1.6 |
+| lifecycle | peak RSS, MiB | 26.5 | 27.1 | +2.1 |
+| completion | release to terminal p99, ms | 6.33 | 6.23 | -1.6 |
+| admission | lone submit CPU, ms | 24.24 | 23.51 | -3.0 |
+| admission | burst submit p99, ms | 2.365 | 2.372 | +0.3 |
+| footprint | idle RSS, MiB | 17.5 | 17.7 | +1.0 |
+| footprint | per idle bot, KiB | 1.87 | 1.74 | -6.6 |
+| footprint | RSS after a turn each, MiB | 46.8 | 55.1 | +17.7 |
+| footprint | CPU per turn, ms | 0.592 | 0.627 | +5.9 |
+| sonny | quiet window CPU, ms/s | 0.39 | 0.195 | -50.0 |
+| sonny | quiet window requests, /s | 0.695 | 0.0 | -100.0 |
+
+None of these screens follows a pattern, so the fan-out's clone and
+encode for a pattern's live events never run in them; the gate passed.
