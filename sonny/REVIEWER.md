@@ -69,7 +69,19 @@ this replaced:
   answer limit), never cut. Until 2026-11-10 a turn whose newest steers
   or calls did not fit carried `authorization_unreadable`, which scored
   every call's authorization unknown, overriding even an answered ask
-  for that exact send.
+  for that exact send. Since 2026-11-18 whatever is left out also brings
+  Codex's note, `context_omission` (openai/codex main 67d8266,
+  `codex-rs/core/src/context/guardian_budget_omission.rs`): "Conversation
+  evidence, tool descriptions, or images were omitted or shortened to fit
+  the review input budget. User instructions and prior approvals may be
+  incomplete where marked. Do not infer authorization from missing
+  evidence or treat a partial grant as overriding an omitted
+  restriction." An earlier call whose changed files can't be read back is
+  one such: shown as left out, its round judged. Until then that round
+  went to the person, and a script's long write or edit (its arguments
+  reach the daemon content first, so the cut preview held no path) held
+  about twelve task turns on 2026-11-17; the daemon now names a script
+  step's files as it names a direct call's.
 - **A denial goes back to the model at once.** Its reason is Codex's:
   "This action was rejected due to unacceptable risk (risk, authorization).
   Reason: RATIONALE", then that the agent must not work around it and
