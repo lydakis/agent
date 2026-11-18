@@ -10315,6 +10315,10 @@ impl App {
                 return;
             };
             self.counted_mark = counted.mark;
+            // A count a read left unfinished counts again, idle or not.
+            if counted.mark.is_none() {
+                self.counted_local = None;
+            }
             match counted.listed {
                 Some((listed, mark)) => (self.listed, self.rows_mark) = (Some(listed), Some(mark)),
                 // A read failed: what moved is unknown, so start over.
@@ -10405,13 +10409,9 @@ impl App {
             }
             if running {
                 let ask = json!({"name": scope.glob, "active": true, "limit": 256});
-                let Ok(page) = client.request("bots", ask).await else {
+                let Ok(rows) = standing::every(&client, ask).await else {
                     return Some(failed());
                 };
-                let rows: Vec<Value> = (page["bots"].as_array().into_iter().flatten())
-                    .cloned()
-                    .map(standing::kept)
-                    .collect();
                 // Running agents that stand as they stood leave the
                 // listing, and its mark, as they were.
                 if rows_differ(&listed, &rows) {

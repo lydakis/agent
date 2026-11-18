@@ -27,7 +27,7 @@ use tokio::sync::Notify;
 /// The events that move where an agent stands, as a `bots` row says it:
 /// its status, running turn, what it waits on and how its last turn
 /// ended; an approval held for the person; an agent made or gone.
-pub const KINDS: [&str; 15] = [
+pub const KINDS: [&str; 16] = [
     "created",
     "forked",
     "queued",
@@ -42,6 +42,7 @@ pub const KINDS: [&str; 15] = [
     "approval_requested",
     "approval_asked",
     "call_lifted",
+    "lifted_ended",
     "deleted",
 ];
 
@@ -100,16 +101,32 @@ pub async fn list(client: &Client, pattern: &str) -> agent_client::Result<(Vec<V
 pub async fn rows(client: &Client, names: &[String]) -> agent_client::Result<Vec<Value>> {
     let mut rows = Vec::new();
     for chunk in names.chunks(256) {
-        let page = client
-            .request("bots", json!({"names": chunk, "limit": 256}))
-            .await?;
+        rows.extend(every(client, json!({"names": chunk, "limit": 256})).await?);
+    }
+    Ok(rows)
+}
+
+/// Every page of the `bots` listing `ask` names, each row [`kept`]: a page
+/// ends at its row count or its size, whichever comes first.
+pub async fn every(client: &Client, ask: Value) -> agent_client::Result<Vec<Value>> {
+    let mut rows = Vec::new();
+    let mut after: Option<String> = None;
+    loop {
+        let mut ask = ask.clone();
+        if let Some(after) = &after {
+            ask["after"] = json!(after);
+        }
+        let page = client.request("bots", ask).await?;
         rows.extend(
             (page["bots"].as_array().into_iter().flatten())
                 .cloned()
                 .map(kept),
         );
+        match page["next_after"].as_str() {
+            Some(next) if after.as_deref() != Some(next) => after = Some(next.to_owned()),
+            _ => return Ok(rows),
+        }
     }
-    Ok(rows)
 }
 
 /// What the follow heard since the window last took it.
