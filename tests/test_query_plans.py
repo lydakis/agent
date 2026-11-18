@@ -26,6 +26,11 @@ class QueryPlanTests(unittest.TestCase):
         self.assertTrue(any('name GLOB ?3 AND running_turn IS NOT NULL ORDER BY name' in q for q in bots))
         self.assertTrue(any('name GLOB ?3 AND created_by_id = ?4 AND running_turn IS NOT NULL' in q
                             for q in bots))
+        # A bot's instructions live in their own table, so a listing's rows
+        # stay small and never spill into overflow pages.
+        ddl = source.split('CREATE TABLE IF NOT EXISTS bots(', 1)[1].split(');', 1)[0]
+        self.assertNotIn('instructions', ddl)
+        self.assertTrue(all('instructions' not in q for q in bots))
         self.assertTrue(any('ORDER BY t.id DESC LIMIT ?4' in q for q in queries))
         self.assertTrue(any('ORDER BY t.id ASC LIMIT ?4' in q for q in queries))
         # A prune never drops a running process; a deletion refuses a bot

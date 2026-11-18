@@ -6687,6 +6687,29 @@ opening covers only a field's name and separator, so the cost of a read
 stays with the redaction it already did. The session sweep runs once per
 terminal or detached command, at its end, off the runtime thread.
 
+## Private per-bot sockets for long daemon addresses
+
+November 17, 2026. Matched offline release builds on macOS arm64 against `7860d0e5`. SHA-256 prefixes were `fa68990710aa` (base) and `70d3854dd265` (candidate).
+
+The Linux sandbox CLI integration passed with the previously failing store path, and the listener lifetime test passed using an explicit 98-byte daemon address. The main socket keeps its configured address. Other daemons derive the same per-bot folder for their sandbox rules.
+
+Both sides used 6.001 store jobs per turn in all four footprint trials. Admission and completion operation counts also matched. The initial footprint CPU medians crossed the 15% warning threshold (0.429 to 0.509 ms per turn). The footprint bench uses stdio and does not open per-bot sockets. In two additional socket-branch trials CPU was 0.442 and 0.419 ms per turn. The paired base trials were 0.416 and 0.443 ms per turn. This screen gives no sustained CPU gain or loss estimate.
+
+The table gives medians after warmup. The base ran first and last across two blocks. Each side contributed six 32-bot admission and completion trials, four 1,000-bot footprint trials, and two 32-bot socket echo lifecycle trials.
+
+| Benchmark | Measure | Base | Candidate |
+| --- | --- | ---: | ---: |
+| admission | lone submit CPU, ms | 22.584 | 25.327 |
+| admission | burst submit p99, ms | 2.341 | 2.395 |
+| completion | release to terminal p99, ms | 5.434 | 5.220 |
+| footprint | idle RSS, MiB | 13.523 | 13.500 |
+| footprint | per idle bot, KiB | 2.528 | 2.536 |
+| footprint | RSS after a turn each, MiB | 37.289 | 38.695 |
+| footprint | CPU per turn, ms | 0.429 | 0.509 |
+| lifecycle | CPU, s | 0.373 | 0.328 |
+| lifecycle | p95 turn, ms | 600.258 | 600.890 |
+| lifecycle | peak RSS, MiB | 27.750 | 26.672 |
+
 ## A bot's socket listens while it is used (#563)
 
 A sandboxed bot's own socket now listens only while a share in it is
@@ -10781,3 +10804,65 @@ the CI runner, 2026-11-17:
 
 Store jobs a turn are unchanged on every screen: the gate fails on any
 increase, and it passed. Every row is within the runner's spread.
+
+## A bot's instructions out of its row (schema 107)
+
+Each bot's instructions and compaction instructions now live in
+`bot_instructions`, keyed by bot id, instead of in its `bots` row. A lead's
+store on 2026-11-17 held 1,639 bots whose instructions averaged 35 KB, so a
+row spilled into overflow pages, and `bots` pages read columns stored after
+the instructions (`closed_ms` among them, which the `open` filter reads), so
+SQLite walked each row's overflow chain, closed bots included. Every write of
+a bot's row, several per turn, rewrote the whole record with it. The row is
+now a few hundred bytes. Release builds, main (7860d0e, `98d09e3a78f8`)
+against the change (`5e5fcfab6ffb`), Linux x86_64, 4 CPUs, synthetic model,
+2026-11-18.
+
+`bench.bot_listing`: N bots with 35,000-byte instructions, different for each,
+and 1 KB compaction instructions, every third closed; a full listing is every
+page of 256 open bots, 20 times warm and once after a restart. Store time is
+the store's own time for the listing's pages; the turn row is the store time
+32 text turns spent, per turn.
+
+| Bots (open) | Measure | Main | Change |
+| ---: | --- | ---: | ---: |
+| 10 (6) | full listing p50, ms | 0.26 | 0.55 |
+| 1,000 (666) | full listing p50, ms | 20.92 | 12.84 |
+| 1,000 | store time a listing, ms | 12.15 | 5.10 |
+| 1,000 | store time a turn, ms | 1.688 | 0.875 |
+| 5,000 (3,333) | full listing p50, ms | 107.26 | 60.84 |
+| 5,000 | store time a listing, ms | 63.75 | 20.80 |
+| 5,000 | listing after a restart, ms | 102.76 | 58.76 |
+| 5,000 | store time a turn, ms | 1.375 | 0.688 |
+| 10,000 (6,666) | full listing p50, ms | 212.86 | 134.16 |
+| 10,000 | full listing p95, ms | 240.26 | 155.71 |
+| 10,000 | store time a listing, ms | 128.80 | 51.65 |
+| 10,000 | listing after a restart, ms | 219.29 | 130.83 |
+| 10,000 | store time a turn, ms | 1.406 | 0.844 |
+
+The 10-bot row is one page of six bots; three more alternating runs of 200
+listings each read 0.32, 0.30, 0.29 ms on main and 0.29, 0.29, 0.37 ms on the
+change, the same within the run's spread. Store jobs a turn are unchanged:
+the turn is cheaper because each write of the row is smaller, not because it
+does less.
+
+The hot-path screen, two alternating rounds (`bench/perf_gate.py`), where
+bots have short instructions and nothing should move:
+
+| Screen | Row | Main | Head | Change |
+| --- | --- | ---: | ---: | ---: |
+| `bench.admission_burst` | Lone submit CPU | 32.275 ms | 33.797 ms | +4.7% |
+| `bench.admission_burst` | Burst submit p99 | 4.220 ms | 4.087 ms | -3.1% |
+| `bench.completion_burst` | Release to terminal p99 | 10.132 ms | 10.532 ms | +4.0% |
+| `bench.footprint` | Idle RSS | 17.205 MiB | 17.141 MiB | -0.4% |
+| `bench.footprint` | Per idle bot | 1.866 KiB | 1.906 KiB | +2.1% |
+| `bench.footprint` | RSS after a turn each | 32.115 MiB | 32.918 MiB | +2.5% |
+| `bench.footprint` | CPU per turn | 0.836 ms | 0.838 ms | +0.2% |
+| `bench.lifecycle` | Daemon CPU | 0.53 s | 0.515 s | -2.8% |
+| `bench.lifecycle` | Turn p95 | 584.749 ms | 578.847 ms | -1.0% |
+| `bench.lifecycle` | Peak RSS | 26.090 MiB | 26.207 MiB | +0.4% |
+
+Store work a turn is unchanged on every screen and every row is within the
+spread. `bench.query_plans` plans 488 statements with no table scan. The
+migration of a store of 2,000 such bots (70 MB of instructions) from schema
+106, its backup copy included, took 0.73 s at open.
