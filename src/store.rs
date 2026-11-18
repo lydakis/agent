@@ -369,6 +369,7 @@ struct Slow {
     op: &'static str,
     kind: &'static str,
     program: Option<String>,
+    label: Option<String>,
     ns: u64,
 }
 /// What counts as slow: a second.
@@ -376,7 +377,14 @@ pub const SLOW_NS: u64 = 1_000_000_000;
 /// How many slow operations are kept.
 const SLOW_KEPT: usize = 100;
 impl Inner {
-    fn slow(&mut self, op: &'static str, kind: &'static str, program: Option<&str>, ns: u64) {
+    fn slow(
+        &mut self,
+        op: &'static str,
+        kind: &'static str,
+        program: Option<&str>,
+        label: Option<&str>,
+        ns: u64,
+    ) {
         if ns < SLOW_NS {
             return;
         }
@@ -385,12 +393,12 @@ impl Inner {
         }
         let at_ms = (std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH))
             .map_or(0, |since| since.as_millis() as u64);
-        let program = program.map(str::to_owned);
         self.slow.push_back(Slow {
             at_ms,
             op,
             kind,
-            program,
+            program: program.map(str::to_owned),
+            label: label.map(str::to_owned),
             ns,
         });
     }
@@ -467,13 +475,14 @@ impl Counters {
             queued.elapsed().as_nanos() as u64,
             storage_error,
         );
-        inner.slow(label, "store", None, ran_ns);
+        inner.slow(label, "store", None, None, ran_ns);
     }
-    /// A hold of the service loop, by a request from `program` or by the
-    /// loop's own chore: kept when it is slow.
-    pub fn held(&self, op: &'static str, program: Option<&str>, ns: u64) {
+    /// A hold of the service loop, by a request from a session of
+    /// `program` with `label`, or by the loop's own chore: kept when it is
+    /// slow.
+    pub fn held(&self, op: &'static str, program: Option<&str>, label: Option<&str>, ns: u64) {
         if ns >= SLOW_NS {
-            self.inner.lock().unwrap().slow(op, "loop", program, ns);
+            (self.inner.lock().unwrap()).slow(op, "loop", program, label, ns);
         }
     }
     /// The slow operations kept, newest first.
@@ -485,6 +494,9 @@ impl Counters {
                     "kind": slow.kind, "ms": slow.ns / 1_000_000});
                 if let Some(program) = &slow.program {
                     row["program"] = program.as_str().into();
+                }
+                if let Some(label) = &slow.label {
+                    row["label"] = label.as_str().into();
                 }
                 row
             })
@@ -511,7 +523,7 @@ impl Counters {
                 residence,
                 job.storage_error,
             );
-            inner.slow(job.label, "store", None, ran_ns);
+            inner.slow(job.label, "store", None, None, ran_ns);
         }
         if let Some(commit_ns) = commit_ns {
             inner
@@ -519,7 +531,7 @@ impl Counters {
                 .entry("commit")
                 .or_default()
                 .add(0, commit_ns, commit_ns, false);
-            inner.slow("commit", "store", None, commit_ns);
+            inner.slow("commit", "store", None, None, commit_ns);
         }
         let groups = &mut inner.groups;
         groups.count += 1;

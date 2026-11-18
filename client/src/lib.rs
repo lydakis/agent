@@ -130,8 +130,21 @@ static PROGRAM: std::sync::OnceLock<&'static str> = std::sync::OnceLock::new();
 pub fn name_program(program: &'static str) {
     let _ = PROGRAM.set(program);
 }
+static LABEL: std::sync::OnceLock<String> = std::sync::OnceLock::new();
 /// The id of a connection's `hello`, whose answer no one waits for.
 const HELLO: u64 = u64::MAX;
+/// The `hello` naming this process's connections, once it has a program:
+/// with its label once [`Client::label`] gave one.
+fn hello() -> Option<Vec<u8>> {
+    let program = PROGRAM.get()?;
+    let mut hello = json!({"id": HELLO, "op": "hello", "program": program});
+    if let Some(label) = LABEL.get() {
+        hello["label"] = json!(label);
+    }
+    let mut line = hello.to_string().into_bytes();
+    line.push(b'\n');
+    Some(line)
+}
 /// How long the daemon holds a turn on a cause a person can fix before it
 /// fails with it, for a bot that sets no `hold_ms`: five days, as mail is
 /// retried (RFC 5321 suggests four to five) before it is returned.
@@ -395,12 +408,9 @@ impl Client {
         }
         // Named before its first request, unanswered: the reader drops the
         // reply, as no request waits under its id.
-        if let Some(program) = PROGRAM.get() {
-            let hello = json!({"id": HELLO, "op": "hello", "program": program});
-            let mut line = hello.to_string();
-            line.push('\n');
+        if let Some(line) = hello() {
             write
-                .write_all(line.as_bytes())
+                .write_all(&line)
                 .await
                 .map_err(|_| Error::new("daemon_disconnected"))?;
         }
@@ -498,6 +508,28 @@ impl Client {
     /// waiting on the notifications sees them close.
     pub async fn close(&self) {
         let _ = self.writer.lock().await.shutdown().await;
+    }
+
+    /// Say which one of its program this process is, such as the agent a
+    /// window shows, on this connection now and on each one it makes
+    /// later, so the daemon's `stats` tells its connections from others
+    /// of the program. The first label given stays. Unanswered, as the
+    /// first `hello` is; nothing is said for a process with no program.
+    pub async fn label(&self, label: &str) -> Result<()> {
+        let _ = LABEL.set(label.to_owned());
+        let Some(line) = hello() else { return Ok(()) };
+        let mut writer = self.writer.lock().await;
+        if self.closed.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(Error::new("daemon_disconnected"));
+        }
+        let mut frame = FrameWrite {
+            fd: writer.as_ref().as_raw_fd(),
+            closed: &self.closed,
+            complete: false,
+        };
+        writer.write_all(&line).await?;
+        frame.complete = true;
+        Ok(())
     }
 
     /// The lineage of the daemon's store, which a client keeps to know the
