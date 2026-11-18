@@ -4963,6 +4963,7 @@ impl Database {
     /// read from an index of only them; `created_by` keeps those the bot
     /// with that id made, read from an index by maker, so a page costs that
     /// bot's own children whatever else the store holds.
+    #[allow(clippy::too_many_arguments)]
     pub fn list(
         &self,
         after: Option<&str>,
