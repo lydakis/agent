@@ -5290,6 +5290,10 @@ struct App {
     reaching: Option<tokio::sync::oneshot::Receiver<Option<approvals::Reach>>>,
     /// The model and effort picked, set once no turn runs.
     switch: Option<(String, Option<String>)>,
+    /// The model and speed sent and not answered yet: a pick compares
+    /// with them, not with what the bot ran before.
+    switch_sent: Option<(String, Option<String>)>,
+    pace_sent: Option<&'static str>,
     /// The prompt-cache lifetime a bot made before Sonny gave its model
     /// one takes, set once no turn runs.
     cache: Option<&'static str>,
@@ -6416,6 +6420,11 @@ impl Fleet {
             self.unread.extend(raised);
         }
         for (bot, seen) in read.scanned {
+            // An event since left its questions unsure: what was read is
+            // older than that, and the turn's end reads them again.
+            if self.needs.unsure(&bot) {
+                continue;
+            }
             let ask = self.open_ask(&bot, seen);
             self.needs.asked(&bot, ask);
             self.scanned.remove(&bot);
@@ -7169,6 +7178,8 @@ impl App {
             making: None,
             send_after: None,
             switch: None,
+            switch_sent: None,
+            pace_sent: None,
             cache: None,
             pace: None,
             tools: record["tools"]
@@ -7435,7 +7446,9 @@ impl App {
                         held = self.wheel_burst(&mut keys, chat).await;
                     }
                 }
-                event = events.recv(), if self.down.is_none() && !self.cut => {
+                // Taken only as fast as they are heard: the rest wait in
+                // the connection's own bounded queue.
+                event = events.recv(), if self.down.is_none() && !self.cut && self.unheard.len() < HEARD_AT_ONCE => {
                     changed = true;
                     heard = Instant::now();
                     match event {
@@ -7996,6 +8009,14 @@ impl App {
         let (text, switch, gating) = (self.instruct.take(), self.switch.take(), self.gating.take());
         let cache = self.cache.take();
         let pace = self.pace.take();
+        // What was sent is what a pick made before the daemon answers
+        // compares with.
+        if switch.is_some() {
+            self.switch_sent = switch.clone();
+        }
+        if pace.is_some() {
+            self.pace_sent = pace;
+        }
         let env = self.env.take();
         let mut declare = self.declare.take();
         // A bot that went without the tools Sonny gates, as its gate was
@@ -8109,6 +8130,12 @@ impl App {
             env,
             let_go,
         } = picked;
+        if self.switch_sent.is_some() && self.switch_sent == switch {
+            self.switch_sent = None;
+        }
+        if self.pace_sent.is_some() && self.pace_sent == pace {
+            self.pace_sent = None;
+        }
         // Not taken: what the switch let go is the window's again, unless
         // picked anew meanwhile.
         if taken.is_err() {
@@ -16264,7 +16291,7 @@ impl App {
                                 .filter(|speed| speeds.contains(speed))
                                 .unwrap_or("standard");
                             self.picker = None;
-                            let now = (self.pace).unwrap_or(
+                            let now = (self.pace).or(self.pace_sent).unwrap_or(
                                 self.speed.as_deref().map_or("standard", |now| {
                                     SPEEDS.into_iter().find(|s| *s == now).unwrap_or("standard")
                                 }),
@@ -16272,7 +16299,8 @@ impl App {
                             if speed != now {
                                 self.pace = Some(speed);
                             }
-                            let model = (self.switch.as_ref().map(|(m, e)| (m.clone(), e.clone())))
+                            let model = (self.switch.as_ref().or(self.switch_sent.as_ref()))
+                                .map(|(m, e)| (m.clone(), e.clone()))
                                 .unwrap_or((self.model.clone(), self.effort.clone()));
                             if chosen != model {
                                 self.switch = Some(chosen);
