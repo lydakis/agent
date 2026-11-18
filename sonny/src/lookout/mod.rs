@@ -1019,6 +1019,10 @@ impl Service {
         if complete && self.unheld(listed_at) {
             self.subscribers = subs::all(&self.store).into_iter().collect();
         }
+        // And bots closed while it was away, or before it first watched.
+        if self.closed_unheard() {
+            self.subscribers = subs::all(&self.store).into_iter().collect();
+        }
         self.read_at.clear();
         subs::take(&mut self.read_at, &revisions, epoch_ms());
         subs::took(&self.store, &self.read_at);
@@ -1173,6 +1177,19 @@ impl Service {
                                 self.reread();
                             }
                         }
+                    }
+                    // Closed, it still is: what it held ends but what
+                    // outlives a close, only as news, as for a delete. A
+                    // close the replay tells ends it only if the listing
+                    // shows it closed still: one a turn opened again since
+                    // keeps what it holds now.
+                    if news
+                        && event["event"] == "closed"
+                        && let Some(name) = event["bot"].as_str()
+                        && (live || self.listed_closed(name))
+                        && self.closed(name)
+                    {
+                        self.reread();
                     }
                     let bot_id = (event["bot"].as_str())
                         .and_then(|bot| self.records.get(bot))
@@ -1700,6 +1717,44 @@ impl Service {
         any
     }
 
+    /// A bot was closed: the subscriptions it held end, but those that
+    /// outlive a close. Another's that watch it stay: it can be sent work
+    /// again. Whether any ended.
+    fn closed(&self, name: &str) -> bool {
+        if !self.subscribers.contains_key(name) {
+            return false;
+        }
+        let id = (self.records.get(name)).and_then(|record| record["bot_id"].as_i64());
+        let ended = subs::closed(&self.store, name, id);
+        let any = ended.as_ref().is_ok_and(|n| *n > 0) || ended.is_err();
+        if any {
+            self.write(
+                &json!({"at_ms": epoch_ms(), "lead": name, "ended": "all but what outlives a close",
+                "why": "its subscriber was closed", "error": ended.err()}),
+            );
+        }
+        any
+    }
+
+    /// Subscribers the listing shows closed, as after closes the lookout
+    /// was away for: what they held ends, as for one it hears closed.
+    /// Whether any did.
+    fn closed_unheard(&self) -> bool {
+        let mut any = false;
+        for name in self.subscribers.keys() {
+            if self.listed_closed(name) {
+                any |= self.closed(name);
+            }
+        }
+        any
+    }
+
+    /// Whether the listing shows `name` closed: none of its turns has
+    /// started since it was.
+    fn listed_closed(&self, name: &str) -> bool {
+        (self.records.get(name)).is_some_and(|bot| !bot["closed_ms"].is_null())
+    }
+
     /// Whether `event` ends a call of Sonny's that wrote files the lookout
     /// reads, a `follows` or `commons` call (posting
     /// subscribes), which the tool host answers. A turn that ends forgets the calls it left under way.
@@ -2013,14 +2068,15 @@ pub(crate) fn number(event: &Value) -> Option<i64> {
     event["turn"].as_i64().or_else(|| event["message"].as_i64())
 }
 
-/// The events a lookout reads, of every bot: what bots there are, how
-/// their messages go in line and are taken in or end there, how their
-/// turns end, the tools they call, and the calls that wait on the person.
+/// The events a lookout reads, of every bot: what bots there are and
+/// which are closed, how their messages go in line and are taken in or end
+/// there, how their turns end, the tools they call, and the calls that wait on the person.
 /// The text a model streams, most of all events, is no one's news here.
-const KINDS: [&str; 12] = [
+const KINDS: [&str; 13] = [
     "created",
     "forked",
     "deleted",
+    "closed",
     "accepted",
     "queued",
     "steered",
@@ -3779,6 +3835,7 @@ mod tests {
             until: None,
             runs: None,
             made: None,
+            outlives_close: false,
         }
     }
 
@@ -5421,6 +5478,87 @@ mod tests {
         let before = std::time::SystemTime::now() - Duration::from_secs(5);
         assert!(!service.unheld(before));
         assert_eq!(subs::read(&store, "shop.new").len(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_closed_bot_keeps_only_its_commons_follows_and_others_keep_watching_it() {
+        let dir = std::env::temp_dir().join(format!("sonny-closed-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = dir.join("state.sqlite");
+        let add = |subscriber: &str, owner: i64, sub: Value| {
+            subs::change(
+                &store,
+                subscriber,
+                Some(owner),
+                Some(&sub),
+                None,
+                &["ci".into(), "commons".into()],
+            )
+            .unwrap();
+        };
+        add(
+            "shop.fix",
+            2,
+            json!({"name": "mine", "agents": ["shop.lead"]}),
+        );
+        add("shop.fix", 2, json!({"name": "ci", "sources": ["ci"]}));
+        add(
+            "shop.fix",
+            2,
+            json!({"name": "both", "sources": ["ci", "commons:t2"]}),
+        );
+        // As posting in a commons thread subscribes it.
+        subs::ensure(&store, "shop.fix", subs::Sub::commons("t1", Some(2))).unwrap();
+        add(
+            "shop.fix",
+            2,
+            json!({"name": "threads", "sources": ["commons"]}),
+        );
+        add(
+            "shop.lead",
+            1,
+            json!({"name": "fix", "agents": ["shop.fix"]}),
+        );
+        let lead = json!({"name": "shop.lead", "bot_id": 1});
+        let fix = json!({"name": "shop.fix", "bot_id": 2});
+        let mut service = service(store.clone(), &[lead, fix]);
+        service.log = dir.join("state.sqlite.lookout.jsonl");
+        service.subscribers = subs::all(&store).into_iter().collect();
+        // A close the replay tells, of a bot the listing shows open, a
+        // turn having opened it again since, is not its to end.
+        assert!(!service.listed_closed("shop.fix"));
+        assert!(service.closed("shop.fix"));
+        let names = |subscriber: &str| -> Vec<String> {
+            (subs::read(&store, subscriber).into_iter())
+                .map(|s| s.name)
+                .collect()
+        };
+        // What posting in a thread subscribed outlives it; a follow of the
+        // commons it added itself does not.
+        assert_eq!(names("shop.fix"), ["commons.t1"]);
+        // It still is, and may be sent work again: who watches it still does.
+        assert_eq!(names("shop.lead"), ["fix"]);
+        // Closed again, nothing more ends.
+        service.subscribers = subs::all(&store).into_iter().collect();
+        assert!(!service.closed("shop.fix"));
+        // One with no follows of its own ends nothing.
+        assert!(!service.closed("shop.docs"));
+        // Closed while the lookout was away, or before it first watched:
+        // the listing shows it closed still.
+        service.subscribers = subs::all(&store).into_iter().collect();
+        assert!(!service.closed_unheard());
+        assert_eq!(names("shop.lead"), ["fix"]);
+        (service.records).insert(
+            "shop.lead".into(),
+            json!({"name": "shop.lead", "bot_id": 1, "closed_ms": 1_000}),
+        );
+        assert!(service.listed_closed("shop.lead"));
+        assert!(service.closed_unheard());
+        assert!(names("shop.lead").is_empty());
+        let log = std::fs::read_to_string(&service.log).unwrap();
+        assert!(log.contains("its subscriber was closed"), "{log}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
