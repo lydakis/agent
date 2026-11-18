@@ -357,9 +357,15 @@ reports beside them, with `waited_ms` and a `waited` histogram, how long
 each request waited for the loop from its line's read to its dispatch.
 One map entry per op the daemon has seen, touched only by the loop, so no
 lock. `loop` reports the same holds for the loop's own work between
-requests: `reap` (a turn's task ended), `start_ready`, `resume`, `wake`,
-`admission` (a queued admission answered), `lapse`, `holds`, `expire` and
-`reload`. `programs` splits the requests by the program each session
+requests: `reap` (a turn's task ended), `start_ready`, `claimed` (a
+parked turn's claim landed and its turn started), `resume` (the loop
+waiting for claims on their way to land before work that looks at running
+turns), `admission` (a queued admission answered), `lapse`, `holds`,
+`expire` and `reload`. `writes` and `claims` count the clients' writes and
+the parked turns' claims that landed (`landed`), and how long they waited
+after landing for the loop to take them up, behind an older one still on
+its way or the loop's other work: `behind_ms` in all and `behind_most_ms`
+at most. `programs` splits the requests by the program each session
 named in its first line, `{"op":"hello","program":NAME}` (1 to 32 of
 `a-z`, `0-9` and `_`; a client library sends it unanswered, under an id no
 request takes): each program's `count`, `held_ms`, `waited_ms`, and the
@@ -1668,7 +1674,7 @@ row never rewrites them; schema 107 moves them there. With `bot_id`,
 a bot that no longer holds that identity is `bot_not_found`, as on `submit`. Concurrent
 creations before an already-consumed cursor require restarting the listing.
 `agent ls` reads pages incrementally while preserving its JSON-array output.
-Protocol 88 lets `bots` take `names`, 1 to 256 names of up to 128 bytes,
+Protocol 90 lets `bots` take `names`, 1 to 256 names of up to 128 bytes,
 listing only those (with `name`, those the pattern matches too), in name
 order and paged as before; a name not there is not listed. It is the read
 after a watch: Sonny's window lists its project once, with the page's
@@ -2975,6 +2981,30 @@ it starts, from a message sent later or one already in line, opens it
 again. Both arrive in protocol version 84 (the `close` request, the
 `bots` request's `open` filter); a store from before schema 105 gives the
 two to every bot that has `send_message`.
+
+Protocol 89 lets `close` take the selector `messages` and `follow` take,
+as Kubernetes deletes a collection by the selector it lists by: `bot` is a
+name, or a GLOB pattern naming every open bot it matches (a page in name
+order, `after` and `limit` as `bots` pages, 64 by default, at most 256,
+with `next_after`), with `no_turn_since_ms` only those running no turn
+whose last turn ended before then, or that never ran one; or `names`, 1 to
+256 names. It answers `{closed, refused, next_after}`: each closed bot with
+`bot_id`, `was_open`, `closed_ms` (kept first, as before), the
+`running_turn` it was marked in, and `stopped_turn` when the daemon
+stopped that turn, as `interrupt` stops one, so every client that closes
+stops what it runs, where only the tool did (a stop that failed, leaving
+the turn parked, is `stop_failed` with the `turn`, `error` and why, and
+one name alone is refused with that error); each refused one with
+`error` (`bot_not_found`, `not_permitted`) and why. Each bot is checked by
+the rule a single name always met: a bot's own socket closes the bots it
+made, and itself only when named alone, whose own turn runs on; a person's
+connections close any. One name alone is refused outright, as before; a
+selector lists its refusals and closes the rest, in one store job. History
+is never touched. `agent close --bot NAME|GLOB [--no-turn-since DURATION]`
+or `agent close NAME...` pages through and prints `{closed, refused}`,
+exiting 1 when any was refused or its stop failed, and `close_agent` takes `name`, `names`,
+`no_turn_since_ms`, `after` and `limit` and answers the same; it closes
+what its agent made, as Codex's does, never the agent itself.
 
 `shell` runs a noninteractive command with `/bin/bash -c` (`/bin/sh` where
 bash is not installed) in the bot workspace, or in `workdir` when the call

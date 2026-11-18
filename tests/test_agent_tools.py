@@ -261,8 +261,8 @@ class AgentToolsTests(ModelFixture):
                        ('close_agent', {'name': 'shop.fix'}),
                        ('list_agents', {}),
                        ('list_agents', {'closed': True}))
-        closed = json.loads(self.output(client, 'shop.lead', 'close_agent-1'))
-        self.assertEqual((closed['name'], closed['was_open']), ('shop.fix', True), closed)
+        closed = json.loads(self.output(client, 'shop.lead', 'close_agent-1'))['closed'][0]
+        self.assertEqual((closed['bot'], closed['was_open']), ('shop.fix', True), closed)
         self.assertNotIn('stopped_turn', closed)
         own = json.loads(self.output(client, 'shop.lead', 'list_agents-2'))
         self.assertEqual([a['name'] for a in own['bots']], ['shop.lead'])
@@ -285,10 +285,40 @@ class AgentToolsTests(ModelFixture):
         self.run_calls(client, 'shop.lead', 'go',
                        ('close_agent', {'name': 'shop.fix'}),
                        ('close_agent', {'name': 'shop.other'}))
-        closed = json.loads(self.output(client, 'shop.lead', 'close_agent-1'))
+        closed = json.loads(self.output(client, 'shop.lead', 'close_agent-1'))['closed'][0]
         self.assertEqual(closed['stopped_turn'], busy, closed)
         self.assertEqual(client.finished(busy)['data']['status'], 'interrupted')
         self.assertTrue(client.request('inspect', bot='shop.fix')['result']['closed_ms'])
         refused = self.output(client, 'shop.lead', 'close_agent-2')
         self.assertIn('not_permitted', refused)
         self.assertNotIn('closed_ms', client.request('inspect', bot='shop.other')['result'])
+
+    def test_a_pattern_closes_the_quiet_agents_the_caller_made_and_refuses_the_rest(self):
+        client = self.client(TOOLS)
+        lead = client.request('create', bot='shop.lead', workspace=str(self.path))['result']
+        for name in ('shop.fix', 'shop.look', 'shop.busy'):
+            client.request('create', bot=name, workspace=str(self.path),
+                           created_by='shop.lead', created_by_id=lead['bot_id'])
+        client.request('create', bot='shop.other', workspace=str(self.path))
+        busy = client.request('submit', bot='shop.busy', request_id='busy', prompt='wait')['result']['message']
+        self.model.requests.get(timeout=3)
+        self.run_calls(client, 'shop.lead', 'go',
+                       ('close_agent', {'name': 'shop.*', 'no_turn_since_ms': int(time.time() * 1000) + 60_000}),
+                       ('close_agent', {'names': ['shop.busy', 'shop.gone']}),
+                       ('close_agent', {'names': ['shop.lead']}))
+        answer = json.loads(self.output(client, 'shop.lead', 'close_agent-1'))
+        # The running one and the lead, whose turn asks, have a turn now.
+        self.assertEqual([c['bot'] for c in answer['closed']], ['shop.fix', 'shop.look'], answer)
+        self.assertEqual([(r['bot'], r['error']) for r in answer['refused']],
+                         [('shop.other', 'not_permitted')], answer)
+        named = json.loads(self.output(client, 'shop.lead', 'close_agent-2'))
+        self.assertEqual(named['closed'][0]['stopped_turn'], busy, named)
+        self.assertEqual(named['refused'], [{'bot': 'shop.gone', 'error': 'bot_not_found'}])
+        self.assertEqual(client.finished(busy)['data']['status'], 'interrupted')
+        self.assertNotIn('closed_ms', client.request('inspect', bot='shop.other')['result'])
+        # The tool never closes its own agent, named alone or in a list.
+        self.assertIn('not_permitted', self.output(client, 'shop.lead', 'close_agent-3'))
+        self.assertNotIn('closed_ms', client.request('inspect', bot='shop.lead')['result'])
+        # `*` is a pattern: a person's connection closes every open bot.
+        every = client.request('close', bot='*')['result']
+        self.assertEqual([c['bot'] for c in every['closed']], ['shop.lead', 'shop.other'], every)

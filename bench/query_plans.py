@@ -33,6 +33,7 @@ OPTIONAL = {'{glob}': ('', " AND t.bot GLOB ?3 AND t.bot >= ?4 AND t.bot < ?4 ||
                            "UNION ALL SELECT id FROM messages WHERE bot=?1 AND status='ready')"),
             '{bots}': ('m.bot=?1', 'm.bot GLOB ?1'),
             '{kinds}': ('', ' AND m.from_bot IS NULL AND m.origin IS NULL', ' AND m.from_bot IS NOT NULL'),
+            '{quiet}': ('', ' AND running_turn IS NULL AND COALESCE(last_finished_ms,last_started_ms,-1) < ?5'),
             '{text}': ('',),
             '{text_node}': ('',)}
 

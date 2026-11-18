@@ -121,6 +121,7 @@ fn next_id() -> u32 {
 
 /// A picture ready to show: its PNG, the cells it fills, and whether it
 /// was cut short.
+#[derive(Clone)]
 pub struct Drawn {
     pub png: Vec<u8>,
     pub cols: u32,

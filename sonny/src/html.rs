@@ -75,8 +75,16 @@ fn root() -> bool {
     unsafe { libc::geteuid() == 0 }
 }
 
+/// The browser a test draws its pages with, in place of any here.
+#[cfg(test)]
+pub static STAND_IN: std::sync::Mutex<Option<PathBuf>> = std::sync::Mutex::new(None);
+
 /// A Chromium-based browser: `SONNY_CHROME`, the usual apps, then PATH.
 fn chrome() -> Option<PathBuf> {
+    #[cfg(test)]
+    if let Some(bin) = STAND_IN.lock().unwrap().clone() {
+        return Some(bin);
+    }
     if let Some(bin) = std::env::var_os("SONNY_CHROME") {
         return Some(PathBuf::from(bin));
     }

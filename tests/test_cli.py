@@ -751,7 +751,7 @@ class SocketAndCliTests(ModelFixture):
 
     def test_help_and_invalid_flags_do_not_start_a_daemon(self):
         for args in [('--help',), ('-h',), ('help', 'run')]+[(c, '--help') for c in
-                ('run', 'follow', 'fork', 'interrupt', 'ls', 'inspect', 'turns', 'wait', 'rm', 'prune', 'models', 'stats', 'shutdown', 'serve')]:
+                ('run', 'follow', 'fork', 'interrupt', 'ls', 'inspect', 'turns', 'wait', 'rm', 'close', 'prune', 'models', 'stats', 'shutdown', 'serve')]:
             with self.subTest(args=args):
                 result = self.agent(*args)
                 self.assertIn('Usage:', result.stdout)
@@ -882,6 +882,30 @@ class SocketAndCliTests(ModelFixture):
         self.assertEqual(freed['turns'], 3)
         self.assertNotIn('Bob', self.agent('ls', '--store', str(self.store), '--pretty').stdout)
         self.assertIn('bot_not_found', self.agent('rm', '--store', str(self.store), '--bot', 'Bob', check=False).stderr)
+
+    def test_close_takes_names_or_a_pattern_of_quiet_bots_and_keeps_their_history(self):
+        for name in ('shop.fix', 'shop.look', 'web.lead'):
+            self.agent('run', *self.common, '--new', '--bot', name, 'hi')
+        store = ['--store', str(self.store)]
+        # A pattern with no turn for an hour: none yet, all ran just now.
+        quiet = json.loads(self.agent('close', *store, '--bot', 'shop.*', '--no-turn-since', '1h').stdout)
+        self.assertEqual(quiet, {'closed': [], 'refused': []})
+        # No turn in the last moment: both of the project's, page by page.
+        closed = json.loads(self.agent('close', *store, '--bot', 'shop.*', '--no-turn-since', '1ms').stdout)
+        self.assertEqual([c['bot'] for c in closed['closed']], ['shop.fix', 'shop.look'], closed)
+        self.assertTrue(all(c['was_open'] for c in closed['closed']))
+        # By name: one closed already keeps its time; one not there is refused, exit 1.
+        named = self.agent('close', *store, 'shop.fix', 'gone', check=False)
+        self.assertEqual(named.returncode, 1, named.stderr)
+        named = json.loads(named.stdout)
+        self.assertEqual(named['closed'][0]['closed_ms'], closed['closed'][0]['closed_ms'])
+        self.assertEqual(named['refused'], [{'bot': 'gone', 'error': 'bot_not_found'}])
+        self.assertIn('usage', self.agent('close', *store, '--bot', 'web.lead', 'shop.fix', check=False).stderr)
+        inspect = lambda bot: json.loads(self.agent('inspect', *store, '--bot', bot).stdout)
+        self.assertTrue(inspect('shop.fix')['closed_ms'])
+        self.assertNotIn('closed_ms', inspect('web.lead'))
+        # Its history stays whole.
+        self.assertEqual(len(json.loads(self.agent('turns', *store, '--bot', 'shop.fix').stdout)), 1)
 
     def test_consecutive_submissions_preserve_live_completion_order(self):
         client = SocketClient(self.binary, self.store, self.url, 'echo')

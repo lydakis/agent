@@ -22805,6 +22805,110 @@ fn an_answered_call_s_end_is_told_once_its_group_commits() {
 }
 
 #[test]
+fn close_all_closes_names_or_a_patterns_quiet_bots_the_asker_made() {
+    use agent_runtime::store::Closing;
+    let mut db = Database::initialize(Connection::open_in_memory().unwrap()).unwrap();
+    let lead = db
+        .create("shop.lead", Some("/synthetic"), binding())
+        .unwrap()
+        .0;
+    for name in ["shop.fix", "shop.look", "shop.busy"] {
+        let made = Binding {
+            created_by: Some("shop.lead"),
+            created_by_id: Some(lead.bot_id),
+            ..binding()
+        };
+        db.create(name, Some("/synthetic"), made).unwrap();
+    }
+    db.create("shop.other", Some("/synthetic"), binding())
+        .unwrap();
+    let turn = |db: &mut Database, bot: &str, id: &str| {
+        db.begin(
+            bot,
+            id,
+            "work",
+            true,
+            &TurnOptions::default(),
+            allow_provider,
+        )
+        .unwrap()
+        .turn
+    };
+    let ran = turn(&mut db, "shop.look", "r1");
+    db.finish(ran, None).unwrap();
+    let busy = turn(&mut db, "shop.busy", "r1");
+    let bots = |answer: &Value, key: &str| -> Vec<String> {
+        answer[key]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|b| b["bot"].as_str().unwrap().to_owned())
+            .collect()
+    };
+    let pattern = |no_turn_since_ms, after, limit| Closing::Pattern {
+        pattern: "shop.*",
+        no_turn_since_ms,
+        after,
+        limit,
+    };
+    // No turn since long ago: only those that never ran, of the lead's, the
+    // lead itself left open, as a selector never closes the asker; the one
+    // it did not make refused.
+    let answer = db
+        .close_all(&pattern(Some(1), "", 64), Some(lead.bot_id), 1_000)
+        .unwrap();
+    assert_eq!(bots(&answer, "closed"), ["shop.fix"]);
+    assert_eq!(bots(&answer, "refused"), ["shop.lead", "shop.other"]);
+    assert_eq!(answer["refused"][1]["error"], "not_permitted");
+    assert_eq!(answer["closed"][0]["was_open"], true);
+    assert!(answer["next_after"].is_null());
+    // No turn since now: the one whose turn ended too, never the one
+    // running; a page at a time, closed bots no longer matched.
+    let now = i64::MAX;
+    let first = db
+        .close_all(&pattern(Some(now), "", 1), None, 2_000)
+        .unwrap();
+    assert_eq!(bots(&first, "closed"), ["shop.lead"]);
+    assert_eq!(first["next_after"], "shop.lead");
+    let rest = db
+        .close_all(&pattern(Some(now), "shop.lead", 64), None, 2_000)
+        .unwrap();
+    assert_eq!(bots(&rest, "closed"), ["shop.look", "shop.other"]);
+    assert!(rest["next_after"].is_null());
+    // By name: a running one is closed and names its turn; one closed
+    // already keeps its time; one not there is refused.
+    let names = ["shop.busy", "shop.fix", "shop.gone"].map(str::to_owned);
+    let answer = db
+        .close_all(&Closing::Names(&names), Some(lead.bot_id), 3_000)
+        .unwrap();
+    assert_eq!(bots(&answer, "closed"), ["shop.busy", "shop.fix"]);
+    assert_eq!(answer["closed"][0]["running_turn"], busy);
+    assert_eq!(answer["closed"][1]["was_open"], false);
+    assert_eq!(answer["closed"][1]["closed_ms"], 1_000);
+    assert_eq!(
+        answer["refused"],
+        json!([{"bot": "shop.gone", "error": "bot_not_found"}])
+    );
+    // A bot closes itself only by its name alone.
+    let me = ["shop.lead".to_owned()];
+    assert_eq!(
+        bots(
+            &db.close_all(&Closing::Names(&me), Some(lead.bot_id), 4_000)
+                .unwrap(),
+            "closed"
+        ),
+        ["shop.lead"]
+    );
+    assert_eq!(
+        db.close_all(&Closing::Names(&[]), None, 4_000)
+            .unwrap_err()
+            .code,
+        "invalid_bot_filter"
+    );
+    db.finish(busy, None).unwrap();
+}
+
+#[test]
 fn a_closed_bot_is_listed_only_when_asked_until_a_turn_of_its_starts() {
     let mut db = Database::initialize(Connection::open_in_memory().unwrap()).unwrap();
     for name in ["shop.lead", "shop.fix", "shop.look"] {

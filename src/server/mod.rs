@@ -405,14 +405,27 @@ enum Command {
         /// An idempotency key, as on `create`.
         request_id: Option<String>,
     },
-    /// Close a bot, done with: it is listed only when closed bots are
-    /// asked for, its history kept whole, until a turn of its starts. Only
-    /// the mark: a turn it is running runs on unless interrupted, and the
-    /// answer names that turn, read as the mark is made.
+    /// Close bots, done with: each is listed only when closed bots are
+    /// asked for, its history kept whole, until a turn of its starts, and a
+    /// turn it was running as it was marked is stopped. One bot by name,
+    /// several by `names`, or the open bots a GLOB pattern in `bot` names,
+    /// with `no_turn_since_ms` only those running no turn and with none
+    /// since, paged by `after` and `limit` as `bots` pages. A bot's own
+    /// socket closes only itself and the bots it made; the rest are refused.
     Close {
-        bot: String,
-        /// The identity `bot` must hold; another is `bot_not_found`.
+        bot: Option<String>,
+        /// The identity `bot`, a name, must hold; another is `bot_not_found`.
         bot_id: Option<i64>,
+        names: Option<Vec<String>>,
+        /// Unix ms: of the pattern's bots, only those whose last turn ended
+        /// before it, or that never ran one.
+        no_turn_since_ms: Option<i64>,
+        after: Option<String>,
+        limit: Option<usize>,
+        /// The bot whose socket asks, set by the daemon; a person's
+        /// connection closes any bot.
+        #[serde(skip)]
+        by: Option<i64>,
     },
     /// Remove an idle bot and everything only it owns.
     Delete {
@@ -1127,6 +1140,32 @@ impl Command {
                 | Command::StepResult { .. }
         )
     }
+    /// The bots whose running turns this request may look at, while
+    /// parked turns' claims are on their way: a read, a recorded write or
+    /// a `wait` looks at none, a request for one bot at that bot's, and
+    /// one that ends or holds turns, or names no one bot, at any (`None`).
+    /// A claim on its way for a bot it looks at lands first, so it finds
+    /// the claimed turn running, as when each claim was awaited in turn.
+    fn turns_seen(&self) -> Option<Vec<&str>> {
+        if self.observes() || self.records() || matches!(self, Command::Wait { .. }) {
+            return Some(Vec::new());
+        }
+        if self.ends_turns() {
+            return None;
+        }
+        match self {
+            Command::Fork { source, bot, .. } => Some(vec![source, bot]),
+            Command::Create { bot, .. }
+            | Command::Lend { bot, .. }
+            | Command::Compact { bot, .. }
+            | Command::Submit { bot, .. }
+            | Command::Follow { bot, .. }
+            | Command::Artifact { bot, .. }
+            | Command::RunStep { bot, .. }
+            | Command::ProcessOutput { bot, .. } => Some(vec![bot]),
+            _ => None,
+        }
+    }
     /// It ends or holds turns, or stops a call: the clients' writes on their way land first,
     /// as they did when each was awaited in turn, so none lets its client
     /// start work after it.
@@ -1557,6 +1596,15 @@ struct Stepping {
     /// coordinator, which runs it or answers.
     daemon: Option<(i64, Box<str>)>,
 }
+/// What a parked turn's claim found: it runs (with what it waited for,
+/// and whether a steer waits and lifts its call), waits again (until its
+/// next lapse, if any), or is no longer parked.
+enum Claim {
+    Run(Box<Waiting>, bool, bool),
+    Later(Option<u64>),
+    Stale,
+}
+
 /// Clients' writes on their way to the store, and what keeps a step put
 /// to its gates from missing a decision made before its write lands.
 #[derive(Default)]
@@ -1907,6 +1955,9 @@ struct Service {
     stepping: HashMap<i64, Stepping>,
     /// Clients' writes on their way to the store, answered as they land.
     writing: Writing,
+    /// Parked turns' claims on their way to the store, each turn started
+    /// as its claim lands, in the order claimed.
+    claims: writes::Ordered<(String, i64, bool), Result<Claim>>,
     /// Checks of waiting steps with the store.
     step_checks: JoinSet<Vec<(i64, Result<Stepped>)>>,
     /// Daemon steps, from their asking to their reply.
@@ -2785,6 +2836,7 @@ pub async fn run(config: Configuration) -> Result<()> {
         store,
         stepping: HashMap::new(),
         writing: Writing::default(),
+        claims: writes::Ordered::default(),
         lent: HashMap::new(),
         step_checks: JoinSet::new(),
         steps: Default::default(),
@@ -2920,7 +2972,7 @@ pub async fn run(config: Configuration) -> Result<()> {
             Vec<std::sync::Weak<agent_runtime::provider::pace::Pace>>,
         >::new();
         loop {
-            if service.draining() && service.active.is_empty() {
+            if service.draining() && service.active.is_empty() && service.claims.is_empty() {
                 break;
             }
             // Computed before the select so its arms borrow the service freely.
@@ -2958,6 +3010,7 @@ pub async fn run(config: Configuration) -> Result<()> {
                 _ = service.tails.running.join_next(), if !service.tails.running.is_empty() => {}
                 joined = service.jobs.join_next(), if !service.jobs.is_empty() => {
                     let (bot, turn, task, exit) = joined.unwrap().map_err(|_| Error::new("turn_task_failed"))?;
+                    service.claims_landed().await?;
                     let chore = std::time::Instant::now();
                     service.complete(bot, turn, task, exit).await?;
                     service.chores.count("reap", chore);
@@ -2973,14 +3026,17 @@ pub async fn run(config: Configuration) -> Result<()> {
                     // the next start.
                     let running = service.store.op("running_processes", |db| db.running_processes()).await?;
                     let clients = sessions.keys().any(|id| !companion_sessions.contains(id));
-                    if !clients && service.active.is_empty() && service.admissions.is_empty() && running == 0 && service.tails.running.is_empty() {
+                    if !clients && service.active.is_empty() && service.claims.is_empty() && service.admissions.is_empty() && running == 0 && service.tails.running.is_empty() {
                         if last_activity.elapsed() >= idle_exit.unwrap() { break; }
                     } else {
                         last_activity = std::time::Instant::now();
                     }
                 }
                 Some(woken) = pool_wakes.recv() => match woken {
-                    agent_runtime::provider::pace::Woken::Turn(bot, turn) => service.pool_wake(bot, turn),
+                    agent_runtime::provider::pace::Woken::Turn(bot, turn) => {
+                        service.land_claims_of(&[&bot]).await?;
+                        service.pool_wake(bot, turn);
+                    }
                     agent_runtime::provider::pace::Woken::Lapse(at, pace) => ramp_lapses.entry(at).or_default().push(pace),
                 },
                 _ = tokio::time::sleep_until(ramp_lapse.unwrap_or_else(tokio::time::Instant::now)), if ramp_lapse.is_some() => {
@@ -2988,10 +3044,15 @@ pub async fn run(config: Configuration) -> Result<()> {
                         pools.iter().filter_map(std::sync::Weak::upgrade).for_each(|pace| pace.lapse());
                     }
                 }
+                // A parked turn goes on: its claim goes to the store, and the
+                // turn starts once it lands.
                 Some((bot, turn)) = resumes.recv(), if service.has_capacity() => {
+                    service.claim(bot, turn, false);
+                }
+                Some(((bot, turn, due), done)) = service.claims.next(), if !service.claims.is_empty() => {
                     let chore = std::time::Instant::now();
-                    service.resume(bot, turn, false).await?;
-                    service.chores.count("resume", chore);
+                    service.claimed(bot, turn, due, done)?;
+                    service.chores.count("claimed", chore);
                 }
                 // One queued turn per iteration, so requests interleave with a
                 // long backlog; resumes hold no slot and are not starved because
@@ -3011,6 +3072,7 @@ pub async fn run(config: Configuration) -> Result<()> {
                 // Idle bots whose time ran out are deleted, here and not on a
                 // client's request, so a client that stopped leaves none.
                 _ = tokio::time::sleep_until(expiry.unwrap_or_else(tokio::time::Instant::now)), if expiry.is_some() && !service.draining() => {
+                    service.land_claims().await?;
                     let chore = std::time::Instant::now();
                     service.expire().await?;
                     service.chores.count("expire", chore);
@@ -3020,6 +3082,7 @@ pub async fn run(config: Configuration) -> Result<()> {
                 _ = tokio::time::sleep_until(lapses.unwrap_or_else(tokio::time::Instant::now)), if lapses.is_some() && !service.draining() => {
                     // A store refusing writes leaves them attached and due,
                     // looked at again after a backoff, as ready turns are.
+                    service.land_claims().await?;
                     let chore = std::time::Instant::now();
                     match service.lapse().await {
                         Err(error) if error.code == "storage_error" => {
@@ -3032,6 +3095,7 @@ pub async fn run(config: Configuration) -> Result<()> {
                 }
                 // Turns held in line on a cause are tried again.
                 _ = tokio::time::sleep_until(holds.unwrap_or_else(tokio::time::Instant::now)), if holds.is_some() && !service.draining() => {
+                    service.land_claims().await?;
                     let chore = std::time::Instant::now();
                     match service.holds_due().await {
                         Err(error) if error.code == "storage_error" => {
@@ -3048,9 +3112,7 @@ pub async fn run(config: Configuration) -> Result<()> {
                 // reused) is dropped.
                 _ = tokio::time::sleep(wake_delay), if wake_due && service.has_capacity() => {
                     if let Some((bot, turn, due)) = service.wakes.pop() {
-                        let chore = std::time::Instant::now();
-                        service.resume(bot, turn, due).await?;
-                        service.chores.count("wake", chore);
+                        service.claim(bot, turn, due);
                     }
                 }
                 // A wait's deadline, or a step answered, ended or lapsing:
@@ -3079,6 +3141,8 @@ pub async fn run(config: Configuration) -> Result<()> {
                 }
                 // Queued admissions are answered as their commits land, in order.
                 _ = arrived(&mut service.admissions), if !service.admissions.is_empty() => {
+                    // The claims queued before its commit have landed too.
+                    service.claims_landed().await?;
                     let chore = std::time::Instant::now();
                     let (session, output, id, result) = service.settled();
                     reply(&mut service, &mut sessions, stdio_owner, session, &output, id, result).await?;
@@ -3140,6 +3204,13 @@ pub async fn run(config: Configuration) -> Result<()> {
                         // up, or a write's once it lands.
                         Inbound::Request(id, request, credit, read) => {
                             let Some(output) = sessions.get(&id).cloned() else { continue };
+                            // A request that may look at a running turn finds
+                            // it running if its claim is on its way.
+                            service.claims_landed().await?;
+                            match request.as_ref().map(|r| r.command.turns_seen()) {
+                                Ok(Some(bots)) => service.land_claims_of(&bots).await?,
+                                _ => service.land_claims().await?,
+                            }
                             // A bad id is refused like a malformed line, after the
                             // admissions queued before it.
                             let request = request.and_then(|request| match &request.id {
@@ -3163,7 +3234,10 @@ pub async fn run(config: Configuration) -> Result<()> {
                             let settling = std::time::Instant::now();
                             let mut settled = false;
                             while service.must_settle(request.as_ref().ok().map(|r| &r.command), id, &output, bound) {
-                                let (session, output, id, result) = service.settle().await;
+                                arrived(&mut service.admissions).await;
+                                // The claims queued before its commit have landed too.
+                                service.claims_landed().await?;
+                                let (session, output, id, result) = service.settled();
                                 reply(&mut service, &mut sessions, stdio_owner, session, &output, id, result).await?;
                                 settled = true;
                             }
@@ -3294,6 +3368,10 @@ pub async fn run(config: Configuration) -> Result<()> {
     // explicit pruning can be reissued. Await drops before joining stdout.
     service.retention.abort_all();
     while service.retention.join_next().await.is_some() {}
+    // Claims on their way land first, as when each was awaited in turn:
+    // their turns are stopped below like any other.
+    let landed = service.land_claims().await;
+    let served = served.and(landed);
     answer_queued(&mut service, &mut sessions, stdio_owner).await;
     // Stopping, however it was asked: a write landing now starts nothing.
     (service.draining).store(true, std::sync::atomic::Ordering::Relaxed);
@@ -3801,8 +3879,9 @@ impl Service {
                     }
                 }
             }
+            // Each bot a selector names is checked as it is closed.
+            Command::Close { by, .. } => *by = Some(me.bot_id),
             Command::Delete { bot, .. }
-            | Command::Close { bot, .. }
             | Command::Prune { bot, .. }
             | Command::Compact { bot, .. }
             | Command::Interrupt { bot, .. }
@@ -3858,7 +3937,8 @@ impl Service {
     }
     fn has_capacity(&self) -> bool {
         self.held().is_none()
-            && (self.limit_active == 0 || self.active.holding() + self.reserved < self.limit_active)
+            && (self.limit_active == 0
+                || self.active.holding() + self.reserved + self.claims.len() < self.limit_active)
     }
 
     /// Why no turn may start, if none may: the daemon is shutting down or
@@ -3925,7 +4005,8 @@ impl Service {
                     || (self.held().is_none()
                         && self.limit_active != 0
                         && self.reserved > 0
-                        && self.active.holding() + self.reserved >= self.limit_active)
+                        && self.active.holding() + self.reserved + self.claims.len()
+                            >= self.limit_active)
             }
             // A read, or a wait, waits only for its own session's
             // admissions, to be answered after them. Another session's are
@@ -4542,38 +4623,47 @@ impl Service {
         }
     }
 
-    /// `due` marks a wake-up from the turn's own time rather than an
-    /// answer or a resolved handle.
-    async fn resume(&mut self, bot: String, turn: i64, due: bool) -> Result<()> {
+    /// Claim a parked turn to go on. `due` marks a wake-up from the turn's
+    /// own time rather than an answer or a resolved handle. The claim goes
+    /// to the store from its own task, holding a slot meanwhile
+    /// (`has_capacity`), and the turn starts once it lands (`claimed`), so
+    /// a slow commit holds the writer, not the loop.
+    fn claim(&mut self, bot: String, turn: i64, due: bool) {
         // A wake-up can outlive an interrupt, deletion, or reuse of the name,
         // and one turn can get several (a restart's check and an answer). The
         // job that checks its identity and state also claims it, so a later
         // wake-up finds it running and is dropped; the claim also drops the
         // turn's lapse, which would otherwise wait out the gate's expiry.
-        enum Claim {
-            Run(String, Box<Waiting>, bool, bool),
-            Later(String, Option<u64>),
-            Stale,
-        }
-        let name = bot.clone();
-        let claimed = match self
-            .store
-            .op("resume", move |db| match db.wake(&name, turn, due)? {
-                Wake::Resume => match db.resume(turn) {
-                    Ok((waiting, _, steers)) => {
-                        // A steer for the turn lifts what the rest of the
-                        // parked call's batch would block on.
-                        let joins = steers && db.joining_steer(&name)?;
-                        Ok(Claim::Run(name, Box::new(waiting), steers, joins))
-                    }
-                    Err(error) if error.code == "turn_not_waiting" => Ok(Claim::Stale),
-                    Err(error) => Err(error),
-                },
-                Wake::Later(at) => Ok(Claim::Later(name, at)),
-                Wake::Stale => Ok(Claim::Stale),
-            })
-            .await
-        {
+        let (store, name) = (self.store.clone(), bot.clone());
+        self.claims.push((bot, turn, due), async move {
+            store
+                .op("resume", move |db| match db.wake(&name, turn, due)? {
+                    Wake::Resume => match db.resume(turn) {
+                        Ok((waiting, _, steers)) => {
+                            // A steer for the turn lifts what the rest of the
+                            // parked call's batch would block on.
+                            let joins = steers && db.joining_steer(&name)?;
+                            Ok(Claim::Run(Box::new(waiting), steers, joins))
+                        }
+                        Err(error) if error.code == "turn_not_waiting" => Ok(Claim::Stale),
+                        Err(error) => Err(error),
+                    },
+                    Wake::Later(at) => Ok(Claim::Later(at)),
+                    Wake::Stale => Ok(Claim::Stale),
+                })
+                .await
+        });
+    }
+
+    /// A claim landed: its turn starts, or waits again.
+    fn claimed(
+        &mut self,
+        bot: String,
+        turn: i64,
+        due: bool,
+        done: Option<Result<Claim>>,
+    ) -> Result<()> {
+        let claimed = match done.ok_or_else(|| Error::new("resume_failed"))? {
             // A lost group (a full disk, say) leaves the turn parked: the
             // same wake-up comes due again after a backoff.
             Err(error) if error.code == "storage_error" => {
@@ -4585,16 +4675,64 @@ impl Service {
         };
         self.storage_backoff = Duration::ZERO;
         match claimed {
-            Claim::Run(bot, waiting, steers, joins) => {
+            Claim::Run(waiting, steers, joins) => {
                 self.wakes.cancel(turn);
                 self.spawn(bot, turn, Some(*waiting), steers, joins);
             }
             // Still parked: its next lapse may have moved, or gone.
-            Claim::Later(bot, Some(at)) => self.wakes.set(at, bot, turn),
-            Claim::Later(_, None) => self.wakes.cancel(turn),
+            Claim::Later(Some(at)) => self.wakes.set(at, bot, turn),
+            Claim::Later(None) => self.wakes.cancel(turn),
             Claim::Stale => {}
         }
         Ok(())
+    }
+
+    /// Start the turns whose claims already landed, oldest first, without
+    /// waiting for one on its way. What the store answered after them (an
+    /// admission, a turn's end, the next ready turn) then finds them
+    /// running, as when each claim was awaited in turn.
+    async fn claims_landed(&mut self) -> Result<()> {
+        while let Some(((bot, turn, due), done)) = self.claims.landed().await {
+            self.claimed(bot, turn, due, done)?;
+        }
+        Ok(())
+    }
+
+    /// Wait for the claims on their way to land when one is for a bot in
+    /// `bots`, and start their turns.
+    async fn land_claims_of(&mut self, bots: &[&str]) -> Result<()> {
+        if self
+            .claims
+            .pending()
+            .any(|(bot, _, _)| bots.contains(&bot.as_str()))
+        {
+            self.land_claims().await?;
+        }
+        Ok(())
+    }
+
+    /// Start every turn claimed so far, once its claim lands: what may
+    /// look at any running turn (a request that ends or holds turns or
+    /// names no one bot, the loop's timers) sees each claimed turn
+    /// running, as when each claim was awaited in turn. Its own store work
+    /// would queue behind the claims anyway.
+    async fn land_claims(&mut self) -> Result<()> {
+        if self.claims.is_empty() {
+            return Ok(());
+        }
+        let landing = std::time::Instant::now();
+        while let Some(((bot, turn, due), done)) = self.claims.next().await {
+            self.claimed(bot, turn, due, done)?;
+        }
+        self.chores.count("resume", landing);
+        Ok(())
+    }
+
+    /// Claim a parked turn and start it once the claim lands.
+    #[cfg(test)]
+    async fn resume(&mut self, bot: String, turn: i64, due: bool) -> Result<()> {
+        self.claim(bot, turn, due);
+        self.land_claims().await
     }
 
     /// The wait after the store refused to start a turn: doubling from
@@ -4628,6 +4766,8 @@ impl Service {
             self.ready_hint = false;
             return Ok(());
         };
+        // Claims made before the look have landed: their turns start first.
+        self.claims_landed().await?;
         // One its last turn kept and no end took (a store that refused it
         // then, say) is taken before this one starts; a store refusing it
         // still leaves the turn ready, as a refused start does.
@@ -5337,6 +5477,96 @@ impl Service {
         Err(Error::new("deferred"))
     }
 
+    /// Stop `bot`'s turn `turn`: a running one is cancelled, a message in
+    /// line withdrawn, a parked turn ended here. Answers the turn's view,
+    /// with whether the stop was asked for, or how it had already ended.
+    async fn interrupt(&mut self, bot: String, turn: i64) -> Result<Value> {
+        let store = &self.store;
+        // The reply is the turn view: as it stood when the interrupt
+        // was requested, or its final state when it had already ended.
+        let reader = store.clone();
+        let view = |store: &Store, bot: String, requested: bool| {
+            let store = store.clone();
+            async move {
+                // On the writer, which has seen the end it just recorded.
+                let mut view = store
+                    .op("turn_view", move |db| db.turn_view(&bot, turn))
+                    .await?;
+                view["interrupt_requested"] = json!(requested);
+                Ok(view)
+            }
+        };
+        if let Some(active) = self.active.get(&bot).filter(|a| a.turn == turn) {
+            if active.cancel(turn::INTERRUPTED) {
+                return view(&reader, bot, true).await;
+            }
+            // The task exited but its JoinSet result has not been reaped.
+            // Release its slot; the result still gets checked by the loop.
+            self.active.remove(&bot);
+        }
+        let check = bot.clone();
+        let status = store
+            .op("turn_status", move |db| db.turn_status(&check, turn))
+            .await?;
+        match status.as_str() {
+            // A message in line has no task either; withdraw it.
+            "queued" | "ready" | "attached" => {
+                self.end_queued(bot.clone(), turn, Error::new(turn::INTERRUPTED))
+                    .await?;
+                return view(&reader, bot, true).await;
+            }
+            // Repeating an interrupt, or one that crossed the turn's
+            // own end, finds it ended and says how; a message
+            // another turn took in is that turn's now.
+            "completed" | "failed" | "interrupted" | "withdrawn" | "taken" => {
+                return view(&reader, bot, false).await;
+            }
+            _ => {}
+        }
+        // Refusals say what the bot is running and where the named
+        // turn stands.
+        let stale = |running: Option<i64>| {
+            Error::with(
+                "stale_turn",
+                match running {
+                    Some(running) if running == turn => format!("turn {turn} is starting"),
+                    Some(running) => format!("{bot} is running turn {running}, not {turn}"),
+                    None => format!("{bot} is running no turn"),
+                },
+            )
+            .facts(json!({"running_turn":running,"status":status}))
+        };
+        if let Some(active) = self.active.get(&bot) {
+            return Err(stale(Some(active.turn)));
+        }
+        // A parked turn has no task; confirm durable state and end it.
+        let check = bot.clone();
+        let state = store.op("inspect", move |db| db.inspect(&check)).await?;
+        if state.running_turn != Some(turn)
+            || (state.status != "waiting" && state.status != "paced")
+        {
+            return Err(stale(state.running_turn));
+        }
+        let name = bot.clone();
+        let next_ready = store
+            .op_pruning("finish", name.clone(), move |db| {
+                turn::Finished::record(db, &name, turn, Some(&Error::new(turn::INTERRUPTED)))
+            })
+            .await?;
+        // Only once the end commits: a refused one leaves the turn
+        // parked, and its wait or lapse must still wake it.
+        self.handles.forget(Waiter::Turn(turn));
+        self.wakes.cancel(turn);
+        self.steer_wakes.remove(&turn);
+        if next_ready {
+            self.ready_hint = true;
+        }
+        // It ended here, with no task to finish: what a `configure`
+        // kept for its end is taken now.
+        kept_for_start(self.take_configure(&bot).await)?;
+        view(&reader, bot, true).await
+    }
+
     /// Hand a client's write to the store from its own task, answered from
     /// the run loop once it lands; the session's next request waits for it.
     fn write(
@@ -5709,23 +5939,109 @@ impl Service {
                     .await
                 })
             }
-            Command::Close { bot, bot_id } => {
+            Command::Close {
+                bot,
+                bot_id,
+                names,
+                no_turn_since_ms,
+                after,
+                limit,
+                by,
+            } => {
                 let at = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .map_or(0, |d| d.as_millis() as i64);
-                let name = bot.clone();
-                let (before, running) = store
-                    .op("close", move |db| {
-                        if bot_id.is_some() {
-                            db.identity(&name, bot_id)?;
+                // `*`, every bot, is a pattern too.
+                let pattern =
+                    (bot.as_deref()).is_some_and(|bot| bot == hub::ALL || hub::is_pattern(bot));
+                let one = bot.is_some() && !pattern;
+                let selector = || {
+                    fail_with(
+                        "invalid_close_selector",
+                        "close takes a bot (a name, with bot_id, or a GLOB pattern, with \
+                         no_turn_since_ms, after and limit) or names",
+                    )
+                };
+                if bot.is_some() == names.is_some()
+                    || (bot_id.is_some() && pattern)
+                    || (!pattern
+                        && (no_turn_since_ms.is_some() || after.is_some() || limit.is_some()))
+                {
+                    return selector();
+                }
+                let mut answer = match (bot, names) {
+                    (Some(name), None) if !pattern => {
+                        // One bot by name: one not there, or not the
+                        // caller's, is refused outright.
+                        let names = vec![name];
+                        let answer = store
+                            .op("close", move |db| {
+                                if bot_id.is_some() {
+                                    db.identity(&names[0], bot_id)?;
+                                }
+                                db.close_all(&agent_runtime::store::Closing::Names(&names), by, at)
+                            })
+                            .await?;
+                        if let Some(refused) = answer["refused"].get(0) {
+                            let code = refused["error"].as_str().unwrap_or("not_permitted");
+                            return Err(match refused["message"].as_str() {
+                                Some(message) => Error::with(code, message),
+                                None => Error::new(code),
+                            });
                         }
-                        db.close(&name, at)
-                    })
-                    .await?;
-                Ok(
-                    json!({"bot":bot,"was_open":before.is_none(),"closed_ms":before.unwrap_or(at),
-                    "running_turn":running}),
-                )
+                        answer
+                    }
+                    (Some(pattern), None) => {
+                        let (after, limit) = (after.unwrap_or_default(), limit.unwrap_or(64));
+                        store
+                            .op("close", move |db| {
+                                let closing = agent_runtime::store::Closing::Pattern {
+                                    pattern: &pattern,
+                                    no_turn_since_ms,
+                                    after: &after,
+                                    limit,
+                                };
+                                db.close_all(&closing, by, at)
+                            })
+                            .await?
+                    }
+                    (None, Some(names)) => {
+                        store
+                            .op("close", move |db| {
+                                db.close_all(&agent_runtime::store::Closing::Names(&names), by, at)
+                            })
+                            .await?
+                    }
+                    _ => return selector(),
+                };
+                // The turn each ran as it was marked stops, as `interrupt`
+                // stops it; one that ended meanwhile stopped nothing. A bot
+                // closing itself is marked, and the turn asking runs on.
+                for closed in answer["closed"].as_array_mut().into_iter().flatten() {
+                    let (Some(name), Some(turn)) =
+                        (closed["bot"].as_str(), closed["running_turn"].as_i64())
+                    else {
+                        continue;
+                    };
+                    if by.is_some() && closed["bot_id"].as_i64() == by {
+                        continue;
+                    }
+                    // A stop that failed leaves the turn parked, to wake
+                    // again: one bot asked for by name is refused with the
+                    // failure, and each of many says it.
+                    match self.interrupt(name.to_owned(), turn).await {
+                        Ok(view) if view["interrupt_requested"] == true => {
+                            closed["stopped_turn"] = json!(turn);
+                        }
+                        Ok(_) => {}
+                        Err(error) if one => return Err(error),
+                        Err(error) => {
+                            closed["stop_failed"] =
+                                json!({"turn": turn, "error": error.code, "message": error.detail});
+                        }
+                    }
+                }
+                Ok(answer)
             }
             Command::Delete { bot, bot_id } => {
                 if let Some(id) = bot_id {
@@ -6272,6 +6588,11 @@ impl Service {
                     // turns, starting ready ones, resuming parked ones,
                     // answering queued admissions, and its timers.
                     "loop": self.chores.snapshot(false),
+                    // Clients' writes and parked turns' claims landed, and
+                    // how long each waited after landing for the loop to
+                    // take it up, behind an older one still on its way.
+                    "writes": self.writing.lane.ordered.behind.snapshot(),
+                    "claims": self.claims.behind.snapshot(),
                     "draining": self.draining(),
                     "paused": self.paused,
                 }))
@@ -7318,96 +7639,7 @@ impl Service {
                 });
                 Err(Error::new("deferred"))
             }
-            Command::Interrupt { bot, turn } => {
-                // The reply is the turn view: as it stood when the interrupt
-                // was requested, or its final state when it had already ended.
-                let reader = store.clone();
-                let view = |store: &Store, bot: String, requested: bool| {
-                    let store = store.clone();
-                    async move {
-                        // On the writer, which has seen the end it just recorded.
-                        let mut view = store
-                            .op("turn_view", move |db| db.turn_view(&bot, turn))
-                            .await?;
-                        view["interrupt_requested"] = json!(requested);
-                        Ok(view)
-                    }
-                };
-                if let Some(active) = self.active.get(&bot).filter(|a| a.turn == turn) {
-                    if active.cancel(turn::INTERRUPTED) {
-                        return view(&reader, bot, true).await;
-                    }
-                    // The task exited but its JoinSet result has not been reaped.
-                    // Release its slot; the result still gets checked by the loop.
-                    self.active.remove(&bot);
-                }
-                let check = bot.clone();
-                let status = store
-                    .op("turn_status", move |db| db.turn_status(&check, turn))
-                    .await?;
-                match status.as_str() {
-                    // A message in line has no task either; withdraw it.
-                    "queued" | "ready" | "attached" => {
-                        self.end_queued(bot.clone(), turn, Error::new(turn::INTERRUPTED))
-                            .await?;
-                        return view(&reader, bot, true).await;
-                    }
-                    // Repeating an interrupt, or one that crossed the turn's
-                    // own end, finds it ended and says how; a message
-                    // another turn took in is that turn's now.
-                    "completed" | "failed" | "interrupted" | "withdrawn" | "taken" => {
-                        return view(&reader, bot, false).await;
-                    }
-                    _ => {}
-                }
-                // Refusals say what the bot is running and where the named
-                // turn stands.
-                let stale = |running: Option<i64>| {
-                    Error::with(
-                        "stale_turn",
-                        match running {
-                            Some(running) if running == turn => format!("turn {turn} is starting"),
-                            Some(running) => format!("{bot} is running turn {running}, not {turn}"),
-                            None => format!("{bot} is running no turn"),
-                        },
-                    )
-                    .facts(json!({"running_turn":running,"status":status}))
-                };
-                if let Some(active) = self.active.get(&bot) {
-                    return Err(stale(Some(active.turn)));
-                }
-                // A parked turn has no task; confirm durable state and end it.
-                let check = bot.clone();
-                let state = store.op("inspect", move |db| db.inspect(&check)).await?;
-                if state.running_turn != Some(turn)
-                    || (state.status != "waiting" && state.status != "paced")
-                {
-                    return Err(stale(state.running_turn));
-                }
-                let name = bot.clone();
-                let next_ready = store
-                    .op_pruning("finish", name.clone(), move |db| {
-                        turn::Finished::record(
-                            db,
-                            &name,
-                            turn,
-                            Some(&Error::new(turn::INTERRUPTED)),
-                        )
-                    })
-                    .await?;
-                // Only once the end commits: a refused one leaves the turn
-                // parked, and its wait or lapse must still wake it.
-                self.handles.forget(Waiter::Turn(turn));
-                self.wakes.cancel(turn);
-                self.steer_wakes.remove(&turn);
-                if next_ready {
-                    self.ready_hint = true;
-                }
-                // It ended here, with no task to finish: what a `configure`
-                // kept for its end is taken now.
-                kept_for_start(self.take_configure(&bot).await)?;
-                view(&reader, bot, true).await
-            }
+            Command::Interrupt { bot, turn } => self.interrupt(bot, turn).await,
             Command::Shutdown { grace_ms } => {
                 if grace_ms > 86_400_000 {
                     return fail_with("invalid_timeout", "grace_ms may be up to 86400000");
@@ -8226,6 +8458,7 @@ mod tests {
             store: store.clone(),
             stepping: HashMap::new(),
             writing: Writing::default(),
+            claims: writes::Ordered::default(),
             lent: HashMap::new(),
             step_checks: JoinSet::new(),
             steps: Default::default(),
@@ -8449,6 +8682,7 @@ mod tests {
             store: store.clone(),
             stepping: HashMap::new(),
             writing: Writing::default(),
+            claims: writes::Ordered::default(),
             lent: HashMap::new(),
             step_checks: JoinSet::new(),
             steps: Default::default(),
@@ -8766,6 +9000,7 @@ mod tests {
             store: store.clone(),
             stepping: HashMap::new(),
             writing: Writing::default(),
+            claims: writes::Ordered::default(),
             lent: HashMap::new(),
             step_checks: JoinSet::new(),
             steps: Default::default(),
@@ -9027,6 +9262,7 @@ mod tests {
             store: store.clone(),
             stepping: HashMap::new(),
             writing: Writing::default(),
+            claims: writes::Ordered::default(),
             lent: HashMap::new(),
             step_checks: JoinSet::new(),
             steps: Default::default(),
@@ -9831,6 +10067,110 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_parked_turn_s_claim_goes_to_the_store_beside_the_run_loop() {
+        let dir = scratch("claim-beside");
+        let path = dir.join("state.sqlite");
+        let (store, _publications) = Store::open(&path).await.unwrap();
+        let bob = running(&store, &["Bob".into()]).await[0].1;
+        store
+            .call(move |db| {
+                db.suspend_paced(
+                    bob, 0, 0, 0, 0, 0, 0, false, None, None, None, None, None, None, None,
+                )
+                .map(|_| ())
+            })
+            .await
+            .unwrap();
+        let mut service = admitting(&store, 1);
+        let (output, _writer) = Output::stdout();
+        // A commit that takes seconds, as on a saturated disk.
+        let (held, gate) = hold(&store).await;
+        service.claim("Bob".into(), bob, true);
+        // The claim holds the only slot while it is on its way.
+        assert!(!service.has_capacity());
+        // A read is answered from the readers meanwhile.
+        let inspect = Command::Inspect {
+            bot: "Bob".into(),
+            bot_id: None,
+        };
+        assert_eq!(inspect.turns_seen(), Some(Vec::new()));
+        let deferred = (service.dispatch(inspect, 1, &output, json!("r"), Bound::default()))
+            .await
+            .unwrap_err();
+        assert_eq!(deferred.code, "deferred");
+        let (asker, sent) = tokio::time::timeout(Duration::from_secs(5), service.lane.next())
+            .await
+            .expect("read beside the held writer")
+            .unwrap();
+        assert_eq!((asker.session, sent), (1, true));
+        // A request for another bot, or what the store answered before
+        // the claim, does not wait for it.
+        let other = service.land_claims_of(&["Zed"]);
+        tokio::time::timeout(Duration::from_secs(5), other)
+            .await
+            .expect("not held by Bob's claim")
+            .unwrap();
+        service.claims_landed().await.unwrap();
+        assert_eq!(service.claims.len(), 1);
+        // The turn starts only once its claim lands.
+        let early = tokio::time::timeout(Duration::from_millis(50), service.claims.next());
+        assert!(early.await.is_err(), "landed before its commit");
+        assert!(service.active.is_empty());
+        gate.send(()).unwrap();
+        held.await.unwrap();
+        // A request for Bob waits for it, and finds the turn running.
+        service.land_claims_of(&["Bob"]).await.unwrap();
+        assert!(service.claims.is_empty());
+        assert!(service.active.contains_key("Bob"));
+        assert_eq!(service.claims.behind.count, 1);
+        let (bot, turn, task, exit) = service.jobs.join_next().await.unwrap().unwrap();
+        service.complete(bot, turn, task, exit).await.unwrap();
+        drop(service);
+        drop(store);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn a_submission_settles_admissions_when_a_claim_fills_the_last_slot() {
+        let dir = scratch("claim-settles");
+        let path = dir.join("state.sqlite");
+        let (store, _publications) = Store::open(&path).await.unwrap();
+        let bob = running(&store, &["Bob".into()]).await[0].1;
+        store
+            .call(move |db| {
+                db.suspend_paced(
+                    bob, 0, 0, 0, 0, 0, 0, false, None, None, None, None, None, None, None,
+                )
+                .map(|_| ())
+            })
+            .await
+            .unwrap();
+        let mut service = admitting(&store, 2);
+        let (output, _writer) = Output::stdout();
+        let (held, gate) = hold(&store).await;
+        service.claim("Bob".into(), bob, true);
+        for (index, command) in [create("Ann", &dir), submit("Ann", "r1")]
+            .into_iter()
+            .enumerate()
+        {
+            let bytes = service.admission_sends(&command, &json!(index), 0);
+            let deferred = service
+                .dispatch(command, 0, &output, json!(index), bytes)
+                .await;
+            assert_eq!(deferred.unwrap_err().code, "deferred");
+        }
+        assert_eq!((service.reserved, service.claims.len()), (1, 1));
+        // The claim and the queued submission fill both slots, so another
+        // submission settles the admissions before it is refused for room.
+        assert!(service.must_settle(Some(&submit("Cat", "r1")), 0, &output, Bound::default()));
+        gate.send(()).unwrap();
+        held.await.unwrap();
+        drop(service);
+        drop(store);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
     async fn a_resume_the_store_refuses_leaves_the_turn_parked() {
         let dir = scratch("resume-write-refused");
         let path = dir.join("state.sqlite");
@@ -10480,6 +10820,20 @@ mod tests {
         assert!(ends(r#"{"op":"pause","reason":"r"}"#));
         assert!(!ends(r#"{"op":"resume"}"#));
         assert!(!ends(r#"{"op":"tool_calls","tag":"t"}"#));
+        // They wait for every parked turn's claim on its way, a request
+        // for one bot for that bot's, and a read or a wait for none.
+        let seen = |line: &str| {
+            let command = serde_json::from_str::<Command>(line).unwrap();
+            command.turns_seen().map(|bots| bots.join(","))
+        };
+        assert_eq!(seen(r#"{"op":"interrupt","bot":"a","turn":1}"#), None);
+        assert_eq!(seen(r#"{"op":"pause","reason":"r"}"#), None);
+        assert_eq!(
+            seen(r#"{"op":"submit","bot":"a","request_id":"r","prompt":"p"}"#),
+            Some("a".into())
+        );
+        assert_eq!(seen(r#"{"op":"tool_calls","tag":"t"}"#), Some("".into()));
+        assert_eq!(seen(r#"{"op":"wait","handles":["a/1"]}"#), Some("".into()));
     }
 
     #[tokio::test]

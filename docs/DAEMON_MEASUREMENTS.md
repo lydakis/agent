@@ -11715,3 +11715,279 @@ Still read before showing: a card's first read when it opens (`/status`,
 `/usage`, `/audit`, `/context`), `/switch`, `/new` and a side chat, listing
 agents, a fold opened on items not yet read, a react click on a reply too old
 to be kept, and a reconnect's catching up.
+
+## Close by a selector (#1181)
+
+`close` takes a pattern or up to 256 names and closes them in one store
+job; every close stops the turn its bot runs. Main is 3cb71ec, and the
+change is the same base with bulk close on it, both built with
+`--workspace --bins` on the 4-CPU Linux container.
+
+### Closing 1,000 agents
+
+A copy of the 10,000-agent store, a fresh daemon each run, 1,000 idle
+agents closed. One at a time (`close {bot}`), the per-close time is the
+store write either way. By `names`, four requests close all of them:
+
+| Side | How | 1,000 closes, ms (two runs) |
+| --- | --- | ---: |
+| main | one `close` a name | 886, 569 |
+| change | one `close` a name | 741, 809 |
+| change | `close {names}`, 256 a request | 12, 15 |
+
+### Low end and high end
+
+`bench.ends`, as in the step writes section above. Neither end calls
+`close`; these rows check that nothing else moved.
+
+#### Low end
+
+One window on a folder of 10 agents, three alternating runs each:
+
+| Side | Window start, ms | Daemon idle CPU % | Daemon RSS / PSS, MiB | Window idle CPU % | Window RSS / PSS, MiB | Key p50 / p99, ms | Turn p50 / p99, ms |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| main | 61 to 96 | 0 to 0.05 | 20.1 / 18.0 to 18.1 | 0.15 to 0.20 | 22.4 to 22.7 / 14.5 to 14.6 | 0.45 to 0.65 / 0.93 to 2.42 | 48.1 to 48.2 / 51.4 to 54.9 |
+| change | 71 to 421 | 0 to 0.05 | 19.1 to 20.6 / 17.0 to 18.6 | 0.15 to 0.25 | 21.7 to 22.8 / 14.1 to 14.4 | 0.32 to 0.53 / 1.19 to 6.97 | 48.3 to 48.7 / 51.8 to 68.0 |
+
+The change's two slow figures, a 421 ms start and a 68 ms turn, came in its
+first run, which was the first after a build, and they did not come again.
+Every key on both sides was under 10 ms.
+
+#### High end
+
+10,000 stored agents, 30 running turns and 8 running scripts at most one
+every 0.5 s, N windows on one busy project. Both sides finished 1,410
+turns and 369 to 376 scripts. The figures are over 20 s, with CPU as a
+percent of one core and the windows summed:
+
+| Windows | Side | Window start p50, ms | Key p50 / p99 / most, ms | Daemon CPU % | Daemon RSS / PSS, MiB | Windows CPU % | Windows RSS / PSS, GiB | Requests |
+| ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 100 | main | 3,168 | 1.46 / 18.0 / 76.0 | 133.9 | 40.7 / 38.7 | 121.4 | 5.58 / 3.79 | 145,160 |
+| 100 | change | 3,344 | 1.48 / 9.0 / 50.9 | 133.0 | 39.6 / 37.6 | 122.1 | 5.69 / 3.92 | 148,292 |
+| 200 | main | 5,549 | 1.78 / 9.5 / 27.4 | 138.5 | 44.8 / 42.6 | 111.7 | 10.95 / 7.36 | 33,577 |
+| 200 | change | 5,968 | 1.93 / 12.5 / 15.7 | 138.5 | 44.8 / 42.5 | 112.4 | 11.15 / 7.59 | 33,563 |
+
+Daemon and window CPU are within 1 point at both sizes, and memory is
+within 2%. Window start runs 6 to 8% slower on the change and key p99
+moves both ways, all within the spread runs of main against itself show
+in the sections above.
+
+## A Sonny window waits for keys without waking
+
+A window read keys on a thread of its own that asked the terminal every 50 ms
+whether a key had come, so that it could end with the window: 20 wakeups a
+second in every window, idle or not, 4,000 a second for 200 windows. It now
+reads as Codex's TUI does, through crossterm's event stream: its reader
+blocks until the terminal says something, and the window letting go of it
+wakes the read to end it.
+
+Measured with `bench/ends.py` and its wakeups column (added here): the times any thread of the window's processes was put on a CPU
+(the third field of each thread's `schedstat`), per second. One daemon
+binary for every build, 4-CPU Linux. "Before" is the key-loop change (#1166)
+this builds on; "current thread" is this change with the window's runtime on
+one thread, tried and left out (below).
+
+Low end: one idle window on a folder of 10 agents.
+
+| Build | Window start | Idle window wakeups/s | Idle window CPU | Idle window RSS | Key p50 | Key p99 | Turn p50 |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| before | 46 ms | 26.6 | 0.20% | 25.8 MiB | 0.49 ms | 0.97 ms | 45.1 ms |
+| this change | 48 ms | 6.6 | 0.05% | 26.1 MiB | 0.35 ms | 1.14 ms | 47.8 ms |
+| this change, again | 41 ms | 6.7 | 0.05% | 26.1 MiB | 0.41 ms | 1.20 ms | 47.6 ms |
+| current thread | 45 ms | 4.0 | 0.05% | 25.5 MiB | 0.37 ms | 1.21 ms | 44.6 ms |
+
+Again against the key-loop change at 15e5b6d (main merged in, its 3 s
+reads applied at the look round rather than waking the window), with
+`bench/ends.py`'s own wakeups column, each build twice:
+
+| Build | Idle window wakeups/s | Idle window CPU | Idle window RSS | Key p99 | Turn p50 |
+|---|---:|---:|---:|---:|---:|
+| before | 26.6, 26.5 | 0.15%, 0.15% | 26.1 MiB | 1.08, 3.53 ms | 47.8, 46.0 ms |
+| this change | 6.6, 6.7 | 0.05%, 0.05% | 25.7, 26.0 MiB | 1.58, 1.08 ms | 47.7, 47.5 ms |
+
+And 200 windows in one project under the high end's load, against 15e5b6d:
+
+| Build | Windows wakeups/s | Windows CPU | Windows RSS | Daemon CPU | Key p50 | Key p99 | Key max | Pauses over 100 ms | Turns in 20 s |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| before | 16,867 | 65.9% | 11,910 MiB | 174% | 1.46 ms | 6.5 ms | 7.4 ms | 0 | 7,636 |
+| this change | 13,203 | 61.5% | 11,866 MiB | 177% | 1.52 ms | 6.6 ms | 8.0 ms | 0 | 7,792 |
+
+What an idle window still wakes for, from `strace` over 10 s: its look
+round once a second (its clocks, the reactions and config files it reads),
+which wakes the runtime's timer twice (the timer wheel's coarse slot, then
+the tick), a worker it hands a job to, and the reads it repeats every 3 s.
+
+High end: 10,000 stored agents, every window in one project, 30 agents
+running turns back to back and 8 running code-mode scripts, measured over
+the same 20 s as the keys.
+
+| Windows | Build | Windows wakeups/s | Windows CPU | Windows RSS | Daemon CPU | Key p50 | Key p99 | Key max | Pauses over 100 ms | Window start p50 | Turns in 20 s |
+|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 32 | before | 10,834 | 25.5% | 2,152 MiB | 139% | 1.01 ms | 6.3 ms | 8.5 ms | 0 | 0.70 s | 8,763 |
+| 32 | this change | 10,343 | 25.2% | 2,123 MiB | 138% | 1.08 ms | 5.3 ms | 5.4 ms | 0 | 0.77 s | 8,792 |
+| 32 | current thread | 8,200 | 21.9% | 2,198 MiB | 141% | 1.05 ms | 5.8 ms | 17.6 ms | 0 | 0.68 s | 8,799 |
+| 100 | before | 14,467 | 35.7% | 6,144 MiB | 146% | 1.37 ms | 7.4 ms | 12.3 ms | 0 | 1.81 s | 9,313 |
+| 100 | this change | 12,291 | 34.0% | 6,169 MiB | 145% | 1.52 ms | 7.5 ms | 18.6 ms | 0 | 1.92 s | 9,279 |
+| 100 | current thread | 8,930 | 30.1% | 6,559 MiB | 145% | 1.34 ms | 7.3 ms | 30.7 ms | 0 | 1.70 s | 9,221 |
+| 200 | before | 15,423 | 59.1% | 11,890 MiB | 180% | 1.81 ms | 8.5 ms | 19.6 ms | 0 | 3.56 s | 8,808 |
+| 200 | this change | 10,763 | 53.9% | 12,006 MiB | 183% | 1.84 ms | 9.0 ms | 10.2 ms | 0 | 3.76 s | 8,864 |
+| 200 | current thread | 6,693 | 54.3% | 13,090 MiB | 176% | 1.77 ms | 9.2 ms | 13.7 ms | 0 | 3.38 s | 8,605 |
+
+200 windows spread, each its own project, the same load (the first two
+runs of each were taken while the machine compiled, so run again; this
+change twice):
+
+| Build | Windows wakeups/s | Windows CPU | Windows RSS | Daemon CPU | Key p50 | Key p99 | Key max | Pauses over 100 ms | Window start p50 | Turns in 20 s |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| before | 15,423 | 59.4% | 11,971 MiB | 181% | 1.88 ms | 13.2 ms | 24.4 ms | 0 | 4.03 s | 8,847 |
+| this change | 10,745 | 54.4% | 11,907 MiB | 178% | 1.83 ms | 9.0 ms | 15.8 ms | 0 | 3.50 s | 8,769 |
+| this change, again | 10,916 | 54.0% | 11,872 MiB | 182% | 1.70 ms | 8.3 ms | 11.7 ms | 0 | 3.66 s | 8,857 |
+
+Every key stays under 10 ms at p99 with this change and none pauses over
+100 ms.
+
+The window's runtime on one thread cuts its wakeups further (4.0 a second
+idle, 38% fewer than two workers at 200 busy windows) and keeps keys as
+fast, but each window grows: about 5.5 MiB more at 200 busy windows (13,090
+against 12,006 MiB), 3.9 MiB at 100, while the window's own reads and the
+connection's reader share the one thread with drawing. The windows stay on
+two workers until what a window takes in has a bound of its own.
+
+After the busy agents stop, the windows of a busy project keep reading: 30 s
+later, 100 windows still sent the daemon about 11,500 `inspect` requests a
+second (230,000 in 20 s, against 34,000 while the turns ran), with their
+CPU at about 130%. Main at ae1bf65 does the same (220,000), so it is not the
+key loop's; it is the repeated reads of the project's tasks, measured here
+and left for that work.
+
+## A parked turn's claim beside the run loop
+
+A parked turn going on (store op `resume`: check the turn, claim it, drop
+its lapse) no longer holds the run loop while the claim commits. The claim
+goes to the store from its own task (`writes::Ordered`, as #1163's writes
+do) and holds a slot meanwhile; its turn starts as the claim lands, in the
+order claimed. A claim that landed starts its turn before the loop takes up
+an admission, a turn's end or the next ready turn. Reads, recorded writes
+and `wait` go on while claims are on their way; a request for one bot waits
+only for that bot's claims; a request that ends or holds turns, one that
+names no one bot, and the loop's timers wait for every claim on its way.
+
+All on Linux x86_64 (4 CPUs), 2026-11-18, release builds made the same way
+(`cargo build --release --workspace --bins`): main (a7a5e69) against the
+change at bfcf0ba. Main commits merged in after it do not touch the claim
+path. The Mac was not measured.
+
+### Slow disk, with scripts running
+
+`bench.held_reads` with `slow_sync.c` (every sync 300 ms), 424 bots, 30
+running turns back to back and 8 running code-mode scripts, 20 s, three
+alternating runs each. Milliseconds, p50 / most. `stats` now reports how
+long each landed write and claim waited for the loop to take it up.
+
+| Side | `approvals` | `inspect` | `bots` | New connection's `ready` | Turns | `resume` held the loop | Loop held in all | Claims landed / waited at most | Writes landed / waited at most |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| main | 1.1 / 1,202 | 0.6 / 907 | 2.0 / 2,120 | 0.7 / 2,904 | 217 | 6.3 s | 7.0 s | not reported | not reported |
+| main | 0.9 / 2,396 | 0.5 / 9.8 | 1.6 / 300 | 0.6 / 1,635 | 253 | 6.7 s | 7.9 s | not reported | not reported |
+| main | 1.2 / 2,067 | 0.5 / 3.9 | 1.8 / 2.9 | 0.7 / 1,301 | 255 | 5.8 s | 6.3 s | not reported | not reported |
+| change | 1.2 / 4.4 | 0.5 / 3.3 | 1.9 / 299 | 0.7 / 597 | 270 | 0 | 1.0 s | 16 / 2 ms | 128 / 3 ms |
+| change | 1.1 / 301 | 0.5 / 3.1 | 1.7 / 3.0 | 0.7 / 597 | 264 | 0 | 1.0 s | 16 / 2 ms | 128 / 3 ms |
+| change | 1.0 / 5.3 | 0.5 / 2.8 | 1.6 / 9.3 | 0.6 / 499 | 270 | 0 | 0.5 s | 16 / 1 ms | 128 / 2 ms |
+
+Every script finished on both sides (16 per run). What still holds the loop
+is `settle` (a request answering admissions queued before it), about 0.6 s.
+A landed claim or write waited at most 3 ms behind an older one.
+
+### Low end
+
+`bench.ends --end low`: one Sonny window on a folder of 10 agents, three
+alternating runs each.
+
+| Side | Window start, ms | Daemon idle CPU % | Daemon RSS / PSS, MiB | Window idle CPU % | Window RSS / PSS, MiB | Key p50 / p99, ms | Turn p50 / p99, ms |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| main | 48 to 76 | 0 to 0.05 | 18.9 to 20.3 / 16.9 to 18.3 | 0.15 to 0.20 | 21.4 to 22.3 / 13.7 to 14.1 | 0.29 to 0.54 / 0.87 to 1.27 | 47.8 to 48.0 / 49.9 to 54.7 |
+| change | 47 to 54 | 0 | 18.9 to 19.9 / 16.9 to 17.9 | 0.15 to 0.20 | 22.1 to 22.4 / 14.0 to 14.7 | 0.28 to 0.35 / 0.81 to 0.90 | 45.4 to 48.1 / 49.7 to 52.3 |
+
+### High end
+
+`bench.ends --end high --pace 0.5`: 10,000 stored agents, 30 agents
+running turns and 8 running scripts, each at most one every 0.5 s. N
+windows on one busy project (`one`) or each on its own folder (`spread`),
+300 keys typed across them, CPU and requests over the same 20 s. The
+windows open before the fleet starts (`--open idle`, as before) or while it
+already runs (`--open busy`, new), so their start is measured under load;
+turns and scripts count from the fleet's start, so busy-open rows count
+more. In these screens turns park rarely: the claims landed are 0 with the
+windows opened idle and up to 52 opened busy.
+
+Windows opened on an idle fleet:
+
+| Windows | Layout | Side | Window start p50, ms | Key p50 / p99 / most, ms | Daemon CPU % | Daemon RSS / PSS, MiB | Windows CPU % | Windows RSS / PSS, GiB | Requests in the 20 s | Daemon CPU % per 1,000 requests | Turns / scripts |
+| ---: | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 32 | one | main | 756 | 0.88 / 3.11 / 3.42 | 132.3 | 38.8 / 36.7 | 110.0 | 1.92 / 1.37 | 213,808 | 0.619 | 1,410 / 375 |
+| 32 | one | change | 851 | 0.88 / 3.44 / 21.38 | 127.9 | 40.0 / 37.9 | 104.0 | 1.87 / 1.32 | 213,496 | 0.599 | 1,410 / 371 |
+| 32 | spread | main | 767 | 0.81 / 2.31 / 6.34 | 130.7 | 38.0 / 36.0 | 105.1 | 1.84 / 1.29 | 215,340 | 0.607 | 1,410 / 372 |
+| 32 | spread | change | 825 | 0.87 / 5.27 / 17.61 | 127.2 | 38.5 / 36.4 | 101.6 | 1.86 / 1.32 | 206,310 | 0.616 | 1,410 / 368 |
+| 100 | one | main | 1,888 | 1.16 / 5.20 / 8.73 | 133.4 | 40.7 / 39.0 | 126.3 | 5.52 / 3.77 | 220,827 | 0.604 | 1,410 / 375 |
+| 100 | one | change | 1,947 | 1.16 / 4.49 / 19.20 | 136.7 | 41.7 / 39.7 | 122.6 | 5.58 / 3.83 | 212,638 | 0.643 | 1,410 / 376 |
+| 100 | spread | main | 1,943 | 1.04 / 5.70 / 7.00 | 134.8 | 39.5 / 38.0 | 122.9 | 5.60 / 3.85 | 216,339 | 0.623 | 1,410 / 376 |
+| 100 | spread | change | 1,843 | 1.12 / 5.15 / 8.26 | 135.2 | 40.6 / 38.5 | 123.5 | 5.47 / 3.72 | 207,503 | 0.651 | 1,410 / 375 |
+| 200 | one | main | 3,321 | 1.19 / 9.91 / 185.86 | 147.8 | 42.9 / 40.7 | 91.7 | 10.88 / 7.36 | 50,687 | 2.915 | 1,410 / 376 |
+| 200 | one | change | 3,582 | 1.10 / 3.44 / 10.94 | 147.3 | 42.5 / 40.3 | 92.6 | 11.01 / 7.49 | 53,726 | 2.742 | 1,410 / 376 |
+| 200 | spread | main | 3,650 | 1.13 / 5.23 / 61.41 | 147.7 | 42.4 / 40.3 | 90.5 | 11.08 / 7.57 | 46,770 | 3.157 | 1,410 / 376 |
+| 200 | spread | change | 3,720 | 1.23 / 7.22 / 15.84 | 146.6 | 43.4 / 41.1 | 91.3 | 11.03 / 7.51 | 46,183 | 3.174 | 1,410 / 376 |
+
+Windows opened while the fleet runs:
+
+| Windows | Layout | Side | Window start p50, ms | Key p50 / p99 / most, ms | Daemon CPU % | Daemon RSS / PSS, MiB | Windows CPU % | Windows RSS / PSS, GiB | Requests in the 20 s | Daemon CPU % per 1,000 requests | Turns / scripts |
+| ---: | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 32 | one | main | 969 | 0.88 / 5.18 / 20.42 | 135.2 | 39.0 / 36.8 | 114.5 | 1.99 / 1.44 | 224,724 | 0.601 | 2,160 / 576 |
+| 32 | one | change | 912 | 0.86 / 4.65 / 4.68 | 137.4 | 38.7 / 36.6 | 110.9 | 2.00 / 1.46 | 215,793 | 0.637 | 2,160 / 576 |
+| 32 | spread | main | 971 | 0.87 / 3.78 / 5.03 | 136.3 | 39.2 / 37.0 | 112.5 | 2.01 / 1.46 | 221,542 | 0.615 | 2,160 / 576 |
+| 32 | spread | change | 950 | 0.99 / 3.87 / 15.50 | 136.5 | 38.8 / 36.6 | 114.2 | 1.94 / 1.39 | 209,747 | 0.651 | 2,160 / 576 |
+| 100 | one | main | 2,171 | 1.38 / 9.84 / 42.87 | 133.9 | 43.0 / 40.8 | 125.0 | 5.55 / 3.80 | 191,814 | 0.698 | 2,490 / 664 |
+| 100 | one | change | 2,433 | 1.60 / 5.82 / 9.91 | 134.2 | 42.1 / 39.9 | 125.5 | 5.41 / 3.66 | 193,153 | 0.695 | 2,490 / 664 |
+| 100 | spread | main | 2,360 | 1.25 / 5.83 / 21.85 | 134.7 | 42.2 / 40.0 | 124.6 | 5.50 / 3.75 | 193,472 | 0.696 | 2,490 / 664 |
+| 100 | spread | change | 2,196 | 1.38 / 18.58 / 25.92 | 134.0 | 41.9 / 39.7 | 128.6 | 5.57 / 3.82 | 193,708 | 0.692 | 2,490 / 664 |
+| 200 | one | main | 4,629 | 1.24 / 10.74 / 12.82 | 144.9 | 44.2 / 42.0 | 102.4 | 10.89 / 7.38 | 41,187 | 3.517 | 3,000 / 787 |
+| 200 | one | change | 4,611 | 1.45 / 25.52 / 29.66 | 144.3 | 45.9 / 43.7 | 105.2 | 10.80 / 7.29 | 40,391 | 3.573 | 3,030 / 782 |
+| 200 | spread | main | 4,843 | 1.23 / 6.60 / 10.87 | 147.2 | 45.0 / 42.8 | 103.5 | 10.83 / 7.32 | 42,908 | 3.430 | 3,000 / 794 |
+| 200 | spread | change | 4,484 | 1.54 / 6.98 / 84.49 | 146.8 | 45.4 / 43.2 | 103.4 | 10.89 / 7.38 | 41,582 | 3.529 | 2,970 / 787 |
+
+Every row is under 50 ms at p99. The two busy-open rows where the change's
+p99 was higher were run again, alternating, on a quiet machine (a run made
+while a build ran beside it is left out on both sides):
+
+| Windows | Layout | Side | Runs | Key p99, ms | Keys over 100 ms |
+| ---: | --- | --- | ---: | --- | ---: |
+| 200 | one | main | 3 | 10.7, 8.9, 6.5 | 0 |
+| 200 | one | change | 8 | 25.5, 9.2, 7.3, 65.5, 10.8, 9.7, 7.7, 11.2 | 1 (148 ms) |
+| 100 | spread | main | 3 | 5.8, 52.2, 8.0 | 0 |
+| 100 | spread | change | 3 | 18.6, 4.6, 4.7 | 0 |
+
+Median p99 is 8.9 ms on main and 10.3 ms with the change at 200 windows,
+and 8.0 against 4.7 at 100. One key of 2,400 typed with the change at 200
+windows took 148 ms; the main row in the idle-open table above had one of
+186 ms. Daemon CPU per request served moved 6% either way, as from run to
+run; memory and window start are the same.
+
+### Hot-path screens
+
+The CI Perf job (`bench/perf_gate.py`, Ubuntu 24.04 runner) on bfcf0ba
+against a7a5e69, screened alternately. Store jobs per turn are 6.001 on
+both sides in every footprint run, and the gate passed.
+
+| Bench | Measure | Base | Head | Change |
+| --- | --- | ---: | ---: | ---: |
+| lifecycle | CPU, s | 0.33 | 0.335 | +1.5% |
+| lifecycle | p95 turn, ms | 574.499 | 574.722 | +0.0% |
+| lifecycle | peak RSS, MiB | 26.818 | 26.48 | -1.3% |
+| completion | release to terminal p99, ms | 7.073 | 6.782 | -4.1% |
+| admission | lone submit CPU, ms | 24.074 | 23.942 | -0.5% |
+| admission | burst submit p99, ms | 2.613 | 2.699 | +3.3% |
+| footprint | idle RSS, MiB | 17.346 | 17.344 | -0.0% |
+| footprint | per idle bot, KiB | 1.864 | 1.81 | -2.9% |
+| footprint | RSS after a turn each, MiB | 61.047 | 60.25 | -1.3% |
+| footprint | CPU per turn, ms | 0.722 | 0.702 | -2.8% |
+
+This change does not touch Sonny. Of the same job's Sonny rows, only the
+quiet window's CPU moved more than 15% (0.77 to 0.96 ms a second).
