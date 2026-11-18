@@ -4087,28 +4087,37 @@ struct Counted {
     /// The tasks as template notes' `tasks()` gives them, when read.
     tasks: Option<Vec<Value>>,
     /// The project's agents as the count left them, the rows that moved
-    /// read again; none when a read failed, so the window takes a fresh
-    /// snapshot.
-    listed: Option<Arc<Vec<Value>>>,
+    /// read again, with their [`rows_mark`]; none when a read failed, so
+    /// the window takes a fresh snapshot.
+    listed: Option<(Arc<Vec<Value>>, u64)>,
     /// This window's agent's own tasks, as the margin lists them, when read.
     own: Option<Vec<status::Own>>,
 }
 
-/// A mark of where the agents `listed` stand, and of what waits on the
-/// person: what decides each one's group, and a running one's history,
-/// whose newest items can hold a question. `here` is this window's own
-/// open question and calls. A task marked done beside `store` counts too:
-/// a lead elsewhere can mark it without it moving. None when the daemon
-/// could not be asked.
-async fn standing(
-    client: &Client,
-    store: &std::path::Path,
-    listed: &[Value],
-    here: (usize, usize),
-) -> Option<u64> {
+/// A mark of where the agents stand, and of what waits on the person:
+/// their rows' mark ([`rows_mark`]: what decides each one's group, and a
+/// running one's history, whose newest items can hold a question), this
+/// window's own open question and calls, and the done marks beside the
+/// store (a lead elsewhere can mark a task without it moving). None when
+/// the daemon could not be asked.
+async fn standing(client: &Client, rows: u64, local: Local) -> Option<u64> {
     use std::hash::{Hash, Hasher};
     let mut mark = std::collections::hash_map::DefaultHasher::new();
-    here.hash(&mut mark);
+    (rows, local).hash(&mut mark);
+    needs::listing(client, None).await.ok().hash(&mut mark);
+    Some(mark.finish())
+}
+
+/// A window's own question and calls, and when the done marks beside the
+/// store last changed: one look at their folder says whether any did,
+/// however many agents are listed.
+type Local = ((usize, usize), Option<std::time::SystemTime>);
+
+/// A mark of where the agents `listed` stand as their rows say it, taken
+/// again only when the rows changed.
+fn rows_mark(listed: &[Value]) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut mark = std::collections::hash_map::DefaultHasher::new();
     for bot in listed {
         for key in [
             "name",
@@ -4123,12 +4132,20 @@ async fn standing(
         if !bot["running_turn"].is_null() {
             bot["head"].to_string().hash(&mut mark);
         }
-        if let Some(name) = bot["name"].as_str() {
-            resolved::read(store, name).hash(&mut mark);
-        }
     }
-    needs::listing(client, None).await.ok().hash(&mut mark);
-    Some(mark.finish())
+    mark.finish()
+}
+
+/// Whether `rows` differ from the rows of the same names in `listed`,
+/// which is in name order, or name agents it does not hold.
+fn rows_differ(listed: &[Value], rows: &[Value]) -> bool {
+    rows.iter().any(|row| {
+        let name = row["name"].as_str().unwrap_or_default();
+        match listed.binary_search_by(|bot| bot["name"].as_str().unwrap_or_default().cmp(name)) {
+            Ok(at) => listed[at] != *row,
+            Err(_) => true,
+        }
+    })
 }
 
 /// `listed` with the rows of the agents `moved` read again: one gone is
@@ -4697,8 +4714,10 @@ struct App {
     /// The follow of this window's project that keeps `listed` current,
     /// on the window's own connection.
     follower: Option<standing::Follower>,
-    /// The project's agents as last read, kept current by `follower`.
+    /// The project's agents as last read, kept current by `follower`,
+    /// with their [`rows_mark`] once counted.
     listed: Option<Arc<Vec<Value>>>,
+    rows_mark: Option<u64>,
     folded: Option<(bool, u64)>,
     refold: bool,
     /// The `plan` calls drawn, by the number each is tagged with, and the
@@ -6455,6 +6474,7 @@ impl App {
             counted_local: None,
             follower: None,
             listed: None,
+            rows_mark: None,
             folded: None,
             refold: false,
             plans: HashMap::new(),
@@ -10281,7 +10301,7 @@ impl App {
         {
             self.counted_mark = counted.mark;
             match counted.listed {
-                Some(listed) => self.listed = Some(listed),
+                Some((listed, mark)) => (self.listed, self.rows_mark) = (Some(listed), Some(mark)),
                 // A read failed: what moved is unknown, so start over.
                 None => self.follower = None,
             }
@@ -10309,7 +10329,7 @@ impl App {
         if (self.follower.as_ref())
             .is_none_or(|follower| follower.pattern != scope.glob || !follower.on(&self.client))
         {
-            self.listed = None;
+            (self.listed, self.rows_mark) = (None, None);
             self.follower = Some(standing::Follower::start(
                 self.client.clone(),
                 scope.glob.clone(),
@@ -10325,7 +10345,7 @@ impl App {
         );
         let marks = agent_client::socket::canonical_store(&self.options.store)
             .unwrap_or_else(|_| self.options.store.clone());
-        let local = (here, resolved_changed(&marks));
+        let local: Local = (here, resolved_changed(&marks));
         let listed = match changes.snapshot {
             Some(snapshot) => Arc::new(snapshot),
             None => match &self.listed {
@@ -10350,6 +10370,8 @@ impl App {
         let (store, bot) = (self.options.store.clone(), self.bot.clone());
         let (mut latest, mut seen) = (self.status_read.clone(), self.asks_seen.clone());
         let (was, turns) = (self.counted_mark, self.turns.clone());
+        // The rows' mark is taken again only when a row changed.
+        let kept_mark = self.rows_mark.filter(|_| !whole);
         self.counting = Some(tokio::spawn(async move {
             let failed = || Counted {
                 mark: None,
@@ -10358,13 +10380,14 @@ impl App {
                 listed: None,
                 own: None,
             };
-            let mut listed = listed;
+            let (mut listed, mut kept_mark) = (listed, kept_mark);
             if !moved.is_empty() {
                 let names: Vec<String> = moved.iter().cloned().collect();
                 let Ok(rows) = standing::rows(&client, &names).await else {
                     return Some(failed());
                 };
                 listed = Arc::new(moved_rows(&listed, &moved, rows));
+                kept_mark = None;
             }
             if running {
                 let ask = json!({"name": scope.glob, "active": true, "limit": 256});
@@ -10375,12 +10398,18 @@ impl App {
                     .cloned()
                     .map(standing::kept)
                     .collect();
-                let names = (rows.iter())
-                    .filter_map(|row| Some(row["name"].as_str()?.to_owned()))
-                    .collect();
-                listed = Arc::new(moved_rows(&listed, &names, rows));
+                // Running agents that stand as they stood leave the
+                // listing, and its mark, as they were.
+                if rows_differ(&listed, &rows) {
+                    let names = (rows.iter())
+                        .filter_map(|row| Some(row["name"].as_str()?.to_owned()))
+                        .collect();
+                    listed = Arc::new(moved_rows(&listed, &names, rows));
+                    kept_mark = None;
+                }
             }
-            let Some(mark) = standing(&client, &marks, &listed, here).await else {
+            let rows = kept_mark.unwrap_or_else(|| rows_mark(&listed));
+            let Some(mark) = standing(&client, rows, local).await else {
                 return Some(failed());
             };
             if was == Some(mark) {
@@ -10388,7 +10417,7 @@ impl App {
                     mark: Some(mark),
                     read: None,
                     tasks: None,
-                    listed: Some(listed),
+                    listed: Some((listed, rows)),
                     own: None,
                 });
             }
@@ -10421,7 +10450,7 @@ impl App {
                     (latest, seen),
                 )),
                 tasks: Some(status::tasks(&read.rows)),
-                listed: Some(listed),
+                listed: Some((listed, rows)),
                 own: Some(status::own(&read.rows, &bot)),
             })
         }));
