@@ -22069,7 +22069,7 @@ fn retention_keeps_the_ending_of_the_message_it_ends() {
         .turn;
     converse(&mut db, "Bob", 2);
     let status = |db: &Database| -> Value {
-        messages_page(&db, "Bob", 0, None, 16, false, false).unwrap()["messages"]
+        messages_page(db, "Bob", 0, None, 16, false, false).unwrap()["messages"]
             .as_array()
             .unwrap()
             .iter()
