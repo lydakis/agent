@@ -8392,26 +8392,25 @@ mod tests {
 
     /// A daemon that sends a burst of `count` events of a few KiB each,
     /// faster than the sky takes them, from any cursor a follow asks for.
-    /// Every connection after the first greets with the cord pulled. How
-    /// many connections it was asked for is counted.
+    /// Every connection greets with the cord pulled. How many lines it
+    /// wrote is counted.
     fn burst(socket: &std::path::Path, count: i64, at: Burst) -> Arc<AtomicUsize> {
         use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
         let listener = tokio::net::UnixListener::bind(socket).unwrap();
-        let connections = Arc::new(AtomicUsize::new(0));
-        let counted = connections.clone();
+        let written = Arc::new(AtomicUsize::new(0));
+        let lives = Arc::new(AtomicUsize::new(0));
+        let counted = written.clone();
         tokio::spawn(async move {
             loop {
                 let Ok((stream, _)) = listener.accept().await else {
                     return;
                 };
-                let first = counted.fetch_add(1, Ordering::SeqCst) == 0;
+                let (written, lives) = (counted.clone(), lives.clone());
                 tokio::spawn(async move {
                     let (read, mut write) = stream.into_split();
                     let mut lines = BufReader::new(read).lines();
                     let mut ready = json!({"event": "ready", "protocol": agent_client::PROTOCOL});
-                    if !first {
-                        ready["paused"] = json!({"by": "shop.a1", "reason": "hold on"});
-                    }
+                    ready["paused"] = json!({"by": "shop.a1", "reason": "hold on"});
                     let mut out = vec![ready];
                     let pad = "x".repeat(2048);
                     loop {
@@ -8425,6 +8424,7 @@ mod tests {
                             {
                                 return;
                             }
+                            written.fetch_add(1, Ordering::SeqCst);
                         }
                         let Ok(Some(line)) = lines.next_line().await else {
                             return;
@@ -8447,8 +8447,9 @@ mod tests {
                                         "event": "accepted", "data": {"pad": pad}})
                                 });
                                 // Live, the burst comes once the first
-                                // follow is live; a later follow finds it
-                                // kept, and replays it.
+                                // live follow is live; a later one finds
+                                // it kept, and replays it.
+                                let first = !past && lives.fetch_add(1, Ordering::SeqCst) == 0;
                                 let at = if at == Burst::Live && !first {
                                     Burst::Replay
                                 } else {
@@ -8471,7 +8472,7 @@ mod tests {
                 });
             }
         });
-        connections
+        written
     }
 
     /// A sky slower than its daemon: what waits for it stays within the
@@ -8486,7 +8487,7 @@ mod tests {
         let socket = dir.join("agent.sock");
         // Some 50 MiB, past the budget of both the connection and the view.
         let count = 24_000;
-        let connections = burst(&socket, count, at);
+        let written = burst(&socket, count, at);
         let (send, mut feed) = Feeder::new();
         let room = send.room.clone();
         tokio::spawn(follow(socket, dir.join("state.sqlite"), send));
@@ -8512,22 +8513,29 @@ mod tests {
             };
             assert_eq!(event["cursor"], next);
             next += 1;
-            // The sky stalls a while, as on a long frame, then takes its
-            // time.
+            // The sky stalls, as on a long frame, until its connection,
+            // which reads whatever comes until it falls behind, stops
+            // reading; then it takes its time.
             if next == 2 {
-                tokio::time::sleep(Duration::from_secs(2)).await;
+                let mut was = written.load(Ordering::SeqCst);
+                loop {
+                    tokio::time::sleep(Duration::from_millis(250)).await;
+                    let now = written.load(Ordering::SeqCst);
+                    if now == was {
+                        break;
+                    }
+                    was = now;
+                }
             } else if next % 32 == 0 {
                 tokio::time::sleep(Duration::from_millis(1)).await;
             }
             drop(held);
         }
-        let connections = connections.load(Ordering::SeqCst);
         assert!(most <= agent_client::QUEUE_BYTES);
         assert!(
             most > agent_client::QUEUE_BYTES / 2,
             "the sky was never behind: {most}"
         );
-        assert!(connections > 1, "the follow never fell behind");
         // Pulled while it was behind, which no replay brings.
         assert_eq!(cord.as_deref(), Some("paused"));
         std::fs::remove_dir_all(dir).unwrap();
