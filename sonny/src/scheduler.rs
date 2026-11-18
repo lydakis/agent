@@ -1582,6 +1582,11 @@ impl Kept {
                 self.last = last;
             }
             Err(error) => {
+                // Some of the lines may be in the log, the last cut short:
+                // their numbers are not used again, and the next write is
+                // the whole, which passes over them and starts the log over.
+                self.last = last;
+                self.logged = self.times.len();
                 let error = format!("{}: {error}", path.display());
                 eprintln!("{}", trigger::error_json(&error));
             }
@@ -2705,6 +2710,42 @@ mod tests {
         again.insert("d".into(), ("g".into(), 400));
         again.write(&places);
         assert_eq!(Kept::read(&places).get("d"), Some(&("g".to_owned(), 400)));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_log_write_that_fails_part_way_is_not_read_over_what_comes_after() {
+        let root =
+            std::env::temp_dir().join(format!("agent-scheduler-failed-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let places = Places::under(&root);
+        let mut kept = Kept::default();
+        for name in ["a", "b", "c", "d", "e", "f", "g", "h", "i", "j"] {
+            kept.insert(name.into(), ("g".into(), 60));
+        }
+        kept.write(&places);
+        // The append fails: here the log cannot be opened, as when a
+        // write or its sync fails after some of its lines went in.
+        let next = kept.last + 1;
+        std::fs::create_dir_all(places.looked_log()).unwrap();
+        kept.insert("a".into(), ("g".into(), 100));
+        kept.insert("b".into(), ("g".into(), 100));
+        kept.write(&places);
+        assert_eq!(kept.changed.len(), 2);
+        // What such a write may leave: a's line, b's cut short.
+        std::fs::remove_dir(places.looked_log()).unwrap();
+        let left = format!(
+            "{{\"n\":{next},\"name\":\"a\",\"generation\":\"g\",\"looked\":100}}\n{{\"n\":{},\"na",
+            next + 1
+        );
+        std::fs::write(places.looked_log(), left).unwrap();
+        // The next write gives a newer time; read again, it holds.
+        kept.insert("a".into(), ("g".into(), 200));
+        kept.write(&places);
+        let read = Kept::read(&places);
+        assert_eq!(read.get("a"), Some(&("g".to_owned(), 200)));
+        assert_eq!(read.get("b"), Some(&("g".to_owned(), 100)));
+        assert_eq!(read.times, kept.times);
         let _ = std::fs::remove_dir_all(&root);
     }
 
