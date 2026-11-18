@@ -11106,9 +11106,10 @@ listed the calls waiting on a client (`tool_calls`) on the writer's
 connection too. Now the loop hands each write to the writer and answers it
 when its commit lands, and the connection that sent it reads nothing else
 until then, so each connection's order is kept; the write's line keeps its
-input credit until then too. `tool_calls` reads on the readers, past the
+input credit until then too. Writes are answered in the order they were
+sent, whichever connection sent them. `tool_calls` reads on the readers, past the
 answers the writer held at its last commit. An `interrupt`, `close`,
-`delete`, `pause` or `shutdown` waits for the writes on their way before it
+`delete`, `pause`, `shutdown` or `stop_process` waits for the writes on their way before it
 is taken up, as it did when each was awaited in turn, so no call taken or
 step allowed starts after it. `configure`, `interrupt` and a `submit` at
 the active limit still write from the loop: each is several steps that
@@ -11117,8 +11118,8 @@ later requests depend on.
 All on Linux x86_64 (4 CPUs), 2026-11-18, release builds made the same way
 (`cargo build --release --workspace --bins`), main (652af4b) against the
 change (2100e79; the commits after it only make the requests that end or
-hold turns wait for the writes on their way, and hold a write's input
-credit until it lands). The Mac was not measured.
+hold turns wait for the writes on their way, answer writes in the order
+they were sent, and hold a write's input credit until it lands). The Mac was not measured.
 
 ### Slow disk, with scripts running
 
