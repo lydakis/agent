@@ -20488,6 +20488,131 @@ fn a_step_under_no_gate_is_recorded_even_when_it_would_ask() {
 }
 
 #[test]
+fn a_daemon_step_cut_short_still_names_the_files_it_changes() {
+    use agent_runtime::store::{StepAsk, StepOpened};
+    let mut db = db();
+    let run = Declared {
+        name: "run".into(),
+        description: "Run.".into(),
+        parameters: json!({"type":"object"}),
+        result: "ok".into(),
+        answered_by: Some("sonny".into()),
+        expire_ms: None,
+        grammar: None,
+        steps: true,
+        gate_daemon_steps: false,
+        lift: false,
+        inherit: Inherit::All,
+        kind: Some("mcp".into()),
+    };
+    // Writes are gated, edits and patches are not.
+    let gate = Gate {
+        tag: "manual".into(),
+        tools: vec!["write".into()],
+        expire_ms: None,
+    };
+    let tools: Vec<String> = ["read", "write", "edit", "apply_patch"]
+        .map(str::to_owned)
+        .to_vec();
+    db.create(
+        "Lead",
+        Some("/synthetic"),
+        Binding {
+            declared: Some(&ToolList::new(vec![run]).unwrap()),
+            gate: Some(&gate),
+            tools: &tools,
+            ..binding()
+        },
+    )
+    .unwrap();
+    let turn = db
+        .begin(
+            "Lead",
+            "request",
+            "work",
+            true,
+            &TurnOptions::default(),
+            allow_provider,
+        )
+        .unwrap()
+        .turn;
+    let call = ToolCall {
+        name: "run".into(),
+        call_id: "c1".into(),
+        arguments: "{}".into(),
+        custom: false,
+        links: Default::default(),
+    };
+    db.append(turn, vec![], std::slice::from_ref(&call), None)
+        .unwrap();
+    db.tool_start(turn, &call, false, false).unwrap();
+    let long = "x".repeat(3000);
+    // A script's arguments reach the daemon with their keys in order, so a
+    // long text comes before the path the preview would have named.
+    let ask = |step: &str, tool: &str, arguments: Value| StepAsk {
+        bot: "Lead".into(),
+        turn,
+        call_id: "c1".into(),
+        step: step.into(),
+        tool: tool.into(),
+        arguments: arguments.to_string(),
+        links: Default::default(),
+    };
+    let edit = ask("e", "edit", json!({"new":long,"old":"a","path":"notes.md"}));
+    assert!(matches!(
+        db.step_open(&edit, None, 0).unwrap(),
+        StepOpened::Run { .. }
+    ));
+    let patch = format!(
+        "*** Begin Patch\n*** Add File: a.md\n+{long}\n*** Add File: run.sh\n+ls\n*** End Patch"
+    );
+    let patch = ask("p", "apply_patch", json!({"input":patch}));
+    assert!(matches!(
+        db.step_open(&patch, None, 0).unwrap(),
+        StepOpened::Run { .. }
+    ));
+    // A gated step names them too once its gate allows it.
+    let write = ask("w", "write", json!({"content":long,"path":"run.sh"}));
+    assert!(matches!(
+        db.step_open(&write, None, 0).unwrap(),
+        StepOpened::Pending { .. }
+    ));
+    db.answer(Decision {
+        bot: "Lead",
+        turn,
+        call_id: "c1/w",
+        request: 1,
+        tag: Some("manual"),
+        allow: true,
+        unreviewed: false,
+        reason: None,
+        by: Some("test"),
+        leased: false,
+    })
+    .unwrap();
+    db.step_check("Lead", turn, "c1/w", 0, false).unwrap();
+    let read = db.prompts("Lead", turn, 64 * 1024).unwrap();
+    let named: Vec<(Value, Value, Value)> = (read["calls"].as_array().unwrap().iter())
+        .filter(|call| call["call_id"] != "c1")
+        .map(|call| {
+            (
+                call["call_id"].clone(),
+                call["arguments_truncated"].clone(),
+                call["paths"].clone(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        named,
+        [
+            (json!("c1/e"), json!(true), json!(["notes.md"])),
+            (json!("c1/p"), json!(true), json!(["a.md", "run.sh"])),
+            (json!("c1/w"), json!(true), json!(["run.sh"])),
+        ]
+    );
+}
+
+#[test]
 fn the_trail_reads_by_filter_and_pages_back_by_id() {
     use agent_runtime::store::audit::Query;
     let mut db = db();
