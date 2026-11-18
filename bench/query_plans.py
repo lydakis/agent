@@ -29,7 +29,11 @@ OPTIONAL = {'{glob}': ('', " AND t.bot GLOB ?3 AND t.bot >= ?4 AND t.bot < ?4 ||
             '{open}': ('', ' AND closed_ms IS NULL'),
             '{order}': ('ASC', 'DESC'),
             '{line}': ('', "AND m.id IN (SELECT id FROM messages WHERE bot=?1 AND status='queued' "
-                           "UNION ALL SELECT id FROM messages WHERE bot=?1 AND status='ready')")}
+                           "UNION ALL SELECT id FROM messages WHERE bot=?1 AND status='ready')"),
+            '{bots}': ('m.bot=?1', 'm.bot GLOB ?1'),
+            '{kinds}': ('', ' AND m.from_bot IS NULL AND m.origin IS NULL', ' AND m.from_bot IS NOT NULL'),
+            '{text}': ('',),
+            '{text_node}': ('',)}
 
 STRUCTURAL_SCANS = {'SCAN CONSTANT ROW', 'SCAN c', 'SCAN chain', 'SCAN held', 'SCAN kin', 'SCAN sqlite_master',
                     'SCAN sqlite_sequence'}

@@ -91,9 +91,9 @@ const COMMANDS: &[Command] = &[
     },
     Command {
         name: "messages",
-        about: "A bot's messages, each by its number: where it stands and the turn that took it in",
-        usage: "messages --bot NAME [--after N] [--newest] [--limit N]",
-        flags: "--bot --after --newest --limit --pretty --no-spawn",
+        about: "Messages, each by its number: where it stands and the turn that took it in",
+        usage: "messages --bot NAME|GLOB [--since DURATION] [--from person,agent,client] [--after N] [--newest] [--limit N]",
+        flags: "--bot --since --from --after --newest --limit --pretty --no-spawn",
         settings: "",
         startup: true,
     },
@@ -625,7 +625,11 @@ fn print_flags(flags: &str) {
             "--limit" => ("N", "List at most N"),
             "--since" => (
                 "DURATION",
-                "From this long ago: for usage, only turns started since (default: all); for follow, events written since",
+                "From this long ago: for usage, only turns started since (default: all); for follow, events written since; for messages, those sent since",
+            ),
+            "--from" => (
+                "KINDS",
+                "Only messages from these senders, comma-separated: person, agent, client",
             ),
             "--bucket" => (
                 "DURATION",

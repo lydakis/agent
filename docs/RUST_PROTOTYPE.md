@@ -506,7 +506,34 @@ each with `message`, `turn` (null until taken), `delivery`, `node`,
 prompt preview, paged as `turns` is, and with `waiting` only those still in
 line, `queued` or `ready` (protocol 74), which a window that opens on a busy
 bot reads to show what waits there; `turns` lists runs only, so steers and
-attached messages never hide what a bot did. `wait` on a message's handle
+attached messages never hide what a bot did.
+
+Protocol 87 gives `messages` and `follow` one selector, the shape `bots`
+and `audit` already take, as Kubernetes lists and watches by one selector
+and Gmail lists one query across every thread. `bot` is a name, or a GLOB
+pattern (`shop.*`, `*.lead`, `*`); no name holds `*`, `?` or `[`, so a
+plain name is one bot's and an unknown one is `bot_not_found`, while a
+pattern names whichever bots match, any made later too. `messages` adds
+`since_ms` and `until_ms` (sent at or after, and before, in Unix ms) and
+`from`, the kinds of sender: `person` (no other agent's turn and no named
+client sent it, named person or not), `agent` (another agent's turn) and
+`client` (a client by its own name, such as an automation or the lookout);
+any other is `invalid_message_filter`. With `words`, each message carries
+its `text` whole beside the preview, and a page holds as many as fit in
+half a response, at least one. A message's `sent_ms` is never before the
+one sent before it, so times rise with numbers and a time range is found
+by halving the number range, a few point reads, as `audit` and `follow`'s
+`since_ms` find theirs; then the read is a range of numbers. People's
+messages have their own index (`messages_people`, by number), so
+`messages {bot:"*", from:["person"], since_ms}`, what the person wrote to
+any agent lately, reads only those; Sonny's `memory said` is that one
+read, paged, where it asked for every agent's turns, about 1,650 requests
+with 1,650 agents, and reads an agent's history only for a reaction or an
+answer to an ask among them. `follow` with a pattern replays every bot's
+events from a store-wide cursor, as `*` does, and delivers only the
+matching bots', in replay and live; `kinds` narrows it as before. The
+publisher matches a pattern by SQLite's GLOB rules, so live delivery agrees
+with what replay read. `wait` on a message's handle
 resolves when it is taken, withdrawn or failed, or for a turn's opener when
 the turn ends; `interrupt` names a message (`turn` keeps its field name)
 and withdraws one in line or stops the turn it opened. A message ended in

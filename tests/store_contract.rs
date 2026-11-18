@@ -4684,7 +4684,7 @@ fn prompts_name_who_wrote_each_and_what_the_turn_ran() {
     // The steer named no folder, so it records the one its turn ran in,
     // which a later move does not rewrite.
     let row = |db: &Database, id: i64| {
-        let messages = db.messages("Carol", 0, None, 10, false, false).unwrap();
+        let messages = messages_page(&db, "Carol", 0, None, 10, false, false).unwrap();
         let ran = (messages["messages"].as_array().unwrap().iter())
             .find(|m| m["message"] == id)
             .unwrap()["turn"]
@@ -5283,7 +5283,7 @@ fn schema_39_records_the_folder_each_earlier_turn_ran_in() {
         .unwrap();
     let mut db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
     // The steer ran with the folder and model of the turn it joined.
-    let messages = db.messages("Dan", 0, None, 10, false, false).unwrap();
+    let messages = messages_page(&db, "Dan", 0, None, 10, false, false).unwrap();
     let joined = (messages["messages"].as_array().unwrap().iter())
         .find(|m| m["message"] == steer)
         .unwrap()["turn"]
@@ -5453,7 +5453,7 @@ fn schema_41_turns_ran_at_their_bots_effort() {
         "medium"
     );
     assert_eq!(
-        db.messages("Bob", 0, None, 10, false, false).unwrap()["messages"][1]["effort"],
+        messages_page(&db, "Bob", 0, None, 10, false, false).unwrap()["messages"][1]["effort"],
         "medium"
     );
     drop(db);
@@ -5655,7 +5655,7 @@ fn schema_42_backfills_absorbed_effort_or_rolls_back_when_history_is_missing() {
             assert!(!conn.query_row("SELECT EXISTS(SELECT 1 FROM pragma_table_info('turns') WHERE name='inherited_reasoning')", [], |r| r.get::<_, bool>(0)).unwrap());
         } else {
             let db = opened.unwrap();
-            let listed = db.messages("Bob", 0, None, 10, false, false).unwrap();
+            let listed = messages_page(&db, "Bob", 0, None, 10, false, false).unwrap();
             let levels: Vec<_> = listed["messages"]
                 .as_array()
                 .unwrap()
@@ -6650,7 +6650,7 @@ fn a_turn_runs_at_its_own_effort_or_its_bots() {
         )
         .unwrap();
     assert_eq!(plain.entry.unwrap()["data"]["effort"], "high");
-    let listed = db.messages("Bob", 0, None, 10, false, false).unwrap();
+    let listed = messages_page(&db, "Bob", 0, None, 10, false, false).unwrap();
     let levels: Vec<&Value> = listed["messages"]
         .as_array()
         .unwrap()
@@ -6721,7 +6721,7 @@ fn absorbed_effort_does_not_change_the_submitted_request() {
             // Both the inline and shared-prompt paths report the effective effort,
             // but retries still compare the original omission or explicit level.
             assert_eq!(
-                db.messages("Bob", 0, None, 10, false, false).unwrap()["messages"][1]["effort"],
+                messages_page(&db, "Bob", 0, None, 10, false, false).unwrap()["messages"][1]["effort"],
                 "low"
             );
             let retry = db
@@ -10049,8 +10049,7 @@ fn pruning_takes_the_events_of_messages_that_ended_in_line() {
     // Each message keeps its row: history stays.
     for message in &ended {
         assert_eq!(
-            db.messages("Bob", message - 1, None, 1, false, false)
-                .unwrap()["messages"][0]["message"],
+            messages_page(&db, "Bob", message - 1, None, 1, false, false).unwrap()["messages"][0]["message"],
             *message
         );
     }
@@ -19844,13 +19843,14 @@ fn messages_that_joined_a_declined_request_go_back_in_line_as_sent() {
     // The person's and the agent's messages are in line again, as sent,
     // each its own message, in the order they came; neither the note nor
     // the fact goes again.
-    let listed: Vec<Value> = db.messages("Carol", turn, None, 8, false, false).unwrap()["messages"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .filter(|t| t["status"] != "taken")
-        .cloned()
-        .collect();
+    let listed: Vec<Value> =
+        messages_page(&db, "Carol", turn, None, 8, false, false).unwrap()["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|t| t["status"] != "taken")
+            .cloned()
+            .collect();
     let again: Vec<Value> = listed
         .iter()
         .map(|t| json!([t["prompt_preview"], t["status"], t["delivery"], t["effort"]]))
@@ -19874,18 +19874,18 @@ fn messages_that_joined_a_declined_request_go_back_in_line_as_sent() {
             .map(|m| m["message"].clone())
             .collect()
     };
-    let waiting = ids(db.messages("Carol", 0, None, 8, false, true).unwrap());
+    let waiting = ids(messages_page(&db, "Carol", 0, None, 8, false, true).unwrap());
     assert_eq!(
         waiting,
         [listed[0]["message"].clone(), listed[1]["message"].clone()]
     );
-    let newest = ids(db.messages("Carol", 0, None, 1, true, true).unwrap());
+    let newest = ids(messages_page(&db, "Carol", 0, None, 1, true, true).unwrap());
     assert_eq!(newest, [listed[1]["message"].clone()]);
     let first = listed[0]["message"].as_i64().unwrap();
     let second = listed[1]["message"].as_i64().unwrap();
     let (accepted, _) = db.start(first, allow_provider).unwrap();
     assert_eq!(accepted["data"]["person"], "pat");
-    let waiting = ids(db.messages("Carol", 0, None, 8, false, true).unwrap());
+    let waiting = ids(messages_page(&db, "Carol", 0, None, 8, false, true).unwrap());
     assert_eq!(waiting, [json!(second)], "the first is out of line");
     // In the declined turn the model is told each went again; the note
     // and the fact are left out as before. The next turn opens on the
@@ -19979,13 +19979,13 @@ fn a_message_sent_again_runs_where_it_joined_and_daemon_notes_stay_notes() {
     .unwrap();
     let refused = Error::new("provider_refusal").facts(json!({"category":"cyber"}));
     db.finish(turn, Some(&refused)).unwrap();
-    let again: Vec<Value> = (db.messages("Dan", turn, None, 8, false, false).unwrap()["messages"]
-        .as_array())
-    .unwrap()
-    .iter()
-    .filter(|t| t["status"] == "ready" || t["status"] == "queued")
-    .map(|t| json!([t["prompt_preview"], t["workspace"]]))
-    .collect();
+    let again: Vec<Value> =
+        (messages_page(&db, "Dan", turn, None, 8, false, false).unwrap()["messages"].as_array())
+            .unwrap()
+            .iter()
+            .filter(|t| t["status"] == "ready" || t["status"] == "queued")
+            .map(|t| json!([t["prompt_preview"], t["workspace"]]))
+            .collect();
     assert_eq!(again, [json!(["look here too", "/synthetic"])]);
 }
 
@@ -20044,12 +20044,13 @@ fn a_message_sent_again_keeps_who_sent_it_and_what_it_quoted() {
     db.delete_bot("Bob").unwrap();
     let refused = Error::new("provider_refusal").facts(json!({"category":"cyber"}));
     db.finish(turn, Some(&refused)).unwrap();
-    let again = (db.messages("Carol", turn, None, 8, false, false).unwrap()["messages"].as_array())
-        .unwrap()
-        .iter()
-        .find(|t| t["status"] == "ready")
-        .cloned()
-        .expect("the message did not go back in line");
+    let again = (messages_page(&db, "Carol", turn, None, 8, false, false).unwrap()["messages"]
+        .as_array())
+    .unwrap()
+    .iter()
+    .find(|t| t["status"] == "ready")
+    .cloned()
+    .expect("the message did not go back in line");
     assert_eq!(again["prompt_preview"], "see this");
     let (accepted, _) = db
         .start(again["message"].as_i64().unwrap(), allow_provider)
@@ -21551,7 +21552,7 @@ fn a_lifted_call_waits_on_past_its_turn_and_its_verdict_runs_or_ends_it() {
         db.process_result(p2).unwrap(),
         Some(("finished".into(), Some(result.clone())))
     );
-    let told = db.messages("Bob", 0, None, 16, false, false).unwrap();
+    let told = messages_page(&db, "Bob", 0, None, 16, false, false).unwrap();
     let prompts: Vec<&str> = (told["messages"].as_array().unwrap().iter())
         .filter_map(|t| t["prompt_preview"].as_str())
         .collect();
@@ -21586,7 +21587,7 @@ fn a_lifted_call_waits_on_past_its_turn_and_its_verdict_runs_or_ends_it() {
     // Its bot at rest is told it ended with its tool's own fields, as its
     // turn would have read them.
     db.tell_finished("Bob").unwrap();
-    let told = db.messages("Bob", 0, None, 16, false, false).unwrap();
+    let told = messages_page(&db, "Bob", 0, None, 16, false, false).unwrap();
     let prompts: Vec<&str> = (told["messages"].as_array().unwrap().iter())
         .filter_map(|t| t["prompt_preview"].as_str())
         .collect();
@@ -22068,7 +22069,7 @@ fn retention_keeps_the_ending_of_the_message_it_ends() {
         .turn;
     converse(&mut db, "Bob", 2);
     let status = |db: &Database| -> Value {
-        db.messages("Bob", 0, None, 16, false, false).unwrap()["messages"]
+        messages_page(&db, "Bob", 0, None, 16, false, false).unwrap()["messages"]
             .as_array()
             .unwrap()
             .iter()
@@ -22698,4 +22699,182 @@ fn schema_107_moves_instructions_out_of_the_row() {
     assert_eq!(rows, 2);
     drop(db);
     std::fs::remove_file(path).unwrap();
+}
+
+/// A page of one bot's messages, as `messages` read them before it took a
+/// selector.
+fn messages_page(
+    db: &Database,
+    bot: &str,
+    after: i64,
+    before: Option<i64>,
+    limit: usize,
+    newest: bool,
+    waiting: bool,
+) -> agent_runtime::Result<Value> {
+    db.messages(&agent_runtime::store::Messages {
+        bot,
+        after,
+        before,
+        since_ms: None,
+        until_ms: None,
+        from: None,
+        limit,
+        newest,
+        waiting,
+        words: false,
+    })
+}
+
+#[test]
+fn messages_pick_bots_by_pattern_time_and_sender() {
+    let mut db = db();
+    let by_person = gated_turn(&mut db, None);
+    for name in ["shop.a", "shop.b", "web.c"] {
+        db.create(name, Some("/synthetic"), binding()).unwrap();
+    }
+    let send = |db: &mut Database, bot: &str, request: &str, text: &str, options: TurnOptions| {
+        db.begin(bot, request, text, false, &options, allow_provider)
+            .unwrap()
+            .turn
+    };
+    let queue = TurnOptions {
+        delivery: Delivery::Queue,
+        ..TurnOptions::default()
+    };
+    let person = send(&mut db, "shop.a", "r1", "ship the cart", queue.clone());
+    let client = send(
+        &mut db,
+        "shop.b",
+        "r2",
+        "a digest",
+        TurnOptions {
+            origin: Some("lookout".into()),
+            ..queue.clone()
+        },
+    );
+    let agent = send(
+        &mut db,
+        "web.c",
+        "r3",
+        "check the page",
+        TurnOptions {
+            from: Some(("Bob".into(), by_person)),
+            ..queue.clone()
+        },
+    );
+    let pick = |db: &Database, bot: &str, from: Option<&[&str]>, since_ms: Option<i64>| {
+        let page = db
+            .messages(&agent_runtime::store::Messages {
+                bot,
+                after: 0,
+                before: None,
+                since_ms,
+                until_ms: None,
+                from: from.map(|from| from.iter().map(|f| f.to_string()).collect()),
+                limit: 10,
+                newest: true,
+                waiting: false,
+                words: true,
+            })
+            .unwrap();
+        (page["messages"].as_array().unwrap().iter())
+            .map(|m| {
+                (
+                    m["message"].as_i64().unwrap(),
+                    m["text"].as_str().unwrap().to_owned(),
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+    // Every bot's, newest first, each with its words whole.
+    assert_eq!(
+        pick(&db, "*", None, None),
+        [
+            (agent, "check the page".into()),
+            (client, "a digest".into()),
+            (person, "ship the cart".into()),
+            (by_person, "work".into())
+        ]
+    );
+    // A pattern's bots, and only the senders asked for.
+    assert_eq!(pick(&db, "shop.*", None, None).len(), 2);
+    assert_eq!(
+        pick(&db, "*", Some(&["person"]), None),
+        [(person, "ship the cart".into()), (by_person, "work".into())]
+    );
+    assert_eq!(
+        pick(&db, "shop.*", Some(&["person"]), None),
+        [(person, "ship the cart".into())]
+    );
+    assert_eq!(
+        pick(&db, "*", Some(&["agent"]), None),
+        [(agent, "check the page".into())]
+    );
+    assert_eq!(
+        pick(&db, "*", Some(&["client", "agent"]), None),
+        [
+            (agent, "check the page".into()),
+            (client, "a digest".into())
+        ]
+    );
+    // Sent since a time: all of them from the start, none from later.
+    assert_eq!(pick(&db, "*", Some(&["person"]), Some(0)).len(), 2);
+    let later = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64
+        + 60_000;
+    assert!(pick(&db, "*", None, Some(later)).is_empty());
+    // A name is one bot's, which must exist; a sender kind must be known.
+    let refused = |bot: &str, from: Option<Vec<String>>| {
+        db.messages(&agent_runtime::store::Messages {
+            bot,
+            after: 0,
+            before: None,
+            since_ms: None,
+            until_ms: None,
+            from,
+            limit: 10,
+            newest: false,
+            waiting: false,
+            words: false,
+        })
+        .unwrap_err()
+        .code
+    };
+    assert_eq!(refused("shop.z", None), "bot_not_found");
+    assert_eq!(
+        refused("*", Some(vec!["robot".into()])),
+        "invalid_message_filter"
+    );
+    assert_eq!(refused("*", Some(vec![])), "invalid_message_filter");
+}
+
+#[test]
+fn glob_matches_as_the_store_does() {
+    use agent_runtime::store::glob;
+    let sqlite = Connection::open_in_memory().unwrap();
+    for (pattern, name) in [
+        ("shop.*", "shop.lead"),
+        ("shop.*", "shop."),
+        ("shop.*", "shopx"),
+        ("*.lead", "web.lead"),
+        ("*", "anything"),
+        ("s?op.*", "shop.a"),
+        ("shop.[ab]", "shop.a"),
+        ("shop.[ab]", "shop.c"),
+        ("shop.[a-c]*", "shop.cart"),
+        ("shop.[^a]", "shop.a"),
+        ("shop.[^a]", "shop.b"),
+        ("*a*b*", "xaxxbx"),
+        ("*a*b", "xaxxbx"),
+        ("a.b", "a.b"),
+        ("a.b", "a.bc"),
+    ] {
+        let stored: bool = sqlite
+            .query_row("SELECT ?2 GLOB ?1", [pattern, name], |r| r.get(0))
+            .unwrap();
+        assert_eq!(glob(pattern, name), stored, "{pattern} on {name}");
+    }
 }

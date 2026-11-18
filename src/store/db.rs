@@ -2629,6 +2629,149 @@ fn plan_stably(conn: &Connection) -> Result<()> {
 fn glob_prefix(pattern: &str) -> &str {
     &pattern[..pattern.find(['*', '?', '[']).unwrap_or(pattern.len())]
 }
+/// What `messages` picks: a bot by name, or a GLOB pattern of names as
+/// `bots` takes one; a range of message numbers and of the times they were
+/// sent; who sent them; and the page. The same selector `follow` takes for
+/// its bots, as Kubernetes lists and watches by one selector.
+pub struct Messages<'a> {
+    pub bot: &'a str,
+    pub after: i64,
+    pub before: Option<i64>,
+    pub since_ms: Option<i64>,
+    pub until_ms: Option<i64>,
+    /// Who sent them: `person` (no other agent's turn and no named
+    /// client), `agent` (another agent's turn) or `client` (a client by
+    /// its own name, such as an automation); any when absent.
+    pub from: Option<Vec<String>>,
+    pub limit: usize,
+    pub newest: bool,
+    /// Only those still in line.
+    pub waiting: bool,
+    /// Each one's words whole, as `text`, beside the preview.
+    pub words: bool,
+}
+/// The kinds of sender a message has, by what it records: another bot's
+/// turn (`from_bot`), a client's name (`origin`), or neither, a person.
+#[derive(Clone, Copy, PartialEq)]
+struct Senders(u8);
+impl Senders {
+    const PERSON: u8 = 1;
+    const AGENT: u8 = 2;
+    const CLIENT: u8 = 4;
+    const ALL: Self = Self(7);
+    const NAMES: [&'static str; 3] = ["person", "agent", "client"];
+    fn named(names: &[String]) -> Result<Self> {
+        let refused = || {
+            Error::with(
+                "invalid_message_filter",
+                format!("from names one or more of {}", Self::NAMES.join(", ")),
+            )
+            .facts(json!({"from":Self::NAMES}))
+        };
+        let mut kinds = 0;
+        for name in names {
+            kinds |= match name.as_str() {
+                "person" => Self::PERSON,
+                "agent" => Self::AGENT,
+                "client" => Self::CLIENT,
+                _ => return Err(refused()),
+            };
+        }
+        match kinds {
+            0 => Err(refused()),
+            kinds => Ok(Self(kinds)),
+        }
+    }
+    /// The filter, written as the `messages_people` index's own terms when
+    /// only people's are asked for, so that index serves it. A message has
+    /// at most one of `from_bot` and `origin`.
+    fn clause(self) -> &'static str {
+        match self.0 {
+            1 => " AND m.from_bot IS NULL AND m.origin IS NULL",
+            2 => " AND m.from_bot IS NOT NULL",
+            4 => " AND m.origin IS NOT NULL",
+            3 => " AND m.origin IS NULL",
+            5 => " AND m.from_bot IS NULL",
+            6 => " AND (m.from_bot IS NOT NULL OR m.origin IS NOT NULL)",
+            _ => "",
+        }
+    }
+}
+/// Whether `name` matches `pattern` as SQLite's GLOB matches it: `*` any
+/// run of characters, `?` any one, `[...]` one of a set or range (`[^...]`
+/// one not in it), case kept. What a live follow of a pattern delivers
+/// against, so it delivers what its replay read from the store.
+pub fn glob(pattern: &str, name: &str) -> bool {
+    fn class(set: &[char], c: char) -> Option<(bool, usize)> {
+        // `set` starts after `[`; answers whether `c` is in it and how
+        // long the class is, through its `]`.
+        let (negated, mut i) = match set.first() {
+            Some('^') => (true, 1),
+            _ => (false, 0),
+        };
+        let mut found = false;
+        let mut first = true;
+        while i < set.len() {
+            let start = set[i];
+            if start == ']' && !first {
+                return Some((found != negated, i + 1));
+            }
+            first = false;
+            if set.get(i + 1) == Some(&'-') && set.get(i + 2).is_some_and(|end| *end != ']') {
+                found |= (start..=set[i + 2]).contains(&c);
+                i += 3;
+            } else {
+                found |= start == c;
+                i += 1;
+            }
+        }
+        None
+    }
+    let (pattern, name): (Vec<char>, Vec<char>) =
+        (pattern.chars().collect(), name.chars().collect());
+    let (mut p, mut n) = (0, 0);
+    let mut star: Option<(usize, usize)> = None;
+    loop {
+        if p < pattern.len() {
+            match pattern[p] {
+                '*' => {
+                    star = Some((p, n));
+                    p += 1;
+                    continue;
+                }
+                '?' if n < name.len() => {
+                    p += 1;
+                    n += 1;
+                    continue;
+                }
+                '[' if n < name.len() => {
+                    if let Some((true, len)) = class(&pattern[p + 1..], name[n]) {
+                        p += 1 + len;
+                        n += 1;
+                        continue;
+                    }
+                }
+                c if c != '?' && c != '[' && n < name.len() && c == name[n] => {
+                    p += 1;
+                    n += 1;
+                    continue;
+                }
+                _ => {}
+            }
+        } else if n == name.len() {
+            return true;
+        }
+        // A mismatch: let the last `*` take one more character.
+        match star {
+            Some((at, from)) if from < name.len() => {
+                star = Some((at, from + 1));
+                p = at + 1;
+                n = from + 1;
+            }
+            _ => return false,
+        }
+    }
+}
 pub struct Database {
     conn: Connection,
     /// Bounds on submissions waiting to start, turns and prompt bytes; zero
@@ -3607,6 +3750,7 @@ impl Database {
             CREATE INDEX IF NOT EXISTS messages_queued ON messages(bot,id) WHERE status='queued';
             CREATE INDEX IF NOT EXISTS messages_steers ON messages(bot,id) WHERE status='queued' AND delivery='steer';
             CREATE INDEX IF NOT EXISTS messages_attached ON messages(bot,id) WHERE status='attached';
+            CREATE INDEX IF NOT EXISTS messages_people ON messages(id) WHERE from_bot IS NULL AND origin IS NULL;
             CREATE INDEX IF NOT EXISTS messages_persons ON messages(bot,id)
                 WHERE status='taken' AND from_bot IS NULL AND origin IS NULL AND person IS NULL;
             CREATE INDEX IF NOT EXISTS messages_due ON messages(due_ms) WHERE status='attached' AND due_ms IS NOT NULL;
@@ -8023,11 +8167,14 @@ impl Database {
             .query_row([], |r| r.get(0))?;
         let now = epoch_ms();
         // A message starting at once is in line until `start_locked` takes
-        // it in, in this same job.
+        // it in, in this same job. Its time is never before the last
+        // message's, so times rise with numbers and a time range is a
+        // range of numbers (`first_sent`), as the audit trail's are.
         tx.prepare_cached(
             "INSERT INTO messages(id,bot,request_id,text,status,workspace,model,delivery,expected_turn,from_bot,from_turn,from_id,origin,reasoning,budget_tokens,images,person,quotes,
                 wait_ms,due_ms,budget_counts,output_schema,sent_ms,turn,taken_ms)
-             VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+             VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,
+                MAX(?23,COALESCE((SELECT sent_ms FROM messages WHERE id=(SELECT MAX(id) FROM messages)),?23)),?,?)",
         )?.execute(
             // Queued work keeps the folder it was sent to even if the bot
             // moves before it starts; a steer without one joins any turn.
@@ -15936,36 +16083,81 @@ impl Database {
             false => json!({"turns":turns,"next_after":next}),
         })
     }
-    /// A page of a bot's messages between `after` and `before`, as `turns`
-    /// pages its runs: each as sent, with where it stands (in line, taken
-    /// in by `turn`, withdrawn or failed), its words previewed, when it was
-    /// sent and taken in, and the effort it ran at or asked for. With
-    /// `waiting`, only those still in line (`queued` or `ready`), read
-    /// through the line's own indexes rather than every message the bot
-    /// was sent.
-    pub fn messages(
-        &self,
-        name: &str,
-        after: i64,
-        before: Option<i64>,
-        limit: usize,
-        newest: bool,
-        waiting: bool,
-    ) -> Result<Value> {
-        self.inspect(name)?;
-        if after < 0 || before.is_some_and(|b| b < 1) || !(1..=256).contains(&limit) {
+    /// A page of the messages a [`Messages`] selector picks, between
+    /// `after` and `before` by number, as `turns` pages its runs: each as
+    /// sent, with where it stands (in line, taken in by `turn`, withdrawn
+    /// or failed), its words previewed (whole too with `words`), when it
+    /// was sent and taken in, and the effort it ran at or asked for. A bot
+    /// named whole reads its own index, and an unknown one is an error; a
+    /// pattern reads the numbers in range, and the messages of people
+    /// alone their own index, so what the person wrote to every agent
+    /// since a time is one range read. Times rise with numbers, so
+    /// `since_ms` and `until_ms` narrow the range of numbers read.
+    pub fn messages(&self, selector: &Messages) -> Result<Value> {
+        let Messages {
+            bot,
+            after,
+            before,
+            since_ms,
+            until_ms,
+            ref from,
+            limit,
+            newest,
+            waiting,
+            words,
+        } = *selector;
+        if bot.is_empty() || bot.len() > 256 {
             return fail_with(
-                "invalid_message_page",
-                "limit must be 1 to 256, after 0 or more and before 1 or more",
+                "invalid_bot_filter",
+                "bot is a name or a GLOB pattern of 1 to 256 bytes",
             );
         }
+        // No name holds `*`, `?` or `[`: without them it is one bot's.
+        let one = !bot.contains(['*', '?', '[']);
+        if one {
+            self.inspect(bot)?;
+        }
+        if after < 0
+            || before.is_some_and(|b| b < 1)
+            || !(1..=256).contains(&limit)
+            || since_ms.is_some_and(|ms| ms < 0)
+            || until_ms.is_some_and(|ms| ms < 0)
+        {
+            return fail_with(
+                "invalid_message_page",
+                "limit must be 1 to 256, after, since_ms and until_ms 0 or more and before 1 or more",
+            );
+        }
+        let senders = match from {
+            None => Senders::ALL,
+            Some(from) => Senders::named(from)?,
+        };
+        let mut low = after;
+        let mut high = before.unwrap_or(i64::MAX);
+        if let Some(since) = since_ms {
+            low = low.max(self.first_sent(since)? - 1);
+        }
+        if let Some(until) = until_ms {
+            high = high.min(self.first_sent(until)?);
+        }
         let order = if newest { "DESC" } else { "ASC" };
-        let line = match waiting {
-            true => {
+        let bots = if one { "m.bot=?1" } else { "m.bot GLOB ?1" };
+        let line = match (waiting, one) {
+            (false, _) => "",
+            (true, true) => {
                 "AND m.id IN (SELECT id FROM messages WHERE bot=?1 AND status='queued'
                     UNION ALL SELECT id FROM messages WHERE bot=?1 AND status='ready')"
             }
-            false => "",
+            (true, false) => "AND m.status IN ('queued','ready')",
+        };
+        let kinds = senders.clause();
+        let (text, text_node) = match words {
+            true => (
+                ",CASE WHEN n.id IS NULL THEN m.text
+                    ELSE json_extract(CAST(COALESCE(d.item,n.item) AS TEXT),'$.content[0].text') END",
+                " LEFT JOIN nodes n ON n.id=m.node AND m.text=''",
+            ),
+            false => ("", ""),
         };
         let mut statement = self.conn.prepare_cached(&format!(
             "SELECT {TURN_VIEW},{PREVIEW},m.delivery,m.node,m.sent_ms,m.taken_ms,
@@ -15973,14 +16165,16 @@ impl Database {
                     CASE WHEN r.id IS NULL THEN COALESCE(m.reasoning,b.reasoning)
                          ELSE COALESCE(r.reasoning,CASE WHEN r.bot_model IS NULL THEN b.reasoning
                             ELSE r.bot_reasoning END) END,
-                    COALESCE(r.workspace,m.workspace)
-             FROM {MESSAGE_FROM} LEFT JOIN turns r ON r.id=m.turn {PREVIEW_NODE}
-             WHERE m.bot=?1 AND m.id>?2 AND m.id<?3 {line} ORDER BY m.id {order} LIMIT ?4"
+                    COALESCE(r.workspace,m.workspace){text}
+             FROM {MESSAGE_FROM} LEFT JOIN turns r ON r.id=m.turn {PREVIEW_NODE}{text_node}
+             WHERE {bots} AND m.id>?2 AND m.id<?3 {line}{kinds} ORDER BY m.id {order} LIMIT ?4"
         ))?;
-        let before = before.unwrap_or(i64::MAX);
-        let mut rows = statement.query(params![name, after, before, (limit + 1) as i64])?;
+        let mut rows = statement.query(params![bot, low, high, (limit + 1) as i64])?;
         let mut messages = Vec::new();
         let mut more = false;
+        // Whole words are kept within half a response, as event pages are;
+        // a page holds at least one.
+        let mut bytes = 0;
         while let Some(r) = rows.next()? {
             if messages.len() == limit {
                 more = true;
@@ -16000,6 +16194,15 @@ impl Database {
             message["effort"] = json!(r.get::<_, Option<String>>(at + 10)?);
             // The folder it runs in once taken in, else the one it named.
             message["workspace"] = json!(r.get::<_, Option<String>>(at + 11)?);
+            if words {
+                message["text"] = json!(r.get::<_, Option<String>>(at + 12)?.unwrap_or_default());
+                let size = crate::output::encoded_len(&message)? + 1;
+                if !messages.is_empty() && bytes + size > crate::output::MAX_EVENT / 2 {
+                    more = true;
+                    break;
+                }
+                bytes += size;
+            }
             messages.push(message);
         }
         let next = more.then(|| {
@@ -16012,6 +16215,37 @@ impl Database {
             true => json!({"messages":messages,"next_before":next}),
             false => json!({"messages":messages,"next_after":next}),
         })
+    }
+
+    /// The smallest message number sent at or after `ms`, by bisection
+    /// over numbers: times rise with them. One past the newest when none
+    /// is; a message with no time counts as older.
+    fn first_sent(&self, ms: i64) -> Result<i64> {
+        let bounds: Option<(i64, i64)> = self.conn.query_row(
+            "SELECT (SELECT MIN(id) FROM messages),(SELECT MAX(id) FROM messages)",
+            [],
+            |r| Ok(r.get::<_, Option<i64>>(0)?.zip(r.get::<_, Option<i64>>(1)?)),
+        )?;
+        let Some((mut low, high)) = bounds else {
+            return Ok(1);
+        };
+        let mut high = high + 1;
+        let mut at = self.conn.prepare_cached(
+            "SELECT id,COALESCE(sent_ms,-1) FROM messages WHERE id>=? ORDER BY id LIMIT 1",
+        )?;
+        while low < high {
+            let middle = low + (high - low) / 2;
+            let row: Option<(i64, i64)> = at
+                .query_row([middle], |r| Ok((r.get(0)?, r.get(1)?)))
+                .optional()?;
+            match row {
+                Some((id, _)) if id >= high => high = middle,
+                None => high = middle,
+                Some((id, sent)) if sent < ms => low = id + 1,
+                Some((id, _)) => high = id,
+            }
+        }
+        Ok(low)
     }
 
     /// What the turns of the bots whose names match `name` (every bot
