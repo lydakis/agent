@@ -178,7 +178,7 @@ impl Lab {
 
     /// The lead starts demo.fix from its folder's `src`.
     fn task(&self, fail: bool, setup: bool) -> (bool, String) {
-        let start = serde_json::json!({"name": "demo.fix", "brief": "fix it", "setup": setup});
+        let start = serde_json::json!({"title": "Synthetic work", "name": "demo.fix", "brief": "fix it", "setup": setup});
         self.tool(&self.repo.join("src"), "start_task", start, fail)
     }
 
@@ -281,7 +281,7 @@ fn a_start_lists_the_folders_the_lead_s_gone_tasks_left() {
         .unwrap();
     };
     let start = |name: &str, own: bool| {
-        let call = serde_json::json!({"name": name, "brief": "b", "own_folder": own});
+        let call = serde_json::json!({"title": "Synthetic work", "name": name, "brief": "b", "own_folder": own});
         let (ok, said) = lab.tool(&src, "start_task", call, false);
         assert!(ok, "{said}");
         said
@@ -312,7 +312,7 @@ fn a_start_lists_the_folders_the_lead_s_gone_tasks_left() {
     lab.git(&other, &["init", "-q"]);
     lab.git(&other, &["commit", "-q", "--allow-empty", "-m", "one"]);
     listed(&["demo.new", "demo.else"]);
-    let call = serde_json::json!({"name": "else", "brief": "b"});
+    let call = serde_json::json!({"title": "Synthetic work", "name": "else", "brief": "b"});
     let (ok, said) = lab.tool(&other, "start_task", call, false);
     assert!(ok && !said.contains("no longer there"), "{said}");
     // remove_task clears them, with its checks.
@@ -341,7 +341,7 @@ fn a_brief_that_names_the_lead_s_folder_names_the_task_s_copy() {
     std::os::unix::fs::symlink(&lab.repo, lab.home.join("link")).unwrap();
     let repo = lab.repo.to_string_lossy();
     let brief = format!("edit {repo}/src/lib.rs and ~/link/src, keep {repo}2/x");
-    let start = serde_json::json!({"name": "fix", "brief": brief});
+    let start = serde_json::json!({"title": "Synthetic work", "name": "fix", "brief": brief});
     let (ok, said) = lab.tool(&lab.repo.join("src"), "start_task", start, false);
     assert!(ok, "{said}");
     let copy = lab.home.join(".agent/worktrees/demo.fix");
@@ -480,7 +480,7 @@ fn a_task_starts_with_the_agent_installed_beside_sonny() {
         .spawn()
         .unwrap();
     use std::io::Write;
-    let start = serde_json::json!({"name": "fix", "brief": "fix it"});
+    let start = serde_json::json!({"title": "Synthetic work", "name": "fix", "brief": "fix it"});
     child
         .stdin
         .take()
@@ -575,7 +575,8 @@ fn a_task_outside_git_is_removed() {
     let lab = Lab::new("rm-outside");
     let workspace = lab.scratch.join("workspace");
     std::fs::create_dir(&workspace).unwrap();
-    let start = serde_json::json!({"name": "demo.fix", "brief": "fix it"});
+    let start =
+        serde_json::json!({"title": "Synthetic work", "name": "demo.fix", "brief": "fix it"});
     let (ok, said) = lab.tool(&workspace, "start_task", start, false);
     assert!(ok, "{said}");
     let listed = serde_json::json!([{"name": "demo.fix", "bot_id": 5, "workspace": workspace}]);
@@ -602,7 +603,8 @@ fn a_task_outside_git_works_in_an_empty_folder_of_its_own() {
     std::fs::write(ws.join("AGENTS.md"), "Build with the workspace tool.\n").unwrap();
     std::fs::rename(&lab.repo, ws.join("src/api")).unwrap();
     // By default, a task shares the folder, and is told so.
-    let shared = serde_json::json!({"name": "edit", "brief": "edit the deck"});
+    let shared =
+        serde_json::json!({"title": "Synthetic work", "name": "edit", "brief": "edit the deck"});
     let (ok, said) = lab.tool(&ws, "start_task", shared, false);
     assert!(ok, "{said}");
     assert!(
@@ -623,7 +625,7 @@ fn a_task_outside_git_works_in_an_empty_folder_of_its_own() {
         (shared_ran.windows(2)).any(|pair| pair[0] == "--writable" && pair[1] == state),
         "{shared_ran:?}"
     );
-    let start = serde_json::json!({"name": "fix", "brief": "fix it", "own_folder": true});
+    let start = serde_json::json!({"title": "Synthetic work", "name": "fix", "brief": "fix it", "own_folder": true});
     let (ok, said) = lab.tool(&ws, "start_task", start.clone(), false);
     assert!(ok, "{said}");
     assert!(said.contains("an empty folder of its own"), "{said}");
@@ -665,7 +667,7 @@ fn a_task_s_own_folder_is_removed_only_with_discard() {
     let lab = Lab::new("rm-folder");
     let ws = lab.scratch.join("ws");
     std::fs::create_dir_all(&ws).unwrap();
-    let start = serde_json::json!({"name": "fix", "brief": "fix it", "own_folder": true});
+    let start = serde_json::json!({"title": "Synthetic work", "name": "fix", "brief": "fix it", "own_folder": true});
     let (ok, said) = lab.tool(&ws, "start_task", start.clone(), false);
     assert!(ok, "{said}");
     let folder = lab.home.join(".agent/worktrees/demo.fix");
@@ -690,7 +692,7 @@ fn a_task_s_own_folder_is_removed_only_with_discard() {
     let (ok, err) = lab.tool(
         &lab.repo,
         "start_task",
-        serde_json::json!({"name": "fix", "brief": "x"}),
+        serde_json::json!({"title": "Synthetic work", "name": "fix", "brief": "x"}),
         false,
     );
     assert!(!ok && err.contains("pick another name"), "{err}");
@@ -727,7 +729,7 @@ fn a_task_given_a_repository_in_the_lead_s_folder_gets_a_worktree_of_it() {
         std::fs::write(&setup, script).unwrap();
         std::fs::set_permissions(&setup, std::fs::Permissions::from_mode(0o755)).unwrap();
     }
-    let start = serde_json::json!({"name": "fix", "brief": format!("fix {}/src/lib.rs", api.display()),
+    let start = serde_json::json!({"title": "Synthetic work", "name": "fix", "brief": format!("fix {}/src/lib.rs", api.display()),
         "folder": "src/api", "setup": true});
     let (ok, said) = lab.tool(&ws, "start_task", start, false);
     assert!(ok, "{said}");
@@ -761,7 +763,7 @@ fn a_task_given_a_repository_in_the_lead_s_folder_gets_a_worktree_of_it() {
         "Work as the workspace's worker.\n",
     )
     .unwrap();
-    let role = serde_json::json!({"name": "role", "brief": "b", "folder": "src/api",
+    let role = serde_json::json!({"title": "Synthetic work", "name": "role", "brief": "b", "folder": "src/api",
         "profile": "worker"});
     let (ok, said) = lab.tool(&ws, "start_task", role, false);
     assert!(ok, "{said}");
@@ -777,12 +779,12 @@ fn a_task_given_a_repository_in_the_lead_s_folder_gets_a_worktree_of_it() {
     );
     assert!(ok, "{err}");
     // A folder outside the lead's is refused.
-    let away = serde_json::json!({"name": "away", "brief": "b", "folder": "../"});
+    let away = serde_json::json!({"title": "Synthetic work", "name": "away", "brief": "b", "folder": "../"});
     let (ok, said) = lab.tool(&ws, "start_task", away, false);
     assert!(!ok && said.contains("not a folder inside"), "{said}");
     // As is one in no repository, or in what git keeps.
     for folder in ["src", "src/api/.git/hooks"] {
-        let away = serde_json::json!({"name": "away", "brief": "b", "folder": folder});
+        let away = serde_json::json!({"title": "Synthetic work", "name": "away", "brief": "b", "folder": folder});
         let (ok, said) = lab.tool(&ws, "start_task", away, false);
         assert!(
             !ok && said.contains("not in a git repository"),
@@ -797,7 +799,7 @@ fn a_task_given_a_repository_in_the_lead_s_folder_gets_a_worktree_of_it() {
     lab.git(&api, &["commit", "-qm", "out"]);
     std::fs::remove_file(api.join("out")).unwrap();
     std::fs::create_dir(api.join("out")).unwrap();
-    let away = serde_json::json!({"name": "away", "brief": "b", "folder": "src/api/out"});
+    let away = serde_json::json!({"title": "Synthetic work", "name": "away", "brief": "b", "folder": "src/api/out"});
     let (ok, said) = lab.tool(&ws, "start_task", away, false);
     assert!(!ok && said.contains("leading out of it"), "{said}");
     assert!(!lab.home.join(".agent/worktrees/demo.away").exists());
@@ -825,7 +827,7 @@ fn a_task_given_a_linked_checkout_in_the_lead_s_folder_is_removed_from_it() {
     let away = ws.join("away");
     let target = away.to_string_lossy().into_owned();
     lab.git(&lab.repo, &["worktree", "add", "-q", "-b", "away", &target]);
-    let start = serde_json::json!({"name": "fix", "brief": "fix it", "folder": "away"});
+    let start = serde_json::json!({"title": "Synthetic work", "name": "fix", "brief": "fix it", "folder": "away"});
     let (ok, said) = lab.tool(&ws, "start_task", start, false);
     assert!(!ok && said.contains("outside this folder"), "{said}");
     let worktree = lab.home.join(".agent/worktrees/demo.fix");
@@ -842,7 +844,7 @@ fn a_task_given_a_linked_checkout_in_the_lead_s_folder_is_removed_from_it() {
     let web = ws.join("web");
     let target = web.to_string_lossy().into_owned();
     lab.git(&main, &["worktree", "add", "-q", "-b", "web", &target]);
-    let start = serde_json::json!({"name": "fix", "brief": "fix it", "folder": "web"});
+    let start = serde_json::json!({"title": "Synthetic work", "name": "fix", "brief": "fix it", "folder": "web"});
     let (ok, said) = lab.tool(&ws, "start_task", start, false);
     assert!(ok, "{said}");
     assert!(worktree.join(".git").exists());
@@ -916,7 +918,7 @@ fn a_task_of_a_lead_in_a_submodule_is_removed_with_its_worktree() {
         ],
     );
     let sub = main.join("sub");
-    let start = serde_json::json!({"name": "fix", "brief": "fix it"});
+    let start = serde_json::json!({"title": "Synthetic work", "name": "fix", "brief": "fix it"});
     let (ok, said) = lab.tool(&sub, "start_task", start, false);
     assert!(ok, "{said}");
     let worktree = lab.home.join(".agent/worktrees/demo.fix");
@@ -952,7 +954,7 @@ fn a_task_starts_its_own_helper_on_its_branch_as_deep_as_the_config_lets_it() {
     // project and repository, on its own branch's last commit.
     *lab.bot.borrow_mut() = "demo.fix".into();
     let brief = format!("review {}", fix.join("src/lib.rs").display());
-    let call = serde_json::json!({"name": "review", "brief": brief, "setup": true});
+    let call = serde_json::json!({"title": "Synthetic work", "name": "review", "brief": brief, "setup": true});
     let (ok, said) = lab.tool(&fix.join("src"), "start_task", call, false);
     assert!(ok, "{said}");
     assert!(said.contains(".agents/setup did not run"), "{said}");
@@ -987,7 +989,7 @@ fn a_task_starts_its_own_helper_on_its_branch_as_deep_as_the_config_lets_it() {
         r#"{"error":"depth_limit","detail":"demo.deeper would be 3 generations below the bot that starts its line; max_depth is 2","depth":3,"max_depth":2}"#,
     )
     .unwrap();
-    let call = serde_json::json!({"name": "deeper", "brief": "b"});
+    let call = serde_json::json!({"title": "Synthetic work", "name": "deeper", "brief": "b"});
     let (ok, said) = lab.tool(&review.join("src"), "start_task", call.clone(), false);
     assert!(!ok);
     assert!(said.contains("depth_limit"), "{said}");
@@ -1001,7 +1003,7 @@ fn a_task_starts_its_own_helper_on_its_branch_as_deep_as_the_config_lets_it() {
     assert!(fix.exists());
     // With a daemon that lets lines go deeper, it does.
     std::fs::remove_file(&refused).unwrap();
-    let call = serde_json::json!({"name": "deeper", "brief": "b"});
+    let call = serde_json::json!({"title": "Synthetic work", "name": "deeper", "brief": "b"});
     let (ok, said) = lab.tool(&review.join("src"), "start_task", call, false);
     assert!(ok, "{said}");
     assert!(lab.home.join(".agent/worktrees/demo.deeper").exists());
@@ -1011,7 +1013,7 @@ fn a_task_starts_its_own_helper_on_its_branch_as_deep_as_the_config_lets_it() {
         "workspace": fix.join("src")});
     listed(serde_json::json!([lead, task, helper, side]));
     *lab.bot.borrow_mut() = "demo.fix.side-a1".into();
-    let call = serde_json::json!({"name": "peek", "brief": "b"});
+    let call = serde_json::json!({"title": "Synthetic work", "name": "peek", "brief": "b"});
     let (ok, said) = lab.tool(&fix.join("src"), "start_task", call, false);
     assert!(!ok);
     assert!(
@@ -1044,7 +1046,7 @@ fn a_helper_of_a_task_in_a_repository_inside_the_lead_s_folder_starts_on_its_bra
     std::fs::create_dir_all(ws.join("src")).unwrap();
     let api = ws.join("src/api");
     std::fs::rename(&lab.repo, &api).unwrap();
-    let start = serde_json::json!({"name": "fix", "brief": "b", "folder": "src/api"});
+    let start = serde_json::json!({"title": "Synthetic work", "name": "fix", "brief": "b", "folder": "src/api"});
     let (ok, said) = lab.tool(&ws, "start_task", start, false);
     assert!(ok, "{said}");
     let fix = lab.home.join(".agent/worktrees/demo.fix");
@@ -1061,7 +1063,8 @@ fn a_helper_of_a_task_in_a_repository_inside_the_lead_s_folder_starts_on_its_bra
     // Named no folder, the helper works in the task's repository, from
     // its branch.
     *lab.bot.borrow_mut() = "demo.fix".into();
-    let call = serde_json::json!({"name": "review", "brief": "review it"});
+    let call =
+        serde_json::json!({"title": "Synthetic work", "name": "review", "brief": "review it"});
     let (ok, said) = lab.tool(&fix, "start_task", call, false);
     assert!(ok, "{said}");
     let review = lab.home.join(".agent/worktrees/demo.review");
