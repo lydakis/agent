@@ -69,7 +69,7 @@ each setting is; what to set is the person's call.
 - `[speeds]` in the config: the tiers faster than standard a model
   serves, by `PROVIDER/MODEL` with `*` and `?` wildcards, each a list of
   `"fast"` and `"ultrafast"`, `[]` for standard only
-  (`"openai/gpt-6.2-sol" = ["fast"]`), over the daemon's own list; the
+  (`"openai/gpt-*" = ["fast"]`), over the daemon's own list; the
   most specific pattern wins. An agent's speed reaches only a model that
   serves it, and runs at standard on any other. Each window passes the
   table to the daemon as it starts it (`--speeds`), so a change needs the

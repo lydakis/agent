@@ -251,12 +251,7 @@ impl Tiers {
 ///   2026-11-10). Bedrock serves Claude at standard speed only.
 /// - OpenAI on an API key: priority on every model Codex's bundled catalog
 ///   gives it (openai/codex 551fc71, models.json), ultrafast on GPT-6.1 Sol
-///   and GPT-6 Astra (OpenAI's pricing page); priority on GPT-6.2 Astra and
-///   GPT-6.2 Sol ("Standard, Fast, and Batch processing", OpenAI's Using
-///   GPT-6.2 guide, read 2026-11-18), whose ultrafast no model names yet
-///   (the Ultrafast mode guide lists GPT-6 Astra and GPT-6.1 Sol alone).
-///   Bedrock documents no tier faster than standard for GPT-6.2, and
-///   refused ultrafast for bare `openai.gpt-6.2-sol` in us-east-1 (11-17).
+///   and GPT-6 Astra (OpenAI's pricing page).
 /// - The ChatGPT sign-in: what Codex's bundled catalog lists for it,
 ///   priority on those models and no ultrafast (openai/codex 5228d94,
 ///   models.json); Codex learns any more from the plan's own model listing.
@@ -273,9 +268,7 @@ const CLAUDE_API: [(&str, Tiers); 5] = [
     ("claude-opus-5", Tiers::FAST),
     ("claude-opus-4-8", Tiers::FAST),
 ];
-const OPENAI: [(&str, Tiers); 11] = [
-    ("gpt-6.2-astra", Tiers::FAST),
-    ("gpt-6.2-sol", Tiers::FAST),
+const OPENAI: [(&str, Tiers); 9] = [
     ("gpt-6.1-sol", Tiers::BOTH),
     ("gpt-6-astra", Tiers::BOTH),
     ("gpt-6.1-terra", Tiers::FAST),
@@ -4699,8 +4692,6 @@ mod tests {
         let fast = at(Family::Responses, openai, Some(Speed::Fast));
         assert_eq!(encoded(&fast, sol)["service_tier"], "priority");
         assert_eq!(encoded(&fast, "gpt-6.1-terra")["service_tier"], "priority");
-        assert_eq!(encoded(&fast, "gpt-6.2-sol")["service_tier"], "priority");
-        assert_eq!(encoded(&fast, "gpt-6.2-astra")["service_tier"], "priority");
         // Every tier counts against the model's own limit.
         assert_eq!(fast.pool_key(sol), Family::Responses.pool_key(sol));
         let ultra = at(Family::Responses, openai, Some(Speed::Ultrafast));
@@ -4710,7 +4701,6 @@ mod tests {
                 .get("service_tier")
                 .is_none()
         );
-        assert!(encoded(&ultra, "gpt-6.2-sol").get("service_tier").is_none());
         assert!(
             encoded(&ultra, "gpt-6.1-sol-mini")
                 .get("service_tier")
