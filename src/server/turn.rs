@@ -6172,30 +6172,41 @@ impl Turn {
                 }
                 answer
             }
-            Agents::Close { name } => {
-                // Its own record says whether this bot made it, before the
-                // daemon marks it.
-                let target = request(json!({"op":"inspect","bot":name})).await?;
-                if target["created_by_id"].as_i64() != Some(bot_id) {
+            Agents::Close {
+                name,
+                names,
+                no_turn_since_ms,
+                after,
+                limit,
+            } => {
+                // The daemon closes, as this bot: only the bots it made, and
+                // stops the turns they run. This one closes itself by ending
+                // its turn, not with the tool.
+                if name.as_deref() == Some(self.bot.as_str())
+                    || (names.as_deref()).is_some_and(|names| names.contains(&self.bot))
+                {
                     return Err(Error::with(
                         "not_permitted",
-                        format!("{name} was not made by this bot, so this bot may not close it"),
+                        format!(
+                            "{} was not made by this bot, so this bot may not close it",
+                            self.bot
+                        ),
                     ));
                 }
-                let closed = request(json!({"op":"close","bot":name,
-                    "bot_id":target["bot_id"]}))
-                .await?;
-                let mut answer = json!({"name":name,"was_open":closed["was_open"]});
-                // The turn it ran as it was marked: one that starts after
-                // opens it again.
-                if let Some(turn) = closed["running_turn"].as_i64() {
-                    // A turn that ended meanwhile answers how it ended.
-                    let stopped = request(json!({"op":"interrupt","bot":name,"turn":turn})).await?;
-                    if stopped["interrupt_requested"] == true {
-                        answer["stopped_turn"] = json!(turn);
+                let mut asked = json!({"op":"close"});
+                let fields = [
+                    ("bot", json!(name)),
+                    ("names", json!(names)),
+                    ("no_turn_since_ms", json!(no_turn_since_ms)),
+                    ("after", json!(after)),
+                    ("limit", json!(limit)),
+                ];
+                for (key, value) in fields {
+                    if !value.is_null() {
+                        asked[key] = value;
                     }
                 }
-                answer
+                request(asked).await?
             }
         };
         Ok(Outcome::text(self.registry.redact_text(answer.to_string())))
