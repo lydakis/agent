@@ -415,6 +415,16 @@ def main():
                 if found.get('pending') or found.get('status') != 'completed':
                     raise RuntimeError(f'turn: {found}')
 
+            def busy_still(submitted):
+                # Only a bot still ending its last turn is tried again;
+                # any other refusal fails the run.
+                if 'result' in submitted:
+                    return False
+                error = submitted.get('error')
+                if (error.get('code') if isinstance(error, dict) else error) == 'bot_busy':
+                    return True
+                raise RuntimeError(f'submit: {submitted.get("error")}')
+
             def worker(run, name):
                 try:
                     run()
@@ -432,7 +442,7 @@ def main():
                     turn += 1
                     due = time.monotonic() + args.pace
                     submitted = connection.request('submit', bot=f'b{n}', request_id=f'r{turn}', prompt='delay:50')
-                    if 'result' not in submitted:
+                    if busy_still(submitted):
                         time.sleep(.05)
                         continue
                     ended(connection, f'b{n}/{submitted["result"]["message"]}')
@@ -450,7 +460,7 @@ def main():
                     turn += 1
                     due = time.monotonic() + args.pace
                     submitted = connection.request('submit', bot=bot, request_id=f'r{turn}', prompt='call:exec')
-                    if 'result' not in submitted:
+                    if busy_still(submitted):
                         time.sleep(.05)
                         continue
                     call = None
@@ -502,6 +512,8 @@ def main():
                 thread.join(timeout=120)
             if failures:
                 raise RuntimeError('workers failed: ' + '; '.join(failures))
+            if (args.busy and not finished[0]) or (args.scripts and not finished[1]):
+                raise RuntimeError(f'no work done: {finished}')
             result['turns_finished'] = finished[0]
             result['scripts_finished'] = finished[1]
             result.update(windows=args.windows, layout=args.layout, busy_agents=args.busy,
