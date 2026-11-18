@@ -162,69 +162,7 @@ impl Markdown {
         let Some((lang, source)) = self.ready.take() else {
             return Vec::new();
         };
-        if matches!(lang.as_str(), "diff" | "patch") {
-            return crate::diff::fence(&source, width);
-        }
-        if lang == "html" {
-            return page(&source, width);
-        }
-        // Math where pictures cannot be drawn: as text, line by line.
-        if lang == "math" && !crate::term::graphics() {
-            return source
-                .lines()
-                .filter(|l| !l.trim().is_empty())
-                .flat_map(|l| {
-                    let line = Line::from(crate::math::unicode(l.trim())).italic();
-                    wrap(line, width, Span::raw("    "), Span::raw("    "))
-                })
-                .collect();
-        }
-        // Kept in a file a click on the picture opens in the pane, bigger:
-        // the diagram's source, or the formula as MathJax drew it. Only
-        // counted, it is kept nowhere: counting writes no file.
-        let measured = crate::term::measured();
-        let kept = match lang.as_str() {
-            _ if measured => None,
-            "mermaid" => keep(&source, "mmd", |path| {
-                crate::cache::write_new(path, &source)
-            }),
-            "svg" => keep(&source, "svg", |path| {
-                crate::cache::write_new(path, &source)
-            }),
-            _ => None,
-        };
-        let math = (lang == "math" && !measured)
-            .then(|| kept_path(&(&source, crate::term::light()), "svg"));
-        let drawn = crate::cache::drawn(&lang, &source, width, || {
-            let svg = match lang.as_str() {
-                "mermaid" => crate::mermaid::svg(&source)?,
-                "math" => {
-                    let svg = crate::math::svg(&source)?;
-                    if let Some(Some(path)) = &math {
-                        let _ = crate::cache::write_new(path, &svg);
-                    }
-                    svg
-                }
-                _ => source.clone(),
-            };
-            crate::image::render(&svg, width)
-        });
-        let kept = kept.or(math.flatten().filter(|path| path.is_file()));
-        let url = kept.and_then(|path| crate::links::file_url(&path));
-        match drawn.map(|drawn| crate::image::show_linked(drawn, url)) {
-            Ok(rows) => rows,
-            Err(error) => {
-                let mut out: Vec<Line<'static>> = source
-                    .lines()
-                    .flat_map(|line| {
-                        let code = Line::from(line.to_owned()).fg(Color::Cyan);
-                        wrap(code, width, Span::raw("    "), Span::raw("    "))
-                    })
-                    .collect();
-                out.push(Line::from(format!("    could not draw it: {error}")).dim());
-                out
-            }
-        }
+        fence_picture(lang, source, width)
     }
 
     /// The styled line, or none for a fence marker, which is not shown.
@@ -385,7 +323,7 @@ impl Markdown {
         };
         for picture in pictures {
             let path = self.path(&picture.src);
-            match path.as_deref().and_then(|path| picture_file(path, width)) {
+            match (path.as_deref()).and_then(|path| picture_file(path, width, picture)) {
                 Some(rows) => {
                     flush(&mut words, &mut out);
                     out.extend(rows);
@@ -423,6 +361,95 @@ impl Markdown {
             },
         };
         path.is_file().then_some(path)
+    }
+}
+
+/// The picture a fence drew, as rows of the terminal's image cells; or,
+/// when it could not be drawn, its source and why; or a row saying it is
+/// being drawn, beside the loop.
+pub(crate) fn fence_picture(lang: String, source: String, width: usize) -> Vec<Line<'static>> {
+    if matches!(lang.as_str(), "diff" | "patch") {
+        return crate::diff::fence(&source, width);
+    }
+    if lang == "html" {
+        return page(&source, width);
+    }
+    // Math where pictures cannot be drawn: as text, line by line.
+    if lang == "math" && !crate::term::graphics() {
+        return source
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .flat_map(|l| {
+                let line = Line::from(crate::math::unicode(l.trim())).italic();
+                wrap(line, width, Span::raw("    "), Span::raw("    "))
+            })
+            .collect();
+    }
+    // Kept in a file a click on the picture opens in the pane, bigger:
+    // the diagram's source, or the formula as MathJax drew it. Only
+    // counted, it is kept nowhere: counting writes no file.
+    let measured = crate::term::measured();
+    let kept = match lang.as_str() {
+        _ if measured => None,
+        "mermaid" => keep(&source, "mmd", |path| {
+            crate::cache::write_new(path, &source)
+        }),
+        "svg" => keep(&source, "svg", |path| {
+            crate::cache::write_new(path, &source)
+        }),
+        _ => None,
+    };
+    let math =
+        (lang == "math" && !measured).then(|| kept_path(&(&source, crate::term::light()), "svg"));
+    let draw = {
+        let (lang, source, math) = (lang.clone(), source.clone(), math.clone());
+        move || {
+            let svg = match lang.as_str() {
+                "mermaid" => crate::mermaid::svg(&source)?,
+                "math" => {
+                    let svg = crate::math::svg(&source)?;
+                    if let Some(Some(path)) = &math {
+                        let _ = crate::cache::write_new(path, &svg);
+                    }
+                    svg
+                }
+                _ => source,
+            };
+            crate::image::render(&svg, width)
+        }
+    };
+    let drawing = crate::cache::drawn(&lang, &source, width, draw);
+    let drawn = match drawing {
+        crate::cache::Drawing::Done(drawn) => drawn,
+        crate::cache::Drawing::Waits(key) => {
+            let what = match lang.as_str() {
+                "mermaid" => "the diagram",
+                "math" => "the formula",
+                _ => "the picture",
+            };
+            let redraw = crate::drawing::Redraw::Fence {
+                lang,
+                source,
+                width,
+            };
+            return crate::drawing::placeholder(key, what, redraw);
+        }
+    };
+    let kept = kept.or(math.flatten().filter(|path| path.is_file()));
+    let url = kept.and_then(|path| crate::links::file_url(&path));
+    match drawn.map(|drawn| crate::image::show_linked(drawn, url)) {
+        Ok(rows) => rows,
+        Err(error) => {
+            let mut out: Vec<Line<'static>> = source
+                .lines()
+                .flat_map(|line| {
+                    let code = Line::from(line.to_owned()).fg(Color::Cyan);
+                    wrap(code, width, Span::raw("    "), Span::raw("    "))
+                })
+                .collect();
+            out.push(Line::from(format!("    could not draw it: {error}")).dim());
+            out
+        }
     }
 }
 
@@ -491,7 +518,11 @@ fn markdown_picture(text: &str) -> Option<(usize, Picture)> {
 
 /// A picture file drawn, `path`'s rows of the terminal's cells that a
 /// click opens in the pane; none where it cannot be.
-fn picture_file(path: &std::path::Path, width: usize) -> Option<Vec<Line<'static>>> {
+fn picture_file(
+    path: &std::path::Path,
+    width: usize,
+    picture: &Picture,
+) -> Option<Vec<Line<'static>>> {
     if !crate::term::graphics() {
         return None;
     }
@@ -506,22 +537,56 @@ fn picture_file(path: &std::path::Path, width: usize) -> Option<Vec<Line<'static
         meta.len(),
         meta.modified().ok()
     );
-    let drawn = match extension.as_str() {
-        "svg" => crate::cache::drawn("svg file", &key, width, || {
-            let text = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
-            crate::image::render(&text, width)
-        }),
+    let drawing = match extension.as_str() {
+        "svg" => {
+            let path = path.to_owned();
+            crate::cache::drawn("svg file", &key, width, move || {
+                let text = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
+                crate::image::render(&text, width)
+            })
+        }
         "png" | "jpg" | "jpeg" | "gif" | "webp" => {
-            crate::cache::drawn("picture file", &key, width, || {
-                crate::image::file(path, width, crate::image::ROWS)
+            let path = path.to_owned();
+            crate::cache::drawn("picture file", &key, width, move || {
+                crate::image::file(&path, width, crate::image::ROWS)
             })
         }
         _ => return None,
+    };
+    let drawn = match drawing {
+        crate::cache::Drawing::Done(drawn) => drawn,
+        crate::cache::Drawing::Waits(key) => {
+            let redraw = crate::drawing::Redraw::File {
+                path: path.to_owned(),
+                width,
+                alt: picture.alt.clone(),
+                src: picture.src.clone(),
+            };
+            return Some(crate::drawing::placeholder(key, "the picture", redraw));
+        }
     };
     let url = crate::links::file_url(path);
     drawn
         .map(|drawn| crate::image::show_linked(drawn, url))
         .ok()
+}
+
+/// A picture file drawn beside the loop, drawn again once it is ready:
+/// as its words, should it turn out not to draw.
+pub(crate) fn picture_again(
+    path: &std::path::Path,
+    width: usize,
+    alt: &str,
+    src: &str,
+) -> Vec<Line<'static>> {
+    let picture = Picture {
+        alt: alt.to_owned(),
+        src: src.to_owned(),
+    };
+    picture_file(path, width, &picture).unwrap_or_else(|| {
+        let named = Line::from(picture_words(&picture, true));
+        wrap(named, width, Span::raw("  "), Span::raw("  "))
+    })
 }
 
 /// A picture as words where it is not drawn: a mark, its description
@@ -960,14 +1025,18 @@ fn page(source: &str, width: usize) -> Vec<Line<'static>> {
     if crate::term::measured() {
         return vec![Line::default(); crate::image::ROWS as usize];
     }
+    // Numbered in the window as well as timed: fences laid out in the
+    // same millisecond keep files of their own.
+    static KEPT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let dir = std::env::temp_dir().join("sonny-pages");
     let name = format!(
-        "{}-{}.html",
+        "{}-{}-{}.html",
         std::process::id(),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
-            .as_millis()
+            .as_millis(),
+        KEPT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
     );
     let path = dir.join(name);
     if let Err(error) =
@@ -975,11 +1044,34 @@ fn page(source: &str, width: usize) -> Vec<Line<'static>> {
     {
         return vec![Line::from(format!("    could not keep the page: {error}")).dim()];
     }
+    kept_page(path, source, width)
+}
+
+/// The page `source`, kept at `path`, drawn under it.
+pub(crate) fn kept_page(
+    path: std::path::PathBuf,
+    source: &str,
+    width: usize,
+) -> Vec<Line<'static>> {
     let drawn = match crate::term::graphics() {
-        true => crate::cache::drawn("html", source, width, || {
-            let png = crate::html::render(&path, crate::image::page_width(width))?;
-            crate::image::page(&png, width)
-        })
+        true => {
+            let file = path.clone();
+            let drawing = crate::cache::drawn("html", source, width, move || {
+                let png = crate::html::render(&file, crate::image::page_width(width))?;
+                crate::image::page(&png, width)
+            });
+            match drawing {
+                crate::cache::Drawing::Done(drawn) => drawn,
+                crate::cache::Drawing::Waits(key) => {
+                    // Drawn again from the file it was kept in.
+                    let redraw = crate::drawing::Redraw::Page {
+                        path: path.clone(),
+                        width,
+                    };
+                    return crate::drawing::placeholder(key, "the page", redraw);
+                }
+            }
+        }
         .map(|drawn| {
             let url = crate::links::file_url(&path);
             let cut = drawn.cut;
@@ -2353,7 +2445,7 @@ pub fn markdown_at(
 
 /// `row` with its first two columns, the lead Markdown draws, swapped
 /// for `lead`; where it says a wrapped row's lead is, moved to match.
-fn relead(mut row: Line<'static>, lead: &Line<'static>) -> Line<'static> {
+pub fn relead(mut row: Line<'static>, lead: &Line<'static>) -> Line<'static> {
     let more = lead.width() as isize - 2;
     let marks = row
         .spans
@@ -4777,6 +4869,26 @@ mod tests {
         assert!(!browser_page("file:///w/site/index.html"));
         let beside = crate::links::file_url(&std::env::temp_dir().join("sonny-pages2/a.html"));
         assert!(!browser_page(&beside.unwrap()));
+    }
+
+    #[test]
+    fn pages_laid_out_in_the_same_moment_keep_files_of_their_own() {
+        let kept: Vec<String> = (0..20)
+            .map(|n| {
+                let lines = page(&format!("<p>{n}</p>"), 80);
+                let last = lines.last().unwrap().to_string();
+                assert!(!last.contains("could not keep"), "{last}");
+                last.trim_start_matches("    ↗ ").to_owned()
+            })
+            .collect();
+        let mut unique = kept.clone();
+        unique.sort();
+        unique.dedup();
+        assert_eq!(unique.len(), kept.len(), "{kept:?}");
+        for path in kept {
+            assert!(std::path::Path::new(&path).exists(), "{path}");
+            let _ = std::fs::remove_file(path);
+        }
     }
 
     #[test]

@@ -121,7 +121,7 @@ pub fn default_tools(
 
 /// The socket protocol's version in `ready`. The daemon and its clients ship
 /// together, so a client refuses a daemon of any other version.
-pub const PROTOCOL: u64 = 87;
+pub const PROTOCOL: u64 = 89;
 static PROGRAM: std::sync::OnceLock<&'static str> = std::sync::OnceLock::new();
 /// Name this process's connections as `program` (such as `window` or
 /// `reviewer`): each later [`Client::connect`] says it in its first line,
@@ -647,6 +647,13 @@ impl Client {
     /// waiting on the notifications sees them close.
     pub async fn close(&self) {
         let _ = self.writer.lock().await.shutdown().await;
+    }
+
+    /// Whether the connection is gone: the daemon closed it, or this
+    /// client let go of it for falling behind. Every request fails from
+    /// then on, and what the events held is from before it.
+    pub fn is_closed(&self) -> bool {
+        self.closed.load(std::sync::atomic::Ordering::SeqCst)
     }
 
     /// Say which one of its program this process is, such as the agent a

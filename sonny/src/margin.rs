@@ -935,7 +935,7 @@ pub struct Blanks {
 /// What a margin's rows were drawn from: its width, the running turn,
 /// the terminal's light, how many times its notes and files changed, and
 /// the folder its files are read from.
-type Drawn = (usize, Option<i64>, bool, u64, PathBuf);
+type Drawn = (usize, Option<i64>, bool, (u64, u64), PathBuf);
 
 /// The rows a margin's notes draw, with their marks.
 type Rows = (Vec<Line<'static>>, Vec<(usize, Mark)>);
@@ -1319,11 +1319,13 @@ impl Margin {
     /// changed.
     pub fn lines(&mut self, width: usize, workspace: &Path, live: Option<i64>) -> Rows {
         self.freshen(workspace);
+        // Drawn again as pictures drawn beside the loop land, each in
+        // place of the row that stood for it.
         let from = (
             width,
             live,
             crate::term::light(),
-            self.changes,
+            (self.changes, crate::drawing::landed()),
             workspace.to_owned(),
         );
         if let Some((drawn, rows)) = &self.drawn
