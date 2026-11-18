@@ -607,8 +607,30 @@ async fn read_status(
         status_read,
         asks_seen,
         view,
+        None,
     )
     .await
+}
+
+/// What a window's count built, kept for its next count, as an informer's
+/// cache keeps each object until an event names it: an idle agent no event
+/// moved stands as it stood, so its row is built again only once it moves.
+#[derive(Default)]
+struct Built {
+    /// Each idle agent's row as the last count built it, by [`name_key`]
+    /// of its own name (a row taken checks its name).
+    rows: HashMap<u64, status::Row>,
+    /// The agents the last count listed, as `status::bots` gives them.
+    bots: std::collections::HashSet<String>,
+    /// A mark of each agent's calls waiting on someone, as that count
+    /// listed them: an agent whose calls changed is built again.
+    held: Option<HashMap<String, u64>>,
+}
+
+/// A key for `name` that costs no copy of it.
+fn name_key(name: &str) -> u64 {
+    use std::hash::{BuildHasher, BuildHasherDefault};
+    BuildHasherDefault::<std::collections::hash_map::DefaultHasher>::default().hash_one(name)
 }
 
 /// [`read_status`] of the agents `listed`, as a `bots` listing of the
@@ -624,6 +646,7 @@ async fn read_status_of(
     status_read: &mut HashMap<String, (Value, Latest)>,
     asks_seen: &mut HashMap<String, (i64, Seen)>,
     view: StatusView<'_>,
+    kept_rows: Option<(&mut Built, &std::collections::BTreeSet<String>)>,
 ) -> Result<StatusRead, String> {
     let background::Scope {
         project,
@@ -643,6 +666,34 @@ async fn read_status_of(
     if let Ok(held) = &held {
         needs.held(held.clone(), |_| true);
     }
+    // The rows a count kept hold for every agent but those `again` names
+    // and those whose calls waiting on someone changed. An agent taken from
+    // them is not in `needs`, which a count does not read.
+    let held_marks = held.as_ref().ok().map(|held| {
+        use std::hash::{Hash, Hasher};
+        let mut marks: HashMap<String, std::collections::hash_map::DefaultHasher> = HashMap::new();
+        for call in held {
+            call.hash(marks.entry(call.bot.clone()).or_default());
+        }
+        (marks.into_iter())
+            .map(|(bot, mark)| (bot, mark.finish()))
+            .collect::<HashMap<String, u64>>()
+    });
+    let mut reuse = kept_rows.and_then(|(kept, again)| {
+        let rows = std::mem::take(&mut kept.rows);
+        let was = std::mem::replace(&mut kept.held, held_marks.clone());
+        let (Some(was), Some(now)) = (was, &held_marks) else {
+            return None;
+        };
+        let mut again = again.clone();
+        for (bot, mark) in &was {
+            if now.get(bot) != Some(mark) {
+                again.insert(bot.clone());
+            }
+        }
+        again.extend(now.keys().filter(|bot| !was.contains_key(*bot)).cloned());
+        Some((rows, again))
+    });
     let (mut read, mut idle) = (Vec::new(), Vec::new());
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -665,9 +716,11 @@ async fn read_status_of(
     // With other leads in the folder, their tasks are theirs: each
     // lead shows as a row of its own.
     let mine = owned(listed, &project, &lead);
-    // Side chats are not the project's agents.
-    let mut kept = HashMap::new();
+    // The agents listed here, whose histories and questions as read are
+    // kept for the next read.
+    let mut listed_here: std::collections::HashSet<&str> = std::collections::HashSet::new();
     let (mut fresh, mut whole) = (false, true);
+    // Side chats are not the project's agents.
     for bot in listed {
         let Some(name) = (bot["name"].as_str()).filter(|_| bot["expire_ms"].is_null()) else {
             continue;
@@ -692,6 +745,21 @@ async fn read_status_of(
         {
             continue;
         }
+        listed_here.insert(name);
+        // An idle agent no event moved, built as the last count built it.
+        if let Some((rows_kept, again)) = &mut reuse
+            && bot["running_turn"].is_null()
+            && name != view.bot
+            && !again.contains(name)
+            && let Some(row) = rows_kept
+                .remove(&name_key(name))
+                .filter(|row| row.bot == name)
+        {
+            read.push(name.to_owned());
+            idle.push(name.to_owned());
+            rows.push(row);
+            continue;
+        }
         // Its latest items are read again only once its history moved:
         // the same head is the same history. A failed read is kept
         // for none, so the next refresh tries again.
@@ -709,7 +777,7 @@ async fn read_status_of(
             }
         };
         if let Some(latest) = &latest {
-            kept.insert(name.to_owned(), (head, latest.clone()));
+            status_read.insert(name.to_owned(), (head, latest.clone()));
         }
         let latest = latest.unwrap_or_default();
         // Its turn, as the listing says: the one the daemon runs, however
@@ -894,6 +962,7 @@ async fn read_status_of(
             maker: bot["created_by"].as_str().unwrap_or("").to_owned(),
             group,
             run: None,
+            line: None,
         });
     }
     // Each workflow that runs is one row, under the agent that started it.
@@ -916,7 +985,7 @@ async fn read_status_of(
         });
     }
     // Agents gone from the listing are forgotten with it.
-    *status_read = kept;
+    status_read.retain(|name, _| listed_here.contains(name.as_str()));
     // The project's title, from its lead's folder's file.
     let lead_folder = (listed.iter())
         .find(|bot| bot["name"] == lead.as_str())
@@ -4596,15 +4665,21 @@ async fn task_turn_at(
 /// No mark when a history read failed, so the next count reads again.
 struct Counted {
     mark: Option<u64>,
-    read: Option<((status::Counts, std::collections::HashSet<String>), Reads)>,
+    /// The counts, and the agents counted when they changed.
+    read: Option<(status::Counts, Option<std::collections::HashSet<String>>)>,
+    /// What the count read of each agent's history and question, given
+    /// back whether or not it counted.
+    reads: Option<Reads>,
     /// The tasks as template notes' `tasks()` gives them, when read.
-    tasks: Option<Vec<Value>>,
+    tasks: Option<Vec<status::Task>>,
     /// The project's agents as the count left them, the rows that moved
     /// read again, with their [`rows_mark`]; none when a read failed, so
     /// the window takes a fresh snapshot.
     listed: Option<(Vec<Value>, u64)>,
     /// This window's agent's own tasks, as the margin lists them, when read.
     own: Option<Vec<status::Own>>,
+    /// The rows the count built, for the next; none builds every row again.
+    kept: Option<Built>,
 }
 
 /// A mark of where the agents stand, and of what waits on the person:
@@ -4626,25 +4701,29 @@ async fn standing(client: &Client, rows: u64, local: Local) -> Option<u64> {
 /// however many agents are listed.
 type Local = ((usize, usize), Option<std::time::SystemTime>);
 
-/// A mark of where the agents `listed` stand as their rows say it, taken
-/// again only when the rows changed.
+/// A mark of where the agents `listed` stand as their rows say it: the
+/// sum of each row's [`row_mark`], so a row that changes changes it by its
+/// own marks alone.
 fn rows_mark(listed: &[Value]) -> u64 {
+    (listed.iter()).fold(0, |mark, bot| mark.wrapping_add(row_mark(bot)))
+}
+
+/// A mark of where one agent stands as its row says it.
+fn row_mark(bot: &Value) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut mark = std::collections::hash_map::DefaultHasher::new();
-    for bot in listed {
-        for key in [
-            "name",
-            "running_turn",
-            "status",
-            "waiting_on",
-            "last",
-            "expire_ms",
-        ] {
-            bot[key].to_string().hash(&mut mark);
-        }
-        if !bot["running_turn"].is_null() {
-            bot["head"].to_string().hash(&mut mark);
-        }
+    for key in [
+        "name",
+        "running_turn",
+        "status",
+        "waiting_on",
+        "last",
+        "expire_ms",
+    ] {
+        bot[key].to_string().hash(&mut mark);
+    }
+    if !bot["running_turn"].is_null() {
+        bot["head"].to_string().hash(&mut mark);
     }
     mark.finish()
 }
@@ -4664,29 +4743,42 @@ fn rows_differ(listed: &[Value], rows: &[Value]) -> bool {
 /// `listed`, in name order as the listing keeps it, with the rows of the
 /// agents `moved` read again, changed where it lies: one gone is taken
 /// out, one new put in its place. Only those rows are copied, so a window
-/// holds its project's listing once however often it counts.
+/// holds its project's listing once however often it counts; `mark`, the
+/// listing's [`rows_mark`], changes by the rows that changed.
 fn moved_rows(
     listed: &mut Vec<Value>,
     moved: &std::collections::BTreeSet<String>,
     rows: Vec<Value>,
+    mark: &mut Option<u64>,
 ) {
+    let at = |listed: &[Value], name: &str| {
+        listed.binary_search_by(|bot| bot["name"].as_str().unwrap_or_default().cmp(name))
+    };
     let found: std::collections::HashSet<&str> = (rows.iter())
         .filter_map(|row| row["name"].as_str())
         .collect();
-    listed.retain(|bot| {
-        (bot["name"].as_str()).is_none_or(|name| !moved.contains(name) || found.contains(name))
-    });
+    for name in moved.iter().filter(|name| !found.contains(name.as_str())) {
+        if let Ok(gone) = at(listed, name) {
+            let gone = listed.remove(gone);
+            *mark = mark.map(|mark| mark.wrapping_sub(row_mark(&gone)));
+        }
+    }
     drop(found);
     for row in rows {
-        let at = {
-            let Some(name) = row["name"].as_str() else {
-                continue;
-            };
-            listed.binary_search_by(|bot| bot["name"].as_str().unwrap_or_default().cmp(name))
+        let Some(name) = row["name"].as_str() else {
+            continue;
         };
-        match at {
-            Ok(at) => listed[at] = row,
-            Err(at) => listed.insert(at, row),
+        let new = row_mark(&row);
+        match at(listed, name) {
+            Ok(at) => {
+                let old = row_mark(&listed[at]);
+                *mark = mark.map(|mark| mark.wrapping_sub(old).wrapping_add(new));
+                listed[at] = row;
+            }
+            Err(at) => {
+                *mark = mark.map(|mark| mark.wrapping_add(new));
+                listed.insert(at, row);
+            }
         }
     }
 }
@@ -5243,6 +5335,9 @@ struct App {
     /// What this window holds that the count reads, when last counted:
     /// its own question and calls, and when the done marks last changed.
     counted_local: Option<((usize, usize), Option<std::time::SystemTime>)>,
+    /// The rows this window's last count built, which its next keeps for
+    /// every idle agent no event moved.
+    kept_rows: Built,
     /// The follow of this window's project that keeps `listed` current,
     /// on the window's own connection.
     follower: Option<standing::Follower>,
@@ -7261,6 +7356,7 @@ impl App {
             counted_at: None,
             counted_mark: None,
             counted_local: None,
+            kept_rows: Built::default(),
             follower: None,
             listed: None,
             rows_mark: None,
@@ -11286,8 +11382,8 @@ impl App {
 
     /// The tasks as `/status` read them now, for template notes'
     /// `tasks()`: counted as a change only where they differ.
-    fn tasks_read(&mut self, tasks: Vec<Value>) {
-        if *self.blanks.tasks != tasks {
+    fn tasks_read(&mut self, tasks: Vec<status::Task>) {
+        if !status::same_tasks(&self.blanks.tasks, &tasks) {
             self.blanks.tasks = std::sync::Arc::new(tasks);
             self.blanks.tasks_read += 1;
         }
@@ -11434,11 +11530,16 @@ impl App {
             if let Some(own) = counted.own {
                 self.margin.set_tasks(own);
             }
-            if let Some(((counts, bots), (latest, seen))) = counted.read {
-                self.counts = Some(counts);
-                self.status_counted(bots);
+            self.kept_rows = counted.kept.unwrap_or_default();
+            if let Some((latest, seen)) = counted.reads {
                 self.status_read = latest;
                 self.asks_seen = seen;
+            }
+            if let Some((counts, bots)) = counted.read {
+                self.counts = Some(counts);
+                if let Some(bots) = bots {
+                    self.status_counted(bots);
+                }
             }
         }
         if self.counting.is_some()
@@ -11484,37 +11585,51 @@ impl App {
             self.listed = Some(listed);
             return;
         }
-        // The count holds the listing until it gives it back.
+        // The count holds the listing, and the rows it built last, until it
+        // gives them back. Every row is built again from a new snapshot, or
+        // once this window's own question or calls, or a done mark, changed.
         self.listed = None;
+        let mut kept_rows = std::mem::take(&mut self.kept_rows);
+        if whole || self.counted_local != Some(local) {
+            kept_rows = Built::default();
+        }
         self.counted_local = Some(local);
         self.counted_at = Some(Instant::now());
         let (client, woken) = (self.client.clone(), self.woken.clone());
         let (store, bot) = (self.options.store.clone(), self.bot.clone());
-        let (mut latest, mut seen) = (self.status_read.clone(), self.asks_seen.clone());
+        // What was read of each agent's history and question goes with the
+        // count, which gives it back however it ends.
+        let (mut latest, mut seen) = (
+            std::mem::take(&mut self.status_read),
+            std::mem::take(&mut self.asks_seen),
+        );
         let (was, turns) = (self.counted_mark, self.turns.clone());
-        // The rows' mark is taken again only when a row changed.
+        let told = self.blanks.tasks.clone();
+        // The rows' mark is kept up to date as rows change, and taken again
+        // whole only from a new snapshot.
         let kept_mark = self.rows_mark.filter(|_| !whole);
         self.counting = Some(tokio::spawn(async move {
-            let failed = || Counted {
+            let failed = |reads| Counted {
                 mark: None,
                 read: None,
+                reads: Some(reads),
                 tasks: None,
                 listed: None,
                 own: None,
+                kept: None,
             };
             let (mut listed, mut kept_mark) = (listed, kept_mark);
             if !moved.is_empty() {
                 let names: Vec<String> = moved.iter().cloned().collect();
                 let Ok(rows) = standing::rows(&client, &names).await else {
-                    return Some(failed());
+                    return Some(failed((latest, seen)));
                 };
-                moved_rows(&mut listed, &moved, rows);
-                kept_mark = None;
+                moved_rows(&mut listed, &moved, rows, &mut kept_mark);
             }
             if running {
                 let ask = json!({"name": scope.glob, "active": true, "limit": 256});
                 let Ok(rows) = standing::every(&client, ask).await else {
-                    return Some(failed());
+                    return Some(failed((latest, seen)));
                 };
                 // Running agents that stand as they stood leave the
                 // listing, and its mark, as they were.
@@ -11522,27 +11637,28 @@ impl App {
                     let names = (rows.iter())
                         .filter_map(|row| Some(row["name"].as_str()?.to_owned()))
                         .collect();
-                    moved_rows(&mut listed, &names, rows);
-                    kept_mark = None;
+                    moved_rows(&mut listed, &names, rows, &mut kept_mark);
                 }
             }
             let rows = kept_mark.unwrap_or_else(|| rows_mark(&listed));
             // The listing is current from here: a read that fails keeps it
             // and counts again.
-            let unread = |listed| Counted {
+            let unread = |listed, reads| Counted {
                 listed: Some((listed, rows)),
-                ..failed()
+                ..failed(reads)
             };
             let Some(mark) = standing(&client, rows, local).await else {
-                return Some(unread(listed));
+                return Some(unread(listed, (latest, seen)));
             };
             if was == Some(mark) {
                 return Some(Counted {
                     mark: Some(mark),
                     read: None,
+                    reads: Some((latest, seen)),
                     tasks: None,
                     listed: Some((listed, rows)),
                     own: None,
+                    kept: Some(kept_rows),
                 });
             }
             let view = StatusView {
@@ -11563,21 +11679,50 @@ impl App {
                 &mut latest,
                 &mut seen,
                 view,
+                Some((&mut kept_rows, &moved)),
             )
             .await
             else {
-                return Some(unread(listed));
+                return Some(unread(listed, (latest, seen)));
             };
             woken.notify_one();
+            let whole = read.whole && read.listed;
+            let mut built = read.rows;
+            let counts = status::counts(&built);
+            // The agents counted, made again only once they are not those
+            // the last count counted.
+            let bots = match built.len() == kept_rows.bots.len()
+                && (built.iter()).all(|row| kept_rows.bots.contains(&row.bot))
+            {
+                true => None,
+                false => Some(status::bots(&built)),
+            };
+            if let Some(bots) = &bots {
+                kept_rows.bots = bots.clone();
+            }
+            let own = status::own(&built, &bot);
+            // The tasks' lines, each made once for a row kept, and handed
+            // over only once they say something new.
+            let tasks =
+                Some(status::tasks(&mut built)).filter(|tasks| !status::same_tasks(&told, tasks));
+            drop(told);
+            // An idle agent's row is kept for the next count, once every
+            // read the count made was read.
+            kept_rows.rows = match whole {
+                true => (built.into_iter())
+                    .filter(|row| !row.running && row.run.is_none())
+                    .map(|row| (name_key(&row.bot), row))
+                    .collect(),
+                false => HashMap::new(),
+            };
             Some(Counted {
-                mark: (read.whole && read.listed).then_some(mark),
-                read: Some((
-                    (status::counts(&read.rows), status::bots(&read.rows)),
-                    (latest, seen),
-                )),
-                tasks: Some(status::tasks(&read.rows)),
+                mark: whole.then_some(mark),
+                read: Some((counts, bots)),
+                reads: Some((latest, seen)),
+                tasks,
                 listed: Some((listed, rows)),
-                own: Some(status::own(&read.rows, &bot)),
+                own: Some(own),
+                kept: Some(kept_rows),
             })
         }));
     }
@@ -14240,10 +14385,10 @@ impl App {
 
     /// What a read of `/status` found, kept: the footer's counts, the
     /// tasks, and what waits on the person.
-    fn status_kept(&mut self, read: StatusRead) -> (String, Vec<status::Row>) {
+    fn status_kept(&mut self, mut read: StatusRead) -> (String, Vec<status::Row>) {
         self.counts = Some(status::counts(&read.rows));
         self.status_counted(status::bots(&read.rows));
-        self.tasks_read(status::tasks(&read.rows));
+        self.tasks_read(status::tasks(&mut read.rows));
         self.margin.set_tasks(status::own(&read.rows, &self.bot));
         // The windows' names and the footer say what this read, as it is
         // newer than what they had. A running agent's question is read
@@ -22835,16 +22980,20 @@ mod tests {
         let mut listed = vec![row("a", "idle"), row("b", "idle"), row("c", "idle")];
         let moved: std::collections::BTreeSet<String> =
             ["b", "c", "d"].into_iter().map(String::from).collect();
-        // b changed, c is gone, d is new; a did not move.
+        // b changed, c is gone, d is new; a did not move. The listing's
+        // mark changes as the rows did.
+        let mut mark = Some(rows_mark(&listed));
         moved_rows(
             &mut listed,
             &moved,
             vec![row("d", "idle"), row("b", "running")],
+            &mut mark,
         );
         assert_eq!(
             listed,
             vec![row("a", "idle"), row("b", "running"), row("d", "idle")]
         );
+        assert_eq!(mark, Some(rows_mark(&listed)));
     }
 
     /// Request ids made in one millisecond, as two reactions sent back to
@@ -24879,6 +25028,10 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(app.counts, Some(counts(0, 1, 1)));
+        // The idle agents' rows are kept for the next count; a running
+        // one's is built every count.
+        assert!(app.kept_rows.rows.contains_key(&name_key("shop.lead")));
+        assert!(!app.kept_rows.rows.contains_key(&name_key("shop.fix.help")));
         let taken =
             |reads: &Arc<std::sync::Mutex<Vec<Value>>>| std::mem::take(&mut *reads.lock().unwrap());
         // Only the running agents' rows were read again, never the project.
@@ -24922,6 +25075,77 @@ mod tests {
         app.follower.as_ref().unwrap().moved("shop.fix");
         counted(&mut app).await;
         assert!(app.counted_mark.is_some());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn a_kept_row_is_built_again_once_its_own_calls_change() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        // Two idle tasks the count keeps, and one running, so the window
+        // counts every time it looks.
+        let snapshot = json!([
+            {"name": "shop.lead", "bot_id": 1, "head": null},
+            {"name": "shop.a", "bot_id": 2, "head": null, "created_by": "shop.lead",
+                "last": {"turn": 3, "status": "completed"}},
+            {"name": "shop.b", "bot_id": 3, "head": null, "created_by": "shop.lead",
+                "last": {"turn": 5, "status": "completed"}},
+            {"name": "shop.run", "bot_id": 4, "head": null, "created_by": "shop.lead",
+                "running_turn": 2, "status": "running"}]);
+        let running = snapshot[3].clone();
+        let (lifted, asked) = (
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicBool::new(false)),
+        );
+        let (held, call) = (lifted.clone(), asked.clone());
+        let client = daemon_answering(move |ask| match ask["op"].as_str().unwrap_or("") {
+            "bots" if ask["names"].is_null() && ask["active"].is_null() => {
+                json!({"bots": snapshot, "cursor": 7, "next_after": null})
+            }
+            "bots" => json!({"bots": [running], "next_after": null}),
+            "follow" => json!({"following": ask["bot"]}),
+            // A call of shop.a's, lifted past its turn, waits on the person.
+            "approvals" if held.load(Ordering::SeqCst) => {
+                call.store(true, Ordering::SeqCst);
+                json!({"approvals": [{"bot": "shop.a", "turn": 3, "call_id": "c1",
+                    "handle": "h1", "asked": "may I?"}], "next_after": null})
+            }
+            "approvals" => json!({"approvals": [], "next_after": null}),
+            _ => json!({}),
+        })
+        .await;
+        let mut app = app(client);
+        app.bot = "shop.lead".into();
+        let dir = std::env::temp_dir().join(unique("sonny-kept-rows"));
+        std::fs::create_dir_all(&dir).unwrap();
+        app.options.store = dir.join("state.sqlite");
+        let counted = async |app: &mut App| {
+            app.counted_at = None;
+            app.count_agents().await;
+            if let Some(job) = &app.counting {
+                while !job.is_finished() {
+                    tokio::task::yield_now().await;
+                }
+            }
+            app.counted_at = Some(Instant::now());
+            app.count_agents().await;
+        };
+        app.count_agents().await;
+        while !app.follower.as_ref().unwrap().snapshot_waits() {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        counted(&mut app).await;
+        let needs = |app: &App| app.counts.as_ref().map(|counts| counts.needs_you);
+        assert_eq!(needs(&app), Some(0));
+        assert!(app.kept_rows.rows.contains_key(&name_key("shop.a")));
+        // Unmoved, shop.a's row is built again once its call waits.
+        lifted.store(true, Ordering::SeqCst);
+        counted(&mut app).await;
+        assert!(asked.load(Ordering::SeqCst));
+        assert_eq!(needs(&app), Some(1));
+        // And again once it is gone.
+        lifted.store(false, Ordering::SeqCst);
+        counted(&mut app).await;
+        assert_eq!(needs(&app), Some(0));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

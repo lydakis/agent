@@ -924,7 +924,7 @@ pub struct Blanks {
     /// The sources the person set up, by name.
     pub sources: Arc<Vec<String>>,
     /// The agents as `/status` last read them, as `tasks()` gives them.
-    pub tasks: Arc<Vec<Value>>,
+    pub tasks: Arc<Vec<crate::status::Task>>,
     /// Counts each change to `tasks`.
     pub tasks_read: u64,
     /// The person's own notes, `[sonny.notes.NAME]`, shown over the
@@ -1946,7 +1946,9 @@ mod tests {
     #[test]
     fn a_template_note_fills_and_fills_again_only_once_what_it_read_changes() {
         let mut margin = margin();
-        margin.blanks.tasks = Arc::new(vec![json!({"name": "calc.add", "state": "working"})]);
+        margin.blanks.tasks = Arc::new(vec![Arc::new(
+            json!({"name": "calc.add", "state": "working"}),
+        )]);
         let post = json!({"kind": "pinned", "id": "tasks", "title": "Tasks",
             "live": true, "markdown": "{% for t in tasks() %}- {{ t.name }}: {{ t.state }}\n{% endfor %}"});
         assert_eq!(
@@ -1968,7 +1970,9 @@ mod tests {
         later(&mut margin);
         drawn(&mut margin, folder);
         assert_eq!(margin.changes(), changes, "nothing it read changed");
-        margin.blanks.tasks = Arc::new(vec![json!({"name": "calc.add", "state": "failed"})]);
+        margin.blanks.tasks = Arc::new(vec![Arc::new(
+            json!({"name": "calc.add", "state": "failed"}),
+        )]);
         margin.blanks.tasks_read += 1;
         later(&mut margin);
         assert!(drawn(&mut margin, folder).contains("calc.add: failed"));
@@ -3294,7 +3298,7 @@ mod tests {
         let tasks = |n: usize| {
             Arc::new(
                 (0..n)
-                    .map(|i| json!({"name": format!("t{i}"), "state": "working"}))
+                    .map(|i| Arc::new(json!({"name": format!("t{i}"), "state": "working"})))
                     .collect(),
             )
         };
