@@ -10801,7 +10801,7 @@ CI runner, 2026-11-18:
 | `bench.footprint` | Idle RSS | 17.012 MiB | 17.086 MiB | +0.4% |
 | `bench.footprint` | Per idle bot | 1.832 KiB | 1.912 KiB | +4.4% |
 | `bench.footprint` | RSS after a turn each | 59.490 MiB | 53.445 MiB | -10.2% |
-| `bench.footprint` | CPU per turn | 0.566 ms | 0.540 ms | -4.6% |
+| `bench.footprint` | CPU per turn | 0.566 ms | 0.540 ms | -4.4% |
 | `bench.lifecycle` | Daemon CPU | 0.285 s | 0.315 s | +10.5% |
 | `bench.lifecycle` | Turn p95 | 569.936 ms | 570.648 ms | +0.1% |
 | `bench.lifecycle` | Peak RSS | 26.219 MiB | 25.854 MiB | -1.4% |
