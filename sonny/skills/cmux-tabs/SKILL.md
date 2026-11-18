@@ -17,7 +17,7 @@ Workspaces are for leads: each project's lead has a cmux workspace of its own, a
 
 ## Where things go
 
-- An agent you start gets no tab unless the person asked for one; Sonny opens its tab when it needs them.
+- An agent you start gets no tab unless the person asked for one.
 - Never make a cmux workspace, tab or split yourself (`cmux new-workspace`, `new-surface`, `new-split`, `new-pane`), and never leave out `--surface`: without it, cmux picks a tab that may not be yours.
 - Never close a tab the person has typed in or asked you to open; ask them first.
 
