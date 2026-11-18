@@ -4089,7 +4089,7 @@ struct Counted {
     /// The project's agents as the count left them, the rows that moved
     /// read again, with their [`rows_mark`]; none when a read failed, so
     /// the window takes a fresh snapshot.
-    listed: Option<(Arc<Vec<Value>>, u64)>,
+    listed: Option<(Vec<Value>, u64)>,
     /// This window's agent's own tasks, as the margin lists them, when read.
     own: Option<Vec<status::Own>>,
 }
@@ -4148,23 +4148,34 @@ fn rows_differ(listed: &[Value], rows: &[Value]) -> bool {
     })
 }
 
-/// `listed` with the rows of the agents `moved` read again: one gone is
-/// left out, one new is added, in name order as the listing keeps them.
+/// `listed`, in name order as the listing keeps it, with the rows of the
+/// agents `moved` read again, changed where it lies: one gone is taken
+/// out, one new put in its place. Only those rows are copied, so a window
+/// holds its project's listing once however often it counts.
 fn moved_rows(
-    listed: &[Value],
+    listed: &mut Vec<Value>,
     moved: &std::collections::BTreeSet<String>,
     rows: Vec<Value>,
-) -> Vec<Value> {
-    let mut kept: std::collections::BTreeMap<String, Value> = (listed.iter())
-        .filter_map(|bot| Some((bot["name"].as_str()?.to_owned(), bot.clone())))
-        .filter(|(name, _)| !moved.contains(name))
+) {
+    let found: std::collections::HashSet<&str> = (rows.iter())
+        .filter_map(|row| row["name"].as_str())
         .collect();
+    listed.retain(|bot| {
+        (bot["name"].as_str()).is_none_or(|name| !moved.contains(name) || found.contains(name))
+    });
+    drop(found);
     for row in rows {
-        if let Some(name) = row["name"].as_str() {
-            kept.insert(name.to_owned(), row);
+        let at = {
+            let Some(name) = row["name"].as_str() else {
+                continue;
+            };
+            listed.binary_search_by(|bot| bot["name"].as_str().unwrap_or_default().cmp(name))
+        };
+        match at {
+            Ok(at) => listed[at] = row,
+            Err(at) => listed.insert(at, row),
         }
     }
-    kept.into_values().collect()
 }
 
 /// When the marks of tasks resolved beside `store` last changed: a mark is
@@ -4715,8 +4726,9 @@ struct App {
     /// on the window's own connection.
     follower: Option<standing::Follower>,
     /// The project's agents as last read, kept current by `follower`,
-    /// with their [`rows_mark`] once counted.
-    listed: Option<Arc<Vec<Value>>>,
+    /// with their [`rows_mark`] once counted; the count holds it while it
+    /// runs, so there is one copy.
+    listed: Option<Vec<Value>>,
     rows_mark: Option<u64>,
     folded: Option<(bool, u64)>,
     refold: bool,
@@ -10296,9 +10308,12 @@ impl App {
     /// moves without a change of state; and a task marked done beside the
     /// store counts too. While `/status` is open, its own reads count them.
     async fn count_agents(&mut self) {
-        if let Some(job) = self.counting.take_if(|job| job.is_finished())
-            && let Ok(Some(counted)) = job.await
-        {
+        if let Some(job) = self.counting.take_if(|job| job.is_finished()) {
+            let Ok(Some(counted)) = job.await else {
+                // The listing went with it: start over.
+                self.follower = None;
+                return;
+            };
             self.counted_mark = counted.mark;
             match counted.listed {
                 Some((listed, mark)) => (self.listed, self.rows_mark) = (Some(listed), Some(mark)),
@@ -10346,24 +10361,23 @@ impl App {
         let marks = agent_client::socket::canonical_store(&self.options.store)
             .unwrap_or_else(|_| self.options.store.clone());
         let local: Local = (here, resolved_changed(&marks));
+        let whole = changes.snapshot.is_some();
         let listed = match changes.snapshot {
-            Some(snapshot) => Arc::new(snapshot),
-            None => match &self.listed {
-                Some(listed) => listed.clone(),
+            Some(snapshot) => snapshot,
+            None => match self.listed.take() {
+                Some(listed) => listed,
                 // No snapshot yet: nothing to count from.
                 None => return,
             },
         };
         let running = listed.iter().any(|bot| bot["running_turn"].is_i64());
         let moved = changes.moved;
-        let whole = self
-            .listed
-            .as_ref()
-            .is_none_or(|was| !Arc::ptr_eq(was, &listed));
         if !whole && moved.is_empty() && !running && self.counted_local == Some(local) {
+            self.listed = Some(listed);
             return;
         }
-        self.listed = Some(listed.clone());
+        // The count holds the listing until it gives it back.
+        self.listed = None;
         self.counted_local = Some(local);
         self.counted_at = Some(Instant::now());
         let (client, woken) = (self.client.clone(), self.woken.clone());
@@ -10386,7 +10400,7 @@ impl App {
                 let Ok(rows) = standing::rows(&client, &names).await else {
                     return Some(failed());
                 };
-                listed = Arc::new(moved_rows(&listed, &moved, rows));
+                moved_rows(&mut listed, &moved, rows);
                 kept_mark = None;
             }
             if running {
@@ -10404,13 +10418,19 @@ impl App {
                     let names = (rows.iter())
                         .filter_map(|row| Some(row["name"].as_str()?.to_owned()))
                         .collect();
-                    listed = Arc::new(moved_rows(&listed, &names, rows));
+                    moved_rows(&mut listed, &names, rows);
                     kept_mark = None;
                 }
             }
             let rows = kept_mark.unwrap_or_else(|| rows_mark(&listed));
+            // The listing is current from here: a read that fails keeps it
+            // and counts again.
+            let unread = |listed| Counted {
+                listed: Some((listed, rows)),
+                ..failed()
+            };
             let Some(mark) = standing(&client, rows, local).await else {
-                return Some(failed());
+                return Some(unread(listed));
             };
             if was == Some(mark) {
                 return Some(Counted {
@@ -10430,7 +10450,7 @@ impl App {
                 aside: &|_| false,
                 details: false,
             };
-            let read = read_status_of(
+            let Ok(read) = read_status_of(
                 &client,
                 &store,
                 scope,
@@ -10441,7 +10461,9 @@ impl App {
                 view,
             )
             .await
-            .ok()?;
+            else {
+                return Some(unread(listed));
+            };
             woken.notify_one();
             Some(Counted {
                 mark: read.whole.then_some(mark),
@@ -20669,6 +20691,24 @@ fn zen_notice(on: bool) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rows_that_moved_are_changed_where_they_lie_in_name_order() {
+        let row = |name: &str, status: &str| json!({"name": name, "status": status});
+        let mut listed = vec![row("a", "idle"), row("b", "idle"), row("c", "idle")];
+        let moved: std::collections::BTreeSet<String> =
+            ["b", "c", "d"].into_iter().map(String::from).collect();
+        // b changed, c is gone, d is new; a did not move.
+        moved_rows(
+            &mut listed,
+            &moved,
+            vec![row("d", "idle"), row("b", "running")],
+        );
+        assert_eq!(
+            listed,
+            vec![row("a", "idle"), row("b", "running"), row("d", "idle")]
+        );
+    }
 
     /// Request ids made in one millisecond, as two reactions sent back to
     /// back, are still two requests to the daemon.
