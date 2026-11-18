@@ -1534,6 +1534,9 @@ impl Kept {
             ..Self::default()
         };
         if !log.is_empty() {
+            // Until the log starts over, its last line may be cut short:
+            // the next write is the whole again, never a line after it.
+            kept.logged = kept.times.len();
             kept.write_whole(places);
         }
         kept
@@ -1595,6 +1598,10 @@ impl Kept {
 
     /// Everything kept, written whole, and the log started over.
     fn write_whole(&mut self, places: &Places) {
+        #[cfg(test)]
+        if WHOLE_FAILS.with(|fails| fails.get()) {
+            return;
+        }
         // Every change so far is in it, those not yet logged too.
         let last = self.last + self.changed.len() as u64;
         let mut value: serde_json::Map<String, serde_json::Value> = (self.times.iter())
@@ -1643,6 +1650,10 @@ impl std::ops::Index<&str> for Kept {
 // start writes its own trigger's, not every trigger's.
 #[cfg(test)]
 thread_local!(static WRITTEN: std::cell::Cell<usize> = const { std::cell::Cell::new(0) });
+
+// Makes the whole fail to be written, in tests, as a full disk does.
+#[cfg(test)]
+thread_local!(static WHOLE_FAILS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) });
 
 /// `bytes` of the kept times written.
 fn written(bytes: usize) {
@@ -2746,6 +2757,32 @@ mod tests {
         assert_eq!(read.get("a"), Some(&("g".to_owned(), 200)));
         assert_eq!(read.get("b"), Some(&("g".to_owned(), 100)));
         assert_eq!(read.times, kept.times);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_log_read_that_cannot_start_over_is_never_written_after() {
+        let root =
+            std::env::temp_dir().join(format!("agent-scheduler-unstarted-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let places = Places::under(&root);
+        let mut kept = Kept::default();
+        for name in ["a", "b", "c", "d", "e", "f", "g", "h", "i", "j"] {
+            kept.insert(name.into(), ("g".into(), 60));
+        }
+        kept.write(&places);
+        // A crash cut the log's last line short.
+        let next = kept.last + 1;
+        std::fs::write(places.looked_log(), format!("{{\"n\":{next},\"na")).unwrap();
+        // The whole cannot be written as it is read, as when the disk is
+        // full.
+        WHOLE_FAILS.with(|fails| fails.set(true));
+        let mut read = Kept::read(&places);
+        WHOLE_FAILS.with(|fails| fails.set(false));
+        // Room again: the next change is written, then read back.
+        read.insert("a".into(), ("g".into(), 200));
+        read.write(&places);
+        assert_eq!(Kept::read(&places).get("a"), Some(&("g".to_owned(), 200)));
         let _ = std::fs::remove_dir_all(&root);
     }
 
