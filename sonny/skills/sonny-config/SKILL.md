@@ -66,6 +66,16 @@ each setting is; what to set is the person's call.
   wildcards (`"bedrock/*openai.*" = 1000000`), over what its provider
   lists; the most specific pattern wins, and it may be lower on purpose.
   Read when the daemon starts.
+- `[speeds]` in the config: the tiers faster than standard a model
+  serves, by `PROVIDER/MODEL` with `*` and `?` wildcards, each a list of
+  `"fast"` and `"ultrafast"`, `[]` for standard only
+  (`"openai/gpt-*" = ["fast"]`), over the daemon's own list; the
+  most specific pattern wins. An agent's speed reaches only a model that
+  serves it, and runs at standard on any other. Each window passes the
+  table to the daemon as it starts it (`--speeds`), so a change needs the
+  daemon started again. A tier listed here that the provider refuses
+  fails that call as `provider_speed_refused`, never retried at standard:
+  list only what the provider documents.
 - The price sheet, `~/.agent/prices.toml`, or the file the config's
   `prices = "~/path/sheet.toml"` names: what a million tokens cost, which
   `/usage` turns into each model's cost and a total, by `PROVIDER/MODEL`

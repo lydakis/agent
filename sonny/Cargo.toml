@@ -79,6 +79,12 @@ minijinja-contrib = { version = "3.1", default-features = false, features = ["py
 # Code checks one; no remote $refs.
 jsonschema = { version = "0.61.1", default-features = false }
 
+# jemalloc in the static Linux builds, as Codex ships them (codex-rs/cli,
+# codex-rs/app-server): musl's own allocator serializes every thread on one
+# lock. The Mac and glibc builds keep the system allocator.
+[target.'cfg(all(target_os = "linux", target_env = "musl", any(target_arch = "x86_64", target_arch = "aarch64")))'.dependencies]
+tikv-jemallocator = "=0.7.0"
+
 [dev-dependencies]
 # A stand-in daemon on a Unix socket, for the event handling's tests.
 tokio = { version = "1", features = ["net", "io-util"] }

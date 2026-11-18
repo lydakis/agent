@@ -41,6 +41,12 @@ libc = "0.2"
 [target.'cfg(target_os = "linux")'.dependencies]
 seccompiler = "0.5"
 
+# jemalloc in the static Linux builds, as Codex ships them (codex-rs/cli,
+# codex-rs/app-server): musl's own allocator serializes every thread on one
+# lock. The Mac and glibc builds keep the system allocator.
+[target.'cfg(all(target_os = "linux", target_env = "musl", any(target_arch = "x86_64", target_arch = "aarch64")))'.dependencies]
+tikv-jemallocator = "=0.7.0"
+
 [profile.release]
 lto = "thin"
 codegen-units = 1

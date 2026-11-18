@@ -2,8 +2,9 @@
 //! Rex with no model call. Its agents are grouped by where they stand, as
 //! a thread list is, the lead first in its group: what needs the person,
 //! what works, and, folded away, what sits idle and what is marked done.
-//! Each row is one line: the agent, its state and for how long, and at the
-//! right its code reviews; one that needs the person says what for under
+//! Each row is one line: what the work is, then who does it (its title,
+//! then the agent's name), its state where its group does not say it, for
+//! how long, and at the right its code reviews; one that needs the person says what for under
 //! it. More, on a key: what it follows, what runs for it in the background
 //! and where its window is, and the picked one's model, profile and latest
 //! step. A task's own helpers fold under it.
@@ -20,6 +21,9 @@ pub struct Row {
     pub name: String,
     /// The agent's own name, which a click on its row opens.
     pub bot: String,
+    /// What its work is, in the person's words: a task's as started, a
+    /// lead's its project's; empty for one with none.
+    pub title: String,
     pub state: String,
     /// Whether a turn of its runs.
     pub running: bool,
@@ -91,6 +95,18 @@ impl Group {
             Group::Working => "working",
             Group::Idle => "idle",
             Group::Done => "done",
+        }
+    }
+
+    /// The state word a row in this group leaves unsaid: its heading
+    /// says it.
+    fn own(self) -> &'static str {
+        match self {
+            Group::NeedsYou => "needs you",
+            Group::Failed => "failed",
+            Group::Working => "working",
+            Group::Idle => crate::started::IDLE,
+            Group::Done => crate::started::DONE,
         }
     }
 
@@ -434,6 +450,19 @@ pub fn card(
         Details::Quiet => false,
     };
     let trackers = details != Details::Quiet;
+    // The titles share a column, so the names after them line up: as wide
+    // as the widest, a helper's counted from its indent, and narrow enough
+    // that the widest name still fits after it.
+    let titled: Vec<(&Row, usize)> = (listed.iter().map(|row| (*row, 0)))
+        .chain((under.values().flatten()).map(|row| (*row, 2)))
+        .filter(|(row, _)| !row.title.is_empty() && row.run.is_none())
+        .collect();
+    let names = (titled.iter()).map(|(row, _)| row.name.width()).max();
+    let titles = (titled.iter())
+        .map(|(row, indent)| indent + row.title.width())
+        .max()
+        .unwrap_or(0)
+        .min(width.saturating_sub(5 + names.unwrap_or(0)));
     for group in GROUPS {
         let in_group: Vec<&&Row> = listed.iter().filter(|r| r.group == group).collect();
         if in_group.is_empty() {
@@ -458,7 +487,7 @@ pub fn card(
         let showing = if shut { 0 } else { n };
         for row in in_group.iter().take(showing) {
             named.push((out.len(), row.bot.clone()));
-            out.extend(row_lines(row, width, "", shown(row), trackers));
+            out.extend(row_lines(row, width, "", titles, shown(row), trackers));
             // A helper listed with what needs the person shows alone.
             let Some(helped) =
                 (under.get(&row.bot)).filter(|_| !helping.contains(row.bot.as_str()))
@@ -483,7 +512,14 @@ pub fn card(
             if unfolded {
                 for helper in helped {
                     named.push((out.len(), helper.bot.clone()));
-                    out.extend(row_lines(helper, width, "  ", shown(helper), trackers));
+                    out.extend(row_lines(
+                        helper,
+                        width,
+                        "  ",
+                        titles,
+                        shown(helper),
+                        trackers,
+                    ));
                 }
             }
         }
@@ -792,15 +828,19 @@ fn run_spans(
     out
 }
 
-/// One agent's lines, after `indent`: its mark, name, state and time,
-/// at the right its code reviews, and with `trackers` what it follows,
-/// what runs for it and where its window is too; under it, with `details` or
-/// while it waits on the person or failed, its latest step, and with `details` its
-/// model and profile too.
+/// One agent's lines, after `indent`: its mark, its title in a column
+/// `titles` wide, its name, its state where its group does not say it,
+/// and its time, at the right its code reviews, and with `trackers` what
+/// it follows, what runs for it and where its window is too; under it,
+/// with `details` or while it waits on the person or failed, its latest
+/// step, and with `details` its model and profile too. Short of room the
+/// time goes first, then the title is cut at a word; the mark and the
+/// name stay.
 fn row_lines(
     row: &Row,
     width: usize,
     indent: &str,
+    titles: usize,
     details: bool,
     trackers: bool,
 ) -> Vec<Line<'static>> {
@@ -817,18 +857,38 @@ fn row_lines(
         _ if row.run.is_some() => mark("working"),
         _ => mark(&row.state),
     };
-    let time = match time.is_empty() {
+    let mut time = match time.is_empty() {
         true => None,
         false => Some(Span::raw(format!(" · {time}")).dim()),
     };
     let mut spans = vec![Span::raw(format!(" {indent}")), mark];
     match &row.run {
         Some(run) => spans.extend(run_spans(run, width, &spans, time.as_ref())),
-        None => spans.extend([
+        None => {
+            // The state word only where its group's heading does not say it.
+            let state = (row.state != row.group.own() && !row.state.is_empty())
+                .then(|| Span::raw(format!(" · {}", row.state)));
+            let name = row.name.width();
+            let fixed = spans.iter().map(|s| s.content.width()).sum::<usize>()
+                + name
+                + state.as_ref().map_or(0, |s| s.content.width());
+            let column = titles
+                .saturating_sub(indent.width())
+                .min(width.saturating_sub(fixed + 2));
+            if !row.title.is_empty() && column > 1 {
+                // The time goes first, then the title is cut at a word.
+                let timed = time.as_ref().map_or(0, |t| t.content.width());
+                if fixed + 2 + column + timed > width {
+                    time = None;
+                }
+                let title = crate::title::cut(&row.title, column);
+                let pad = column.saturating_sub(title.width());
+                spans.push(Span::raw(format!("{title}{}  ", " ".repeat(pad))));
+            }
             // In the agents' color: a click opens it.
-            Span::raw(row.name.clone()).bold().fg(Color::Blue),
-            Span::raw(format!(" {}", row.state)),
-        ]),
+            spans.push(Span::raw(row.name.clone()).bold().fg(Color::Blue));
+            spans.extend(state);
+        }
     }
     spans.extend(time);
     // Its code reviews always; the rest only when asked for more.
@@ -902,7 +962,7 @@ mod tests {
     fn a_workflow_s_row_draws_its_strip_where_the_counts_were() {
         use crate::workflow::view::{Counts, Live};
         let text = |row: &Row, width: usize| -> String {
-            let lines = row_lines(row, width, "", false, false);
+            let lines = row_lines(row, width, "", 0, false, false);
             assert_eq!(lines.len(), 1, "one row");
             lines[0].spans.iter().map(|s| s.content.as_ref()).collect()
         };
@@ -941,7 +1001,7 @@ mod tests {
             " ● blind-role-eval-score Score · ✓✓✓ ✓●● · 19s"
         );
         // The run's name is bold in the text's own color: blue is an agent's.
-        let lines = row_lines(&row, 80, "", false, false);
+        let lines = row_lines(&row, 80, "", 0, false, false);
         let name = (lines[0].spans.iter())
             .find(|s| s.content == "blind-role-eval-score")
             .expect("the run's name");
@@ -1294,6 +1354,67 @@ mod tests {
         );
     }
 
+    #[test]
+    fn a_row_says_what_the_work_is_then_who_does_it() {
+        let rows = [
+            Row {
+                title: "Tally invoices".into(),
+                seconds: None,
+                ..row("lead", "waiting on halves", Group::Working)
+            },
+            Row {
+                title: "Check the README against the code".into(),
+                seconds: None,
+                ..row("readme", "needs you", Group::NeedsYou)
+            },
+            Row {
+                title: "Round half cents to even".into(),
+                seconds: Some(130),
+                pr: "#412".into(),
+                ..row("halves", "working", Group::Working)
+            },
+            // One with no title: its name alone.
+            row("old", "working", Group::Working),
+        ];
+        let lines = text(&card("Tally invoices", &rows, 72, &[], Details::Quiet, &[]));
+        let trimmed: Vec<&str> = lines.iter().map(|l| l.trim_end()).collect();
+        assert_eq!(
+            trimmed,
+            [
+                "Tally invoices · 1 needs you · 3 working",
+                "",
+                "Needs you · 1",
+                " ? Check the README against the code  readme",
+                "",
+                "Working · 3",
+                " ◌ Tally invoices                     lead · waiting on halves",
+                " ● Round half cents to even           halves · 2m 10s               #412",
+                " ● old · 42s",
+            ]
+        );
+        // Too long for its row: the time goes first, then the title is
+        // cut at a word; the mark and the name stay, the names still in
+        // a column.
+        let lines = text(&card("Tally invoices", &rows, 60, &[], Details::Quiet, &[]));
+        assert_eq!(
+            lines[7].trim_end(),
+            " ● Round half cents to even           halves · 2m 10s   #412"
+        );
+        let lines = text(&card("Tally invoices", &rows, 44, &[], Details::Quiet, &[]));
+        assert_eq!(
+            lines[7].trim_end(),
+            " ● Round half cents to even           halves"
+        );
+        let lines = text(&card("Tally invoices", &rows, 36, &[], Details::Quiet, &[]));
+        assert_eq!(lines[3].trim_end(), " ? Check the README against…  readme");
+        assert_eq!(lines[7].trim_end(), " ● Round half cents to even   halves");
+        let lines = text(&card("Tally invoices", &rows, 30, &[], Details::Quiet, &[]));
+        assert_eq!(lines[7].trim_end(), " ● Round half cents…    halves");
+        // Too narrow for any word: the name stays whole.
+        let lines = text(&card("Tally invoices", &rows, 14, &[], Details::Quiet, &[]));
+        assert!(lines[7].contains("halves"), "{}", lines[7]);
+    }
+
     fn text(card: &Card) -> Vec<String> {
         (card.lines.iter())
             .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect())
@@ -1333,11 +1454,11 @@ mod tests {
                 "calc · 1 needs you · 1 working · 1 idle · 1 done",
                 "",
                 "Needs you · 1",
-                " ? zero needs you · took 42s",
+                " ? zero · took 42s",
                 "   └ asks: staging or prod?",
                 "",
                 "Working · 1",
-                " ● lead working · 42s",
+                " ● lead · 42s",
                 "",
                 "Idle · 1 ▸",
                 "",
@@ -1349,7 +1470,7 @@ mod tests {
         let idle = card("calc", &rows, 80, &[Group::Idle], Details::Quiet, &[]);
         let lines = text(&idle);
         assert_eq!(lines[10].width(), 80);
-        assert!(lines[10].starts_with(" ○ equal idle · took 42s "));
+        assert!(lines[10].starts_with(" ○ equal · took 42s "));
         assert!(lines[10].ends_with(" 2 reviews · o/r#9"), "{}", lines[10]);
         assert!(!lines[10].contains("tab 2") && !lines[10].contains('▲'));
         // More: what each tracks at its right.
@@ -1363,17 +1484,17 @@ mod tests {
         );
         let lines = text(&plain);
         // What it waits for shows whether picked or not.
-        assert_eq!(lines[3], " ? zero needs you · took 42s");
+        assert_eq!(lines[3], " ? zero · took 42s");
         assert_eq!(lines[4], "   └ asks: staging or prod?");
         assert_eq!(
             lines[7].trim_end(),
-            " ● lead working · 42s                                                      tab 1"
+            " ● lead · 42s                                                              tab 1"
         );
         assert_eq!(lines[7].width(), 80);
         assert_eq!(lines[9], "Idle · 1 ▾");
         assert_eq!(
             lines[10],
-            " ○ equal idle · took 42s          ▲ · 2 reviews · o/r#9 · ↻ 1 automation · tab 2"
+            " ○ equal · took 42s               ▲ · 2 reviews · o/r#9 · ↻ 1 automation · tab 2"
         );
         assert_eq!(lines[12], "Done · 1 ▸");
         assert_eq!(lines.len(), 13);
@@ -1395,7 +1516,7 @@ mod tests {
         let opened = card("calc", &rows, 80, &[Group::Done], Details::Quiet, &[]);
         let lines = text(&opened);
         assert_eq!(lines[lines.len() - 2], "Done · 1 ▾");
-        assert_eq!(lines[lines.len() - 1], " ✓ old done · took 42s");
+        assert_eq!(lines[lines.len() - 1], " ✓ old · took 42s");
     }
 
     #[test]
@@ -1422,17 +1543,17 @@ mod tests {
                 "calc · 1 needs you · 2 failed · 1 working",
                 "",
                 "Needs you · 1",
-                " ? ask needs you · took 42s",
+                " ? ask · took 42s",
                 "   └ asks: staging or prod?",
                 "",
                 "Failed · 2",
-                " ✗ broke failed · took 42s",
+                " ✗ broke · took 42s",
                 "   └ provider_failed: login expired",
                 "   ▸ 1 helper, 1 failed",
-                " ✗ helper failed · took 42s",
+                " ✗ helper · took 42s",
                 "",
                 "Working · 1",
-                " ● lead working · 42s",
+                " ● lead · 42s",
             ]
         );
         let counted = counts(&rows);
@@ -1482,9 +1603,9 @@ mod tests {
         let shut = card("calc", &rows, 80, &[], Details::Picked(None), &[]);
         let lines = text(&shut);
         assert_eq!(lines[2], "Needs you · 1");
-        assert_eq!(lines[3], " ? ask needs you · took 42s");
+        assert_eq!(lines[3], " ? ask · took 42s");
         assert_eq!(lines[5], "Working · 1");
-        assert_eq!(lines[6], " ● fix working · 42s");
+        assert_eq!(lines[6], " ● fix · 42s");
         assert_eq!(lines[7], "   ▸ 4 helpers, 1 needs you, 1 working");
         assert_eq!(lines.len(), 8);
         assert_eq!(shut.helpers, [(7, "calc.fix".to_owned())]);
@@ -1498,10 +1619,10 @@ mod tests {
         );
         let lines = text(&open);
         assert_eq!(lines[7], "   ▾ 4 helpers, 1 needs you, 1 working");
-        assert_eq!(lines[8], "   ● review working · 42s");
-        assert_eq!(lines[9], "   ○ tests idle · took 42s");
-        assert_eq!(lines[10], "   ○ lint idle · took 42s");
-        assert_eq!(lines[11], "   ? ask needs you · took 42s");
+        assert_eq!(lines[8], "   ● review · 42s");
+        assert_eq!(lines[9], "   ○ tests · took 42s");
+        assert_eq!(lines[10], "   ○ lint · took 42s");
+        assert_eq!(lines[11], "   ? ask · took 42s");
         let named: Vec<&str> = open.named.iter().map(|(_, b)| b.as_str()).collect();
         assert_eq!(
             named,
