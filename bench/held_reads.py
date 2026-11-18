@@ -11,6 +11,11 @@ has a group to commit. Meanwhile, for SECONDS:
 - a new connection opens every second and waits for its `ready` greeting,
   as an automation's does.
 
+With --scripts N, N more bots run code-mode scripts back to back, each
+served by its own client as Sonny serves a script: the call is listed
+(`tool_calls`), taken, three steps are put to the bot's gates and recorded,
+and the call is answered; each of those requests' waits is recorded too.
+
 Each request's wait is recorded; the result has p50, p99 and the most for
 each, the turns the busy bots finished, and the store's own counts.
 
@@ -76,6 +81,7 @@ def main():
     parser.add_argument('--sync-ms', type=int, default=300)
     parser.add_argument('--seconds', type=float, default=20)
     parser.add_argument('--window', action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument('--scripts', type=int, default=0)
     parser.add_argument('--out', required=True)
     args = parser.parse_args()
     server, url = start()
@@ -91,6 +97,12 @@ def main():
             extra = {'tools': ['shell'], 'approve': ['shell'], 'approver': 'manual'} if gated else {}
             created = control.request('create', bot=f'b{n}', workspace=str(folder), **extra)
             assert 'result' in created, created
+        for n in range(args.scripts):
+            script = {'name': 'exec', 'description': 'Run a script.',
+                      'parameters': {'type': 'object', 'properties': {}},
+                      'answered_by': f'h{n}', 'steps': True}
+            created = control.request('create', bot=f's{n}', workspace=str(folder), declare=[script])
+            assert 'result' in created, created
         stop(process, control)
         # Then held: every sync waits.
         env = {**clean_env(), 'LD_PRELOAD': str(Path(args.shim).resolve()),
@@ -101,6 +113,25 @@ def main():
             control.request('submit', bot=f'b{n}', request_id=f'g{n}', prompt='shell:true')
         stopping = threading.Event()
         finished = [0]
+        failures = []
+
+        def refused_busy(submitted):
+            # Only a bot still ending its last turn is tried again.
+            if 'result' in submitted:
+                return False
+            error = submitted.get('error')
+            assert (error.get('code') if isinstance(error, dict) else error) == 'bot_busy', submitted
+            return True
+
+        def guarded(work, *args):
+            # A worker that fails ends the screen with no measurement.
+            def run():
+                try:
+                    work(*args)
+                except Exception as error:
+                    failures.append(f'{work.__name__}{args}: {error!r}')
+                    stopping.set()
+            return threading.Thread(target=run)
 
         def busy(n):
             connection = Connection(sock, retain_durable=False)
@@ -108,15 +139,58 @@ def main():
             while not stopping.is_set():
                 turn += 1
                 submitted = connection.request('submit', bot=bot, request_id=f'r{turn}', prompt='delay:50')
-                if 'result' not in submitted:
+                if refused_busy(submitted):
                     time.sleep(.05)
                     continue
                 handle = f'{bot}/{submitted["result"]["message"]}'
-                connection.request('wait', handles=[handle], timeout_ms=60_000)
+                ended = connection.request('wait', handles=[handle], timeout_ms=60_000)
+                found = ended['result']['results'][handle]
+                assert not found.get('pending') and found.get('status') == 'completed', found
                 finished[0] += 1
             connection.close()
 
-        waits = {'approvals': [], 'inspect': [], 'bots': [], 'ready': []}
+        waits = {'approvals': [], 'inspect': [], 'bots': [], 'ready': [],
+                 **({op: [] for op in ('tool_calls', 'take_call', 'approve_step', 'step_result',
+                                       'tool_result')} if args.scripts else {})}
+        scripts = [0]
+
+        def timed(connection, op, **params):
+            began = time.monotonic()
+            answered = connection.request(op, **params)
+            waits[op].append(time.monotonic() - began)
+            return answered
+
+        def script(n):
+            connection = Connection(sock, retain_durable=False)
+            bot, tag, turn = f's{n}', f'h{n}', 0
+            while not stopping.is_set():
+                turn += 1
+                submitted = connection.request('submit', bot=bot, request_id=f'r{turn}', prompt='call:exec')
+                if refused_busy(submitted):
+                    time.sleep(.05)
+                    continue
+                call = None
+                while call is None and not stopping.is_set():
+                    listed = timed(connection, 'tool_calls', tag=tag)['result']['calls']
+                    call = next((c for c in listed if c['bot'] == bot), None)
+                    if call is None:
+                        time.sleep(.01)
+                if call is None:
+                    break
+                at = dict(bot=bot, turn=call['turn'], call_id=call['call_id'])
+                assert 'result' in timed(connection, 'take_call', **at)
+                for step in ('1', '2', '3'):
+                    stepped = timed(connection, 'approve_step', **at, step=step, name='mcp__docs__read',
+                                    arguments={'path': step})
+                    assert stepped.get('result', {}).get('decision') == 'allow', stepped
+                    assert 'result' in timed(connection, 'step_result', **at, step=step)
+                assert 'result' in timed(connection, 'tool_result', **at, output='done')
+                handle = f'{bot}/{submitted["result"]["message"]}'
+                ended = connection.request('wait', handles=[handle], timeout_ms=60_000)
+                found = ended['result']['results'][handle]
+                assert not found.get('pending') and found.get('status') == 'completed', found
+                scripts[0] += 1
+            connection.close()
 
         def window():
             connection = Connection(sock, retain_durable=False)
@@ -139,20 +213,26 @@ def main():
                 connection.close()
                 stopping.wait(1)
 
-        threads = [threading.Thread(target=busy, args=(n,)) for n in range(args.busy)]
+        threads = [guarded(busy, n) for n in range(args.busy)]
+        threads += [guarded(script, n) for n in range(args.scripts)]
         time.sleep(1)
-        threads += [threading.Thread(target=window)] if args.window else []
-        threads += [threading.Thread(target=connects)]
+        threads += [guarded(window)] if args.window else []
+        threads += [guarded(connects)]
         for thread in threads:
             thread.start()
         time.sleep(args.seconds)
         stopping.set()
         for thread in threads:
             thread.join(timeout=120)
+        if failures:
+            raise RuntimeError('workers failed: ' + '; '.join(failures))
+        if args.scripts and not scripts[0]:
+            raise RuntimeError('no script finished')
         stats = control.request('stats')['result']
         storage = stats.get('store', stats.get('storage', {}))
         result = {'agents': args.agents, 'busy': args.busy, 'sync_ms': args.sync_ms,
                   'seconds': args.seconds, 'turns_finished': finished[0],
+                  'scripts': args.scripts, 'scripts_finished': scripts[0],
                   **{op: summary(w) for op, w in waits.items()},
                   'loop_held_ms': {op: [row['held_ms'], row['slowest_ms']]
                                    for part in ('commands', 'loop')

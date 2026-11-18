@@ -5303,6 +5303,9 @@ struct App {
     /// with them, not with what the bot ran before.
     switch_sent: Option<(String, Option<String>)>,
     pace_sent: Option<&'static str>,
+    /// Permission changes sent and not answered yet: the lead is not on
+    /// its new row until none is, so `/permissions`' spread goes on.
+    gating_sent: usize,
     /// The prompt-cache lifetime a bot made before Sonny gave its model
     /// one takes, set once no turn runs.
     cache: Option<&'static str>,
@@ -7197,6 +7200,7 @@ impl App {
             switch: None,
             switch_sent: None,
             pace_sent: None,
+            gating_sent: 0,
             cache: None,
             pace: None,
             tools: record["tools"]
@@ -7936,8 +7940,10 @@ impl App {
             self.wrote();
             self.verdicts_came();
             self.hear();
-            if let Some(job) = self.raising.take_if(|job| job.is_finished()) {
+            // Read every few seconds, it wakes no one: waited on here.
+            if let Some(job) = self.raising.take() {
                 self.approvals_raised(job.await.expect("the calls below were read"));
+                continue;
             }
             if self.writes.is_empty()
                 && self.hearing.is_none()
@@ -8054,6 +8060,9 @@ impl App {
             .as_ref()
             .and(self.mode)
             .filter(|mode| *mode != "full"));
+        if gating.is_some() {
+            self.gating_sent += 1;
+        }
         // An agent's sandbox goes with its row, a lead's, a task's or
         // a side chat's, which the daemon holds within its agent's.
         let workspace = std::path::Path::new(&self.workspace);
@@ -8160,6 +8169,9 @@ impl App {
         if self.pace_sent.is_some() && self.pace_sent == pace {
             self.pace_sent = None;
         }
+        if gating.is_some() {
+            self.gating_sent = self.gating_sent.saturating_sub(1);
+        }
         // Not taken: what the switch let go is the window's again, unless
         // picked anew meanwhile.
         if taken.is_err() {
@@ -8255,7 +8267,12 @@ impl App {
             // after the lead had its change, read each, and changed none:
             // one changed while on its old permissions may have made an
             // agent that listing did not name.
-            if after_lead && !again && spread.waiting.is_empty() && self.gating.is_none() {
+            if after_lead
+                && !again
+                && spread.waiting.is_empty()
+                && self.gating.is_none()
+                && self.gating_sent == 0
+            {
                 self.spread = None;
             }
             return;
@@ -8267,7 +8284,7 @@ impl App {
             self.client.clone(),
             self.bot.clone(),
             (spread.pick, spread.mode),
-            self.gating.is_none(),
+            self.gating.is_none() && self.gating_sent == 0,
             (spread.settled.clone(), spread.waiting.clone()),
             std::mem::take(&mut spread.sandboxes),
             self.woken.clone(),
@@ -9603,12 +9620,9 @@ impl App {
             others,
             named,
         };
-        let woken = self.woken.clone();
-        self.tasking = Some(tokio::spawn(async move {
-            let read = asked.read().await;
-            woken.notify_one();
-            read
-        }));
+        // Applied at the next look-round, which draws anyway: a read
+        // repeated every few seconds draws no frame of its own.
+        self.tasking = Some(tokio::spawn(asked.read()));
     }
 
     /// What a read of the tasks started found, kept and drawn.
@@ -11200,12 +11214,12 @@ impl App {
         if reading.is_empty() {
             return;
         }
-        let (client, woken) = (self.client.clone(), self.woken.clone());
+        // Applied at the next look-round, which draws anyway.
+        let client = self.client.clone();
         self.referencing = Some(tokio::spawn(async move {
             for ((bot, id), reference) in &mut reading {
                 read_reference(&client, bot, id, reference).await;
             }
-            woken.notify_one();
             reading
         }));
     }
@@ -14278,19 +14292,19 @@ impl App {
         }
         // One read at a time, beside the loop: what it found is kept as
         // the next pass begins.
+        // Applied at the next look-round, which draws anyway: a read
+        // repeated every few seconds draws no frame of its own.
         if !(verdicts.is_empty() && unread.is_empty()) {
-            let (client, woken) = (self.client.clone(), self.woken.clone());
+            let client = self.client.clone();
             let verdicts_asked: Vec<CallKey> =
                 verdicts.iter().map(|(key, _)| key.clone()).collect();
             self.verdicts_out.extend(verdicts_asked.iter().cloned());
             self.raising = Some(tokio::spawn(async move {
-                let raised = Raised {
+                Raised {
                     verdicts: read_verdicts(client.clone(), verdicts).await,
                     verdicts_asked,
                     ..raise_calls(&client, unread).await
-                };
-                woken.notify_one();
-                raised
+                }
             }));
         }
         self.aside_waiting();
@@ -17524,7 +17538,8 @@ impl App {
         if unsettled.is_empty() && watched.is_empty() {
             return;
         }
-        let (client, woken) = (self.client.clone(), self.woken.clone());
+        // Applied at the next look-round, which draws anyway.
+        let client = self.client.clone();
         self.settling = Some(tokio::spawn(async move {
             let mut settled = Settled::default();
             for ask in unsettled {
@@ -17545,7 +17560,6 @@ impl App {
                 settled.gone.push((ask.key(), state));
             }
             settled.watched = reread_watched(&client, watched).await;
-            woken.notify_one();
             settled
         }));
     }
@@ -17631,7 +17645,8 @@ impl App {
         if due.is_empty() {
             return;
         }
-        let (client, woken) = (self.client.clone(), self.woken.clone());
+        // Applied at the next look-round, which draws anyway.
+        let client = self.client.clone();
         self.rechecking = Some(tokio::spawn(async move {
             let mut rows = Vec::new();
             for (bot, turn) in due {
@@ -17639,7 +17654,6 @@ impl App {
                     rows.push((bot, turn, row));
                 }
             }
-            woken.notify_one();
             rows
         }));
     }
@@ -33454,6 +33468,13 @@ mod tests {
         app.gating = None;
         app.spread().await;
         assert!(app.spread.is_some());
+        // Nor does one while the lead's change is sent and not answered.
+        app.gating_sent = 1;
+        app.spread = Some(Spread::new("auto", None));
+        finish(&mut app).await;
+        app.spread().await;
+        assert!(app.spread.is_some(), "the lead's change is not in yet");
+        app.gating_sent = 0;
         // The same row picked again, its config perhaps changed, takes
         // nothing from the earlier pick's pass.
         app.spread.as_mut().unwrap().at = Instant::now();

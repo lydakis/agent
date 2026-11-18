@@ -406,6 +406,18 @@ fn nearest(hits: &[(Spot, Spot)], bottom: usize) -> usize {
         .unwrap_or(hits.len().saturating_sub(1))
 }
 
+/// Of pages drawn at `placed`, in order down the rows, those whose rows
+/// share any of `near`: found by halving, as each page starts and ends
+/// no higher than the one after it.
+fn over<At: std::borrow::Borrow<std::ops::Range<usize>>>(
+    placed: &[At],
+    near: &std::ops::Range<usize>,
+) -> std::ops::Range<usize> {
+    let first = placed.partition_point(|at| at.borrow().end <= near.start);
+    let end = placed.partition_point(|at| at.borrow().start < near.end);
+    first..end.max(first)
+}
+
 /// Text looked for in the rows (Ctrl+F): each place it is, from the
 /// oldest, as the rows it starts and ends on, and the one shown.
 struct Finding {
@@ -1182,6 +1194,7 @@ impl Screen {
     /// The pages of older items, from the first, and how many rows each
     /// is drawn on: to stand in for them once the rows are drawn anew.
     pub fn pages(&mut self) -> Vec<(u64, usize)> {
+        self.place_pages();
         let placed = self.placed();
         (self.pages.iter().enumerate())
             .map(|(p, page)| (page.id, placed.get(p).map_or(page.rows, |at| at.len())))
@@ -1193,9 +1206,11 @@ impl Screen {
         let height = self.area.height as usize;
         let bottom = self.shown.len() - self.back.min(self.shown.len());
         let near = bottom.saturating_sub(height * (NEAR + 1))..bottom + height * NEAR;
+        self.place_pages();
         let placed = self.placed();
-        (self.pages.iter().zip(placed))
-            .filter(|(page, at)| !page.drawn && at.start < near.end && near.start < at.end)
+        let over = over(placed, &near);
+        (self.pages[over.clone()].iter().zip(&placed[over]))
+            .filter(|(page, _)| !page.drawn)
             .min_by_key(|(_, at)| at.start.abs_diff(bottom).min(at.end.abs_diff(bottom)))
             .map(|(page, _)| page.id)
     }
@@ -1206,6 +1221,7 @@ impl Screen {
     fn swap(&mut self, page: usize, lines: Vec<Row>) {
         let row = self.pages[..page].iter().map(|p| p.rows).sum::<usize>();
         let rows = self.pages[page].rows;
+        self.place_pages();
         let at = self.placed().get(page).cloned().unwrap_or(0..0);
         let mut new = Self {
             rows: lines,
@@ -1290,16 +1306,20 @@ impl Screen {
     /// each for blank rows as tall, so nothing moves; never `kept`, just
     /// drawn.
     fn let_go(&mut self, kept: Option<usize>) {
-        let placed = self.placed();
-        let drawn = |pages: &[Page]| -> usize {
-            (pages.iter().zip(&placed))
+        let drawn = |pages: &[Page], placed: &[std::ops::Range<usize>]| -> usize {
+            (pages.iter().zip(placed))
                 .filter(|(page, _)| page.drawn)
                 .map(|(_, at)| at.len())
                 .sum()
         };
-        if placed.len() < self.pages.len() || drawn(&self.pages) <= PAGES_KEPT {
+        self.place_pages();
+        let placed = self.placed();
+        if placed.len() < self.pages.len() || drawn(&self.pages, placed) <= PAGES_KEPT {
             return;
         }
+        // Where the pages were drawn, as pages are let go below.
+        let placed = placed.to_vec();
+        let drawn = |pages: &[Page]| drawn(pages, &placed);
         let height = self.area.height as usize;
         let bottom = self.shown.len() - self.back.min(self.shown.len());
         let near = bottom.saturating_sub(height * (NEAR + 1))..bottom + height * NEAR;
@@ -1377,12 +1397,19 @@ impl Screen {
         self.placed = None;
     }
 
-    /// Where each page is drawn in `shown`, once its rows are wrapped.
-    fn placed(&mut self) -> Vec<std::ops::Range<usize>> {
-        if let Some((laid, placed)) = &self.placed
+    /// Where each page is drawn in `shown`, as [`Screen::place_pages`] last
+    /// laid it out.
+    fn placed(&self) -> &[std::ops::Range<usize>] {
+        self.placed.as_ref().map_or(&[], |(_, placed)| placed)
+    }
+
+    /// Where each page is drawn in `shown`, once its rows are wrapped,
+    /// worked out again only when they were laid out anew.
+    fn place_pages(&mut self) {
+        if let Some((laid, _)) = &self.placed
             && *laid == self.laid
         {
-            return placed.clone();
+            return;
         }
         let mut placed = Vec::new();
         let (mut row, mut at) = (0, 0);
@@ -1401,8 +1428,7 @@ impl Screen {
             }
             placed.push(start..at);
         }
-        self.placed = Some((self.laid, placed.clone()));
-        placed
+        self.placed = Some((self.laid, placed));
     }
 
     /// Up (`rows` > 0) or down the conversation.
@@ -1649,9 +1675,10 @@ impl Screen {
                 },
             ],
         };
+        self.place_pages();
         let placed = self.placed();
         ranges.into_iter().find_map(|(from, to)| {
-            let gaps = (self.pages.iter().zip(&placed))
+            let gaps = (self.pages.iter().zip(placed))
                 .filter(|(page, at)| !page.drawn && at.start < to && from < at.end)
                 .filter(|(page, _)| !looked.contains(&page.id));
             let nearest = match older {
@@ -4015,6 +4042,77 @@ mod tests {
         assert_eq!(row(&buf, 0).trim_end(), "row 0");
         assert_eq!(screen.height(20), 280);
         assert_eq!(screen.wanted(), Some(2));
+    }
+
+    /// [`Screen::wanted`] as every page looked at finds it.
+    fn wanted_of_every_page(screen: &mut Screen) -> Option<u64> {
+        let height = screen.area.height as usize;
+        let bottom = screen.shown.len() - screen.back.min(screen.shown.len());
+        let near = bottom.saturating_sub(height * (NEAR + 1))..bottom + height * NEAR;
+        screen.place_pages();
+        (screen.pages.iter().zip(screen.placed()))
+            .filter(|(page, at)| !page.drawn && at.start < near.end && near.start < at.end)
+            .min_by_key(|(_, at)| at.start.abs_diff(bottom).min(at.end.abs_diff(bottom)))
+            .map(|(page, _)| page.id)
+    }
+
+    #[test]
+    fn the_page_wanted_is_the_one_every_page_looked_at_finds() {
+        let area = Rect::new(0, 0, 20, 5);
+        let (mut screen, _) = screen(rows(20_000..20_050), 20, 5);
+        let tall = |id: u64| 1 + id as usize % 9;
+        screen.prepend_blank((1..=2_000).map(|id| (id, tall(id))).collect());
+        drawn(&mut screen, area);
+        // Every seventh page drawn again, the rest blank.
+        for id in (1..=2_000).step_by(7) {
+            screen.fill(id, written(rows(0..tall(id))));
+        }
+        drawn(&mut screen, area);
+        let (mut found, mut at) = (0, 0);
+        while at < screen.shown.len() {
+            screen.back = at;
+            let wanted = screen.wanted();
+            assert_eq!(wanted, wanted_of_every_page(&mut screen), "{at} rows up");
+            found += usize::from(wanted.is_some());
+            at += 3;
+        }
+        assert!(found > 3_000, "{found}");
+    }
+
+    #[test]
+    fn the_pages_near_the_view_are_found_in_steps_that_grow_as_the_log_of_the_pages() {
+        /// A page's rows, counted each time they are looked at.
+        struct Counted<'a>(std::ops::Range<usize>, &'a std::cell::Cell<usize>);
+        impl std::borrow::Borrow<std::ops::Range<usize>> for Counted<'_> {
+            fn borrow(&self) -> &std::ops::Range<usize> {
+                self.1.set(self.1.get() + 1);
+                &self.0
+            }
+        }
+        // Pages of three rows, the view of 50 halfway up: how many pages
+        // are looked at, and how many are over it.
+        let looked = |pages: usize| {
+            let looks = std::cell::Cell::new(0);
+            let placed: Vec<_> = (0..pages)
+                .map(|p| Counted(p * 3..p * 3 + 3, &looks))
+                .collect();
+            let bottom = pages * 3 / 2;
+            let near = bottom.saturating_sub(50 * (NEAR + 1))..bottom + 50 * NEAR;
+            let found = over(&placed, &near);
+            let every = (0..pages).filter(|&p| {
+                let at = &placed[p].0;
+                at.start < near.end && near.start < at.end
+            });
+            assert!(every.eq(found.clone()), "{pages} pages");
+            (looks.get(), found.len())
+        };
+        for pages in [10, 1_000, 100_000, 1_000_000] {
+            let (looks, _) = looked(pages);
+            let most = 2 * (pages.ilog2() as usize + 2);
+            assert!(looks <= most, "{pages} pages: {looks} looked at");
+        }
+        // As many over the view of a long history as of one ten times it.
+        assert_eq!(looked(100_000).1, looked(1_000_000).1);
     }
 
     #[test]
