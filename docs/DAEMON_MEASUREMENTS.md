@@ -10866,3 +10866,90 @@ Store work a turn is unchanged on every screen and every row is within the
 spread. `bench.query_plans` plans 488 statements with no table scan. The
 migration of a store of 2,000 such bots (70 MB of instructions) from schema
 106, its backup copy included, took 0.73 s at open.
+
+## Code-mode step writes beside the run loop
+
+A code-mode script's steps froze every window on a slow disk: the service
+loop awaited the storage writer for `take_call`, `approve_step`,
+`step_result`, `tool_result` and a client's `answer`, and listed the calls
+waiting on a client (`tool_calls`) on the writer's connection too. Now the
+loop hands each write to the writer and answers it when its commit lands,
+and the connection that sent it reads nothing else until then, so each
+connection's order is kept. `tool_calls` reads on the readers, past the
+answers the writer held at its last commit. `configure`, `interrupt` and a
+`submit` at the active limit still write from the loop: each is several
+steps that later requests depend on.
+
+All on Linux x86_64 (4 CPUs), 2026-11-18, release builds made the same way
+(`cargo build --release --workspace --bins`), main (a0f574f) against the
+change. The Mac was not measured.
+
+### Slow disk, with scripts running
+
+`bench.held_reads` with `slow_sync.c` (every sync 300 ms), 424 bots, 30
+running turns back to back and 8 running code-mode scripts (`--scripts`:
+submit, list the call, take it, three steps put to the gates and recorded,
+answer), 20 s. Milliseconds, p50 / most.
+
+| Side | `approvals` | `inspect` | `bots` | New connection's `ready` | Turns | Scripts | Loop held |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| main | 2,669 / 3,859 | 2,736 / 3,028 | 2,752 / 3,024 | 2,647 / 3,258 | 150 | 8 | 30.0 s |
+| change | 1.3 / 1,495 | 0.8 / 4.6 | 2.1 / 2,423 | 0.8 / 2,030 | 250 | 16 | 8.4 s |
+
+What still holds the loop is `resume` (a paused turn going on, which
+awaits its claim inline) and `settle`; those are left for a later change.
+
+### Low end
+
+`bench.ends --end low`: one Sonny window on a folder of 10 agents, three
+alternating runs each.
+
+| Side | Window start, ms | Daemon idle CPU % | Daemon RSS, MiB | Window idle CPU % | Window RSS, MiB | Key p50 / p99, ms | Turn p50 / p99, ms |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| main | 61 to 75 | 0.05 | 21.4 to 21.7 | 0.20 to 0.25 | 25.6 to 25.7 | 0.38 to 0.75 / 1.31 to 1.57 | 48.1 to 48.2 / 50.5 to 56.4 |
+| change | 63 to 65 | 0 to 0.05 | 20.5 to 21.2 | 0.20 to 0.25 | 25.6 to 26.0 | 0.40 to 0.47 / 1.26 to 1.67 | 48.1 to 48.4 / 49.9 to 52.4 |
+
+### High end
+
+`bench.ends --end high --pace 0.5`: 10,000 stored agents, 30 agents
+running turns and 8 running scripts (each at most one every 0.5 s, so both
+sides do the same work), and N windows on one busy project (`one`) or each
+on its own folder (`spread`). 300 keys typed across the windows, 20 s
+measured. CPU is percent of one core; windows' RSS is all of them together.
+
+| Windows | Layout | Side | Window start p50, ms | Key p50 / p99 / most, ms | Daemon CPU % | Daemon RSS, MiB | Windows CPU % | Windows RSS | Requests served |
+| ---: | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 32 | one | main | 970 | 1.31 / 4.79 / 18.88 | 129.4 | 38.6 | 110.1 | 2.3 GiB | 273,880 |
+| 32 | one | change | 1,014 | 1.33 / 5.55 / 5.9 | 133.9 | 39.6 | 119.15 | 2.3 GiB | 286,473 |
+| 32 | spread | main | 1,035 | 1.29 / 9.02 / 12.89 | 130.25 | 38.1 | 111.05 | 2.2 GiB | 275,916 |
+| 32 | spread | change | 924 | 1.35 / 5.13 / 9.14 | 134.85 | 39.8 | 117.0 | 2.2 GiB | 289,100 |
+| 100 | one | main | 2,410 | 1.76 / 8.13 / 21.37 | 126.2 | 40.6 | 132.6 | 5.8 GiB | 195,489 |
+| 100 | one | change | 2,646 | 1.95 / 6.93 / 7.91 | 131.0 | 41.6 | 140.55 | 5.8 GiB | 200,123 |
+| 100 | spread | main | 2,388 | 1.65 / 6.79 / 26.46 | 124.75 | 40.4 | 134.7 | 5.7 GiB | 184,708 |
+| 100 | spread | change | 2,683 | 1.85 / 10.34 / 13.32 | 129.75 | 42.3 | 142.7 | 5.8 GiB | 186,209 |
+| 200 | one | main | 4,916 | 2.75 / 16.08 / 24.15 | 151.3 | 44.2 | 107.6 | 11.7 GiB | 60,325 |
+| 200 | one | change | 5,399 | 2.21 / 12.37 / 19.54 | 156.45 | 45.5 | 109.6 | 11.6 GiB | 61,170 |
+| 200 | spread | main | 5,226 | 1.83 / 10.51 / 12.96 | 155.45 | 44.1 | 101.5 | 11.4 GiB | 62,035 |
+| 200 | spread | change | 5,536 | 2.06 / 13.25 / 18.12 | 160.1 | 44.6 | 105.1 | 11.5 GiB | 62,014 |
+| 100 | one, again | main | 2,714 | 1.73 / 6.21 / 56.26 | 125.6 | 40.9 | 135.65 | 5.8 GiB | 181,544 |
+| 100 | one, again | change | 2,627 | 1.98 / 20.06 / 23.41 | 128.2 | 43.3 | 141.2 | 6.0 GiB | 186,730 |
+| 200 | one, again | main | 4,978 | 2.1 / 11.61 / 14.25 | 154.2 | 44.3 | 98.55 | 11.5 GiB | 64,140 |
+| 200 | one, again | change | 4,921 | 2.0 / 16.05 / 39.32 | 158.95 | 43.0 | 102.15 | 11.4 GiB | 66,427 |
+
+Every row is under 50 ms at p99 with no key over 100 ms. The step writes
+held the loop 3.1 to 7.6 s of the 20 on main and 13 to 40 ms with the
+change.
+
+The daemon used 2.6 to 5.2 points more of a core at every size (2 to 4%),
+and it served up to 5% more requests: the windows' reads no longer wait
+behind a step write, so the windows ask again sooner, and their own CPU
+rose the same way. Per request served, the change was 1.2% under to 3.2%
+over main. With no windows, the same paced scripts and turns cost the
+change less: 20.5, 21.2 and 19.8% of a core against main's 21.6, 22.2 and
+21.9 (three alternating 20 s runs). Window start at 100 and 200 windows
+was slower with the change in the first runs and faster in the second; it
+moves by 10% from run to run. The windows' RSS is the same.
+
+The harness is `bench/ends.py`. Build both sides the same way: a daemon
+built with `--bin agent` alone links different features than one built
+with `--workspace --bins`, and its CPU is not comparable.

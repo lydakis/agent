@@ -2695,11 +2695,15 @@ pub struct Shared {
     held: std::sync::Mutex<Arc<HashMap<i64, Held>>>,
     identities: std::sync::Mutex<Identities>,
 }
-/// One running turn's verdicts the worker holds, as `Live` keeps them.
+/// One running turn's verdicts and answers the worker holds, as `Live`
+/// keeps them.
 #[derive(Clone, Default)]
 struct Held {
     answered: HashMap<i64, Vec<String>>,
     verdicts: HashMap<String, Vec<Verdict>>,
+    /// Its answered calls whose answer the worker holds or the turn took,
+    /// not yet written: answered, though no row says so.
+    answers: std::collections::HashSet<String>,
 }
 #[derive(Default)]
 struct Identities {
@@ -2725,12 +2729,18 @@ impl Shared {
         let held = Arc::make_mut(&mut shared);
         for turn in turns {
             match live.get(turn) {
-                Some(live) if !live.answered.is_empty() || !live.verdicts.is_empty() => {
+                Some(live)
+                    if !live.answered.is_empty()
+                        || !live.verdicts.is_empty()
+                        || !live.answers.is_empty()
+                        || !live.taken.is_empty() =>
+                {
                     held.insert(
                         *turn,
                         Held {
                             answered: live.answered.clone(),
                             verdicts: live.verdicts.clone(),
+                            answers: (live.answers.keys()).chain(&live.taken).cloned().collect(),
                         },
                     );
                 }
@@ -2829,6 +2839,18 @@ enum HeldView<'a> {
     Shared(Arc<HashMap<i64, Held>>),
 }
 impl HeldView<'_> {
+    /// Whether call `call_id` of `turn` is answered with an answer not yet
+    /// written: held by the worker, or taken by its turn.
+    fn answer_held(&self, turn: i64, call_id: &str) -> bool {
+        match self {
+            HeldView::Live(live) => live.get(&turn).is_some_and(|live| {
+                live.answers.contains_key(call_id) || live.taken.contains(call_id)
+            }),
+            HeldView::Shared(held) => held
+                .get(&turn)
+                .is_some_and(|held| held.answers.contains(call_id)),
+        }
+    }
     fn answered(&self, turn: i64, approval: i64) -> Option<&[String]> {
         match self {
             HeldView::Live(live) => live.get(&turn)?.answered.get(&approval),
@@ -11141,6 +11163,9 @@ impl Database {
         if !(1..=256).contains(&limit) || after < 0 {
             return fail_with("invalid_page", "limit must be 1 to 256 and after 0 or more");
         }
+        // Taken before the rows are read: an answer held now is in it, and
+        // one written since is in the rows.
+        let held = self.held_view();
         let mut statement = self.conn.prepare_cached(
             "SELECT a.id,t.bot,a.turn,a.call_id,a.name,a.arguments,a.expires_ms,a.taken_ms,a.process FROM answers a
              JOIN turns t ON t.id=a.turn JOIN tools l ON l.turn=a.turn AND l.call_id=a.call_id
@@ -11155,11 +11180,7 @@ impl Database {
             scanned += 1;
             let (id, turn, call_id): (i64, i64, String) = (r.get(0)?, r.get(2)?, r.get(3)?);
             // An answer the worker holds is given already.
-            if self
-                .live
-                .get(&turn)
-                .is_some_and(|live| live.answers.contains_key(&call_id))
-            {
+            if held.answer_held(turn, &call_id) {
                 last = id;
                 continue;
             }
@@ -20902,6 +20923,7 @@ mod tests {
             Held {
                 answered: HashMap::from([(1, vec!["manual".to_owned()])]),
                 verdicts: HashMap::from([("call".to_owned(), vec![verdict])]),
+                answers: Default::default(),
             },
         )])));
         assert_eq!(held.verdicts(7, 1, "call").map(<[_]>::len), Some(1));
