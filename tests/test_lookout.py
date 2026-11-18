@@ -376,7 +376,7 @@ class LookoutTests(ModelFixture):
         time.sleep(1)
         # The person closes it, as a bot closes one it made: it still is.
         # What posting in a commons thread subscribed outlives it.
-        self.assertTrue(self.daemon.request('close', bot='reviewer')['result']['was_open'])
+        self.assertTrue(self.daemon.request('close', bot='reviewer')['result']['closed'][0]['was_open'])
         deadline = time.monotonic() + 20
         while True:
             held = json.loads((folder / 'reviewer.json').read_text())['subscriptions']

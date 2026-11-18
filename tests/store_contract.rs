@@ -22830,6 +22830,31 @@ fn close_all_closes_names_or_a_patterns_quiet_bots_the_asker_made() {
         answer["refused"],
         json!([{"bot": "shop.gone", "error": "bot_not_found"}])
     );
+    // Each bot it closed has one `closed` event, with its time; closing
+    // one again tells nothing.
+    let mut told: Vec<(String, i64)> = db.events_of_kinds(&["closed"], 0, 256).unwrap()["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|event| {
+            (
+                event["bot"].as_str().unwrap().to_owned(),
+                event["data"]["closed_ms"].as_i64().unwrap(),
+            )
+        })
+        .collect();
+    told.sort();
+    assert_eq!(
+        told,
+        [
+            ("shop.busy", 3_000),
+            ("shop.fix", 1_000),
+            ("shop.lead", 2_000),
+            ("shop.look", 2_000),
+            ("shop.other", 2_000),
+        ]
+        .map(|(bot, at)| (bot.to_owned(), at))
+    );
     // A bot closes itself only by its name alone.
     let me = ["shop.lead".to_owned()];
     assert_eq!(

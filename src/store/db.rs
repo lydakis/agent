@@ -5166,7 +5166,7 @@ impl Database {
         Ok((before, running))
     }
     /// Close what `closing` names at `at`, as [`Database::close`] closes
-    /// one, in one job. With `by`, the bot asking, only the bots it made,
+    /// one (with its `closed` event for each bot it closes), in one job. With `by`, the bot asking, only the bots it made,
     /// and itself when named alone: any other is refused. Answers
     /// `{closed, refused, next_after}`: each closed bot with whether it was
     /// open, when it was closed and the turn it was running as it was
@@ -5272,6 +5272,7 @@ impl Database {
             }
             if before.is_none() {
                 mark.execute(params![at, name])?;
+                event(&self.conn, &name, None, "closed", json!({"closed_ms": at}))?;
             }
             closed.push(json!({"bot":name,"bot_id":id,"was_open":before.is_none(),
                 "closed_ms":before.unwrap_or(at),"running_turn":running}));
