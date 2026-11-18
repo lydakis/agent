@@ -10922,8 +10922,8 @@ The table gives medians after warmup. The base ran first and last across two blo
 
 ## Each open connection in `stats`, by its label
 
-2026-11-18, Linux x86_64 cloud VM, 4 CPUs. Main is `ef34245c` with #1145
-(`8ae56e87`); the change adds the `label` to `hello`, the `connections`
+2026-11-18, Linux x86_64 cloud VM, 4 CPUs. Main is `8ae56e87` (#1145),
+and head is the change merged onto it. The change adds the `label` to `hello`, the `connections`
 list and the label on `slow` rows, and Sonny's window labels its
 connections with the agent it shows. Both sides are local release builds
 of the daemon and Sonny. `bench.ends` (from the step-writes change),
