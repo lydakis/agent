@@ -952,10 +952,12 @@ for (let i = 0; ; i++) await agent(`say ${i}`)
         self.assertIn('follows tool', started['follow']['about'])
         # Posting follows the thread for the poster.
         subscribed = json.loads((self.path / 'state.sqlite.lookout/calc.a.json').read_text())
-        # Held by this bot, not one that takes its name later.
+        # Held by this bot, not one that takes its name later, and kept
+        # when it is closed.
         calc_a = self.daemon.request('inspect', bot='calc.a')['result']['bot_id']
         self.assertEqual(subscribed['subscriptions'],
-                         [{'name': 'commons.fake-home', 'sources': ['commons:fake-home'], 'bot_id': calc_a}])
+                         [{'name': 'commons.fake-home', 'sources': ['commons:fake-home'], 'bot_id': calc_a,
+                           'outlives_close': True}])
         # A reply is posted once its author has been shown the thread.
         turn('shop.b', {'read': 'fake-home'})
         replied = turn('shop.b', {'reply': {'thread': 'fake-home', 'text': 'Confirmed here too.'}})
