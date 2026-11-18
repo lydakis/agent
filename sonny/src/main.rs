@@ -45,6 +45,8 @@ mod html;
 mod image;
 mod js;
 mod kept;
+#[cfg(test)]
+mod key_loop_test;
 mod link;
 mod links;
 mod list;
@@ -173,6 +175,7 @@ const DRAW_ATTEMPTS: u32 = 30;
 /// The least time between two draws the daemon's events bring: 30 a
 /// second, Ink's default cap.
 const DRAW_EVERY: Duration = Duration::from_millis(33);
+
 /// The most time between two frames of a window where nothing moves: its
 /// clocks count seconds, and what it reads now and then (counts, tasks,
 /// the margin's files) shows within one.
@@ -214,8 +217,6 @@ const OLDER_ITEMS: u64 = 50;
 /// How many nodes the way up to the first turn reads at a time, cut
 /// into pages of [`OLDER_ITEMS`].
 const WALKED_ITEMS: u64 = 400;
-/// About how many pages the way up to the first turn reads between frames.
-const WALKED_PAGES: usize = 32;
 /// How many pages of 400 nodes a task's history is read back to find
 /// where a note the margin shows of it starts.
 const REFERENCE_PAGES: usize = 25;
@@ -362,7 +363,9 @@ fn keys_apart(on: bool) {
     };
 }
 
-type Tui = Terminal<frames::Backend<frames::Screen>>;
+/// What a window draws on: the terminal's backend, or a test's.
+trait Drawn: Backend<Error = std::io::Error> + std::io::Write {}
+impl<B: Backend<Error = std::io::Error> + std::io::Write> Drawn for B {}
 
 /// The whole screen cleared, and drawn whole at the next frame, without
 /// asking the terminal where its cursor is as `Terminal::clear` does to put
@@ -4078,6 +4081,487 @@ type Reads = (
     HashMap<String, (i64, Seen)>,
 );
 
+/// What a read of the tasks a lead started is for: the tasks to read,
+/// every one or those at work; the agents its `└` rows name that are no
+/// task, with what each was doing; and what was known of each before.
+struct TasksAsked {
+    client: Arc<Client>,
+    store: PathBuf,
+    all: bool,
+    bots: Vec<String>,
+    others: Vec<String>,
+    named: HashMap<String, String>,
+    /// The question each turn ended on, read once per turn it ended.
+    seen: HashMap<String, (i64, Seen)>,
+    /// The newest node of a running task when it was last read.
+    heads: HashMap<String, i64>,
+    /// The tasks that waited on the person when last read.
+    waited: std::collections::HashSet<String>,
+}
+
+/// What that read found.
+struct TasksRead {
+    named: HashMap<String, String>,
+    seen: Vec<(String, (i64, Seen))>,
+    set_states: Vec<(String, String)>,
+    pass: Option<TasksPass>,
+}
+
+/// What the tasks themselves were found doing.
+struct TasksPass {
+    needs: needs::Needs,
+    /// Whether the calls waiting could be listed.
+    listed: bool,
+    read: Vec<String>,
+    ended: Vec<String>,
+    asked: Vec<String>,
+    states: HashMap<String, String>,
+    heads: Vec<(String, i64)>,
+    removed: Vec<String>,
+}
+
+impl TasksAsked {
+    async fn read(self) -> TasksRead {
+        let TasksAsked {
+            client,
+            store,
+            all,
+            bots,
+            others,
+            named,
+            mut seen,
+            heads,
+            waited,
+        } = self;
+        let mut came = TasksRead {
+            named,
+            seen: Vec::new(),
+            set_states: Vec::new(),
+            pass: None,
+        };
+        // What waits on the person, read as every surface reads it.
+        let held = match bots.is_empty() && others.is_empty() {
+            true => None,
+            false => Some(needs::listing(&client, None).await),
+        };
+        // Those others wait on the person for a call held for approval, or
+        // the question their turn ended on.
+        let mut waiting = needs::Needs::default();
+        if let Some(Ok(held)) = &held {
+            waiting.held(held.clone(), |_| true);
+        }
+        for bot in others {
+            let state = match task_turn_at(&client, &bot).await {
+                Ok((turn, _)) => {
+                    let state = started::state(&turn);
+                    if let (true, Some(last)) = (started::settled(&state), turn["turn"].as_i64()) {
+                        let seen = match seen.get(&bot) {
+                            Some((at, seen)) if *at == last => Some(seen.clone()),
+                            _ => {
+                                let read = needs::scan(&client, &bot, Some(last)).await;
+                                if let Some(read) = &read {
+                                    seen.insert(bot.clone(), (last, read.clone()));
+                                    came.seen.push((bot.clone(), (last, read.clone())));
+                                }
+                                read
+                            }
+                        };
+                        if let Some(seen) = seen {
+                            waiting.asked(&bot, seen.open(&store, &bot, false));
+                        }
+                    }
+                    match waiting.waits(&bot) {
+                        true => "needs you".to_owned(),
+                        false => state,
+                    }
+                }
+                Err(error) if error.code == "bot_not_found" => "removed".to_owned(),
+                Err(_) => continue,
+            };
+            came.set_states.push((bot, state));
+        }
+        let Some(held) = held.filter(|_| !bots.is_empty()) else {
+            return came;
+        };
+        let mut needs = needs::Needs::default();
+        if let Ok(held) = &held {
+            needs.held(held.clone(), |_| true);
+        }
+        let (mut read, mut ended) = (Vec::new(), Vec::new());
+        let mut states = HashMap::new();
+        // The tasks whose questions were read this pass.
+        let mut asked = Vec::new();
+        let (mut news, mut removed) = (Vec::new(), Vec::new());
+        for bot in bots {
+            // Marked done, by itself or its lead, since its newest turn.
+            let mut done = false;
+            let state = match task_turn_at(&client, &bot).await {
+                Ok((turn, head)) => {
+                    let state = started::state(&turn);
+                    // A running task may ask and go on working: read again
+                    // now and then, once its history grew since.
+                    if !started::settled(&state)
+                        && all
+                        && head.is_some()
+                        && heads.get(&bot) != head.as_ref()
+                    {
+                        // One that could not be read is read again next pass,
+                        // keeping what it asked meanwhile.
+                        if let Some(seen) = needs::scan(&client, &bot, None).await {
+                            news.push((bot.clone(), head.unwrap_or_default()));
+                            needs.asked(&bot, seen.open(&store, &bot, true));
+                            asked.push(bot.clone());
+                        }
+                    }
+                    // A turn that ended on a question waits on the person;
+                    // read once per turn it ended.
+                    if let (true, Some(last)) = (started::settled(&state), turn["turn"].as_i64()) {
+                        // One that could not be read whole is neither kept
+                        // nor taken as asking nothing: read again next pass,
+                        // keeping what it asked meanwhile.
+                        let seen = match seen.get(&bot) {
+                            Some((at, seen)) if *at == last => Some(seen.clone()),
+                            _ => {
+                                let read = needs::scan(&client, &bot, Some(last)).await;
+                                if let Some(read) = &read {
+                                    seen.insert(bot.clone(), (last, read.clone()));
+                                    came.seen.push((bot.clone(), (last, read.clone())));
+                                }
+                                read
+                            }
+                        };
+                        if let Some(seen) = seen {
+                            // A task's own mark holds once its turn completed.
+                            done = (seen.itself && turn["status"] == "completed")
+                                || resolved::holds(resolved::read(&store, &bot), seen.turn, false);
+                            // One the lead resolved set its question aside.
+                            needs.asked(&bot, seen.open(&store, &bot, false));
+                            ended.push(bot.clone());
+                            asked.push(bot.clone());
+                        }
+                    }
+                    read.push(bot.clone());
+                    // One not read again this pass waits on what it asked.
+                    let waits =
+                        needs.waits(&bot) || (!asked.contains(&bot) && waited.contains(&bot));
+                    match (waits, done) {
+                        (true, _) => "needs you".to_owned(),
+                        (false, true) => started::DONE.to_owned(),
+                        _ => state,
+                    }
+                }
+                Err(error) if error.code == "bot_not_found" => {
+                    removed.push(bot.clone());
+                    "removed".to_owned()
+                }
+                // Not read this time: it stays as it was.
+                Err(_) => continue,
+            };
+            states.insert(bot, state);
+        }
+        came.pass = Some(TasksPass {
+            needs,
+            listed: held.is_ok(),
+            read,
+            ended,
+            asked,
+            states,
+            heads: news,
+            removed,
+        });
+        came
+    }
+}
+
+/// The bot, turn and call a call raised from below is known by.
+fn raised_key(call: &Value) -> CallKey {
+    (
+        call["bot"].as_str().unwrap_or_default().to_owned(),
+        call["turn"].as_i64().unwrap_or(-1),
+        call["call_id"].as_str().unwrap_or_default().to_owned(),
+    )
+}
+
+/// What a read of the calls below that wait on the person found.
+#[derive(Default)]
+struct Raised {
+    /// The verdicts of calls answered elsewhere, from the audit trail.
+    verdicts: Vec<(CallKey, Value)>,
+    /// The calls that wait, whole, by bot.
+    calls: Vec<(String, Value)>,
+    /// The calls looked up, held or not: one no longer listed was answered.
+    looked: Vec<CallKey>,
+    /// The calls whose verdicts were read, found or not.
+    verdicts_asked: Vec<CallKey>,
+}
+
+/// The calls of `unread` that wait on the person, each bot's read by
+/// every page, so a call past the first is not taken as answered.
+async fn raise_calls(client: &Client, unread: std::collections::BTreeSet<CallKey>) -> Raised {
+    let mut raised = Raised::default();
+    let mut bots: Vec<&str> = unread.iter().map(|(bot, ..)| bot.as_str()).collect();
+    bots.dedup();
+    'bots: for bot in bots {
+        let mut after = Value::Null;
+        loop {
+            let mut asked = json!({"bot": bot, "limit": 64});
+            if !after.is_null() {
+                asked["after"] = after;
+            }
+            let Ok(page) = client.request("approvals", asked).await else {
+                continue 'bots;
+            };
+            for call in page["approvals"].as_array().into_iter().flatten() {
+                if !needs::person_call(call) || !unread.contains(&raised_key(call)) {
+                    continue;
+                }
+                let mut call = call.clone();
+                whole_arguments(client, bot, &mut call).await;
+                raised.calls.push((bot.to_owned(), call));
+            }
+            after = page["next_after"].clone();
+            if after.is_null() {
+                break;
+            }
+        }
+        (raised.looked).extend(unread.iter().filter(|(of, ..)| of == bot).cloned());
+    }
+    raised
+}
+
+/// What the tasks' questions were found doing in their tasks.
+#[derive(Default)]
+struct Settled {
+    /// Those that left the pins with no answer from here, as they stand.
+    gone: Vec<(String, asks::State)>,
+    /// Those watched that were read, with the newest node they were read at.
+    watched: Vec<(String, Option<asks::State>, Option<i64>)>,
+}
+
+/// The tasks' questions in `watched` read again from their tasks: each
+/// task looked at with one request, and a question read only when its
+/// task wrote since.
+async fn reread_watched(
+    client: &Client,
+    watched: Watched,
+) -> Vec<(String, Option<asks::State>, Option<i64>)> {
+    let mut read = Vec::new();
+    for (bot, asks) in watched {
+        let Ok(record) = client.request("inspect", json!({"bot": bot})).await else {
+            continue;
+        };
+        let head = record["head"].as_i64();
+        for (key, ask, seen) in asks {
+            let Some(turn) = asks::turn_of(&ask.id).filter(|_| seen != head) else {
+                continue;
+            };
+            let call = ask.id.split_once('/').map_or("", |(_, call)| call);
+            let Ok(found) = asks::standing(client, &bot, turn, call, None).await else {
+                continue;
+            };
+            read.push((key, found.map(|(_, state)| state), head));
+        }
+    }
+    read
+}
+
+/// What `bot` did since `reference` was last read of its note `id`,
+/// and, when that note shows another bot's, what that one did.
+async fn read_reference(client: &Client, bot: &str, id: &str, reference: &mut margin::Reference) {
+    read_history(client, bot, id, reference).await;
+    // Taken away there, or the bot gone, what it showed stays as
+    // last read.
+    if reference.removed() || reference.gone {
+        return;
+    }
+    let Some((through, note)) = reference.shows() else {
+        reference.through = None;
+        return;
+    };
+    // Read again where it was read from, while it shows the same one.
+    let mut shown = (reference.through.take())
+        .filter(|shown| shown.names.as_ref() == Some(&(through.clone(), note.clone())))
+        .unwrap_or_default();
+    shown.names = Some((through.clone(), note.clone()));
+    if !shown.gone {
+        read_history(client, &through, &note, &mut shown).await;
+    }
+    reference.through = Some(shown);
+}
+
+/// What `bot` did since `reference` was last read of its note `id`.
+async fn read_history(client: &Client, bot: &str, id: &str, reference: &mut margin::Reference) {
+    // The bot first read, every time: another given its name once it
+    // is gone is not the one shown, and what was read of it stays.
+    let asked = json!({"bot": bot, "bot_id": reference.bot_id});
+    match client.request("inspect", asked).await {
+        Ok(record) => {
+            reference.bot_id = record["bot_id"].as_i64();
+            if reference.workspace.is_none() {
+                reference.workspace = record["workspace"].as_str().map(str::to_owned);
+            }
+        }
+        Err(error) => {
+            reference.gone = error.code == "bot_not_found";
+            return;
+        }
+    }
+    // The newest nodes first, read back as far as the note's start,
+    // then only what came after them.
+    let mut pages: Vec<Vec<Value>> = Vec::new();
+    let mut newest = None;
+    let mut from: Option<i64> = None;
+    while pages.len() < REFERENCE_PAGES {
+        let asked = match (reference.node, from) {
+            (Some(node), _) => {
+                json!({"bot": bot, "limit": 400, "min_node": node + 1, "oldest_first": true})
+            }
+            (None, Some(from)) => json!({"bot": bot, "limit": 400, "from": from}),
+            (None, None) => json!({"bot": bot, "limit": 400}),
+        };
+        let page = match client.request("history_nodes", asked).await {
+            Ok(page) => page,
+            Err(error) => {
+                reference.gone = error.code == "bot_not_found";
+                return;
+            }
+        };
+        let mut nodes: Vec<i64> = (page["nodes"].as_array().into_iter().flatten())
+            .filter_map(|node| node["node"].as_i64())
+            .collect();
+        nodes.sort_unstable();
+        let Some(&last) = nodes.last() else {
+            break;
+        };
+        newest = newest.max(Some(last));
+        // In the nodes' order, and each node's as it holds them; a read
+        // cut short is asked again from where it was, next time.
+        let (items, short) = needs::items(client, bot, &nodes).await;
+        if short {
+            return;
+        }
+        let items: Vec<Value> = items.into_iter().map(|(_, item)| item).collect();
+        let started = margin::Reference::starts(id, &items);
+        pages.push(items);
+        from = page["next_from"].as_i64();
+        if reference.node.is_some() || started || from.is_none() {
+            break;
+        }
+    }
+    for items in pages.iter().rev() {
+        reference.read(id, items);
+    }
+    if newest.is_some() {
+        reference.node = newest;
+    }
+    if let Some(path) = reference.file() {
+        reference.file_read(margin::read(&path, &[]).ok());
+    }
+}
+
+/// The tasks' questions watched, by task: each with the newest node of
+/// its task it was read at.
+type Watched = Vec<(String, Vec<(String, asks::Ask, Option<i64>)>)>;
+
+/// What `/status` read beside the loop, with what it knows of each agent
+/// after.
+type StatusCame = (
+    Box<StatusRead>,
+    HashMap<String, (Value, Latest)>,
+    HashMap<String, (i64, Seen)>,
+);
+
+/// The margin's references read beside the loop, by bot and note.
+type References = Vec<((String, String), margin::Reference)>;
+
+/// A page drawn again, read beside the loop: which, its items and
+/// whether the read was cut short, and what it read for them.
+type Again = (u64, (Vec<(i64, Value)>, bool), PageRead);
+
+/// What a read for an open card found ([`App::reread`]).
+enum CardRead {
+    Commands(Result<Value, String>),
+    /// What the audit read, with the request it asked: a filter changed
+    /// meanwhile leaves it unshown.
+    Audit(Value, Result<Value, String>),
+    /// What usage read, with the selection it asked for.
+    Usage(
+        (bool, usage::Period),
+        (i64, i64, usize),
+        Result<Value, String>,
+        Vec<(String, agent_client::config::Prices)>,
+    ),
+    /// `/status`'s alerts, with the temporary folders' when read, and
+    /// what it read, with what it knows of each agent after.
+    Status(
+        (Vec<status::Alert>, Option<Vec<status::Alert>>),
+        Option<StatusCame>,
+    ),
+}
+
+/// The commands `/background` lists, every page, as the daemon hands
+/// them, into one list.
+async fn read_commands(client: &Client, mut query: Value) -> Result<Value, String> {
+    let mut rows = Vec::new();
+    loop {
+        match client.request("processes", query.clone()).await {
+            Ok(mut page) => {
+                if let Some(found) = page["processes"].as_array_mut() {
+                    rows.append(found);
+                }
+                match page.get("next_after") {
+                    Some(after) if !after.is_null() => query["after"] = after.clone(),
+                    _ => return Ok(json!({"processes": rows})),
+                }
+            }
+            Err(error) => return Err(error.to_string()),
+        }
+    }
+}
+
+/// What `/status` says is broken around the agents, as the daemon says
+/// it: its companions that are down or keep restarting, whose logs are
+/// at `logs`, and turns held on a cause the person can fix; and the
+/// temporary folders low on room, when `temp_due`.
+async fn read_alerts(
+    client: &Client,
+    logs: &str,
+    temp_due: bool,
+) -> (Vec<status::Alert>, Option<Vec<status::Alert>>) {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+    let mut alerts = Vec::new();
+    if let Ok(listed) = client.request("companions", json!({})).await {
+        alerts.extend(status::companion_alerts(&listed["companions"], now, logs));
+    }
+    // Turns held on a cause the person can fix, one alert per cause:
+    // counted by the daemon, named from the first page.
+    if let Ok(listed) = client.request("held", json!({"limit": 64})).await {
+        alerts.extend(status::held_alerts(&listed));
+    }
+    // The temporary folders every agent's commands share, from `stats` at
+    // most every TEMP_READ: the rest of what it reads is not needed here
+    // every refresh.
+    let temp = match temp_due {
+        true => (client.request("stats", json!({})).await.ok())
+            .map(|stats| status::temp_alerts(&stats["temp"])),
+        false => None,
+    };
+    (alerts, temp)
+}
+
+/// The turn `bot` is on, or its last, with the newest node of its history.
+async fn task_turn_at(
+    client: &Client,
+    bot: &str,
+) -> Result<(Value, Option<i64>), agent_client::Error> {
+    let record = client.request("inspect", json!({"bot": bot})).await?;
+    let turn = active_turn(client, bot, record["running_turn"].as_i64(), None).await?;
+    Ok((with_error(client, turn).await, record["head"].as_i64()))
+}
+
 /// What the footer's count of the agents found: the mark of where they
 /// stood, and, when that had changed, the counts with the reads made.
 /// No mark when a history read failed, so the next count reads again.
@@ -4395,13 +4879,15 @@ struct App {
     /// The calls below that were looked up, by bot, turn and call: one
     /// the listing no longer held is not looked up again.
     raised_read: std::collections::BTreeSet<(String, i64, String)>,
+    /// That read, under way beside the loop.
+    raising: Option<tokio::task::JoinHandle<Raised>>,
     /// Calls Esc set aside, by bot, turn and call: the keys type again,
     /// and Enter on an empty composer brings them back. A later turn's
     /// call of the same id is another.
     calls_aside: std::collections::HashSet<(String, i64, String)>,
     /// The calls waiting on the person written out here, by bot, turn and
     /// call, folded once they wait no more.
-    written: HashMap<(String, i64, String), Written>,
+    written: HashMap<CallKey, Written>,
     /// How many were written, which numbers the next.
     written_count: u64,
     /// How many were kept at the last look for ones trimmed away.
@@ -4450,6 +4936,10 @@ struct App {
     /// The tasks' asks this window answered, by [`asks::Ask::key`], until
     /// their tasks read them: none is pinned again meanwhile.
     task_answers: Vec<TaskAnswer>,
+    /// Those read again, beside the loop.
+    rechecking: Option<tokio::task::JoinHandle<Vec<(String, i64, Value)>>>,
+    /// The tasks' questions read again, beside the loop.
+    settling: Option<tokio::task::JoinHandle<Settled>>,
     /// What the tasks' questions were last pinned from: the fleet's and
     /// the rosters' versions of them, the lineage and the tasks tracked.
     /// Pinned again only once one changes, not every pass of the loop.
@@ -4700,6 +5190,8 @@ struct App {
     /// them; and when they were last read.
     references: HashMap<(String, String), margin::Reference>,
     references_read: Option<Instant>,
+    /// Those read again, beside the loop.
+    referencing: Option<tokio::task::JoinHandle<References>>,
     /// The tasks this agent started that have a turn running, as the
     /// daemon says without windows for the project's agents; and when
     /// they were last read.
@@ -4760,6 +5252,42 @@ struct App {
     opening_all: bool,
     /// A program in the pane drew something: the screen is drawn again.
     woken: Arc<tokio::sync::Notify>,
+    /// The daemon's event taken and not applied yet ([`App::hear`]): one
+    /// at a time, as Codex's TUI takes its events, the rest waiting in the
+    /// connection's own bounded queue.
+    unheard: Option<Value>,
+    /// The read under way for it.
+    hearing: Option<tokio::sync::oneshot::Receiver<Read>>,
+    /// The words last given back to the composer, in front of what was
+    /// typed since ([`App::give_back`]): a message refused after them goes
+    /// after them.
+    given_back: Option<String>,
+    /// The connection closed: it is let go ([`App::dropped`]) once
+    /// nothing it brought waits to be applied.
+    cut: bool,
+    /// Verdicts of calls written out here, read from the audit trail.
+    verdicting: Vec<(Vec<CallKey>, VerdictsReading)>,
+    /// The calls whose verdicts a read beside the loop reads now: none is
+    /// read again until it ends.
+    verdicts_out: std::collections::HashSet<CallKey>,
+    /// The writes to the daemon not yet done, or done and not yet
+    /// applied, oldest first ([`App::write`]).
+    writes: std::collections::VecDeque<tokio::sync::oneshot::Receiver<Wrote>>,
+    /// The newest write's end, which the next one waits for.
+    lane: Option<tokio::sync::oneshot::Receiver<()>>,
+    /// Messages to the bot the daemon has not answered yet: its events
+    /// wait for them ([`App::send_all`]).
+    sending: usize,
+    /// How many messages were staged while being sent, which numbers
+    /// their rows until the daemon numbers them.
+    unsent_rows: i64,
+    /// The older page being read ([`App::older`]): where it was read
+    /// from, what the daemon listed there, and the page read.
+    older_read:
+        Option<tokio::sync::oneshot::Receiver<(i64, agent_client::Result<Value>, PageRead)>>,
+    /// The page being read again ([`App::draw_again`]): its id, what
+    /// newer calls it returned to, and the page.
+    again: Option<tokio::sync::oneshot::Receiver<Again>>,
     /// Every call drawn, rather than the clean view of the bot's words and
     /// the calls that move the work on.
     verbose: bool,
@@ -4840,6 +5368,13 @@ struct App {
     reaching: Option<tokio::sync::oneshot::Receiver<Option<approvals::Reach>>>,
     /// The model and effort picked, set once no turn runs.
     switch: Option<(String, Option<String>)>,
+    /// The model and speed sent and not answered yet: a pick compares
+    /// with them, not with what the bot ran before.
+    switch_sent: Option<(String, Option<String>)>,
+    pace_sent: Option<&'static str>,
+    /// Permission changes sent and not answered yet: the lead is not on
+    /// its new row until none is, so `/permissions`' spread goes on.
+    gating_sent: usize,
     /// The prompt-cache lifetime a bot made before Sonny gave its model
     /// one takes, set once no turn runs.
     cache: Option<&'static str>,
@@ -4928,6 +5463,10 @@ struct App {
     tasks_read: Option<Instant>,
     /// When every task started, ended ones too, was last read.
     tasks_all_read: Option<Instant>,
+    /// That read, under way beside the loop.
+    tasking: Option<tokio::task::JoinHandle<TasksRead>>,
+    /// A read for the open card, under way beside the loop.
+    card_read: Option<tokio::task::JoinHandle<CardRead>>,
     /// The width the tasks started were drawn at.
     tasks_width: usize,
     /// The words view's hints on the turn being drawn.
@@ -4947,6 +5486,8 @@ struct App {
     /// When what runs for this agent in the background was last read, for
     /// what of it failed.
     behind_read: Option<Instant>,
+    /// How the turns fires sent ended, asked beside the loop.
+    behind: Option<tokio::task::JoinHandle<HashMap<String, Value>>>,
     /// The temporary folders low on room as the daemon's `stats` last
     /// said, and when: read at most every [`TEMP_READ`] while `/status`
     /// is open, as they fill over minutes, not seconds.
@@ -4979,6 +5520,86 @@ enum Told {
     Line(String),
     Notice(String),
     Beside(String),
+}
+
+/// A read of the leads this one follows ([`Fleet::follow_leads`]): those
+/// followed now, and what was known before.
+struct Following {
+    followed: Vec<String>,
+    /// A reconcile reads every call after: the new ones' are not listed.
+    now: bool,
+    lineage: std::collections::HashSet<String>,
+    /// The bots raised before.
+    was: std::collections::HashSet<String>,
+    /// Bots raised whose calls could not be listed yet.
+    unheld: std::collections::HashSet<String>,
+}
+
+/// What that read found.
+struct Followed {
+    followed: Vec<String>,
+    raised: std::collections::HashSet<String>,
+    /// Their bots with no turn running.
+    sure: Vec<String>,
+    /// Their bots, with the head each is at.
+    heads: Vec<(String, Value)>,
+    /// The bots raised now that were not, or whose calls were not listed.
+    new: std::collections::HashSet<String>,
+    /// What waits on the person, listed for those new ones.
+    held: Option<agent_client::Result<Vec<needs::Held>>>,
+}
+
+impl Following {
+    /// Which bots are the followed leads': the asked back when a listing
+    /// fails.
+    async fn read(self, client: &Client) -> Result<Followed, Box<Following>> {
+        let mut raised = std::collections::HashSet::new();
+        let (mut sure, mut heads) = (Vec::new(), Vec::new());
+        for lead in &self.followed {
+            let Some(project) = project::lead_project(lead) else {
+                continue;
+            };
+            let Some(bots) = bots_named(client, &format!("{project}.*")).await else {
+                return Err(Box::new(self));
+            };
+            let theirs = lead_and_lineage(&bots, lead);
+            for bot in &bots {
+                if let Some(name) = bot["name"].as_str().filter(|name| theirs.contains(*name)) {
+                    if bot["running_turn"].is_null() {
+                        sure.push(name.to_owned());
+                    }
+                    heads.push((name.to_owned(), json!([bot["bot_id"], bot["head"]])));
+                }
+            }
+            raised.extend(theirs);
+        }
+        raised.retain(|bot| !self.lineage.contains(bot));
+        let mut new = self.unheld;
+        new.extend(raised.difference(&self.was).cloned());
+        new.retain(|bot| raised.contains(bot));
+        let held = match !self.now && !new.is_empty() {
+            true => Some(needs::listing(client, None).await),
+            false => None,
+        };
+        Ok(Followed {
+            followed: self.followed,
+            raised,
+            sure,
+            heads,
+            new,
+            held,
+        })
+    }
+}
+
+/// What a rescan of the fleet read ([`Fleet::rescan`]).
+struct Rescanned {
+    followed: Option<Result<Followed, Box<Following>>>,
+    /// The questions of the agents whose turn ended unsure of them, each
+    /// with [`needs::Needs::stirred`] as the read began.
+    scanned: Vec<(String, needs::Seen, u64)>,
+    /// Those of one agent not read since the last reconcile, at its head.
+    one: Option<(String, Value, needs::Seen)>,
 }
 
 /// The lead's tasks, laid out in the project's home in a multiplexer: a window for
@@ -5018,6 +5639,10 @@ struct Fleet {
     /// person in theirs waits in this window too, and is answered here.
     /// Never a window here, nor a tab.
     raised: std::collections::HashSet<String>,
+    /// Bots the daemon's events added to `raised` (true) or took from it
+    /// (false) since the followed leads were last asked for: a read of
+    /// them that lands later started before these, and keeps them.
+    raised_since: HashMap<String, bool>,
     /// How a task's window runs Sonny on it, without the bot's name.
     command: Vec<String>,
     /// Said once in the status row when tasks open where this pane is not.
@@ -5051,6 +5676,10 @@ struct Fleet {
     /// Finished calls that may have waited, to read for the turns they
     /// returned: the bot, the output's node, and the call.
     returned: Vec<(String, i64, String)>,
+    /// Those read, beside the loop: the tasks and turns they returned.
+    closing: Option<tokio::task::JoinHandle<Vec<(String, i64)>>>,
+    /// A rescan read beside the loop ([`Fleet::rescan`]).
+    rescanning: Option<tokio::task::JoinHandle<Rescanned>>,
     /// Tasks' turns that resolved them: their window closes once the turn
     /// completes.
     resolving: resolved::Own,
@@ -5516,6 +6145,7 @@ impl Fleet {
             refollow: false,
             unheld: Default::default(),
             raised: Default::default(),
+            raised_since: HashMap::new(),
             command,
             note,
             place,
@@ -5532,6 +6162,8 @@ impl Fleet {
             ended: HashMap::new(),
             waits: Default::default(),
             returned: Vec::new(),
+            closing: None,
+            rescanning: None,
             resolving: Default::default(),
             began: HashMap::new(),
             used_when: used::when,
@@ -5569,6 +6201,7 @@ impl Fleet {
             refollow: false,
             unheld: Default::default(),
             raised: Default::default(),
+            raised_since: HashMap::new(),
             command: Vec::new(),
             note: None,
             doing: HashMap::new(),
@@ -5583,6 +6216,8 @@ impl Fleet {
             ended: HashMap::new(),
             waits: Default::default(),
             returned: Vec::new(),
+            closing: None,
+            rescanning: None,
             resolving: Default::default(),
             began: HashMap::new(),
             used_when: used::when,
@@ -5729,63 +6364,77 @@ impl Fleet {
     /// theirs waits on the person. Returns those whose questions are to be
     /// read, with the head each is at, as the lineage's are.
     async fn follow_leads(&mut self, now: bool) -> Vec<(String, Value)> {
+        let Some(asked) = self.follow_due(now) else {
+            return Vec::new();
+        };
+        let read = asked.read(&self.client).await;
+        self.followed_read(read)
+    }
+
+    /// What [`Fleet::follow_leads`] reads, when it is due.
+    fn follow_due(&mut self, now: bool) -> Option<Following> {
         if !now
             && self
                 .followed_at
                 .is_some_and(|at| at.elapsed() < FOLLOWED_EVERY)
         {
-            return Vec::new();
+            return None;
         }
         self.followed_at = Some(Instant::now());
+        self.raised_since.clear();
         let store = self.store.clone();
         let followed = followed_leads(&self.lead, |bot| lookout::subs::read(&store, bot));
         if !now && !self.refollow && followed == self.followed {
-            return Vec::new();
+            return None;
         }
-        let mut raised = std::collections::HashSet::new();
-        let mut heads = Vec::new();
-        for lead in &followed {
-            let Some(project) = project::lead_project(lead) else {
-                continue;
-            };
-            // Read again next time when a listing fails.
-            let Some(bots) = bots_named(&self.client, &format!("{project}.*")).await else {
+        Some(Following {
+            followed,
+            now,
+            lineage: self.lineage.clone(),
+            was: self.raised.clone(),
+            unheld: std::mem::take(&mut self.unheld),
+        })
+    }
+
+    /// What a read of the followed leads found, kept: none when a listing
+    /// failed, read again next time.
+    fn followed_read(&mut self, read: Result<Followed, Box<Following>>) -> Vec<(String, Value)> {
+        let read = match read {
+            Ok(read) => read,
+            Err(asked) => {
+                self.unheld.extend(asked.unheld);
                 self.refollow = true;
                 return Vec::new();
-            };
-            let theirs = lead_and_lineage(&bots, lead);
-            for bot in &bots {
-                if let Some(name) = bot["name"].as_str().filter(|name| theirs.contains(*name)) {
-                    // A turn that ended while away ends what its events
-                    // left unsure: its history, read next, says.
-                    if bot["running_turn"].is_null() {
-                        self.needs.sure(name);
-                    }
-                    heads.push((name.to_owned(), json!([bot["bot_id"], bot["head"]])));
-                }
             }
-            raised.extend(theirs);
+        };
+        // A turn that ended while away ends what its events left unsure:
+        // its history, read next, says.
+        for name in &read.sure {
+            self.needs.sure(name);
         }
-        raised.retain(|bot| !self.lineage.contains(bot));
+        // What events changed since the read was asked for stands over it.
+        let mut raised = read.raised;
+        for (bot, joined) in self.raised_since.drain() {
+            match joined {
+                true => raised.insert(bot),
+                false => raised.remove(&bot),
+            };
+        }
         for gone in self.raised.difference(&raised) {
             self.needs.forget(gone);
             self.scanned.remove(gone);
         }
-        let mut new = std::mem::take(&mut self.unheld);
-        new.extend(raised.difference(&self.raised).cloned());
-        new.retain(|bot| raised.contains(bot));
         self.raised = raised;
-        self.followed = followed;
+        self.followed = read.followed;
         self.refollow = false;
         // A reconcile reads every call after; else the new ones' now, and
         // when that fails, next time.
-        if !now && !new.is_empty() {
-            match needs::listing(&self.client, None).await {
-                Ok(held) => self.needs.held(held, |bot| new.contains(bot)),
-                Err(_) => (self.unheld, self.refollow) = (new, true),
-            }
+        match read.held {
+            Some(Ok(held)) => self.needs.held(held, |bot| read.new.contains(bot)),
+            Some(Err(_)) => (self.unheld, self.refollow) = (read.new, true),
+            None => {}
         }
-        (heads.into_iter())
+        (read.heads.into_iter())
             .filter(|(bot, head)| self.raised.contains(bot) && self.scanned.get(bot) != Some(head))
             .collect()
     }
@@ -5818,32 +6467,90 @@ impl Fleet {
     /// Read again the questions of the agents whose turn ended unsure of
     /// them, and show what they wait on; then those of one agent not read
     /// since the last reconcile.
-    async fn rescan(&mut self) {
-        let raised = self.follow_leads(false).await;
-        self.unread.extend(raised);
-        for (bot, turn) in self.needs.due() {
-            let Some(seen) = needs::scan(&self.client, &bot, turn).await else {
-                continue;
+    async fn rescan(&mut self, woken: &Arc<tokio::sync::Notify>) {
+        if let Some(job) = self.rescanning.take_if(|job| job.is_finished())
+            && let Ok(read) = job.await
+        {
+            self.rescanned(read);
+        }
+        if self.rescanning.is_some() {
+            return;
+        }
+        let following = self.follow_due(false);
+        let due: Vec<_> = (self.needs.due().into_iter())
+            .map(|(bot, turn)| {
+                let stirred = self.needs.stirred(&bot);
+                (bot, turn, stirred)
+            })
+            .collect();
+        let one = (self.unread.pop()).filter(|(bot, _)| self.below(bot));
+        if following.is_none() && due.is_empty() && one.is_none() {
+            return;
+        }
+        let (client, woken) = (self.client.clone(), woken.clone());
+        self.rescanning = Some(tokio::spawn(async move {
+            let followed = match following {
+                Some(asked) => Some(asked.read(&client).await),
+                None => None,
             };
+            let mut scanned = Vec::new();
+            for (bot, turn, stirred) in due {
+                if let Some(seen) = needs::scan(&client, &bot, turn).await {
+                    scanned.push((bot, seen, stirred));
+                }
+            }
+            // One that failed is read at the next reconcile.
+            let one = match one {
+                Some((bot, head)) => {
+                    (needs::scan(&client, &bot, None).await).map(|seen| (bot, head, seen))
+                }
+                None => None,
+            };
+            woken.notify_one();
+            Rescanned {
+                followed,
+                scanned,
+                one,
+            }
+        }));
+    }
+
+    /// What a rescan read, shown.
+    fn rescanned(&mut self, read: Rescanned) {
+        if let Some(followed) = read.followed {
+            let raised = self.followed_read(followed);
+            self.unread.extend(raised);
+        }
+        for (bot, seen, stirred) in read.scanned {
+            // An event since changed its question: what was read is older
+            // than what it said, and any read it asks for comes after.
+            if self.needs.stirred(&bot) != stirred {
+                continue;
+            }
             let ask = self.open_ask(&bot, seen);
             self.needs.asked(&bot, ask);
             self.scanned.remove(&bot);
             let waits = self.needs.waits(&bot);
             self.settle(&bot, waits);
         }
-        if let Some((bot, head)) = self.unread.pop()
+        // While a turn the events left unsure of runs, its end reads it.
+        if let Some((bot, head, seen)) = read.one
             && self.below(&bot)
+            && !self.needs.unsure(&bot)
         {
-            // One that failed is read at the next reconcile. While a turn
-            // the events left unsure of runs, its end reads it.
-            if let Some(seen) = needs::scan(&self.client, &bot, None).await
-                && !self.needs.unsure(&bot)
-            {
-                let ask = self.open_ask(&bot, seen);
-                self.needs.asked(&bot, ask);
-                self.scanned.insert(bot.clone(), head);
-                self.settle(&bot, false);
-            }
+            let ask = self.open_ask(&bot, seen);
+            self.needs.asked(&bot, ask);
+            self.scanned.insert(bot.clone(), head);
+            self.settle(&bot, false);
+        }
+    }
+
+    /// [`Fleet::rescan`] through to what it read, shown.
+    #[cfg(test)]
+    async fn rescan_through(&mut self) {
+        self.rescan(&Arc::new(tokio::sync::Notify::new())).await;
+        if let Some(job) = self.rescanning.take() {
+            self.rescanned(job.await.expect("the rescan read"));
         }
     }
 
@@ -6027,37 +6734,65 @@ impl Fleet {
     /// waits returned, with `task_tabs = "every"`, as each task opened one;
     /// with `"asked"`, a tab stays until the person or an agent closes it,
     /// or the task is resolved.
-    async fn close_taken(&mut self) {
+    async fn close_taken(&mut self, woken: &Arc<tokio::sync::Notify>) {
+        if let Some(job) = self.closing.take_if(|job| job.is_finished())
+            && let Ok(returned) = job.await
+        {
+            self.results_taken(returned);
+        }
+        if self.closing.is_some() || self.returned.is_empty() {
+            return;
+        }
+        let (client, woken) = (self.client.clone(), woken.clone());
+        let returned = std::mem::take(&mut self.returned);
+        self.closing = Some(tokio::spawn(async move {
+            let mut taken = Vec::new();
+            for (bot, node, call) in returned {
+                let Ok(read) = client
+                    .request("history_items", json!({"bot": bot, "nodes": [node]}))
+                    .await
+                else {
+                    continue;
+                };
+                let Some(result) = responses(&read["items"][0]["item"])
+                    .into_iter()
+                    .find(|item| item["call_id"] == call.as_str())
+                else {
+                    continue;
+                };
+                let (printed, _) = output(&result);
+                taken.extend(calls::returned(&printed));
+            }
+            woken.notify_one();
+            taken
+        }));
+    }
+
+    /// [`Fleet::close_taken`] through to the windows it closed.
+    #[cfg(test)]
+    async fn close_taken_through(&mut self) {
+        self.close_taken(&Arc::new(tokio::sync::Notify::new()))
+            .await;
+        if let Some(job) = self.closing.take() {
+            self.results_taken(job.await.expect("the results were read"));
+        }
+    }
+
+    /// The tasks and turns the finished waits returned, their windows
+    /// closed ([`Fleet::close_taken`]).
+    fn results_taken(&mut self, returned: Vec<(String, i64)>) {
         let every = self.windows.lock().is_ok_and(|mut windows| windows.every());
-        for (bot, node, call) in std::mem::take(&mut self.returned) {
-            let Ok(read) = self
-                .client
-                .request("history_items", json!({"bot": bot, "nodes": [node]}))
-                .await
-            else {
-                continue;
-            };
-            let Some(result) = responses(&read["items"][0]["item"])
-                .into_iter()
-                .find(|item| item["call_id"] == call.as_str())
-            else {
-                continue;
-            };
-            let (printed, _) = output(&result);
-            for (task, turn) in calls::returned(&printed) {
-                // One that ended on a question waits for its answer there.
-                if task != self.lead
-                    && self.ended.get(&task) == Some(&turn)
-                    && !self.needs.waits(&task)
-                {
-                    self.ended.remove(&task);
-                    if every {
-                        self.close(&task);
-                    }
-                    self.doing.remove(&task);
-                    self.activity.remove(&task);
-                    self.name_windows();
+        for (task, turn) in returned {
+            // One that ended on a question waits for its answer there.
+            if task != self.lead && self.ended.get(&task) == Some(&turn) && !self.needs.waits(&task)
+            {
+                self.ended.remove(&task);
+                if every {
+                    self.close(&task);
                 }
+                self.doing.remove(&task);
+                self.activity.remove(&task);
+                self.name_windows();
             }
         }
     }
@@ -6257,6 +6992,7 @@ impl Fleet {
                     // A followed lead's new task is followed with it.
                     Kin::None if self.raised.contains(by) && !project::is_lead(bot) => {
                         self.raised.insert(bot.to_owned());
+                        self.raised_since.insert(bot.to_owned(), true);
                     }
                     // One no agent made may be a followed first lead's:
                     // the listing says, as it does at the start.
@@ -6286,6 +7022,7 @@ impl Fleet {
                 self.layout.send(move |_| used::forget(&gone));
                 self.lineage.remove(bot);
                 self.raised.remove(bot);
+                self.raised_since.insert(bot.to_owned(), false);
                 self.doing.remove(bot);
                 self.activity.remove(bot);
                 self.needs.forget(bot);
@@ -6348,6 +7085,7 @@ impl App {
             told: None,
             raised: Vec::new(),
             raised_read: Default::default(),
+            raising: None,
             calls_aside: Default::default(),
             written: HashMap::new(),
             written_count: 0,
@@ -6366,6 +7104,8 @@ impl App {
             watched_at: None,
             sent_answers: Vec::new(),
             task_answers: Vec::new(),
+            rechecking: None,
+            settling: None,
             task_asks_read: None,
             done_read: None,
             kept: Kept::default(),
@@ -6393,6 +7133,7 @@ impl App {
             pick: 0,
             watch: None,
             behind_read: None,
+            behind: None,
             temp_read: None,
             failed: 0,
             failures: Default::default(),
@@ -6476,6 +7217,7 @@ impl App {
             marked: HashMap::new(),
             references: HashMap::new(),
             references_read: None,
+            referencing: None,
             counts: None,
             blanks: margin::Blanks::default(),
             sources_read: None,
@@ -6502,6 +7244,18 @@ impl App {
             naming: None,
             opening_all: false,
             woken: Arc::new(tokio::sync::Notify::new()),
+            unheard: None,
+            hearing: None,
+            cut: false,
+            given_back: None,
+            verdicting: Vec::new(),
+            verdicts_out: Default::default(),
+            writes: Default::default(),
+            lane: None,
+            sending: 0,
+            unsent_rows: 0,
+            older_read: None,
+            again: None,
             verbose: false,
             words_only: false,
             view: agent_client::config::View::Words,
@@ -6533,6 +7287,9 @@ impl App {
             making: None,
             send_after: None,
             switch: None,
+            switch_sent: None,
+            pace_sent: None,
+            gating_sent: 0,
             cache: None,
             pace: None,
             tools: record["tools"]
@@ -6573,6 +7330,8 @@ impl App {
             starting: None,
             tasks_read: None,
             tasks_all_read: None,
+            tasking: None,
+            card_read: None,
             tasks_width: 0,
             turn_hints: TurnHints::default(),
             top_turn: None,
@@ -6582,7 +7341,11 @@ impl App {
         }
     }
 
-    async fn main(&mut self, terminal: &mut Tui, events: &mut Events) -> Result<(), String> {
+    async fn main(
+        &mut self,
+        terminal: &mut Terminal<impl Drawn>,
+        events: &mut Events,
+    ) -> Result<(), String> {
         term::laid_out().await;
         let _ = terminal.autoresize();
         self.width = terminal.size().map(|s| s.width as usize).unwrap_or(80);
@@ -6638,7 +7401,7 @@ impl App {
             self.rest = Some(if failed { "error" } else { "idle" });
             self.rested(ended);
         }
-        self.configure().await;
+        self.configure();
         self.tell_upgrades().await;
         self.tell_warnings().await;
         // What was typed in the window this one reopened from, after an
@@ -6664,17 +7427,19 @@ impl App {
             let _ = std::fs::remove_file(&file);
             match first {
                 Ok(first) => {
-                    if let Err(error) = self.send(first.clone(), None, false, false, &[]).await {
-                        self.input.set(&first);
-                        self.notice = Some(error);
-                    }
+                    let then = Then::Composed {
+                        typed: first.clone(),
+                        pictures: Vec::new(),
+                        answering: None,
+                    };
+                    self.send(first, None, (false, false), &[], then);
                 }
                 Err(error) => {
                     self.notice = Some(format!("the first message, {}: {error}", file.display()))
                 }
             }
         }
-        let (keys_tx, mut keys) = tokio::sync::mpsc::unbounded_channel();
+        let (keys_tx, keys) = tokio::sync::mpsc::unbounded_channel();
         // Poll, not a bare read, so the reader ends with the client.
         std::thread::spawn(move || {
             while !keys_tx.is_closed() {
@@ -6694,6 +7459,19 @@ impl App {
                 }
             }
         });
+        self.run(terminal, events, keys).await
+    }
+
+    /// The window's loop: the person's keys, the daemon's events and what
+    /// was read for them, each taken as it comes and the screen drawn
+    /// between them. Nothing in it waits on the daemon: what it asks of
+    /// the daemon runs beside it, and comes back to it.
+    async fn run(
+        &mut self,
+        terminal: &mut Terminal<impl Drawn>,
+        events: &mut Events,
+        mut keys: tokio::sync::mpsc::UnboundedReceiver<Event>,
+    ) -> Result<(), String> {
         let mut ticked = Instant::now();
         let mut heard = Instant::now();
         // A terminal waking with the Mac can be slow to answer the cursor
@@ -6732,26 +7510,25 @@ impl App {
                     Err(error) => return Err(error.to_string()),
                 }
             }
-            // Older items are drawn above the view after a frame, never
-            // before one: a page each time round once the view is a few
+            // Older items are read beside the loop and drawn above the view
+            // once they come: a page at a time once the view is a few
             // screens from the first row, and while the person reads back,
-            // more between their keys, so the wheel finds rows drawn
-            // rather than waits on a page. A lead's page can be a row or
-            // two, its gaps one row each, so reading ahead is what keeps
-            // the wheel off the first row.
-            let mut reading = false;
+            // more between their keys, so the wheel finds rows drawn rather
+            // than waits on a page. A lead's page can be a row or two, its
+            // gaps one row each, so reading ahead is what keeps the wheel
+            // off the first row.
             if self.older.is_some() && !self.to_first && self.screen.wants_older(keys.is_empty()) {
-                let from = self.older;
-                self.older().await;
-                changed = true;
-                // Round again at once while pages come; a read that failed
-                // or was cut short waits for the next event.
-                reading = self.older != from;
+                self.older();
             }
             // What came since the last draw waits for the next one, due
             // once the cap allows.
             let undrawn = drawn.filter(|_| wanted && skipped);
             if self.quit {
+                // What the person sent goes before the window does, as it
+                // did when each write was awaited where it was made.
+                if let Some(lane) = self.lane.take() {
+                    let _ = lane.await;
+                }
                 return Ok(());
             }
             let every = tick_every(self.moving(), heard.elapsed());
@@ -6766,7 +7543,20 @@ impl App {
                 continue;
             }
             tokio::select! {
-                event = events.recv(), if self.down.is_none() => {
+                // Keys first: whatever else is ready waits for them.
+                biased;
+                Some(key) = keys.recv() => {
+                    keyed = true;
+                    heard = Instant::now();
+                    let (wheel, chat) = (is_wheel(&key), self.over_chat(&key));
+                    self.key(key).await;
+                    if wheel {
+                        held = self.wheel_burst(&mut keys, chat).await;
+                    }
+                }
+                // Taken only as fast as they are heard: the rest wait in
+                // the connection's own bounded queue.
+                event = events.recv(), if self.down.is_none() && !self.cut && self.unheard.is_none() => {
                     // The project's follow shares the connection: what it
                     // brings wakes the window once it has something new.
                     if let Some(event) = &event
@@ -6777,17 +7567,8 @@ impl App {
                     changed = true;
                     heard = Instant::now();
                     match event {
-                        Some(event) => self.daemon(event).await,
-                        None => self.dropped(),
-                    }
-                }
-                Some(key) = keys.recv() => {
-                    keyed = true;
-                    heard = Instant::now();
-                    let (wheel, chat) = (is_wheel(&key), self.over_chat(&key));
-                    self.key(key).await;
-                    if wheel {
-                        held = self.wheel_burst(&mut keys, chat).await;
+                        Some(event) => self.unheard = Some(event),
+                        None => self.cut = true,
                     }
                 }
                 _ = tokio::time::sleep(undrawn.map_or(Duration::ZERO, |at| DRAW_EVERY.saturating_sub(at.elapsed()))), if undrawn.is_some() => {}
@@ -6839,13 +7620,13 @@ impl App {
                         && let Some(bot) = event["bot"].as_str().filter(|bot| *bot != self.bot)
                     {
                         let bot = bot.to_owned();
-                        self.heard_verdict_or_read(&bot, event["turn"].as_i64(), &event["data"])
-                            .await;
+                        let reads = self.verdict_or_reads(&bot, event["turn"].as_i64(), &event["data"]);
+                        self.read_verdicts_beside(reads);
                     }
                     if let Some(fleet) = &mut self.fleet
                         && !fleet.returned.is_empty()
                     {
-                        fleet.close_taken().await;
+                        fleet.close_taken(&self.woken).await;
                     }
                     let alerts = self
                         .fleet
@@ -6867,7 +7648,22 @@ impl App {
                     changed = true;
                     heard = Instant::now();
                 }
-                _ = std::future::ready(()), if reading => {}
+            }
+            // What the person sent lands before the events after it.
+            self.wrote();
+            self.hear();
+            // The connection is gone: what it brought and was not applied
+            // yet is let go, a read for it having failed with it, and the
+            // window catches up from the last item it drew, so nothing is
+            // drawn from a read that never came or drawn twice.
+            if self.down.is_none() && self.client.is_closed() {
+                self.cut = true;
+                self.unheard = None;
+                self.hearing = None;
+            }
+            if self.cut && self.unheard.is_none() && self.hearing.is_none() {
+                self.cut = false;
+                self.dropped();
             }
             if self.picked_read.elapsed() > Duration::from_secs(1) {
                 self.picked_read = Instant::now();
@@ -6930,13 +7726,17 @@ impl App {
             self.done_elsewhere();
             self.done_resting(false);
             if let Some(fleet) = &mut self.fleet {
-                fleet.rescan().await;
+                fleet.rescan(&self.woken).await;
+                // Results taken whose read landed close their windows now,
+                // not when the next wait returns.
+                fleet.close_taken(&self.woken).await;
                 // What the rescan set off sounds now, not with the next
                 // event.
                 for (alert, what) in std::mem::take(&mut fleet.alerts) {
                     self.sounds.alert(alert, &what);
                 }
             }
+            self.verdicts_came();
             self.pin_task_asks();
             self.raise_approvals().await;
             self.recheck_task_answers().await;
@@ -6948,33 +7748,37 @@ impl App {
             for what in std::mem::take(&mut self.pressed) {
                 self.press(&what).await;
             }
+            changed |= self.older_came().await;
             // On the way up to the first turn, a page each time round.
             if self.to_first && self.older.is_some() && self.screen.near_top() {
-                self.older().await;
+                self.older();
             }
             if self.to_first {
                 self.screen.scroll(isize::MAX);
                 self.to_first = self.repaint || self.older.is_some() && self.screen.near_top();
-                // The next page asked for once this one is drawn, not a tick on.
-                if self.to_first && !self.repaint {
+                // The next page asked for once this one is drawn, not a
+                // tick on: one being read comes round when it comes.
+                if self.to_first && !self.repaint && self.older_read.is_none() {
                     self.woken.notify_one();
                 }
             }
-            if let Some((older, looked)) = &mut self.find_step {
+            let again = self.again_came().await;
+            changed |= again.is_some();
+            if let Some((older, looked)) = &mut self.find_step
+                && self.again.is_none()
+            {
                 let older = *older;
-                match (self.screen.find_gap(older, looked)).filter(|_| self.finding.is_some()) {
+                let gap = (self.screen.find_gap(older, looked)).filter(|_| self.finding.is_some());
+                match gap {
+                    // A read cut short steps over what it did not draw.
+                    _ if again == Some(true) => {
+                        self.find_step = None;
+                        self.screen.find_next(older);
+                    }
                     // A page at a time, the screen drawn between.
                     Some(page) => {
                         looked.push(page);
-                        self.draw_again(page).await;
-                        // A read cut short steps over what it did not draw.
-                        match self.short_read.get() {
-                            true => {
-                                self.find_step = None;
-                                self.screen.find_next(older);
-                            }
-                            false => self.woken.notify_one(),
-                        }
+                        self.draw_again(page);
                     }
                     None => {
                         self.find_step = None;
@@ -6989,9 +7793,9 @@ impl App {
                 && self.find_step.is_none()
                 && let Some(page) = self.screen.wanted()
             {
-                self.draw_again(page).await;
+                self.draw_again(page);
             }
-            self.jumped().await;
+            self.jumped();
             self.repaint |= term::switched();
             if self.repaint && self.running.is_none() {
                 self.repaint = false;
@@ -7050,29 +7854,8 @@ impl App {
             let record = user_shell::record(&ran);
             // Refused, it is kept, to go with the next message, and the
             // question stays open for that message to answer.
-            match self
-                .send(record.clone(), Some(SHELL), false, false, &[])
-                .await
-            {
-                Ok(()) => {
-                    self.ran_here.extend(user_shell::read(&record));
-                    // Still open: answered or written past meanwhile, it
-                    // takes nothing more.
-                    if let Some(ask) =
-                        answering.filter(|ask| self.asks.iter().any(|open| open.key() == ask.key()))
-                    {
-                        let answer = asks::answer(&ask, &asks::ran(&ran));
-                        match self.send(answer.clone(), None, true, false, &[]).await {
-                            Ok(()) => self.close_ask(&ask, &answer),
-                            Err(error) => self.notice = Some(error),
-                        }
-                    }
-                }
-                Err(error) => {
-                    self.notice = Some(format!("{error}; it goes with your next message"));
-                    hold(&mut self.unsent, record);
-                }
-            }
+            let then = Then::Ran(answering.map(|ask| (ask, ran)));
+            self.send(record, Some(SHELL), (false, false), &[], then);
         }
         if self.live.is_none() && !self.shown.is_empty() {
             let shown = std::mem::take(&mut self.shown);
@@ -7188,7 +7971,7 @@ impl App {
     /// again as a turn ends, and sent by the [`App::configure`] that
     /// follows when they changed. A file of the folder's it cannot use is
     /// left out, and said, and the lead told.
-    async fn folder_instructions(&mut self) {
+    fn folder_instructions(&mut self) {
         if self.project.is_none() || self.options.side.is_some() {
             return;
         }
@@ -7199,22 +7982,140 @@ impl App {
             Ok((Some(text), left_out)) => {
                 self.instruct = Some(text);
                 self.notice = project::warnings_notice(&left_out, true);
-                if let Err(error) = project::tell_warnings(&self.client, &self.bot, &left_out).await
-                {
-                    self.notice = Some(format!("the lead's instructions: {error}"));
-                }
+                let (client, bot) = (self.client.clone(), self.bot.clone());
+                self.write(async move {
+                    let told = project::tell_warnings(&client, &bot, &left_out).await;
+                    let said = told
+                        .err()
+                        .map(|error| format!("the lead's instructions: {error}"));
+                    Wrote::Said(said)
+                });
             }
             Err(error) => self.notice = Some(format!("the lead's instructions: {error}")),
         }
     }
 
-    /// The lead's instructions as composed on attach, sent once no turn
-    /// runs; the next turn reads them.
+    /// `write` sent to the daemon beside the loop, once the writes made
+    /// before it are done, as Codex sends its ops one after another: the
+    /// window goes on meanwhile, and what came of each is applied in the
+    /// order they were made ([`App::wrote`]).
+    fn write(&mut self, write: impl std::future::Future<Output = Wrote> + Send + 'static) {
+        self.write_boxed(Box::pin(write));
+    }
+
+    /// [`App::write`], one body for every write.
+    fn write_boxed(
+        &mut self,
+        write: std::pin::Pin<Box<dyn std::future::Future<Output = Wrote> + Send>>,
+    ) {
+        let before = self.lane.take();
+        let (done, after) = tokio::sync::oneshot::channel::<()>();
+        self.lane = Some(after);
+        let (send, receive) = tokio::sync::oneshot::channel();
+        let woken = self.woken.clone();
+        tokio::spawn(async move {
+            if let Some(before) = before {
+                let _ = before.await;
+            }
+            let _ = send.send(write.await);
+            let _ = done.send(());
+            woken.notify_one();
+        });
+        self.writes.push_back(receive);
+    }
+
+    /// Everything the window left running beside its loop done and
+    /// applied, as the loop applies it: what a test looks at once the
+    /// window is at rest.
+    #[cfg(test)]
+    async fn beside_done(&mut self) {
+        loop {
+            self.wrote();
+            self.verdicts_came();
+            self.hear();
+            // Read every few seconds, it wakes no one: waited on here.
+            if let Some(job) = self.raising.take() {
+                self.approvals_raised(job.await.expect("the calls below were read"));
+                continue;
+            }
+            if self.writes.is_empty()
+                && self.hearing.is_none()
+                && self.verdicting.is_empty()
+                && self.unheard.is_none()
+                && self.raising.is_none()
+            {
+                return;
+            }
+            let woken = self.woken.clone();
+            tokio::time::timeout(Duration::from_secs(10), woken.notified())
+                .await
+                .expect("what runs beside the window came back");
+        }
+    }
+
+    /// What came of the writes done, in the order they were made.
+    fn wrote(&mut self) {
+        while let Some(writing) = self.writes.front_mut() {
+            let wrote = match writing.try_recv() {
+                Ok(wrote) => wrote,
+                Err(tokio::sync::oneshot::error::TryRecvError::Empty) => return,
+                Err(_) => {
+                    self.writes.pop_front();
+                    continue;
+                }
+            };
+            self.writes.pop_front();
+            match wrote {
+                Wrote::Configured(picked, taken, reviewer) => {
+                    self.configured(*picked, taken, reviewer)
+                }
+                Wrote::Said(said) => {
+                    if let Some(said) = said {
+                        self.notice = Some(said);
+                    }
+                }
+                Wrote::Sent(sent) => {
+                    for (message, reply) in sent {
+                        self.sent(message, reply);
+                    }
+                }
+                Wrote::TaskAnswered(answering, reply) => self.task_answered(*answering, reply),
+                // Taken off, not toggled: the person may have taken it off
+                // already while it was being sent.
+                Wrote::Reacted(node, emoji, Some(error)) => {
+                    let _ = self.reactions.set(node, &emoji, false);
+                    self.notice = Some(error);
+                    let row = self.reacted_row(node);
+                    self.flush();
+                    let (tag, buttons) = (screen::Tag::Reactions(node), self.reacted_buttons(node));
+                    (self.screen).put_under_with(screen::Tag::End(node), tag, row, buttons);
+                }
+                Wrote::Reacted(_, _, None) => {}
+                Wrote::Quoted(said) => self.quote(&said),
+                // Taken away once the agent will hear of it; kept to close
+                // again when it could not be told.
+                Wrote::NoteClosed(id, None) => {
+                    self.margin.remove(&id, None);
+                    self.closing.insert(id);
+                }
+                Wrote::NoteClosed(_, Some(error)) => self.notice = Some(error),
+                Wrote::Compacted(Ok(_)) => self.compact_next = true,
+                Wrote::Compacted(Err(error)) => self.notice = Some(format!("compact: {error}")),
+                Wrote::Answered(answering, answered, rest) => {
+                    self.call_answered(*answering, answered, rest)
+                }
+            }
+        }
+    }
+
+    /// The lead's instructions as composed on attach, and what the person
+    /// picked, sent once no turn runs; the next turn reads them. Sent
+    /// beside the loop, after the writes before it ([`App::write`]): the
+    /// picks are the bot's once the daemon takes them ([`App::configured`]).
     ///
-    /// Whether what was picked is now the bot's: false while it waits
-    /// for the turn to end, or when the daemon refused it (the notice says
-    /// why).
-    async fn configure(&mut self) -> bool {
+    /// Whether what was picked was sent: false while it waits for the
+    /// turn to end.
+    fn configure(&mut self) -> bool {
         if self.instruct.is_none()
             && self.switch.is_none()
             && self.gating.is_none()
@@ -7231,6 +8132,14 @@ impl App {
         let (text, switch, gating) = (self.instruct.take(), self.switch.take(), self.gating.take());
         let cache = self.cache.take();
         let pace = self.pace.take();
+        // What was sent is what a pick made before the daemon answers
+        // compares with.
+        if switch.is_some() {
+            self.switch_sent = switch.clone();
+        }
+        if pace.is_some() {
+            self.pace_sent = pace;
+        }
         let env = self.env.take();
         let mut declare = self.declare.take();
         // A bot that went without the tools Sonny gates, as its gate was
@@ -7244,6 +8153,9 @@ impl App {
             .as_ref()
             .and(self.mode)
             .filter(|mode| *mode != "full"));
+        if gating.is_some() {
+            self.gating_sent += 1;
+        }
         // An agent's sandbox goes with its row, a lead's, a task's or
         // a side chat's, which the daemon holds within its agent's.
         let workspace = std::path::Path::new(&self.workspace);
@@ -7290,7 +8202,77 @@ impl App {
         if !settings.is_empty() {
             asked["settings"] = Value::Object(settings);
         }
-        match self.client.request("configure", asked).await {
+        // The reviewer `auto` asks for, on the model the bot runs once
+        // this is taken.
+        let reviewer = (gating)
+            .filter(|mode| approvals::reviews(Some(*mode)))
+            .map(|_| {
+                switch
+                    .as_ref()
+                    .map_or(&self.model, |(model, _)| model)
+                    .clone()
+            });
+        let let_go = match switch {
+            Some(_) => (self.turn_model.take(), self.boost.take()),
+            None => (None, None),
+        };
+        let picked = Configuring {
+            text,
+            switch,
+            gating,
+            declare,
+            cache,
+            pace,
+            env,
+            let_go,
+        };
+        let client = self.client.clone();
+        self.write(async move {
+            let taken = client.request("configure", asked).await;
+            let reviewer = match (&taken, reviewer) {
+                (Ok(_), Some(model)) => serve_auto(&client, &model).await.err(),
+                _ => None,
+            };
+            Wrote::Configured(Box::new(picked), taken, reviewer)
+        });
+        true
+    }
+
+    /// What came of a `configure` [`App::configure`] sent: the picks the
+    /// bot's now, or picked again once its turn ends.
+    fn configured(
+        &mut self,
+        picked: Configuring,
+        taken: Result<Value, agent_client::Error>,
+        reviewer: Option<String>,
+    ) {
+        let Configuring {
+            text,
+            switch,
+            gating,
+            declare,
+            cache,
+            pace,
+            env,
+            let_go,
+        } = picked;
+        if self.switch_sent.is_some() && self.switch_sent == switch {
+            self.switch_sent = None;
+        }
+        if self.pace_sent.is_some() && self.pace_sent == pace {
+            self.pace_sent = None;
+        }
+        if gating.is_some() {
+            self.gating_sent = self.gating_sent.saturating_sub(1);
+        }
+        // Not taken: what the switch let go is the window's again, unless
+        // picked anew meanwhile.
+        if taken.is_err() {
+            let (turn_model, boost) = let_go;
+            self.turn_model = self.turn_model.take().or(turn_model);
+            self.boost = self.boost.take().or(boost);
+        }
+        match taken {
             Ok(_) => {
                 if let Some(declare) = &declare {
                     self.declared = declare.clone();
@@ -7324,29 +8306,26 @@ impl App {
                 }
                 if let Some(mode) = gating {
                     self.mode = Some(mode);
-                    if approvals::reviews(Some(mode))
-                        && let Err(error) = serve_auto(&self.client, &self.model).await
-                    {
-                        self.notice = Some(error);
-                    }
+                }
+                if let Some(error) = reviewer {
+                    self.notice = Some(error);
                 }
             }
+            // Picked again meanwhile, the newer pick stands.
             Err(error) if error.code == "bot_busy" => {
-                self.instruct = text;
-                self.switch = switch;
-                self.gating = gating;
-                self.declare = declare;
-                self.cache = cache;
-                self.pace = pace;
-                self.env = env;
-                return false;
+                self.instruct = self.instruct.take().or(text);
+                self.switch = self.switch.take().or(switch);
+                self.gating = self.gating.take().or(gating);
+                self.declare = self.declare.take().or(declare);
+                self.cache = self.cache.take().or(cache);
+                self.pace = self.pace.take().or(pace);
+                self.env = self.env.take().or(env);
+                if self.switch.is_some() || self.pace.is_some() || self.gating.is_some() {
+                    self.notice = Some("applies when idle".into());
+                }
             }
-            Err(error) => {
-                self.notice = Some(error.to_string());
-                return false;
-            }
+            Err(error) => self.notice = Some(error.to_string()),
         }
-        true
     }
 
     /// Give the row picked with `/permissions` to every agent the lead made,
@@ -7381,7 +8360,12 @@ impl App {
             // after the lead had its change, read each, and changed none:
             // one changed while on its old permissions may have made an
             // agent that listing did not name.
-            if after_lead && !again && spread.waiting.is_empty() && self.gating.is_none() {
+            if after_lead
+                && !again
+                && spread.waiting.is_empty()
+                && self.gating.is_none()
+                && self.gating_sent == 0
+            {
                 self.spread = None;
             }
             return;
@@ -7393,7 +8377,7 @@ impl App {
             self.client.clone(),
             self.bot.clone(),
             (spread.pick, spread.mode),
-            self.gating.is_none(),
+            self.gating.is_none() && self.gating_sent == 0,
             (spread.settled.clone(), spread.waiting.clone()),
             std::mem::take(&mut spread.sandboxes),
             self.woken.clone(),
@@ -7550,7 +8534,7 @@ impl App {
     /// in the view just picked, once no turn is running: the screen
     /// cleared, and the bot's items read again as on attach. The pages of
     /// older items above are drawn again only as the view nears them.
-    async fn repaint(&mut self, terminal: &mut Tui) -> Result<(), String> {
+    async fn repaint(&mut self, terminal: &mut Terminal<impl Drawn>) -> Result<(), String> {
         // The pages of older items above stay, as blank rows drawn again
         // as the view nears them: only the newest rows are drawn now.
         let pages = self.screen.pages();
@@ -7603,117 +8587,211 @@ impl App {
         Ok(())
     }
 
-    /// The page of items before the oldest drawn, drawn on its own and
-    /// put above the rest, the view left where it is: the conversation
-    /// drawn so far is not drawn again, and a turn running goes on. On
-    /// the way up to the first turn, the pages over it are blank rows as
-    /// tall as they may be, a few at a time, drawn once the view nears
-    /// them.
-    async fn older(&mut self) {
+    /// The page of items before the oldest drawn, read beside the loop
+    /// and drawn once it comes ([`App::older_came`]): the conversation
+    /// drawn so far scrolls meanwhile. One is read at a time.
+    fn older(&mut self) {
+        let Some(from) = self.older.filter(|_| self.older_read.is_none()) else {
+            return;
+        };
+        // On the way up, as many nodes as a read gives, cut into pages.
+        let to_first = self.to_first;
+        let limit = match to_first {
+            true => WALKED_ITEMS,
+            false => OLDER_ITEMS,
+        };
+        // Who started the turn the page drawn starts in, where it is shown.
+        let prompts = self.zen.is_some() || !self.palette().is_empty() || self.words();
+        let (client, bot, woken) = (self.client.clone(), self.bot.clone(), self.woken.clone());
+        let (send, receive) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let asked = json!({"bot": bot, "from": from, "limit": limit});
+            let page = client.request("history_nodes", asked).await;
+            let mut read = PageRead::default();
+            if let Ok(page) = &page {
+                let listed: Vec<(i64, Option<i64>)> = (page["nodes"].as_array().into_iter())
+                    .flatten()
+                    .filter_map(|n| Some((n["node"].as_i64()?, n["turn"].as_i64())))
+                    .rev()
+                    .collect();
+                let nodes: Vec<i64> = listed.iter().map(|(node, _)| *node).collect();
+                // The page drawn: the newest, or on the way up the first.
+                let drawn = match (to_first, page["next_from"].is_null()) {
+                    (false, _) => listed.len().saturating_sub(OLDER_ITEMS as usize),
+                    (true, true) => 0,
+                    (true, false) => listed.len(),
+                };
+                let turns: Vec<i64> = (listed.get(drawn).and_then(|(_, turn)| *turn))
+                    .filter(|_| prompts)
+                    .into_iter()
+                    .collect();
+                read = read_page(&client, &bot, &nodes, &turns).await;
+            }
+            let _ = send.send((from, page, read));
+            woken.notify_one();
+        });
+        self.older_read = Some(receive);
+    }
+
+    /// The page [`App::older`] read, drawn above the rest, the view left
+    /// where it is: the conversation drawn so far is not drawn again, and
+    /// a turn running goes on. On the way up to the first turn, the pages
+    /// over it are blank rows as tall as they may be, drawn once the view
+    /// nears them. Whether one came.
+    async fn older_came(&mut self) -> bool {
+        let Some(reading) = &mut self.older_read else {
+            return false;
+        };
+        let (from, page, mut read) = match reading.try_recv() {
+            Ok(came) => came,
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty) => return false,
+            Err(_) => {
+                self.older_read = None;
+                return false;
+            }
+        };
+        self.older_read = None;
+        // Drawn anew meanwhile: what was read goes where nothing waits for it.
+        if self.older != Some(from) {
+            return false;
+        }
+        let page = match page {
+            Ok(page) => page,
+            Err(error) => {
+                self.notice = Some(error.to_string());
+                // Not asked again at once: the way up stops.
+                self.to_first = false;
+                return true;
+            }
+        };
+        let mut nodes: Vec<i64> = Vec::new();
+        let mut turns: HashMap<i64, i64> = HashMap::new();
+        for n in page["nodes"].as_array().into_iter().flatten() {
+            let Some(node) = n["node"].as_i64() else {
+                continue;
+            };
+            nodes.push(node);
+            if let Some(turn) = n["turn"].as_i64() {
+                turns.insert(node, turn);
+            }
+        }
+        nodes.reverse();
+        self.older = page["next_from"].as_i64();
+        if nodes.is_empty() {
+            self.older = None;
+            return true;
+        }
+        // A read cut short: the rest of the way drawn a page at a time.
+        if self.to_first && read.short {
+            self.older = Some(from);
+            self.to_first = false;
+            return true;
+        }
+        let mut items = std::mem::take(&mut read.items);
         // Newest first, those on the way up, by their ids and rows.
         let mut blanks: Vec<(u64, usize)> = Vec::new();
-        while let Some(from) = self.older
-            && blanks.len() < WALKED_PAGES
-        {
-            // On the way up, as many nodes as a read gives, cut into pages.
-            let limit = match self.to_first {
-                true => WALKED_ITEMS,
-                false => OLDER_ITEMS,
-            };
-            let asked = json!({"bot": self.bot, "from": from, "limit": limit});
-            let page = match self.client.request("history_nodes", asked).await {
-                Ok(page) => page,
-                Err(error) => {
-                    self.notice = Some(error.to_string());
-                    // Not asked again at once: the way up stops.
-                    self.to_first = false;
-                    break;
-                }
-            };
-            let mut nodes: Vec<i64> = Vec::new();
-            let mut turns: HashMap<i64, i64> = HashMap::new();
-            for n in page["nodes"].as_array().into_iter().flatten() {
-                let Some(node) = n["node"].as_i64() else {
-                    continue;
+        while !nodes.is_empty() {
+            let cut = nodes.len().saturating_sub(OLDER_ITEMS as usize);
+            let ours = nodes.split_off(cut);
+            self.first_node = Some(ours[0]);
+            let turns = (ours.iter())
+                .filter_map(|node| Some((*node, *turns.get(node)?)))
+                .collect();
+            let after = std::mem::take(&mut self.unpaired);
+            let first = self.older.is_none() && nodes.is_empty();
+            let paged = Paged::new(ours, turns, &after, first);
+            let id = self.next_page;
+            self.next_page += 1;
+            let cut = items.partition_point(|(node, _)| *node < paged.nodes[0]);
+            let ours = items.split_off(cut);
+            if !self.to_first || paged.first {
+                blanks.reverse();
+                self.screen.prepend_blank(std::mem::take(&mut blanks));
+                let page = PageRead {
+                    items: ours,
+                    short: read.short,
+                    prompts: std::mem::take(&mut read.prompts),
                 };
-                nodes.push(node);
-                if let Some(turn) = n["turn"].as_i64() {
-                    turns.insert(node, turn);
-                }
-            }
-            nodes.reverse();
-            self.older = page["next_from"].as_i64();
-            if nodes.is_empty() {
-                self.older = None;
-                break;
-            }
-            self.short_read.set(false);
-            let mut items = match self.to_first {
-                true => self.items_at(&nodes).await,
-                false => Vec::new(),
-            };
-            // A read cut short: the rest of the way drawn a page at a time.
-            if self.short_read.get() {
-                self.older = Some(from);
-                self.to_first = false;
-                break;
-            }
-            while !nodes.is_empty() {
-                let cut = nodes.len().saturating_sub(OLDER_ITEMS as usize);
-                let ours = nodes.split_off(cut);
-                self.first_node = Some(ours[0]);
-                let turns = (ours.iter())
-                    .filter_map(|node| Some((*node, *turns.get(node)?)))
-                    .collect();
-                let after = std::mem::take(&mut self.unpaired);
-                let first = self.older.is_none() && nodes.is_empty();
-                let paged = Paged::new(ours, turns, &after, first);
-                let id = self.next_page;
-                self.next_page += 1;
-                let cut = items.partition_point(|(node, _)| *node < paged.nodes[0]);
-                let read = items.split_off(cut);
-                if !self.to_first || paged.first {
-                    blanks.reverse();
-                    self.screen.prepend_blank(blanks);
-                    let (older, unpaired) = self.draw_page(&paged, after).await;
-                    self.unpaired = unpaired;
-                    self.page_rows.0 += older.rows();
-                    self.page_rows.1 += paged.nodes.len();
-                    self.pages.insert(id, paged);
-                    self.screen.prepend(id, older);
-                    self.join_page(id);
-                    return;
-                }
-                // Only read: what its calls returned is all drawing it gives.
-                self.unpaired = unpaired(read.into_iter().chain(after));
-                let (rows, items) = self.page_rows;
-                blanks.push((id, paged.nodes.len() * rows.max(1) / items.max(1)));
+                let (older, unpaired) = self.draw_page(&paged, after, page).await;
+                self.unpaired = unpaired;
+                self.page_rows.0 += older.rows();
+                self.page_rows.1 += paged.nodes.len();
                 self.pages.insert(id, paged);
+                self.screen.prepend(id, older);
+                self.join_page(id);
+                if nodes.is_empty() {
+                    return true;
+                }
+                // The way up to the first turn was left while this read
+                // was out: the rest it read waits above as blank pages,
+                // drawn as the view nears them, so none is skipped.
+                continue;
             }
+            // Only read: what its calls returned is all drawing it gives.
+            self.unpaired = unpaired(ours.into_iter().chain(after));
+            let (rows, items) = self.page_rows;
+            blanks.push((id, paged.nodes.len() * rows.max(1) / items.max(1)));
+            self.pages.insert(id, paged);
         }
         blanks.reverse();
         self.screen.prepend_blank(blanks);
+        true
     }
 
-    /// The page `id`, let go as the view moved away, drawn again as it
-    /// nears it: once all its items are read, else asked for again.
-    async fn draw_again(&mut self, id: u64) {
-        let Some(paged) = self.pages.remove(&id) else {
+    /// The page `id`, let go as the view moved away, read again beside
+    /// the loop as the view nears it ([`App::again_came`]). One is read
+    /// at a time.
+    fn draw_again(&mut self, id: u64) {
+        let prompts = self.zen.is_some() || !self.palette().is_empty() || self.words();
+        let Some(paged) = self.pages.get(&id).filter(|_| self.again.is_none()) else {
             return;
         };
-        self.short_read.set(false);
-        let mut after = self.items_at(&paged.after).await;
+        let (nodes, after) = (paged.nodes.clone(), paged.after.clone());
+        let turns: Vec<i64> = (nodes.first().and_then(|node| paged.turns.get(node)))
+            .filter(|_| prompts)
+            .copied()
+            .into_iter()
+            .collect();
+        let (client, bot, woken) = (self.client.clone(), self.bot.clone(), self.woken.clone());
+        let (send, receive) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let after = needs::items(&client, &bot, &after).await;
+            let page = read_page(&client, &bot, &nodes, &turns).await;
+            let _ = send.send((id, after, page));
+            woken.notify_one();
+        });
+        self.again = Some(receive);
+    }
+
+    /// The page [`App::draw_again`] read, drawn in its place: once all its
+    /// items were read, else asked for again. Whether it was read short,
+    /// when one came.
+    async fn again_came(&mut self) -> Option<bool> {
+        let reading = self.again.as_mut()?;
+        let (id, (mut after, short), page) = match reading.try_recv() {
+            Ok(came) => came,
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty) => return None,
+            Err(_) => {
+                self.again = None;
+                return None;
+            }
+        };
+        self.again = None;
+        let paged = self.pages.remove(&id)?;
+        self.short_read.set(short);
         after.retain(|(_, item)| {
             paged
                 .returned
                 .contains(item["call_id"].as_str().unwrap_or(""))
         });
-        let (older, _) = self.draw_page(&paged, after).await;
+        let (older, _) = self.draw_page(&paged, after, page).await;
         self.pages.insert(id, paged);
-        if !self.short_read.get() {
+        let short = self.short_read.get();
+        if !short {
             self.screen.fill(id, older);
             self.join_page(id);
         }
+        Some(short)
     }
 
     /// The rows of a page of older items, and what calls older than it
@@ -7724,6 +8802,7 @@ impl App {
         &mut self,
         paged: &Paged,
         after: Vec<(i64, Value)>,
+        page: PageRead,
     ) -> (screen::Screen, Vec<(i64, Value)>) {
         self.flush();
         self.newer = Some(std::mem::take(&mut self.screen));
@@ -7741,7 +8820,7 @@ impl App {
             self.commit_welcome();
         }
         let unpaired = self
-            .draw_nodes(&paged.nodes, &paged.turns, true, after, None)
+            .draw_nodes(&paged.nodes, &paged.turns, true, after, None, Some(page))
             .await;
         // The page's last rows wear what they were drawn with; the blank
         // under them, none.
@@ -8539,6 +9618,11 @@ impl App {
     /// What the tasks started are doing, read again every few seconds:
     /// those still at work, and every one when news of them came.
     async fn read_tasks(&mut self) {
+        if let Some(job) = self.tasking.take_if(|job| job.is_finished())
+            && let Ok(read) = job.await
+        {
+            self.tasks_came(read);
+        }
         // Rosters whose rows the conversation let go are neither kept nor
         // read again.
         let gone: Vec<usize> = (self.tasks.keys())
@@ -8575,6 +9659,7 @@ impl App {
             self.redraw_run_rows(true);
         }
         if none
+            || self.tasking.is_some()
             || self
                 .tasks_read
                 .is_some_and(|at| at.elapsed() < Duration::from_secs(3))
@@ -8610,150 +9695,72 @@ impl App {
             .cloned()
             .collect();
         others.sort();
-        // What waits on the person, read as every surface reads it.
-        let held = match bots.is_empty() && others.is_empty() {
-            true => None,
-            false => Some(needs::listing(&self.client, None).await),
+        let asked = TasksAsked {
+            client: self.client.clone(),
+            store: self.store(),
+            all,
+            seen: (bots.iter().chain(&others))
+                .filter_map(|bot| Some((bot.clone(), self.asks_seen.get(bot)?.clone())))
+                .collect(),
+            heads: (bots.iter())
+                .filter_map(|bot| Some((bot.clone(), *self.running_heads.get(bot)?)))
+                .collect(),
+            waited: (bots.iter())
+                .filter(|bot| self.task_needs.waits(bot))
+                .cloned()
+                .collect(),
+            bots,
+            others,
+            named,
         };
-        let store = self.store();
-        // Those others wait on the person for a call held for approval, or
-        // the question their turn ended on.
-        let mut waiting = needs::Needs::default();
-        if let Some(Ok(held)) = &held {
-            waiting.held(held.clone(), |_| true);
-        }
-        for bot in others {
-            let state = match self.task_turn_at(&bot).await {
-                Ok((turn, _)) => {
-                    let state = started::state(&turn);
-                    if let (true, Some(last)) = (started::settled(&state), turn["turn"].as_i64()) {
-                        let seen = match self.asks_seen.get(&bot) {
-                            Some((at, seen)) if *at == last => Some(seen.clone()),
-                            _ => {
-                                let seen = needs::scan(&self.client, &bot, Some(last)).await;
-                                if let Some(seen) = &seen {
-                                    self.asks_seen.insert(bot.clone(), (last, seen.clone()));
-                                }
-                                seen
-                            }
-                        };
-                        if let Some(seen) = seen {
-                            waiting.asked(&bot, seen.open(&store, &bot, false));
-                        }
-                    }
-                    match waiting.waits(&bot) {
-                        true => "needs you".to_owned(),
-                        false => state,
-                    }
-                }
-                Err(error) if error.code == "bot_not_found" => "removed".to_owned(),
-                Err(_) => continue,
-            };
-            self.set_states.insert(bot, state);
-        }
-        let Some(held) = held.filter(|_| !bots.is_empty()) else {
-            self.redraw_set_rows(&named);
-            return;
-        };
-        let mut needs = needs::Needs::default();
-        if let Ok(held) = &held {
-            needs.held(held.clone(), |_| true);
-        }
-        let (mut read, mut ended) = (Vec::new(), Vec::new());
-        let mut states = HashMap::new();
-        // The tasks whose questions were read this pass.
-        let mut asked = Vec::new();
-        for bot in bots {
-            // Marked done, by itself or its lead, since its newest turn.
-            let mut done = false;
-            let state = match self.task_turn_at(&bot).await {
-                Ok((turn, head)) => {
-                    let state = started::state(&turn);
-                    // A running task may ask and go on working: read again
-                    // now and then, once its history grew since.
-                    if !started::settled(&state)
-                        && all
-                        && head.is_some()
-                        && self.running_heads.get(&bot) != head.as_ref()
+        // Applied at the next look-round, which draws anyway: a read
+        // repeated every few seconds draws no frame of its own.
+        self.tasking = Some(tokio::spawn(asked.read()));
+    }
+
+    /// What a read of the tasks started found, kept and drawn.
+    fn tasks_came(&mut self, came: TasksRead) {
+        self.asks_seen.extend(came.seen);
+        self.set_states.extend(came.set_states);
+        if let Some(pass) = came.pass {
+            for bot in &pass.removed {
+                // A removed task asks nothing.
+                self.task_needs.forget(bot);
+                self.running_heads.remove(bot);
+            }
+            self.running_heads.extend(pass.heads);
+            let listed: &[String] = if pass.listed { &pass.read } else { &[] };
+            if let Some(fleet) = &mut self.fleet {
+                fleet.adopt(&pass.needs, pass.listed.then_some(listed), &pass.ended);
+            }
+            // A running task not read again this pass keeps what it asked;
+            // the calls waiting are as listed, when they could be.
+            self.task_needs.adopt(&pass.needs, listed, &pass.asked);
+            for at in self.tasks.keys().copied().collect::<Vec<_>>() {
+                let mut changed = false;
+                for task in self.tasks.get_mut(&at).into_iter().flatten() {
+                    if let Some(state) = pass.states.get(&task.bot)
+                        && *state != task.state
                     {
-                        // One that could not be read is read again next pass,
-                        // keeping what it asked meanwhile.
-                        if let Some(seen) = needs::scan(&self.client, &bot, None).await {
-                            self.running_heads
-                                .insert(bot.clone(), head.unwrap_or_default());
-                            needs.asked(&bot, seen.open(&store, &bot, true));
-                            asked.push(bot.clone());
-                        }
-                    }
-                    // A turn that ended on a question waits on the person;
-                    // read once per turn it ended.
-                    if let (true, Some(last)) = (started::settled(&state), turn["turn"].as_i64()) {
-                        // One that could not be read whole is neither kept
-                        // nor taken as asking nothing: read again next pass,
-                        // keeping what it asked meanwhile.
-                        let seen = match self.asks_seen.get(&bot) {
-                            Some((at, seen)) if *at == last => Some(seen.clone()),
-                            _ => {
-                                let seen = needs::scan(&self.client, &bot, Some(last)).await;
-                                if let Some(seen) = &seen {
-                                    self.asks_seen.insert(bot.clone(), (last, seen.clone()));
-                                }
-                                seen
-                            }
-                        };
-                        if let Some(seen) = seen {
-                            // A task's own mark holds once its turn completed.
-                            done = (seen.itself && turn["status"] == "completed")
-                                || resolved::holds(resolved::read(&store, &bot), seen.turn, false);
-                            // One the lead resolved set its question aside.
-                            needs.asked(&bot, seen.open(&store, &bot, false));
-                            ended.push(bot.clone());
-                            asked.push(bot.clone());
-                        }
-                    }
-                    read.push(bot.clone());
-                    // One not read again this pass waits on what it asked.
-                    let waits =
-                        needs.waits(&bot) || (!asked.contains(&bot) && self.task_needs.waits(&bot));
-                    match (waits, done) {
-                        (true, _) => "needs you".to_owned(),
-                        (false, true) => started::DONE.to_owned(),
-                        _ => state,
+                        task.state = state.clone();
+                        changed = true;
                     }
                 }
-                Err(error) if error.code == "bot_not_found" => {
-                    // A removed task asks nothing.
-                    self.task_needs.forget(&bot);
-                    self.running_heads.remove(&bot);
-                    "removed".to_owned()
-                }
-                // Not read this time: it stays as it was.
-                Err(_) => continue,
-            };
-            states.insert(bot, state);
-        }
-        if let Some(fleet) = &mut self.fleet {
-            fleet.adopt(&needs, held.is_ok().then_some(&read[..]), &ended);
-        }
-        // A running task not read again this pass keeps what it asked; the
-        // calls waiting are as listed, when they could be.
-        let listed: &[String] = if held.is_ok() { &read } else { &[] };
-        self.task_needs.adopt(&needs, listed, &asked);
-        for at in self.tasks.keys().copied().collect::<Vec<_>>() {
-            let mut changed = false;
-            for task in self.tasks.get_mut(&at).into_iter().flatten() {
-                if let Some(state) = states.get(&task.bot)
-                    && *state != task.state
-                {
-                    task.state = state.clone();
-                    changed = true;
+                if changed {
+                    self.draw_started(at);
                 }
             }
-            if changed {
-                self.draw_started(at);
-            }
         }
-        self.redraw_set_rows(&named);
+        self.redraw_set_rows(&came.named);
+    }
+
+    /// [`App::read_tasks`] through to what it found, kept and drawn.
+    #[cfg(test)]
+    async fn read_tasks_through(&mut self) {
+        self.read_tasks().await;
+        if let Some(job) = self.tasking.take() {
+            self.tasks_came(job.await.expect("the tasks were read"));
+        }
     }
 
     /// The `└` rows naming an agent whose state is no longer as `was`
@@ -8787,11 +9794,7 @@ impl App {
 
     /// [`App::task_turn`], with the newest node of `bot`'s history.
     async fn task_turn_at(&self, bot: &str) -> Result<(Value, Option<i64>), agent_client::Error> {
-        let record = (self.client)
-            .request("inspect", json!({"bot": bot}))
-            .await?;
-        let turn = active_turn(&self.client, bot, record["running_turn"].as_i64(), None).await?;
-        Ok((self.with_error(turn).await, record["head"].as_i64()))
+        task_turn_at(&self.client, bot).await
     }
 
     /// A failed `turn` with why it failed, which `turns` leaves out, as
@@ -9116,14 +10119,10 @@ impl App {
                 return;
             };
             let answer = asks::answer(&ask, &(at + 1).to_string());
-            let sent = match &ask.task {
-                Some(_) => self.answer_task(&ask, &answer, &[]).await,
-                None => (self.send(answer.clone(), None, false, false, &[]).await)
-                    .map(|()| self.close_ask(&ask, &answer)),
-            };
-            match sent {
-                Ok(()) => self.notice = None,
-                Err(error) => self.notice = Some(error),
+            self.notice = None;
+            match &ask.task {
+                Some(_) => self.answer_task(&ask, &answer, &[], None),
+                None => self.send(answer, None, (false, false), &[], Then::Closes(ask)),
             }
         }
     }
@@ -10276,25 +11275,70 @@ impl App {
     /// seconds while their bots are there: what each shows is kept once
     /// its bot is gone.
     async fn read_references(&mut self) {
+        if let Some(job) = self.referencing.take_if(|job| job.is_finished()) {
+            self.references_came(job.await.unwrap_or_default());
+        }
         let shown = self.margin.references();
         (self.references).retain(|(bot, id), _| shown.iter().any(|(_, b, i)| b == bot && i == id));
         if shown.is_empty()
+            || self.referencing.is_some()
             || (self.references_read).is_some_and(|at| at.elapsed() < Duration::from_secs(3))
         {
             return;
         }
         self.references_read = Some(Instant::now());
-        let mut read = std::collections::HashSet::new();
+        let mut reading = Vec::new();
         for (note, bot, id) in shown {
             let key = (bot, id);
-            let mut reference = self.references.remove(&key).unwrap_or_default();
-            if read.insert(key.clone()) && !reference.gone {
-                self.read_reference(&key.0, &key.1, &mut reference).await;
+            if reading.iter().any(|(read, _)| *read == key) {
+                continue;
             }
-            if let Some((title, body, folder)) = reference.shown() {
+            match self.references.remove(&key) {
+                // Gone, what it showed stays as last read.
+                Some(reference) if reference.gone => {
+                    if let Some((title, body, folder)) = reference.shown() {
+                        self.margin.resolved(&note, title, body, folder);
+                    }
+                    self.references.insert(key, reference);
+                }
+                reference => reading.push((key, reference.unwrap_or_default())),
+            }
+        }
+        if reading.is_empty() {
+            return;
+        }
+        // Applied at the next look-round, which draws anyway.
+        let client = self.client.clone();
+        self.referencing = Some(tokio::spawn(async move {
+            for ((bot, id), reference) in &mut reading {
+                read_reference(&client, bot, id, reference).await;
+            }
+            reading
+        }));
+    }
+
+    /// The notes read beside the loop, shown on every note that names
+    /// each.
+    fn references_came(&mut self, came: References) {
+        let fresh: Vec<(String, String)> = came.iter().map(|(key, _)| key.clone()).collect();
+        self.references.extend(came);
+        for (note, bot, id) in self.margin.references() {
+            let key = (bot, id);
+            if fresh.contains(&key)
+                && let Some((title, body, folder)) =
+                    self.references.get(&key).and_then(margin::Reference::shown)
+            {
                 self.margin.resolved(&note, title, body, folder);
             }
-            self.references.insert(key, reference);
+        }
+    }
+
+    /// [`App::read_references`] through to what it read, shown.
+    #[cfg(test)]
+    async fn read_references_through(&mut self) {
+        self.read_references().await;
+        if let Some(job) = self.referencing.take() {
+            self.references_came(job.await.expect("the references were read"));
         }
     }
 
@@ -10478,102 +11522,6 @@ impl App {
         }));
     }
 
-    /// What `bot` did since `reference` was last read of its note `id`,
-    /// and, when that note shows another bot's, what that one did.
-    async fn read_reference(&self, bot: &str, id: &str, reference: &mut margin::Reference) {
-        self.read_history(bot, id, reference).await;
-        // Taken away there, or the bot gone, what it showed stays as
-        // last read.
-        if reference.removed() || reference.gone {
-            return;
-        }
-        let Some((through, note)) = reference.shows() else {
-            reference.through = None;
-            return;
-        };
-        // Read again where it was read from, while it shows the same one.
-        let mut shown = (reference.through.take())
-            .filter(|shown| shown.names.as_ref() == Some(&(through.clone(), note.clone())))
-            .unwrap_or_default();
-        shown.names = Some((through.clone(), note.clone()));
-        if !shown.gone {
-            self.read_history(&through, &note, &mut shown).await;
-        }
-        reference.through = Some(shown);
-    }
-
-    /// What `bot` did since `reference` was last read of its note `id`.
-    async fn read_history(&self, bot: &str, id: &str, reference: &mut margin::Reference) {
-        // The bot first read, every time: another given its name once it
-        // is gone is not the one shown, and what was read of it stays.
-        let asked = json!({"bot": bot, "bot_id": reference.bot_id});
-        match self.client.request("inspect", asked).await {
-            Ok(record) => {
-                reference.bot_id = record["bot_id"].as_i64();
-                if reference.workspace.is_none() {
-                    reference.workspace = record["workspace"].as_str().map(str::to_owned);
-                }
-            }
-            Err(error) => {
-                reference.gone = error.code == "bot_not_found";
-                return;
-            }
-        }
-        // The newest nodes first, read back as far as the note's start,
-        // then only what came after them.
-        let mut pages: Vec<Vec<Value>> = Vec::new();
-        let mut newest = None;
-        let mut from: Option<i64> = None;
-        while pages.len() < REFERENCE_PAGES {
-            let asked = match (reference.node, from) {
-                (Some(node), _) => {
-                    json!({"bot": bot, "limit": 400, "min_node": node + 1, "oldest_first": true})
-                }
-                (None, Some(from)) => json!({"bot": bot, "limit": 400, "from": from}),
-                (None, None) => json!({"bot": bot, "limit": 400}),
-            };
-            let page = match self.client.request("history_nodes", asked).await {
-                Ok(page) => page,
-                Err(error) => {
-                    reference.gone = error.code == "bot_not_found";
-                    return;
-                }
-            };
-            let mut nodes: Vec<i64> = (page["nodes"].as_array().into_iter().flatten())
-                .filter_map(|node| node["node"].as_i64())
-                .collect();
-            nodes.sort_unstable();
-            let Some(&last) = nodes.last() else {
-                break;
-            };
-            newest = newest.max(Some(last));
-            // In the nodes' order, and each node's as it holds them; a read
-            // cut short is asked again from where it was, next time.
-            let short = self.short_read.replace(false);
-            let items: Vec<Value> = (self.items_of(bot, &nodes).await.into_iter())
-                .map(|(_, item)| item)
-                .collect();
-            if self.short_read.replace(short) {
-                return;
-            }
-            let started = margin::Reference::starts(id, &items);
-            pages.push(items);
-            from = page["next_from"].as_i64();
-            if reference.node.is_some() || started || from.is_none() {
-                break;
-            }
-        }
-        for items in pages.iter().rev() {
-            reference.read(id, items);
-        }
-        if newest.is_some() {
-            reference.node = newest;
-        }
-        if let Some(path) = reference.file() {
-            reference.file_read(margin::read(&path, &[]).ok());
-        }
-    }
-
     /// [`App::items`], each with the node it is kept at.
     async fn items_at(&self, nodes: &[i64]) -> Vec<(i64, Value)> {
         self.items_of(&self.bot, nodes).await
@@ -10586,28 +11534,6 @@ impl App {
             self.short_read.set(true);
         }
         items
-    }
-
-    /// Call `id`, its name and arguments, read from the bot's newest items.
-    async fn call(&self, id: &str) -> Option<(String, Value)> {
-        let page = self
-            .client
-            .request("history_nodes", json!({"bot": self.bot, "limit": 32}))
-            .await
-            .ok()?;
-        let nodes: Vec<i64> = page["nodes"]
-            .as_array()?
-            .iter()
-            .filter_map(|n| n["node"].as_i64())
-            .collect();
-        let items = self.items(&nodes).await;
-        let call = items
-            .iter()
-            .find(|item| item["type"] == "function_call" && item["call_id"] == id)?;
-        Some((
-            call["name"].as_str()?.to_owned(),
-            serde_json::from_str(call["arguments"].as_str()?).ok()?,
-        ))
     }
 
     /// The bot's latest items, written as the transcript would have shown
@@ -10692,7 +11618,7 @@ impl App {
         if !every {
             self.commit_welcome();
         }
-        let unpaired = (self.draw_nodes(&nodes, &turns, false, Vec::new(), caught_up)).await;
+        let unpaired = (self.draw_nodes(&nodes, &turns, false, Vec::new(), caught_up, None)).await;
         if from_start {
             self.unpaired = unpaired;
         }
@@ -10777,8 +11703,13 @@ impl App {
         older: bool,
         after: Vec<(i64, Value)>,
         mut caught_up: Option<HashMap<String, Value>>,
+        mut page: Option<PageRead>,
     ) -> Vec<(i64, Value)> {
         let short = self.short_read.replace(false);
+        // Read beside the loop already, the page draws without waiting.
+        if page.as_ref().is_some_and(|page| page.short) {
+            self.short_read.set(true);
+        }
         // An older page's turns end their own hints, apart from the newest's.
         let hints = match older {
             true => Some(std::mem::take(&mut self.turn_hints)),
@@ -10803,12 +11734,13 @@ impl App {
         // In words, who started it, for the `↳` over its reply.
         if (self.zen.is_some() || colored || self.words())
             && let Some(&turn) = nodes.first().and_then(|node| turns.get(node))
-            && let Ok(read) = (self.client)
-                .request(
-                    "prompts",
-                    json!({"bot": self.bot, "turn": turn, "bytes": 4096}),
-                )
-                .await
+            && let Some(read) = match &mut page {
+                Some(page) => page.prompts.remove(&turn),
+                None => (self.client)
+                    .request("prompts", prompts_asked(&self.bot, turn))
+                    .await
+                    .ok(),
+            }
             && let Some(prompts) = read["prompts"].as_array()
         {
             let said = |prompt: &Value| {
@@ -10862,9 +11794,10 @@ impl App {
         let mut chunks = nodes.chunks(100);
         let mut after = Some(after);
         loop {
-            let items = match chunks.next() {
-                Some(chunk) => self.items_at(chunk).await,
-                None => match after.take() {
+            let items = match (chunks.next(), &mut page) {
+                (Some(_), Some(page)) => std::mem::take(&mut page.items),
+                (Some(chunk), None) => self.items_at(chunk).await,
+                (None, _) => match after.take() {
                     Some(after) => after,
                     None => break,
                 },
@@ -11049,8 +11982,7 @@ impl App {
                             continue;
                         }
                         if resolves(&name) && !failed && !reactions::refused(&item) {
-                            self.resolve(&arguments, turns.get(&node).copied(), false)
-                                .await;
+                            self.resolve(&arguments, turns.get(&node).copied(), false);
                         }
                         if name == asks::TOOL && !failed && !reactions::refused(&item) {
                             self.asked(id, turns.get(&node).copied(), &arguments);
@@ -11164,21 +12096,24 @@ impl App {
     /// The person's words in line that another window or client sent,
     /// staged here as they are there, from the `queued` event that says
     /// they wait: this window's own were staged as it sent them.
-    async fn stage_sent_elsewhere(&mut self, event: &Value) {
+    fn stage_sent_elsewhere(&mut self, event: &Value, prompt: Option<String>) {
         let data = &event["data"];
-        let Some(message) = event["message"].as_i64() else {
+        let Some(message) = self.sent_elsewhere(event) else {
             return;
         };
-        if data["lapsed"] == true
-            || !needs::from_person(data)
-            || self.staged.iter().any(|(sent, _)| *sent == message)
-        {
-            return;
-        }
-        if let Some(prompt) = self.prompt_of(message).await {
+        if let Some(prompt) = prompt {
             self.staged.push((message, prompt));
             self.waits_as(message, data["delivery"].as_str());
         }
+    }
+
+    /// The message a `queued` event says was sent from elsewhere, when
+    /// this window has not staged it: its words are read to stage it.
+    fn sent_elsewhere(&self, event: &Value) -> Option<i64> {
+        let data = &event["data"];
+        let message = event["message"].as_i64()?;
+        let staged = self.staged.iter().any(|(sent, _)| *sent == message);
+        (data["lapsed"] != true && needs::from_person(data) && !staged).then_some(message)
     }
 
     /// A staged message marked with what it waits for, by how it was
@@ -11197,10 +12132,7 @@ impl App {
     /// A message's words as the person wrote them, read whole from the
     /// store: what its staged row shows.
     async fn prompt_of(&self, message: i64) -> Option<String> {
-        let asked = json!({"bot": self.bot, "turn": message, "bytes": PROMPT_READ_BYTES});
-        let read = self.client.request("prompts", asked).await.ok()?;
-        let text = read["prompts"][0]["text"].as_str()?;
-        Some(stamp::unstamped(text).to_owned())
+        read_prompt(&self.client, &self.bot, message).await
     }
 
     /// The folder the agent works in, where its pictures' paths start:
@@ -11510,7 +12442,118 @@ impl App {
         }
     }
 
+    /// The daemon's event `event` applied at once, what it needs read
+    /// first: for catching up on reconnecting, which waits on the daemon
+    /// anyway. The loop takes events through [`App::hear`].
     async fn daemon(&mut self, event: Value) {
+        let read = (self.wants(&event))
+            .read(self.client.clone(), self.bot.clone())
+            .await;
+        self.heard(event, read);
+    }
+
+    /// The daemon's event taken, applied once what it needs is read
+    /// ([`App::wants`]): the read runs beside the loop, which goes on
+    /// taking keys, and the events after it wait in the connection's queue
+    /// for it. One is applied a pass, so a burst of them never keeps a key
+    /// waiting.
+    fn hear(&mut self) {
+        // What the person sent lands before what the daemon says after it.
+        if self.sending > 0 {
+            return;
+        }
+        // The connection went: what it brought and what was read for it
+        // may be short, and catching up from history draws it whole.
+        if self.client.is_closed() {
+            return;
+        }
+        if let Some(reading) = &mut self.hearing {
+            let read = match reading.try_recv() {
+                Ok(read) => read,
+                Err(tokio::sync::oneshot::error::TryRecvError::Empty) => return,
+                // Its read went with the daemon: applied with nothing read.
+                Err(_) => Read::default(),
+            };
+            self.hearing = None;
+            if let Some(event) = self.unheard.take() {
+                self.heard(event, read);
+            }
+            return;
+        }
+        let Some(event) = self.unheard.take() else {
+            return;
+        };
+        let wants = self.wants(&event);
+        if wants.any() {
+            let (client, bot, woken) = (self.client.clone(), self.bot.clone(), self.woken.clone());
+            let (send, receive) = tokio::sync::oneshot::channel();
+            tokio::spawn(async move {
+                let _ = send.send(wants.read(client, bot).await);
+                woken.notify_one();
+            });
+            self.unheard = Some(event);
+            self.hearing = Some(receive);
+            return;
+        }
+        self.heard(event, Read::default());
+    }
+
+    /// What the daemon's event `event` needs read before [`App::heard`]
+    /// applies it, as the window is once those before it are applied.
+    fn wants(&self, event: &Value) -> Wants {
+        let mut wants = Wants::default();
+        let kind = event["event"].as_str().unwrap_or("");
+        if !self.following || event["bot"] != self.bot.as_str() {
+            return wants;
+        }
+        let data = &event["data"];
+        let turn = event["turn"].as_i64();
+        let node = data["node"].as_i64();
+        let drawn = node.is_some_and(|node| node <= self.seen_node);
+        if kind == "queued" {
+            wants.prompt = self.sent_elsewhere(event);
+        }
+        if drawn && matches!(kind, "steered" | "message" | "tool_completed") {
+            return wants;
+        }
+        let id = data["call_id"].as_str().unwrap_or("");
+        match kind {
+            "configured" => wants.record = true,
+            "accepted" if !drawn => wants.node = node,
+            "steered" | "message" => wants.node = node,
+            "tool_started"
+                if data["name"] != reactions::TOOL && data["arguments_truncated"] == true =>
+            {
+                wants.call = Some(id.to_owned())
+            }
+            "tool_completed" if !self.react_calls.contains_key(id) => {
+                let kept = self.calls.contains_key(id);
+                let denied = data["denied"] == true;
+                if !kept && denied {
+                    wants.call = Some(id.to_owned());
+                }
+                if kept || denied {
+                    wants.node = node;
+                }
+            }
+            "approval_requested" | "approval_asked" | "step_decided" => {
+                wants.approvals = Some(self.running.as_ref().map(|r| r.turn).or(turn));
+            }
+            "lifted_ended" if data["outcome"] == "denied" && !data["approvals"].is_array() => {
+                let key = (self.bot.clone(), turn.unwrap_or(-1), id.to_owned());
+                wants.verdicts = self.verdicts_to_read(vec![key]);
+            }
+            _ => {}
+        }
+        wants
+    }
+
+    /// The daemon's event `event`, applied with what was read for it
+    /// ([`App::wants`]): nothing here asks the daemon anything.
+    fn heard(&mut self, event: Value, mut read: Read) {
+        if read.short {
+            self.short_read.set(true);
+        }
         let kind = event["event"].as_str().unwrap_or("");
         // Every agent's, not this one's: told to every client.
         if matches!(kind, "paused" | "resumed") {
@@ -11568,7 +12611,7 @@ impl App {
             }
         }
         if kind == "queued" {
-            self.stage_sent_elsewhere(&event).await;
+            self.stage_sent_elsewhere(&event, read.prompt.take());
         }
         match kind {
             // Changed by this or another client: the footer and the
@@ -11600,12 +12643,8 @@ impl App {
                         dropped.join(" and ")
                     ));
                 }
-                if let Ok(record) = self
-                    .client
-                    .request("inspect", json!({"bot": self.bot}))
-                    .await
-                {
-                    self.refresh(&record, changed("model"));
+                if let Some(record) = &read.record {
+                    self.refresh(record, changed("model"));
                 }
             }
             "accepted" => {
@@ -11643,7 +12682,7 @@ impl App {
                     self.elsewhere = from_lookout(data);
                 }
                 let woke = match (drawn, data["node"].as_i64()) {
-                    (false, Some(node)) => self.items(&[node]).await.into_iter().next(),
+                    (false, Some(_)) => std::mem::take(&mut read.items).into_iter().next(),
                     _ => None,
                 };
                 if !drawn {
@@ -11676,7 +12715,7 @@ impl App {
             "steered" => {
                 // A reaction was drawn when it was sent.
                 if let Some(node) = data["node"].as_i64()
-                    && let Some(item) = self.items(&[node]).await.first()
+                    && let Some(item) = read.items.first()
                     && !self.note_closed(node, &text(item))
                     && !quiet_message(&text(item))
                 {
@@ -11800,7 +12839,7 @@ impl App {
             }
             "message" => {
                 let item = match data["node"].as_i64() {
-                    Some(node) => self.items(&[node]).await.into_iter().next(),
+                    Some(_) => std::mem::take(&mut read.items).into_iter().next(),
                     None => None,
                 };
                 // Reasoning and calls are kept as items too, each with its
@@ -12015,7 +13054,7 @@ impl App {
                     .retain(|call| call["call_id"] != id || call["turn"].as_i64() != turn);
                 // A long call's event carries a preview; the call is kept whole.
                 let arguments = match data["arguments_truncated"] == true {
-                    true => self.call(id).await.map(|(_, arguments)| arguments),
+                    true => read.call.take().map(|(_, arguments)| arguments),
                     false => data["arguments"]
                         .as_str()
                         .and_then(|a| serde_json::from_str(a).ok()),
@@ -12040,7 +13079,7 @@ impl App {
                 self.reviewing.remove(id);
                 let call = match self.calls.remove(id) {
                     Some(call) => Some(call),
-                    None if data["denied"] == true => self.call(id).await,
+                    None if data["denied"] == true => read.call.take(),
                     None => None,
                 };
                 let Some((name, arguments)) = call else {
@@ -12049,12 +13088,8 @@ impl App {
                 self.end_live(Words::Step);
                 let mut shown = (String::new(), data["failed"] == true);
                 let mut reason = String::new();
-                if let Some(node) = data["node"].as_i64()
-                    && let Some(item) = self
-                        .items(&[node])
-                        .await
-                        .iter()
-                        .find(|i| i["call_id"] == id)
+                if data["node"].is_i64()
+                    && let Some(item) = read.items.iter().find(|i| i["call_id"] == id)
                 {
                     shown = output(item);
                     shown.1 |= data["failed"] == true;
@@ -12105,7 +13140,7 @@ impl App {
                     self.ask_closed(&arguments);
                 }
                 if resolves(&name) && !shown.1 && !reactions::refused(&json!({"output": shown.0})) {
-                    self.resolve(&arguments, turn, true).await;
+                    self.resolve(&arguments, turn, true);
                 }
                 if self.calls.is_empty() && !self.held.is_empty() {
                     let held = std::mem::take(&mut self.held);
@@ -12131,7 +13166,7 @@ impl App {
                     let bot = self.bot.clone();
                     self.heard_verdict(&bot, turn, data);
                 }
-                self.approvals_for(turn).await
+                self.approvals_read(turn, read.approvals.take())
             }
             // A message lifted a call out of its turn: it, and the steps
             // its client asks for, wait on past that turn, until its
@@ -12147,8 +13182,13 @@ impl App {
             }
             "lifted_ended" => {
                 // Allowed after a message lifted it: no start says so.
-                let bot = self.bot.clone();
-                self.heard_verdict_or_read(&bot, turn, data).await;
+                match data["outcome"] == "denied" && !data["approvals"].is_array() {
+                    true => self.verdicts_read(std::mem::take(&mut read.verdicts)),
+                    false => {
+                        let bot = self.bot.clone();
+                        self.heard_verdict(&bot, turn, data);
+                    }
+                }
                 (self.approvals).retain(|call| call["handle"] != data["handle"]);
             }
             "turn_waiting" => {
@@ -12323,8 +13363,8 @@ impl App {
                     "interrupted" => "idle",
                     _ => "error",
                 });
-                self.folder_instructions().await;
-                self.configure().await;
+                self.folder_instructions();
+                self.configure();
                 // Only this view knows whether the turn said anything, so it
                 // rings for the end of every turn of its own; the project's
                 // other ends ring from the fleet.
@@ -12361,7 +13401,7 @@ impl App {
     /// kept the mark before answering it, so this window only shows it. A
     /// lead marking itself sets its own questions aside; a task marked
     /// done `now`, as it happens, has its window closed.
-    async fn resolve(&mut self, arguments: &Value, turn: Option<i64>, now: bool) {
+    fn resolve(&mut self, arguments: &Value, turn: Option<i64>, now: bool) {
         // A side chat forked from a lead resolves that lead's tasks.
         let side = (self.options.side.is_some())
             .then(|| side_source(&self.bot))
@@ -12477,7 +13517,7 @@ impl App {
             self.turns.clone(),
         );
         view.set_tasks(&self.blanks.tasks);
-        self.read_scheduler(&view);
+        Self::read_scheduler(&self.woken, &view);
         self.watch = Some(Watch {
             project,
             rows: Vec::new(),
@@ -12607,27 +13647,6 @@ impl App {
     async fn read_audit(&self, view: &mut audit::View) {
         let read = self.client.request("audit", view.query()).await;
         view.loaded(read.map_err(|error| error.to_string()));
-    }
-
-    /// The commands `view` lists read from the daemon again.
-    async fn read_commands(&self, view: &mut background::View) {
-        // Every page, as the daemon hands them, into one list.
-        let (mut query, mut rows) = (view.commands_query(), Vec::new());
-        let read = loop {
-            match self.client.request("processes", query.clone()).await {
-                Ok(mut page) => {
-                    if let Some(found) = page["processes"].as_array_mut() {
-                        rows.append(found);
-                    }
-                    match page.get("next_after") {
-                        Some(after) if !after.is_null() => query["after"] = after.clone(),
-                        _ => break Ok(json!({"processes": rows})),
-                    }
-                }
-                Err(error) => break Err(error.to_string()),
-            }
-        };
-        view.commands_loaded(read);
     }
 
     /// Stop `bot`'s command `handle` from `/background`, beside the
@@ -12773,9 +13792,9 @@ impl App {
     /// Whether the scheduler runs, read beside the window while
     /// `/background` lists an automation: one status read of the system's
     /// job, which the card says when it does not run.
-    fn read_scheduler(&self, view: &background::View) {
+    fn read_scheduler(woken: &Arc<tokio::sync::Notify>, view: &background::View) {
         if let Some(state) = view.scheduler_query() {
-            let woken = self.woken.clone();
+            let woken = woken.clone();
             tokio::task::spawn_blocking(move || {
                 state.came(scheduler::not_running());
                 woken.notify_one();
@@ -12784,17 +13803,33 @@ impl App {
     }
 
     async fn reread(&mut self) {
+        if let Some(job) = self.card_read.take_if(|job| job.is_finished())
+            && let Ok(read) = job.await
+        {
+            self.card_came(read);
+        }
+        // One read at a time, beside the loop.
+        if self.card_read.is_some() {
+            return;
+        }
         // `/sky` follows the daemon live and reads nothing again.
         if self.watch.as_ref().is_some_and(|w| w.sky.is_some()) {
             return;
         }
-        if let Some(mut view) = self.watch.as_mut().and_then(|w| w.background.take()) {
+        let (client, woken) = (self.client.clone(), self.woken.clone());
+        if let Some(view) = self.watch.as_mut().and_then(|w| w.background.as_mut()) {
             view.set_tasks(&self.blanks.tasks);
             view.reload();
             if view.commands_due() {
-                self.read_commands(&mut view).await;
+                let query = view.commands_query();
+                let (client, woken) = (client.clone(), woken.clone());
+                self.card_read = Some(tokio::spawn(async move {
+                    let read = read_commands(&client, query).await;
+                    woken.notify_one();
+                    CardRead::Commands(read)
+                }));
             }
-            self.read_scheduler(&view);
+            Self::read_scheduler(&woken, view);
             // The open command's newest lines, beside the window.
             if let Some((query, output)) = view.output_query() {
                 let (client, woken) = (self.client.clone(), self.woken.clone());
@@ -12805,7 +13840,6 @@ impl App {
                 });
             }
             if let Some(watch) = &mut self.watch {
-                watch.background = Some(view);
                 watch.read = Instant::now();
             }
             return;
@@ -12824,33 +13858,130 @@ impl App {
             watch.read = Instant::now();
             return;
         }
-        if let Some(mut view) = self.watch.as_mut().and_then(|w| w.audit.take()) {
-            if view.due() {
-                self.read_audit(&mut view).await;
-            }
-            if let Some(watch) = &mut self.watch {
-                watch.audit = Some(view);
-                watch.read = Instant::now();
-            }
-            return;
-        }
-        if let Some(mut view) = self.watch.as_mut().and_then(|w| w.usage.take()) {
-            if view.due() {
-                self.read_usage(&mut view).await;
-            }
-            if let Some(watch) = &mut self.watch {
-                watch.usage = Some(view);
-                watch.read = Instant::now();
-            }
-            return;
-        }
-        let alerts = self.status_alerts().await;
-        if let Ok((_, rows)) = self.status_rows().await
-            && let Some(watch) = &mut self.watch
+        if let Some(watch) = &mut self.watch
+            && let Some(view) = &mut watch.audit
         {
-            watch.rows = rows;
+            if view.due() {
+                let query = view.query();
+                self.card_read = Some(tokio::spawn(async move {
+                    let read = client.request("audit", query.clone()).await;
+                    woken.notify_one();
+                    CardRead::Audit(query, read.map_err(|error| error.to_string()))
+                }));
+            }
             watch.read = Instant::now();
-            watch.alerts = alerts;
+            return;
+        }
+        if let Some(watch) = &mut self.watch
+            && let Some(view) = &mut watch.usage
+        {
+            if view.due() {
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis() as i64;
+                let (query, window) = view.query(now);
+                let selection = view.selection();
+                self.card_read = Some(tokio::spawn(async move {
+                    let read = client.request("usage", query).await;
+                    // The price sheet as its file says now, so an edit shows
+                    // at the next read; a sheet that does not parse prices
+                    // nothing.
+                    let prices = agent_client::config::load()
+                        .and_then(|config| agent_client::config::prices(&config))
+                        .unwrap_or_default();
+                    woken.notify_one();
+                    let read = read.map_err(|error| error.to_string());
+                    CardRead::Usage(selection, window, read, prices)
+                }));
+            }
+            watch.read = Instant::now();
+            return;
+        }
+        self.card_read = Some(self.read_status_beside());
+    }
+
+    /// `/status` read again beside the loop: its alerts, then its rows.
+    fn read_status_beside(&mut self) -> tokio::task::JoinHandle<CardRead> {
+        let (client, woken) = (self.client.clone(), self.woken.clone());
+        let (store, scope, turns) = (self.options.store.clone(), self.scope(), self.turns.clone());
+        let (mut latest, mut seen) = (self.status_read.clone(), self.asks_seen.clone());
+        let (bot, asks, approvals) = (self.bot.clone(), self.asks.clone(), self.approvals.clone());
+        let turn_model = self.turn_model.clone();
+        let fleet = self.fleet.as_ref();
+        let places = fleet.map(|fleet| fleet.layout.places()).unwrap_or_default();
+        let aside: Box<dyn Fn(&str) -> bool + Send + Sync> = match fleet {
+            Some(fleet) => Box::new(fleet.layout.asides()),
+            None => Box::new(|_| false),
+        };
+        let logs = tilde(&format!("{}.companions", self.store().display()));
+        let temp_due = (self.temp_read.as_ref()).is_none_or(|(at, _)| at.elapsed() >= TEMP_READ);
+        tokio::spawn(async move {
+            let alerts = read_alerts(&client, &logs, temp_due).await;
+            let view = StatusView {
+                bot: &bot,
+                asks: &asks,
+                approvals: &approvals,
+                turn_model: turn_model.as_deref(),
+                places,
+                aside: &*aside,
+                details: true,
+            };
+            let read = read_status(&client, &store, scope, &turns, &mut latest, &mut seen, view)
+                .await
+                .ok()
+                .map(|read| (Box::new(read), latest, seen));
+            woken.notify_one();
+            CardRead::Status(alerts, read)
+        })
+    }
+
+    /// What a read for the open card found, shown in it while it is open.
+    fn card_came(&mut self, read: CardRead) {
+        let Some(watch) = &mut self.watch else {
+            return;
+        };
+        match read {
+            CardRead::Commands(read) => {
+                if let Some(view) = &mut watch.background {
+                    view.commands_loaded(read);
+                }
+            }
+            // Asked for what the card no longer shows: left unshown, and
+            // the card, still due, reads what it shows next.
+            CardRead::Audit(query, read) => {
+                if let Some(view) = watch.audit.as_mut().filter(|view| view.query() == query) {
+                    view.loaded(read);
+                }
+            }
+            CardRead::Usage(selection, window, read, prices) => {
+                if let Some(view) =
+                    (watch.usage.as_mut()).filter(|view| view.selection() == selection)
+                {
+                    view.loaded(window, read, prices);
+                }
+            }
+            CardRead::Status((alerts, temp), read) => {
+                if let Some(temp) = temp {
+                    self.temp_read = Some((Instant::now(), temp));
+                }
+                let mut alerts = alerts;
+                if let Some((_, temp)) = &self.temp_read {
+                    alerts.extend(temp.iter().cloned());
+                }
+                alerts.extend(status::background_alert(self.failed));
+                let Some((read, latest, seen)) = read else {
+                    return;
+                };
+                self.status_read = latest;
+                self.asks_seen = seen;
+                let (_, rows) = self.status_kept(*read);
+                if let Some(watch) = &mut self.watch {
+                    watch.rows = rows;
+                    watch.read = Instant::now();
+                    watch.alerts = alerts;
+                }
+            }
         }
     }
 
@@ -12860,30 +13991,11 @@ impl App {
     /// space or inodes, and failures `/background` lists that the person
     /// has not seen there. Nothing when all is well.
     async fn status_alerts(&mut self) -> Vec<status::Alert> {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis() as u64;
-        let mut alerts = Vec::new();
-        if let Ok(listed) = self.client.request("companions", json!({})).await {
-            let logs = tilde(&format!("{}.companions", self.store().display()));
-            alerts.extend(status::companion_alerts(&listed["companions"], now, &logs));
-        }
-        // Turns held on a cause the person can fix, one alert per cause:
-        // counted by the daemon, named from the first page.
-        if let Ok(listed) = self.client.request("held", json!({"limit": 64})).await {
-            alerts.extend(status::held_alerts(&listed));
-        }
-        // The temporary folders every agent's commands share, from `stats`
-        // at most every TEMP_READ: the rest of what it reads is not needed
-        // here every refresh.
-        if self
-            .temp_read
-            .as_ref()
-            .is_none_or(|(at, _)| at.elapsed() >= TEMP_READ)
-            && let Ok(stats) = self.client.request("stats", json!({})).await
-        {
-            self.temp_read = Some((Instant::now(), status::temp_alerts(&stats["temp"])));
+        let logs = tilde(&format!("{}.companions", self.store().display()));
+        let temp_due = (self.temp_read.as_ref()).is_none_or(|(at, _)| at.elapsed() >= TEMP_READ);
+        let (mut alerts, temp) = read_alerts(&self.client, &logs, temp_due).await;
+        if let Some(temp) = temp {
+            self.temp_read = Some((Instant::now(), temp));
         }
         if let Some((_, temp)) = &self.temp_read {
             alerts.extend(temp.iter().cloned());
@@ -12897,26 +14009,53 @@ impl App {
     /// again only once they changed, and the daemon asked at once how the
     /// turns fires sent ended.
     async fn count_behind(&mut self) {
-        if self
-            .behind_read
-            .is_some_and(|at| at.elapsed() < Duration::from_secs(10))
+        if let Some(job) = self.behind.take_if(|job| job.is_finished())
+            && let Ok(ended) = job.await
+        {
+            self.turns.extend(ended);
+            let items = self.read_behind();
+            self.behind_counted(items);
+        }
+        if self.behind.is_some()
+            || self
+                .behind_read
+                .is_some_and(|at| at.elapsed() < Duration::from_secs(10))
             || self.options.side.is_some()
         {
             return;
         }
-        let scope = self.scope();
-        let read = |turns: &HashMap<String, Value>| {
-            background::read_around(&self.options.store, self.client.store(), turns, &scope)
-        };
-        let mut items = read(&self.turns);
+        self.behind_read = Some(Instant::now());
+        let items = self.read_behind();
+        // How the turns fires sent ended is asked beside the loop, and
+        // counted again once it is told.
         let unended = background::unended(&items, &self.turns);
         if !unended.is_empty() {
-            let ended = trigger::ended(&self.client, unended).await;
-            if !ended.is_empty() {
-                self.turns.extend(ended);
-                items = read(&self.turns);
-            }
+            let (client, woken) = (self.client.clone(), self.woken.clone());
+            self.behind = Some(tokio::spawn(async move {
+                let ended = trigger::ended(&client, unended).await;
+                if !ended.is_empty() {
+                    woken.notify_one();
+                }
+                ended
+            }));
         }
+        self.behind_counted(items);
+    }
+
+    /// What runs for this agent in the background, as its files say.
+    fn read_behind(&self) -> Vec<background::Item> {
+        let scope = self.scope();
+        background::read_around(
+            &self.options.store,
+            self.client.store(),
+            &self.turns,
+            &scope,
+        )
+    }
+
+    /// What [`App::read_behind`] read, counted: what failed of what
+    /// `/background` lists, and the triggers' turns kept.
+    fn behind_counted(&mut self, mut items: Vec<background::Item>) {
         // A trigger that ended goes once its last turn did well, also one
         // that ended after its turn did, as a `--reply-to` fire passing on
         // the answer, and a one-off its `--if` said no to. Found among the
@@ -12924,13 +14063,13 @@ impl App {
         if let Some(store) = self.client.store()
             && background::forget_done(store, &self.turns) > 0
         {
-            items = read(&self.turns);
+            items = self.read_behind();
         }
         let fired: std::collections::HashSet<&String> =
             items.iter().filter_map(|i| i.handle.as_ref()).collect();
         self.turns.retain(|handle, _| fired.contains(handle));
+        let scope = self.scope();
         items.retain(|item| background::shown(&scope, item));
-        self.behind_read = Some(Instant::now());
         self.count_failures(background::failures(&items));
         if let Some(view) = (self.watch.as_mut()).and_then(|w| w.background.as_mut()) {
             view.set_turns(&self.turns);
@@ -12990,6 +14129,12 @@ impl App {
             view,
         )
         .await?;
+        Ok(self.status_kept(read))
+    }
+
+    /// What a read of `/status` found, kept: the footer's counts, the
+    /// tasks, and what waits on the person.
+    fn status_kept(&mut self, read: StatusRead) -> (String, Vec<status::Row>) {
         self.counts = Some(status::counts(&read.rows));
         self.status_counted(status::bots(&read.rows));
         self.tasks_read(status::tasks(&read.rows));
@@ -13003,7 +14148,7 @@ impl App {
         }
         self.reads_unkept |= read.fresh;
         // The head names the project by its title, else its name.
-        Ok((read.title.unwrap_or(read.project), read.rows))
+        (read.title.unwrap_or(read.project), read.rows)
     }
 
     /// Start a lead window's one background pass over its agents'
@@ -13184,12 +14329,16 @@ impl App {
     /// now is the turn whose calls these are, whichever turn's event asked:
     /// a lifted call's step or hand-over names its own older turn.
     async fn approvals_for(&mut self, turn: Option<i64>) {
+        let waits = self.running.as_ref().map(|running| running.turn).or(turn);
+        let page = read_approvals(self.client.clone(), self.bot.clone(), waits).await;
+        self.approvals_read(turn, page);
+    }
+
+    /// The calls of this bot that wait on the person, from `page` as
+    /// [`read_approvals`] read it: none read leaves them as they were.
+    fn approvals_read(&mut self, turn: Option<i64>, page: Option<Value>) {
         let turn = self.running.as_ref().map(|running| running.turn).or(turn);
-        let Ok(page) = self
-            .client
-            .request("approvals", json!({"bot": self.bot, "limit": 64}))
-            .await
-        else {
+        let Some(page) = page else {
             return;
         };
         // What the approver serving `auto` is still reviewing: not yet
@@ -13214,17 +14363,10 @@ impl App {
             .as_array()
             .into_iter()
             .flatten()
-            .filter(|call| {
-                (call["turn"].as_i64() == turn || !call["handle"].is_null())
-                    && (!call["asked"].is_null()
-                        || call["gates"]
-                            .as_array()
-                            .is_some_and(|gates| gates.iter().any(|g| g == "manual")))
-            })
+            .filter(|call| waits_on_person(call, turn))
             .cloned()
             .collect();
         for call in &mut self.approvals {
-            whole_arguments(&self.client, &self.bot, call).await;
             approvals::offer(call);
         }
         if let Some(running) = &mut self.running {
@@ -13248,11 +14390,22 @@ impl App {
     /// they wait: each looked up once, as its own window lists it, and let
     /// go once it waits no more, answered here or anywhere else.
     async fn raise_approvals(&mut self) {
+        if let Some(job) = self.raising.take_if(|job| job.is_finished())
+            && let Ok(came) = job.await
+        {
+            self.approvals_raised(came);
+        }
+        self.raise();
+    }
+
+    /// The calls below that wait on the person, as [`App::raise_approvals`]
+    /// reads them, the read set off beside the loop.
+    fn raise(&mut self) {
         let tracked: std::collections::HashSet<&str> = (self.tasks.values().flatten())
             .map(|task| task.bot.as_str())
             .collect();
         let me = self.bot.as_str();
-        let wanted: std::collections::BTreeSet<(String, i64, String)> = match &self.fleet {
+        let wanted: std::collections::BTreeSet<CallKey> = match &self.fleet {
             Some(fleet) => (fleet.needs.calls())
                 .filter(|(bot, ..)| *bot != me && fleet.below(bot))
                 .map(|(bot, turn, call)| (bot.to_owned(), turn, call.to_owned()))
@@ -13262,17 +14415,10 @@ impl App {
                 .map(|(bot, turn, call)| (bot.to_owned(), turn, call.to_owned()))
                 .collect(),
         };
-        let key = |call: &Value| {
-            (
-                call["bot"].as_str().unwrap_or_default().to_owned(),
-                call["turn"].as_i64().unwrap_or(-1),
-                call["call_id"].as_str().unwrap_or_default().to_owned(),
-            )
-        };
         // Answered where no event of theirs reaches this window: what came
         // of each written out here is read from the audit trail.
-        let mut gone: Vec<(String, i64, String)> = (self.raised.iter())
-            .map(key)
+        let mut gone: Vec<CallKey> = (self.raised.iter())
+            .map(raised_key)
             .filter(|read| !wanted.contains(read))
             .collect();
         // Answered here, its final verdict still unheard: another gate may
@@ -13291,54 +14437,77 @@ impl App {
             gone.sort();
             gone.dedup();
         }
-        self.raised.retain(|call| wanted.contains(&key(call)));
-        self.verdicts_from_audit(gone).await;
+        self.raised
+            .retain(|call| wanted.contains(&raised_key(call)));
         self.raised_read.retain(|read| wanted.contains(read));
-        let unread: std::collections::BTreeSet<&str> = (wanted.iter())
-            .filter(|read| !self.raised_read.contains(*read))
-            .map(|(bot, ..)| bot.as_str())
+        let unread: std::collections::BTreeSet<CallKey> = (wanted.into_iter())
+            .filter(|read| !self.raised_read.contains(read))
             .collect();
-        'bots: for bot in unread {
-            // Every page, so a call past the first is not taken as answered.
-            let mut after = Value::Null;
-            loop {
-                let mut asked = json!({"bot": bot, "limit": 64});
-                if !after.is_null() {
-                    asked["after"] = after;
-                }
-                let Ok(page) = self.client.request("approvals", asked).await else {
-                    continue 'bots;
-                };
-                for call in page["approvals"].as_array().into_iter().flatten() {
-                    let read = key(call);
-                    if !needs::person_call(call)
-                        || !wanted.contains(&read)
-                        || self.raised_read.contains(&read)
-                    {
-                        continue;
-                    }
-                    let mut call = call.clone();
-                    whole_arguments(&self.client, bot, &mut call).await;
-                    approvals::offer(&mut call);
-                    self.names.get_mut().learn(bot.to_owned(), true);
-                    self.raised.push(call);
-                    self.raised_read.insert(read);
-                }
-                after = page["next_after"].clone();
-                if after.is_null() {
-                    break;
-                }
-            }
-            // Looked up, held or not: one no longer listed was answered.
-            for read in wanted.iter().filter(|(of, ..)| of == bot) {
-                self.raised_read.insert(read.clone());
-            }
+        let verdicts = self.verdicts_to_read(gone);
+        // The calls gone are no longer raised, so their verdicts are read
+        // now, beside a read already under way, or never.
+        if self.raising.is_some() {
+            self.read_verdicts_beside(verdicts);
+            self.aside_waiting();
+            return;
         }
-        let waiting: std::collections::HashSet<(String, i64, String)> =
+        // One read at a time, beside the loop: what it found is kept as
+        // the next pass begins.
+        // Applied at the next look-round, which draws anyway: a read
+        // repeated every few seconds draws no frame of its own.
+        if !(verdicts.is_empty() && unread.is_empty()) {
+            let client = self.client.clone();
+            let verdicts_asked: Vec<CallKey> =
+                verdicts.iter().map(|(key, _)| key.clone()).collect();
+            self.verdicts_out.extend(verdicts_asked.iter().cloned());
+            self.raising = Some(tokio::spawn(async move {
+                Raised {
+                    verdicts: read_verdicts(client.clone(), verdicts).await,
+                    verdicts_asked,
+                    ..raise_calls(&client, unread).await
+                }
+            }));
+        }
+        self.aside_waiting();
+    }
+
+    /// What a read of the calls below found: the verdicts drawn, the calls
+    /// that wait raised, each once.
+    fn approvals_raised(&mut self, came: Raised) {
+        for key in &came.verdicts_asked {
+            self.verdicts_out.remove(key);
+        }
+        self.verdicts_read(came.verdicts);
+        for (bot, mut call) in came.calls {
+            let read = raised_key(&call);
+            if self.raised_read.contains(&read) {
+                continue;
+            }
+            approvals::offer(&mut call);
+            self.names.get_mut().learn(bot, true);
+            self.raised.push(call);
+            self.raised_read.insert(read);
+        }
+        self.raised_read.extend(came.looked);
+        self.aside_waiting();
+    }
+
+    /// Only calls that still wait stay set aside.
+    fn aside_waiting(&mut self) {
+        let waiting: std::collections::HashSet<CallKey> =
             (self.approvals.iter().chain(&self.raised))
                 .map(|call| self.aside_key(call))
                 .collect();
         self.calls_aside.retain(|call| waiting.contains(call));
+    }
+
+    /// [`App::raise_approvals`] through to what it found, kept and drawn.
+    #[cfg(test)]
+    async fn raise_approvals_through(&mut self) {
+        self.raise_approvals().await;
+        if let Some(job) = self.raising.take() {
+            self.approvals_raised(job.await.expect("the calls below were read"));
+        }
     }
 
     /// The call the keys answer: this window's own first, then those
@@ -13372,7 +14541,7 @@ impl App {
 
     /// Answers the call waiting first; one allowed is recorded under it,
     /// with the command `kept` from now on when it is always allowed.
-    async fn answer(&mut self, decision: &str, kept: Option<&str>) {
+    fn answer(&mut self, decision: &str, kept: Option<&str>) {
         let first = |calls: &[Value]| calls.iter().position(|call| !self.set_aside(call));
         let Some((own, at)) = (first(&self.approvals).map(|at| (true, at)))
             .or_else(|| first(&self.raised).map(|at| (false, at)))
@@ -13384,15 +14553,48 @@ impl App {
             false => self.raised.remove(at),
         };
         let bot = call["bot"].as_str().unwrap_or(&self.bot).to_owned();
-        let answered = self
-            .client
-            .request(
-                "answer",
-                json!({"bot": bot, "turn": call["turn"], "call_id": call["call_id"],
-                    "request": call["request"], "tag": person_gate(&call), "decision": decision,
-                    "by": "tui"}),
-            )
-            .await;
+        let asked = json!({"bot": bot, "turn": call["turn"], "call_id": call["call_id"],
+            "request": call["request"], "tag": person_gate(&call), "decision": decision,
+            "by": "tui"});
+        // A round with more calls waiting than one listing holds shows the
+        // rest once these are answered.
+        let rest = (own && self.approvals.is_empty()).then(|| {
+            let waits = self.running.as_ref().map(|running| running.turn);
+            (self.bot.clone(), waits.or(call["turn"].as_i64()))
+        });
+        let client = self.client.clone();
+        let answering = Answering {
+            call,
+            own,
+            bot,
+            decision: decision.to_owned(),
+            kept: kept.map(str::to_owned),
+        };
+        self.write(async move {
+            let answered = client.request("answer", asked).await;
+            let rest = match rest {
+                Some((bot, waits)) => read_approvals(client, bot, waits).await,
+                None => None,
+            };
+            Wrote::Answered(Box::new(answering), answered, rest)
+        });
+    }
+
+    /// What the daemon said of an answer to a call ([`App::answer`]), and
+    /// the calls of this bot's round still waiting, read after it.
+    fn call_answered(
+        &mut self,
+        answering: Answering,
+        answered: agent_client::Result<Value>,
+        rest: Option<Value>,
+    ) {
+        let Answering {
+            call,
+            own,
+            bot,
+            decision,
+            kept,
+        } = answering;
         match answered {
             // A call below that could not be answered is read again: it
             // waits here still, asked again under a new request when an
@@ -13405,7 +14607,7 @@ impl App {
                     call["call_id"].as_str().unwrap_or_default().to_owned(),
                 );
                 self.raised_read.remove(&read);
-                self.raise_approvals().await;
+                self.raise();
                 return;
             }
             Err(error) => self.notice = Some(error.to_string()),
@@ -13417,15 +14619,25 @@ impl App {
                     call["call_id"].as_str().unwrap_or_default(),
                 ) =>
             {
-                let decided = match decision {
-                    "allow" => transcript::Decided::Allowed {
-                        you: true,
-                        kept: kept.map(str::to_owned),
-                    },
+                let decided = match decision.as_str() {
+                    "allow" => transcript::Decided::Allowed { you: true, kept },
                     _ => transcript::Decided::Denied { you: true },
                 };
                 if let Some(written) = self.written.get_mut(&self.aside_key(&call)) {
-                    written.decided = Some(decided);
+                    match (&mut written.decided, decided) {
+                        // Its own verdict came first and is final: what the
+                        // person kept is only added to an allow.
+                        (
+                            Some(transcript::Decided::Allowed { kept: heard, .. }),
+                            transcript::Decided::Allowed { kept, .. },
+                        ) if written.heard => {
+                            if heard.is_none() {
+                                *heard = kept;
+                            }
+                        }
+                        _ if written.heard => {}
+                        (_, decided) => written.decided = Some(decided),
+                    }
                 }
             }
             Ok(_) if decision == "allow" => {
@@ -13433,7 +14645,7 @@ impl App {
                 let lines = transcript::allowed(
                     name,
                     &call["arguments"],
-                    kept,
+                    kept.as_deref(),
                     &self.workspace,
                     self.width,
                 );
@@ -13441,13 +14653,8 @@ impl App {
             }
             Ok(_) => {}
         }
-        if !own {
-            return;
-        }
-        // A round with more calls waiting than one listing holds shows
-        // the rest once these are answered.
-        if self.approvals.is_empty() {
-            self.approvals_for(call["turn"].as_i64()).await;
+        if own && self.approvals.is_empty() {
+            self.approvals_read(call["turn"].as_i64(), rest);
         }
     }
 
@@ -13461,36 +14668,24 @@ impl App {
             self.notice = Some(format!("couldn't keep {shown}: {error}"));
             return;
         }
-        self.answer("allow", Some(&shown)).await;
+        self.answer("allow", Some(&shown));
     }
 
     /// `/compact`, once the person said yes.
     /// `/retry`'s call confirmed: the person's approval of that exact
     /// call sent, once, and it leaves the list.
-    async fn retry(&mut self, denied: Denial) {
+    fn retry(&mut self, denied: Denial) {
         let kept = self.denials.clone();
         self.denials.retain(|d| d.call_id != denied.call_id);
-        let sent = self.send(approval(&denied), None, false, false, &[]).await;
-        self.notice = Some(match sent {
-            Ok(()) => "allowed one retry; the retry is still reviewed".into(),
-            Err(error) => {
-                self.denials = kept;
-                error
-            }
-        });
+        let then = Then::Retried(kept);
+        self.send(approval(&denied), None, (false, false), &[], then);
     }
 
     /// `/compact`, once the person said yes: until it runs, the footer
     /// says it waits, a state the notice would lose to the next one.
-    async fn compact(&mut self) {
-        match self
-            .client
-            .request("compact", json!({"bot": self.bot}))
-            .await
-        {
-            Ok(_) => self.compact_next = true,
-            Err(error) => self.notice = Some(format!("compact: {error}")),
-        }
+    fn compact(&mut self) {
+        let (client, asked) = (self.client.clone(), json!({"bot": self.bot}));
+        self.write(async move { Wrote::Compacted(client.request("compact", asked).await) });
     }
 
     /// The slash commands the input could be, while it is one word that
@@ -14671,17 +15866,16 @@ impl App {
                 let Ok(node) = id.parse::<i64>() else {
                     return;
                 };
-                let read = self
-                    .client
-                    .request("history_items", json!({"bot": self.bot, "nodes": [node]}))
-                    .await;
-                match read {
-                    Ok(read) => {
-                        let said = text(&read["items"][0]["item"]);
-                        self.quote(&said);
+                let (client, asked) = (
+                    self.client.clone(),
+                    json!({"bot": self.bot, "nodes": [node]}),
+                );
+                self.write(async move {
+                    match client.request("history_items", asked).await {
+                        Ok(read) => Wrote::Quoted(text(&read["items"][0]["item"])),
+                        Err(error) => Wrote::Said(Some(error.to_string())),
                     }
-                    Err(error) => self.notice = Some(error.to_string()),
-                }
+                });
             }
             "close" => {
                 if self.margin.note(id).is_none() {
@@ -14690,23 +15884,13 @@ impl App {
                 // The person's click, said in Sonny's words: nothing the
                 // agent wrote, and asking for nothing.
                 let told = margin::closed_message(id);
-                let sent = self
-                    .client
-                    .request(
-                        "submit",
-                        json!({"bot": self.bot, "request_id": unique("tui"), "prompt": told,
-                            "delivery": "attach", "origin": "margin"}),
-                    )
-                    .await;
-                match sent {
-                    // Taken away once the agent will hear of it; kept to
-                    // close again when it could not be told.
-                    Ok(_) => {
-                        self.margin.remove(id, None);
-                        self.closing.insert(id.to_owned());
-                    }
-                    Err(error) => self.notice = Some(error.to_string()),
-                }
+                let asked = json!({"bot": self.bot, "request_id": unique("tui"), "prompt": told,
+                    "delivery": "attach", "origin": "margin"});
+                let (client, id) = (self.client.clone(), id.to_owned());
+                self.write(async move {
+                    let sent = client.request("submit", asked).await;
+                    Wrote::NoteClosed(id, sent.err().map(|error| error.to_string()))
+                });
             }
             "status" if self.options.side.is_none() => self.status().await,
             // An agent's title button: this window becomes its Sonny.
@@ -14758,18 +15942,19 @@ impl App {
 
     /// A jump to where a note was put, once the conversation is drawn
     /// back far enough: shown, or the next page older read.
-    async fn jumped(&mut self) {
+    fn jumped(&mut self) {
         let Some((pin, pages)) = self.jump else {
             return;
         };
-        if self.repaint {
+        // A page still being read is waited for.
+        if self.repaint || self.older_read.is_some() {
             return;
         }
         if self.screen.show_tagged(pin, 2) {
             self.jump = None;
         } else if pages > 0 && self.older.is_some() {
             self.jump = Some((pin, pages - 1));
-            self.older().await;
+            self.older();
         } else {
             self.jump = None;
             self.notice = Some("that note's place is no longer in the conversation".into());
@@ -15212,8 +16397,8 @@ impl App {
                 // Only Enter says yes; any other key says no, and so does
                 // the notice.
                 match (key.code, confirm) {
-                    (KeyCode::Enter, Confirm::Compact) => self.compact().await,
-                    (KeyCode::Enter, Confirm::Retry(denied)) => self.retry(denied).await,
+                    (KeyCode::Enter, Confirm::Compact) => self.compact(),
+                    (KeyCode::Enter, Confirm::Retry(denied)) => self.retry(denied),
                     (_, Confirm::Compact) => self.notice = Some("not compacted".into()),
                     (_, Confirm::Retry(_)) => self.notice = Some("not allowed".into()),
                 }
@@ -15238,7 +16423,7 @@ impl App {
                             let earlier = self.spread.take().and_then(|s| s.pass);
                             self.spread = Some(Spread::new(mode, earlier));
                             self.gating = Some(mode);
-                            self.configure().await;
+                            self.configure();
                             if self.gating.is_some() {
                                 self.notice = Some("applies when idle".into());
                             }
@@ -15350,7 +16535,7 @@ impl App {
                                 .filter(|speed| speeds.contains(speed))
                                 .unwrap_or("standard");
                             self.picker = None;
-                            let now = (self.pace).unwrap_or(
+                            let now = (self.pace).or(self.pace_sent).unwrap_or(
                                 self.speed.as_deref().map_or("standard", |now| {
                                     SPEEDS.into_iter().find(|s| *s == now).unwrap_or("standard")
                                 }),
@@ -15358,13 +16543,14 @@ impl App {
                             if speed != now {
                                 self.pace = Some(speed);
                             }
-                            let model = (self.switch.as_ref().map(|(m, e)| (m.clone(), e.clone())))
+                            let model = (self.switch.as_ref().or(self.switch_sent.as_ref()))
+                                .map(|(m, e)| (m.clone(), e.clone()))
                                 .unwrap_or((self.model.clone(), self.effort.clone()));
                             if chosen != model {
                                 self.switch = Some(chosen);
                             }
                             let faster = self.pace.filter(|speed| *speed != "standard");
-                            self.notice = match self.configure().await {
+                            self.notice = match self.configure() {
                                 true => faster.map(|speed| {
                                     format!(
                                         "{speed} from the next call, at a higher price per token"
@@ -15485,8 +16671,7 @@ impl App {
                             self.notice =
                                 Some("only part of this call could be read; n denies it".into());
                         } else {
-                            self.answer(if c == 'y' { "allow" } else { "deny" }, None)
-                                .await;
+                            self.answer(if c == 'y' { "allow" } else { "deny" }, None);
                         }
                     }
                     KeyCode::Char('a')
@@ -15641,11 +16826,12 @@ impl App {
                         if let Some(shell) = &self.shell {
                             shell.stop();
                         } else if let Some(running) = &self.running {
-                            let turn = running.turn;
-                            let _ = self
-                                .client
-                                .request("interrupt", json!({"bot": self.bot, "turn": turn}))
-                                .await;
+                            let asked = json!({"bot": self.bot, "turn": running.turn});
+                            let client = self.client.clone();
+                            self.write(async move {
+                                let _ = client.request("interrupt", asked).await;
+                                Wrote::Said(None)
+                            });
                         } else if self.options.embedded {
                             // What was typed is cleared; with nothing left
                             // to do here, the conversation it is drawn
@@ -15925,29 +17111,33 @@ impl App {
         }
         if prompt == "/resume" {
             self.input.clear();
-            self.notice = Some(match self.client.request("resume", json!({})).await {
-                Ok(said) if said["changed"] == true => "the agents go on".into(),
-                Ok(_) => "nothing was paused".into(),
-                Err(error) => format!("resume: {error}"),
+            let client = self.client.clone();
+            self.write(async move {
+                Wrote::Said(Some(match client.request("resume", json!({})).await {
+                    Ok(said) if said["changed"] == true => "the agents go on".into(),
+                    Ok(_) => "nothing was paused".into(),
+                    Err(error) => format!("resume: {error}"),
+                }))
             });
             return;
         }
         if prompt == "/pause" || prompt.starts_with("/pause ") {
             self.input.clear();
             let reason = prompt["/pause".len()..].trim();
-            self.notice = Some(match reason {
-                "" => "/pause takes why: /pause REASON".into(),
-                reason => match (self.client)
-                    .request("pause", json!({"reason": reason}))
-                    .await
-                {
+            if reason.is_empty() {
+                self.notice = Some("/pause takes why: /pause REASON".into());
+                return;
+            }
+            let (client, asked) = (self.client.clone(), json!({"reason": reason}));
+            self.write(async move {
+                Wrote::Said(Some(match client.request("pause", asked).await {
                     Ok(said) if said["changed"] == true => format!(
                         "every agent is paused; {} running wait for /resume",
                         said["parked"]
                     ),
                     Ok(_) => "already paused".into(),
                     Err(error) => format!("pause: {error}"),
-                },
+                }))
             });
             return;
         }
@@ -16099,15 +17289,11 @@ impl App {
         // An answer to a task's question goes to the task, alone.
         if let Some(ask) = answering.clone().filter(|ask| ask.task.is_some()) {
             let pictures = self.placed(&prompt);
-            let sent = self.answer_task(&ask, &prompt, &pictures).await;
-            match sent {
-                Ok(()) => {
-                    self.input.clear();
-                    self.notice = None;
-                    self.pictures.clear();
-                }
-                Err(error) => self.notice = Some(error),
-            }
+            let typed = (*self.input).to_owned();
+            let back = (typed, std::mem::take(&mut self.pictures));
+            self.answer_task(&ask, &prompt, &pictures, Some(back));
+            self.input.clear();
+            self.notice = None;
             return;
         }
         if answering.is_none()
@@ -16122,32 +17308,23 @@ impl App {
         // What the person ran and the agent could not be given yet goes
         // first, each on its own, and this message joins the turn they start;
         // queued, each waits its turn too.
-        let mut join = false;
-        while let Some(record) = self.unsent.first().cloned() {
-            if let Err(error) =
-                (self.send(record.clone(), Some(SHELL), join && !queue, queue, &[])).await
-            {
-                self.notice = Some(error);
-                return;
-            }
-            self.ran_here.extend(user_shell::read(&record));
-            self.unsent.remove(0);
-            join = true;
+        // Refused, one goes back to wait, and nothing after it is sent.
+        let mut messages = Vec::new();
+        for record in std::mem::take(&mut self.unsent) {
+            let join = !messages.is_empty() && !queue;
+            messages.push(self.message(record, Some(SHELL), (join, queue), &[], Then::Held));
         }
         let pictures = self.placed(&prompt);
-        let prompt_sent = prompt.clone();
-        let sent = (self.send(prompt, None, join && !queue, queue, &pictures)).await;
-        match sent {
-            Ok(()) => {
-                self.input.clear();
-                self.notice = None;
-                self.pictures.clear();
-                if let Some(ask) = answering {
-                    self.close_ask(&ask, &prompt_sent);
-                }
-            }
-            Err(error) => self.notice = Some(error),
-        }
+        let then = Then::Composed {
+            typed: (*self.input).to_owned(),
+            pictures: std::mem::take(&mut self.pictures),
+            answering,
+        };
+        let join = !messages.is_empty() && !queue;
+        messages.push(self.message(prompt, None, (join, queue), &pictures, then));
+        self.input.clear();
+        self.notice = None;
+        self.send_all(messages);
     }
 
     /// Drop what is being written, with the pictures it was given.
@@ -16167,16 +17344,29 @@ impl App {
 
     /// Send `prompt`: a turn of its own, or a steer of the running one (or
     /// of the one just started, `join`), or with `queue` a turn after
-    /// whatever runs; staged until it lands. `origin` names what sent it
-    /// when the person's words did not.
-    async fn send(
+    /// whatever runs. `origin` names what sent it when the person's words
+    /// did not. It goes beside the loop ([`App::send_all`]).
+    fn send(
         &mut self,
         prompt: String,
-        origin: Option<&str>,
-        join: bool,
-        queue: bool,
+        origin: Option<&'static str>,
+        (join, queue): (bool, bool),
         pictures: &[attach::Picture],
-    ) -> Result<(), String> {
+        then: Then,
+    ) {
+        let sent = self.message(prompt, origin, (join, queue), pictures, then);
+        self.send_all(vec![sent]);
+    }
+
+    /// `prompt` as [`App::send`] sends it, staged at once as being sent.
+    fn message(
+        &mut self,
+        prompt: String,
+        origin: Option<&'static str>,
+        (join, queue): (bool, bool),
+        pictures: &[attach::Picture],
+        then: Then,
+    ) -> Sent {
         // A message to a busy bot joins its running turn, on that turn's
         // model. One to a bot at rest starts a turn, as a steer too: if
         // something else started one meanwhile, it joins that rather than
@@ -16191,60 +17381,249 @@ impl App {
         // A boost is the next turn's: a steer joins one running already.
         let effort = match steer || origin.is_some() {
             true => None,
-            false => self.boost.clone(),
+            false => self.boost.take(),
         };
         if steer && origin.is_none() && self.boost.is_some() {
             self.notice = Some("the boost waits for a message that starts a turn".into());
         }
         // A steer never moves a bot, so a moved lead comes back with the
         // next message that starts a turn.
-        let workspace = (!steer).then(|| self.move_to.clone()).flatten();
+        let workspace = (!steer).then(|| self.move_to.take()).flatten();
         // An answer goes once, whichever window sends it ([`answer_once`]).
         let submitted = json!({"bot": self.bot, "prompt": prompt, "delivery": delivery,
             "model": model, "workspace": workspace, "effort": effort, "origin": origin,
             "images": attach::submitted(pictures)});
-        let reply = match asks::answer_of(&prompt, origin) {
-            Some(ask) => answer_once(&self.client, ask, submitted).await?,
-            None => {
-                let mut submitted = submitted;
-                submitted["request_id"] = json!(unique("tui"));
-                (self.client.request("submit", submitted).await).map_err(|e| e.to_string())?
+        // Shown where it will land while it goes, under a number of its own.
+        self.unsent_rows += 1;
+        let sending = -self.unsent_rows;
+        self.staged.push((sending, prompt.clone()));
+        Sent {
+            prompt,
+            origin,
+            steer,
+            queue,
+            effort,
+            workspace,
+            sending,
+            submitted,
+            then,
+        }
+    }
+
+    /// `prompt` sent as the person's words and the daemon's answer
+    /// applied, waiting for it: what a test looks at.
+    #[cfg(test)]
+    async fn send_now(
+        &mut self,
+        prompt: String,
+        (join, queue): (bool, bool),
+    ) -> Result<(), String> {
+        let then = Then::Composed {
+            typed: String::new(),
+            pictures: Vec::new(),
+            answering: None,
+        };
+        let message = self.message(prompt, None, (join, queue), &[], then);
+        self.sending += 1;
+        let reply = submit_message(&self.client, &message).await;
+        let refused = reply.as_ref().err().cloned();
+        self.sent(message, reply);
+        refused.map_or(Ok(()), Err)
+    }
+
+    /// `messages` sent beside the loop one after another, as Codex sends
+    /// the person's ops ([`App::write`]): the window goes on meanwhile.
+    /// Once one is refused, those after it are not sent. The daemon's
+    /// events wait until the daemon has them, so each lands where it went
+    /// ([`App::sent`]).
+    fn send_all(&mut self, messages: Vec<Sent>) {
+        self.sending += messages.len();
+        let client = self.client.clone();
+        self.write(async move {
+            let mut sent = Vec::new();
+            let mut refused = false;
+            for message in messages {
+                let reply = match refused {
+                    true => Err(String::new()),
+                    false => submit_message(&client, &message).await,
+                };
+                refused |= reply.is_err();
+                sent.push((message, reply));
+            }
+            Wrote::Sent(sent)
+        });
+    }
+
+    /// What came of `message`: staged where it went, or, refused (or
+    /// not sent, with no reason, as one before it was refused), what it
+    /// was sent with given back.
+    fn sent(&mut self, message: Sent, reply: Result<Value, String>) {
+        let Sent {
+            prompt,
+            origin,
+            steer,
+            queue,
+            effort,
+            workspace,
+            sending,
+            then,
+            ..
+        } = message;
+        self.sending = self.sending.saturating_sub(1);
+        let at = (self.staged.iter()).position(|(staged, _)| *staged == sending);
+        let reply = match reply {
+            Ok(reply) => reply,
+            Err(error) => {
+                if let Some(at) = at {
+                    self.staged.remove(at);
+                }
+                self.boost = self.boost.take().or(effort);
+                self.move_to = self.move_to.take().or(workspace);
+                self.unsent(prompt, then, error);
+                return;
             }
         };
-        if effort.is_some() {
-            self.boost = None;
-        }
         // The lead the folder opens next time.
         if origin.is_none() && self.options.side.is_none() {
             project::wrote_to(self.client.store(), &self.workspace, &self.bot);
         }
-        if let Some(turn) = reply["message"].as_i64() {
-            // A steer is a message of its own that a turn takes in; the
-            // person's is the turn it joins: the running one, or the one the
-            // message before it started.
-            if origin.is_none() {
-                self.yours = match steer {
-                    false => Some(turn),
-                    true => (self.running.as_ref().map(|r| r.turn))
-                        .or_else(|| self.staged.last().map(|(started, _)| *started)),
-                };
+        match reply["message"].as_i64() {
+            Some(turn) => {
+                // A steer is a message of its own that a turn takes in; the
+                // person's is the turn it joins: the running one, or the one
+                // the message before it started.
+                if origin.is_none() {
+                    let before = self.staged[..at.unwrap_or(self.staged.len())].last();
+                    self.yours = match steer {
+                        false => Some(turn),
+                        true => (self.running.as_ref().map(|r| r.turn))
+                            .or_else(|| before.map(|(started, _)| *started)),
+                    };
+                }
+                match at {
+                    Some(at) => self.staged[at].0 = turn,
+                    None => self.staged.push((turn, prompt.clone())),
+                }
+                let staged = &self.staged;
+                let waiting = |sent: &i64| staged.iter().any(|(turn, _)| turn == sent);
+                self.queued.retain(waiting);
+                self.steering.retain(waiting);
+                if queue {
+                    self.queued.push(turn);
+                }
+                if steer && self.running.is_some() {
+                    self.steering.push(turn);
+                }
             }
-            self.staged.push((turn, prompt));
-            let staged = &self.staged;
-            let waiting = |sent: &i64| staged.iter().any(|(turn, _)| turn == sent);
-            self.queued.retain(waiting);
-            self.steering.retain(waiting);
-            if queue {
-                self.queued.push(turn);
-            }
-            if steer && self.running.is_some() {
-                self.steering.push(turn);
+            None => {
+                if let Some(at) = at {
+                    self.staged.remove(at);
+                }
             }
         }
-        if workspace.is_some() {
-            self.move_to = None;
+        self.landed(prompt, then);
+    }
+
+    /// What follows a message the daemon took.
+    fn landed(&mut self, prompt: String, then: Then) {
+        match then {
+            Then::Composed { answering, .. } => {
+                if let Some(ask) = answering {
+                    self.close_ask(&ask, &prompt);
+                }
+            }
+            Then::Closes(ask) => self.close_ask(&ask, &prompt),
+            Then::Held => self.ran_here.extend(user_shell::read(&prompt)),
+            Then::Ran(answering) => {
+                self.ran_here.extend(user_shell::read(&prompt));
+                // Still open: answered or written past meanwhile, it takes
+                // nothing more.
+                if let Some((ask, ran)) = answering
+                    .filter(|(ask, _)| self.asks.iter().any(|open| open.key() == ask.key()))
+                {
+                    let answer = asks::answer(&ask, &asks::ran(&ran));
+                    self.send(answer, None, (true, false), &[], Then::Closes(ask));
+                }
+            }
+            Then::Zen(focus, _) => {
+                if let Err(error) = zen::set(self.reactions_key.as_deref(), focus.as_deref()) {
+                    self.notice = Some(error);
+                    return;
+                }
+                let changed = self.zen.is_some() != focus.is_some();
+                self.notice = Some(zen_notice(focus.is_some()));
+                self.zen = focus;
+                self.pane_keys = false;
+                // Drawn again in the other view; a new focus redraws nothing.
+                if changed {
+                    self.zen_view_changed();
+                }
+            }
+            Then::Retried(_) => {
+                self.notice = Some("allowed one retry; the retry is still reviewed".into());
+            }
         }
-        Ok(())
+    }
+
+    /// A message the daemon refused (`error`), or that was not sent as
+    /// one before it was refused (no `error`): what it was sent with
+    /// given back, its words in the composer when the person wrote them.
+    fn unsent(&mut self, prompt: String, then: Then, error: String) {
+        if !error.is_empty() {
+            self.notice = Some(error.clone());
+        }
+        match then {
+            Then::Composed {
+                typed, pictures, ..
+            } => {
+                self.give_back(&typed, pictures);
+            }
+            Then::Zen(_, typed) => self.give_back(&typed, Vec::new()),
+            Then::Ran(_) => {
+                if !error.is_empty() {
+                    self.notice = Some(format!("{error}; it goes with your next message"));
+                }
+                hold(&mut self.unsent, prompt);
+            }
+            Then::Retried(kept) => self.denials = kept,
+            Then::Held => hold(&mut self.unsent, prompt),
+            Then::Closes(_) => {}
+        }
+    }
+
+    /// Words the person sent that did not go, back in the composer: in
+    /// front of anything typed since, as they were written first. Their
+    /// pictures follow any attached since, their placeholders numbered on
+    /// from those, so each still names its own picture.
+    fn give_back(&mut self, typed: &str, pictures: Vec<Option<attach::Picture>>) {
+        let after = self.pictures.len();
+        let mut typed = typed.to_owned();
+        if after > 0 {
+            // From the last, so no number is moved twice.
+            for number in (1..=pictures.len()).rev() {
+                typed = typed.replace(
+                    &attach::placeholder(number),
+                    &attach::placeholder(number + after),
+                );
+            }
+        }
+        self.pictures.extend(pictures);
+        let now = (*self.input).to_owned();
+        // After words given back before it and still in front, as each
+        // message was sent after them.
+        let (before, now) = match self.given_back.take() {
+            Some(given) if !given.is_empty() && now.starts_with(&given) => (
+                format!("{given}\n"),
+                now[given.len()..].trim_start_matches('\n').to_owned(),
+            ),
+            _ => (String::new(), now),
+        };
+        let given = format!("{before}{typed}");
+        match now.trim().is_empty() {
+            true => self.input.set(&given),
+            false => self.input.set(&format!("{given}\n{now}")),
+        }
+        self.given_back = Some(given);
     }
 
     /// The person's answer to `task`'s question `ask`, sent to the task as
@@ -16255,27 +17634,51 @@ impl App {
     /// kept, with the turn they went as, until the task takes them, so the
     /// question is not pinned again meanwhile; taken back unread, it is
     /// pinned again to answer anew.
-    async fn answer_task(
+    fn answer_task(
         &mut self,
         ask: &asks::Ask,
         prompt: &str,
         pictures: &[attach::Picture],
-    ) -> Result<(), String> {
+        back: Option<(String, Vec<Option<attach::Picture>>)>,
+    ) {
         let Some(task) = ask.task.clone() else {
-            return Err("that question is not a task's".into());
+            self.notice = Some("that question is not a task's".into());
+            return;
         };
         let submitted = json!({"bot": task.bot, "prompt": prompt,
             "delivery": "steer", "images": attach::submitted(pictures)});
-        let reply = answer_once(&self.client, &ask.id, submitted).await?;
+        let (client, ask, prompt) = (self.client.clone(), ask.clone(), prompt.to_owned());
+        self.write(async move {
+            let reply = answer_once(&client, &ask.id, submitted).await;
+            Wrote::TaskAnswered(Box::new(TaskAnswering { ask, prompt, back }), reply)
+        });
+    }
+
+    /// What came of an answer [`App::answer_task`] sent: kept until the
+    /// task takes it, or, refused, the person's words given back.
+    fn task_answered(&mut self, answering: TaskAnswering, reply: Result<Value, String>) {
+        let TaskAnswering { ask, prompt, back } = answering;
+        let reply = match reply {
+            Ok(reply) => reply,
+            Err(error) => {
+                self.notice = Some(error);
+                if let Some((typed, pictures)) = back {
+                    self.give_back(&typed, pictures);
+                }
+                return;
+            }
+        };
+        let Some(task) = ask.task.clone() else {
+            return;
+        };
         self.task_answers.push(TaskAnswer {
             key: ask.key(),
             bot: task.bot.clone(),
             turn: reply["message"].as_i64(),
             checked: Instant::now(),
         });
-        self.close_ask(ask, prompt);
+        self.close_ask(&ask, &prompt);
         self.fleet_said(format!("your answer went to {}", task.name));
-        Ok(())
     }
 
     /// The tasks' questions that left the pins with no answer from here,
@@ -16283,76 +17686,97 @@ impl App {
     /// by the task, or set aside there; their cards say so. One read per
     /// question gone, never per pass.
     async fn settle_task_asks(&mut self) {
-        for ask in std::mem::take(&mut self.unsettled) {
-            let (Some(task), Some(turn)) = (&ask.task, asks::turn_of(&ask.id)) else {
-                continue;
-            };
-            let call = ask.id.split_once('/').map_or("", |(_, call)| call);
-            let state = match asks::standing(&self.client, &task.bot, turn, call, None).await {
-                Ok(Some((_, state))) => state,
-                // Unread, or the task gone: it waits on nobody here.
-                _ => asks::State::Aside,
-            };
-            // Still open there, it is no longer pinned here: set aside.
-            let state = match state {
-                asks::State::Open => asks::State::Aside,
-                state => state,
-            };
-            self.settle(&ask.key(), state);
+        if let Some(job) = self.settling.take_if(|job| job.is_finished())
+            && let Ok(settled) = job.await
+        {
+            self.task_asks_settled(settled);
         }
-        self.reread_watched().await;
+        if self.settling.is_some() {
+            return;
+        }
+        let unsettled = std::mem::take(&mut self.unsettled);
+        let watched = self.watched_due();
+        if unsettled.is_empty() && watched.is_empty() {
+            return;
+        }
+        // Applied at the next look-round, which draws anyway.
+        let client = self.client.clone();
+        self.settling = Some(tokio::spawn(async move {
+            let mut settled = Settled::default();
+            for ask in unsettled {
+                let (Some(task), Some(turn)) = (&ask.task, asks::turn_of(&ask.id)) else {
+                    continue;
+                };
+                let call = ask.id.split_once('/').map_or("", |(_, call)| call);
+                let state = match asks::standing(&client, &task.bot, turn, call, None).await {
+                    Ok(Some((_, state))) => state,
+                    // Unread, or the task gone: it waits on nobody here.
+                    _ => asks::State::Aside,
+                };
+                // Still open there, it is no longer pinned here: set aside.
+                let state = match state {
+                    asks::State::Open => asks::State::Aside,
+                    state => state,
+                };
+                settled.gone.push((ask.key(), state));
+            }
+            settled.watched = reread_watched(&client, watched).await;
+            settled
+        }));
     }
 
-    /// The tasks' questions not yet answered by the person, read again
-    /// from their tasks once a task's history moved on: answered or closed
-    /// there, so they read here too; still open or set aside, they stay.
-    /// Each task is looked at once every few seconds, one request each,
-    /// and a question read only when its task wrote since.
-    async fn reread_watched(&mut self) {
+    /// The tasks' questions not yet answered by the person, by task, with
+    /// the newest node each was read at: those of tasks looked at over
+    /// five seconds ago, read again once their task wrote since.
+    fn watched_due(&mut self) -> Watched {
         if self.watched.is_empty()
             || self
                 .watched_at
                 .is_some_and(|at| at.elapsed() < Duration::from_secs(5))
         {
-            return;
+            return Vec::new();
         }
         self.watched_at = Some(Instant::now());
-        let mut bots: Vec<String> = (self.watched.values())
-            .filter_map(|(ask, _)| ask.task.as_ref().map(|task| task.bot.clone()))
-            .collect();
-        bots.sort();
-        bots.dedup();
-        for bot in bots {
-            let Ok(record) = self.client.request("inspect", json!({"bot": bot})).await else {
-                continue;
-            };
-            let head = record["head"].as_i64();
-            let due: Vec<(String, asks::Ask)> = (self.watched.iter())
-                .filter(|(_, (ask, seen))| {
-                    ask.task.as_ref().is_some_and(|task| task.bot == bot) && *seen != head
-                })
-                .map(|(key, (ask, _))| (key.clone(), ask.clone()))
-                .collect();
-            for (key, ask) in due {
-                let Some(turn) = asks::turn_of(&ask.id) else {
-                    continue;
-                };
-                let call = ask.id.split_once('/').map_or("", |(_, call)| call);
-                let Ok(found) = asks::standing(&self.client, &bot, turn, call, None).await else {
-                    continue;
-                };
-                // What changed there reads here; still open or set aside
-                // there, it stays where it is here.
-                if let Some((_, state)) = found
-                    && state.settled()
-                    && self.settled.get(&key) != Some(&state)
-                {
-                    self.settle(&key, state);
-                }
-                if let Some((_, seen)) = self.watched.get_mut(&key) {
-                    *seen = head;
-                }
+        let mut by_bot: BTreeMap<String, Vec<(String, asks::Ask, Option<i64>)>> = BTreeMap::new();
+        for (key, (ask, seen)) in &self.watched {
+            if let Some(task) = &ask.task {
+                (by_bot.entry(task.bot.clone()).or_default()).push((
+                    key.clone(),
+                    ask.clone(),
+                    *seen,
+                ));
             }
+        }
+        by_bot.into_iter().collect()
+    }
+
+    /// What the tasks' questions were found doing there: settled here as
+    /// there, and each read at its task's newest node.
+    fn task_asks_settled(&mut self, settled: Settled) {
+        for (key, state) in settled.gone {
+            self.settle(&key, state);
+        }
+        for (key, found, head) in settled.watched {
+            // What changed there reads here; still open or set aside
+            // there, it stays where it is here.
+            if let Some(state) = found
+                && state.settled()
+                && self.settled.get(&key) != Some(&state)
+            {
+                self.settle(&key, state);
+            }
+            if let Some((_, seen)) = self.watched.get_mut(&key) {
+                *seen = head;
+            }
+        }
+    }
+
+    /// [`App::settle_task_asks`] through to what it found.
+    #[cfg(test)]
+    async fn settle_task_asks_through(&mut self) {
+        self.settle_task_asks().await;
+        if let Some(job) = self.settling.take() {
+            self.task_asks_settled(job.await.expect("the questions were read"));
         }
     }
 
@@ -16361,18 +17785,47 @@ impl App {
     /// queue or by its turn's end, answered nothing, and its question is
     /// pinned again. One read per answer in flight, never per task.
     async fn recheck_task_answers(&mut self) {
-        let mut released = false;
-        for at in (0..self.task_answers.len()).rev() {
-            let answer = &self.task_answers[at];
-            let Some(turn) = answer
+        if let Some(job) = self.rechecking.take_if(|job| job.is_finished())
+            && let Ok(rows) = job.await
+        {
+            self.task_answers_read(rows);
+        }
+        if self.rechecking.is_some() {
+            return;
+        }
+        let mut due = Vec::new();
+        for answer in &mut self.task_answers {
+            if let Some(turn) = answer
                 .turn
                 .filter(|_| answer.checked.elapsed() >= Duration::from_secs(3))
+            {
+                answer.checked = Instant::now();
+                due.push((answer.bot.clone(), turn));
+            }
+        }
+        if due.is_empty() {
+            return;
+        }
+        // Applied at the next look-round, which draws anyway.
+        let client = self.client.clone();
+        self.rechecking = Some(tokio::spawn(async move {
+            let mut rows = Vec::new();
+            for (bot, turn) in due {
+                if let Some(row) = message_row(&client, &bot, turn).await {
+                    rows.push((bot, turn, row));
+                }
+            }
+            rows
+        }));
+    }
+
+    /// What the answers sent to tasks were found doing.
+    fn task_answers_read(&mut self, rows: Vec<(String, i64, Value)>) {
+        let mut released = false;
+        for (bot, turn, row) in rows {
+            let Some(at) = (self.task_answers.iter())
+                .position(|answer| answer.bot == bot && answer.turn == Some(turn))
             else {
-                continue;
-            };
-            let bot = answer.bot.clone();
-            self.task_answers[at].checked = Instant::now();
-            let Some(row) = message_row(&self.client, &bot, turn).await else {
                 continue;
             };
             if asks::undelivered(&row) {
@@ -16388,6 +17841,15 @@ impl App {
         }
         if released {
             self.task_asks_read = None;
+        }
+    }
+
+    /// [`App::recheck_task_answers`] through to what it found.
+    #[cfg(test)]
+    async fn recheck_task_answers_through(&mut self) {
+        self.recheck_task_answers().await;
+        if let Some(job) = self.rechecking.take() {
+            self.task_answers_read(job.await.expect("the answers were read"));
         }
     }
 
@@ -17146,21 +18608,16 @@ impl App {
                 return false;
             }
         };
+        // Sent beside the loop; one the daemon refuses is taken off again.
         if added {
             let told = reactions::message(emoji, (!last).then_some(first.as_str()));
-            let sent = self
-                .client
-                .request(
-                    "submit",
-                    json!({"bot": self.bot, "request_id": unique("tui"), "prompt": told,
-                        "delivery": "attach"}),
-                )
-                .await;
-            if let Err(error) = sent {
-                let _ = self.reactions.toggle(node, emoji);
-                self.notice = Some(error.to_string());
-                return false;
-            }
+            let asked = json!({"bot": self.bot, "request_id": unique("tui"), "prompt": told,
+                "delivery": "attach"});
+            let (client, emoji) = (self.client.clone(), emoji.to_owned());
+            self.write(async move {
+                let sent = client.request("submit", asked).await;
+                Wrote::Reacted(node, emoji, sent.err().map(|error| error.to_string()))
+            });
         }
         self.notice = None;
         // Under the reply, wherever it is in the conversation; else, as
@@ -17410,23 +18867,10 @@ impl App {
             zen::Command::On(focus) => (format!("/zen {focus}"), Some(focus)),
             zen::Command::Off => ("/zen off".to_owned(), None),
         };
-        if let Err(error) = self.send(said, None, false, queue, &[]).await {
-            self.notice = Some(error);
-            return;
-        }
+        // Refused, the command goes back in the composer.
+        let typed = (*self.input).to_owned();
         self.input.clear();
-        if let Err(error) = zen::set(self.reactions_key.as_deref(), focus.as_deref()) {
-            self.notice = Some(error);
-            return;
-        }
-        let changed = self.zen.is_some() != focus.is_some();
-        self.notice = Some(zen_notice(focus.is_some()));
-        self.zen = focus;
-        self.pane_keys = false;
-        // Drawn again in the other view; a new focus redraws nothing.
-        if changed {
-            self.zen_view_changed();
-        }
+        self.send(said, None, (false, queue), &[], Then::Zen(focus, typed));
     }
 
     /// `/new [NAME]`: an agent started from this lead's folder, its profile
@@ -18097,14 +19541,20 @@ impl App {
     /// wait ended): its verdicts, the person's first.
     /// A lifted call denied ends without its verdicts: who denied it is
     /// read from the audit trail instead.
-    async fn heard_verdict_or_read(&mut self, bot: &str, turn: Option<i64>, data: &Value) {
+    /// A call's end, its verdict told: or, denied with none told, the
+    /// verdicts to read from the audit trail ([`read_verdicts`]).
+    fn verdict_or_reads(
+        &mut self,
+        bot: &str,
+        turn: Option<i64>,
+        data: &Value,
+    ) -> Vec<(CallKey, i64)> {
         if data["outcome"] == "denied" && !data["approvals"].is_array() {
             let call = data["call_id"].as_str().unwrap_or_default().to_owned();
-            self.verdicts_from_audit(vec![(bot.to_owned(), turn.unwrap_or(-1), call)])
-                .await;
-        } else {
-            self.heard_verdict(bot, turn, data);
+            return self.verdicts_to_read(vec![(bot.to_owned(), turn.unwrap_or(-1), call)]);
         }
+        self.heard_verdict(bot, turn, data);
+        Vec::new()
     }
 
     fn heard_verdict(&mut self, bot: &str, turn: Option<i64>, data: &Value) {
@@ -18162,39 +19612,70 @@ impl App {
     /// told this window of, read from the audit trail's rows since each was
     /// written, which a decision follows: who approved it, and whether it
     /// was denied.
-    async fn verdicts_from_audit(&mut self, gone: Vec<(String, i64, String)>) {
-        for key in gone {
-            let Some(at_ms) = (self.written.get(&key))
-                .filter(|written| !written.heard)
-                .map(|written| written.at_ms)
-            else {
+    async fn verdicts_from_audit(&mut self, gone: Vec<CallKey>) {
+        let reads = self.verdicts_to_read(gone);
+        let rows = read_verdicts(self.client.clone(), reads).await;
+        self.verdicts_read(rows);
+    }
+
+    /// The verdicts `reads` names read beside the loop, drawn as they come
+    /// ([`App::verdicts_came`]).
+    fn read_verdicts_beside(&mut self, reads: Vec<(CallKey, i64)>) {
+        if reads.is_empty() {
+            return;
+        }
+        let (client, woken) = (self.client.clone(), self.woken.clone());
+        let keys: Vec<CallKey> = reads.iter().map(|(key, _)| key.clone()).collect();
+        self.verdicts_out.extend(keys.iter().cloned());
+        let (send, receive) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let _ = send.send(read_verdicts(client, reads).await);
+            woken.notify_one();
+        });
+        self.verdicting.push((keys, receive));
+    }
+
+    /// The verdicts read beside the loop that came.
+    fn verdicts_came(&mut self) {
+        let mut came = Vec::new();
+        let mut ended = Vec::new();
+        self.verdicting.retain_mut(|(keys, reading)| {
+            match reading.try_recv() {
+                Ok(rows) => came.extend(rows),
+                Err(tokio::sync::oneshot::error::TryRecvError::Empty) => return true,
+                Err(_) => {}
+            }
+            ended.append(keys);
+            false
+        });
+        for key in &ended {
+            self.verdicts_out.remove(key);
+        }
+        self.verdicts_read(came);
+    }
+
+    /// Those of `gone` written out here whose verdict was not heard yet,
+    /// nor being read, with when each was written: what [`read_verdicts`]
+    /// reads.
+    fn verdicts_to_read(&self, gone: Vec<CallKey>) -> Vec<(CallKey, i64)> {
+        (gone.into_iter())
+            .filter(|key| !self.verdicts_out.contains(key))
+            .filter_map(|key| {
+                let at_ms = (self.written.get(&key))
+                    .filter(|written| !written.heard)?
+                    .at_ms;
+                Some((key, at_ms))
+            })
+            .collect()
+    }
+
+    /// The verdicts [`read_verdicts`] found, drawn where each call was
+    /// written out, unless heard meanwhile.
+    fn verdicts_read(&mut self, rows: Vec<(CallKey, Value)>) {
+        for (key, row) in rows {
+            if (self.written.get(&key)).is_none_or(|written| written.heard) {
                 continue;
-            };
-            // A step's row names its call and the step apart.
-            let (call, step) = match key.2.rsplit_once('/') {
-                Some((call, step)) => (call, Some(step)),
-                None => (key.2.as_str(), None),
-            };
-            let mut asked = json!({"bot": key.0, "turn": key.1, "limit": 64,
-                "since_ms": at_ms.saturating_sub(AUDIT_SLACK_MS)});
-            // Newest first, page by page, back to when it was written.
-            let row = loop {
-                let Ok(page) = self.client.request("audit", asked.clone()).await else {
-                    break None;
-                };
-                let row = (page["rows"].as_array().into_iter().flatten())
-                    .find(|row| row["call_id"] == call && row["step"].as_str() == step);
-                if let Some(row) = row {
-                    break Some(row.clone());
-                }
-                match page["next_before"].as_i64() {
-                    Some(before) => asked["before"] = json!(before),
-                    None => break None,
-                }
-            };
-            let Some(row) = row else {
-                continue;
-            };
+            }
             let denied = row["outcome"] == "denied";
             let decided = match (row["approved"].as_str(), denied) {
                 (Some("person"), true) => transcript::Decided::Denied { you: true },
@@ -18290,7 +19771,7 @@ impl App {
     /// A frame drawn, the whole screen written again when it is stale
     /// (cleared first); every frame shown whole, or not written at all
     /// when it changes nothing ([`frames`]).
-    fn draw(&mut self, terminal: &mut Tui) -> std::io::Result<()> {
+    fn draw(&mut self, terminal: &mut Terminal<impl Drawn>) -> std::io::Result<()> {
         let stale = std::mem::take(&mut self.stale);
         frames::frame(|| {
             if stale {
@@ -18301,7 +19782,7 @@ impl App {
         })
     }
 
-    fn frame(&mut self, terminal: &mut Tui) -> std::io::Result<()> {
+    fn frame(&mut self, terminal: &mut Terminal<impl Drawn>) -> std::io::Result<()> {
         // A question open here holds this window's place in its lead's
         // multiplexer, as the person still has it to answer.
         used::asking(&self.bot, !self.asks.is_empty());
@@ -20346,6 +21827,322 @@ fn shimmer(text: &str, since: Duration) -> Vec<Span<'static>> {
 
 /// A call listed cut made whole: the person answers the whole of it, read
 /// from the node of `bot`'s that planned it, or is told it could not be.
+/// Message `message` of `bot`, its words as the person wrote them, read
+/// whole from the store: what its staged row shows.
+async fn read_prompt(client: &Client, bot: &str, message: i64) -> Option<String> {
+    let asked = json!({"bot": bot, "turn": message, "bytes": PROMPT_READ_BYTES});
+    let read = client.request("prompts", asked).await.ok()?;
+    let text = read["prompts"][0]["text"].as_str()?;
+    Some(stamp::unstamped(text).to_owned())
+}
+
+/// Call `id` of `bot`, its name and arguments, read from the bot's
+/// newest items.
+async fn read_call(client: &Client, bot: &str, id: &str) -> Option<(String, Value)> {
+    let page = client
+        .request("history_nodes", json!({"bot": bot, "limit": 32}))
+        .await
+        .ok()?;
+    let nodes: Vec<i64> = page["nodes"]
+        .as_array()?
+        .iter()
+        .filter_map(|n| n["node"].as_i64())
+        .collect();
+    let (items, _) = needs::items(client, bot, &nodes).await;
+    let (_, call) = items
+        .iter()
+        .find(|(_, item)| item["type"] == "function_call" && item["call_id"] == id)?;
+    Some((
+        call["name"].as_str()?.to_owned(),
+        serde_json::from_str(call["arguments"].as_str()?).ok()?,
+    ))
+}
+
+/// What `prompts` is asked for the words that started `turn` of `bot`.
+fn prompts_asked(bot: &str, turn: i64) -> Value {
+    json!({"bot": bot, "turn": turn, "bytes": 4096})
+}
+
+/// A page of the bot's older items, read beside the loop that takes keys
+/// ([`read_page`]): drawn without waiting on the daemon.
+#[derive(Default)]
+struct PageRead {
+    items: Vec<(i64, Value)>,
+    /// The items were read short.
+    short: bool,
+    /// What `prompts` gave for the turns pages start in, by turn.
+    prompts: HashMap<i64, Value>,
+}
+
+/// The items at `nodes` of `bot`, and with `prompts` the words that
+/// started each turn of `turns`.
+async fn read_page(client: &Client, bot: &str, nodes: &[i64], turns: &[i64]) -> PageRead {
+    let (items, short) = needs::items(client, bot, nodes).await;
+    let mut prompts = HashMap::new();
+    for &turn in turns {
+        if let Ok(read) = client.request("prompts", prompts_asked(bot, turn)).await {
+            prompts.insert(turn, read);
+        }
+    }
+    PageRead {
+        items,
+        short,
+        prompts,
+    }
+}
+
+/// A message being sent to the bot ([`App::message`]), and what it was
+/// sent with, to stage it where it went once the daemon has it.
+struct Sent {
+    prompt: String,
+    origin: Option<&'static str>,
+    steer: bool,
+    queue: bool,
+    /// The boost it took, given back should it not go.
+    effort: Option<String>,
+    /// The folder it moves the lead to, given back should it not go.
+    workspace: Option<String>,
+    /// The number its row is staged under while it goes.
+    sending: i64,
+    submitted: Value,
+    then: Then,
+}
+
+/// What follows a message once the daemon took it ([`App::landed`]), or
+/// refused it ([`App::unsent`]).
+enum Then {
+    /// The person's words: back in the composer, with the pictures it
+    /// carried, should it not go; the question it answers closed once it
+    /// lands.
+    Composed {
+        typed: String,
+        pictures: Vec<Option<attach::Picture>>,
+        answering: Option<asks::Ask>,
+    },
+    /// The answer to a question, closed once it lands.
+    Closes(asks::Ask),
+    /// A command the person ran that waited to go with their next message.
+    Held,
+    /// A command the person ran, kept to go with their next message should
+    /// it not go; once it lands, the question it ran for answered with how
+    /// it went.
+    Ran(Option<(asks::Ask, user_shell::Ran)>),
+    /// `/zen`, kept for this agent and drawn once it lands; the command as
+    /// typed, back in the composer should it not go.
+    Zen(Option<String>, String),
+    /// `/retry`'s approval: the denials as they were should it not go.
+    Retried(Vec<Denial>),
+}
+
+/// `message` sent: once, when it answers a question ([`answer_once`]).
+async fn submit_message(client: &Client, message: &Sent) -> Result<Value, String> {
+    let submitted = message.submitted.clone();
+    match asks::answer_of(&message.prompt, message.origin) {
+        Some(ask) => answer_once(client, ask, submitted).await,
+        None => {
+            let mut submitted = submitted;
+            submitted["request_id"] = json!(unique("tui"));
+            (client.request("submit", submitted).await).map_err(|e| e.to_string())
+        }
+    }
+}
+
+/// What came of a write to the daemon ([`App::write`]), applied in the
+/// order the writes were made ([`App::wrote`]).
+enum Wrote {
+    /// What a `configure` sent, what the daemon said, and why the
+    /// reviewer its row asks for could not be kept.
+    Configured(
+        Box<Configuring>,
+        Result<Value, agent_client::Error>,
+        Option<String>,
+    ),
+    /// A write that only says, in the notice, why it failed.
+    Said(Option<String>),
+    /// Messages to the bot, and what the daemon said of each.
+    Sent(Vec<(Sent, Result<Value, String>)>),
+    /// An answer to a call that waits on the person, what the daemon said
+    /// of it, and the calls of this bot's round still waiting.
+    Answered(Box<Answering>, agent_client::Result<Value>, Option<Value>),
+    /// A message read to quote where the person writes.
+    Quoted(String),
+    /// A margin note the agent was told was taken away, and why the
+    /// daemon refused to tell it.
+    NoteClosed(String, Option<String>),
+    /// An emoji put on the reply at a node, and why the daemon refused it.
+    Reacted(i64, String, Option<String>),
+    /// What the daemon said of `/compact`.
+    Compacted(agent_client::Result<Value>),
+    /// An answer to a task's question, and what the daemon said of it.
+    TaskAnswered(Box<TaskAnswering>, Result<Value, String>),
+}
+
+/// An answer to a call that waits on the person ([`App::answer`]).
+struct Answering {
+    call: Value,
+    /// Whether the call is this bot's own, not one raised from below.
+    own: bool,
+    bot: String,
+    decision: String,
+    kept: Option<String>,
+}
+
+/// An answer to a task's question being sent ([`App::answer_task`]).
+struct TaskAnswering {
+    ask: asks::Ask,
+    prompt: String,
+    /// What the person typed, and its pictures, should it not go.
+    back: Option<(String, Vec<Option<attach::Picture>>)>,
+}
+
+/// The picks a `configure` sent ([`App::configure`]): the bot's once the
+/// daemon takes them, picked again when its turn still runs.
+struct Configuring {
+    text: Option<String>,
+    switch: Option<(String, Option<String>)>,
+    gating: Option<&'static str>,
+    declare: Option<Value>,
+    cache: Option<&'static str>,
+    pace: Option<&'static str>,
+    env: Option<Value>,
+    /// The window's own turn model and boost, let go as the switch went
+    /// so a message sent behind it runs on the new model: given back when
+    /// the switch was not taken.
+    let_go: (Option<String>, Option<String>),
+}
+
+/// What a daemon event needs read before it is applied ([`App::wants`]),
+/// read beside the loop that takes keys: the event and those after it
+/// wait for it, so the transcript is drawn in the order it happened.
+#[derive(Default)]
+struct Wants {
+    /// The items at this node of the bot's history.
+    node: Option<i64>,
+    /// This call's name and arguments, from the bot's newest items.
+    call: Option<String>,
+    /// The calls waiting on the person, of this turn.
+    approvals: Option<Option<i64>>,
+    /// The bot's record.
+    record: bool,
+    /// This message's words, as the person wrote them.
+    prompt: Option<i64>,
+    /// Verdicts of calls written out here, from the audit trail.
+    verdicts: Vec<(CallKey, i64)>,
+}
+
+impl Wants {
+    fn any(&self) -> bool {
+        self.node.is_some()
+            || self.call.is_some()
+            || self.approvals.is_some()
+            || self.record
+            || self.prompt.is_some()
+            || !self.verdicts.is_empty()
+    }
+
+    async fn read(self, client: Arc<Client>, bot: String) -> Read {
+        let mut read = Read::default();
+        if let Some(node) = self.node {
+            let (items, short) = needs::items(&client, &bot, &[node]).await;
+            read.items = items.into_iter().map(|(_, item)| item).collect();
+            read.short = short;
+        }
+        if let Some(id) = &self.call {
+            read.call = read_call(&client, &bot, id).await;
+        }
+        if let Some(turn) = self.approvals {
+            read.approvals = read_approvals(client.clone(), bot.clone(), turn).await;
+        }
+        if self.record {
+            read.record = client.request("inspect", json!({"bot": bot})).await.ok();
+        }
+        if let Some(message) = self.prompt {
+            read.prompt = read_prompt(&client, &bot, message).await;
+        }
+        read.verdicts = read_verdicts(client, self.verdicts).await;
+        read
+    }
+}
+
+/// What [`Wants`] read, for [`App::heard`].
+#[derive(Default)]
+struct Read {
+    items: Vec<Value>,
+    /// The items were read short.
+    short: bool,
+    call: Option<(String, Value)>,
+    approvals: Option<Value>,
+    record: Option<Value>,
+    prompt: Option<String>,
+    verdicts: Vec<(CallKey, Value)>,
+}
+
+/// A call of a bot written out in a window: the bot, its turn (-1 for
+/// none) and the call's id, a step's as `CALL/STEP`.
+type CallKey = (String, i64, String);
+
+/// The verdicts a read beside the loop found, as they come.
+type VerdictsReading = tokio::sync::oneshot::Receiver<Vec<(CallKey, Value)>>;
+
+/// The audit trail's row for each call of `calls` written at the time
+/// given, when it has one: who allowed or denied it.
+async fn read_verdicts(client: Arc<Client>, calls: Vec<(CallKey, i64)>) -> Vec<(CallKey, Value)> {
+    let mut rows = Vec::new();
+    for (key, at_ms) in calls {
+        // A step's row names its call and the step apart.
+        let (call, step) = match key.2.rsplit_once('/') {
+            Some((call, step)) => (call, Some(step)),
+            None => (key.2.as_str(), None),
+        };
+        let mut asked = json!({"bot": key.0, "turn": key.1, "limit": 64,
+            "since_ms": at_ms.saturating_sub(AUDIT_SLACK_MS)});
+        // Newest first, page by page, back to when it was written.
+        let row = loop {
+            let Ok(page) = client.request("audit", asked.clone()).await else {
+                break None;
+            };
+            let row = (page["rows"].as_array().into_iter().flatten())
+                .find(|row| row["call_id"] == call && row["step"].as_str() == step);
+            if let Some(row) = row {
+                break Some(row.clone());
+            }
+            match page["next_before"].as_i64() {
+                Some(before) => asked["before"] = json!(before),
+                None => break None,
+            }
+        };
+        if let Some(row) = row {
+            rows.push((key, row));
+        }
+    }
+    rows
+}
+
+/// Whether `call`, as `approvals` lists it, waits on the person: one of
+/// turn `turn`, or one a message lifted out of its turn (with its steps,
+/// listed under its handle), which waits on past it.
+fn waits_on_person(call: &Value, turn: Option<i64>) -> bool {
+    (call["turn"].as_i64() == turn || !call["handle"].is_null())
+        && (!call["asked"].is_null()
+            || call["gates"]
+                .as_array()
+                .is_some_and(|gates| gates.iter().any(|g| g == "manual")))
+}
+
+/// `bot`'s calls as `approvals` lists them, those waiting on the person
+/// in turn `turn` with their arguments read whole; `None` when the
+/// daemon could not say.
+async fn read_approvals(client: Arc<Client>, bot: String, turn: Option<i64>) -> Option<Value> {
+    let asked = json!({"bot": bot, "limit": 64});
+    let mut page = client.request("approvals", asked).await.ok()?;
+    if let Some(calls) = page["approvals"].as_array_mut() {
+        for call in calls.iter_mut().filter(|call| waits_on_person(call, turn)) {
+            whole_arguments(&client, &bot, call).await;
+        }
+    }
+    Some(page)
+}
+
 async fn whole_arguments(client: &Client, bot: &str, call: &mut Value) {
     let whole = call["arguments"].is_object()
         && call["arguments_cut"].as_array().is_none_or(Vec::is_empty)
@@ -21456,10 +23253,10 @@ mod tests {
         let mut app = app(client);
         app.boost = Some("max".into());
         assert!(app.footer_line(120).to_string().contains(" ↑max"));
-        app.send("Think it through".into(), None, false, false, &[])
+        app.send_now("Think it through".into(), (false, false))
             .await
             .unwrap();
-        app.send("And this".into(), None, false, false, &[])
+        app.send_now("And this".into(), (false, false))
             .await
             .unwrap();
         let submits: Vec<Value> = (asked.lock().unwrap().iter())
@@ -21526,6 +23323,7 @@ mod tests {
         // Only a lead's window starts agents from its folder.
         app.input.set("/new");
         app.submit().await;
+        app.beside_done().await;
         assert_eq!(
             app.notice.as_deref(),
             Some("/new starts agents from a folder's lead; /switch to one")
@@ -21545,6 +23343,7 @@ mod tests {
         app.workspace = dir.display().to_string();
         app.input.set("/new Fix.It");
         app.submit().await;
+        app.beside_done().await;
         assert!(
             app.notice
                 .as_deref()
@@ -21555,6 +23354,7 @@ mod tests {
         // The profiles first, the project's lead first and marked.
         app.input.set("/new");
         app.submit().await;
+        app.beside_done().await;
         let (items, _) = app.making.as_ref().and_then(new::Making::listed).unwrap();
         assert_eq!((items[0].name.as_str(), items[0].current), ("lead", true));
         assert!(items.iter().any(|item| item.name == "reviewer"));
@@ -21563,6 +23363,7 @@ mod tests {
             app.key(key(KeyCode::Char(c))).await;
         }
         app.key(key(KeyCode::Enter)).await;
+        app.beside_done().await;
         // In git: a worktree first, then this folder or an empty one. (The
         // folder is a checkout of its own: outside one, any sandbox running
         // meanwhile holds a placeholder /tmp/.git that makes it /tmp's.)
@@ -21571,6 +23372,7 @@ mod tests {
         assert_eq!(places, ["worktree", "this folder", "empty folder"]);
         app.key(key(KeyCode::Down)).await;
         app.key(key(KeyCode::Enter)).await;
+        app.beside_done().await;
         // Then its first message, in the composer, under what it starts.
         assert!(app.new_brief() && !app.listing_open());
         assert_eq!(
@@ -21590,6 +23392,7 @@ mod tests {
         app.approvals
             .push(json!({"name": "shell", "arguments": {"command": "ls"}}));
         app.key(key(KeyCode::Char('y'))).await;
+        app.beside_done().await;
         assert_eq!((app.input.trim(), app.approvals.len()), ("y", 1));
         app.approvals.clear();
         app.input.clear();
@@ -21600,6 +23403,7 @@ mod tests {
         }));
         app.input.set("look at [Image #1]");
         app.submit().await;
+        app.beside_done().await;
         let making = app.making.as_mut().unwrap();
         assert!(making.failed.take().unwrap().contains("picture"));
         assert!(app.new_brief() && app.input.trim().contains("look at"));
@@ -21614,7 +23418,9 @@ mod tests {
         // not the window.
         app.input.set("/new");
         app.submit().await;
+        app.beside_done().await;
         app.key(key(KeyCode::Enter)).await;
+        app.beside_done().await;
         assert_eq!(
             app.answering_over(80).unwrap().to_string(),
             "  new lead in this folder · named from your words"
@@ -21675,20 +23481,24 @@ mod tests {
         // By its whole name, or its name in this window's project.
         app.input.set("/switch fix");
         app.submit().await;
+        app.beside_done().await;
         assert_eq!(app.switch_to.as_deref(), Some("shop.fix"));
         assert!(app.quit);
         (app.switch_to, app.quit) = (None, false);
         app.input.set("/switch b");
         app.submit().await;
+        app.beside_done().await;
         assert_eq!(app.notice.as_deref(), Some("this window is b's already"));
         // A name found in none lists what it narrows to: here, nothing.
         app.notice = None;
         app.input.set("/switch nobody");
         app.submit().await;
+        app.beside_done().await;
         let agents = app.agents.as_ref().expect("the list is open");
         assert_eq!(agents.filter(), "nobody");
         assert_eq!(agents.chosen(), None);
         app.key(Event::Key(KeyCode::Enter.into())).await;
+        app.beside_done().await;
         assert!(!app.quit && app.agents.is_some(), "Enter takes nothing");
         app.key(Event::Key(KeyCode::Esc.into())).await;
         assert!(app.agents.is_none());
@@ -21696,12 +23506,14 @@ mod tests {
         // not this window picked.
         app.input.set("/switch");
         app.submit().await;
+        app.beside_done().await;
         assert_eq!(
             app.agents.as_ref().and_then(|a| a.chosen()).as_deref(),
             Some("shop.lead")
         );
         app.key(Event::Key(KeyCode::Down.into())).await;
         app.key(Event::Key(KeyCode::Enter.into())).await;
+        app.beside_done().await;
         assert_eq!(app.switch_to.as_deref(), Some("shop.fix"));
         (app.switch_to, app.quit) = (None, false);
         // The agent open beside the conversation is picked to start.
@@ -21710,6 +23522,7 @@ mod tests {
         app.open_pane(pane);
         app.input.set("/switch");
         app.submit().await;
+        app.beside_done().await;
         assert_eq!(
             app.agents.as_ref().and_then(|a| a.chosen()).as_deref(),
             Some("shop.fix")
@@ -21725,6 +23538,7 @@ mod tests {
         app.options.embedded = true;
         app.input.set("/switch shop.lead");
         app.submit().await;
+        app.beside_done().await;
         assert!(app.switch_to.is_none() && !app.quit);
         assert!(
             embed::OPENED_HERE
@@ -21736,6 +23550,7 @@ mod tests {
         app.options.side = Some(1);
         app.input.set("/switch shop.fix");
         app.submit().await;
+        app.beside_done().await;
         assert!(app.switch_to.is_none() && !app.quit);
         assert!(
             !embed::OPENED_HERE
@@ -21792,6 +23607,7 @@ mod tests {
         app.asks_seen.insert("notes".into(), (2, question));
         app.input.set("/switch");
         app.submit().await;
+        app.beside_done().await;
         let state = |app: &App, name: &str| {
             let agents = app.agents.as_ref().expect("the list is open");
             (agents.rows().into_iter())
@@ -21836,12 +23652,14 @@ mod tests {
         };
         app.input.set("/pause");
         app.submit().await;
+        app.beside_done().await;
         assert_eq!(
             app.notice.as_deref(),
             Some("/pause takes why: /pause REASON")
         );
         app.input.set("/pause the migration deletes rows");
         app.submit().await;
+        app.beside_done().await;
         assert_eq!(
             app.notice.as_deref(),
             Some("every agent is paused; 2 running wait for /resume")
@@ -21888,6 +23706,7 @@ mod tests {
             .await;
         app.input.set("/resume");
         app.submit().await;
+        app.beside_done().await;
         assert_eq!(app.notice.as_deref(), Some("the agents go on"));
         // It holds the line over an approval, whose keys wait for it.
         app.approvals
@@ -22970,6 +24789,7 @@ mod tests {
         let mut app = app(client);
         app.input.set("what changed in the cart?");
         app.submit().await;
+        app.beside_done().await;
         app.daemon(turn_event("accepted", 1, json!({}))).await;
         app.daemon(turn_event(
             "turn_finished",
@@ -23053,6 +24873,7 @@ mod tests {
         let narrow = row(&app, 24);
         assert!(narrow.ends_with("…  tab  idea"), "{narrow}");
         app.key(tab()).await;
+        app.beside_done().await;
         assert_eq!(&*app.input, "add a cold start benchmark");
         // A tip for a command: Tab takes it, Enter would run it.
         let mut app = guessed("/side why did the build slow down\ntip").await;
@@ -23061,6 +24882,7 @@ mod tests {
             "› /side why did the build slow down  tab  tip"
         );
         app.key(tab()).await;
+        app.beside_done().await;
         assert_eq!(&*app.input, "/side why did the build slow down");
         // A tip for a key is only read: no `tab`, and Tab does what it
         // does otherwise.
@@ -23069,6 +24891,7 @@ mod tests {
         // Each command or key is tipped once in a window.
         assert_eq!(app.tipped, ["ctrl+r"]);
         app.key(tab()).await;
+        app.beside_done().await;
         assert!(app.input.is_empty());
         // A tip for what Sonny does not have shows nothing.
         for said in [
@@ -23099,6 +24922,7 @@ mod tests {
         let mut app = app(client);
         app.input.set("fix the bug and run tests");
         app.submit().await;
+        app.beside_done().await;
         app.daemon(turn_event("accepted", 1, json!({}))).await;
         app.daemon(turn_event(
             "turn_finished",
@@ -23166,6 +24990,7 @@ mod tests {
         app.daemon(turn_event("accepted", 1, json!({}))).await;
         app.input.set("and the reversed range too");
         app.submit().await;
+        app.beside_done().await;
         assert_eq!(app.yours, Some(1));
         app.daemon(turn_event("steered", 1, json!({"message": 2})))
             .await;
@@ -23239,8 +25064,10 @@ mod tests {
             "  answering “Bump it?” (1 of 4)"
         );
         app.submit().await;
+        app.beside_done().await;
         app.input.set("2");
         app.submit().await;
+        app.beside_done().await;
         // Its answer landing leaves the other question asked the same open.
         app.answered("You asked (ask:1/c1): Keep the old API?\n\nDrop it", None);
         // After Esc, words are the person's own, sent as they wrote them:
@@ -23250,6 +25077,7 @@ mod tests {
         app.input.set("how is it going?");
         assert!(app.answering_over(80).is_none());
         app.submit().await;
+        app.beside_done().await;
         app.chatting = false;
         app.input.set("!ls");
         assert!(app.answering_over(80).is_none());
@@ -23289,6 +25117,7 @@ mod tests {
         assert_eq!(app.aside.len(), 2);
         app.input.clear();
         app.press("answer/0/ask:1/c2").await;
+        app.beside_done().await;
         assert_eq!(
             sent.lock().unwrap().last().unwrap(),
             "You asked (ask:1/c2): Tag it?\n\nKeep it"
@@ -23319,6 +25148,7 @@ mod tests {
         app.answered("You asked (ask:1/c5): Tag it?\n\nKeep it", None);
         assert_eq!(app.asking().map(|a| a.id.as_str()), Some("ask:1/c6"));
         app.press("answer/0/ask:1/c7").await;
+        app.beside_done().await;
         assert_eq!(app.asking().map(|a| a.id.as_str()), Some("ask:1/c6"));
     }
 
@@ -23896,6 +25726,7 @@ mod tests {
             assert!(COMMANDS.iter().all(|(name, _)| *name != word), "{word}");
             app.input.set(word);
             app.submit().await;
+            app.beside_done().await;
             let said = format!("no command {word} · / lists them");
             assert_eq!(app.notice.as_deref(), Some(said.as_str()));
             // It stays to be fixed: nothing is sent.
@@ -24185,12 +26016,14 @@ mod tests {
         app.reactions_key = Some("0000-9".into());
         app.input.set("/zen");
         app.submit().await;
+        app.beside_done().await;
         assert_eq!(
             app.notice.as_deref(),
             Some("/zen FOCUS: say the one thing to talk about")
         );
         app.input.set("/zen the receipts' currency");
         app.submit().await;
+        app.beside_done().await;
         assert_eq!(app.zen.as_deref(), Some("the receipts' currency"));
         assert_eq!(
             zen::focus(Some("0000-9")).as_deref(),
@@ -24229,6 +26062,7 @@ mod tests {
         app.repaint = false;
         app.input.set("/zen");
         app.submit().await;
+        app.beside_done().await;
         assert_eq!(app.zen, None);
         assert_eq!(zen::focus(Some("0000-9")), None);
         assert!(app.repaint);
@@ -24478,6 +26312,7 @@ mod tests {
         app.running = None;
         app.input.set("/retry");
         app.submit().await;
+        app.beside_done().await;
         assert_eq!(
             app.approving.as_ref().and_then(|(_, list)| list.chosen()),
             Some(0)
@@ -24494,6 +26329,7 @@ mod tests {
         // Picked, the whole call is written out and the one confirm
         // asks; nothing is sent yet. Any key but Enter says no.
         app.key(enter()).await;
+        app.beside_done().await;
         assert!(app.approving.is_none());
         assert!(matches!(app.confirming, Some(Confirm::Retry(_))));
         assert!(sent.lock().unwrap().is_empty());
@@ -24510,9 +26346,12 @@ mod tests {
         assert_eq!(app.notice.as_deref(), Some("not allowed"));
         app.input.set("/retry");
         app.submit().await;
+        app.beside_done().await;
         app.key(enter()).await;
+        app.beside_done().await;
         assert!(matches!(&app.confirming, Some(Confirm::Retry(d)) if d.call_id != "c0"));
         app.key(enter()).await;
+        app.beside_done().await;
         assert!(app.confirming.is_none());
         assert_eq!(app.denials, [other]);
         app.denials.clear();
@@ -24524,6 +26363,7 @@ mod tests {
         // Nothing left to approve.
         app.input.set("/retry");
         app.submit().await;
+        app.beside_done().await;
         assert_eq!(app.notice.as_deref(), Some("no recent reviewer denials"));
     }
 
@@ -24616,12 +26456,14 @@ mod tests {
         app.workspace = std::env::temp_dir().to_string_lossy().into_owned();
         app.input.set("!echo hello");
         app.submit().await;
+        app.beside_done().await;
         assert!(app.input.is_empty());
         assert_eq!(app.shell_rows(80).len(), 1);
         while app.shell.as_ref().is_some_and(|s| !s.is_finished()) {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
         app.shell_ran().await;
+        app.beside_done().await;
         assert!(app.shell.is_none());
         // Shown, and sent at once, no message of the person's needed: to
         // an idle agent, as a turn of its own.
@@ -24643,10 +26485,12 @@ mod tests {
         // To a busy one, as a steer of its running turn.
         app.input.set("!true");
         app.submit().await;
+        app.beside_done().await;
         while app.shell.as_ref().is_some_and(|s| !s.is_finished()) {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
         app.shell_ran().await;
+        app.beside_done().await;
         assert_eq!(sent.lock().unwrap()[1]["delivery"], "steer");
         let landed_here: Vec<String> =
             landed(prompt, &mut app.ran_here, 80, std::path::Path::new("."))
@@ -24667,6 +26511,7 @@ mod tests {
         // The next message goes alone.
         app.input.set("thanks");
         app.submit().await;
+        app.beside_done().await;
         assert_eq!(words_sent(&sent.lock().unwrap()[2]), "thanks");
     }
 
@@ -24715,10 +26560,12 @@ mod tests {
             "  answering “Sign in to the registry?” (1 of 2)"
         );
         app.submit().await;
+        app.beside_done().await;
         while app.shell.as_ref().is_some_and(|s| !s.is_finished()) {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
         app.shell_ran().await;
+        app.beside_done().await;
         let sent = sent.lock().unwrap().clone();
         // What it printed goes as the command's record, never the person's
         // words; their answer, what ran and how it exited, joins its turn.
@@ -24776,10 +26623,12 @@ mod tests {
             app.input.set("!true");
             assert!(app.answering_over(80).is_none());
             app.submit().await;
+            app.beside_done().await;
             while app.shell.as_ref().is_some_and(|s| !s.is_finished()) {
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
             app.shell_ran().await;
+            app.beside_done().await;
             assert_eq!(app.asks, asks);
         }
         let sent = sent.lock().unwrap().clone();
@@ -24809,6 +26658,7 @@ mod tests {
         assert!(app.asking().is_none());
         assert!(app.answering_over(80).is_none());
         app.submit().await;
+        app.beside_done().await;
         // Landing, they went on past it, as words after Esc do.
         app.answered("also rename the crate", None);
         assert!(app.asks.is_empty());
@@ -24821,6 +26671,7 @@ mod tests {
         app.asked("c2", Some(3), &json!({"question": "Tag it?"}));
         assert_eq!(app.asking().unwrap().id, "ask:3/c1");
         app.submit().await;
+        app.beside_done().await;
         assert_eq!(
             *sent.lock().unwrap(),
             [
@@ -24852,10 +26703,12 @@ mod tests {
         for command in ["!echo hello", "!echo again"] {
             app.input.set(command);
             app.submit().await;
+            app.beside_done().await;
             while app.shell.as_ref().is_some_and(|s| !s.is_finished()) {
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
             app.shell_ran().await;
+            app.beside_done().await;
         }
         // Refused: kept, and said to be.
         assert_eq!(app.unsent.len(), 2);
@@ -24873,6 +26726,7 @@ mod tests {
         );
         app.input.set("and now?");
         app.submit().await;
+        app.beside_done().await;
         // Each record goes first, on its own, and the message joins the
         // turn the first starts.
         let sent = sent.lock().unwrap().clone();
@@ -24939,6 +26793,7 @@ mod tests {
         app.input
             .set("Use **bold** and `code`:\n\n| a | b |\n|---|---|\n| 1 | 2 |");
         app.submit().await;
+        app.beside_done().await;
         let rows = app.staged_rows(80);
         let shown: Vec<String> = rows.iter().map(|l| l.to_string()).collect();
         assert_eq!(shown[1], "›↪ Use bold and code:", "{shown:?}");
@@ -24980,6 +26835,7 @@ mod tests {
         for prompt in ["steer one", "steer two"] {
             app.input.set(prompt);
             app.submit().await;
+            app.beside_done().await;
         }
         assert_eq!(staged(&app), [2, 3]);
         let rows: Vec<String> = app.staged_rows(80).iter().map(|l| l.to_string()).collect();
@@ -25006,6 +26862,7 @@ mod tests {
         // A prompt that ends in line is unstaged too.
         app.input.set("never ran");
         app.submit().await;
+        app.beside_done().await;
         app.daemon(
             json!({"event": "message_ended", "bot": "b", "turn": null, "message": 4,
             "data": {"status": "withdrawn"}}),
@@ -25016,6 +26873,7 @@ mod tests {
         app.pending.clear();
         app.input.set("ran out");
         app.submit().await;
+        app.beside_done().await;
         let failed = staged(&app)[0];
         app.daemon(
             json!({"event": "message_ended", "bot": "b", "turn": null, "message": failed,
@@ -25597,7 +27455,7 @@ mod tests {
                 .flatten()
                 .any(|task| task.bot == "calc.add")
         );
-        app.read_tasks().await;
+        app.read_tasks_through().await;
         assert!(
             app.tasks
                 .values()
@@ -26537,7 +28395,8 @@ mod tests {
     async fn a_compaction_asked_for_waits_in_the_footer_not_the_notice() {
         let client = daemon_answering(|_| json!({"duplicate": false})).await;
         let mut app = app(client);
-        app.compact().await;
+        app.compact();
+        app.beside_done().await;
         assert_eq!(app.notice, None);
         let footer = app.footer_line(200).to_string();
         assert!(
@@ -26861,6 +28720,7 @@ mod tests {
         app.any_history = true;
         app.input.set("👍");
         app.submit().await;
+        app.beside_done().await;
         assert_eq!(app.notice.as_deref(), Some("no reply to react to yet"));
         for (node, reply) in [
             (4, "Merged it.\nThe notes are updated."),
@@ -26874,6 +28734,7 @@ mod tests {
         // The last reply: the emoji alone, attached, right under it.
         app.input.set(":+1:");
         app.submit().await;
+        app.beside_done().await;
         let first = sent.lock().unwrap()[0].clone();
         assert_eq!(first["prompt"], "👍");
         assert_eq!(first["delivery"], "attach");
@@ -26890,6 +28751,7 @@ mod tests {
         // An older reply, picked with /react: quoted, so the bot knows.
         app.input.set("/react");
         app.submit().await;
+        app.beside_done().await;
         // The newest picked to start.
         assert_eq!(
             app.reacting.as_ref().and_then(|(_, list)| list.chosen()),
@@ -26903,16 +28765,19 @@ mod tests {
         app.replies = replies.clone();
         app.input.set("/react");
         app.submit().await;
+        app.beside_done().await;
         // Replies that come and go while it is open, as the oldest does
         // past the limit, move no row onto another.
         app.saw_reply(11, "Later.");
         app.replies.remove(0);
         app.key(Event::Key(KeyCode::Up.into())).await;
         app.key(Event::Key(KeyCode::Enter.into())).await;
+        app.beside_done().await;
         assert_eq!(app.react_to, Some((4, "Merged it.".into())));
         app.replies = replies;
         app.input.set("🎉");
         app.submit().await;
+        app.beside_done().await;
         assert_eq!(sent.lock().unwrap()[1]["prompt"], "> Merged it.\n\n🎉");
         let rows = drawn(&mut app);
         assert_eq!(
@@ -26923,6 +28788,7 @@ mod tests {
         // The same emoji again takes it off, telling the bot nothing.
         app.input.set("👍");
         app.submit().await;
+        app.beside_done().await;
         assert_eq!(sent.lock().unwrap().len(), 2);
         assert_eq!(drawn(&mut app).last().unwrap(), "• Tagged 0.4.0.");
         assert!(app.reactions.on(8).is_empty());
@@ -26931,12 +28797,14 @@ mod tests {
         app.saw_reply(10, "Gone.");
         app.input.set("🚀");
         app.submit().await;
+        app.beside_done().await;
         assert_eq!(app.reactions.on(10), ["🚀"]);
         assert_eq!(drawn(&mut app).last().unwrap(), "• Tagged 0.4.0.");
         assert_eq!(app.notice.as_deref(), Some("🚀 on “Gone.”"));
         // Words with an emoji are a message, sent as one.
         app.input.set("👍 ship it");
         app.submit().await;
+        app.beside_done().await;
         assert_eq!(words_sent(&sent.lock().unwrap()[3]), "👍 ship it");
         assert_eq!(sent.lock().unwrap()[3]["delivery"], "steer");
     }
@@ -27052,6 +28920,7 @@ mod tests {
         assert_eq!(app.react_to, Some((4, "Merged it.".into())));
         app.input.set("🎉");
         app.submit().await;
+        app.beside_done().await;
         assert_eq!(sent.lock().unwrap()[0]["prompt"], "> Merged it.\n\n🎉");
         assert_eq!(app.reactions.on(4), ["🎉"]);
         // Each of the person's reactions is a button on its row.
@@ -27119,6 +28988,7 @@ mod tests {
         app.react_to = Some((4, "Merged it.".into()));
         app.input.set("🎉");
         app.submit().await;
+        app.beside_done().await;
         let rows = drawn(&mut app);
         assert_eq!(rows[..2], ["• Merged it.", "   🎉 "], "{rows:?}");
         assert_eq!(rows.last().map(String::as_str), Some("• Tagged 0.4.0."));
@@ -27126,14 +28996,17 @@ mod tests {
         app.react_to = Some((4, "Merged it.".into()));
         app.input.set("👍");
         app.submit().await;
+        app.beside_done().await;
         assert_eq!(drawn(&mut app)[1], "   🎉 👍 ");
         app.react_to = Some((4, "Merged it.".into()));
         app.input.set("🎉");
         app.submit().await;
+        app.beside_done().await;
         assert_eq!(drawn(&mut app)[1], "   👍 ");
         app.react_to = Some((4, "Merged it.".into()));
         app.input.set("👍");
         app.submit().await;
+        app.beside_done().await;
         assert_eq!(drawn(&mut app)[..2], ["• Merged it.", ""]);
     }
 
@@ -27377,10 +29250,11 @@ mod tests {
             effort: None,
             acted: false,
         });
-        assert!(!app.configure().await);
+        assert!(!app.configure());
         assert!(asked.lock().unwrap().is_empty());
         app.running = None;
-        assert!(app.configure().await);
+        assert!(app.configure());
+        app.beside_done().await;
         let sent = asked.lock().unwrap()[0].clone();
         assert_eq!(sent["op"], "configure");
         let unconfined = served::Role::TASK.within(&Value::Null);
@@ -27437,6 +29311,7 @@ mod tests {
         assert!(asked.lock().unwrap().is_empty());
         // Nothing is open over the composer now: Esc stops the turn.
         app.key(esc()).await;
+        app.beside_done().await;
         assert_eq!(*asked.lock().unwrap(), [json!("interrupt")]);
     }
 
@@ -27457,6 +29332,7 @@ mod tests {
         // Idle, Tab sends nothing: Enter starts a turn.
         app.input.set("first");
         app.key(tab()).await;
+        app.beside_done().await;
         assert!(sent.lock().unwrap().is_empty());
         assert_eq!(app.input.trim(), "first");
         app.input.clear();
@@ -27479,6 +29355,7 @@ mod tests {
         );
         app.notice = None;
         app.key(tab()).await;
+        app.beside_done().await;
         assert!(app.input.is_empty());
         // A turn of its own, once the running one ends: it may move the
         // lead, and it is the person's.
@@ -27493,6 +29370,7 @@ mod tests {
         // Enter still steers.
         app.input.set("now");
         app.key(enter()).await;
+        app.beside_done().await;
         let steer = sent.lock().unwrap()[1].clone();
         assert_eq!(steer["delivery"], "steer");
         let staged: Vec<String> = app.staged_rows(80).iter().map(|l| l.to_string()).collect();
@@ -27530,7 +29408,8 @@ mod tests {
         .await;
         let mut app = app(client);
         app.cache = Some("1h");
-        assert!(app.configure().await);
+        assert!(app.configure());
+        app.beside_done().await;
         let sent = asked.lock().unwrap()[0].clone();
         assert_eq!(
             (&sent["op"], &sent["settings"]["cache_ttl"]),
@@ -27554,6 +29433,7 @@ mod tests {
         let mut app = app(client);
         app.input.set("/permissions");
         app.submit().await;
+        app.beside_done().await;
         assert!(matches!(&app.choosing, Some((Choice::Permissions, _))));
         // The list opens at once; the reach follows once the listing is in.
         assert!(app.reach.is_none());
@@ -27665,6 +29545,7 @@ mod tests {
     async fn model_picker(app: &mut App) {
         app.input.set("/model");
         app.submit().await;
+        app.beside_done().await;
         for _ in 0..400 {
             app.listed();
             if app.picker.is_some() {
@@ -27699,10 +29580,13 @@ mod tests {
         // ← and → move effort until Tab moves them to speed.
         assert_eq!(row(&app), Some(("standard", false)));
         app.key(key(KeyCode::Tab)).await;
+        app.beside_done().await;
         app.key(key(KeyCode::Right)).await;
         app.key(key(KeyCode::Right)).await;
         assert_eq!(row(&app), Some(("fast", true)));
         app.key(key(KeyCode::Enter)).await;
+        app.beside_done().await;
+        app.beside_done().await;
         assert!(app.picker.is_none());
         assert_eq!(
             app.notice.as_deref(),
@@ -27715,11 +29599,15 @@ mod tests {
         model_picker(&mut app).await;
         assert_eq!(row(&app), Some(("fast", false)));
         app.key(key(KeyCode::Enter)).await;
+        app.beside_done().await;
         assert_eq!(asked.lock().unwrap().len(), 1);
         model_picker(&mut app).await;
         app.key(key(KeyCode::Tab)).await;
+        app.beside_done().await;
         app.key(key(KeyCode::Left)).await;
         app.key(key(KeyCode::Enter)).await;
+        app.beside_done().await;
+        app.beside_done().await;
         assert_eq!(app.speed, None);
         let speeds: Vec<_> = (asked.lock().unwrap().iter())
             .map(|sent| sent["settings"]["speed"].clone())
@@ -27730,16 +29618,20 @@ mod tests {
         app.model = "bedrock/us.xai.grok-4.7".into();
         model_picker(&mut app).await;
         app.key(key(KeyCode::Tab)).await;
+        app.beside_done().await;
         assert_eq!(row(&app), Some(("standard", false)));
         app.key(key(KeyCode::Esc)).await;
         app.model = "openai/gpt-6.1-sol".into();
         assert_eq!(app.speeds_of(&app.model).len(), 3);
         model_picker(&mut app).await;
         app.key(key(KeyCode::Tab)).await;
+        app.beside_done().await;
         for _ in 0..3 {
             app.key(key(KeyCode::Right)).await;
         }
         app.key(key(KeyCode::Enter)).await;
+        app.beside_done().await;
+        app.beside_done().await;
         assert_eq!(app.speed.as_deref(), Some("ultrafast"));
         // On a model that does not serve it, the footer shows none: its
         // calls run at standard.
@@ -27790,6 +29682,7 @@ mod tests {
         app.model = "anthropic/claude-opus-5-5".into();
         model_picker(&mut app).await;
         app.key(key(KeyCode::Tab)).await;
+        app.beside_done().await;
         app.key(key(KeyCode::Right)).await;
         assert_eq!(row(&app), Some(("fast", true)));
         // A model that serves standard alone shows it, ← and → back on
@@ -27846,7 +29739,8 @@ mod tests {
         app.mode = approvals::mode(&custom);
         app.declared = declared::declare(&custom, served::Role::LEAD).unwrap();
         app.gating = Some("ask");
-        assert!(app.configure().await);
+        assert!(app.configure());
+        app.beside_done().await;
         let sent = asked.lock().unwrap()[0].clone();
         let names: Vec<&str> = (sent["declare"].as_array().into_iter().flatten())
             .filter_map(|tool| tool["name"].as_str())
@@ -28308,7 +30202,7 @@ mod tests {
             "calc.many/1",
             false,
         );
-        app.read_tasks().await;
+        app.read_tasks_through().await;
         let rows = drawn(&mut app);
         assert_eq!(rows[1], "  ● many  working");
     }
@@ -28338,11 +30232,11 @@ mod tests {
         app.width = 80;
         let arguments = json!({"name": "add", "brief": "Fix add"});
         app.commit_call("c", Some(1), served::START, &arguments, "calc.add/1", false);
-        app.read_tasks().await;
+        app.read_tasks_through().await;
         assert!(!app.asks_seen.contains_key("calc.add"));
         broken.store(false, Ordering::SeqCst);
         app.tasks_read = None;
-        app.read_tasks().await;
+        app.read_tasks_through().await;
         assert!(app.asks_seen.contains_key("calc.add"));
     }
 
@@ -28384,13 +30278,13 @@ mod tests {
         app.width = 80;
         let arguments = json!({"name": "add", "brief": "Fix add"});
         app.commit_call("c", Some(1), served::START, &arguments, "calc.add/1", false);
-        app.read_tasks().await;
+        app.read_tasks_through().await;
         assert_eq!(drawn(&mut app)[1], "  ● add  working");
         // Idle, the stopped message never ran: the turn before it says
         // what the task did.
         running.store(false, std::sync::atomic::Ordering::SeqCst);
         app.tasks_read = None;
-        app.read_tasks().await;
+        app.read_tasks_through().await;
         assert_eq!(drawn(&mut app)[1], "  ○ add  idle");
     }
 
@@ -28442,14 +30336,14 @@ mod tests {
         assert_eq!(rows[0], "• Started 2 tasks · click one to open it");
         assert_eq!(rows[1], "  ◌ Fix add  add  starting");
         // What each does is read, and drawn where they are.
-        app.read_tasks().await;
+        app.read_tasks_through().await;
         let rows = drawn(&mut app);
         assert_eq!(rows[1], "  ○ Fix add  add  idle");
         assert_eq!(rows[2], "  ● Fix neg  neg  working");
         // A task the daemon could not read stays as it was; one it does not
         // have is removed.
         start(&mut app, "gone");
-        app.read_tasks().await;
+        app.read_tasks_through().await;
         let rows = drawn(&mut app);
         assert_eq!(rows[2], "  ● Fix neg   neg   working");
         assert_eq!(rows[3], "  ■ Fix gone  gone  removed");
@@ -28508,7 +30402,7 @@ mod tests {
             margin::Body::From { shown, .. } => shown.as_deref().cloned(),
             _ => None,
         };
-        app.read_references().await;
+        app.read_references_through().await;
         assert_eq!(shown(&app), Some(margin::Body::Markdown("one".into())));
         assert_eq!(app.margin.note("flow").unwrap().title, "Flow");
         // Its pictures are read in the task's folder.
@@ -28524,16 +30418,16 @@ mod tests {
             path: "flow.md".into(),
             text: "# Flow".into(),
         };
-        app.read_references().await;
+        app.read_references_through().await;
         assert_eq!(shown(&app), Some(margin::Body::Markdown("one".into())));
         app.references_read = None;
-        app.read_references().await;
+        app.read_references_through().await;
         assert_eq!(shown(&app), Some(read_flow.clone()));
         // The task gone, with its folder, what it showed stays.
         gone.store(true, std::sync::atomic::Ordering::SeqCst);
         std::fs::remove_dir_all(&folder).unwrap();
         app.references_read = None;
-        app.read_references().await;
+        app.read_references_through().await;
         assert!(app.references.values().all(|reference| reference.gone));
         assert_eq!(shown(&app), Some(read_flow.clone()));
     }
@@ -28582,14 +30476,14 @@ mod tests {
                 None,
                 None,
             );
-            app.read_references().await;
+            app.read_references_through().await;
             assert_eq!(shown(&app), Some(margin::Body::Markdown("deep".into())));
             assert_eq!(app.margin.note("flow").unwrap().title, "Flow");
             // Taken away by the task, or the task gone, what it showed
             // stays as last read.
             phase.store(then, SeqCst);
             app.references_read = None;
-            app.read_references().await;
+            app.read_references_through().await;
             assert_eq!(shown(&app), Some(margin::Body::Markdown("deep".into())));
         }
     }
@@ -28631,12 +30525,12 @@ mod tests {
             margin::Body::From { shown, .. } => shown.as_deref().cloned(),
             _ => None,
         };
-        app.read_references().await;
+        app.read_references_through().await;
         assert_eq!(shown(&app), Some(margin::Body::Markdown("ours".into())));
         // Removed, and another task given its name: what was read stays.
         reused.store(true, std::sync::atomic::Ordering::SeqCst);
         app.references_read = None;
-        app.read_references().await;
+        app.read_references_through().await;
         assert!(app.references.values().all(|reference| reference.gone));
         assert_eq!(shown(&app), Some(margin::Body::Markdown("ours".into())));
     }
@@ -28700,7 +30594,7 @@ mod tests {
             _ => None,
         };
         // A read cut short leaves where it was read from.
-        app.read_references().await;
+        app.read_references_through().await;
         assert_eq!(shown(&app), None);
         assert!(
             app.references
@@ -28708,12 +30602,12 @@ mod tests {
                 .all(|reference| reference.node.is_none())
         );
         app.references_read = None;
-        app.read_references().await;
+        app.read_references_through().await;
         assert_eq!(shown(&app), Some(margin::Body::Markdown("b".into())));
         assert_eq!(app.margin.note("flow").unwrap().title, "Flow");
         // Retitled there, it is here too.
         app.references_read = None;
-        app.read_references().await;
+        app.read_references_through().await;
         assert_eq!(shown(&app), Some(margin::Body::Markdown("c".into())));
         assert_eq!(app.margin.note("flow").unwrap().title, "Flow two");
         // Given its own title here, it keeps it.
@@ -28721,7 +30615,7 @@ mod tests {
             json!({"kind": "pinned", "id": "flow", "title": "Mine", "from": "calc.add/flow"});
         app.note_call("c2", &titled, None, None);
         app.references_read = None;
-        app.read_references().await;
+        app.read_references_through().await;
         assert_eq!(shown(&app), Some(margin::Body::Markdown("d".into())));
         assert_eq!(app.margin.note("flow").unwrap().title, "Mine");
     }
@@ -28747,7 +30641,7 @@ mod tests {
             let output = format!("calc.{name}/1");
             app.commit_call("c", Some(1), served::START, &arguments, &output, false);
         }
-        app.read_tasks().await;
+        app.read_tasks_through().await;
         let rows = drawn(&mut app);
         assert_eq!(rows[1], "  ○ quiet  no reply");
         assert_eq!(rows[2], "  ✗ bad    failed");
@@ -28891,11 +30785,11 @@ mod tests {
         app.width = 80;
         let arguments = json!({"name": "ask", "brief": "Fix ask"});
         app.commit_call("c", Some(1), served::START, &arguments, "calc.ask/1", false);
-        app.read_tasks().await;
+        app.read_tasks_through().await;
         assert_eq!(drawn(&mut app)[1], "  ? ask  needs you");
         // Its history is read once for the turn it ended.
         app.tasks_read = None;
-        app.read_tasks().await;
+        app.read_tasks_through().await;
         assert_eq!(scans.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 
@@ -28952,6 +30846,7 @@ mod tests {
             };
             app.key(Event::Mouse(click)).await;
         }
+        app.beside_done().await;
         assert_eq!(
             sent.lock().unwrap()[..],
             [json!("You asked (ask:4/a4): Merge?\n\nNo")]
@@ -28959,6 +30854,7 @@ mod tests {
         assert!(app.asks.is_empty());
         // Once answered, another click sends nothing.
         app.press("answer/0/ask:4/a4").await;
+        app.beside_done().await;
         assert_eq!(sent.lock().unwrap().len(), 1);
         assert_eq!(
             app.notice.as_deref(),
@@ -28996,11 +30892,11 @@ mod tests {
         let mut app = app(client);
         for pick in ["No", "Yes"] {
             let answer = format!("You asked (ask:4/a4): Merge?\n\n{pick}");
-            app.send(answer, None, false, true, &[]).await.unwrap();
+            app.send_now(answer, (false, true)).await.unwrap();
         }
         let answer = "You asked (ask:4/a4): Merge?\n\nNo".to_owned();
         assert_eq!(
-            app.send(answer, None, false, true, &[]).await,
+            app.send_now(answer, (false, true)).await,
             Err("that question was answered already".to_owned())
         );
         assert_eq!(
@@ -29083,6 +30979,7 @@ mod tests {
         assert_eq!(app.compacted.as_ref().unwrap()["summary_bytes"], 400);
         app.input.set("/context");
         app.submit().await;
+        app.beside_done().await;
         let inspect = asked
             .lock()
             .unwrap()
@@ -29112,6 +31009,7 @@ mod tests {
             app.notice = None;
             app.input.set(command);
             app.submit().await;
+            app.beside_done().await;
             assert!(app.pane.is_none() && app.watch.is_none(), "{command}");
             assert_eq!(app.notice.as_deref(), Some(BESIDE), "{command}");
         }
@@ -29149,6 +31047,7 @@ mod tests {
         let mut app = app(client);
         app.input.set("/context");
         app.submit().await;
+        app.beside_done().await;
         assert!(app.pane.is_some() && app.pane_keys);
         let press = |code| Event::Key(event::KeyEvent::new(code, KeyModifiers::NONE));
         // A key the view does not list is not typed into the composer,
@@ -29193,12 +31092,14 @@ mod tests {
         // `/memory`, which takes its own keys, closes the same way.
         app.input.set("/memory");
         app.submit().await;
+        app.beside_done().await;
         assert!(app.pane.is_some());
         app.pane_keys = true;
         app.key(ctrl_c()).await;
         assert!(app.pane.is_none() && !app.pane_keys && !app.quit);
         app.input.set("/context");
         app.submit().await;
+        app.beside_done().await;
         assert!(app.pane.is_some());
         app.pane_keys = true;
         app.key(ctrl_c()).await;
@@ -29228,6 +31129,7 @@ mod tests {
         ] {
             app.input.set(typed);
             app.submit().await;
+            app.beside_done().await;
             assert_eq!(app.notice.as_deref(), Some(said));
             // Kept, to be fixed and sent again.
             assert_eq!(&*app.input, typed);
@@ -29238,14 +31140,17 @@ mod tests {
         app.input.set("/ps");
         assert_eq!(app.menu()[0].0, "/pause");
         app.key(Event::Key(KeyCode::Enter.into())).await;
+        app.beside_done().await;
         assert_eq!(app.notice.as_deref(), Some("no command /ps · / lists them"));
         assert_eq!(&*app.input, "/ps");
         // A beginning of the name runs it.
         app.input.set("/verb");
         app.key(Event::Key(KeyCode::Enter.into())).await;
+        app.beside_done().await;
         assert!(app.input.is_empty(), "/verbose ran");
         app.input.set("/ps");
         app.key(Event::Key(KeyCode::Enter.into())).await;
+        app.beside_done().await;
         // The menu steps aside for the answer until the words change, and
         // its keys offer Enter only where it runs the pick.
         assert!(app.menu().is_empty());
@@ -29270,6 +31175,7 @@ mod tests {
         app.key(Event::Key(KeyCode::Up.into())).await;
         assert_eq!(app.menu()[app.pick].0, "/pause");
         app.key(Event::Key(KeyCode::Enter.into())).await;
+        app.beside_done().await;
         assert_eq!(
             app.notice.as_deref(),
             Some("/pause takes why: /pause REASON")
@@ -29283,11 +31189,13 @@ mod tests {
         app.key(Event::Key(KeyCode::Down.into())).await;
         let second = app.menu()[1].0;
         app.key(Event::Key(KeyCode::Enter.into())).await;
+        app.beside_done().await;
         assert_ne!(&*app.input, "/ps", "{second} ran");
         // Words that only start with a slash word, or a path, go as written.
         for typed in ["/etc/hosts", "/tmp is full", "/ alone"] {
             app.input.set(typed);
             app.submit().await;
+            app.beside_done().await;
         }
         assert_eq!(
             *sent.lock().unwrap(),
@@ -29520,7 +31428,7 @@ mod tests {
         // The questions asked while away are read one at a time after.
         assert_eq!(fleet.doing["calc.ask"], "idle");
         while !fleet.unread.is_empty() {
-            fleet.rescan().await;
+            fleet.rescan_through().await;
         }
         assert_eq!(fleet.doing["calc.ask"], "needs you");
         // The call answered, the task works on.
@@ -29709,6 +31617,16 @@ mod tests {
         let unread = fleet.follow_leads(false).await;
         assert!(fleet.raised.contains("shop.loose"));
         assert!(unread.iter().any(|(bot, _)| bot == "shop.loose"));
+        // A read that lands after the events since it was asked for keeps
+        // what they changed: a task made and one deleted meanwhile.
+        let asked = fleet.follow_due(true).expect("asked now");
+        let read = asked.read(&fleet.client).await;
+        fleet.event(&json!({"event": "created", "bot": "shop.new",
+            "data": {"created_by": "shop.lead"}}));
+        fleet.event(&json!({"event": "deleted", "bot": "shop.fix", "data": {}}));
+        fleet.followed_read(read);
+        assert!(fleet.raised.contains("shop.new"));
+        assert!(!fleet.raised.contains("shop.fix"));
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -29859,7 +31777,7 @@ mod tests {
         app.approvals
             .push(json!({"turn": 7, "call_id": "o1", "name": "shell",
             "gates": ["manual"], "arguments": {"command": "git push"}}));
-        app.raise_approvals().await;
+        app.raise_approvals_through().await;
         app.show_asked();
         app.flush();
         assert!(app.screen.texts().contains(&"⏸ Run git push?".to_owned()));
@@ -29889,6 +31807,7 @@ mod tests {
         // The task's, answered here: folded to the verdict, no line under it.
         let key = |code| Event::Key(event::KeyEvent::new(code, KeyModifiers::NONE));
         app.key(key(KeyCode::Char('y'))).await;
+        app.beside_done().await;
         app.fold_written();
         app.flush();
         let texts = app.screen.texts();
@@ -30141,16 +32060,52 @@ mod tests {
         app.flush();
         let key = |code| Event::Key(event::KeyEvent::new(code, KeyModifiers::NONE));
         app.key(key(KeyCode::Char('y'))).await;
+        app.beside_done().await;
         app.raised.clear();
         app.fold_written();
         // No fleet: the reviewer's gate denying it is read from the trail.
-        app.raise_approvals().await;
+        app.raise_approvals_through().await;
         app.flush();
         let texts = app.screen.texts();
         assert!(
             texts.contains(&"✗ The reviewer denied cargo publish · shop.fix".to_owned()),
             "{texts:?}"
         );
+    }
+
+    /// A verdict still being read is not read again beside it: one read
+    /// per call at a time, however often the loop passes meanwhile.
+    #[tokio::test]
+    async fn a_verdict_being_read_is_not_read_again_until_its_read_ends() {
+        let client = daemon_answering(|request| match request["op"].as_str() {
+            Some("audit") => json!({"rows": [], "next_before": null}),
+            _ => json!({}),
+        })
+        .await;
+        let mut app = app(client);
+        app.bot = "home.lead".into();
+        app.width = 80;
+        app.raised
+            .push(json!({"bot": "shop.fix", "turn": 4, "call_id": "c1",
+            "name": "shell", "gates": ["manual", "auto"], "arguments": {"command": "cargo publish"}}));
+        app.show_asked();
+        app.flush();
+        let key = |code| Event::Key(event::KeyEvent::new(code, KeyModifiers::NONE));
+        app.key(key(KeyCode::Char('y'))).await;
+        app.beside_done().await;
+        app.raised.clear();
+        let call: CallKey = ("shop.fix".into(), 4, "c1".into());
+        app.raise();
+        assert!(app.raising.is_some(), "its verdict is read");
+        assert!(app.verdicts_to_read(vec![call.clone()]).is_empty());
+        // Passes while that read is out start no other read of it.
+        app.raise();
+        app.raise();
+        assert!(app.verdicting.is_empty(), "read once");
+        let came = app.raising.take().unwrap().await.unwrap();
+        app.approvals_raised(came);
+        // Found nothing yet: it is read again on a later pass.
+        assert_eq!(app.verdicts_to_read(vec![call.clone()]).len(), 1);
     }
 
     #[tokio::test]
@@ -30166,6 +32121,7 @@ mod tests {
         app.flush();
         let key = |code| Event::Key(event::KeyEvent::new(code, KeyModifiers::NONE));
         app.key(key(KeyCode::Char('y'))).await;
+        app.beside_done().await;
         app.daemon(json!({"event": "lifted_ended", "bot": "b", "turn": 3,
             "data": {"call_id": "c1", "handle": "proc:9", "outcome": "expired",
                 "failed": true}}))
@@ -30191,6 +32147,7 @@ mod tests {
         app.flush();
         let key = |code| Event::Key(event::KeyEvent::new(code, KeyModifiers::NONE));
         app.key(key(KeyCode::Char('y'))).await;
+        app.beside_done().await;
         app.fold_written();
         app.flush();
         let texts = app.screen.texts();
@@ -30290,7 +32247,7 @@ mod tests {
         let mut app = app(client);
         app.bot = "home.lead".into();
         app.fleet = Some(fleet);
-        app.raise_approvals().await;
+        app.raise_approvals_through().await;
         assert_eq!(app.raised.len(), 1);
         app.show_asked();
         let text = |lines: &[Line]| -> Vec<String> {
@@ -30315,13 +32272,14 @@ mod tests {
             ]
         );
         // Read once, however often the loop asks.
-        app.raise_approvals().await;
+        app.raise_approvals_through().await;
         app.show_asked();
         assert_eq!((app.raised.len(), app.pending.len()), (1, 6));
         let key = |code| Event::Key(event::KeyEvent::new(code, KeyModifiers::NONE));
         // Esc sets it aside: y types, and the row says it still waits.
         app.key(key(KeyCode::Esc)).await;
         app.key(key(KeyCode::Char('y'))).await;
+        app.beside_done().await;
         assert_eq!(app.input.trim(), "y");
         assert!(sent.lock().unwrap().is_empty());
         assert_eq!(text(&[app.status_line()]), ["⏸ 1 approval set aside"]);
@@ -30330,6 +32288,7 @@ mod tests {
         let first = text(&app.pending);
         app.input.set("");
         app.key(key(KeyCode::Enter)).await;
+        app.beside_done().await;
         assert!(app.waiting().is_some());
         app.show_asked();
         let again = app.pending.len() - 6;
@@ -30345,11 +32304,13 @@ mod tests {
         );
         // An answer that failed leaves it waiting here, to answer again.
         app.key(key(KeyCode::Char('n'))).await;
+        app.beside_done().await;
         assert!(sent.lock().unwrap().is_empty());
         assert_eq!(app.notice.as_deref(), Some("internal (try again)"));
         assert!(app.waiting().is_some());
         // Answered on the task's own call, and let go here.
         app.key(key(KeyCode::Char('n'))).await;
+        app.beside_done().await;
         let sent = sent.lock().unwrap().clone();
         assert_eq!(sent.len(), 1);
         assert_eq!(
@@ -30378,7 +32339,7 @@ mod tests {
             &json!({"event": "step_decided", "bot": "shop.fix", "turn": 4,
             "data": {"call_id": "c3"}}),
         );
-        app.raise_approvals().await;
+        app.raise_approvals_through().await;
         assert!(app.raised.is_empty());
     }
 
@@ -30445,7 +32406,7 @@ mod tests {
         let mut fleet = Fleet::in_memory(client.clone(), events, "calc", "calc.lead");
         fleet.reconcile().await;
         while !fleet.unread.is_empty() {
-            fleet.rescan().await;
+            fleet.rescan_through().await;
         }
         let mut app = app(client);
         app.bot = "calc.lead".into();
@@ -30504,6 +32465,7 @@ mod tests {
         assert_eq!(app.asks.len(), 1);
         app.input.set("2");
         app.submit().await;
+        app.beside_done().await;
         let submitted = sent.lock().unwrap().clone();
         assert_eq!(submitted.len(), 1, "{submitted:?}");
         let to = &submitted[0];
@@ -30558,6 +32520,7 @@ mod tests {
         let pinned: Vec<String> = app.asks.iter().map(asks::Ask::key).collect();
         assert_eq!(pinned, ["@calc.ask/ask:2/q1", "@calc.fork/ask:2/q1"]);
         app.press("answer/0/@calc.fork/ask:2/q1").await;
+        app.beside_done().await;
         let to = sent.lock().unwrap().last().cloned().unwrap();
         assert_eq!(to["bot"], "calc.fork");
         assert_eq!(to["request_id"], json!(asks::request_id("ask:2/q1", 0)));
@@ -30614,6 +32577,7 @@ mod tests {
         app.press("card/ask:1/c1").await;
         assert!(drawn(&mut app).iter().any(|row| row.contains("Drop it")));
         app.press("answer/1/ask:1/c1").await;
+        app.beside_done().await;
         assert_eq!(
             sent.lock().unwrap().last().unwrap(),
             "You asked (ask:1/c1): Keep the old API?\n\nDrop it"
@@ -30621,6 +32585,7 @@ mod tests {
         assert!(drawn(&mut app).contains(&"┃ Answered · Drop it".to_owned()));
         // Answered by the person, it takes no other pick.
         app.press("answer/0/ask:1/c1").await;
+        app.beside_done().await;
         assert_eq!(
             app.notice.as_deref(),
             Some("that question was answered already")
@@ -30682,7 +32647,7 @@ mod tests {
         assert_eq!(app.asking().map(asks::Ask::key), Some(key.clone()));
         // Watched in its task; still unanswered there, it stays.
         assert!(app.watched.contains_key(&key));
-        app.settle_task_asks().await;
+        app.settle_task_asks_through().await;
         assert_eq!(app.asking().map(asks::Ask::key), Some(key.clone()));
         assert!(app.watched.contains_key(&key));
     }
@@ -30722,7 +32687,7 @@ mod tests {
         app.commit_ask(&ask);
         app.settle(&key, asks::State::Aside);
         assert!(app.watched.contains_key(&key));
-        app.reread_watched().await;
+        app.settle_task_asks_through().await;
         assert!(
             drawn(&mut app).contains(&"┃ Withdrawn · signed in already".to_owned()),
             "{:?}",
@@ -30732,7 +32697,7 @@ mod tests {
         // newest node noted, and not read again until the task writes on.
         assert_eq!(app.watched.get(&key).map(|(_, seen)| *seen), Some(Some(3)));
         app.watched_at = None;
-        app.reread_watched().await;
+        app.settle_task_asks_through().await;
         assert_eq!(app.watched.get(&key).map(|(_, seen)| *seen), Some(Some(3)));
         // The person's answer makes it final, and the watch ends.
         app.settle(&key, asks::State::Answered("done".into()));
@@ -30779,21 +32744,22 @@ mod tests {
         app.commit_call("c", Some(1), served::START, &arguments, "calc.ask/1", false);
         drawn(&mut app);
         // Its history could not be read: read again on the next slow pass.
-        app.read_tasks().await;
+        app.read_tasks_through().await;
         app.pin_task_asks();
         assert!(app.asks.is_empty());
         down.store(false, std::sync::atomic::Ordering::SeqCst);
         app.tasks_read = Some(Instant::now() - Duration::from_secs(5));
         app.tasks_all_read = None;
-        app.read_tasks().await;
+        app.read_tasks_through().await;
         app.pin_task_asks();
         assert_eq!(app.asks.len(), 1, "read while it runs");
         // A quick pass that does not read it again still says it needs you.
         app.tasks_read = Some(Instant::now() - Duration::from_secs(5));
-        app.read_tasks().await;
+        app.read_tasks_through().await;
         assert!(drawn(&mut app)[1].contains("needs you"));
         app.input.set("done");
         app.submit().await;
+        app.beside_done().await;
         let to = sent.lock().unwrap().last().cloned().unwrap();
         assert_eq!(to["bot"], "calc.ask");
         // Words typed while it is in focus answer it, once.
@@ -30807,7 +32773,7 @@ mod tests {
             "not pinned again while the task may take it"
         );
         app.task_answers[0].checked -= Duration::from_secs(5);
-        app.recheck_task_answers().await;
+        app.recheck_task_answers_through().await;
         app.pin_task_asks();
         assert_eq!(app.asks.len(), 1, "taken back unread, it is open again");
     }
@@ -30842,7 +32808,7 @@ mod tests {
         assert_eq!(app.asks.len(), 1);
         // Removed, it asks nothing.
         gone.store(true, std::sync::atomic::Ordering::SeqCst);
-        app.read_tasks().await;
+        app.read_tasks_through().await;
         let rows = drawn(&mut app);
         assert!(rows[1].ends_with("ask  removed"), "{rows:?}");
         app.pin_task_asks();
@@ -31014,7 +32980,7 @@ mod tests {
             "tool_completed",
             json!({"call_id": "w1", "node": 9}),
         ));
-        fleet.close_taken().await;
+        fleet.close_taken_through().await;
         fleet.layout.settle();
         // The one the person went to stays.
         let shown = windowed(&fleet);
@@ -31219,7 +33185,7 @@ mod tests {
         mark("calc.lead", "calc.lead", 12, "c1", json!({}))
             .await
             .unwrap();
-        app.resolve(&json!({}), Some(12), true).await;
+        app.resolve(&json!({}), Some(12), true);
         assert_eq!(resolved::read(&app.store(), "calc.lead"), Some(12));
         assert!(app.asks.is_empty());
         assert_eq!(app.aside.len(), 1);
@@ -31296,7 +33262,7 @@ mod tests {
         std::fs::write(dir.join("store.resolved/calc.ask.json"), r#"{"turn": 5}"#).unwrap();
         fleet.reconcile().await;
         while !fleet.unread.is_empty() {
-            fleet.rescan().await;
+            fleet.rescan_through().await;
         }
         assert_eq!(fleet.doing["calc.ask"], "idle");
         assert_eq!(
@@ -31313,7 +33279,7 @@ mod tests {
             let output = format!("calc.{name}/2");
             app.commit_call("c", Some(1), served::START, &arguments, &output, false);
         }
-        app.read_tasks().await;
+        app.read_tasks_through().await;
         let states: HashMap<_, _> = (app.tasks.values().flatten())
             .map(|task| (task.bot.as_str(), task.state.as_str()))
             .collect();
@@ -31331,7 +33297,7 @@ mod tests {
         let mut fleet = Fleet::in_memory(client.clone(), events, "calc", "calc.lead");
         fleet.reconcile().await;
         while !fleet.unread.is_empty() {
-            fleet.rescan().await;
+            fleet.rescan_through().await;
         }
         let event = |kind: &str, turn: i64, data: Value| json!({"event": kind, "bot": "calc.new", "turn": turn, "data": data});
         // A reviewer's call is no one's to answer here.
@@ -31353,13 +33319,48 @@ mod tests {
         // the turn reads its history again.
         assert_eq!(fleet.doing["calc.new"], "needs you");
         assert_eq!(fleet.ended.get("calc.new"), Some(&3));
-        fleet.rescan().await;
+        fleet.rescan_through().await;
         assert_eq!(fleet.doing["calc.new"], "needs you");
         // The person's words steered into a turn running then answer it,
         // as the fleet follows steers too.
         assert!(FLEET_KINDS.contains(&"steered"));
         fleet.event(&event("steered", 4, json!({"message": 5})));
         assert_eq!(fleet.doing["calc.new"], "idle");
+    }
+
+    /// A question a task asked and goes on working past is read as its
+    /// call completes, not held back for the turn's end; a read the
+    /// person's words overtook is not shown.
+    #[tokio::test]
+    async fn a_task_s_question_is_read_as_asked_unless_answered_meanwhile() {
+        let (client, events) = project_waiting().await;
+        let mut fleet = Fleet::in_memory(client.clone(), events, "calc", "calc.lead");
+        fleet.reconcile().await;
+        while !fleet.unread.is_empty() {
+            fleet.rescan_through().await;
+        }
+        let event = |kind: &str, turn: i64, data: Value| json!({"event": kind, "bot": "calc.new", "turn": turn, "data": data});
+        let asking = |fleet: &Fleet| fleet.needs.asks().any(|(bot, _)| bot == "calc.new");
+        fleet.event(&event("accepted", 3, json!({})));
+        let ask = json!({"name": "ask", "call_id": "q2", "arguments": "{}"});
+        fleet.event(&event("tool_started", 3, ask.clone()));
+        fleet.event(&event("tool_completed", 3, json!({"call_id": "q2"})));
+        assert!(!asking(&fleet), "not read yet");
+        fleet.rescan_through().await;
+        assert!(asking(&fleet), "read while the turn goes on");
+        // Asked again, and answered while the read is out.
+        fleet.event(&event(
+            "tool_started",
+            3,
+            json!({"name": "ask", "call_id": "q3", "arguments": "{}"}),
+        ));
+        fleet.event(&event("tool_completed", 3, json!({"call_id": "q3"})));
+        fleet.rescan(&Arc::new(tokio::sync::Notify::new())).await;
+        fleet.event(&event("steered", 3, json!({"message": 5})));
+        let read = fleet.rescanning.take().unwrap().await.unwrap();
+        fleet.rescanned(read);
+        assert!(!asking(&fleet), "the answer stands");
+        assert!(fleet.needs.unsure("calc.new"), "the turn's end reads it");
     }
 
     /// An outer lead's footer counts the questions its window shows from
@@ -31729,6 +33730,13 @@ mod tests {
         app.gating = None;
         app.spread().await;
         assert!(app.spread.is_some());
+        // Nor does one while the lead's change is sent and not answered.
+        app.gating_sent = 1;
+        app.spread = Some(Spread::new("auto", None));
+        finish(&mut app).await;
+        app.spread().await;
+        assert!(app.spread.is_some(), "the lead's change is not in yet");
+        app.gating_sent = 0;
         // The same row picked again, its config perhaps changed, takes
         // nothing from the earlier pick's pass.
         app.spread.as_mut().unwrap().at = Instant::now();
@@ -32087,6 +34095,7 @@ mod tests {
         );
         assert!(app.beside().is_none(), "never this window's own agent");
         app.key(key(KeyCode::Enter)).await;
+        app.beside_done().await;
         assert!(app.pane.is_none(), "closed, as Esc closes it");
     }
 
@@ -32165,6 +34174,7 @@ mod tests {
         app.watch.as_mut().unwrap().run = None;
         // `enter` opens its page; `←` goes back to the list.
         app.key(key(KeyCode::Enter)).await;
+        app.beside_done().await;
         assert_eq!(watch(&app), (Some("run1".into()), None));
         app.key(key(KeyCode::Left)).await;
         assert_eq!(watch(&app), (None, None));
@@ -32173,6 +34183,7 @@ mod tests {
         app.key(key(KeyCode::Char('x'))).await;
         assert_eq!(watch(&app), (Some("run1".into()), Some("run1".into())));
         app.key(key(KeyCode::Enter)).await;
+        app.beside_done().await;
         assert_eq!(app.notice.as_deref(), Some("stopping audit"));
         assert!(run.join(workflow::view::STOP).exists());
         assert_eq!(watch(&app), (Some("run1".into()), None));
@@ -32267,6 +34278,7 @@ mod tests {
         assert_eq!(picked(&app), idle);
         assert_eq!(picks(&app).len(), 2);
         app.key(key(KeyCode::Enter)).await;
+        app.beside_done().await;
         assert_eq!(picks(&app).len(), 3);
         // `i` and `d` are no keys of its: the pane keeps them.
         app.key(key(KeyCode::Char('i'))).await;
@@ -32342,6 +34354,7 @@ mod tests {
         // What is sent is the newest.
         app.input.set("ship it");
         app.submit().await;
+        app.beside_done().await;
         app.key(key(KeyCode::Up)).await;
         assert_eq!(&*app.input, "ship it");
     }
@@ -32427,6 +34440,7 @@ mod tests {
         // Ctrl+R again goes further back, as a shell's does.
         app.key(ctrl('r')).await;
         app.key(key(KeyCode::Enter)).await;
+        app.beside_done().await;
         assert!(app.searching.is_none());
         assert_eq!(&*app.input, "fix the rounding", "put in to edit, not sent");
         // Up and Down go on from it; past the newest, the draft.
@@ -32455,6 +34469,7 @@ mod tests {
         });
         app.key(ctrl('r')).await;
         app.key(key(KeyCode::Tab)).await;
+        app.beside_done().await;
         assert!(app.searching.is_none());
         assert_eq!(&*app.input, "fix the readme");
     }
@@ -32504,6 +34519,7 @@ mod tests {
         // Enter on part of its name picks /compact as any other command,
         // and it asks first; any key but Enter keeps the conversation.
         app.key(enter()).await;
+        app.beside_done().await;
         assert!(app.confirming.is_some() && app.input.is_empty());
         app.key(Event::Key(event::KeyEvent::new(
             KeyCode::Char('x'),
@@ -32520,14 +34536,17 @@ mod tests {
             Some("↑↓ pick · enter run · esc close".to_owned())
         );
         app.key(enter()).await;
+        app.beside_done().await;
         assert!(app.confirming.is_some() && !compacted());
         app.key(enter()).await;
+        app.beside_done().await;
         assert!(app.confirming.is_none() && compacted());
         // Any other command runs on part of its name, and what was run
         // more ranks first among the names that start the same.
         for _ in 0..3 {
             app.input.set("/cop");
             app.key(enter()).await;
+            app.beside_done().await;
             assert_eq!(app.notice.as_deref(), Some("no reply yet"));
         }
         app.input.set("/co");
@@ -32615,6 +34634,45 @@ mod tests {
         app.key(ctrl(']')).await;
         assert_eq!(shown(&app), None);
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A refused message's pictures come back after those attached since,
+    /// each placeholder still naming its own picture.
+    #[tokio::test]
+    async fn a_refused_message_s_pictures_come_back_after_those_attached_since() {
+        let mut app = app(daemon_answering(|_| json!({})).await);
+        let picture = |n| attach::Picture {
+            media_type: "image/png",
+            data: vec![n],
+        };
+        app.attach(Ok(picture(3)));
+        app.input.set("next [Image #1]");
+        let then = Then::Composed {
+            typed: "look [Image #1] and [Image #2]".into(),
+            pictures: vec![Some(picture(1)), Some(picture(2))],
+            answering: None,
+        };
+        app.unsent(String::new(), then, "refused".into());
+        assert_eq!(
+            &*app.input,
+            "look [Image #2] and [Image #3]\nnext [Image #1]"
+        );
+        assert_eq!(
+            app.placed("look [Image #2] and [Image #3]"),
+            [picture(1), picture(2)]
+        );
+        assert_eq!(app.placed("next [Image #1]"), [picture(3)]);
+        // One sent after it and refused after it comes back after it.
+        let then = Then::Composed {
+            typed: "then this".into(),
+            pictures: Vec::new(),
+            answering: None,
+        };
+        app.unsent(String::new(), then, "refused".into());
+        assert_eq!(
+            &*app.input,
+            "look [Image #2] and [Image #3]\nthen this\nnext [Image #1]"
+        );
     }
 
     #[tokio::test]
@@ -33965,6 +36023,7 @@ mod tests {
         for what in std::mem::take(&mut app.pressed) {
             app.press(&what).await;
         }
+        app.beside_done().await;
         assert!(app.margin.note("repro").is_none());
         let sent = sent.lock().unwrap();
         assert_eq!(sent[0]["delivery"], "attach");
@@ -33984,6 +36043,7 @@ mod tests {
         for what in std::mem::take(&mut app.pressed) {
             app.press(&what).await;
         }
+        app.beside_done().await;
         assert!(app.margin.note("repro").is_some());
         assert!(app.notice.is_some());
     }
