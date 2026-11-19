@@ -1436,7 +1436,7 @@ async fn intent(
             let workspace = workspace.clone();
             tokio::task::spawn_blocking(move || {
                 let files = agent_client::policy::given_agents_files(&workspace, &given);
-                if first["id"] == inspected["id"] {
+                if same_bot(&first, &inspected) {
                     return files;
                 }
                 let (Some(folder), Some(given)) =
@@ -1813,9 +1813,26 @@ async fn delegated(
     }
 }
 
+/// Whether `a` and `b`, bots as `inspect` gives them, are one bot: by its
+/// store-wide id, which a recycled name doesn't share.
+fn same_bot(a: &Value, b: &Value) -> bool {
+    a["bot_id"]
+        .as_i64()
+        .is_some_and(|id| b["bot_id"].as_i64() == Some(id))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_bot_is_the_same_only_by_its_id() {
+        let lead = json!({"name": "shop.lead", "bot_id": 1});
+        let child = json!({"name": "shop.fix", "bot_id": 2, "created_by": "shop.lead"});
+        assert!(same_bot(&lead, &lead.clone()));
+        assert!(!same_bot(&lead, &child));
+        assert!(!same_bot(&json!({}), &json!({})));
+    }
 
     #[test]
     fn only_a_call_that_would_leave_its_sandbox_for_the_agent_s_home_waits_for_the_person() {

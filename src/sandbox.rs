@@ -162,11 +162,18 @@ impl Policy {
             .collect();
         daemons.dedup();
         // The folder its own linked worktree keeps in its repository's git
-        // folder, which it writes as it commits.
-        let own = workspace
+        // folder, which it writes as it commits: of the checkout its folder
+        // is in, as git finds it, the nearest `.git` above.
+        let own = (workspace.into_iter())
+            .flat_map(Path::ancestors)
             .map(|folder| folder.join(".git"))
-            .filter(|file| std::fs::symlink_metadata(file).is_ok_and(|found| found.is_file()))
-            .and_then(|file| gitdir(&file));
+            .find_map(|dot| {
+                std::fs::symlink_metadata(&dot)
+                    .ok()
+                    .map(|found| (dot, found))
+            })
+            .filter(|(_, found)| found.is_file())
+            .and_then(|(file, _)| gitdir(&file));
         let mut roots = Vec::new();
         for path in paths {
             // One gone since it was named is skipped, as Codex skips it:
@@ -3898,6 +3905,19 @@ mod tests {
         assert!(!policy.can_write(&git.join("worktrees/theirs/index.lock")));
         assert!(!policy.can_write(&git.join("worktrees/theirs/commondir")));
         assert!(!policy.can_write(&git.join("worktrees/new/commondir")));
+        // A folder inside the checkout writes its checkout's own too.
+        std::fs::create_dir_all(mine.join("src")).unwrap();
+        let nested = Policy::new(
+            Some(Mode::WorkspaceWrite),
+            Some(&mine.join("src")),
+            &[git.to_str().unwrap().to_owned()],
+            false,
+            &protecting(),
+        )
+        .unwrap()
+        .unwrap();
+        assert!(nested.can_write(&git.join("worktrees/mine/index.lock")));
+        assert!(!nested.can_write(&git.join("worktrees/theirs/index.lock")));
         if available().is_ok() {
             let worktrees = git.join("worktrees");
             let script = "cd \"$1\" && { mv theirs gone || true; } && { mv mine gone || true; } \
