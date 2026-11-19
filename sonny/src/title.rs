@@ -12,54 +12,104 @@ use std::path::{Path, PathBuf};
 pub const MOST: usize = 60;
 
 /// Where Sonny keeps the title each agent was started with: beside the
-/// store, one file per agent.
-fn file(store: &Path, bot: &str) -> PathBuf {
-    let store = agent_client::socket::canonical_store(store).unwrap_or_else(|_| store.to_owned());
-    let mut dir = store.into_os_string();
-    dir.push(".titles");
-    PathBuf::from(dir).join(bot)
+/// store, one file per agent, in this folder, found once for each store.
+fn folder(store: &Path) -> PathBuf {
+    static FOUND: std::sync::LazyLock<
+        std::sync::Mutex<std::collections::HashMap<PathBuf, PathBuf>>,
+    > = std::sync::LazyLock::new(Default::default);
+    let mut found = FOUND.lock().unwrap_or_else(|e| e.into_inner());
+    (found.entry(store.to_owned()))
+        .or_insert_with(|| {
+            let store =
+                agent_client::socket::canonical_store(store).unwrap_or_else(|_| store.to_owned());
+            let mut dir = store.into_os_string();
+            dir.push(".titles");
+            PathBuf::from(dir)
+        })
+        .clone()
+}
+
+/// The names noted in each folder, read whole only once the folder
+/// changed since (its modified time), and as it was when read.
+#[derive(Default)]
+struct Names {
+    at: Option<std::time::SystemTime>,
+    names: std::collections::HashSet<std::ffi::OsString>,
+}
+
+static NAMES: std::sync::LazyLock<std::sync::Mutex<std::collections::HashMap<PathBuf, Names>>> =
+    std::sync::LazyLock::new(Default::default);
+
+/// Each title read or noted, by its agent's name and id.
+static READ: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<(String, i64), String>>,
+> = std::sync::LazyLock::new(Default::default);
+
+fn changed_at(dir: &Path) -> Option<std::time::SystemTime> {
+    std::fs::metadata(dir).and_then(|meta| meta.modified()).ok()
+}
+
+/// What was read or noted of `bot` in `dir`, for every listing after.
+fn known(dir: &Path, bot: &str, id: i64, title: &str) {
+    (READ.lock().unwrap_or_else(|e| e.into_inner())).insert((bot.to_owned(), id), title.to_owned());
+    let mut names = NAMES.lock().unwrap_or_else(|e| e.into_inner());
+    (names.entry(dir.to_owned()).or_default().names).insert(bot.into());
 }
 
 /// Note `title` as the title of `bot`, the agent of id `id`: its id
 /// first, so an agent given the name later takes none of it.
 pub fn note(store: &Path, bot: &str, id: i64, title: &str) -> std::io::Result<()> {
-    let file = file(store, bot);
-    std::fs::create_dir_all(file.parent().unwrap_or(Path::new("/")))?;
-    std::fs::write(file, format!("{id}\n{}\n", title.trim()))
+    let dir = folder(store);
+    std::fs::create_dir_all(&dir)?;
+    let before = changed_at(&dir);
+    std::fs::write(dir.join(bot), format!("{id}\n{}\n", title.trim()))?;
+    let after = changed_at(&dir);
+    known(&dir, bot, id, title.trim());
+    // Its own note leaves the names as read: only another's reads them again.
+    let mut names = NAMES.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(names) = names
+        .get_mut(&dir)
+        .filter(|names| names.at.is_some() && names.at == before)
+    {
+        names.at = after;
+    }
+    Ok(())
 }
 
 /// The titles noted beside a store, for a listing of many agents: the
-/// folder read once, and each title read once for each agent, by its
-/// id, since a title is set when its agent starts and never changes.
+/// folder read again only once it changed, and each title read once for
+/// each agent, by its id, since a title is set when its agent starts and
+/// never changes.
 pub struct Noted {
     dir: PathBuf,
-    names: std::collections::HashSet<std::ffi::OsString>,
 }
-
-/// Each title read, by its agent's name and id.
-static READ: std::sync::LazyLock<
-    std::sync::Mutex<std::collections::HashMap<(String, i64), String>>,
-> = std::sync::LazyLock::new(Default::default);
 
 impl Noted {
     pub fn read(store: &Path) -> Self {
-        let dir = file(store, "-")
-            .parent()
-            .unwrap_or(Path::new("/"))
-            .to_owned();
-        let names = (std::fs::read_dir(&dir).into_iter().flatten())
-            .filter_map(|entry| Some(entry.ok()?.file_name()))
-            .collect();
-        Self { dir, names }
+        let dir = folder(store);
+        let at = changed_at(&dir);
+        let mut names = NAMES.lock().unwrap_or_else(|e| e.into_inner());
+        let names = names.entry(dir.clone()).or_default();
+        if at.is_none() || names.at != at {
+            names.names = (std::fs::read_dir(&dir).into_iter().flatten())
+                .filter_map(|entry| Some(entry.ok()?.file_name()))
+                .collect();
+            names.at = at;
+        }
+        Self { dir }
     }
 
     /// The title noted for `bot`, the agent of id `id`: none where it
     /// was noted for another agent of that name.
     pub fn of(&self, bot: &str, id: Option<i64>) -> Option<String> {
         let id = id?;
-        if !self.names.contains(std::ffi::OsStr::new(bot)) {
+        let names = NAMES.lock().unwrap_or_else(|e| e.into_inner());
+        if !(names.get(&self.dir))
+            .is_some_and(|names| names.names.contains(std::ffi::OsStr::new(bot)))
+        {
             return None;
         }
+        drop(names);
         let key = (bot.to_owned(), id);
         let mut read = READ.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(title) = read.get(&key) {
@@ -88,11 +138,18 @@ pub fn of_message(message: &str) -> String {
 
 /// The title noted for `bot`, the agent of id `id`, read from its file.
 pub fn noted(store: &Path, bot: &str, id: i64) -> Option<String> {
-    let text = std::fs::read_to_string(file(store, bot)).ok()?;
+    let key = (bot.to_owned(), id);
+    if let Some(title) = (READ.lock().unwrap_or_else(|e| e.into_inner())).get(&key) {
+        return Some(title.clone());
+    }
+    let dir = folder(store);
+    let text = std::fs::read_to_string(dir.join(bot)).ok()?;
     let (noted, title) = text.split_once('\n')?;
-    (noted.trim().parse::<i64>().ok()? == id)
+    let title = (noted.trim().parse::<i64>().ok()? == id)
         .then(|| title.trim().to_owned())
-        .filter(|title| !title.is_empty())
+        .filter(|title| !title.is_empty())?;
+    known(&dir, bot, id, &title);
+    Some(title)
 }
 
 /// The agents, by name and id, whose first line was asked for, each
@@ -233,6 +290,31 @@ pub fn cut(title: &str, room: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_listing_sees_its_own_notes_and_another_window_s() {
+        let dir = std::env::temp_dir().join(format!("sonny-titles-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = dir.join("state.sqlite");
+        note(&store, "calc.fix", 2, "Fix the sums").unwrap();
+        assert_eq!(
+            Noted::read(&store).of("calc.fix", Some(2)).as_deref(),
+            Some("Fix the sums")
+        );
+        // Another agent of that name takes none of it.
+        assert_eq!(Noted::read(&store).of("calc.fix", Some(9)), None);
+        // Another window's note, written straight to the folder.
+        std::fs::write(folder(&store).join("calc.docs"), "3\nDocument the sums\n").unwrap();
+        assert_eq!(
+            Noted::read(&store).of("calc.docs", Some(3)).as_deref(),
+            Some("Document the sums")
+        );
+        assert_eq!(
+            noted(&store, "calc.docs", 3).as_deref(),
+            Some("Document the sums")
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn a_title_is_cut_at_a_word() {

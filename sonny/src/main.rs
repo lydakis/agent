@@ -866,8 +866,14 @@ async fn read_status_of(
                         .is_some_and(|(seen, latest)| *seen == head && latest.first.is_some());
                     if untitled && !known {
                         later.push(bot);
-                    } else if untitled && read_title(client, &store, bot, status_read).await {
-                        title = (bot.bot_id).and_then(|id| crate::title::noted(&store, name, id));
+                    } else if untitled {
+                        // One that failed leaves the count to read again.
+                        let read = read_title(client, &store, bot, status_read).await;
+                        whole &= read;
+                        if read {
+                            title =
+                                (bot.bot_id).and_then(|id| crate::title::noted(&store, name, id));
+                        }
                     }
                 }
             }
@@ -1090,7 +1096,9 @@ async fn read_status_of(
             .collect();
         let mut noted = Vec::new();
         for bot in later {
-            if read_title(client, &store, bot, status_read).await
+            let read = read_title(client, &store, bot, status_read).await;
+            whole &= read;
+            if read
                 && let Some(title) =
                     (bot.bot_id).and_then(|id| crate::title::noted(&store, &bot.name, id))
                 && let Some(&at) = at.get(bot.name.as_str())
@@ -1683,7 +1691,11 @@ async fn read_title(
     if let Some(first) = &first {
         let title = crate::title::of_message(first);
         if !title.is_empty() {
-            let _ = crate::title::note(store, name, id, &title);
+            // Written off the loop: a backfill writes one for each agent.
+            let (store, bot) = (store.to_owned(), name.to_owned());
+            let noted =
+                tokio::task::spawn_blocking(move || crate::title::note(&store, &bot, id, &title));
+            let _ = noted.await;
         }
     }
     reading.2 = first.is_some();
