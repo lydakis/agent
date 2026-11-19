@@ -55,3 +55,6 @@ mechanism, and borrow a client's word only where it means the same thing.
   runs, a client's helper; the daemon knows nothing of what it does.
 - **event**: what the daemon reports of a bot as it happens, read with
   `events` or `follow`.
+- **namespace**: the group a client puts a bot in, a setting: its agent
+  tools list `NAMESPACE.*` and name the bots it makes `NAMESPACE.NAME`.
+  The daemon never reads one from a name.
