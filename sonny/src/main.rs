@@ -687,8 +687,12 @@ async fn read_status(
 #[derive(Default)]
 struct Built {
     /// Each idle agent's row as the last count built it, by [`name_key`]
-    /// of its own name (a row taken checks its name).
-    rows: HashMap<u64, status::Row>,
+    /// of its own name (a row taken checks its name), with the count that
+    /// last found it listed: a count leaves each where it is, and builds
+    /// only the rows that moved.
+    rows: HashMap<u64, (u64, status::Row)>,
+    /// How many counts kept rows here.
+    counted: u64,
     /// The agents the last count listed, as `status::bots` gives them.
     bots: std::collections::HashSet<String>,
     /// A mark of each agent's calls waiting on someone, as that count
@@ -752,21 +756,25 @@ async fn read_status_of(
     // A count keeps rows, and asks nothing of who was read: those lists
     // are for what adopts what a read found.
     let counting = kept_rows.is_some();
-    let mut reuse = kept_rows.and_then(|(kept, again)| {
-        let rows = std::mem::take(&mut kept.rows);
-        let was = std::mem::replace(&mut kept.held, held_marks.clone());
-        let (Some(was), Some(now)) = (was, &held_marks) else {
-            return None;
-        };
-        let mut again = again.clone();
-        for (bot, mark) in &was {
-            if now.get(bot) != Some(mark) {
-                again.insert(bot.clone());
+    let (mut kept_here, again) = kept_rows.unzip();
+    let mut reuse = (kept_here.as_deref_mut())
+        .zip(again)
+        .and_then(|(kept, again)| {
+            kept.counted += 1;
+            let rows = std::mem::take(&mut kept.rows);
+            let was = std::mem::replace(&mut kept.held, held_marks.clone());
+            let (Some(was), Some(now)) = (was, &held_marks) else {
+                return None;
+            };
+            let mut again = again.clone();
+            for (bot, mark) in &was {
+                if now.get(bot) != Some(mark) {
+                    again.insert(bot.clone());
+                }
             }
-        }
-        again.extend(now.keys().filter(|bot| !was.contains_key(*bot)).cloned());
-        Some((rows, again))
-    });
+            again.extend(now.keys().filter(|bot| !was.contains_key(*bot)).cloned());
+            Some((rows, again))
+        });
     let (mut read, mut idle) = (Vec::new(), Vec::new());
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -790,7 +798,13 @@ async fn read_status_of(
     // lead shows as a row of its own.
     let mine = owned(listed, &project, &lead);
     // The agents listed here, whose histories and questions as read are
-    // kept for the next read.
+    // kept for the next read: a count looks for those gone only once more
+    // were read than are listed.
+    let prune = !counting || status_read.len() > listed.len();
+    // The rows a count left where they are kept, and the count they were
+    // found listed in.
+    let counted = kept_here.as_ref().map_or(0, |kept| kept.counted);
+    let mut kept_here_now = 0;
     let mut listed_here: std::collections::HashSet<&str> = std::collections::HashSet::new();
     let (mut fresh, mut whole) = (false, true);
     let mut unread_here = Vec::new();
@@ -821,22 +835,22 @@ async fn read_status_of(
         {
             continue;
         }
-        listed_here.insert(name);
-        // An idle agent no event moved, built as the last count built it.
+        if prune {
+            listed_here.insert(name);
+        }
+        // An idle agent no event moved stands as the last count built it,
+        // its row left where it is kept; one that moved is built again.
+        let key = name_key(name);
         if let Some((rows_kept, again)) = &mut reuse
-            && bot.running_turn.is_none()
-            && name != view.bot
-            && !again.contains(name)
-            && let Some(row) = rows_kept
-                .remove(&name_key(name))
-                .filter(|row| row.bot == name)
+            && let Some((at, row)) = rows_kept.get_mut(&key)
+            && row.bot == name
         {
-            if !counting {
-                read.push(name.to_owned());
-                idle.push(name.to_owned());
+            if bot.running_turn.is_none() && name != view.bot && !again.contains(name) {
+                *at = counted;
+                kept_here_now += 1;
+                continue;
             }
-            rows.push(row);
-            continue;
+            rows_kept.remove(&key);
         }
         // Its history is read again only once it moved, here or, while
         // the card fills, beside it: a row not read yet says what the
@@ -1046,7 +1060,11 @@ async fn read_status_of(
     }
     // Each workflow that runs is one row, under the agent that started it.
     for run in workflow::view::live(&store, &project) {
-        if !read.contains(&run.caller) {
+        let kept = (reuse.as_ref())
+            .and_then(|(kept, _)| kept.get(&name_key(&run.caller)))
+            .is_some_and(|(at, row)| *at == counted && row.bot == run.caller);
+        let caller = |row: &status::Row| row.bot == run.caller;
+        if !read.contains(&run.caller) && !(counting && (kept || rows.iter().any(caller))) {
             continue;
         }
         rows.push(status::Row {
@@ -1064,7 +1082,17 @@ async fn read_status_of(
         });
     }
     // Agents gone from the listing are forgotten with it.
-    status_read.retain(|name, _| listed_here.contains(name.as_str()));
+    if prune {
+        status_read.retain(|name, _| listed_here.contains(name.as_str()));
+    }
+    // The rows a count kept go back, but for those of agents it did not
+    // find listed: the rows read here are the ones that moved.
+    if let (Some(kept), Some((mut left, _))) = (kept_here, reuse) {
+        if left.len() > kept_here_now {
+            left.retain(|_, (at, _)| *at == counted);
+        }
+        kept.rows = left;
+    }
     // The project's title, from its lead's folder's file.
     let lead_folder = (listed.iter())
         .find(|bot| bot.name == lead)
@@ -12249,33 +12277,49 @@ impl App {
             let whole = read.whole && read.listed;
             let mut built = read.rows;
             // The agents counted, made again only once they are not those
-            // the last count counted.
-            let bots = match built.len() == kept_rows.bots.len()
-                && (built.iter()).all(|row| kept_rows.bots.contains(&row.bot))
-            {
+            // the last count counted: a row kept was counted then.
+            let same = kept_rows.rows.len() + built.len() == kept_rows.bots.len()
+                && (built.iter()).all(|row| kept_rows.bots.contains(&row.bot));
+            // Every row counted, those kept where they stand and those built
+            // now, in `/status`'s order: the lead first, then by group, the
+            // latest first in each.
+            let mut all: Vec<&mut status::Row> = (kept_rows.rows.values_mut())
+                .map(|(_, row)| row)
+                .chain(built.iter_mut())
+                .collect();
+            fn key(row: &status::Row) -> (bool, status::Group, std::cmp::Reverse<u64>, &str) {
+                let at = std::cmp::Reverse(row.at.unwrap_or(0));
+                (row.name != "lead", row.group, at, row.bot.as_str())
+            }
+            all.sort_unstable_by(|one, other| key(one).cmp(&key(other)));
+            let bots = match same {
                 true => None,
-                false => Some(status::bots(&built)),
+                false => Some(status::bots(&all)),
             };
             if let Some(bots) = &bots {
                 kept_rows.bots = bots.clone();
             }
-            let agents = status::agents(read.title.as_ref().unwrap_or(&read.project), &built);
+            let agents = status::agents(read.title.as_ref().unwrap_or(&read.project), &all);
             // Its counts are the footer's, as `status::counts` gives them.
             let counts = agents.counts;
             // The tasks' lines, each made once for a row kept, and handed
             // over only once they say something new.
             let tasks =
-                Some(status::tasks(&mut built)).filter(|tasks| !status::same_tasks(&told, tasks));
-            drop(told);
+                Some(status::tasks(&mut all)).filter(|tasks| !status::same_tasks(&told, tasks));
+            drop((told, all));
             // An idle agent's row is kept for the next count, once every
             // read the count made was read.
-            kept_rows.rows = HashMap::with_capacity(if whole { built.len() } else { 0 });
-            if whole {
-                (kept_rows.rows).extend(
-                    (built.into_iter())
+            match whole {
+                true => {
+                    let counted = kept_rows.counted;
+                    for row in built
+                        .into_iter()
                         .filter(|row| !row.running && row.run.is_none())
-                        .map(|row| (name_key(&row.bot), row)),
-                );
+                    {
+                        kept_rows.rows.insert(name_key(&row.bot), (counted, row));
+                    }
+                }
+                false => kept_rows.rows.clear(),
             }
             Some(Counted {
                 mark: whole.then_some(mark),
