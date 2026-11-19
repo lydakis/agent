@@ -43,8 +43,8 @@ enum Undo {
 /// A `start_task` call.
 pub struct Start {
     pub name: String,
-    /// What the task is for, in the person's words, noted beside its name.
-    pub title: String,
+    /// Everything the task needs; its first line is the title the person
+    /// knows it by, noted beside its name.
     pub brief: String,
     pub profile: Option<String>,
     /// One of the person's `/permissions` rows to hold the task in, at
@@ -549,7 +549,7 @@ pub fn start(here: &Path, project: &str, starter: &str, start: &Start) -> Result
         // later has.
         let started: Value = serde_json::from_slice(&output.stdout).unwrap_or_default();
         if let Some(id) = started["bot_id"].as_i64() {
-            let _ = crate::title::note(store, name, id, &start.title);
+            let _ = crate::title::note(store, name, id, &crate::title::of_message(&start.brief));
         }
         match profile {
             Some(profile) => {
@@ -3065,7 +3065,6 @@ mod tests {
         let store = dir.join("state.sqlite");
         let start = Start {
             name: "fix".into(),
-            title: "Fix the sums".into(),
             brief: String::new(),
             profile: None,
             permissions: None,

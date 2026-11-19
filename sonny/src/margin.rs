@@ -1083,6 +1083,11 @@ impl Margin {
         }
     }
 
+    /// The project's agents as the pane lists them.
+    pub fn agents(&self) -> &crate::status::Agents {
+        &self.agents.0
+    }
+
     /// The newest node of the bot's history the notes were brought up to.
     pub fn through(&self) -> Option<i64> {
         self.kept.through
