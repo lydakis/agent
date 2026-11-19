@@ -5138,7 +5138,7 @@ const ZEN_ENDS: &str = "End zen and hear what was kept";
 
 /// Every key Sonny takes and what it does, as `?` lists them; a tip in
 /// the empty composer names only these.
-const SHORTCUTS: [(&str, &str); 22] = [
+const SHORTCUTS: [(&str, &str); 24] = [
     ("enter", "send, or steer the running turn"),
     ("tab", "queue for after the running turn"),
     ("↑↓", "earlier prompts, past the first or last row"),
@@ -5153,6 +5153,11 @@ const SHORTCUTS: [(&str, &str); 22] = [
     ("pgup pgdn", "scroll"),
     ("tab", "with nothing typed, keys to the pane"),
     ("←", "with nothing typed, every project"),
+    ("→", "with nothing typed, keys to the pane"),
+    (
+        "alt+← alt+→",
+        "with nothing typed, the agent above or below",
+    ),
     ("ctrl+\\", "keys to the pane and back"),
     ("ctrl+[ ctrl+]", "hide the pane, show it again"),
     ("ctrl+g", "open the pane's agent in the main view"),
@@ -5162,6 +5167,18 @@ const SHORTCUTS: [(&str, &str); 22] = [
     ("ctrl+c", "copy the selection, clear, or quit"),
     ("ctrl+l", "draw the screen again"),
 ];
+
+/// The agent `alt+→` (`down`) or `alt+←` goes to from `here` in the
+/// pane's list of the project's agents (`listed`, the lead first): the
+/// next or the one before, around the ends; the lead from one not listed.
+fn stepped<'a>(listed: &[&'a str], here: &str, down: bool) -> Option<&'a str> {
+    let lead = listed.first()?;
+    Some(match listed.iter().position(|bot| *bot == here) {
+        Some(at) if down => listed[(at + 1) % listed.len()],
+        Some(at) => listed[(at + listed.len() - 1) % listed.len()],
+        None => lead,
+    })
+}
 
 /// Whether Enter runs the menu's pick (`picked`): when what is `typed`
 /// begins its name, or the person `moved` to it with the arrows. A name
@@ -16565,6 +16582,10 @@ impl App {
                     KeyCode::PageDown => pane.screen.page(false),
                     KeyCode::Home => pane.screen.hold(usize::MAX),
                     KeyCode::End => pane.screen.latest(),
+                    // The list, with no page open: nothing to close.
+                    KeyCode::Left if key.modifiers.is_empty() && view.depth() == 0 => {
+                        self.left_ends();
+                    }
                     _ => {
                         let paged = view.depth();
                         match view.key(*key, pane.screen.in_view()) {
@@ -16617,6 +16638,9 @@ impl App {
                     KeyCode::PageDown => pane.screen.page(false),
                     KeyCode::Home => pane.screen.hold(usize::MAX),
                     KeyCode::End => pane.screen.latest(),
+                    KeyCode::Left if key.modifiers.is_empty() && view.left_ends() => {
+                        self.left_ends();
+                    }
                     _ => match view.key(*key, pane.screen.in_view()) {
                         memory::Key::Close => self.close_pane(true),
                         memory::Key::Scroll(up) => pane.screen.scroll(if up { 1 } else { -1 }),
@@ -16664,6 +16688,8 @@ impl App {
                     KeyCode::Char(' ') if reading => pane.screen.page(false),
                     KeyCode::Home => pane.screen.hold(usize::MAX),
                     KeyCode::End => pane.screen.latest(),
+                    // The list of threads: nothing to close.
+                    KeyCode::Left if key.modifiers.is_empty() && !reading => self.left_ends(),
                     _ => {
                         if view.key(*key) == commons::Key::Close {
                             self.close_pane(true);
@@ -16693,6 +16719,8 @@ impl App {
                     KeyCode::PageDown | KeyCode::Char(' ') => pane.screen.page(false),
                     KeyCode::Home => pane.screen.hold(usize::MAX),
                     KeyCode::End => pane.screen.latest(),
+                    // Nothing in `/audit` opens or closes.
+                    KeyCode::Left if key.modifiers.is_empty() => self.left_ends(),
                     _ => match view.key(*key) {
                         audit::Key::Stay => {}
                         audit::Key::Close => self.close_pane(true),
@@ -16815,6 +16843,8 @@ impl App {
                     KeyCode::Left | KeyCode::Backspace if pane.goes_back() => {
                         self.step_pane(true);
                     }
+                    // At the first page, the keys back to the conversation.
+                    KeyCode::Left if key.modifiers.is_empty() => self.pane_keys = false,
                     KeyCode::Right if pane.can_go(false) => self.go(false),
                     // A page of text: ↑↓ pick its links in view, as Lynx
                     // does, and scroll where none is left that way.
@@ -16840,9 +16870,15 @@ impl App {
                 }
                 return true;
             }
-            // Ctrl+\, or Tab with nothing typed, puts the keys in the pane.
+            // Ctrl+\, or Tab with nothing typed, puts the keys in the pane;
+            // so does `→` with nothing typed, where **Projects** is `←`.
+            let right = key.code == KeyCode::Right
+                && key.modifiers.is_empty()
+                && self.zen.is_none()
+                && self.options.side.is_none()
+                && !self.options.embedded;
             if switches(key)
-                || key.code == KeyCode::Tab
+                || (key.code == KeyCode::Tab || right)
                     && self.input.is_empty()
                     && self.picker.is_none()
                     && self.agents.is_none()
@@ -16979,8 +17015,8 @@ impl App {
             Picked::Group(group) => {
                 if watch.open.contains(&group) != open {
                     watch.toggle(group);
-                } else if !open && self.pane.as_ref().is_some_and(pane::Pane::goes_back) {
-                    self.step_pane(true);
+                } else if !open {
+                    self.left_ends();
                 }
             }
             Picked::Agent(bot) if open => watch.helpers_of(&bot, Some(true)),
@@ -16998,12 +17034,38 @@ impl App {
                         watch.pick = (card_picks(watch, width).iter())
                             .position(|picked| *picked == Picked::Group(group));
                     }
-                    None if self.pane.as_ref().is_some_and(pane::Pane::goes_back) => {
-                        self.step_pane(true);
-                    }
-                    None => {}
+                    None => self.left_ends(),
                 }
             }
+        }
+    }
+
+    /// `←` with nothing left to close in the pane: its previous page, as
+    /// `‹` goes, and at the first page the keys back to the conversation.
+    fn left_ends(&mut self) {
+        match self.pane.as_ref().is_some_and(pane::Pane::goes_back) {
+            true => {
+                self.step_pane(true);
+            }
+            false => self.pane_keys = false,
+        }
+    }
+
+    /// `alt+←` or `alt+→` with nothing typed: the window becomes the
+    /// agent above or below this one in the pane's list of the project's
+    /// agents, around its ends, as a multiplexer's previous and next tab.
+    /// From an agent the list does not show, either goes to the lead.
+    fn step_agent(&mut self, down: bool) {
+        let listed: Vec<&str> = (self.margin.agents().listed.iter())
+            .filter(|agent| agent.run.is_none())
+            .map(|agent| agent.bot.as_str())
+            .collect();
+        let Some(to) = stepped(&listed, &self.bot, down) else {
+            return;
+        };
+        if to != self.bot {
+            let to = to.to_owned();
+            self.switch_window(to);
         }
     }
 
@@ -18160,6 +18222,17 @@ impl App {
                         Ok(None) => self.notice = Some("no picture on the clipboard".into()),
                         Err(error) => self.notice = Some(error),
                     },
+                    // With nothing typed, the agent above or below in the
+                    // pane's list of the project's agents. A terminal that
+                    // sends alt+← as alt+b is taken at its word.
+                    KeyCode::Left | KeyCode::Right | KeyCode::Char('b') | KeyCode::Char('f')
+                        if self.input.is_empty()
+                            && self.projects_here()
+                            && (alt
+                                || ctrl && matches!(key.code, KeyCode::Left | KeyCode::Right)) =>
+                    {
+                        self.step_agent(matches!(key.code, KeyCode::Right | KeyCode::Char('f')))
+                    }
                     KeyCode::Char('b') if alt => self.input.word_left(),
                     KeyCode::Char('f') if alt => self.input.word_right(),
                     KeyCode::Char('d') if alt => self.input.delete_word_forward(),
@@ -28124,6 +28197,44 @@ mod tests {
     }
 
     #[test]
+    fn alt_arrows_step_through_the_projects_agents_around_the_ends() {
+        let listed = ["calc.lead", "calc.readme", "calc.halves"];
+        assert_eq!(stepped(&listed, "calc.lead", true), Some("calc.readme"));
+        assert_eq!(stepped(&listed, "calc.lead", false), Some("calc.halves"));
+        assert_eq!(stepped(&listed, "calc.halves", true), Some("calc.lead"));
+        assert_eq!(stepped(&listed, "calc.readme", false), Some("calc.lead"));
+        // From an agent the list does not show, both go to the lead.
+        assert_eq!(stepped(&listed, "calc.divide", true), Some("calc.lead"));
+        assert_eq!(stepped(&listed, "calc.divide", false), Some("calc.lead"));
+        assert_eq!(stepped(&[], "calc.lead", true), None);
+    }
+
+    #[tokio::test]
+    async fn right_with_nothing_typed_gives_the_pane_the_keys_and_left_takes_them_back() {
+        let mut app = app(zen_daemon().await);
+        let key = |code: KeyCode| Event::Key(event::KeyEvent::new(code, KeyModifiers::NONE));
+        app.pane = Some(pane::Pane::margin());
+        // Words typed: the arrows move the cursor, as before.
+        app.input.set("fix it");
+        app.key(key(KeyCode::Left)).await;
+        app.key(key(KeyCode::Right)).await;
+        assert!(!app.pane_keys);
+        assert!(app.projects.is_none());
+        app.input.set("");
+        app.key(key(KeyCode::Right)).await;
+        assert!(app.pane_keys);
+        // At the pane's first page, with nothing to close, `←` gives the
+        // keys back; it does not close the pane.
+        app.key(key(KeyCode::Left)).await;
+        assert!(!app.pane_keys);
+        assert!(app.pane.is_some());
+        // In zen they do nothing.
+        app.zen = Some("the rounding".into());
+        app.key(key(KeyCode::Right)).await;
+        assert!(!app.pane_keys);
+    }
+
+    #[test]
     fn each_agent_counts_under_the_lead_it_answers_to_where_a_folder_has_two() {
         let makers: HashMap<&str, &str> = [
             ("shop.lead", ""),
@@ -33648,19 +33759,26 @@ mod tests {
         assert!(app.pane.is_some() && app.pane_keys);
         let press = |code| Event::Key(event::KeyEvent::new(code, KeyModifiers::NONE));
         // A key the view does not list is not typed into the composer,
-        // `q` included; ← at the first page and `h` neither move the keys.
+        // `q` included.
         for code in [
             KeyCode::Char('q'),
             KeyCode::Char('x'),
             KeyCode::Char('/'),
-            KeyCode::Left,
-            KeyCode::Char('h'),
             KeyCode::Char('j'),
             KeyCode::Char('k'),
         ] {
             app.key(press(code)).await;
             assert!(app.pane.is_some() && app.pane_keys, "{code:?}");
             assert!(app.input.is_empty(), "{code:?}");
+        }
+        // ← at the first page, with nothing to close, gives the keys back
+        // and leaves the pane open, and so does `h`, which is `←` in every
+        // pane; `→` with nothing typed takes them again.
+        for code in [KeyCode::Left, KeyCode::Char('h')] {
+            app.key(press(code)).await;
+            assert!(app.pane.is_some() && !app.pane_keys, "{code:?}");
+            app.key(press(KeyCode::Right)).await;
+            assert!(app.pane_keys, "{code:?}");
         }
         // Tab with nothing typed moves the keys, both ways; Esc closes.
         app.key(press(KeyCode::Tab)).await;
@@ -36885,11 +37003,13 @@ mod tests {
         app.key(key(KeyCode::Char('i'))).await;
         assert_eq!(picks(&app).len(), 3);
         assert!(app.input.is_empty() && app.pane_keys);
-        // ← on the open heading folds it; again, at the first page, nothing.
+        // ← on the open heading folds it; again, at the first page, it
+        // gives the keys back to the conversation, the pane left open.
         app.key(key(KeyCode::Left)).await;
+        assert!(app.pane_keys);
         app.key(key(KeyCode::Left)).await;
         assert_eq!(picks(&app).len(), 2);
-        assert!(app.pane.is_some() && app.pane_keys);
+        assert!(app.pane.is_some() && !app.pane_keys);
         assert_eq!(
             status_keys(app.watch.as_ref().unwrap(), true),
             "↑↓ pick · enter open · →← fold · m more · esc close"
