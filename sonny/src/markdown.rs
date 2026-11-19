@@ -983,7 +983,12 @@ impl Draw<'_> {
             self.code_lines(None, text);
             return;
         }
-        // Colored once while its block is drawn again.
+        // Colored once, when closed, while its block is drawn again: one
+        // still growing is colored as it reads now.
+        if !closed {
+            self.code_lines(crate::highlight::Code::language(lang), text);
+            return;
+        }
         let key = (lang.to_owned(), text.to_owned());
         let lines = match self.cells.code.get(&key) {
             Some(lines) => lines.clone(),
@@ -1476,6 +1481,9 @@ pub struct Markdown {
     /// it, and its item's indent, mark and number. A new item after it is
     /// read alone, the items before it done.
     list: Option<(bool, usize, u8, Option<u64>)>,
+    /// The width the last line was read at, which the rows kept are drawn
+    /// at.
+    fed: usize,
     /// The open block is a table at the top level: a line that goes on
     /// with it, a row starting with `|`, is only kept until it ends.
     table: bool,
@@ -1554,6 +1562,7 @@ impl Markdown {
     }
 
     fn read(&mut self, line: &str, width: usize, out: &mut Vec<Line<'static>>) {
+        self.fed = width;
         if let Some(open) = &mut self.fence {
             if open.fence.closed_by(line) {
                 let open = self.fence.take().expect("open");
@@ -1684,7 +1693,9 @@ impl Markdown {
             let rows = &open.rows[self.given.min(open.rows.len())..];
             self.give(rows, gap, out);
             let gap = gap && rows.is_empty();
-            let opened = &self.source[open.start.min(self.source.len())..];
+            let opened = (open.start.checked_sub(drained))
+                .and_then(|start| self.source.get(start..))
+                .unwrap_or("");
             let body = opened.split_once('\n').map_or("", |(_, body)| body);
             let picture = drawn(&fence.lang, self.at.document).then(|| body.to_owned());
             let mut code = match picture {
@@ -1797,6 +1808,7 @@ impl Markdown {
             && !(open.across.iter()).any(|marks| marks.start < cut && cut < marks.end)
             && let Some(from) = cut.checked_sub(drained)
             && starts_with_word(&self.source[from..])
+            && !self.source[..from].contains("]:")
         {
             self.source.drain(..from);
             self.last.drain(..self.given);
@@ -1909,6 +1921,9 @@ impl Markdown {
         }
         let blank = self.source.trim_start_matches(['\n', ' ']).is_empty();
         match self.prose {
+            // A definition before the paragraph goes to the definitions
+            // with it, once a block after it comes.
+            Some(_) if self.source.contains("]:") => return false,
             Some(gap) => {
                 let rows = self.last.split_off(self.given.min(self.last.len()));
                 if !rows.is_empty() {
@@ -2036,6 +2051,10 @@ impl Markdown {
         first: bool,
         most: usize,
     ) -> Option<Vec<Line<'static>>> {
+        // The rows kept are drawn at the width they were read at.
+        if width != self.fed && self.last.len() > self.given {
+            return None;
+        }
         // A list starting under a reply's paragraph ends it: the list is
         // drawn on its own after it.
         let list = (self.prose)
@@ -2572,7 +2591,11 @@ pub fn inline(text: &str, base: Style) -> Vec<Span<'static>> {
         let digits = words.bytes().take_while(u8::is_ascii_digit).count();
         match first {
             Some('#' | '>' | '|' | '=') => true,
-            Some('-' | '+' | '*') => second.is_none_or(|c| c == ' ' || c == first.unwrap()),
+            Some(mark @ ('-' | '+' | '*')) => {
+                second.is_none_or(|c| c == ' ')
+                    || (words.chars().all(|c| c == mark || c == ' ')
+                        && words.chars().filter(|c| *c == mark).count() >= 3)
+            }
             Some('`' | '~') => words.starts_with("```") || words.starts_with("~~~"),
             Some(_) => {
                 digits > 0
