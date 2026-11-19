@@ -494,17 +494,21 @@ class ServedToolTests(ModelFixture):
         self.assertEqual(status, 'completed')
         self.assertIn('ran', results[-1][1])
 
-    def test_a_lifted_script_goes_on_to_its_next_steps(self):
+    def test_a_message_never_moves_a_running_script(self):
+        # As Codex takes a message once the running tool returns: the
+        # script's own result, every step of it run, then the message.
         code = ('for (let n = 0; n < 5; n++) {\n'
                 '  const r = await tools.shell({command: `sleep 0.5; echo ${n} >> steps`});\n'
                 '  if (r.isError) { text(r.content[0].text); break; }\n'
                 '}\ntext("all");')
         results, status = self.steered_script('', code=code, waits=False)
-        handle = json.loads(results[0][1])['handle']
-        later = self.daemon.request('submit', bot='calc.lead', request_id='c', prompt='collect:' + handle)['result']['message']
-        self.assertEqual(self.daemon.finished(later, 30)['data']['status'], 'completed')
-        self.assertIn('all', self.output('calc.lead', later))
+        self.assertEqual(status, 'completed')
+        [(_, said)] = results
+        self.assertNotIn('"handle"', said)
+        self.assertTrue(said.endswith('all'), said)
         self.assertEqual((self.path / 'steps').read_text(), '0\n1\n2\n3\n4\n')
+        events = self.daemon.request('events', bot='calc.lead', after=0, limit=256)['result']['events']
+        self.assertEqual([e for e in events if e['event'] == 'call_lifted'], [])
 
     def test_a_message_during_two_scripts_of_one_round_leaves_both_running(self):
         code = ('const r = await tools.shell({command: "sleep 2; echo CALL >> made; echo ran CALL"});\n'
@@ -532,16 +536,6 @@ class ServedToolTests(ModelFixture):
                                               after=lambda turn: self.gate(turn))
         self.assertEqual(status, 'completed')
         self.assertIn('ran', results[-1][1])
-
-    def test_a_script_a_message_lifted_outlives_its_turn(self):
-        results, status = self.steered_script('sleep 3; echo done > made; echo ran', waits=False)
-        self.assertEqual(status, 'completed')
-        handle = json.loads(results[0][1])['handle']
-        later = self.daemon.request('submit', bot='calc.lead', request_id='c', prompt='collect:' + handle)['result']['message']
-        self.assertEqual(self.daemon.finished(later, 30)['data']['status'], 'completed')
-        got = self.output('calc.lead', later)
-        self.assertIn('ran', got)
-        self.assertEqual((self.path / 'made').read_text(), 'done\n')
 
     def yielding_script(self, code):
         """A code-mode lead runs `code`, then waits on the handle its call

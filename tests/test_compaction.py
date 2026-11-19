@@ -339,7 +339,7 @@ class CompactionTests(ModelFixture):
             self.assertEqual(self.run_turn(client, 'Bob', n, f'{n}: ' + text)['data']['status'], 'completed')
         self.assertIsNotNone(client.request('inspect', bot='Bob')['result']['compaction'])
         for offset in (0, 97):
-            ended = self.run_turn(client, 'Bob', f'h-{offset}', f'history:1,{offset},97')
+            ended = self.run_turn(client, 'Bob', f'h-{offset}', f'history:1,{offset}')
             self.assertEqual(ended['data']['status'], 'completed')
             requests = self.requests()
             results = [json.loads(i['output']) for r in requests for i in r['input']
@@ -395,8 +395,9 @@ class CompactionTests(ModelFixture):
             self.assertEqual(self.run_turn(client, 'Bob', n, f'{n}: ' + 'x' * 150)['data']['status'], 'completed')
         self.requests()
         self.model.history_prefill = 1800
+        pages = {}
         for offset in (0, 97):
-            self.assertEqual(self.run_turn(client, 'Bob', f'h-{offset}', f'history:1,{offset},97')['data']['status'],
+            self.assertEqual(self.run_turn(client, 'Bob', f'h-{offset}', f'history:1,{offset}')['data']['status'],
                              'completed')
             requests = self.requests()
             results = [json.loads(i['output']) for r in requests for i in r['input']
@@ -405,11 +406,15 @@ class CompactionTests(ModelFixture):
             page = results[-1]
             self.assertNotIn('error', page)
             self.assertEqual(page['offset'], offset)
-            self.assertEqual(page['next_offset'], offset + 97)
-            self.assertEqual(len(page['text'].encode()), 97)
+            self.assertTrue(page['text'])
+            self.assertEqual(page['next_offset'], offset + len(page['text'].encode()))
+            pages[offset] = page['text']
             self.assertTrue(all(len(json.dumps(r['input'], separators=(',', ':'), ensure_ascii=False).encode()) - 2 <= 4096
                                 for r in requests))
             self.assertTrue(any('[context note]' in str(r['input']) for r in requests))
+        # Both pages read the same turn, the second from byte 97 on.
+        tail, later = pages[0].encode()[97:], pages[97].encode()
+        self.assertTrue(later.startswith(tail) or tail.startswith(later), (tail, later))
 
     def test_optional_previews_leave_room_for_the_current_prompt(self):
         client = self.client(settings={'context_bytes': 4096})

@@ -188,16 +188,16 @@ tries its held turns at once.
   follows the turn from its queued state to its end; with `steer` it ends
   with exit 0 when the message is taken into the running turn (`taken`,
   naming the turn it joined) or when the turn it started completes. A steer never waits behind
-  a blocking call and never cancels one: a turn parked on `wait` resumes at
+  a wait on someone and never cancels a call: a turn parked on `wait` resumes at
   once with its unresolved handles pending (still valid) and `steered: true`,
-  and a foreground `shell` command still running 250 ms after the steer
-  moves to the background and returns its `proc:` handle, as does a call
-  waiting for its approval, which waits on past the turn and reports back
-  as a background command does. A call its client answers is lifted the
-  same way only when its tool is declared with `lift` (and has waited
-  250 ms) or a step of it waits for approval; any other is answered first,
-  as Codex lets a running tool return, and the steer joins the turn
-  right after. `queue` deliveries leave all of these alone.
+  and a call waiting for its approval, or a call its client answers one of
+  whose steps waits for approval, moves to the background and returns its
+  `proc:` handle, waits on past the turn and reports back as a background
+  command does. A running call is never moved: a `shell` command, or a call
+  its client answers, is answered first, or yields on its own time (a
+  command at its `timeout_ms`, a client's call when its client yields it),
+  as Codex lets a running tool return, and the steer joins the turn right
+  after. `queue` deliveries leave all of these alone.
   A steer with an explicit workspace or model that differs from the running
   turn stays queued and runs separately with those choices.
   `attach` adds a message that needs no reply to the bot's next model call,
@@ -580,6 +580,11 @@ turn with a level sees it in its shell as `AGENT_EFFORT`, and a new bot that tak
 from `AGENT_MODEL` takes its level from `AGENT_EFFORT`, so a peer started
 on its creator's model thinks as hard as its creator; a bot given
 `--model` or a profile's model gets only its own `--effort`.
+`run --replaces BOT/N` names a message this same sender sent to `--bot`
+that this prompt replaces: still in line, it is withdrawn and this prompt
+sent in its place in one step; taken in already, it stays and this prompt
+goes after it. The reply's `replaced` says which (`withdrawn` or `taken`,
+with the turn that took it in), and `--pretty` adds it to the first line.
 `run --quote BOT/N` copies that one message's words after this prompt,
 with a line saying who wrote it, even when other messages were steered or
 attached beside it; `BOT/N:reply` copies the reply the finished turn it

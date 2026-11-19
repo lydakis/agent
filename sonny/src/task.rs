@@ -409,8 +409,8 @@ pub fn start(here: &Path, project: &str, starter: &str, start: &Start) -> Result
     // now: the ones the lead or the person picked from, even uncommitted,
     // never a worktree's copy as of its last commit, nor a folder inside.
     let roles = here;
-    let mut flags = match told(&place.told, roles, here, &info, &flags) {
-        Ok(flags) => flags,
+    let (mut flags, role_sandbox) = match told(&place.told, roles, here, &info, &flags) {
+        Ok(told) => told,
         Err(error) => return failed(&place, false, error),
     };
     with_cache(&mut flags);
@@ -431,6 +431,12 @@ pub fn start(here: &Path, project: &str, starter: &str, start: &Start) -> Result
             }
         }
         (None, None) => {}
+    }
+    // The profile's own sandbox, never looser than the one it would get.
+    if let Some(mode) = &role_sandbox
+        && let Err(why) = agent_client::policy::with_sandbox(&mut sandbox, mode)
+    {
+        return failed(&place, false, format!("invalid_setting: {why}"));
     }
     for (key, value) in sandbox {
         // Asked for as the gate's `--approval never`.
@@ -841,14 +847,15 @@ fn with_cache(flags: &mut Vec<String>) {
 /// for a task in `dir` given as `--instructions`, with what every task is
 /// told (`task.md`, or the task profile the project `info` or the config
 /// names) after it, and the role's model and tools unless the flags name
-/// their own. Roles are found from `roles`. Other flags pass as they are.
+/// their own; and the role's sandbox. Roles are found from `roles`. Other
+/// flags pass as they are.
 fn told(
     dir: &Path,
     roles: &Path,
     lead: &Path,
     info: &Value,
     flags: &[&String],
-) -> Result<Vec<String>, String> {
+) -> Result<(Vec<String>, Option<String>), String> {
     let mut kept = Vec::new();
     let (mut agents, mut profile) = (false, None);
     let mut flags = flags.iter().map(|flag| flag.as_str());
@@ -863,7 +870,7 @@ fn told(
         }
     }
     if !agents && profile.is_none() {
-        return Ok(kept);
+        return Ok((kept, None));
     }
     // A value flag is --flag VALUE or --flag=VALUE.
     let named = |flag: &str| {
@@ -908,7 +915,7 @@ fn told(
         crate::project::as_task(roles, info, &composed.text)?,
     ]);
     kept.extend(added);
-    Ok(kept)
+    Ok((kept, role.and_then(|role| role.sandbox)))
 }
 
 /// `brief` with each path in the folder `from` turned into the same path
@@ -3154,6 +3161,7 @@ mod tests {
                 &project.borrow(),
                 &flags.iter().collect::<Vec<_>>(),
             )
+            .map(|(flags, _)| flags)
         };
         let person = |flags: &[String]| {
             let at = flags.iter().position(|f| f == "--instructions").unwrap();
@@ -3169,6 +3177,26 @@ mod tests {
         let flags = told(&["--profile", "reviewer"]).unwrap();
         assert_eq!(flags[..4], ["--model", "a/b", "--tools", "shell,read"]);
         assert!(person(&flags).contains("Review it."));
+        // Its sandbox comes back beside the flags, for the task's settings.
+        std::fs::write(
+            dir.join(".agents/agents/reader.md"),
+            "---\nextends: reviewer\nsandbox: read-only\n---\nRead it.\n",
+        )
+        .unwrap();
+        let sandbox = |flags: &[&str]| {
+            let flags: Vec<String> = flags.iter().map(|f| f.to_string()).collect();
+            let flags: Vec<&String> = flags.iter().collect();
+            super::told(&dir, &dir, &dir, &project.borrow(), &flags)
+                .unwrap()
+                .1
+        };
+        assert_eq!(
+            sandbox(&["--profile", "reader"]).as_deref(),
+            Some("read-only")
+        );
+        assert_eq!(sandbox(&["--profile", "reviewer"]), None);
+        assert_eq!(sandbox(&["--agents"]), None);
+        std::fs::remove_file(dir.join(".agents/agents/reader.md")).unwrap();
         // The task's own picks win over the role's.
         let flags = told(&["--profile", "reviewer", "--model", "x/y"]).unwrap();
         assert_eq!(flags[..4], ["--model", "x/y", "--tools", "shell,read"]);
