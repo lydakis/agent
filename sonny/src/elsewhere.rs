@@ -18,7 +18,7 @@
 //! a new connection follows every agent on from the last event, with
 //! nothing read again.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -31,11 +31,12 @@ use crate::needs::{self, Seen};
 use crate::standing;
 
 /// The kinds of event every agent is followed for: those that can start
-/// a wait on the person, and an agent's deletion.
-pub const WIDE: [&str; 4] = [
+/// a wait on the person, and an agent's closing or deletion.
+pub const WIDE: [&str; 5] = [
     "approval_requested",
     "approval_asked",
     "tool_started",
+    "closed",
     "deleted",
 ];
 
@@ -95,11 +96,18 @@ impl Elsewhere {
 
 /// Whether `bot` is an agent of a project other than `project`, of those
 /// in `projects` (each by name): not one of Sonny's own (a leading dot),
-/// nor a side chat, which `/status` leaves out too.
-pub fn other(bot: &str, project: &str, projects: &HashMap<String, usize>) -> bool {
+/// nor a side chat, which `/status` leaves out too. A side chat is named
+/// as `/side` names one, but for the tasks in `named_as_sides`, listed
+/// with such a name though no side chat's record.
+pub fn other(
+    bot: &str,
+    project: &str,
+    projects: &HashMap<String, usize>,
+    named_as_sides: &HashSet<String>,
+) -> bool {
     !bot.starts_with('.')
         && bot.contains('.')
-        && crate::side_source(bot).is_none()
+        && (crate::side_source(bot).is_none() || named_as_sides.contains(bot))
         && project_in(bot, projects) != project
 }
 
@@ -134,10 +142,11 @@ async fn follow(
     let Seeded {
         mut needs,
         order,
+        named_as_sides,
         mut seen_of,
         running,
     } = seeded;
-    let theirs = |bot: &str| other(bot, &project, &order);
+    let theirs = |bot: &str| other(bot, &project, &order, &named_as_sides);
     // The agents followed narrowly, and whether each has waited since:
     // those that wait now, and those whose turn runs, to its end.
     let mut narrow: HashMap<String, bool> = HashMap::new();
@@ -181,7 +190,13 @@ async fn follow(
         if let Some(done) = done {
             marked.entry(bot.clone()).or_default().push(done);
         }
-        let changed = needs.event(&event);
+        let mut changed = needs.event(&event);
+        // Closed, it needs no one, as `/status` lists it no more.
+        if event["event"] == "closed" {
+            changed |= needs.waits(&bot);
+            needs.forget(&bot);
+            seen_of.remove(&bot);
+        }
         // A turn that may have asked or answered, read once it ends.
         let mut read = false;
         for (due, turn) in needs.due() {
@@ -254,6 +269,8 @@ struct Seeded {
     needs: needs::Needs,
     /// Each project's place in **Projects**, by name.
     order: HashMap<String, usize>,
+    /// The tasks listed with a side chat's name that are not side chats.
+    named_as_sides: HashSet<String>,
     /// What the history of each agent with a question open said, kept to
     /// read again when a lead marks it done.
     seen_of: HashMap<String, Seen>,
@@ -269,7 +286,14 @@ async fn seed(client: &Client, store: &std::path::Path, project: &str) -> Option
     let held = needs::listing(client, None).await.ok()?;
     let (listed, _) = standing::list(client, "*.*").await.ok()?;
     let order = in_order(store, &listed);
-    let theirs = |bot: &str| other(bot, project, &order);
+    let named_as_sides: HashSet<String> = (listed.iter())
+        .filter(|bot| {
+            crate::side_source(&bot.name)
+                .is_some_and(|source| bot.maker() != source || bot.expire_ms.is_none())
+        })
+        .map(|bot| bot.name.clone())
+        .collect();
+    let theirs = |bot: &str| other(bot, project, &order, &named_as_sides);
     needs.held(held, theirs);
     let mut seen_of: HashMap<String, Seen> = HashMap::new();
     let mut running = Vec::new();
@@ -316,6 +340,7 @@ async fn seed(client: &Client, store: &std::path::Path, project: &str) -> Option
     Some(Seeded {
         needs,
         order,
+        named_as_sides,
         seen_of,
         running,
     })
@@ -394,8 +419,8 @@ fn tell_waiting(
     woken: &Notify,
 ) {
     let place = |bot: &str| (order.get(project_in(bot, order)).copied()).unwrap_or(usize::MAX);
+    // Only the other projects' agents are followed, so every one waiting.
     let mut agents: Vec<(usize, String)> = (needs.waiting())
-        .filter(|bot| other(bot, project, order))
         .map(|bot| (place(bot), bot.to_owned()))
         .collect();
     agents.sort();
@@ -446,13 +471,16 @@ mod tests {
             [("tally", 0), ("site", 1), ("shop", 2), ("shop.web", 3)]
                 .map(|(name, at)| (name.to_owned(), at))
                 .into();
-        let other = |bot, project| other(bot, project, &projects);
+        let sides: HashSet<String> = ["site.side-feed".to_owned()].into();
+        let other = |bot, project| other(bot, project, &projects, &sides);
         assert!(other("site.lead", "tally"));
         assert!(other("books.fix", "tally"));
         assert!(!other("tally.readme", "tally"));
         assert!(!other(".sky.lead", "tally"));
         // A side chat is left out, as `/status` leaves it.
         assert!(!other("site.lead.side-1a2b", "tally"));
+        // A task named like one, which its record says it is not.
+        assert!(other("site.side-feed", "tally"));
         // A project named with a dot is its own, not the one it starts with.
         assert!(other("shop.web.lead", "shop"));
         assert!(other("shop.web.page", "shop"));
